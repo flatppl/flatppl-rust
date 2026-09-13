@@ -4616,7 +4616,7 @@ fn reification_type(
             );
             entries.iter().map(|(n, _)| *n).collect()
         }
-        Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
+        Some(Inputs::Auto) => match inf.auto_inputs_of(id) {
             Some(entries) => {
                 declared.extend(
                     entries
@@ -4665,7 +4665,7 @@ fn reification_type(
                         .filter(|(_, r)| r.ns == RefNs::SelfMod)
                         .map(|(_, r)| r.name),
                 );
-                inf.module.set_auto_inputs(id, entries.into());
+                inf.set_auto_inputs(id, entries.into());
                 names
             }
         },
@@ -4973,7 +4973,7 @@ fn captured_draws(
                 }
                 // Enter the nested `functionof` under its own boundary names.
                 let mut inner = scopes[scope].clone();
-                inner.extend(reification_boundary_targets(module, id));
+                inner.extend(reification_boundary_targets(inf, id));
                 inner.sort_unstable();
                 inner.dedup();
                 let next = match scopes.iter().position(|s| *s == inner) {
@@ -5026,8 +5026,8 @@ fn captured_draws(
 /// inputs, under either origin tag. A `%local` placeholder entry names no
 /// binding and is skipped: it is the reification's own input, not an ancestor
 /// the boundary cuts away.
-fn reification_boundary_targets(module: &flatppl_core::Module, id: NodeId) -> Vec<Symbol> {
-    let Node::Call(call) = module.node(id) else {
+fn reification_boundary_targets(inf: &Inferencer<'_, '_>, id: NodeId) -> Vec<Symbol> {
+    let Node::Call(call) = inf.module.node(id) else {
         return Vec::new();
     };
     let collect = |entries: &[(Symbol, Ref)]| {
@@ -5039,7 +5039,7 @@ fn reification_boundary_targets(module: &flatppl_core::Module, id: NodeId) -> Ve
     };
     match call.inputs.as_ref() {
         Some(Inputs::Spec(entries)) => collect(entries),
-        Some(Inputs::Auto) => module.auto_inputs_of(id).map(collect).unwrap_or_default(),
+        Some(Inputs::Auto) => inf.auto_inputs_of(id).map(collect).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -5837,7 +5837,7 @@ fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Na
 
 /// Per-call result type of a **local** reified callable, computed by substituting
 /// the concrete call-arg annotations for the callable's input parameters and
-/// re-inferring its body in a throwaway module clone. This is the single-module
+/// re-inferring its body in a fresh annotation scope. This is the single-module
 /// analogue of the cross-module substitution path (`modules::seed_plan` +
 /// `infer_dep`): there the dependency's input *bindings* are seeded; here the
 /// body's `%local` placeholder refs (or a self-bound input binding's RHS) are
@@ -5898,15 +5898,11 @@ fn substituted_result(
         return None;
     }
 
-    // Re-infer ONLY the body in an isolated clone seeded with the substitutions.
+    // Re-infer ONLY the body with isolated annotations seeded by substitutions.
     // Inferring the body alone (not the whole module via `run`) avoids re-entering
     // the application that triggered this — the seeds cut every parameter, so the
     // body walk never reaches back to the call site.
-    let mut clone = inf.module.clone();
-    let mut sub = Inferencer::new_seeded(&mut clone, inf.level, inf.session, &seeds);
-    let (ty, _) = sub.infer_node(body);
-    let vset = sub.lookup_valueset(body);
-    Some((ty, vset))
+    Some(inf.infer_substituted(body, &seeds))
 }
 
 /// Deref a callee expression to its local reification: follow `self` refs to the
@@ -5934,7 +5930,7 @@ fn input_entries(inf: &Inferencer<'_, '_>, reif_id: NodeId) -> Option<Vec<(Symbo
     };
     match call.inputs.as_ref()? {
         Inputs::Spec(entries) => Some(entries.to_vec()),
-        Inputs::Auto => inf.module.auto_inputs_of(reif_id).map(<[_]>::to_vec),
+        Inputs::Auto => inf.auto_inputs_of(reif_id).map(<[_]>::to_vec),
     }
 }
 

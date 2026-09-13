@@ -6,6 +6,7 @@
 //! `(%failed …)` type so the gap is visible in annotated output.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use flatppl_core::{
     BindingId, Call, CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol,
@@ -15,6 +16,8 @@ use flatppl_core::{
 use crate::modules::InferSession;
 use crate::ops;
 use crate::{Diagnostic, Level};
+
+type AutoInputScope = HashMap<NodeId, Box<[(Symbol, Ref)]>>;
 
 pub(crate) struct Inferencer<'m, 's> {
     pub(crate) module: &'m mut Module,
@@ -54,7 +57,10 @@ pub(crate) struct Inferencer<'m, 's> {
     /// Argument positions of a `builtin_*` primitive or a `broadcast`, where a
     /// bare distribution-constructor atom is a kernel TAG rather than a value
     /// reference. See [`collect_kernel_tag_nodes`].
-    kernel_tag_nodes: HashSet<NodeId>,
+    kernel_tag_nodes: Rc<HashSet<NodeId>>,
+    /// Nested substitutions inherit known boundaries but discard discoveries
+    /// made under their argument phases. Only the root scope is flushed.
+    auto_inputs: Vec<AutoInputScope>,
 }
 
 /// The exact node ids sitting in a kernel-TAG SLOT, where a bare
@@ -96,7 +102,16 @@ fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
 
 impl<'m, 's> Inferencer<'m, 's> {
     pub(crate) fn new(module: &'m mut Module, level: Level, session: &'s InferSession<'s>) -> Self {
-        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
+        let kernel_tag_nodes = Rc::new(collect_kernel_tag_nodes(module));
+        Self::with_kernel_tags(module, level, session, kernel_tag_nodes)
+    }
+
+    fn with_kernel_tags(
+        module: &'m mut Module,
+        level: Level,
+        session: &'s InferSession<'s>,
+        kernel_tag_nodes: Rc<HashSet<NodeId>>,
+    ) -> Self {
         Inferencer {
             module,
             level,
@@ -112,6 +127,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
             kernel_tag_nodes,
+            auto_inputs: vec![HashMap::new()],
         }
     }
 
@@ -124,27 +140,52 @@ impl<'m, 's> Inferencer<'m, 's> {
         session: &'s InferSession<'s>,
         seeds: &[(NodeId, crate::modules::Resolved)],
     ) -> Self {
-        let seed_map = seeds
+        let mut inf = Self::new(module, level, session);
+        inf.seed_inputs(seeds);
+        inf
+    }
+
+    fn seed_inputs(&mut self, seeds: &[(NodeId, crate::modules::Resolved)]) {
+        self.seeds = seeds
             .iter()
             .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
             .collect();
-        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
-        Inferencer {
-            module,
-            level,
-            session,
-            diags: Vec::new(),
-            tys: HashMap::new(),
-            phases: HashMap::new(),
-            vsets: HashMap::new(),
-            seeds: seed_map,
-            in_progress: Vec::new(),
-            active_bindings: HashSet::new(),
-            noted_gaps: HashSet::new(),
-            module_callable_results: HashMap::new(),
-            module_catalogue_refs: HashMap::new(),
-            kernel_tag_nodes,
-        }
+    }
+
+    /// Reuse the unchanged graph, not the caller's inferred annotations.
+    /// Moving the boundary stack gives the child ancestor visibility without
+    /// copying it. The parent's walk is suspended until the stack is restored.
+    pub(crate) fn infer_substituted(
+        &mut self,
+        body: NodeId,
+        seeds: &[(NodeId, crate::modules::Resolved)],
+    ) -> (Type, ValueSet) {
+        let mut sub = Inferencer::with_kernel_tags(
+            self.module,
+            self.level,
+            self.session,
+            Rc::clone(&self.kernel_tag_nodes),
+        );
+        sub.seed_inputs(seeds);
+        sub.auto_inputs = std::mem::take(&mut self.auto_inputs);
+        sub.auto_inputs.push(HashMap::new());
+        let (ty, _) = sub.infer_node(body);
+        let vset = sub.lookup_valueset(body);
+        sub.auto_inputs.pop();
+        self.auto_inputs = sub.auto_inputs;
+        (ty, vset)
+    }
+
+    pub(crate) fn auto_inputs_of(&self, id: NodeId) -> Option<&[(Symbol, Ref)]> {
+        self.auto_inputs
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&id).map(AsRef::as_ref))
+            .or_else(|| self.module.auto_inputs_of(id))
+    }
+
+    pub(crate) fn set_auto_inputs(&mut self, id: NodeId, entries: Box<[(Symbol, Ref)]>) {
+        self.auto_inputs.last_mut().unwrap().insert(id, entries);
     }
 
     pub(crate) fn run(mut self) -> Vec<Diagnostic> {
@@ -162,6 +203,9 @@ impl<'m, 's> Inferencer<'m, 's> {
             self.infer_binding(id);
         }
         // Level-aware flush into the module's annotation side-tables.
+        for (id, entries) in self.auto_inputs.pop().unwrap() {
+            self.module.set_auto_inputs(id, entries);
+        }
         for (&id, phase) in &self.phases {
             self.module.set_phase(id, *phase);
         }
