@@ -43,7 +43,10 @@ flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
 flatppl prepare model.flatppl                  # fetch the model's remote deps into the cache
 flatppl convert model.flatppl model.html       # the model as a page of mathematics (MathML)
+flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation; default is f32
 ```
+
+StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 
 Formats are inferred from the file extensions. FlatPPL output uses the full
 surface syntax (operators, indexing, lambdas, `:=`); pass `--syntax minimal`
