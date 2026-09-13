@@ -370,7 +370,7 @@ fn a_bare_value_law_still_serves_in_every_measure_position() {
         ),
         (
             format!("{one}lp = logdensityof(iid(lawof(z), 2), [0.3, 0.4])"),
-            "(add ",
+            "(sum ",
         ),
         (
             format!("{two}lp = logdensityof(superpose(lawof(z), lawof(q)), 0.3)"),

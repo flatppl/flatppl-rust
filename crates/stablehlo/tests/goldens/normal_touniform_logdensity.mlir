@@ -1,9 +1,8 @@
 module {
   func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
     %0 = stablehlo.constant dense<0.5> : tensor<f32>
-    %1 = stablehlo.constant dense<0> : tensor<i32>
     %2 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %3 = stablehlo.convert %1 : (tensor<i32>) -> tensor<f32>
+    %3 = stablehlo.constant dense<0.0> : tensor<f32>
     %4 = stablehlo.compare GE, %0, %3 : (tensor<f32>, tensor<f32>) -> tensor<i1>
     %5 = stablehlo.compare LE, %0, %2 : (tensor<f32>, tensor<f32>) -> tensor<i1>
     %6 = stablehlo.and %4, %5 : tensor<i1>
@@ -19,31 +18,23 @@ module {
     %16 = stablehlo.multiply %14, %15 : tensor<f32>
     %17 = stablehlo.add %10, %11 : tensor<f32>
     %18 = stablehlo.add %17, %16 : tensor<f32>
-    %19 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %20 = stablehlo.negate %19 : tensor<f32>
-    %21 = stablehlo.select %6, %18, %20 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %22 = stablehlo.subtract %2, %arg0 : tensor<f32>
-    %23 = stablehlo.constant dense<1.4142135623730951> : tensor<f32>
-    %24 = stablehlo.multiply %arg1, %23 : tensor<f32>
-    %25 = stablehlo.divide %22, %24 : tensor<f32>
-    %26 = chlo.erf %25 : tensor<f32> -> tensor<f32>
-    %27 = stablehlo.constant dense<1.0> : tensor<f32>
-    %28 = stablehlo.add %27, %26 : tensor<f32>
-    %29 = stablehlo.constant dense<0.5> : tensor<f32>
-    %30 = stablehlo.multiply %29, %28 : tensor<f32>
-    %31 = stablehlo.convert %1 : (tensor<i32>) -> tensor<f32>
-    %32 = stablehlo.subtract %31, %arg0 : tensor<f32>
-    %33 = stablehlo.constant dense<1.4142135623730951> : tensor<f32>
-    %34 = stablehlo.multiply %arg1, %33 : tensor<f32>
-    %35 = stablehlo.divide %32, %34 : tensor<f32>
-    %36 = chlo.erf %35 : tensor<f32> -> tensor<f32>
-    %37 = stablehlo.constant dense<1.0> : tensor<f32>
-    %38 = stablehlo.add %37, %36 : tensor<f32>
-    %39 = stablehlo.constant dense<0.5> : tensor<f32>
-    %40 = stablehlo.multiply %39, %38 : tensor<f32>
-    %41 = stablehlo.subtract %30, %40 : tensor<f32>
-    %42 = stablehlo.log %41 : tensor<f32>
-    %43 = stablehlo.subtract %21, %42 : tensor<f32>
-    return %43 : tensor<f32>
+    %19 = stablehlo.negate %2 : tensor<f32>
+    %20 = stablehlo.select %6, %18, %19 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %21 = stablehlo.subtract %2, %arg0 : tensor<f32>
+    %22 = stablehlo.constant dense<1.4142135623730951> : tensor<f32>
+    %23 = stablehlo.multiply %arg1, %22 : tensor<f32>
+    %24 = stablehlo.divide %21, %23 : tensor<f32>
+    %25 = chlo.erf %24 : tensor<f32> -> tensor<f32>
+    %26 = stablehlo.add %7, %25 : tensor<f32>
+    %27 = stablehlo.multiply %0, %26 : tensor<f32>
+    %28 = stablehlo.subtract %3, %arg0 : tensor<f32>
+    %29 = stablehlo.divide %28, %23 : tensor<f32>
+    %30 = chlo.erf %29 : tensor<f32> -> tensor<f32>
+    %31 = stablehlo.add %7, %30 : tensor<f32>
+    %32 = stablehlo.multiply %0, %31 : tensor<f32>
+    %33 = stablehlo.subtract %27, %32 : tensor<f32>
+    %34 = stablehlo.log %33 : tensor<f32>
+    %35 = stablehlo.subtract %20, %34 : tensor<f32>
+    return %35 : tensor<f32>
   }
 }

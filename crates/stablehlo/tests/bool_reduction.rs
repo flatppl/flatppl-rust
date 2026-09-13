@@ -62,9 +62,15 @@ const LITERAL_MASK: &str = "mask = [true, true, false]\nc = sum(mask)\noutputs =
 /// `0` — not the boolean `false` the old code emitted.
 #[test]
 fn boolean_sum_converts_to_integer_before_reducing() {
-    let mlir = emit(LITERAL_MASK, &["outputs"]);
+    let mlir = emit(
+        &format!("{LITERAL_MASK}inputs = (mask)\n"),
+        &["inputs", "outputs"],
+    );
     assert!(
-        mlir.contains("stablehlo.convert %6 : (tensor<3xi1>) -> tensor<3xi32>"),
+        mlir.lines().any(|line| {
+            line.contains("stablehlo.convert ")
+                && line.contains(": (tensor<3xi1>) -> tensor<3xi32>")
+        }),
         "the i1 batch must be converted before reducing:\n{mlir}"
     );
     assert!(
@@ -171,15 +177,19 @@ fn real_and_integer_sums_emit_no_conversion() {
 fn a_rank_two_boolean_sum_converts_once_then_reduces_each_axis() {
     let src = "m = rowstack([[true, false, true], [true, true, false]])\n\
                c = sum(m)\n\
+               inputs = (m)\n\
                outputs = (c)\n";
-    let mlir = emit(src, &["outputs"]);
+    let mlir = emit(src, &["inputs", "outputs"]);
     assert_eq!(
         mlir.matches("stablehlo.convert").count(),
         1,
         "exactly one convert, not one per axis:\n{mlir}"
     );
     assert!(
-        mlir.contains("stablehlo.convert %16 : (tensor<2x3xi1>) -> tensor<2x3xi32>"),
+        mlir.lines().any(|line| {
+            line.contains("stablehlo.convert ")
+                && line.contains(": (tensor<2x3xi1>) -> tensor<2x3xi32>")
+        }),
         "the whole rank-2 batch is promoted up front:\n{mlir}"
     );
     // Two reduces, each at i32: [2, 3] -> [3] -> scalar.
@@ -194,7 +204,7 @@ fn a_rank_two_boolean_sum_converts_once_then_reduces_each_axis() {
         "both passes run at i32:\n{mlir}"
     );
     assert!(
-        mlir.contains("func.func @logdensity() -> tensor<i32>"),
+        mlir.contains("func.func @logdensity(%arg0: tensor<2x3xi1>) -> tensor<i32>"),
         "and the ABI returns a count:\n{mlir}"
     );
 }

@@ -34,6 +34,12 @@ use crate::Dtype;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
+#[path = "batching.rs"]
+mod batching;
+#[path = "constants.rs"]
+mod constants;
+use batching::{Axes, shape};
+
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
 /// negative infinity, spelled as the raw bit pattern MLIR's float-attribute
 /// hex-literal syntax expects (`0xFF800000` / `0xFFF0000000000000`). A finite
@@ -112,6 +118,11 @@ pub struct Emitter<'m> {
     /// pre-bound to its `%argN` `Value` via [`Emitter::bind`]) before the body
     /// graph that references it is walked.
     memo: HashMap<NodeId, Value>,
+    /// Exact pure-operation RHS -> SSA, confined to the current region.
+    pure_ops: HashMap<(String, Option<Axes>), String>,
+    axes: HashMap<String, Axes>,
+    constants: HashMap<String, constants::Constant>,
+    broadcast_frame: Vec<Option<u64>>,
     body: String,
     /// The threaded rng-state key (spec §07 rng ABI). Set by
     /// [`crate::registry::lower_sample`] from a `builtin_sample`'s rng arg
@@ -150,6 +161,10 @@ impl<'m> Emitter<'m> {
             dtype,
             next: 0,
             memo: HashMap::new(),
+            pure_ops: HashMap::new(),
+            axes: HashMap::new(),
+            constants: HashMap::new(),
+            broadcast_frame: Vec::new(),
             body: String::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
@@ -228,17 +243,21 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Reuse only explicitly pure, single-result operations. Keeping the full
+    /// RHS preserves operand order, attributes, and concrete element types.
+    fn pure(&mut self, rhs: String) -> String {
+        self.pure_axes(rhs, Axes::default())
+    }
+
     // ---- elementary ops -------------------------------------------------
 
     /// `%N = stablehlo.constant dense<x> : ty` — a (possibly splat, for a
     /// non-scalar `ty`) constant.
     pub fn constant(&mut self, x: f64, ty: MlirTy) -> Value {
-        let ssa = self.fresh();
         let ty_text = ty.render(self.dtype, ElemKind::Real);
         let lit = render_float_literal(x);
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
+        self.remember_constant(&ssa, [Scalar::Real(x)]);
         Value {
             ssa,
             ty,
@@ -251,6 +270,41 @@ impl<'m> Emitter<'m> {
         self.constant(x, MlirTy::Scalar)
     }
 
+    /// Pack literal data without emitting a scalar operation per element.
+    /// Mixed kinds retain the normal path and its intermediate conversions.
+    pub(crate) fn literal_vector(&mut self, args: &[NodeId], elem: ElemKind) -> Option<Value> {
+        // Even literal nodes can be rebound by the declared runtime inputs.
+        if args.iter().any(|id| self.memo.contains_key(id)) {
+            return None;
+        }
+        let literals = args
+            .iter()
+            .map(|&id| match (self.m.node(id), elem) {
+                (Node::Lit(Scalar::Bool(b)), ElemKind::Bool) => Some(b.to_string()),
+                (Node::Lit(Scalar::Int(i)), ElemKind::Int) => Some(i.to_string()),
+                (Node::Lit(Scalar::Real(x)), ElemKind::Real) if x.is_finite() => {
+                    Some(render_float_literal(*x))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let ty = MlirTy::Ranked(vec![Some(args.len() as u64)]);
+        let ty_text = ty.render(self.dtype, elem);
+        let ssa = self.pure(format!(
+            "stablehlo.constant dense<[{}]> : {ty_text}",
+            literals.join(", ")
+        ));
+        let data = args
+            .iter()
+            .map(|&id| match self.m.node(id) {
+                Node::Lit(x) => x.clone(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        self.remember_constant(&ssa, data);
+        Some(Value { ssa, ty, elem })
+    }
+
     /// `%N = stablehlo.constant dense<+inf> : ty` — positive infinity (the
     /// `ifelse`/`neg(inf)` "outside the support" log-density floor). Cannot
     /// go through [`Emitter::constant`]: that renders `x` as a *decimal*
@@ -261,12 +315,9 @@ impl<'m> Emitter<'m> {
     /// pattern parses. Same reasoning as [`reduce_max_identity`]'s negative
     /// infinity, sign bit cleared.
     pub fn inf(&mut self, ty: MlirTy) -> Value {
-        let ssa = self.fresh();
         let ty_text = ty.render(self.dtype, ElemKind::Real);
         let lit = pos_inf_literal(self.dtype);
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
         Value {
             ssa,
             ty,
@@ -282,9 +333,11 @@ impl<'m> Emitter<'m> {
     /// already-`Real` `a` — the caller converted it first — so the pass-
     /// through is equally correct there).
     pub fn unary(&mut self, op: &str, a: &Value) -> Value {
-        let ssa = self.fresh();
+        if let Some(value) = self.fold_unary(op, a) {
+            return value;
+        }
         let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!("{ssa} = {op} {} : {ty_text}", a.ssa));
+        let ssa = self.pure_like(format!("{op} {} : {ty_text}", a.ssa), a);
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -299,9 +352,11 @@ impl<'m> Emitter<'m> {
     /// reconciled a kind mismatch first, if needed) — the result `elem`
     /// copies `a`'s.
     fn emit_binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
-        let ssa = self.fresh();
+        if let Some(value) = self.fold_binary(op, a, b) {
+            return value;
+        }
         let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!("{ssa} = {op} {}, {} : {ty_text}", a.ssa, b.ssa));
+        let ssa = self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a);
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -535,7 +590,7 @@ impl<'m> Emitter<'m> {
     /// second rounding on top of the division's one.
     pub fn log10(&mut self, a: &Value) -> Value {
         let lx = self.log(a);
-        let ln10 = self.constant(std::f64::consts::LN_10, lx.ty.clone());
+        let ln10 = self.constant_like(std::f64::consts::LN_10, &lx);
         self.div(&lx, &ln10)
     }
     /// Spec §07 `log2`, $\log_{2}(x)$ — `log(x) / ln(2)`, exactly as
@@ -544,7 +599,7 @@ impl<'m> Emitter<'m> {
     /// `1/ln(2)` would double.
     pub fn log2(&mut self, a: &Value) -> Value {
         let lx = self.log(a);
-        let ln2 = self.constant(std::f64::consts::LN_2, lx.ty.clone());
+        let ln2 = self.constant_like(std::f64::consts::LN_2, &lx);
         self.div(&lx, &ln2)
     }
     /// Spec §07 `abs2`, $\vert x\vert^2$ — `x * x` over the reals this crate
@@ -571,7 +626,7 @@ impl<'m> Emitter<'m> {
     /// three dead ops in every `atan` a `pushfwd` emits.
     pub fn atan2(&mut self, y: &Value, x: &Value) -> Value {
         let raw = self.binary_real("stablehlo.atan2", y, x);
-        let zero = self.constant(0.0, raw.ty.clone());
+        let zero = self.constant_like(0.0, &raw);
         let y_zero = self.compare("EQ", y, &zero);
         let x_zero = self.compare("EQ", x, &zero);
         let origin = self.and(&y_zero, &x_zero);
@@ -607,7 +662,7 @@ impl<'m> Emitter<'m> {
     /// gate: at `p = 0` the ratio is `0/1 = 0` so `log 0 = −inf`, and at
     /// `p = 1` it is `1/0 = +inf` so `log(+inf) = +inf`.
     pub(crate) fn logit(&mut self, a: &Value) -> Value {
-        let one = self.constant(1.0, a.ty.clone());
+        let one = self.constant_like(1.0, a);
         let omp = self.sub(&one, a);
         let ratio = self.div(a, &omp);
         self.log(&ratio)
@@ -623,12 +678,12 @@ impl<'m> Emitter<'m> {
     /// module is not silently held to f32 accuracy. See [`Emitter::erf_inv`]
     /// for the gradient limitation this inherits.
     pub(crate) fn probit(&mut self, a: &Value) -> Value {
-        let two = self.constant(2.0, a.ty.clone());
-        let one = self.constant(1.0, a.ty.clone());
+        let two = self.constant_like(2.0, a);
+        let one = self.constant_like(1.0, a);
         let scaled = self.mul(a, &two);
         let centred = self.sub(&scaled, &one);
         let e = self.erf_inv(&centred);
-        let sqrt2 = self.constant(std::f64::consts::SQRT_2, a.ty.clone());
+        let sqrt2 = self.constant_like(std::f64::consts::SQRT_2, a);
         self.mul(&e, &sqrt2)
     }
 
@@ -637,12 +692,12 @@ impl<'m> Emitter<'m> {
     /// `mu = 0, sigma = 1`, spelled here for the op map because
     /// `crate::ops` has no `Params` to read.
     pub(crate) fn invprobit(&mut self, a: &Value) -> Value {
-        let sqrt2 = self.constant(std::f64::consts::SQRT_2, a.ty.clone());
+        let sqrt2 = self.constant_like(std::f64::consts::SQRT_2, a);
         let z = self.div(a, &sqrt2);
         let erf_z = self.erf(&z);
-        let one = self.constant(1.0, a.ty.clone());
+        let one = self.constant_like(1.0, a);
         let one_plus = self.add(&one, &erf_z);
-        let half = self.constant(0.5, a.ty.clone());
+        let half = self.constant_like(0.5, a);
         self.mul(&half, &one_plus)
     }
 
@@ -708,7 +763,7 @@ impl<'m> Emitter<'m> {
         let plus = self.log1p(a);
         let minus = self.log1p(&neg);
         let diff = self.sub(&plus, &minus);
-        let half = self.constant(0.5, a.ty.clone());
+        let half = self.constant_like(0.5, a);
         self.mul(&half, &diff)
     }
 
@@ -746,7 +801,6 @@ impl<'m> Emitter<'m> {
         let a = self.convert(a, target);
         let b = self.convert(b, target);
         let (a, b) = self.broadcast_pair(&a, &b);
-        let ssa = self.fresh();
         let lhs_ty = a.ty.render(self.dtype, a.elem);
         let rhs_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = render_i1(&a.ty);
@@ -761,10 +815,10 @@ impl<'m> Emitter<'m> {
         } else {
             ""
         };
-        self.push(&format!(
-            "{ssa} = stablehlo.compare {dir}, {}, {}{compare_type} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
+        let ssa = self.pure_like(format!(
+            "stablehlo.compare {dir}, {}, {}{compare_type} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
             a.ssa, b.ssa
-        ));
+        ), &a);
         Value {
             ssa,
             ty: a.ty,
@@ -809,6 +863,14 @@ impl<'m> Emitter<'m> {
         let a = self.convert(a, elem_target);
         let b = self.convert(b, elem_target);
         let (a, b) = self.broadcast_pair(&a, &b);
+        let batched = [c, &a, &b].iter().any(|v| self.batch_rank(v) != 0);
+        let (c, a, b) = if batched {
+            let (c, a) = self.broadcast_pair(c, &a);
+            let (b, _) = self.broadcast_pair(&b, &a);
+            (c, a, b)
+        } else {
+            (c.clone(), a, b)
+        };
         // Target the ranked shape among {pred, on_true, on_false}, if any —
         // `a`/`b` already share a shape (just above); this second pass only
         // does anything when that shared shape is `Scalar` but `c` is
@@ -825,13 +887,15 @@ impl<'m> Emitter<'m> {
             ),
             None => (a, b),
         };
-        let ssa = self.fresh();
         let pred_ty = render_i1(&c.ty);
         let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = stablehlo.select {}, {}, {} : ({pred_ty}, {ty_text}, {ty_text}) -> {ty_text}",
-            c.ssa, a.ssa, b.ssa
-        ));
+        let ssa = self.pure_like(
+            format!(
+                "stablehlo.select {}, {}, {} : ({pred_ty}, {ty_text}, {ty_text}) -> {ty_text}",
+                c.ssa, a.ssa, b.ssa
+            ),
+            &a,
+        );
         Value {
             ssa,
             ty: a.ty,
@@ -850,13 +914,12 @@ impl<'m> Emitter<'m> {
         if v.elem == target {
             return v.clone();
         }
-        let ssa = self.fresh();
+        if let Some(value) = self.fold_convert(v, target) {
+            return value;
+        }
         let from = v.ty.render(self.dtype, v.elem);
         let to = v.ty.render(self.dtype, target);
-        self.push(&format!(
-            "{ssa} = stablehlo.convert {} : ({from}) -> {to}",
-            v.ssa
-        ));
+        let ssa = self.pure_like(format!("stablehlo.convert {} : ({from}) -> {to}", v.ssa), v);
         Value {
             ssa,
             ty: v.ty.clone(),
@@ -902,14 +965,20 @@ impl<'m> Emitter<'m> {
             .collect();
         let result_ty = MlirTy::Ranked(result_dims);
 
-        let ssa = self.fresh();
+        if let Some(value) = self.fold_extract(a, starts, result_ty.clone()) {
+            return value;
+        }
+
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
-            a.ssa,
-            ranges.join(", ")
-        ));
+        let ssa = self.pure_like(
+            format!(
+                "stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
+                a.ssa,
+                ranges.join(", ")
+            ),
+            a,
+        );
         Value {
             ssa,
             ty: result_ty,
@@ -923,18 +992,32 @@ impl<'m> Emitter<'m> {
     /// `Scalar`. Shape-only — same element-type-preserving contract as
     /// [`Emitter::slice`], so the result `elem` copies `a`'s.
     pub fn reshape(&mut self, a: &Value, ty: MlirTy) -> Value {
-        let ssa = self.fresh();
+        let batch = self.batch_rank(a);
+        let rank = shape(&ty).len() - batch;
+        let axes = Axes {
+            batch,
+            layers: if rank == 0 { vec![] } else { vec![rank] },
+        };
+        self.reshape_axes(a, ty, axes)
+    }
+
+    fn reshape_axes(&mut self, a: &Value, ty: MlirTy, axes: Axes) -> Value {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = stablehlo.reshape {} : ({operand_ty}) -> {result_ty_text}",
-            a.ssa
-        ));
-        Value {
+        let ssa = self.pure_axes(
+            format!(
+                "stablehlo.reshape {} : ({operand_ty}) -> {result_ty_text}",
+                a.ssa
+            ),
+            axes,
+        );
+        let out = Value {
             ssa,
             ty,
             elem: a.elem,
-        }
+        };
+        self.copy_constant(a, &out);
+        out
     }
 
     /// `%N = stablehlo.broadcast_in_dim %a, dims = [...] : (operand_ty) ->
@@ -948,7 +1031,6 @@ impl<'m> Emitter<'m> {
     /// broadcast). Shape-only — same element-type-preserving contract as
     /// [`Emitter::slice`], so the result `elem` copies `a`'s.
     pub fn broadcast_in_dim(&mut self, a: &Value, dims: &[u64], ty: MlirTy) -> Value {
-        let ssa = self.fresh();
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = ty.render(self.dtype, a.elem);
         let dims_text = dims
@@ -956,43 +1038,30 @@ impl<'m> Emitter<'m> {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        self.push(&format!(
-            "{ssa} = stablehlo.broadcast_in_dim {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
+        let ssa = self.pure(format!(
+            "stablehlo.broadcast_in_dim {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value {
+        let out = Value {
             ssa,
             ty,
             elem: a.elem,
+        };
+        if dims.windows(2).all(|pair| pair[0] < pair[1]) {
+            self.copy_constant(a, &out);
         }
+        out
     }
 
-    /// `get(operand, idx)` / `get0(...)` (spec §07) with a RUNTIME rank-1
-    /// `Int` selector `idx` (the `theta[person]`-style vector-index case —
-    /// `crate::ops::lower_get`'s fallback once its compile-time
-    /// `literal_index` fast path fails) — lowers `operand[idx]` (`operand`
-    /// rank-1, length `K`) at every position of `idx` (rank-1, length `N`,
-    /// `base`-based) to a rank-1 result of length `N`, via
-    /// `stablehlo.gather`. `base` (1 for `get`, 0 for `get0`) is subtracted
-    /// from `idx` first ([`Emitter::sub`], kind-polymorphic — stays `Int`,
-    /// auto-broadcasting the scalar `base` over `idx`'s shape) to land on
-    /// StableHLO's 0-based convention; FlatPPL indices are valid
-    /// `posintegers`, so the result is always in range after subtraction
-    /// (`stablehlo.gather` also clamps internally, but no explicit clamp is
-    /// needed here). The 1-D index vector is then reshaped `[N] -> [N, 1]`
-    /// (`index_vector_dim = 1`) before the generic-form `stablehlo.gather`
-    /// (no pretty form — same reasoning as [`Emitter::tri_solve`]): one
-    /// scalar slice per index (`slice_sizes = [1]`, `collapsed_slice_dims =
-    /// [0]`), gathered along `operand`'s only axis (`start_index_map =
-    /// [0]`). Dimension numbers are pinned VERBATIM against JAX/XLA's own
-    /// emission for `operand[idx]` — do not deviate. Result `elem` copies
-    /// `operand`'s (a gather of reals stays real, of ints stays int); both
-    /// `operand` and `idx` must already be rank-1 — `crate::ops::lower_get`'s
-    /// job to check before calling this.
+    /// Select vector cells using a rank-1 integer index. With a batched operand,
+    /// the shared indices select its last axis, retaining the batch prefix as
+    /// gather offset dimensions. Otherwise the result inherits the index layout.
+    /// The caller validates shapes and rejects batch-varying indices against
+    /// batched operands. Indices use FlatPPL's `base`, StableHLO uses zero.
     pub fn gather(&mut self, operand: &Value, idx: &Value, base: i64) -> Value {
         assert!(
-            matches!(&operand.ty, MlirTy::Ranked(dims) if dims.len() == 1),
-            "gather expects a rank-1 operand, got {:?}",
+            matches!(&self.cell_ty(operand), MlirTy::Ranked(dims) if dims.len() == 1),
+            "gather expects vector cells, got {:?}",
             operand.ty
         );
         let n = match &idx.ty {
@@ -1009,15 +1078,41 @@ impl<'m> Emitter<'m> {
         let idx0 = self.sub(idx, &base_const);
         let idx2d = self.reshape(&idx0, MlirTy::Ranked(vec![n, Some(1)]));
 
-        let result_ty = MlirTy::Ranked(vec![n]);
+        let batch = self.batch_rank(operand);
+        let prefix = &shape(&operand.ty)[..batch];
+        let mut result_dims = prefix.to_vec();
+        result_dims.push(n);
+        let result_ty = MlirTy::Ranked(result_dims);
+        let offsets = if batch == 0 {
+            String::new()
+        } else {
+            format!(
+                "offset_dims = [{}], ",
+                (0..batch)
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let slice_sizes = prefix
+            .iter()
+            .map(|d| d.expect("static batch checked").to_string())
+            .chain(std::iter::once("1".into()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let ssa = self.fresh();
         let operand_ty = operand.ty.render(self.dtype, operand.elem);
         let idx_ty = idx2d.ty.render(self.dtype, idx2d.elem);
         let result_ty_text = result_ty.render(self.dtype, operand.elem);
         self.push(&format!(
-            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
+            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<{offsets}collapsed_slice_dims = [{batch}], start_index_map = [{batch}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {slice_sizes}>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
             operand.ssa, idx2d.ssa
         ));
+        let mut axes = self.axes_of(idx);
+        if batch != 0 {
+            axes.batch = batch;
+        }
+        self.remember_axes(&ssa, axes);
         Value {
             ssa,
             ty: result_ty,
@@ -1028,6 +1123,7 @@ impl<'m> Emitter<'m> {
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
     /// ...) -> result_ty` — packs `elems` into a tensor one rank higher than
     /// each element, of length `elems.len()` along the new leading dim:
+    /// Singleton stacks only reshape; repeated elements broadcast. Otherwise,
     /// every element is first `reshape`d to add a length-1 leading axis
     /// (`tensor<1x...>`, `...` being the element's own shape), then
     /// concatenated along dim 0. Rank-generic because spec §03 arrays may
@@ -1048,8 +1144,13 @@ impl<'m> Emitter<'m> {
     /// tensor<1x3xf32>) -> tensor<2x3xf32>`).
     pub fn vector(&mut self, elems: &[Value]) -> Value {
         assert!(!elems.is_empty(), "vector: expected at least one element");
+        if elems.iter().any(|v| self.batch_rank(v) != 0) {
+            return self.vector_batched(elems);
+        }
         let elem_ty = elems[0].ty.clone();
         let elem_kind = elems[0].elem;
+        let mut axes = self.axes_of(&elems[0]);
+        axes.layers.insert(0, 1);
         assert!(
             elems.iter().all(|v| v.ty == elem_ty),
             "vector: elements must have identical shape (ragged vector-of-vectors \
@@ -1072,15 +1173,26 @@ impl<'m> Emitter<'m> {
             dims.extend(inner_dims.iter().copied());
             MlirTy::Ranked(dims)
         };
+        if elems.len() == 1 {
+            return self.reshape_axes(&elems[0], stacked_elem_ty, axes);
+        }
+
+        let mut result_dims = Vec::with_capacity(inner_dims.len() + 1);
+        result_dims.push(Some(elems.len() as u64));
+        result_dims.extend(inner_dims.iter().copied());
+        let result_ty = MlirTy::Ranked(result_dims);
+        if elems.iter().all(|v| v == &elems[0]) {
+            let dims: Vec<u64> = (1..=inner_dims.len() as u64).collect();
+            return self.expand_axes(&elems[0], &dims, result_ty, axes);
+        }
+        if let Some(value) = self.fold_vector(elems, result_ty.clone(), axes.clone()) {
+            return value;
+        }
+
         let reshaped: Vec<Value> = elems
             .iter()
             .map(|v| self.reshape(v, stacked_elem_ty.clone()))
             .collect();
-
-        let mut result_dims = Vec::with_capacity(inner_dims.len() + 1);
-        result_dims.push(Some(reshaped.len() as u64));
-        result_dims.extend(inner_dims.iter().copied());
-        let result_ty = MlirTy::Ranked(result_dims);
 
         let operand_ssas = reshaped
             .iter()
@@ -1094,15 +1206,74 @@ impl<'m> Emitter<'m> {
             .join(", ");
         let result_ty_text = result_ty.render(self.dtype, elem_kind);
 
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
-        ));
+        let ssa = self.pure_axes(format!(
+            "stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
+        ), axes);
         Value {
             ssa,
             ty: result_ty,
             elem: elem_kind,
         }
+    }
+
+    /// Concatenate vector cells, preserving batch prefixes and nested cells.
+    pub(crate) fn concatenate(&mut self, id: NodeId, values: &[Value]) -> Result<Value, EmitError> {
+        let first = &values[0];
+        let cell = self.cell_ty(first);
+        let inner = match &cell {
+            MlirTy::Ranked(dims) if self.axes_of(first).layers.first() == Some(&1) => &dims[1..],
+            _ => return Err(EmitError::at(id, "cat: expected vector arguments")),
+        };
+        for v in values {
+            if self.axes_of(v).layers != self.axes_of(first).layers
+                || shape(&self.cell_ty(v)).get(1..) != Some(inner)
+            {
+                return Err(EmitError::at(id, "cat: vector element shapes must match"));
+            }
+        }
+        let mut target = first.clone();
+        for v in &values[1..] {
+            target = self.broadcast_batches(&target, v).0;
+        }
+        let parts = values
+            .iter()
+            .map(|v| self.broadcast_batches(v, &target).0)
+            .collect::<Vec<_>>();
+        let axes = self.axes_of(&target);
+        let mut dims = shape(&target.ty).to_vec();
+        dims[axes.batch] = parts
+            .iter()
+            .try_fold(0_u64, |n, v| n.checked_add(shape(&v.ty)[axes.batch]?));
+        if dims[axes.batch].is_none() {
+            return Err(EmitError::at(
+                id,
+                "cat: vector lengths must be static and fit u64",
+            ));
+        }
+        let ty = MlirTy::Ranked(dims);
+        let names = parts
+            .iter()
+            .map(|v| v.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let types = parts
+            .iter()
+            .map(|v| v.ty.render(self.dtype, v.elem))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let result = ty.render(self.dtype, first.elem);
+        let ssa = self.pure_axes(
+            format!(
+                "stablehlo.concatenate {names}, dim = {} : ({types}) -> {result}",
+                axes.batch
+            ),
+            axes,
+        );
+        Ok(Value {
+            ssa,
+            ty,
+            elem: first.elem,
+        })
     }
 
     /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->
@@ -1157,9 +1328,11 @@ impl<'m> Emitter<'m> {
     /// no CHLO op here has integer semantics.
     fn chlo_unary(&mut self, op: &str, a: &Value) -> Value {
         let a = &self.convert(a, ElemKind::Real);
-        let ssa = self.fresh();
+        if let Some(value) = self.fold_unary(op, a) {
+            return value;
+        }
         let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!("{ssa} = {op} {} : {ty_text} -> {ty_text}", a.ssa));
+        let ssa = self.pure_like(format!("{op} {} : {ty_text} -> {ty_text}", a.ssa), a);
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -1259,9 +1432,8 @@ impl<'m> Emitter<'m> {
         self.reduce_axis("stablehlo.add", "0.000000e+00", a, rank - 1)
     }
 
-    /// Shared full-reduction lowering: reduces axis 0 with [`reduce_axis`]
-    /// once per rank, which collapses an `n`-D tensor to a scalar (an
-    /// already-`Scalar` operand takes the zero-iteration path unchanged).
+    /// Reduce cell axes only. Callable batch axes represent independent
+    /// applications and must survive reductions inside the body.
     fn reduce_full(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
         let rank = match &a.ty {
             MlirTy::Scalar => 0,
@@ -1270,8 +1442,9 @@ impl<'m> Emitter<'m> {
             MlirTy::Key => panic!("reduce over an rng key has no lowering"),
         };
         let mut cur = a.clone();
-        for _ in 0..rank {
-            cur = self.reduce_axis(combine_op, identity_lit, &cur, 0);
+        let batch = self.batch_rank(a);
+        for _ in batch..rank {
+            cur = self.reduce_axis(combine_op, identity_lit, &cur, batch);
         }
         cur
     }
@@ -1385,6 +1558,21 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
             a.ssa
         ));
+        let mut axes = self.axes_of(a);
+        if axis < axes.batch {
+            axes.batch -= 1;
+        } else {
+            let mut cell_axis = axis - axes.batch;
+            for rank in &mut axes.layers {
+                if cell_axis < *rank {
+                    *rank -= 1;
+                    break;
+                }
+                cell_axis -= *rank;
+            }
+            axes.layers.retain(|&rank| rank != 0);
+        }
+        self.remember_axes(&ssa, axes);
         Value {
             ssa,
             ty: result_ty,
@@ -1575,6 +1763,7 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.cholesky {}, lower = true : {ty_text}",
             a.ssa
         ));
+        self.remember_axes(&ssa, self.axes_of(a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -1591,7 +1780,8 @@ impl<'m> Emitter<'m> {
     /// column-index tensors, mask everything off the diagonal to zero, then
     /// row-sum (exactly one nonzero survives per row).
     pub fn diag(&mut self, a: &Value) -> Value {
-        match &a.ty {
+        let batch = self.batch_rank(a);
+        match self.cell_ty(a) {
             MlirTy::Ranked(dims) if dims.len() == 2 => {}
             other => panic!("diag expects a rank-2 (square matrix) operand, got {other:?}"),
         }
@@ -1600,8 +1790,9 @@ impl<'m> Emitter<'m> {
 
         let row_ssa = self.fresh();
         self.push(&format!(
-            "{row_ssa} = stablehlo.iota dim = 0 : {mat_ty_text}"
+            "{row_ssa} = stablehlo.iota dim = {batch} : {mat_ty_text}"
         ));
+        self.remember_axes(&row_ssa, self.axes_of(a));
         let row = Value {
             ssa: row_ssa,
             ty: mat_ty.clone(),
@@ -1609,9 +1800,11 @@ impl<'m> Emitter<'m> {
         };
 
         let col_ssa = self.fresh();
+        let col_axis = batch + 1;
         self.push(&format!(
-            "{col_ssa} = stablehlo.iota dim = 1 : {mat_ty_text}"
+            "{col_ssa} = stablehlo.iota dim = {col_axis} : {mat_ty_text}"
         ));
+        self.remember_axes(&col_ssa, self.axes_of(a));
         let col = Value {
             ssa: col_ssa,
             ty: mat_ty.clone(),
@@ -1619,10 +1812,10 @@ impl<'m> Emitter<'m> {
         };
 
         let mask = self.compare("EQ", &row, &col);
-        let zero = self.constant(0.0, mat_ty);
+        let zero = self.constant_like(0.0, a);
         let masked = self.select(&mask, a, &zero);
 
-        self.reduce_axis("stablehlo.add", "0.000000e+00", &masked, 1)
+        self.reduce_axis("stablehlo.add", "0.000000e+00", &masked, col_axis)
     }
 
     /// Matrix-vector product `a @ b` via `stablehlo.dot_general`'s pretty
@@ -1875,6 +2068,7 @@ impl<'m> Emitter<'m> {
     /// validated *generic* form verbatim (quoted op name, `<{...}>`
     /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
+        let (l, b) = self.broadcast_batches(l, b);
         let ssa = self.fresh();
         let l_ty = l.ty.render(self.dtype, l.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
@@ -1884,6 +2078,7 @@ impl<'m> Emitter<'m> {
             "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = true, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
             l.ssa, b.ssa
         ));
+        self.remember_axes(&ssa, self.axes_of(&b));
         Value {
             ssa,
             ty: result_ty,
@@ -2043,12 +2238,13 @@ impl<'m> Emitter<'m> {
     /// CHLO function-type op (`operand-ty -> result-ty`), same assembly shape
     /// as [`Emitter::lgamma`].
     fn uniform_to_normal(&mut self, u: &Value) -> Value {
-        let two = self.constant(2.0, u.ty.clone());
-        let one = self.constant(1.0, u.ty.clone());
+        let two = self.constant_like(2.0, u);
+        let one = self.constant_like(1.0, u);
         let t = self.mul(u, &two);
         let s = self.sub(&t, &one);
         let e = self.erf_inv(&s);
         let sqrt2 = self.const_lit("1.4142135", u.ty.clone());
+        let sqrt2 = self.axes_view(&sqrt2, self.axes_of(u));
         self.mul(&e, &sqrt2)
     }
 
@@ -2069,7 +2265,7 @@ impl<'m> Emitter<'m> {
     /// `builtin_touniform`, see [`crate::registry::cauchy_cdf`]); `atan(±inf) =
     /// ±π/2` gives the correct `F(±inf) = {1, 0}` limits.
     pub(crate) fn atan(&mut self, a: &Value) -> Value {
-        let one = self.constant(1.0, a.ty.clone());
+        let one = self.constant_like(1.0, a);
         self.binary("stablehlo.atan2", a, &one)
     }
 
@@ -2133,7 +2329,10 @@ impl<'m> Emitter<'m> {
     /// refuse(panic)-don't-mislower discipline for this crate's infallible
     /// helpers (`binary`/`compare`/`select` have no `Result` to propagate a
     /// caller-facing [`EmitError`] through — see their own doc comments).
-    fn broadcast_pair(&mut self, a: &Value, b: &Value) -> (Value, Value) {
+    pub(crate) fn broadcast_pair(&mut self, a: &Value, b: &Value) -> (Value, Value) {
+        if self.batch_rank(a) != 0 || self.batch_rank(b) != 0 {
+            return self.broadcast_batched_pair(a, b);
+        }
         if a.ty == b.ty {
             return (a.clone(), b.clone());
         }
@@ -2208,10 +2407,7 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::dynamic_slice_scalar`]), never a float op — whose `render`
     /// would (wrongly) spell it `tensor<f32>`.
     pub fn int_const(&mut self, x: i64) -> Value {
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{x}> : tensor<i32>"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{x}> : tensor<i32>"));
         Value {
             ssa,
             ty: MlirTy::Scalar,
@@ -2226,10 +2422,7 @@ impl<'m> Emitter<'m> {
     /// ([`Emitter::compare`]/[`Emitter::select`]/[`Emitter::and`]/
     /// [`Emitter::not`]), never a float op.
     pub fn bool_const(&mut self, b: bool) -> Value {
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{b}> : tensor<i1>"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{b}> : tensor<i1>"));
         Value {
             ssa,
             ty: MlirTy::Scalar,
@@ -2244,11 +2437,9 @@ impl<'m> Emitter<'m> {
     /// this is deliberately distinct from — that one is a loop counter, never
     /// reaching a FlatPDL value; this is the FlatPDL integer VALUE itself).
     pub fn int_value_const(&mut self, i: i64) -> Value {
-        let ssa = self.fresh();
         let ty_text = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{i}> : {ty_text}"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{i}> : {ty_text}"));
+        self.remember_constant(&ssa, [Scalar::Int(i)]);
         Value {
             ssa,
             ty: MlirTy::Scalar,
@@ -2264,10 +2455,8 @@ impl<'m> Emitter<'m> {
     /// placeholder's [`ElemKind::Real`] — this is the FlatPDL boolean VALUE
     /// itself, not a loop's accept-flag.
     pub fn bool_value_const(&mut self, b: bool) -> Value {
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.constant dense<{b}> : tensor<i1>"
-        ));
+        let ssa = self.pure(format!("stablehlo.constant dense<{b}> : tensor<i1>"));
+        self.remember_constant(&ssa, [Scalar::Bool(b)]);
         Value {
             ssa,
             ty: MlirTy::Scalar,
@@ -2316,12 +2505,14 @@ impl<'m> Emitter<'m> {
     /// operands are [`Emitter::compare`]-shaped `i1`s; rendered via
     /// [`render_i1`], like `compare`/`select`.
     pub fn and(&mut self, a: &Value, b: &Value) -> Value {
+        let (a, b) = self.broadcast_pair(a, b);
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!(
             "{ssa} = stablehlo.and {}, {} : {ty}",
             a.ssa, b.ssa
         ));
+        self.remember_axes(&ssa, self.axes_of(&a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2336,9 +2527,11 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::and`]; both operands share `a`'s shape (`tensor<i1>` scalar
     /// or `tensor<Nxi1>` batch).
     pub fn or(&mut self, a: &Value, b: &Value) -> Value {
+        let (a, b) = self.broadcast_pair(a, b);
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.or {}, {} : {ty}", a.ssa, b.ssa));
+        self.remember_axes(&ssa, self.axes_of(&a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2351,12 +2544,14 @@ impl<'m> Emitter<'m> {
     /// as [`Emitter::and`]/[`Emitter::or`]; parser-validated (and compiled)
     /// against `iree-base-compiler` 3.11.
     pub fn xor(&mut self, a: &Value, b: &Value) -> Value {
+        let (a, b) = self.broadcast_pair(a, b);
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!(
             "{ssa} = stablehlo.xor {}, {} : {ty}",
             a.ssa, b.ssa
         ));
+        self.remember_axes(&ssa, self.axes_of(&a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2371,6 +2566,7 @@ impl<'m> Emitter<'m> {
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.not {} : {ty}", a.ssa));
+        self.remember_axes(&ssa, self.axes_of(a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2424,7 +2620,7 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Reduce EVERY axis of a boolean (`i1`) tensor to a scalar `i1` with
+    /// Reduce every cell axis of a boolean (`i1`) tensor with
     /// `combine_op` and `identity_lit` — spec §07 "Boolean reductions" `lany`
     /// (`stablehlo.or` / `false`) and `lall` (`stablehlo.and` / `true`).
     ///
@@ -2440,7 +2636,8 @@ impl<'m> Emitter<'m> {
     /// The result carries [`ElemKind::Bool`], so [`Emitter::finish`] renders the
     /// module's return type `tensor<i1>` — agreeing with the `Scalar(Boolean)`
     /// `infer` types the call. Rank-agnostic: §07's domain is "boolean arrays", and
-    /// each axis is reduced in turn like [`Emitter::reduce_full`].
+    /// each cell axis is reduced in turn like [`Emitter::reduce_full`], keeping
+    /// callable batch axes intact. Internal rejection flags have no such prefix.
     pub(crate) fn reduce_boolean(
         &mut self,
         combine_op: &str,
@@ -2457,7 +2654,8 @@ impl<'m> Emitter<'m> {
             ty: a.ty.clone(),
             elem: ElemKind::Bool,
         };
-        for _ in 0..rank {
+        let batch = self.batch_rank(a);
+        for _ in batch..rank {
             let init_ssa = self.fresh();
             self.push(&format!(
                 "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
@@ -2467,7 +2665,7 @@ impl<'m> Emitter<'m> {
                 MlirTy::Ranked(dims) => dims.clone(),
                 other => panic!("reduce_boolean lost its shape: {other:?}"),
             };
-            dims.remove(0);
+            dims.remove(batch);
             let result_ty = if dims.is_empty() {
                 MlirTy::Scalar
             } else {
@@ -2476,9 +2674,21 @@ impl<'m> Emitter<'m> {
             let result_ty_text = render_i1(&result_ty);
             let ssa = self.fresh();
             self.push(&format!(
-                "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [0] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
+                "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{batch}] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
                 cur.ssa
             ));
+            let cell_rank = shape(&result_ty).len() - batch;
+            self.remember_axes(
+                &ssa,
+                Axes {
+                    batch,
+                    layers: if cell_rank == 0 {
+                        vec![]
+                    } else {
+                        vec![cell_rank]
+                    },
+                },
+            );
             cur = Value {
                 ssa,
                 ty: result_ty,
@@ -2684,13 +2894,17 @@ impl<'m> Emitter<'m> {
 
         // cond region, captured into its own buffer.
         let saved = std::mem::take(&mut self.body);
+        let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let pred = cond(&mut *self, &arg_values);
         let cond_body = std::mem::replace(&mut self.body, saved);
+        self.pure_ops = saved_pure_ops;
 
         // do region, captured into its own buffer.
         let saved = std::mem::take(&mut self.body);
+        let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let next = body(&mut *self, &arg_values);
         let do_body = std::mem::replace(&mut self.body, saved);
+        self.pure_ops = saved_pure_ops;
         assert_eq!(
             next.len(),
             inits.len(),
@@ -3127,10 +3341,10 @@ impl<'m> Emitter<'m> {
     /// input is bound to its broadcast argument (positional in `rest`, or by
     /// keyword name from the call's `%kwarg` entries, per §04 "Keyword arguments
     /// bind inputs by name … positional binding is also permitted"), then the
-    /// body is lowered. The body's arithmetic ops auto-broadcast scalar↔rank-1
-    /// exactly as the bare-builtin `broadcast` path relies on, so a scalar-and-
-    /// vector mix (`a + b*x` with scalar `a`,`b` and rank-1 `x`) yields the
-    /// right rank-1 result with no explicit iteration.
+    /// body is lowered once. Each input's outer collection layer becomes a
+    /// batch prefix; the body retains its own cell axes. Nested reductions
+    /// therefore contract components, not observations. No per-element clone
+    /// or loop is emitted.
     ///
     /// Inputs are bound by seeding each body `%local` ref's `NodeId` in the memo
     /// (via [`Emitter::bind`], the same mechanism the mode builder uses for model
@@ -3195,7 +3409,7 @@ impl<'m> Emitter<'m> {
         // Bind each declared input to its argument, keyed by the body-side
         // `%local` placeholder name (`entry.1.name`), lowering the argument now
         // (it lives outside the body subtree — the caller's own expression).
-        let mut local_values: HashMap<Symbol, Value> = HashMap::new();
+        let mut local_values = Vec::with_capacity(entries.len());
         for (i, (param, placeholder)) in entries.iter().enumerate() {
             let arg = kwargs
                 .iter()
@@ -3212,8 +3426,11 @@ impl<'m> Emitter<'m> {
                     )
                 })?;
             let value = self.lower_node(arg)?;
-            local_values.insert(placeholder.name, value);
+            let value = self.typed_axes(arg, value);
+            local_values.push((placeholder.name, value));
         }
+        let parent_frame = self.enter_broadcast(id, &mut local_values)?;
+        let local_values: HashMap<_, _> = local_values.into_iter().collect();
 
         // Collect the body subtree's `NodeId`s (the walk stops at ref/lit leaves
         // — `for_each_child` yields nothing for a non-`Call`, so a `SelfMod` ref
@@ -3236,6 +3453,7 @@ impl<'m> Emitter<'m> {
             .map(|&n| (n, self.memo.get(&n).cloned()))
             .collect();
         for &n in &subtree {
+            self.memo.remove(&n);
             if let Node::Ref(Ref {
                 ns: RefNs::Local,
                 name,
@@ -3249,7 +3467,12 @@ impl<'m> Emitter<'m> {
             // `lower_ref`'s `Local` refusal — refuse-don't-mislower.
         }
 
-        let result = self.lower_node(body);
+        let result = self.lower_node(body).map(|value| {
+            let value = self.typed_axes(body, value);
+            let frame = self.broadcast_frame.clone();
+            self.finish_broadcast(&value, &frame, parent_frame.len())
+        });
+        self.broadcast_frame = parent_frame;
 
         // Restore memo isolation (whatever the outcome) so a second application
         // of the same `functionof` re-lowers against its own arguments.
@@ -3465,7 +3688,30 @@ impl<'m> Emitter<'m> {
         out.push_str(&format!(
             "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
-        for line in self.body.lines() {
+        // Folding replaces whole constant chains. Drop their dead definitions
+        // before sending dense tensor literals to the backend. Only one-line
+        // operations already classified pure are eligible; loops and RNG stay.
+        let pure: std::collections::HashSet<&str> =
+            self.pure_ops.values().map(String::as_str).collect();
+        let mut live: std::collections::HashSet<&str> =
+            rets.iter().map(|v| v.ssa.as_str()).collect();
+        let mut lines = Vec::new();
+        for line in self.body.lines().rev() {
+            if let Some((ssa, _)) = line.trim().split_once(" = ")
+                && pure.contains(ssa)
+                && !live.contains(ssa)
+            {
+                continue;
+            }
+            for (i, _) in line.match_indices('%') {
+                let end = line[i + 1..]
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .map_or(line.len(), |n| i + 1 + n);
+                live.insert(&line[i..end]);
+            }
+            lines.push(line);
+        }
+        for line in lines.into_iter().rev() {
             out.push_str("    ");
             out.push_str(line);
             out.push('\n');

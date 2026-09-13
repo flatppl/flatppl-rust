@@ -182,6 +182,7 @@ pub(crate) fn lower_builtin(
         "pi" => lower_pi(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),
         "vector" => lower_vector(e, id, args),
+        "cat" => lower_cat(e, id, args),
         "sum" => lower_sum(e, id, args),
         // §07 reductions `maximum`/`minimum` ($\max_i x_i$ / $\min_i x_i$ over
         // a real array) — NOT §07's binary `max`/`min`, which this map does not
@@ -367,7 +368,7 @@ fn binary<'m>(
     require_same_orientation(e, id, a, b)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
-    require_broadcastable(id, &a, &b)?;
+    require_broadcastable(e, id, &a, &b)?;
     Ok(op(e, &a, &b))
 }
 
@@ -391,7 +392,7 @@ fn binary<'m>(
 /// `Key` or `Tuple` operand reaches its `(ta, tb) => panic!` arm exactly as a
 /// rank mismatch does. Matching positively also means a variant added later
 /// refuses by default instead of silently acquiring a panic path.
-fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitError> {
+fn require_broadcastable(e: &Emitter, id: NodeId, a: &Value, b: &Value) -> Result<(), EmitError> {
     let refuse = |why: &str| {
         Err(EmitError::at(
             id,
@@ -411,7 +412,7 @@ fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitErr
              rng state is threaded, never computed on)",
         );
     }
-    match (&a.ty, &b.ty) {
+    match (&e.cell_ty(a), &e.cell_ty(b)) {
         // A scalar operand broadcasts against any rank.
         (MlirTy::Scalar, _) | (_, MlirTy::Scalar) => Ok(()),
         (MlirTy::Ranked(da), MlirTy::Ranked(db)) => {
@@ -1507,8 +1508,22 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     // `broadcast_pair` (which panics on a pair with no broadcast form), and then
     // broadcasts both against the first ranked shape among {pred, a, b}. So two
     // pairings have to hold, and neither is checked by the infallible helper:
-    require_broadcastable(id, &a, &b)?;
-    require_select_predicate(id, &c, &a, &b)?;
+    require_broadcastable(e, id, &a, &b)?;
+    require_select_predicate(
+        id,
+        &Value {
+            ty: e.cell_ty(&c),
+            ..c.clone()
+        },
+        &Value {
+            ty: e.cell_ty(&a),
+            ..a.clone()
+        },
+        &Value {
+            ty: e.cell_ty(&b),
+            ..b.clone()
+        },
+    )?;
     Ok(e.select(&c, &a, &b))
 }
 
@@ -1870,7 +1885,7 @@ fn lower_compare(
     let b = e.lower_node(b)?;
     // `Emitter::compare` reconciles its operands through `broadcast_pair` exactly
     // as `Emitter::binary` does, and is equally infallible.
-    require_broadcastable(id, &a, &b)?;
+    require_broadcastable(e, id, &a, &b)?;
     Ok(e.compare(dir, &a, &b))
 }
 
@@ -1901,7 +1916,7 @@ fn lower_exact_compare(
     require_same_orientation(e, id, a_id, b_id)?;
     let a = e.lower_node(a_id)?;
     let b = e.lower_node(b_id)?;
-    require_broadcastable(id, &a, &b)?;
+    require_broadcastable(e, id, &a, &b)?;
     for v in [&a, &b] {
         if v.elem == ElemKind::Real {
             return Err(EmitError::at(
@@ -1958,7 +1973,7 @@ fn lower_land(
     require_predicate_head(e, b_id, &format!("{name} operand"))?;
     let a = e.lower_node(a_id)?;
     let b = e.lower_node(b_id)?;
-    if a.ty != b.ty {
+    if e.cell_ty(&a) != e.cell_ty(&b) {
         return Err(EmitError::at(
             id,
             format!(
@@ -2051,7 +2066,7 @@ fn lower_finiteness(
         ));
     }
     let mag = e.abs(&a);
-    let inf = e.inf(mag.ty.clone());
+    let inf = e.inf_like(&mag);
     Ok(match which {
         Finiteness::Finite => e.compare("LT", &mag, &inf),
         Finiteness::Inf => e.compare("EQ", &mag, &inf),
@@ -2067,7 +2082,7 @@ fn lower_finiteness(
 fn lower_iszero(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
-    let zero = e.constant(0.0, a.ty.clone());
+    let zero = e.constant_like(0.0, &a);
     Ok(e.compare("EQ", &a, &zero))
 }
 
@@ -2151,7 +2166,7 @@ fn lower_binary_extremum(
     require_same_orientation(e, id, a_id, b_id)?;
     let a = e.lower_node(a_id)?;
     let b = e.lower_node(b_id)?;
-    require_broadcastable(id, &a, &b)?;
+    require_broadcastable(e, id, &a, &b)?;
     for v in [&a, &b] {
         if v.elem == ElemKind::Bool {
             return Err(EmitError::at(
@@ -2173,17 +2188,23 @@ fn lower_binary_extremum(
 ///
 /// The result shape is read off `id`'s OWN inferred type, not by lowering
 /// `size`: the determiniser spells the size as `lengthof(v)`, which has no
-/// tensor form, while inference has already resolved the result shape. A
-/// dynamic (`?`) axis is refused — `broadcast_in_dim`'s result shape must be
-/// static text.
+/// tensor form, while inference has already resolved the result shape. An
+/// unknown scalar extent can also be recovered from a folded size expression.
+/// Runtime extents refuse — `broadcast_in_dim` needs a static result shape.
 ///
 /// A fill value whose kind OUTRANKS the array's element kind is refused too:
 /// [`Emitter::convert`] is exact only going UP §03's `booleans ⊂ integers ⊂ reals`
 /// chain, and a real value into an integer array would truncate toward zero.
 /// Inference should reject that upstream, so this is a narrow-and-refuse guard.
 fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    let [x_id, _size] = args_exact(id, args)?;
-    let (ty, kind) = e.node_ty(id)?;
+    let [x_id, size] = args_exact(id, args)?;
+    let (mut ty, kind) = e.node_ty(id)?;
+    if ty == MlirTy::Ranked(vec![None]) {
+        let value = e.lower_node(size)?;
+        if let Some(n) = e.constant_extent(&value) {
+            ty = MlirTy::Ranked(vec![Some(n)]);
+        }
+    }
     match &ty {
         MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => {}
         other => {
@@ -2194,7 +2215,7 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         }
     }
     let x = e.lower_node(x_id)?;
-    if x.ty != MlirTy::Scalar {
+    if e.cell_ty(&x) != MlirTy::Scalar {
         return Err(EmitError::at(
             id,
             format!("fill: fill value must be a scalar, got {:?}", x.ty),
@@ -2211,7 +2232,7 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         ));
     }
     let x = e.convert(&x, kind);
-    Ok(e.broadcast_in_dim(&x, &[], ty))
+    Ok(e.fill_cell(&x, ty))
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
@@ -2255,7 +2276,7 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     if let Some([t0, t1]) = static_pair_terms(e, v) {
         let a = e.lower_node(t0)?;
         let b = e.lower_node(t1)?;
-        if a.ty == MlirTy::Scalar && b.ty == MlirTy::Scalar {
+        if e.cell_ty(&a) == MlirTy::Scalar && e.cell_ty(&b) == MlirTy::Scalar {
             return Ok(lower_logaddexp(e, &a, &b));
         }
         // Ranked terms: the reduce below contracts the stacked axis together with
@@ -2263,7 +2284,7 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     }
     let v = e.lower_node(v)?;
     let m = e.reduce_max(&v);
-    let m_bc = broadcast_to(e, id, &m, &v.ty)?;
+    let m_bc = broadcast_to(e, id, &m, &v)?;
     let shifted = e.sub(&v, &m_bc);
     let exp_shifted = e.exp(&shifted);
     let sum = e.reduce_sum(&exp_shifted);
@@ -2335,7 +2356,7 @@ fn lower_logaddexp(e: &mut Emitter, a: &Value, b: &Value) -> Value {
     let mag = e.abs(&m);
     // `Emitter::inf`, not `scalar(f64::INFINITY)`: a decimal float literal
     // prints as `inf`, which MLIR's float-attribute grammar rejects.
-    let inf = e.inf(mag.ty.clone());
+    let inf = e.inf(MlirTy::Scalar);
     let saturated = e.compare("EQ", &mag, &inf);
     let raw = e.sub(a, b);
     let zero = e.scalar(0.0);
@@ -2367,7 +2388,17 @@ fn lower_logaddexp(e: &mut Emitter, a: &Value, b: &Value) -> Value {
 ///
 /// Refuses (rather than mis-emitting a shape-mismatched op) for anything
 /// else — a rank mismatch, or an axis that is neither equal nor size-1.
-fn broadcast_to(e: &mut Emitter, id: NodeId, a: &Value, ty: &MlirTy) -> Result<Value, EmitError> {
+fn broadcast_to(
+    e: &mut Emitter,
+    id: NodeId,
+    a: &Value,
+    target: &Value,
+) -> Result<Value, EmitError> {
+    if e.batch_rank(a) != 0 || e.batch_rank(target) != 0 {
+        require_broadcastable(e, id, a, target)?;
+        return Ok(e.broadcast_pair(a, target).0);
+    }
+    let ty = &target.ty;
     if &a.ty == ty {
         return Ok(a.clone());
     }
@@ -2412,23 +2443,44 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     if args.is_empty() {
         return Err(EmitError::at(id, "vector: expected at least one element"));
     }
+    let target = e.node_kind(id);
+    if let Some(value) = e.literal_vector(args, target) {
+        return Ok(value);
+    }
     let elems: Vec<Value> = args
         .iter()
         .map(|&a| e.lower_node(a))
         .collect::<Result<_, _>>()?;
-    let elem_ty = &elems[0].ty;
-    if elems.iter().any(|v| &v.ty != elem_ty) {
+    let elem_ty = e.cell_ty(&elems[0]);
+    if elems.iter().any(|v| e.cell_ty(v) != elem_ty) {
         return Err(EmitError::at(
             id,
             "vector elements must have identical shape; ragged vector-of-vectors has no tensor form",
         ));
     }
-    let target = e.node_kind(id);
     let elems: Vec<Value> = elems.iter().map(|v| e.convert(v, target)).collect();
     Ok(e.vector(&elems))
 }
 
 // ---- get / get0 ---------------------------------------------------------------
+
+fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    if args.is_empty() {
+        return Err(EmitError::at(id, "cat: expected at least one argument"));
+    }
+    let target = e.node_kind(id);
+    let values = args
+        .iter()
+        .map(|&arg| {
+            let value = e.lower_node(arg)?;
+            Ok(e.convert(&value, target))
+        })
+        .collect::<Result<Vec<_>, EmitError>>()?;
+    if values.iter().all(|v| e.cell_ty(v) == MlirTy::Scalar) {
+        return Ok(e.vector(&values));
+    }
+    e.concatenate(id, &values)
+}
 
 /// `get0(container, index)` / `get(container, index)` (spec §07): zero- vs
 /// one-based element access. Two cases are implemented:
@@ -2470,7 +2522,7 @@ fn lower_get_literal(
     let idx = idx as u64;
 
     let v = e.lower_node(container)?;
-    let len = match &v.ty {
+    let len = match &e.cell_ty(&v) {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
         other => {
             return Err(EmitError::at(
@@ -2487,15 +2539,28 @@ fn lower_get_literal(
         return Err(EmitError::at(id, "get/get0: index out of range"));
     }
 
-    let sliced = e.slice(&v, &[idx], &[idx + 1], &[1]);
-    Ok(e.reshape(&sliced, MlirTy::Scalar))
+    let batch = e.batch_rank(&v);
+    if batch == 0 {
+        let sliced = e.slice(&v, &[idx], &[idx + 1], &[1]);
+        return Ok(e.reshape(&sliced, MlirTy::Scalar));
+    }
+    let mut limits = match &v.ty {
+        MlirTy::Ranked(dims) => dims.iter().copied().collect::<Option<Vec<_>>>(),
+        _ => None,
+    }
+    .ok_or_else(|| EmitError::at(id, "get/get0: indexing needs a static shape"))?;
+    let mut starts = vec![0; limits.len()];
+    starts[batch] = idx;
+    limits[batch] = idx + 1;
+    let sliced = e.slice(&v, &starts, &limits, &vec![1; limits.len()]);
+    let result_ty = MlirTy::Ranked(limits[..batch].iter().copied().map(Some).collect());
+    Ok(e.reshape(&sliced, result_ty))
 }
 
 /// The runtime-index fallback — see [`lower_get`]. Reached once
-/// `literal_index` fails on `index`; supported ONLY for a rank-1 `container`
-/// indexed by a runtime rank-1 `Int` tensor. Every other shape (multi-
-/// selector, record/table/tuple, rank-2+ operand, a non-`Int` index) is
-/// refused here rather than mislowered.
+/// `literal_index` fails on `index`. A rank-1 `Int` tensor selects vector
+/// cells. Batched cells require static batch extents and a shared selector.
+/// Other shapes, including batch-varying selectors over batched cells, refuse.
 fn lower_get_gather(
     e: &mut Emitter,
     id: NodeId,
@@ -2507,12 +2572,22 @@ fn lower_get_gather(
     let idx = e.lower_node(index)?;
 
     let is_rank1 = |ty: &MlirTy| matches!(ty, MlirTy::Ranked(dims) if dims.len() == 1);
-    if !is_rank1(&operand.ty) || !is_rank1(&idx.ty) || idx.elem != ElemKind::Int {
+    let batch = e.batch_rank(&operand);
+    let static_batch = match &operand.ty {
+        MlirTy::Ranked(dims) => dims[..batch].iter().all(Option::is_some),
+        _ => false,
+    };
+    if !static_batch
+        || !is_rank1(&e.cell_ty(&operand))
+        || !is_rank1(&idx.ty)
+        || idx.elem != ElemKind::Int
+        || (batch != 0 && e.batch_rank(&idx) != 0)
+    {
         return Err(EmitError::at(
             id,
             format!(
                 "get/get0: selector must be a literal integer, or (for a runtime index) \
-                 a rank-1 Int tensor indexing a rank-1 tensor container; got container \
+                 a rank-1 Int tensor indexing vector cells (one shared selector for batched cells); got container \
                  {:?} index {:?} ({:?})",
                 operand.ty, idx.ty, idx.elem
             ),
@@ -2619,18 +2694,18 @@ fn elem_membership(
 ) -> Result<Value, EmitError> {
     match set {
         ElemSet::PosReals => {
-            let zero = e.constant(0.0, v.ty.clone());
+            let zero = e.constant_like(0.0, v);
             Ok(e.compare("GT", v, &zero))
         }
         ElemSet::NonNegReals => {
-            let zero = e.constant(0.0, v.ty.clone());
+            let zero = e.constant_like(0.0, v);
             Ok(e.compare("GE", v, &zero))
         }
         ElemSet::Interval(lo_id, hi_id) => {
             let lo = e.lower_node(lo_id)?;
             let hi = e.lower_node(hi_id)?;
-            let lo = broadcast_to(e, id, &lo, &v.ty)?;
-            let hi = broadcast_to(e, id, &hi, &v.ty)?;
+            let lo = broadcast_to(e, id, &lo, v)?;
+            let hi = broadcast_to(e, id, &hi, v)?;
             let above_lo = e.compare("GE", v, &lo);
             let below_hi = e.compare("LE", v, &hi);
             Ok(e.and(&above_lo, &below_hi))

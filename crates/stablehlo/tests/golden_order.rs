@@ -608,8 +608,8 @@ outputs = (o1, o2)
     );
     assert_eq!(
         out.matches("stablehlo.compare GT").count(),
-        2,
-        "each reduction carries its own mask (no CSE here):\n{out}"
+        1,
+        "both reductions share their identical comparison mask:\n{out}"
     );
 }
 

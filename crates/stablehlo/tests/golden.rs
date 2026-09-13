@@ -62,7 +62,9 @@ mu = a .+ x\n\
 y = draw(Normal.(mu, 0.5))\n\
 L = likelihoodof(kernelof(record(y = y), a = a), record(y = y_obs))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
-score = logdensityof(post, record(a = 0.5))\n\
+aa = elementof(reals)\n\
+score = logdensityof(post, record(a = aa))\n\
+inputs = (aa)\n\
 outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
@@ -262,7 +264,10 @@ mu = rate.(eta)\n\
 y = draw(Poisson.(mu))\n\
 L = likelihoodof(kernelof(record(y = y), a = a, b = b), record(y = y_obs))\n\
 post = bayesupdate(L, lawof(record(a = a, b = b)))\n\
-score = logdensityof(post, record(a = 0.0, b = 0.0))\n\
+aa = elementof(reals)\n\
+bb = elementof(reals)\n\
+score = logdensityof(post, record(a = aa, b = bb))\n\
+inputs = (aa, bb)\n\
 outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
@@ -486,7 +491,7 @@ fn emitter_scalar_add_produces_well_formed_module() {
     let c = e.add(&a, &b);
     let out = e.finish("logdensity", &[], &[&c]);
 
-    assert!(out.contains("stablehlo.add"));
+    assert!(out.contains("stablehlo.constant dense<5.0>"));
     assert!(out.contains("func.func @logdensity"));
     assert!(out.contains("return"));
     assert!(is_delimiter_balanced(&out));
@@ -519,7 +524,11 @@ fn emitter_finish_wraps_args_and_return_type() {
 fn emitter_elementary_wrappers_emit_expected_ops() {
     let m = Module::new();
     let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.scalar(1.0);
+    let a = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
+    };
     let b = e.scalar(2.0);
 
     let cases: Vec<(flatppl_stablehlo::Value, &str)> = vec![
@@ -534,7 +543,12 @@ fn emitter_elementary_wrappers_emit_expected_ops() {
         (e.abs(&a), "stablehlo.abs"),
         (e.cos(&a), "stablehlo.cosine"),
     ];
-    let out = e.finish("f", &[], &[&cases[0].0]);
+    let results: Vec<_> = cases.iter().map(|(value, _)| value).collect();
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &results,
+    );
     for (_, op) in &cases {
         assert!(out.contains(op), "missing {op} in:\n{out}");
     }
@@ -550,9 +564,17 @@ fn emitter_elementary_wrappers_emit_expected_ops() {
 fn emitter_lgamma_emits_function_type_form() {
     let m = Module::new();
     let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.scalar(1.0);
+    let a = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
+    };
     let r = e.lgamma(&a);
-    let out = e.finish("f", &[], &[&r]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &[&r],
+    );
 
     assert!(
         out.contains("chlo.lgamma %"),
@@ -801,8 +823,13 @@ fn lower_node_add_mul_emits_multiply_before_add() {
     let add_node = call(&mut m, "add", &[mul_node, one]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, x, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(add_node).unwrap();
-    let out = e.finish("logdensity", &[], &[&result]);
+    let out = e.finish(
+        "logdensity",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
 
     let mul_pos = out.find("stablehlo.multiply").expect("missing multiply");
     let add_pos = out.find("stablehlo.add").expect("missing add");
@@ -835,8 +862,13 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
         let node = call(&mut m, head, &args);
 
         let mut e = Emitter::new(&m, Dtype::F32);
+        bind_arg(&mut e, a, "%arg0", MlirTy::Scalar);
         let result = e.lower_node(node).unwrap();
-        let out = e.finish("f", &[], &[&result]);
+        let out = e.finish(
+            "f",
+            &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+            &[&result],
+        );
         assert!(out.contains(op), "head '{head}': missing {op} in:\n{out}");
         assert!(is_delimiter_balanced(&out));
     }
@@ -863,10 +895,22 @@ fn lower_node_mixed_int_real_add_converts_before_add() {
     m.set_type(add_node, Type::Scalar(ScalarType::Real));
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        i,
+        Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        },
+    );
     let result = e.lower_node(add_node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Real);
-    let out = e.finish("f", &[], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&result],
+    );
 
     assert!(
         out.contains("tensor<i32>"),
@@ -916,10 +960,7 @@ outputs = (lp)\n";
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
         .unwrap();
     assert!(out.contains("module {") && is_delimiter_balanced(&out));
-    assert!(
-        out.contains("tensor<i32>"),
-        "the literal shape/rate params render as i32:\n{out}"
-    );
+    // Integer literals may fold through their real conversion.
     for line in out.lines() {
         if line.contains("stablehlo.log") || line.contains("chlo.lgamma") {
             assert!(
@@ -1813,10 +1854,10 @@ fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
     );
 
     assert!(
-        out.contains("stablehlo.constant dense<3.141592653589793> : tensor<f32>"),
+        out.contains("stablehlo.constant dense<1.5707963705062866> : tensor<f32>"),
         "in:\n{out}"
     );
-    assert!(out.contains("stablehlo.divide"), "in:\n{out}");
+    assert!(!out.contains("stablehlo.divide"), "half pi folds:\n{out}");
     assert!(out.contains("stablehlo.compare LT"), "in:\n{out}");
     assert!(is_delimiter_balanced(&out));
 }
@@ -2025,9 +2066,21 @@ fn lower_real_converts_an_integer_operand() {
     let node = call(&mut m, "real", &[k]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        k,
+        Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        },
+    );
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.elem, ElemKind::Real);
-    let out = e.finish("f", &[], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&result],
+    );
     assert!(
         out.contains("stablehlo.convert") && out.contains("(tensor<i32>) -> tensor<f32>"),
         "in:\n{out}"
@@ -2161,7 +2214,7 @@ fn lower_fill_refuses_a_narrowing_fill_value() {
 fn lower_fill_refuses_a_dynamic_result_shape() {
     let mut m = Module::new();
     let w = real(&mut m, 1.0);
-    let n = int(&mut m, 3);
+    let n = local_ref(&mut m, "n");
     let node = call(&mut m, "fill", &[w, n]);
     m.set_type(
         node,
@@ -2172,6 +2225,7 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
     );
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, n, "%n", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("statically-shaped"),
@@ -2933,7 +2987,8 @@ fn lower_get0_refuses_out_of_range_index() {
 #[test]
 fn lower_node_memoizes_shared_ancestor() {
     let mut m = Module::new();
-    let x = real(&mut m, 5.0);
+    let input = local_ref(&mut m, "input");
+    let x = call(&mut m, "exp", &[input]);
     top_level(&mut m, "x", x);
     let x_ref1 = self_ref(&mut m, "x");
     let x_ref2 = self_ref(&mut m, "x");
@@ -2942,11 +2997,16 @@ fn lower_node_memoizes_shared_ancestor() {
     let node = call(&mut m, "add", &[x_ref1, doubled]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, input, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
-    let out = e.finish("f", &[], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
 
     assert_eq!(
-        out.matches("dense<5").count(),
+        out.matches("stablehlo.exponential").count(),
         1,
         "x re-emitted instead of reused, in:\n{out}"
     );
@@ -4532,8 +4592,8 @@ fn emit_logdensity_studentt_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
-        6,
-        "expected exactly six multiplies, in:\n{out}"
+        5,
+        "expected five live multiplies, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
@@ -5462,7 +5522,7 @@ fn emit_logdensity_bernoulli_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.log").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.subtract").count(), 2);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
     assert_eq!(out.matches("stablehlo.add").count(), 1);
     assert!(
         !out.contains("chlo."),
@@ -5511,9 +5571,9 @@ fn emit_logdensity_poisson_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
-    assert_eq!(out.matches("stablehlo.negate").count(), 2);
-    assert_eq!(out.matches("stablehlo.add").count(), 3);
-    assert_eq!(out.matches("chlo.lgamma").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("stablehlo.add").count(), 2);
+    assert_eq!(out.matches("chlo.lgamma").count(), 0);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -5559,9 +5619,9 @@ fn emit_logdensity_binomial_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.log").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
     assert_eq!(out.matches("stablehlo.subtract").count(), 2);
-    assert_eq!(out.matches("stablehlo.add").count(), 7);
-    assert_eq!(out.matches("stablehlo.negate").count(), 2);
-    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 6);
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -5655,9 +5715,9 @@ fn emit_logdensity_negative_binomial_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.log").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 4);
-    assert_eq!(out.matches("stablehlo.add").count(), 8);
-    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert_eq!(out.matches("stablehlo.negate").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 7);
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
         "NegativeBinomial's log-form has no subtraction, in:\n{out}"
@@ -5706,9 +5766,9 @@ fn emit_logdensity_negative_binomial2_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.log").count(), 3);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 9);
-    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert_eq!(out.matches("stablehlo.negate").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 8);
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
         "NegativeBinomial2's log-form has no subtraction, in:\n{out}"
@@ -5729,16 +5789,7 @@ fn emit_logdensity_negative_binomial2_matches_frozen_golden() {
     );
 }
 
-/// §08 Categorical, verbatim: `log(p_k)`, `k` 1-based. `p`'s literal array
-/// lowers via `vector(...)` (one `concatenate` of three reshaped scalars,
-/// spec §07), then the 1-based selector `k=2` slices 0-based array position
-/// `k-1=1` (the `[1:2]` slice bound) — a zero-arg `func.func @logdensity()`
-/// (no free parameters: `p` is a literal, and the observed `k` is consumed
-/// structurally, never lowered as an arithmetic operand). Exactly one
-/// `slice`, one final `log`, and four `reshape`s (three packing `vector`'s
-/// elements + one unpacking the sliced length-1 result to a `Scalar`) — no
-/// `chlo.*`, `negate`, `subtract`, `multiply`, or `add`: the density is a
-/// pure lookup.
+/// Fixed categorical lookup and log fold to one constant, not runtime work.
 #[test]
 fn emit_logdensity_categorical_has_expected_structure() {
     let d = determinize_src(CATEGORICAL_DENSITY_SRC);
@@ -5758,16 +5809,15 @@ fn emit_logdensity_categorical_has_expected_structure() {
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.concatenate"),
-        "missing concatenate (p's vector literal), in:\n{out}"
+        out.contains("stablehlo.constant dense<-1.2039728164672852>"),
+        "expected log(0.3) at f32 precision, in:\n{out}"
     );
+    assert!(!out.contains("stablehlo.concatenate"), "{out}");
     assert!(
-        out.contains("stablehlo.slice") && out.contains("[1:2]"),
-        "expected 1-based k=2 to slice 0-based index 1, in:\n{out}"
+        !out.contains("stablehlo.slice"),
+        "fixed lookup must fold, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.slice").count(), 1);
-    assert_eq!(out.matches("stablehlo.reshape").count(), 4);
-    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert_eq!(out.matches(" = ").count(), 1);
     assert!(
         !out.contains("chlo.")
             && !out.contains("stablehlo.negate")
@@ -5814,12 +5864,11 @@ fn emit_logdensity_categorical0_has_expected_structure() {
         "missing func.func @logdensity() (no free params) in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.slice") && out.contains("[1:2]"),
-        "expected 0-based k=1 to slice 0-based index 1, in:\n{out}"
+        out.contains("stablehlo.constant dense<-1.2039728164672852>"),
+        "expected 0-based k=1 to select p[1]=0.3 and fold its log, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.slice").count(), 1);
-    assert_eq!(out.matches("stablehlo.reshape").count(), 4);
-    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert!(!out.contains("stablehlo.concatenate"), "{out}");
+    assert_eq!(out.matches(" = ").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -6023,7 +6072,7 @@ fn categorical_logpdf_refuses_out_of_range_category() {
 /// `Categorical`'s own `k = 1` floor (one-based, `get`'s convention already
 /// covered by `lower_get_refuses_selector_below_one_based_floor`).
 #[test]
-fn categorical0_logpdf_at_floor_slices_first_element() {
+fn categorical0_logpdf_at_floor_selects_first_element() {
     let mut m = Module::new();
     let ctor = const_node(&mut m, "Categorical0");
     let e0 = real(&mut m, 0.2);
@@ -6038,8 +6087,8 @@ fn categorical0_logpdf_at_floor_slices_first_element() {
     let result = e.lower_node(node).unwrap();
     let out = e.finish("f", &[], &[&result]);
     assert!(
-        out.contains("stablehlo.slice") && out.contains("[0:1]"),
-        "expected k=0 to slice 0-based index 0, in:\n{out}"
+        out.contains("stablehlo.constant dense<-1.6094379425048828>"),
+        "expected k=0 to select p[0]=0.2 and fold its log, in:\n{out}"
     );
 }
 
@@ -6324,9 +6373,9 @@ fn emit_logdensity_multinomial_has_expected_structure() {
         out.contains("%arg0: tensor<i32>") && out.contains("%arg1: tensor<3xf32>"),
         "n (integer) / p must become scalar/vector func args, in:\n{out}"
     );
-    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    assert_eq!(out.matches("chlo.lgamma").count(), 1);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
-    assert_eq!(out.matches("= stablehlo.add ").count(), 4);
+    assert_eq!(out.matches("= stablehlo.add ").count(), 3);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
     assert_eq!(out.matches("stablehlo.negate").count(), 1);
     assert!(
@@ -7623,7 +7672,7 @@ fn emit_sample_geometric_has_expected_structure() {
     assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.floor").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
@@ -7910,6 +7959,33 @@ x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
 draws = rand(s, lawof(x))
 outputs = (draws)
 ";
+
+#[test]
+fn sampler_loop_regions_do_not_share_local_constants() {
+    let d = determinize_src(
+        "s = rnginit(0)\nx = draw(Multinomial(n = 1, p = [1.0]))\n\
+         draws = rand(s, lawof(x))\nzero = 0\nflag = false\n\
+         outputs = (zero, flag, draws)\n",
+    );
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let out = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::Sample,
+            &flatppl_stablehlo::EmitOptions { dtype },
+        )
+        .unwrap();
+        let (_, regions) = out.split_once("cond {").unwrap();
+        let (cond, body) = regions.split_once("} do {").unwrap();
+        for region in [cond, body] {
+            assert!(region.contains("constant dense<1> : tensor<i32>"), "{out}");
+        }
+        assert_eq!(
+            out.matches("stablehlo.rng_bit_generator").count(),
+            1,
+            "{out}"
+        );
+    }
+}
 
 /// §08 Multinomial's bounded `while` over `n = 4` Categorical(p) draws
 /// (`p` length-3, so a length-3 count vector): exactly one `stablehlo.rng`
@@ -8993,7 +9069,7 @@ fn emit_sample_geometric_iid_has_expected_structure() {
         1,
         "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.floor").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
@@ -12164,13 +12240,13 @@ fn emit_logdensity_expm1_pushfwd_gates_strictly_above_minus_one() {
     assert!(!out.contains("stablehlo.and"), "nothing to conjoin:\n{out}");
     assert_eq!(
         out.matches("stablehlo.log_plus_one").count(),
-        2,
-        "`log1p` inverts `expm1`, and is its log-volume term:\n{out}"
+        1,
+        "the inverse and log-volume share the same `log1p` result:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.exponential_minus_one").count(),
-        1,
-        "`expm1` itself only at the safe-point witness:\n{out}"
+        0,
+        "the constant safe-point witness folds:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -12210,8 +12286,8 @@ fn emit_logdensity_asinh_pushfwd_carries_no_image_gate() {
     );
     assert_eq!(
         out.matches("stablehlo.abs %arg0").count(),
-        2,
-        "the log-volume is `−ln cosh y`, in the query point:\n{out}"
+        1,
+        "the log-volume shares the query-point magnitude in `−ln cosh y`:\n{out}"
     );
     assert!(
         !out.contains("chlo.asinh"),
@@ -12953,5 +13029,50 @@ fn aggregate_composes_with_functionof_placeholders() {
         emit_agg(&src),
         include_str!("goldens/aggregate_matmul.mlir"),
         "§04's functionof composition must emit the same module as the direct aggregate"
+    );
+}
+
+#[test]
+fn singleton_broadcast_computes_parameter_only_terms_once() {
+    let m = determinize_src(
+        "sigma = elementof(posreals)\n\
+        xs = elementof(cartpow(reals, 20))\n\
+        f(a, x) = log(a) + x\n\
+        score = sum(f.([sigma], xs))\n\
+        inputs = (sigma, xs)\noutputs = (score)",
+    );
+    let out = emit_logdensity(&m);
+    let logs = out
+        .lines()
+        .filter(|line| line.contains("stablehlo.log "))
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1, "{out}");
+    assert!(
+        logs[0].contains("tensor<f32>"),
+        "parameter log must stay scalar:\n{out}"
+    );
+}
+
+#[test]
+fn constant_special_functions_fold_before_backend_compilation() {
+    let m = determinize_src(
+        "p = elementof(reals)\n\
+        counts = [0, 3, 7]\n\
+        score = sum(loggamma.(counts .+ 1)) + p\n\
+        inputs = (p)\noutputs = (score)",
+    );
+    let out = emit_logdensity(&m);
+    assert_eq!(
+        out.matches("stablehlo.constant").count(),
+        2,
+        "only the folded vector and reduction identity remain:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo.lgamma"),
+        "constant special function remains:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.add"),
+        "runtime parameter must remain:\n{out}"
     );
 }

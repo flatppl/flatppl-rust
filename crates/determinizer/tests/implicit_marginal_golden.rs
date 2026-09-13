@@ -902,12 +902,12 @@ lp = logdensityof(iid(lawof(y1), 2), [0.5, 0.7])"),
     );
     assert_eq!(
         iid_lp.matches("builtin_logdensityof").count(),
-        2,
-        "iid's independent product is two factors:\n{iid_lp}"
+        1,
+        "iid broadcasts one density body over both observations:\n{iid_lp}"
     );
     assert_eq!(
         iid_lp.matches("(%field sigma 1.4142135623730951)").count(),
-        2,
+        1,
         "each factor is the marginal Normal(0, sqrt 2):\n{iid_lp}"
     );
 }

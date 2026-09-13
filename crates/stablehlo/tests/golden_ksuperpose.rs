@@ -151,7 +151,9 @@ fn dirac_superposition_matches_frozen_golden() {
 /// logpdf blocks. The batch dimension is the component count.
 #[test]
 fn the_mixture_emits_one_batched_density_reduced_by_logsumexp() {
-    let out = emit_logdensity(NORMAL_MIXTURE_SRC);
+    let out = emit_logdensity(&format!(
+        "{NORMAL_MIXTURE_SRC}\ninputs = (w, mus, sigmas)\n"
+    ));
     assert!(
         out.contains("tensor<2xf32>"),
         "the component axis is the batch dimension:\n{out}"

@@ -97,11 +97,10 @@ pub(crate) struct ResolvedRef<'a> {
 /// than the `load_module` of §04 *Multi-file models*.
 ///
 /// A §09 member is a CATALOGUE entry, not a submodule binding: there is no
-/// subtree in the `ModuleBundle` to graft, so every graft path must decline such
-/// a ref and leave it to the constructor lowering
-/// ([`crate::density::split_kernel_constructor`]), which emits the BARE member
-/// name as the kernel tag — the same tag `lower_broadcast_kernel` already emits
-/// for a module-qualified broadcast head.
+/// subtree in the `ModuleBundle` to graft. Preserve its alias declaration and
+/// leave the member to standard-function or constructor lowering. Constructor
+/// lowering ([`crate::density::split_kernel_constructor`]) emits the bare member
+/// name as the kernel tag, as does `lower_broadcast_kernel`.
 ///
 /// The requested `version` is NOT re-checked here: inference already rejects a
 /// version the catalogue does not provide ("standard module `X` has unknown
@@ -696,7 +695,9 @@ fn graft_node(
 /// unrelated-host-binding collision). `%assign`-substituted names are handled by
 /// the caller ([`graft_node`]) before this is reached.
 ///
-/// A `Module`-namespace ref is a NESTED cross-module reference: the submodule
+/// A standard-module ref keeps its catalogue alias, grafting the declaration
+/// so later standard-function/constructor lowering can resolve the member.
+/// Other `Module`-namespace refs are NESTED cross-module references: the submodule
 /// being grafted itself has its own `load_module`, and the grafted body names
 /// that nested alias. It is resolved against the bundle (`ctx.bundle`) via
 /// [`resolve_src_module_ref`] — reading the CURRENT submodule's own
@@ -725,7 +726,20 @@ fn graft_ref(
                 name: hname,
             })
         }
-        RefNs::Module(alias) => graft_nested_module_ref(host, src, alias, r.name, ctx),
+        RefNs::Module(alias) => {
+            let is_standard = src.binding_by_name(alias).is_some_and(|bid| {
+                crate::density::builtin_name(src, src.binding(bid).rhs) == Some("standard_module")
+            });
+            if is_standard {
+                graft_binding(host, src, alias, ctx)?;
+                Ok(Ref {
+                    ns: RefNs::Module(host.intern(src.resolve(alias))),
+                    name: hname,
+                })
+            } else {
+                graft_nested_module_ref(host, src, alias, r.name, ctx)
+            }
+        }
     }
 }
 

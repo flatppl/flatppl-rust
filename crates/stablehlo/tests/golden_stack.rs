@@ -69,6 +69,81 @@ fn emit_err(src: &str) -> String {
     .msg
 }
 
+#[test]
+fn singleton_vector_only_adds_an_axis() {
+    let out = emit_logdensity(&determinize_abi(
+        "x = elementof(cartpow(reals, 3))\ninputs = x\noutputs = [x]\n",
+    ));
+    assert_eq!(out.matches(" = stablehlo.").count(), 1, "{out}");
+    assert!(out.contains("stablehlo.reshape %arg0"), "{out}");
+    assert!(out.contains("-> tensor<1x3xf32>"), "{out}");
+}
+
+#[test]
+fn callable_body_size_does_not_grow_with_observation_count() {
+    let emit = |n| {
+        emit_logdensity(&determinize_abi(&format!(
+            "mu = elementof(reals)\nx = elementof(cartpow(reals, {n}))\n\
+         M = ksuperpose(Normal, [0.4, 0.6])(mu = [mu, 3.0], sigma = [1.0, 2.0])\n\
+         score = sum(fn(logdensityof(M, _)).(x))\ninputs = (mu, x)\noutputs = (score)\n"
+        )))
+    };
+    let small = emit(20);
+    let large = emit(20000);
+    assert_eq!(
+        small.matches(" = stablehlo.").count(),
+        large.matches(" = stablehlo.").count()
+    );
+    assert_eq!(small.matches("stablehlo.reduce(").count(), 3);
+    assert!(large.contains("tensor<20000x2xf32>"), "{large}");
+    assert_eq!(small, emit(20), "SSA emission order must be stable");
+}
+
+#[test]
+fn repeated_scalar_expressions_share_their_result() {
+    let out = emit_logdensity(&determinize_abi(
+        "x = elementof(posreals)\ninputs = x\noutputs = log(x) + log(x)\n",
+    ));
+    assert_eq!(out.matches("stablehlo.log ").count(), 1, "{out}");
+    assert_eq!(out.matches("stablehlo.add ").count(), 1, "{out}");
+}
+
+#[test]
+fn broadcast_calls_share_only_matching_arguments() {
+    let out = emit_logdensity(&determinize_abi(
+        "f = fn(exp(_))\nx = elementof(reals)\ny = elementof(reals)\n\
+         inputs = (x, y)\noutputs = (f.(x), f.(x), f.(y))\n",
+    ));
+    assert_eq!(out.matches("stablehlo.exponential ").count(), 2, "{out}");
+    assert!(out.contains("stablehlo.exponential %arg0"), "{out}");
+    assert!(out.contains("stablehlo.exponential %arg1"), "{out}");
+}
+
+#[test]
+fn repeated_vector_elements_use_one_broadcast() {
+    let out = emit_logdensity(&determinize_abi(
+        "x = elementof(cartpow(reals, 3))\ninputs = x\noutputs = [x, x, x, x]\n",
+    ));
+    assert_eq!(out.matches(" = stablehlo.").count(), 1, "{out}");
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim %arg0, dims = [1]"),
+        "{out}"
+    );
+    assert!(out.contains("-> tensor<4x3xf32>"), "{out}");
+}
+
+#[test]
+fn literal_vectors_emit_one_dense_constant_each() {
+    let m = determinize_src("outputs = ([true, false, true], [1, 2, 3], [0.25, 0.5, 0.75])\n");
+    for dtype in [flatppl_stablehlo::Dtype::F32, flatppl_stablehlo::Dtype::F64] {
+        let out = emit_with_dtype(&m, dtype);
+        assert_eq!(out.matches(" = stablehlo.").count(), 3, "{out}");
+        assert!(out.contains("dense<[true, false, true]>"), "{out}");
+        assert!(out.contains("dense<[1, 2, 3]>"), "{out}");
+        assert!(out.contains("dense<[0.25, 0.5, 0.75]>"), "{out}");
+    }
+}
+
 /// §04 "Multi-axis aggregation"'s own example prelude, verbatim (integer
 /// literals included), with the matrix product §04 prints as `[[6, 8], [10, 6]]`.
 ///
@@ -109,10 +184,11 @@ fn rowstack_literals_matmul_matches_frozen_golden() {
 fn integer_matrix_product_keeps_its_element_type() {
     let out = emit_logdensity(&determinize_src(MATMUL_LITERALS_SRC));
     assert!(
-        out.contains(
-            "stablehlo.dot_general %16, %35, contracting_dims = [1] x [0], precision = \
-             [DEFAULT, DEFAULT] : (tensor<2x3xi32>, tensor<3x2xi32>) -> tensor<2x2xi32>"
-        ),
+        out.lines().any(|line| {
+            line.contains("stablehlo.dot_general ")
+                && line.contains("contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT]")
+                && line.contains(": (tensor<2x3xi32>, tensor<3x2xi32>) -> tensor<2x2xi32>")
+        }),
         "integer operands must give an integer product:\n{out}"
     );
     assert!(
@@ -173,9 +249,10 @@ outputs = (M)
         "emitted @logdensity drifted from tests/goldens/stack_colstack.mlir"
     );
     assert!(
-        out.contains(
-            "stablehlo.transpose %16, dims = [1, 0] : (tensor<2x3xf32>) -> tensor<3x2xf32>"
-        ),
+        out.lines().any(|line| {
+            line.contains("stablehlo.transpose ")
+                && line.contains("dims = [1, 0] : (tensor<2x3xf32>) -> tensor<3x2xf32>")
+        }),
         "colstack transposes the row stack:\n{out}"
     );
 }
@@ -243,11 +320,17 @@ outputs = (np_style, jl_style)
 ";
     let out = emit_logdensity(&determinize_src(src));
     assert!(
-        out.contains("stablehlo.reshape %23 : (tensor<3xf32>) -> tensor<1x3xf32>"),
+        out.lines().any(|line| {
+            line.contains("stablehlo.reshape ")
+                && line.contains(": (tensor<3xf32>) -> tensor<1x3xf32>")
+        }),
         "addaxes(b3, 1, 0) is a LEADING singleton axis (NumPy-style):\n{out}"
     );
     assert!(
-        out.contains("stablehlo.reshape %31 : (tensor<2xf32>) -> tensor<2x1xf32>"),
+        out.lines().any(|line| {
+            line.contains("stablehlo.reshape ")
+                && line.contains(": (tensor<2xf32>) -> tensor<2x1xf32>")
+        }),
         "addaxes(b2, 0, 1) is a TRAILING singleton axis (Julia-style):\n{out}"
     );
 }
@@ -265,7 +348,10 @@ outputs = (X)
 ";
     let out = emit_logdensity(&determinize_src(src));
     assert!(
-        out.contains("stablehlo.reshape %16 : (tensor<2x3xf32>) -> tensor<1x1x2x3x1x1x1xf32>"),
+        out.lines().any(|line| {
+            line.contains("stablehlo.reshape ")
+                && line.contains(": (tensor<2x3xf32>) -> tensor<1x1x2x3x1x1x1xf32>")
+        }),
         "2 leading and 3 trailing singleton axes:\n{out}"
     );
 }

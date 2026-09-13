@@ -126,8 +126,8 @@ fn a_batched_categorical_density_is_one_gather_into_log_p() {
         "expected `log(p)` once, taken before the gather, in:\n{out}"
     );
     assert!(
-        out.contains("dense<1> : tensor<i32>"),
-        "Categorical is 1-based, so the gather must subtract 1, in:\n{out}"
+        out.contains("dense<[0, 2, 1, 0]> : tensor<4xi32>"),
+        "the 1-based observations fold to 0-based gather indices:\n{out}"
     );
 }
 
@@ -153,8 +153,8 @@ outputs = (lp)
         "expected exactly one gather, in:\n{out}"
     );
     assert!(
-        out.contains("dense<0> : tensor<i32>"),
-        "Categorical0 is 0-based, so the gather must subtract 0, in:\n{out}"
+        out.contains("dense<[0, 2, 1, 0]> : tensor<4xi32>"),
+        "Categorical0 already supplies 0-based gather indices:\n{out}"
     );
 }
 

@@ -5,8 +5,7 @@ module {
     %2 = stablehlo.broadcast_in_dim %1, dims = [1, 2] : (tensor<2x3xf32>) -> tensor<2x2x3xf32>
     %3 = stablehlo.broadcast_in_dim %arg2, dims = [2] : (tensor<3xf32>) -> tensor<2x2x3xf32>
     %4 = stablehlo.subtract %0, %2 : tensor<2x2x3xf32>
-    %5 = stablehlo.constant dense<2> : tensor<i32>
-    %6 = stablehlo.convert %5 : (tensor<i32>) -> tensor<f32>
+    %6 = stablehlo.constant dense<2.0> : tensor<f32>
     %7 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<f32>) -> tensor<2x2x3xf32>
     %8 = stablehlo.power %4, %7 : tensor<2x2x3xf32>
     %9 = stablehlo.multiply %8, %3 : tensor<2x2x3xf32>
