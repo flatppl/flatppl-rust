@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
 
-use crate::driver::{binding_is_referenced, map_tree};
+use crate::driver::{map_tree, referenced_binding_names};
 
 /// Fold builtin arithmetic on literal operands. Two-phase: `map_tree`'s closure
 /// only gets `&Module` (no `alloc`), so phase 1 walks each binding's RHS
@@ -317,16 +317,16 @@ pub(crate) fn sweep_dead_bindings(m: &mut Module) -> bool {
         // eligibility is keyed on the RHS being a combinator op or
         // Measure/Likelihood/Kernel-*typed*; a zeroed `Lit` fails that check on
         // its own, so that sweep's loop naturally drops it and terminates).
-        let dead: Vec<flatppl_core::BindingId> = m
+        let mut dead: Vec<flatppl_core::BindingId> = m
             .bindings()
-            .filter(|(bid, b)| {
-                !b.public
-                    && b.synthetic
-                    && !is_zeroed_sentinel(m, b.rhs)
-                    && !binding_is_referenced(m, *bid, b.name)
-            })
+            .filter(|(_, b)| !b.public && b.synthetic && !is_zeroed_sentinel(m, b.rhs))
             .map(|(bid, _)| bid)
             .collect();
+        if dead.is_empty() {
+            break;
+        }
+        let referenced = referenced_binding_names(m, false);
+        dead.retain(|bid| !referenced.contains(&m.binding(*bid).name));
         if dead.is_empty() {
             break;
         }

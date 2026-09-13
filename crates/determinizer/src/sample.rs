@@ -115,7 +115,7 @@ fn rand_result_is_destructured(m: &Module, rand_bid: BindingId) -> bool {
 /// `(%ref self name)` and whose selector argument is an integer literal — see
 /// [`rand_result_is_destructured`]. Mirrors the worklist-over-`for_each_child`
 /// idiom used throughout this crate (e.g. this file's own
-/// [`referenced_draw_bindings`], `driver.rs`'s `subtree_contains_ref`).
+/// [`referenced_draw_bindings`], `driver.rs`'s `collect_referenced_names`).
 fn subtree_has_int_projection_of(m: &Module, root: NodeId, name: Symbol) -> bool {
     let mut queue = vec![root];
     let mut qi = 0;
