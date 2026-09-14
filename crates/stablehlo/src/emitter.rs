@@ -1350,9 +1350,8 @@ impl<'m> Emitter<'m> {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.transpose {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
+        let ssa = self.pure(format!(
+            "stablehlo.transpose {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
         Value {

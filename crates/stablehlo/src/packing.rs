@@ -559,11 +559,13 @@ impl Packer<'_, '_> {
         }
         let mut source = source?;
         source.ssa = self.original(&source.ssa);
-        let selected = self.select(&source, selected_axis, &indices);
-        let mut perm = (0..shape(&selected.ty).len() as u64).collect::<Vec<_>>();
+        let mut perm = (0..shape(&source.ty).len() as u64).collect::<Vec<_>>();
         let moved = perm.remove(selected_axis);
         perm.insert(PACKET_AXIS, moved);
-        Some(self.out.transpose(&selected, &perm))
+        // Share the source layout across packets instead of transposing each
+        // selected packet separately.
+        let source = self.out.transpose(&source, &perm);
+        Some(self.select(&source, PACKET_AXIS, &indices))
     }
 
     fn select(&mut self, source: &Value, axis: usize, indices: &[usize]) -> Value {

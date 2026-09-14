@@ -22,8 +22,7 @@ module {
     %19 = stablehlo.multiply %17, %18 : tensor<3x3xf32>
     %20 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x3xf32>) -> tensor<3x3xf32>
     %21 = stablehlo.dot_general %arg0, %20, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
-    %22 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x3xf32>) -> tensor<3x3xf32>
-    %23 = stablehlo.dot_general %22, %arg0, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
-    return %8, %14, %16, %19, %21, %23 : tensor<f32>, tensor<3xf32>, tensor<f32>, tensor<3x3xf32>, tensor<3x3xf32>, tensor<3x3xf32>
+    %22 = stablehlo.dot_general %20, %arg0, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
+    return %8, %14, %16, %19, %21, %22 : tensor<f32>, tensor<3xf32>, tensor<f32>, tensor<3x3xf32>, tensor<3x3xf32>, tensor<3x3xf32>
   }
 }
