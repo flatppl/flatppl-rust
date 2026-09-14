@@ -414,12 +414,17 @@ impl Packer<'_, '_> {
         let rank = shape(&values[0].ty).len();
         let inputs = values
             .iter()
-            .map(
-                |value| match self.out.pointwise.get(&value.ssa).map(|p| &p.op) {
-                    Some(Pointwise::Broadcast(base, dims)) => (base.clone(), dims.clone()),
-                    _ => (value.clone(), (0..rank as u64).collect()),
-                },
-            )
+            .map(|value| {
+                let mut base = value.clone();
+                let mut dims = (0..rank as u64).collect::<Vec<_>>();
+                while let Some(Pointwise::Broadcast(input, map)) =
+                    self.out.pointwise.get(&base.ssa).map(|p| &p.op)
+                {
+                    dims = map.iter().map(|&d| dims[d as usize]).collect();
+                    base = input.clone();
+                }
+                (base, dims)
+            })
             .collect::<Vec<_>>();
         let mut used = vec![false; rank];
         if let Some(axis) = keep {
