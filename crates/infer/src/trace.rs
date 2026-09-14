@@ -29,8 +29,7 @@ pub(crate) struct Inferencer<'m, 's> {
     /// Inferred types/phases/value-sets, local until the final level-aware
     /// flush (a `Level::Phase` run computes types internally but never
     /// annotates them).
-    tys: HashMap<NodeId, Type>,
-    phases: HashMap<NodeId, Phase>,
+    inferred: HashMap<NodeId, (Type, Phase)>,
     vsets: HashMap<NodeId, ValueSet>,
     /// Pre-seeded annotations for substituted input nodes: (type, phase,
     /// valueset). Applied at the top of `infer_node` before any other logic,
@@ -84,7 +83,7 @@ pub(crate) struct Inferencer<'m, 's> {
 /// constructor pass in the observed-value, params and rngstate slots
 /// (`builtin_logdensityof(Normal, record(…), CrystalBall)` and friends lowered at
 /// exit 0). Only the tag slot is a tag.
-fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
+fn collect_kernel_tag_nodes(m: &Module) -> (HashSet<NodeId>, usize) {
     let mut out = HashSet::new();
     let mut visited = HashSet::new();
     let mut pending: Vec<NodeId> = m.bindings().map(|(_, binding)| binding.rhs).collect();
@@ -95,15 +94,21 @@ fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
         if let Node::Call(c) = m.node(id) {
             out.extend(crate::builtins::kernel_tag_node(m, c));
         }
-        pending.extend(m.node(id).children());
+        m.node(id).for_each_child(|child| pending.push(child));
     }
-    out
+    (out, visited.len())
 }
 
 impl<'m, 's> Inferencer<'m, 's> {
     pub(crate) fn new(module: &'m mut Module, level: Level, session: &'s InferSession<'s>) -> Self {
-        let kernel_tag_nodes = Rc::new(collect_kernel_tag_nodes(module));
-        Self::with_kernel_tags(module, level, session, kernel_tag_nodes)
+        let (kernel_tag_nodes, reachable) = collect_kernel_tag_nodes(module);
+        let mut inf = Self::with_kernel_tags(module, level, session, Rc::new(kernel_tag_nodes));
+        // A root walk can reach every binding. Substituted body walks stay sparse.
+        inf.inferred.reserve(reachable);
+        if level >= Level::Valueset {
+            inf.vsets.reserve(reachable);
+        }
+        inf
     }
 
     fn with_kernel_tags(
@@ -117,8 +122,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             level,
             session,
             diags: Vec::new(),
-            tys: HashMap::new(),
-            phases: HashMap::new(),
+            inferred: HashMap::new(),
             vsets: HashMap::new(),
             seeds: HashMap::new(),
             in_progress: Vec::new(),
@@ -193,9 +197,10 @@ impl<'m, 's> Inferencer<'m, 's> {
         // and seeding the offending node `Failed` keeps a refused bracket to one
         // error instead of a cascade of type complaints about it.
         for (node, diag) in crate::axes::position_errors(self.module) {
-            self.tys
-                .insert(node, Type::Failed("axis out of position".into()));
-            self.phases.insert(node, Phase::Fixed);
+            self.inferred.insert(
+                node,
+                (Type::Failed("axis out of position".into()), Phase::Fixed),
+            );
             self.diags.push(diag);
         }
         let ids: Vec<BindingId> = self.module.bindings().map(|(id, _)| id).collect();
@@ -206,30 +211,30 @@ impl<'m, 's> Inferencer<'m, 's> {
         for (id, entries) in self.auto_inputs.pop().unwrap() {
             self.module.set_auto_inputs(id, entries);
         }
-        for (&id, phase) in &self.phases {
-            self.module.set_phase(id, *phase);
-        }
-        if self.level >= Level::Type {
-            for (&id, ty) in &self.tys {
-                self.module.set_type(id, ty.clone());
-            }
-        }
-        if self.level >= Level::Valueset {
-            // Total discipline (spec §11): a value-typed node's set is at
-            // least the type's natural extent — fall back where no producer
-            // established anything finer. One chokepoint; producers stay
-            // refinement-only.
-            for (&id, ty) in &self.tys {
+        // Move completed annotations into the module as natural value sets
+        // are derived, without cloning either table.
+        for (id, (ty, phase)) in self.inferred {
+            if self.level >= Level::Valueset {
+                // Total discipline (spec §11): a value-typed node's set is at
+                // least the type's natural extent — fall back where no producer
+                // established anything finer. One chokepoint; producers stay
+                // refinement-only.
                 let stored = self.vsets.get(&id);
                 if stored.is_none() || stored == Some(&ValueSet::Unknown) {
-                    let natural = ValueSet::natural_of(ty);
+                    let natural = ValueSet::natural_of(&ty);
                     if natural != ValueSet::Unknown {
                         self.vsets.insert(id, natural);
                     }
                 }
             }
-            for (&id, set) in &self.vsets {
-                self.module.set_valueset(id, set.clone());
+            self.module.set_phase(id, phase);
+            if self.level >= Level::Type {
+                self.module.set_type(id, ty);
+            }
+        }
+        if self.level >= Level::Valueset {
+            for (id, set) in self.vsets {
+                self.module.set_valueset(id, set);
             }
         }
         // Drain dependency diagnostics accumulated during this run (cross-module
@@ -243,7 +248,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// The inferred type of an already-visited node (ops rules use this to
     /// look through reified bodies).
     pub(crate) fn lookup_type(&self, id: NodeId) -> Option<&Type> {
-        self.tys.get(&id)
+        self.inferred.get(&id).map(|(ty, _)| ty)
     }
 
     /// The inferred phase of an already-visited node. `None` while the walk has
@@ -251,7 +256,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// final flush, so an ops rule must read the live table, not `Module`.
     /// A caller pruning on this must treat `None` as "do not prune".
     pub(crate) fn lookup_phase(&self, id: NodeId) -> Option<Phase> {
-        self.phases.get(&id).copied()
+        self.inferred.get(&id).map(|(_, phase)| *phase)
     }
 
     /// The cross-module callable body-result type recorded for `id`, if `id`
@@ -324,7 +329,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             }
             // A fixed-phase subgraph has no `elementof` ancestor (spec §04) — prune.
             // (Absent phase ⇒ don't prune: soundly does extra work, never skips.)
-            if self.phases.get(&id) == Some(&Phase::Fixed) {
+            if self.lookup_phase(id) == Some(Phase::Fixed) {
                 continue;
             }
             // Cached reference chains can be arbitrarily deep even when inference
@@ -379,8 +384,8 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// Type + phase of a binding's RHS (memoised).
     pub(crate) fn infer_binding(&mut self, id: BindingId) -> (Type, Phase) {
         let rhs = self.module.binding(id).rhs;
-        if let (Some(ty), Some(phase)) = (self.tys.get(&rhs), self.phases.get(&rhs)) {
-            return (ty.clone(), *phase);
+        if let Some(result) = self.inferred.get(&rhs) {
+            return result.clone();
         }
         if !self.active_bindings.insert(id) {
             let path: Vec<&str> = self
@@ -397,8 +402,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                 path.join(" → ")
             )));
             let ty = Type::Failed("reference cycle".into());
-            self.tys.insert(rhs, ty.clone());
-            self.phases.insert(rhs, Phase::Fixed);
+            self.inferred.insert(rhs, (ty.clone(), Phase::Fixed));
             return (ty, Phase::Fixed);
         }
         self.in_progress.push(id);
@@ -416,15 +420,14 @@ impl<'m, 's> Inferencer<'m, 's> {
         // substitution, write its annotation directly and return — making the
         // input authoritative for everything downstream that references it.
         if let Some((ty, phase, vset)) = self.seeds.get(&id).cloned() {
-            self.tys.insert(id, ty.clone());
-            self.phases.insert(id, phase);
+            self.inferred.insert(id, (ty.clone(), phase));
             if self.level >= Level::Valueset {
                 self.vsets.insert(id, vset);
             }
             return (ty, phase);
         }
-        if let (Some(ty), Some(phase)) = (self.tys.get(&id), self.phases.get(&id)) {
-            return (ty.clone(), *phase);
+        if let Some(result) = self.inferred.get(&id) {
+            return result.clone();
         }
         self.infer_node_inner(id)
     }
@@ -535,11 +538,10 @@ impl<'m, 's> Inferencer<'m, 's> {
         };
         // A cycle marker may have landed on this node while the walk was in
         // flight (see infer_binding); it is authoritative — don't clobber it.
-        if let (Some(t), Some(p)) = (self.tys.get(&id), self.phases.get(&id)) {
-            return (t.clone(), *p);
+        if let Some(result) = self.inferred.get(&id) {
+            return result.clone();
         }
-        self.tys.insert(id, ty.clone());
-        self.phases.insert(id, phase);
+        self.inferred.insert(id, (ty.clone(), phase));
         (ty, phase)
     }
 
@@ -656,7 +658,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                         // Phase. The substitution value was inferred just
                         // above, so its phase is recorded; skip if not (never
                         // false-positive on a missing phase).
-                        if let Some(&value_phase) = self.phases.get(&value_node) {
+                        if let Some(value_phase) = self.lookup_phase(value_node) {
                             let required = kind.required_phase();
                             if value_phase != required {
                                 self.diags.push(Diagnostic::error_at(
