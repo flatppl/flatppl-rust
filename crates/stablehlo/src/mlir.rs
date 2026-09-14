@@ -14,7 +14,7 @@
 use crate::Dtype;
 
 /// An MLIR tensor type, shape-only (no baked-in element dtype).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MlirTy {
     /// A rank-0 tensor (`tensor<f32>`) — FlatPDL scalars.
     Scalar,
@@ -32,7 +32,7 @@ pub enum MlirTy {
 /// and float precision (`Dtype`). Resolved from a value's inferred scalar
 /// kind (spec §03 boolean/integer/real categories); `Complex` has no tensor
 /// form and is refused before reaching here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ElemKind {
     Real,
     Int,

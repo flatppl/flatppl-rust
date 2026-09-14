@@ -145,9 +145,7 @@ impl Emitter<'_> {
         );
         let out = Value { ssa, ..v.clone() };
         self.copy_constant(v, &out);
-        if let Some(op) = self.pointwise.get(&v.ssa).cloned() {
-            self.pointwise.insert(out.ssa.clone(), op);
-        }
+        self.remember_pointwise(&out.ssa, &out, Pointwise::Reshape(v.clone()));
         out
     }
 
@@ -208,6 +206,11 @@ impl Emitter<'_> {
         if dims.windows(2).all(|pair| pair[0] < pair[1]) {
             self.copy_constant(v, &out);
         }
+        self.remember_pointwise(
+            &out.ssa,
+            &out,
+            Pointwise::Broadcast(v.clone(), dims.to_vec()),
+        );
         out
     }
 

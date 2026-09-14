@@ -1,6 +1,5 @@
-//! Expand batched scalar producers into their consumer's cell shape without
-//! changing arithmetic order. Batch-invariant work and non-pointwise producers
-//! remain computed leaves.
+//! Typed pointwise recipes shared by consumer expansion and horizontal packing.
+//! Expansion keeps batch-invariant work hoisted and preserves arithmetic order.
 
 use super::*;
 
@@ -11,13 +10,57 @@ pub(super) enum Pointwise {
     Compare(String, Value, Value),
     Select(Value, Value, Value),
     Convert(Value, ElemKind),
+    Broadcast(Value, Vec<u64>),
+    Reshape(Value),
+    Slice(Value, Vec<u64>, Vec<u64>, Vec<u64>),
+}
+
+#[derive(Clone)]
+pub(super) struct Producer {
+    pub value: Value,
+    pub op: Pointwise,
+}
+
+impl Pointwise {
+    pub(super) fn inputs(&self) -> Vec<&Value> {
+        match self {
+            Self::Unary(_, a)
+            | Self::Convert(a, _)
+            | Self::Broadcast(a, _)
+            | Self::Reshape(a)
+            | Self::Slice(a, ..) => vec![a],
+            Self::Binary(_, a, b) | Self::Compare(_, a, b) => vec![a, b],
+            Self::Select(c, a, b) => vec![c, a, b],
+        }
+    }
+
+    pub(super) fn signature(&self) -> Option<(String, Vec<u64>)> {
+        let name = match self {
+            Self::Unary(op, _) | Self::Binary(op, ..) => op.clone(),
+            Self::Compare(dir, ..) => format!("compare {dir}"),
+            Self::Select(..) => "select".to_owned(),
+            Self::Convert(..) => "convert".to_owned(),
+            Self::Broadcast(_, dims) => return Some(("broadcast".to_owned(), dims.clone())),
+            Self::Reshape(_) | Self::Slice(..) => return None,
+        };
+        Some((name, vec![]))
+    }
 }
 
 impl Emitter<'_> {
     pub(super) fn remember_pointwise(&mut self, ssa: &str, shape_source: &Value, op: Pointwise) {
-        if self.batch_rank(shape_source) > 0 && self.cell_ty(shape_source) == MlirTy::Scalar {
-            self.pointwise.insert(ssa.to_owned(), op);
-        }
+        let elem = match &op {
+            Pointwise::Compare(..) => ElemKind::Bool,
+            Pointwise::Convert(_, target) => *target,
+            _ => shape_source.elem,
+        };
+        let value = Value {
+            ssa: ssa.to_owned(),
+            ty: shape_source.ty.clone(),
+            elem,
+        };
+        self.pointwise
+            .insert(ssa.to_owned(), Producer { value, op });
     }
 
     pub(super) fn expand_pointwise(
@@ -44,7 +87,15 @@ impl Emitter<'_> {
         if let Some(out) = self.expanded.get(&key) {
             return Some(out.clone());
         }
-        let op = self.pointwise.get(&value.ssa)?.clone();
+        let mut op = self.pointwise.get(&value.ssa)?.op.clone();
+        // A semantic axes view has the same physical shape. Follow it while
+        // retaining the viewed value's expansion guard and target layout.
+        while let Pointwise::Reshape(ref a) = op {
+            if a.ty != value.ty {
+                return None;
+            }
+            op = self.pointwise.get(&a.ssa)?.op.clone();
+        }
         let mut expand = |v: &Value| self.expand_axes(v, dims, ty.clone(), axes.clone());
         let out = match op {
             Pointwise::Unary(op, a) => {
@@ -71,6 +122,7 @@ impl Emitter<'_> {
                 let a = expand(&a);
                 self.convert(&a, elem)
             }
+            Pointwise::Broadcast(..) | Pointwise::Reshape(_) | Pointwise::Slice(..) => return None,
         };
         self.expanded.insert(key, out.clone());
         Some(out)

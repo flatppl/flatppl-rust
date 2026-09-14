@@ -38,6 +38,8 @@ use crate::refuse::EmitError;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
+#[path = "packing.rs"]
+mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
 use batching::{Axes, shape};
@@ -123,8 +125,8 @@ pub struct Emitter<'m> {
     memo: HashMap<NodeId, Value>,
     /// Exact pure-operation RHS -> SSA, confined to the current region.
     pure_ops: HashMap<(String, Option<Axes>), String>,
-    /// Reusable scalar-cell producers; their SSA operands never change.
-    pointwise: HashMap<String, Pointwise>,
+    /// Typed numeric producers; their SSA operands never change.
+    pointwise: HashMap<String, pointwise::Producer>,
     /// Expanded results belong to the current region, just like pure_ops.
     expanded: HashMap<(String, Vec<Option<u64>>, Axes), Value>,
     axes: HashMap<String, Axes>,
@@ -1003,11 +1005,22 @@ impl<'m> Emitter<'m> {
             ),
             a,
         );
-        Value {
+        let out = Value {
             ssa,
             ty: result_ty,
             elem: a.elem,
-        }
+        };
+        self.remember_pointwise(
+            &out.ssa,
+            &out,
+            Pointwise::Slice(
+                a.clone(),
+                starts.to_vec(),
+                limits.to_vec(),
+                strides.to_vec(),
+            ),
+        );
+        out
     }
 
     /// `%N = stablehlo.reshape %a : (operand_ty) -> result_ty` — reinterprets
@@ -1041,6 +1054,7 @@ impl<'m> Emitter<'m> {
             elem: a.elem,
         };
         self.copy_constant(a, &out);
+        self.remember_pointwise(&out.ssa, &out, Pointwise::Reshape(a.clone()));
         out
     }
 
@@ -1074,6 +1088,11 @@ impl<'m> Emitter<'m> {
         if dims.windows(2).all(|pair| pair[0] < pair[1]) {
             self.copy_constant(a, &out);
         }
+        self.remember_pointwise(
+            &out.ssa,
+            &out,
+            Pointwise::Broadcast(a.clone(), dims.to_vec()),
+        );
         out
     }
 
@@ -3693,6 +3712,11 @@ impl<'m> Emitter<'m> {
             !rets.is_empty(),
             "finish requires at least one return value"
         );
+        let packed = packing::pack(&self, args, rets);
+        let rets = packed.as_ref().map_or_else(
+            || rets.to_vec(),
+            |(_, values)| values.iter().collect::<Vec<_>>(),
+        );
         let dtype = self.dtype;
         let arg_list = args
             .iter()
@@ -3716,6 +3740,22 @@ impl<'m> Emitter<'m> {
         out.push_str(&format!(
             "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
+        let lines = packed.as_ref().map_or_else(
+            || self.live_lines(&rets),
+            |(body, _)| body.lines().collect(),
+        );
+        for line in lines {
+            out.push_str("    ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!("    return {ret_ssas} : {ret_tys_joined}\n"));
+        out.push_str("  }\n");
+        out.push_str("}\n");
+        out
+    }
+
+    fn live_lines(&self, rets: &[&Value]) -> Vec<&str> {
         // Folding replaces whole constant chains. Drop their dead definitions
         // before sending dense tensor literals to the backend. Only one-line
         // operations already classified pure are eligible; loops and RNG stay.
@@ -3731,23 +3771,13 @@ impl<'m> Emitter<'m> {
             {
                 continue;
             }
-            for (i, _) in line.match_indices('%') {
-                let end = line[i + 1..]
-                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .map_or(line.len(), |n| i + 1 + n);
-                live.insert(&line[i..end]);
+            for (_, name) in packing::ssa_uses(line) {
+                live.insert(name);
             }
             lines.push(line);
         }
-        for line in lines.into_iter().rev() {
-            out.push_str("    ");
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str(&format!("    return {ret_ssas} : {ret_tys_joined}\n"));
-        out.push_str("  }\n");
-        out.push_str("}\n");
-        out
+        lines.reverse();
+        lines
     }
 }
 

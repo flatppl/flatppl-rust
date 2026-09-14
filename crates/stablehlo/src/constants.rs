@@ -89,7 +89,12 @@ impl Emitter<'_> {
         }
     }
 
-    fn folded_constant(&mut self, values: Vec<Scalar>, ty: MlirTy, axes: Axes) -> Option<Value> {
+    pub(super) fn folded_constant(
+        &mut self,
+        values: Vec<Scalar>,
+        ty: MlirTy,
+        axes: Axes,
+    ) -> Option<Value> {
         let values = values
             .into_iter()
             .map(|v| self.rounded_constant(v))
