@@ -85,6 +85,11 @@ pub enum Math {
     Cases(Vec<(Math, Option<Math>)>),
     /// An overline (complex conjugate).
     Overline(Box<Math>),
+    /// `base` with `mark` written above it (`=ᵍ`).
+    Marked {
+        base: Box<Math>,
+        mark: Box<Math>,
+    },
     /// Fallback: source text in monospace.
     Code(String),
 }
@@ -153,6 +158,8 @@ pub enum Op {
     Transpose,
     /// Adjoint `†`.
     Dagger,
+    /// A relation sign as a bare glyph (the base of a marked `=`).
+    Relation(Rel),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,12 +228,15 @@ pub enum BigOp {
     Integral,
 }
 
-/// One rendered row: `lhs rel rhs`.
+/// One rendered row: `lhs rel rhs`, the relation sign optionally marked
+/// (`=ᵍ`: a metric sum's equality, lower indices lowered by `g`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Statement {
     pub lhs: Math,
     pub rel: Rel,
     pub rhs: Math,
+    /// An expression written above the relation sign.
+    pub mark: Option<Math>,
 }
 
 impl Statement {
@@ -234,7 +244,8 @@ impl Statement {
     /// (including the row's own names, when the left-hand side carries them).
     pub fn refs(&self) -> Vec<String> {
         let mut out = self.lhs.refs();
-        for r in self.rhs.refs() {
+        let rest = self.mark.iter().chain(std::iter::once(&self.rhs));
+        for r in rest.flat_map(Math::refs) {
             if !out.contains(&r) {
                 out.push(r);
             }
@@ -242,15 +253,34 @@ impl Statement {
         out
     }
 
-    /// The deeper of the two sides ([`Math::depth`]).
+    /// The deepest of the sides and the mark ([`Math::depth`]).
     pub fn depth(&self) -> usize {
-        self.lhs.depth().max(self.rhs.depth())
+        self.lhs
+            .depth()
+            .max(self.rhs.depth())
+            .max(self.mark.as_ref().map_or(0, Math::depth))
     }
 
-    /// Visit every identifier on both sides, mutably.
+    /// Visit every identifier on both sides and in the mark, mutably.
     pub fn for_each_ident_mut(&mut self, f: &mut impl FnMut(&mut Ident)) {
         self.lhs.for_each_ident_mut(f);
         self.rhs.for_each_ident_mut(f);
+        if let Some(m) = &mut self.mark {
+            m.for_each_ident_mut(f);
+        }
+    }
+
+    /// The relation sign as an expression, marked when the row is: the form
+    /// the printers write between the sides and the legend shows for `=ᵍ`.
+    pub fn relation_form(&self) -> Math {
+        let base = Math::Op(Op::Relation(self.rel));
+        match &self.mark {
+            Some(mark) => Math::Marked {
+                base: Box::new(base),
+                mark: Box::new(mark.clone()),
+            },
+            None => base,
+        }
     }
 }
 
@@ -641,6 +671,7 @@ impl Math {
             Math::Sub(a, b) | Math::Sup(a, b) | Math::Frac(a, b) => vec![a, b],
             Math::SubSup(a, b, c) => vec![a, b, c],
             Math::Sqrt(a) | Math::Overline(a) | Math::Unary { arg: a, .. } => vec![a],
+            Math::Marked { base, mark } => vec![base, mark],
             Math::Apply { head, args } => {
                 std::iter::once(head.as_ref()).chain(args.iter()).collect()
             }
@@ -681,6 +712,7 @@ impl Math {
             Math::Sub(a, b) | Math::Sup(a, b) | Math::Frac(a, b) => vec![a, b],
             Math::SubSup(a, b, c) => vec![a, b, c],
             Math::Sqrt(a) | Math::Overline(a) | Math::Unary { arg: a, .. } => vec![a],
+            Math::Marked { base, mark } => vec![base, mark],
             Math::Apply { head, args } => std::iter::once(head.as_mut())
                 .chain(args.iter_mut())
                 .collect(),

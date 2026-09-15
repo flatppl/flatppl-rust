@@ -127,12 +127,12 @@ impl Format {
             let (lhs, rel, rhs) = match self {
                 Self::Markdown | Self::Latex => (
                     tex::expr(&stmt.lhs),
-                    tex::relation(stmt.rel),
+                    tex::relation_of(stmt),
                     tex::expr(&stmt.rhs),
                 ),
                 Self::Typst => (
                     typst::expr(&stmt.lhs),
-                    typst::relation(stmt.rel),
+                    typst::relation_of(stmt),
                     typst::expr(&stmt.rhs),
                 ),
             };
@@ -304,6 +304,7 @@ fn document(
                     lhs: Math::binding(&binding.name),
                     rel: Rel::Eq,
                     rhs: value,
+                    mark: None,
                 };
                 format.equations(&mut out, &[(&stmt, None)]);
             }

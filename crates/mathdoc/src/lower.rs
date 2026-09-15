@@ -314,6 +314,9 @@ impl<'m> Lowerer<'m> {
         let mut lowered = lowered.unwrap_or_else(|| self.source_fallback(id, &name));
         self.style_idents(&mut lowered.statement.lhs);
         self.style_idents(&mut lowered.statement.rhs);
+        if let Some(m) = &mut lowered.statement.mark {
+            self.style_idents(m);
+        }
         if let Some(d) = self.collision_diagnostic(&name) {
             self.diagnostics.push(d);
         }
@@ -355,6 +358,7 @@ impl<'m> Lowerer<'m> {
                 lhs: lhs.clone(),
                 rel,
                 rhs,
+                mark: None,
             })
         };
         if statement
@@ -370,6 +374,7 @@ impl<'m> Lowerer<'m> {
                 lhs,
                 rel,
                 rhs: Math::Code(text),
+                mark: None,
             }
         });
         let mut statement = statement;
@@ -423,6 +428,7 @@ impl<'m> Lowerer<'m> {
                 lhs,
                 rel,
                 rhs: Math::Code(text),
+                mark: None,
             },
             annotation,
             elided: false,
@@ -539,6 +545,7 @@ impl<'m> Lowerer<'m> {
                         lhs,
                         rel: Rel::In,
                         rhs: set,
+                        mark: None,
                     },
                     annotation: (head == "external").then(|| "external input".to_string()),
                     elided: false,
@@ -551,6 +558,7 @@ impl<'m> Lowerer<'m> {
                         lhs,
                         rel: Rel::Sim,
                         rhs: measure,
+                        mark: None,
                     },
                     annotation: None,
                     elided: false,
@@ -603,8 +611,13 @@ impl<'m> Lowerer<'m> {
                 let agg = self.aggregation(call, &head);
                 let lhs = decorate_with_axes(lhs, &agg.out_axes);
                 Lowered {
-                    statement: eq(lhs, agg.body),
-                    annotation: agg.annotation,
+                    statement: Statement {
+                        lhs,
+                        rel: Rel::Eq,
+                        rhs: agg.body,
+                        mark: agg.metric,
+                    },
+                    annotation: None,
                     elided: false,
                 }
             }
@@ -620,6 +633,7 @@ impl<'m> Lowerer<'m> {
                         lhs,
                         rel: Rel::In,
                         rhs: set,
+                        mark: None,
                     },
                     annotation: Some(format!("{n} values, see the data appendix")),
                     elided: true,
@@ -1755,7 +1769,8 @@ impl<'m> Lowerer<'m> {
     // ── aggregation ────────────────────────────────────────────────────────
 
     /// `aggregate(f, [out axes], body)` / `metricsum(g, [out axes], body)`:
-    /// the output axes, the reduced body, and an annotation.
+    /// the output axes, the reduced body, and for a metric sum the metric,
+    /// which the row writes over its equality sign (`=ᵍ`).
     fn aggregation(&mut self, call: &Call, head: &str) -> Aggregation {
         let out_axes = self.axis_list(call.args[1]);
         let body_node = call.args[2];
@@ -1766,10 +1781,7 @@ impl<'m> Lowerer<'m> {
             return Aggregation {
                 out_axes,
                 body,
-                annotation: Some(format!(
-                    "indices lowered with the metric {}",
-                    plain_name(&metric)
-                )),
+                metric: Some(metric),
             };
         }
         let reduced: Vec<Math> = body_axes
@@ -1789,7 +1801,7 @@ impl<'m> Lowerer<'m> {
         Aggregation {
             out_axes,
             body,
-            annotation: None,
+            metric: None,
         }
     }
 
@@ -1841,7 +1853,7 @@ struct Integrand {
 struct Aggregation {
     out_axes: Vec<(String, Option<Variance>)>,
     body: Math,
-    annotation: Option<String>,
+    metric: Option<Math>,
 }
 
 /// Whether the expression at `id` nests deeper than
@@ -2210,15 +2222,7 @@ fn eq(lhs: Math, rhs: Math) -> Statement {
         lhs,
         rel: Rel::Eq,
         rhs,
-    }
-}
-
-/// The source name of an identifier, for annotations.
-fn plain_name(m: &Math) -> String {
-    match m {
-        Math::Ident(id) => id.name.clone(),
-        Math::Text(t) => t.clone(),
-        _ => "g".to_string(),
+        mark: None,
     }
 }
 
@@ -2750,9 +2754,14 @@ mod tests {
             body.contains("<msub><mi data-flatppl-ref=\"r\">r</mi><mi>μ</mi></msub>"),
             "{body}"
         );
-        assert_eq!(
-            s.annotation.as_deref(),
-            Some("indices lowered with the metric g")
+        // The metric marks the equality sign, `s =ᵍ r^μ r_μ`, and is a reference.
+        assert_eq!(s.annotation, None);
+        assert_eq!(s.statement.mark, Some(Math::binding("g")));
+        assert!(s.statement.refs().contains(&"g".to_string()));
+        let row = mathml::statement(&s.statement);
+        assert!(
+            row.contains("<mover><mo>=</mo><mi data-flatppl-ref=\"g\">g</mi></mover>"),
+            "{row}"
         );
     }
 

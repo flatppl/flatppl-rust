@@ -119,7 +119,7 @@ the same rules (`.mu` → μ).
 | `K = kernelof(x, p = a)` | K(p) = Law(x \| p) |
 | `L = likelihoodof(K, data)` | L(inputs) = p_K(data \| inputs) |
 | `C[.i, .k] := body` | C_{ik} = Σ_{j} body |
-| `g: s[] := body` | s = body with upper/lower indices, annotation "indices lowered with g" |
+| `g: s[] := body` | s =ᵍ body with upper/lower indices as written; the metric over the equality sign says lower indices are lowered with g (arrays are stored contravariant, §04), and the legend defines =ᵍ |
 | `a, b ~ M` | (a, b) ∼ M |
 | `K, nu = disintegrate(["obs"], M)` | (K, ν) = disintegrate_{obs}(M) |
 
@@ -188,7 +188,7 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |
 | `a[idx]` with an array of indices | a_{idx} and, under an index i, a_{idx_i} |
 | `aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` | Σ_{j} A_{ij} B_{jk}, other reductions as var_{j}(…) in roman |
-| `metricsum(g, [.mu^], r[.mu^] * r[.mu_])` | r^{μ} r_{μ}, upper and lower indices as written |
+| `metricsum(g, [.mu^], r[.mu^] * r[.mu_])` | s =ᵍ r^{μ} r_{μ}, upper and lower indices as written, the metric over the equality sign |
 
 Index letters are fresh (i, j, k, … skipping names bound in the module). The
 range comes from the typed module: a named size where the source gives one
