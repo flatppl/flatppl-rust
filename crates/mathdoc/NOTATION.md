@@ -56,7 +56,7 @@ the rules stated here.
 - Long sums with at least three terms use aligned continuation lines in all
   printers. Only the left-associated sum chain splits; right-hand groups,
   enclosing fences, powers and source references stay intact. What follows
-  the sum in its row (an index range) sits on the last line. The shared
+  the sum in its row (a differential) sits on the last line. The shared
   width estimate is deterministic, not a font or viewport measurement.
   HTML equation blocks scroll horizontally when an expression still cannot fit.
 - A generated notation key explains the symbols used in the module: each
@@ -191,9 +191,9 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | FlatPPL | Math |
 | --- | --- |
 | `iid(M, n)`, `iid(M, [m, n])` | Mⁿ, M^{m×n} — the n-fold product measure as a bare power (van der Vaart's Pⁿ), matching Sⁿ for `cartpow`; the `⊗` is kept for products of different factors |
-| `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i),  i = 1, …, n — one law per index; the range follows when the length is static, an index over a length inference cannot give stays unbound (y_i ∼ …, for each i) |
-| `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c),  i = 1, …, n — as an axis-indexed row `v[.i] := …` reads, which carries no range yet |
-| `W = f.(A)` with A a matrix | W_{i,j} = f(A_{i,j}),  i = 1, …, m,  j = 1, …, n — one index per axis |
+| `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i) — one law per index, the index running over the collection; no range is written, it would follow every such row and add nothing the index does not say |
+| `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c) — as an axis-indexed row `v[.i] := …` reads |
+| `W = f.(A)` with A a matrix | W_{i,j} = f(A_{i,j}) — one index per axis |
 | `M = K.(xs)` as a row | M = ⨂_{i=1}^{n} K(xs_i) — the array-valued measure is one object (§04), so its row keeps the product; `y ∼ M` then draws from it whole |
 | `a, b ~ K.(xs)` | (a, b) ∼ ⨂_{i=1}^{2} K(xs_i) — a decomposition names the components, not an index |
 | `f.(a, b)` with no collection argument | f(a, b), the single application §04 defines |

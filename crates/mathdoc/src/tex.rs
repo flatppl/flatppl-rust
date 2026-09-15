@@ -70,7 +70,6 @@ pub fn expr(m: &Math) -> String {
             Op::Comma => ",",
             Op::Restrict => r"\vert",
             Op::ThinSpace => r"\,",
-            Op::QuadSpace => r"\quad",
             Op::Differential => r"\mathrm{d}",
             Op::Transpose => r"\mathrm{T}",
             Op::Dagger => r"\dagger",

@@ -1843,36 +1843,16 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A row whose right-hand side is a broadcast, written with a free index
-    /// per axis: `y_i ∼ K(x_i),  i = 1, …, n` or `v_{i,j} = f(x_{i,j}),
-    /// i = 1, …, m,  j = 1, …, n`. An axis whose length is not static leaves
-    /// its index unbound.
+    /// per axis: `y_i ∼ K(x_i)`, `v_{i,j} = f(x_{i,j})`. The index runs over
+    /// the collection; no range is written (it would follow every such row
+    /// and says nothing the index does not).
     fn indexed_row(&mut self, lhs: Math, rel: Rel, e: Elementwise) -> Lowered {
-        let indices: Vec<Math> = e.axes.iter().map(|a| a.index.clone()).collect();
-        let lhs = Math::subscript(lhs, index_list(&indices));
-        let mut rhs = vec![e.body];
-        for axis in e.axes {
-            let Some(hi) = axis.len else {
-                continue;
-            };
-            rhs.push(Math::Op(Op::Comma));
-            rhs.push(Math::Op(Op::QuadSpace));
-            rhs.push(Math::relation(
-                axis.index,
-                Rel::Eq,
-                Math::row(vec![
-                    Math::int(1),
-                    Math::Op(Op::Comma),
-                    Math::Sym(Sym::Ellipsis),
-                    Math::Op(Op::Comma),
-                    hi,
-                ]),
-            ));
-        }
+        let indices: Vec<Math> = e.axes.into_iter().map(|a| a.index).collect();
         Lowered {
             statement: Statement {
-                lhs,
+                lhs: Math::subscript(lhs, index_list(&indices)),
                 rel,
-                rhs: Math::row(rhs),
+                rhs: e.body,
                 mark: None,
             },
             annotation: None,
@@ -2620,31 +2600,25 @@ mod tests {
             grid.ends_with("<mrow><mn>2</mn><mo>×</mo><mn>3</mn></mrow></msup>"),
             "{grid}"
         );
-        // A broadcast row is written with a free index and its range:
-        // `y_i ∼ 𝒩(θ_i, s_i²),  i = 1, …, J`.
+        // A broadcast row is written with a free index: `y_i ∼ 𝒩(θ_i, s_i²)`.
         let y_row = row_named(&rows, "y");
         assert_eq!(
             mathml::expr(&y_row.statement.lhs),
             "<msub data-flatppl-ref=\"y\"><mi>y</mi><mi>i</mi></msub>"
         );
         let y = mathml::expr(&y_row.statement.rhs);
-        assert!(y.starts_with("<mrow><mrow><mi>𝒩</mi>"), "{y}");
+        assert!(y.starts_with("<mrow><mi>𝒩</mi>"), "{y}");
         assert!(y.contains("<msub data-flatppl-ref=\"theta\"><mi>θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub data-flatppl-ref=\"s\"><mi>s</mi><mi>i</mi></msub><mn>2</mn></msup>"), "{y}");
-        assert!(y.ends_with("<mo>,</mo><mspace width=\"1em\"/><mrow><mi>i</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mi data-flatppl-ref=\"J\">J</mi></mrow></mrow></mrow>"), "{y}");
+        assert!(!y.contains("<mi>…</mi>"), "{y}");
         let means_row = row_named(&rows, "means");
         assert_eq!(
             mathml::expr(&means_row.statement.lhs),
             "<msub data-flatppl-ref=\"means\"><mi>means</mi><mi>i</mi></msub>"
         );
         let means = mathml::expr(&means_row.statement.rhs);
-        assert!(
-            means.starts_with("<mrow><mrow><mi data-flatppl-ref=\"alpha\">α</mi><mo>+</mo>"),
-            "{means}"
-        );
-        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub>"), "{means}");
-        assert!(
-            means.ends_with("<mo>,</mo><mi>…</mi><mo>,</mo><mn>4</mn></mrow></mrow></mrow>"),
-            "{means}"
+        assert_eq!(
+            means,
+            "<mrow><mi data-flatppl-ref=\"alpha\">α</mi><mo>+</mo><mrow><mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub></mrow></mrow>"
         );
         // In expression position a broadcast stays the object: a family.
         let inner = rhs(
@@ -2728,8 +2702,8 @@ mod tests {
         );
         let rhs = mathml::expr(&w.statement.rhs);
         assert!(rhs.contains("<msub data-flatppl-ref=\"R\"><mi>R</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"), "{rhs}");
-        assert!(rhs.ends_with("<mrow><mi>i</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mn>2</mn></mrow></mrow><mo>,</mo><mspace width=\"1em\"/><mrow><mi>j</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mn>3</mn></mrow></mrow></mrow>"), "{rhs}");
-        // In expression position, one product per axis.
+        assert!(!rhs.contains("<mi>…</mi>"), "{rhs}");
+        // In expression position, one product per axis, with their ranges.
         let m2 = mathml::expr(&row_named(&rows, "M2").statement.rhs);
         assert_eq!(m2.matches("<mo>⨂</mo>").count(), 2, "{m2}");
     }
@@ -2758,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn an_axis_without_a_static_length_leaves_its_index_unbound() {
+    fn a_gathered_collection_is_indexed_through_its_gather() {
         let src = "dat = table(counts = [2, 1])\nxs = [1.0, 2.0]\ng = cat(fill(1, dat.counts[1]), fill(2, dat.counts[2]))\ny ~ Normal.(xs[g], 1.0)";
         let rows = rows(src);
         let y = row_named(&rows, "y");
@@ -2767,16 +2741,7 @@ mod tests {
             "<msub data-flatppl-ref=\"y\"><mi>y</mi><mi>i</mi></msub>"
         );
         let rhs = mathml::expr(&y.statement.rhs);
-        assert!(!rhs.contains("<mi>…</mi>"), "{rhs}");
         assert!(rhs.contains("<msub data-flatppl-ref=\"xs\"><mi>xs</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{rhs}");
-    }
-
-    #[test]
-    fn the_range_is_set_off_by_a_quad_in_every_printer() {
-        let rows = rows("xs = [1.0, 2.0, 3.0]\nv = 2 .* xs");
-        let rhs = &row_named(&rows, "v").statement.rhs;
-        assert!(crate::tex::expr(rhs).ends_with(r", \quad i = 1 , \ldots , 3"));
-        assert!(crate::typst::expr(rhs).contains(" quad "));
     }
 
     #[test]

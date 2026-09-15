@@ -478,7 +478,6 @@ fn write_op(out: &mut String, op: Op) {
         Op::Comma => "<mo>,</mo>",
         Op::Restrict => "<mo stretchy=\"false\">|</mo>",
         Op::ThinSpace => "<mspace width=\"0.1667em\"/>",
-        Op::QuadSpace => "<mspace width=\"1em\"/>",
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
         Op::Dagger => "<mo>†</mo>",
@@ -625,30 +624,20 @@ mod tests {
         let i = || Math::ident("i", None);
         let term = || Math::subscript(b("std_errs_data"), i());
         let sum = (0..8).fold(term(), |acc, _| Math::plus(acc, term()));
-        let range = Math::relation(
-            i(),
-            crate::ast::Rel::Eq,
-            Math::row(vec![
-                Math::int(1),
-                Math::Op(Op::Comma),
-                Math::Sym(Sym::Ellipsis),
-                Math::Op(Op::Comma),
-                Math::int(8),
-            ]),
-        );
+        // An integrand that wraps keeps its differential on the last line.
         let row = Math::row(vec![
             sum,
-            Math::Op(Op::Comma),
-            Math::Op(Op::QuadSpace),
-            range,
+            Math::Op(Op::ThinSpace),
+            Math::Op(Op::Differential),
+            b("M"),
         ]);
         let out = expr(&row);
         assert!(out.starts_with("<mtable class=\"flatppl-sum\""), "{out}");
         assert!(
-            out.ends_with("<mo>,</mo><mspace width=\"1em\"/><mrow><mi>i</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mn>8</mn></mrow></mrow></mrow></mtd></mtr></mtable>"),
+            out.ends_with("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"M\">M</mi></mrow></mtd></mtr></mtable>"),
             "{out}"
         );
-        assert!(crate::tex::expr(&row).ends_with(r"\ldots , 8\end{aligned}"));
+        assert!(crate::tex::expr(&row).ends_with(r"\mathrm{d} M\end{aligned}"));
     }
 
     #[test]

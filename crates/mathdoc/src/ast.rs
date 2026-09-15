@@ -157,8 +157,6 @@ pub enum Op {
     Restrict,
     /// A thin space, between an integrand and its differential.
     ThinSpace,
-    /// A quad space, before the index range that follows an indexed row.
-    QuadSpace,
     /// Differential `d` in `M(dx)` and `dM(x)`.
     Differential,
     /// Transpose `ᵀ`, as a superscript body.
