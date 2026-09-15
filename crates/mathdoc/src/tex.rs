@@ -7,9 +7,14 @@ pub fn statement(stmt: &Statement) -> String {
     format!(
         "{} {} {}",
         expr(&stmt.lhs),
-        relation(stmt.rel),
+        relation_of(stmt),
         expr(&stmt.rhs)
     )
+}
+
+/// The relation sign, `\overset{mark}{=}` when the row carries a mark.
+pub(crate) fn relation_of(stmt: &Statement) -> String {
+    expr(&stmt.relation_form())
 }
 
 pub fn expr(m: &Math) -> String {
@@ -77,6 +82,7 @@ pub fn expr(m: &Math) -> String {
             Op::Differential => r"\mathrm{d}",
             Op::Transpose => r"\mathrm{T}",
             Op::Dagger => r"\dagger",
+            Op::Relation(rel) => relation(*rel),
         }
         .into(),
         Math::Row(items) => items.iter().map(render).collect::<Vec<_>>().join(" "),
@@ -183,6 +189,9 @@ pub fn expr(m: &Math) -> String {
                 .join(r" \\ ")
         ),
         Math::Overline(arg) => format!(r"\overline{{{}}}", render(arg)),
+        Math::Marked { base, mark } => {
+            format!(r"\overset{{{}}}{{{}}}", render(mark), render(base))
+        }
         Math::Code(s) => format!(r"\texttt{{{}}}", escape(s)),
     }
 }

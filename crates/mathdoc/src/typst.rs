@@ -14,9 +14,14 @@ pub fn statement(stmt: &Statement) -> String {
     format!(
         "{} {} {}",
         expr(&stmt.lhs),
-        relation(stmt.rel),
+        relation_of(stmt),
         expr(&stmt.rhs)
     )
+}
+
+/// The relation sign, `attach(eq, t: mark)` when the row carries a mark.
+pub(crate) fn relation_of(stmt: &Statement) -> String {
+    expr(&stmt.relation_form())
 }
 
 /// An expression in native Typst math syntax, without `$` delimiters.
@@ -180,6 +185,14 @@ pub fn expr(m: &Math) -> String {
                 .join(", ")
         ),
         Math::Overline(arg) => format!("overline({})", expr(arg)),
+        Math::Marked { base, mark } => {
+            // Typst's math parser wants the symbol name as an attach base.
+            let base = match **base {
+                Math::Op(Op::Relation(Rel::Eq)) => "eq".to_string(),
+                _ => expr(base),
+            };
+            format!("attach({base}, t: {})", expr(mark))
+        }
         Math::Code(source) => format!("#raw({})", quote(source)),
     }
 }
@@ -300,5 +313,6 @@ fn operator(op: Op) -> &'static str {
         Op::Differential => "upright(d)",
         Op::Transpose => "upright(T)",
         Op::Dagger => "†",
+        Op::Relation(rel) => relation(rel),
     }
 }

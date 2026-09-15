@@ -26,20 +26,25 @@ pub fn fragment(binding: &str, stmt: &Statement) -> String {
     )
 }
 
-/// The statement's row without the `<math>` root: `<mrow>lhs <mo>rel</mo> rhs</mrow>`.
+/// The statement's row without the `<math>` root: `<mrow>lhs rel rhs</mrow>`.
 pub fn statement(stmt: &Statement) -> String {
     format!(
-        "<mrow>{}<mo>{}</mo>{}</mrow>",
+        "<mrow>{}{}{}</mrow>",
         expr(&stmt.lhs),
-        rel_glyph(stmt.rel),
+        expr(&stmt.relation_form()),
         expr(&stmt.rhs)
     )
 }
 
-/// The three aligned parts of a statement (`lhs`, relation glyph, `rhs`), for
-/// a document that lays rows out in one `<mtable>`.
-pub fn statement_parts(stmt: &Statement) -> (String, &'static str, String) {
-    (expr(&stmt.lhs), rel_glyph(stmt.rel), expr(&stmt.rhs))
+/// The three aligned parts of a statement (`lhs`, the relation sign as
+/// markup — `<mo>=</mo>`, or an `<mover>` when the row is marked — and
+/// `rhs`), for a document that lays rows out in one `<mtable>`.
+pub fn statement_parts(stmt: &Statement) -> (String, String, String) {
+    (
+        expr(&stmt.lhs),
+        expr(&stmt.relation_form()),
+        expr(&stmt.rhs),
+    )
 }
 
 /// An expression as MathML content (no `<math>` root).
@@ -312,6 +317,12 @@ fn write_expr(out: &mut String, m: &Math) {
             write_wrapped(out, arg);
             out.push_str("<mo>‾</mo></mover>");
         }
+        Math::Marked { base, mark } => {
+            out.push_str("<mover>");
+            write_wrapped(out, base);
+            write_wrapped(out, mark);
+            out.push_str("</mover>");
+        }
         Math::Code(text) => {
             let _ = write!(
                 out,
@@ -396,7 +407,11 @@ fn write_sym(out: &mut String, s: Sym) {
 }
 
 fn write_op(out: &mut String, op: Op) {
-    out.push_str(match op {
+    let glyph = match op {
+        Op::Relation(rel) => {
+            let _ = write!(out, "<mo>{}</mo>", rel_glyph(rel));
+            return;
+        }
         Op::Bar => "<mo stretchy=\"false\">|</mo>",
         Op::Star => "<mo>∗</mo>",
         Op::Times => "<mo>×</mo>",
@@ -408,7 +423,8 @@ fn write_op(out: &mut String, op: Op) {
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
         Op::Dagger => "<mo>†</mo>",
-    });
+    };
+    out.push_str(glyph);
 }
 
 /// `<mrow>` `open` … `close` `</mrow>` around what `body` writes. The fences
@@ -560,6 +576,7 @@ mod tests {
             lhs: b("mu"),
             rel: Rel::Sim,
             rhs: Math::call("Normal", vec![Math::int(0), Math::int(5)]),
+            mark: None,
         };
         assert_eq!(
             fragment("mu", &stmt),
@@ -585,7 +602,8 @@ mod tests {
                 &Statement {
                     lhs: b("x"),
                     rel: Rel::Eq,
-                    rhs: Math::int(1)
+                    rhs: Math::int(1),
+                    mark: None,
                 }
             )
             .contains("data-flatppl-binding=\"a&quot;b\"")
