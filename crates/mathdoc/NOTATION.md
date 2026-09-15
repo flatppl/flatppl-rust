@@ -284,6 +284,12 @@ forms are native math source without delimiters or browser annotations.
 MathML remains the default. The viewer shows the shared notation key in a
 collapsed disclosure after the equations.
 
+A host writes whole documents through `export_math` (`flatppl_wasm_api`,
+`flatppl_mathdoc::json`): the same `{source, path, bundle}` as `render_math`
+plus `document` — `html`, `md`, `tex` or `typ` — and the document text comes
+back as the CLI would write it, without the CLI's generated-file banner. The
+one list of document formats is `export::DocumentFormat`.
+
 ## Modules, data, randomness
 
 | FlatPPL | Math |

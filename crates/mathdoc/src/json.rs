@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::document;
+use crate::export::DocumentFormat;
 use crate::render::{self, Rendering};
 
 #[derive(Deserialize)]
@@ -69,6 +70,25 @@ struct Request {
 
 fn default_path() -> String {
     "model.flatppl".to_string()
+}
+
+/// A request for a whole document ([`export_math`]): the primary module, its
+/// path and dependency bundle as for [`render_math`], and the document format
+/// by file extension.
+#[derive(Deserialize)]
+struct ExportRequest {
+    source: String,
+    #[serde(default = "default_path")]
+    path: String,
+    #[serde(default)]
+    bundle: HashMap<String, String>,
+    document: String,
+}
+
+/// The fallback document title: the file stem of the module path.
+fn title_of(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(".flatppl").unwrap_or(name)
 }
 
 fn default_formats() -> Vec<String> {
@@ -156,18 +176,34 @@ pub fn render_math(input: &str) -> Result<String, String> {
     let req: Request = serde_json::from_str(input).map_err(|e| format!("request: {e}"))?;
     let (module, rendering) =
         render::render_source_with_module(&req.source, &req.path, &req.bundle)?;
-    let document = req.document.then(|| {
-        let title = req.path.rsplit('/').next().unwrap_or(&req.path);
-        let title = title.strip_suffix(".flatppl").unwrap_or(title);
-        DocumentJson {
-            html: document::fragment(&module, &rendering, title).html,
-            css: document::CSS,
-        }
+    let document = req.document.then(|| DocumentJson {
+        html: document::fragment(&module, &rendering, title_of(&req.path)).html,
+        css: document::CSS,
     });
     let want_mathml = req.formats.is_empty() || req.formats.iter().any(|f| f == "mathml");
     let mut response = to_response(rendering, want_mathml, &req.formats);
     response.document = document;
     serde_json::to_string(&response).map_err(|e| format!("response: {e}"))
+}
+
+/// Write the whole mathematical document for the request in `input` (JSON):
+/// `{source, path, bundle, document}`, `document` one of `html`, `md`, `tex`,
+/// `typ`. Returns the document text itself, not JSON — what
+/// `flatppl convert model.flatppl model.<document>` writes, without the
+/// CLI's generated-file banner. A malformed request, an unknown format or an
+/// unparsable primary module is an `Err` with the message; inference failures
+/// degrade the typed features and appear in the document's diagnostics.
+pub fn export_math(input: &str) -> Result<String, String> {
+    let req: ExportRequest = serde_json::from_str(input).map_err(|e| format!("request: {e}"))?;
+    let format = DocumentFormat::from_extension(&req.document).ok_or_else(|| {
+        format!(
+            "document: unknown format `{}` (expected html, md, tex or typ)",
+            req.document
+        )
+    })?;
+    let (module, rendering) =
+        render::render_source_with_module(&req.source, &req.path, &req.bundle)?;
+    Ok(format.render(&module, &rendering, title_of(&req.path)))
 }
 
 fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> Response {
@@ -361,6 +397,36 @@ mod tests {
         .unwrap();
         assert!(legacy.get("document").is_none());
         assert_eq!(out["bindings"], legacy["bindings"]);
+    }
+
+    #[test]
+    fn export_math_writes_the_document_the_cli_writes() {
+        let source = "% $\\alpha$\nx ~ Normal(0, 2)\ndata = [1,2,3,4,5,6,7,8,9,10,11,12,13]";
+        let (module, rendering) =
+            render::render_source_with_module(source, "dir/m.flatppl", &HashMap::new()).unwrap();
+        for (ext, format) in [
+            ("html", DocumentFormat::Html),
+            ("md", DocumentFormat::Markdown),
+            ("tex", DocumentFormat::Latex),
+            ("typ", DocumentFormat::Typst),
+        ] {
+            let input =
+                serde_json::json!({ "source": source, "path": "dir/m.flatppl", "document": ext });
+            let out = export_math(&input.to_string()).unwrap();
+            // The title falls back to the file stem, `m`.
+            assert_eq!(out, format.render(&module, &rendering, "m"), "{ext}");
+            assert_eq!(format.extension(), ext);
+        }
+        let html =
+            export_math(&serde_json::json!({ "source": source, "document": "html" }).to_string())
+                .unwrap();
+        assert!(html.contains("<math") && html.contains("<mn>13</mn>"));
+        let err =
+            export_math(&serde_json::json!({ "source": source, "document": "pdf" }).to_string())
+                .unwrap_err();
+        assert!(err.contains("`pdf`") && err.contains("typ"), "{err}");
+        let err = export_math(&serde_json::json!({ "source": source }).to_string()).unwrap_err();
+        assert!(err.starts_with("request:"), "{err}");
     }
 
     #[test]

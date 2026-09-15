@@ -503,13 +503,15 @@ fn convert_document(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("model");
-    let mut text = match to {
-        Format::Html => flatppl_mathdoc::document::html(module, &rendering, title),
-        Format::Markdown => flatppl_mathdoc::export::github_markdown(module, &rendering, title),
-        Format::Latex => flatppl_mathdoc::export::latex(module, &rendering, title),
-        Format::Typst => flatppl_mathdoc::export::typst(module, &rendering, title),
+    use flatppl_mathdoc::export::DocumentFormat;
+    let format = match to {
+        Format::Html => DocumentFormat::Html,
+        Format::Markdown => DocumentFormat::Markdown,
+        Format::Latex => DocumentFormat::Latex,
+        Format::Typst => DocumentFormat::Typst,
         _ => unreachable!("convert_document requires a document output format"),
     };
+    let mut text = format.render(module, &rendering, title);
     if !no_header {
         text.insert_str(0, &banner(to.comment_style()));
     }

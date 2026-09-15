@@ -15,6 +15,54 @@ use crate::render::Rendering;
 use crate::{tex, typst};
 
 /// GitHub Markdown with TeX display math and the full data and notation appendices.
+/// A document format the crate writes for a rendered module: the one list
+/// of them, keyed by file extension, shared by the CLI (`convert model.flatppl
+/// model.tex`) and the wasm `export_math` entry point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentFormat {
+    /// A standalone page with MathML.
+    Html,
+    /// GitHub Markdown with fenced TeX math.
+    Markdown,
+    /// LaTeX (LuaLaTeX / XeLaTeX with `unicode-math`).
+    Latex,
+    Typst,
+}
+
+impl DocumentFormat {
+    /// By file extension: `html`, `md` (or `markdown`), `tex`, `typ`.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        Some(match ext {
+            "html" => DocumentFormat::Html,
+            "md" | "markdown" => DocumentFormat::Markdown,
+            "tex" => DocumentFormat::Latex,
+            "typ" => DocumentFormat::Typst,
+            _ => return None,
+        })
+    }
+
+    /// The canonical file extension.
+    pub fn extension(self) -> &'static str {
+        match self {
+            DocumentFormat::Html => "html",
+            DocumentFormat::Markdown => "md",
+            DocumentFormat::Latex => "tex",
+            DocumentFormat::Typst => "typ",
+        }
+    }
+
+    /// The whole document for `module` as rendered, `title` the fallback
+    /// title when the module documentation has none.
+    pub fn render(self, module: &Module, rendering: &Rendering, title: &str) -> String {
+        match self {
+            DocumentFormat::Html => crate::document::html(module, rendering, title),
+            DocumentFormat::Markdown => github_markdown(module, rendering, title),
+            DocumentFormat::Latex => latex(module, rendering, title),
+            DocumentFormat::Typst => typst(module, rendering, title),
+        }
+    }
+}
+
 pub fn github_markdown(module: &Module, rendering: &Rendering, title: &str) -> String {
     document(module, rendering, title, Format::Markdown)
 }
