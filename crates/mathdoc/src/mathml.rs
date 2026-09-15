@@ -340,6 +340,29 @@ fn write_ident(out: &mut String, id: &Ident) {
         Some(t) => format!(" data-flatppl-ref=\"{}\"", escape(t)),
         None => String::new(),
     };
+    // A marked name puts the back-reference on the wrapper, its outermost
+    // element, and prints the bare symbol inside it.
+    match id.display.wrap {
+        Some(crate::names::Wrap::Squared) => {
+            let _ = write!(out, "<msup{attr}>");
+            write_ident(out, &bare(id));
+            out.push_str("<mn>2</mn></msup>");
+            return;
+        }
+        Some(crate::names::Wrap::Sqrt) => {
+            let _ = write!(out, "<msqrt{attr}>");
+            write_ident(out, &bare(id));
+            out.push_str("</msqrt>");
+            return;
+        }
+        Some(crate::names::Wrap::Log) => {
+            let _ = write!(out, "<mrow{attr}><mi>log</mi><mo>&#x2061;</mo>");
+            write_ident(out, &bare(id));
+            out.push_str("</mrow>");
+            return;
+        }
+        None => {}
+    }
     if id.display.subs.is_empty() {
         let _ = write!(out, "<mi{attr}>{}</mi>", atom_text(&id.display.head));
         return;
@@ -358,6 +381,15 @@ fn write_ident(out: &mut String, id: &Ident) {
         out.push_str("</mrow>");
     }
     out.push_str("</msub>");
+}
+
+/// `id` without its marker and without a back-reference (the wrapper carries it).
+fn bare(id: &Ident) -> Ident {
+    Ident {
+        name: id.name.clone(),
+        display: crate::names::DisplayName::new(id.display.head.clone(), id.display.subs.clone()),
+        target: None,
+    }
 }
 
 fn atom_text(atom: &Atom) -> String {

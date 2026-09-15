@@ -97,7 +97,14 @@ rule), comma-separated.
 | `mu_a`, `sigma_B`, `S_mu`, `nu_B` | μ_a, σ_B, S_μ, ν_B |
 | `y_data`, `x_init`, `L_input` | y_{data}, x_{init}, L_{input} (upright subscript words) |
 | `E1_data`, `Z0_12` | E_{1,data}, Z_{0,12} |
-| `sigma2` | σ₂ (the rule cannot know it means σ²; name it so it reads right) |
+| `sigma2` | σ₂ (the rule cannot know it means σ²; write `sigma_sq`) |
+| `sigma_sq`, `s_1_sq` | σ², s₁² — the `_sq` marker squares the symbol |
+| `s_sqrt` | √s — the `_sqrt` marker |
+| `log_sigma`, `log_m_B` | log σ, log m_B — the `log_` prefix |
+
+A marker is part of the name, chosen by the author: the rest of the name
+follows the rules above, and one marker at most applies (`log_sigma_sq` prints
+as written). A function named `f_sqrt` prints as √f, so name it otherwise.
 
 Heads are resolved by role: `Gamma` in value position is Γ, `Gamma(shape, rate)`
 in call position is the distribution, printed roman. Distribution and builtin

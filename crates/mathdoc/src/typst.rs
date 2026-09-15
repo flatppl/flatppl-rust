@@ -51,7 +51,7 @@ pub fn expr(m: &Math) -> String {
     match m {
         Math::Ident(id) => {
             let head = atom(&id.display.head);
-            if id.display.subs.is_empty() {
+            let symbol = if id.display.subs.is_empty() {
                 head
             } else {
                 format!(
@@ -63,6 +63,12 @@ pub fn expr(m: &Math) -> String {
                         .collect::<Vec<_>>()
                         .join(" \\, ")
                 )
+            };
+            match id.display.wrap {
+                Some(crate::names::Wrap::Squared) => format!("{symbol}^2"),
+                Some(crate::names::Wrap::Sqrt) => format!("sqrt({symbol})"),
+                Some(crate::names::Wrap::Log) => format!("log {symbol}"),
+                None => symbol,
             }
         }
         Math::Num(n) => n.clone(),

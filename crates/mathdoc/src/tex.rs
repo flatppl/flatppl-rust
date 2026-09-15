@@ -64,6 +64,12 @@ pub fn expr(m: &Math) -> String {
                         .join(", ")
                 ));
             }
+            match id.display.wrap {
+                Some(crate::names::Wrap::Squared) => s = format!("{{{s}}}^{{2}}"),
+                Some(crate::names::Wrap::Sqrt) => s = format!(r"\sqrt{{{s}}}"),
+                Some(crate::names::Wrap::Log) => s = format!(r"\log {s}"),
+                None => {}
+            }
             s
         }
         Math::Num(n) => n.clone(),
