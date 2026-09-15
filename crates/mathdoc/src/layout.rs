@@ -13,7 +13,13 @@ pub(crate) fn width(m: &Math) -> usize {
     };
     match m {
         Math::Ident(id) => {
-            atom(&id.display.head) + id.display.subs.iter().map(atom).sum::<usize>().div_ceil(2)
+            atom(&id.display.head)
+                + id.display.subs.iter().map(atom).sum::<usize>().div_ceil(2)
+                + match id.display.wrap {
+                    Some(crate::names::Wrap::Log) => 4,
+                    Some(_) => 1,
+                    None => 0,
+                }
         }
         Math::Num(s) | Math::Text(s) | Math::Str(s) | Math::Code(s) => s.chars().count(),
         Math::Frac(a, b) => width(a).max(width(b)) + 2,

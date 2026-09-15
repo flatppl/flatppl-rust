@@ -305,10 +305,7 @@ impl Math {
     pub fn letter(c: char) -> Math {
         Math::Ident(Ident {
             name: c.to_string(),
-            display: DisplayName {
-                head: crate::names::Atom::Letter(c),
-                subs: Vec::new(),
-            },
+            display: DisplayName::new(crate::names::Atom::Letter(c), Vec::new()),
             target: None,
         })
     }

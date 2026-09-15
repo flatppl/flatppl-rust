@@ -266,10 +266,7 @@ impl<'m> Lowerer<'m> {
                 return;
             };
             if self.verbatim.contains_key(target) {
-                id.display = crate::names::DisplayName {
-                    head: crate::names::Atom::Word(target.to_string()),
-                    subs: Vec::new(),
-                };
+                id.display = crate::names::DisplayName::word(target);
             } else if self.script_names.contains(target)
                 && let crate::names::Atom::Letter(c) = id.display.head
             {
@@ -2626,10 +2623,45 @@ mod tests {
     }
 
     #[test]
-    fn a_reified_named_output_renders_by_reference() {
-        let src = "a = elementof(nonnegreals)\nb = a^0.5\nf_sqrt = functionof(b)";
+    fn name_markers_square_root_and_log_their_symbol() {
+        let src = "sigma_sq ~ InverseGamma(2, 2)\nsigma = sqrt(sigma_sq)\ns_1_sqrt = 2.0\nlog_m_B = 1.5\nlog_sigma_sq = 0.1\nrate_sq = 4.0";
         let rows = rows(src);
-        let f = row_named(&rows, "f_sqrt");
+        let lhs = |n: &str| mathml::expr(&row_named(&rows, n).statement.lhs);
+        assert_eq!(
+            lhs("sigma_sq"),
+            "<msup data-flatppl-ref=\"sigma_sq\"><mi>σ</mi><mn>2</mn></msup>"
+        );
+        assert_eq!(
+            lhs("s_1_sqrt"),
+            "<msqrt data-flatppl-ref=\"s_1_sqrt\"><msub><mi>s</mi><mn>1</mn></msub></msqrt>"
+        );
+        assert_eq!(
+            lhs("log_m_B"),
+            "<mrow data-flatppl-ref=\"log_m_B\"><mi>log</mi><mo>&#x2061;</mo><msub><mi>m</mi><mi>B</mi></msub></mrow>"
+        );
+        // A word head squares too; two markers print as written.
+        assert_eq!(
+            lhs("rate_sq"),
+            "<msup data-flatppl-ref=\"rate_sq\"><mi>rate_sq</mi><mn>2</mn></msup>"
+                .replace("rate_sq</mi>", "rate</mi>")
+        );
+        assert_eq!(
+            lhs("log_sigma_sq"),
+            "<mi data-flatppl-ref=\"log_sigma_sq\">log_sigma_sq</mi>"
+        );
+        // The reference keeps the marker: σ = √σ².
+        let sigma = mathml::expr(&row_named(&rows, "sigma").statement.rhs);
+        assert_eq!(
+            sigma,
+            "<msqrt><msup data-flatppl-ref=\"sigma_sq\"><mi>σ</mi><mn>2</mn></msup></msqrt>"
+        );
+    }
+
+    #[test]
+    fn a_reified_named_output_renders_by_reference() {
+        let src = "a = elementof(nonnegreals)\nb = a^0.5\nf_root = functionof(b)";
+        let rows = rows(src);
+        let f = row_named(&rows, "f_root");
         let lhs = mathml::expr(&f.statement.lhs);
         assert!(
             lhs.contains("<mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"a\">a</mi><mo stretchy=\"false\">)</mo>"),

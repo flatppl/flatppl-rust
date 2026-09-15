@@ -6,12 +6,25 @@
 //! module — the same function serves binding names, lambda parameters, record
 //! fields and axis names.
 
-/// A rendered identifier: a head plus subscript parts.
+/// A rendered identifier: a head plus subscript parts, optionally squared or
+/// under a root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayName {
     pub head: Atom,
     /// Subscript parts, comma-separated when printed. Empty for a plain head.
     pub subs: Vec<Atom>,
+    /// A marker the name carries: `_sq` squares the symbol (`sigma_sq` → σ²),
+    /// `_sqrt` puts it under a root (`s_sqrt` → √s), `log_` takes its
+    /// logarithm (`log_sigma` → log σ).
+    pub wrap: Option<Wrap>,
+}
+
+/// What a name marker does to the symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wrap {
+    Squared,
+    Sqrt,
+    Log,
 }
 
 /// One piece of a display name.
@@ -31,29 +44,99 @@ pub enum Atom {
 }
 
 impl DisplayName {
+    /// A head with its subscript parts, unmarked.
+    pub fn new(head: Atom, subs: Vec<Atom>) -> Self {
+        DisplayName {
+            head,
+            subs,
+            wrap: None,
+        }
+    }
+
     /// A plain upright word with no subscripts (operator names, roman heads).
     pub fn word(text: impl Into<String>) -> Self {
-        DisplayName {
-            head: Atom::Word(text.into()),
-            subs: Vec::new(),
-        }
+        DisplayName::new(Atom::Word(text.into()), Vec::new())
+    }
+
+    /// The same symbol under a marker's effect.
+    pub fn wrapped(mut self, wrap: Wrap) -> Self {
+        self.wrap = Some(wrap);
+        self
     }
 }
 
-/// Render `name` by the `NOTATION.md` name rules.
+/// A name marker: a fixed affix and what it does to the symbol the rest of
+/// the name spells. The table is the whole rule; adding a marker is one row.
+struct Marker {
+    affix: Affix,
+    text: &'static str,
+    wrap: Wrap,
+}
+
+enum Affix {
+    Prefix,
+    Suffix,
+}
+
+const MARKERS: &[Marker] = &[
+    Marker {
+        affix: Affix::Suffix,
+        text: "_sq",
+        wrap: Wrap::Squared,
+    },
+    Marker {
+        affix: Affix::Suffix,
+        text: "_sqrt",
+        wrap: Wrap::Sqrt,
+    },
+    Marker {
+        affix: Affix::Prefix,
+        text: "log_",
+        wrap: Wrap::Log,
+    },
+];
+
+/// `name` without its marker, and the marker's effect, when it carries one.
+/// The remainder must be a name of its own (non-empty, not starting or
+/// ending in `_`).
+fn strip_marker(name: &str) -> Option<(&str, Wrap)> {
+    MARKERS.iter().find_map(|m| {
+        let inner = match m.affix {
+            Affix::Prefix => name.strip_prefix(m.text)?,
+            Affix::Suffix => name.strip_suffix(m.text)?,
+        };
+        (!inner.is_empty() && !inner.starts_with('_') && !inner.ends_with('_'))
+            .then_some((inner, m.wrap))
+    })
+}
+
+/// Render `name` by the `NOTATION.md` name rules: strip one marker, apply the
+/// segment rules to the rest, wrap. A name with two markers, a leading
+/// underscore, a word head or a doubled underscore prints as written.
 pub fn display_name(name: &str) -> DisplayName {
-    // A leading underscore marks a private or generated name: no segment rules.
     if name.starts_with('_') || name.is_empty() {
         return DisplayName::word(name);
     }
+    match strip_marker(name) {
+        Some((inner, wrap)) => match strip_marker(inner) {
+            Some(_) => DisplayName::word(name),
+            // A word inside a marker is still marked: `rate_sq` is rate².
+            None => segments(inner)
+                .unwrap_or_else(|| DisplayName::word(inner))
+                .wrapped(wrap),
+        },
+        None => segments(name).unwrap_or_else(|| DisplayName::word(name)),
+    }
+}
+
+/// The segment rules: a Greek or single-letter head takes subscripts from its
+/// trailing digits and underscore segments. `None` for a word head or a
+/// doubled underscore, which print as written.
+fn segments(name: &str) -> Option<DisplayName> {
     let mut segments = name.split('_');
     let head_seg = segments.next().unwrap_or("");
     let (head_alpha, head_digits) = split_trailing_digits(head_seg);
-    let head = match classify_head(head_alpha) {
-        Some(atom) => atom,
-        // A word head keeps the whole name, underscores and digits included.
-        None => return DisplayName::word(name),
-    };
+    let head = classify_head(head_alpha)?;
     let mut subs = Vec::new();
     if !head_digits.is_empty() {
         subs.push(Atom::Digits(head_digits.to_string()));
@@ -61,11 +144,11 @@ pub fn display_name(name: &str) -> DisplayName {
     for seg in segments {
         if seg.is_empty() {
             // `a__b`: a doubled underscore is not a subscript separator.
-            return DisplayName::word(name);
+            return None;
         }
         subs.push(classify_segment(seg));
     }
-    DisplayName { head, subs }
+    Some(DisplayName::new(head, subs))
 }
 
 /// Split `theta1` into `("theta", "1")`; a segment with no trailing digits keeps
@@ -193,32 +276,14 @@ mod tests {
 
     #[test]
     fn greek_heads_become_letters() {
-        assert_eq!(
-            dn("mu"),
-            DisplayName {
-                head: Greek('μ'),
-                subs: vec![]
-            }
-        );
-        assert_eq!(
-            dn("Gamma"),
-            DisplayName {
-                head: Greek('Γ'),
-                subs: vec![]
-            }
-        );
+        assert_eq!(dn("mu"), DisplayName::new(Greek('μ'), vec![]));
+        assert_eq!(dn("Gamma"), DisplayName::new(Greek('Γ'), vec![]));
         assert_eq!(dn("varphi").head, Greek('ϕ'));
     }
 
     #[test]
     fn single_letters_are_italic_letters() {
-        assert_eq!(
-            dn("J"),
-            DisplayName {
-                head: Letter('J'),
-                subs: vec![]
-            }
-        );
+        assert_eq!(dn("J"), DisplayName::new(Letter('J'), vec![]));
         assert_eq!(dn("x").head, Letter('x'));
     }
 
@@ -226,30 +291,18 @@ mod tests {
     fn trailing_digits_subscript_a_greek_or_letter_head() {
         assert_eq!(
             dn("theta1"),
-            DisplayName {
-                head: Greek('θ'),
-                subs: vec![Digits("1".into())]
-            }
+            DisplayName::new(Greek('θ'), vec![Digits("1".into())])
         );
         assert_eq!(
             dn("s12"),
-            DisplayName {
-                head: Letter('s'),
-                subs: vec![Digits("12".into())]
-            }
+            DisplayName::new(Letter('s'), vec![Digits("12".into())])
         );
         assert_eq!(dn("c0").subs, vec![Digits("0".into())]);
     }
 
     #[test]
     fn underscore_segments_subscript_a_greek_or_letter_head() {
-        assert_eq!(
-            dn("mu_a"),
-            DisplayName {
-                head: Greek('μ'),
-                subs: vec![Letter('a')]
-            }
-        );
+        assert_eq!(dn("mu_a"), DisplayName::new(Greek('μ'), vec![Letter('a')]));
         assert_eq!(dn("sigma_B").subs, vec![Letter('B')]);
         assert_eq!(dn("S_mu").subs, vec![Greek('μ')]);
         assert_eq!(dn("y_data").subs, vec![Word("data".into())]);
