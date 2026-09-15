@@ -452,6 +452,7 @@ fn write_op(out: &mut String, op: Op) {
         Op::Comma => "<mo>,</mo>",
         Op::Restrict => "<mo stretchy=\"false\">|</mo>",
         Op::ThinSpace => "<mspace width=\"0.1667em\"/>",
+        Op::QuadSpace => "<mspace width=\"1em\"/>",
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
         Op::Dagger => "<mo>†</mo>",

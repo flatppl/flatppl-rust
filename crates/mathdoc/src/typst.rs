@@ -316,6 +316,7 @@ fn operator(op: Op) -> &'static str {
         Op::Cdot => "⋅",
         Op::Comma => "\\,",
         Op::ThinSpace => "thin",
+        Op::QuadSpace => "quad",
         Op::Differential => "upright(d)",
         Op::Transpose => "upright(T)",
         Op::Dagger => "†",

@@ -25,7 +25,8 @@ use flatppl_core::{
     RefNs, Scalar, Symbol, Type, Variance,
 };
 
-use crate::ast::{BigOp, BinOp, Fence, Math, Op, Rel, Statement, Sym};
+use crate::ast::{BigOp, BinOp, Fence, Ident, Math, Op, Rel, Statement, Sym};
+use crate::names::Atom;
 
 /// Literal data beyond this entry count moves to the data appendix.
 /// Wide numeric strings may reach the shared display-width limit sooner.
@@ -549,6 +550,16 @@ impl<'m> Lowerer<'m> {
                 }
             }
             "draw" if call.args.len() == 1 => {
+                // `y ~ K.(xs)`: one law per index.
+                if let Node::Call(inner) = self.m.node(call.args[0])
+                    && self.head_is(inner, "broadcast")
+                    && !inner.args.is_empty()
+                {
+                    let inner = inner.clone();
+                    if let Some(e) = self.elementwise(call.args[0], &inner, None) {
+                        return self.indexed_row(lhs, Rel::Sim, e);
+                    }
+                }
                 let measure = self.expr(call.args[0]);
                 Lowered {
                     statement: Statement {
@@ -559,6 +570,13 @@ impl<'m> Lowerer<'m> {
                     },
                     annotation: None,
                     elided: false,
+                }
+            }
+            "broadcast" if !call.args.is_empty() => {
+                // `v = f.(xs)`: one value per index.
+                match self.elementwise(rhs, call, None) {
+                    Some(e) => self.indexed_row(lhs, Rel::Eq, e),
+                    None => plain(self, lhs),
                 }
             }
             "fixed" if call.args.len() == 1 && call.named.is_empty() => {
@@ -1668,13 +1686,20 @@ impl<'m> Lowerer<'m> {
             }
         }
         let whole = self.expr(collection);
-        Math::subscript(whole, i.clone())
+        index_ident(whole, i)
     }
 
-    /// `broadcast(f, args…)`: the elementwise body under a fresh index, wrapped
-    /// as an independent product (kernel) or a family (function). With
-    /// `shared` set, only the body is returned (a nested dotted expression).
-    fn broadcast(&mut self, node: NodeId, call: &Call, shared: Option<&Math>) -> Math {
+    /// The elementwise reading of `broadcast(f, args…)`: a fresh index (or
+    /// the enclosing one), the body with every collection argument indexed,
+    /// the static range when the shapes give one, and whether the body is a
+    /// measure. `None` when nothing is known to be a collection, where the
+    /// construct keeps its name.
+    fn elementwise(
+        &mut self,
+        node: NodeId,
+        call: &Call,
+        shared: Option<&Math>,
+    ) -> Option<Elementwise> {
         let head = call.args[0];
         let rest: Vec<NodeId> = call.args[1..].to_vec();
         let any_typed = rest
@@ -1685,10 +1710,7 @@ impl<'m> Lowerer<'m> {
                     || matches!(self.m.node(*a), Node::Call(c) if self.head_is(c, "vector"))
             });
         if !any_typed {
-            let mut args = vec![self.expr(head)];
-            args.extend(self.args_from(&rest));
-            args.extend(self.labelled(call));
-            return Math::call("broadcast", args);
+            return None;
         }
         let index = match shared {
             Some(i) => i.clone(),
@@ -1720,9 +1742,6 @@ impl<'m> Lowerer<'m> {
             kwargs.push((name, v));
         }
         let body = self.apply_head(head, args, kwargs);
-        if shared.is_some() {
-            return body;
-        }
         let is_measure = match self.m.type_of(node) {
             Some(Type::Measure { .. }) => true,
             Some(_) => false,
@@ -1730,15 +1749,71 @@ impl<'m> Lowerer<'m> {
                 matches!(self.m.node(head), Node::Const(s) if self.is_measure_head(self.m.resolve(*s)))
             }
         };
-        let range = range_hi.map(|hi| (Math::int(1), hi));
-        if is_measure {
-            let (sub, sup) = match range {
-                Some((lo, hi)) => (Some(Math::relation(index, Rel::Eq, lo)), Some(hi)),
-                None => (Some(index), None),
+        Some(Elementwise {
+            index,
+            body,
+            range: range_hi.map(|hi| (Math::int(1), hi)),
+            is_measure,
+        })
+    }
+
+    /// `broadcast(f, args…)` in expression position: the object it denotes,
+    /// an independent product (kernel) or a family (function). With `shared`
+    /// set, only the body is returned (a nested dotted expression).
+    fn broadcast(&mut self, node: NodeId, call: &Call, shared: Option<&Math>) -> Math {
+        let Some(e) = self.elementwise(node, call, shared) else {
+            let mut args = vec![self.expr(call.args[0])];
+            args.extend(self.args_from(&call.args[1..]));
+            args.extend(self.labelled(call));
+            return Math::call("broadcast", args);
+        };
+        if shared.is_some() {
+            return e.body;
+        }
+        if e.is_measure {
+            let (sub, sup) = match e.range {
+                Some((lo, hi)) => (Some(Math::relation(e.index, Rel::Eq, lo)), Some(hi)),
+                None => (Some(e.index), None),
             };
-            Math::big(BigOp::Otimes, sub, sup, body)
+            Math::big(BigOp::Otimes, sub, sup, e.body)
         } else {
-            Math::family(body, index, range)
+            Math::family(e.body, e.index, e.range)
+        }
+    }
+
+    /// A row whose right-hand side is a broadcast, written with a free
+    /// index: `y_i ∼ K(x_i),  i = 1, …, n` or `v_i = f(x_i),  i = 1, …, n`,
+    /// the range when the shape is static.
+    fn indexed_row(&mut self, lhs: Math, rel: Rel, e: Elementwise) -> Lowered {
+        let lhs = index_ident(lhs, &e.index);
+        let rhs = match e.range {
+            Some((lo, hi)) => Math::row(vec![
+                e.body,
+                Math::Op(Op::Comma),
+                Math::Op(Op::QuadSpace),
+                Math::relation(
+                    e.index,
+                    Rel::Eq,
+                    Math::row(vec![
+                        lo,
+                        Math::Op(Op::Comma),
+                        Math::Sym(Sym::Ellipsis),
+                        Math::Op(Op::Comma),
+                        hi,
+                    ]),
+                ),
+            ]),
+            None => e.body,
+        };
+        Lowered {
+            statement: Statement {
+                lhs,
+                rel,
+                rhs,
+                mark: None,
+            },
+            annotation: None,
+            elided: false,
         }
     }
 
@@ -1844,6 +1919,32 @@ impl<'m> Lowerer<'m> {
 struct Integrand {
     body: Math,
     vars: Option<Vec<Math>>,
+}
+
+/// The elementwise reading of a broadcast ([`Lowerer::elementwise`]).
+struct Elementwise {
+    index: Math,
+    body: Math,
+    range: Option<(Math, Math)>,
+    is_measure: bool,
+}
+
+/// `base` indexed by `i`. A name takes a plain index letter into its own
+/// subscript list (`x_data` at `i` is `x_{data,i}`, not `x_{data_i}`);
+/// anything else is subscripted.
+fn index_ident(base: Math, i: &Math) -> Math {
+    let plain_letter = |id: &Ident| {
+        id.display.subs.is_empty()
+            && id.display.wrap.is_none()
+            && matches!(id.display.head, Atom::Letter(_) | Atom::Greek(_))
+    };
+    match (base, i) {
+        (Math::Ident(mut id), Math::Ident(ix)) if id.display.wrap.is_none() && plain_letter(ix) => {
+            id.display.subs.push(ix.display.head.clone());
+            Math::Ident(id)
+        }
+        (base, i) => Math::subscript(base, i.clone()),
+    }
 }
 
 /// The pieces of a lowered `aggregate` / `metricsum`.
@@ -2420,19 +2521,44 @@ mod tests {
             grid.ends_with("<mrow><mn>2</mn><mo>×</mo><mn>3</mn></mrow></msup>"),
             "{grid}"
         );
-        let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
-        assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
-        assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub><mn>2</mn></msup>"));
-        let means = mathml::expr(&row_named(&rows, "means").statement.rhs);
+        // A broadcast row is written with a free index and its range:
+        // `y_i ∼ 𝒩(θ_i, s_i²),  i = 1, …, J`.
+        let y_row = row_named(&rows, "y");
+        assert_eq!(
+            mathml::expr(&y_row.statement.lhs),
+            "<msub data-flatppl-ref=\"y\"><mi>y</mi><mi>i</mi></msub>"
+        );
+        let y = mathml::expr(&y_row.statement.rhs);
+        assert!(y.starts_with("<mrow><mrow><mi>𝒩</mi>"), "{y}");
+        assert!(y.contains("<msub data-flatppl-ref=\"theta\"><mi>θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub data-flatppl-ref=\"s\"><mi>s</mi><mi>i</mi></msub><mn>2</mn></msup>"), "{y}");
+        assert!(y.ends_with("<mo>,</mo><mspace width=\"1em\"/><mrow><mi>i</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mi data-flatppl-ref=\"J\">J</mi></mrow></mrow></mrow>"), "{y}");
+        let means_row = row_named(&rows, "means");
+        assert_eq!(
+            mathml::expr(&means_row.statement.lhs),
+            "<msub data-flatppl-ref=\"means\"><mi>means</mi><mi>i</mi></msub>"
+        );
+        let means = mathml::expr(&means_row.statement.rhs);
         assert!(
-            means.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
+            means.starts_with("<mrow><mrow><mi data-flatppl-ref=\"alpha\">α</mi><mo>+</mo>"),
             "{means}"
         );
+        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub>"), "{means}");
         assert!(
-            means.contains("<mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>4</mn></msubsup>"),
+            means.ends_with("<mo>,</mo><mi>…</mi><mo>,</mo><mn>4</mn></mrow></mrow></mrow>"),
             "{means}"
         );
-        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub><mi data-flatppl-ref=\"x\">x</mi><mi>i</mi></msub>"), "{means}");
+        // In expression position a broadcast stays the object: a family.
+        let inner = rhs(
+            "alpha = elementof(reals)\nx = [1.1, 1.5]\nw = 2 * (alpha .+ x)",
+            "w",
+        );
+        assert!(
+            inner.contains("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
+            "{inner}"
+        );
+        // An indexed name joins the index to its own subscripts.
+        let data = rhs("x_data = [1.0, 2.0, 3.0]\nv = 2 .* x_data", "v");
+        assert!(data.contains("<msub data-flatppl-ref=\"x_data\"><mi>x</mi><mrow><mi>data</mi><mo>,</mo><mi>i</mi></mrow></msub>"), "{data}");
     }
 
     #[test]
@@ -2440,9 +2566,9 @@ mod tests {
         let src = "G = 3\na ~ iid(Normal(0, 1), G)\ng = [1, 2, 3, 1, 2, 3]\nxs = [-1.2, 0.4, 1.1, -0.3, 0.8, 2.0]\nb = elementof(reals)\neta = a[g] .+ b .* xs\np = invlogit.(eta)";
         let rows = rows(src);
         let eta = mathml::expr(&row_named(&rows, "eta").statement.rhs);
-        assert!(eta.contains("<msub><mi data-flatppl-ref=\"a\">a</mi><msub><mi data-flatppl-ref=\"g\">g</mi><mi>i</mi></msub></msub>"), "{eta}");
+        assert!(eta.contains("<msub><mi data-flatppl-ref=\"a\">a</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{eta}");
         let p = mathml::expr(&row_named(&rows, "p").statement.rhs);
-        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub><mi data-flatppl-ref=\"eta\">η</mi><mi>i</mi></msub>"), "{p}");
+        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub data-flatppl-ref=\"eta\"><mi>η</mi><mi>i</mi></msub>"), "{p}");
     }
 
     #[test]
@@ -2833,10 +2959,11 @@ mod tests {
             mathml::expr(&row_named(&rows, "y").statement.rhs),
             "<msub><mi data-flatppl-ref=\"v\">v</mi><mn>2</mn></msub>"
         );
+        // The running index joins the name's own subscripts.
         let z = mathml::expr(&row_named(&rows, "z").statement.rhs);
         assert_eq!(
             z,
-            "<mrow><munder><mo>∑</mo><mi>i</mi></munder><msub><mi data-flatppl-ref=\"v\">v</mi><mi>i</mi></msub></mrow>"
+            "<mrow><munder><mo>∑</mo><mi>i</mi></munder><msub data-flatppl-ref=\"v\"><mi>v</mi><mi>i</mi></msub></mrow>"
         );
         assert!(
             mathml::expr(&row_named(&rows, "q").statement.rhs).ends_with(

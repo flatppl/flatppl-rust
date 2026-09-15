@@ -190,8 +190,10 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | FlatPPL | Math |
 | --- | --- |
 | `iid(M, n)`, `iid(M, [m, n])` | Mⁿ, M^{m×n} — the n-fold product measure as a bare power (van der Vaart's Pⁿ), matching Sⁿ for `cartpow`; the `⊗` is kept for products of different factors |
-| `K.(xs, ys)`, `broadcast(K, xs, ys)` with K a kernel | ⨂_{i=1}^{n} K(xs_i, ys_i) |
-| `f.(xs, c)`, `xs .+ c`, `broadcast(f, xs, c)` with f a function | (f(xs_i, c))_{i=1}^{n}, (xs_i + c)_{i=1}^{n} |
+| `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i),  i = 1, …, n — one law per index, the range when the shape is static |
+| `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c),  i = 1, …, n — the same row `v[.i] := …` gives |
+| a broadcast in expression position | ⨂_{i=1}^{n} K(xs_i, ys_i), (f(xs_i, c))_{i=1}^{n} — the object it denotes, since no left-hand side carries the index |
+| an indexed name | the index joins the name's subscripts: `x_data` at i is x_{data,i} |
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |
 | `a[idx]` with an array of indices | a_{idx} and, under an index i, a_{idx_i} |
 | `aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` | Σ_{j} A_{ij} B_{jk}, other reductions as var_{j}(…) in roman |
