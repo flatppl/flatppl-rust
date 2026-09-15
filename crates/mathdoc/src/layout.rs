@@ -31,6 +31,14 @@ pub(crate) fn width(m: &Math) -> usize {
     }
 }
 
+/// A row whose first item wraps into sum lines and which continues after it
+/// (a trailing `,  i = 1, …, n`): the continuation belongs on the block's
+/// last line, not beside its middle.
+pub(crate) fn wrapped_head(items: &[Math]) -> Option<(&Math, &[Math])> {
+    let (head, trailer) = items.split_first()?;
+    (!trailer.is_empty() && !sum_lines(head).is_empty()).then_some((head, trailer))
+}
+
 pub(crate) struct SumLine<'a> {
     pub(crate) sign: Option<BinOp>,
     pub(crate) term: &'a Math,

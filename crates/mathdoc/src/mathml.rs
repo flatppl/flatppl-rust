@@ -114,25 +114,14 @@ fn fence_glyph(f: Fence, open: bool) -> &'static str {
 }
 
 fn write_expr(out: &mut String, m: &Math) {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
-        for line in lines {
-            out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
-            if let Some(sign) = line.sign {
-                let glyph = if sign == BinOp::Sub { "−" } else { "+" };
-                let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
-            }
-            if line.parens {
-                write_fenced(out, "(", ")", is_tall(line.term), |out| {
-                    write_expr(out, line.term)
-                });
-            } else {
-                write_expr(out, line.term);
-            }
-            out.push_str("</mrow></mtd></mtr>");
-        }
-        out.push_str("</mtable>");
+    if let Math::Row(items) = m
+        && let Some((head, trailer)) = crate::layout::wrapped_head(items)
+    {
+        write_sum_lines(out, head, trailer);
+        return;
+    }
+    if !crate::layout::sum_lines(m).is_empty() {
+        write_sum_lines(out, m, &[]);
         return;
     }
     match m {
@@ -331,6 +320,35 @@ fn write_expr(out: &mut String, m: &Math) {
             );
         }
     }
+}
+
+/// A sum split into aligned continuation lines ([`crate::layout::sum_lines`]),
+/// with `trailer` on the last line.
+fn write_sum_lines(out: &mut String, m: &Math, trailer: &[Math]) {
+    let lines = crate::layout::sum_lines(m);
+    let last = lines.len() - 1;
+    out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
+        if let Some(sign) = line.sign {
+            let glyph = if sign == BinOp::Sub { "−" } else { "+" };
+            let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
+        }
+        if line.parens {
+            write_fenced(out, "(", ")", is_tall(line.term), |out| {
+                write_expr(out, line.term)
+            });
+        } else {
+            write_expr(out, line.term);
+        }
+        if i == last {
+            for item in trailer {
+                write_expr(out, item);
+            }
+        }
+        out.push_str("</mrow></mtd></mtr>");
+    }
+    out.push_str("</mtable>");
 }
 
 /// An identifier: head `<mi>` plus an optional `<msub>` of its parts and
@@ -600,6 +618,37 @@ mod tests {
         // Anything else keeps a plain subscript.
         let m = Math::subscript(Math::text("Law"), i());
         assert_eq!(expr(&m), "<msub><mi>Law</mi><mi>i</mi></msub>");
+    }
+
+    #[test]
+    fn what_follows_a_wrapped_sum_sits_on_its_last_line() {
+        let i = || Math::ident("i", None);
+        let term = || Math::subscript(b("std_errs_data"), i());
+        let sum = (0..8).fold(term(), |acc, _| Math::plus(acc, term()));
+        let range = Math::relation(
+            i(),
+            crate::ast::Rel::Eq,
+            Math::row(vec![
+                Math::int(1),
+                Math::Op(Op::Comma),
+                Math::Sym(Sym::Ellipsis),
+                Math::Op(Op::Comma),
+                Math::int(8),
+            ]),
+        );
+        let row = Math::row(vec![
+            sum,
+            Math::Op(Op::Comma),
+            Math::Op(Op::QuadSpace),
+            range,
+        ]);
+        let out = expr(&row);
+        assert!(out.starts_with("<mtable class=\"flatppl-sum\""), "{out}");
+        assert!(
+            out.ends_with("<mo>,</mo><mspace width=\"1em\"/><mrow><mi>i</mi><mo>=</mo><mrow><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mn>8</mn></mrow></mrow></mrow></mtd></mtr></mtable>"),
+            "{out}"
+        );
+        assert!(crate::tex::expr(&row).ends_with(r"\ldots , 8\end{aligned}"));
     }
 
     #[test]

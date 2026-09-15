@@ -26,27 +26,13 @@ pub(crate) fn relation_of(stmt: &Statement) -> String {
 
 /// An expression in native Typst math syntax, without `$` delimiters.
 pub fn expr(m: &Math) -> String {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        let rows = lines
-            .iter()
-            .map(|line| {
-                let term = expr(line.term);
-                let term = if line.parens {
-                    fenced(Fence::Paren, Fence::Paren, &term)
-                } else {
-                    term
-                };
-                let sign = match line.sign {
-                    Some(BinOp::Sub) => "− ",
-                    Some(_) => "+ ",
-                    None => "",
-                };
-                format!("{sign}{term}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("vec(delim: #none, align: #left, {rows})");
+    if let Math::Row(items) = m
+        && let Some((head, trailer)) = crate::layout::wrapped_head(items)
+    {
+        return sum_lines(head, trailer);
+    }
+    if !crate::layout::sum_lines(m).is_empty() {
+        return sum_lines(m, &[]);
     }
     match m {
         Math::Ident(id) => {
@@ -222,6 +208,40 @@ pub(crate) fn quote(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A sum split into aligned continuation lines, `trailer` on the last one.
+fn sum_lines(m: &Math, trailer: &[Math]) -> String {
+    let lines = crate::layout::sum_lines(m);
+    let last = lines.len() - 1;
+    let rows = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let term = expr(line.term);
+            let term = if line.parens {
+                fenced(Fence::Paren, Fence::Paren, &term)
+            } else {
+                term
+            };
+            let sign = match line.sign {
+                Some(BinOp::Sub) => "− ",
+                Some(_) => "+ ",
+                None => "",
+            };
+            let tail = if i == last {
+                trailer
+                    .iter()
+                    .map(|t| format!(" {}", expr(t)))
+                    .collect::<String>()
+            } else {
+                String::new()
+            };
+            format!("{sign}{term}{tail}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("vec(delim: #none, align: #left, {rows})")
 }
 
 fn atom(atom: &Atom) -> String {

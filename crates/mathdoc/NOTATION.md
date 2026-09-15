@@ -55,7 +55,8 @@ the rules stated here.
   keep their `table(c = …)` expression. No values are rounded for layout.
 - Long sums with at least three terms use aligned continuation lines in all
   printers. Only the left-associated sum chain splits; right-hand groups,
-  enclosing fences, powers and source references stay intact. The shared
+  enclosing fences, powers and source references stay intact. What follows
+  the sum in its row (an index range) sits on the last line. The shared
   width estimate is deterministic, not a font or viewport measurement.
   HTML equation blocks scroll horizontally when an expression still cannot fit.
 - A generated notation key explains the symbols used in the module: each
@@ -147,7 +148,7 @@ the same rules (`.mu` → μ).
 | `cartpow(S, n)`, `cartpow(S, [m, n])` | Sⁿ, S^{m×n} |
 | `cartprod(S, T)`, `cartprod(a = S, b = T)` | S × T, {a ∈ S, b ∈ T} |
 | `stdsimplex(n)` | Δ^{n−1} |
-| `c = fixed(x)` | c = x, annotation "fixed"; inside a record `fixed(x)` stays in roman |
+| `c = fixed(x)` | the row `c = x` would have, annotation "fixed"; inside a record `fixed(x)` stays in roman |
 
 ## Operators and functions
 
@@ -190,18 +191,24 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | FlatPPL | Math |
 | --- | --- |
 | `iid(M, n)`, `iid(M, [m, n])` | Mⁿ, M^{m×n} — the n-fold product measure as a bare power (van der Vaart's Pⁿ), matching Sⁿ for `cartpow`; the `⊗` is kept for products of different factors |
-| `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i),  i = 1, …, n — one law per index, the range when the shape is static |
-| `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c),  i = 1, …, n — the same row `v[.i] := …` gives |
-| a broadcast in expression position | ⨂_{i=1}^{n} K(xs_i, ys_i), (f(xs_i, c))_{i=1}^{n} — the object it denotes, since no left-hand side carries the index |
+| `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i),  i = 1, …, n — one law per index; the range follows when the length is static, an index over a length inference cannot give stays unbound (y_i ∼ …, for each i) |
+| `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c),  i = 1, …, n — as an axis-indexed row `v[.i] := …` reads, which carries no range yet |
+| `W = f.(A)` with A a matrix | W_{i,j} = f(A_{i,j}),  i = 1, …, m,  j = 1, …, n — one index per axis |
+| `M = K.(xs)` as a row | M = ⨂_{i=1}^{n} K(xs_i) — the array-valued measure is one object (§04), so its row keeps the product; `y ∼ M` then draws from it whole |
+| `a, b ~ K.(xs)` | (a, b) ∼ ⨂_{i=1}^{2} K(xs_i) — a decomposition names the components, not an index |
+| `f.(a, b)` with no collection argument | f(a, b), the single application §04 defines |
+| a broadcast in expression position | ⨂_{i=1}^{n} K(xs_i, ys_i), (f(xs_i, c))_{i=1}^{n} — the object it denotes, since no left-hand side carries the index; one operator per axis, the first outermost |
 | an index on a name | joins the name's subscript list, whatever the index: `x_data` at i is x_{data,i}, `nu_B[g]` under i is ν_{B,g_i}, `A[i][j]` is A_{i,j}; a marked name keeps the index inside its marker (`sigma_sq` at i is σ_i²) |
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |
 | `a[idx]` with an array of indices | a_{idx} and, under an index i, a_{idx_i} |
 | `aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` | Σ_{j} A_{ij} B_{jk}, other reductions as var_{j}(…) in roman |
 | `metricsum(g, [.mu^], r[.mu^] * r[.mu_])` | s =ᵍ r^{μ} r_{μ}, upper and lower indices as written, the metric over the equality sign |
 
-Index letters are fresh (i, j, k, … skipping names bound in the module). The
-range comes from the typed module: a named size where the source gives one
-(`iid(M, J)`), else the static length, else a bare index.
+Index letters are fresh (i, j, k, …), skipping names bound in the module and
+letters a binding's name ends in (`x_data_i` reserves i, since `x_data` at i
+would print the same). The range comes from the typed module: a named size
+where the source gives one (`iid(M, J)`), else the static length, else a bare
+index.
 
 ## Measures, kernels, likelihoods (§06, §04)
 
