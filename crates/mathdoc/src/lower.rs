@@ -391,7 +391,7 @@ impl<'m> Lowerer<'m> {
     /// The full value of a binding whose row elided it (the data appendix).
     pub fn full_value(&mut self, id: BindingId) -> Math {
         self.indices.clear();
-        let rhs = self.m.binding(id).rhs;
+        let rhs = self.through_fixed(self.m.binding(id).rhs);
         if too_deep(self.m, rhs) {
             return Math::Code(self.rhs_text(id).1);
         }
@@ -469,6 +469,7 @@ impl<'m> Lowerer<'m> {
     }
 
     fn kind(&self, rhs: NodeId) -> Kind {
+        let rhs = self.through_fixed(rhs);
         if let Node::Call(call) = self.m.node(rhs)
             && self.head_is(call, "draw")
         {
@@ -490,6 +491,19 @@ impl<'m> Lowerer<'m> {
                 },
                 _ => Kind::Value,
             },
+        }
+    }
+
+    /// The value under a top-level `fixed(…)`: the hint changes no row, no
+    /// kind and no appendix value (§03: `fixed(x)` is `identity(x)`).
+    fn through_fixed(&self, rhs: NodeId) -> NodeId {
+        match self.m.node(rhs) {
+            Node::Call(c)
+                if self.head_is(c, "fixed") && c.args.len() == 1 && c.named.is_empty() =>
+            {
+                self.through_fixed(c.args[0])
+            }
+            _ => rhs,
         }
     }
 
@@ -549,6 +563,17 @@ impl<'m> Lowerer<'m> {
                 }
             }
             "draw" if call.args.len() == 1 => {
+                // `y ~ K.(xs)`: one law per index.
+                if let Node::Call(inner) = self.m.node(call.args[0])
+                    && self.head_is(inner, "broadcast")
+                    && !inner.args.is_empty()
+                {
+                    let inner = inner.clone();
+                    if let Broadcast::Elementwise(e) = self.elementwise(call.args[0], &inner, None)
+                    {
+                        return self.indexed_row(lhs, Rel::Sim, e);
+                    }
+                }
                 let measure = self.expr(call.args[0]);
                 Lowered {
                     statement: Statement {
@@ -561,13 +586,27 @@ impl<'m> Lowerer<'m> {
                     elided: false,
                 }
             }
-            "fixed" if call.args.len() == 1 && call.named.is_empty() => {
-                let value = self.expr(call.args[0]);
-                Lowered {
-                    statement: eq(lhs, value),
-                    annotation: Some("fixed".to_string()),
+            "broadcast" if !call.args.is_empty() => match self.elementwise(rhs, call, None) {
+                // `v = f.(xs)`: one value per index.
+                Broadcast::Elementwise(e) if !e.is_measure => self.indexed_row(lhs, Rel::Eq, e),
+                // `M = K.(xs)` is one array-valued measure (§04), the product;
+                // the index belongs to a draw from it, not to `M`.
+                Broadcast::Elementwise(e) => Lowered {
+                    statement: eq(lhs, self.broadcast_object(e)),
+                    annotation: None,
                     elided: false,
-                }
+                },
+                Broadcast::Plain | Broadcast::Unknown => plain(self, lhs),
+            },
+            "fixed" if call.args.len() == 1 && call.named.is_empty() => {
+                // `fixed(x)` is `x` with a hint (§03): the row is x's own,
+                // its annotation kept ("external input", an elided literal).
+                let mut lowered = self.statement(name, call.args[0]);
+                lowered.annotation = Some(match lowered.annotation.take() {
+                    Some(inner) => format!("{inner}; fixed"),
+                    None => "fixed".to_string(),
+                });
+                lowered
             }
             "functionof" | "kernelof" if !call.args.is_empty() => {
                 let statement = self.reification_statement(name, rhs, call, &head);
@@ -1253,9 +1292,13 @@ impl<'m> Lowerer<'m> {
                     "maximum" => BigOp::Max,
                     _ => BigOp::Min,
                 };
-                let i = self.fresh_index();
-                let body = self.indexed(call.args[0], &i);
-                Math::big(op, Some(i), None, body)
+                // One index per axis of the argument: `sum` reduces them all.
+                let rank = self
+                    .collection_axes(call.args[0])
+                    .map_or(1, |a| a.len().max(1));
+                let indices: Vec<Math> = (0..rank).map(|_| self.fresh_index()).collect();
+                let body = self.indexed(call.args[0], &indices);
+                Math::big(op, Some(index_list(&indices)), None, body)
             }
             "aggregate" | "metricsum" if call.args.len() == 3 => {
                 let agg = self.aggregation(call, head);
@@ -1571,7 +1614,11 @@ impl<'m> Lowerer<'m> {
             'i', 'j', 'k', 'l', 'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w',
         ] {
             let s = c.to_string();
-            if self.bound.contains(&s) || self.indices.contains(&s) || self.scope_has(&s) {
+            if self.bound.contains(&s)
+                || self.indices.contains(&s)
+                || self.scope_has(&s)
+                || self.reserved_index(c)
+            {
                 continue;
             }
             self.indices.push(s);
@@ -1581,6 +1628,18 @@ impl<'m> Lowerer<'m> {
         let s = format!("i{}", self.indices.len());
         self.indices.push(s.clone());
         Math::ident(&s, None)
+    }
+
+    /// Bindings `x_data` and `x_data_i` together make `i` unusable as an
+    /// index letter: `x_data` at `i` would print like the other binding,
+    /// x_{data,i}. A trailing `_i` alone (`mu_i` with no `mu`) reserves
+    /// nothing.
+    fn reserved_index(&self, c: char) -> bool {
+        self.bound.iter().any(|name| {
+            name.strip_suffix(c)
+                .and_then(|n| n.strip_suffix('_'))
+                .is_some_and(|prefix| self.bound.contains(prefix))
+        })
     }
 
     fn scope_has(&self, name: &str) -> bool {
@@ -1596,31 +1655,34 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// The static length of a rank-1 collection, as math: a named `iid` size
+    /// The axes of a collection, each with its length: a named `iid` size
     /// where the source gives one, else the inferred static dimension.
-    fn collection_len(&mut self, id: NodeId) -> Option<Math> {
-        if let Node::Ref(r) = self.m.node(id)
+    /// `None` for anything that is not a collection.
+    fn collection_axes(&mut self, id: NodeId) -> Option<Vec<AxisLen>> {
+        let rank_one =
+            !matches!(self.m.type_of(id), Some(Type::Array { shape, .. }) if shape.len() != 1);
+        if rank_one
+            && let Node::Ref(r) = self.m.node(id)
             && r.ns == RefNs::SelfMod
             && let Some(b) = self.m.binding_by_name(r.name)
             && let Some(size) = self.iid_size(self.m.binding(b).rhs)
         {
-            return Some(self.expr(size));
+            return Some(vec![AxisLen::Named(self.expr(size))]);
         }
+        let dim = |d: &Dim| match d {
+            Dim::Static(n) => AxisLen::Static(u64::from(*n)),
+            Dim::Dynamic => AxisLen::Unknown,
+        };
         match self.m.type_of(id) {
-            Some(Type::Array { shape, .. }) if shape.len() == 1 => match shape[0] {
-                Dim::Static(n) => Some(Math::int(n as i64)),
-                Dim::Dynamic => None,
-            },
-            Some(Type::TVector {
-                len: Dim::Static(n),
-                ..
-            }) => Some(Math::int(*n as i64)),
-            Some(Type::Table {
-                nrows: Dim::Static(n),
-                ..
-            }) => Some(Math::int(*n as i64)),
-            _ => match self.m.node(id) {
-                Node::Call(c) if self.head_is(c, "vector") => Some(Math::int(c.args.len() as i64)),
+            Some(Type::Array { shape, .. }) => Some(shape.iter().map(dim).collect()),
+            Some(Type::TVector { len, .. }) => Some(vec![dim(len)]),
+            Some(Type::Table { nrows, .. }) => Some(vec![dim(nrows)]),
+            Some(_) => None,
+            None => match self.m.node(id) {
+                // Untyped: a literal vector is a collection by syntax.
+                Node::Call(c) if self.head_is(c, "vector") => {
+                    Some(vec![AxisLen::Static(c.args.len() as u64)])
+                }
                 _ => None,
             },
         }
@@ -1644,76 +1706,86 @@ impl<'m> Lowerer<'m> {
         None
     }
 
-    /// `collection` at index `i`: a nested dotted expression shares the index,
-    /// a gather `a[idx]` becomes `a_{idx_i}`, anything else is subscripted.
-    fn indexed(&mut self, collection: NodeId, i: &Math) -> Math {
+    /// `collection` at `indices` (one per axis): a nested dotted expression
+    /// shares them, a gather `a[idx]` becomes `a_{idx_i}`, anything else is
+    /// subscripted.
+    fn indexed(&mut self, collection: NodeId, indices: &[Math]) -> Math {
         if let Node::Call(c) = self.m.node(collection) {
             if self.head_is(c, "broadcast") && !c.args.is_empty() {
                 let c = c.clone();
-                return self.broadcast(collection, &c, Some(i));
+                return self.broadcast(collection, &c, Some(indices));
             }
             if self.head_is(c, "get") && c.args.len() == 2 && self.is_collection(c.args[1]) {
                 let base = self.expr(c.args[0]);
-                let idx = self.indexed(c.args[1], i);
+                let idx = self.indexed(c.args[1], indices);
                 return Math::subscript(base, idx);
             }
         }
         let whole = self.expr(collection);
-        Math::subscript(whole, i.clone())
+        Math::subscript(whole, index_list(indices))
     }
 
-    /// `broadcast(f, args…)`: the elementwise body under a fresh index, wrapped
-    /// as an independent product (kernel) or a family (function). With
-    /// `shared` set, only the body is returned (a nested dotted expression).
-    fn broadcast(&mut self, node: NodeId, call: &Call, shared: Option<&Math>) -> Math {
+    /// What `broadcast(f, args…)` is, read from its typed arguments: the
+    /// elementwise body under one index per axis (fresh, or the enclosing
+    /// ones), with each axis's static length and whether the body is a
+    /// measure; a plain application when no argument is a collection (§04);
+    /// unknown when nothing is typed, where the construct keeps its name.
+    fn elementwise(&mut self, node: NodeId, call: &Call, shared: Option<&[Math]>) -> Broadcast {
         let head = call.args[0];
-        let rest: Vec<NodeId> = call.args[1..].to_vec();
-        let any_typed = rest
+        let operands: Vec<NodeId> = call.args[1..]
             .iter()
-            .chain(call.named.iter().map(|n| &n.value))
-            .any(|a| {
-                self.m.type_of(*a).is_some()
-                    || matches!(self.m.node(*a), Node::Call(c) if self.head_is(c, "vector"))
-            });
+            .copied()
+            .chain(call.named.iter().map(|n| n.value))
+            .collect();
+        let any_typed = operands.iter().any(|a| {
+            self.m.type_of(*a).is_some()
+                || matches!(self.m.node(*a), Node::Call(c) if self.head_is(c, "vector"))
+        });
         if !any_typed {
-            let mut args = vec![self.expr(head)];
-            args.extend(self.args_from(&rest));
-            args.extend(self.labelled(call));
-            return Math::call("broadcast", args);
+            return Broadcast::Unknown;
         }
-        let index = match shared {
-            Some(i) => i.clone(),
-            None => self.fresh_index(),
-        };
-        let mut range_hi = None;
-        let mut args = Vec::new();
-        for a in &rest {
-            if self.is_collection(*a) {
-                if range_hi.is_none() {
-                    range_hi = self.collection_len(*a);
-                }
-                args.push(self.indexed(*a, &index));
-            } else {
-                args.push(self.expr(*a));
+        // The broadcast axes: every collection argument has the same number
+        // of axes (§04), a singleton axis expanding to the others' length.
+        let mut lens: Vec<AxisLen> = Vec::new();
+        for a in &operands {
+            let Some(axes) = self.collection_axes(*a) else {
+                continue;
+            };
+            if lens.len() < axes.len() {
+                lens.resize_with(axes.len(), || AxisLen::Unknown);
             }
+            for (slot, len) in lens.iter_mut().zip(axes) {
+                if len.outranks(slot) {
+                    *slot = len;
+                }
+            }
+        }
+        if lens.is_empty() {
+            return Broadcast::Plain;
+        }
+        let mut indices: Vec<Math> = shared.map(<[Math]>::to_vec).unwrap_or_default();
+        while indices.len() < lens.len() {
+            indices.push(self.fresh_index());
+        }
+        let axes: Vec<Axis> = indices
+            .iter()
+            .zip(lens)
+            .map(|(index, len)| Axis {
+                index: index.clone(),
+                len: len.into_math(),
+            })
+            .collect();
+        let mut args = Vec::new();
+        for a in &call.args[1..] {
+            args.push(self.operand(*a, &indices));
         }
         let mut kwargs = Vec::new();
         for n in call.named.iter() {
             let name = self.m.resolve(n.name).to_string();
-            let v = if self.is_collection(n.value) {
-                if range_hi.is_none() {
-                    range_hi = self.collection_len(n.value);
-                }
-                self.indexed(n.value, &index)
-            } else {
-                self.expr(n.value)
-            };
+            let v = self.operand(n.value, &indices);
             kwargs.push((name, v));
         }
         let body = self.apply_head(head, args, kwargs);
-        if shared.is_some() {
-            return body;
-        }
         let is_measure = match self.m.type_of(node) {
             Some(Type::Measure { .. }) => true,
             Some(_) => false,
@@ -1721,15 +1793,86 @@ impl<'m> Lowerer<'m> {
                 matches!(self.m.node(head), Node::Const(s) if self.is_measure_head(self.m.resolve(*s)))
             }
         };
-        let range = range_hi.map(|hi| (Math::int(1), hi));
-        if is_measure {
-            let (sub, sup) = match range {
-                Some((lo, hi)) => (Some(Math::relation(index, Rel::Eq, lo)), Some(hi)),
-                None => (Some(index), None),
-            };
-            Math::big(BigOp::Otimes, sub, sup, body)
+        Broadcast::Elementwise(Elementwise {
+            axes,
+            body,
+            is_measure,
+        })
+    }
+
+    /// A broadcast operand: indexed when it is a collection, itself otherwise.
+    fn operand(&mut self, a: NodeId, indices: &[Math]) -> Math {
+        if self.is_collection(a) {
+            self.indexed(a, indices)
         } else {
-            Math::family(body, index, range)
+            self.expr(a)
+        }
+    }
+
+    /// `broadcast(f, args…)` in expression position: the object it denotes.
+    /// With `shared` set, only the body is returned (a nested dotted
+    /// expression).
+    fn broadcast(&mut self, node: NodeId, call: &Call, shared: Option<&[Math]>) -> Math {
+        match self.elementwise(node, call, shared) {
+            Broadcast::Elementwise(e) if shared.is_some() => e.body,
+            Broadcast::Elementwise(e) => self.broadcast_object(e),
+            Broadcast::Plain => {
+                let head = call.args[0];
+                let args = self.args_from(&call.args[1..]);
+                let named: Vec<(String, NodeId)> = call
+                    .named
+                    .iter()
+                    .map(|n| (self.m.resolve(n.name).to_string(), n.value))
+                    .collect();
+                let kwargs = named
+                    .into_iter()
+                    .map(|(name, v)| (name, self.expr(v)))
+                    .collect();
+                self.apply_head(head, args, kwargs)
+            }
+            Broadcast::Unknown => {
+                let mut args = vec![self.expr(call.args[0])];
+                args.extend(self.args_from(&call.args[1..]));
+                args.extend(self.labelled(call));
+                Math::call("broadcast", args)
+            }
+        }
+    }
+
+    /// The object an elementwise reading denotes: an independent product
+    /// (kernel) or a family (function), one operator per axis, the first
+    /// axis outermost.
+    fn broadcast_object(&mut self, e: Elementwise) -> Math {
+        let mut body = e.body;
+        for axis in e.axes.into_iter().rev() {
+            body = if e.is_measure {
+                let (sub, sup) = match axis.len {
+                    Some(hi) => (Math::relation(axis.index, Rel::Eq, Math::int(1)), Some(hi)),
+                    None => (axis.index, None),
+                };
+                Math::big(BigOp::Otimes, Some(sub), sup, body)
+            } else {
+                Math::family(body, axis.index, axis.len.map(|hi| (Math::int(1), hi)))
+            };
+        }
+        body
+    }
+
+    /// A row whose right-hand side is a broadcast, written with a free index
+    /// per axis: `y_i ∼ K(x_i)`, `v_{i,j} = f(x_{i,j})`. The index runs over
+    /// the collection; no range is written (it would follow every such row
+    /// and says nothing the index does not).
+    fn indexed_row(&mut self, lhs: Math, rel: Rel, e: Elementwise) -> Lowered {
+        let indices: Vec<Math> = e.axes.into_iter().map(|a| a.index).collect();
+        Lowered {
+            statement: Statement {
+                lhs: Math::subscript(lhs, index_list(&indices)),
+                rel,
+                rhs: e.body,
+                mark: None,
+            },
+            annotation: None,
+            elided: false,
         }
     }
 
@@ -1837,6 +1980,60 @@ struct Integrand {
     vars: Option<Vec<Math>>,
 }
 
+/// What a broadcast is ([`Lowerer::elementwise`]).
+enum Broadcast {
+    /// No argument has a type: the construct keeps its name.
+    Unknown,
+    /// No argument is a collection: a single application (§04).
+    Plain,
+    Elementwise(Elementwise),
+}
+
+/// The elementwise reading of a broadcast: the body under one index per axis.
+struct Elementwise {
+    axes: Vec<Axis>,
+    body: Math,
+    is_measure: bool,
+}
+
+/// One broadcast axis: its index and, when the shape gives it, its length.
+struct Axis {
+    index: Math,
+    len: Option<Math>,
+}
+
+/// The length of one axis of a collection argument.
+enum AxisLen {
+    /// A named `iid` size written in the source (`iid(M, J)`).
+    Named(Math),
+    Static(u64),
+    Unknown,
+}
+
+impl AxisLen {
+    /// Whether this length should replace `other` for the shared axis: a name
+    /// over a number, any length over none, and a real length over a singleton
+    /// axis, which expands to the others' length (§04).
+    fn outranks(&self, other: &AxisLen) -> bool {
+        match (self, other) {
+            (AxisLen::Unknown, _) => false,
+            (_, AxisLen::Unknown) => true,
+            (AxisLen::Named(_), AxisLen::Named(_)) => false,
+            (AxisLen::Named(_), AxisLen::Static(_)) => true,
+            (AxisLen::Static(_), AxisLen::Named(_)) => false,
+            (AxisLen::Static(n), AxisLen::Static(m)) => *m == 1 && *n != 1,
+        }
+    }
+
+    fn into_math(self) -> Option<Math> {
+        match self {
+            AxisLen::Named(m) => Some(m),
+            AxisLen::Static(n) => Some(Math::int(n as i64)),
+            AxisLen::Unknown => None,
+        }
+    }
+}
+
 /// Einstein axis slots on a tensor: lower and upper index lists attached to
 /// the whole name, `{r_{12}}^{μ} {r_{12}}_{μ}`. Unlike an element index, a
 /// slot is structural — it pairs with the one on the other side — so it does
@@ -1851,6 +2048,14 @@ fn axis_slots(base: Math, lower: Vec<Math>, upper: Vec<Math>) -> Math {
             Box::new(Math::row(upper)),
         ),
         (true, true) => base,
+    }
+}
+
+/// Indices as one subscript: the index itself, or `i, j` for several.
+fn index_list(indices: &[Math]) -> Math {
+    match indices {
+        [one] => one.clone(),
+        many => Math::row(intersperse_commas(many.to_vec())),
     }
 }
 
@@ -2419,19 +2624,188 @@ mod tests {
             grid.ends_with("<mrow><mn>2</mn><mo>×</mo><mn>3</mn></mrow></msup>"),
             "{grid}"
         );
-        let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
-        assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
-        assert!(y.contains("<msub data-flatppl-ref=\"theta\"><mi>θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub data-flatppl-ref=\"s\"><mi>s</mi><mi>i</mi></msub><mn>2</mn></msup>"));
-        let means = mathml::expr(&row_named(&rows, "means").statement.rhs);
-        assert!(
-            means.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
-            "{means}"
+        // A broadcast row is written with a free index: `y_i ∼ 𝒩(θ_i, s_i²)`.
+        let y_row = row_named(&rows, "y");
+        assert_eq!(
+            mathml::expr(&y_row.statement.lhs),
+            "<msub data-flatppl-ref=\"y\"><mi>y</mi><mi>i</mi></msub>"
+        );
+        let y = mathml::expr(&y_row.statement.rhs);
+        assert!(y.starts_with("<mrow><mi>𝒩</mi>"), "{y}");
+        assert!(y.contains("<msub data-flatppl-ref=\"theta\"><mi>θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub data-flatppl-ref=\"s\"><mi>s</mi><mi>i</mi></msub><mn>2</mn></msup>"), "{y}");
+        assert!(!y.contains("<mi>…</mi>"), "{y}");
+        let means_row = row_named(&rows, "means");
+        assert_eq!(
+            mathml::expr(&means_row.statement.lhs),
+            "<msub data-flatppl-ref=\"means\"><mi>means</mi><mi>i</mi></msub>"
+        );
+        let means = mathml::expr(&means_row.statement.rhs);
+        assert_eq!(
+            means,
+            "<mrow><mi data-flatppl-ref=\"alpha\">α</mi><mo>+</mo><mrow><mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub></mrow></mrow>"
+        );
+        // In expression position a broadcast stays the object: a family.
+        let inner = rhs(
+            "alpha = elementof(reals)\nx = [1.1, 1.5]\nw = 2 * (alpha .+ x)",
+            "w",
         );
         assert!(
-            means.contains("<mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>4</mn></msubsup>"),
-            "{means}"
+            inner.contains("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
+            "{inner}"
         );
-        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub>"), "{means}");
+        // An indexed name joins the index to its own subscripts.
+        let data = rhs("x_data = [1.0, 2.0, 3.0]\nv = 2 .* x_data", "v");
+        assert!(data.contains("<msub data-flatppl-ref=\"x_data\"><mi>x</mi><mrow><mi>data</mi><mo>,</mo><mi>i</mi></mrow></msub>"), "{data}");
+    }
+
+    #[test]
+    fn a_colliding_name_keeps_its_index() {
+        // `theta1` and `theta_1` print as written; the index still applies.
+        let rows = rows("theta1 = [1.0, 2.0]\ntheta_1 = 5.0\nv = 2 .* theta1");
+        let v = mathml::expr(&row_named(&rows, "v").statement.rhs);
+        assert!(
+            v.contains("<msub data-flatppl-ref=\"theta1\"><mi>theta1</mi><mi>i</mi></msub>"),
+            "{v}"
+        );
+        let rows = self::rows("xs = [1.0, 2.0]\ntheta1 = 2 .* xs\ntheta_1 = 5.0");
+        assert_eq!(
+            mathml::expr(&row_named(&rows, "theta1").statement.lhs),
+            "<msub data-flatppl-ref=\"theta1\"><mi>theta1</mi><mi>i</mi></msub>"
+        );
+    }
+
+    #[test]
+    fn a_measure_valued_broadcast_bound_to_a_name_keeps_the_product() {
+        let rows = rows("a = [0.0, 1.0]\nb = [1.0, 2.0]\nM = Normal.(a, b)\ny ~ M");
+        let m = row_named(&rows, "M");
+        assert_eq!(
+            mathml::expr(&m.statement.lhs),
+            "<mi data-flatppl-ref=\"M\">M</mi>"
+        );
+        let rhs = mathml::expr(&m.statement.rhs);
+        assert!(rhs.starts_with("<mrow><munderover><mo>⨂</mo>"), "{rhs}");
+        assert_eq!(
+            mathml::expr(&row_named(&rows, "y").statement.rhs),
+            "<mi data-flatppl-ref=\"M\">M</mi>"
+        );
+    }
+
+    #[test]
+    fn a_broadcast_with_no_collection_is_a_single_application() {
+        let src = "mu = elementof(reals)\ns = elementof(posreals)\nv = mu .+ s\ny ~ Normal.(mu, s)";
+        let rows = rows(src);
+        let v = row_named(&rows, "v");
+        assert_eq!(
+            mathml::expr(&v.statement.lhs),
+            "<mi data-flatppl-ref=\"v\">v</mi>"
+        );
+        assert_eq!(
+            mathml::expr(&v.statement.rhs),
+            "<mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>+</mo><mi data-flatppl-ref=\"s\">s</mi></mrow>"
+        );
+        let y = row_named(&rows, "y");
+        assert_eq!(
+            mathml::expr(&y.statement.lhs),
+            "<mi data-flatppl-ref=\"y\">y</mi>"
+        );
+        let rhs = mathml::expr(&y.statement.rhs);
+        assert!(
+            rhs.contains("<mi>𝒩</mi>") && !rhs.contains("<mi>i</mi>"),
+            "{rhs}"
+        );
+    }
+
+    #[test]
+    fn a_matrix_broadcast_takes_one_index_per_axis() {
+        let src = "R = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\nW = 2 .* R\nM2 = iid(Normal.(R, 1.0), 3)";
+        let rows = rows(src);
+        let w = row_named(&rows, "W");
+        assert_eq!(
+            mathml::expr(&w.statement.lhs),
+            "<msub data-flatppl-ref=\"W\"><mi>W</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"
+        );
+        let rhs = mathml::expr(&w.statement.rhs);
+        assert!(rhs.contains("<msub data-flatppl-ref=\"R\"><mi>R</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"), "{rhs}");
+        assert!(!rhs.contains("<mi>…</mi>"), "{rhs}");
+        // In expression position, one product per axis, with their ranges.
+        let m2 = mathml::expr(&row_named(&rows, "M2").statement.rhs);
+        assert_eq!(m2.matches("<mo>⨂</mo>").count(), 2, "{m2}");
+    }
+
+    #[test]
+    fn index_letters_avoid_a_binding_the_indexed_name_would_print_like() {
+        // A trailing `_i` with no `mu` binding reserves nothing.
+        let rows = rows("mu_i = 2.0\nxs = [1.0, 2.0]\nw = 2 .* xs");
+        assert_eq!(
+            mathml::expr(&row_named(&rows, "w").statement.lhs),
+            "<msub data-flatppl-ref=\"w\"><mi>w</mi><mi>i</mi></msub>"
+        );
+        let rows = self::rows("x_data = [1.0, 2.0]\nx_data_i = 5.0\nv = x_data_i .* x_data");
+        let v = row_named(&rows, "v");
+        assert_eq!(
+            mathml::expr(&v.statement.lhs),
+            "<msub data-flatppl-ref=\"v\"><mi>v</mi><mi>j</mi></msub>"
+        );
+        let rhs = mathml::expr(&v.statement.rhs);
+        assert!(rhs.contains("<msub data-flatppl-ref=\"x_data\"><mi>x</mi><mrow><mi>data</mi><mo>,</mo><mi>j</mi></mrow></msub>"), "{rhs}");
+    }
+
+    #[test]
+    fn fixed_keeps_the_row_its_value_would_have() {
+        let src = "xs = [1.0, 2.0]\nv = fixed(2 .* xs)\nn = fixed(external(posintegers))\nz = fixed(draw(Normal(0.0, 1.0)))";
+        let rows = rows(src);
+        let v = row_named(&rows, "v");
+        assert_eq!(v.annotation.as_deref(), Some("fixed"));
+        assert_eq!(
+            mathml::expr(&v.statement.lhs),
+            "<msub data-flatppl-ref=\"v\"><mi>v</mi><mi>i</mi></msub>"
+        );
+        // The inner row's own annotation and kind survive the hint.
+        let n = row_named(&rows, "n");
+        assert_eq!(n.annotation.as_deref(), Some("external input; fixed"));
+        assert_eq!(n.statement.rel, Rel::In);
+        assert_eq!(row_named(&rows, "z").kind, Kind::Draw);
+    }
+
+    #[test]
+    fn a_reduction_takes_one_index_per_axis() {
+        let src = "R = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\nt = sum(exp.(R))\nxs = [1.0, 2.0]\ns = sum(xs)";
+        let rows = rows(src);
+        let t = mathml::expr(&row_named(&rows, "t").statement.rhs);
+        assert!(
+            t.starts_with(
+                "<mrow><munder><mo>∑</mo><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></munder>"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("<msub data-flatppl-ref=\"R\"><mi>R</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"), "{t}");
+        let s = mathml::expr(&row_named(&rows, "s").statement.rhs);
+        assert!(
+            s.starts_with("<mrow><munder><mo>∑</mo><mi>i</mi></munder>"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn tensor_axis_slots_attach_to_the_whole_name() {
+        let rows = rows("g = eye(2)\nr12 = [1.0, 2.0]\ng: s[] := r12[.mu^] * r12[.mu_]");
+        let s = mathml::expr(&row_named(&rows, "s").statement.rhs);
+        let name = "<msub data-flatppl-ref=\"r12\"><mi>r</mi><mn>12</mn></msub>";
+        assert!(s.contains(&format!("<msup>{name}<mi>μ</mi></msup>")), "{s}");
+        assert!(s.contains(&format!("<msub>{name}<mi>μ</mi></msub>")), "{s}");
+    }
+
+    #[test]
+    fn a_gathered_collection_is_indexed_through_its_gather() {
+        let src = "dat = table(counts = [2, 1])\nxs = [1.0, 2.0]\ng = cat(fill(1, dat.counts[1]), fill(2, dat.counts[2]))\ny ~ Normal.(xs[g], 1.0)";
+        let rows = rows(src);
+        let y = row_named(&rows, "y");
+        assert_eq!(
+            mathml::expr(&y.statement.lhs),
+            "<msub data-flatppl-ref=\"y\"><mi>y</mi><mi>i</mi></msub>"
+        );
+        let rhs = mathml::expr(&y.statement.rhs);
+        assert!(rhs.contains("<msub data-flatppl-ref=\"xs\"><mi>xs</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{rhs}");
     }
 
     #[test]
@@ -2738,6 +3112,7 @@ mod tests {
         let c = row_named(&rows, "C");
         assert_eq!(
             mathml::expr(&c.statement.lhs),
+            // An axis slot attaches to the whole name, unlike an element index.
             "<msub><mi data-flatppl-ref=\"C\">C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub>"
         );
         let body = mathml::expr(&c.statement.rhs);
@@ -2832,6 +3207,7 @@ mod tests {
             mathml::expr(&row_named(&rows, "y").statement.rhs),
             "<msub data-flatppl-ref=\"v\"><mi>v</mi><mn>2</mn></msub>"
         );
+        // The running index joins the name's own subscripts.
         let z = mathml::expr(&row_named(&rows, "z").statement.rhs);
         assert_eq!(
             z,
