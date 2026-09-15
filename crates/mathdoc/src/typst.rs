@@ -26,43 +26,23 @@ pub(crate) fn relation_of(stmt: &Statement) -> String {
 
 /// An expression in native Typst math syntax, without `$` delimiters.
 pub fn expr(m: &Math) -> String {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        let rows = lines
-            .iter()
-            .map(|line| {
-                let term = expr(line.term);
-                let term = if line.parens {
-                    fenced(Fence::Paren, Fence::Paren, &term)
-                } else {
-                    term
-                };
-                let sign = match line.sign {
-                    Some(BinOp::Sub) => "− ",
-                    Some(_) => "+ ",
-                    None => "",
-                };
-                format!("{sign}{term}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("vec(delim: #none, align: #left, {rows})");
+    if !crate::layout::sum_lines(m).is_empty() {
+        return sum_lines(m);
     }
     match m {
         Math::Ident(id) => {
             let head = atom(&id.display.head);
-            let symbol = if id.display.subs.is_empty() {
+            let parts: Vec<String> = id
+                .display
+                .subs
+                .iter()
+                .map(atom)
+                .chain(id.indices.iter().map(expr))
+                .collect();
+            let symbol = if parts.is_empty() {
                 head
             } else {
-                format!(
-                    "attach({head}, br: {})",
-                    id.display
-                        .subs
-                        .iter()
-                        .map(atom)
-                        .collect::<Vec<_>>()
-                        .join(" \\, ")
-                )
+                format!("attach({head}, br: {})", parts.join(" \\, "))
             };
             match id.display.wrap {
                 Some(crate::names::Wrap::Squared) => format!("{symbol}^2"),
@@ -223,6 +203,29 @@ pub(crate) fn quote(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A sum split into aligned continuation lines.
+fn sum_lines(m: &Math) -> String {
+    let rows = crate::layout::sum_lines(m)
+        .iter()
+        .map(|line| {
+            let term = expr(line.term);
+            let term = if line.parens {
+                fenced(Fence::Paren, Fence::Paren, &term)
+            } else {
+                term
+            };
+            let sign = match line.sign {
+                Some(BinOp::Sub) => "− ",
+                Some(_) => "+ ",
+                None => "",
+            };
+            format!("{sign}{term}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("vec(delim: #none, align: #left, {rows})")
 }
 
 fn atom(atom: &Atom) -> String {

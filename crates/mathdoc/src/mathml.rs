@@ -114,25 +114,8 @@ fn fence_glyph(f: Fence, open: bool) -> &'static str {
 }
 
 fn write_expr(out: &mut String, m: &Math) {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
-        for line in lines {
-            out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
-            if let Some(sign) = line.sign {
-                let glyph = if sign == BinOp::Sub { "−" } else { "+" };
-                let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
-            }
-            if line.parens {
-                write_fenced(out, "(", ")", is_tall(line.term), |out| {
-                    write_expr(out, line.term)
-                });
-            } else {
-                write_expr(out, line.term);
-            }
-            out.push_str("</mrow></mtd></mtr>");
-        }
-        out.push_str("</mtable>");
+    if !crate::layout::sum_lines(m).is_empty() {
+        write_sum_lines(out, m);
         return;
     }
     match m {
@@ -333,8 +316,29 @@ fn write_expr(out: &mut String, m: &Math) {
     }
 }
 
-/// An identifier: head `<mi>` plus an optional `<msub>` of its parts, the
-/// back-reference attribute on the outermost element.
+/// A sum split into aligned continuation lines ([`crate::layout::sum_lines`]).
+fn write_sum_lines(out: &mut String, m: &Math) {
+    out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
+    for line in crate::layout::sum_lines(m) {
+        out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
+        if let Some(sign) = line.sign {
+            let glyph = if sign == BinOp::Sub { "−" } else { "+" };
+            let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
+        }
+        if line.parens {
+            write_fenced(out, "(", ")", is_tall(line.term), |out| {
+                write_expr(out, line.term)
+            });
+        } else {
+            write_expr(out, line.term);
+        }
+        out.push_str("</mrow></mtd></mtr>");
+    }
+    out.push_str("</mtable>");
+}
+
+/// An identifier: head `<mi>` plus an optional `<msub>` of its parts and
+/// indices, the back-reference attribute on the outermost element.
 fn write_ident(out: &mut String, id: &Ident) {
     let attr = match &id.target {
         Some(t) => format!(" data-flatppl-ref=\"{}\"", escape(t)),
@@ -363,21 +367,28 @@ fn write_ident(out: &mut String, id: &Ident) {
         }
         None => {}
     }
-    if id.display.subs.is_empty() {
+    let parts = id.display.subs.len() + id.indices.len();
+    if parts == 0 {
         let _ = write!(out, "<mi{attr}>{}</mi>", atom_text(&id.display.head));
         return;
     }
     let _ = write!(out, "<msub{attr}><mi>{}</mi>", atom_text(&id.display.head));
-    if id.display.subs.len() == 1 {
-        write_atom(out, &id.display.subs[0]);
-    } else {
+    if parts > 1 {
         out.push_str("<mrow>");
-        for (i, part) in id.display.subs.iter().enumerate() {
-            if i > 0 {
-                out.push_str("<mo>,</mo>");
-            }
-            write_atom(out, part);
+    }
+    for (i, part) in id.display.subs.iter().enumerate() {
+        if i > 0 {
+            out.push_str("<mo>,</mo>");
         }
+        write_atom(out, part);
+    }
+    for (i, index) in id.indices.iter().enumerate() {
+        if i + id.display.subs.len() > 0 {
+            out.push_str("<mo>,</mo>");
+        }
+        write_expr(out, index);
+    }
+    if parts > 1 {
         out.push_str("</mrow>");
     }
     out.push_str("</msub>");
@@ -389,6 +400,7 @@ fn bare(id: &Ident) -> Ident {
         name: id.name.clone(),
         display: crate::names::DisplayName::new(id.display.head.clone(), id.display.subs.clone()),
         target: None,
+        indices: id.indices.clone(),
     }
 }
 
@@ -565,6 +577,32 @@ mod tests {
             "<msub data-flatppl-ref=\"E1_data\"><mi>E</mi><mrow><mn>1</mn><mo>,</mo><mi>data</mi></mrow></msub>"
         );
         assert_eq!(expr(&Math::ident("par", None)), "<mi>par</mi>");
+    }
+
+    #[test]
+    fn an_index_joins_the_name_subscript_list() {
+        let i = || Math::ident("i", None);
+        // `A[i][j]` is one subscript list, the anchor still on the outermost element.
+        let m = Math::subscript(Math::subscript(b("A"), i()), Math::ident("j", None));
+        assert_eq!(
+            expr(&m),
+            "<msub data-flatppl-ref=\"A\"><mi>A</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"
+        );
+        // A gather on a subscripted name: `nu_B[g]` under `i` is ν_{B,g_i}.
+        let m = Math::subscript(b("nu_B"), Math::subscript(b("g"), i()));
+        assert_eq!(
+            expr(&m),
+            "<msub data-flatppl-ref=\"nu_B\"><mi>ν</mi><mrow><mi>B</mi><mo>,</mo><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></mrow></msub>"
+        );
+        // A marked name keeps the index inside its marker: σ_i².
+        let m = Math::subscript(b("sigma_sq"), i());
+        assert_eq!(
+            expr(&m),
+            "<msup data-flatppl-ref=\"sigma_sq\"><msub><mi>σ</mi><mi>i</mi></msub><mn>2</mn></msup>"
+        );
+        // Anything else keeps a plain subscript.
+        let m = Math::subscript(Math::text("Law"), i());
+        assert_eq!(expr(&m), "<msub><mi>Law</mi><mi>i</mi></msub>");
     }
 
     #[test]

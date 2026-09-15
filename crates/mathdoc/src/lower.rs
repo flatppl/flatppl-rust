@@ -1546,16 +1546,7 @@ impl<'m> Lowerer<'m> {
                     _ => lower.push(ident),
                 }
             }
-            return match (lower.is_empty(), upper.is_empty()) {
-                (false, true) => Math::subscript(base, Math::row(lower)),
-                (true, false) => Math::pow(base, Math::row(upper)),
-                (false, false) => Math::SubSup(
-                    Box::new(base),
-                    Box::new(Math::row(lower)),
-                    Box::new(Math::row(upper)),
-                ),
-                (true, true) => base,
-            };
+            return axis_slots(base, lower, upper);
         }
         // Ordinary indices, comma-separated; `only` selects the sole element.
         let mut parts = Vec::new();
@@ -1846,6 +1837,23 @@ struct Integrand {
     vars: Option<Vec<Math>>,
 }
 
+/// Einstein axis slots on a tensor: lower and upper index lists attached to
+/// the whole name, `{r_{12}}^{μ} {r_{12}}_{μ}`. Unlike an element index, a
+/// slot is structural — it pairs with the one on the other side — so it does
+/// not join the name's subscript list.
+fn axis_slots(base: Math, lower: Vec<Math>, upper: Vec<Math>) -> Math {
+    match (lower.is_empty(), upper.is_empty()) {
+        (false, true) => Math::Sub(Box::new(base), Box::new(Math::row(lower))),
+        (true, false) => Math::pow(base, Math::row(upper)),
+        (false, false) => Math::SubSup(
+            Box::new(base),
+            Box::new(Math::row(lower)),
+            Box::new(Math::row(upper)),
+        ),
+        (true, true) => base,
+    }
+}
+
 /// The pieces of a lowered `aggregate` / `metricsum`.
 struct Aggregation {
     out_axes: Vec<(String, Option<Variance>)>,
@@ -1896,16 +1904,7 @@ fn decorate_with_axes(lhs: Math, out_axes: &[(String, Option<Variance>)]) -> Mat
         .into_iter()
         .map(|(n, _)| Math::ident(n, None))
         .collect();
-    match (lower.is_empty(), upper.is_empty()) {
-        (false, true) => Math::subscript(lhs, Math::row(lower)),
-        (true, false) => Math::pow(lhs, Math::row(upper)),
-        (false, false) => Math::SubSup(
-            Box::new(lhs),
-            Box::new(Math::row(lower)),
-            Box::new(Math::row(upper)),
-        ),
-        (true, true) => lhs,
-    }
+    axis_slots(lhs, lower, upper)
 }
 
 /// The big-operator form of an `aggregate` reduction (spec §04 lists the
@@ -2422,7 +2421,7 @@ mod tests {
         );
         let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
         assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
-        assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub><mn>2</mn></msup>"));
+        assert!(y.contains("<msub data-flatppl-ref=\"theta\"><mi>θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub data-flatppl-ref=\"s\"><mi>s</mi><mi>i</mi></msub><mn>2</mn></msup>"));
         let means = mathml::expr(&row_named(&rows, "means").statement.rhs);
         assert!(
             means.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
@@ -2432,7 +2431,7 @@ mod tests {
             means.contains("<mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>4</mn></msubsup>"),
             "{means}"
         );
-        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub><mi data-flatppl-ref=\"x\">x</mi><mi>i</mi></msub>"), "{means}");
+        assert!(means.contains("<mi data-flatppl-ref=\"beta\">β</mi><mo>&#x2062;</mo><msub data-flatppl-ref=\"x\"><mi>x</mi><mi>i</mi></msub>"), "{means}");
     }
 
     #[test]
@@ -2440,9 +2439,9 @@ mod tests {
         let src = "G = 3\na ~ iid(Normal(0, 1), G)\ng = [1, 2, 3, 1, 2, 3]\nxs = [-1.2, 0.4, 1.1, -0.3, 0.8, 2.0]\nb = elementof(reals)\neta = a[g] .+ b .* xs\np = invlogit.(eta)";
         let rows = rows(src);
         let eta = mathml::expr(&row_named(&rows, "eta").statement.rhs);
-        assert!(eta.contains("<msub><mi data-flatppl-ref=\"a\">a</mi><msub><mi data-flatppl-ref=\"g\">g</mi><mi>i</mi></msub></msub>"), "{eta}");
+        assert!(eta.contains("<msub data-flatppl-ref=\"a\"><mi>a</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{eta}");
         let p = mathml::expr(&row_named(&rows, "p").statement.rhs);
-        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub><mi data-flatppl-ref=\"eta\">η</mi><mi>i</mi></msub>"), "{p}");
+        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub data-flatppl-ref=\"eta\"><mi>η</mi><mi>i</mi></msub>"), "{p}");
     }
 
     #[test]
@@ -2831,12 +2830,12 @@ mod tests {
         );
         assert_eq!(
             mathml::expr(&row_named(&rows, "y").statement.rhs),
-            "<msub><mi data-flatppl-ref=\"v\">v</mi><mn>2</mn></msub>"
+            "<msub data-flatppl-ref=\"v\"><mi>v</mi><mn>2</mn></msub>"
         );
         let z = mathml::expr(&row_named(&rows, "z").statement.rhs);
         assert_eq!(
             z,
-            "<mrow><munder><mo>∑</mo><mi>i</mi></munder><msub><mi data-flatppl-ref=\"v\">v</mi><mi>i</mi></msub></mrow>"
+            "<mrow><munder><mo>∑</mo><mi>i</mi></munder><msub data-flatppl-ref=\"v\"><mi>v</mi><mi>i</mi></msub></mrow>"
         );
         assert!(
             mathml::expr(&row_named(&rows, "q").statement.rhs).ends_with(

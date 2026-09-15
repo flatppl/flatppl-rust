@@ -18,27 +18,8 @@ pub(crate) fn relation_of(stmt: &Statement) -> String {
 }
 
 pub fn expr(m: &Math) -> String {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        let rows = lines
-            .iter()
-            .map(|line| {
-                let term = expr(line.term);
-                let term = if line.parens {
-                    format!(r"\left({term}\right)")
-                } else {
-                    term
-                };
-                let sign = match line.sign {
-                    Some(BinOp::Sub) => "- ",
-                    Some(_) => "+ ",
-                    None => "",
-                };
-                format!("&{sign}{term}")
-            })
-            .collect::<Vec<_>>()
-            .join(r" \\ ");
-        return format!(r"\begin{{aligned}}{rows}\end{{aligned}}");
+    if !crate::layout::sum_lines(m).is_empty() {
+        return sum_lines(m);
     }
     let render = |m: &Math| expr(m);
     let operand = |child: &Math, slot| {
@@ -53,16 +34,15 @@ pub fn expr(m: &Math) -> String {
     match m {
         Math::Ident(id) => {
             let mut s = atom(&id.display.head);
-            if !id.display.subs.is_empty() {
-                s.push_str(&format!(
-                    "_{{{}}}",
-                    id.display
-                        .subs
-                        .iter()
-                        .map(atom)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+            let parts: Vec<String> = id
+                .display
+                .subs
+                .iter()
+                .map(atom)
+                .chain(id.indices.iter().map(&render))
+                .collect();
+            if !parts.is_empty() {
+                s.push_str(&format!("_{{{}}}", parts.join(", ")));
             }
             match id.display.wrap {
                 Some(crate::names::Wrap::Squared) => s = format!("{{{s}}}^{{2}}"),
@@ -200,6 +180,29 @@ pub fn expr(m: &Math) -> String {
         }
         Math::Code(s) => format!(r"\texttt{{{}}}", escape(s)),
     }
+}
+
+/// A sum split into aligned continuation lines.
+fn sum_lines(m: &Math) -> String {
+    let rows = crate::layout::sum_lines(m)
+        .iter()
+        .map(|line| {
+            let term = expr(line.term);
+            let term = if line.parens {
+                format!(r"\left({term}\right)")
+            } else {
+                term
+            };
+            let sign = match line.sign {
+                Some(BinOp::Sub) => "- ",
+                Some(_) => "+ ",
+                None => "",
+            };
+            format!("&{sign}{term}")
+        })
+        .collect::<Vec<_>>()
+        .join(r" \\ ");
+    format!(r"\begin{{aligned}}{rows}\end{{aligned}}")
 }
 
 fn atom(a: &Atom) -> String {

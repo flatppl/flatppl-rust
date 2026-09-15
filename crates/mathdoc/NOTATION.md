@@ -192,10 +192,11 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | `iid(M, n)`, `iid(M, [m, n])` | Mⁿ, M^{m×n} — the n-fold product measure as a bare power (van der Vaart's Pⁿ), matching Sⁿ for `cartpow`; the `⊗` is kept for products of different factors |
 | `K.(xs, ys)`, `broadcast(K, xs, ys)` with K a kernel | ⨂_{i=1}^{n} K(xs_i, ys_i) |
 | `f.(xs, c)`, `xs .+ c`, `broadcast(f, xs, c)` with f a function | (f(xs_i, c))_{i=1}^{n}, (xs_i + c)_{i=1}^{n} |
+| an index on a name | joins the name's subscript list, whatever the index: `x_data` at i is x_{data,i}, `nu_B[g]` under i is ν_{B,g_i}, `A[i][j]` is A_{i,j}; a marked name keeps the index inside its marker (`sigma_sq` at i is σ_i²) |
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |
 | `a[idx]` with an array of indices | a_{idx} and, under an index i, a_{idx_i} |
 | `aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` | Σ_{j} A_{ij} B_{jk}, other reductions as var_{j}(…) in roman |
-| `metricsum(g, [.mu^], r[.mu^] * r[.mu_])` | s =ᵍ r^{μ} r_{μ}, upper and lower indices as written, the metric over the equality sign |
+| `metricsum(g, [.mu^], r[.mu^] * r[.mu_])` | s =ᵍ r^{μ} r_{μ}, upper and lower indices as written, the metric over the equality sign; axis slots attach to the whole name ({r₁₂}^{μ} {r₁₂}_{μ}), unlike an element index, which joins its subscript list |
 
 Index letters are fresh (i, j, k, … skipping names bound in the module). The
 range comes from the typed module: a named size where the source gives one
