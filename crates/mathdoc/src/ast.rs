@@ -18,6 +18,11 @@ pub struct Ident {
     /// The module binding this identifier denotes, when it is one. `None` for
     /// lambda parameters, placeholders, indices and record fields.
     pub target: Option<String>,
+    /// Index expressions that join the name's subscript list when printed:
+    /// `x_data` at `i` is `x_{data,i}`, `A[i][j]` is `A_{i,j}`, and a marked
+    /// name keeps them inside its marker (`sigma_sq` at `i` is σ_i²). Built
+    /// by [`Math::subscript`].
+    pub indices: Vec<Math>,
 }
 
 /// A mathematical expression.
@@ -295,6 +300,7 @@ impl Math {
             name: name.to_string(),
             display: display_name(name),
             target: target.map(str::to_string),
+            indices: Vec::new(),
         })
     }
 
@@ -309,6 +315,7 @@ impl Math {
             name: c.to_string(),
             display: DisplayName::new(crate::names::Atom::Letter(c), Vec::new()),
             target: None,
+            indices: Vec::new(),
         })
     }
 
@@ -437,8 +444,17 @@ impl Math {
         Math::Sup(Box::new(base), Box::new(exp))
     }
 
+    /// A subscript. On an identifier it joins the name's own subscript list
+    /// ([`Ident::indices`]): `x_data` at `i` reads `x_{data,i}` rather than
+    /// `x_{data_i}`, and the back-reference stays on one element.
     pub fn subscript(base: Math, sub: Math) -> Math {
-        Math::Sub(Box::new(base), Box::new(sub))
+        match base {
+            Math::Ident(mut id) => {
+                id.indices.push(sub);
+                Math::Ident(id)
+            }
+            base => Math::Sub(Box::new(base), Box::new(sub)),
+        }
     }
 
     pub fn sqrt(arg: Math) -> Math {
@@ -694,8 +710,8 @@ impl Math {
                 .iter()
                 .flat_map(|(v, c)| std::iter::once(v).chain(c.iter()))
                 .collect(),
-            Math::Ident(_)
-            | Math::Num(_)
+            Math::Ident(id) => id.indices.iter().collect(),
+            Math::Num(_)
             | Math::Text(_)
             | Math::Str(_)
             | Math::Sym(_)
@@ -735,8 +751,8 @@ impl Math {
                 .iter_mut()
                 .flat_map(|(v, c)| std::iter::once(v).chain(c.iter_mut()))
                 .collect(),
-            Math::Ident(_)
-            | Math::Num(_)
+            Math::Ident(id) => id.indices.iter_mut().collect(),
+            Math::Num(_)
             | Math::Text(_)
             | Math::Str(_)
             | Math::Sym(_)
@@ -751,6 +767,7 @@ impl Math {
         while let Some(m) = stack.pop() {
             if let Math::Ident(id) = m {
                 f(id);
+                stack.extend(id.indices.iter_mut());
                 continue;
             }
             stack.extend(m.children_mut());
@@ -898,6 +915,26 @@ mod tests {
         let sum = Math::plus(b, c);
         let prod = Math::times(sum.clone(), Math::binding("d"));
         assert!(prod.needs_parens(&sum, Slot::Left));
+    }
+
+    #[test]
+    fn a_subscript_on_a_name_is_one_of_its_indices() {
+        let i = Math::ident("i", None);
+        let m = Math::subscript(Math::binding("x_data"), i.clone());
+        let Math::Ident(id) = &m else {
+            panic!("{m:?}");
+        };
+        assert_eq!(id.indices, vec![i.clone()]);
+        assert_eq!(id.target.as_deref(), Some("x_data"));
+        // Indices are children: their references and depth count.
+        let g = Math::subscript(Math::binding("a"), Math::subscript(Math::binding("g"), i));
+        assert_eq!(g.refs(), vec!["a", "g"]);
+        assert_eq!(g.depth(), 3);
+        // Any other base keeps a `Sub` node.
+        assert!(matches!(
+            Math::subscript(Math::text("Law"), Math::int(1)),
+            Math::Sub(..)
+        ));
     }
 
     #[test]

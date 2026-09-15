@@ -25,8 +25,7 @@ use flatppl_core::{
     RefNs, Scalar, Symbol, Type, Variance,
 };
 
-use crate::ast::{BigOp, BinOp, Fence, Ident, Math, Op, Rel, Statement, Sym};
-use crate::names::Atom;
+use crate::ast::{BigOp, BinOp, Fence, Math, Op, Rel, Statement, Sym};
 
 /// Literal data beyond this entry count moves to the data appendix.
 /// Wide numeric strings may reach the shared display-width limit sooner.
@@ -1686,7 +1685,7 @@ impl<'m> Lowerer<'m> {
             }
         }
         let whole = self.expr(collection);
-        index_ident(whole, i)
+        Math::subscript(whole, i.clone())
     }
 
     /// The elementwise reading of `broadcast(f, args…)`: a fresh index (or
@@ -1785,7 +1784,7 @@ impl<'m> Lowerer<'m> {
     /// index: `y_i ∼ K(x_i),  i = 1, …, n` or `v_i = f(x_i),  i = 1, …, n`,
     /// the range when the shape is static.
     fn indexed_row(&mut self, lhs: Math, rel: Rel, e: Elementwise) -> Lowered {
-        let lhs = index_ident(lhs, &e.index);
+        let lhs = Math::subscript(lhs, e.index.clone());
         let rhs = match e.range {
             Some((lo, hi)) => Math::row(vec![
                 e.body,
@@ -1927,24 +1926,6 @@ struct Elementwise {
     body: Math,
     range: Option<(Math, Math)>,
     is_measure: bool,
-}
-
-/// `base` indexed by `i`. A name takes a plain index letter into its own
-/// subscript list (`x_data` at `i` is `x_{data,i}`, not `x_{data_i}`);
-/// anything else is subscripted.
-fn index_ident(base: Math, i: &Math) -> Math {
-    let plain_letter = |id: &Ident| {
-        id.display.subs.is_empty()
-            && id.display.wrap.is_none()
-            && matches!(id.display.head, Atom::Letter(_) | Atom::Greek(_))
-    };
-    match (base, i) {
-        (Math::Ident(mut id), Math::Ident(ix)) if id.display.wrap.is_none() && plain_letter(ix) => {
-            id.display.subs.push(ix.display.head.clone());
-            Math::Ident(id)
-        }
-        (base, i) => Math::subscript(base, i.clone()),
-    }
 }
 
 /// The pieces of a lowered `aggregate` / `metricsum`.
@@ -2566,7 +2547,7 @@ mod tests {
         let src = "G = 3\na ~ iid(Normal(0, 1), G)\ng = [1, 2, 3, 1, 2, 3]\nxs = [-1.2, 0.4, 1.1, -0.3, 0.8, 2.0]\nb = elementof(reals)\neta = a[g] .+ b .* xs\np = invlogit.(eta)";
         let rows = rows(src);
         let eta = mathml::expr(&row_named(&rows, "eta").statement.rhs);
-        assert!(eta.contains("<msub><mi data-flatppl-ref=\"a\">a</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{eta}");
+        assert!(eta.contains("<msub data-flatppl-ref=\"a\"><mi>a</mi><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></msub>"), "{eta}");
         let p = mathml::expr(&row_named(&rows, "p").statement.rhs);
         assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub data-flatppl-ref=\"eta\"><mi>η</mi><mi>i</mi></msub>"), "{p}");
     }
@@ -2865,7 +2846,7 @@ mod tests {
         let c = row_named(&rows, "C");
         assert_eq!(
             mathml::expr(&c.statement.lhs),
-            "<msub><mi data-flatppl-ref=\"C\">C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub>"
+            "<msub data-flatppl-ref=\"C\"><mi>C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub>"
         );
         let body = mathml::expr(&c.statement.rhs);
         assert!(
@@ -2874,7 +2855,7 @@ mod tests {
         );
         assert!(
             body.contains(
-                "<msub><mi data-flatppl-ref=\"A\">A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub>"
+                "<msub data-flatppl-ref=\"A\"><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub>"
             ),
             "{body}"
         );
@@ -2909,7 +2890,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("<msub><mi data-flatppl-ref=\"r\">r</mi><mi>μ</mi></msub>"),
+            body.contains("<msub data-flatppl-ref=\"r\"><mi>r</mi><mi>μ</mi></msub>"),
             "{body}"
         );
         // The metric marks the equality sign, `s =ᵍ r^μ r_μ`, and is a reference.
@@ -2957,7 +2938,7 @@ mod tests {
         );
         assert_eq!(
             mathml::expr(&row_named(&rows, "y").statement.rhs),
-            "<msub><mi data-flatppl-ref=\"v\">v</mi><mn>2</mn></msub>"
+            "<msub data-flatppl-ref=\"v\"><mi>v</mi><mn>2</mn></msub>"
         );
         // The running index joins the name's own subscripts.
         let z = mathml::expr(&row_named(&rows, "z").statement.rhs);

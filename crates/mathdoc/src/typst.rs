@@ -51,18 +51,17 @@ pub fn expr(m: &Math) -> String {
     match m {
         Math::Ident(id) => {
             let head = atom(&id.display.head);
-            let symbol = if id.display.subs.is_empty() {
+            let parts: Vec<String> = id
+                .display
+                .subs
+                .iter()
+                .map(atom)
+                .chain(id.indices.iter().map(expr))
+                .collect();
+            let symbol = if parts.is_empty() {
                 head
             } else {
-                format!(
-                    "attach({head}, br: {})",
-                    id.display
-                        .subs
-                        .iter()
-                        .map(atom)
-                        .collect::<Vec<_>>()
-                        .join(" \\, ")
-                )
+                format!("attach({head}, br: {})", parts.join(" \\, "))
             };
             match id.display.wrap {
                 Some(crate::names::Wrap::Squared) => format!("{symbol}^2"),

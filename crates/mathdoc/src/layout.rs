@@ -14,7 +14,9 @@ pub(crate) fn width(m: &Math) -> usize {
     match m {
         Math::Ident(id) => {
             atom(&id.display.head)
-                + id.display.subs.iter().map(atom).sum::<usize>().div_ceil(2)
+                + (id.display.subs.iter().map(atom).sum::<usize>()
+                    + id.indices.iter().map(width).sum::<usize>())
+                .div_ceil(2)
                 + match id.display.wrap {
                     Some(crate::names::Wrap::Log) => 4,
                     Some(_) => 1,

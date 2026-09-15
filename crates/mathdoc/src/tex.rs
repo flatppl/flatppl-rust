@@ -53,16 +53,15 @@ pub fn expr(m: &Math) -> String {
     match m {
         Math::Ident(id) => {
             let mut s = atom(&id.display.head);
-            if !id.display.subs.is_empty() {
-                s.push_str(&format!(
-                    "_{{{}}}",
-                    id.display
-                        .subs
-                        .iter()
-                        .map(atom)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+            let parts: Vec<String> = id
+                .display
+                .subs
+                .iter()
+                .map(atom)
+                .chain(id.indices.iter().map(&render))
+                .collect();
+            if !parts.is_empty() {
+                s.push_str(&format!("_{{{}}}", parts.join(", ")));
             }
             match id.display.wrap {
                 Some(crate::names::Wrap::Squared) => s = format!("{{{s}}}^{{2}}"),

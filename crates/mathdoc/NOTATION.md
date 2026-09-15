@@ -193,7 +193,7 @@ Negative right-hand factors keep parentheses, including nested coefficients:
 | `y ~ K.(xs, ys)` as a row | y_i ∼ K(xs_i, ys_i),  i = 1, …, n — one law per index, the range when the shape is static |
 | `v = f.(xs, c)`, `v = xs .+ c` as a row | v_i = f(xs_i, c),  i = 1, …, n — the same row `v[.i] := …` gives |
 | a broadcast in expression position | ⨂_{i=1}^{n} K(xs_i, ys_i), (f(xs_i, c))_{i=1}^{n} — the object it denotes, since no left-hand side carries the index |
-| an indexed name | the index joins the name's subscripts: `x_data` at i is x_{data,i} |
+| an index on a name | joins the name's subscript list, whatever the index: `x_data` at i is x_{data,i}, `nu_B[g]` under i is ν_{B,g_i}, `A[i][j]` is A_{i,j}; a marked name keeps the index inside its marker (`sigma_sq` at i is σ_i²) |
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |
 | `a[idx]` with an array of indices | a_{idx} and, under an index i, a_{idx_i} |
 | `aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` | Σ_{j} A_{ij} B_{jk}, other reductions as var_{j}(…) in roman |
