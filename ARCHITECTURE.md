@@ -197,11 +197,12 @@ trace + per-op rule catalogue) · `flatppl-lint` (lint rules over the IR) ·
 `flatppl-determinizer` (measure-elimination → FlatPDL; density side: MVP + `is_flatpdl`
 in #57, plus structural lowering in #60/#62; sample side is Phase-3 LEFT) ·
 `flatppl-mathdoc` (FlatPPL → mathematics: a target-independent math AST built
-from the typed module, a MathML printer, HTML document assembly; the notation
-contract is `crates/mathdoc/NOTATION.md`; a Typst printer with a Typst-CLI
-oracle test is the planned second target) ·
-`flatppl-cli` (the `flatppl` driver binary — `convert` incl. the `.html`
-math target, `infer`, `prepare`, `determinize`, `fmt`, `lint`) ·
+from the typed module, MathML / TeX / Typst printers that only choose glyphs,
+and HTML, Markdown, TeX and Typst document assembly; the notation contract is
+`crates/mathdoc/NOTATION.md`) ·
+`flatppl-cli` (the `flatppl` driver binary — `convert` incl. the `.html` /
+`.md` / `.tex` / `.typ` math targets, `infer`, `prepare`, `determinize`,
+`fmt`, `lint`) ·
 `flatppl-lsp` (the FlatPPL language server binary) ·
 `flatppl-wasm-api` (wasm-bindgen `convert` + `render_math` bindings; WASM artifact).
 `syntax`/`flatpir`/`infer` depend on `core`; `core` depends on nothing. Library
@@ -285,8 +286,9 @@ feature is on — lean default build, opt-in weight; `infer` is light and rides
 in the default set). Verbs map to library crates: `convert` → syntax + flatpir;
 `infer` → `flatppl-infer`; `prepare` → `flatppl-fileaccess/net`; `determinize` →
 `flatppl-determinizer` (the "legalize to FlatPDL" verb, already landed);
-`convert … .html` → `flatppl-mathdoc` (the `mathdoc` feature, which rides on
-`infer` because the page is rendered from the typed module); a broader
+`convert … .html` / `.md` / `.tex` / `.typ` → `flatppl-mathdoc` (the `mathdoc`
+feature, which rides on `infer` because the document is rendered from the typed
+module); a broader
 `check` → profile checker is future work. The crate can host additional `[[bin]]`s later (gated by
 `required-features`); a second tool with its own heavy dependency stack would
 split into its own crate instead.
