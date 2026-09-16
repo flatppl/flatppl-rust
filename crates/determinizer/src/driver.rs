@@ -40,8 +40,9 @@ const MEASURE_VOCAB: &[&str] = &[
     "densityof",
     "rand",
     // `totalmass` is OUT of FlatPDL: it is a query op that takes a measure, which
-    // is no longer a value (flatpdl-determinise.md §1–§2). It must be eliminated
-    // (refused, in this MVP) like any other measure-layer op — never emitted.
+    // is no longer a value (see ARCHITECTURE.md "Lowering" and the FlatPDL boundary in
+    // this crate's `lib.rs` header). It must be eliminated (refused, in this MVP) like
+    // any other measure-layer op — never emitted.
     "totalmass",
     "likelihoodof",
     "joint_likelihood",
@@ -708,7 +709,7 @@ const COMBINATOR_OPS: &[&str] = &[
     // terms), so a `d = joint(...)` binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
     "joint",
-    // Likelihood combinator (Task 3 / measure-algebra-audit.md H2): a
+    // Likelihood combinator (Task 3; measure-algebra audit, 2026-06, finding H2): a
     // `obs = likelihoodof(K, data)`
     // binding is unwrapped at the `logdensityof` entry (its `K` is scored at the
     // baked-in `data`), so a binding referenced only by the now-lowered
@@ -762,7 +763,7 @@ const COMBINATOR_OPS: &[&str] = &[
 /// The type-based arm generalises past the fixed `COMBINATOR_OPS` op-name list:
 /// distribution *constructors* (`Normal`, `Beta`, …) are not a closed set, so a
 /// standalone `gauss_x = Normal(mu, sigma)` orphaned after a `likelihoodof`
-/// density query (measure-algebra-audit.md H2) cannot be caught by op name.
+/// density query (measure-algebra audit, 2026-06, finding H2) cannot be caught by op name.
 /// Keying the second arm
 /// on the *inferred type* — which `is_flatpdl` itself uses to reject residual
 /// measure-layer values — sweeps exactly the bindings that would otherwise trip

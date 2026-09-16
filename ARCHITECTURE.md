@@ -24,6 +24,16 @@ FlatPPL / FlatPIR text  ──read──►  flatppl-core (one multi-level IR)
                               target-profile-conforming core  ──►  codegen / emit
 ```
 
+Three commitments shape everything downstream. **FlatPDL is the narrow waist and it
+stays high-level:** per-backend lowering is a spectrum, so `MvNormal` stays
+`MvNormal` and `aggregate` stays `aggregate` until a backend that needs them gone
+lowers them — FlatPDL is a high MLIR-style dialect, not a scalar-primitive soup.
+**The query module is the single compilation unit** — `(model + pinned external
+shapes + requested output set)` — and local interpretation, local codegen and remote
+offload are backend choices over that same unit. **Every transformation pass is
+endomorphic:** in-memory FlatPIR → in-memory FlatPIR, so a pass's output re-parses as
+valid FlatPIR and its annotations are strippable on serialisation.
+
 ## `flatppl-core` — one multi-level IR
 
 `flatppl-core` is the single in-memory IR — the extended-FlatPIR model — and it is
@@ -353,6 +363,42 @@ bugs:
   value-set must be a subset of `natural_of(type)`, the canonical type→value-set
   mapping. Extend its corpus when you add a value-set producer, so a new one
   cannot silently drift from the natural extent.
+- **Derive oracles independently of `flatppl-js`.** Reuse its fixtures as
+  *stimuli* — they have proven discriminating power — but never bake its output in as
+  the expected value. That is oracle contamination, and it is how the measure-algebra
+  divergences survived: no test stepped off `prior == lawof(draws)`. Expected values
+  come from closed forms or from a lineage-independent library (Distributions.jl /
+  MeasureBase.jl). LLMs are triage and disagreement-detectors, not authorities.
+
+## Determiniser design constraints
+
+Three properties of symbolic disintegration that bound what the measure-elimination
+pass can promise. **Tractability is syntactic, not semantic:** disintegration fails on
+semantically-equivalent-but-syntactically-different forms (`x+x` vs `2x`), blows up on
+`superpose`, and refuses non-absolutely-continuous observations — so a loud, actionable
+refusal is a first-class outcome of the pass, not an edge case. **Order-irrelevance is
+bounded by normalization:** commutativity holds within the unnormalized s-finite
+fragment only, so no reordering or rewrite pass may move terms across a
+`normalize`/conditioning boundary. **FlatPPL sits in the safe semantic fragment** —
+first-order, flat, no measures-of-measures — which sidesteps the
+Giry-monad-not-strong / quasi-Borel complications; keep it that way.
+
+**Why the marginalisation classifier admits no Monte-Carlo route.** A latent whose
+variate is not in the query point must be integrated out, and `crates/determinizer`
+routes it three ways: discrete finite support → enumerate to a mass-weighted
+`logsumexp` (exact); a recognised conjugate pair → the closed-form
+`CONJUGATE_TABLE` marginal; any other continuous or infinite-discrete latent →
+refuse. There is no deferred bucket. Numeric quadrature is permitted by §06 for
+a projection of a measure with no explicit product structure ("engines may either
+compute the marginal numerically or report a static error") but is not built, so
+that case refuses too. The obvious further route — MC, `logsumexp − logN` over sampled
+`aᵢ` — is **rejected outright**, not deferred. It injects `builtin_sample` plus an
+rngstate into a `logdensityof`, which makes the density *stochastic*, and it is
+*Jensen-biased*; both are disqualifying for gradient inference, and a stochastic
+density breaks the determinised profile's whole point. (Distinct from Borel
+non-uniqueness, which bites *conditioning* — `disintegrate`/`restrict` — not the
+forward marginal.) The maths behind each conjugate row is in
+`crates/determinizer/src/marginal.md`.
 
 ## Open / not-yet-locked
 

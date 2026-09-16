@@ -1,6 +1,6 @@
 //! CLI-level coverage for `flatppl stablehlo`'s `inputs`/`outputs` ABI
 //! recognition (PR-1, design doc
-//! `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`):
+//! `crates/stablehlo/docs/inputs-outputs-abi.md`):
 //! `stablehlo_cmd` roots on the declared `inputs`/`outputs` binding names
 //! when present (no deprecation warning), and falls back to the legacy
 //! last-public-binding convention — WITH a one-line deprecation warning on

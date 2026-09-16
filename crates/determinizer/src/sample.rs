@@ -1,6 +1,6 @@
-//! Sample-side determinisation (spec §07 measure-eval-prims; flatppl-dev
-//! flatpdl-determinise.md §6b). `rand(rng, lawof(x))` re-runs `x`'s generative
-//! subgraph with each `draw(mᵢ)` replaced by `builtin_sample(rngᵢ, mᵢ, inputᵢ)`,
+//! Sample-side determinisation (spec §07 measure-eval-prims). `rand(rng, lawof(x))`
+//! re-runs `x`'s generative subgraph with each `draw(mᵢ)` replaced by
+//! `builtin_sample(rngᵢ, mᵢ, inputᵢ)`,
 //! threading one RNG state sequentially in dependency order.
 //!
 //! Independent draws (a `record` of leaf draws each referenced once) are built
@@ -13,7 +13,7 @@
 //! [`Module::set_binding_rhs`], mirroring `density::lower_record_of_draws`) and
 //! lets consumers reference it as `(%ref self mu)`. Inlining a shared latent
 //! per consumer would re-draw it and break shared-ancestor identity
-//! (measure-algebra-audit H7/M4). A `record` field's `draw` (inline or reached
+//! (measure-algebra audit, 2026-06, findings H7/M4). A `record` field's `draw` (inline or reached
 //! via a `(%ref self x)` binding reference) is resolved uniformly by
 //! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
@@ -796,7 +796,7 @@ fn lower_record_of_draws_sample(
     // A `draw`-binding referenced by more than one consumer (two fields here, or
     // another draw's kernel input) is a SHARED latent: the per-field inline fold
     // below would sample it once per consumer, re-drawing it and breaking
-    // shared-ancestor identity (measure-algebra-audit H7/M4). Detect that and route
+    // shared-ancestor identity (measure-algebra audit, 2026-06, H7/M4). Detect that and route
     // to the binding-rewrite path, which samples each latent once.
     let field_bids: Vec<Option<BindingId>> = fields
         .iter()

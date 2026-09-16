@@ -9245,7 +9245,7 @@ fn emit_sample_categorical_single_category_iid_matches_frozen_golden() {
 // ---- PR-1: the `inputs`/`outputs` compilation ABI --------------------------
 //
 // `inputs = (a, b)` / `outputs = (q1, q2)` are reserved top-level bindings
-// (design doc `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`)
+// (design doc `crates/stablehlo/docs/inputs-outputs-abi.md`)
 // that survive determinization (they are the DCE roots) and give the emitted
 // `func.func` an explicit, ordered arg/result list — superseding
 // `is_free_param`'s source-order convention and `select_query`'s

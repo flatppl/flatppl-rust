@@ -908,7 +908,7 @@ lp = logdensityof(L, record(mu = 0.0, nu = 0.5, xi = 1.0))";
     );
 }
 
-// Regression fixture for transitive pinning (measure-algebra-audit.md H3): a variate reached
+// Regression fixture for transitive pinning (measure-algebra audit, 2026-06, H3): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may
 // survive, even though `a` is unreferenced by `lp` and depends on `theta`.

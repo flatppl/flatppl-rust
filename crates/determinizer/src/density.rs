@@ -103,7 +103,7 @@
 //!   components is neither form — **refused** rather than guessing which one
 //!   was meant.
 //!
-//! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
+//! **Likelihood query** (measure-algebra audit, 2026-06, finding H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
 //! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
 //! `obs` baked into the likelihood. `K` is scored at `obs`, then each θ field is
@@ -404,7 +404,7 @@ fn lower_bayesupdate(
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
 /// with `K`'s free parameters bound from the θ record (§06 "Likelihood
-/// construction", measure-algebra-audit.md H2).
+/// construction"; measure-algebra audit, 2026-06, finding H2).
 ///
 /// Each θ field value is inlined into THIS query's emitted density subtree only
 /// (a self-contained per-query substitution keyed on `(%ref self <name>)` — see

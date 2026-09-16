@@ -877,7 +877,7 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
     };
 
     // The `inputs`/`outputs` compilation ABI (design doc
-    // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) is
+    // `crates/stablehlo/docs/inputs-outputs-abi.md`) is
     // REQUIRED, both modes: the last-public-binding query heuristic has been
     // removed. DCE roots on both present reserved names (so the outputs'
     // backward cone AND the declared inputs survive — an unused declared input
