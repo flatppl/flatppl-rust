@@ -14,3 +14,6 @@ staterror / shapefactor). Out-of-scope constructs fail loud rather than mis-conv
 emitted module is re-parsed to validate it.
 
 Drives the `flatppl convert --from hs3|pyhf` verb in [`flatppl-cli`](../cli).
+
+[`ORACLES.md`](ORACLES.md) holds one independently-derived checkpoint per HS3 kind — what to reach
+for when an end-to-end score moves and you need to know which construct moved.
