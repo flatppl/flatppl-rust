@@ -96,14 +96,8 @@ pub fn determinize_with_roots(
     // bindings, so this is a no-op there.
     crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
 
-    // §09 standard-module FUNCTION member lowering: rewrite `hep.interp_pwlin(…)`
-    // and its siblings into base ops (`crate::stdfn`). A function member is a
-    // catalogue entry with a closed form in §09, not a measure, so it cannot reach
-    // the constructor-tag path a §09 DISTRIBUTION member takes; without this it
-    // survives as a `CallHead::User` application and the conformance gate refuses
-    // it. Runs here so the measure-reduction loop and the density lowering see
-    // base ops only. A member with no base-op form is left in place for the
-    // conformance gate to name (root-based DCE must still be able to drop one).
+    // Lower local §09 functions before the application-graft guards. Their
+    // unused arguments may contain module refs that root-based DCE will drop.
     crate::stdfn::lower_std_module_functions(&mut work)?;
 
     // Cross-module FUNCTION/kernel APPLICATION callees in regular bindings
@@ -117,12 +111,19 @@ pub fn determinize_with_roots(
     // nested inside a binding's application RHS, which that pass does not reach.
     let app_bindings: Vec<(flatppl_core::BindingId, NodeId)> =
         work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    let mut grafted_application = false;
     for (bid, rhs) in app_bindings {
         if let Some(rebuilt) =
             crate::density::graft_kernel_application_callee(&mut work, rhs, bundle)?
         {
             work.set_binding_rhs(bid, rebuilt);
+            grafted_application = true;
         }
+    }
+
+    // Application grafts can introduce members absent from the initial pass.
+    if grafted_application {
+        crate::stdfn::lower_std_module_functions(&mut work)?;
     }
 
     loop {
@@ -443,6 +444,8 @@ fn apply_rule(
         if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
+            // The initial standard-function pass could not see this dependency.
+            crate::stdfn::lower_std_module_functions(m)?;
             // The intermediate `x = m.L` self-ref binding (if any) and the
             // `helpers = load_module(…)` binding may now be dead; sweep the
             // measure-typed ones so the next scan is clean.

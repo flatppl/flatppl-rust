@@ -1589,3 +1589,40 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
         "expected a Normal density term with the grafted-function-derived mean:\n{ir}"
     );
 }
+
+/// Lower local members before graft checks and imported members after grafts.
+#[test]
+fn standard_functions_lower_before_and_after_module_grafts() {
+    let helpers = r#"
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+x = 1.0
+a = elementof(reals)
+g(p) = hep.interp_poly6_exp(0.8, 1.0, 1.2, p)
+k = functionof(Normal(mu = hep.interp_poly6_exp(0.8, 1.0, 1.2, a), sigma = 1.0))
+L = likelihoodof(k, 2.0)
+"#;
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    for query in [
+        "lp = logdensityof(h.L, record(a = theta))",
+        "mu = h.g(theta)\nlp = logdensityof(Normal(mu, 1.0), 2.0)",
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         unused = hep.kallen(h.x, 1.0, 1.0)\n\
+         lp = logdensityof(Normal(0.0, 1.0), 0.0)",
+    ] {
+        let source = format!(
+            "flatppl_compat = \"0.1\"\nh = load_module(\"helpers.flatppl\")\n\
+             theta = elementof(reals)\n{query}"
+        );
+        let mut model = parse(&source);
+        let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
+        let roots = [model.intern("lp")];
+        let lowered = flatppl_determinizer::determinize_with_roots(&model, &bundle, Some(&roots))
+            .expect("imported standard functions must lower after their graft");
+        assert!(flatppl_determinizer::is_flatpdl(&lowered).is_ok());
+    }
+}
