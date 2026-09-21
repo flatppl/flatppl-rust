@@ -15,6 +15,8 @@ use flatppl_core::{
 
 use crate::Level;
 use crate::consteval::{count_dims, count_dims_with_zero, resolve_count, resolve_dim, static_dim};
+use crate::rule::RuleStep;
+use crate::rule::RuleStep::Ready;
 use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -59,7 +61,7 @@ pub(crate) fn call_rule(
     args: &[ArgInfo],
     named: &[NamedInfo],
     joined: Phase,
-) -> (Type, Phase) {
+) -> RuleStep<(Type, Phase)> {
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
@@ -83,16 +85,16 @@ pub(crate) fn call_rule(
                      known value like `{name}` would need to be one)"
                 ),
             ));
-            return (
+            return Ready((
                 Type::Failed(format!("{name} is not callable").into()),
                 Phase::Fixed,
-            );
+            ));
         }
         if let Some(ty) = user_arity_check(inf, id, callee_node, &callee_ty, args, named) {
-            return (ty, joined);
+            return Ready((ty, joined));
         }
-        let ty = user_call_type(inf, callee_node, &callee_ty, args, named);
-        return (ty, joined);
+        return user_call_type(inf, callee_node, &callee_ty, args, named)
+            .map(inf, move |_, ty| (ty, joined));
     }
 
     let flatppl_core::CallHead::Builtin(op) = call.head else {
@@ -111,17 +113,17 @@ pub(crate) fn call_rule(
             source,
             "only file, http and https source schemes are allowed (spec §04)",
         ));
-        return (
+        return Ready((
             Type::Failed("unsupported source scheme".into()),
             Phase::Fixed,
-        );
+        ));
     }
 
     // Reified callables (`functionof` / `kernelof`) — typed by their boundary
     // + body. The phase follows the CAPTURED ancestors, so the rule returns it
     // rather than assuming `%fixed`; see [`reification_type`].
     if call.inputs.is_some() {
-        return reification_type(inf, id, call, &name, args);
+        return Ready(reification_type(inf, id, call, &name, args));
     }
 
     // Keyword arguments moved into their DECLARED POSITIONS, once, before any rule reads
@@ -141,7 +143,7 @@ pub(crate) fn call_rule(
     // per-op rules because most of them index fixed argument positions and so
     // ignore extras and silently type an under-supplied call.
     if let Some(ty) = arity_check(inf, id, &name, args, named) {
-        return (ty, joined);
+        return Ready((ty, joined));
     }
 
     // §04's special operations declare their input counts in prose, not in the
@@ -149,19 +151,19 @@ pub(crate) fn call_rule(
     // This is the same rule read off that list, plus §04's flat "Nullary calls
     // (`f()`) are not allowed."
     if let Some(ty) = special_arity_check(inf, id, &name, args, named) {
-        return (ty, joined);
+        return Ready((ty, joined));
     }
 
     // §03 well-formedness of the aggregate CONSTRUCTORS, before the per-op rules
     // build a type from names they have not checked are usable.
     if let Some(ty) = constructor_check(inf, id, &name, args, named) {
-        return (ty, joined);
+        return Ready((ty, joined));
     }
 
     // Written sizes, after `arity_check` (which needs the call as written) and
     // ahead of the per-op rules, which read the size to build a shape.
     if let Some(ty) = written_size_check(inf, &name, args, named) {
-        return (ty, joined);
+        return Ready((ty, joined));
     }
 
     // AFTER `arity_check`, which must see the call as WRITTEN: it counts
@@ -181,7 +183,7 @@ pub(crate) fn call_rule(
     // and ahead of the per-op rules, which read an argument's type without asking
     // whether the row's documented domain admits it.
     if let Some(ty) = domain_check(inf, &name, args) {
-        return (ty, joined);
+        return Ready((ty, joined));
     }
 
     let ty = match name.as_str() {
@@ -369,22 +371,22 @@ pub(crate) fn call_rule(
             if name == "metricsum" {
                 // First: every check below reads `output_axes` as a literal list.
                 if let Some(failed) = metricsum_output_axes_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
                 if let Some(failed) = metricsum_neutral_axis_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
                 if let Some(failed) = metricsum_metric_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
                 if let Some(failed) = metricsum_expr_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
                 if let Some(failed) = metricsum_output_index_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
                 if let Some(failed) = metricsum_contraction_check(inf, args) {
-                    return (failed, joined);
+                    return Ready((failed, joined));
                 }
             }
             let elem = Type::Scalar(aggregate_result_kind(inf, args).unwrap_or_else(|| {
@@ -465,10 +467,10 @@ pub(crate) fn call_rule(
                                  `n_trailing`"
                             ),
                         ));
-                        return (
+                        return Ready((
                             Type::Failed("addaxes structural rank exceeds resource guard".into()),
                             joined,
-                        );
+                        ));
                     };
                     let mut dims = Vec::with_capacity(rank);
                     dims.extend(std::iter::repeat_n(static_dim(1), nl as usize));
@@ -585,10 +587,17 @@ pub(crate) fn call_rule(
         // variate (domain + support value-set) and reading `f`'s body type gives
         // the codomain; fall back to `f`'s un-substituted body, then to `%any`
         // (honest — never a guess). Mass is filled (mass-preserving) by `fill_mass`.
-        "pushfwd" => Type::Measure {
-            domain: Box::new(pushfwd_codomain(inf, args).unwrap_or(Type::Any)),
-            mass: Mass::Deferred,
-        },
+        "pushfwd" => {
+            return pushfwd_codomain(inf, args).map(inf, move |_, codomain| {
+                (
+                    Type::Measure {
+                        domain: Box::new(codomain.unwrap_or(Type::Any)),
+                        mass: Mass::Deferred,
+                    },
+                    joined,
+                )
+            });
+        }
         // `markovchain(kernel, init, n)` / `kscan(kernel, init, xs)` (spec §06):
         // a measure over a length-`len` trajectory in `init`'s state space.
         // Domain is `array[len]` of `init`'s type — `n` (markovchain) folds at
@@ -801,7 +810,9 @@ pub(crate) fn call_rule(
         }
 
         // ---- broadcasting (spec §04) ----
-        "broadcast" => broadcast_type(inf, id, args, named),
+        "broadcast" => {
+            return broadcast_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
+        }
 
         // ---- catalogue dispatch (spec §07 functions + spec §08 distributions) ----
         // Per-name functions whose result is a pure scalar (constant, RealOrComplexOfArg,
@@ -835,7 +846,7 @@ pub(crate) fn call_rule(
                                  not a FlatPPL built-in (spec §04 \"Name resolution\")"
                             ),
                         ));
-                        return (Type::Failed("unresolvable name".into()), Phase::Fixed);
+                        return Ready((Type::Failed("unresolvable name".into()), Phase::Fixed));
                     }
                     // A predefined constant (spec §03) is a KNOWN VALUE, never a
                     // callable — §04 "no callables may have nullary inputs, as this
@@ -855,10 +866,10 @@ pub(crate) fn call_rule(
                                  known value like `{name}` would need to be one)"
                             ),
                         ));
-                        return (
+                        return Ready((
                             Type::Failed(format!("{name} is not callable").into()),
                             Phase::Fixed,
-                        );
+                        ));
                     }
                     inf.note_gap(op);
                     Type::Deferred
@@ -881,7 +892,7 @@ pub(crate) fn call_rule(
             .map_or(Phase::Fixed, |a| law_phase(inf, a.0, 0)),
         _ => joined,
     };
-    (ty, phase)
+    Ready((ty, phase))
 }
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
@@ -1931,29 +1942,31 @@ fn metricsum_neutral_axis_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) 
 /// offender wins: a whole body of neutral axes is one mistake, and naming them
 /// all would bury the fix.
 fn neutral_axis_scan(inf: &Inferencer<'_, '_>, node: NodeId, bare: &mut Option<(NodeId, String)>) {
-    if bare.is_some() {
-        return;
-    }
-    if let Node::Axis(ax) = inf.module.node(node) {
-        if ax.variance.is_none() {
-            *bare = Some((node, inf.module.resolve(ax.name).to_string()));
-        }
-        return;
-    }
-    let Node::Call(c) = inf.module.node(node).clone() else {
-        return;
-    };
-    if let flatppl_core::CallHead::Builtin(op) = c.head {
-        let name = inf.module.resolve(op);
-        if name == "aggregate" || name == "metricsum" {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if bare.is_some() {
             return;
         }
-    }
-    for &a in c.args.iter() {
-        neutral_axis_scan(inf, a, bare);
-    }
-    for n in c.named.iter() {
-        neutral_axis_scan(inf, n.value, bare);
+        if inf.is_substituted(node) {
+            continue;
+        }
+        if let Node::Axis(ax) = inf.module.node(node) {
+            if ax.variance.is_none() {
+                *bare = Some((node, inf.module.resolve(ax.name).to_string()));
+            }
+            continue;
+        }
+        let Node::Call(c) = inf.module.node(node) else {
+            continue;
+        };
+        if let flatppl_core::CallHead::Builtin(op) = c.head {
+            let name = inf.module.resolve(op);
+            if name == "aggregate" || name == "metricsum" {
+                continue;
+            }
+        }
+        pending.extend(c.named.iter().rev().map(|n| n.value));
+        pending.extend(c.args.iter().rev().copied());
     }
 }
 
@@ -2059,34 +2072,33 @@ fn variance_container_scan(
     node: NodeId,
     bad: &mut Option<(NodeId, String, &'static str)>,
 ) {
-    if bad.is_some() {
-        return;
-    }
-    let Node::Call(c) = inf.module.node(node).clone() else {
-        return;
-    };
-    if let flatppl_core::CallHead::Builtin(op) = c.head {
-        let name = inf.module.resolve(op).to_string();
-        if name == "aggregate" || name == "metricsum" {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if bad.is_some() {
             return;
         }
-        if (name == "get" || name == "get0") && c.args.len() >= 2 {
-            let variance_marked = c.args[1..]
-                .iter()
-                .any(|&i| matches!(inf.module.node(i), Node::Axis(ax) if ax.variance.is_some()));
-            if variance_marked {
-                *bad = variance_container_complaint(inf, c.args[0]);
-                if bad.is_some() {
-                    return;
+        if inf.is_substituted(node) {
+            continue;
+        }
+        let Node::Call(c) = inf.module.node(node) else {
+            continue;
+        };
+        if let flatppl_core::CallHead::Builtin(op) = c.head {
+            let name = inf.module.resolve(op);
+            if name == "aggregate" || name == "metricsum" {
+                continue;
+            }
+            if (name == "get" || name == "get0") && c.args.len() >= 2 {
+                let variance_marked = c.args[1..].iter().any(
+                    |&i| matches!(inf.module.node(i), Node::Axis(ax) if ax.variance.is_some()),
+                );
+                if variance_marked {
+                    *bad = variance_container_complaint(inf, c.args[0]);
                 }
             }
         }
-    }
-    for &a in c.args.iter() {
-        variance_container_scan(inf, a, bad);
-    }
-    for n in c.named.iter() {
-        variance_container_scan(inf, n.value, bad);
+        pending.extend(c.named.iter().rev().map(|n| n.value));
+        pending.extend(c.args.iter().rev().copied());
     }
 }
 
@@ -2094,10 +2106,10 @@ fn variance_container_scan(
 /// of scalars or its type is not yet known. A container that is not an array at
 /// all is a different error, left to `get`'s own rule.
 fn variance_container_complaint(
-    inf: &mut Inferencer<'_, '_>,
+    inf: &Inferencer<'_, '_>,
     container: NodeId,
 ) -> Option<(NodeId, String, &'static str)> {
-    let ty = inf.infer_node(container).0;
+    let ty = inf.node_annotation(container).0;
     let Type::Array { elem, .. } = &ty else {
         return None;
     };
@@ -2327,26 +2339,28 @@ fn variance_axis_occurrences(
     node: NodeId,
     out: &mut Vec<(NodeId, Symbol, Variance)>,
 ) {
-    if let Node::Axis(ax) = inf.module.node(node) {
-        if let Some(v) = ax.variance {
-            out.push((node, ax.name, v));
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if inf.is_substituted(node) {
+            continue;
         }
-        return;
-    }
-    let Node::Call(c) = inf.module.node(node) else {
-        return;
-    };
-    if let flatppl_core::CallHead::Builtin(op) = c.head {
-        let name = inf.module.resolve(op);
-        if name == "aggregate" || name == "metricsum" {
-            return;
+        if let Node::Axis(ax) = inf.module.node(node) {
+            if let Some(v) = ax.variance {
+                out.push((node, ax.name, v));
+            }
+            continue;
         }
-    }
-    for &a in c.args.iter() {
-        variance_axis_occurrences(inf, a, out);
-    }
-    for n in c.named.iter() {
-        variance_axis_occurrences(inf, n.value, out);
+        let Node::Call(c) = inf.module.node(node) else {
+            continue;
+        };
+        if let flatppl_core::CallHead::Builtin(op) = c.head {
+            let name = inf.module.resolve(op);
+            if name == "aggregate" || name == "metricsum" {
+                continue;
+            }
+        }
+        pending.extend(c.named.iter().rev().map(|n| n.value));
+        pending.extend(c.args.iter().rev().copied());
     }
 }
 
@@ -3430,29 +3444,33 @@ fn flatten_dims(t: &Type) -> Vec<Dim> {
 /// consistency); axes that never index a statically-shaped array stay absent
 /// (→ dynamic).
 fn collect_axis_dims(
-    inf: &mut Inferencer<'_, '_>,
+    inf: &Inferencer<'_, '_>,
     node: NodeId,
     out: &mut std::collections::HashMap<Symbol, Dim>,
 ) {
-    let Node::Call(c) = inf.module.node(node).clone() else {
-        return;
-    };
-    if let flatppl_core::CallHead::Builtin(op) = c.head {
-        let name = inf.module.resolve(op).to_string();
-        if (name == "get" || name == "get0") && !c.args.is_empty() {
-            let arr_ty = inf.infer_node(c.args[0]).0;
-            let flat = flatten_dims(&arr_ty);
-            for (k, &idx) in c.args.iter().enumerate().skip(1) {
-                if let Node::Axis(ax) = inf.module.node(idx)
-                    && let Some(&d) = flat.get(k - 1)
-                {
-                    out.entry(ax.name).or_insert(d);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if inf.is_substituted(node) {
+            continue;
+        }
+        let Node::Call(c) = inf.module.node(node) else {
+            continue;
+        };
+        if let flatppl_core::CallHead::Builtin(op) = c.head {
+            let name = inf.module.resolve(op);
+            if (name == "get" || name == "get0") && !c.args.is_empty() {
+                let arr_ty = inf.node_annotation(c.args[0]).0;
+                let flat = flatten_dims(&arr_ty);
+                for (k, &idx) in c.args.iter().enumerate().skip(1) {
+                    if let Node::Axis(ax) = inf.module.node(idx)
+                        && let Some(&d) = flat.get(k - 1)
+                    {
+                        out.entry(ax.name).or_insert(d);
+                    }
                 }
             }
         }
-    }
-    for &a in c.args.iter() {
-        collect_axis_dims(inf, a, out);
+        pending.extend(c.args.iter().rev().copied());
     }
 }
 
@@ -4262,19 +4280,23 @@ fn ksuperpose_result_type(
     callee: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Option<Type> {
-    let call = ksuperpose_callee(inf, callee)?;
-    let weights = *call.args.get(1)?;
-    let component = *call.args.first()?;
+) -> RuleStep<Option<Type>> {
+    let Some(call) = ksuperpose_callee(inf, callee) else {
+        return Ready(None);
+    };
+    let (Some(&component), Some(&weights)) = (call.args.first(), call.args.get(1)) else {
+        return Ready(None);
+    };
     if let Some(failed) = ksuperpose_family_check(inf, component, weights, args, named) {
-        return Some(failed);
+        return Ready(Some(failed));
     }
-    let cell = ksuperpose_cell_variate(inf, component, args, named)?;
-    Some(Type::Measure {
-        domain: Box::new(cell),
-        // `user_call_type` fills this from the lifted kernel's own class, which
-        // §11 defines as "uniform over all inputs".
-        mass: Mass::Deferred,
+    ksuperpose_cell_variate(inf, component, args, named).map(inf, |_, cell| {
+        cell.map(|cell| Type::Measure {
+            domain: Box::new(cell),
+            // `user_call_type` fills this from the lifted kernel's own class,
+            // which §11 defines as "uniform over all inputs".
+            mass: Mass::Deferred,
+        })
     })
 }
 
@@ -4489,7 +4511,7 @@ fn ksuperpose_cell_variate(
     component: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Option<Type> {
+) -> RuleStep<Option<Type>> {
     // Exactly ONE axis stripped per family argument — the family axis §06 gives
     // each collection argument — leaving the parameter's own rank behind. A
     // multi-dimensional `shape` keeps its trailing axes: an $N \times d \times d$
@@ -4514,43 +4536,45 @@ fn ksuperpose_cell_variate(
         .collect();
     // A reified component reaches its variate by substitution, exactly as
     // `broadcast_type`'s `Type::Kernel` head does.
-    if let Some(ty) = substituted_result(inf, component, &cell_args, &cell_named)
-        .map(|(ty, _)| ty)
-        .or_else(|| reified_result_type(inf, component))
-    {
-        return match ty {
-            Type::Measure { domain, .. } if !matches!(*domain, Type::Deferred) => Some(*domain),
-            Type::Measure { .. } | Type::Deferred => None,
-            value_ty => Some(value_ty),
-        };
-    }
-    // A §09 member reference carries its catalogue sig; a bare builtin
-    // constructor reaches its domain by name. Both mirror `broadcast_type`.
-    if let Some(sig) = inf.module_catalogue_ref(component).map(|c| c.sig.clone()) {
-        return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
-            Type::Measure { domain, .. } => Some(*domain),
-            _ => None,
-        };
-    }
-    let name = ksuperpose_constructor_name(inf, component)?;
-    if let Some(domain) = distribution_domain(inf, &name, &cell_args, &cell_named) {
-        return Some(domain);
-    }
-    // `Dirac` is a §06 FUNDAMENTAL measure, deliberately outside the §08
-    // distribution catalogue, so `distribution_domain` declines it. Its variate
-    // is its `value` argument — here the per-cell element of the family's
-    // `value` column, which is what makes §08's
-    // `normalize(ksuperpose(Dirac, p)(value = labels))` a measure over the
-    // labels' own type. `Lebesgue`/`Counting` take a support SET rather than a
-    // point, and no family reading of that is settled, so they stay `%deferred`.
-    if name == "Dirac" {
-        return cell_named
-            .iter()
-            .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
-            .map(|(_, _, t, _)| t.clone())
-            .or_else(|| cell_args.first().map(|(_, t, _)| t.clone()));
-    }
-    None
+    substituted_result(inf, component, &cell_args, &cell_named).map(inf, move |inf, sub| {
+        if let Some(ty) = sub
+            .map(|(ty, _)| ty)
+            .or_else(|| reified_result_type(inf, component))
+        {
+            return match ty {
+                Type::Measure { domain, .. } if !matches!(*domain, Type::Deferred) => Some(*domain),
+                Type::Measure { .. } | Type::Deferred => None,
+                value_ty => Some(value_ty),
+            };
+        }
+        // A §09 member reference carries its catalogue sig; a bare builtin
+        // constructor reaches its domain by name. Both mirror `broadcast_type`.
+        if let Some(sig) = inf.module_catalogue_ref(component).map(|c| c.sig.clone()) {
+            return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
+                Type::Measure { domain, .. } => Some(*domain),
+                _ => None,
+            };
+        }
+        let name = ksuperpose_constructor_name(inf, component)?;
+        if let Some(domain) = distribution_domain(inf, &name, &cell_args, &cell_named) {
+            return Some(domain);
+        }
+        // `Dirac` is a §06 FUNDAMENTAL measure, deliberately outside the §08
+        // distribution catalogue, so `distribution_domain` declines it. Its variate
+        // is its `value` argument — here the per-cell element of the family's
+        // `value` column, which is what makes §08's
+        // `normalize(ksuperpose(Dirac, p)(value = labels))` a measure over the
+        // labels' own type. `Lebesgue`/`Counting` take a support SET rather than a
+        // point, and no family reading of that is settled, so they stay `%deferred`.
+        if name == "Dirac" {
+            return cell_named
+                .iter()
+                .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
+                .map(|(_, _, t, _)| t.clone())
+                .or_else(|| cell_args.first().map(|(_, t, _)| t.clone()));
+        }
+        None
+    })
 }
 
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
@@ -5588,7 +5612,7 @@ fn user_call_type(
     callee_ty: &Type,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Type {
+) -> RuleStep<Type> {
     // §09 standard-module application (`hepphys.CrystalBall(args)` /
     // `specfns.erf(x)`): the callee is a `RefNs::Module` ref whose catalogue
     // signature was stashed at resolution time. Lower it with the concrete
@@ -5605,16 +5629,19 @@ fn user_call_type(
         if let Some(note) = note {
             inf.note_once_str(&note);
         }
-        return catalogue_call_type(inf, callee, args);
+        return Ready(catalogue_call_type(inf, callee, args));
     }
     // Prefer the per-call substituted body type (arg types bound to the
     // callable's parameters); fall back to the un-substituted body type for
     // cross-module callables and any case substitution can't bind.
     match callee_ty {
-        Type::Function { .. } => substituted_result(inf, callee, args, named)
-            .map(|(ty, _)| ty)
-            .or_else(|| reified_result_type(inf, callee))
-            .unwrap_or(Type::Deferred),
+        Type::Function { .. } => {
+            substituted_result(inf, callee, args, named).map(inf, move |inf, sub| {
+                sub.map(|(ty, _)| ty)
+                    .or_else(|| reified_result_type(inf, callee))
+                    .unwrap_or(Type::Deferred)
+            })
+        }
         // A fan-out kernel (`joint(K1, K2, …)`) is not a reification, so neither
         // substitution nor a reified body reaches its output measure —
         // `kernel_joint_result_type` builds it from the components (spec §06: "At
@@ -5624,25 +5651,35 @@ fn user_call_type(
         // is tried FIRST: the family-axis rule it enforces
         // ([`ksuperpose_family_check`]) must run even when the component happens
         // to be a reification that `substituted_result` could type on its own.
-        Type::Kernel { mass, .. } => match ksuperpose_result_type(inf, callee, args, named)
-            .or_else(|| substituted_result(inf, callee, args, named).map(|(ty, _)| ty))
-            .or_else(|| reified_result_type(inf, callee))
-            .or_else(|| kernel_joint_result_type(inf, callee))
-        {
-            Some(Type::Measure { domain, .. }) => Type::Measure {
-                domain,
-                mass: *mass,
-            },
-            // A rejected application (the `ksuperpose` family-axis rule) stays
-            // failed; wrapping it would publish a measure over `(%failed …)`.
-            Some(failed @ Type::Failed(_)) => failed,
-            Some(value_ty) => Type::Measure {
-                domain: Box::new(value_ty),
-                mass: *mass,
-            },
-            None => Type::Deferred,
-        },
-        _ => Type::Deferred,
+        Type::Kernel { mass, .. } => {
+            let mass = *mass;
+            let lifted = ksuperpose_result_type(inf, callee, args, named);
+            let args = args.to_vec();
+            let named = named.to_vec();
+            lifted
+                .and_then(inf, move |inf, lifted| match lifted {
+                    Some(ty) => Ready(Some(ty)),
+                    None => substituted_result(inf, callee, &args, &named)
+                        .map(inf, |_, sub| sub.map(|(ty, _)| ty)),
+                })
+                .map(inf, move |inf, result| {
+                    match result
+                        .or_else(|| reified_result_type(inf, callee))
+                        .or_else(|| kernel_joint_result_type(inf, callee))
+                    {
+                        Some(Type::Measure { domain, .. }) => Type::Measure { domain, mass },
+                        // A rejected application (the `ksuperpose` family-axis rule)
+                        // stays failed rather than becoming a measure over a failure.
+                        Some(failed @ Type::Failed(_)) => failed,
+                        Some(value_ty) => Type::Measure {
+                            domain: Box::new(value_ty),
+                            mass,
+                        },
+                        None => Type::Deferred,
+                    }
+                })
+        }
+        _ => Ready(Type::Deferred),
     }
 }
 
@@ -5748,8 +5785,11 @@ fn reified_body(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
 /// and `f`'s re-inferred body type is the codomain. Falls back to `f`'s
 /// un-substituted body type, then `None` (caller uses `%any`) when `f` is not a
 /// resolvable reification or its body is `%deferred`.
-fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    let f_node = args.first()?.0;
+fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Option<Type>> {
+    let Some((f_node, _, _)) = args.first() else {
+        return Ready(None);
+    };
+    let f_node = *f_node;
     let seed = match args.get(1) {
         Some((m_node, Type::Measure { domain, .. }, m_phase))
             if !matches!(domain.as_ref(), Type::Deferred) =>
@@ -5758,11 +5798,19 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Ty
         }
         _ => None,
     };
-    let sub = seed.and_then(|s| substituted_result(inf, f_node, &s, &[]).map(|(t, _)| t));
-    match sub.or_else(|| reified_result_type(inf, f_node)) {
-        Some(Type::Deferred) | None => None,
-        Some(t) => Some(t),
-    }
+    let sub = match seed {
+        Some(s) => substituted_result(inf, f_node, &s, &[]),
+        None => Ready(None),
+    };
+    sub.map(inf, move |inf, sub| {
+        match sub
+            .map(|(ty, _)| ty)
+            .or_else(|| reified_result_type(inf, f_node))
+        {
+            Some(Type::Deferred) | None => None,
+            Some(t) => Some(t),
+        }
+    })
 }
 
 /// The inferred type of a callable's reified body. For a cross-module callable
@@ -5849,9 +5897,9 @@ fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Na
 /// `broadcast` — types as `any`. Substituting the call's arg types makes
 /// `f(1.0, 2.0, 3.0)` a `real` and `broadcast(f, x = real[5])` a `real[5]`.
 ///
-/// Returns the substituted body's `(type, value-set)` — so a callable whose body
+/// Requests the substituted body's `(type, value-set)` — so a callable whose body
 /// tightens its range (`f(x) = sqrt(x)` → `nonnegreals`) carries that set to the
-/// call site too. `None` when `callee` is not a local reification, or no
+/// call site too. Immediately returns `None` when `callee` is not a local reification, or no
 /// parameter could be bound to an argument (caller falls back to the
 /// un-substituted body).
 fn substituted_result(
@@ -5859,9 +5907,13 @@ fn substituted_result(
     callee: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Option<(Type, ValueSet)> {
-    let (reif_id, body) = local_reification(inf, callee)?;
-    let inputs = input_entries(inf, reif_id)?;
+) -> RuleStep<Option<(Type, ValueSet)>> {
+    let Some((reif_id, body)) = local_reification(inf, callee) else {
+        return Ready(None);
+    };
+    let Some(inputs) = input_entries(inf, reif_id) else {
+        return Ready(None);
+    };
 
     // Seed targets: for each parameter bound to a call argument, the body nodes
     // that read it (every matching `%local` placeholder ref, or a self-bound
@@ -5895,14 +5947,18 @@ fn substituted_result(
         }
     }
     if seeds.is_empty() {
-        return None;
+        return Ready(None);
     }
 
     // Re-infer ONLY the body with isolated annotations seeded by substitutions.
     // Inferring the body alone (not the whole module via `run`) avoids re-entering
     // the application that triggered this — the seeds cut every parameter, so the
     // body walk never reaches back to the call site.
-    Some(inf.infer_substituted(body, &seeds))
+    RuleStep::InferBody {
+        body,
+        seeds,
+        resume: Box::new(|_, result| Ready(Some(result))),
+    }
 }
 
 /// Deref a callee expression to its local reification: follow `self` refs to the
@@ -5976,9 +6032,9 @@ fn broadcast_type(
     id: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Type {
+) -> RuleStep<Type> {
     let Some((head_node, head_ty, _)) = args.first() else {
-        return Type::Deferred;
+        return Ready(Type::Deferred);
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
 
@@ -5996,7 +6052,7 @@ fn broadcast_type(
                 match &shape {
                     None => shape = Some(s.clone()),
                     Some(prev) if prev == s => {}
-                    Some(_) => return Type::Deferred,
+                    Some(_) => return Ready(Type::Deferred),
                 }
                 elems.push(elem.as_ref().clone());
             }
@@ -6005,7 +6061,7 @@ fn broadcast_type(
                 match &shape {
                     None => shape = Some(rows),
                     Some(prev) if prev == &rows => {}
-                    Some(_) => return Type::Deferred,
+                    Some(_) => return Ready(Type::Deferred),
                 }
                 elems.push(Type::Record(columns.clone()));
             }
@@ -6021,7 +6077,7 @@ fn broadcast_type(
         // call-site substitution then refines the concrete shape. A deterministic
         // op or a user-callable head with no array input stays a shape-wise
         // no-op (`%deferred`).
-        return broadcast_distribution_no_shape(inf, head_node);
+        return Ready(broadcast_distribution_no_shape(inf, head_node));
     };
 
     // User-callable head (`broadcast(predict, x = x_data)`): the cell comes from
@@ -6044,27 +6100,32 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            let cell = substituted_result(inf, head_node, &cell_args, &cell_named)
-                .map(|(ty, _)| ty)
-                .or_else(|| reified_result_type(inf, head_node))
-                .unwrap_or(Type::Deferred);
-            if let Type::Record(columns) = cell {
-                if shape.len() != 1 {
-                    inf.diags.push(crate::Diagnostic::error_at(
-                        id,
-                        "record-valued broadcast requires one axis (spec §04)",
-                    ));
-                    return Type::Failed("multi-axis record broadcast".into());
-                }
-                return Type::Table {
-                    columns,
-                    nrows: shape[0],
-                };
-            }
-            return Type::Array {
-                shape,
-                elem: Box::new(cell),
-            };
+            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
+                inf,
+                move |inf, sub| {
+                    let cell = sub
+                        .map(|(ty, _)| ty)
+                        .or_else(|| reified_result_type(inf, head_node))
+                        .unwrap_or(Type::Deferred);
+                    if let Type::Record(columns) = cell {
+                        if shape.len() != 1 {
+                            inf.diags.push(crate::Diagnostic::error_at(
+                                id,
+                                "record-valued broadcast requires one axis (spec §04)",
+                            ));
+                            return Type::Failed("multi-axis record broadcast".into());
+                        }
+                        return Type::Table {
+                            columns,
+                            nrows: shape[0],
+                        };
+                    }
+                    Type::Array {
+                        shape,
+                        elem: Box::new(cell),
+                    }
+                },
+            );
         }
         Type::Kernel { mass, .. } => {
             let mass = *mass;
@@ -6076,21 +6137,26 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            let cell = match substituted_result(inf, head_node, &cell_args, &cell_named)
-                .map(|(ty, _)| ty)
-                .or_else(|| reified_result_type(inf, head_node))
-            {
-                Some(Type::Measure { domain, .. }) => *domain,
-                Some(value_ty) => value_ty,
-                None => return Type::Deferred,
-            };
-            return Type::Measure {
-                domain: Box::new(Type::Array {
-                    shape,
-                    elem: Box::new(cell),
-                }),
-                mass: broadcast_mass(mass),
-            };
+            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
+                inf,
+                move |inf, sub| {
+                    let cell = match sub
+                        .map(|(ty, _)| ty)
+                        .or_else(|| reified_result_type(inf, head_node))
+                    {
+                        Some(Type::Measure { domain, .. }) => *domain,
+                        Some(value_ty) => value_ty,
+                        None => return Type::Deferred,
+                    };
+                    Type::Measure {
+                        domain: Box::new(Type::Array {
+                            shape,
+                            elem: Box::new(cell),
+                        }),
+                        mass: broadcast_mass(mass),
+                    }
+                },
+            );
         }
         _ => {}
     }
@@ -6114,43 +6180,45 @@ fn broadcast_type(
                 (*n, cell, *p)
             })
             .collect();
-        return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
-            // Distribution head: an independent product over the array. Its cell
-            // domain and mass come from the catalogue sig, so a non-probability
-            // measure like `ContinuedPoisson` stays `Finite`, not forced to
-            // `Normalized` (mirrors the built-in distribution path below).
-            Type::Measure { domain, mass } => Type::Measure {
-                domain: Box::new(Type::Array {
+        return Ready(
+            match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
+                // Distribution head: an independent product over the array. Its cell
+                // domain and mass come from the catalogue sig, so a non-probability
+                // measure like `ContinuedPoisson` stays `Finite`, not forced to
+                // `Normalized` (mirrors the built-in distribution path below).
+                Type::Measure { domain, mass } => Type::Measure {
+                    domain: Box::new(Type::Array {
+                        shape,
+                        elem: domain,
+                    }),
+                    mass: broadcast_mass(mass),
+                },
+                // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
+                // elementwise into an array of the per-cell result, exactly as the
+                // built-in deterministic-op path does.
+                cell => Type::Array {
                     shape,
-                    elem: domain,
-                }),
-                mass: broadcast_mass(mass),
+                    elem: Box::new(cell),
+                },
             },
-            // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
-            // elementwise into an array of the per-cell result, exactly as the
-            // built-in deterministic-op path does.
-            cell => Type::Array {
-                shape,
-                elem: Box::new(cell),
-            },
-        };
+        );
     }
 
     // Built-in head: a distribution constructor broadcasts into a measure
     // over the array; a deterministic scalar op maps elementwise.
     let Node::Const(op) = inf.module.node(head_node) else {
-        return Type::Deferred;
+        return Ready(Type::Deferred);
     };
     let op_name = inf.module.resolve(*op).to_string();
     if let Some(cell_domain) = distribution_domain(inf, &op_name, &[], &[]) {
-        return Type::Measure {
+        return Ready(Type::Measure {
             domain: Box::new(Type::Array {
                 shape,
                 elem: Box::new(cell_domain),
             }),
             // Independent product of per-cell distributions.
             mass: Mass::Normalized,
-        };
+        });
     }
 
     // A §07 collection-domain head (`sum`, `lany`, `l2norm`, `cumsum`, …). §04 applies
@@ -6161,9 +6229,11 @@ fn broadcast_type(
     if let Some((section, domain)) = collection_domain_head(&op_name) {
         let cell = elems.first().cloned().unwrap_or(Type::Deferred);
         if matches!(cell, Type::Scalar(_)) {
-            return refuse_broadcast_collection_cell(inf, id, &op_name, section, domain, &cell);
+            return Ready(refuse_broadcast_collection_cell(
+                inf, id, &op_name, section, domain, &cell,
+            ));
         }
-        return match broadcast_collection_cell(&op_name, &cell) {
+        return Ready(match broadcast_collection_cell(&op_name, &cell) {
             Some(inner) => Type::Array {
                 shape,
                 elem: Box::new(inner),
@@ -6172,7 +6242,7 @@ fn broadcast_type(
             // pinned — never an accusation, since the refusal keys on a cell that IS a
             // scalar rather than on the absence of an answer.
             None => Type::Deferred,
-        };
+        });
     }
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
@@ -6199,12 +6269,12 @@ fn broadcast_type(
             | "in" | "isfinite" | "isinf" | "isnan" | "iszero",
             [_] | [_, _],
         ) => Type::Scalar(ScalarType::Boolean),
-        _ => return Type::Deferred,
+        _ => return Ready(Type::Deferred),
     };
-    Type::Array {
+    Ready(Type::Array {
         shape,
         elem: Box::new(cell),
-    }
+    })
 }
 
 /// `broadcast` with no concrete array argument (e.g. a reified lambda body
@@ -8330,39 +8400,42 @@ pub(crate) fn call_valueset(
     args: &[ArgInfo],
     named: &[NamedInfo],
     ty: &Type,
-) -> ValueSet {
+) -> RuleStep<ValueSet> {
     // User-callable application: the reified body's set rides over (for a
     // kernel call, the body set IS the output measure's support). A §09
     // standard-module reference has no reified body — its support/result set
     // is lowered from the catalogue sig with the call args.
     if let Some((callee_node, _)) = callee {
         if inf.module_catalogue_ref(*callee_node).is_some() {
-            return catalogue_call_valueset(inf, *callee_node, args);
+            return Ready(catalogue_call_valueset(inf, *callee_node, args));
         }
         // Per-call substituted body value-set (arg sets bound to the callable's
         // parameters): a callable whose body tightens its range — `f(x) =
         // sqrt(x)` — carries `nonnegreals` to the call site. Fall back to the
         // un-substituted body set when substitution binds nothing or yields no
         // finer set.
-        if let Some((_, vs)) = substituted_result(inf, *callee_node, args, named)
-            && vs != ValueSet::Unknown
-        {
-            return vs;
-        }
-        return match reified_body(inf, *callee_node) {
-            Some(body) => inf.lookup_valueset(body),
-            None => ValueSet::Unknown,
-        };
+        let callee_node = *callee_node;
+        return substituted_result(inf, callee_node, args, named).map(inf, move |inf, sub| {
+            if let Some((_, vs)) = sub
+                && vs != ValueSet::Unknown
+            {
+                return vs;
+            }
+            match reified_body(inf, callee_node) {
+                Some(body) => inf.lookup_valueset(body),
+                None => ValueSet::Unknown,
+            }
+        });
     }
     let CallHead::Builtin(op) = call.head else {
-        return ValueSet::Unknown;
+        return Ready(ValueSet::Unknown);
     };
     // Reifications are callables, not values.
     if call.inputs.is_some() {
-        return ValueSet::Unknown;
+        return Ready(ValueSet::Unknown);
     }
     let name = inf.module.resolve(op).to_string();
-    match name.as_str() {
+    Ready(match name.as_str() {
         // A set-constructor used directly as a value binding is a PRESET (spec
         // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
         // is not a value type — set in the `cartprod`/`interval`/… type arms.)
@@ -8376,7 +8449,7 @@ pub(crate) fn call_valueset(
         // Other heads (built-ins / §09 modules) fall back to the natural set.
         "broadcast" => {
             let Some((head_node, _, _)) = args.first() else {
-                return ValueSet::Unknown;
+                return Ready(ValueSet::Unknown);
             };
             let head_node = *head_node;
             let cell = |t: &Type| match t {
@@ -8391,15 +8464,16 @@ pub(crate) fn call_valueset(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell(t), *p))
                 .collect();
-            match (
-                substituted_result(inf, head_node, &cell_args, &cell_named),
-                result_array_dim(ty),
-            ) {
-                (Some((_, cell_vs)), Some(dim)) if cell_vs != ValueSet::Unknown => {
-                    ValueSet::CartPow(Box::new(cell_vs), dim)
-                }
-                _ => ValueSet::Unknown,
-            }
+            let dim = result_array_dim(ty);
+            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
+                inf,
+                move |_, sub| match (sub, dim) {
+                    (Some((_, cell_vs)), Some(dim)) if cell_vs != ValueSet::Unknown => {
+                        ValueSet::CartPow(Box::new(cell_vs), dim)
+                    }
+                    _ => ValueSet::Unknown,
+                },
+            );
         }
         // `load_data`'s value lies in the declared `valueset` itself (spec §07:
         // "`valueset` fully determines the result's shape") — no extra row axis.
@@ -8527,7 +8601,7 @@ pub(crate) fn call_valueset(
                 distribution_support(inf, &name, args, named)
             }
         }
-    }
+    })
 }
 
 /// The leading dim of a rank-1 array result, drilling through a measure wrapper

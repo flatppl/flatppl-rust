@@ -19,6 +19,7 @@
 //! `aggregate` has no `:=` form, and `kernelof` has no lambda form.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use flatppl_core::{
     Axis, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
@@ -106,6 +107,47 @@ struct Infix {
     rmin: u8,
     left: NodeId,
     right: NodeId,
+}
+
+/// Rendering state belongs to an occurrence: the same node can be printed in
+/// different precedence positions or under different lambda boundaries.
+#[derive(Clone)]
+struct PrintExpr {
+    id: NodeId,
+    min: u8,
+    syntax: Syntax,
+    lambda: Rc<[Symbol]>,
+}
+
+impl PrintExpr {
+    fn child(&self, id: NodeId, min: u8) -> Self {
+        Self {
+            id,
+            min,
+            syntax: self.syntax,
+            lambda: self.lambda.clone(),
+        }
+    }
+}
+
+enum PrintPiece {
+    Text(String),
+    Flat(PrintExpr),
+    Wide {
+        expr: PrintExpr,
+        col: usize,
+        indent: usize,
+        bracketed: bool,
+    },
+}
+
+impl PrintPiece {
+    fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+    fn child(expr: &PrintExpr, id: NodeId, min: u8) -> Self {
+        Self::Flat(expr.child(id, min))
+    }
 }
 
 /// The lowered builtin → infix operator map (the inverse of the parser's
@@ -238,9 +280,20 @@ impl<'m> Printer<'m> {
     /// already consumed by the statement's `lhs = ` / `lhs ~ ` / `… :=` prefix);
     /// [`Syntax::Minimal`] always emits the flat linear form.
     fn body_w(&self, id: NodeId, col: usize) -> String {
+        let expr = PrintExpr {
+            id,
+            min: EXPR,
+            syntax: self.syntax,
+            lambda: Rc::from([]),
+        };
         match self.syntax {
-            Syntax::Full => self.full_w(id, EXPR, &[], col, 0, false),
-            Syntax::Minimal => self.minimal(id),
+            Syntax::Full => self.render(PrintPiece::Wide {
+                expr,
+                col,
+                indent: 0,
+                bracketed: false,
+            }),
+            Syntax::Minimal => self.render(PrintPiece::Flat(expr)),
         }
     }
 
@@ -319,40 +372,93 @@ impl<'m> Printer<'m> {
         Some(parts.join(", "))
     }
 
-    // ---- full syntax (precedence-aware, all sugar) ----
+    // ---- expression output ----
 
-    /// Print `id` for a context accepting precedence ≥ `min`, parenthesizing
-    /// if the node binds looser. `lambda` is the innermost enclosing lambda's
-    /// placeholder set (those print bare); it is REPLACED, not extended, at
-    /// each reification boundary — placeholders are innermost-scoped
-    /// (spec §04), so an outer placeholder inside a nested reification keeps
-    /// its `_x_` spelling.
-    fn full(&self, id: NodeId, min: u8, lambda: &[Symbol]) -> String {
-        let (text, prec) = self.full_node(id, lambda);
-        if prec < min {
-            format!("({text})")
-        } else {
-            text
+    /// Stream text and expression continuations. Width probes consume this same
+    /// flat stream only up to WIDTH; no rendered subtree strings are cached.
+    fn render(&self, first: PrintPiece) -> String {
+        let mut pending = vec![first];
+        let mut out = String::new();
+        while let Some(piece) = pending.pop() {
+            match piece {
+                PrintPiece::Text(text) => out.push_str(&text),
+                PrintPiece::Flat(expr) => pending.extend(self.flat_pieces(&expr).into_iter().rev()),
+                PrintPiece::Wide {
+                    expr,
+                    col,
+                    indent,
+                    bracketed,
+                } => {
+                    if col <= WIDTH && self.fits(&expr, WIDTH - col) {
+                        pending.push(PrintPiece::Flat(expr));
+                        continue;
+                    }
+                    let (_, prec) = self.expression_parts(&expr);
+                    let grouped = prec < expr.min;
+                    let inner_indent = if grouped { indent + INDENT } else { indent };
+                    if let Some(mut parts) =
+                        self.break_parts(&expr, inner_indent, bracketed || grouped)
+                    {
+                        if grouped {
+                            parts.insert(
+                                0,
+                                PrintPiece::text(format!("(\n{}", " ".repeat(inner_indent))),
+                            );
+                            parts.push(PrintPiece::text(format!("\n{})", " ".repeat(indent))));
+                        }
+                        pending.extend(parts.into_iter().rev());
+                    } else {
+                        pending.push(PrintPiece::Flat(expr));
+                    }
+                }
+            }
         }
+        out
     }
 
-    fn full_node(&self, id: NodeId, lambda: &[Symbol]) -> (String, u8) {
-        match self.module.node(id) {
-            // A negative numeric literal prints like the unary-minus
-            // expression it re-parses as.
+    fn fits(&self, expr: &PrintExpr, mut remaining: usize) -> bool {
+        let mut pending = vec![PrintPiece::Flat(expr.clone())];
+        while let Some(piece) = pending.pop() {
+            match piece {
+                PrintPiece::Text(text) => {
+                    let width = text.chars().take(remaining + 1).count();
+                    if width > remaining {
+                        return false;
+                    }
+                    remaining -= width;
+                }
+                PrintPiece::Flat(expr) => pending.extend(self.flat_pieces(&expr).into_iter().rev()),
+                PrintPiece::Wide { .. } => {
+                    unreachable!("flat width probes contain no layout requests")
+                }
+            }
+        }
+        true
+    }
+
+    fn flat_pieces(&self, expr: &PrintExpr) -> Vec<PrintPiece> {
+        let (mut parts, prec) = self.expression_parts(expr);
+        if expr.syntax == Syntax::Full && prec < expr.min {
+            parts.insert(0, PrintPiece::text("("));
+            parts.push(PrintPiece::text(")"));
+        }
+        parts
+    }
+
+    fn expression_parts(&self, expr: &PrintExpr) -> (Vec<PrintPiece>, u8) {
+        let (text, prec) = match self.module.node(expr.id) {
             Node::Lit(s) => (print_scalar(s), scalar_prec(s)),
             Node::Const(sym) => (self.builtin_name(*sym), ATOM),
             Node::Hole => ("_".to_string(), ATOM),
-            Node::Ref(r) => self.ref_form(r, lambda),
+            Node::Ref(r) => self.ref_form(r, &expr.lambda),
             Node::Axis(a) => (print_axis(self.module, a), ATOM),
-            Node::Call(c) => self.full_call(id, c, lambda),
-        }
+            Node::Call(call) => return self.call_parts(expr, call),
+        };
+        (vec![PrintPiece::text(text)], prec)
     }
 
     fn ref_form(&self, r: &Ref, lambda: &[Symbol]) -> (String, u8) {
         if matches!(r.ns, RefNs::Local) && lambda.contains(&r.name) {
-            // The innermost lambda's placeholder prints as its bare argument
-            // name (`_x_` → `x`); re-parsing rewrites it back.
             let spelled = self.module.resolve(r.name);
             return (spelled[1..spelled.len() - 1].to_string(), ATOM);
         }
@@ -362,102 +468,143 @@ impl<'m> Printer<'m> {
         }
     }
 
-    fn full_call(&self, id: NodeId, call: &Call, lambda: &[Symbol]) -> (String, u8) {
+    fn call_parts(&self, expr: &PrintExpr, call: &Call) -> (Vec<PrintPiece>, u8) {
         if call.inputs.is_some() {
-            if let Some(text) = self.lambda_form(call) {
-                return (text, EXPR);
+            if expr.syntax == Syntax::Full
+                && let Some((head, lambda)) = self.lambda_head(call)
+            {
+                let body = PrintExpr {
+                    id: call.args[0],
+                    min: EXPR,
+                    syntax: Syntax::Full,
+                    lambda,
+                };
+                return (vec![PrintPiece::text(head), PrintPiece::Flat(body)], EXPR);
             }
-            return (self.reified_text(call, Syntax::Full), POSTFIX);
+            return (self.reified_parts(expr, call), POSTFIX);
         }
-        match &call.head {
-            CallHead::Builtin(op) => {
-                let name = self.module.resolve(*op);
+
+        if let CallHead::Builtin(op) = call.head {
+            let name = self.module.resolve(op);
+            if expr.syntax == Syntax::Full {
                 if call.named.is_empty()
                     && call.args.len() == 2
                     && let Some(op) = binop(name)
                 {
-                    if op.prec == AND {
-                        // `land` may be a lowered comparison chain.
-                        if let Some(chain) = self.comparison_chain(id, lambda) {
-                            return (chain, CMP);
-                        }
+                    if op.prec == AND
+                        && let Some(parts) = self.comparison_parts(expr)
+                    {
+                        return (parts, CMP);
                     }
                     let (lmin, rmin) = operand_mins(op.prec);
-                    let text = format!(
-                        "{} {} {}",
-                        self.full(call.args[0], lmin, lambda),
-                        op.plain,
-                        self.full(call.args[1], rmin, lambda)
+                    return (
+                        vec![
+                            PrintPiece::child(expr, call.args[0], lmin),
+                            PrintPiece::text(format!(" {} ", op.plain)),
+                            PrintPiece::child(expr, call.args[1], rmin),
+                        ],
+                        op.prec,
                     );
-                    return (text, op.prec);
                 }
                 if call.named.is_empty()
                     && call.args.len() == 1
                     && let Some((plain, _)) = unop(name)
                 {
-                    let text = format!("{plain}{}", self.full(call.args[0], UNARY, lambda));
-                    return (text, UNARY);
+                    return (
+                        vec![
+                            PrintPiece::text(plain),
+                            PrintPiece::child(expr, call.args[0], UNARY),
+                        ],
+                        UNARY,
+                    );
                 }
                 match name {
                     "get" if call.named.is_empty() && call.args.len() >= 2 => {
-                        self.get_form(call, lambda)
+                        return (self.get_parts(expr, call), POSTFIX);
                     }
-                    "broadcast" if call.args.len() >= 2 => self.broadcast_form(call, lambda),
-                    "vector" if call.named.is_empty() => {
-                        (format!("[{}]", self.expr_list(&call.args, lambda)), ATOM)
-                    }
-                    "tuple" if call.named.is_empty() && call.args.len() >= 2 => {
-                        (format!("({})", self.expr_list(&call.args, lambda)), ATOM)
-                    }
-                    _ => (
-                        format!(
-                            "{}({})",
-                            self.builtin_name(*op),
-                            self.args_text(call, lambda)
-                        ),
-                        POSTFIX,
-                    ),
+                    "broadcast" if call.args.len() >= 2 => return self.broadcast_parts(expr, call),
+                    _ => {}
                 }
             }
-            // The callee is an expression (a ref prints as its bare/dotted
-            // name; an inline callable as itself, e.g. `functionof(…)(args)`).
-            CallHead::User(callee) => (
-                format!(
-                    "{}({})",
-                    self.full(*callee, POSTFIX, lambda),
-                    self.args_text(call, lambda)
-                ),
-                POSTFIX,
-            ),
+            let literal = match name {
+                "vector" if call.named.is_empty() => Some(("[", "]")),
+                "tuple" if call.named.is_empty() && call.args.len() >= 2 => Some(("(", ")")),
+                _ => None,
+            };
+            if let Some((open, close)) = literal {
+                let mut parts = vec![PrintPiece::text(open)];
+                self.argument_parts(&mut parts, expr, &call.args, &[]);
+                parts.push(PrintPiece::text(close));
+                return (parts, ATOM);
+            }
+            let mut parts = vec![PrintPiece::text(format!("{}(", self.builtin_name(op)))];
+            self.argument_parts(&mut parts, expr, &call.args, &call.named);
+            parts.push(PrintPiece::text(")"));
+            return (parts, POSTFIX);
+        }
+        let CallHead::User(callee) = call.head else {
+            unreachable!()
+        };
+        let mut parts = vec![
+            PrintPiece::child(expr, callee, POSTFIX),
+            PrintPiece::text("("),
+        ];
+        self.argument_parts(&mut parts, expr, &call.args, &call.named);
+        parts.push(PrintPiece::text(")"));
+        (parts, POSTFIX)
+    }
+
+    fn argument_parts(
+        &self,
+        parts: &mut Vec<PrintPiece>,
+        expr: &PrintExpr,
+        positional: &[NodeId],
+        named: &[NamedArg],
+    ) {
+        for (i, &arg) in positional.iter().enumerate() {
+            if i > 0 {
+                parts.push(PrintPiece::text(", "));
+            }
+            parts.push(PrintPiece::child(expr, arg, EXPR));
+        }
+        for (i, arg) in named.iter().enumerate() {
+            if i > 0 || !positional.is_empty() {
+                parts.push(PrintPiece::text(", "));
+            }
+            parts.push(PrintPiece::text(format!(
+                "{} = ",
+                self.module.resolve(arg.name)
+            )));
+            parts.push(PrintPiece::child(expr, arg.value, EXPR));
         }
     }
 
-    /// Indexing `obj[i, :, !]` or field access `obj.name` (spec §05). Field
-    /// access applies only when the printed form re-parses as one: the key
-    /// must be a non-reserved `Name` and the object must not be a namespace
-    /// (`self` / `base` / a module binding — dot syntax there means member
-    /// access).
-    fn get_form(&self, call: &Call, lambda: &[Symbol]) -> (String, u8) {
+    fn get_parts(&self, expr: &PrintExpr, call: &Call) -> Vec<PrintPiece> {
         if call.args.len() == 2
             && let Node::Lit(Scalar::Str(key)) = self.module.node(call.args[1])
             && is_field_name(key)
             && !self.is_namespace(call.args[0])
         {
-            let object = self.dot_object(call.args[0], lambda);
-            return (format!("{object}.{key}"), POSTFIX);
+            let mut parts = self.dot_parts(expr, call.args[0]);
+            parts.push(PrintPiece::text(format!(".{key}")));
+            return parts;
         }
-        let object = self.full(call.args[0], POSTFIX, lambda);
-        let entries: Vec<String> = call.args[1..]
-            .iter()
-            .map(|&a| match self.module.node(a) {
-                // The `all` / `only` selectors print as `:` / `!` slices; a
-                // top-of-entry `!` is unambiguous (always before `,` / `]`).
-                Node::Const(s) if self.module.resolve(*s) == "all" => ":".to_string(),
-                Node::Const(s) if self.module.resolve(*s) == "only" => "!".to_string(),
-                _ => self.full(a, EXPR, lambda),
-            })
-            .collect();
-        (format!("{object}[{}]", entries.join(", ")), POSTFIX)
+        let mut parts = vec![
+            PrintPiece::child(expr, call.args[0], POSTFIX),
+            PrintPiece::text("["),
+        ];
+        for (i, &arg) in call.args[1..].iter().enumerate() {
+            if i > 0 {
+                parts.push(PrintPiece::text(", "));
+            }
+            parts.push(match self.module.node(arg) {
+                Node::Const(s) if self.module.resolve(*s) == "all" => PrintPiece::text(":"),
+                Node::Const(s) if self.module.resolve(*s) == "only" => PrintPiece::text("!"),
+                _ => PrintPiece::child(expr, arg, EXPR),
+            });
+        }
+        parts.push(PrintPiece::text("]"));
+        parts
     }
 
     fn is_namespace(&self, id: NodeId) -> bool {
@@ -468,22 +615,22 @@ impl<'m> Printer<'m> {
         }
     }
 
-    /// The object of a `.field` / `.(…)` postfix. A non-negative numeric
-    /// literal must be parenthesized or the following `.` would lex into the
-    /// number by maximal munch (`1.foo` lexes as the real `1.` then `foo`).
-    fn dot_object(&self, id: NodeId, lambda: &[Symbol]) -> String {
-        let text = self.full(id, POSTFIX, lambda);
-        match self.module.node(id) {
-            Node::Lit(Scalar::Int(n)) if *n >= 0 => format!("({text})"),
-            Node::Lit(Scalar::Real(r)) if !r.is_sign_negative() => format!("({text})"),
-            _ => text,
+    /// Keep a following dot out of a nonnegative numeric literal's token.
+    fn dot_parts(&self, expr: &PrintExpr, id: NodeId) -> Vec<PrintPiece> {
+        let numeric = match self.module.node(id) {
+            Node::Lit(Scalar::Int(n)) => *n >= 0,
+            Node::Lit(Scalar::Real(r)) => !r.is_sign_negative(),
+            _ => false,
+        };
+        let child = PrintPiece::child(expr, id, POSTFIX);
+        if numeric {
+            vec![PrintPiece::text("("), child, PrintPiece::text(")")]
+        } else {
+            vec![child]
         }
     }
 
-    /// `broadcast` re-sugars to the dotted forms (spec §05): a dotted
-    /// operator when the head is that operator's name, a dot-call `f.(…)`
-    /// otherwise.
-    fn broadcast_form(&self, call: &Call, lambda: &[Symbol]) -> (String, u8) {
+    fn broadcast_parts(&self, expr: &PrintExpr, call: &Call) -> (Vec<PrintPiece>, u8) {
         if call.named.is_empty()
             && let Node::Const(f) = self.module.node(call.args[0])
         {
@@ -493,41 +640,36 @@ impl<'m> Printer<'m> {
                 && let Some(dotted) = op.dotted
             {
                 let (lmin, rmin) = operand_mins(op.prec);
-                let text = format!(
-                    "{} {dotted} {}",
-                    self.full(call.args[1], lmin, lambda),
-                    self.full(call.args[2], rmin, lambda)
+                return (
+                    vec![
+                        PrintPiece::child(expr, call.args[1], lmin),
+                        PrintPiece::text(format!(" {dotted} ")),
+                        PrintPiece::child(expr, call.args[2], rmin),
+                    ],
+                    op.prec,
                 );
-                return (text, op.prec);
             }
             if call.args.len() == 2
                 && let Some((_, dotted)) = unop(f)
             {
-                let text = format!("{dotted}{}", self.full(call.args[1], UNARY, lambda));
-                return (text, UNARY);
+                return (
+                    vec![
+                        PrintPiece::text(dotted),
+                        PrintPiece::child(expr, call.args[1], UNARY),
+                    ],
+                    UNARY,
+                );
             }
         }
-        let mut parts: Vec<String> = call.args[1..]
-            .iter()
-            .map(|&a| self.full(a, EXPR, lambda))
-            .collect();
-        for n in call.named.iter() {
-            parts.push(format!(
-                "{} = {}",
-                self.module.resolve(n.name),
-                self.full(n.value, EXPR, lambda)
-            ));
-        }
-        let head = self.dot_object(call.args[0], lambda);
-        (format!("{head}.({})", parts.join(", ")), POSTFIX)
+        let mut parts = self.dot_parts(expr, call.args[0]);
+        parts.push(PrintPiece::text(".("));
+        self.argument_parts(&mut parts, expr, &call.args[1..], &call.named);
+        parts.push(PrintPiece::text(")"));
+        (parts, POSTFIX)
     }
 
-    /// A `functionof` whose authored boundary is exclusively placeholder
-    /// declarations is exactly the lambda desugaring (spec §04) — print it
-    /// back as `x -> body` / `(x, y) -> body` with the placeholders bare.
-    /// (`fn`-hole reifications are indistinguishable after lowering and
-    /// canonicalize to a lambda too. `kernelof` has no lambda form.)
-    fn lambda_form(&self, call: &Call) -> Option<String> {
+    /// A lambda replaces the enclosing placeholder scope, never extends it.
+    fn lambda_head(&self, call: &Call) -> Option<(String, Rc<[Symbol]>)> {
         let CallHead::Builtin(op) = call.head else {
             return None;
         };
@@ -547,36 +689,72 @@ impl<'m> Printer<'m> {
                 return None;
             }
             let param = self.module.resolve(*name);
-            if self.module.resolve(r.name) != format!("_{param}_") {
-                return None;
-            }
-            if !is_lambda_param_name(param) {
+            if self.module.resolve(r.name) != format!("_{param}_") || !is_lambda_param_name(param) {
                 return None;
             }
             params.push(param);
             placeholders.push(r.name);
         }
-        let body = self.full(call.args[0], EXPR, &placeholders);
-        Some(if params.len() == 1 {
-            format!("{} -> {body}", params[0])
+        let head = if params.len() == 1 {
+            params[0].to_string()
         } else {
-            format!("({}) -> {body}", params.join(", "))
-        })
+            format!("({})", params.join(", "))
+        };
+        Some((format!("{head} -> "), placeholders.into()))
     }
 
-    /// Re-sugar a lowered comparison chain. `a < b <= c` lowers to
-    /// `land(land(lt(a, b), le(b, c)), …)` re-using the middle operands, so a
-    /// left `land`-spine of plain comparisons whose adjacent operands are
-    /// structurally equal prints back as the chain.
-    fn comparison_chain(&self, id: NodeId, lambda: &[Symbol]) -> Option<String> {
+    fn reified_parts(&self, expr: &PrintExpr, call: &Call) -> Vec<PrintPiece> {
+        let body = PrintExpr {
+            id: call.args[0],
+            min: EXPR,
+            syntax: expr.syntax,
+            lambda: Rc::from([]),
+        };
+        let mut parts = match call.head {
+            CallHead::Builtin(op) => vec![PrintPiece::text(self.module.resolve(op))],
+            CallHead::User(callee) => vec![PrintPiece::child(&body, callee, EXPR)],
+        };
+        parts.push(PrintPiece::text("("));
+        parts.push(PrintPiece::Flat(body));
+        if let Some(Inputs::Spec(entries)) = &call.inputs {
+            for (name, r) in entries.iter() {
+                parts.push(PrintPiece::text(format!(
+                    ", {} = {}",
+                    self.module.resolve(*name),
+                    print_ref(self.module, r)
+                )));
+            }
+        }
+        parts.push(PrintPiece::text(")"));
+        parts
+    }
+
+    fn comparison_parts(&self, expr: &PrintExpr) -> Option<Vec<PrintPiece>> {
         let mut elems = Vec::new();
-        self.land_spine(id, &mut elems);
+        let mut id = expr.id;
+        // Reverse the left spine once to retain the original comparison order.
+        loop {
+            if let Node::Call(c) = self.module.node(id)
+                && let CallHead::Builtin(op) = c.head
+                && self.module.resolve(op) == "land"
+                && c.args.len() == 2
+                && c.named.is_empty()
+                && c.inputs.is_none()
+            {
+                elems.push(c.args[1]);
+                id = c.args[0];
+            } else {
+                elems.push(id);
+                break;
+            }
+        }
         if elems.len() < 2 {
             return None;
         }
+        elems.reverse();
         let mut cmps = Vec::with_capacity(elems.len());
-        for &e in &elems {
-            let Node::Call(c) = self.module.node(e) else {
+        for id in elems {
+            let Node::Call(c) = self.module.node(id) else {
                 return None;
             };
             let CallHead::Builtin(op) = c.head else {
@@ -589,258 +767,122 @@ impl<'m> Printer<'m> {
             cmps.push((op.plain, c.args[0], c.args[1]));
         }
         for pair in cmps.windows(2) {
-            if !self.structural_eq(pair[0].2, pair[1].1) {
+            if !self.module.structural_eq(pair[0].2, pair[1].1) {
                 return None;
             }
         }
-        let mut text = self.full(cmps[0].1, ADD, lambda);
-        for (op, _, rhs) in &cmps {
-            text.push_str(&format!(" {op} {}", self.full(*rhs, ADD, lambda)));
+        let mut parts = vec![PrintPiece::child(expr, cmps[0].1, ADD)];
+        for (op, _, rhs) in cmps {
+            parts.push(PrintPiece::text(format!(" {op} ")));
+            parts.push(PrintPiece::child(expr, rhs, ADD));
         }
-        Some(text)
+        Some(parts)
     }
 
-    /// Flatten the left-leaning spine of plain binary `land` calls.
-    fn land_spine(&self, id: NodeId, out: &mut Vec<NodeId>) {
-        if let Node::Call(c) = self.module.node(id)
-            && let CallHead::Builtin(op) = c.head
-            && self.module.resolve(op) == "land"
-            && c.args.len() == 2
-            && c.named.is_empty()
-            && c.inputs.is_none()
-        {
-            self.land_spine(c.args[0], out);
-            out.push(c.args[1]);
-            return;
-        }
-        out.push(id);
-    }
+    // ---- width-aware layout ----
 
-    /// Structural equality of two expression trees (chain middles are shared
-    /// node ids straight from the parser, but FlatPIR round-trips duplicate
-    /// them). Lives on [`Module`] so inference's own structural readers share it.
-    fn structural_eq(&self, a: NodeId, b: NodeId) -> bool {
-        self.module.structural_eq(a, b)
-    }
-
-    fn expr_list(&self, ids: &[NodeId], lambda: &[Symbol]) -> String {
-        ids.iter()
-            .map(|&e| self.full(e, EXPR, lambda))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// Positional args, then named entries (each `name = value`).
-    fn args_text(&self, call: &Call, lambda: &[Symbol]) -> String {
-        let mut parts: Vec<String> = call
-            .args
-            .iter()
-            .map(|&a| self.full(a, EXPR, lambda))
-            .collect();
-        for n in call.named.iter() {
-            parts.push(format!(
-                "{} = {}",
-                self.module.resolve(n.name),
-                self.full(n.value, EXPR, lambda)
-            ));
-        }
-        parts.join(", ")
-    }
-
-    // ---- full-syntax line wrapping (width-aware) ----
-    //
-    // A node prints flat when it fits within `WIDTH` at its starting column;
-    // otherwise it breaks at its outermost composition boundary. Breaking is
-    // only ever introduced INSIDE a bracket pair (call `()`, dot-call `.(`,
-    // literal `[ ]`): a broken operator chain puts the operator at the START of
-    // the continuation line, and only a TRAILING operator continues a statement
-    // at depth 0 (§05). So a bare top-level operator chain (no enclosing
-    // bracket) is left flat; the `bracketed` flag tracks whether breaking is
-    // admissible here. The flat
-    // form drives every fit/measure decision, so re-parsing and re-printing a
-    // wrapped module reproduces it exactly (idempotent, semantics-preserving).
-
-    /// Print `id` for a context accepting precedence ≥ `min`, breaking across
-    /// lines if the flat form would overflow `WIDTH` from column `col`.
-    /// `indent` is the indentation of the line this node starts on (its
-    /// continuation lines indent one [`INDENT`] step deeper); `bracketed` is
-    /// whether an enclosing bracket makes a line break safe here.
-    fn full_w(
+    /// None means that this shape stays flat. Every returned layout contains
+    /// a newline, so the caller need not retain an ancestor's flat fallback.
+    fn break_parts(
         &self,
-        id: NodeId,
-        min: u8,
-        lambda: &[Symbol],
-        col: usize,
+        expr: &PrintExpr,
         indent: usize,
         bracketed: bool,
-    ) -> String {
-        let (text, prec) = self.full_node(id, lambda);
-        let flat = if prec < min {
-            format!("({text})")
-        } else {
-            text
-        };
-        if col + flat.chars().count() <= WIDTH {
-            return flat;
-        }
-        // Over width. Parenthesizing parens are a real bracket pair, so an
-        // otherwise-unbreakable node may break inside them.
-        if prec < min {
-            let inner = self.break_node(id, lambda, indent + INDENT, true);
-            if inner.contains('\n') {
-                let pad = " ".repeat(indent + INDENT);
-                let close = " ".repeat(indent);
-                return format!("(\n{pad}{inner}\n{close})");
+    ) -> Option<Vec<PrintPiece>> {
+        if bracketed && let Some(inf) = self.as_infix(expr.id) {
+            let mut elems = Vec::new();
+            let mut id = expr.id;
+            while let Some(next) = self.as_infix(id)
+                && next.op == inf.op
+            {
+                elems.push(next.right);
+                id = next.left;
             }
-            return flat;
+            elems.push(id);
+            elems.reverse();
+            let mut parts = vec![PrintPiece::Wide {
+                expr: expr.child(elems[0], inf.lmin),
+                col: indent,
+                indent,
+                bracketed: true,
+            }];
+            let opcol = indent + inf.op.chars().count() + 1;
+            for &id in &elems[1..] {
+                parts.push(PrintPiece::text(format!(
+                    "\n{}{} ",
+                    " ".repeat(indent),
+                    inf.op
+                )));
+                parts.push(PrintPiece::Wide {
+                    expr: expr.child(id, inf.rmin),
+                    col: opcol,
+                    indent,
+                    bracketed: true,
+                });
+            }
+            return Some(parts);
         }
-        let broken = self.break_node(id, lambda, indent, bracketed);
-        if broken.contains('\n') { broken } else { flat }
-    }
-
-    /// Break `id` across lines at its outermost composition boundary. Returns a
-    /// flat string (no newline) when the node has no breakable form, in which
-    /// case [`full_w`](Self::full_w) keeps the measured flat text instead.
-    fn break_node(&self, id: NodeId, lambda: &[Symbol], indent: usize, bracketed: bool) -> String {
-        // An operator chain breaks one operand per line — but only inside a
-        // bracket, since a leading operator does not continue a depth-0 line.
-        if bracketed && let Some(inf) = self.as_infix(id) {
-            return self.break_op(id, &inf.op, inf.lmin, inf.rmin, lambda, indent);
-        }
-        let Node::Call(c) = self.module.node(id) else {
-            return self.full(id, EXPR, lambda);
+        let Node::Call(call) = self.module.node(expr.id) else {
+            return None;
         };
-        // Reified callables / lambdas keep their flat form.
-        if c.inputs.is_some() {
-            return self.full(id, EXPR, lambda);
+        if call.inputs.is_some() {
+            return None;
         }
-        match &c.head {
-            CallHead::Builtin(op) => {
-                let name = self.module.resolve(*op);
-                match name {
-                    "vector" if c.named.is_empty() => {
-                        self.break_list("[", "]", &c.args, &[], lambda, indent)
-                    }
-                    "tuple" if c.named.is_empty() && c.args.len() >= 2 => {
-                        self.break_list("(", ")", &c.args, &[], lambda, indent)
-                    }
-                    // A non-operator broadcast prints as a dot-call `head.(…)`;
-                    // break its operand list (the operator forms are handled by
-                    // the `as_infix` branch above).
-                    "broadcast" if c.args.len() >= 2 => {
-                        let head = self.dot_object(c.args[0], lambda);
-                        let open = format!("{head}.(");
-                        self.break_list(&open, ")", &c.args[1..], &c.named, lambda, indent)
-                    }
-                    // Indexing / field access (`get`) has no comma-list to break.
-                    "get" => self.full(id, EXPR, lambda),
-                    _ => {
-                        let open = format!("{}(", self.builtin_name(*op));
-                        self.break_list(&open, ")", &c.args, &c.named, lambda, indent)
-                    }
+        let (mut parts, close, args) = match call.head {
+            CallHead::Builtin(op) => match self.module.resolve(op) {
+                "vector" if call.named.is_empty() => {
+                    (vec![PrintPiece::text("[")], "]", &call.args[..])
                 }
-            }
-            CallHead::User(callee) => {
-                let open = format!("{}(", self.full(*callee, POSTFIX, lambda));
-                self.break_list(&open, ")", &c.args, &c.named, lambda, indent)
-            }
-        }
-    }
-
-    /// Render a bracketed argument / element list one entry per line:
-    /// ```text
-    /// open
-    ///   entry0,
-    ///   entry1,
-    /// close
-    /// ```
-    /// `open` carries the head and opening bracket (e.g. `f(`, `[`, `m.(`);
-    /// the trailing comma re-parses away. Each entry is itself width-aware at
-    /// the deeper indent.
-    fn break_list(
-        &self,
-        open: &str,
-        close: &str,
-        positional: &[NodeId],
-        named: &[NamedArg],
-        lambda: &[Symbol],
-        indent: usize,
-    ) -> String {
+                "tuple" if call.named.is_empty() && call.args.len() >= 2 => {
+                    (vec![PrintPiece::text("(")], ")", &call.args[..])
+                }
+                "broadcast" if call.args.len() >= 2 => {
+                    let mut head = self.dot_parts(expr, call.args[0]);
+                    head.push(PrintPiece::text(".("));
+                    (head, ")", &call.args[1..])
+                }
+                "get" => return None,
+                _ => (
+                    vec![PrintPiece::text(format!("{}(", self.builtin_name(op)))],
+                    ")",
+                    &call.args[..],
+                ),
+            },
+            CallHead::User(callee) => (
+                vec![
+                    PrintPiece::child(expr, callee, POSTFIX),
+                    PrintPiece::text("("),
+                ],
+                ")",
+                &call.args[..],
+            ),
+        };
         let child = indent + INDENT;
-        let pad = " ".repeat(child);
-        let mut s = String::from(open);
-        s.push('\n');
-        for &a in positional {
-            let r = self.full_w(a, EXPR, lambda, child, child, true);
-            s.push_str(&pad);
-            s.push_str(&r);
-            s.push_str(",\n");
+        parts.push(PrintPiece::text("\n"));
+        for &id in args {
+            parts.push(PrintPiece::text(" ".repeat(child)));
+            parts.push(PrintPiece::Wide {
+                expr: expr.child(id, EXPR),
+                col: child,
+                indent: child,
+                bracketed: true,
+            });
+            parts.push(PrintPiece::text(",\n"));
         }
-        for n in named {
-            let key = self.module.resolve(n.name);
-            let prefix = format!("{key} = ");
-            let r = self.full_w(
-                n.value,
-                EXPR,
-                lambda,
-                child + prefix.chars().count(),
-                child,
-                true,
-            );
-            s.push_str(&pad);
-            s.push_str(&prefix);
-            s.push_str(&r);
-            s.push_str(",\n");
+        for named in &call.named {
+            let prefix = format!("{} = ", self.module.resolve(named.name));
+            let col = child + prefix.chars().count();
+            parts.push(PrintPiece::text(format!("{}{prefix}", " ".repeat(child))));
+            parts.push(PrintPiece::Wide {
+                expr: expr.child(named.value, EXPR),
+                col,
+                indent: child,
+                bracketed: true,
+            });
+            parts.push(PrintPiece::text(",\n"));
         }
-        s.push_str(&" ".repeat(indent));
-        s.push_str(close);
-        s
-    }
-
-    /// Break a same-operator chain `e0 op e1 op e2` so each subsequent operand
-    /// starts a continuation line under a leading operator:
-    /// ```text
-    /// e0
-    /// op e1
-    /// op e2
-    /// ```
-    /// (A leading-operator continuation re-lexes inside the enclosing bracket.)
-    fn break_op(
-        &self,
-        id: NodeId,
-        op: &str,
-        lmin: u8,
-        rmin: u8,
-        lambda: &[Symbol],
-        indent: usize,
-    ) -> String {
-        let mut elems = Vec::new();
-        self.op_spine(id, op, &mut elems);
-        let pad = " ".repeat(indent);
-        let mut s = self.full_w(elems[0], lmin, lambda, indent, indent, true);
-        for &e in &elems[1..] {
-            let opcol = indent + op.chars().count() + 1;
-            let r = self.full_w(e, rmin, lambda, opcol, indent, true);
-            s.push('\n');
-            s.push_str(&pad);
-            s.push_str(op);
-            s.push(' ');
-            s.push_str(&r);
-        }
-        s
-    }
-
-    /// Flatten the left spine of nodes joined by the SAME infix operator `op`
-    /// (left-associative), so the chain prints as one column of operands.
-    fn op_spine(&self, id: NodeId, op: &str, out: &mut Vec<NodeId>) {
-        if let Some(inf) = self.as_infix(id)
-            && inf.op == op
-        {
-            self.op_spine(inf.left, op, out);
-            out.push(inf.right);
-            return;
-        }
-        out.push(id);
+        parts.push(PrintPiece::text(format!("{}{close}", " ".repeat(indent))));
+        Some(parts)
     }
 
     /// View a node as a breakable infix operator application: a plain binary
@@ -889,93 +931,6 @@ impl<'m> Printer<'m> {
             });
         }
         None
-    }
-
-    // ---- reified callables (shared by both syntaxes) ----
-
-    /// Explicit reification form: output first, then — for an authored
-    /// boundary — the entries as boundary kwargs (`p = a`, `x = _x_`). An
-    /// `%autoinputs` cut prints as the bare boundary-less form (a filled list
-    /// is inference metadata and is dropped on conversion to FlatPPL,
-    /// spec §11). The whole call is a placeholder-scope boundary, so the body
-    /// prints with no enclosing-lambda strip set.
-    fn reified_text(&self, call: &Call, syntax: Syntax) -> String {
-        let render = |id: NodeId| match syntax {
-            Syntax::Full => self.full(id, EXPR, &[]),
-            Syntax::Minimal => self.minimal(id),
-        };
-        let head = match &call.head {
-            CallHead::Builtin(op) => self.module.resolve(*op).to_string(),
-            CallHead::User(callee) => render(*callee),
-        };
-        let mut parts = vec![render(call.args[0])];
-        if let Some(Inputs::Spec(entries)) = &call.inputs {
-            for (pname, r) in entries.iter() {
-                parts.push(format!(
-                    "{} = {}",
-                    self.module.resolve(*pname),
-                    print_ref(self.module, r)
-                ));
-            }
-        }
-        format!("{head}({})", parts.join(", "))
-    }
-
-    // ---- minimal syntax (lowered linear form) ----
-
-    fn minimal(&self, id: NodeId) -> String {
-        match self.module.node(id) {
-            Node::Lit(s) => print_scalar(s),
-            Node::Const(sym) => self.builtin_name(*sym),
-            Node::Hole => "_".to_string(),
-            Node::Ref(r) => print_ref(self.module, r),
-            Node::Axis(a) => print_axis(self.module, a),
-            Node::Call(c) => self.minimal_call(c),
-        }
-    }
-
-    fn minimal_call(&self, call: &Call) -> String {
-        if call.inputs.is_some() {
-            return self.reified_text(call, Syntax::Minimal);
-        }
-        match &call.head {
-            CallHead::Builtin(op) => {
-                let name = self.module.resolve(*op);
-                match name {
-                    // Canonical literal surface forms (kept in minimal too —
-                    // they are the only spelling of array / tuple literals).
-                    "vector" if call.named.is_empty() => {
-                        format!("[{}]", self.minimal_list(&call.args))
-                    }
-                    "tuple" if call.named.is_empty() && call.args.len() >= 2 => {
-                        format!("({})", self.minimal_list(&call.args))
-                    }
-                    _ => format!("{}({})", self.builtin_name(*op), self.minimal_args(call)),
-                }
-            }
-            CallHead::User(callee) => {
-                format!("{}({})", self.minimal(*callee), self.minimal_args(call))
-            }
-        }
-    }
-
-    fn minimal_list(&self, ids: &[NodeId]) -> String {
-        ids.iter()
-            .map(|&e| self.minimal(e))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    fn minimal_args(&self, call: &Call) -> String {
-        let mut parts: Vec<String> = call.args.iter().map(|&a| self.minimal(a)).collect();
-        for n in call.named.iter() {
-            parts.push(format!(
-                "{} = {}",
-                self.module.resolve(n.name),
-                self.minimal(n.value)
-            ));
-        }
-        parts.join(", ")
     }
 }
 

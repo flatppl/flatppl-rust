@@ -26,6 +26,7 @@ mod catalogue;
 mod consteval;
 mod modules;
 mod ops;
+mod rule;
 mod trace;
 
 use crate::modules::InferSession;

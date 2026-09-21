@@ -3,36 +3,49 @@
 use std::fs;
 use std::process::Command;
 
-use flatppl_core::depth::DEFAULT_MAX_DEPTH;
-
 mod common;
 use common::Scratch;
 
 #[test]
-fn deep_forward_references_return_a_resource_error() {
+fn deep_references_infer_in_either_declaration_order() {
     let dir = Scratch::new("infer-reference-depth");
-    for count in [DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH + 1, 4001] {
-        let mut source = String::new();
-        for i in 0..count - 1 {
-            source.push_str(&format!("x{i} = x{}\n", i + 1));
-        }
-        source.push_str(&format!("x{} = 1\n", count - 1));
-        let input = dir.path(&format!("chain-{count}.flatppl"));
-        fs::write(&input, source).unwrap();
+    let count = 10_000;
+    let mut bindings: Vec<_> = (0..count - 1)
+        .map(|i| format!("x{i} = x{}", i + 1))
+        .collect();
+    bindings.push(format!("x{} = 1", count - 1));
+    for order in ["forward", "reverse"] {
+        let input = dir.path(&format!("chain-{order}.flatppl"));
+        let emitted = dir.path(&format!("chain-{order}.flatpir"));
+        fs::write(
+            &input,
+            format!("{}\nresult = add(x0, 0)\n", bindings.join("\n")),
+        )
+        .unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_flatppl"))
             .arg("infer")
             .arg(input)
-            .arg(dir.path(&format!("chain-{count}.flatpir")))
+            .arg(&emitted)
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if count == DEFAULT_MAX_DEPTH {
-            assert!(output.status.success(), "{stderr}");
-        } else {
-            assert_eq!(output.status.code(), Some(1), "{stderr}");
-            assert!(stderr.contains("inference graph"), "{stderr}");
-            assert!(stderr.contains("resource guard"), "{stderr}");
-        }
+        assert!(output.status.success(), "{order}: {stderr}");
+        let module = flatppl_flatpir::read(&fs::read_to_string(emitted).unwrap()).unwrap();
+        let (_, result) = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == "result")
+            .unwrap();
+        assert_eq!(
+            module.phase_of(result.rhs),
+            Some(flatppl_core::Phase::Fixed)
+        );
+        assert_eq!(
+            module.type_of(result.rhs),
+            Some(&flatppl_core::Type::Scalar(
+                flatppl_core::ScalarType::Integer
+            ))
+        );
+        bindings.reverse();
     }
 }
 

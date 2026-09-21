@@ -116,7 +116,9 @@ pub(crate) enum ConstEval {
 /// Const-evaluate `node`'s fixed value. Recursion is depth-bounded (ref/self
 /// cycles); a non-fixed ancestor yields `Dynamic` (the value varies).
 fn const_eval(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> ConstEval {
-    if depth > 64 {
+    // A substituted boundary replaces its original computation (§04). Seeds
+    // carry types and sets, not concrete values, even when their phase is fixed.
+    if inf.is_substituted(node) || depth > 64 {
         return ConstEval::Dynamic;
     }
     match inf.module.node(node).clone() {
@@ -130,7 +132,7 @@ fn const_eval(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> ConstEv
             let rhs = inf.module.binding(binding).rhs;
             // A non-fixed binding's value varies between evaluations — the
             // §17.1 "legitimately %dynamic" case, never an op-gap.
-            if inf.infer_node(rhs).1 == Phase::Fixed {
+            if inf.node_annotation(rhs).1 == Phase::Fixed {
                 const_eval(inf, rhs, depth + 1)
             } else {
                 ConstEval::Dynamic
@@ -189,7 +191,7 @@ fn gap_or_dynamic(
     name: &str,
     depth: u32,
 ) -> ConstEval {
-    let (ty, phase) = inf.infer_node(node);
+    let (ty, phase) = inf.node_annotation(node);
     // Non-fixed ⇒ value varies; non-value (measure/kernel/function/…) ⇒ no fixed
     // value to compute. Either way `%dynamic`, not a gap.
     if phase != Phase::Fixed || !is_value_type(&ty) {
@@ -329,7 +331,7 @@ fn length_observer(inf: &mut Inferencer<'_, '_>, c: &Call) -> ConstEval {
     let Some(&arg) = c.args.first() else {
         return ConstEval::Dynamic;
     };
-    match inf.infer_node(arg).0 {
+    match inf.node_annotation(arg).0 {
         Type::Array { shape, .. } if shape.len() == 1 => dim_to_ce(shape[0]),
         Type::TVector { len, .. } => dim_to_ce(len),
         Type::Table { nrows, .. } => dim_to_ce(nrows),
@@ -344,7 +346,7 @@ fn sizeof_observer(inf: &mut Inferencer<'_, '_>, c: &Call) -> ConstEval {
     let Some(&arg) = c.args.first() else {
         return ConstEval::Dynamic;
     };
-    match inf.infer_node(arg).0 {
+    match inf.node_annotation(arg).0 {
         Type::Array { shape, .. } => {
             let mut dims = Vec::with_capacity(shape.len());
             for d in shape.iter() {

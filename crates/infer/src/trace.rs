@@ -1,7 +1,7 @@
 //! The memoised type/phase trace over a module's binding DAG.
 //!
-//! Bindings are visited in source order; references recurse (FlatPPL is
-//! order-irrelevant) with the side-tables doubling as the memo. A reference
+//! Bindings are visited in source order; an explicit work stack resolves
+//! dependencies with the side-tables doubling as the memo. A reference
 //! cycle is an error (the module is not a DAG); the offending binding gets a
 //! `(%failed …)` type so the gap is visible in annotated output.
 
@@ -13,11 +13,64 @@ use flatppl_core::{
     Type, ValueSet,
 };
 
-use crate::modules::InferSession;
+use crate::modules::{Dependency, InferSession, Resolution, Resolved};
 use crate::ops;
+use crate::rule::{Resume, RuleStep};
 use crate::{Diagnostic, Level};
 
 type AutoInputScope = HashMap<NodeId, Box<[(Symbol, Ref)]>>;
+
+enum Work {
+    Binding(BindingId),
+    Enter(NodeId),
+    Finish(NodeId),
+    LeaveBinding(BindingId),
+    ResumeBody(Box<BodyFrame>),
+    ResumeModule(Box<ModuleFrame>),
+}
+
+/// Mutable annotations belong to one substitution context, not to the graph.
+struct Scope {
+    diags: Vec<Diagnostic>,
+    inferred: HashMap<NodeId, (Type, Phase)>,
+    vsets: HashMap<NodeId, ValueSet>,
+    seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
+    in_progress: Vec<BindingId>,
+    active_bindings: HashSet<BindingId>,
+    noted_gaps: HashSet<Symbol>,
+    module_callable_results: HashMap<NodeId, Type>,
+    module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
+}
+
+struct CallFrame {
+    id: NodeId,
+    call: Call,
+    callee: Option<(NodeId, Type)>,
+    args: Vec<(NodeId, Type, Phase)>,
+    named: Vec<(Symbol, NodeId, Type, Phase)>,
+}
+
+enum CallResume {
+    Type(CallFrame, Resume<(Type, Phase)>),
+    Valueset(CallFrame, Type, Phase, Resume<ValueSet>),
+}
+
+struct BodyFrame {
+    body: NodeId,
+    scope: Scope,
+    resume: CallResume,
+}
+
+struct ModuleFrame {
+    node: NodeId,
+    module: Module,
+    scope: Scope,
+    kernel_tag_nodes: Rc<HashSet<NodeId>>,
+    auto_inputs: Vec<AutoInputScope>,
+    key: (String, String),
+    path: String,
+    binding: String,
+}
 
 pub(crate) struct Inferencer<'m, 's> {
     pub(crate) module: &'m mut Module,
@@ -32,7 +85,7 @@ pub(crate) struct Inferencer<'m, 's> {
     inferred: HashMap<NodeId, (Type, Phase)>,
     vsets: HashMap<NodeId, ValueSet>,
     /// Pre-seeded annotations for substituted input nodes: (type, phase,
-    /// valueset). Applied at the top of `infer_node` before any other logic,
+    /// valueset). Applied when entering a node before any other logic,
     /// making the substituted input authoritative for everything downstream.
     seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
     /// Bindings on the active resolution path (cycle detection).
@@ -135,20 +188,6 @@ impl<'m, 's> Inferencer<'m, 's> {
         }
     }
 
-    /// Like `new`, but pre-seeds the given node annotations so that
-    /// substituted input nodes carry their importer-context types into the
-    /// dependency walk.
-    pub(crate) fn new_seeded(
-        module: &'m mut Module,
-        level: Level,
-        session: &'s InferSession<'s>,
-        seeds: &[(NodeId, crate::modules::Resolved)],
-    ) -> Self {
-        let mut inf = Self::new(module, level, session);
-        inf.seed_inputs(seeds);
-        inf
-    }
-
     fn seed_inputs(&mut self, seeds: &[(NodeId, crate::modules::Resolved)]) {
         self.seeds = seeds
             .iter()
@@ -156,28 +195,30 @@ impl<'m, 's> Inferencer<'m, 's> {
             .collect();
     }
 
-    /// Reuse the unchanged graph, not the caller's inferred annotations.
-    /// Moving the boundary stack gives the child ancestor visibility without
-    /// copying it. The parent's walk is suspended until the stack is restored.
-    pub(crate) fn infer_substituted(
-        &mut self,
-        body: NodeId,
-        seeds: &[(NodeId, crate::modules::Resolved)],
-    ) -> (Type, ValueSet) {
-        let mut sub = Inferencer::with_kernel_tags(
-            self.module,
-            self.level,
-            self.session,
-            Rc::clone(&self.kernel_tag_nodes),
-        );
-        sub.seed_inputs(seeds);
-        sub.auto_inputs = std::mem::take(&mut self.auto_inputs);
-        sub.auto_inputs.push(HashMap::new());
-        let (ty, _) = sub.infer_node(body);
-        let vset = sub.lookup_valueset(body);
-        sub.auto_inputs.pop();
-        self.auto_inputs = sub.auto_inputs;
-        (ty, vset)
+    fn suspend_scope(&mut self) -> Scope {
+        Scope {
+            diags: std::mem::take(&mut self.diags),
+            inferred: std::mem::take(&mut self.inferred),
+            vsets: std::mem::take(&mut self.vsets),
+            seeds: std::mem::take(&mut self.seeds),
+            in_progress: std::mem::take(&mut self.in_progress),
+            active_bindings: std::mem::take(&mut self.active_bindings),
+            noted_gaps: std::mem::take(&mut self.noted_gaps),
+            module_callable_results: std::mem::take(&mut self.module_callable_results),
+            module_catalogue_refs: std::mem::take(&mut self.module_catalogue_refs),
+        }
+    }
+
+    fn restore_scope(&mut self, scope: Scope) {
+        self.diags = scope.diags;
+        self.inferred = scope.inferred;
+        self.vsets = scope.vsets;
+        self.seeds = scope.seeds;
+        self.in_progress = scope.in_progress;
+        self.active_bindings = scope.active_bindings;
+        self.noted_gaps = scope.noted_gaps;
+        self.module_callable_results = scope.module_callable_results;
+        self.module_catalogue_refs = scope.module_catalogue_refs;
     }
 
     pub(crate) fn auto_inputs_of(&self, id: NodeId) -> Option<&[(Symbol, Ref)]> {
@@ -193,6 +234,19 @@ impl<'m, 's> Inferencer<'m, 's> {
     }
 
     pub(crate) fn run(mut self) -> Vec<Diagnostic> {
+        self.initialize_module();
+        let mut work = Vec::new();
+        self.schedule_bindings(&mut work);
+        self.drain_work(&mut work);
+        self.finish_module()
+    }
+
+    fn schedule_bindings(&self, work: &mut Vec<Work>) {
+        let ids: Vec<_> = self.module.bindings().map(|(id, _)| id).collect();
+        work.extend(ids.into_iter().rev().map(Work::Binding));
+    }
+
+    fn initialize_module(&mut self) {
         // Spec §05 axis positions, before the trace: the rules are positional,
         // and seeding the offending node `Failed` keeps a refused bracket to one
         // error instead of a cascade of type complaints about it.
@@ -203,17 +257,16 @@ impl<'m, 's> Inferencer<'m, 's> {
             );
             self.diags.push(diag);
         }
-        let ids: Vec<BindingId> = self.module.bindings().map(|(id, _)| id).collect();
-        for id in ids {
-            self.infer_binding(id);
-        }
+    }
+
+    fn finish_module(&mut self) -> Vec<Diagnostic> {
         // Level-aware flush into the module's annotation side-tables.
         for (id, entries) in self.auto_inputs.pop().unwrap() {
             self.module.set_auto_inputs(id, entries);
         }
         // Move completed annotations into the module as natural value sets
         // are derived, without cloning either table.
-        for (id, (ty, phase)) in self.inferred {
+        for (id, (ty, phase)) in std::mem::take(&mut self.inferred) {
             if self.level >= Level::Valueset {
                 // Total discipline (spec §11): a value-typed node's set is at
                 // least the type's natural extent — fall back where no producer
@@ -233,16 +286,16 @@ impl<'m, 's> Inferencer<'m, 's> {
             }
         }
         if self.level >= Level::Valueset {
-            for (id, set) in self.vsets {
+            for (id, set) in std::mem::take(&mut self.vsets) {
                 self.module.set_valueset(id, set);
             }
         }
         // Drain dependency diagnostics accumulated during this run (cross-module
-        // cycle errors and other dep-level errors). `infer_dep` stores child
+        // cycle errors and other dep-level errors). Module frames store child
         // diagnostics here after each dependency walk; draining ensures they
         // propagate up through every level of the import chain.
         self.diags.extend(self.session.drain_dep_diags());
-        self.diags
+        std::mem::take(&mut self.diags)
     }
 
     /// The inferred type of an already-visited node (ops rules use this to
@@ -381,12 +434,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         }
     }
 
-    /// Type + phase of a binding's RHS (memoised).
-    pub(crate) fn infer_binding(&mut self, id: BindingId) -> (Type, Phase) {
-        let rhs = self.module.binding(id).rhs;
-        if let Some(result) = self.inferred.get(&rhs) {
-            return result.clone();
-        }
+    fn enter_binding(&mut self, id: BindingId) -> bool {
         if !self.active_bindings.insert(id) {
             let path: Vec<&str> = self
                 .in_progress
@@ -402,38 +450,199 @@ impl<'m, 's> Inferencer<'m, 's> {
                 path.join(" → ")
             )));
             let ty = Type::Failed("reference cycle".into());
+            let rhs = self.module.binding(id).rhs;
             self.inferred.insert(rhs, (ty.clone(), Phase::Fixed));
-            return (ty, Phase::Fixed);
+            return false;
         }
         self.in_progress.push(id);
-        let result = self.infer_node(rhs);
-        self.in_progress.pop();
-        self.active_bindings.remove(&id);
-        result
+        true
     }
 
-    /// Type + phase of a node (memoised). Every node is traced; the flush
-    /// annotates the module per level, and the FlatPIR writer projects
-    /// `%meta` at call positions only (spec §11).
-    pub(crate) fn infer_node(&mut self, id: NodeId) -> (Type, Phase) {
-        // Substitution seed: if this node was pre-seeded by a %assign
-        // substitution, write its annotation directly and return — making the
-        // input authoritative for everything downstream that references it.
-        if let Some((ty, phase, vset)) = self.seeds.get(&id).cloned() {
-            self.inferred.insert(id, (ty.clone(), phase));
-            if self.level >= Level::Valueset {
-                self.vsets.insert(id, vset);
+    /// Rules run after their dependencies finish. Reading an annotation must
+    /// never launch another trace or cross a substituted boundary.
+    pub(crate) fn node_annotation(&self, id: NodeId) -> (Type, Phase) {
+        self.inferred
+            .get(&id)
+            .expect("inference dependency must be complete")
+            .clone()
+    }
+
+    pub(crate) fn is_substituted(&self, id: NodeId) -> bool {
+        self.seeds.contains_key(&id)
+    }
+
+    fn drain_work(&mut self, work: &mut Vec<Work>) {
+        while let Some(step) = work.pop() {
+            match step {
+                Work::Binding(binding) => {
+                    let rhs = self.module.binding(binding).rhs;
+                    if !self.inferred.contains_key(&rhs) && self.enter_binding(binding) {
+                        work.push(Work::LeaveBinding(binding));
+                        work.push(Work::Enter(rhs));
+                    }
+                }
+                Work::LeaveBinding(binding) => {
+                    self.in_progress.pop();
+                    self.active_bindings.remove(&binding);
+                }
+                Work::Finish(node) => {
+                    // A cycle marker keeps its failed type, but the operation
+                    // still runs its independent checks (e.g. arity).
+                    self.finish_node(node, work);
+                }
+                Work::ResumeBody(frame) => {
+                    let ty = self.inferred[&frame.body].0.clone();
+                    let vset = self.lookup_valueset(frame.body);
+                    self.auto_inputs.pop();
+                    self.restore_scope(frame.scope);
+                    match frame.resume {
+                        CallResume::Type(call, resume) => {
+                            let step = resume(self, (ty, vset));
+                            self.finish_call_type(call, step, work);
+                        }
+                        CallResume::Valueset(call, result, phase, resume) => {
+                            let step = resume(self, (ty, vset));
+                            self.finish_call_valueset(call, result, phase, step, work);
+                        }
+                    }
+                }
+                Work::ResumeModule(frame) => {
+                    let diags = self.finish_module();
+                    self.session.push_dep_diags(diags);
+                    let dependency = std::mem::replace(self.module, frame.module);
+                    self.kernel_tag_nodes = frame.kernel_tag_nodes;
+                    self.auto_inputs = frame.auto_inputs;
+                    self.restore_scope(frame.scope);
+                    self.session
+                        .finish_dependency(frame.key.clone(), dependency);
+                    let result = self.session.resolved_binding(
+                        self.module,
+                        &frame.key,
+                        &frame.path,
+                        &frame.binding,
+                    );
+                    self.record_resolution(frame.node, result);
+                }
+                Work::Enter(node) => {
+                    if let Some((ty, phase, vset)) = self.seeds.get(&node).cloned() {
+                        self.inferred.insert(node, (ty, phase));
+                        self.set_vset(node, vset);
+                        continue;
+                    }
+                    if self.inferred.contains_key(&node) {
+                        continue;
+                    }
+                    work.push(Work::Finish(node));
+                    match self.module.node(node) {
+                        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                            if let Some(binding) = self.module.binding_by_name(r.name) {
+                                let rhs = self.module.binding(binding).rhs;
+                                if !self.inferred.contains_key(&rhs) && self.enter_binding(binding)
+                                {
+                                    work.push(Work::LeaveBinding(binding));
+                                    work.push(Work::Enter(rhs));
+                                }
+                            }
+                        }
+                        Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
+                            let RefNs::Module(alias) = r.ns else {
+                                unreachable!()
+                            };
+                            for (_, value) in self
+                                .session
+                                .substitutions_of(self.module, alias)
+                                .into_iter()
+                                .rev()
+                            {
+                                work.push(Work::Enter(value));
+                            }
+                        }
+                        node => {
+                            let start = work.len();
+                            node.for_each_child(|child| work.push(Work::Enter(child)));
+                            work[start..].reverse();
+                        }
+                    }
+                }
             }
-            return (ty, phase);
         }
-        if let Some(result) = self.inferred.get(&id) {
-            return result.clone();
+    }
+
+    fn finish_node(&mut self, id: NodeId, work: &mut Vec<Work>) {
+        match self.module.node(id).clone() {
+            Node::Call(call) => self.start_call(id, call, work),
+            Node::Ref(Ref {
+                ns: RefNs::Module(alias),
+                name,
+            }) => {
+                let binding = self.module.resolve(name).to_string();
+                let seeds = self.subst_annos_for(alias);
+                match self.session.resolve(self.module, alias, &binding, &seeds) {
+                    Ok(Resolution::Ready(result)) => self.record_resolution(id, Ok(result)),
+                    Err(error) => self.record_resolution(id, Err(error)),
+                    Ok(Resolution::Infer(dependency)) => self.start_module(id, *dependency, work),
+                }
+            }
+            _ => {
+                self.infer_node_inner(id);
+            }
         }
-        self.infer_node_inner(id)
+    }
+
+    fn start_module(&mut self, node: NodeId, dependency: Dependency, work: &mut Vec<Work>) {
+        let Dependency {
+            module,
+            seeds,
+            key,
+            path,
+            binding,
+        } = dependency;
+        let scope = self.suspend_scope();
+        let module = std::mem::replace(self.module, module);
+        let (tags, reachable) = collect_kernel_tag_nodes(self.module);
+        let kernel_tag_nodes = std::mem::replace(&mut self.kernel_tag_nodes, Rc::new(tags));
+        let auto_inputs = std::mem::replace(&mut self.auto_inputs, vec![HashMap::new()]);
+        self.inferred.reserve(reachable);
+        if self.level >= Level::Valueset {
+            self.vsets.reserve(reachable);
+        }
+        self.seed_inputs(&seeds);
+        self.initialize_module();
+        work.push(Work::ResumeModule(Box::new(ModuleFrame {
+            node,
+            module,
+            scope,
+            kernel_tag_nodes,
+            auto_inputs,
+            key,
+            path,
+            binding,
+        })));
+        self.schedule_bindings(work);
+    }
+
+    fn record_resolution(&mut self, node: NodeId, result: Result<Resolved, String>) {
+        let result = match result {
+            Ok(res) => {
+                if let Some(result) = res.result {
+                    self.module_callable_results.insert(node, result);
+                }
+                if let Some(catalogue) = res.catalogue {
+                    self.module_catalogue_refs.insert(node, catalogue);
+                }
+                self.set_vset(node, res.vset);
+                (res.ty, res.phase)
+            }
+            Err(message) => {
+                self.diags.push(Diagnostic::error_at(node, message));
+                (Type::Failed("cross-module resolution".into()), Phase::Fixed)
+            }
+        };
+        self.inferred.insert(node, result);
     }
 
     fn infer_node_inner(&mut self, id: NodeId) -> (Type, Phase) {
-        // Clone the node to release the module borrow during recursion; nodes
+        // Clone the node to release the module borrow while annotating; nodes
         // are small (boxed slices of ids).
         let node = self.module.node(id).clone();
         let (ty, phase) = match &node {
@@ -475,8 +684,8 @@ impl<'m, 's> Inferencer<'m, 's> {
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => match self.module.binding_by_name(r.name) {
                     Some(b) => {
-                        let result = self.infer_binding(b);
                         let rhs = self.module.binding(b).rhs;
+                        let result = self.inferred[&rhs].clone();
                         let set = self.lookup_valueset(rhs);
                         self.set_vset(id, set);
                         result
@@ -496,48 +705,16 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.set_vset(id, ValueSet::Anything);
                     (Type::Any, Phase::Parameterized)
                 }
-                RefNs::Module(alias) => {
-                    let binding_name = self.module.resolve(r.name).to_string();
-                    let subst_annos = self.subst_annos_for(alias);
-                    match self.session.resolve(
-                        &mut *self.module,
-                        alias,
-                        &binding_name,
-                        &subst_annos,
-                        self.level,
-                    ) {
-                        Ok(res) => {
-                            // Stash the dependency's callable body-result type
-                            // (if any) keyed by this ref node, so applying the
-                            // callable (`reified_result_type`) can reach it
-                            // across the interner boundary.
-                            if let Some(result) = res.result {
-                                self.module_callable_results.insert(id, result);
-                            }
-                            // Stash the §09 catalogue sig (if any) keyed by this
-                            // ref node, so the user-call path can lower it with
-                            // the concrete call args when the ref is applied.
-                            if let Some(catalogue) = res.catalogue {
-                                self.module_catalogue_refs.insert(id, catalogue);
-                            }
-                            self.set_vset(id, res.vset);
-                            (res.ty, res.phase)
-                        }
-                        Err(message) => {
-                            self.diags.push(crate::Diagnostic::error_at(id, message));
-                            (Type::Failed("cross-module resolution".into()), Phase::Fixed)
-                        }
-                    }
-                }
+                RefNs::Module(_) => unreachable!("module references use scheduler frames"),
             },
             Node::Hole | Node::Axis(_) => {
                 self.set_vset(id, ValueSet::Unknown);
                 (Type::Any, Phase::Fixed)
             }
-            Node::Call(call) => self.infer_call(id, call),
+            Node::Call(_) => unreachable!("calls use scheduler frames"),
         };
         // A cycle marker may have landed on this node while the walk was in
-        // flight (see infer_binding); it is authoritative — don't clobber it.
+        // flight (see enter_binding); it is authoritative — don't clobber it.
         if let Some(result) = self.inferred.get(&id) {
             return result.clone();
         }
@@ -545,17 +722,17 @@ impl<'m, 's> Inferencer<'m, 's> {
         (ty, phase)
     }
 
-    fn infer_call(&mut self, id: NodeId, call: &Call) -> (Type, Phase) {
+    fn start_call(&mut self, id: NodeId, call: Call, work: &mut Vec<Work>) {
         // Children first: callee (user calls), positional, named.
         let callee = match call.head {
-            CallHead::User(callee) => Some((callee, self.infer_node(callee))),
+            CallHead::User(callee) => Some((callee, self.node_annotation(callee))),
             CallHead::Builtin(_) => None,
         };
         let args: Vec<(NodeId, Type, Phase)> = call
             .args
             .iter()
             .map(|&a| {
-                let (t, p) = self.infer_node(a);
+                let (t, p) = self.node_annotation(a);
                 (a, t, p)
             })
             .collect();
@@ -563,12 +740,12 @@ impl<'m, 's> Inferencer<'m, 's> {
             .named
             .iter()
             .map(|n| {
-                let (t, p) = self.infer_node(n.value);
+                let (t, p) = self.node_annotation(n.value);
                 (n.name, n.value, t, p)
             })
             .collect();
 
-        self.validate_load_assigns(call);
+        self.validate_load_assigns(&call);
 
         // The §04 ancestor rule: a call's phase is the join of its inputs'
         // phases, except where the op itself introduces a phase.
@@ -580,17 +757,106 @@ impl<'m, 's> Inferencer<'m, 's> {
             .fold(Phase::Fixed, join_phase);
 
         let callee = callee.map(|(n, tp)| (n, tp.0));
-        let (ty, phase) = ops::call_rule(self, id, call, callee.clone(), &args, &named, joined);
-        if self.level >= Level::Valueset {
-            let set = ops::call_valueset(self, call, callee.as_ref(), &args, &named, &ty);
-            self.set_vset(id, set);
-        }
-        let ty = if self.level >= Level::Normalization {
-            ops::fill_mass(self, id, call, callee.as_ref(), ty, &args, &named)
-        } else {
-            ty
+        let step = ops::call_rule(self, id, &call, callee.clone(), &args, &named, joined);
+        let frame = CallFrame {
+            id,
+            call,
+            callee,
+            args,
+            named,
         };
-        (ty, phase)
+        self.finish_call_type(frame, step, work);
+    }
+
+    fn start_body(
+        &mut self,
+        body: NodeId,
+        seeds: Vec<(NodeId, Resolved)>,
+        resume: CallResume,
+        work: &mut Vec<Work>,
+    ) {
+        let scope = self.suspend_scope();
+        self.seed_inputs(&seeds);
+        self.auto_inputs.push(HashMap::new());
+        work.push(Work::ResumeBody(Box::new(BodyFrame {
+            body,
+            scope,
+            resume,
+        })));
+        work.push(Work::Enter(body));
+    }
+
+    fn finish_call_type(
+        &mut self,
+        call: CallFrame,
+        step: RuleStep<(Type, Phase)>,
+        work: &mut Vec<Work>,
+    ) {
+        match step {
+            RuleStep::Ready((ty, phase)) => {
+                let valueset = if self.level >= Level::Valueset {
+                    ops::call_valueset(
+                        self,
+                        &call.call,
+                        call.callee.as_ref(),
+                        &call.args,
+                        &call.named,
+                        &ty,
+                    )
+                } else {
+                    RuleStep::Ready(ValueSet::Unknown)
+                };
+                self.finish_call_valueset(call, ty, phase, valueset, work);
+            }
+            RuleStep::InferBody {
+                body,
+                seeds,
+                resume,
+            } => {
+                self.start_body(body, seeds, CallResume::Type(call, resume), work);
+            }
+        }
+    }
+
+    fn finish_call_valueset(
+        &mut self,
+        call: CallFrame,
+        ty: Type,
+        phase: Phase,
+        step: RuleStep<ValueSet>,
+        work: &mut Vec<Work>,
+    ) {
+        match step {
+            RuleStep::Ready(set) => {
+                self.set_vset(call.id, set);
+                let ty = if self.level >= Level::Normalization {
+                    ops::fill_mass(
+                        self,
+                        call.id,
+                        &call.call,
+                        call.callee.as_ref(),
+                        ty,
+                        &call.args,
+                        &call.named,
+                    )
+                } else {
+                    ty
+                };
+                self.inferred.entry(call.id).or_insert((ty, phase));
+            }
+            RuleStep::InferBody {
+                body,
+                seeds,
+                resume,
+            } => {
+                self.start_body(
+                    body,
+                    seeds,
+                    CallResume::Valueset(call, ty, phase, resume),
+                    work,
+                );
+            }
+        }
     }
 
     /// Validate `%assign` substitutions on a `load_module` call against spec §04
@@ -729,7 +995,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         let subs = self.session.substitutions_of(self.module, alias);
         subs.into_iter()
             .map(|(name, value)| {
-                let (ty, phase) = self.infer_node(value);
+                let (ty, phase) = self.node_annotation(value);
                 let vset = self.lookup_valueset(value);
                 (
                     name,

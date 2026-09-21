@@ -49,76 +49,76 @@ pub(crate) fn position_errors(module: &Module) -> Vec<(NodeId, Diagnostic)> {
     out
 }
 
-fn scan(m: &Module, id: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(NodeId, Diagnostic)>) {
-    let node = m.node(id);
-    let Node::Call(c) = node else {
-        if let Node::Axis(ax) = node
-            && slot != Slot::Index
-        {
-            out.push((id, axis_error(m, id, ax.name)));
-        }
-        return;
-    };
+fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(NodeId, Diagnostic)>) {
+    // Context belongs to each occurrence, not just its NodeId: a shared axis
+    // can be legal in one position and illegal in another. Reverse scheduling
+    // preserves the recursive walk's callee/positional/named diagnostic order.
+    let mut pending = vec![(root, slot, in_body)];
+    while let Some((id, slot, in_body)) = pending.pop() {
+        let node = m.node(id);
+        let Node::Call(c) = node else {
+            if let Node::Axis(ax) = node
+                && slot != Slot::Index
+            {
+                out.push((id, axis_error(m, id, ax.name)));
+            }
+            continue;
+        };
 
-    if is_axis_list(m, c) {
-        if slot != Slot::OutputAxes {
-            out.push((id, axis_list_error(id, c.args.is_empty())));
+        if is_axis_list(m, c) {
+            if slot != Slot::OutputAxes {
+                out.push((id, axis_list_error(id, c.args.is_empty())));
+            }
+            // Reported through the bracket either way: the entries of a legal
+            // list are legal, and refused entries add nothing.
+            continue;
         }
-        // Reported through the bracket either way: the entries of a legal list
-        // are legal, and the entries of a refused one add nothing.
-        return;
-    }
 
-    let head = match c.head {
-        CallHead::Builtin(h) => Some(m.resolve(h)),
-        CallHead::User(callee) => {
-            scan(m, callee, Slot::Value, in_body, out);
-            None
+        let head = match c.head {
+            CallHead::Builtin(h) => Some(m.resolve(h)),
+            CallHead::User(_) => None,
+        };
+        match head {
+            // `aggregate(f_reduction, output_axes, expr)` /
+            // `metricsum(metric, output_axes, expr)` (spec §04).
+            Some("aggregate" | "metricsum") => {
+                for (i, &a) in c.args.iter().enumerate().rev() {
+                    let child = if i == 1 {
+                        Slot::OutputAxes
+                    } else {
+                        Slot::Value
+                    };
+                    pending.push((a, child, in_body || i == 2));
+                }
+                // No keyword branch: distinguished inputs cannot be passed by
+                // keyword (§04 Calling conventions); special_arity_check
+                // refuses that spelling before the axis scan.
+            }
+            Some("get") => {
+                pending.extend(
+                    c.named
+                        .iter()
+                        .rev()
+                        .map(|n| (n.value, Slot::Value, in_body)),
+                );
+                let index_slot = if in_body { Slot::Index } else { Slot::Value };
+                for (i, &a) in c.args.iter().enumerate().rev() {
+                    let child = if i == 0 { Slot::Value } else { index_slot };
+                    pending.push((a, child, in_body));
+                }
+            }
+            _ => {
+                pending.extend(
+                    c.named
+                        .iter()
+                        .rev()
+                        .map(|n| (n.value, Slot::Value, in_body)),
+                );
+                pending.extend(c.args.iter().rev().map(|&a| (a, Slot::Value, in_body)));
+            }
         }
-    };
-
-    match head {
-        // `aggregate(f_reduction, output_axes, expr)` /
-        // `metricsum(metric, output_axes, expr)` (spec §04).
-        Some("aggregate" | "metricsum") => {
-            for (i, &a) in c.args.iter().enumerate() {
-                let child = if i == 1 {
-                    Slot::OutputAxes
-                } else {
-                    Slot::Value
-                };
-                scan(m, a, child, in_body || i == 2, out);
-            }
-            // No keyword branch: the keyword spelling of a distinguished input
-            // is a static error (§04 "Calling conventions": "A distinguished
-            // input has no name and so cannot be passed by keyword"), refused by
-            // `ops::special_arity_check` before any axis scan runs. Where §04
-            // refers to such an input by a name, the name "identifies the input
-            // in prose only" — adjudicated 2026-09-03, merged as
-            // flatppl-design PR #109; see
-            // `flatppl-dev/adjudication-keyword-distinguished-inputs.md`. An
-            // earlier revision mapped `output_axes`/`expr` by keyword here, which
-            // made this the one place an illegal spelling was given a meaning.
-        }
-        // `A[.i, 1, .j]` and its `get(A, .i, 1, .j)` spelling: the indices are
-        // index positions, the indexed object is not.
-        Some("get") => {
-            let index_slot = if in_body { Slot::Index } else { Slot::Value };
-            for (i, &a) in c.args.iter().enumerate() {
-                let child = if i == 0 { Slot::Value } else { index_slot };
-                scan(m, a, child, in_body, out);
-            }
-            for n in c.named.iter() {
-                scan(m, n.value, Slot::Value, in_body, out);
-            }
-        }
-        _ => {
-            for &a in c.args.iter() {
-                scan(m, a, Slot::Value, in_body, out);
-            }
-            for n in c.named.iter() {
-                scan(m, n.value, Slot::Value, in_body, out);
-            }
+        if let CallHead::User(callee) = c.head {
+            pending.push((callee, Slot::Value, in_body));
         }
     }
 }
