@@ -86,7 +86,7 @@ enum Command {
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
-        /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`). A local
+        /// with `--from hs3`, or pyhf model/workspace JSON with `--from pyhf`). A local
         /// path — a model with remote `load_module` deps must be pre-fetched
         /// with `flatppl prepare`.
         input: PathBuf,
@@ -100,7 +100,7 @@ enum Command {
         /// Input format: `auto` infers from the file extension (`.flatppl` /
         /// `.flatpir`, and `.hs3.json` / `.pyhf.json`); `hs3` reads a native HS3
         /// JSON document (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf
-        /// workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
+        /// model or workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
         /// override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
@@ -264,7 +264,7 @@ enum FromFormat {
     /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
     /// Requires the optional `hs3` build feature.
     Hs3,
-    /// Read a pyhf workspace JSON document (top-level `channels` array).
+    /// Read a pyhf model or workspace JSON document (top-level `channels` array).
     /// Requires the optional `hs3` build feature.
     Pyhf,
 }

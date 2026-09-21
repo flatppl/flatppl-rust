@@ -308,7 +308,69 @@ pub fn derive_vector_param_name(parameters: &[String]) -> String {
 
 // ---- pyhf top-level document ----
 
-/// Top-level pyhf JSON document.
+/// The pyhf model schema has no observations or measurement metadata. Keep it
+/// distinct from a workspace so missing workspace data remains an error.
+#[derive(Debug)]
+pub enum PyhfDocument {
+    Model(PyhfModel),
+    Workspace(PyhfWorkspace),
+}
+
+impl PyhfDocument {
+    pub fn from_value(value: serde_json::Value) -> serde_json::Result<Self> {
+        // model.json permits only these two keys. Dispatch before deserializing
+        // to retain serde's field-specific errors for malformed workspaces.
+        let model_only = value.as_object().is_some_and(|obj| {
+            obj.keys()
+                .all(|key| matches!(key.as_str(), "channels" | "parameters"))
+        });
+        if model_only {
+            serde_json::from_value(value).map(Self::Model)
+        } else {
+            serde_json::from_value(value).map(Self::Workspace)
+        }
+    }
+
+    pub fn channels(&self) -> &[PyhfChannel] {
+        match self {
+            Self::Model(model) => &model.channels,
+            Self::Workspace(workspace) => &workspace.channels,
+        }
+    }
+
+    pub fn measurements(&self) -> impl Iterator<Item = &PyhfMeasurement> {
+        let (measurements, toplvl) = match self {
+            Self::Model(_) => (&[][..], None),
+            Self::Workspace(workspace) => {
+                (workspace.measurements.as_slice(), workspace.toplvl.as_ref())
+            }
+        };
+        measurements
+            .iter()
+            .chain(toplvl.into_iter().flat_map(|t| &t.measurements))
+    }
+
+    pub fn parameters(&self) -> &[PyhfParam] {
+        match self {
+            Self::Model(model) => &model.parameters,
+            // pyhf selects the first measurement unless the caller names one.
+            Self::Workspace(_) => self
+                .measurements()
+                .next()
+                .map_or(&[], |m| m.config.parameters.as_slice()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PyhfModel {
+    pub channels: Vec<PyhfChannel>,
+    #[serde(default)]
+    pub parameters: Vec<PyhfParam>,
+}
+
+/// Top-level pyhf workspace JSON document.
 ///
 /// Supports two schemas:
 /// - **New (workspace):** `observations: [{name, data:[...]}]` and top-level `measurements`.
@@ -319,7 +381,7 @@ pub fn derive_vector_param_name(parameters: &[String]) -> String {
 /// with `pyhf.exceptions.InvalidSpecification`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PyhfDocument {
+pub struct PyhfWorkspace {
     pub channels: Vec<PyhfChannel>,
     /// pyhf workspace schema version. Not lowered; parsed so
     /// `deny_unknown_fields` accepts a conforming workspace.
