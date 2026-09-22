@@ -1,0 +1,36 @@
+{
+  "channels": [
+    {"name": "alpha", "samples": [
+      {"name": "signal", "data": [3.0], "modifiers": [
+        {"name": "mu", "type": "normfactor", "data": null},
+        {"name": "lumi", "type": "lumi", "data": null},
+        {"name": "t", "type": "normsys", "data": {"lo": 0.9, "hi": 1.1}}
+      ]},
+      {"name": "background", "data": [8.0], "modifiers": [
+        {"name": "st", "type": "staterror", "data": [1.0]}
+      ]}
+    ]},
+    {"name": "zeta", "samples": [
+      {"name": "signal", "data": [5.0, 10.0], "modifiers": [
+        {"name": "mu", "type": "normfactor", "data": null},
+        {"name": "lumi", "type": "lumi", "data": null},
+        {"name": "t", "type": "normsys", "data": {"lo": 0.9, "hi": 1.1}},
+        {"name": "h", "type": "histosys", "data": {
+          "lo_data": [4.0, 8.0], "hi_data": [7.0, 11.0]
+        }}
+      ]},
+      {"name": "background", "data": [20.0, 25.0], "modifiers": [
+        {"name": "g", "type": "shapesys", "data": [3.0, 4.0]},
+        {"name": "st", "type": "staterror", "data": [2.0, 3.0]},
+        {"name": "beta", "type": "shapefactor", "data": null}
+      ]}
+    ]}
+  ],
+  "parameters": [
+    {"name": "lumi", "inits": [1.0], "bounds": [[0.5, 1.5]], "auxdata": [1.1], "sigmas": [0.12]},
+    {"name": "t", "auxdata": [0.3]},
+    {"name": "h", "auxdata": [-0.2]},
+    {"name": "g", "auxdata": [30.0, 40.0], "factors": [25.0, 36.0]},
+    {"name": "st", "auxdata": [1.1, 0.9, 1.05], "sigmas": [0.125, 0.2, 0.12]}
+  ]
+}

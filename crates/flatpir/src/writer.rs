@@ -16,8 +16,8 @@
 use crate::error::{Error, Result};
 use crate::sexpr::{self, Sexpr};
 use flatppl_core::{
-    Axis, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedKind, Node, NodeId, Phase,
-    Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
+    Axis, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedArg, NamedKind, Node, NodeId,
+    Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
 };
 
 /// Render `module` as canonical FlatPIR text, refusing text the FlatPIR reader
@@ -113,6 +113,13 @@ fn render_doc(doc: &Doc) -> String {
     format!("({})", parts.join(" "))
 }
 
+enum RenderStep<'m> {
+    Node(NodeId),
+    Text(&'static str),
+    Named(&'m NamedArg),
+    Inputs(NodeId, &'m Inputs),
+}
+
 /// Render a node, wrapping it in a `(%meta (<type> <phase> <valueset>) …)`
 /// annotation when warranted. `%meta` is a transparent wrapper that *can* go
 /// around any expression (spec §11), but serialization is **sparse**: we emit it
@@ -121,24 +128,69 @@ fn render_doc(doc: &Doc) -> String {
 /// are recoverable and the spec annotated example keeps them bare. A bare
 /// (pre-inference) node also renders without a wrapper.
 fn render_node(module: &Module, id: NodeId) -> String {
-    let inner = render_node_inner(module, id);
-    if matches!(module.node(id), Node::Call(_))
-        && let Some(triple) = render_meta(module, id)
-    {
-        return format!("(%meta {triple} {inner})");
+    // Emit directly into one buffer. Keeping subtree strings at every ancestor
+    // costs quadratic copying and ties expression depth to the native stack.
+    let mut out = String::new();
+    let mut pending = vec![RenderStep::Node(id)];
+    while let Some(step) = pending.pop() {
+        match step {
+            RenderStep::Text(text) => out.push_str(text),
+            RenderStep::Named(named) => {
+                let head = match named.kind {
+                    NamedKind::Kwarg => "%kwarg",
+                    NamedKind::Field => "%field",
+                    NamedKind::Assign => "%assign",
+                };
+                out.push_str(&format!(" ({head} {} ", module.resolve(named.name)));
+                pending.push(RenderStep::Text(")"));
+                pending.push(RenderStep::Node(named.value));
+            }
+            RenderStep::Inputs(id, inputs) => match inputs {
+                Inputs::Spec(entries) => {
+                    out.push_str(" %specinputs ");
+                    out.push_str(&render_input_entries(module, entries));
+                }
+                Inputs::Auto => {
+                    out.push_str(" %autoinputs ");
+                    match module.auto_inputs_of(id) {
+                        Some(entries) => out.push_str(&render_input_entries(module, entries)),
+                        None => out.push_str("%deferred"),
+                    }
+                }
+            },
+            RenderStep::Node(id) => match module.node(id) {
+                Node::Lit(lit) => out.push_str(&render_scalar(lit)),
+                Node::Const(sym) => out.push_str(module.resolve(*sym)),
+                Node::Hole => out.push('_'),
+                Node::Ref(r) => out.push_str(&render_ref(module, r)),
+                Node::Axis(a) => out.push_str(&render_axis(module, a)),
+                Node::Call(call) => {
+                    if let Some(triple) = render_meta(module, id) {
+                        out.push_str(&format!("(%meta {triple} "));
+                        pending.push(RenderStep::Text(")"));
+                    }
+                    out.push('(');
+                    pending.push(RenderStep::Text(")"));
+                    if let Some(inputs) = &call.inputs {
+                        pending.push(RenderStep::Inputs(id, inputs));
+                    }
+                    pending.extend(call.named.iter().rev().map(RenderStep::Named));
+                    for &arg in call.args.iter().rev() {
+                        pending.push(RenderStep::Node(arg));
+                        pending.push(RenderStep::Text(" "));
+                    }
+                    match call.head {
+                        CallHead::Builtin(sym) => out.push_str(module.resolve(sym)),
+                        CallHead::User(callee) => {
+                            out.push_str("%call ");
+                            pending.push(RenderStep::Node(callee));
+                        }
+                    }
+                }
+            },
+        }
     }
-    inner
-}
-
-fn render_node_inner(module: &Module, id: NodeId) -> String {
-    match module.node(id) {
-        Node::Lit(lit) => render_scalar(lit),
-        Node::Const(sym) => module.resolve(*sym).to_string(),
-        Node::Hole => "_".to_string(),
-        Node::Ref(r) => render_ref(module, r),
-        Node::Axis(a) => render_axis(module, a),
-        Node::Call(call) => render_call(module, id, call),
-    }
+    out
 }
 
 fn render_scalar(lit: &Scalar) -> String {
@@ -196,60 +248,6 @@ fn render_axis(module: &Module, a: &Axis) -> String {
         Some(Variance::Upper) => format!("(%uaxis {name})"),
         Some(Variance::Lower) => format!("(%laxis {name})"),
     }
-}
-
-fn render_call(module: &Module, id: NodeId, call: &Call) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    // Head: a bare built-in symbol, or `%call <callable>` for a user callable
-    // (the callee is an expression — a `(%ref …)` in the common case, spec §11).
-    match &call.head {
-        CallHead::Builtin(sym) => parts.push(module.resolve(*sym).to_string()),
-        CallHead::User(callee) => {
-            parts.push("%call".to_string());
-            parts.push(render_node(module, *callee));
-        }
-    }
-
-    // Positional arguments.
-    for &arg in call.args.iter() {
-        parts.push(render_node(module, arg));
-    }
-
-    // Named entries, in order: `%kwarg` / `%field` / `%assign`.
-    for n in call.named.iter() {
-        let head = match n.kind {
-            NamedKind::Kwarg => "%kwarg",
-            NamedKind::Field => "%field",
-            NamedKind::Assign => "%assign",
-        };
-        parts.push(format!(
-            "({head} {} {})",
-            module.resolve(n.name),
-            render_node(module, n.value)
-        ));
-    }
-
-    // Reified-callable input list (functionof / kernelof): the trailing
-    // origin tag + list (spec §11 "Reified callables"). A filled `%autoinputs`
-    // list is projected from the inference side-table.
-    if let Some(inputs) = &call.inputs {
-        match inputs {
-            Inputs::Spec(entries) => {
-                parts.push("%specinputs".to_string());
-                parts.push(render_input_entries(module, entries));
-            }
-            Inputs::Auto => {
-                parts.push("%autoinputs".to_string());
-                match module.auto_inputs_of(id) {
-                    Some(entries) => parts.push(render_input_entries(module, entries)),
-                    None => parts.push("%deferred".to_string()),
-                }
-            }
-        }
-    }
-
-    format!("({})", parts.join(" "))
 }
 
 fn render_input_entries(module: &Module, entries: &[(Symbol, Ref)]) -> String {

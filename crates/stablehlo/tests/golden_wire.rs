@@ -564,7 +564,9 @@ fn isfinite_and_isinf_refuse_a_boolean_operand_but_isnan_does_not() {
         "x = elementof(reals)\ny = isfinite(ifelse(lt(x, 1.0), 1.0, 0.0))\ninputs = (x)\noutputs = (y)\n",
     );
     assert!(
-        via_real.contains("stablehlo.abs %4 : tensor<f32>"),
+        via_real
+            .lines()
+            .any(|line| line.contains("stablehlo.abs ") && line.contains(": tensor<f32>")),
         "a real-valued operand takes the ordinary path:\n{via_real}"
     );
 }

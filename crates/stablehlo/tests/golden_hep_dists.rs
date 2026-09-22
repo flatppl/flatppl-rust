@@ -330,13 +330,11 @@ outputs = (lp)";
 #[test]
 fn a_literal_variate_reaches_the_same_guarded_formula_at_each_support_case() {
     // (variate literal, the constant it must emit) — in support at an integer,
-    // in support at a NON-integer, and below the support. A negative literal is
-    // emitted as its magnitude plus a `negate`, which is why the third case
-    // matches `dense<0.5>` rather than a signed constant.
+    // in support at a NON-integer, and below the support.
     for (variate, constant) in [
         ("3.0", "dense<3.0>"),
         ("3.7", "dense<3.7>"),
-        ("-0.5", "dense<0.5>"),
+        ("-0.5", "dense<-0.5>"),
     ] {
         let src = format!(
             "hep = standard_module(\"particle-physics\", \"0.1\")\n\

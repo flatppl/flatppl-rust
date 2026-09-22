@@ -3,6 +3,7 @@
 //! `lower` bridge to core inference types. Per-name *signatures* only;
 //! structural inference stays in `ops.rs`/`trace.rs`.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -14,6 +15,10 @@ pub(crate) use lower::{LowerCtx, lower, no_intern};
 pub struct Catalogue {
     pub(crate) base: Vec<Builtin>,
     pub(crate) modules: Vec<Module>,
+    /// Base rows are immutable after parsing. Keep their declaration order
+    /// while sharing the name lookup across inference passes.
+    #[serde(skip)]
+    base_index: OnceLock<HashMap<String, usize>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -554,7 +559,15 @@ pub(crate) fn sig_param_names(sig: &Sig) -> Option<&[String]> {
 impl Catalogue {
     /// Look up a base (built-in) distribution signature by name.
     pub(crate) fn base(&self, name: &str) -> Option<&Sig> {
-        self.base.iter().find(|b| b.name == name).map(|b| &b.sig)
+        let index = self.base_index.get_or_init(|| {
+            let mut index = HashMap::with_capacity(self.base.len());
+            for (i, row) in self.base.iter().enumerate() {
+                // Preserve the first-row precedence of the former linear scan.
+                index.entry(row.name.clone()).or_insert(i);
+            }
+            index
+        });
+        index.get(name).map(|&i| &self.base[i].sig)
     }
 
     /// The declared call arity of base builtin `name`, or `None` when the
@@ -1725,6 +1738,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parsed_base_catalogue_preserves_first_row() {
+        let cat = parse_catalogue(
+            r#"Catalogue(base: [
+                Builtin(name: "f", sig: Structural(params: [Any])),
+                Builtin(name: "g", sig: Structural(params: [Any, Any])),
+                Builtin(name: "f", sig: Structural(params: [Any, Any, Any])),
+            ], modules: [])"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cat.base_arity("f"),
+            Some(Arity {
+                min: 1,
+                max: Some(1)
+            })
+        );
+        assert_eq!(cat.base_names().collect::<Vec<_>>(), ["f", "g", "f"]);
     }
 
     /// The §07/§08 argument counts the arity rule enforces, including the two

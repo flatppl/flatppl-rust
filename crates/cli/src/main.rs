@@ -86,7 +86,7 @@ enum Command {
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
-        /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`). A local
+        /// with `--from hs3`, or pyhf model/workspace JSON with `--from pyhf`). A local
         /// path — a model with remote `load_module` deps must be pre-fetched
         /// with `flatppl prepare`.
         input: PathBuf,
@@ -100,7 +100,7 @@ enum Command {
         /// Input format: `auto` infers from the file extension (`.flatppl` /
         /// `.flatpir`, and `.hs3.json` / `.pyhf.json`); `hs3` reads a native HS3
         /// JSON document (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf
-        /// workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
+        /// model or workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
         /// override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
@@ -187,6 +187,9 @@ enum Command {
         /// Computation to emit: `logdensity` or `sample`.
         #[arg(long, default_value = "logdensity")]
         mode: String,
+        /// Floating-point precision for emitted tensors.
+        #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
+        dtype: String,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -261,7 +264,7 @@ enum FromFormat {
     /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
     /// Requires the optional `hs3` build feature.
     Hs3,
-    /// Read a pyhf workspace JSON document (top-level `channels` array).
+    /// Read a pyhf model or workspace JSON document (top-level `channels` array).
     /// Requires the optional `hs3` build feature.
     Pyhf,
 }
@@ -316,8 +319,9 @@ fn main() -> ExitCode {
         Command::Stablehlo {
             input,
             mode,
+            dtype,
             output,
-        } => stablehlo_cmd(&input, &mode, output.as_deref()),
+        } => stablehlo_cmd(&input, &mode, &dtype, output.as_deref()),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -863,7 +867,12 @@ fn determinize_cmd(
 /// the determiniser or emitter cannot legalize — the same exit-code
 /// convention as `determinize`.
 #[cfg(feature = "stablehlo")]
-fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
+fn stablehlo_cmd(
+    input: &Path,
+    mode: &str,
+    dtype: &str,
+    output: Option<&Path>,
+) -> Result<(), Failure> {
     let (module, bundle, source) = load_and_infer(input)?;
 
     let mode = match mode {
@@ -908,7 +917,13 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
 
     let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    let opts = flatppl_stablehlo::EmitOptions::default();
+    let opts = flatppl_stablehlo::EmitOptions {
+        dtype: if dtype == "f64" {
+            flatppl_stablehlo::Dtype::F64
+        } else {
+            flatppl_stablehlo::Dtype::F32
+        },
+    };
     let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {

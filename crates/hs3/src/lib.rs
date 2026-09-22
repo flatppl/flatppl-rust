@@ -5,7 +5,7 @@
 //!
 //! Accepts two JSON formats:
 //! - Native HS3: top-level `distributions`, `likelihoods`, etc.
-//! - pyhf workspace: top-level `channels` key triggers the pyhf lift path.
+//! - pyhf model or workspace: top-level `channels` triggers the pyhf lift path.
 mod error;
 pub use error::{Error, Result};
 pub(crate) mod builder;
@@ -15,8 +15,10 @@ pub(crate) mod dist_spec;
 pub(crate) mod distribution;
 pub(crate) mod expr;
 pub(crate) mod histfactory;
+mod histosys;
 pub(crate) mod likelihood;
 pub(crate) mod model;
+mod normsys;
 pub(crate) mod presets;
 pub(crate) mod pyhf;
 
@@ -69,7 +71,7 @@ pub fn read(json: &str) -> Result<Module> {
 pub fn read_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_some() {
-        let doc: model::PyhfDocument = serde_json::from_value(value)?;
+        let doc = model::PyhfDocument::from_value(value)?;
         pyhf::pyhf_to_module(&doc)
     } else {
         let doc: model::Document = serde_json::from_value(value)?;
@@ -77,9 +79,10 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
     }
 }
 
-/// Parse a pyhf workspace JSON document into a FlatPPL module.
+/// Parse a pyhf model or workspace JSON document into a FlatPPL module.
 ///
-/// Requires the top-level `"channels"` key that identifies a pyhf workspace.
+/// Model-only documents expose each channel's observations as an external input.
+/// Requires the top-level `"channels"` key that identifies a pyhf document.
 /// Returns [`Error::Unsupported`] if the document lacks `"channels"`, with a
 /// hint to use the native HS3 path instead.
 ///
@@ -99,12 +102,12 @@ pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_none() {
         return Err(Error::Unsupported(
-            "expected a pyhf workspace with top-level `channels`; \
+            "expected a pyhf model or workspace with top-level `channels`; \
              this looks like a native HS3 document — use --from hs3 instead"
                 .to_owned(),
         ));
     }
-    let doc: model::PyhfDocument = serde_json::from_value(value)?;
+    let doc = model::PyhfDocument::from_value(value)?;
     pyhf::pyhf_to_module(&doc)
 }
 

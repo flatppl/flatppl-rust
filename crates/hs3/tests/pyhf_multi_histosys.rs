@@ -24,35 +24,40 @@ const TWO_HISTOSYS: &str = r#"{
 fn two_histosys_shifts_add_against_the_original_nominal() {
     let m = flatppl_hs3::read(TWO_HISTOSYS).unwrap();
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
-    // Each modifier interpolates the SAME nominal binding. Nesting the second
-    // interpolation around the first one's output uses a wrong nominal and, at a
-    // knot, discards the first shift entirely (pyhf sums the additive deltas).
+    // Keep the modifier axis through interpolation, then sum additive shifts.
+    // Nesting interpolation around another modifier's result changes the model.
     assert_eq!(
         text.matches("interp_poly6_lin").count(),
-        2,
-        "expected two interpolations, got:\n{text}"
+        1,
+        "expected one tensor interpolation, got:\n{text}"
     );
-    for side in ["[45.0, 58.0]", "[48.0, 54.0]"] {
+    for input in [
+        "rowstack([[45.0, 58.0], [48.0, 54.0]])",
+        "rowstack([[55.0, 63.0], [52.0, 66.0]])",
+        "rowstack([ch1_bkg_nominal, ch1_bkg_nominal])",
+        "addaxes([a1, a2], 0, 1)",
+    ] {
         assert!(
-            text.contains(&format!("interp_poly6_lin({side}, ch1_bkg_nominal,")),
-            "{side} must interpolate ch1_bkg_nominal directly, got:\n{text}"
+            text.contains(input),
+            "missing interpolation input {input}:\n{text}"
         );
     }
     assert!(
-        text.contains(
-            "ch1_bkg_expected = broadcast(add, broadcast(add, ch1_bkg_nominal, \
-                       ch1_bkg_a1_shift), ch1_bkg_a2_shift)"
-        ),
-        "expected nominal + a1 shift + a2 shift, got:\n{text}"
+        text.contains("ch1_bkg_expected = broadcast(add, ch1_bkg_nominal, aggregate(sum,"),
+        "expected nominal plus modifier-axis reduction, got:\n{text}"
     );
-    for param in ["a1", "a2"] {
-        assert!(
-            text.contains(&format!(
-                "ch1_bkg_{param}_shift = broadcast(sub, hepphys.interp_poly6_lin"
-            )) && text.contains(&format!("{param}), ch1_bkg_nominal)")),
-            "{param} shift must be interp - nominal, got:\n{text}"
-        );
-    }
+}
+
+#[test]
+fn histosys_interpolation_is_shared_across_samples() {
+    let mut doc: serde_json::Value = serde_json::from_str(TWO_HISTOSYS).unwrap();
+    let samples = doc["channels"][0]["samples"].as_array_mut().unwrap();
+    let mut extra = samples[1].clone();
+    extra["name"] = "other_background".into();
+    samples.push(extra);
+    let module = flatppl_hs3::read(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    assert_eq!(text.matches("interp_poly6_lin").count(), 1, "{text}");
 }
 
 const HISTOSYS_AND_SHAPESYS: &str = r#"{

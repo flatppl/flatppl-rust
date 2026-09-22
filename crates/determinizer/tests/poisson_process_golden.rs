@@ -34,14 +34,13 @@ lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     // One per-event logsumexp over the two intensity components.
     assert_eq!(
         pir.matches("logsumexp").count(),
-        3,
-        "one logsumexp per observed event:\n{pir}"
+        1,
+        "one logsumexp body shared across observed events:\n{pir}"
     );
-    // The events are read off the variate positionally, one `get0` per event per
-    // component gate (the truncate gate re-reads its own point).
+    // The shared density body receives each event through the broadcast.
     assert!(
-        pir.contains("get0"),
-        "events indexed off the variate:\n{pir}"
+        pir.contains("broadcast"),
+        "one broadcast over the variate:\n{pir}"
     );
     // `totalmass` is a measure query and must never be emitted; the total mass
     // is synthesized as `s · 1.0 + b · 1.0` instead.
@@ -82,7 +81,7 @@ lp = logdensityof(lawof(record(events = events)), record(events = obs))";
         "Λ = n · totalmass(shape) = n · 1.0:\n{text}"
     );
     assert!(
-        text.contains(" - "),
+        text.contains(" - ") || text.contains("sub("),
         "the mass is SUBTRACTED from the events term:\n{text}"
     );
 }
@@ -204,16 +203,15 @@ lp = logdensityof(lawof(record(a = a)), record(a = 2.0))";
     );
 }
 
-// A source-controlled event count must not allocate or synthesize billions of
-// density terms. Determinization refuses before the static unroll.
+// A source-controlled event count must not allocate billions of density terms.
 #[test]
-fn poisson_process_caps_static_unroll() {
+fn poisson_process_body_size_does_not_grow_with_event_count() {
     let src = "\
 events = elementof(cartpow(reals, 4294967295))
 lp = logdensityof(PoissonProcess(intensity = Normal(mu = 0.0, sigma = 1.0)), events)
 inputs = (events)
 outputs = (lp)";
-    let err = determinize(&parse_infer(src)).expect_err("the event unroll must be bounded");
-    assert_eq!(err.construct, "PoissonProcess", "{err:?}");
-    assert!(err.reason.contains("resource guard"), "{err:?}");
+    let large = determinize_src(src);
+    let small = determinize_src(&src.replace("4294967295", "20"));
+    assert_eq!(large.node_count(), small.node_count());
 }

@@ -38,6 +38,40 @@ const SHAPESYS: &str = r#"{ "name": "g", "type": "shapesys", "data": [5.0, 6.0] 
 const STATERROR: &str = r#"{ "name": "st", "type": "staterror", "data": [5.0, 6.0] }"#;
 
 #[test]
+fn model_parameter_config_matches_workspace_config() {
+    let source = include_str!("fixtures/pyhf_model.json");
+    let mut workspace: serde_json::Value = serde_json::from_str(source).unwrap();
+    let parameters = workspace
+        .as_object_mut()
+        .unwrap()
+        .remove("parameters")
+        .unwrap();
+    workspace["measurements"] = serde_json::json!([
+        {"name": "measurement", "config": {"poi": "", "parameters": parameters}}
+    ]);
+    workspace["observations"] = serde_json::json!([
+        {"name": "alpha", "data": [11.5]},
+        {"name": "zeta", "data": [24.5, 36.0]}
+    ]);
+    // Both spellings must lower the same expected yields and auxiliary terms.
+    // The channel data alone changes from a fixed vector to an external input.
+    let model = convert(source);
+    let workspace = convert(&workspace.to_string());
+    let without_observations = |text: &str| {
+        text.lines()
+            .filter(|line| {
+                !line.starts_with("alpha_observed =") && !line.starts_with("zeta_observed =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        without_observations(&model),
+        without_observations(&workspace)
+    );
+}
+
+#[test]
 fn normsys_auxdata_moves_the_observed_point() {
     let text = convert(&ws(NORMSYS, r#"{ "name": "t", "auxdata": [0.5] }"#));
     assert!(

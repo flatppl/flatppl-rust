@@ -592,9 +592,32 @@ pub fn require_param(m: &Modifier, spec: &ModSpec) -> Result<String> {
 pub enum Effect {
     /// Multiply the running expected by this factor (normfactor / shapefactor /
     /// lumi / staterror gamma / shapesys gamma / normsys interpolation factor).
-    Multiply(NodeId),
-    /// Replace the sample nominal with this interpolated array (histosys).
-    ReplaceNominal(NodeId),
+    Multiply(Multiplier),
+    /// Interpolate the original nominal. Keep axes available for tensor lowering.
+    ReplaceNominal(Interpolation),
+}
+
+pub enum Multiplier {
+    Value(NodeId),
+    Interpolated(crate::normsys::Interpolation),
+}
+
+#[derive(Clone, Copy)]
+pub struct Interpolation {
+    pub function: &'static str,
+    pub lo: NodeId,
+    pub hi: NodeId,
+    pub alpha: NodeId,
+}
+
+impl Interpolation {
+    pub fn apply(&self, b: &mut Builder, nominal: NodeId) -> NodeId {
+        b.module_user_call(
+            "hepphys",
+            self.function,
+            &[self.lo, nominal, self.hi, self.alpha],
+        )
+    }
 }
 
 /// A constraint a modifier's parameter needs, emitted once per parameter by the
@@ -616,13 +639,11 @@ pub enum PendingConstraint {
 /// constraints are channel-level (assembler emits them from the channel-summed
 /// uncertainties / measurement config).
 ///
-/// `nom` is the sample's nominal node, used for histosys interpolation;
-/// `nom_vals` carries the same values, for the per-bin array-length checks and
+/// `nom_vals` carries the sample's nominal values, for the per-bin array-length checks and
 /// the shapesys degenerate-bin rule.
 pub fn modifier_effect(
     b: &mut Builder,
     m: &Modifier,
-    nom: NodeId,
     nom_vals: &[f64],
 ) -> Result<(Effect, Option<(String, PendingConstraint)>)> {
     let spec = require_spec(m)?;
@@ -630,9 +651,10 @@ pub fn modifier_effect(
     let nom_len = nom_vals.len();
     match spec.kind {
         // Free / channel-level-constrained: just a multiply here.
-        "normfactor" | "shapefactor" | "lumi" | "staterror" => {
-            Ok((Effect::Multiply(b.self_ref(&param)), None))
-        }
+        "normfactor" | "shapefactor" | "lumi" | "staterror" => Ok((
+            Effect::Multiply(Multiplier::Value(b.self_ref(&param))),
+            None,
+        )),
 
         "shapesys" => {
             let data = m.data.as_ref().ok_or_else(|| {
@@ -650,7 +672,7 @@ pub fn modifier_effect(
             }
             let factor = b.self_ref(&param);
             Ok((
-                Effect::Multiply(factor),
+                Effect::Multiply(Multiplier::Value(factor)),
                 Some((
                     param,
                     PendingConstraint::Shapesys {
@@ -664,14 +686,14 @@ pub fn modifier_effect(
         "normsys" => {
             // data = {hi: <f64>, lo: <f64>}
             let (lo_val, hi_val) = parse_normsys_data(m)?;
-            let lo = b.lit_real(lo_val);
-            let one = b.lit_real(1.0);
-            let hi = b.lit_real(hi_val);
-            let alpha = b.self_ref(&param);
             let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_NORMSYS_DEFAULT)?;
-            let factor = b.module_user_call("hepphys", fn_name, &[lo, one, hi, alpha]);
             Ok((
-                Effect::Multiply(factor),
+                Effect::Multiply(Multiplier::Interpolated(crate::normsys::Interpolation {
+                    function: fn_name,
+                    lo: lo_val,
+                    hi: hi_val,
+                    param: b.sym(&param),
+                })),
                 Some((param, PendingConstraint::Normal01)),
             ))
         }
@@ -681,9 +703,13 @@ pub fn modifier_effect(
             let (lo_arr, hi_arr) = parse_histosys_data(b, m, nom_len)?;
             let alpha = b.self_ref(&param);
             let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_HISTOSYS_DEFAULT)?;
-            let new_nom = b.module_user_call("hepphys", fn_name, &[lo_arr, nom, hi_arr, alpha]);
             Ok((
-                Effect::ReplaceNominal(new_nom),
+                Effect::ReplaceNominal(Interpolation {
+                    function: fn_name,
+                    lo: lo_arr,
+                    hi: hi_arr,
+                    alpha,
+                }),
                 Some((param, PendingConstraint::Normal01)),
             ))
         }

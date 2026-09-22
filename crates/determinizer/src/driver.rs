@@ -97,14 +97,8 @@ pub fn determinize_with_roots(
     // bindings, so this is a no-op there.
     crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
 
-    // §09 standard-module FUNCTION member lowering: rewrite `hep.interp_pwlin(…)`
-    // and its siblings into base ops (`crate::stdfn`). A function member is a
-    // catalogue entry with a closed form in §09, not a measure, so it cannot reach
-    // the constructor-tag path a §09 DISTRIBUTION member takes; without this it
-    // survives as a `CallHead::User` application and the conformance gate refuses
-    // it. Runs here so the measure-reduction loop and the density lowering see
-    // base ops only. A member with no base-op form is left in place for the
-    // conformance gate to name (root-based DCE must still be able to drop one).
+    // Lower local §09 functions before the application-graft guards. Their
+    // unused arguments may contain module refs that root-based DCE will drop.
     crate::stdfn::lower_std_module_functions(&mut work)?;
 
     // Cross-module FUNCTION/kernel APPLICATION callees in regular bindings
@@ -118,12 +112,19 @@ pub fn determinize_with_roots(
     // nested inside a binding's application RHS, which that pass does not reach.
     let app_bindings: Vec<(flatppl_core::BindingId, NodeId)> =
         work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    let mut grafted_application = false;
     for (bid, rhs) in app_bindings {
         if let Some(rebuilt) =
             crate::density::graft_kernel_application_callee(&mut work, rhs, bundle)?
         {
             work.set_binding_rhs(bid, rebuilt);
+            grafted_application = true;
         }
+    }
+
+    // Application grafts can introduce members absent from the initial pass.
+    if grafted_application {
+        crate::stdfn::lower_std_module_functions(&mut work)?;
     }
 
     loop {
@@ -444,6 +445,8 @@ fn apply_rule(
         if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
+            // The initial standard-function pass could not see this dependency.
+            crate::stdfn::lower_std_module_functions(m)?;
             // The intermediate `x = m.L` self-ref binding (if any) and the
             // `helpers = load_module(…)` binding may now be dead; sweep the
             // measure-typed ones so the next scan is clean.
@@ -754,7 +757,7 @@ const COMBINATOR_OPS: &[&str] = &[
 /// eliminable measure binding — either a combinator op (`is_combinator_rhs`) OR a
 /// `Measure`/`Likelihood`-typed RHS (`is_measure_typed_rhs`) — AND (b) provably
 /// unreferenced: no *other* binding subtree contains a `(%ref self name)` to it
-/// (`binding_is_referenced`'s BFS).  Zeroing a genuinely-dead measure binding is
+/// (see [`referenced_binding_names`]). Zeroing a genuinely-dead measure binding is
 /// sound dead-code elimination: it has no observable effect because nothing reads
 /// it.  The guard below never touches anything that fails *either* condition, so
 /// it cannot disturb a live value, a non-measure binding, or a still-referenced
@@ -769,7 +772,7 @@ const COMBINATOR_OPS: &[&str] = &[
 /// measure-layer values — sweeps exactly the bindings that would otherwise trip
 /// the conformance gate, and no others (a value-typed binding never matches).
 /// A query-pinned latent's PRIOR is exempt while another query is still unreduced —
-/// see [`referenced_via_pinned_prior`].
+/// see [`referenced_binding_names`].
 fn sweep_dead_measure_bindings(m: &mut Module) {
     // §13 "Output reduction" reduces PER OUTPUT, so a second query over the same
     // measure re-reads the `draw(prior)` an earlier query's pin overwrote
@@ -793,30 +796,28 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
         // predicates are read-only over `m`, so we settle the full kill-set
         // before any mutation (a later zeroing in this pass cannot make a
         // previously-live binding look dead).
-        let dead: Vec<BindingId> = m
+        let mut dead: Vec<BindingId> = m
             .bindings()
-            .filter(|(bid, b)| {
-                is_eliminable_measure_rhs(m, b.rhs)
-                    && !binding_is_referenced(m, *bid, b.name)
-                    && !(queries_pending && referenced_via_pinned_prior(m, *bid, b.name))
-            })
+            .filter(|(_, b)| is_eliminable_measure_rhs(m, b.rhs))
             .map(|(bid, _)| bid)
             .collect();
 
+        // Already-lowered modules need no reference walk.
+        if dead.is_empty() {
+            return;
+        }
+        let referenced = referenced_binding_names(m, queries_pending);
+        dead.retain(|bid| !referenced.contains(&m.binding(*bid).name));
         if dead.is_empty() {
             return;
         }
 
         for bid in dead {
-            // Re-assert the invariant at the rewrite site: we only zero a binding
-            // that is still an eliminable measure binding and still unreferenced.
-            // Cheap, and it documents/enforces that the sweep never rewrites
-            // anything else.
+            // Zeroing can only remove references, so the sweep's reference set
+            // remains a conservative guard throughout this kill-set.
             let binding = m.binding(bid);
             debug_assert!(
-                is_eliminable_measure_rhs(m, binding.rhs)
-                    && !binding_is_referenced(m, bid, binding.name)
-                    && !(queries_pending && referenced_via_pinned_prior(m, bid, binding.name)),
+                is_eliminable_measure_rhs(m, binding.rhs) && !referenced.contains(&binding.name),
                 "sweep must only zero a dead measure binding"
             );
             let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
@@ -880,44 +881,28 @@ fn is_combinator_rhs(m: &Module, rhs: NodeId) -> bool {
     false
 }
 
-/// True iff any binding (other than `bid` itself) contains a `(%ref self name)`
-/// node that refers to `name_sym`.
+/// Names referenced by another binding, including reification input boundaries.
+/// Compute once per sweep, not by scanning all bindings for each candidate.
 ///
-/// `pub(crate)`: also called by `canon::fold::sweep_dead_bindings`, which needs
-/// the identical reification-input-boundary-aware referenced-check for its own
-/// (non-measure-typed) dead-binding sweep — shared rather than duplicated so the
-/// two sweeps can never drift and so `sweep_preserves_binding_referenced_only_via_reification_input`
-/// below covers both callers.
-pub(crate) fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
-    for (other_bid, binding) in m.bindings() {
-        if other_bid == bid {
-            continue;
+/// While queries remain, include query-pinned DECLARED right-hand sides: after
+/// `theta ~ p` is pinned to one query's point, a later query still needs `p`.
+/// The canonical sweep runs after query lowering and excludes that provenance.
+pub(crate) fn referenced_binding_names(
+    m: &Module,
+    include_pinned_priors: bool,
+) -> std::collections::HashSet<Symbol> {
+    let mut referenced = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for (bid, binding) in m.bindings() {
+        names.clear();
+        collect_referenced_names(m, binding.rhs, &mut names);
+        if include_pinned_priors && let Some(rhs) = m.query_pinned_rhs(bid) {
+            collect_referenced_names(m, rhs, &mut names);
         }
-        if subtree_contains_ref(m, binding.rhs, name_sym) {
-            return true;
-        }
+        // A binding's own self-reference never kept it alive in either sweep.
+        referenced.extend(names.iter().copied().filter(|name| *name != binding.name));
     }
-    false
-}
-
-/// True iff some other QUERY-PINNED binding's DECLARED right-hand side — the
-/// `draw(prior)` the pin overwrote ([`flatppl_core::Module::query_pinned_rhs`]) —
-/// refers to `name_sym`.
-///
-/// [`binding_is_referenced`] cannot see this: it reads the post-pin literal, in which
-/// the reference is gone. The measure it names is still live for a LATER query, which
-/// re-reads the declared right-hand side (§13 "Output reduction" reduces per output).
-/// The shape is `p = Normal(0, 1)` / `theta ~ p`: pinning `theta` to the first query's
-/// point leaves `p` looking orphaned while a second query still needs it.
-///
-/// Reads the pin provenance ONLY, so it adds no reference a live binding tree does not
-/// already have, and shares [`subtree_contains_ref`] with the body walk.
-fn referenced_via_pinned_prior(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
-    m.bindings().any(|(other_bid, _)| {
-        other_bid != bid
-            && m.query_pinned_rhs(other_bid)
-                .is_some_and(|rhs| subtree_contains_ref(m, rhs, name_sym))
-    })
+    referenced
 }
 
 /// Collect every `%ref self <name>` reachable in `root`'s subtree — as a body
@@ -937,20 +922,21 @@ fn referenced_via_pinned_prior(m: &Module, bid: BindingId, name_sym: Symbol) -> 
 ///
 /// The forward-reachability primitive for root-based DCE
 /// ([`crate::canon::dce::retain_reachable`]); shares its traversal with
-/// [`subtree_contains_ref`] (below) so the Inputs-awareness lives in one place.
+/// [`referenced_binding_names`] so the Inputs-awareness lives in one place.
 ///
 /// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` (via
-/// [`binding_is_referenced`]) and `canon::dce::retain_reachable`.
+/// [`referenced_binding_names`]) and `canon::dce::retain_reachable`.
 pub(crate) fn collect_referenced_names(
     m: &Module,
     root: NodeId,
     out: &mut std::collections::HashSet<Symbol>,
 ) {
-    let mut queue = vec![root];
-    let mut qi = 0;
-    while qi < queue.len() {
-        let id = queue[qi];
-        qi += 1;
+    let mut pending = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
         match m.node(id) {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
@@ -971,21 +957,8 @@ pub(crate) fn collect_referenced_names(
             }
             _ => {}
         }
-        m.for_each_child(id, |c| queue.push(c));
+        m.for_each_child(id, |c| pending.push(c));
     }
-}
-
-/// BFS subtree search: returns true iff the subtree at `root` contains a
-/// `Ref(SelfMod, name_sym)` node — as a body sub-node OR as a `functionof` /
-/// `kernelof` reification *input* boundary entry.
-///
-/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` — see
-/// [`binding_is_referenced`]. Delegates to [`collect_referenced_names`] so the
-/// `Inputs`-aware traversal lives in exactly one place.
-pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
-    let mut names = std::collections::HashSet::new();
-    collect_referenced_names(m, root, &mut names);
-    names.contains(&name_sym)
 }
 
 #[cfg(test)]
@@ -998,7 +971,7 @@ mod tests {
     /// (`(g, %ref self g)`) must NOT be swept as dead. `children()` excludes the
     /// `Inputs` bucket (core `node.rs`), so a body-only reference check judged `g`
     /// unreferenced and the type arm zeroed it — leaving the live reification `k`
-    /// closing over a zeroed constructor. The `Inputs`-aware `subtree_contains_ref`
+    /// closing over a zeroed constructor. The `Inputs`-aware reference walk
     /// sees the boundary reference, so the sweep leaves `g` alone. This drives the
     /// sweep directly (the full `determinize` over such a shape refuses anyway,
     /// because the surviving `g` is a residual measure-layer binding — the point

@@ -1,12 +1,16 @@
 //! Ergonomic helpers for building flatppl_core IR.
 use crate::error::{Error, Result};
 use flatppl_core::id::{NodeId, Symbol};
-use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar};
+use flatppl_core::node::{
+    Axis, Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar,
+};
 use flatppl_core::{Binding, Doc, Markup, Module};
 
 /// FlatPPL reserved words that may not be a binding name (spec §05 / the parser's
 /// `check_binding_name`). The name allocator must never hand one of these back.
-const RESERVED: &[&str] = &["true", "false", "in", "all", "only", "self", "base"];
+const RESERVED: &[&str] = &[
+    "true", "false", "in", "all", "only", "im", "pi", "inf", "self", "base",
+];
 
 /// Reserved top-level binding names: the determinization signature (spec §05
 /// "Note on reserved words", §13).
@@ -30,10 +34,10 @@ fn is_placeholder(name: &str) -> bool {
 /// `Letter ::= "a" .. "z" | "A" .. "Z"`, minus the reserved words, the
 /// determinization signature names, and the placeholder form.
 ///
-/// The importer must not repair a name by sanitizing it: the emitted model's
-/// names are the source document's names, so a rename would silently produce a
-/// model that no longer matches the input. `what` names the source block for the
-/// message (e.g. "distribution", "pyhf modifier parameter").
+/// Source parameter and distribution bindings retain their names: silently
+/// renaming them would break external references. Generated intermediates and
+/// metadata labels instead use `alloc_name`. `what` names the source block for
+/// the message (e.g. "distribution", "pyhf modifier parameter").
 pub(crate) fn check_binding_name(name: &str, what: &str) -> Result<()> {
     let bad = |why: &str| {
         Err(Error::Unsupported(format!(
@@ -185,6 +189,23 @@ impl<'m> Builder<'m> {
         self.call("vector", elems)
     }
 
+    /// Sum a matrix's rows while retaining its columns (spec §04 aggregate).
+    pub(crate) fn column_sums(&mut self, matrix: NodeId) -> NodeId {
+        let mut axis = |name: &str| {
+            let name = self.sym(name);
+            self.m.alloc(Node::Axis(Axis {
+                name,
+                variance: None,
+            }))
+        };
+        let row = axis("row");
+        let col = axis("col");
+        let cell = self.call("get", &[matrix, row, col]);
+        let outputs = self.array(&[col]);
+        let sum = self.call_head("sum");
+        self.call("aggregate", &[sum, outputs, cell])
+    }
+
     /// Stamp the module with `flatppl_compat = "<version>"` (spec §11: an ordinary
     /// string binding declaring the targeted FlatPPL language version). Call this
     /// **first** when building a generated module so it lands as the first binding.
@@ -272,7 +293,10 @@ impl<'m> Builder<'m> {
         let mut cand = base.clone();
         let mut i = 2u32;
         loop {
-            let reserved = RESERVED.contains(&cand.as_str());
+            let reserved = RESERVED.contains(&cand.as_str())
+                || RESERVED_TOPLEVEL.contains(&cand.as_str())
+                || cand == "_"
+                || is_placeholder(&cand);
             let sym = self.m.intern(&cand);
             if !reserved && self.m.binding_by_name(sym).is_none() {
                 return cand;

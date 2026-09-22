@@ -171,8 +171,8 @@ fn require_not_table(e: &Emitter, id: NodeId, head: &str, arg: NodeId) -> Result
 ///
 /// A dynamic (`?`) extent is refused with the same message: the emitted window
 /// and broadcast shapes are static text.
-fn require_static_vector(id: NodeId, head: &str, v: &Value) -> Result<u64, EmitError> {
-    match &v.ty {
+fn require_static_vector(id: NodeId, head: &str, ty: &MlirTy) -> Result<u64, EmitError> {
+    match ty {
         MlirTy::Ranked(dims) if dims.len() == 1 => {
             if let Some(n) = dims[0] {
                 return Ok(n);
@@ -185,7 +185,7 @@ fn require_static_vector(id: NodeId, head: &str, v: &Value) -> Result<u64, EmitE
         format!(
             "{head}: §07 gives this head the domain \"vectors\", so its operand must be a \
              statically-sized rank-1 array, got {:?}",
-            v.ty
+            ty
         ),
     ))
 }
@@ -193,8 +193,8 @@ fn require_static_vector(id: NodeId, head: &str, v: &Value) -> Result<u64, EmitE
 /// Broadcast a reduced SCALAR back over `ty`'s shape, the splat form
 /// (`dims = []`) §04 "Broadcasting" defines. StableHLO's elementwise ops require
 /// identical operand shapes — there is no implicit scalar broadcast.
-fn splat(e: &mut Emitter, s: &Value, ty: &MlirTy) -> Value {
-    e.broadcast_in_dim(s, &[], ty.clone())
+fn splat(e: &mut Emitter, s: &Value, target: &Value) -> Value {
+    e.broadcast_pair(s, target).0
 }
 
 // ---- §07 reductions -----------------------------------------------------------
@@ -225,7 +225,7 @@ pub(crate) fn lower_reduction(
     require_not_table(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
 
-    let dims = match &xs.ty {
+    let dims = match &e.cell_ty(&xs) {
         MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => dims.clone(),
         other => {
             return Err(EmitError::at(
@@ -296,7 +296,7 @@ pub(crate) fn lower_reduction(
             ),
         ));
     }
-    let mean_full = splat(e, &mean, &xs.ty);
+    let mean_full = splat(e, &mean, &xs);
     let dev = e.sub(&xs, &mean_full);
     let sq = e.mul(&dev, &dev);
     let ssq = e.reduce_trailing_axes(id, AxisReduce::Sum, &sq, rank)?;
@@ -349,7 +349,7 @@ pub(crate) fn lower_cumulative(
     let [xs_id] = args_exact(id, args)?;
     require_not_table(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
-    let n = require_static_vector(id, head, &xs)?;
+    let n = require_static_vector(id, head, &xs.ty)?;
 
     // §03's promotion, for [`lower_reduction`]'s reason: no `i1` combine
     // computes a cumulative sum or product.
@@ -417,7 +417,7 @@ pub(crate) fn lower_norm(
     let head = which.spec_name();
     let [v_id] = args_exact(id, args)?;
     let v = e.lower_node(v_id)?;
-    require_static_vector(id, head, &v)?;
+    require_static_vector(id, head, &e.cell_ty(&v))?;
     // §07's domain is "real/complex vectors" and §03 admits an integer or
     // boolean vector inside it; `infer` types `l1norm`/`l2norm` `Scalar(Real)`
     // and the unit pair a real array, so widen once here and let every op below
@@ -438,7 +438,7 @@ pub(crate) fn lower_norm(
     if !which.is_unit() {
         return Ok(norm);
     }
-    let d = splat(e, &norm, &v.ty);
+    let d = splat(e, &norm, &v);
     Ok(e.div(&v, &d))
 }
 
@@ -474,25 +474,25 @@ pub(crate) fn lower_softmax(
     };
     let [v_id] = args_exact(id, args)?;
     let v = e.lower_node(v_id)?;
-    require_static_vector(id, head, &v)?;
+    require_static_vector(id, head, &e.cell_ty(&v))?;
     // §07's domain is "real vectors" here (unlike the norms' "real/complex"),
     // and `infer` types both heads a real array. §03 still admits an integer or
     // boolean operand, so widen rather than refuse.
     let v = e.convert(&v, ElemKind::Real);
 
     let m = e.reduce_trailing_axes(id, AxisReduce::Max, &v, 1)?;
-    let m_full = splat(e, &m, &v.ty);
+    let m_full = splat(e, &m, &v);
     let shifted = e.sub(&v, &m_full);
     let ex = e.exp(&shifted);
     let s = e.reduce_trailing_axes(id, AxisReduce::Sum, &ex, 1)?;
     match which {
         Softmax::Plain => {
-            let d = splat(e, &s, &v.ty);
+            let d = splat(e, &s, &v);
             Ok(e.div(&ex, &d))
         }
         Softmax::Log => {
             let log_s = e.log(&s);
-            let log_s_full = splat(e, &log_s, &v.ty);
+            let log_s_full = splat(e, &log_s, &v);
             Ok(e.sub(&shifted, &log_s_full))
         }
     }

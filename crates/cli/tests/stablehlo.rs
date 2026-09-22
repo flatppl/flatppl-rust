@@ -47,11 +47,9 @@ fn stablehlo_model_without_abi_refuses_with_exit_3() {
     );
 }
 
-/// A model declaring `inputs`/`outputs`: no deprecation warning, and the
-/// emitted `func.func` carries the ordered 2-arg/2-result ABI signature
-/// (`inputs = (a, b)` / `outputs = (q1, q2)`).
+/// The ordered ABI uses f32 by default and f64 when requested.
 #[test]
-fn stablehlo_abi_model_emits_ordered_signature_with_no_warning() {
+fn stablehlo_abi_model_preserves_precision_and_order() {
     let input = write_model(
         "abi",
         "a = elementof(reals)\n\
@@ -63,24 +61,26 @@ fn stablehlo_abi_model_emits_ordered_signature_with_no_warning() {
          inputs = (a, b)\n\
          outputs = (q1, q2)\n",
     );
-    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("no inputs/outputs bindings"),
-        "an ABI-declaring model must not print the legacy deprecation warning, stderr:\n{stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(
-            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> (tensor<f32>, tensor<f32>)"
-        ),
-        "expected the ordered ABI signature:\n{stdout}"
-    );
+    for (args, dtype) in [(vec![], "f32"), (vec!["--dtype", "f64"], "f64")] {
+        let out = flatppl()
+            .arg("stablehlo")
+            .arg(&input)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "func.func @logdensity(%arg0: tensor<{dtype}>, %arg1: tensor<{dtype}>) -> (tensor<{dtype}>, tensor<{dtype}>)"
+            )),
+            "expected the ordered ABI signature:\n{stdout}"
+        );
+    }
 }
 
 /// A `load_data` ABI input is shaped from its declared `valueset` end-to-end

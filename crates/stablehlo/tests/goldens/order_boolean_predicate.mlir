@@ -13,23 +13,13 @@ module {
     %10 = stablehlo.compare GT, %arg0, %9 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
     %11 = stablehlo.constant dense<true> : tensor<i1>
     %12 = stablehlo.reduce(%10 init: %11) applies stablehlo.and across dimensions = [0] : (tensor<4xi1>, tensor<i1>) -> tensor<i1>
-    %13 = stablehlo.constant dense<1.0> : tensor<f32>
-    %14 = stablehlo.constant dense<2.0> : tensor<f32>
-    %15 = stablehlo.select %12, %13, %14 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %16 = stablehlo.constant dense<3.0> : tensor<f32>
-    %17 = stablehlo.broadcast_in_dim %16, dims = [] : (tensor<f32>) -> tensor<4xf32>
-    %18 = stablehlo.compare GT, %arg0, %17 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-    %19 = stablehlo.constant dense<false> : tensor<i1>
-    %20 = stablehlo.reduce(%18 init: %19) applies stablehlo.or across dimensions = [0] : (tensor<4xi1>, tensor<i1>) -> tensor<i1>
-    %21 = stablehlo.constant dense<0.0> : tensor<f32>
-    %22 = stablehlo.broadcast_in_dim %21, dims = [] : (tensor<f32>) -> tensor<4xf32>
-    %23 = stablehlo.compare GT, %arg0, %22 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-    %24 = stablehlo.constant dense<true> : tensor<i1>
-    %25 = stablehlo.reduce(%23 init: %24) applies stablehlo.and across dimensions = [0] : (tensor<4xi1>, tensor<i1>) -> tensor<i1>
-    %26 = stablehlo.and %20, %25 : tensor<i1>
-    %27 = stablehlo.constant dense<1.0> : tensor<f32>
-    %28 = stablehlo.constant dense<2.0> : tensor<f32>
-    %29 = stablehlo.select %26, %27, %28 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %7, %15, %29 : tensor<f32>, tensor<f32>, tensor<f32>
+    %13 = stablehlo.select %12, %5, %6 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %14 = stablehlo.constant dense<false> : tensor<i1>
+    %15 = stablehlo.reduce(%2 init: %14) applies stablehlo.or across dimensions = [0] : (tensor<4xi1>, tensor<i1>) -> tensor<i1>
+    %16 = stablehlo.constant dense<true> : tensor<i1>
+    %17 = stablehlo.reduce(%10 init: %16) applies stablehlo.and across dimensions = [0] : (tensor<4xi1>, tensor<i1>) -> tensor<i1>
+    %18 = stablehlo.and %15, %17 : tensor<i1>
+    %19 = stablehlo.select %18, %5, %6 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %7, %13, %19 : tensor<f32>, tensor<f32>, tensor<f32>
   }
 }

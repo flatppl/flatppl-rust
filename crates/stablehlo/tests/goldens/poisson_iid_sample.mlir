@@ -8,8 +8,7 @@ module {
     %6 = stablehlo.constant dense<1.1920929E-7> : tensor<4xf32>
     %7 = stablehlo.multiply %5, %6 : tensor<4xf32>
     %8 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
-    %9 = stablehlo.negate %8 : tensor<4xf32>
-    %10 = stablehlo.exponential %9 : tensor<4xf32>
+    %10 = stablehlo.constant dense<0.049787066876888275> : tensor<4xf32>
     %11 = stablehlo.constant dense<0.0> : tensor<f32>
     %12 = stablehlo.constant dense<false> : tensor<4xi1>
     %13 = stablehlo.constant dense<0.0> : tensor<4xf32>

@@ -14,9 +14,6 @@
 
 use crate::error::{Error, Result};
 
-/// Bound the number of heap-allocated tokens produced from one source.
-const MAX_SURFACE_TOKENS: usize = 262_144;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
@@ -178,14 +175,6 @@ impl Lexer {
         loop {
             self.skip_inline_ws_and_comments()?;
             let Some(c) = self.peek() else { break };
-
-            if self.tokens.len() >= MAX_SURFACE_TOKENS {
-                return Err(self.err_span(
-                    self.byte_pos(),
-                    self.line,
-                    format!("surface token count exceeds resource limit of {MAX_SURFACE_TOKENS}"),
-                ));
-            }
 
             if c == '\n' || c == '\r' {
                 self.lex_newline();

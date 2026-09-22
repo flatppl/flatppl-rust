@@ -9,19 +9,18 @@ module {
     %6 = stablehlo.multiply %arg0, %5 : tensor<f32>
     %7 = chlo.lgamma %arg0 : tensor<f32> -> tensor<f32>
     %8 = stablehlo.negate %7 : tensor<f32>
-    %9 = stablehlo.constant dense<1.0> : tensor<f32>
-    %10 = stablehlo.add %arg0, %9 : tensor<f32>
-    %11 = stablehlo.log %4 : tensor<f32>
-    %12 = stablehlo.multiply %10, %11 : tensor<f32>
-    %13 = stablehlo.negate %12 : tensor<f32>
-    %14 = stablehlo.divide %arg1, %4 : tensor<f32>
-    %15 = stablehlo.negate %14 : tensor<f32>
-    %16 = stablehlo.add %6, %8 : tensor<f32>
-    %17 = stablehlo.add %16, %13 : tensor<f32>
-    %18 = stablehlo.add %17, %15 : tensor<f32>
-    %19 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %20 = stablehlo.negate %19 : tensor<f32>
-    %21 = stablehlo.select %2, %18, %20 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %21 : tensor<f32>
+    %9 = stablehlo.add %arg0, %3 : tensor<f32>
+    %10 = stablehlo.log %4 : tensor<f32>
+    %11 = stablehlo.multiply %9, %10 : tensor<f32>
+    %12 = stablehlo.negate %11 : tensor<f32>
+    %13 = stablehlo.divide %arg1, %4 : tensor<f32>
+    %14 = stablehlo.negate %13 : tensor<f32>
+    %15 = stablehlo.add %6, %8 : tensor<f32>
+    %16 = stablehlo.add %15, %12 : tensor<f32>
+    %17 = stablehlo.add %16, %14 : tensor<f32>
+    %18 = stablehlo.constant dense<0x7F800000> : tensor<f32>
+    %19 = stablehlo.negate %18 : tensor<f32>
+    %20 = stablehlo.select %2, %17, %19 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %20 : tensor<f32>
   }
 }

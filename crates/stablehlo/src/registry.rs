@@ -968,7 +968,7 @@ fn mask_support(
 ) -> Result<Value, EmitError> {
     let v_safe = e.select(in_support, v, safe);
     let dens = body(e, &v_safe)?;
-    let pos_inf = e.inf(dens.ty.clone());
+    let pos_inf = e.inf_like(&dens);
     let neg_inf = e.neg(&pos_inf);
     Ok(e.select(in_support, &dens, &neg_inf))
 }
@@ -1609,7 +1609,7 @@ fn uniform_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     // there is no formula to feed a domain-safe variate to, and routing through
     // that helper would emit a `select` onto a `safe` value nothing reads.
     let dens = e.scalar(-(hi - lo).ln());
-    let pos_inf = e.inf(dens.ty.clone());
+    let pos_inf = e.inf_like(&dens);
     let neg_inf = e.neg(&pos_inf);
     Ok(e.select(&in_support, &dens, &neg_inf))
 }
@@ -2644,9 +2644,9 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let diff = e.sub(v, &mu);
     let vec_ty = MlirTy::Ranked(vec![Some(n)]);
     let col_ty = MlirTy::Ranked(vec![Some(n), Some(1)]);
-    let diff_col = e.reshape(&diff, col_ty);
+    let diff_col = e.reshape_cell(&diff, col_ty);
     let y_col = e.tri_solve(&l, &diff_col);
-    let y = e.reshape(&y_col, vec_ty);
+    let y = e.reshape_cell(&y_col, vec_ty);
     let y_sq = e.mul(&y, &y);
     let quad = e.reduce_sum(&y_sq);
     let neg_half_quad = e.mul(&neg_half, &quad);
@@ -2713,7 +2713,7 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 /// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))
 /// + sum((alpha - 1) * log(x))`. `alpha - 1` needs a vector-shaped `1`
-/// (`Emitter::constant(1.0, alpha.ty.clone())`, a splat — see the batch doc
+/// (`Emitter::constant_like(1.0, &alpha)`, a splat — see the batch doc
 /// comment on why a bare `Emitter::scalar` cannot be subtracted from a
 /// vector directly). Its `@sample` builder ([`dirichlet_sample`], Task 15)
 /// draws `g_i ~ Gamma(alpha_i, 1)` per component (one [`draw_gamma`]
@@ -2728,7 +2728,7 @@ fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     let sum_lgamma_alpha = e.reduce_sum(&lgamma_alpha);
     let neg_sum_lgamma_alpha = e.neg(&sum_lgamma_alpha);
 
-    let one_vec = e.constant(1.0, alpha.ty.clone());
+    let one_vec = e.constant_like(1.0, &alpha);
     let alpha_minus_one = e.sub(&alpha, &one_vec);
     let log_x = e.log(v);
     let term = e.mul(&alpha_minus_one, &log_x);
@@ -2752,7 +2752,7 @@ fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
     let n_plus_one = e.add(&n, &one);
     let lgamma_n1 = e.lgamma(&n_plus_one);
 
-    let one_vec = e.constant(1.0, v.ty.clone());
+    let one_vec = e.constant_like(1.0, v);
     let x_plus_one = e.add(v, &one_vec);
     let lgamma_x1 = e.lgamma(&x_plus_one);
     let sum_lgamma_x1 = e.reduce_sum(&lgamma_x1);

@@ -1,4 +1,4 @@
-//! pyhf workspace JSON → FlatPPL module assembly.
+//! pyhf model / workspace JSON → FlatPPL module assembly.
 //!
 //! Implements the lift described in §12 "pyhf uncorrelated_background" of the
 //! profiles doc: each channel → `broadcast(Poisson, expected)` obs model
@@ -8,9 +8,10 @@
 use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
 use crate::histfactory::{
-    AuxOverride, Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
-    emit_normal01_constraint, emit_shapesys_constraint, emit_staterror_constraint, mod_spec,
-    modifier_effect, require_param, require_spec, sample_nominal, staterror_gaussian,
+    AuxOverride, Effect, Multiplier, ParamDomain, PendingConstraint, PyhfParamset,
+    emit_lumi_constraint, emit_normal01_constraint, emit_shapesys_constraint,
+    emit_staterror_constraint, mod_spec, modifier_effect, require_param, require_spec,
+    sample_nominal, staterror_gaussian,
 };
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
@@ -18,7 +19,7 @@ use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Node};
 use std::collections::{BTreeMap, HashSet};
 
-/// Convert a pyhf workspace document into a FlatPPL [`Module`].
+/// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
 pub fn pyhf_to_module(doc: &PyhfDocument) -> Result<Module> {
     let mut m = Module::new();
     {
@@ -71,14 +72,14 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
     let mut staterror_total: BTreeMap<String, usize> = BTreeMap::new();
     let mut staterror_counted: HashSet<(String, String)> = HashSet::new();
 
-    if doc.channels.is_empty() {
+    if doc.channels().is_empty() {
         // pyhf: InvalidSpecification ("[] should be non-empty").
         return Err(Error::Unsupported(
             "workspace has no channels, so there is no observation model to build".into(),
         ));
     }
     let mut channel_names: HashSet<&str> = HashSet::new();
-    for channel in &doc.channels {
+    for channel in doc.channels() {
         // Two channels of one name each get their own bindings but share the one
         // observation entry, so the observed counts would enter the likelihood
         // twice. pyhf: InvalidModel.
@@ -166,9 +167,7 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
     // A measurement's `poi` must name a parameter some modifier declares. pyhf
     // does not accept one declared only in `config.parameters` either: that block
     // configures an existing parameter, it does not create one.
-    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
-    for meas in doc.measurements.iter().chain(toplvl) {
-        check_binding_name(&meas.name, "pyhf measurement")?;
+    for meas in doc.measurements() {
         match &meas.config.poi {
             Some(poi) if !poi.is_empty() && !seen.contains_key(poi) => {
                 // pyhf: InvalidModel.
@@ -233,69 +232,61 @@ fn collect_param_overrides(
     staterror_total: &BTreeMap<String, usize>,
 ) -> Result<BTreeMap<String, AuxOverride>> {
     let mut out: BTreeMap<String, AuxOverride> = BTreeMap::new();
-    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
-    // pyhf selects measurement index 0 by default. Later measurements must
-    // neither replace that measurement's defaults nor validate its overrides.
-    for meas in doc.measurements.iter().chain(toplvl).take(1) {
-        let mut configured = HashSet::new();
-        for p in &meas.config.parameters {
-            if !configured.insert(p.name.as_str()) {
+    let mut configured = HashSet::new();
+    for p in doc.parameters() {
+        if !configured.insert(p.name.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "parameter `{}` is configured more than once",
+                p.name
+            )));
+        }
+        let Some(first) = seen.get(&p.name) else {
+            continue;
+        };
+        let spec = mod_spec(first.kind).expect("kind came from MOD_SPECS");
+        let n_pars = match first.use_.domain {
+            // A staterror parameter spans its channels, so an override
+            // covers every one of their bins.
+            ParamDomain::PosRealsPow => staterror_total
+                .get(&p.name)
+                .copied()
+                .unwrap_or(first.n_bins),
+            _ => 1,
+        };
+        for (field, values, used) in [
+            ("auxdata", &p.auxdata, spec.uses_auxdata),
+            ("sigmas", &p.sigmas, spec.uses_sigmas),
+            ("factors", &p.factors, spec.uses_factors),
+        ] {
+            if values.is_empty() {
+                continue;
+            }
+            if !used {
+                // pyhf: InvalidModel.
                 return Err(Error::Unsupported(format!(
-                    "measurement `{}` configures parameter `{}` more than once",
-                    meas.name, p.name
+                    "configuration sets `{field}` on parameter `{}`, but a `{}` \
+                     modifier's parameter does not use `{field}`",
+                    p.name, first.kind
                 )));
             }
-            let Some(first) = seen.get(&p.name) else {
-                continue;
-            };
-            let spec = mod_spec(first.kind).expect("kind came from MOD_SPECS");
-            let n_pars = match first.use_.domain {
-                // A staterror parameter spans its channels, so an override
-                // covers every one of their bins.
-                ParamDomain::PosRealsPow => staterror_total
-                    .get(&p.name)
-                    .copied()
-                    .unwrap_or(first.n_bins),
-                _ => 1,
-            };
-            for (field, values, used) in [
-                ("auxdata", &p.auxdata, spec.uses_auxdata),
-                ("sigmas", &p.sigmas, spec.uses_sigmas),
-                ("factors", &p.factors, spec.uses_factors),
-            ] {
-                if values.is_empty() {
-                    continue;
-                }
-                if !used {
-                    // pyhf: InvalidModel.
-                    return Err(Error::Unsupported(format!(
-                        "measurement `{}` sets `{field}` on parameter `{}`, but a `{}` \
-                         modifier's parameter does not use `{field}`",
-                        meas.name, p.name, first.kind
-                    )));
-                }
-                if values.len() != n_pars {
-                    // pyhf: InvalidModel.
-                    return Err(Error::Unsupported(format!(
-                        "measurement `{}` sets {} `{field}` value(s) on parameter `{}`, which \
-                         has {n_pars}",
-                        meas.name,
-                        values.len(),
-                        p.name
-                    )));
-                }
-            }
-            let e = out.entry(p.name.clone()).or_default();
-            if e.auxdata.is_empty() {
-                e.auxdata = p.auxdata.clone();
-            }
-            if e.sigmas.is_empty() {
-                e.sigmas = p.sigmas.clone();
-            }
-            if e.factors.is_empty() {
-                e.factors = p.factors.clone();
+            if values.len() != n_pars {
+                // pyhf: InvalidModel.
+                return Err(Error::Unsupported(format!(
+                    "configuration sets {} `{field}` value(s) on parameter `{}`, which \
+                     has {n_pars}",
+                    values.len(),
+                    p.name
+                )));
             }
         }
+        out.insert(
+            p.name.clone(),
+            AuxOverride {
+                auxdata: p.auxdata.clone(),
+                sigmas: p.sigmas.clone(),
+                factors: p.factors.clone(),
+            },
+        );
     }
     Ok(out)
 }
@@ -316,7 +307,7 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
     // Every channel's staterror layout first: a shared name's component count
     // is the total over the channels that carry it, and the parameter is
     // declared while the first of them is assembled.
-    for channel in &doc.channels {
+    for channel in doc.channels() {
         let n_bins = channel.samples.first().map_or(0, |s| s.data.len());
         let params: Vec<String> = channel
             .samples
@@ -327,37 +318,41 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
             .collect();
         register_staterror_layout(&mut terms, &channel.name, n_bins, &params);
     }
-    for channel in &doc.channels {
+    for channel in doc.channels() {
         emit_channel(b, doc, channel, &mut terms)?;
     }
-
-    // Measurement parameter-of-interest → record binding (so `config.poi`
-    // survives the lift; FlatPPL has no dedicated POI construct).
-    emit_poi(b, doc);
 
     // The flat top-level `likelihood` = joint of every channel's observation term
     // and all constraint terms.
     bind_likelihood(b, &terms);
 
+    // Allocate metadata after the model so labels cannot shadow its bindings.
+    emit_poi(b, doc);
+
     Ok(())
 }
 
-/// Emit each measurement's parameter-of-interest as `<measurement> = record(poi = <param>)`.
+/// Preserve each measurement's parameter-of-interest in a named record.
 ///
 /// pyhf's `config.poi` names a free parameter already declared by a modifier; a
 /// record preserves the association without inventing a language construct.
+/// Measurement labels are not parameter names: allocate a valid, unique binding
+/// and retain the original label in its doc comment.
 /// Measurements from either schema (top-level `measurements` or old-format
 /// `toplvl.measurements`) are covered.
 fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
-    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
-    for meas in doc.measurements.iter().chain(toplvl) {
+    for meas in doc.measurements() {
         match &meas.config.poi {
             // An empty `poi` string means "no POI declared" — skip it (emitting
             // `record(poi = )` would be syntactically invalid).
             Some(poi) if !poi.is_empty() => {
                 let poi_ref = b.self_ref(poi);
                 let rec = b.call_kw("record", &[("poi", poi_ref)]);
-                b.bind(&meas.name, rec);
+                b.bind_unique_doc(
+                    &meas.name,
+                    rec,
+                    &format!("pyhf measurement {:?}", meas.name),
+                );
             }
             _ => {}
         }
@@ -390,7 +385,7 @@ pub struct Observed {
     pub node: NodeId,
     /// Bin count, checked against the samples.
     pub n_bins: usize,
-    /// Some count is fractional, so the channel scores `hepphys.ContinuedPoisson`.
+    /// Counts are fractional or supplied later, so use `hepphys.ContinuedPoisson`.
     pub fractional: bool,
 }
 
@@ -404,17 +399,9 @@ pub struct LumiConfig {
     pub nom: f64,
 }
 
-/// Find the lumi parameter config in the selected first measurement.
+/// Find the lumi parameter config in the model or selected first measurement.
 fn find_lumi_param(doc: &PyhfDocument) -> Option<&PyhfParam> {
-    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
-    doc.measurements
-        .iter()
-        .chain(toplvl)
-        .next()?
-        .config
-        .parameters
-        .iter()
-        .find(|p| p.name == "lumi")
+    doc.parameters().iter().find(|p| p.name == "lumi")
 }
 
 fn emit_channel(
@@ -433,7 +420,7 @@ fn emit_channel(
         .collect();
 
     // Resolve observation for this channel into an array node (and its bin count).
-    let observed = find_obs(b, doc, channel_name)?;
+    let observed = find_obs(b, doc, channel)?;
 
     // Resolve lumi config (sigma) if any sample carries a lumi modifier.
     let has_lumi = channel.samples.iter().any(|s| {
@@ -444,7 +431,7 @@ fn emit_channel(
     let lumi = if has_lumi {
         let lumi_cfg = find_lumi_param(doc).ok_or_else(|| {
             Error::Unsupported(
-                "lumi modifier present but no `lumi` parameter entry found in measurement config \
+                "lumi modifier present but no `lumi` parameter entry found in parameter config \
                  (need `sigmas` and `auxdata`)"
                     .into(),
             )
@@ -484,6 +471,8 @@ pub struct Terms {
     /// paramset), so it must be declared once. `validate_workspace` has already
     /// established that every occurrence of a shared name agrees on the domain.
     declared_params: HashSet<String>,
+    /// Shared deterministic normalization factors across samples and channels.
+    normsys_factors: crate::normsys::Factors,
     /// The staterror constraint form to use when the modifier does not name one.
     ///
     /// pyhf's staterror paramset is always `constrained_by_normal` and its
@@ -626,43 +615,6 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
 ///
 /// `observed.fractional` swaps the count distribution to
 /// `hepphys.ContinuedPoisson`, from [`validate_observed_counts`].
-/// Combine one sample's histosys interpolations into its shifted nominal.
-///
-/// `shifted` pairs each histosys parameter name with the interpolation of the
-/// sample's original nominal for that modifier alone. No modifier: the nominal.
-/// One: the interpolation, which already is `nominal + shift`. Two or more:
-/// `nominal + sum_m (interp_m - nominal)`, each shift bound to a name so the
-/// emitted model stays readable.
-fn histosys_total(
-    b: &mut Builder,
-    channel_name: &str,
-    sname: &str,
-    nom_name: &str,
-    shifted: &[(String, NodeId)],
-) -> NodeId {
-    match shifted.len() {
-        0 => b.self_ref(nom_name),
-        1 => shifted[0].1,
-        _ => {
-            let mut acc = b.self_ref(nom_name);
-            for (param, interp) in shifted {
-                let base = b.self_ref(nom_name);
-                let sub = b.call_head("sub");
-                let delta = b.call("broadcast", &[sub, *interp, base]);
-                let shift_name = b.bind_unique_doc(
-                    &format!("{channel_name}_{sname}_{param}_shift"),
-                    delta,
-                    "Additive histosys shift relative to the sample nominal.",
-                );
-                let shift_ref = b.self_ref(&shift_name);
-                let add = b.call_head("add");
-                acc = b.call("broadcast", &[add, acc, shift_ref]);
-            }
-            acc
-        }
-    }
-}
-
 pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
@@ -828,6 +780,8 @@ pub fn assemble_channel(
     // (each carries the sample nominal its `tau` needs).
     let mut sample_expected: Vec<NodeId> = Vec::new();
     let mut pending: Vec<(String, PendingConstraint, NodeId)> = Vec::new();
+    let mut nominal_names = Vec::new();
+    let mut histosys = Vec::new();
     for (sname, nominal, modifiers) in samples {
         let data = SampleData::Flat(nominal.to_vec());
         let nom_arr = sample_nominal(b, &data);
@@ -842,14 +796,12 @@ pub fn assemble_channel(
         // nominal and, at a knot, discard the first shift entirely (pyhf sums the
         // per-modifier additive deltas onto the nominal, then applies the
         // multiplicative factors; ROOT's PiecewiseInterpolation sums them too).
-        let mut shifted: Vec<(String, NodeId)> = Vec::new();
+        let mut shifted = Vec::new();
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
-                let base = b.self_ref(&nom_name);
-                let (effect, constraint) = modifier_effect(b, modifier, base, nominal)?;
-                let param = constraint.as_ref().map(|(p, _)| p.clone());
+                let (effect, constraint) = modifier_effect(b, modifier, nominal)?;
                 if let Effect::ReplaceNominal(new_nom) = effect {
-                    shifted.push((param.unwrap_or_default(), new_nom));
+                    shifted.push(new_nom);
                 }
                 if let Some((param, pc)) = constraint {
                     let base = b.self_ref(&nom_name);
@@ -857,15 +809,18 @@ pub fn assemble_channel(
                 }
             }
         }
-        let nom = histosys_total(b, channel_name, sname, &nom_name, &shifted);
-
-        // Then: multiplicative modifiers (`acc = broadcast(mul, acc, factor)`).
-        let mut acc = nom;
+        nominal_names.push(nom_name);
+        histosys.push(shifted);
+    }
+    let shifted = crate::histosys::shifted_nominals(b, channel_name, &nominal_names, &histosys);
+    let mut multipliers = Vec::new();
+    for ((_, nominal, modifiers), nom_name) in samples.iter().zip(&nominal_names) {
+        let mut factors = Vec::new();
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
                 continue;
             }
-            let (effect, constraint) = modifier_effect(b, modifier, nom, nominal)?;
+            let (effect, constraint) = modifier_effect(b, modifier, nominal)?;
             if let Effect::Multiply(factor) = effect {
                 // A staterror parameter may span channels, in which case this
                 // channel multiplies in only its own slice.
@@ -873,21 +828,33 @@ pub fn assemble_channel(
                     Some(spec) if spec.channel_staterror => {
                         let param = require_param(modifier, spec)?;
                         let (total, offset) = staterror_slice(terms, &param, channel_name);
-                        staterror_factor(b, &param, total, offset, n_bins)
+                        Multiplier::Value(staterror_factor(b, &param, total, offset, n_bins))
                     }
                     _ => factor,
                 };
-                let mul = b.call_head("mul");
-                acc = b.call("broadcast", &[mul, acc, factor]);
+                factors.push(factor);
             }
             // shapesys reads the sample's UNSHIFTED nominal for its tau (pyhf
             // takes `nom_data` from the sample's own `data`); other constraints
             // ignore it. Passing the post-histosys nominal would make the
             // constraint's observed aux data depend on the histosys alphas.
             if let Some((param, pc)) = constraint {
-                let base = b.self_ref(&nom_name);
+                let base = b.self_ref(nom_name);
                 pending.push((param, pc, base));
             }
+        }
+        multipliers.push(factors);
+    }
+    let multipliers = terms
+        .normsys_factors
+        .multipliers(b, channel_name, multipliers);
+    for ((sname, _, _), (nom, factors)) in samples.iter().zip(shifted.into_iter().zip(multipliers))
+    {
+        // Keep the original product order after sharing interpolation work.
+        let mut acc = nom;
+        for factor in factors {
+            let mul = b.call_head("mul");
+            acc = b.call("broadcast", &[mul, acc, factor]);
         }
 
         let exp_name = b.bind_unique_doc(
@@ -899,15 +866,14 @@ pub fn assemble_channel(
     }
 
     // ---- Total expected per bin (sum over samples) ----
-    let total = if sample_expected.is_empty() {
-        b.array(&[])
-    } else {
-        let mut acc = sample_expected[0];
-        for &next in &sample_expected[1..] {
-            let add = b.call_head("add");
-            acc = b.call("broadcast", &[add, acc, next]);
+    let total = match sample_expected.as_slice() {
+        [] => b.array(&[]),
+        [single] => *single,
+        _ => {
+            let rows = b.array(&sample_expected);
+            let matrix = b.call("rowstack", &[rows]);
+            b.column_sums(matrix)
         }
-        acc
     };
     let expected_name = b.bind_unique_doc(
         &format!("{channel_name}_expected"),
@@ -1078,12 +1044,29 @@ fn param_domain_set(b: &mut Builder, domain: ParamDomain, n_bins: usize) -> Node
     }
 }
 
-/// Resolve the observed-data vector for `channel_name` from either schema.
+/// Resolve workspace observations or declare a model's external data input.
 ///
 /// New format: `doc.observations` list keyed by name.
 /// Old format: `doc.data` map keyed by channel name.
 ///
-fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<Observed> {
+fn find_obs(
+    b: &mut Builder,
+    doc: &PyhfDocument,
+    channel: &crate::model::PyhfChannel,
+) -> Result<Observed> {
+    let channel_name = channel.name.as_str();
+    let PyhfDocument::Workspace(doc) = doc else {
+        let n_bins = channel.samples.first().map_or(0, |s| s.data.len());
+        let counts = b.call_head("nonnegreals");
+        let size = b.lit_int(n_bins as i64);
+        let domain = b.call("cartpow", &[counts, size]);
+        return Ok(Observed {
+            node: b.call("external", &[domain]),
+            n_bins,
+            // pyhf scores real-valued data, including fractional Asimov counts.
+            fractional: true,
+        });
+    };
     let mut build = |data: &[f64]| -> Result<Observed> {
         let fractional = validate_observed_counts(channel_name, data)?;
         let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
@@ -1109,12 +1092,13 @@ mod tests {
     use super::*;
     use crate::model::Modifier;
     use crate::model::{
-        PyhfChannel, PyhfMeasurement, PyhfMeasurementConfig, PyhfObservation, PyhfParam, PyhfSample,
+        PyhfChannel, PyhfMeasurement, PyhfMeasurementConfig, PyhfObservation, PyhfParam,
+        PyhfSample, PyhfWorkspace,
     };
     use flatppl_syntax::{Syntax, print_with};
 
-    fn make_uncorrelated_doc() -> PyhfDocument {
-        PyhfDocument {
+    fn make_uncorrelated_doc() -> PyhfWorkspace {
+        PyhfWorkspace {
             version: None,
             channels: vec![PyhfChannel {
                 name: "singlechannel".into(),
@@ -1170,7 +1154,7 @@ mod tests {
         for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             let mut doc = make_uncorrelated_doc();
             doc.channels[0].samples[0].data[1] = bad;
-            let err = pyhf_to_module(&doc)
+            let err = pyhf_to_module(&PyhfDocument::Workspace(doc))
                 .expect_err("a non-finite nominal yield must be refused")
                 .to_string();
             assert!(
@@ -1187,7 +1171,8 @@ mod tests {
     fn negative_nominal_is_imported() {
         let mut doc = make_uncorrelated_doc();
         doc.channels[0].samples[0].data[1] = -11.0;
-        let m = pyhf_to_module(&doc).expect("a negative nominal yield must import");
+        let m = pyhf_to_module(&PyhfDocument::Workspace(doc))
+            .expect("a negative nominal yield must import");
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("-11.0"), "got:\n{text}");
     }
@@ -1195,7 +1180,7 @@ mod tests {
     #[test]
     fn pyhf_module_contains_required_constructs() {
         let doc = make_uncorrelated_doc();
-        let m = pyhf_to_module(&doc).unwrap();
+        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("broadcast(Poisson"), "got:\n{text}");
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -1211,7 +1196,7 @@ mod tests {
     #[test]
     fn hepphys_standard_module_binding_present() {
         let doc = make_uncorrelated_doc();
-        let m = pyhf_to_module(&doc).unwrap();
+        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("standard_module"), "got:\n{text}");
         assert!(text.contains("particle-physics"), "got:\n{text}");
@@ -1220,7 +1205,7 @@ mod tests {
     #[test]
     fn normsys_emits_normal_aux_and_interp() {
         // Single-channel doc with one normsys modifier
-        let doc = PyhfDocument {
+        let doc = PyhfWorkspace {
             version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
@@ -1246,7 +1231,7 @@ mod tests {
             data: None,
             toplvl: None,
         };
-        let m = pyhf_to_module(&doc).unwrap();
+        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "missing Normal aux, got:\n{text}");
         assert!(
@@ -1259,7 +1244,7 @@ mod tests {
     #[test]
     fn lumi_requires_config_param() {
         // lumi modifier with no measurement config → should return Err
-        let doc = PyhfDocument {
+        let doc = PyhfWorkspace {
             version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
@@ -1286,7 +1271,7 @@ mod tests {
             toplvl: None,
         };
         assert!(
-            pyhf_to_module(&doc).is_err(),
+            pyhf_to_module(&PyhfDocument::Workspace(doc)).is_err(),
             "should fail without lumi config"
         );
     }
@@ -1294,7 +1279,7 @@ mod tests {
     #[test]
     fn lumi_with_config_converts() {
         // lumi modifier with proper config → converts OK, emits Normal aux
-        let doc = PyhfDocument {
+        let doc = PyhfWorkspace {
             version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
@@ -1331,7 +1316,7 @@ mod tests {
             data: None,
             toplvl: None,
         };
-        let m = pyhf_to_module(&doc).unwrap();
+        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "missing lumi Normal, got:\n{text}");
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");

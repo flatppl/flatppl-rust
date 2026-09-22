@@ -158,6 +158,68 @@ y = broadcast(hepphys.interp_poly6_exp, lo, nom, hi, alpha)
     );
 }
 
+/// Same-rank singleton axes broadcast to the corresponding non-singleton
+/// extents.  This is the rectangular HistFactory shape: one row per modifier,
+/// one column per bin, with the nominal row and nuisance column held constant
+/// along their singleton axes.
+#[test]
+fn broadcast_of_std_function_joins_singleton_axes() {
+    let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+lo = elementof(cartpow(reals, [2, 3]))
+nom = elementof(cartpow(reals, [1, 3]))
+hi = elementof(cartpow(reals, [2, 3]))
+alpha = elementof(cartpow(reals, [2, 1]))
+y = broadcast(hepphys.interp_poly6_lin, lo, nom, hi, alpha)
+"#;
+    let (module, diags) = infer_src(src, Level::Type);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+
+    assert_eq!(
+        binding_ty(&module, "y"),
+        Some(&Type::Array {
+            shape: Box::new([Dim::Static(2), Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        })
+    );
+}
+
+#[test]
+fn singleton_shape_join_rejects_real_mismatches() {
+    for incompatible in ["[2, 4]", "[2, 3, 1]"] {
+        let src = format!(
+            "a = elementof(cartpow(reals, [2, 3]))\n\
+             b = elementof(cartpow(reals, {incompatible}))\n\
+             y = broadcast(add, a, b)\n"
+        );
+        let (module, diags) = infer_src(&src, Level::Type);
+        assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+        assert_eq!(binding_ty(&module, "y"), Some(&Type::Deferred));
+    }
+}
+
+#[test]
+fn singleton_shape_join_keeps_nested_cell_type() {
+    let src = r#"
+left = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+right = [[10.0, 20.0, 30.0]]
+combine(a, b) = a .+ b
+y = broadcast(combine, left, right)
+"#;
+    let (module, diags) = infer_src(src, Level::Type);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+    assert_eq!(
+        binding_ty(&module, "y"),
+        Some(&Type::Array {
+            shape: Box::new([Dim::Static(2)]),
+            elem: Box::new(Type::Array {
+                shape: Box::new([Dim::Static(3)]),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            }),
+        })
+    );
+}
+
 /// A §09 function whose result is a different scalar kind than its inputs
 /// (`hepphys.resonance_breitwigner(…) → Complex`) broadcasts to an array of that
 /// result kind — the cell type comes from the catalogue sig, not the inputs.

@@ -3,7 +3,7 @@
 //! memo, and cross-module cycle detection. Single-module inference lives in
 //! `trace.rs`; everything that crosses a module boundary lives here.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ fn is_remote_source(source: &str) -> bool {
 /// bundle repeatedly (e.g. the LSP, once per keystroke) shares one parsed copy
 /// rather than deep-cloning each dependency `Module` on every assembly. Inserts
 /// and lookups move/borrow the `Arc`; the only deep clone of a dependency is the
-/// per-import-site working copy `infer_dep` mutates, which is genuinely needed
+/// per-import-site working copy inference mutates, which is genuinely needed
 /// (inference annotates it in place).
 #[derive(Debug, Default, Clone)]
 pub struct ModuleBundle {
@@ -336,6 +336,23 @@ pub(crate) struct Resolved {
     pub(crate) catalogue: Option<CatalogueRef>,
 }
 
+// This transient return value is not stored in a collection. Keep cached
+// resolutions inline rather than allocating a box for every imported reference.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Resolution {
+    Ready(Resolved),
+    Infer(Box<Dependency>),
+}
+
+/// An uncached module instance. Seeds already use its symbol interner.
+pub(crate) struct Dependency {
+    pub(crate) module: Module,
+    pub(crate) seeds: Vec<(NodeId, Resolved)>,
+    pub(crate) key: (String, String),
+    pub(crate) path: String,
+    pub(crate) binding: String,
+}
+
 /// A §09 standard-module binding resolved against the built-in catalogue: its
 /// signature (cloned so the application site can lower it with concrete call
 /// args) and its honest-degrade note.
@@ -360,12 +377,9 @@ struct LoadDirective {
 
 /// Spans a `ModuleBundle` for one `infer_module` run. Holds the per-import-site
 /// dependency memo and the active-import stack. Interior mutability lets the
-/// per-module `Inferencer` borrow `&InferSession` while recursing into a child
-/// `Inferencer` over a cloned dependency.
+/// scheduler retain the session while it suspends one module and visits another.
 pub(crate) struct InferSession<'b> {
     pub(crate) bundle: &'b ModuleBundle,
-    /// Active trace depth spans loaded modules as well as local references.
-    pub(crate) trace_depth: Cell<flatppl_core::depth::Depth>,
     /// Merged catalogue set (built-in + host-supplied external catalogues).
     /// `standard_module` resolution consults this instead of `builtin()` directly
     /// so that host-supplied external catalogues are visible.
@@ -387,7 +401,6 @@ impl<'b> InferSession<'b> {
     pub(crate) fn new(bundle: &'b ModuleBundle) -> Self {
         InferSession {
             bundle,
-            trace_depth: Cell::default(),
             catalogues: CatalogueSet::builtin_only(),
             memo: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
@@ -404,7 +417,6 @@ impl<'b> InferSession<'b> {
     ) -> Self {
         InferSession {
             bundle,
-            trace_depth: Cell::default(),
             catalogues: CatalogueSet::with_external(external),
             memo: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
@@ -420,7 +432,7 @@ impl<'b> InferSession<'b> {
     }
 
     /// Append `diags` to the dependency-diagnostic accumulator. Called by
-    /// `infer_dep` after each child inference walk.
+    /// the driver after each child inference walk.
     pub(crate) fn push_dep_diags(&self, diags: Vec<Diagnostic>) {
         self.dep_diags.borrow_mut().extend(diags);
     }
@@ -485,41 +497,9 @@ impl<'b> InferSession<'b> {
         })
     }
 
-    /// Infer (and memo) the dependency with resolved identity `id`, seeding
-    /// substitution inputs
-    /// with `seeds` before the walk. Pushes/pops the active-import stack and
-    /// inserts the annotated clone into `self.memo` under `key` when done.
-    /// The caller (`resolve`) is responsible for the cycle check before calling.
-    /// Diagnostics from the child run are accumulated in `self.dep_diags` so
-    /// that cycle errors and other dep-level errors reach the root caller.
-    ///
-    /// The seeds carry `importer`-context types, so their names are re-interned
-    /// into the dependency clone before the walk — the mirror of the outbound
-    /// translation in `resolve`. Without it the dependency's annotation table
-    /// holds foreign `Symbol` indices, which the outbound translation then reads
-    /// against the wrong interner.
-    fn infer_dep(
-        &self,
-        dep: &Module,
-        importer: &Module,
-        id: &str,
-        key: &(String, String),
-        seeds: &[(NodeId, Resolved)],
-        level: crate::Level,
-    ) {
-        self.stack.borrow_mut().push(id.to_string());
-        let mut dep_clone = dep.clone();
-        let seeds: Vec<(NodeId, Resolved)> = seeds
-            .iter()
-            .map(|(n, r)| (*n, reintern_resolved(&mut dep_clone, importer, r.clone())))
-            .collect();
-        let child_diags =
-            crate::trace::Inferencer::new_seeded(&mut dep_clone, level, self, &seeds).run();
+    pub(crate) fn finish_dependency(&self, key: (String, String), module: Module) {
         self.stack.borrow_mut().pop();
-        self.push_dep_diags(child_diags);
-        // Two-phase memo access: `contains_key` above released the `Ref` so we
-        // can call `borrow_mut()` here without conflicting borrows.
-        self.memo.borrow_mut().insert(key.clone(), dep_clone);
+        self.memo.borrow_mut().insert(key, module);
     }
 
     /// Returns the `%assign` substitutions of the `load_module` call bound to
@@ -538,9 +518,9 @@ impl<'b> InferSession<'b> {
     }
 
     /// Resolve `(%ref alias binding_name)` from `importer`. `subst_annos` are
-    /// importer-context inferred annotations for substitution inputs. On
-    /// failure returns `Err(message)`; the caller emits an anchored error +
-    /// `Type::Failed`.
+    /// importer-context inferred annotations for substitution inputs.
+    /// An uncached dependency returns work for the trace scheduler. No module
+    /// inference runs on this call stack.
     ///
     /// `importer` is `&mut` because the returned `Resolved` is re-interned into
     /// the importer's interner before it leaves the boundary
@@ -551,8 +531,7 @@ impl<'b> InferSession<'b> {
         alias: Symbol,
         binding_name: &str,
         subst_annos: &[(String, Resolved)],
-        level: crate::Level,
-    ) -> Result<Resolved, String> {
+    ) -> Result<Resolution, String> {
         let directive = self.load_directive(importer, alias)?;
 
         // §09 standard modules resolve against the merged catalogue set
@@ -561,7 +540,8 @@ impl<'b> InferSession<'b> {
         // the application site (where the concrete arg types are known), so the
         // catalogue sig rides over here.
         if directive.standard {
-            return resolve_standard(&self.catalogues, &directive, binding_name);
+            return resolve_standard(&self.catalogues, &directive, binding_name)
+                .map(Resolution::Ready);
         }
 
         // The literal resolves against the module that declares it (spec §04
@@ -602,13 +582,34 @@ impl<'b> InferSession<'b> {
                 chain.push(dep_id.clone());
                 return Err(format!("module cycle: {}", chain.join(" → ")));
             }
-            let seeds = seed_plan(dep, subst_annos);
-            self.infer_dep(dep, importer, &dep_id, &key, &seeds, level);
+            let mut module = dep.clone();
+            let seeds = seed_plan(dep, subst_annos)
+                .into_iter()
+                .map(|(node, resolved)| (node, reintern_resolved(&mut module, importer, resolved)))
+                .collect();
+            self.stack.borrow_mut().push(dep_id);
+            return Ok(Resolution::Infer(Box::new(Dependency {
+                module,
+                seeds,
+                key,
+                path: directive.path,
+                binding: binding_name.to_string(),
+            })));
         }
 
+        self.resolved_binding(importer, &key, &directive.path, binding_name)
+            .map(Resolution::Ready)
+    }
+
+    pub(crate) fn resolved_binding(
+        &self,
+        importer: &mut Module,
+        key: &(String, String),
+        dep_path: &str,
+        binding_name: &str,
+    ) -> Result<Resolved, String> {
         let memo = self.memo.borrow();
-        let dep_annotated = memo.get(&key).expect("just inserted");
-        let dep_path = &directive.path;
+        let dep_annotated = memo.get(key).expect("dependency inference completed");
         // CROSS-INTERNER: resolve by string, not Symbol — the importer and
         // dependency have separate interners.
         let (_, b) = dep_annotated

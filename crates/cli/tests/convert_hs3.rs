@@ -113,6 +113,63 @@ fn fixture(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn pyhf_model_accepts_runtime_observations() {
+    let dir = scratch("pyhf-model");
+    let input = dir.join("model.pyhf.json");
+    let model = dir.join("model.flatppl");
+    std::fs::write(
+        &input,
+        r#"{"channels":[{"name":"singlechannel","samples":[
+          {"name":"signal","data":[5.0,10.0],"modifiers":[
+            {"name":"my_normfactor","type":"normfactor","data":null}]}]}]}"#,
+    )
+    .unwrap();
+    let converted = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("convert")
+        .arg(&input)
+        .arg(&model)
+        .output()
+        .unwrap();
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+
+    // Data stays fixed during parameter evaluation, but both enter the compiled
+    // query at runtime. Loading uses the same input API as hand-written models.
+    let query = dir.join("query.flatppl");
+    std::fs::write(
+        &query,
+        r#"flatppl_compat = "0.1"
+data = external(cartpow(nonnegreals, 2))
+strength = elementof(reals)
+model = load_module("model.flatppl", singlechannel_observed = data)
+score = logdensityof(model.likelihood, record(my_normfactor = strength))
+inputs = (strength, data)
+outputs = score
+"#,
+    )
+    .unwrap();
+    let emitted = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("stablehlo")
+        .arg(&query)
+        .output()
+        .unwrap();
+    assert!(
+        emitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&emitted.stdout).contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<2xf32>) -> tensor<f32>"
+        ),
+        "the query must accept the strength and both observed counts at runtime"
+    );
+}
+
+#[test]
 fn convert_from_pyhf_fixture() {
     let inp = fixture("2bin_1channel.json");
     let out = scratch("pyhf2bin").join("pyhf_2bin_cli.flatppl");
@@ -236,6 +293,21 @@ fn hs3_convert_emits_banner_and_compat() {
         text.contains("flatppl_compat = \"0.1\""),
         "generated module must stamp the leading flatppl_compat binding, got:\n{text}"
     );
+    for args in [
+        vec!["fmt", "--check"],
+        vec!["lint", "--deny", "not-canonical"],
+    ] {
+        let check = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .args(args)
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
     // No pseudo-provenance / personal information of any kind.
     for leaked in [
         "generator:",

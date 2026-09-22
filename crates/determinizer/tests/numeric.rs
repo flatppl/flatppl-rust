@@ -385,61 +385,21 @@ lp = logdensityof(d, data)";
     );
 }
 
-// `iid(M, n)` where `M` is a BARE constructor with a NON-SCALAR variate
-// domain (`MvNormal`, vector domain) must NOT take the axis-native broadcast
-// fast path: `emit_kernel_broadcast_density`'s size-1-array-of-records
-// flatten is verified only for a SCALAR-domain kernel (each scalar param
-// lifted to a length-1 `vector`) — a non-scalar-domain kernel has its own
-// compound parameters (e.g. MvNormal's rank-1 `mu`) that would need a
-// genuinely different wrap the flatten does not build. `is_scalar_domain_kernel`
-// gates both `lower_iid` fast-path entries on the kernel's own inferred
-// domain being CONFIRMED scalar, so a bare `MvNormal` structurally matches
-// `split_kernel_constructor` but fails that gate and falls through —
-// unchanged — to the `get0`/`fold_add` unroll fallback (the same path this
-// took before the axis-native fast path existed). Regression guard for the
-// whole-branch review: confirms the gate re-routes MvNormal to the safe
-// unroll rather than refusing or (worse) mislowering it through the flatten.
+// A multivariate observation remains one cell, not a flattened scalar axis.
 #[test]
-fn iid_nonscalar_domain_kernel_uses_unroll_not_broadcast_flatten() {
-    let src = "\
-data = [[0.2, 0.3], [0.4, -0.1], [0.0, 0.5]]
-d = iid(MvNormal(mu = [0.0, 0.0], cov = eye(2)), 3)
-lp = logdensityof(d, data)";
-    let m = parse_infer(src);
-    let out = determinize(&m)
-        .expect("iid over a non-scalar-domain kernel must lower via unroll, not refuse/panic");
-    assert!(
-        flatppl_determinizer::is_flatpdl(&out).is_ok(),
-        "emitted FlatPDL must be conformant"
+fn iid_nonscalar_kernel_broadcasts_whole_observations() {
+    let m = parse_infer(
+        "data = [[0.2, 0.3], [0.4, -0.1], [0.0, 0.5]]\n\
+        d = iid(MvNormal(mu = [0.0, 0.0], cov = eye(2)), 3)\n\
+        lp = logdensityof(d, data)",
     );
+    let out = determinize(&m).expect("multivariate iid must lower");
+    flatppl_determinizer::is_flatpdl(&out).unwrap();
     let pir = flatppl_flatpir::write(&out);
-    // Unroll fallback: one `get0` per iid element (3), NOT the size-1-broadcast
-    // flatten form.
-    assert_eq!(
-        pir.matches("(get0 ").count(),
-        3,
-        "unroll fallback: one get0 per iid element, not the broadcast flatten:\n{pir}"
-    );
-    assert_eq!(
-        pir.matches("builtin_logdensityof").count(),
-        3,
-        "one MvNormal density term per unrolled element:\n{pir}"
-    );
-    assert!(
-        pir.contains("MvNormal"),
-        "each term scores MvNormal directly:\n{pir}"
-    );
-    // The broadcast-flatten form this gate must NOT take: no `broadcast record`
-    // synthesizing a singleton params array, and no bare axis-native
-    // `(broadcast builtin_logdensityof MvNormal ...)` head.
-    assert!(
-        !pir.contains("(broadcast record"),
-        "must not build the singleton-broadcast kernel_input:\n{pir}"
-    );
-    assert!(
-        !pir.contains("(broadcast builtin_logdensityof"),
-        "must not take the axis-native broadcast fast path for a non-scalar-domain kernel:\n{pir}"
-    );
+    assert_eq!(pir.matches("builtin_logdensityof").count(), 1, "{pir}");
+    assert_eq!(pir.matches("(get0 ").count(), 0, "{pir}");
+    assert!(pir.contains("(broadcast "), "{pir}");
+    assert!(pir.contains("MvNormal"), "{pir}");
 }
 
 #[test]
@@ -709,16 +669,16 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
         !pir.contains("(likelihoodof ") && !pir.contains("(iid "),
         "measure layer gone:\n{pir}"
     );
-    // Structural: the θ point {mu=0.0, sigma=1.0} is INLINED into the kernel's
-    // params (not left as `(%ref self mu/sigma)`), and the kernel is scored at the
+    // The θ point becomes singleton arguments of the shared density body
+    // (not residual `(%ref self mu/sigma)`), and the kernel is scored at the
     // baked-in observation 1.27.
     let lp_line = pir
         .lines()
         .find(|l| l.contains("(%bind lp "))
         .expect("lp binding present");
     assert!(
-        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
-        "θ inlined into the kernel params:\n{lp_line}"
+        lp_line.contains("(vector 0.0)") && lp_line.contains("(vector 1.0)"),
+        "θ supplied to the shared kernel body:\n{lp_line}"
     );
     assert!(
         lp_line.contains("1.27"),
@@ -771,11 +731,11 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
         .expect("lp2 binding present");
 
     assert!(
-        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
+        lp_line.contains("(vector 0.0)") && lp_line.contains("(vector 1.0)"),
         "lp must score at ITS θ (mu=0.0, sigma=1.0):\n{lp_line}"
     );
     assert!(
-        lp2_line.contains("(%field mu 5.0)") && lp2_line.contains("(%field sigma 2.0)"),
+        lp2_line.contains("(vector 5.0)") && lp2_line.contains("(vector 2.0)"),
         "lp2 must score at ITS θ (mu=5.0, sigma=2.0):\n{lp2_line}"
     );
 
@@ -855,7 +815,7 @@ lp = logdensityof(L, record(mu = 0.0, nu = 0.5))";
     // Each component scores at ITS θ: component 1 → Normal(mu=0.0), scored at the
     // baked-in observation 1.0; component 2 → Normal(mu=0.5), scored at 2.0.
     assert!(
-        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field mu 0.5)"),
+        lp_line.contains("(vector 0.0)") && lp_line.contains("(vector 0.5)"),
         "each component binds its own free param from the shared θ:\n{lp_line}"
     );
     assert!(
@@ -1063,10 +1023,10 @@ lp = logdensityof(L, record(mu_a = 0.3, mu_b = 1.0))";
         !pir.contains("(iid ") && !pir.contains("(logdensityof ") && !pir.contains("(joint "),
         "measure layer eliminated:\n{pir}"
     );
-    // One term per row per field: 2 rows x 2 fields.
+    // One body per field, broadcast across both rows.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        4,
+        2,
         "Σ over rows x fields:\n{pir}"
     );
     // Each field is scored at the θ value, NOT at the marginal of a latent.

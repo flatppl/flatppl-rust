@@ -151,8 +151,8 @@ use flatppl_core::{
 };
 use flatppl_infer::ModuleBundle;
 
-/// Cap source-driven determinization expansion before allocating new nodes.
-const MAX_STATIC_UNROLL: u32 = 4096;
+#[path = "density_broadcast.rs"]
+mod broadcast;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -499,7 +499,8 @@ fn graft_cross_module_target(
 /// self …)` hop to — a cross-module `(%ref <alias> member)` into a loaded
 /// submodule, graft the referenced subtree into the host and return
 /// `Some(new_query)`: a freshly-built `logdensityof` whose target arg is the
-/// LOCAL grafted node (arg 1, the variate / θ, is carried over unchanged).
+/// LOCAL grafted node. A direct cross-module variate is grafted on a subsequent
+/// scan, before lowering needs its type or destructures its observation cells.
 ///
 /// The driver rewrites the binding to `new_query` and RETURNS WITHOUT lowering.
 /// It then reloops, re-runs inference (typing the grafted subtree — crucially an
@@ -516,8 +517,8 @@ fn graft_cross_module_target(
 /// grafted submodule dependency colliding with an unrelated host binding —
 /// refuse-don't-mislower).
 ///
-/// Termination: a graft here fires AT MOST ONCE per query. It rewrites the
-/// target from a `(%ref <alias> …)` (or a self-ref reaching one) to a local
+/// Termination: a graft here fires at most once per argument. It rewrites the
+/// argument from a `(%ref <alias> …)` (or a self-ref reaching one) to a local
 /// grafted node, so on the next scan `graft_cross_module_target` sees a local
 /// node and returns `Ok(None)` — the query then lowers (strictly reducing the
 /// measure-node count) rather than grafting again.
@@ -552,6 +553,11 @@ pub(crate) fn graft_query_target(
     // now-local application next iteration.
     if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle)? {
         return Ok(Some(build_call(m, op, &[new_call, arg2])));
+    }
+    // Density destructuring also needs imported observations to be local and
+    // inferred. Use the same graft path and defer lowering until the next scan.
+    if let Some(grafted) = graft_cross_module_target(m, arg2, bundle)? {
+        return Ok(Some(build_call(m, op, &[arg1, grafted])));
     }
     Ok(None) // same-module target — driver lowers normally
 }
@@ -6261,211 +6267,11 @@ fn iid_static_table_rows(m: &Module, iid_node: NodeId) -> Option<usize> {
     }
 }
 
-/// The column names of an `iid` node whose variate is a table, in declaration
-/// order — the field names of one row (§03 "Tables": "Each row of a table is a
-/// record"). `None` for any other domain.
-fn iid_table_columns(m: &Module, iid_node: NodeId) -> Option<Vec<Symbol>> {
-    let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
-        return None;
-    };
-    let Type::Table { columns, .. } = domain.as_ref() else {
-        return None;
-    };
-    Some(columns.iter().map(|&(name, _)| name).collect())
-}
-
-/// Row `i` of the table `v`, as a SYNTACTIC `record(name = …, …)`.
-///
-/// `get0(v, i)` already denotes that row (§03 "Indexing": "returns the `i`-th row
-/// as a record"), but it is a fresh call node with no inferred type, so the arms
-/// that consume a record variate — [`lower_keyword_joint`] above all — cannot pin
-/// their components against it: they match a `record(...)` node structurally and
-/// refuse anything else rather than trust an unresolved type. So the row is handed
-/// over already destructured.
-///
-/// Each field is read **from its column** when `v` is a visible `table(a = …, b =
-/// …)` node: §03 makes a table "a named collection of columns of equal length"
-/// whose row `i` takes field `a` from element `i` of column `a`, so
-/// `get0(col_a, i)` is that field, and the emitted FlatPDL then carries plain
-/// array indexing with no table value at all — the form `crates/stablehlo` can
-/// lower ("unsupported builtin head 'table'" otherwise). A table-valued
-/// expression whose columns are NOT visible (a `load_data`, a passed-in table)
-/// falls back to `get(get0(v, i), "name")`, the general spelling.
-fn row_record(m: &mut Module, v: NodeId, index: NodeId, columns: &[Symbol]) -> NodeId {
-    let visible_columns: Option<Vec<(Symbol, NodeId)>> = {
-        let (resolved, _) = resolve_ref_one(m, v);
-        expect_builtin_call(m, resolved, "table").map(|c| {
-            c.named
-                .iter()
-                .map(|n| (n.name, n.value))
-                .collect::<Vec<_>>()
-        })
-    };
-    let record_sym = m.intern("record");
-    let row = visible_columns
-        .is_none()
-        .then(|| build_call(m, "get0", &[v, index]));
-    let fields: Vec<NamedArg> = columns
-        .iter()
-        .map(|&name| {
-            let value = match visible_columns
-                .as_ref()
-                .and_then(|cols| cols.iter().find(|&&(c, _)| c == name))
-            {
-                Some(&(_, column)) => build_call(m, "get0", &[column, index]),
-                None => {
-                    let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).to_string().into())));
-                    let row = row.unwrap_or_else(|| build_call(m, "get0", &[v, index]));
-                    build_call(m, "get", &[row, key])
-                }
-            };
-            NamedArg {
-                kind: NamedKind::Field,
-                name,
-                value,
-            }
-        })
-        .collect();
-    m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(record_sym),
-        args: Vec::<NodeId>::new().into(),
-        named: fields.into(),
-        inputs: None,
-    }))
-}
-
-/// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
-/// (§06 "Density of composed measures", "iid(M, n) → Σ_i log densityof(M, xᵢ)").
-/// `N` is the static repeat count read from the iid node's own inferred domain
-/// shape (see [`iid_static_size`]) — general over any const-resolvable size
-/// (`lengthof(obs)`, `sizeof(M)`, arithmetic on lengths, a named or inline
-/// literal), since `flatppl_infer` (at `Level::Shape`) has already folded the
-/// size into that static shape. A genuinely dynamic size, or a multi-axis /
-/// vector `size` (e.g. `[2, 3]`), is refused ([`iid_static_size`] returns
-/// `None`).
-/// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
-/// it lowers to the log-density literal `0.0` (consistent with the empty measure
-/// `record()`), not a refusal.
-///
-/// **Axis-native fast path for a PRIMITIVE `M`.** When `M` is a bare
-/// distribution constructor with a CONFIRMED SCALAR variate domain
-/// (`split_kernel_constructor` succeeds AND [`is_scalar_domain_kernel`]
-/// confirms `Some(VariateKind::Scalar)` — e.g. `Normal(mu = a, sigma = b)`; a
-/// bare NON-scalar-domain constructor like `MvNormal` structurally matches
-/// `split_kernel_constructor` but fails the domain gate and falls through to
-/// the unroll fallback below instead), the Σ is emitted as ONE axis-level expression
-/// — `sum(broadcast(builtin_logdensityof, K, broadcast(record, p = vector(a),
-/// …), v))` — identical for `N = 3` or `N = 3000`, rather than `N` unrolled
-/// `get0`/`add` terms (see [`emit_kernel_broadcast_density`], shared with
-/// [`lower_broadcast_kernel`]'s value-broadcast case). `M`'s params are a
-/// length-1 ARRAY-of-records (a bare record is not a legal broadcast input,
-/// §04 "Broadcasting", "Disallowed inputs") that singleton-expands across the
-/// obs axis, since a primitive `iid`'s per-copy kernel is the SAME
-/// distribution at every index (unlike a value-broadcast's per-cell param
-/// arrays). Each scalar param is lifted to a length-1 `vector(param)` first —
-/// `vector(record(…))` directly is rejected by §03's array-literal-element
-/// restriction, so the array-of-records is synthesized the same way
-/// [`lower_broadcast_kernel`] does, via `broadcast(record, …)` over length-1
-/// arrays rather than the `vector` literal constructor.
-///
-/// **Nested-`iid`-of-primitive-kernel fast path (flatten, no unroll).** When
-/// `M` is not itself a bare constructor but is a further `iid(K, size)` (or a
-/// chain of them) bottoming out at a bare constructor `K` with a CONFIRMED
-/// SCALAR variate domain (`split_kernel_constructor` succeeds on the innermost
-/// measure AND [`is_scalar_domain_kernel`] confirms it — same gate as the
-/// primitive fast path above), the WHOLE
-/// nested product `iid(iid(…iid(K, size_d)…, size_2), size_1)` is flattened
-/// to the SAME single axis-level expression as the primitive fast path above,
-/// reusing [`emit_kernel_broadcast_density`] unchanged: `Σ` over every leaf
-/// of a nested independent product is order-independent (§06 "Independent
-/// composition" — each axis contributes an independent Σ, and Σ commutes), so
-/// scoring `K` once per leaf of the FULL rank-`d` variate `v` (rather than
-/// recursing rank-by-rank) is exact. Each of `K`'s scalar params is lifted to
-/// a `d`-deep nested `vector(vector(…vector(param)…))` (depth = the total
-/// number of peeled `iid` layers, 2 for `iid(iid(K, 2), 3)`) instead of the
-/// single-deep `vector(param)` the primitive case uses — this is a legal
-/// rank-`d` array-of-records whose `d` size-1 axes broadcast (§04 "Size-one
-/// array axes are implicitly expanded by repetition") against `v`'s full
-/// rank-`d` shape, one axis per peeled `iid` layer (verified rank-generic:
-/// `Emitter::vector`, `crates/stablehlo/src/emitter.rs:814`, is documented to
-/// lower a vector-of-vectors to a rank-2+ tensor; `Emitter::broadcast_pair`,
-/// `emitter.rs:1527`, reconciles size-1 axes per-axis for ANY equal rank —
-/// the `f6abc85` fix generalized by construction; `Emitter::reduce_full`,
-/// `emitter.rs:992`, fully reduces any rank to a scalar). This peel-and-flatten
-/// only fires when EVERY peeled layer is itself a statically-sized `iid`
-/// (`iid_static_size` resolves at each layer, matching the outer size's own
-/// static requirement above) and the innermost measure is a bare constructor;
-/// anything else (a `joint`, `pushfwd`, or a dynamic/multi-axis nested size)
-/// falls through unchanged to the composed fallback below.
-///
-/// **Composed-`M` fallback: static unroll.** When `M` is neither a bare
-/// constructor nor a peelable nested-`iid`-of-constructor (a `joint`,
-/// `pushfwd`, an `iid` whose own inner measure is itself composed, …),
-/// `split_kernel_constructor` fails at every peeled layer and this falls back
-/// to the `get0`/`fold_add` unroll below (corpus N small). This is also the
-/// safe floor when the peel loop finds a non-static inner size — never
-/// mislower a dynamic shape into a size-1-broadcast form that assumes a known
-/// rank.
-///
-/// **Why the earlier `functionof`-broadcast candidate was rejected instead —
-/// StableHLO could not lower it (superseded by the flatten above for the
-/// nested-`iid` case).** A previous attempt generalized the primitive fast
-/// path by lowering `density(M, x)` once against a fresh `%local` placeholder
-/// `x`, wrapping it in a one-input `functionof`, and emitting
-/// `sum(broadcast(functionof(...), v))`. That form round-tripped through
-/// `flatppl-js` (scipy oracle == exact) but crashed `crates/stablehlo`'s
-/// emitter: `Emitter::lower_broadcast_userfn`
-/// (`crates/stablehlo/src/emitter.rs:2296`) binds the placeholder to the
-/// *whole* collection value (rank `[N, …M-shape]`) and relies on the body's
-/// own arithmetic auto-broadcasting against it — a fusion model that only
-/// works for a SIMPLE scalar-arithmetic body. A COMPOSED `M`'s density body
-/// contains its own nested `sum(broadcast(...))` (e.g. `M = iid(Normal, k)`'s
-/// own primitive fast path), whose inner `broadcast_pair` then reconciles its
-/// own rank-1 kernel-param shape against the OUTER placeholder still bound to
-/// the full multi-row collection — a genuine rank mismatch, not a missing
-/// `broadcast_in_dim`: `Emitter::broadcast_pair` (emitter.rs:1527) panics
-/// (`rank mismatch ([Some(3), Some(2)] vs [Some(1)])`) rather than silently
-/// mislowering. That is an architectural gap in `lower_broadcast_userfn`
-/// itself (no notion of "evaluate the body once per top-level slice"), which
-/// the determiniser-side flatten above sidesteps entirely — it never
-/// constructs a `functionof` at all, so `lower_broadcast_userfn` is never
-/// reached for this case. `functionof`-broadcast remains unimplemented for
-/// the genuinely non-flattenable composed shapes (`joint`, `pushfwd`) that
-/// still take the unroll below; see `.superpowers/sdd/task-3-spike.md` for
-/// the fuller comparison of alternatives.
-///
-/// **Fast-path scalar-domain gate — orthogonal to the unroll fallback's own
-/// unrestricted `M`.** Both axis-native fast paths above additionally require
-/// the innermost bare constructor `K`'s OWN inferred variate domain to be
-/// CONFIRMED scalar ([`is_scalar_domain_kernel`]) — not because `get0`/the
-/// unroll needs it, but because the size-1-array-of-records broadcast flatten
-/// ([`emit_kernel_broadcast_density`]) has only been verified for a
-/// scalar-domain kernel. A non-scalar-domain kernel (`MvNormal`, `Dirichlet`,
-/// `Multinomial`, `Wishart`, `LKJ`, …) has its own compound parameters (e.g.
-/// `MvNormal`'s rank-1 `mu`) that would need a DIFFERENT, deeper wrap the
-/// flatten does not build — treating it as a scalar leaf would silently
-/// mislower the rank rather than refuse. A bare non-scalar constructor (e.g.
-/// `iid(MvNormal(...), n)`) structurally matches `split_kernel_constructor`
-/// but fails this gate, so it falls through — unchanged — to the
-/// `get0`/`fold_add` unroll below. An unknown/deferred domain also fails the
-/// gate (fail-closed: never fast-path on an unconfirmed domain), the same
-/// discipline [`lower_joint`]'s component guard uses.
-///
-/// **No scalar-`M` guard on the UNROLL fallback itself — deliberate asymmetry
-/// with [`lower_joint`].** `iid(M,
-/// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
-/// with a leading repeat axis `[N, …M-shape]` (§06 "Independent composition", the
-/// `iid` bullet). So `get0(v, i)` recovers the full i-th
-/// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
-/// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
-/// or a nested `iid(iid(…), n)`, lowers correctly via the unroll fallback —
-/// which is exactly where the scalar-domain gate above sends it — its
-/// inner variate reached by a further `get0`). `joint`, by contrast, has a
-/// HETEROGENEOUS variate: the flat
-/// `cat` of its component variates, so `joint`'s positional `get0(v, i)` only
-/// aligns when every component is scalar — hence the scalar-component guard in
-/// [`lower_joint`]. Adding that guard to the UNROLL fallback here would WRONGLY
-/// refuse valid non-scalar `iid`, so it is intentionally absent from that path.
+/// IID log density is a sum over independent observations (§06).
+/// Primitive scalar kernels use a direct axis expression. Nested primitive
+/// products flatten independent sums. Other array-valued observations map one
+/// reified density over the outer collection, preserving each observation cell.
+/// Static one-dimensional counts are required; zero returns the empty sum.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     // The repeat count comes from the iid node's own const-evaluated domain shape
     // (see `iid_static_size`), so a `lengthof(obs)` / `sizeof(M)` / arithmetic
@@ -6493,10 +6299,21 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         }
         c.args[0]
     };
-    // Empty independent product: Σ over an empty index set is 0 (log-density 0),
-    // exactly as an empty measure `record()` lowers (the iid Σ rule,
-    // §06 "Density of composed measures", with an empty index set). Short-circuit
-    // BEFORE `fold_add`, which requires at least one term.
+    let (resolved, _) = resolve_ref_one(m, v);
+    let observed_count = match m.type_of(v).or_else(|| m.type_of(resolved)) {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => Some(shape[0]),
+        Some(Type::Table { nrows, .. }) => Some(*nrows),
+        _ => None,
+    };
+    // Synthesized inverse maps have no annotation until the next infer pass.
+    if observed_count.is_some() && observed_count != Some(Dim::Static(n as u32)) {
+        return Err(refuse(
+            v,
+            m,
+            "iid observation count must match its static size",
+        ));
+    }
+    // The empty product has log density zero without evaluating a density body.
     if n == 0 {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
@@ -6551,29 +6368,7 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         cur = next_inner;
     }
 
-    // Composed inner measure (joint / pushfwd / an iid whose own inner measure
-    // is itself composed): fallback to the per-element `get0` unroll. The
-    // axis-native `functionof`-broadcast lambda path was implemented and
-    // three-way tested for this case and REJECTED — see the doc comment above
-    // ("Why the earlier `functionof`-broadcast candidate was rejected
-    // instead") — StableHLO's `lower_broadcast_userfn` cannot lower a reified
-    // body that itself contains a nested `sum(broadcast(...))` (a genuine
-    // rank-mismatch panic in `Emitter::broadcast_pair`, not a missing
-    // `broadcast_in_dim`). Keep unrolling here for the shapes the flatten
-    // above does not reach.
-    // A table variate's i-th element is a ROW, handed over already destructured so
-    // the record-consuming arms can pin their fields (see [`row_record`]).
-    let table_columns = iid_table_columns(m, node);
-    let mut terms = Vec::with_capacity(n);
-    for i in 0..n {
-        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
-        let elem = match &table_columns {
-            Some(columns) => row_record(m, v, idx, columns),
-            None => build_call(m, "get0", &[v, idx]),
-        };
-        terms.push(lower_measure_density(m, m_inner, elem)?);
-    }
-    Ok(fold_add(m, &terms))
+    broadcast::sum_density(m, m_inner, v)
 }
 
 /// `logdensityof(PoissonProcess(intensity = M), v)` — the extended unbinned
@@ -6625,16 +6420,6 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
         )
     })?;
 
-    if n > MAX_STATIC_UNROLL {
-        return Err(refuse(
-            node,
-            m,
-            &format!(
-                "PoissonProcess event count {n} exceeds the {MAX_STATIC_UNROLL}-event static-unroll resource guard"
-            ),
-        ));
-    }
-
     let total_mass = closed_form_totalmass(m, intensity).ok_or_else(|| {
         refuse(
             node,
@@ -6646,17 +6431,11 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
         )
     })?;
 
-    let mut terms: Vec<NodeId> = Vec::with_capacity(n as usize + 1);
-    for j in 0..n {
-        let idx = m.alloc(Node::Lit(Scalar::Int(j as i64)));
-        let event = build_call(m, "get0", &[v, idx]);
-        terms.push(lower_measure_density(m, intensity, event)?);
-    }
     // k = 0 leaves the intensity term empty; the density is then exp(−Λ).
-    let events_term = if terms.is_empty() {
+    let events_term = if n == 0 {
         m.alloc(Node::Lit(Scalar::Real(0.0)))
     } else {
-        fold_add(m, &terms)
+        broadcast::sum_density(m, intensity, v)?
     };
     Ok(build_call(m, "sub", &[events_term, total_mass]))
 }
@@ -6944,6 +6723,10 @@ fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<
 fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
     let (node, _) = resolve_ref_one(m, measure);
 
+    if let Some(weights) = recognize_markov_ksuperpose(m, node) {
+        return Some(build_call(m, "sum", &[weights]));
+    }
+
     if matches!(
         m.type_of(node),
         Some(Type::Measure {
@@ -7032,10 +6815,9 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
 /// member `Ref { ns: Module(_), name }` (`broadcast(hepphys.ContinuedPoisson, …)`,
 /// §09); both reduce to the member name and emit the BARE `Const(name)` kernel.
 ///
-/// **Refuse-don't-mislower.** A value-broadcast (head a deterministic op like
-/// `add`, or any other head shape — a `%ref self`/`%ref %local` binding, a
-/// literal) is not a kernel — it is refused rather than treated as a measure. A
-/// head whose resolved name is not a known distribution constructor
+/// Reified kernels share one lowered density body across argument cells.
+/// A value-broadcast (head a deterministic op like `add`) is not a kernel.
+/// A head whose resolved name is not a known distribution constructor
 /// (`distribution_param_names` → `None`, e.g. a module *function* member) is
 /// likewise refused.
 fn lower_broadcast_kernel(
@@ -7055,6 +6837,10 @@ fn lower_broadcast_kernel(
         let kw_args: Vec<(Symbol, NodeId)> = c.named.iter().map(|n| (n.name, n.value)).collect();
         (head, pos_args, kw_args)
     };
+
+    if let Some(kernel) = crate::kernel::resolve_reified(m, head) {
+        return broadcast::kernel_density(m, head, &kernel, &pos_args, &kw_args, obs);
+    }
 
     // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
     // one: a bare built-in `Node::Const(sym)` (`broadcast(Poisson, …)`), or a

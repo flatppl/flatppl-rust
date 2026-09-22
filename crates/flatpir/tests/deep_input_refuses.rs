@@ -7,6 +7,40 @@
 
 use flatppl_core::DEFAULT_MAX_DEPTH;
 
+#[test]
+fn deep_annotated_graph_writes_on_a_small_stack() {
+    use flatppl_core::{Call, CallHead, Node, Phase};
+
+    let mut module = flatppl_flatpir::read("(%module (%public x) (%bind x 1))").unwrap();
+    let (binding, mut rhs) = module.bindings().map(|(id, b)| (id, b.rhs)).next().unwrap();
+    let neg = module.intern("neg");
+    let depth = 4000;
+    for _ in 0..depth {
+        rhs = module.alloc(Node::Call(Call {
+            head: CallHead::Builtin(neg),
+            args: Box::new([rhs]),
+            named: Box::new([]),
+            inputs: None,
+        }));
+        module.set_phase(rhs, Phase::Fixed);
+    }
+    module.set_binding_rhs(binding, rhs);
+    let rendered = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || flatppl_flatpir::write(&module))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        rendered,
+        format!(
+            "(%module\n  (%public x)\n\n  (%bind x {}1{}))",
+            "(%meta (%deferred %fixed %deferred) (neg ".repeat(depth),
+            "))".repeat(depth)
+        )
+    );
+}
+
 fn nested_sexpr(depth: usize) -> String {
     format!(
         "(%module (%bind x {}1.0{}))\n",

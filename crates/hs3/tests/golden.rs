@@ -281,7 +281,8 @@ fn golden_pyhf_2bin_assembly() {
     assert!(
         text.contains(
             "singlechannel_expected = \
-             broadcast(add, singlechannel_signal_expected, singlechannel_background_expected)"
+             aggregate(sum, [.col], get(rowstack([singlechannel_signal_expected, \
+             singlechannel_background_expected]), .row, .col))"
         ),
         "total expected mismatch, got:\n{text}"
     );

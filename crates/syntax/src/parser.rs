@@ -343,7 +343,10 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             for p in &params {
                 ep.check_lambda_param(p)?;
             }
-            let rhs = ep.lower_lambda(params, 0)?;
+            ep.reify_frames.push(ReifyFrame::Lambda(params.clone()));
+            let body = ep.parse_expr()?;
+            ep.reify_frames.pop();
+            let rhs = ep.lower_lambda(params, 0, body);
             ep.expect_end()?;
             bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             Ok(())
@@ -535,12 +538,6 @@ struct ExprParser<'a> {
     /// innermost frame; a match in an outer frame is the spec's DISALLOWED
     /// cross-reification capture and errors.
     reify_frames: Vec<ReifyFrame>,
-    /// Recursion budget for nested expressions. Every nested construct —
-    /// parentheses, call arguments, array elements, index arguments — re-enters
-    /// through `parse_expr`, so guarding that one entry bounds the whole
-    /// precedence ladder. Without it, deeply nested source aborted the process
-    /// with a stack overflow above about 5500 levels instead of refusing.
-    depth: flatppl_core::Depth,
 }
 
 /// One enclosing reification while its body is being parsed. Every variant is
@@ -564,6 +561,74 @@ enum MemberNs {
     Module(flatppl_core::Symbol),
 }
 
+/// Continuations of the expression grammar. Child expressions return through
+/// `value` in the driver, never through the native call stack.
+enum ExprFrame {
+    Expr,
+    Level(Precedence),
+    BinaryTail(Precedence, usize),
+    BinaryRhs(Precedence, usize, NodeId, CmpOp),
+    Compare(usize, Vec<NodeId>, Vec<CmpOp>),
+    Unary(usize, CmpOp),
+    Power(usize),
+    PowerRhs(usize, NodeId, bool),
+    Postfix(usize),
+    Group(usize),
+    List(ListArgs),
+    ListItem(ListArgs),
+    Call(CallArgs),
+    CallItem(CallArgs, Option<String>),
+    Lambda(usize, Vec<String>),
+    Fn(usize),
+}
+
+#[derive(Clone, Copy)]
+enum Precedence {
+    Or,
+    And,
+    Comparison,
+    Add,
+    Mul,
+    Unary,
+    Power,
+    Postfix,
+    Primary,
+}
+
+enum Primary {
+    Ready(NodeId),
+    Call(CallTarget),
+    Fn,
+}
+
+enum CallTarget {
+    Name(String),
+    Builtin(String),
+    Ref(Ref),
+    Applied(NodeId),
+    Broadcast(NodeId),
+}
+
+struct CallArgs {
+    target: CallTarget,
+    start: usize,
+    positional: Vec<NodeId>,
+    named: Vec<NamedArg>,
+    reify: bool,
+}
+
+enum ListKind {
+    Array,
+    Tuple,
+    Index,
+}
+
+struct ListArgs {
+    kind: ListKind,
+    start: usize,
+    elems: Vec<NodeId>,
+}
+
 impl<'a> ExprParser<'a> {
     fn new(toks: &'a [Token], module: &'a mut Module, names: &'a Names) -> Self {
         ExprParser {
@@ -572,7 +637,6 @@ impl<'a> ExprParser<'a> {
             module,
             names,
             reify_frames: Vec::new(),
-            depth: flatppl_core::Depth::default(),
         }
     }
 
@@ -669,24 +733,14 @@ impl<'a> ExprParser<'a> {
 
     // ---- precedence levels (low → high) ----
 
-    /// Guarded entry to the expression grammar. Charges one level of nesting,
-    /// runs the real parse, then gives the level back so that BREADTH is free
-    /// and only nesting counts.
+    /// Parse an expression and check the resulting tree before consumers see it.
     fn parse_expr(&mut self) -> Result<NodeId> {
-        let deeper = self
-            .depth
-            .deeper("expression")
-            .map_err(|e| self.err_here(e.to_string()))?;
-        let saved = self.depth;
-        self.depth = deeper;
-        let result = self
-            .parse_expr_body()
-            .and_then(|id| self.guard_constructed_depth(id).map(|()| id));
-        self.depth = saved;
-        result
+        let id = self.parse_expr_body()?;
+        self.guard_constructed_depth(id)?;
+        Ok(id)
     }
 
-    /// Reject a left-deep tree before recursive inference and printers see it.
+    /// Retain the constructed-tree guard for downstream recursive consumers.
     fn guard_constructed_depth(&self, root: NodeId) -> Result<()> {
         let mut deepest = HashMap::new();
         let mut pending = vec![(root, 1usize)];
@@ -712,13 +766,400 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_expr_body(&mut self) -> Result<NodeId> {
-        // Lambdas sit at the lowest precedence; the body extends as far right
-        // as possible (spec §05).
-        let start = self.pos;
-        if let Some(params) = self.try_lambda_params()? {
-            return self.lower_lambda(params, start);
+        // Child frames consume `value` before scheduling their child; the
+        // continuation receives exactly one completed NodeId. The stack owns
+        // partial argument lists and scope exits, so error unwinding also
+        // avoids recursively traversing parser state.
+        let mut work = vec![ExprFrame::Expr];
+        let mut value = None;
+        while let Some(frame) = work.pop() {
+            match frame {
+                ExprFrame::Expr => {
+                    let start = self.pos;
+                    if let Some(params) = self.try_lambda_params()? {
+                        self.reify_frames.push(ReifyFrame::Lambda(params.clone()));
+                        work.push(ExprFrame::Lambda(start, params));
+                        work.push(ExprFrame::Expr);
+                    } else {
+                        work.push(ExprFrame::Level(Precedence::Or));
+                    }
+                }
+                ExprFrame::Level(level) => {
+                    let start = self.pos;
+                    match level {
+                        Precedence::Or | Precedence::And | Precedence::Add | Precedence::Mul => {
+                            work.push(ExprFrame::BinaryTail(level, start));
+                            work.push(ExprFrame::Level(level.operand()));
+                        }
+                        Precedence::Comparison => {
+                            work.push(ExprFrame::Compare(start, Vec::new(), Vec::new()));
+                            work.push(ExprFrame::Level(Precedence::Add));
+                        }
+                        Precedence::Unary => {
+                            let op = match self.peek() {
+                                Some(TokenKind::Minus) => Some(CmpOp {
+                                    func: "neg",
+                                    dotted: false,
+                                }),
+                                Some(TokenKind::Bang) => Some(CmpOp {
+                                    func: "lnot",
+                                    dotted: false,
+                                }),
+                                Some(TokenKind::DotMinus) => Some(CmpOp {
+                                    func: "neg",
+                                    dotted: true,
+                                }),
+                                Some(TokenKind::DotBang) => Some(CmpOp {
+                                    func: "lnot",
+                                    dotted: true,
+                                }),
+                                _ => None,
+                            };
+                            if let Some(op) = op {
+                                self.advance();
+                                work.push(ExprFrame::Unary(start, op));
+                                work.push(ExprFrame::Level(Precedence::Unary));
+                            } else {
+                                work.push(ExprFrame::Level(Precedence::Power));
+                            }
+                        }
+                        Precedence::Power => {
+                            work.push(ExprFrame::Power(start));
+                            work.push(ExprFrame::Level(Precedence::Postfix));
+                        }
+                        Precedence::Postfix => {
+                            work.push(ExprFrame::Postfix(start));
+                            work.push(ExprFrame::Level(Precedence::Primary));
+                        }
+                        Precedence::Primary => match self.peek() {
+                            Some(TokenKind::LParen) => {
+                                self.advance();
+                                work.push(ExprFrame::Group(start));
+                                work.push(ExprFrame::Expr);
+                            }
+                            Some(TokenKind::LBracket) => {
+                                self.advance();
+                                work.push(ExprFrame::List(ListArgs {
+                                    kind: ListKind::Array,
+                                    start,
+                                    elems: Vec::new(),
+                                }));
+                            }
+                            _ => {
+                                let primary = self.parse_primary()?;
+                                self.schedule_primary(primary, start, &mut work, &mut value);
+                            }
+                        },
+                    }
+                }
+                ExprFrame::BinaryTail(level, start) => {
+                    if let Some(op) = self.peek().and_then(|token| level.operator(token)) {
+                        self.advance();
+                        work.push(ExprFrame::BinaryRhs(
+                            level,
+                            start,
+                            value.take().unwrap(),
+                            op,
+                        ));
+                        work.push(ExprFrame::Level(level.operand()));
+                    }
+                }
+                ExprFrame::BinaryRhs(level, start, lhs, op) => {
+                    let rhs = value.take().unwrap();
+                    value = Some(self.apply_binop(op.func, op.dotted, lhs, rhs, start));
+                    work.push(ExprFrame::BinaryTail(level, start));
+                }
+                ExprFrame::Compare(start, mut operands, mut ops) => {
+                    operands.push(value.take().unwrap());
+                    if let Some(op) = self.peek().and_then(cmp_op) {
+                        self.advance();
+                        ops.push(op);
+                        work.push(ExprFrame::Compare(start, operands, ops));
+                        work.push(ExprFrame::Level(Precedence::Add));
+                    } else {
+                        value = Some(self.lower_comparison(start, operands, ops)?);
+                    }
+                }
+                ExprFrame::Unary(start, op) => {
+                    let operand = value.take().unwrap();
+                    value = Some(if op.dotted {
+                        self.broadcast_unop(op.func, operand, start)
+                    } else {
+                        self.builtin_call(op.func, vec![operand], start)
+                    });
+                }
+                ExprFrame::Power(start) => {
+                    // The RHS is Unary: powers associate right and bind more
+                    // tightly than a leading minus, including `a ^ -b ^ c`.
+                    if matches!(self.peek(), Some(TokenKind::Caret | TokenKind::DotCaret)) {
+                        let dotted = self.peek() == Some(&TokenKind::DotCaret);
+                        self.advance();
+                        work.push(ExprFrame::PowerRhs(start, value.take().unwrap(), dotted));
+                        work.push(ExprFrame::Level(Precedence::Unary));
+                    }
+                }
+                ExprFrame::PowerRhs(start, lhs, dotted) => {
+                    let rhs = value.take().unwrap();
+                    value = Some(self.apply_binop("pow", dotted, lhs, rhs, start));
+                }
+                ExprFrame::Postfix(start) => {
+                    let expr = value.take().unwrap();
+                    let primary = match self.peek() {
+                        Some(TokenKind::Dot) => {
+                            self.advance();
+                            let name = self.expect_name("a member or field name after `.`")?;
+                            if let Some(ns) = self.member_namespace(expr) {
+                                self.lower_member(ns, &name, start)?
+                            } else {
+                                let key = self.alloc_spanned(
+                                    Node::Lit(Scalar::Str(name.into_boxed_str())),
+                                    start,
+                                );
+                                Primary::Ready(self.builtin_call("get", vec![expr, key], start))
+                            }
+                        }
+                        Some(TokenKind::LBracket) => {
+                            self.advance();
+                            work.push(ExprFrame::Postfix(start));
+                            work.push(ExprFrame::List(ListArgs {
+                                kind: ListKind::Index,
+                                start,
+                                elems: vec![expr],
+                            }));
+                            continue;
+                        }
+                        Some(TokenKind::DotLParen) => {
+                            self.advance();
+                            Primary::Call(CallTarget::Broadcast(expr))
+                        }
+                        Some(TokenKind::LParen) => {
+                            self.advance();
+                            Primary::Call(CallTarget::Applied(expr))
+                        }
+                        _ => {
+                            value = Some(expr);
+                            continue;
+                        }
+                    };
+                    work.push(ExprFrame::Postfix(start));
+                    self.schedule_primary(primary, start, &mut work, &mut value);
+                }
+                ExprFrame::Group(start) => {
+                    if self.eat(&TokenKind::Comma) {
+                        work.push(ExprFrame::List(ListArgs {
+                            kind: ListKind::Tuple,
+                            start,
+                            elems: vec![value.take().unwrap()],
+                        }));
+                    } else {
+                        self.expect(&TokenKind::RParen, "`)` to close the group")?;
+                    }
+                }
+                ExprFrame::List(mut list) => {
+                    if self.peek() == Some(&list.kind.close()) {
+                        value = Some(self.finish_list(list)?);
+                        continue;
+                    }
+                    let selector = if matches!(list.kind, ListKind::Index) {
+                        match self.peek() {
+                            Some(TokenKind::Colon) => Some("all"),
+                            Some(TokenKind::Bang)
+                                if matches!(
+                                    self.peek_at(1),
+                                    Some(TokenKind::Comma | TokenKind::RBracket)
+                                ) =>
+                            {
+                                Some("only")
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(selector) = selector {
+                        self.advance();
+                        let sym = self.module.intern(selector);
+                        list.elems
+                            .push(self.alloc_spanned(Node::Const(sym), self.pos - 1));
+                        if self.eat(&TokenKind::Comma) {
+                            work.push(ExprFrame::List(list));
+                        } else {
+                            value = Some(self.finish_list(list)?);
+                        }
+                    } else {
+                        work.push(ExprFrame::ListItem(list));
+                        work.push(ExprFrame::Expr);
+                    }
+                }
+                ExprFrame::ListItem(mut list) => {
+                    list.elems.push(value.take().unwrap());
+                    if self.eat(&TokenKind::Comma) {
+                        work.push(ExprFrame::List(list));
+                    } else {
+                        value = Some(self.finish_list(list)?);
+                    }
+                }
+                ExprFrame::Call(call) => {
+                    if self.peek() == Some(&TokenKind::RParen) {
+                        value = Some(self.finish_call(call)?);
+                    } else {
+                        let key = if let (Some(TokenKind::Name(n)), Some(TokenKind::Assign)) =
+                            (self.peek(), self.peek_at(1))
+                        {
+                            let key = n.clone();
+                            self.advance();
+                            self.advance();
+                            Some(key)
+                        } else {
+                            None
+                        };
+                        work.push(ExprFrame::CallItem(call, key));
+                        work.push(ExprFrame::Expr);
+                    }
+                }
+                ExprFrame::CallItem(mut call, key) => {
+                    let arg = value.take().unwrap();
+                    if let Some(key) = key {
+                        call.named.push(NamedArg {
+                            kind: NamedKind::Kwarg,
+                            name: self.module.intern(&key),
+                            value: arg,
+                        });
+                    } else {
+                        call.positional.push(arg);
+                    }
+                    if self.eat(&TokenKind::Comma) {
+                        work.push(ExprFrame::Call(call));
+                    } else {
+                        value = Some(self.finish_call(call)?);
+                    }
+                }
+                ExprFrame::Lambda(start, params) => {
+                    self.reify_frames.pop();
+                    value = Some(self.lower_lambda(params, start, value.take().unwrap()));
+                }
+                ExprFrame::Fn(start) => {
+                    value = Some(self.lower_fn(start, value.take().unwrap())?);
+                }
+            }
         }
-        self.parse_or()
+        Ok(value.expect("expression continuation returns one value"))
+    }
+
+    fn schedule_primary(
+        &mut self,
+        primary: Primary,
+        start: usize,
+        work: &mut Vec<ExprFrame>,
+        value: &mut Option<NodeId>,
+    ) {
+        match primary {
+            Primary::Ready(id) => *value = Some(id),
+            Primary::Fn => {
+                self.reify_frames.push(ReifyFrame::Fn(Vec::new()));
+                work.push(ExprFrame::Fn(start));
+                work.push(ExprFrame::Expr);
+            }
+            Primary::Call(target) => {
+                // Both bare and base-qualified constructs scope their whole
+                // argument list, including the boundary keyword arguments.
+                let reify = matches!(&target, CallTarget::Name(name) | CallTarget::Builtin(name) if name == "functionof" || name == "kernelof");
+                if reify {
+                    self.reify_frames.push(ReifyFrame::Explicit);
+                }
+                work.push(ExprFrame::Call(CallArgs {
+                    target,
+                    start,
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                    reify,
+                }));
+            }
+        }
+    }
+
+    fn finish_call(&mut self, call: CallArgs) -> Result<NodeId> {
+        if call.reify {
+            self.reify_frames.pop();
+        }
+        let close = if matches!(call.target, CallTarget::Broadcast(_)) {
+            "`)` to close dot-call"
+        } else {
+            "`)` to close the call"
+        };
+        self.expect(&TokenKind::RParen, close)?;
+        let CallArgs {
+            target,
+            start,
+            positional,
+            named,
+            ..
+        } = call;
+        match target {
+            CallTarget::Name(name) => self.make_call(&name, positional, named, start),
+            CallTarget::Builtin(name) => self.make_builtin_call(&name, positional, named, start),
+            CallTarget::Ref(r) => Ok(self.make_user_call(r, positional, named, start)),
+            CallTarget::Applied(callee) => {
+                Ok(self.make_applied_call(callee, positional, named, start))
+            }
+            CallTarget::Broadcast(callee) => {
+                let mut args = vec![callee];
+                args.extend(positional);
+                let head = CallHead::Builtin(self.module.intern("broadcast"));
+                Ok(self.alloc_spanned(
+                    Node::Call(Call {
+                        head,
+                        args: args.into(),
+                        named: named.into(),
+                        inputs: None,
+                    }),
+                    start,
+                ))
+            }
+        }
+    }
+
+    fn finish_list(&mut self, list: ListArgs) -> Result<NodeId> {
+        let (op, close) = match list.kind {
+            ListKind::Array => ("vector", "`]` to close the array"),
+            ListKind::Tuple => ("tuple", "`)` to close the tuple"),
+            ListKind::Index => ("get", "`]` to close indexing"),
+        };
+        self.expect(&list.kind.close(), close)?;
+        Ok(self.builtin_call(op, list.elems, list.start))
+    }
+
+    fn lower_comparison(
+        &mut self,
+        start: usize,
+        operands: Vec<NodeId>,
+        ops: Vec<CmpOp>,
+    ) -> Result<NodeId> {
+        if ops.is_empty() {
+            return Ok(operands[0]);
+        }
+        if ops.len() == 1 {
+            return Ok(self.apply_binop(
+                ops[0].func,
+                ops[0].dotted,
+                operands[0],
+                operands[1],
+                start,
+            ));
+        }
+        if ops.iter().any(|op| op.dotted) {
+            return Err(self.err_here("chained dotted comparisons are not supported"));
+        }
+        let terms: Vec<_> = ops
+            .iter()
+            .enumerate()
+            .map(|(k, op)| self.builtin_call(op.func, vec![operands[k], operands[k + 1]], start))
+            .collect();
+        let mut acc = terms[0];
+        for &term in &terms[1..] {
+            acc = self.builtin_call("land", vec![acc, term], start);
+        }
+        Ok(acc)
     }
 
     /// Bounded lookahead for a lambda head — `name ->` or `(name, name, …) ->`
@@ -784,12 +1225,7 @@ impl<'a> ExprParser<'a> {
     /// Lambda sugar (spec §04): `x -> expr` resolves to
     /// `functionof(expr', x = _x_)` where free occurrences of `x` in `expr`
     /// are rewritten to the placeholder `_x_`.
-    fn lower_lambda(&mut self, params: Vec<String>, start: usize) -> Result<NodeId> {
-        self.reify_frames.push(ReifyFrame::Lambda(params.clone()));
-        let body = self.parse_expr();
-        self.reify_frames.pop();
-        let body = body?;
-
+    fn lower_lambda(&mut self, params: Vec<String>, start: usize, body: NodeId) -> NodeId {
         let mut entries = Vec::with_capacity(params.len());
         for p in &params {
             let name_sym = self.module.intern(p);
@@ -803,7 +1239,7 @@ impl<'a> ExprParser<'a> {
             ));
         }
         let head = CallHead::Builtin(self.module.intern("functionof"));
-        Ok(self.alloc_spanned(
+        self.alloc_spanned(
             Node::Call(Call {
                 head,
                 args: Box::new([body]),
@@ -811,20 +1247,17 @@ impl<'a> ExprParser<'a> {
                 inputs: Some(Inputs::Spec(entries.into())),
             }),
             start,
-        ))
+        )
     }
 
     /// `fn(expr)` hole sugar (spec §04): each `_` in `expr` becomes a distinct
     /// positional input `arg<n>` in left-to-right reading order, lowering to
     /// `functionof(expr', arg1 = _arg1_, …)`. The `fn(…)` call delimits the
     /// hole scope. The opening `(` has already been consumed.
-    fn lower_fn(&mut self, start: usize) -> Result<NodeId> {
-        self.reify_frames.push(ReifyFrame::Fn(Vec::new()));
-        let body = self.parse_expr();
+    fn lower_fn(&mut self, start: usize, body: NodeId) -> Result<NodeId> {
         let Some(ReifyFrame::Fn(entries)) = self.reify_frames.pop() else {
             unreachable!("Fn frame pushed above");
         };
-        let body = body?;
         self.expect(&TokenKind::RParen, "`)` to close `fn(…)`")?;
         if entries.is_empty() {
             return Err(self.err_prev("`fn(…)` requires at least one `_` hole in its expression"));
@@ -841,300 +1274,39 @@ impl<'a> ExprParser<'a> {
         ))
     }
 
-    fn parse_or(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let mut lhs = self.parse_and()?;
-        loop {
-            match self.peek() {
-                Some(TokenKind::PipePipe) => {
-                    self.advance();
-                    let rhs = self.parse_and()?;
-                    lhs = self.builtin_call("lor", vec![lhs, rhs], start);
-                }
-                Some(TokenKind::DotPipePipe) => {
-                    self.advance();
-                    let rhs = self.parse_and()?;
-                    lhs = self.broadcast_op("lor", lhs, rhs, start);
-                }
-                _ => return Ok(lhs),
-            }
-        }
-    }
-
-    fn parse_and(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let mut lhs = self.parse_cmp()?;
-        loop {
-            match self.peek() {
-                Some(TokenKind::AmpAmp) => {
-                    self.advance();
-                    let rhs = self.parse_cmp()?;
-                    lhs = self.builtin_call("land", vec![lhs, rhs], start);
-                }
-                Some(TokenKind::DotAmpAmp) => {
-                    self.advance();
-                    let rhs = self.parse_cmp()?;
-                    lhs = self.broadcast_op("land", lhs, rhs, start);
-                }
-                _ => return Ok(lhs),
-            }
-        }
-    }
-
-    /// Comparisons chain: `a < b <= c` lowers to `land(lt(a,b), le(b,c))`.
-    fn parse_cmp(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let first = self.parse_add()?;
-        let mut operands = vec![first];
-        let mut ops: Vec<&'static str> = Vec::new();
-        let mut dotted = false;
-        while let Some(op) = self.peek().and_then(cmp_op) {
-            if op.dotted {
-                dotted = true;
-            }
-            self.advance();
-            let rhs = self.parse_add()?;
-            ops.push(op.func);
-            operands.push(rhs);
-        }
-        if ops.is_empty() {
-            return Ok(operands.pop().unwrap());
-        }
-        if ops.len() == 1 {
-            let rhs = operands.pop().unwrap();
-            let lhs = operands.pop().unwrap();
-            return Ok(if dotted {
-                self.broadcast_op(ops[0], lhs, rhs, start)
-            } else {
-                self.builtin_call(ops[0], vec![lhs, rhs], start)
-            });
-        }
-        // Chained: AND together each adjacent comparison (plain only; dotted
-        // chains are unusual and not lowered here).
-        if dotted {
-            return Err(self.err_here("chained dotted comparisons are not supported"));
-        }
-        let mut terms = Vec::with_capacity(ops.len());
-        for (k, func) in ops.iter().enumerate() {
-            let pair = self.builtin_call(func, vec![operands[k], operands[k + 1]], start);
-            terms.push(pair);
-        }
-        let mut acc = terms[0];
-        for &t in &terms[1..] {
-            acc = self.builtin_call("land", vec![acc, t], start);
-        }
-        Ok(acc)
-    }
-
-    fn parse_add(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let mut lhs = self.parse_mul()?;
-        loop {
-            let (func, dotted) = match self.peek() {
-                Some(TokenKind::Plus) => ("add", false),
-                Some(TokenKind::Minus) => ("sub", false),
-                Some(TokenKind::DotPlus) => ("add", true),
-                Some(TokenKind::DotMinus) => ("sub", true),
-                _ => return Ok(lhs),
-            };
-            self.advance();
-            let rhs = self.parse_mul()?;
-            lhs = self.apply_binop(func, dotted, lhs, rhs, start);
-        }
-    }
-
-    fn parse_mul(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let mut lhs = self.parse_unary()?;
-        loop {
-            let (func, dotted) = match self.peek() {
-                Some(TokenKind::Star) => ("mul", false),
-                Some(TokenKind::Slash) => ("divide", false),
-                Some(TokenKind::DotStar) => ("mul", true),
-                Some(TokenKind::DotSlash) => ("divide", true),
-                _ => return Ok(lhs),
-            };
-            self.advance();
-            let rhs = self.parse_unary()?;
-            lhs = self.apply_binop(func, dotted, lhs, rhs, start);
-        }
-    }
-
-    fn parse_unary(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        match self.peek() {
-            Some(TokenKind::Minus) => {
-                self.advance();
-                let operand = self.parse_unary()?;
-                Ok(self.builtin_call("neg", vec![operand], start))
-            }
-            Some(TokenKind::Bang) => {
-                self.advance();
-                let operand = self.parse_unary()?;
-                Ok(self.builtin_call("lnot", vec![operand], start))
-            }
-            Some(TokenKind::DotMinus) => {
-                self.advance();
-                let operand = self.parse_unary()?;
-                Ok(self.broadcast_unop("neg", operand, start))
-            }
-            Some(TokenKind::DotBang) => {
-                self.advance();
-                let operand = self.parse_unary()?;
-                Ok(self.broadcast_unop("lnot", operand, start))
-            }
-            _ => self.parse_exp(),
-        }
-    }
-
-    /// `^` is right-associative and binds tighter than unary minus (its RHS is a
-    /// `Unary`, so `a ^ -b` and `a ^ b ^ c` parse as in the spec).
-    fn parse_exp(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let base = self.parse_postfix()?;
-        match self.peek() {
-            Some(TokenKind::Caret) => {
-                self.advance();
-                let exp = self.parse_unary()?;
-                Ok(self.builtin_call("pow", vec![base, exp], start))
-            }
-            Some(TokenKind::DotCaret) => {
-                self.advance();
-                let exp = self.parse_unary()?;
-                Ok(self.broadcast_op("pow", base, exp, start))
-            }
-            _ => Ok(base),
-        }
-    }
-
-    fn parse_postfix(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        let mut expr = self.parse_primary()?;
-        loop {
-            match self.peek() {
-                Some(TokenKind::Dot) => {
-                    self.advance();
-                    let name = self.expect_name("a member or field name after `.`")?;
-                    // Module-member access (`self.x`, `base.x`, `mod.x`) is a
-                    // separate syntactic category from field access: modules
-                    // are namespaces, so the access lowers to a ref or call
-                    // head, never to `get` (spec §04 / §07).
-                    if let Some(ns) = self.member_namespace(expr) {
-                        expr = self.lower_member(ns, &name, start)?;
-                    } else {
-                        // Field access `obj.name` → `get(obj, "name")`.
-                        let key = self
-                            .alloc_spanned(Node::Lit(Scalar::Str(name.into_boxed_str())), start);
-                        expr = self.builtin_call("get", vec![expr, key], start);
-                    }
-                }
-                Some(TokenKind::LBracket) => {
-                    // Indexing `obj[i, …]` → `get(obj, i, …)`.
-                    self.advance();
-                    let mut args = vec![expr];
-                    self.parse_index_args(&mut args)?;
-                    self.expect(&TokenKind::RBracket, "`]` to close indexing")?;
-                    expr = self.builtin_call("get", args, start);
-                }
-                Some(TokenKind::DotLParen) => {
-                    // Dot-call `f.(args)` → `broadcast(f, args…)`.
-                    self.advance();
-                    let (mut positional, named) = self.parse_call_args()?;
-                    self.expect(&TokenKind::RParen, "`)` to close dot-call")?;
-                    let mut args = vec![expr];
-                    args.append(&mut positional);
-                    let head = CallHead::Builtin(self.module.intern("broadcast"));
-                    expr = self.alloc_spanned(
-                        Node::Call(Call {
-                            head,
-                            args: args.into(),
-                            named: named.into(),
-                            inputs: None,
-                        }),
-                        start,
-                    );
-                }
-                Some(TokenKind::LParen) => {
-                    // Postfix application (spec §05 `Postfix Call`): the
-                    // expression so far is the callee — `(%call <callable> …)`
-                    // with an expression head (spec §11). Named-callee calls
-                    // never reach here (consumed in `parse_name_tail` /
-                    // `lower_member`); this covers inline callables like
-                    // `functionof(…)(v)` and chained calls `f(x)(y)`.
-                    self.advance();
-                    let (positional, named) = self.parse_call_args()?;
-                    self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                    expr = self.make_applied_call(expr, positional, named, start);
-                }
-                _ => return Ok(expr),
-            }
-        }
-    }
-
-    fn parse_index_args(&mut self, args: &mut Vec<NodeId>) -> Result<()> {
-        loop {
-            match self.peek() {
-                Some(TokenKind::RBracket) => return Ok(()),
-                // `:` is the `all` selector (entire axis, spec §05).
-                Some(TokenKind::Colon) => {
-                    self.advance();
-                    let sym = self.module.intern("all");
-                    let id = self.alloc_spanned(Node::Const(sym), self.pos - 1);
-                    args.push(id);
-                }
-                // `!` immediately before `,` / `]` is the `only` selector
-                // (unique element of a length-1 axis); otherwise it starts a
-                // unary logical-not expression (spec §05 disambiguation note).
-                Some(TokenKind::Bang)
-                    if matches!(
-                        self.peek_at(1),
-                        Some(TokenKind::Comma | TokenKind::RBracket)
-                    ) =>
-                {
-                    self.advance();
-                    let sym = self.module.intern("only");
-                    let id = self.alloc_spanned(Node::Const(sym), self.pos - 1);
-                    args.push(id);
-                }
-                _ => {
-                    let idx = self.parse_expr()?;
-                    args.push(idx);
-                }
-            }
-            if !self.eat(&TokenKind::Comma) {
-                return Ok(());
-            }
-        }
-    }
-
-    fn parse_primary(&mut self) -> Result<NodeId> {
+    fn parse_primary(&mut self) -> Result<Primary> {
         let start = self.pos;
         match self.peek() {
             Some(TokenKind::Int(n)) => {
                 let n = *n;
                 self.advance();
-                Ok(self.alloc_spanned(Node::Lit(Scalar::Int(n)), start))
+                Ok(Primary::Ready(
+                    self.alloc_spanned(Node::Lit(Scalar::Int(n)), start),
+                ))
             }
             Some(TokenKind::Real(r)) => {
                 let r = *r;
                 self.advance();
-                Ok(self.alloc_spanned(Node::Lit(Scalar::Real(r)), start))
+                Ok(Primary::Ready(
+                    self.alloc_spanned(Node::Lit(Scalar::Real(r)), start),
+                ))
             }
             Some(TokenKind::Str(s)) => {
                 let s = s.clone();
                 self.advance();
-                Ok(self.alloc_spanned(Node::Lit(Scalar::Str(s.into_boxed_str())), start))
+                Ok(Primary::Ready(self.alloc_spanned(
+                    Node::Lit(Scalar::Str(s.into_boxed_str())),
+                    start,
+                )))
             }
             Some(TokenKind::Name(n)) => {
                 let n = n.clone();
                 self.advance();
                 self.parse_name_tail(n, start)
             }
-            Some(TokenKind::LParen) => self.parse_paren_or_tuple(),
-            Some(TokenKind::LBracket) => self.parse_array(),
             // A leading `.name` is an axis label (legal inside aggregate bodies /
             // indexing); a `.name` *after* an expression is field access (postfix).
-            Some(TokenKind::Dot) => self.parse_axis_node(),
+            Some(TokenKind::Dot) => self.parse_axis_node().map(Primary::Ready),
             other => {
                 Err(self.err_here(format!("expected an expression, found {}", describe(other))))
             }
@@ -1255,26 +1427,14 @@ impl<'a> ExprParser<'a> {
     /// Lower `<ns>.<name>` — optionally followed by a call — to a ref, a bare
     /// built-in constant, or a call through the namespace. `base.foo` always
     /// denotes the built-in and lowers to the bare form (spec §11).
-    fn lower_member(&mut self, ns: MemberNs, name: &str, start: usize) -> Result<NodeId> {
+    fn lower_member(&mut self, ns: MemberNs, name: &str, start: usize) -> Result<Primary> {
         let is_call = self.eat(&TokenKind::LParen);
         if let MemberNs::Base = ns {
             return if is_call {
-                // `base.functionof(…)` is still the reification construct —
-                // same placeholder-scope boundary as the bare form.
-                let reify = name == "functionof" || name == "kernelof";
-                if reify {
-                    self.reify_frames.push(ReifyFrame::Explicit);
-                }
-                let args = self.parse_call_args();
-                if reify {
-                    self.reify_frames.pop();
-                }
-                let (positional, named) = args?;
-                self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                self.make_builtin_call(name, positional, named, start)
+                Ok(Primary::Call(CallTarget::Builtin(name.to_owned())))
             } else {
                 let sym = self.module.intern(name);
-                Ok(self.alloc_spanned(Node::Const(sym), start))
+                Ok(Primary::Ready(self.alloc_spanned(Node::Const(sym), start)))
             };
         }
         let name_sym = self.module.intern(name);
@@ -1287,23 +1447,25 @@ impl<'a> ExprParser<'a> {
             name: name_sym,
         };
         if is_call {
-            let (positional, named) = self.parse_call_args()?;
-            self.expect(&TokenKind::RParen, "`)` to close the call")?;
-            Ok(self.make_user_call(r, positional, named, start))
+            Ok(Primary::Call(CallTarget::Ref(r)))
         } else {
-            Ok(self.alloc_spanned(Node::Ref(r), start))
+            Ok(Primary::Ready(self.alloc_spanned(Node::Ref(r), start)))
         }
     }
 
     /// A bare name has already been consumed; decide literal / call / reference.
     /// `start` is the token index of that name (its span anchor).
-    fn parse_name_tail(&mut self, name: String, start: usize) -> Result<NodeId> {
+    fn parse_name_tail(&mut self, name: String, start: usize) -> Result<Primary> {
         // `true` / `false` are boolean literals (never callable).
         if name == "true" {
-            return Ok(self.alloc_spanned(Node::Lit(Scalar::Bool(true)), start));
+            return Ok(Primary::Ready(
+                self.alloc_spanned(Node::Lit(Scalar::Bool(true)), start),
+            ));
         }
         if name == "false" {
-            return Ok(self.alloc_spanned(Node::Lit(Scalar::Bool(false)), start));
+            return Ok(Primary::Ready(
+                self.alloc_spanned(Node::Lit(Scalar::Bool(false)), start),
+            ));
         }
 
         // `_` is a hole (spec §04): valid only when the *innermost* enclosing
@@ -1334,7 +1496,7 @@ impl<'a> ExprParser<'a> {
                 name: ph_sym,
             };
             entries.push((arg_sym, r));
-            return Ok(self.alloc_spanned(Node::Ref(r), start));
+            return Ok(Primary::Ready(self.alloc_spanned(Node::Ref(r), start)));
         }
 
         // A lambda argument shadows module bindings and built-ins inside its
@@ -1351,11 +1513,9 @@ impl<'a> ExprParser<'a> {
                 name: ph_sym,
             };
             if self.eat(&TokenKind::LParen) {
-                let (positional, named) = self.parse_call_args()?;
-                self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                return Ok(self.make_user_call(r, positional, named, start));
+                return Ok(Primary::Call(CallTarget::Ref(r)));
             }
-            return Ok(self.alloc_spanned(Node::Ref(r), start));
+            return Ok(Primary::Ready(self.alloc_spanned(Node::Ref(r), start)));
         }
         if self.reify_frames.iter().any(lambda_arg) {
             return Err(self.err_prev(format!(
@@ -1367,23 +1527,12 @@ impl<'a> ExprParser<'a> {
 
         if matches!(self.peek(), Some(TokenKind::LParen)) {
             self.advance();
-            // `fn(expr)` is the hole-sugar special operation (spec §05).
-            if name == "fn" {
-                return self.lower_fn(start);
-            }
-            // An explicit reification's whole argument list is a placeholder-
-            // scope boundary (body and boundary kwargs alike).
-            let reify = name == "functionof" || name == "kernelof";
-            if reify {
-                self.reify_frames.push(ReifyFrame::Explicit);
-            }
-            let args = self.parse_call_args();
-            if reify {
-                self.reify_frames.pop();
-            }
-            let (positional, named) = args?;
-            self.expect(&TokenKind::RParen, "`)` to close the call")?;
-            return self.make_call(&name, positional, named, start);
+            // `fn(expr)` starts its own hole scope.
+            return Ok(if name == "fn" {
+                Primary::Fn
+            } else {
+                Primary::Call(CallTarget::Name(name))
+            });
         }
 
         // A bare reference: a placeholder (`_x_`, reserved lexical class) is a
@@ -1403,7 +1552,7 @@ impl<'a> ExprParser<'a> {
         } else {
             Node::Const(sym)
         };
-        Ok(self.alloc_spanned(node, start))
+        Ok(Primary::Ready(self.alloc_spanned(node, start)))
     }
 
     fn make_call(
@@ -1521,74 +1670,6 @@ impl<'a> ExprParser<'a> {
         ))
     }
 
-    /// Parse `pos, …, kw = val, …` up to (not consuming) the closing delimiter.
-    fn parse_call_args(&mut self) -> Result<(Vec<NodeId>, Vec<NamedArg>)> {
-        let mut positional = Vec::new();
-        let mut named = Vec::new();
-        loop {
-            if matches!(self.peek(), Some(TokenKind::RParen)) {
-                break;
-            }
-            // Keyword argument: `Name = expr`.
-            if let (Some(TokenKind::Name(n)), Some(TokenKind::Assign)) =
-                (self.peek(), self.peek_at(1))
-            {
-                let key = n.clone();
-                self.advance();
-                self.advance();
-                let value = self.parse_expr()?;
-                named.push(NamedArg {
-                    kind: NamedKind::Kwarg,
-                    name: self.module.intern(&key),
-                    value,
-                });
-            } else {
-                positional.push(self.parse_expr()?);
-            }
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
-        }
-        Ok((positional, named))
-    }
-
-    fn parse_paren_or_tuple(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        self.advance(); // (
-        let first = self.parse_expr()?;
-        if matches!(self.peek(), Some(TokenKind::Comma)) {
-            let mut elems = vec![first];
-            while self.eat(&TokenKind::Comma) {
-                if matches!(self.peek(), Some(TokenKind::RParen)) {
-                    break;
-                }
-                elems.push(self.parse_expr()?);
-            }
-            self.expect(&TokenKind::RParen, "`)` to close the tuple")?;
-            Ok(self.builtin_call("tuple", elems, start))
-        } else {
-            self.expect(&TokenKind::RParen, "`)` to close the group")?;
-            Ok(first)
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<NodeId> {
-        let start = self.pos;
-        self.advance(); // [
-        let mut elems = Vec::new();
-        loop {
-            if matches!(self.peek(), Some(TokenKind::RBracket)) {
-                break;
-            }
-            elems.push(self.parse_expr()?);
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
-        }
-        self.expect(&TokenKind::RBracket, "`]` to close the array")?;
-        Ok(self.builtin_call("vector", elems, start))
-    }
-
     // ---- broadcast helpers (dotted operators) ----
 
     fn broadcast_op(&mut self, func: &str, lhs: NodeId, rhs: NodeId, start: usize) -> NodeId {
@@ -1630,10 +1711,50 @@ impl<'a> ExprParser<'a> {
     }
 }
 
-/// A comparison operator's lowered function name and whether it is dotted.
+/// An operator's lowered function name and whether it is dotted.
 struct CmpOp {
     func: &'static str,
     dotted: bool,
+}
+
+impl Precedence {
+    fn operand(self) -> Self {
+        match self {
+            Self::Or => Self::And,
+            Self::And => Self::Comparison,
+            Self::Add => Self::Mul,
+            Self::Mul => Self::Unary,
+            _ => unreachable!("only binary precedence levels have operands"),
+        }
+    }
+
+    fn operator(self, token: &TokenKind) -> Option<CmpOp> {
+        let (func, dotted) = match (self, token) {
+            (Self::Or, TokenKind::PipePipe) => ("lor", false),
+            (Self::Or, TokenKind::DotPipePipe) => ("lor", true),
+            (Self::And, TokenKind::AmpAmp) => ("land", false),
+            (Self::And, TokenKind::DotAmpAmp) => ("land", true),
+            (Self::Add, TokenKind::Plus) => ("add", false),
+            (Self::Add, TokenKind::Minus) => ("sub", false),
+            (Self::Add, TokenKind::DotPlus) => ("add", true),
+            (Self::Add, TokenKind::DotMinus) => ("sub", true),
+            (Self::Mul, TokenKind::Star) => ("mul", false),
+            (Self::Mul, TokenKind::Slash) => ("divide", false),
+            (Self::Mul, TokenKind::DotStar) => ("mul", true),
+            (Self::Mul, TokenKind::DotSlash) => ("divide", true),
+            _ => return None,
+        };
+        Some(CmpOp { func, dotted })
+    }
+}
+
+impl ListKind {
+    fn close(&self) -> TokenKind {
+        match self {
+            Self::Tuple => TokenKind::RParen,
+            Self::Array | Self::Index => TokenKind::RBracket,
+        }
+    }
 }
 
 fn cmp_op(kind: &TokenKind) -> Option<CmpOp> {

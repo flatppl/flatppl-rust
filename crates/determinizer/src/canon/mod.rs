@@ -11,6 +11,7 @@ mod dce;
 mod flatten;
 mod fold;
 mod inline;
+mod sharing;
 
 /// Whether `bid` is the reserved `inputs` binding (spec §13
 /// `sec:determinization-signature`).
@@ -106,5 +107,8 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
     }
     if let Some(roots) = roots {
         dce::retain_reachable(m, roots);
+    }
+    if sharing::share_broadcasts(m) {
+        let _ = flatppl_infer::infer(m);
     }
 }
