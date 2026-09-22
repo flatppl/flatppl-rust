@@ -6049,20 +6049,24 @@ fn broadcast_type(
     for t in data_types {
         match t {
             Type::Array { shape: s, elem } => {
-                match &shape {
-                    None => shape = Some(s.clone()),
-                    Some(prev) if prev == s => {}
-                    Some(_) => return Ready(Type::Deferred),
-                }
+                shape = match shape {
+                    None => Some(s.clone()),
+                    Some(prev) => match broadcast_shape_join(&prev, s) {
+                        Some(joined) => Some(joined),
+                        None => return Ready(Type::Deferred),
+                    },
+                };
                 elems.push(elem.as_ref().clone());
             }
             Type::Table { columns, nrows } => {
                 let rows: Box<[Dim]> = Box::new([*nrows]);
-                match &shape {
-                    None => shape = Some(rows),
-                    Some(prev) if prev == &rows => {}
-                    Some(_) => return Ready(Type::Deferred),
-                }
+                shape = match shape {
+                    None => Some(rows),
+                    Some(prev) => match broadcast_shape_join(&prev, &rows) {
+                        Some(joined) => Some(joined),
+                        None => return Ready(Type::Deferred),
+                    },
+                };
                 elems.push(Type::Record(columns.clone()));
             }
             other => elems.push(other.clone()),
@@ -6275,6 +6279,42 @@ fn broadcast_type(
         shape,
         elem: Box::new(cell),
     })
+}
+
+/// Join the equal-rank collection shapes accepted by §04 broadcasting.
+/// A singleton extent contributes no size constraint, while a dynamic extent
+/// keeps the joined extent dynamic.  Two distinct fixed non-singleton extents,
+/// or different ranks, have no common broadcast shape.
+fn broadcast_shape_join(left: &[Dim], right: &[Dim]) -> Option<Box<[Dim]>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(&a, &b)| match (a, b) {
+            (x, y) if x == y => Some(x),
+            (Dim::Static(1), x) | (x, Dim::Static(1)) => Some(x),
+            (Dim::Dynamic, _) | (_, Dim::Dynamic) => Some(Dim::Dynamic),
+            (Dim::Static(_), Dim::Static(_)) => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+#[cfg(test)]
+mod broadcast_shape_join_tests {
+    use super::*;
+
+    /// A zero extent is a valid derived runtime size.  Broadcasting it with a
+    /// singleton stays empty; using a numeric maximum here would incorrectly
+    /// turn the result into a one-element axis.
+    #[test]
+    fn zero_with_singleton_stays_zero() {
+        assert_eq!(
+            broadcast_shape_join(&[Dim::Static(0)], &[Dim::Static(1)]),
+            Some(vec![Dim::Static(0)].into_boxed_slice())
+        );
+    }
 }
 
 /// `broadcast` with no concrete array argument (e.g. a reified lambda body

@@ -5,7 +5,7 @@
 use super::*;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(super) struct Axes {
+pub(crate) struct Axes {
     pub batch: usize,
     pub layers: Vec<usize>,
 }
@@ -99,7 +99,7 @@ impl Emitter<'_> {
         (expand(a), expand(b))
     }
 
-    pub(super) fn axes_of(&self, v: &Value) -> Axes {
+    pub(crate) fn axes_of(&self, v: &Value) -> Axes {
         self.axes.get(&v.ssa).cloned().unwrap_or_else(|| Axes {
             batch: 0,
             layers: if shape(&v.ty).is_empty() {
@@ -177,7 +177,7 @@ impl Emitter<'_> {
         v
     }
 
-    pub(super) fn expand_axes(&mut self, v: &Value, dims: &[u64], ty: MlirTy, axes: Axes) -> Value {
+    pub(crate) fn expand_axes(&mut self, v: &Value, dims: &[u64], ty: MlirTy, axes: Axes) -> Value {
         if v.ty == ty && dims.iter().copied().eq(0..shape(&ty).len() as u64) {
             return self.axes_view(v, axes);
         }

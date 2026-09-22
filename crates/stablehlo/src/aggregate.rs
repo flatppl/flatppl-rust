@@ -55,7 +55,7 @@ use std::collections::HashMap;
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar, Symbol};
 
-use crate::emitter::{AxisReduce, Emitter, elem_rank};
+use crate::emitter::{Axes, AxisReduce, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::norms::checked_shape_product;
 use crate::refuse::EmitError;
@@ -471,7 +471,7 @@ fn build_frame(
     for site in sites.iter() {
         let container = e.lower_node(site.container)?;
         let dims = match &container.ty {
-            MlirTy::Ranked(dims) => dims.clone(),
+            MlirTy::Ranked(dims) => dims[e.batch_rank(&container)..].to_vec(),
             other => {
                 return Err(EmitError::at(
                     site.get_id,
@@ -587,6 +587,7 @@ fn build_frame(
 /// separate and the emitted map is always increasing.
 fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, EmitError> {
     let operand = e.lower_node(site.container)?;
+    let batch = e.batch_rank(&operand);
     let MlirTy::Ranked(dims) = operand.ty.clone() else {
         // `build_frame` already refused a non-ranked operand.
         return Err(EmitError::at(
@@ -601,11 +602,12 @@ fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, E
         .iter()
         .any(|s| matches!(s, Sel::Lit(_) | Sel::Only));
     let sliced = if has_lit {
-        let mut starts = Vec::with_capacity(dims.len());
-        let mut limits = Vec::with_capacity(dims.len());
-        let mut kept: Vec<Option<u64>> = Vec::new();
+        // Literal selectors address model dimensions, not enclosing callables.
+        let mut starts = vec![0; batch];
+        let mut limits: Vec<_> = dims[..batch].iter().map(|d| d.unwrap()).collect();
+        let mut kept = dims[..batch].to_vec();
         for (k, sel) in site.sels.iter().enumerate() {
-            let len = dims[k].expect("static extent checked in build_frame");
+            let len = dims[batch + k].expect("static extent checked in build_frame");
             match sel {
                 Sel::Lit(idx) => {
                     starts.push(*idx);
@@ -643,13 +645,11 @@ fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, E
     };
 
     // 2. The frame position of each surviving operand dimension, in order.
-    let positions: Vec<usize> = site
-        .sels
-        .iter()
-        .filter_map(|s| match s {
-            Sel::Axis(name) => frame.pos(*name),
+    let positions: Vec<usize> = (0..batch)
+        .chain(site.sels.iter().filter_map(|s| match s {
+            Sel::Axis(name) => frame.pos(*name).map(|position| batch + position),
             Sel::Lit(_) | Sel::Only => None,
-        })
+        }))
         .collect();
 
     // 3. Permute them into ascending frame order.
@@ -665,7 +665,20 @@ fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, E
     dims_map.sort_unstable();
 
     // 4. Broadcast up to the frame.
-    let frame_ty = frame.ty();
+    let mut target_dims = dims[..batch].to_vec();
+    target_dims.extend(frame.lens.iter().map(|&len| Some(len)));
+    let frame_ty = MlirTy::Ranked(target_dims);
+    if batch != 0 {
+        return Ok(e.expand_axes(
+            &permuted,
+            &dims_map,
+            frame_ty,
+            Axes {
+                batch,
+                layers: vec![frame.lens.len()],
+            },
+        ));
+    }
     if permuted.ty == frame_ty && dims_map.len() == frame.lens.len() {
         return Ok(permuted);
     }
@@ -691,11 +704,11 @@ fn require_frame_shaped(
         return Ok(cell.clone());
     }
     let frame_ty = frame.ty();
-    if cell.ty == frame_ty {
+    if e.cell_ty(cell) == frame_ty {
         return Ok(cell.clone());
     }
-    if cell.ty == MlirTy::Scalar {
-        return Ok(e.broadcast_in_dim(cell, &[], frame_ty));
+    if e.cell_ty(cell) == MlirTy::Scalar {
+        return Ok(e.fill_cell(cell, frame_ty));
     }
     Err(EmitError::at(
         id,
@@ -781,8 +794,13 @@ fn reduce(
     // The centred sum of squares, per output cell: the mean broadcasts back over
     // the reduced axes under the identity map (it carries the frame's leading
     // `n_out` dimensions, so the map is `[0, 1, …, n_out - 1]`).
-    let dims: Vec<u64> = (0..frame.n_out as u64).collect();
-    let mean_frame = e.broadcast_in_dim(&mean, &dims, frame.ty());
+    let batch = e.batch_rank(&cell);
+    let dims: Vec<u64> = (0..(batch + frame.n_out) as u64).collect();
+    let mean_frame = if batch == 0 {
+        e.broadcast_in_dim(&mean, &dims, frame.ty())
+    } else {
+        e.expand_axes(&mean, &dims, cell.ty.clone(), e.axes_of(&cell))
+    };
     let dev = e.sub(&cell, &mean_frame);
     let sq = e.mul(&dev, &dev);
     let ssq = e.reduce_trailing_axes(id, AxisReduce::Sum, &sq, n_red)?;

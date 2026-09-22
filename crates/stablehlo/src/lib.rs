@@ -200,6 +200,7 @@
 
 mod aggregate;
 mod emitter;
+mod indexing;
 mod mlir;
 mod modes;
 mod norms;

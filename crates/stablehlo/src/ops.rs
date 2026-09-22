@@ -55,7 +55,7 @@
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
 
-use crate::emitter::{Emitter, elem_rank};
+use crate::emitter::{Axes, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
@@ -917,7 +917,7 @@ fn lower_stack(
     require_vector_container(e, id, vs_id, head)?;
     require_uniform_orientation(e, id, vs_id, head)?;
     let vs = e.lower_node(vs_id)?;
-    if !matches!(&vs.ty, MlirTy::Ranked(dims) if dims.len() == 2) {
+    if !matches!(e.cell_ty(&vs), MlirTy::Ranked(dims) if dims.len() == 2) {
         return Err(EmitError::at(
             id,
             format!(
@@ -931,7 +931,27 @@ fn lower_stack(
     }
     Ok(match kind {
         Stack::Rows => vs,
-        Stack::Cols => e.transpose(&vs, &[1, 0]),
+        Stack::Cols => {
+            let batch = e.batch_rank(&vs);
+            let perm: Vec<_> = (0..batch as u64)
+                .chain([batch as u64 + 1, batch as u64])
+                .collect();
+            let transposed = e.transpose(&vs, &perm);
+            if batch == 0 {
+                transposed
+            } else {
+                let identity: Vec<_> = (0..(batch + 2) as u64).collect();
+                e.expand_axes(
+                    &transposed,
+                    &identity,
+                    transposed.ty.clone(),
+                    Axes {
+                        batch,
+                        layers: vec![2],
+                    },
+                )
+            }
+        }
     })
 }
 
@@ -1104,8 +1124,10 @@ fn lower_addaxes(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, 
     if n_leading == 0 && n_trailing == 0 {
         return Ok(a);
     }
-    let mut out = vec![Some(1); n_leading];
-    out.extend(dims);
+    let batch = e.batch_rank(&a);
+    let mut out = dims[..batch].to_vec();
+    out.resize(out.len() + n_leading, Some(1));
+    out.extend_from_slice(&dims[batch..]);
     out.resize(out.len() + n_trailing, Some(1));
     Ok(e.reshape(&a, MlirTy::Ranked(out)))
 }
@@ -2482,8 +2504,8 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
     e.concatenate(id, &values)
 }
 
-/// `get0(container, index)` / `get(container, index)` (spec §07): zero- vs
-/// one-based element access. Two cases are implemented:
+/// `get0(container, selectors...)` / `get(container, selectors...)` (spec §07):
+/// zero- vs one-based element access. Three cases are implemented:
 ///
 /// - A **literal-integer** selector into a rank-1 tensor container (the
 ///   shape the determiniser itself emits) — [`lower_get_literal`], via
@@ -2492,13 +2514,17 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 /// - A **runtime rank-1 `Int`-tensor** selector into a rank-1 tensor
 ///   container (the `theta[person]`-style vector-index case) —
 ///   [`lower_get_gather`], via [`Emitter::gather`].
+/// - Multi-axis numeric tensor selection with one shared rank-1 integer-vector
+///   selector and literal integer / `all` / `only` selectors on the remaining
+///   axes — [`crate::indexing::lower_multi_axis`].
 ///
-/// Multi-selector / named-field / `all`/`only` forms (record, table, tuple),
-/// multi-dimensional array access, and a non-`Int` runtime index (spec §07)
-/// are refused, not guessed: `get`/`get0` can also reach this map from
-/// user-authored FlatPDL, not just the determiniser's own output, and none
-/// of those forms has an obvious single-op tensor lowering.
+/// Named-field forms (record, table, tuple), multiple integer-vector selectors,
+/// batch-varying selectors, nested cells, and non-numeric tensors remain
+/// refused, not guessed.
 fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<Value, EmitError> {
+    if args.len() != 2 {
+        return crate::indexing::lower_multi_axis(e, id, args, base);
+    }
     let [container, index] = args_exact(id, args)?;
 
     if let Ok(selector) = literal_index(e, id, index) {

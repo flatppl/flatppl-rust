@@ -42,7 +42,8 @@ mod constants;
 mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
-use batching::{Axes, shape};
+pub(crate) use batching::Axes;
+use batching::shape;
 use pointwise::Pointwise;
 
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
@@ -1107,6 +1108,39 @@ impl<'m> Emitter<'m> {
             "gather expects vector cells, got {:?}",
             operand.ty
         );
+        let out = self.gather_axis(operand, idx, base, 0);
+        // A mapped scalar selector carries the batch on the index, not on
+        // the shared vector. Preserve that layout on the rank-1 path.
+        let mut axes = self.axes_of(idx);
+        let batch = self.batch_rank(operand);
+        if batch != 0 {
+            axes.batch = batch;
+        }
+        self.remember_axes(&out.ssa, axes);
+        out
+    }
+
+    /// Select one cell axis with a shared rank-1 integer index, replacing that
+    /// axis by the index length. Callable batch axes remain leading offset
+    /// dimensions and are never indexed. [`Emitter::gather`] is the rank-1
+    /// compatibility wrapper; keeping this generalization here gives both
+    /// paths one StableHLO dimension-number construction.
+    pub(crate) fn gather_axis(
+        &mut self,
+        operand: &Value,
+        idx: &Value,
+        base: i64,
+        cell_axis: usize,
+    ) -> Value {
+        let cell_dims = match self.cell_ty(operand) {
+            MlirTy::Ranked(dims) => dims,
+            other => panic!("gather_axis expects ranked cells, got {other:?}"),
+        };
+        assert!(
+            cell_axis < cell_dims.len(),
+            "gather_axis cell axis {cell_axis} out of range for {:?}",
+            operand.ty
+        );
         let n = match &idx.ty {
             MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
             other => panic!("gather expects a rank-1 index, got {other:?}"),
@@ -1122,25 +1156,30 @@ impl<'m> Emitter<'m> {
         let idx2d = self.reshape(&idx0, MlirTy::Ranked(vec![n, Some(1)]));
 
         let batch = self.batch_rank(operand);
-        let prefix = &shape(&operand.ty)[..batch];
-        let mut result_dims = prefix.to_vec();
-        result_dims.push(n);
+        let axis = batch + cell_axis;
+        let operand_dims = shape(&operand.ty);
+        let mut result_dims = operand_dims.to_vec();
+        result_dims[axis] = n;
         let result_ty = MlirTy::Ranked(result_dims);
-        let offsets = if batch == 0 {
+        let offset_dims = (0..operand_dims.len())
+            .filter(|&d| d != axis)
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>();
+        let offsets = if offset_dims.is_empty() {
             String::new()
         } else {
-            format!(
-                "offset_dims = [{}], ",
-                (0..batch)
-                    .map(|d| d.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            format!("offset_dims = [{}], ", offset_dims.join(", "))
         };
-        let slice_sizes = prefix
+        let slice_sizes = operand_dims
             .iter()
-            .map(|d| d.expect("static batch checked").to_string())
-            .chain(std::iter::once("1".into()))
+            .enumerate()
+            .map(|(d, extent)| {
+                if d == axis {
+                    "1".into()
+                } else {
+                    extent.expect("static gather shape checked").to_string()
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let ssa = self.fresh();
@@ -1148,14 +1187,10 @@ impl<'m> Emitter<'m> {
         let idx_ty = idx2d.ty.render(self.dtype, idx2d.elem);
         let result_ty_text = result_ty.render(self.dtype, operand.elem);
         self.push(&format!(
-            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<{offsets}collapsed_slice_dims = [{batch}], start_index_map = [{batch}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {slice_sizes}>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
+            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<{offsets}collapsed_slice_dims = [{axis}], start_index_map = [{axis}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {slice_sizes}>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
             operand.ssa, idx2d.ssa
         ));
-        let mut axes = self.axes_of(idx);
-        if batch != 0 {
-            axes.batch = batch;
-        }
-        self.remember_axes(&ssa, axes);
+        self.remember_axes(&ssa, self.axes_of(operand));
         Value {
             ssa,
             ty: result_ty,
@@ -3209,6 +3244,12 @@ impl<'m> Emitter<'m> {
         self.m.type_of(id)
     }
 
+    /// Apply the inferred array nesting for an operation that must distinguish
+    /// one flat matrix cell from a vector whose elements are vectors.
+    pub(crate) fn with_typed_axes(&mut self, id: NodeId, value: Value) -> Value {
+        self.typed_axes(id, value)
+    }
+
     /// Resolve a node's statically-known [`ValueSet`] (spec §03), read
     /// straight from the FlatPDL module's `Module::valueset_of` side table.
     /// A narrow accessor mirroring [`Emitter::node`]/[`Emitter::resolve`] —
@@ -3675,7 +3716,12 @@ impl<'m> Emitter<'m> {
                     )
                 })?;
                 let rhs = self.m.binding(bid).rhs;
-                self.lower_node(rhs)
+                // Module bindings have no lexical broadcast frame. Cache their
+                // value at module scope, not with the first caller's batch axes.
+                let frame = std::mem::take(&mut self.broadcast_frame);
+                let value = self.lower_node(rhs);
+                self.broadcast_frame = frame;
+                value
             }
             RefNs::Local => Err(EmitError::at(
                 id,
