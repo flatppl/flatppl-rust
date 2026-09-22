@@ -105,7 +105,29 @@ pub fn entries(module: &Module, rows: &[crate::render::BindingRender]) -> Vec<No
         }
         module.for_each_child(id, |c| stack.push(c));
     }
-    names.into_iter().map(entry).collect()
+    let mut entries: Vec<NotationEntry> = names.into_iter().map(entry).collect();
+    // A marked equality (`=ᵍ`) is a symbol of ours; one entry per metric.
+    let mut seen: Vec<String> = Vec::new();
+    for b in rows {
+        let Some(metric) = &b.statement.mark else {
+            continue;
+        };
+        let key = format!("{metric:?}");
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        entries.push(NotationEntry {
+            form: b.statement.relation_form(),
+            name: "metric-equality".to_string(),
+            note: vec![
+                text("Equality with lower indices lowered by the metric "),
+                math(metric.clone()),
+                text("; arrays are stored contravariant."),
+            ],
+        });
+    }
+    entries
 }
 
 /// Whether `m` holds the symbol `sym` anywhere.

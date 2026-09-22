@@ -249,6 +249,7 @@ pub(crate) fn fragment(
                     lhs: Math::binding(name),
                     rel: crate::ast::Rel::Eq,
                     rhs: value,
+                    mark: None,
                 };
                 // Not a `fragment`: the row above already carries the
                 // binding's `data-flatppl-binding` hook, and the page must
@@ -474,7 +475,7 @@ fn row_html(b: &crate::render::BindingRender, annotation: Option<&str>) -> Strin
         .map(|a| format!("<mtext class=\"flatppl-annot\">{a}</mtext>"))
         .unwrap_or_default();
     format!(
-        "<mtr data-flatppl-binding=\"{name}\" id=\"flatppl-{name}\"><mtd>{lhs}</mtd><mtd><mo>{rel}</mo></mtd><mtd>{rhs}</mtd><mtd>{annot}</mtd></mtr>",
+        "<mtr data-flatppl-binding=\"{name}\" id=\"flatppl-{name}\"><mtd>{lhs}</mtd><mtd>{rel}</mtd><mtd>{rhs}</mtd><mtd>{annot}</mtd></mtr>",
         name = escape(&b.name)
     )
 }
@@ -710,6 +711,23 @@ mod tests {
             out.matches("</mrow></math>").count(),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_metric_sum_marks_its_equality_and_the_legend_defines_the_mark() {
+        let src =
+            "g = rowstack([[1.0, 0.0], [0.0, -1.0]])\nr = [1.0, 2.0]\ng: s[] := r[.mu^] * r[.mu_]";
+        let p = page(src);
+        // The row: `s =ᵍ r^μ r_μ`, the metric written over the sign.
+        assert!(
+            p.contains("<mtd><mover><mo>=</mo><mi data-flatppl-ref=\"g\">g</mi></mover></mtd>"),
+            "{p}"
+        );
+        assert!(!p.contains("indices lowered with the metric"), "{p}");
+        // The legend defines the marked sign.
+        assert!(p.contains("<td><math><mover><mo>=</mo><mi data-flatppl-ref=\"g\">g</mi></mover></math></td><td><p>Equality with lower indices lowered by the metric <math><mi data-flatppl-ref=\"g\">g</mi></math>; arrays are stored contravariant.</p>"), "{p}");
+        let plain = page("x = 1.0\ny = 2 * x");
+        assert!(!plain.contains("<mover><mo>=</mo>"), "{plain}");
     }
 
     #[test]

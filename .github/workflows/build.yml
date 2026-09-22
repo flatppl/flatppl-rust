@@ -44,7 +44,7 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.0
 
       - name: Install musl linker
         if: contains(matrix.target, 'musl')
@@ -110,7 +110,7 @@ jobs:
           merge-multiple: true
 
       - name: Update nightly release
-        uses: softprops/action-gh-release@v3.0.1
+        uses: softprops/action-gh-release@v3.0.2
         with:
           tag_name: nightly
           name: Nightly Build

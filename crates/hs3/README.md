@@ -33,3 +33,6 @@ the likelihood. Model-only input declares no parameter of interest.
 
 Workspace imports still require observations for every channel. Integer-count
 workspaces keep `Poisson`; fractional-count channels use `ContinuedPoisson`.
+
+[`ORACLES.md`](ORACLES.md) holds one independently-derived checkpoint per HS3 kind — what to reach
+for when an end-to-end score moves and you need to know which construct moved.

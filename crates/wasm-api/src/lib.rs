@@ -53,9 +53,21 @@ pub fn render_math_str(request: &str) -> Result<String, String> {
     flatppl_mathdoc::json::render_math(request)
 }
 
-/// The wasm/JS boundary. `convert(input, from, to) -> string` and
-/// `render_math(request) -> string`; a returned `Err` becomes a JavaScript
-/// `Error` object carrying the message.
+/// Write a model as a whole mathematical document (HTML with MathML, GitHub
+/// Markdown, LaTeX or Typst) — the viewer's "save math as…" tools and the
+/// VS Code export commands.
+///
+/// `request` is `{source, path, bundle, document}`: the first three as for
+/// [`render_math_str`], `document` the format by file extension (`html`,
+/// `md`, `tex`, `typ`). Returns the document text, implemented by
+/// [`flatppl_mathdoc::json::export_math`].
+pub fn export_math_str(request: &str) -> Result<String, String> {
+    flatppl_mathdoc::json::export_math(request)
+}
+
+/// The wasm/JS boundary. `convert(input, from, to) -> string`,
+/// `render_math(request) -> string` and `export_math(request) -> string`; a
+/// returned `Err` becomes a JavaScript `Error` object carrying the message.
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -66,6 +78,11 @@ mod wasm {
     }
 
     #[wasm_bindgen]
+    pub fn export_math(request: &str) -> Result<String, JsError> {
+        super::export_math_str(request).map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
     pub fn render_math(request: &str) -> Result<String, JsError> {
         super::render_math_str(request).map_err(|e| JsError::new(&e))
     }
@@ -73,10 +90,25 @@ mod wasm {
 
 #[cfg(test)]
 mod tests {
-    use super::convert_str;
+    use super::{convert_str, export_math_str};
 
     // A real pyhf workspace, shared with the hs3 crate's own tests.
     const PYHF_2BIN: &str = include_str!("../../hs3/tests/fixtures/2bin_1channel.json");
+
+    #[test]
+    fn export_math_writes_a_document_in_the_requested_format() {
+        let request = |document: &str| {
+            format!(
+                r#"{{"source": "mu ~ Normal(0, 5)\ny ~ Normal(mu, 1)", "path": "m.flatppl", "document": "{document}"}}"#
+            )
+        };
+        let html = export_math_str(&request("html")).expect("html");
+        assert!(html.contains("<math") && html.contains("data-flatppl-binding=\"y\""));
+        let tex = export_math_str(&request("tex")).expect("tex");
+        assert!(tex.contains("\\mathcal{N}"), "{tex}");
+        let err = export_math_str(&request("docx")).unwrap_err();
+        assert!(err.contains("docx"), "{err}");
+    }
 
     #[test]
     fn pyhf_to_flatppl_preserves_the_model() {

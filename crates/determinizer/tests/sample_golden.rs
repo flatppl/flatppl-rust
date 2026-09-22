@@ -220,7 +220,7 @@ draws = rand(s, lawof(record(a = a, b = b)))";
 // Unlike the independent-draws path (which inlines each sample), a SHARED latent
 // is rewritten to a single named `builtin_sample` binding (`__sample_mu`) whose
 // slots are read by-name — inlining it per consumer would re-draw `mu`, breaking
-// shared-ancestor identity (measure-algebra-audit H7/M4). Because the FlatPIR
+// shared-ancestor identity (measure-algebra audit, 2026-06, H7/M4). Because the FlatPIR
 // writer has no CSE, a by-name ref prints the underlying `builtin_sample` exactly
 // once, so the count is a faithful "mu sampled once" check (a 4th occurrence would
 // mean `mu` was inlined and re-expanded / re-drawn).
@@ -318,7 +318,7 @@ draws = rand(s, lawof(record(a)))";
 // The other shared-latent shape: one draw-binding `mu` bound to TWO record fields
 // (`record(a = mu, b = mu)`). No hierarchy — but the naive per-field fold would
 // still sample `mu` once per field (twice), the same shared-ancestor break as the
-// hierarchical case (measure-algebra-audit H7/M4). The binding-rewrite path samples
+// hierarchical case (measure-algebra audit, 2026-06, H7/M4). The binding-rewrite path samples
 // `mu` ONCE and both fields reference it by name.
 #[test]
 fn latent_shared_by_two_fields_sampled_once() {

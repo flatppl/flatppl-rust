@@ -14,50 +14,41 @@ pub fn statement(stmt: &Statement) -> String {
     format!(
         "{} {} {}",
         expr(&stmt.lhs),
-        relation(stmt.rel),
+        relation_of(stmt),
         expr(&stmt.rhs)
     )
 }
 
+/// The relation sign, `attach(eq, t: mark)` when the row carries a mark.
+pub(crate) fn relation_of(stmt: &Statement) -> String {
+    expr(&stmt.relation_form())
+}
+
 /// An expression in native Typst math syntax, without `$` delimiters.
 pub fn expr(m: &Math) -> String {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        let rows = lines
-            .iter()
-            .map(|line| {
-                let term = expr(line.term);
-                let term = if line.parens {
-                    fenced(Fence::Paren, Fence::Paren, &term)
-                } else {
-                    term
-                };
-                let sign = match line.sign {
-                    Some(BinOp::Sub) => "− ",
-                    Some(_) => "+ ",
-                    None => "",
-                };
-                format!("{sign}{term}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("vec(delim: #none, align: #left, {rows})");
+    if !crate::layout::sum_lines(m).is_empty() {
+        return sum_lines(m);
     }
     match m {
         Math::Ident(id) => {
             let head = atom(&id.display.head);
-            if id.display.subs.is_empty() {
+            let parts: Vec<String> = id
+                .display
+                .subs
+                .iter()
+                .map(atom)
+                .chain(id.indices.iter().map(expr))
+                .collect();
+            let symbol = if parts.is_empty() {
                 head
             } else {
-                format!(
-                    "attach({head}, br: {})",
-                    id.display
-                        .subs
-                        .iter()
-                        .map(atom)
-                        .collect::<Vec<_>>()
-                        .join(" \\, ")
-                )
+                format!("attach({head}, br: {})", parts.join(" \\, "))
+            };
+            match id.display.wrap {
+                Some(crate::names::Wrap::Squared) => format!("{symbol}^2"),
+                Some(crate::names::Wrap::Sqrt) => format!("sqrt({symbol})"),
+                Some(crate::names::Wrap::Log) => format!("log {symbol}"),
+                None => symbol,
             }
         }
         Math::Num(n) => n.clone(),
@@ -180,6 +171,14 @@ pub fn expr(m: &Math) -> String {
                 .join(", ")
         ),
         Math::Overline(arg) => format!("overline({})", expr(arg)),
+        Math::Marked { base, mark } => {
+            // Typst's math parser wants the symbol name as an attach base.
+            let base = match **base {
+                Math::Op(Op::Relation(Rel::Eq)) => "eq".to_string(),
+                _ => expr(base),
+            };
+            format!("attach({base}, t: {})", expr(mark))
+        }
         Math::Code(source) => format!("#raw({})", quote(source)),
     }
 }
@@ -204,6 +203,29 @@ pub(crate) fn quote(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A sum split into aligned continuation lines.
+fn sum_lines(m: &Math) -> String {
+    let rows = crate::layout::sum_lines(m)
+        .iter()
+        .map(|line| {
+            let term = expr(line.term);
+            let term = if line.parens {
+                fenced(Fence::Paren, Fence::Paren, &term)
+            } else {
+                term
+            };
+            let sign = match line.sign {
+                Some(BinOp::Sub) => "− ",
+                Some(_) => "+ ",
+                None => "",
+            };
+            format!("{sign}{term}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("vec(delim: #none, align: #left, {rows})")
 }
 
 fn atom(atom: &Atom) -> String {
@@ -300,5 +322,6 @@ fn operator(op: Op) -> &'static str {
         Op::Differential => "upright(d)",
         Op::Transpose => "upright(T)",
         Op::Dagger => "†",
+        Op::Relation(rel) => relation(rel),
     }
 }

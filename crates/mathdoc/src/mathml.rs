@@ -26,20 +26,25 @@ pub fn fragment(binding: &str, stmt: &Statement) -> String {
     )
 }
 
-/// The statement's row without the `<math>` root: `<mrow>lhs <mo>rel</mo> rhs</mrow>`.
+/// The statement's row without the `<math>` root: `<mrow>lhs rel rhs</mrow>`.
 pub fn statement(stmt: &Statement) -> String {
     format!(
-        "<mrow>{}<mo>{}</mo>{}</mrow>",
+        "<mrow>{}{}{}</mrow>",
         expr(&stmt.lhs),
-        rel_glyph(stmt.rel),
+        expr(&stmt.relation_form()),
         expr(&stmt.rhs)
     )
 }
 
-/// The three aligned parts of a statement (`lhs`, relation glyph, `rhs`), for
-/// a document that lays rows out in one `<mtable>`.
-pub fn statement_parts(stmt: &Statement) -> (String, &'static str, String) {
-    (expr(&stmt.lhs), rel_glyph(stmt.rel), expr(&stmt.rhs))
+/// The three aligned parts of a statement (`lhs`, the relation sign as
+/// markup — `<mo>=</mo>`, or an `<mover>` when the row is marked — and
+/// `rhs`), for a document that lays rows out in one `<mtable>`.
+pub fn statement_parts(stmt: &Statement) -> (String, String, String) {
+    (
+        expr(&stmt.lhs),
+        expr(&stmt.relation_form()),
+        expr(&stmt.rhs),
+    )
 }
 
 /// An expression as MathML content (no `<math>` root).
@@ -109,25 +114,8 @@ fn fence_glyph(f: Fence, open: bool) -> &'static str {
 }
 
 fn write_expr(out: &mut String, m: &Math) {
-    let lines = crate::layout::sum_lines(m);
-    if !lines.is_empty() {
-        out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
-        for line in lines {
-            out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
-            if let Some(sign) = line.sign {
-                let glyph = if sign == BinOp::Sub { "−" } else { "+" };
-                let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
-            }
-            if line.parens {
-                write_fenced(out, "(", ")", is_tall(line.term), |out| {
-                    write_expr(out, line.term)
-                });
-            } else {
-                write_expr(out, line.term);
-            }
-            out.push_str("</mrow></mtd></mtr>");
-        }
-        out.push_str("</mtable>");
+    if !crate::layout::sum_lines(m).is_empty() {
+        write_sum_lines(out, m);
         return;
     }
     match m {
@@ -312,6 +300,12 @@ fn write_expr(out: &mut String, m: &Math) {
             write_wrapped(out, arg);
             out.push_str("<mo>‾</mo></mover>");
         }
+        Math::Marked { base, mark } => {
+            out.push_str("<mover>");
+            write_wrapped(out, base);
+            write_wrapped(out, mark);
+            out.push_str("</mover>");
+        }
         Math::Code(text) => {
             let _ = write!(
                 out,
@@ -322,31 +316,92 @@ fn write_expr(out: &mut String, m: &Math) {
     }
 }
 
-/// An identifier: head `<mi>` plus an optional `<msub>` of its parts, the
-/// back-reference attribute on the outermost element.
+/// A sum split into aligned continuation lines ([`crate::layout::sum_lines`]).
+fn write_sum_lines(out: &mut String, m: &Math) {
+    out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
+    for line in crate::layout::sum_lines(m) {
+        out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
+        if let Some(sign) = line.sign {
+            let glyph = if sign == BinOp::Sub { "−" } else { "+" };
+            let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
+        }
+        if line.parens {
+            write_fenced(out, "(", ")", is_tall(line.term), |out| {
+                write_expr(out, line.term)
+            });
+        } else {
+            write_expr(out, line.term);
+        }
+        out.push_str("</mrow></mtd></mtr>");
+    }
+    out.push_str("</mtable>");
+}
+
+/// An identifier: head `<mi>` plus an optional `<msub>` of its parts and
+/// indices, the back-reference attribute on the outermost element.
 fn write_ident(out: &mut String, id: &Ident) {
     let attr = match &id.target {
         Some(t) => format!(" data-flatppl-ref=\"{}\"", escape(t)),
         None => String::new(),
     };
-    if id.display.subs.is_empty() {
+    // A marked name puts the back-reference on the wrapper, its outermost
+    // element, and prints the bare symbol inside it.
+    match id.display.wrap {
+        Some(crate::names::Wrap::Squared) => {
+            let _ = write!(out, "<msup{attr}>");
+            write_ident(out, &bare(id));
+            out.push_str("<mn>2</mn></msup>");
+            return;
+        }
+        Some(crate::names::Wrap::Sqrt) => {
+            let _ = write!(out, "<msqrt{attr}>");
+            write_ident(out, &bare(id));
+            out.push_str("</msqrt>");
+            return;
+        }
+        Some(crate::names::Wrap::Log) => {
+            let _ = write!(out, "<mrow{attr}><mi>log</mi><mo>&#x2061;</mo>");
+            write_ident(out, &bare(id));
+            out.push_str("</mrow>");
+            return;
+        }
+        None => {}
+    }
+    let parts = id.display.subs.len() + id.indices.len();
+    if parts == 0 {
         let _ = write!(out, "<mi{attr}>{}</mi>", atom_text(&id.display.head));
         return;
     }
     let _ = write!(out, "<msub{attr}><mi>{}</mi>", atom_text(&id.display.head));
-    if id.display.subs.len() == 1 {
-        write_atom(out, &id.display.subs[0]);
-    } else {
+    if parts > 1 {
         out.push_str("<mrow>");
-        for (i, part) in id.display.subs.iter().enumerate() {
-            if i > 0 {
-                out.push_str("<mo>,</mo>");
-            }
-            write_atom(out, part);
+    }
+    for (i, part) in id.display.subs.iter().enumerate() {
+        if i > 0 {
+            out.push_str("<mo>,</mo>");
         }
+        write_atom(out, part);
+    }
+    for (i, index) in id.indices.iter().enumerate() {
+        if i + id.display.subs.len() > 0 {
+            out.push_str("<mo>,</mo>");
+        }
+        write_expr(out, index);
+    }
+    if parts > 1 {
         out.push_str("</mrow>");
     }
     out.push_str("</msub>");
+}
+
+/// `id` without its marker and without a back-reference (the wrapper carries it).
+fn bare(id: &Ident) -> Ident {
+    Ident {
+        name: id.name.clone(),
+        display: crate::names::DisplayName::new(id.display.head.clone(), id.display.subs.clone()),
+        target: None,
+        indices: id.indices.clone(),
+    }
 }
 
 fn atom_text(atom: &Atom) -> String {
@@ -396,7 +451,11 @@ fn write_sym(out: &mut String, s: Sym) {
 }
 
 fn write_op(out: &mut String, op: Op) {
-    out.push_str(match op {
+    let glyph = match op {
+        Op::Relation(rel) => {
+            let _ = write!(out, "<mo>{}</mo>", rel_glyph(rel));
+            return;
+        }
         Op::Bar => "<mo stretchy=\"false\">|</mo>",
         Op::Star => "<mo>∗</mo>",
         Op::Times => "<mo>×</mo>",
@@ -408,7 +467,8 @@ fn write_op(out: &mut String, op: Op) {
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
         Op::Dagger => "<mo>†</mo>",
-    });
+    };
+    out.push_str(glyph);
 }
 
 /// `<mrow>` `open` … `close` `</mrow>` around what `body` writes. The fences
@@ -520,6 +580,32 @@ mod tests {
     }
 
     #[test]
+    fn an_index_joins_the_name_subscript_list() {
+        let i = || Math::ident("i", None);
+        // `A[i][j]` is one subscript list, the anchor still on the outermost element.
+        let m = Math::subscript(Math::subscript(b("A"), i()), Math::ident("j", None));
+        assert_eq!(
+            expr(&m),
+            "<msub data-flatppl-ref=\"A\"><mi>A</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow></msub>"
+        );
+        // A gather on a subscripted name: `nu_B[g]` under `i` is ν_{B,g_i}.
+        let m = Math::subscript(b("nu_B"), Math::subscript(b("g"), i()));
+        assert_eq!(
+            expr(&m),
+            "<msub data-flatppl-ref=\"nu_B\"><mi>ν</mi><mrow><mi>B</mi><mo>,</mo><msub data-flatppl-ref=\"g\"><mi>g</mi><mi>i</mi></msub></mrow></msub>"
+        );
+        // A marked name keeps the index inside its marker: σ_i².
+        let m = Math::subscript(b("sigma_sq"), i());
+        assert_eq!(
+            expr(&m),
+            "<msup data-flatppl-ref=\"sigma_sq\"><msub><mi>σ</mi><mi>i</mi></msub><mn>2</mn></msup>"
+        );
+        // Anything else keeps a plain subscript.
+        let m = Math::subscript(Math::text("Law"), i());
+        assert_eq!(expr(&m), "<msub><mi>Law</mi><mi>i</mi></msub>");
+    }
+
+    #[test]
     fn juxtaposition_uses_the_invisible_times_and_the_dot_is_explicit() {
         let m = Math::plus(Math::times(Math::int(2), b("x")), Math::int(1));
         assert_eq!(
@@ -560,6 +646,7 @@ mod tests {
             lhs: b("mu"),
             rel: Rel::Sim,
             rhs: Math::call("Normal", vec![Math::int(0), Math::int(5)]),
+            mark: None,
         };
         assert_eq!(
             fragment("mu", &stmt),
@@ -585,7 +672,8 @@ mod tests {
                 &Statement {
                     lhs: b("x"),
                     rel: Rel::Eq,
-                    rhs: Math::int(1)
+                    rhs: Math::int(1),
+                    mark: None,
                 }
             )
             .contains("data-flatppl-binding=\"a&quot;b\"")

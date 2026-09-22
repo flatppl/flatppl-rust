@@ -78,7 +78,7 @@ use crate::types::{mlir_type_of, mlir_type_of_ty};
 
 /// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
 /// top-level bindings (design doc
-/// `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`): an
+/// `crates/stablehlo/docs/inputs-outputs-abi.md`): an
 /// explicit, ordered argument/result list for the emitted `func.func`. This
 /// is the sole way a query and its arguments are designated — the legacy
 /// source-order / last-public-binding heuristic has been removed. `inputs` are
