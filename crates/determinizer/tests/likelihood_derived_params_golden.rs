@@ -15,6 +15,62 @@ use flatppl_core::{CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Symbol};
 use flatppl_determinizer::determinize;
 use std::collections::HashSet;
 
+#[test]
+fn derived_vector_is_serialized_once_per_query() {
+    let m = parse_infer(
+        r#"
+x = elementof(reals)
+a = elementof(reals)
+b = elementof(reals)
+rates = broadcast(exp, [x, x + 1.0, x + 2.0])
+L = likelihoodof(Normal(rates[1] + rates[2] + rates[3], 1.0), 0.0)
+lp = logdensityof(L, record(x = a))
+lp2 = logdensityof(L, record(x = b))
+"#,
+    );
+    let roots: Vec<_> = m
+        .bindings()
+        .filter(|(_, binding)| matches!(m.resolve(binding.name), "lp" | "lp2"))
+        .map(|(_, binding)| binding.name)
+        .collect();
+    let out = flatppl_determinizer::determinize_with_roots(
+        &m,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+    )
+    .expect("derived-vector likelihoods must lower");
+    let source = flatppl_syntax::print(&out);
+    assert_eq!(
+        source.matches("exp.(").count(),
+        2,
+        "each runtime query needs one vector, not one copy per selector:\n{source}"
+    );
+    let roundtrip = parse_infer(&source);
+    assert!(flatppl_determinizer::is_flatpdl(&roundtrip).is_ok());
+    let again = determinize(&out).expect("shared FlatPDL remains lowerable");
+    assert_eq!(flatppl_syntax::print(&again), source);
+}
+
+#[test]
+fn reified_density_substitutes_shared_derived_parameters() {
+    let m = parse_infer(
+        r#"
+x = elementof(reals)
+a = elementof(reals)
+rates = broadcast(exp, [x, x + 1.0])
+L = likelihoodof(Normal(rates[1] + rates[2], 1.0), 0.0)
+lp = logdensityof(L, record(x = a))
+f = functionof(lp, a = a)
+out = f(0.0)
+"#,
+    );
+    let out = determinize(&m).expect("an applied reified density must lower");
+    assert!(
+        !closure_reaches_elementof(&out, binding_rhs(&out, "out")),
+        "the applied density must not retain its free parameter"
+    );
+}
+
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
