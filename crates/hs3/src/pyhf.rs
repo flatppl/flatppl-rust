@@ -8,9 +8,10 @@
 use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
 use crate::histfactory::{
-    AuxOverride, Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
-    emit_normal01_constraint, emit_shapesys_constraint, emit_staterror_constraint, mod_spec,
-    modifier_effect, require_param, require_spec, sample_nominal, staterror_gaussian,
+    AuxOverride, Effect, Multiplier, ParamDomain, PendingConstraint, PyhfParamset,
+    emit_lumi_constraint, emit_normal01_constraint, emit_shapesys_constraint,
+    emit_staterror_constraint, mod_spec, modifier_effect, require_param, require_spec,
+    sample_nominal, staterror_gaussian,
 };
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
@@ -470,6 +471,8 @@ pub struct Terms {
     /// paramset), so it must be declared once. `validate_workspace` has already
     /// established that every occurrence of a shared name agrees on the domain.
     declared_params: HashSet<String>,
+    /// Shared deterministic normalization factors across samples and channels.
+    normsys_factors: crate::normsys::Factors,
     /// The staterror constraint form to use when the modifier does not name one.
     ///
     /// pyhf's staterror paramset is always `constrained_by_normal` and its
@@ -612,43 +615,6 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
 ///
 /// `observed.fractional` swaps the count distribution to
 /// `hepphys.ContinuedPoisson`, from [`validate_observed_counts`].
-/// Combine one sample's histosys interpolations into its shifted nominal.
-///
-/// `shifted` pairs each histosys parameter name with the interpolation of the
-/// sample's original nominal for that modifier alone. No modifier: the nominal.
-/// One: the interpolation, which already is `nominal + shift`. Two or more:
-/// `nominal + sum_m (interp_m - nominal)`, each shift bound to a name so the
-/// emitted model stays readable.
-fn histosys_total(
-    b: &mut Builder,
-    channel_name: &str,
-    sname: &str,
-    nom_name: &str,
-    shifted: &[(String, NodeId)],
-) -> NodeId {
-    match shifted.len() {
-        0 => b.self_ref(nom_name),
-        1 => shifted[0].1,
-        _ => {
-            let mut acc = b.self_ref(nom_name);
-            for (param, interp) in shifted {
-                let base = b.self_ref(nom_name);
-                let sub = b.call_head("sub");
-                let delta = b.call("broadcast", &[sub, *interp, base]);
-                let shift_name = b.bind_unique_doc(
-                    &format!("{channel_name}_{sname}_{param}_shift"),
-                    delta,
-                    "Additive histosys shift relative to the sample nominal.",
-                );
-                let shift_ref = b.self_ref(&shift_name);
-                let add = b.call_head("add");
-                acc = b.call("broadcast", &[add, acc, shift_ref]);
-            }
-            acc
-        }
-    }
-}
-
 pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
@@ -814,6 +780,8 @@ pub fn assemble_channel(
     // (each carries the sample nominal its `tau` needs).
     let mut sample_expected: Vec<NodeId> = Vec::new();
     let mut pending: Vec<(String, PendingConstraint, NodeId)> = Vec::new();
+    let mut nominal_names = Vec::new();
+    let mut histosys = Vec::new();
     for (sname, nominal, modifiers) in samples {
         let data = SampleData::Flat(nominal.to_vec());
         let nom_arr = sample_nominal(b, &data);
@@ -828,14 +796,12 @@ pub fn assemble_channel(
         // nominal and, at a knot, discard the first shift entirely (pyhf sums the
         // per-modifier additive deltas onto the nominal, then applies the
         // multiplicative factors; ROOT's PiecewiseInterpolation sums them too).
-        let mut shifted: Vec<(String, NodeId)> = Vec::new();
+        let mut shifted = Vec::new();
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
-                let base = b.self_ref(&nom_name);
-                let (effect, constraint) = modifier_effect(b, modifier, base, nominal)?;
-                let param = constraint.as_ref().map(|(p, _)| p.clone());
+                let (effect, constraint) = modifier_effect(b, modifier, nominal)?;
                 if let Effect::ReplaceNominal(new_nom) = effect {
-                    shifted.push((param.unwrap_or_default(), new_nom));
+                    shifted.push(new_nom);
                 }
                 if let Some((param, pc)) = constraint {
                     let base = b.self_ref(&nom_name);
@@ -843,15 +809,18 @@ pub fn assemble_channel(
                 }
             }
         }
-        let nom = histosys_total(b, channel_name, sname, &nom_name, &shifted);
-
-        // Then: multiplicative modifiers (`acc = broadcast(mul, acc, factor)`).
-        let mut acc = nom;
+        nominal_names.push(nom_name);
+        histosys.push(shifted);
+    }
+    let shifted = crate::histosys::shifted_nominals(b, channel_name, &nominal_names, &histosys);
+    let mut multipliers = Vec::new();
+    for ((_, nominal, modifiers), nom_name) in samples.iter().zip(&nominal_names) {
+        let mut factors = Vec::new();
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
                 continue;
             }
-            let (effect, constraint) = modifier_effect(b, modifier, nom, nominal)?;
+            let (effect, constraint) = modifier_effect(b, modifier, nominal)?;
             if let Effect::Multiply(factor) = effect {
                 // A staterror parameter may span channels, in which case this
                 // channel multiplies in only its own slice.
@@ -859,21 +828,33 @@ pub fn assemble_channel(
                     Some(spec) if spec.channel_staterror => {
                         let param = require_param(modifier, spec)?;
                         let (total, offset) = staterror_slice(terms, &param, channel_name);
-                        staterror_factor(b, &param, total, offset, n_bins)
+                        Multiplier::Value(staterror_factor(b, &param, total, offset, n_bins))
                     }
                     _ => factor,
                 };
-                let mul = b.call_head("mul");
-                acc = b.call("broadcast", &[mul, acc, factor]);
+                factors.push(factor);
             }
             // shapesys reads the sample's UNSHIFTED nominal for its tau (pyhf
             // takes `nom_data` from the sample's own `data`); other constraints
             // ignore it. Passing the post-histosys nominal would make the
             // constraint's observed aux data depend on the histosys alphas.
             if let Some((param, pc)) = constraint {
-                let base = b.self_ref(&nom_name);
+                let base = b.self_ref(nom_name);
                 pending.push((param, pc, base));
             }
+        }
+        multipliers.push(factors);
+    }
+    let multipliers = terms
+        .normsys_factors
+        .multipliers(b, channel_name, multipliers);
+    for ((sname, _, _), (nom, factors)) in samples.iter().zip(shifted.into_iter().zip(multipliers))
+    {
+        // Keep the original product order after sharing interpolation work.
+        let mut acc = nom;
+        for factor in factors {
+            let mul = b.call_head("mul");
+            acc = b.call("broadcast", &[mul, acc, factor]);
         }
 
         let exp_name = b.bind_unique_doc(
@@ -885,15 +866,14 @@ pub fn assemble_channel(
     }
 
     // ---- Total expected per bin (sum over samples) ----
-    let total = if sample_expected.is_empty() {
-        b.array(&[])
-    } else {
-        let mut acc = sample_expected[0];
-        for &next in &sample_expected[1..] {
-            let add = b.call_head("add");
-            acc = b.call("broadcast", &[add, acc, next]);
+    let total = match sample_expected.as_slice() {
+        [] => b.array(&[]),
+        [single] => *single,
+        _ => {
+            let rows = b.array(&sample_expected);
+            let matrix = b.call("rowstack", &[rows]);
+            b.column_sums(matrix)
         }
-        acc
     };
     let expected_name = b.bind_unique_doc(
         &format!("{channel_name}_expected"),

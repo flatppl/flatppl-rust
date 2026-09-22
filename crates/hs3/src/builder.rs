@@ -1,7 +1,9 @@
 //! Ergonomic helpers for building flatppl_core IR.
 use crate::error::{Error, Result};
 use flatppl_core::id::{NodeId, Symbol};
-use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar};
+use flatppl_core::node::{
+    Axis, Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar,
+};
 use flatppl_core::{Binding, Doc, Markup, Module};
 
 /// FlatPPL reserved words that may not be a binding name (spec §05 / the parser's
@@ -185,6 +187,23 @@ impl<'m> Builder<'m> {
     /// Array literal `[a,b,...]`. Uses `vector` (the canonical FlatPPL builtin).
     pub(crate) fn array(&mut self, elems: &[NodeId]) -> NodeId {
         self.call("vector", elems)
+    }
+
+    /// Sum a matrix's rows while retaining its columns (spec §04 aggregate).
+    pub(crate) fn column_sums(&mut self, matrix: NodeId) -> NodeId {
+        let mut axis = |name: &str| {
+            let name = self.sym(name);
+            self.m.alloc(Node::Axis(Axis {
+                name,
+                variance: None,
+            }))
+        };
+        let row = axis("row");
+        let col = axis("col");
+        let cell = self.call("get", &[matrix, row, col]);
+        let outputs = self.array(&[col]);
+        let sum = self.call_head("sum");
+        self.call("aggregate", &[sum, outputs, cell])
     }
 
     /// Stamp the module with `flatppl_compat = "<version>"` (spec §11: an ordinary

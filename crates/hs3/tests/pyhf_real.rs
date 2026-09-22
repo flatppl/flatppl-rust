@@ -95,10 +95,11 @@ fn multichan_old_converts() {
         "must NOT emit `call(hepphys...)` (invalid FlatPPL builtin), got:\n{text}"
     );
 
-    // Module-member call syntax must be used instead
+    // Call or broadcast the module member, not a non-existent `call` builtin.
     assert!(
-        text.contains("hepphys.interp_poly6_exp("),
-        "must emit `hepphys.interp_poly6_exp(...)` (module-member call), got:\n{text}"
+        text.contains("hepphys.interp_poly6_exp(")
+            || text.contains("broadcast(hepphys.interp_poly6_exp,"),
+        "must call or broadcast `hepphys.interp_poly6_exp`, got:\n{text}"
     );
 
     // Round-trip: emitted FlatPPL must re-parse without error

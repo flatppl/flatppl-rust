@@ -15,8 +15,10 @@ pub(crate) mod dist_spec;
 pub(crate) mod distribution;
 pub(crate) mod expr;
 pub(crate) mod histfactory;
+mod histosys;
 pub(crate) mod likelihood;
 pub(crate) mod model;
+mod normsys;
 pub(crate) mod presets;
 pub(crate) mod pyhf;
 
