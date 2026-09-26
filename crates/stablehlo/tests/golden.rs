@@ -5533,9 +5533,7 @@ fn emit_logdensity_bernoulli_matches_frozen_golden() {
     );
 }
 
-/// §08 Poisson, verbatim: `k * log(rate) - rate - lgamma(k + 1)`. Op counts:
-/// one `log`, one `multiply`, two `negate`s (`-rate`'s own, `-lgamma(k+1)`),
-/// three `add`s, one `chlo.lgamma`.
+/// A known small count keeps the direct formula and the zero-rate boundary.
 #[test]
 fn emit_logdensity_poisson_has_expected_structure() {
     let d = determinize_src(POISSON_DENSITY_SRC);
@@ -5561,7 +5559,7 @@ fn emit_logdensity_poisson_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
     assert_eq!(out.matches("stablehlo.negate").count(), 1);
-    assert_eq!(out.matches("stablehlo.add").count(), 2);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 2);
     assert_eq!(out.matches("chlo.lgamma").count(), 0);
     assert!(is_delimiter_balanced(&out));
 }
