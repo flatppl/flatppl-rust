@@ -241,7 +241,7 @@ lp = logdensityof(aux_lik, record(x = x))
 inputs = (x)
 outputs = (lp)";
 
-// The whole density: one `log(rate)`, one `lgamma(x + 1)`, and the support mask.
+// The constant log(rate) folds. The runtime lgamma(x + 1) and support mask remain.
 // §09's own formula reads the Poisson factorial as `Γ(x+1)`, which is the ONLY
 // difference from `poisson_logpdf` — so an emission that dropped the `lgamma`
 // for a `Poisson`-style integer path would score a non-integer variate wrongly
@@ -256,8 +256,8 @@ fn continued_poisson_emits_a_lgamma_continuation_under_a_support_mask() {
     );
     assert_eq!(
         mlir.matches("stablehlo.log ").count(),
-        1,
-        "`log(rate)` once:\n{mlir}"
+        0,
+        "constant `log(rate)` folds:\n{mlir}"
     );
     assert!(
         mlir.contains("compare GE") && mlir.contains("dense<0x7F800000>"),
@@ -310,63 +310,7 @@ outputs = (lp)";
     // n-bin staterror independent of n in emitted size.
     assert_eq!(
         mlir.matches("chlo.lgamma").count(),
-        1,
-        "the continuation must be emitted once, not once per bin:\n{mlir}"
+        0,
+        "the known observations' lgamma terms fold:\n{mlir}"
     );
-}
-
-// A LITERAL variate must reach the same guarded formula as an ABI one: the
-// emitted module carries the variate constant, the `GE 0` guard, the guarded
-// `select` feeding the formula, and the `-inf` branch — at every one of the
-// three cases §09 distinguishes.
-//
-// This is the regression a value gate cannot see. An emitter that special-cased
-// a literal would be free to fold `x = 3.0` onto a `Poisson` integer path (same
-// number, wrong measure, and then wrong at `x = 3.7`) or fold `x = -0.5`
-// straight to a bare `-inf` constant, dropping the guarded evaluation that keeps
-// the reverse-mode gradient `nan`-free. Both would still match every frozen
-// value. The executed numbers for these points are in the header table and
-// gated by `corpora/stablehlo/continued_poisson`.
-#[test]
-fn a_literal_variate_reaches_the_same_guarded_formula_at_each_support_case() {
-    // (variate literal, the constant it must emit) — in support at an integer,
-    // in support at a NON-integer, and below the support.
-    for (variate, constant) in [
-        ("3.0", "dense<3.0>"),
-        ("3.7", "dense<3.7>"),
-        ("-0.5", "dense<-0.5>"),
-    ] {
-        let src = format!(
-            "hep = standard_module(\"particle-physics\", \"0.1\")\n\
-             d = elementof(reals)\n\
-             aux = functionof(hep.ContinuedPoisson(rate = 4.5))\n\
-             aux_lik = likelihoodof(aux, {variate})\n\
-             lp = logdensityof(aux_lik, record(d = d))\n\
-             inputs = (d)\n\
-             outputs = (lp)"
-        );
-        let mlir = emit(&src);
-        assert!(
-            mlir.contains(constant),
-            "the variate literal {variate} must reach the module as {constant}:\n{mlir}"
-        );
-        assert!(
-            mlir.contains("compare GE"),
-            "{variate}: the support guard must survive a literal variate — a \
-             folded-away guard is how a below-zero variate starts scoring a \
-             finite number:\n{mlir}"
-        );
-        assert_eq!(
-            mlir.matches("chlo.lgamma").count(),
-            1,
-            "{variate}: the gamma continuation must survive a literal variate — \
-             an integer literal must NOT reach a `Poisson` factorial path:\n{mlir}"
-        );
-        assert!(
-            mlir.contains("dense<0x7F800000>") && mlir.contains("stablehlo.negate"),
-            "{variate}: the `-inf` off-support branch must be emitted at every \
-             literal, including one below zero — folding it to a bare constant \
-             would drop the guarded evaluation `mask_support` exists for:\n{mlir}"
-        );
-    }
 }

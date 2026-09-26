@@ -592,11 +592,19 @@ fn emitter_lgamma_emits_function_type_form() {
 fn emitter_compare_and_select_type_check() {
     let m = Module::new();
     let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.scalar(1.0);
+    let a = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
+    };
     let b = e.scalar(2.0);
     let pred = e.compare("LT", &a, &b);
     let picked = e.select(&pred, &a, &b);
-    let out = e.finish("f", &[], &[&picked]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &[&picked],
+    );
 
     assert!(out.contains("stablehlo.compare LT"));
     assert!(out.contains("tensor<i1>"));
@@ -1023,21 +1031,8 @@ fn sum_over_int_array_reduces_with_int_init_and_result() {
     );
 }
 
-/// Fix-up regression (post-A2 review): an all-integer `in(k, posreals)` must
-/// still emit a well-typed `stablehlo.compare`. `k` stays `Int` (a literal),
-/// but `elem_membership`'s own `zero` constant is unconditionally `Real`
-/// (`Emitter::constant(0.0, ...)`) — so `Emitter::compare` must reconcile the
-/// mismatched pair (widening `Int` up to `Real`, per `elem_rank`'s order)
-/// rather than emitting `stablehlo.compare` over a declared-mismatched
-/// `(tensor<i32>, tensor<f32>)` operand pair. Every operand is a plain
-/// `Lit(Int)` (not a free/bound arg), so this needs no determinizer pass and
-/// cannot be const-folded (this test calls `Emitter::lower_node` directly,
-/// never `flatppl_determinizer::determinize`).
-///
-/// Moved here from `interval(0, 10)` (`elem_membership`'s boundary-NaN fix):
-/// the split-compare interval lowering no longer builds a `zero` constant at
-/// all, so it no longer exercises this reconciliation; `posreals`/
-/// `nonnegreals` still do and are the same `in(...)` predicate family.
+/// An integer input compared with membership's real zero must widen to Real.
+/// A runtime binding keeps the type reconciliation visible after folding.
 #[test]
 fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
     let mut m = Module::new();
@@ -1046,10 +1041,22 @@ fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
     let cond = call(&mut m, "in", &[k, set]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        k,
+        Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        },
+    );
     let result = e.lower_node(cond).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Bool);
-    let out = e.finish("f", &[], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&result],
+    );
     assert!(is_delimiter_balanced(&out));
 
     let compare_line = out
@@ -1076,7 +1083,7 @@ fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
 /// matches the emitted `i32` `stablehlo.select` — `Emitter::select` used to
 /// hardcode its result `elem: Real` regardless of the branches' actual kind.
 /// Reuses the all-`Int` `in(...)` predicate above as `ifelse`'s condition, so
-/// this also exercises `lower_ifelse`/`require_predicate_head` end to end
+/// this also exercises `lower_ifelse`/`lower_predicate` end to end
 /// over an all-integer expression.
 #[test]
 fn int_ifelse_select_returns_int_tagged_value() {
@@ -1121,10 +1128,18 @@ fn compare_adds_signed_compare_type_for_int_operands_only() {
     let m = Module::new();
 
     let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.int_value_const(3);
+    let a = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Scalar,
+        elem: ElemKind::Int,
+    };
     let b = e.int_value_const(5);
     let cmp = e.compare("LT", &a, &b);
-    let out = e.finish("f", &[], &[&cmp]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&cmp],
+    );
     let line = out
         .lines()
         .find(|l| l.contains("stablehlo.compare"))
@@ -1135,10 +1150,18 @@ fn compare_adds_signed_compare_type_for_int_operands_only() {
     );
 
     let mut e2 = Emitter::new(&m, Dtype::F32);
-    let x = e2.scalar(1.0);
+    let x = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
+    };
     let y = e2.scalar(2.0);
     let cmp2 = e2.compare("LT", &x, &y);
-    let out2 = e2.finish("f", &[], &[&cmp2]);
+    let out2 = e2.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Real)],
+        &[&cmp2],
+    );
     let line2 = out2
         .lines()
         .find(|l| l.contains("stablehlo.compare"))
@@ -1489,14 +1512,11 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
     assert!(is_delimiter_balanced(&out));
 }
 
-/// `ifelse(true, a, b)` — a bare bool-literal condition, not an `in`/
-/// `compare` predicate — must refuse rather than let `select` render an
-/// ill-typed `i1` predicate operand against a `Lit(Bool)`'s actual
-/// `tensor<f32>` lowering.
+/// A numeric condition must not masquerade as an i1 predicate.
 #[test]
 fn lower_ifelse_refuses_non_predicate_condition() {
     let mut m = Module::new();
-    let cond = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let cond = real(&mut m, 1.0);
     let a = real(&mut m, 1.0);
     let b = real(&mut m, 2.0);
     let node = call(&mut m, "ifelse", &[cond, a, b]);
@@ -1909,16 +1929,14 @@ fn lower_land_ands_two_predicates() {
     assert!(is_delimiter_balanced(&out));
 }
 
-/// A `land` operand that is not a predicate-producing head refuses: a bare
-/// `Lit(Bool)` lowers as a float `constant`, which would make
-/// `stablehlo.and`'s declared `i1` type disagree with its operand.
+/// Logical operands must lower to i1, without numeric truth-value coercion.
 #[test]
 fn lower_land_refuses_a_non_predicate_operand() {
     let mut m = Module::new();
     let v = local_ref(&mut m, "v");
     let set = const_node(&mut m, "posreals");
     let image = call(&mut m, "in", &[v, set]);
-    let lit = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let lit = real(&mut m, 1.0);
     let node = call(&mut m, "land", &[image, lit]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
@@ -3751,40 +3769,36 @@ fn emit_logdensity_exponential_has_expected_structure() {
     assert_eq!(
         out.matches("stablehlo.log").count(),
         1,
-        "expected exactly one log, in:\n{out}"
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         1,
-        "expected exactly one multiply, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates (1 formula + 1 off-support -inf)"
+        1,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         1,
-        "expected exactly one add, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
     assert!(
         !out.contains("chlo."),
         "Exponential needs no CHLO ops, in:\n{out}"
     );
-    // Constrained support (§08 support `nonnegreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -3831,47 +3845,43 @@ fn emit_logdensity_gamma_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
-        2,
-        "expected exactly two logs, in:\n{out}"
+        1,
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("chlo.lgamma").count(),
         1,
-        "expected exactly one lgamma, in:\n{out}"
+        "folded chlo.lgamma count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates (2 formula + 1 off-support -inf)"
+        2,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
         1,
-        "expected exactly one subtract, in:\n{out}"
+        "folded stablehlo.subtract count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         3,
-        "expected exactly three multiplies, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         3,
-        "expected exactly three adds, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
-    // Constrained support (§08 support `posreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -3919,55 +3929,51 @@ fn emit_logdensity_weibull_has_expected_structure() {
     assert_eq!(
         out.matches("stablehlo.log").count(),
         3,
-        "expected exactly three logs, in:\n{out}"
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates (2 formula + 1 off-support -inf)"
+        2,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
         1,
-        "expected exactly one divide, in:\n{out}"
+        "folded stablehlo.divide count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
         1,
-        "expected exactly one subtract, in:\n{out}"
+        "folded stablehlo.subtract count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         1,
-        "expected exactly one multiply, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.power").count(),
         1,
-        "expected exactly one power, in:\n{out}"
+        "folded stablehlo.power count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         3,
-        "expected exactly three adds, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
     assert!(
         !out.contains("chlo."),
         "Weibull needs no CHLO ops, in:\n{out}"
     );
-    // Constrained support (§08 support `nonnegreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -4096,47 +4102,43 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
-        2,
-        "expected exactly two logs, in:\n{out}"
+        1,
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("chlo.lgamma").count(),
         1,
-        "expected exactly one lgamma, in:\n{out}"
+        "folded chlo.lgamma count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        4,
-        "expected exactly four negates (3 formula + 1 off-support -inf)"
+        3,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
         1,
-        "expected exactly one divide, in:\n{out}"
+        "folded stablehlo.divide count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         2,
-        "expected exactly two multiplies, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         4,
-        "expected exactly four adds, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
-    // Constrained support (§08 support `posreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -4185,52 +4187,48 @@ fn emit_logdensity_chi_squared_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
-        1,
-        "expected exactly one log, in:\n{out}"
+        0,
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("chlo.lgamma").count(),
         1,
-        "expected exactly one lgamma, in:\n{out}"
+        "folded chlo.lgamma count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        4,
-        "expected exactly four negates (3 formula + 1 off-support -inf)"
+        2,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
         1,
-        "expected exactly one subtract, in:\n{out}"
+        "folded stablehlo.subtract count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
-        1,
-        "expected exactly one divide, in:\n{out}"
+        0,
+        "folded stablehlo.divide count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         3,
-        "expected exactly three multiplies, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         3,
-        "expected exactly three adds, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
-    // Constrained support (§08 support `posreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -4279,51 +4277,47 @@ fn emit_logdensity_lognormal_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
-        2,
-        "expected exactly two logs, in:\n{out}"
+        1,
+        "folded stablehlo.log count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates (2 formula + 1 off-support -inf)"
+        1,
+        "folded stablehlo.negate count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
         1,
-        "expected exactly one subtract, in:\n{out}"
+        "folded stablehlo.subtract count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
         1,
-        "expected exactly one divide, in:\n{out}"
+        "folded stablehlo.divide count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
         2,
-        "expected exactly two multiplies, in:\n{out}"
+        "folded stablehlo.multiply count, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         3,
-        "expected exactly three adds, in:\n{out}"
+        "folded stablehlo.add count, in:\n{out}"
     );
     assert!(
         !out.contains("chlo."),
         "LogNormal needs no CHLO ops, in:\n{out}"
     );
-    // Constrained support (§08 support `posreals`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // The known in-support observation removes the runtime support mask.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        0,
+        "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -4423,15 +4417,10 @@ fn emit_logdensity_uniform_has_expected_structure() {
         out.contains("dense<-1.3862943611198906>"),
         "expected the folded -log(4.0) literal, in:\n{out}"
     );
-    for op in [
-        "compare GE",
-        "compare LE",
-        "stablehlo.and",
-        "stablehlo.select",
-    ] {
+    for op in ["dense<true>", "stablehlo.and", "stablehlo.select"] {
         assert!(
             out.contains(op),
-            "expected the closed-interval support mask to emit `{op}`, in:\n{out}"
+            "expected the folded closed-interval support mask to emit `{op}`, in:\n{out}"
         );
     }
     assert!(is_delimiter_balanced(&out));

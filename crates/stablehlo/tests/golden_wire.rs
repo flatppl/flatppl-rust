@@ -408,20 +408,23 @@ fn a_boolean_output_is_typed_i1_end_to_end() {
     }
 }
 
-/// The connectives keep `land`'s narrow operand rule: the operand must be a
-/// boolean-producing CALL node, so a `Bool`-typed ABI input still refuses. That
-/// gap (a boolean VALUE gating a conditional) is deliberately left open and
-/// documented rather than half-closed here — see
-/// `flatppl-dev/stablehlo-feature-matrix.md`'s prioritized gap 6.
+/// Boolean inputs and literals need no predicate-producing call wrapper.
 #[test]
-fn a_boolean_value_still_cannot_gate_a_connective() {
-    let src = "p = elementof(booleans)\nq = elementof(booleans)\ny = lor(p, q)\n\
-               inputs = (p, q)\noutputs = (y)\n";
-    let msg = emit_err(src);
-    assert!(
-        msg.contains("lor operand must be a boolean predicate"),
-        "unexpected message: {msg}"
-    );
+fn boolean_values_gate_connectives() {
+    for expr in [
+        "lor(p, q)",
+        "land(p, true)",
+        "lxor(p, q)",
+        "lnot(p)",
+        "ifelse(p, q, false)",
+    ] {
+        let src = format!(
+            "p = elementof(booleans)\nq = elementof(booleans)\ny = {expr}\n\
+                           inputs = (p, q)\noutputs = (y)\n"
+        );
+        let out = emit(&src);
+        assert!(out.contains("-> tensor<i1>"), "{expr}:\n{out}");
+    }
 }
 
 /// The newly wired boolean heads are recognized as `ifelse` conditions and as

@@ -198,6 +198,74 @@ impl Emitter<'_> {
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
+
+    pub(super) fn fold_compare(&mut self, dir: &str, a: &Value, b: &Value) -> Option<Value> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let aa = self.constants.get(&a.ssa)?;
+        let bb = self.constants.get(&b.ssa)?;
+        let n = aa.len().max(bb.len());
+        if aa.is_empty()
+            || bb.is_empty()
+            || (aa.len() != 1 && aa.len() != n)
+            || (bb.len() != 1 && bb.len() != n)
+        {
+            return None;
+        }
+        let values = (0..n)
+            .map(|i| {
+                let order = match (&aa[i % aa.len()], &bb[i % bb.len()]) {
+                    (Scalar::Real(x), Scalar::Real(y)) => x.partial_cmp(y)?,
+                    (Scalar::Int(x), Scalar::Int(y)) => x.cmp(y),
+                    (Scalar::Bool(x), Scalar::Bool(y)) => x.cmp(y),
+                    _ => return None,
+                };
+                Some(Scalar::Bool(match dir {
+                    "EQ" => order == Equal,
+                    "NE" => order != Equal,
+                    "LT" => order == Less,
+                    "LE" => order != Greater,
+                    "GT" => order == Greater,
+                    "GE" => order != Less,
+                    _ => return None,
+                }))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.folded_constant(values, a.ty.clone(), self.axes_of(a))
+    }
+
+    pub(super) fn fold_select(&mut self, c: &Value, a: &Value, b: &Value) -> Option<Value> {
+        if c.ty != MlirTy::Scalar && c.ty != a.ty {
+            return None;
+        }
+        let cc = self.constants.get(&c.ssa)?;
+        let Scalar::Bool(first) = cc.first()? else {
+            return None;
+        };
+        if cc
+            .iter()
+            .all(|v| matches!(v, Scalar::Bool(v) if v == first))
+        {
+            return Some(if *first { a.clone() } else { b.clone() });
+        }
+        let aa = self.constants.get(&a.ssa)?;
+        let bb = self.constants.get(&b.ssa)?;
+        let n = cc.len().max(aa.len()).max(bb.len());
+        if [cc.len(), aa.len(), bb.len()]
+            .iter()
+            .any(|&len| len != 1 && len != n)
+        {
+            return None;
+        }
+        let values = (0..n)
+            .map(|i| match cc[i % cc.len()] {
+                Scalar::Bool(true) => Some(aa[i % aa.len()].clone()),
+                Scalar::Bool(false) => Some(bb[i % bb.len()].clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.folded_constant(values, a.ty.clone(), self.axes_of(a))
+    }
 }
 
 fn element_count(ty: &MlirTy) -> Option<usize> {

@@ -1518,12 +1518,11 @@ fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
-    require_predicate_head(e, c, "ifelse condition")?;
+    let c = lower_predicate(e, c, "ifelse condition")?;
     // The two BRANCHES must share an orientation: selecting between a row and a
     // column is not defined, and neither the `broadcast_pair` below nor
     // `Emitter::select` can see the difference (both are `tensor<nxf32>`).
     require_same_orientation(e, id, a, b)?;
-    let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     // `Emitter::select` broadcasts the two BRANCHES against each other through
@@ -1630,46 +1629,6 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
         })
         .collect()
 }
-
-/// The predicate-producing builtin heads this map lowers to an `i1` value.
-/// [`Emitter::select`] and [`Emitter::and`] unconditionally render their
-/// predicate operands as `i1`, so handing either any other node (e.g. a bare
-/// `Lit(Bool)`, which lowers as a plain `tensor<f32>` `dense<1.0>` via
-/// `constant`) would make the declared `i1` operand disagree with the actual
-/// emitted type, producing ill-typed StableHLO.
-/// The heads whose CALL NODE this map recognizes as a boolean predicate — the
-/// operand vocabulary of `ifelse`'s condition and of §07's logical connectives.
-///
-/// Every entry lowers to an `i1`-typed [`Value`], so the list is exactly "the
-/// boolean-producing heads this map lowers" — §07's boolean reductions `lany`/`lall`
-/// included, since each lowers to a scalar `tensor<i1>` and is the most natural thing
-/// to condition an `ifelse` on. It does NOT admit a `Bool`-typed VALUE (a bound
-/// boolean, a boolean ABI input), which stays refused as a separate gap
-/// (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
-const PREDICATE_HEADS: &[&str] = &[
-    "in", "compare", "lt", "gt", "le", "ge", "land", "lor", "lxor", "lnot", "iszero", "equal",
-    "unequal", "isfinite", "isinf", "isnan", "lany", "lall",
-];
-
-/// The [`PREDICATE_HEADS`] entries that do NOT lower elementwise, so `broadcast(P, …)`
-/// over them is not a predicate. §07's boolean reductions consume an array and produce
-/// ONE scalar `i1`, so a broadcast of one is not an elementwise lift of anything.
-///
-/// This gate now runs AHEAD of a second one that refuses the same two heads outright:
-/// `lany`/`lall` are [`flatppl_infer::collection_domain_head`] entries, so
-/// [`Emitter::lower_broadcast`] refuses them under a broadcast along with the rest of
-/// the §07 collection-domain family. Keeping the carve-out here is not redundant — it
-/// refuses STRUCTURALLY, before `lower_node` runs on the condition, and it is what makes
-/// the `ifelse` message name the bare spelling that works. Without it the exclusion
-/// would have to be re-derived from the lowering error.
-///
-/// The two gates were written in the opposite order. This one landed first, when
-/// `lower_builtin` still DISCARDED the `broadcast` wrapper — `lany.(b)` emitted exactly
-/// the bare `lany(b)` reduce while `infer` typed it `%deferred` with no diagnostic, and
-/// the wider family (`sum.(v)`, `mean.(v)`, `maximum.(v)`) answered with the undotted
-/// reduction's NUMBER at exit 0. Excluding two heads from one gate did not close that,
-/// and was not meant to; `lower_broadcast` and `infer`'s domain refusal close it.
-const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
 
 /// Every §07 head whose Domains cell is a COLLECTION — arrays, vectors, matrices or
 /// tables, never a scalar — with the §07 table it lives in and that cell as §07 writes
@@ -1833,58 +1792,16 @@ pub(crate) fn collection_domain_remedy(name: &str) -> String {
     }
 }
 
-/// An `ifelse` condition / `land` operand must be one of
-/// [`PREDICATE_HEADS`], bare or under a `broadcast`. Same narrow-and-refuse
-/// discipline as `get`/`get0`'s literal-selector check: checked structurally
-/// against the *unlowered* node, before `lower_node` ever runs on it.
-///
-/// `broadcast(P, …)` / the dotted spelling counts whenever `P` is an ELEMENTWISE
-/// entry, because that is the ONLY route §07 gives an elementwise comparison:
-/// `infer` refuses a bare `lt(v, w)` over arrays (`ops::refuse_nonscalar_operand`),
-/// so an ARRAY-shaped predicate can now only arrive dotted. It lowers to an `i1`
-/// tensor of the operand's shape — `v1 .< v2` over two `[3]` operands emits
-/// `stablehlo.compare LT … -> tensor<3xi1>` — which is exactly the property this
-/// gate selects for. [`NON_ELEMENTWISE_PREDICATE_HEADS`] is excluded from that arm.
-fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), EmitError> {
-    let head_name = |id: NodeId| match e.node(id) {
-        Node::Call(c) => match c.head {
-            CallHead::Builtin(sym) => Some((e.resolve(sym).to_string(), c.args.to_vec())),
-            _ => None,
-        },
-        _ => None,
-    };
-    let is_predicate = match head_name(cond) {
-        Some((name, args)) if name == "broadcast" || name == "broadcasted" => {
-            args.first().is_some_and(|h| match e.node(*h) {
-                Node::Const(sym) => {
-                    let h = e.resolve(*sym);
-                    PREDICATE_HEADS.contains(&h) && !NON_ELEMENTWISE_PREDICATE_HEADS.contains(&h)
-                }
-                _ => false,
-            })
-        }
-        Some((name, _)) => PREDICATE_HEADS.contains(&name.as_str()),
-        None => false,
-    };
-    if is_predicate {
-        Ok(())
+/// Predicates include literals, bindings, inputs and lowered Boolean calls.
+/// Check the emitted kind so synthesized nodes need no inferred type or head whitelist.
+fn lower_predicate(e: &mut Emitter, cond: NodeId, what: &str) -> Result<Value, EmitError> {
+    let value = e.lower_node(cond)?;
+    if value.elem == ElemKind::Bool {
+        Ok(value)
     } else {
-        // The two clauses must stay separate: naming a boolean reduction as
-        // admissible "under a broadcast" would send the reader back into this
-        // very refusal, since the broadcast spelling is what it rejects.
-        let elementwise: Vec<&str> = PREDICATE_HEADS
-            .iter()
-            .copied()
-            .filter(|h| !NON_ELEMENTWISE_PREDICATE_HEADS.contains(h))
-            .collect();
         Err(EmitError::at(
             cond,
-            format!(
-                "{what} must be a boolean predicate ({}), bare or under a broadcast, or \
-                 ({}) bare only",
-                elementwise.join("/"),
-                NON_ELEMENTWISE_PREDICATE_HEADS.join("/")
-            ),
+            format!("{what} must be a boolean predicate, got {:?}", value.elem),
         ))
     }
 }
@@ -1969,16 +1886,9 @@ enum Connective {
 /// §07 `land`/`lor`/`lxor` (`a && b`, `a || b`, exclusive or, all over
 /// `booleans`) — one `stablehlo.and`/`or`/`xor` over two `i1` predicates.
 ///
-/// Both operands must be [`PREDICATE_HEADS`] calls, and must share a shape:
+/// Both operands must lower to Boolean values and share a shape:
 /// [`Emitter::and`] and its siblings render ONE type for both operands and the
 /// result, so a mismatched pair would emit ill-typed text.
-///
-/// The [`PREDICATE_HEADS`] requirement is NOT "must be boolean" — a `Bool`-typed
-/// bound value or ABI input renders `i1` too and would emit fine. It is the
-/// deliberately narrow same-shape gate `ifelse` uses, kept identical here so the
-/// boolean-VALUE gap is one documented refusal rather than half-closed in two
-/// inconsistent places (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized
-/// gap 6).
 fn lower_land(
     e: &mut Emitter,
     id: NodeId,
@@ -1991,10 +1901,8 @@ fn lower_land(
         Connective::Xor => "lxor",
     };
     let [a_id, b_id] = args_exact(id, args)?;
-    require_predicate_head(e, a_id, &format!("{name} operand"))?;
-    require_predicate_head(e, b_id, &format!("{name} operand"))?;
-    let a = e.lower_node(a_id)?;
-    let b = e.lower_node(b_id)?;
+    let a = lower_predicate(e, a_id, &format!("{name} operand"))?;
+    let b = lower_predicate(e, b_id, &format!("{name} operand"))?;
     if e.cell_ty(&a) != e.cell_ty(&b) {
         return Err(EmitError::at(
             id,
@@ -2011,12 +1919,10 @@ fn lower_land(
     })
 }
 
-/// §07 `lnot` (`!a`, over `booleans`) — one `stablehlo.not`. Same
-/// [`PREDICATE_HEADS`] operand rule as [`lower_land`], for the same reason.
+/// §07 `lnot` (`!a`, over `booleans`) — one `stablehlo.not` over a Boolean value.
 fn lower_lnot(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a_id] = args_exact(id, args)?;
-    require_predicate_head(e, a_id, "lnot operand")?;
-    let a = e.lower_node(a_id)?;
+    let a = lower_predicate(e, a_id, "lnot operand")?;
     Ok(e.not(&a))
 }
 
@@ -2690,7 +2596,7 @@ fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
         }
         let set = classify_elem_set(e, id, elem_id)?;
         let per_cell = elem_membership(e, id, &v, set)?;
-        return Ok(e.reduce_all(&per_cell));
+        return Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell));
     }
 
     let set = classify_elem_set(e, id, set_id)?;
