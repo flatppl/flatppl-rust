@@ -299,11 +299,11 @@ impl Emitter<'_> {
     pub(super) fn enter_broadcast(
         &mut self,
         id: NodeId,
-        values: &mut [(Symbol, Value)],
+        values: &mut [Value],
     ) -> Result<Vec<Option<u64>>, EmitError> {
         let parent = self.broadcast_frame.len();
         let mut outer: Option<Vec<Option<u64>>> = None;
-        for (_, v) in values.iter() {
+        for v in values.iter() {
             let axes = self.axes_of(v);
             let Some(&rank) = axes.layers.first() else {
                 continue;
@@ -326,7 +326,7 @@ impl Emitter<'_> {
         }
         let mut frame = self.broadcast_frame.clone();
         frame.extend(outer.unwrap_or_default());
-        for (_, v) in values.iter_mut() {
+        for v in values.iter_mut() {
             let mut axes = self.axes_of(v);
             if axes.layers.is_empty() {
                 continue;
@@ -359,6 +359,31 @@ impl Emitter<'_> {
             *v = self.expand_axes(v, &map, tensor(dims), axes);
         }
         Ok(std::mem::replace(&mut self.broadcast_frame, frame))
+    }
+
+    /// A collection reduction consumes one outer layer and reduces only the
+    /// remaining cell axes. Restore the input's memo entry for other callers.
+    pub(super) fn lower_broadcast_reduction(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        args: &[NodeId],
+    ) -> Result<Value, EmitError> {
+        let [arg] = crate::ops::args_exact(id, args)?;
+        let value = self.lower_node(arg)?;
+        let mut values = [self.typed_axes(arg, value)];
+        let parent = self.enter_broadcast(id, &mut values)?;
+        let saved = self
+            .memo
+            .insert(arg, values[0].clone())
+            .expect("the argument was lowered before entering the map");
+        let result = crate::ops::lower_builtin(self, id, name, args).map(|value| {
+            let frame = self.broadcast_frame.clone();
+            self.finish_broadcast(&value, &frame, parent.len())
+        });
+        self.memo.insert(arg, saved);
+        self.broadcast_frame = parent;
+        result
     }
 
     pub(super) fn vector_batched(&mut self, elems: &[Value]) -> Value {

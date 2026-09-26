@@ -3359,24 +3359,21 @@ impl<'m> Emitter<'m> {
             // `registry::lower_logdensityof_batched`'s call: the guard belongs
             // with the distribution knowledge, not here.
             crate::registry::lower_logdensityof_batched(self, id, rest)
+        } else if matches!(
+            fname.as_str(),
+            "sum" | "prod" | "mean" | "var" | "std" | "maximum" | "minimum" | "lany" | "lall"
+        ) {
+            self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
-            // A §07 collection-domain head under a broadcast. `lower_builtin` would
-            // lower it as the head's WHOLE-ARRAY form, silently discarding the
-            // `broadcast` wrapper — `sum.(v)` emitted the undotted `sum(v)`'s reduce
-            // and answered with a number at exit 0. Refuse instead.
-            //
-            // Both legal readings are out of reach here, so this is a refusal and not a
-            // gap to be filled later: over scalar elements the call is ill-typed (§07
-            // denies the head a scalar, and `flatppl_infer` now refuses it statically),
-            // and over §03's nested array the operand is a vector of vectors, which has
-            // no tensor form in this emitter at all.
+            // Other collection handlers do not yet separate batch and cell
+            // axes. Dropping the broadcast wrapper would reduce the whole
+            // collection or scan along the wrong axis.
             Err(EmitError::at(
                 id,
                 format!(
                     "`{fname}` under a broadcast has no tensor form: §04 \"Broadcasting\" \
                      applies it to each ELEMENT, while §07 \"{section}\" gives `{fname}` the \
-                     domain \"{domain}\" — so the elements must themselves be arrays, and a \
-                     nested array is not a tensor. Emitting it as the whole-array \
+                     domain \"{domain}\". Emitting it as the whole-array \
                      `{fname}` would answer a different question. {}",
                     crate::ops::collection_domain_remedy(&fname)
                 ),
@@ -3497,7 +3494,7 @@ impl<'m> Emitter<'m> {
         // `%local` placeholder name (`entry.1.name`), lowering the argument now
         // (it lives outside the body subtree — the caller's own expression).
         let mut local_values = Vec::with_capacity(entries.len());
-        for (i, (param, placeholder)) in entries.iter().enumerate() {
+        for (i, (param, _)) in entries.iter().enumerate() {
             let arg = kwargs
                 .iter()
                 .find(|(k, _)| k == param)
@@ -3514,10 +3511,14 @@ impl<'m> Emitter<'m> {
                 })?;
             let value = self.lower_node(arg)?;
             let value = self.typed_axes(arg, value);
-            local_values.push((placeholder.name, value));
+            local_values.push(value);
         }
         let parent_frame = self.enter_broadcast(id, &mut local_values)?;
-        let local_values: HashMap<_, _> = local_values.into_iter().collect();
+        let local_values: HashMap<_, _> = entries
+            .iter()
+            .zip(local_values)
+            .map(|((_, placeholder), value)| (placeholder.name, value))
+            .collect();
 
         // Collect the body subtree's `NodeId`s (the walk stops at ref/lit leaves
         // — `for_each_child` yields nothing for a non-`Call`, so a `SelfMod` ref
