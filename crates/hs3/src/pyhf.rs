@@ -848,6 +848,24 @@ pub fn assemble_channel(
     let multipliers = terms
         .normsys_factors
         .multipliers(b, channel_name, multipliers);
+    let runs = samples
+        .iter()
+        .zip(&multipliers)
+        .flat_map(|((_, _, modifiers), factors)| {
+            let kinds = modifiers.iter().filter_map(|modifier| {
+                mod_spec(&modifier.kind).filter(|spec| !spec.replaces_nominal)
+            });
+            let mut runs = vec![Vec::new()];
+            for (&factor, spec) in factors.iter().zip(kinds) {
+                if spec.param_domain == ParamDomain::PosRealsPow {
+                    runs.push(Vec::new());
+                } else {
+                    runs.last_mut().unwrap().push(factor);
+                }
+            }
+            runs
+        });
+    let products = crate::normsys::products(b, channel_name, runs);
     for ((sname, _, modifiers), (nom, factors)) in
         samples.iter().zip(shifted.into_iter().zip(multipliers))
     {
@@ -858,7 +876,7 @@ pub fn assemble_channel(
             .filter_map(|modifier| mod_spec(&modifier.kind).filter(|spec| !spec.replaces_nominal));
         for (factor, spec) in factors.into_iter().zip(kinds) {
             if spec.param_domain == ParamDomain::PosRealsPow {
-                acc = multiply_scalar_factors(b, acc, &scalars);
+                acc = multiply_scalar_factors(b, acc, &scalars, &products);
                 scalars.clear();
                 let mul = b.call_head("mul");
                 acc = b.call("broadcast", &[mul, acc, factor]);
@@ -866,7 +884,7 @@ pub fn assemble_channel(
                 scalars.push(factor);
             }
         }
-        acc = multiply_scalar_factors(b, acc, &scalars);
+        acc = multiply_scalar_factors(b, acc, &scalars, &products);
 
         let exp_name = b.bind_unique_doc(
             &format!("{channel_name}_{sname}_expected"),
@@ -976,17 +994,27 @@ pub fn assemble_channel(
 
 /// Retain a consecutive scalar factor axis instead of a deep multiply chain.
 /// Vector modifiers stay outside the reduction and preserve their positions.
-fn multiply_scalar_factors(b: &mut Builder, values: NodeId, factors: &[NodeId]) -> NodeId {
+fn multiply_scalar_factors(
+    b: &mut Builder,
+    values: NodeId,
+    factors: &[NodeId],
+    products: &BTreeMap<Vec<NodeId>, NodeId>,
+) -> NodeId {
     // Short products cost less as fused pointwise operations than as a gathered
     // tensor plus reduction. Keep their original multiplication order.
-    if factors.len() < 96 {
-        return factors.iter().fold(values, |acc, factor| {
-            let mul = b.call_head("mul");
-            b.call("broadcast", &[mul, acc, *factor])
-        });
-    }
-    let factors = b.array(factors);
-    let factor = b.call("prod", &[factors]);
+    let factor = match products.get(factors) {
+        Some(&product) => product,
+        None if factors.len() < crate::normsys::PRODUCT_THRESHOLD => {
+            return factors.iter().fold(values, |acc, factor| {
+                let mul = b.call_head("mul");
+                b.call("broadcast", &[mul, acc, *factor])
+            });
+        }
+        None => {
+            let factors = b.array(factors);
+            b.call("prod", &[factors])
+        }
+    };
     let mul = b.call_head("mul");
     b.call("broadcast", &[mul, values, factor])
 }
