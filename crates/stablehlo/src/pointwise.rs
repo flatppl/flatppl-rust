@@ -98,10 +98,9 @@ impl Emitter<'_> {
         }
         let mut expand = |v: &Value| self.expand_axes(v, dims, ty.clone(), axes.clone());
         let out = match op {
-            Pointwise::Unary(op, a) => {
-                let a = expand(&a);
-                self.unary(&op, &a)
-            }
+            // Compute parameter-only functions once per point, then broadcast
+            // their values instead of repeating them along every cell axis.
+            Pointwise::Unary(..) => return None,
             Pointwise::Binary(op, a, b) => {
                 let a = expand(&a);
                 let b = expand(&b);
