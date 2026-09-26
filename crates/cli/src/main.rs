@@ -841,8 +841,9 @@ fn determinize_cmd(
     } else {
         Some(syms.as_slice())
     };
-    let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
+    let mut lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    flatppl_determinizer::prepare_serialization(&mut lowered, roots);
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
         EmitForm::Flatpir => flatppl_flatpir::try_write(&lowered)

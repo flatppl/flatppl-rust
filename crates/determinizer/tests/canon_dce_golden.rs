@@ -8,6 +8,31 @@ fn determinize_roots(src: &str, roots: &[&str]) -> flatppl_core::Module {
     determinize_with_roots(&m, &ModuleBundle::new(), Some(&syms)).expect("must lower")
 }
 
+#[test]
+fn shared_cell_arrays_remain_shared_after_serialization() {
+    for count in [1, 4] {
+        let source = format!(
+            "x = elementof(reals)\n\
+             rates = exp.([x, x + 1.0, x + 2.0])\n\
+             L = likelihoodof(Normal(sum(rates) + sum(rates .* rates), 1.0), 0.2)\n\
+             score(t) = logdensityof(L, record(x = t))\n\
+             points = elementof(cartpow(reals, {count}))\n\
+             inputs = points\noutputs = score.(points)\n"
+        );
+        let mut lowered = determinize_roots(&source, &["inputs", "outputs"]);
+        let roots = [lowered.intern("inputs"), lowered.intern("outputs")];
+        flatppl_determinizer::prepare_serialization(&mut lowered, Some(&roots));
+        let text = flatppl_syntax::print(&lowered);
+        // The numeric array is reused inside a runtime-point scope. Printing
+        // the DAG must not duplicate that array at each use in the cell body.
+        assert_eq!(text.matches("exp.(").count(), 1, "{text}");
+        let mut parsed = flatppl_syntax::parse(&text).expect("serialized FlatPDL");
+        let diagnostics = flatppl_infer::infer(&mut parsed);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}\n{text}");
+        assert!(flatppl_determinizer::is_flatpdl(&parsed).is_ok());
+    }
+}
+
 // With a requested-output root, DCE removes bindings unreachable from it — the
 // dead measure-layer stubs and unreferenced value bindings vanish entirely
 // (not zeroed to 0.0). The root itself and its transitive deps survive. #263 Pass 4-A.
