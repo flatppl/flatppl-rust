@@ -890,28 +890,12 @@ impl<'m> Emitter<'m> {
         let b = self.convert(b, elem_target);
         let (a, b) = self.broadcast_pair(&a, &b);
         let batched = [c, &a, &b].iter().any(|v| self.batch_rank(v) != 0);
-        let (c, a, b) = if batched {
+        let (c, a, b) = if batched || c.ty != MlirTy::Scalar {
             let (c, a) = self.broadcast_pair(c, &a);
             let (b, _) = self.broadcast_pair(&b, &a);
             (c, a, b)
         } else {
             (c.clone(), a, b)
-        };
-        // Target the ranked shape among {pred, on_true, on_false}, if any —
-        // `a`/`b` already share a shape (just above); this second pass only
-        // does anything when that shared shape is `Scalar` but `c` is
-        // `Ranked` (`broadcast_scalar`'s no-op guard makes it a pure no-op
-        // otherwise, since `a`/`b` already equal any ranked shape it'd pick).
-        let shape_target = [&c.ty, &a.ty, &b.ty]
-            .into_iter()
-            .find(|t| matches!(t, MlirTy::Ranked(_)))
-            .cloned();
-        let (a, b) = match &shape_target {
-            Some(shape) => (
-                self.broadcast_scalar(&a, shape),
-                self.broadcast_scalar(&b, shape),
-            ),
-            None => (a, b),
         };
         if let Some(value) = self.fold_select(&c, &a, &b) {
             return value;

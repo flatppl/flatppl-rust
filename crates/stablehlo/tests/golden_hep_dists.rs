@@ -241,11 +241,7 @@ lp = logdensityof(aux_lik, record(x = x))
 inputs = (x)
 outputs = (lp)";
 
-// The constant log(rate) folds. The runtime lgamma(x + 1) and support mask remain.
-// §09's own formula reads the Poisson factorial as `Γ(x+1)`, which is the ONLY
-// difference from `poisson_logpdf` — so an emission that dropped the `lgamma`
-// for a `Poisson`-style integer path would score a non-integer variate wrongly
-// with no structural complaint.
+// Runtime counts choose the direct continuation or the stable large-count formula.
 #[test]
 fn continued_poisson_emits_a_lgamma_continuation_under_a_support_mask() {
     let mlir = emit(CONTINUED_POISSON_SRC);
@@ -256,8 +252,8 @@ fn continued_poisson_emits_a_lgamma_continuation_under_a_support_mask() {
     );
     assert_eq!(
         mlir.matches("stablehlo.log ").count(),
-        0,
-        "constant `log(rate)` folds:\n{mlir}"
+        4,
+        "guarded direct and large-count logarithms:\n{mlir}"
     );
     assert!(
         mlir.contains("compare GE") && mlir.contains("dense<0x7F800000>"),
