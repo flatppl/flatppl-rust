@@ -7,6 +7,8 @@ use flatppl_core::{Node, NodeId, Ref, RefNs, Symbol};
 use crate::builder::Builder;
 use crate::histfactory::Multiplier;
 
+pub(crate) const PRODUCT_THRESHOLD: usize = 96;
+
 #[derive(Clone, Copy)]
 pub(crate) struct Interpolation {
     pub function: &'static str,
@@ -107,4 +109,41 @@ impl Factors {
             })
             .collect()
     }
+}
+
+/// Reduce equal-length scalar runs together, retaining factor order and uses.
+/// Small or unpaired runs keep the caller's original multiplication chain.
+pub(crate) fn products(
+    b: &mut Builder,
+    channel: &str,
+    runs: impl IntoIterator<Item = Vec<NodeId>>,
+) -> BTreeMap<Vec<NodeId>, NodeId> {
+    let mut groups: BTreeMap<usize, BTreeSet<Vec<NodeId>>> = BTreeMap::new();
+    for run in runs
+        .into_iter()
+        .filter(|run| run.len() >= PRODUCT_THRESHOLD)
+    {
+        groups.entry(run.len()).or_default().insert(run);
+    }
+    let mut products = BTreeMap::new();
+    for (length, rows) in groups {
+        if rows.len() < 2 {
+            continue;
+        }
+        let arrays: Vec<_> = rows.iter().map(|row| b.array(row)).collect();
+        let arrays = b.array(&arrays);
+        let prod = b.call_head("prod");
+        let values = b.call("broadcast", &[prod, arrays]);
+        let name = b.bind_unique_doc(
+            &format!("{channel}_scalar_products_{length}"),
+            values,
+            "Products of equal-length scalar modifier runs.",
+        );
+        let values = b.self_ref(&name);
+        for (index, row) in rows.into_iter().enumerate() {
+            let index = b.lit_int(index as i64 + 1);
+            products.insert(row, b.call("get", &[values, index]));
+        }
+    }
+    products
 }
