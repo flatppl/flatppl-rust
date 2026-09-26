@@ -11,13 +11,13 @@ fn long_scalar_products_keep_per_bin_factors_separate() {
         serde_json::json!({"name": name, "data": [10.0, 20.0], "modifiers": modifiers})
     };
     let doc = serde_json::json!({
-        "channels": [{"name": "c", "samples": [sample("short", 63), sample("long", 64)]}],
+        "channels": [{"name": "c", "samples": [sample("short", 95), sample("long", 96)]}],
         "observations": [{"name": "c", "data": [20.0, 40.0]}],
         "measurements": [{"name": "m", "config": {"poi": "f0"}}]
     });
     let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
     let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
-    let factors = (0..64)
+    let factors = (0..96)
         .map(|i| format!("f{i}"))
         .collect::<Vec<_>>()
         .join(", ");

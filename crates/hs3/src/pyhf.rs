@@ -979,7 +979,7 @@ pub fn assemble_channel(
 fn multiply_scalar_factors(b: &mut Builder, values: NodeId, factors: &[NodeId]) -> NodeId {
     // Short products cost less as fused pointwise operations than as a gathered
     // tensor plus reduction. Keep their original multiplication order.
-    if factors.len() < 64 {
+    if factors.len() < 96 {
         return factors.iter().fold(values, |acc, factor| {
             let mul = b.call_head("mul");
             b.call("broadcast", &[mul, acc, *factor])
