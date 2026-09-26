@@ -819,6 +819,9 @@ impl<'m> Emitter<'m> {
         let a = self.convert(a, target);
         let b = self.convert(b, target);
         let (a, b) = self.broadcast_pair(&a, &b);
+        if let Some(value) = self.fold_compare(dir, &a, &b) {
+            return value;
+        }
         let lhs_ty = a.ty.render(self.dtype, a.elem);
         let rhs_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = render_i1(&a.ty);
@@ -910,6 +913,9 @@ impl<'m> Emitter<'m> {
             ),
             None => (a, b),
         };
+        if let Some(value) = self.fold_select(&c, &a, &b) {
+            return value;
+        }
         let pred_ty = render_i1(&c.ty);
         let ty_text = a.ty.render(self.dtype, a.elem);
         let ssa = self.pure_like(

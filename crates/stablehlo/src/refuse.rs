@@ -240,21 +240,10 @@
 //!   (`abs(lt(x, 1.0))` fails identically at base) — pre-existing, carded
 //!   separately; widening `Emitter::abs` to convert a `Bool` operand up would
 //!   close both corners and retire this guard.
-//! - `land`/`lor`/`lxor`/`lnot` whose operand is not a boolean-producing call —
-//!   "<head> operand must be a boolean predicate (in/compare/lt/gt/le/ge/land/
-//!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan), bare or under a
-//!   broadcast, or (lany/lall) bare only". Shared with `ifelse`'s condition check
-//!   (`ops::require_predicate_head` over `ops::PREDICATE_HEADS`). Deliberately NOT
-//!   widened to any `Bool`-typed VALUE, though one renders `i1` and would emit: the
-//!   boolean-value gap is left as ONE documented refusal
-//!   (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6) rather than
-//!   half-closed inconsistently across `ifelse` and the connectives.
-//!
-//!   A `broadcast(P, …)` / dotted spelling whose head `P` is itself in the list
-//!   PASSES the gate, and must: `infer` now refuses a bare comparison over an array
-//!   (§07 gives the comparisons a scalar domain), so an ARRAY-shaped predicate can
-//!   only arrive dotted, and it lowers to an `i1` tensor of the operand's shape —
-//!   the property the gate selects for.
+//! - `land`/`lor`/`lxor`/`lnot` whose operand does not lower to `i1` —
+//!   "<head> operand must be a boolean predicate, got ...". Shared with
+//!   `ifelse` through `ops::lower_predicate`. Boolean literals, bindings,
+//!   inputs and calls are accepted; numeric truth-value coercion is not.
 //! - `land`/`lor`/`lxor` whose operands have different shapes — "<head>:
 //!   operands must have the same shape, got ... and ...". `Emitter::and`/`or`/
 //!   `xor` render ONE type for both operands and the result.
@@ -302,19 +291,8 @@
 //!   argument(s), got M". `diag` is the one head with its OWN arity message
 //!   ("`diag`: expected 1 or 2 argument(s), got N"), because §07 gives it an
 //!   optional second argument that `args_exact`'s fixed `N` cannot express.
-//! - `ifelse`'s condition is not a boolean-producing predicate call — "ifelse
-//!   condition must be a boolean predicate (in/compare/lt/gt/le/ge/land/lor/
-//!   lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". The list is
-//!   `ops::PREDICATE_HEADS` — every head in this map that lowers to an `i1` — so it
-//!   grows whenever a boolean head is wired, and the message ends "bare or under a
-//!   broadcast" (see the connectives above). §07's boolean reductions `lany`/`lall`
-//!   are in the list but appear in a SECOND clause, "or (lany/lall) bare only":
-//!   `broadcast(lany, …)` is refused, because a broadcast of a reduction is not an
-//!   elementwise lift of anything. `Emitter::lower_broadcast` refuses it a second time
-//!   as a collection-domain head (below); this check is the structural one, run before
-//!   `lower_node` ever sees the condition. The doc here said
-//!   "(in/compare)" through several waves in which the actual message had
-//!   already grown; it is generated from the constant, so quote the constant.
+//! - `ifelse`'s condition does not lower to `i1` — "ifelse condition must be
+//!   a boolean predicate, got ...". The same kind check guards the connectives.
 //! - `broadcast_to` asked to broadcast a non-scalar, differently-shaped
 //!   operand (e.g. `in`'s bounds against its variate) — "shape mismatch:
 //!   cannot broadcast ... to ..."
@@ -483,10 +461,6 @@
 //!   is safe today only because `lower_builtin` answers "unsupported builtin head". Add
 //!   the head to `ops::COLLECTION_DOMAIN_HEADS` in the SAME change that wires it, or the
 //!   dotted spelling silently emits the undotted head's answer again.
-//!
-//!   `ops::NON_ELEMENTWISE_PREDICATE_HEADS` overlaps deliberately: `lany`/`lall` hit
-//!   `require_predicate_head`'s structural check first, before `lower_node` runs on an
-//!   `ifelse` condition, and that message names the bare spelling.
 //!
 //! **`norms.rs`** (§07 "Reductions" and "Norms and normalization", reached
 //! through `ops::lower_builtin`'s twelve bare-head arms). Every site below is

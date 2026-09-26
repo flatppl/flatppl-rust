@@ -91,8 +91,8 @@ outputs = (lp)
         "expected a -inf off-support branch, in:\n{out}"
     );
     assert!(
-        out.contains("compare GE") && out.contains("compare LE"),
-        "§03 makes `interval(lo, hi)` CLOSED, so the guard is GE/LE, in:\n{out}"
+        out.contains("dense<false>"),
+        "the constant off-support comparison folds to false, in:\n{out}"
     );
 }
 

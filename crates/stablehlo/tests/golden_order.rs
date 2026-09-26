@@ -453,13 +453,7 @@ fn the_boolean_reductions_reduce_in_i1_with_no_promotion() {
 
 /// A boolean reduction is a legal `ifelse` CONDITION — the EXECUTED artifact.
 ///
-/// `lany`/`lall` lower to a scalar `tensor<i1>`, which is exactly what
-/// `PREDICATE_HEADS` admits ("Every entry lowers to an `i1`-typed `Value`"), and
-/// conditioning on one is the most natural consumer a §07 boolean reduction has. Both
-/// were missing from that list, so a bare `lany(v .> 3.0)` lowered as a module OUTPUT
-/// while `ifelse(lany(v .> 3.0), 1.0, 2.0)` refused. This is not the `Bool`-typed
-/// VALUE the list deliberately excludes (gap 6): it is a call node the map already
-/// lowers.
+/// `lany`/`lall` lower to scalar `tensor<i1>` predicates.
 ///
 /// At `v = [1.5, -2.0, 3.25, 0.5]`: `np.any(v > 3.0)` is `True` → `1.0`,
 /// `np.all(v > 0.0)` is `False` → `2.0`, and their `land` is `False` → `2.0`.
@@ -492,47 +486,21 @@ outputs = (o1, o2, o3)
     );
 }
 
-/// The carve-out that keeps the gate honest: a broadcast of a boolean reduction is
-/// NOT a predicate. `broadcast(P, …)` counts only for the ELEMENTWISE heads, because
-/// that arm exists to admit a dotted comparison.
-///
-/// When this landed, the reason was NOT that the map could not lower `lany.(b)` — it
-/// lowered it, DISCARDING the `broadcast` wrapper, so the dotted spelling silently
-/// emitted the undotted reduction while `infer` typed it `%deferred` with no
-/// diagnostic. That whole family (`sum.(v)`, `mean.(v)`, `maximum.(v)`, which answered
-/// with a NUMBER) is closed since: `flatppl_infer` refuses a collection-domain head
-/// broadcast over SCALAR elements, and `Emitter::lower_broadcast` refuses the head
-/// under a broadcast outright — see `tests/broadcast_collection_domain.rs`.
-///
-/// So the operand here is §03's vector of vectors, the one shape that still types
-/// clean: `lany.(bb)` is a `[2]` boolean array, and an array is not a scalar `i1`
-/// condition. That keeps this gate's own property under test — a broadcast of a
-/// boolean reduction is not a predicate — rather than re-testing the newer refusal.
-///
-/// The message must not name the reduction heads as admissible under a broadcast, or
-/// it sends the reader back into this refusal.
+/// Each row reduction supplies one Boolean to the elementwise conditional.
 #[test]
-fn a_broadcast_boolean_reduction_is_not_a_predicate() {
-    let err = emit_err(
+fn broadcast_boolean_reductions_gate_broadcast_conditionals() {
+    let out = emit(
         "\
 b1 = elementof(cartpow(booleans, [4]))
 b2 = elementof(cartpow(booleans, [4]))
 bb = [b1, b2]
-y = ifelse(lany.(bb), 1.0, 2.0)
+y = ifelse.(lany.(bb), 1.0, 2.0)
 inputs = (b1, b2)
 outputs = (y)
 ",
     );
-    assert!(
-        err.contains("must be a boolean predicate"),
-        "a broadcast `lany` must still refuse: {err}"
-    );
-    // The message must not offer back the spelling it just rejected.
-    assert!(
-        err.contains("(lany/lall) bare only")
-            && !err.contains("lany/lall), bare or under a broadcast"),
-        "the message must say the reduction heads are bare-only: {err}"
-    );
+    assert!(out.contains("stablehlo.reduce"), "{out}");
+    assert!(out.contains("stablehlo.select"), "{out}");
 }
 
 /// The contrast held side by side, so neither head can drift onto the other's rule.
