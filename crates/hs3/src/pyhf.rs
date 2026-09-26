@@ -848,14 +848,25 @@ pub fn assemble_channel(
     let multipliers = terms
         .normsys_factors
         .multipliers(b, channel_name, multipliers);
-    for ((sname, _, _), (nom, factors)) in samples.iter().zip(shifted.into_iter().zip(multipliers))
+    for ((sname, _, modifiers), (nom, factors)) in
+        samples.iter().zip(shifted.into_iter().zip(multipliers))
     {
-        // Keep the original product order after sharing interpolation work.
         let mut acc = nom;
-        for factor in factors {
-            let mul = b.call_head("mul");
-            acc = b.call("broadcast", &[mul, acc, factor]);
+        let mut scalars = Vec::new();
+        let kinds = modifiers
+            .iter()
+            .filter_map(|modifier| mod_spec(&modifier.kind).filter(|spec| !spec.replaces_nominal));
+        for (factor, spec) in factors.into_iter().zip(kinds) {
+            if spec.param_domain == ParamDomain::PosRealsPow {
+                acc = multiply_scalar_factors(b, acc, &scalars);
+                scalars.clear();
+                let mul = b.call_head("mul");
+                acc = b.call("broadcast", &[mul, acc, factor]);
+            } else {
+                scalars.push(factor);
+            }
         }
+        acc = multiply_scalar_factors(b, acc, &scalars);
 
         let exp_name = b.bind_unique_doc(
             &format!("{channel_name}_{sname}_expected"),
@@ -961,6 +972,23 @@ pub fn assemble_channel(
     }
 
     Ok(())
+}
+
+/// Retain a consecutive scalar factor axis instead of a deep multiply chain.
+/// Vector modifiers stay outside the reduction and preserve their positions.
+fn multiply_scalar_factors(b: &mut Builder, values: NodeId, factors: &[NodeId]) -> NodeId {
+    // Short products cost less as fused pointwise operations than as a gathered
+    // tensor plus reduction. Keep their original multiplication order.
+    if factors.len() < 96 {
+        return factors.iter().fold(values, |acc, factor| {
+            let mul = b.call_head("mul");
+            b.call("broadcast", &[mul, acc, *factor])
+        });
+    }
+    let factors = b.array(factors);
+    let factor = b.call("prod", &[factors]);
+    let mul = b.call_head("mul");
+    b.call("broadcast", &[mul, values, factor])
 }
 
 /// Validate a channel's observed bin contents and report whether any is fractional.
