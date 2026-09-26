@@ -1,6 +1,33 @@
 //! Keep independent normalization effects on one tensor interpolation axis.
 
 #[test]
+fn long_scalar_products_keep_per_bin_factors_separate() {
+    let sample = |name: &str, count: usize| {
+        let mut modifiers: Vec<_> = (0..count)
+            .map(|i| serde_json::json!({"name": format!("f{i}"), "type": "normfactor", "data": null}))
+            .collect();
+        modifiers.push(serde_json::json!({"name": "gamma", "type": "shapefactor", "data": null}));
+        modifiers.push(serde_json::json!({"name": "last", "type": "normfactor", "data": null}));
+        serde_json::json!({"name": name, "data": [10.0, 20.0], "modifiers": modifiers})
+    };
+    let doc = serde_json::json!({
+        "channels": [{"name": "c", "samples": [sample("short", 63), sample("long", 64)]}],
+        "observations": [{"name": "c", "data": [20.0, 40.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "f0"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    let factors = (0..64)
+        .map(|i| format!("f{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(text.contains(&format!(
+        "c_long_expected = broadcast(mul, broadcast(mul, broadcast(mul, c_long_nominal, prod([{factors}])), gamma), last)"
+    )), "{text}");
+    assert_eq!(text.matches("prod(").count(), 1, "{text}");
+}
+
+#[test]
 fn normsys_interpolation_reuses_factors_across_samples_and_channels() {
     let mut doc: serde_json::Value = serde_json::from_str(
         r#"{
