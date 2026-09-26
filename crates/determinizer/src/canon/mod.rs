@@ -85,7 +85,7 @@ fn no_canon() -> bool {
 /// between sweeps because a reduction can shift inferred types/phases that a
 /// later pass reads. A no-op if `FLATPPL_DETERMINIZE_NO_CANON` is set.
 ///
-/// DCE runs ONCE, after the fixpoint — the dead-set is only stable once
+/// DCE runs after the fixpoint — the dead-set is only stable once
 /// inline/fold/flatten have converged; running it mid-fixpoint could drop a
 /// binding a later pass would still have rewritten through. `roots = None`
 /// preserves keep-all (backward-compatible).
@@ -108,7 +108,22 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
     if let Some(roots) = roots {
         dce::retain_reachable(m, roots);
     }
-    if sharing::share_broadcasts(m) {
+    if sharing::share_broadcasts(m, false) {
+        let _ = flatppl_infer::infer(m);
+    }
+}
+
+/// Prepare an already-determinized module for FlatPPL or FlatPIR serialization.
+///
+/// Text expands a DAG into a tree. Name repeated cell-local arrays as separate
+/// broadcasts so their expressions are printed once, without cloning per point.
+/// Native backends consume the shared DAG directly and do not need this pass.
+/// `roots` has the same meaning as in `determinize_with_roots`.
+pub fn prepare_serialization(m: &mut Module, roots: Option<&[Symbol]>) {
+    if !no_canon() && sharing::share_broadcasts(m, true) {
+        if let Some(roots) = roots {
+            dce::retain_reachable(m, roots);
+        }
         let _ = flatppl_infer::infer(m);
     }
 }

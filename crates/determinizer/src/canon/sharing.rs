@@ -6,9 +6,12 @@ use std::collections::HashSet;
 
 use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, Ref, RefNs, Type};
 
+mod scoped;
+
 /// Materialize each repeated numeric broadcast once. This deliberately leaves
-/// ABI declarations, structural records, and lexically scoped expressions alone.
-pub(super) fn share_broadcasts(m: &mut Module) -> bool {
+/// ABI declarations and structural records alone. Cell-local work moves only
+/// through a scope-preserving broadcast over the original collection.
+pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
     let bindings: Vec<_> = m
         .bindings()
         .filter(|(bid, _)| !super::is_reserved_abi_binding(m, *bid))
@@ -47,6 +50,12 @@ pub(super) fn share_broadcasts(m: &mut Module) -> bool {
             id
         } else {
             crate::driver::rebuild_with_children(m, id, &replacements)
+        };
+        let rhs = if lift_scopes && let Some(lifted) = scoped::lift_broadcast(m, rhs) {
+            changed = true;
+            lifted
+        } else {
+            rhs
         };
         let replacement = if uses[id.index()] > 1
             && is_numeric_broadcast(m, id)

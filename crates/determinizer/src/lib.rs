@@ -15,6 +15,7 @@ mod marginal;
 mod refuse;
 mod sample;
 mod stdfn;
+pub use canon::prepare_serialization;
 pub use conformance::is_flatpdl;
 pub use driver::{determinize, determinize_with, determinize_with_roots};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
