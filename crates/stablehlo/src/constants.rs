@@ -275,18 +275,27 @@ fn element_count(ty: &MlirTy) -> Option<usize> {
 }
 
 fn dense_literal(values: &[String], dims: &[Option<u64>]) -> Option<String> {
-    if dims.is_empty() {
-        return values.first().cloned();
+    fn append(out: &mut String, values: &[String], dims: &[Option<u64>]) -> Option<()> {
+        if dims.is_empty() {
+            out.push_str(values.first()?);
+            return Some(());
+        }
+        let n = usize::try_from(dims[0]?).ok()?;
+        out.push('[');
+        if let Some(width) = values.len().checked_div(n) {
+            for i in 0..n {
+                if i != 0 {
+                    out.push_str(", ");
+                }
+                append(out, &values[i * width..(i + 1) * width], &dims[1..])?;
+            }
+        }
+        out.push(']');
+        Some(())
     }
-    let n = usize::try_from(dims[0]?).ok()?;
-    if n == 0 {
-        return Some("[]".to_owned());
-    }
-    let width = values.len() / n;
-    let rows = (0..n)
-        .map(|i| dense_literal(&values[i * width..(i + 1) * width], &dims[1..]))
-        .collect::<Option<Vec<_>>>()?;
-    Some(format!("[{}]", rows.join(", ")))
+    let mut out = String::new();
+    append(&mut out, values, dims)?;
+    Some(out)
 }
 
 fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {

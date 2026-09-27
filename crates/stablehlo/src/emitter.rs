@@ -3822,12 +3822,11 @@ impl<'m> Emitter<'m> {
 /// reasoning as `flatpir::writer::render_real`, reimplemented locally since
 /// that helper is private to the `flatpir` crate).
 fn render_float_literal(x: f64) -> String {
-    let s = format!("{x}");
-    if s.contains(['.', 'e', 'E']) {
-        s
-    } else {
-        format!("{s}.0")
+    let mut s = format!("{x}");
+    if !s.contains(['.', 'e', 'E']) {
+        s.push_str(".0");
     }
+    s
 }
 
 /// Render `ty`'s shape as a boolean (`i1`-element) MLIR tensor type text.
