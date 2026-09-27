@@ -21,6 +21,7 @@ pub(crate) mod model;
 mod normsys;
 pub(crate) mod presets;
 pub(crate) mod pyhf;
+mod pyhf_names;
 
 use flatppl_core::Module;
 use flatppl_syntax::{Syntax, parse, print_with};
@@ -72,7 +73,7 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_some() {
         let doc = model::PyhfDocument::from_value(value)?;
-        pyhf::pyhf_to_module(&doc)
+        pyhf::pyhf_to_module(doc)
     } else {
         let doc: model::Document = serde_json::from_value(value)?;
         convert::document_to_module(&doc)
@@ -82,6 +83,9 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
 /// Parse a pyhf model or workspace JSON document into a FlatPPL module.
 ///
 /// Model-only documents expose each channel's observations as an external input.
+/// Parameter names outside FlatPPL's binding grammar receive unique identifiers.
+/// When names change, a `pyhf_parameter_names` record maps the emitted bindings
+/// to their original strings. Its own name gains a suffix if already in use.
 /// Requires the top-level `"channels"` key that identifies a pyhf document.
 /// Returns [`Error::Unsupported`] if the document lacks `"channels"`, with a
 /// hint to use the native HS3 path instead.
@@ -108,7 +112,7 @@ pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
         ));
     }
     let doc = model::PyhfDocument::from_value(value)?;
-    pyhf::pyhf_to_module(&doc)
+    pyhf::pyhf_to_module(doc)
 }
 
 /// Whether the document carries a *non-empty* `analyses` block. That block is

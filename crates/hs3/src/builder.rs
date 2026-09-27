@@ -34,10 +34,9 @@ fn is_placeholder(name: &str) -> bool {
 /// `Letter ::= "a" .. "z" | "A" .. "Z"`, minus the reserved words, the
 /// determinization signature names, and the placeholder form.
 ///
-/// Source parameter and distribution bindings retain their names: silently
-/// renaming them would break external references. Generated intermediates and
-/// metadata labels instead use `alloc_name`. `what` names the source block for
-/// the message (e.g. "distribution", "pyhf modifier parameter").
+/// Native HS3 bindings retain their names. The pyhf reader maps unsupported
+/// parameter names explicitly before this check. Generated intermediates and
+/// metadata labels use `alloc_name`. `what` names the source block for the error.
 pub(crate) fn check_binding_name(name: &str, what: &str) -> Result<()> {
     let bad = |why: &str| {
         Err(Error::Unsupported(format!(
@@ -76,7 +75,7 @@ pub(crate) fn check_binding_name(name: &str, what: &str) -> Result<()> {
 /// `[A-Za-z0-9_]` becomes `_`, a leading digit is prefixed with `_`, and the
 /// empty string becomes `_`. Distinct inputs may sanitize to the same identifier
 /// (e.g. `a-b` and `a.b`); the allocator's dedup step resolves that.
-fn sanitize_ident(s: &str) -> String {
+pub(crate) fn sanitize_ident(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
