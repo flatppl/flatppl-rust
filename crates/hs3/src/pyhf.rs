@@ -20,13 +20,15 @@ use flatppl_core::node::{Call, CallHead, Node};
 use std::collections::{BTreeMap, HashSet};
 
 /// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
-pub fn pyhf_to_module(doc: &PyhfDocument) -> Result<Module> {
+pub fn pyhf_to_module(mut doc: PyhfDocument) -> Result<Module> {
+    let names = crate::pyhf_names::rename_parameters(&mut doc);
     let mut m = Module::new();
     {
         let mut b = Builder::new(&mut m);
         // `flatppl_compat` leads the generated module (spec §11).
         b.stamp_compat();
-        emit_pyhf(&mut b, doc)?;
+        emit_pyhf(&mut b, &doc)?;
+        crate::pyhf_names::emit_metadata(&mut b, &names);
     }
     Ok(m)
 }
@@ -1210,7 +1212,7 @@ mod tests {
         for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             let mut doc = make_uncorrelated_doc();
             doc.channels[0].samples[0].data[1] = bad;
-            let err = pyhf_to_module(&PyhfDocument::Workspace(doc))
+            let err = pyhf_to_module(PyhfDocument::Workspace(doc))
                 .expect_err("a non-finite nominal yield must be refused")
                 .to_string();
             assert!(
@@ -1227,7 +1229,7 @@ mod tests {
     fn negative_nominal_is_imported() {
         let mut doc = make_uncorrelated_doc();
         doc.channels[0].samples[0].data[1] = -11.0;
-        let m = pyhf_to_module(&PyhfDocument::Workspace(doc))
+        let m = pyhf_to_module(PyhfDocument::Workspace(doc))
             .expect("a negative nominal yield must import");
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("-11.0"), "got:\n{text}");
@@ -1236,7 +1238,7 @@ mod tests {
     #[test]
     fn pyhf_module_contains_required_constructs() {
         let doc = make_uncorrelated_doc();
-        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
+        let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("broadcast(Poisson"), "got:\n{text}");
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -1252,7 +1254,7 @@ mod tests {
     #[test]
     fn hepphys_standard_module_binding_present() {
         let doc = make_uncorrelated_doc();
-        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
+        let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("standard_module"), "got:\n{text}");
         assert!(text.contains("particle-physics"), "got:\n{text}");
@@ -1287,7 +1289,7 @@ mod tests {
             data: None,
             toplvl: None,
         };
-        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
+        let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "missing Normal aux, got:\n{text}");
         assert!(
@@ -1327,7 +1329,7 @@ mod tests {
             toplvl: None,
         };
         assert!(
-            pyhf_to_module(&PyhfDocument::Workspace(doc)).is_err(),
+            pyhf_to_module(PyhfDocument::Workspace(doc)).is_err(),
             "should fail without lumi config"
         );
     }
@@ -1372,7 +1374,7 @@ mod tests {
             data: None,
             toplvl: None,
         };
-        let m = pyhf_to_module(&PyhfDocument::Workspace(doc)).unwrap();
+        let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "missing lumi Normal, got:\n{text}");
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
