@@ -38,6 +38,8 @@ use crate::refuse::EmitError;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
+#[path = "packed_gathers.rs"]
+mod packed_gathers;
 #[path = "packing.rs"]
 mod packing;
 #[path = "pointwise.rs"]
