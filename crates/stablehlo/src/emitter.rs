@@ -269,7 +269,15 @@ impl<'m> Emitter<'m> {
     /// non-scalar `ty`) constant.
     pub fn constant(&mut self, x: f64, ty: MlirTy) -> Value {
         let ty_text = ty.render(self.dtype, ElemKind::Real);
-        let lit = render_float_literal(x);
+        let lit = if x.is_finite() {
+            render_float_literal(x)
+        } else {
+            // MLIR requires dtype-exact bits for infinities and NaNs.
+            match self.dtype {
+                Dtype::F32 => format!("0x{:08X}", (x as f32).to_bits()),
+                Dtype::F64 => format!("0x{:016X}", x.to_bits()),
+            }
+        };
         let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
         self.remember_constant(&ssa, [Scalar::Real(x)]);
         Value {
@@ -319,24 +327,9 @@ impl<'m> Emitter<'m> {
         Some(Value { ssa, ty, elem })
     }
 
-    /// `%N = stablehlo.constant dense<+inf> : ty` — positive infinity (the
-    /// `ifelse`/`neg(inf)` "outside the support" log-density floor). Cannot
-    /// go through [`Emitter::constant`]: that renders `x` as a *decimal*
-    /// literal (`render_float_literal`), and `f64::INFINITY` prints as `inf`,
-    /// which — like the bare `-inf` a decimal `f64::NEG_INFINITY` would
-    /// produce — is not a valid MLIR float-attribute token (verified against
-    /// the real StableHLO parser, jax 0.10.2); only the dtype-exact hex bit
-    /// pattern parses. Same reasoning as [`reduce_max_identity`]'s negative
-    /// infinity, sign bit cleared.
+    /// Positive infinity, including the `neg(inf)` log-density floor.
     pub fn inf(&mut self, ty: MlirTy) -> Value {
-        let ty_text = ty.render(self.dtype, ElemKind::Real);
-        let lit = pos_inf_literal(self.dtype);
-        let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
-        Value {
-            ssa,
-            ty,
-            elem: ElemKind::Real,
-        }
+        self.constant(f64::INFINITY, ty)
     }
 
     /// One elementwise unary op: `%N = {op} %a : ty`. Result type copies the
