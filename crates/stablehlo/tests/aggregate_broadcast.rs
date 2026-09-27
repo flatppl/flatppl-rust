@@ -79,6 +79,36 @@ outputs = (f(a[1]) + f(a[2]) + f(a[3]) + f(a[4]), f(b[1]) + f(b[2]) + f(b[3]) + 
 }
 
 #[test]
+fn singleton_broadcasts_share_irregular_gathers() {
+    let source = r#"
+score(t) = sum(
+    2.0 * [t[26]] * exp(t[1]) * exp(t[3])
+  + 3.0 * [t[26]] * exp(t[3]) * exp(t[8])
+  + 4.0 * [t[26]] * exp(t[7]) * exp(t[11])
+  + 5.0 * [t[26]] * exp(t[10]) * exp(t[13])
+  + 6.0 * [t[26]] * exp(t[17]) * exp(t[10])
+  + 7.0 * [t[26]] * exp(t[20]) * exp(t[3])
+  + 8.0 * [t[26]] * exp(t[22]) * exp(t[24])
+  + 9.0 * [t[26]] * exp(t[25]) * exp(t[23])
+)
+points = elementof(cartpow(cartpow(reals, 26), 3))
+inputs = points
+outputs = score.(points)
+"#;
+    let ir = emit(source);
+    // One gather selects exponential inputs. The second shares both irregular
+    // selections, including repeated and out-of-order lanes, before broadcasting.
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 2, "{ir}");
+    // Arithmetic consumers do not meet the view-only profitability condition.
+    let scalar = emit(&source.replace("[t[26]]", "t[26]"));
+    assert_eq!(
+        scalar.matches("\"stablehlo.gather\"").count(),
+        3,
+        "{scalar}"
+    );
+}
+
+#[test]
 fn nested_batched_variance_keeps_fixed_selectors_and_captured_operands() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\

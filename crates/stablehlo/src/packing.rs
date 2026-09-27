@@ -45,6 +45,7 @@ struct Packer<'a, 'm> {
     members: HashMap<String, (usize, usize)>,
     originals: HashMap<String, String>,
     packets: HashMap<Vec<String>, Value>,
+    gathers: packed_gathers::Requests,
 }
 
 fn dimensions(ty: &MlirTy) -> Option<Vec<u64>> {
@@ -213,6 +214,7 @@ pub(super) fn pack(
             .map(|(name, ..)| (name.clone(), name.clone()))
             .collect(),
         packets: HashMap::new(),
+        gathers: packed_gathers::Requests::default(),
     };
     // Build dependencies first so a long expression chain does not consume
     // the call stack. Segment order also preserves every opaque barrier.
@@ -235,6 +237,7 @@ pub(super) fn pack(
         })
         .collect::<Vec<_>>();
     let refs = returns.iter().collect::<Vec<_>>();
+    packer.gathers.finish(&mut packer.out, &refs);
     let packed = packer.out.live_lines(&refs);
     // Small cones can cost more views than they save in arithmetic. Preserve
     // their original text as well as avoiding extra work for the backend.
@@ -701,41 +704,7 @@ impl Packer<'_, '_> {
                 .collect::<Vec<_>>();
             return self.concatenate(&parts, axis);
         }
-        let index_ty = MlirTy::Ranked(vec![Some(indices.len() as u64), Some(1)]);
-        let index = self
-            .out
-            .folded_constant(
-                indices.iter().map(|&i| Scalar::Int(i as i64)).collect(),
-                index_ty,
-                Axes::default(),
-            )
-            .expect("indices fit the target integer type");
-        let mut result_dims = dims.clone();
-        result_dims[axis] = indices.len() as u64;
-        let ty = MlirTy::Ranked(result_dims.into_iter().map(Some).collect());
-        dims[axis] = 1;
-        let offsets = (0..dims.len())
-            .filter(|&d| d != axis)
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sizes = dims
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let from = source.ty.render(self.out.dtype, source.elem);
-        let index_ty = index.ty.render(self.out.dtype, ElemKind::Int);
-        let to = ty.render(self.out.dtype, source.elem);
-        let ssa = self.out.pure(format!(
-            "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<offset_dims = [{offsets}], collapsed_slice_dims = [{axis}], start_index_map = [{axis}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {sizes}>}}> : ({from}, {index_ty}) -> {to}",
-            source.ssa, index.ssa,
-        ));
-        Value {
-            ssa,
-            ty,
-            elem: source.elem,
-        }
+        self.gathers.emit(&mut self.out, source, axis, indices)
     }
 
     fn concatenate(&mut self, values: &[Value], axis: usize) -> Value {
