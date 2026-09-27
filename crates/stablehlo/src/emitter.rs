@@ -1590,8 +1590,9 @@ impl<'m> Emitter<'m> {
     /// Takes its operand at the element kind it is to reduce in: `reduce_axis`
     /// has already promoted a `Bool` operand to `Int`, and
     /// [`Emitter::reduce_trailing_axes`]'s caller (`aggregate::reduce`) widens
-    /// the frame to the aggregate node's own inferred kind. So no `i1` combine
-    /// is ever emitted from here.
+    /// the frame to the aggregate node's own inferred kind. Packed Boolean
+    /// reductions also use this helper, retaining their logical combine and
+    /// Boolean identity without arithmetic promotion.
     fn reduce_axis_lit(
         &mut self,
         combine_op: &str,
@@ -1615,16 +1616,8 @@ impl<'m> Emitter<'m> {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
 
-        let init_ssa = self.fresh();
-        self.push(&format!(
-            "{init_ssa} = stablehlo.constant dense<{init_lit}> : {elem_ty}"
-        ));
+        let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
 
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
-            a.ssa
-        ));
         let mut axes = self.axes_of(a);
         if axis < axes.batch {
             axes.batch -= 1;
@@ -1639,12 +1632,21 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
-        self.remember_axes(&ssa, axes);
-        Value {
-            ssa,
+        let ssa = self.pure_axes(format!(
+            "stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
+            a.ssa
+        ), axes);
+        let out = Value {
+            ssa: ssa.clone(),
             ty: result_ty,
             elem: a.elem,
-        }
+        };
+        self.remember_pointwise(
+            &ssa,
+            &out,
+            Pointwise::Reduce(a.clone(), axis, combine_op.to_owned(), init_lit.to_owned()),
+        );
+        out
     }
 
     /// Reduce `a`'s `n` TRAILING axes with `kind`, leaving the leading axes in
@@ -2723,9 +2725,8 @@ impl<'m> Emitter<'m> {
         };
         let batch = self.batch_rank(a);
         for _ in batch..rank {
-            let init_ssa = self.fresh();
-            self.push(&format!(
-                "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
+            let init_ssa = self.pure(format!(
+                "stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
             ));
             let operand_ty = render_i1(&cur.ty);
             let mut dims = match &cur.ty {
@@ -2739,14 +2740,11 @@ impl<'m> Emitter<'m> {
                 MlirTy::Ranked(dims)
             };
             let result_ty_text = render_i1(&result_ty);
-            let ssa = self.fresh();
-            self.push(&format!(
-                "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{batch}] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
-                cur.ssa
-            ));
             let cell_rank = shape(&result_ty).len() - batch;
-            self.remember_axes(
-                &ssa,
+            let ssa = self.pure_axes(format!(
+                "stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{batch}] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
+                cur.ssa
+            ),
                 Axes {
                     batch,
                     layers: if cell_rank == 0 {
@@ -2756,11 +2754,17 @@ impl<'m> Emitter<'m> {
                     },
                 },
             );
-            cur = Value {
-                ssa,
+            let out = Value {
+                ssa: ssa.clone(),
                 ty: result_ty,
                 elem: ElemKind::Bool,
             };
+            self.remember_pointwise(
+                &ssa,
+                &out,
+                Pointwise::Reduce(cur, batch, combine_op.to_owned(), identity_lit.to_owned()),
+            );
+            cur = out;
         }
         cur
     }

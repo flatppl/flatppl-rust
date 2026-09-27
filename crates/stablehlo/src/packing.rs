@@ -6,22 +6,30 @@ use super::*;
 
 const PACKET_AXIS: usize = 0;
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Class<'a> {
+    Unknown,
+    Constant,
+    Source(&'a str),
+    Group(usize),
+}
+
 struct Instruction<'a> {
     rhs: &'a str,
     inputs: Vec<&'a str>,
     depth: usize,
     pure: bool,
-    class: usize,
+    class: Class<'a>,
 }
 
-type Signature = (
+type Signature<'a> = (
     usize,
     usize,
     (String, Vec<u64>),
     MlirTy,
     ElemKind,
     Axes,
-    Vec<(MlirTy, ElemKind, Axes, usize)>,
+    Vec<(MlirTy, ElemKind, Axes, Class<'a>)>,
 );
 
 struct Group {
@@ -68,7 +76,7 @@ pub(super) fn pack(
     let lines = source.live_lines(rets);
     let mut instructions: HashMap<&str, Instruction<'_>> = HashMap::new();
     let mut groups: Vec<Group> = Vec::new();
-    let mut classes: HashMap<Signature, usize> = HashMap::new();
+    let mut classes: HashMap<Signature<'_>, usize> = HashMap::new();
     let arguments = args
         .iter()
         .map(|(name, ..)| name.as_str())
@@ -106,7 +114,11 @@ pub(super) fn pack(
                 inputs,
                 depth,
                 pure: is_pure,
-                class: usize::from(source.constants.contains_key(ssa)),
+                class: if source.constants.contains_key(ssa) {
+                    Class::Constant
+                } else {
+                    Class::Unknown
+                },
             },
         );
         if !is_pure {
@@ -116,6 +128,21 @@ pub(super) fn pack(
         let Some(producer) = source.pointwise.get(ssa) else {
             continue;
         };
+        // Views retain their source locality even though they are not packed.
+        // Mixing slices of unrelated tensors joins otherwise separate cones.
+        let view_class = match &producer.op {
+            Pointwise::Slice(input, ..) => Some(Class::Source(&input.ssa)),
+            Pointwise::Reshape(input) => Some(
+                instructions
+                    .get(input.ssa.as_str())
+                    .map_or(Class::Unknown, |op| op.class),
+            ),
+            _ => None,
+        };
+        if let Some(class) = view_class {
+            instructions.get_mut(ssa).unwrap().class = class;
+            continue;
+        }
         let Some(signature) = producer.op.signature() else {
             continue;
         };
@@ -139,7 +166,9 @@ pub(super) fn pack(
                         v.ty.clone(),
                         v.elem,
                         source.axes_of(v),
-                        instructions.get(v.ssa.as_str()).map_or(0, |op| op.class),
+                        instructions
+                            .get(v.ssa.as_str())
+                            .map_or(Class::Unknown, |op| op.class),
                     )
                 })
                 .collect(),
@@ -154,7 +183,7 @@ pub(super) fn pack(
         groups[group].values.push(producer.value.clone());
         // Intern the ordered producer-tree shape once. Matching only opcode
         // and depth mixes unrelated chains and adds costly packet permutations.
-        instructions.get_mut(ssa).unwrap().class = group + 2;
+        instructions.get_mut(ssa).unwrap().class = Class::Group(group);
     }
     groups.retain(|g| g.values.len() > 1);
     if groups.is_empty() {
@@ -337,7 +366,7 @@ impl Packer<'_, '_> {
                     .collect::<Vec<_>>();
                 inputs.push(self.packet(&lane_inputs));
             }
-            let hoisted = (!matches!(op, Pointwise::Broadcast(..)))
+            let hoisted = (!matches!(op, Pointwise::Broadcast(..) | Pointwise::Reduce(..)))
                 .then(|| self.hoist_inputs(&inputs, None))
                 .flatten();
             if let Some((ref values, _)) = hoisted {
@@ -349,6 +378,12 @@ impl Packer<'_, '_> {
                 Pointwise::Compare(dir, ..) => self.out.compare(&dir, &inputs[0], &inputs[1]),
                 Pointwise::Select(..) => self.out.select(&inputs[0], &inputs[1], &inputs[2]),
                 Pointwise::Convert(_, elem) => self.out.convert(&inputs[0], elem),
+                Pointwise::Reduce(_, reduced_axis, combine, init) => self.out.reduce_axis_lit(
+                    &combine,
+                    &init,
+                    &inputs[0],
+                    reduced_axis + usize::from(reduced_axis >= axis),
+                ),
                 Pointwise::Broadcast(_, dims) => {
                     let mut dims = dims
                         .iter()

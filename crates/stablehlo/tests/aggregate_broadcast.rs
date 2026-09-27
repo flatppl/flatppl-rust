@@ -33,6 +33,52 @@ fn batched_aggregation_keeps_the_batch_and_output_axes() {
 }
 
 #[test]
+fn independent_reductions_pack_without_reducing_the_batch_axis() {
+    let ir = emit(
+        r#"
+flatppl_compat = "0.1"
+a = elementof(cartpow(cartpow(reals, 4), 3))
+b = elementof(cartpow(cartpow(reals, 4), 3))
+mapped(x) = exp.(sin.(x) .+ cos.(x)) ./ (1.0 .+ exp.(-x))
+combined(x, y) = sum(mapped(x)) + sum(mapped(y))
+inputs = (a, b)
+outputs = combined.(a, b)
+"#,
+    );
+    assert_eq!(ir.matches("stablehlo.reduce(").count(), 1, "{ir}");
+    assert!(ir.contains("across dimensions = [2]"), "{ir}");
+    assert!(ir.contains("tensor<2x3x4xf32>"), "{ir}");
+    assert!(ir.contains("-> tensor<3xf32>"), "{ir}");
+}
+
+#[test]
+fn sliced_consumers_pack_within_each_source_tensor() {
+    let ir = emit(
+        r#"
+flatppl_compat = "0.1"
+x = elementof(cartpow(reals, 4))
+y = elementof(cartpow(reals, 5))
+a = exp.(x)
+b = exp.(y)
+f(z) = ((z * z + 1.0) * z + 2.0) * z + 3.0
+inputs = (x, y)
+outputs = (f(a[1]) + f(a[2]) + f(a[3]) + f(a[4]), f(b[1]) + f(b[2]) + f(b[3]) + f(b[4]))
+"#,
+    );
+    let multiplies: Vec<_> = ir
+        .lines()
+        .filter(|line| line.contains("stablehlo.multiply"))
+        .collect();
+    assert_eq!(multiplies.len(), 6, "{ir}");
+    assert!(
+        multiplies
+            .iter()
+            .all(|line| line.ends_with("tensor<4xf32>")),
+        "{ir}"
+    );
+}
+
+#[test]
 fn nested_batched_variance_keeps_fixed_selectors_and_captured_operands() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\

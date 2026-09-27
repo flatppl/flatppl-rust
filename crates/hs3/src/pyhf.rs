@@ -462,7 +462,7 @@ pub struct Terms {
     /// One observation likelihood term per channel.
     observation: Vec<NodeId>,
     /// Constraint (auxiliary-measurement) likelihood terms.
-    constraints: Vec<NodeId>,
+    constraints: Vec<crate::auxiliary::Constraint>,
     /// Parameters whose constraint has already been emitted — a constraint
     /// belongs to its (possibly shared) parameter, so it is emitted exactly once
     /// (pyhf: one auxiliary measurement per constrained parameter).
@@ -588,7 +588,7 @@ impl Terms {
 /// when there are no terms.
 pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
     let mut all = terms.observation.clone();
-    all.extend(terms.constraints.iter().copied());
+    all.extend(crate::auxiliary::likelihoods(b, &terms.constraints));
     let node = match all.len() {
         0 => return,
         1 => all[0],

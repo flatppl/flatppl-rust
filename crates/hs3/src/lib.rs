@@ -8,6 +8,7 @@
 //! - pyhf model or workspace: top-level `channels` triggers the pyhf lift path.
 mod error;
 pub use error::{Error, Result};
+mod auxiliary;
 pub(crate) mod builder;
 mod convert;
 pub(crate) mod data;
