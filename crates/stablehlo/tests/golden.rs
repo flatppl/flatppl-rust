@@ -3169,20 +3169,35 @@ fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     assert!(out.contains("dense<true> : tensor<i1>"));
 }
 
-/// A bare `Const` symbol (`inf`) is dispatched through the same builtin-head
-/// map as a zero-arg call, and must use the dtype-exact `+inf` bit pattern.
+/// Explicit infinity and nonfinite literals from constant folding must use
+/// MLIR's dtype-exact bit patterns, not invalid decimal spellings.
 #[test]
-fn lower_const_inf_emits_dtype_exact_positive_infinity() {
-    let mut m = Module::new();
-    let node = const_node(&mut m, "inf");
-    let mut e = Emitter::new(&m, Dtype::F32);
-    let result = e.lower_node(node).unwrap();
-    assert_eq!(result.ty, MlirTy::Scalar);
-    let out = e.finish("f", &[], &[&result]);
-    assert!(
-        out.contains("dense<0x7F800000>"),
-        "missing dtype-exact +inf in:\n{out}"
-    );
+fn lower_nonfinite_reals_use_dtype_exact_bit_patterns() {
+    for (dtype, bits) in [
+        (Dtype::F32, ["0x7F800000", "0xFF800000", "0x7FC00000"]),
+        (
+            Dtype::F64,
+            [
+                "0x7FF0000000000000",
+                "0xFFF0000000000000",
+                "0x7FF8000000000000",
+            ],
+        ),
+    ] {
+        let mut m = Module::new();
+        let nodes = [
+            const_node(&mut m, "inf"),
+            real(&mut m, f64::INFINITY),
+            real(&mut m, f64::NEG_INFINITY),
+            real(&mut m, f64::NAN),
+        ];
+        let mut e = Emitter::new(&m, dtype);
+        let results = nodes.map(|node| e.lower_node(node).unwrap());
+        let out = e.finish("f", &[], &results.iter().collect::<Vec<_>>());
+        for literal in bits {
+            assert!(out.contains(&format!("dense<{literal}>")), "{out}");
+        }
+    }
 }
 
 // ---- Task 5: distribution registry + Normal `@logdensity` -------------------
