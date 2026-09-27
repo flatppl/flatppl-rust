@@ -509,12 +509,16 @@ fn interp_poly6_exp(m: &mut Module, [left, center, right, alpha]: [NodeId; 4]) -
         weighted_sum(m, &[(3.0, a0), (-3.0, s1), (1.0, a2)], 0.0, 1.0 / 8.0),
         weighted_sum(m, &[(8.0, s0), (-5.0, a1), (1.0, s2)], -8.0, 1.0 / 8.0),
     ];
-    // Horner from the top coefficient down, then the leading 1.
-    let mut acc = coeffs[5];
-    for &c in coeffs[..5].iter().rev() {
-        let t = mul(m, alpha, acc);
-        acc = add(m, c, t);
-    }
+    // Three independent linear pairs, then Horner in alpha squared.
+    let pairs = [0, 2, 4].map(|i| {
+        let t = mul(m, alpha, coeffs[i + 1]);
+        add(m, coeffs[i], t)
+    });
+    let alpha2 = mul(m, alpha, alpha);
+    let t = mul(m, alpha2, pairs[2]);
+    let t = add(m, pairs[1], t);
+    let t = mul(m, alpha2, t);
+    let acc = add(m, pairs[0], t);
     let t = mul(m, alpha, acc);
     let one = lit(m, 1.0);
     let mod_val = add(m, one, t);

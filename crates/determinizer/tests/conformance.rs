@@ -177,3 +177,74 @@ fn dangling_self_ref_in_reification_input_is_flagged() {
         "expected a DanglingSelfRef violation for the dangling reification input; got: {v:?}"
     );
 }
+
+#[test]
+fn conformance_checks_deep_shared_dags_once() {
+    use flatppl_core::{Binding, Call, CallHead, Module, Node, Scalar, Type};
+    use flatppl_determinizer::NonConformKind;
+
+    let mut m = Module::new();
+    let leaf = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let add = m.intern("add");
+    let mut rhs = leaf;
+    for _ in 0..20_000 {
+        rhs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(add),
+            args: Box::new([rhs, rhs]),
+            named: Box::new([]),
+            inputs: None,
+        }));
+    }
+    let name = m.intern("shared");
+    m.add_binding(Binding {
+        name,
+        rhs,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+    assert!(is_flatpdl(&m).is_ok());
+
+    m.set_type(leaf, Type::Failed("invalid shared leaf".into()));
+    let bad = is_flatpdl(&m).unwrap_err();
+    assert_eq!(bad.len(), 1, "one diagnostic per shared node and context");
+    assert_eq!(bad[0].node, leaf);
+    assert!(matches!(bad[0].kind, NonConformKind::Failed));
+}
+
+#[test]
+fn shared_kernel_is_checked_in_both_parent_contexts() {
+    use flatppl_core::{Binding, Mass, Node, Type};
+    use flatppl_determinizer::NonConformKind;
+
+    let mut m =
+        infer_module("ok = builtin_logdensityof(Normal, record(mu = 0.0, sigma = 1.0), 0.0)");
+    let rhs = m.bindings().next().unwrap().1.rhs;
+    let Node::Call(call) = m.node(rhs) else {
+        panic!("expected builtin call");
+    };
+    let shared = call.args[0];
+    m.set_type(
+        shared,
+        Type::Kernel {
+            inputs: Box::new([]),
+            mass: Mass::Normalized,
+        },
+    );
+    assert!(is_flatpdl(&m).is_ok());
+
+    // The permitted occurrence is visited first. It must not hide this escape.
+    let name = m.intern("escaped");
+    m.add_binding(Binding {
+        name,
+        rhs: shared,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+    let bad = is_flatpdl(&m).unwrap_err();
+    assert!(
+        bad.iter().any(|error| error.node == shared
+            && matches!(error.kind, NonConformKind::KernelNotBuiltinArg))
+    );
+}

@@ -1,5 +1,6 @@
 use crate::refuse::{NonConformKind, NonConformance};
 use flatppl_core::{CallHead, Inputs, Module, Node, NodeId, Phase, Ref, RefNs, Type};
+use std::collections::HashSet;
 
 /// FlatPDL conformance over `flatppl-infer` output: no `Measure`/`Likelihood`-typed node;
 /// `Kernel` type only as an argument of a `builtin_*` primitive (the constructor-tag arg —
@@ -21,8 +22,25 @@ use flatppl_core::{CallHead, Inputs, Module, Node, NodeId, Phase, Ref, RefNs, Ty
 pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
     let mut bad = Vec::new();
     let tags = kernel_tag_slots(m);
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
     for (_bid, binding) in m.bindings() {
-        visit(m, binding.rhs, None, &tags, &mut bad);
+        pending.push((binding.rhs, false));
+        while let Some((id, kernel_allowed)) = pending.pop() {
+            // A shared kernel can occur both inside and outside a builtin_* call.
+            // Its two contexts must be checked independently.
+            if !seen.insert((id, kernel_allowed)) {
+                continue;
+            }
+            check_node(m, id, kernel_allowed, &tags, &mut bad);
+            let node = m.node(id);
+            let child_kernel_allowed = matches!(node, Node::Call(c)
+                if matches!(c.head, CallHead::Builtin(op)
+                    if m.resolve(op).starts_with("builtin_")));
+            let start = pending.len();
+            node.for_each_child(|child| pending.push((child, child_kernel_allowed)));
+            pending[start..].reverse();
+        }
     }
     if bad.is_empty() { Ok(()) } else { Err(bad) }
 }
@@ -31,18 +49,21 @@ pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
 /// `flatppl_infer::builtins::kernel_tag_node` — the same table spec-§04 name
 /// resolution uses, so the resolver and this scan cannot disagree about which
 /// argument is a tag.
-fn kernel_tag_slots(m: &Module) -> std::collections::HashSet<NodeId> {
-    fn walk(m: &Module, id: NodeId, out: &mut std::collections::HashSet<NodeId>) {
-        if let Node::Call(c) = m.node(id) {
-            out.extend(flatppl_infer::builtins::kernel_tag_node(m, c));
-        }
-        for child in m.node(id).children() {
-            walk(m, child, out);
-        }
-    }
-    let mut out = std::collections::HashSet::new();
+fn kernel_tag_slots(m: &Module) -> HashSet<NodeId> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
     for (_bid, b) in m.bindings() {
-        walk(m, b.rhs, &mut out);
+        pending.push(b.rhs);
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Node::Call(c) = m.node(id) {
+                out.extend(flatppl_infer::builtins::kernel_tag_node(m, c));
+            }
+            m.node(id).for_each_child(|child| pending.push(child));
+        }
     }
     out
 }
@@ -69,16 +90,13 @@ fn builtin_primitive_arity(name: &str) -> Option<(usize, bool)> {
     }
 }
 
-// `parent_builtin`: the interned name of the enclosing builtin call head, so a
-// `Kernel`-typed node is allowed iff it sits inside a `builtin_*` call. The kernel arg's
-// position varies by primitive, so the check is by-enclosing-call, not by-index; non-kernel
-// args are never `Kernel`-typed, so this admits no stray kernel.
-
-fn visit(
+// A `Kernel`-typed node is allowed inside a `builtin_*` call. Its argument
+// position varies by primitive, so the enclosing call supplies the context.
+fn check_node(
     m: &Module,
     id: NodeId,
-    parent_builtin: Option<&str>,
-    tags: &std::collections::HashSet<NodeId>,
+    kernel_allowed: bool,
+    tags: &HashSet<NodeId>,
     bad: &mut Vec<NonConformance>,
 ) {
     if matches!(m.phase_of(id), Some(Phase::Stochastic)) {
@@ -99,13 +117,11 @@ fn visit(
             kind: NonConformKind::LikelihoodTyped,
             reason: "likelihood-typed node".into(),
         }),
-        Some(Type::Kernel { .. }) if !parent_builtin.is_some_and(|h| h.starts_with("builtin_")) => {
-            bad.push(NonConformance {
-                node: id,
-                kind: NonConformKind::KernelNotBuiltinArg,
-                reason: "kernel outside a builtin_* argument".into(),
-            })
-        }
+        Some(Type::Kernel { .. }) if !kernel_allowed => bad.push(NonConformance {
+            node: id,
+            kind: NonConformKind::KernelNotBuiltinArg,
+            reason: "kernel outside a builtin_* argument".into(),
+        }),
         Some(Type::Failed(reason)) => bad.push(NonConformance {
             node: id,
             kind: NonConformKind::Failed,
@@ -236,25 +252,5 @@ fn visit(
                 }
             }
         }
-    }
-
-    // Collect children and determine the builtin head symbol before recursing,
-    // keeping the `m.node(id)` borrow scoped so it doesn't conflict with
-    // `m.resolve(sym)` in the recursive call.
-    let (children, head_sym) = {
-        let node = m.node(id);
-        let sym = match node {
-            Node::Call(c) => match c.head {
-                CallHead::Builtin(op) => Some(op),
-                _ => None,
-            },
-            _ => None,
-        };
-        (node.children(), sym)
-    };
-    let this_builtin: Option<&str> = head_sym.map(|op| m.resolve(op));
-
-    for child in children {
-        visit(m, child, this_builtin, tags, bad);
     }
 }

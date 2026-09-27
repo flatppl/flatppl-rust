@@ -402,7 +402,7 @@ pub(crate) fn call_rule(
                     // indexes in the body (`A[.i, .j]` → `.i` is A's flat dim 0).
                     let mut extents = std::collections::HashMap::new();
                     if let Some(b) = args.get(2) {
-                        collect_axis_dims(inf, b.0, &mut extents);
+                        collect_axis_dims(inf, b.0, &axes, &mut extents);
                     }
                     let dims: Vec<Dim> = axes
                         .iter()
@@ -3446,6 +3446,7 @@ fn flatten_dims(t: &Type) -> Vec<Dim> {
 fn collect_axis_dims(
     inf: &Inferencer<'_, '_>,
     node: NodeId,
+    output_axes: &[Symbol],
     out: &mut std::collections::HashMap<Symbol, Dim>,
 ) {
     let mut pending = vec![node];
@@ -3467,6 +3468,11 @@ fn collect_axis_dims(
                     {
                         out.entry(ax.name).or_insert(d);
                     }
+                }
+                // The first binding fixes each extent. Later body nodes cannot
+                // change the output shape once every requested axis has a binding.
+                if output_axes.iter().all(|axis| out.contains_key(axis)) {
+                    return;
                 }
             }
         }
