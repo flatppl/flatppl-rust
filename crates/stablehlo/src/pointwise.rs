@@ -1,5 +1,6 @@
 //! Typed pointwise recipes shared by consumer expansion and horizontal packing.
 //! Expansion keeps batch-invariant work hoisted and preserves arithmetic order.
+//! Reductions participate only in packing, never pointwise expansion.
 
 use super::*;
 
@@ -13,6 +14,7 @@ pub(super) enum Pointwise {
     Broadcast(Value, Vec<u64>),
     Reshape(Value),
     Slice(Value, Vec<u64>, Vec<u64>, Vec<u64>),
+    Reduce(Value, usize, String, String),
 }
 
 #[derive(Clone)]
@@ -28,7 +30,8 @@ impl Pointwise {
             | Self::Convert(a, _)
             | Self::Broadcast(a, _)
             | Self::Reshape(a)
-            | Self::Slice(a, ..) => vec![a],
+            | Self::Slice(a, ..)
+            | Self::Reduce(a, ..) => vec![a],
             Self::Binary(_, a, b) | Self::Compare(_, a, b) => vec![a, b],
             Self::Select(c, a, b) => vec![c, a, b],
         }
@@ -41,6 +44,9 @@ impl Pointwise {
             Self::Select(..) => "select".to_owned(),
             Self::Convert(..) => "convert".to_owned(),
             Self::Broadcast(_, dims) => return Some(("broadcast".to_owned(), dims.clone())),
+            Self::Reduce(_, axis, op, init) => {
+                return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
+            }
             Self::Reshape(_) | Self::Slice(..) => return None,
         };
         Some((name, vec![]))
@@ -121,7 +127,10 @@ impl Emitter<'_> {
                 let a = expand(&a);
                 self.convert(&a, elem)
             }
-            Pointwise::Broadcast(..) | Pointwise::Reshape(_) | Pointwise::Slice(..) => return None,
+            Pointwise::Broadcast(..)
+            | Pointwise::Reshape(_)
+            | Pointwise::Slice(..)
+            | Pointwise::Reduce(..) => return None,
         };
         self.expanded.insert(key, out.clone());
         Some(out)

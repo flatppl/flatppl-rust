@@ -630,7 +630,7 @@ fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     let mx = e.reduce_max(&v);
     assert_eq!(mx.ty, MlirTy::Scalar);
 
-    let out = e.finish("f", &[], &[&mx]);
+    let out = e.finish("f", &[], &[&s, &mx]);
     assert!(out.contains("stablehlo.reduce("));
     assert!(
         out.contains("applies stablehlo.add across dimensions"),

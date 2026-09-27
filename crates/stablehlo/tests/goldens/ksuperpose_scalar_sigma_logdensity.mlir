@@ -11,10 +11,9 @@ module {
     %27 = stablehlo.reduce(%25 init: %26) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
     %28 = stablehlo.log %27 : tensor<f32>
     %29 = stablehlo.add %28, %22 : tensor<f32>
-    %30 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %31 = stablehlo.reduce(%0 init: %30) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %32 = stablehlo.log %31 : tensor<f32>
-    %33 = stablehlo.subtract %29, %32 : tensor<f32>
-    return %33 : tensor<f32>
+    %30 = stablehlo.reduce(%0 init: %26) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+    %31 = stablehlo.log %30 : tensor<f32>
+    %32 = stablehlo.subtract %29, %31 : tensor<f32>
+    return %32 : tensor<f32>
   }
 }

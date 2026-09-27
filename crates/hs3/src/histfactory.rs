@@ -1,5 +1,6 @@
 //! histfactory_dist -> broadcast/arithmetic effects + per-modifier auxiliary
 //! likelihood terms (12-profiles.md; pyhf/ROOT-verified). Point-free (no `fn`).
+use crate::auxiliary::{Constraint, Normal};
 use crate::builder::Builder;
 use crate::error::{Error, Result};
 use crate::model::{Modifier, SampleData};
@@ -102,7 +103,7 @@ pub fn emit_shapesys_constraint(
     nominal_vals: &[f64],
     sigma_vals: &[f64],
     ov: &AuxOverride,
-) -> NodeId {
+) -> Constraint {
     let sigma_elems: Vec<NodeId> = sigma_vals.iter().map(|&v| b.lit_real(v)).collect();
     let sigma_arr = b.array(&sigma_elems);
     let sigma_name = b.bind_unique_doc(
@@ -152,7 +153,10 @@ pub fn emit_shapesys_constraint(
         term,
         "shapesys constraint likelihood term.",
     );
-    b.self_ref(&term_name)
+    Constraint {
+        likelihood: b.self_ref(&term_name),
+        normal: None,
+    }
 }
 
 /// The node the constraint is observed at: the measurement's `auxdata` when it
@@ -169,7 +173,7 @@ fn observed_aux(b: &mut Builder, auxdata: &[f64], derived: NodeId) -> NodeId {
 /// parameter `param`, returning its constraint-likelihood term. Binds
 /// `<param>_constraint` = `functionof(Normal(mu = alpha, sigma = 1.0))` and
 /// `<param>_constraint_likelihood`. Caller emits once per parameter.
-pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) -> NodeId {
+pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) -> Constraint {
     let alpha = b.self_ref(param);
     let sigma_one = b.lit_real(1.0);
     let normal = b.call_kw("Normal", &[("mu", alpha), ("sigma", sigma_one)]);
@@ -188,12 +192,19 @@ pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) 
         term,
         "Constraint likelihood term (observed at 0).",
     );
-    b.self_ref(&term_name)
+    Constraint {
+        likelihood: b.self_ref(&term_name),
+        normal: Some(Normal {
+            mean: b.array(&[alpha]),
+            sigma: b.array(&[sigma_one]),
+            observed: b.array(&[obs_zero]),
+        }),
+    }
 }
 
 /// Emit the **luminosity** constraint `Normal(lumi, sigma) observed at nom` for
 /// parameter `param`, returning its constraint-likelihood term.
-pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) -> NodeId {
+pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) -> Constraint {
     let lam = b.self_ref(param);
     let sigma_node = b.lit_real(sigma);
     let normal = b.call_kw("Normal", &[("mu", lam), ("sigma", sigma_node)]);
@@ -211,7 +222,14 @@ pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) 
         term,
         "Luminosity constraint likelihood term.",
     );
-    b.self_ref(&term_name)
+    Constraint {
+        likelihood: b.self_ref(&term_name),
+        normal: Some(Normal {
+            mean: b.array(&[lam]),
+            sigma: b.array(&[sigma_node]),
+            observed: b.array(&[nom_node]),
+        }),
+    }
 }
 
 /// Emit the **staterror** (Barlow-Beeston) constraint for parameter `param`,
@@ -229,7 +247,7 @@ pub fn emit_staterror_constraint(
     sum_sq: &[f64],
     gaussian: bool,
     ov: &AuxOverride,
-) -> NodeId {
+) -> Constraint {
     let gamma = b.self_ref(param);
     if gaussian {
         let deltas: Vec<f64> = if ov.sigmas.is_empty() {
@@ -263,7 +281,14 @@ pub fn emit_staterror_constraint(
             term,
             "staterror constraint likelihood term.",
         );
-        return b.self_ref(&term_name);
+        return Constraint {
+            likelihood: b.self_ref(&term_name),
+            normal: Some(Normal {
+                mean: gamma,
+                sigma: delta_ref,
+                observed: obs,
+            }),
+        };
     }
     // Poisson form: tau_b = sum_nom_b^2 / sum_sq_b (effective counts), computed
     // directly from the sums to match ROOT exactly.
@@ -303,7 +328,10 @@ pub fn emit_staterror_constraint(
         term,
         "staterror constraint likelihood term.",
     );
-    b.self_ref(&term_name)
+    Constraint {
+        likelihood: b.self_ref(&term_name),
+        normal: None,
+    }
 }
 
 /// The per-bin Gaussian width of a staterror constraint:
