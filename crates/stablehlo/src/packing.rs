@@ -692,6 +692,10 @@ impl Packer<'_, '_> {
             strides[axis] = stride as u64;
             return self.out.slice(source, &starts, &dims, &strides);
         }
+        let indices_fit = indices.iter().all(|&i| {
+            i64::try_from(i).is_ok()
+                && (!matches!(self.out.dtype, Dtype::F32) || i32::try_from(i).is_ok())
+        });
         // A few contiguous runs need no runtime index lookup. Bound the view
         // count so irregular permutations remain one tensor gather.
         let breaks = indices
@@ -707,12 +711,21 @@ impl Packer<'_, '_> {
                 parts.push(self.select(source, axis, &indices[start..end]));
                 start = end;
             }
-            return self.concatenate(&parts, axis);
+            let start = self.out.body.len();
+            let value = self.concatenate(&parts, axis);
+            // Replace only a fresh result, never its possibly shared children.
+            // Broadcast hoisting can emit more than one definition here.
+            if indices_fit
+                && self.out.body[start..]
+                    .split_once(" = ")
+                    .is_some_and(|(ssa, rhs)| ssa == value.ssa && rhs.lines().count() == 1)
+            {
+                self.gathers
+                    .remember(source, axis, indices, &value, start..self.out.body.len());
+            }
+            return value;
         }
-        if indices.iter().any(|&i| {
-            i64::try_from(i).is_err()
-                || (matches!(self.out.dtype, Dtype::F32) && i32::try_from(i).is_err())
-        }) {
+        if !indices_fit {
             // Static slice bounds need not fit the runtime index element type.
             let parts = indices
                 .iter()

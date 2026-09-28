@@ -176,6 +176,47 @@ outputs = score.(points)
 }
 
 #[test]
+fn singleton_broadcasts_share_short_selections() {
+    let source = r#"
+score(t) = sum(
+    2.0 * [t[12]] * exp(t[1]) * exp(t[3])
+  + 3.0 * [t[12]] * exp(t[3]) * exp(t[8])
+  + 4.0 * [t[12]] * exp(t[7]) * exp(t[11])
+)
+points = elementof(cartpow(cartpow(reals, 12), 3))
+inputs = points
+outputs = score.(points)
+"#;
+    let ir = emit(source);
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 2, "{ir}");
+    let scalar = emit(&source.replace("[t[12]]", "t[12]"));
+    assert_eq!(
+        scalar.matches("\"stablehlo.gather\"").count(),
+        1,
+        "{scalar}"
+    );
+}
+
+#[test]
+fn short_selection_sharing_keeps_large_static_indices() {
+    let source = r#"
+score(t) = sum(
+    2.0 * [t[2]] * t[2147483649] * t[3]
+  + 3.0 * [t[2]] * t[3] * t[8]
+  + 4.0 * [t[2]] * t[7] * t[11]
+)
+points = elementof(cartpow(cartpow(reals, 2147483649), 3))
+inputs = points
+outputs = score.(points)
+"#;
+    let small = emit(&source.replace("2147483649", "12"));
+    assert_eq!(small.matches("\"stablehlo.gather\"").count(), 1, "{small}");
+    let ir = emit(source);
+    assert!(ir.contains("2147483648:2147483649"), "{ir}");
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+}
+
+#[test]
 fn nested_batched_variance_keeps_fixed_selectors_and_captured_operands() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\
