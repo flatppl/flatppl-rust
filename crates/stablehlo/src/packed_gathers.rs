@@ -25,7 +25,7 @@ impl Requests {
         axis: usize,
         indices: &[usize],
     ) -> Value {
-        let (value, definition) = gather(out, source, axis, indices);
+        let (value, definition) = gather(out, source, axis, axis, indices);
         self.remember(source, axis, indices, &value, definition);
         value
     }
@@ -112,7 +112,13 @@ impl Requests {
             // the first request, where the shared gather must be inserted.
             let mut scratch = Emitter::new(out.m, out.dtype);
             scratch.next = out.next;
-            let (shared, _) = gather(&mut scratch, &first.source, first.axis, &indices);
+            let (shared, _) = gather(
+                &mut scratch,
+                &first.source,
+                first.axis,
+                first.axis,
+                &indices,
+            );
             out.next = scratch.next;
             let mut offset = 0;
             for (number, request) in requests.into_iter().enumerate() {
@@ -161,10 +167,13 @@ impl Requests {
     }
 }
 
-fn gather(
+/// Select static indices along `axis`, placing them at `output_axis` in the result.
+/// Other source axes retain their relative order; indices must fit the target type.
+pub(super) fn gather(
     out: &mut Emitter<'_>,
     source: &Value,
     axis: usize,
+    output_axis: usize,
     indices: &[usize],
 ) -> (Value, Range<usize>) {
     let index_ty = MlirTy::Ranked(vec![Some(indices.len() as u64), Some(1)]);
@@ -176,11 +185,13 @@ fn gather(
         )
         .expect("indices fit the target integer type");
     let mut dims = shape(&source.ty).to_vec();
-    dims[axis] = Some(indices.len() as u64);
-    let ty = MlirTy::Ranked(dims.clone());
+    let mut selected = dims.clone();
+    selected.remove(axis);
+    selected.insert(output_axis, Some(indices.len() as u64));
+    let ty = MlirTy::Ranked(selected);
     dims[axis] = Some(1);
     let offsets = (0..dims.len())
-        .filter(|&d| d != axis)
+        .filter(|&d| d != output_axis)
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(", ");

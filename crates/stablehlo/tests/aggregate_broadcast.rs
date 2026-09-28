@@ -114,6 +114,26 @@ outputs = pick.(points)
 }
 
 #[test]
+fn shared_singleton_gathers_form_an_input_packet() {
+    let ir = emit(
+        r#"
+mapped(x) = exp.(x) .* sin.(x) .+ cos.(x)
+points = elementof(cartpow(reals, [3, 7]))
+a = points[:, [5]]
+b = points[:, [1]]
+c = points[:, [7]]
+d = points[:, [3]]
+e = points[:, [6]]
+inputs = points
+outputs = (a, b, c, d, e, mapped(a), mapped(b), mapped(c), mapped(d), mapped(e))
+"#,
+    );
+    assert!(!ir.contains("stablehlo.concatenate"), "{ir}");
+    assert!(!ir.contains("stablehlo.transpose"), "{ir}");
+    assert_eq!(ir.matches("stablehlo.exponential").count(), 1, "{ir}");
+}
+
+#[test]
 fn large_static_input_selections_do_not_truncate_to_i32() {
     for expression in ["[x[2147483649], x[1]]", "cat([x[2147483649]], [x[1]])"] {
         let ir = emit(&format!(
