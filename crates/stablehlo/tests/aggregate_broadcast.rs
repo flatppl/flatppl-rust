@@ -68,17 +68,65 @@ outputs = mapped.(points)
 }
 
 #[test]
-fn large_static_input_selections_do_not_truncate_to_i32() {
+fn batched_input_cat_uses_one_ordered_gather() {
     let ir = emit(
         r#"
-select(x) = [x[2147483649], x[1]]
+pick(x) = cat([x[4, :, :]], [x[1, :, :]], [x[4, :, :]], [x[2, :, :]], [x[1, :, :]])
+mapped(x) = pick.(x)
+points = elementof(cartpow(cartpow(cartpow(reals, [7, 2, 3]), 3), 2))
+inputs = points
+outputs = mapped.(points)
+"#,
+    );
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.concatenate"), "{ir}");
+    assert!(ir.contains("-> tensor<2x3x5x2x3xf32>"), "{ir}");
+}
+
+#[test]
+fn input_cat_keeps_existing_gather_boundaries() {
+    for (selection, gathers) in [("x[[3]]", 3), ("x[[1, 4]]", 2)] {
+        let ir = emit(&format!(
+            r#"
+pick(x) = cat([x[4]], [x[1]], {selection}, [x[2]], [x[1]])
+points = elementof(cartpow(cartpow(reals, 7), 3))
+inputs = points
+outputs = pick.(points)
+"#,
+        ));
+        assert_eq!(ir.matches("\"stablehlo.gather\"").count(), gathers, "{ir}");
+        assert_eq!(ir.matches("stablehlo.concatenate").count(), 1, "{ir}");
+    }
+}
+
+#[test]
+fn regular_selections_keep_horizontal_packing_boundaries() {
+    let ir = emit(
+        r#"
+mapped(x) = exp.(sin.(x) .+ cos.(x)) ./ (1.0 .+ exp.(-x))
+pick(x) = sum(mapped(x[[1, 2, 3]]) .+ mapped(x[[4, 5, 6]]))
+points = elementof(cartpow(cartpow(reals, 7), 3))
+inputs = points
+outputs = pick.(points)
+"#,
+    );
+    assert_eq!(ir.matches("stablehlo.sine ").count(), 2, "{ir}");
+}
+
+#[test]
+fn large_static_input_selections_do_not_truncate_to_i32() {
+    for expression in ["[x[2147483649], x[1]]", "cat([x[2147483649]], [x[1]])"] {
+        let ir = emit(&format!(
+            r#"
+select(x) = {expression}
 points = elementof(cartpow(cartpow(reals, 2147483649), 2))
 inputs = points
 outputs = select.(points)
 "#,
-    );
-    assert!(ir.contains("[0:2, 2147483648:2147483649]"), "{ir}");
-    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+        ));
+        assert!(ir.contains("[0:2, 2147483648:2147483649]"), "{ir}");
+        assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+    }
 }
 
 #[test]

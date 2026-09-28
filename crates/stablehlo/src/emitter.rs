@@ -951,6 +951,17 @@ impl<'m> Emitter<'m> {
     /// match its operand's exactly, so the result `elem` copies `a`'s (an
     /// `Int`-array `get`/`get0` slices out an `Int` scalar, not a `Real` one).
     pub fn slice(&mut self, a: &Value, starts: &[u64], limits: &[u64], strides: &[u64]) -> Value {
+        self.slice_value(a, starts, limits, strides, true)
+    }
+
+    fn slice_value(
+        &mut self,
+        a: &Value,
+        starts: &[u64],
+        limits: &[u64],
+        strides: &[u64],
+        reusable: bool,
+    ) -> Value {
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims,
             other => panic!("slice expects a ranked operand, got {other:?}"),
@@ -985,14 +996,19 @@ impl<'m> Emitter<'m> {
 
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
-        let ssa = self.pure_like(
-            format!(
-                "stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
-                a.ssa,
-                ranges.join(", ")
-            ),
-            a,
+        let rhs = format!(
+            "stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
+            a.ssa,
+            ranges.join(", ")
         );
+        let ssa = if reusable {
+            self.pure_like(rhs, a)
+        } else {
+            let ssa = self.fresh();
+            self.push(&format!("{ssa} = {rhs}"));
+            self.remember_axes(&ssa, self.axes_of(a));
+            ssa
+        };
         let out = Value {
             ssa,
             ty: result_ty,
@@ -1140,11 +1156,31 @@ impl<'m> Emitter<'m> {
 
         let base_const = self.int_value_const(base);
         let idx0 = self.sub(idx, &base_const);
-        let idx2d = self.reshape(&idx0, MlirTy::Ranked(vec![n, Some(1)]));
-
         let batch = self.batch_rank(operand);
         let axis = batch + cell_axis;
         let operand_dims = shape(&operand.ty);
+        let indices = self
+            .constants
+            .get(&idx0.ssa)
+            // Keep large splats compact instead of expanding optional metadata.
+            .filter(|data| n.and_then(|n| usize::try_from(n).ok()) == Some(data.len()))
+            .and_then(|data| {
+                data.iter()
+                    .map(|value| match value {
+                        Scalar::Int(value) => u64::try_from(*value)
+                            .ok()
+                            .filter(|&v| Some(v) < operand_dims[axis]),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+        if let Some(indices) = &indices
+            && let Some(value) = self.regular_gather_slice(operand, axis, indices)
+        {
+            return value;
+        }
+
+        let idx2d = self.reshape(&idx0, MlirTy::Ranked(vec![n, Some(1)]));
         let mut result_dims = operand_dims.to_vec();
         result_dims[axis] = n;
         let result_ty = MlirTy::Ranked(result_dims);
@@ -1184,20 +1220,7 @@ impl<'m> Emitter<'m> {
             elem: operand.elem,
         };
         // Retain provenance without changing the gather's scheduling or CSE.
-        if let Some(n) = n.and_then(|n| usize::try_from(n).ok())
-            && let Some(data) = self.constants.get(&idx0.ssa)
-            // Keep large splats compact instead of expanding optional metadata.
-            && data.len() == n
-            && let Some(indices) = data
-                .iter()
-                .map(|value| match value {
-                    Scalar::Int(value) => u64::try_from(*value)
-                        .ok()
-                        .filter(|&v| Some(v) < operand_dims[axis]),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-        {
+        if let Some(indices) = indices {
             self.remember_pointwise(
                 &out.ssa,
                 &out,
@@ -1205,6 +1228,41 @@ impl<'m> Emitter<'m> {
             );
         }
         out
+    }
+
+    /// In-bounds increasing arithmetic progressions need no index tensor.
+    /// Retain the gather's provenance and fresh scheduling policy.
+    fn regular_gather_slice(
+        &mut self,
+        operand: &Value,
+        axis: usize,
+        indices: &[u64],
+    ) -> Option<Value> {
+        let stride = indices.get(1)?.checked_sub(indices[0])?;
+        if stride == 0
+            || indices
+                .windows(2)
+                .any(|p| p[1].checked_sub(p[0]) != Some(stride))
+        {
+            return None;
+        }
+        let mut limits = shape(&operand.ty)
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()?;
+        let mut starts = vec![0; limits.len()];
+        let mut strides = vec![1; limits.len()];
+        starts[axis] = indices[0];
+        limits[axis] = indices.last()?.checked_add(1)?;
+        strides[axis] = stride;
+        // Reusable slices would join existing horizontal-packing regions.
+        let value = self.slice_value(operand, &starts, &limits, &strides, false);
+        self.remember_pointwise(
+            &value.ssa,
+            &value,
+            Pointwise::Gather(operand.clone(), axis, indices.to_vec()),
+        );
+        Some(value)
     }
 
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
@@ -1338,6 +1396,10 @@ impl<'m> Emitter<'m> {
             ));
         }
         let ty = MlirTy::Ranked(dims);
+        let parts = self.coalesce_input_slices(&parts, &axes);
+        if parts.len() == 1 {
+            return Ok(parts[0].clone());
+        }
         let names = parts
             .iter()
             .map(|v| v.ssa.as_str())

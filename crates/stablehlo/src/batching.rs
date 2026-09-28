@@ -387,11 +387,13 @@ impl Emitter<'_> {
     }
 
     pub(super) fn vector_batched(&mut self, elems: &[Value]) -> Value {
-        let selection = self.vector_selection(elems);
-        if let Some((source, indices)) = &selection
-            && let Some(value) = self.gather_input_vector(source, indices, self.axes_of(&elems[0]))
-        {
-            return value;
+        let selection = self.static_selections(elems, false);
+        if let Some((source, indices)) = &selection {
+            let mut axes = self.axes_of(&elems[0]);
+            axes.layers.insert(0, 1);
+            if let Some(value) = self.gather_input_selection(source, indices, axes) {
+                return value;
+            }
         }
         let mut target = elems[0].clone();
         for v in &elems[1..] {
@@ -445,7 +447,46 @@ impl Emitter<'_> {
         value
     }
 
-    fn vector_selection(&self, elems: &[Value]) -> Option<(Value, Vec<u64>)> {
+    /// Coalesce scalar slice stretches, retaining existing selection boundaries.
+    /// Bypassing gathered chunks can inline them into costly downstream fusions.
+    pub(super) fn coalesce_input_slices(&mut self, parts: &[Value], axes: &Axes) -> Vec<Value> {
+        let mut output = Vec::with_capacity(parts.len());
+        let mut start = 0;
+        for end in 0..=parts.len() {
+            if end < parts.len()
+                && matches!(
+                    self.selection_producer(&parts[end]),
+                    Some(Pointwise::Slice(..))
+                )
+            {
+                continue;
+            }
+            if let Some((source, indices)) = self.static_selections(&parts[start..end], true)
+                && let Some(value) = self.gather_input_selection(&source, &indices, axes.clone())
+            {
+                output.push(value);
+            } else {
+                output.extend_from_slice(&parts[start..end]);
+            }
+            if let Some(part) = parts.get(end) {
+                output.push(part.clone());
+            }
+            start = end + 1;
+        }
+        output
+    }
+
+    fn selection_producer(&self, value: &Value) -> Option<&Pointwise> {
+        let mut op = &self.pointwise.get(&value.ssa)?.op;
+        while let Pointwise::Reshape(input) = op {
+            op = &self.pointwise.get(&input.ssa)?.op;
+        }
+        Some(op)
+    }
+
+    /// Recover ordered singleton slices without expanding compact multi-cell slices.
+    /// `cat` retains the selected axis; a vector constructor inserts it.
+    fn static_selections(&self, elems: &[Value], keep_axis: bool) -> Option<(Value, Vec<u64>)> {
         if elems.len() < 2 {
             return None;
         }
@@ -454,50 +495,49 @@ impl Emitter<'_> {
         let mut source: Option<Value> = None;
         let mut indices = Vec::with_capacity(elems.len());
         for value in elems {
-            if value.ty != elems[0].ty || self.axes_of(value) != axes {
+            if (!keep_axis && value.ty != elems[0].ty) || self.axes_of(value) != axes {
                 return None;
             }
-            let Pointwise::Reshape(part) = &self.pointwise.get(&value.ssa)?.op else {
-                return None;
-            };
-            let Pointwise::Slice(base, starts, limits, strides) =
-                &self.pointwise.get(&part.ssa)?.op
+            let Pointwise::Slice(base, starts, limits, strides) = self.selection_producer(value)?
             else {
                 return None;
             };
+            let index = *starts.get(axis)?;
             let dims = shape(&base.ty);
             let width = dims.get(axis).copied().flatten()?;
             let mut cell = dims.to_vec();
-            cell.remove(axis);
+            if keep_axis {
+                cell[axis] = Some(1);
+            } else {
+                cell.remove(axis);
+            }
             if self.batch_rank(base) != axis
                 || cell != shape(&value.ty)
+                || limits.get(axis).copied() != index.checked_add(1)
                 || strides.iter().any(|&s| s != 1)
-                || starts[axis] >= width
-                || limits[axis] != starts[axis] + 1
                 || dims.iter().enumerate().any(|(d, &n)| {
                     n.is_none() || (d != axis && (starts[d] != 0 || Some(limits[d]) != n))
                 })
+                || index >= width
+                || i64::try_from(index).is_err()
+                || (matches!(self.dtype, Dtype::F32) && i32::try_from(index).is_err())
                 || source.as_ref().is_some_and(|s| s != base)
             {
                 return None;
             }
             source.get_or_insert_with(|| base.clone());
-            let index = i64::try_from(starts[axis]).ok()?;
-            if matches!(self.dtype, Dtype::F32) && i32::try_from(index).is_err() {
-                return None;
-            }
-            indices.push(starts[axis]);
+            indices.push(index);
         }
         Some((source?, indices))
     }
 
     /// Assemble input selections directly. Computed sources keep their concat
     /// boundary, with selection provenance available to explicit reductions.
-    fn gather_input_vector(
+    fn gather_input_selection(
         &mut self,
         source: &Value,
         indices: &[u64],
-        mut axes: Axes,
+        axes: Axes,
     ) -> Option<Value> {
         let mut root = source;
         while let Some(pointwise::Producer {
@@ -525,7 +565,6 @@ impl Emitter<'_> {
             Axes::default(),
         )?;
         let gathered = self.gather_axis(source, &index, 0, 0);
-        axes.layers.insert(0, 1);
         Some(self.axes_view(&gathered, axes))
     }
 }
