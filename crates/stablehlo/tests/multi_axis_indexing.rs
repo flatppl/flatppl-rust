@@ -93,6 +93,27 @@ fn vector_selector_can_replace_a_later_axis() {
 }
 
 #[test]
+fn regular_selection_uses_a_slice_with_exact_last_element() {
+    let source = "matrices = elementof(cartpow(cartpow(reals, [4, 7]), 2))\n\
+         pick(matrix) = get(matrix, all, [1, 4])\n\
+         inputs = matrices\noutputs = pick.(matrices)\n";
+    let ir = emit(source).expect("regular column selection must emit");
+
+    assert_eq!(ir.matches("stablehlo.slice").count(), 1, "{ir}");
+    assert!(ir.contains("[0:2, 0:4, 0:4:3]"), "{ir}");
+    assert!(ir.contains("-> tensor<2x4x2xf32>"), "{ir}");
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+
+    let irregular = emit(&source.replace("[1, 4]", "[1, 3, 6]")).unwrap();
+    assert_eq!(
+        irregular.matches("\"stablehlo.gather\"").count(),
+        1,
+        "{irregular}"
+    );
+    assert!(!irregular.contains("stablehlo.slice"), "{irregular}");
+}
+
+#[test]
 fn literal_only_and_all_slice_and_collapse_axes() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\
