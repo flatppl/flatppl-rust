@@ -52,6 +52,43 @@ outputs = combined.(a, b)
 }
 
 #[test]
+fn unequal_segment_sums_share_one_reduction() {
+    let ir = emit(
+        r#"
+flatppl_compat = "0.1"
+planes(a) = aggregate(sum, [.k, .j], a[.i, .j, .k])
+sums(x) = [planes(x[[1, 3, 1], :, :]), planes(x[[7, 2], :, :]), planes(x[[4], :, :])]
+points = elementof(cartpow(cartpow(reals, [7, 2, 3]), 3))
+inputs = points
+outputs = sums.(points)
+"#,
+    );
+    assert_eq!(ir.matches("stablehlo.reduce(").count(), 1, "{ir}");
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 1, "{ir}");
+}
+
+#[test]
+fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
+    for (outputs, count) in [
+        ("(sum(x[index]), sum(x[[2, 3]]))", 2),
+        ("(sum(selected), sum(x[[2, 3]]), selected)", 2),
+        ("(sum(x[fill(1, 3)]), sum(x[[2, 3]]))", 2),
+        (
+            "(sum(x[[1]]), sum(x[[2, 3]]), sum(x[[1, 2, 3, 4, 5, 6, 7]]))",
+            3,
+        ),
+    ] {
+        let ir = emit(&format!(
+            "x = elementof(cartpow(reals, 7))\n\
+             index = elementof(cartpow(posintegers, 3))\n\
+             selected = x[[1, 4, 1]]\n\
+             inputs = (x, index)\noutputs = {outputs}\n"
+        ));
+        assert_eq!(ir.matches("stablehlo.reduce(").count(), count, "{ir}");
+    }
+}
+
+#[test]
 fn sliced_consumers_pack_within_each_source_tensor() {
     let ir = emit(
         r#"
