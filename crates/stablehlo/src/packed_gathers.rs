@@ -26,6 +26,18 @@ impl Requests {
         indices: &[usize],
     ) -> Value {
         let (value, definition) = gather(out, source, axis, indices);
+        self.remember(source, axis, indices, &value, definition);
+        value
+    }
+
+    pub(super) fn remember(
+        &mut self,
+        source: &Value,
+        axis: usize,
+        indices: &[usize],
+        value: &Value,
+        definition: Range<usize>,
+    ) {
         // CSE may reuse a prior definition. Record each definition only once.
         if !definition.is_empty() {
             self.0.push(Request {
@@ -36,7 +48,6 @@ impl Requests {
                 definition,
             });
         }
-        value
     }
 
     /// Terminal body rewrite: no further operations may use the emitter caches.
