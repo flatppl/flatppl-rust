@@ -28,6 +28,22 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+#[test]
+fn const_fold_handles_shared_inlined_arguments() {
+    let out = determinize_src(
+        "twice(x) = x + x
+p = elementof(reals)
+live = twice(twice(p))
+folded = twice(twice(1.5))
+inputs = p
+outputs = (live, folded)",
+    );
+    let text = flatppl_syntax::print_with(&out, flatppl_syntax::Syntax::Minimal);
+    assert!(text.contains("folded = 6.0"), "{text}");
+    assert!(text.contains("live = add(add(p, p), add(p, p))"), "{text}");
+    assert!(text.contains("inputs = p"), "{text}");
+}
+
 // const_fold is idempotent: determinizing the same source twice produces
 // identical FlatPIR (canonicalize already ran to a fixpoint inside the first
 // determinize).
