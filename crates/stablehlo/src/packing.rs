@@ -347,7 +347,10 @@ impl Packer<'_, '_> {
                 .collect::<Vec<_>>();
             return self.out.broadcast_in_dim(&value, &dims, ty);
         }
-        if let Some(value) = self.input_slices(values) {
+        if let Some(value) = self
+            .input_slices(values)
+            .or_else(|| self.input_gathers(values))
+        {
             return value;
         }
         let group = self.members.get(&first.ssa).map(|&(group, _)| group);
@@ -578,6 +581,81 @@ impl Packer<'_, '_> {
             ty,
             Axes::default(),
         )
+    }
+
+    /// Assemble existing singleton-input packets without materializing each leaf.
+    /// Other consumers keep their original gather dependencies.
+    fn input_gathers(&mut self, values: &[Value]) -> Option<Value> {
+        let mut source: Option<(Value, usize)> = None;
+        let mut indices = Vec::with_capacity(values.len());
+        for value in values {
+            let Pointwise::Gather(base, axis, selected) =
+                &self.source.pointwise.get(&value.ssa)?.op
+            else {
+                return None;
+            };
+            let [index] = selected.as_slice() else {
+                return None;
+            };
+            let mut root = base;
+            while let Some(pointwise::Producer {
+                op: Pointwise::Reshape(input),
+                ..
+            }) = self.source.pointwise.get(&root.ssa)
+            {
+                if input.ty != root.ty {
+                    return None;
+                }
+                root = input;
+            }
+            // The packer has already resolved every source to an instruction or ABI argument.
+            if self.instructions.contains_key(root.ssa.as_str()) {
+                return None;
+            }
+            let mut cell = dimensions(&root.ty)?;
+            let width = cell.get_mut(*axis)?;
+            if *index >= *width
+                || i64::try_from(*index).is_err()
+                || (matches!(self.out.dtype, Dtype::F32) && i32::try_from(*index).is_err())
+            {
+                return None;
+            }
+            *width = 1;
+            if cell != dimensions(&value.ty)?
+                || root.elem != value.elem
+                || source.as_ref().is_some_and(|(s, a)| s != root || a != axis)
+            {
+                return None;
+            }
+            source = Some((root.clone(), *axis));
+            indices.push(usize::try_from(*index).ok()?);
+        }
+        let (mut source, axis) = source?;
+        source.ssa = self.original(&source.ssa);
+        let regular = indices
+            .get(1)
+            .and_then(|&i| i.checked_sub(indices[0]))
+            .is_some_and(|stride| {
+                stride > 0
+                    && indices
+                        .windows(2)
+                        .all(|p| p[1].checked_sub(p[0]) == Some(stride))
+            });
+        let selected = if regular {
+            // Regular packets need no index tensor. Slice before moving the
+            // selected axis, retaining the minimal exclusive endpoint.
+            let selected = self.select(&source, axis, &indices);
+            let mut perm = (0..shape(&source.ty).len() as u64).collect::<Vec<_>>();
+            let moved = perm.remove(axis);
+            perm.insert(PACKET_AXIS, moved);
+            self.out.transpose(&selected, &perm)
+        } else {
+            // Put lanes first through gather dimensions, not an ABI transpose
+            // that can force copies at every packed consumer.
+            packed_gathers::gather(&mut self.out, &source, axis, PACKET_AXIS, &indices).0
+        };
+        let ty = self.stacked(&values[0], values.len());
+        Some(self.out.reshape(&selected, ty))
     }
 
     fn input_slices(&mut self, values: &[Value]) -> Option<Value> {
