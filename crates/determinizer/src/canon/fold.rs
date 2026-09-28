@@ -9,18 +9,38 @@ use crate::driver::{map_tree, referenced_binding_names};
 
 /// Fold builtin arithmetic on literal operands. Two-phase: `map_tree`'s closure
 /// only gets `&Module` (no `alloc`), so phase 1 walks each binding's RHS
-/// bottom-up allocating the literal replacement for every foldable node
-/// (`collect_folds`, needs `&mut Module`); phase 2 applies those replacements
-/// via a `map_tree` identity-by-id closure. One sweep folds a whole already-
-/// literal subtree bottom-up (recursion in `collect_folds` sees an inner fold's
-/// result within the same sweep); the driver's fixpoint re-runs this after
-/// `resolve_alias_refs`/`sweep_dead_bindings` may have exposed further literal
-/// operands.
+/// bottom-up allocating the literal replacement for every foldable node;
+/// phase 2 applies those replacements via a `map_tree` identity-by-id closure.
+/// One sweep folds a whole literal subtree, sharing results across the DAG.
+/// The driver's fixpoint re-runs this after alias resolution or other rewrites
+/// may have exposed further literal operands.
 pub(crate) fn const_fold(m: &mut Module) -> bool {
     let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
-    let roots: Vec<NodeId> = m.bindings().map(|(_, b)| b.rhs).collect();
-    for root in &roots {
-        collect_folds(m, *root, &mut replacements);
+    // This phase only allocates new nodes, so cached values stay valid until
+    // replacements are applied below. Rewrites get a fresh cache next sweep.
+    let mut scalars = HashMap::new();
+    let mut pending = m
+        .bindings()
+        .map(|(_, b)| (b.rhs, false))
+        .collect::<Vec<_>>();
+    pending.reverse();
+    while let Some((id, ready)) = pending.pop() {
+        if scalars.contains_key(&id) {
+            continue;
+        }
+        if ready {
+            let value = fold_scalar(m, id, &scalars, &mut replacements);
+            scalars.insert(id, value);
+        } else {
+            pending.push((id, true));
+            pending.extend(
+                m.node(id)
+                    .children()
+                    .into_iter()
+                    .rev()
+                    .map(|id| (id, false)),
+            );
+        }
     }
     if replacements.is_empty() {
         return false;
@@ -41,21 +61,18 @@ pub(crate) fn const_fold(m: &mut Module) -> bool {
     changed
 }
 
-/// Walk `root` bottom-up; for each foldable node, alloc its literal result and
-/// record `node -> replacement`. Recurses so an inner fold's literal result is
-/// visible to its parent within the SAME sweep (faster convergence than relying
-/// only on the driver fixpoint, and keeps the map_tree apply purely by-id).
-fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) -> Option<Scalar> {
+/// Fold one node after its children. `None` is cached too: shared nonconstant
+/// subgraphs must not be walked again through each incoming edge.
+fn fold_scalar(
+    m: &mut Module,
+    id: NodeId,
+    scalars: &HashMap<NodeId, Option<Scalar>>,
+    out: &mut HashMap<NodeId, NodeId>,
+) -> Option<Scalar> {
     let children: Vec<NodeId> = m.node(id).children();
-    let child_scalars: Vec<Option<Scalar>> =
-        children.iter().map(|&c| collect_folds(m, c, out)).collect();
+    let child_scalars: Vec<Option<Scalar>> = children.iter().map(|c| scalars[c].clone()).collect();
 
     let Node::Call(c) = m.node(id) else {
-        // A literal node reports its own value so a parent can fold; a
-        // just-folded child (recorded in `out`) also needs to report its value,
-        // but `out` only maps node -> replacement id, not id -> Scalar, so we
-        // read the replacement's own Lit value back out (it was just alloc'd
-        // as a `Node::Lit`, so this always succeeds).
         if let Node::Lit(s) = m.node(id) {
             return Some(s.clone());
         }
@@ -199,7 +216,7 @@ fn alloc_int_result(m: &mut Module, v: i64) -> Option<NodeId> {
 }
 
 /// A whole number in the small range where `f64::powi` (repeated multiplication)
-/// is exact and cheap — the only `pow` exponents `collect_folds` folds. Its
+/// is exact and cheap — the only `pow` exponents `fold_scalar` folds. Its
 /// result is bit-identical to the JS engine's `Math.pow` (flatppl-js
 /// `value-ops.ts`), whose V8 integer-exponent fast path coincides with `powi`
 /// (verified across the ±64 range). A non-whole or large exponent is left for
