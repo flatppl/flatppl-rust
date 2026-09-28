@@ -525,14 +525,16 @@ fn interp_poly6_exp(m: &mut Module, [left, center, right, alpha]: [NodeId; 4]) -
     let mid = mul(m, center, mod_val);
 
     let up_arg = mul(m, alpha, log_hi);
-    let up_factor = exp(m, up_arg);
-    let up = mul(m, center, up_factor);
     let neg_alpha = neg(m, alpha);
     let dn_arg = mul(m, neg_alpha, log_lo);
-    let dn_factor = exp(m, dn_arg);
-    let dn = mul(m, center, dn_factor);
+    // Select before exp so the unused opposite tail cannot overflow into
+    // reverse-mode derivatives. The polynomial region still selects `mid`.
+    let above = build_call(m, "gt", &[alpha, one]);
+    let tail_arg = build_call(m, "ifelse", &[above, up_arg, dn_arg]);
+    let tail_factor = exp(m, tail_arg);
+    let tail = mul(m, center, tail_factor);
 
-    split_at_unit(m, alpha, up, dn, mid)
+    split_at_unit(m, alpha, tail, tail, mid)
 }
 
 /// `factor * (constant + sum_i k_i * term_i)`.
