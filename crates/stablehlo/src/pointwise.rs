@@ -14,6 +14,9 @@ pub(super) enum Pointwise {
     Broadcast(Value, Vec<u64>),
     Reshape(Value),
     Slice(Value, Vec<u64>, Vec<u64>, Vec<u64>),
+    Transpose(Value, Vec<u64>),
+    // In-bounds, zero-based static selections from gather_axis, not packet gathers.
+    Gather(Value, usize, Vec<u64>),
     Reduce(Value, usize, String, String),
 }
 
@@ -31,6 +34,8 @@ impl Pointwise {
             | Self::Broadcast(a, _)
             | Self::Reshape(a)
             | Self::Slice(a, ..)
+            | Self::Transpose(a, _)
+            | Self::Gather(a, ..)
             | Self::Reduce(a, ..) => vec![a],
             Self::Binary(_, a, b) | Self::Compare(_, a, b) => vec![a, b],
             Self::Select(c, a, b) => vec![c, a, b],
@@ -47,9 +52,25 @@ impl Pointwise {
             Self::Reduce(_, axis, op, init) => {
                 return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
             }
-            Self::Reshape(_) | Self::Slice(..) => return None,
+            Self::Reshape(_) | Self::Slice(..) | Self::Transpose(..) | Self::Gather(..) => {
+                return None;
+            }
         };
         Some((name, vec![]))
+    }
+
+    /// Preserve segment provenance through opaque replay without exposing new
+    /// broadcast recipes to the horizontal packer's hoisting decisions.
+    pub(super) fn remap_segment(&self, mut rename: impl FnMut(&Value) -> Value) -> Option<Self> {
+        Some(match self {
+            Self::Reshape(a) => Self::Reshape(rename(a)),
+            Self::Transpose(a, perm) => Self::Transpose(rename(a), perm.clone()),
+            Self::Gather(a, axis, indices) => Self::Gather(rename(a), *axis, indices.clone()),
+            Self::Reduce(a, axis, op, init) => {
+                Self::Reduce(rename(a), *axis, op.clone(), init.clone())
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -130,6 +151,8 @@ impl Emitter<'_> {
             Pointwise::Broadcast(..)
             | Pointwise::Reshape(_)
             | Pointwise::Slice(..)
+            | Pointwise::Transpose(..)
+            | Pointwise::Gather(..)
             | Pointwise::Reduce(..) => return None,
         };
         self.expanded.insert(key, out.clone());

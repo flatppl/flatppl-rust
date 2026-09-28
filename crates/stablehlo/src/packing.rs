@@ -65,11 +65,11 @@ pub(super) fn ssa_uses(text: &str) -> impl Iterator<Item = (usize, &str)> {
     })
 }
 
-pub(super) fn pack(
-    source: &Emitter<'_>,
+pub(super) fn pack<'m>(
+    source: &Emitter<'m>,
     args: &[(String, MlirTy, ElemKind)],
     rets: &[&Value],
-) -> Option<(String, Vec<Value>)> {
+) -> Option<(Emitter<'m>, Vec<Value>)> {
     // RNG state and region-local recipes never enter the straight-line pass.
     if source.cur_key.is_some() {
         return None;
@@ -241,7 +241,7 @@ pub(super) fn pack(
     let packed = packer.out.live_lines(&refs);
     // Small cones can cost more views than they save in arithmetic. Preserve
     // their original text as well as avoiding extra work for the backend.
-    (packed.len() < lines.len()).then(|| (packed.join("\n"), returns))
+    (packed.len() < lines.len()).then_some((packer.out, returns))
 }
 
 impl Packer<'_, '_> {
@@ -293,6 +293,19 @@ impl Packer<'_, '_> {
                 ssa
             }
         };
+        if !self.members.contains_key(name)
+            && let Some(producer) = self.source.pointwise.get(name)
+            && let Some(op) = producer.op.remap_segment(|v| Value {
+                ssa: self.originals[&v.ssa].clone(),
+                ..v.clone()
+            })
+        {
+            let value = Value {
+                ssa: out.clone(),
+                ..producer.value.clone()
+            };
+            self.out.remember_pointwise(&out, &value, op);
+        }
         self.originals.insert(name.to_owned(), out.clone());
         out
     }
@@ -395,7 +408,10 @@ impl Packer<'_, '_> {
                     dims.insert(PACKET_AXIS, axis as u64);
                     self.out.broadcast_in_dim(&inputs[0], &dims, ty.clone())
                 }
-                Pointwise::Reshape(_) | Pointwise::Slice(..) => unreachable!(),
+                Pointwise::Reshape(_)
+                | Pointwise::Slice(..)
+                | Pointwise::Transpose(..)
+                | Pointwise::Gather(..) => unreachable!(),
             };
             return match hoisted {
                 Some((_, dims)) => self.out.broadcast_in_dim(&result, &dims, ty),

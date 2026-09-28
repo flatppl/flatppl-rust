@@ -44,6 +44,8 @@ mod packed_gathers;
 mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
+#[path = "segment_sums.rs"]
+mod segment_sums;
 pub(crate) use batching::Axes;
 use batching::shape;
 use pointwise::Pointwise;
@@ -1176,11 +1178,33 @@ impl<'m> Emitter<'m> {
             operand.ssa, idx2d.ssa
         ));
         self.remember_axes(&ssa, self.axes_of(operand));
-        Value {
+        let out = Value {
             ssa,
             ty: result_ty,
             elem: operand.elem,
+        };
+        // Retain provenance without changing the gather's scheduling or CSE.
+        if let Some(n) = n.and_then(|n| usize::try_from(n).ok())
+            && let Some(data) = self.constants.get(&idx0.ssa)
+            // Keep large splats compact instead of expanding optional metadata.
+            && data.len() == n
+            && let Some(indices) = data
+                .iter()
+                .map(|value| match value {
+                    Scalar::Int(value) => u64::try_from(*value)
+                        .ok()
+                        .filter(|&v| Some(v) < operand_dims[axis]),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        {
+            self.remember_pointwise(
+                &out.ssa,
+                &out,
+                Pointwise::Gather(operand.clone(), axis, indices),
+            );
         }
+        out
     }
 
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
@@ -1374,11 +1398,17 @@ impl<'m> Emitter<'m> {
             "stablehlo.transpose {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value {
+        let out = Value {
             ssa,
             ty: result_ty,
             elem: a.elem,
-        }
+        };
+        self.remember_pointwise(
+            &out.ssa,
+            &out,
+            Pointwise::Transpose(a.clone(), perm.to_vec()),
+        );
+        out
     }
 
     // ---- CHLO special functions ------------------------------------------
@@ -3775,11 +3805,9 @@ impl<'m> Emitter<'m> {
         out.push_str(&format!(
             "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
-        let lines = packed.as_ref().map_or_else(
-            || self.live_lines(&rets),
-            |(body, _)| body.lines().collect(),
-        );
-        for line in lines {
+        let emitter = packed.as_ref().map_or(&self, |(emitter, _)| emitter);
+        let body = segment_sums::finish(emitter, &rets);
+        for line in body.lines() {
             out.push_str("    ");
             out.push_str(line);
             out.push('\n');
