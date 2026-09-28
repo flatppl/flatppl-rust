@@ -387,6 +387,9 @@ impl Emitter<'_> {
     }
 
     pub(super) fn vector_batched(&mut self, elems: &[Value]) -> Value {
+        if let Some(value) = self.gather_input_vector(elems) {
+            return value;
+        }
         let mut target = elems[0].clone();
         for v in &elems[1..] {
             target = self.broadcast_batched_pair(&target, v).0;
@@ -429,5 +432,81 @@ impl Emitter<'_> {
             ty,
             elem: target.elem,
         }
+    }
+
+    /// Assemble static input selections directly, without materializing every
+    /// scalar slice. Computed sources retain their existing fusion boundaries.
+    fn gather_input_vector(&mut self, elems: &[Value]) -> Option<Value> {
+        if elems.len() < 2 {
+            return None;
+        }
+        let mut axes = self.axes_of(&elems[0]);
+        let axis = axes.batch;
+        let mut source: Option<Value> = None;
+        let mut indices = Vec::with_capacity(elems.len());
+        for value in elems {
+            if value.ty != elems[0].ty || self.axes_of(value) != axes {
+                return None;
+            }
+            let Pointwise::Reshape(part) = &self.pointwise.get(&value.ssa)?.op else {
+                return None;
+            };
+            let Pointwise::Slice(base, starts, limits, strides) =
+                &self.pointwise.get(&part.ssa)?.op
+            else {
+                return None;
+            };
+            let dims = shape(&base.ty);
+            let width = dims.get(axis).copied().flatten()?;
+            let mut cell = dims.to_vec();
+            cell.remove(axis);
+            if self.batch_rank(base) != axis
+                || cell != shape(&value.ty)
+                || strides.iter().any(|&s| s != 1)
+                || starts[axis] >= width
+                || limits[axis] != starts[axis] + 1
+                || dims.iter().enumerate().any(|(d, &n)| {
+                    n.is_none() || (d != axis && (starts[d] != 0 || Some(limits[d]) != n))
+                })
+                || source.as_ref().is_some_and(|s| s != base)
+            {
+                return None;
+            }
+            source.get_or_insert_with(|| base.clone());
+            let index = i64::try_from(starts[axis]).ok()?;
+            if matches!(self.dtype, Dtype::F32) && i32::try_from(index).is_err() {
+                return None;
+            }
+            indices.push(Scalar::Int(index));
+        }
+        let source = source?;
+        let mut root = &source;
+        while let Some(pointwise::Producer {
+            op: Pointwise::Reshape(input),
+            ..
+        }) = self.pointwise.get(&root.ssa)
+        {
+            if input.ty != root.ty {
+                return None;
+            }
+            root = input;
+        }
+        // Mode builders reserve %argN for ABI inputs. Generated operations and
+        // region arguments use numeric names, so bind() alone proves nothing.
+        if !root
+            .ssa
+            .strip_prefix("%arg")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        let index = self.folded_constant(
+            indices,
+            tensor(vec![Some(elems.len() as u64)]),
+            Axes::default(),
+        )?;
+        let gathered = self.gather_axis(&source, &index, 0, 0);
+        axes.layers.insert(0, 1);
+        Some(self.axes_view(&gathered, axes))
     }
 }

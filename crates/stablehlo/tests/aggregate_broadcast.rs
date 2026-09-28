@@ -52,6 +52,36 @@ outputs = combined.(a, b)
 }
 
 #[test]
+fn batched_input_vector_uses_one_ordered_gather() {
+    let ir = emit(
+        r#"
+select(x) = [x[4], x[1], x[4], x[2], x[1]]
+mapped(x) = select.(x)
+points = elementof(cartpow(cartpow(cartpow(reals, 7), 3), 2))
+inputs = points
+outputs = mapped.(points)
+"#,
+    );
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.concatenate"), "{ir}");
+    assert!(ir.contains("-> tensor<2x3x5xf32>"), "{ir}");
+}
+
+#[test]
+fn large_static_input_selections_do_not_truncate_to_i32() {
+    let ir = emit(
+        r#"
+select(x) = [x[2147483649], x[1]]
+points = elementof(cartpow(cartpow(reals, 2147483649), 2))
+inputs = points
+outputs = select.(points)
+"#,
+    );
+    assert!(ir.contains("[0:2, 2147483648:2147483649]"), "{ir}");
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+}
+
+#[test]
 fn unequal_segment_sums_share_one_reduction() {
     let ir = emit(
         r#"
