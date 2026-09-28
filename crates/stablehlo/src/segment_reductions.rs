@@ -1,5 +1,5 @@
-//! Pack independent sums of static selections from one tensor. Unequal lengths
-//! use an appended zero row, never a masked live value (which may be NaN/inf).
+//! Pack independent reductions of static selections from one tensor. Unequal
+//! lengths use an identity row, never a masked live value (which may be NaN/inf).
 //! This terminal pass reads typed provenance and edits only exclusive view chains.
 
 use super::*;
@@ -12,6 +12,7 @@ struct Segment {
     retained: Vec<u64>,
     views: Vec<usize>,
     line: usize,
+    op: String,
     init: String,
 }
 
@@ -24,10 +25,12 @@ fn segment(
     let Pointwise::Reduce(input, axis, op, init) = &producer.op else {
         return None;
     };
-    if op != "stablehlo.add"
-        || !matches!(init.as_str(), "0" | "0.000000e+00")
-        || producer.value.elem == ElemKind::Bool
-    {
+    let identity = match op.as_str() {
+        "stablehlo.add" => matches!(init.as_str(), "0" | "0.000000e+00"),
+        "stablehlo.multiply" => matches!(init.as_str(), "1" | "1.000000e+00"),
+        _ => false,
+    };
+    if !identity || producer.value.elem == ElemKind::Bool {
         return None;
     }
     let mut value = input;
@@ -64,6 +67,7 @@ fn segment(
                     retained: order,
                     views,
                     line: *definitions.get(producer.value.ssa.as_str())?,
+                    op: op.clone(),
                     init: init.clone(),
                 });
             }
@@ -74,7 +78,7 @@ fn segment(
 
 /// Return the final live body. No emitter cache is used after any rewrite.
 pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
-    let lines = out.live_lines(rets);
+    let lines = out.live_lines(&out.body, rets);
     if out.cur_key.is_some() {
         return lines.join("\n");
     }
@@ -113,6 +117,8 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
             segment.source.ssa.clone(),
             segment.axis,
             segment.retained.clone(),
+            segment.op.clone(),
+            segment.init.clone(),
         );
         let group = *by_source.entry(key).or_insert_with(|| {
             groups.push(Vec::new());
@@ -144,18 +150,18 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
         // can hold an identical index tensor defined after the first segment.
         let mut scratch = Emitter::new(out.m, out.dtype);
         scratch.next = next;
-        let sums = emit_sums(&mut scratch, &group, maximum);
+        let reduced = emit_reductions(&mut scratch, &group, maximum);
         let shared = scratch.body.clone();
         scratch.body.clear();
         for (lane, segment) in group.iter().enumerate() {
-            let mut starts = vec![0; shape(&sums.ty).len()];
-            let mut limits = shape(&sums.ty)
+            let mut starts = vec![0; shape(&reduced.ty).len()];
+            let mut limits = shape(&reduced.ty)
                 .iter()
                 .map(|d| d.unwrap())
                 .collect::<Vec<_>>();
             starts[0] = lane as u64;
             limits[0] = lane as u64 + 1;
-            let view = scratch.slice(&sums, &starts, &limits, &vec![1; starts.len()]);
+            let view = scratch.slice(&reduced, &starts, &limits, &vec![1; starts.len()]);
             scratch.push(&format!(
                 "{} = stablehlo.reshape {} : ({}) -> {}",
                 segment.result.ssa,
@@ -181,16 +187,17 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
             body.push('\n');
         }
     }
-    body
+    // Removed selections can orphan their scalar slice/reshape children.
+    out.live_lines(&body, rets).join("\n")
 }
 
-fn emit_sums(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Value {
+fn emit_reductions(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Value {
     let first = &segments[0];
     let source = &first.source;
     let axis = first.axis;
     let dims = shape(&source.ty);
     let scalar_ty = MlirTy::Scalar.render(out.dtype, source.elem);
-    let zero = Value {
+    let identity = Value {
         ssa: out.pure(format!(
             "stablehlo.constant dense<{}> : {scalar_ty}",
             first.init
@@ -198,8 +205,8 @@ fn emit_sums(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Val
         ty: MlirTy::Scalar,
         elem: source.elem,
     };
-    let gathered = padded_gather(out, segments, maximum, &zero);
-    let sums = out.reduce_axis_lit("stablehlo.add", &first.init, &gathered, axis + 1);
+    let gathered = padded_gather(out, segments, maximum, &identity);
+    let reduced = out.reduce_axis_lit(&first.op, &first.init, &gathered, axis + 1);
     let mut perm = vec![0];
     perm.extend(
         first
@@ -208,9 +215,9 @@ fn emit_sums(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Val
             .map(|&d| 1 + d - u64::from(d > axis as u64)),
     );
     if perm.iter().copied().eq(0..dims.len() as u64) {
-        sums
+        reduced
     } else {
-        out.transpose(&sums, &perm)
+        out.transpose(&reduced, &perm)
     }
 }
 
@@ -218,7 +225,7 @@ fn padded_gather(
     out: &mut Emitter<'_>,
     segments: &[Segment],
     maximum: usize,
-    zero: &Value,
+    identity: &Value,
 ) -> Value {
     let first = &segments[0];
     let source = &first.source;
@@ -227,7 +234,7 @@ fn padded_gather(
     let width = dims[axis].unwrap();
     let mut row_dims = dims.to_vec();
     row_dims[axis] = Some(1);
-    let row = out.broadcast_in_dim(zero, &[], MlirTy::Ranked(row_dims.clone()));
+    let row = out.broadcast_in_dim(identity, &[], MlirTy::Ranked(row_dims.clone()));
     let sizes = row_dims
         .iter()
         .map(|d| d.unwrap().to_string())
@@ -259,7 +266,7 @@ fn padded_gather(
         )
         .expect("validated in-bounds indices fit the target integer type");
     // Keep the source axis order inside each segment and preserve its ordered
-    // indices. Only the new leading axis separates independent sums.
+    // indices. Only the new leading axis separates independent reductions.
     let mut gathered_dims = dims.to_vec();
     gathered_dims[axis] = Some(maximum as u64);
     gathered_dims.insert(0, Some(count));

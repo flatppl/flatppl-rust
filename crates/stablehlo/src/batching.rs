@@ -387,7 +387,10 @@ impl Emitter<'_> {
     }
 
     pub(super) fn vector_batched(&mut self, elems: &[Value]) -> Value {
-        if let Some(value) = self.gather_input_vector(elems) {
+        let selection = self.vector_selection(elems);
+        if let Some((source, indices)) = &selection
+            && let Some(value) = self.gather_input_vector(source, indices, self.axes_of(&elems[0]))
+        {
             return value;
         }
         let mut target = elems[0].clone();
@@ -427,20 +430,26 @@ impl Emitter<'_> {
             format!("stablehlo.concatenate {names}, dim = {batch} : ({types}) -> {result}"),
             axes,
         );
-        Value {
+        let value = Value {
             ssa,
             ty,
             elem: target.elem,
+        };
+        if let Some((source, indices)) = selection {
+            self.remember_pointwise(
+                &value.ssa,
+                &value,
+                Pointwise::Gather(source, batch, indices),
+            );
         }
+        value
     }
 
-    /// Assemble static input selections directly, without materializing every
-    /// scalar slice. Computed sources retain their existing fusion boundaries.
-    fn gather_input_vector(&mut self, elems: &[Value]) -> Option<Value> {
+    fn vector_selection(&self, elems: &[Value]) -> Option<(Value, Vec<u64>)> {
         if elems.len() < 2 {
             return None;
         }
-        let mut axes = self.axes_of(&elems[0]);
+        let axes = self.axes_of(&elems[0]);
         let axis = axes.batch;
         let mut source: Option<Value> = None;
         let mut indices = Vec::with_capacity(elems.len());
@@ -477,10 +486,20 @@ impl Emitter<'_> {
             if matches!(self.dtype, Dtype::F32) && i32::try_from(index).is_err() {
                 return None;
             }
-            indices.push(Scalar::Int(index));
+            indices.push(starts[axis]);
         }
-        let source = source?;
-        let mut root = &source;
+        Some((source?, indices))
+    }
+
+    /// Assemble input selections directly. Computed sources keep their concat
+    /// boundary, with selection provenance available to explicit reductions.
+    fn gather_input_vector(
+        &mut self,
+        source: &Value,
+        indices: &[u64],
+        mut axes: Axes,
+    ) -> Option<Value> {
+        let mut root = source;
         while let Some(pointwise::Producer {
             op: Pointwise::Reshape(input),
             ..
@@ -501,11 +520,11 @@ impl Emitter<'_> {
             return None;
         }
         let index = self.folded_constant(
-            indices,
-            tensor(vec![Some(elems.len() as u64)]),
+            indices.iter().map(|&i| Scalar::Int(i as i64)).collect(),
+            tensor(vec![Some(indices.len() as u64)]),
             Axes::default(),
         )?;
-        let gathered = self.gather_axis(&source, &index, 0, 0);
+        let gathered = self.gather_axis(source, &index, 0, 0);
         axes.layers.insert(0, 1);
         Some(self.axes_view(&gathered, axes))
     }

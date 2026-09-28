@@ -74,7 +74,7 @@ pub(super) fn pack<'m>(
     if source.cur_key.is_some() {
         return None;
     }
-    let lines = source.live_lines(rets);
+    let lines = source.live_lines(&source.body, rets);
     let mut instructions: HashMap<&str, Instruction<'_>> = HashMap::new();
     let mut groups: Vec<Group> = Vec::new();
     let mut classes: HashMap<Signature<'_>, usize> = HashMap::new();
@@ -238,7 +238,7 @@ pub(super) fn pack<'m>(
         .collect::<Vec<_>>();
     let refs = returns.iter().collect::<Vec<_>>();
     packer.gathers.finish(&mut packer.out, &refs);
-    let packed = packer.out.live_lines(&refs);
+    let packed = packer.out.live_lines(&packer.out.body, &refs);
     // Small cones can cost more views than they save in arithmetic. Preserve
     // their original text as well as avoiding extra work for the backend.
     (packed.len() < lines.len()).then_some((packer.out, returns))
