@@ -44,8 +44,8 @@ mod packed_gathers;
 mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
-#[path = "segment_sums.rs"]
-mod segment_sums;
+#[path = "segment_reductions.rs"]
+mod segment_reductions;
 pub(crate) use batching::Axes;
 use batching::shape;
 use pointwise::Pointwise;
@@ -3806,7 +3806,7 @@ impl<'m> Emitter<'m> {
             "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
         let emitter = packed.as_ref().map_or(&self, |(emitter, _)| emitter);
-        let body = segment_sums::finish(emitter, &rets);
+        let body = segment_reductions::finish(emitter, &rets);
         for line in body.lines() {
             out.push_str("    ");
             out.push_str(line);
@@ -3818,7 +3818,7 @@ impl<'m> Emitter<'m> {
         out
     }
 
-    fn live_lines(&self, rets: &[&Value]) -> Vec<&str> {
+    fn live_lines<'a>(&self, body: &'a str, rets: &[&Value]) -> Vec<&'a str> {
         // Folding replaces whole constant chains. Drop their dead definitions
         // before sending dense tensor literals to the backend. Only one-line
         // operations already classified pure are eligible; loops and RNG stay.
@@ -3827,7 +3827,7 @@ impl<'m> Emitter<'m> {
         let mut live: std::collections::HashSet<&str> =
             rets.iter().map(|v| v.ssa.as_str()).collect();
         let mut lines = Vec::new();
-        for line in self.body.lines().rev() {
+        for line in body.lines().rev() {
             if let Some((ssa, _)) = line.trim().split_once(" = ")
                 && pure.contains(ssa)
                 && !live.contains(ssa)

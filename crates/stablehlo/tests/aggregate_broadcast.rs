@@ -98,6 +98,23 @@ outputs = sums.(points)
 }
 
 #[test]
+fn computed_selection_sums_and_products_keep_distinct_identities() {
+    let ir = emit(
+        r#"
+segments(x) = [prod([x[1], x[3], x[1]]), prod([x[7], x[2]]),
+               sum([x[4], x[5]]), sum([x[6], x[2], x[6]])]
+mapped(x) = segments(-x)
+points = elementof(cartpow(cartpow(reals, 7), 3))
+inputs = points
+outputs = mapped.(points)
+"#,
+    );
+    assert_eq!(ir.matches("applies stablehlo.add").count(), 1, "{ir}");
+    assert_eq!(ir.matches("applies stablehlo.multiply").count(), 1, "{ir}");
+    assert_eq!(ir.matches("stablehlo.slice").count(), 4, "{ir}");
+}
+
+#[test]
 fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
     for (outputs, count) in [
         ("(sum(x[index]), sum(x[[2, 3]]))", 2),

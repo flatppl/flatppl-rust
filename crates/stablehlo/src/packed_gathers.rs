@@ -57,7 +57,7 @@ impl Requests {
         }
         let mut users: HashMap<&str, Option<&str>> =
             rets.iter().map(|v| (v.ssa.as_str(), None)).collect();
-        for line in out.live_lines(rets) {
+        for line in out.live_lines(&out.body, rets) {
             let Some((ssa, rhs)) = line.split_once(" = ") else {
                 continue;
             };

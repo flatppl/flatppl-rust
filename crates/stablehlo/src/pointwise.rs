@@ -15,7 +15,7 @@ pub(super) enum Pointwise {
     Reshape(Value),
     Slice(Value, Vec<u64>, Vec<u64>, Vec<u64>),
     Transpose(Value, Vec<u64>),
-    // In-bounds, zero-based static selections from gather_axis, not packet gathers.
+    // In-bounds, zero-based selections, including equivalent vector concatenations.
     Gather(Value, usize, Vec<u64>),
     Reduce(Value, usize, String, String),
 }
