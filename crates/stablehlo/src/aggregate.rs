@@ -51,7 +51,7 @@
 //! rather than lowering something else. `metricsum` refuses too, with its own
 //! reason — see [`metricsum_refusal`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar, Symbol};
 
@@ -174,7 +174,7 @@ pub(crate) fn lower_aggregate(
     let output_axes = read_output_axes(e, axes_id)?;
 
     let mut sites = Vec::new();
-    collect_sites(e, body, &mut sites)?;
+    collect_sites(e, body, &mut sites, &mut HashSet::new())?;
 
     let frame = build_frame(e, id, &output_axes, &sites)?;
 
@@ -347,10 +347,18 @@ fn read_output_axes(e: &Emitter, axes_id: NodeId) -> Result<Vec<Symbol>, EmitErr
 /// aggregation's axes are its own and its node lowers through the ordinary
 /// [`Emitter::lower_node`] dispatch (re-entering this module) when the body is
 /// walked.
-fn collect_sites(e: &Emitter, node: NodeId, out: &mut Vec<Site>) -> Result<(), EmitError> {
+fn collect_sites(
+    e: &Emitter,
+    node: NodeId,
+    out: &mut Vec<Site>,
+    empty: &mut HashSet<NodeId>,
+) -> Result<(), EmitError> {
     let Node::Call(c) = e.node(node) else {
         return Ok(());
     };
+    if empty.contains(&node) {
+        return Ok(());
+    }
     let head = match c.head {
         CallHead::Builtin(sym) => e.resolve(sym),
         CallHead::User(_) => "",
@@ -369,7 +377,7 @@ fn collect_sites(e: &Emitter, node: NodeId, out: &mut Vec<Site>) -> Result<(), E
         // A chained axis index (`A[.i][.j]`) would need this operand's own frame
         // value before the frame exists — refuse rather than order it wrongly.
         let mut inner = Vec::new();
-        collect_sites(e, container, &mut inner)?;
+        collect_sites(e, container, &mut inner, empty)?;
         if !inner.is_empty() {
             return Err(EmitError::at(
                 node,
@@ -443,11 +451,17 @@ fn collect_sites(e: &Emitter, node: NodeId, out: &mut Vec<Site>) -> Result<(), E
         });
         return Ok(());
     }
+    let start = out.len();
     for &a in c.args.iter() {
-        collect_sites(e, a, out)?;
+        collect_sites(e, a, out, empty)?;
     }
     for named in c.named.iter() {
-        collect_sites(e, named.value, out)?;
+        collect_sites(e, named.value, out, empty)?;
+    }
+    if out.len() == start {
+        // Only successful zero-site scans are reusable. Positive scans must
+        // still contribute sites inside later chained-index container probes.
+        empty.insert(node);
     }
     Ok(())
 }
