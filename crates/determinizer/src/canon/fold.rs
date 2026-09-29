@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
+use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Ref, RefNs, Scalar};
 
-use crate::driver::{map_tree, referenced_binding_names};
+use crate::driver::{map_tree, rebuild_with_children, referenced_binding_names};
 
 /// Fold builtin arithmetic on literal operands. Two-phase: `map_tree`'s closure
 /// only gets `&Module` (no `alloc`), so phase 1 walks each binding's RHS
@@ -269,11 +269,16 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
     let mut changed = false;
     let pairs: Vec<(flatppl_core::BindingId, NodeId, flatppl_core::Symbol)> =
         m.bindings().map(|(bid, b)| (bid, b.rhs, b.name)).collect();
+    // Original nodes and the replacement snapshot stay fixed during this sweep.
+    // Cache only roots whose own name is absent from the replacement map, so
+    // their self-name guard cannot change the result of a shared subtree.
+    let mut mapped = vec![None; m.node_count()];
+    let mut pending = Vec::new();
     for (bid, root, self_name) in pairs {
         if super::is_reserved_abi_binding(m, bid) {
             continue;
         }
-        let new = map_tree(m, root, &mut |m, id| {
+        let mut replace = |m: &Module, id| {
             if let Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
@@ -288,7 +293,43 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
                 }
             }
             None
-        });
+        };
+        let new = if trivial.contains_key(&self_name) {
+            map_tree(m, root, &mut replace)
+        } else {
+            pending.push((root, false));
+            while let Some((id, ready)) = pending.pop() {
+                if mapped[id.index()].is_some() {
+                    continue;
+                }
+                if ready {
+                    let children = m.node(id).children();
+                    let replacements: Vec<_> = children
+                        .iter()
+                        .map(|child| mapped[child.index()].expect("children precede parents"))
+                        .collect();
+                    mapped[id.index()] = Some(if replacements == children {
+                        id
+                    } else {
+                        rebuild_with_children(m, id, &replacements)
+                    });
+                } else if let Some(replacement) = replace(m, id) {
+                    // Return the snapshot's raw replacement, not its mapped
+                    // result: alias chains advance only on the next sweep.
+                    mapped[id.index()] = Some(replacement);
+                } else {
+                    pending.push((id, true));
+                    pending.extend(
+                        m.node(id)
+                            .children()
+                            .into_iter()
+                            .rev()
+                            .map(|id| (id, false)),
+                    );
+                }
+            }
+            mapped[root.index()].expect("binding root visited")
+        };
         if new != root {
             m.set_binding_rhs(bid, new);
             changed = true;
