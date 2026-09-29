@@ -301,23 +301,23 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
-// `flatten_structural` (isolated on the get/record fixture) is idempotent:
-// determinizing the same source twice produces identical FlatPIR.
 #[test]
-fn flatten_structural_get_record_is_idempotent() {
-    let src = "\
-gamma_shape_rate(mu, sigma) = record(shape = mu, rate = sigma)
-a = draw(Gamma(gamma_shape_rate(2.0, 1.0)))
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
-    let once = flatppl_flatpir::write(&determinize_src(src));
-    assert!(
-        !once.contains("(get "),
-        "sanity: fixture must actually contain a static get flatten_structural \
-         resolves (else this test is vacuous):\n{once}"
+fn shared_nested_projections_reach_a_fixpoint() {
+    let out = determinize_src(
+        r#"flatppl_compat = "0.1"
+twice(x) = x + x
+p = elementof(reals)
+q = twice(1.0 + get0([get(record(value=p), "value"), 9.0], 0))
+inputs = p
+outputs = q"#,
     );
-    let twice = flatppl_flatpir::write(&determinize_src(src));
+    let text = flatppl_syntax::print_with(&out, flatppl_syntax::Syntax::Minimal);
+    assert!(text.contains("q = add(add(1.0, p), add(1.0, p))"), "{text}");
+    assert!(text.contains("inputs = p"), "{text}");
+    let again = determinize(&out).expect("lowered module must remain valid");
     assert_eq!(
-        once, twice,
+        flatppl_flatpir::write(&out),
+        flatppl_flatpir::write(&again),
         "determinize output is a canonicalization fixpoint"
     );
 }
