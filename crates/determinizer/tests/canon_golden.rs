@@ -150,6 +150,34 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
+#[test]
+fn alias_resolution_preserves_shared_outputs_and_inputs() {
+    let mut m = flatppl_syntax::parse(
+        "c = 2.0\np = elementof(reals)\nfirst = p + c\nsecond = first\n\
+         inputs = p\noutputs = (first, second)",
+    )
+    .unwrap();
+    let shared = m
+        .bindings()
+        .find(|(_, b)| m.resolve(b.name) == "first")
+        .unwrap()
+        .1
+        .rhs;
+    let second = m
+        .bindings()
+        .find(|(_, b)| m.resolve(b.name) == "second")
+        .unwrap()
+        .0;
+    m.set_binding_rhs(second, shared);
+    let _ = flatppl_infer::infer(&mut m);
+    let out = determinize(&m).unwrap();
+    let text = flatppl_syntax::print_with(&out, flatppl_syntax::Syntax::Minimal);
+    for name in ["first", "second"] {
+        assert!(text.contains(&format!("{name} = add(p, 2.0)")), "{text}");
+    }
+    assert!(text.contains("inputs = p"), "{text}");
+}
+
 // `sweep_dead_bindings`, isolated: `_ = exp(1.0)` lowers to a synthetic,
 // unreferenced binding (`__0x1`, per the parser's discard-name convention);
 // the sweep must zero it. A scored output named with a leading underscore
