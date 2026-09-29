@@ -7,10 +7,13 @@
 resolver = "3"
 members = ["crates/*"]
 
-# Release artifacts are shipped tools (notably the lean `flatppl-fmt`): strip
-# symbols for a smaller binary. Debug/`dev` builds keep symbols for backtraces.
+# Optimize shipped tools across crates without host-specific CPU flags.
+# Thin LTO trades longer release builds for faster tools and smaller binaries.
+# Debug/`dev` builds keep symbols for backtraces.
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
 
 # Size-optimized profile for the SHIPPED flatppl-lsp binary bundled into the
 # VS Code extension vsix (it is downloaded on every install). Inherits release
