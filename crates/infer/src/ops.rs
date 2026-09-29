@@ -6677,6 +6677,10 @@ fn arity_check(
         return Some(refuse_checked_splat(inf, id, name, cat, args));
     }
     if arity.admits(got) {
+        // Positional calls cannot introduce unknown names or double bindings.
+        if named.is_empty() && !reading.splatting {
+            return None;
+        }
         // The count is right; the names still have to be the declared ones. `?`
         // here means "this row declares none — accept the call", not a failure to
         // propagate; see `base_param_names` for which rows are nameless and why.
