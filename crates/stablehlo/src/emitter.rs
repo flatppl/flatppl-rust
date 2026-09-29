@@ -3873,7 +3873,7 @@ impl<'m> Emitter<'m> {
             "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
         let emitter = packed.as_ref().map_or(&self, |(emitter, _)| emitter);
-        let body = segment_reductions::finish(emitter, &rets);
+        let body = segment_reductions::finish(emitter, args, &rets);
         for line in body.lines() {
             out.push_str("    ");
             out.push_str(line);

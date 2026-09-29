@@ -190,8 +190,140 @@ fn segment(
     }
 }
 
+/// Absorb whole exact-source groups into the smallest admissible superset.
+/// Never move a source before its definition or discard a rejected exact group.
+fn absorb_subsets(
+    out: &Emitter<'_>,
+    args: &[(String, MlirTy, ElemKind)],
+    definitions: &HashMap<&str, usize>,
+    groups: &mut [Vec<Segment>],
+) {
+    let mut order = (0..groups.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| (groups[i][0].sources.len(), groups[i][0].line));
+    let mut rank = vec![0; groups.len()];
+    let mut by_first_source: HashMap<String, Vec<usize>> = HashMap::new();
+    for (position, &i) in order.iter().enumerate() {
+        rank[i] = position;
+        by_first_source
+            .entry(groups[i][0].sources[0].ssa.clone())
+            .or_default()
+            .push(i);
+    }
+    for &target in &order {
+        let Some(first) = groups[target].first() else {
+            continue;
+        };
+        // A subset's first source must occur in the superset. Avoid visiting
+        // every unrelated group while retaining the original candidate order.
+        let mut candidates = first
+            .sources
+            .iter()
+            .filter_map(|s| by_first_source.get(&s.ssa))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|&i| rank[i]);
+        for other in candidates {
+            let (Some(superset), Some(subset)) = (groups[target].first(), groups[other].first())
+            else {
+                continue;
+            };
+            if subset.sources.len() >= superset.sources.len()
+                || subset.axis != superset.axis
+                || subset.retained != superset.retained
+                || subset.op != superset.op
+                || subset.init != superset.init
+                || subset.result.ty != superset.result.ty
+                || subset.result.elem != superset.result.elem
+                || !subset.sources.iter().all(|s| superset.sources.contains(s))
+            {
+                continue;
+            }
+            let first_line = superset.line.min(subset.line);
+            if superset.sources.iter().any(|source| {
+                !definitions
+                    .get(source.ssa.as_str())
+                    .is_some_and(|&line| line < first_line)
+                    && !args.iter().any(|(name, ty, elem)| {
+                        name == &source.ssa && ty == &source.ty && elem == &source.elem
+                    })
+            }) {
+                continue;
+            }
+            let segments = groups[target].iter().chain(&groups[other]);
+            let maximum = segments.clone().map(|s| s.indices.len()).max().unwrap();
+            let Some(rows) = segments
+                .clone()
+                .try_fold(0_usize, |n, s| n.checked_add(s.indices.len()))
+            else {
+                continue;
+            };
+            let Some(padded) = maximum.checked_mul(segments.count()) else {
+                continue;
+            };
+            if padded - rows > rows {
+                continue;
+            }
+            let mut offsets = HashMap::new();
+            let Some(width) = superset.sources.iter().try_fold(0_u64, |offset, source| {
+                offsets.insert(source.ssa.as_str(), offset);
+                offset.checked_add(shape(&source.ty)[superset.axis]?)
+            }) else {
+                continue;
+            };
+            if width >= i64::MAX as u64
+                || (matches!(out.dtype, Dtype::F32) && i32::try_from(width).is_err())
+            {
+                continue;
+            }
+            let mut start = 0;
+            let spans = subset
+                .sources
+                .iter()
+                .map(|source| {
+                    let end = start + shape(&source.ty)[subset.axis].unwrap();
+                    let span = (start..end, offsets[source.ssa.as_str()]);
+                    start = end;
+                    span
+                })
+                .collect::<Vec<_>>();
+            let remapped = groups[other]
+                .iter()
+                .map(|segment| {
+                    segment
+                        .indices
+                        .iter()
+                        .map(|index| {
+                            spans.iter().find_map(|(range, offset)| {
+                                range
+                                    .contains(index)
+                                    .then(|| offset + (index - range.start))
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(remapped) = remapped else {
+                continue;
+            };
+            let sources = superset.sources.clone();
+            let mut moved = std::mem::take(&mut groups[other]);
+            for (segment, indices) in moved.iter_mut().zip(remapped) {
+                segment.sources = sources.clone();
+                segment.indices = indices;
+            }
+            groups[target].append(&mut moved);
+            groups[target].sort_by_key(|s| s.line);
+        }
+    }
+}
+
 /// Return the final live body. No emitter cache is used after any rewrite.
-pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
+pub(super) fn finish(
+    out: &Emitter<'_>,
+    args: &[(String, MlirTy, ElemKind)],
+    rets: &[&Value],
+) -> String {
     let lines = out.live_lines(&out.body, rets);
     if out.cur_key.is_some() {
         return lines.join("\n");
@@ -244,6 +376,7 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
         });
         groups[group].push(segment);
     }
+    absorb_subsets(out, args, &definitions, &mut groups);
     let mut edits = HashMap::new();
     let mut removed = HashSet::new();
     let mut next = out.next;

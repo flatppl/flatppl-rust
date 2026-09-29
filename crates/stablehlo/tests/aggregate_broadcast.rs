@@ -186,14 +186,29 @@ outputs = mapped.(points)
 fn mixed_source_products_share_one_reduction() {
     let ir = emit(
         r#"
-segments(x, y) = [prod([x[1], y[3], x[1]]), prod(cat([y[7]], [x[2]]))]
-mapped(p) = segments(-p, 2 * p)
-points = elementof(cartpow(cartpow(reals, 7), 3))
+segments(x, y, z) = [prod(cat([z[7]], [y[2]], [x[2]])), prod([x[1], z[3], x[1]]),
+                     prod([z[6], z[2], z[6]])]
+mapped(p) = segments(-p[[1, 2, 3, 4, 5, 6, 7]], 2 * p[[1, 2, 3, 4, 5, 6, 7, 8]], 3 * p)
+points = elementof(cartpow(cartpow(reals, 9), 3))
 inputs = points
 outputs = mapped.(points)
 "#,
     );
     assert_eq!(ir.matches("applies stablehlo.multiply").count(), 1, "{ir}");
+}
+
+#[test]
+fn dependent_segment_source_stays_after_its_reduction() {
+    let ir = emit(
+        r#"
+p = elementof(cartpow(reals, 7))
+a = prod(p[[1, 3, 1]])
+b = a * p
+inputs = p
+outputs = (a, prod([p[7], b[2]]))
+"#,
+    );
+    assert_eq!(ir.matches("applies stablehlo.multiply").count(), 2, "{ir}");
 }
 
 #[test]
@@ -206,11 +221,16 @@ fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
             "(sum(x[[1]]), sum(x[[2, 3]]), sum(x[[1, 2, 3, 4, 5, 6, 7]]))",
             3,
         ),
+        (
+            "(sum(x[[1, 3]]), sum(x[[2, 4]]), sum([x[1], y[2], x[3], y[4], x[5], y[6], x[7], y[1], x[2], y[3]]))",
+            2,
+        ),
     ] {
         let ir = emit(&format!(
             "x = elementof(cartpow(reals, 7))\n\
              index = elementof(cartpow(posintegers, 3))\n\
              selected = x[[1, 4, 1]]\n\
+             y = -x\n\
              inputs = (x, index)\noutputs = {outputs}\n"
         ));
         assert_eq!(ir.matches("stablehlo.reduce(").count(), count, "{ir}");
