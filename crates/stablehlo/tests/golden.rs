@@ -12980,6 +12980,31 @@ inputs = (A)\noutputs = (t)\n";
     );
 }
 
+#[test]
+fn aggregate_refuses_chaining_through_an_already_scanned_site() {
+    let mut m = Module::new();
+    let a = local_ref(&mut m, "A");
+    let axes = ["i", "j"].map(|name| {
+        let name = m.intern(name);
+        m.alloc(Node::Axis(flatppl_core::Axis {
+            name,
+            variance: None,
+        }))
+    });
+    let inner = call(&mut m, "get", &[a, axes[0]]);
+    let outer = call(&mut m, "get", &[inner, axes[1]]);
+    // Reuse the same NodeId, not two independently parsed get expressions.
+    let body = call(&mut m, "add", &[inner, outer]);
+    let sum = const_node(&mut m, "sum");
+    let output_axes = call(&mut m, "vector", &[]);
+    let aggregate = call(&mut m, "aggregate", &[sum, output_axes, body]);
+    let error = Emitter::new(&m, Dtype::F64)
+        .lower_node(aggregate)
+        .unwrap_err();
+    assert_eq!(error.node, Some(outer));
+    assert!(error.msg.contains("chained axis indexing"), "{error}");
+}
+
 /// §04: axis names are "lexically scoped to the enclosing `aggregate(...)`", so a
 /// NESTED aggregation owns its own axes and lowers through the ordinary
 /// `lower_node` dispatch — the outer frame's site collection must not descend into
