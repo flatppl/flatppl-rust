@@ -13078,3 +13078,24 @@ fn constant_special_functions_fold_before_backend_compilation() {
         "runtime parameter must remain:\n{out}"
     );
 }
+
+#[test]
+fn folded_dense_constants_preserve_target_rounding_and_signed_zero() {
+    let m = determinize_src(
+        "p = elementof(reals)\n\
+        values = neg.(rowstack([[-1.5, -2.0, 0.0], [-0.1, -3.0, -4.0]]))\n\
+        inputs = p\noutputs = sum(values .+ p)",
+    );
+    for (dtype, rounded) in [(Dtype::F32, "0.10000000149011612"), (Dtype::F64, "0.1")] {
+        let out = flatppl_stablehlo::emit(
+            &m,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions { dtype },
+        )
+        .unwrap();
+        assert!(
+            out.contains(&format!("dense<[[1.5, 2.0, -0.0], [{rounded}, 3.0, 4.0]]>")),
+            "{out}"
+        );
+    }
+}
