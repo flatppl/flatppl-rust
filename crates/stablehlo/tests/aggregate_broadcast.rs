@@ -183,6 +183,20 @@ outputs = mapped.(points)
 }
 
 #[test]
+fn mixed_source_products_share_one_reduction() {
+    let ir = emit(
+        r#"
+segments(x, y) = [prod([x[1], y[3], x[1]]), prod(cat([y[7]], [x[2]]))]
+mapped(p) = segments(-p, 2 * p)
+points = elementof(cartpow(cartpow(reals, 7), 3))
+inputs = points
+outputs = mapped.(points)
+"#,
+    );
+    assert_eq!(ir.matches("applies stablehlo.multiply").count(), 1, "{ir}");
+}
+
+#[test]
 fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
     for (outputs, count) in [
         ("(sum(x[index]), sum(x[[2, 3]]))", 2),

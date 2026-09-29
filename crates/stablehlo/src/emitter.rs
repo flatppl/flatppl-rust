@@ -1354,11 +1354,13 @@ impl<'m> Emitter<'m> {
         let ssa = self.pure_axes(format!(
             "stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
         ), axes);
-        Value {
+        let value = Value {
             ssa,
             ty: result_ty,
             elem: elem_kind,
-        }
+        };
+        self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(reshaped, 0));
+        value
     }
 
     /// Concatenate vector cells, preserving batch prefixes and nested cells.
@@ -1411,6 +1413,7 @@ impl<'m> Emitter<'m> {
             .collect::<Vec<_>>()
             .join(", ");
         let result = ty.render(self.dtype, first.elem);
+        let axis = axes.batch;
         let ssa = self.pure_axes(
             format!(
                 "stablehlo.concatenate {names}, dim = {} : ({types}) -> {result}",
@@ -1418,11 +1421,13 @@ impl<'m> Emitter<'m> {
             ),
             axes,
         );
-        Ok(Value {
+        let value = Value {
             ssa,
             ty,
             elem: first.elem,
-        })
+        };
+        self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(parts, axis));
+        Ok(value)
     }
 
     /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->
