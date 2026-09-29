@@ -443,6 +443,8 @@ impl Emitter<'_> {
                 &value,
                 Pointwise::Gather(source, batch, indices),
             );
+        } else {
+            self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(parts, batch));
         }
         value
     }

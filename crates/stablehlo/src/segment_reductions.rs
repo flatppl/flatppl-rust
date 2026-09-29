@@ -1,4 +1,4 @@
-//! Pack independent reductions of static selections from one tensor. Unequal
+//! Pack independent reductions of static selections from the same tensors. Unequal
 //! lengths use an identity row, never a masked live value (which may be NaN/inf).
 //! This terminal pass reads typed provenance and edits only exclusive view chains.
 
@@ -6,7 +6,7 @@ use super::*;
 
 struct Segment {
     result: Value,
-    source: Value,
+    sources: Vec<Value>,
     axis: usize,
     indices: Vec<u64>,
     retained: Vec<u64>,
@@ -14,6 +14,111 @@ struct Segment {
     line: usize,
     op: String,
     init: String,
+}
+
+/// Recover a static selection through singleton-only reshapes. Other reshapes
+/// can mix retained axes and are not views of columns along the reduction axis.
+fn selection<'a>(
+    out: &'a Emitter<'_>,
+    value: &'a Value,
+    axis: usize,
+) -> Option<(&'a Value, Vec<u64>)> {
+    let mut current = value;
+    while let Some(pointwise::Producer {
+        op: Pointwise::Reshape(input),
+        ..
+    }) = out.pointwise.get(&current.ssa)
+    {
+        if shape(&current.ty)
+            .iter()
+            .filter(|&&d| d != Some(1))
+            .ne(shape(&input.ty).iter().filter(|&&d| d != Some(1)))
+        {
+            return None;
+        }
+        current = input;
+    }
+    let (mut source, indices) = match &out.pointwise.get(&current.ssa)?.op {
+        Pointwise::Gather(source, selected, indices) if *selected == axis => {
+            (source, indices.clone())
+        }
+        Pointwise::Slice(source, starts, limits, strides) => {
+            let dims = shape(&source.ty);
+            let index = *starts.get(axis)?;
+            if limits.get(axis).copied() != index.checked_add(1)
+                || strides.iter().any(|&stride| stride != 1)
+                || dims.iter().enumerate().any(|(d, &size)| {
+                    size.is_none() || (d != axis && (starts[d] != 0 || Some(limits[d]) != size))
+                })
+            {
+                return None;
+            }
+            (source, vec![index])
+        }
+        _ => return None,
+    };
+    let mut selected_shape = shape(&source.ty).to_vec();
+    let width = selected_shape.get(axis).copied().flatten()?;
+    if indices.is_empty() || indices.iter().any(|&index| index >= width) {
+        return None;
+    }
+    selected_shape[axis] = Some(indices.len() as u64);
+    if selected_shape != shape(&value.ty) || source.elem != value.elem {
+        return None;
+    }
+    while let Some(pointwise::Producer {
+        op: Pointwise::Reshape(input),
+        ..
+    }) = out.pointwise.get(&source.ssa)
+    {
+        if input.ty != source.ty {
+            break;
+        }
+        source = input;
+    }
+    Some((source, indices))
+}
+
+fn concat_selection(
+    out: &Emitter<'_>,
+    parts: &[Value],
+    axis: usize,
+) -> Option<(Vec<Value>, Vec<u64>)> {
+    let selections = parts
+        .iter()
+        .map(|part| selection(out, part, axis))
+        .collect::<Option<Vec<_>>>()?;
+    let mut sources = selections
+        .iter()
+        .map(|(source, _)| *source)
+        .collect::<Vec<_>>();
+    sources.sort_unstable_by_key(|source| &source.ssa);
+    sources.dedup_by_key(|source| &source.ssa);
+    let first = sources.first()?;
+    let mut width = 0_u64;
+    let mut offsets = HashMap::new();
+    for source in &sources {
+        let dims = shape(&source.ty);
+        if source.elem != first.elem
+            || dims.len() != shape(&first.ty).len()
+            || dims
+                .iter()
+                .enumerate()
+                .any(|(d, size)| size.is_none() || (d != axis && size != &shape(&first.ty)[d]))
+        {
+            return None;
+        }
+        offsets.insert(source.ssa.as_str(), width);
+        width = width.checked_add(dims[axis]?)?;
+    }
+    let indices = selections
+        .iter()
+        .flat_map(|(source, selected)| {
+            let offset = offsets[source.ssa.as_str()];
+            selected.iter().map(move |&index| offset + index)
+        })
+        .collect();
+    Some((sources.into_iter().cloned().collect(), indices))
 }
 
 fn segment(
@@ -41,38 +146,47 @@ fn segment(
             return None;
         }
         views.push(*definitions.get(value.ssa.as_str())?);
-        match &out.pointwise.get(&value.ssa)?.op {
-            Pointwise::Reshape(input) if input.ty == value.ty => value = input,
+        let (sources, selected, indices) = match &out.pointwise.get(&value.ssa)?.op {
+            Pointwise::Reshape(input) if input.ty == value.ty => {
+                value = input;
+                continue;
+            }
             Pointwise::Transpose(input, perm) => {
                 order = order.iter().map(|&d| perm[d as usize]).collect();
                 value = input;
+                continue;
             }
             Pointwise::Gather(source, selected, indices) => {
-                if order.remove(*axis) != *selected as u64 || indices.is_empty() {
-                    return None;
-                }
-                let dims = shape(&source.ty);
-                let expected = order.iter().map(|&d| dims[d as usize]).collect::<Vec<_>>();
-                if expected != shape(&producer.value.ty)
-                    || dims.iter().any(Option::is_none)
-                    || source.elem != producer.value.elem
-                {
-                    return None;
-                }
-                return Some(Segment {
-                    result: producer.value.clone(),
-                    source: source.clone(),
-                    axis: *selected,
-                    indices: indices.clone(),
-                    retained: order,
-                    views,
-                    line: *definitions.get(producer.value.ssa.as_str())?,
-                    op: op.clone(),
-                    init: init.clone(),
-                });
+                (vec![source.clone()], *selected, indices.clone())
+            }
+            Pointwise::Concat(parts, selected) => {
+                let (sources, indices) = concat_selection(out, parts, *selected)?;
+                (sources, *selected, indices)
             }
             _ => return None,
+        };
+        if order.remove(*axis) != selected as u64 || indices.is_empty() {
+            return None;
         }
+        let dims = shape(&sources[0].ty);
+        let expected = order.iter().map(|&d| dims[d as usize]).collect::<Vec<_>>();
+        if expected != shape(&producer.value.ty)
+            || dims.iter().any(Option::is_none)
+            || sources[0].elem != producer.value.elem
+        {
+            return None;
+        }
+        return Some(Segment {
+            result: producer.value.clone(),
+            sources,
+            axis: selected,
+            indices,
+            retained: order,
+            views,
+            line: *definitions.get(producer.value.ssa.as_str())?,
+            op: op.clone(),
+            init: init.clone(),
+        });
     }
 }
 
@@ -114,7 +228,11 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
             continue;
         };
         let key = (
-            segment.source.ssa.clone(),
+            segment
+                .sources
+                .iter()
+                .map(|source| source.ssa.clone())
+                .collect::<Vec<_>>(),
             segment.axis,
             segment.retained.clone(),
             segment.op.clone(),
@@ -140,7 +258,11 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
             continue;
         }
         let first = &group[0];
-        let width = shape(&first.source.ty)[first.axis].unwrap();
+        let Some(width) = first.sources.iter().try_fold(0_u64, |width, source| {
+            width.checked_add(shape(&source.ty)[first.axis]?)
+        }) else {
+            continue;
+        };
         if width >= i64::MAX as u64
             || (matches!(out.dtype, Dtype::F32) && i32::try_from(width).is_err())
         {
@@ -193,7 +315,7 @@ pub(super) fn finish(out: &Emitter<'_>, rets: &[&Value]) -> String {
 
 fn emit_reductions(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Value {
     let first = &segments[0];
-    let source = &first.source;
+    let source = &first.sources[0];
     let axis = first.axis;
     let dims = shape(&source.ty);
     let scalar_ty = MlirTy::Scalar.render(out.dtype, source.elem);
@@ -228,10 +350,14 @@ fn padded_gather(
     identity: &Value,
 ) -> Value {
     let first = &segments[0];
-    let source = &first.source;
+    let source = &first.sources[0];
     let axis = first.axis;
     let dims = shape(&source.ty);
-    let width = dims[axis].unwrap();
+    let width = first
+        .sources
+        .iter()
+        .map(|source| shape(&source.ty)[axis].unwrap())
+        .sum::<u64>();
     let mut row_dims = dims.to_vec();
     row_dims[axis] = Some(1);
     let row = out.broadcast_in_dim(identity, &[], MlirTy::Ranked(row_dims.clone()));
@@ -242,12 +368,22 @@ fn padded_gather(
         .join(", ");
     row_dims[axis] = Some(width + 1);
     let extended_ty = MlirTy::Ranked(row_dims);
+    let names = first
+        .sources
+        .iter()
+        .chain([&row])
+        .map(|source| source.ssa.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let types = first
+        .sources
+        .iter()
+        .chain([&row])
+        .map(|source| source.ty.render(out.dtype, source.elem))
+        .collect::<Vec<_>>()
+        .join(", ");
     let extended = out.pure(format!(
-        "stablehlo.concatenate {}, {}, dim = {axis} : ({}, {}) -> {}",
-        source.ssa,
-        row.ssa,
-        source.ty.render(out.dtype, source.elem),
-        row.ty.render(out.dtype, row.elem),
+        "stablehlo.concatenate {names}, dim = {axis} : ({types}) -> {}",
         extended_ty.render(out.dtype, source.elem),
     ));
     let count = segments.len() as u64;

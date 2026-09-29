@@ -17,6 +17,7 @@ pub(super) enum Pointwise {
     Transpose(Value, Vec<u64>),
     // In-bounds, zero-based selections, including equivalent vector concatenations.
     Gather(Value, usize, Vec<u64>),
+    Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
 }
 
@@ -39,6 +40,7 @@ impl Pointwise {
             | Self::Reduce(a, ..) => vec![a],
             Self::Binary(_, a, b) | Self::Compare(_, a, b) => vec![a, b],
             Self::Select(c, a, b) => vec![c, a, b],
+            Self::Concat(values, _) => values.iter().collect(),
         }
     }
 
@@ -52,7 +54,11 @@ impl Pointwise {
             Self::Reduce(_, axis, op, init) => {
                 return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
             }
-            Self::Reshape(_) | Self::Slice(..) | Self::Transpose(..) | Self::Gather(..) => {
+            Self::Reshape(_)
+            | Self::Slice(..)
+            | Self::Transpose(..)
+            | Self::Gather(..)
+            | Self::Concat(..) => {
                 return None;
             }
         };
@@ -66,6 +72,10 @@ impl Pointwise {
             Self::Reshape(a) => Self::Reshape(rename(a)),
             Self::Transpose(a, perm) => Self::Transpose(rename(a), perm.clone()),
             Self::Gather(a, axis, indices) => Self::Gather(rename(a), *axis, indices.clone()),
+            Self::Slice(a, starts, limits, strides) => {
+                Self::Slice(rename(a), starts.clone(), limits.clone(), strides.clone())
+            }
+            Self::Concat(values, axis) => Self::Concat(values.iter().map(rename).collect(), *axis),
             Self::Reduce(a, axis, op, init) => {
                 Self::Reduce(rename(a), *axis, op.clone(), init.clone())
             }
@@ -153,6 +163,7 @@ impl Emitter<'_> {
             | Pointwise::Slice(..)
             | Pointwise::Transpose(..)
             | Pointwise::Gather(..)
+            | Pointwise::Concat(..)
             | Pointwise::Reduce(..) => return None,
         };
         self.expanded.insert(key, out.clone());

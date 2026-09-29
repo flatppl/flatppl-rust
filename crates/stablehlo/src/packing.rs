@@ -414,7 +414,8 @@ impl Packer<'_, '_> {
                 Pointwise::Reshape(_)
                 | Pointwise::Slice(..)
                 | Pointwise::Transpose(..)
-                | Pointwise::Gather(..) => unreachable!(),
+                | Pointwise::Gather(..)
+                | Pointwise::Concat(..) => unreachable!(),
             };
             return match hoisted {
                 Some((_, dims)) => self.out.broadcast_in_dim(&result, &dims, ty),
