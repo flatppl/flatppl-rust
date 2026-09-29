@@ -3,6 +3,7 @@
 //! Data stays compact: broadcasts only propagate splats or unchanged extents.
 
 use super::*;
+use std::fmt::Write;
 use std::sync::Arc;
 
 pub(super) type Constant = Arc<[Scalar]>;
@@ -105,23 +106,15 @@ impl Emitter<'_> {
             Scalar::Bool(_) => ElemKind::Bool,
             _ => return None,
         };
-        let literals = values
-            .iter()
-            .map(|v| match v {
-                Scalar::Real(x) => render_float_literal(*x),
-                Scalar::Int(x) => x.to_string(),
-                Scalar::Bool(x) => x.to_string(),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        let literal = if values.len() == 1 {
-            literals[0].clone()
+        let dims = if values.len() == 1 {
+            &[][..]
         } else {
             if element_count(&ty) != Some(values.len()) {
                 return None;
             }
-            dense_literal(&literals, shape(&ty))?
+            shape(&ty)
         };
+        let literal = dense_literal(&values, dims)?;
         let rendered = ty.render(self.dtype, elem);
         let ssa = self.pure_axes(
             format!("stablehlo.constant dense<{literal}> : {rendered}"),
@@ -274,10 +267,22 @@ fn element_count(ty: &MlirTy) -> Option<usize> {
         .try_fold(1usize, |n, d| n.checked_mul(usize::try_from((*d)?).ok()?))
 }
 
-fn dense_literal(values: &[String], dims: &[Option<u64>]) -> Option<String> {
-    fn append(out: &mut String, values: &[String], dims: &[Option<u64>]) -> Option<()> {
+fn dense_literal(values: &[Scalar], dims: &[Option<u64>]) -> Option<String> {
+    fn append(out: &mut String, values: &[Scalar], dims: &[Option<u64>]) -> Option<()> {
         if dims.is_empty() {
-            out.push_str(values.first()?);
+            match values.first()? {
+                Scalar::Real(x) => {
+                    let start = out.len();
+                    write!(out, "{x}").ok()?;
+                    // Match render_float_literal without allocating each token.
+                    if !out[start..].contains(['.', 'e', 'E']) {
+                        out.push_str(".0");
+                    }
+                }
+                Scalar::Int(x) => write!(out, "{x}").ok()?,
+                Scalar::Bool(x) => write!(out, "{x}").ok()?,
+                _ => return None,
+            }
             return Some(());
         }
         let n = usize::try_from(dims[0]?).ok()?;
