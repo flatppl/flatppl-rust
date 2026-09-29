@@ -10,7 +10,7 @@
 //! table (`apply_rule`) is the single extension point.
 
 use crate::refuse::RefuseError;
-use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
+use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
 use flatppl_infer::ModuleBundle;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
@@ -212,27 +212,36 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     if let Some(hit) = find_op_node(m, &["rand"]) {
         return Some(hit);
     }
-    for (bid, binding) in m.bindings() {
-        if let Some(id) = find_in_subtree(m, binding.rhs) {
-            return Some((bid, id));
-        }
-    }
-    None
+    find_node(m, |id| is_measure_layer(m, id))
 }
 
 /// Find the first node (outermost, BFS) whose builtin head is named one of
 /// `ops`, scanning bindings in source order.
 fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
+    find_node(m, |id| {
+        matches!(m.node(id), Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(sym) if ops.contains(&m.resolve(sym))))
+    })
+}
+
+/// Search each binding breadth-first, preserving source order. A node's match
+/// is independent of its path, so revisit neither shared nodes nor their children.
+/// The module stays immutable for this scan; the next rewrite gets a fresh cache.
+fn find_node(m: &Module, matches: impl Fn(NodeId) -> bool) -> Option<(BindingId, NodeId)> {
+    let mut seen = vec![false; m.node_count()];
+    let mut queue = Vec::new();
     for (bid, binding) in m.bindings() {
-        let mut queue = vec![binding.rhs];
+        queue.clear();
+        queue.push(binding.rhs);
         let mut qi = 0;
         while qi < queue.len() {
             let id = queue[qi];
             qi += 1;
-            if let Node::Call(c) = m.node(id)
-                && let CallHead::Builtin(sym) = c.head
-                && ops.contains(&m.resolve(sym))
-            {
+            if seen[id.index()] {
+                continue;
+            }
+            seen[id.index()] = true;
+            if matches(id) {
                 return Some((bid, id));
             }
             m.for_each_child(id, |child| queue.push(child));
@@ -248,19 +257,7 @@ fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
 /// `prior = get(D, 2)`, and if the density query lowered first it would reach the
 /// still-present `get` through the primitive-constructor path and refuse.
 fn find_get_disintegrate(m: &Module) -> Option<(BindingId, NodeId)> {
-    for (bid, binding) in m.bindings() {
-        let mut queue = vec![binding.rhs];
-        let mut qi = 0;
-        while qi < queue.len() {
-            let id = queue[qi];
-            qi += 1;
-            if match_get_disintegrate(m, id).is_some() {
-                return Some((bid, id));
-            }
-            m.for_each_child(id, |c| queue.push(c));
-        }
-    }
-    None
+    find_node(m, |id| match_get_disintegrate(m, id).is_some())
 }
 
 /// Match `get(D, i)` where `D` resolves (one `(%ref self …)` hop) to a
@@ -287,22 +284,6 @@ fn match_get_disintegrate(m: &Module, node: NodeId) -> Option<(NodeId, i64)> {
         return None;
     };
     Some((target, *i))
-}
-
-/// Walk the subtree rooted at `root`, returning the outermost measure-layer
-/// `NodeId` (BFS-order, so the root itself wins over its children).
-fn find_in_subtree(m: &Module, root: NodeId) -> Option<NodeId> {
-    let mut queue = vec![root];
-    let mut qi = 0;
-    while qi < queue.len() {
-        let id = queue[qi];
-        qi += 1;
-        if is_measure_layer(m, id) {
-            return Some(id);
-        }
-        m.for_each_child(id, |c| queue.push(c));
-    }
-    None
 }
 
 /// A node is in the measure layer if it is a `Call` whose builtin head is in
