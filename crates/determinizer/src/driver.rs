@@ -85,6 +85,7 @@ pub fn determinize_with_roots(
     roots: Option<&[Symbol]>,
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
+    let mut imports = crate::crossmodule::GraftState::default();
 
     // Cross-module alias resolution pre-pass (Buffy #359): resolve every top-level
     // host binding whose RHS is a bare cross-module `(%ref <alias> member)` ref IN
@@ -95,7 +96,7 @@ pub fn determinize_with_roots(
     // density lowering (including the variate destructuring, which follows only
     // `SelfMod` refs) run collision-free. A self-contained model has no such
     // bindings, so this is a no-op there.
-    crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
+    crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle, &mut imports)?;
 
     // Lower local §09 functions before the application-graft guards. Their
     // unused arguments may contain module refs that root-based DCE will drop.
@@ -107,7 +108,7 @@ pub fn determinize_with_roots(
     let mut grafted_application = false;
     for (bid, rhs) in app_bindings {
         if let Some(rebuilt) =
-            crate::density::graft_kernel_application_callee(&mut work, rhs, bundle)?
+            crate::density::graft_kernel_application_callee(&mut work, rhs, bundle, &mut imports)?
         {
             work.set_binding_rhs(bid, rebuilt);
             grafted_application = true;
@@ -138,7 +139,7 @@ pub fn determinize_with_roots(
                         if violations
                             .iter()
                             .any(|v| v.kind == crate::NonConformKind::ResidualUserCall)
-                            && graft_application_callees(&mut work, bundle)?
+                            && graft_application_callees(&mut work, bundle, &mut imports)?
                         {
                             crate::stdfn::lower_std_module_functions(&mut work)?;
                             continue;
@@ -157,7 +158,7 @@ pub fn determinize_with_roots(
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(&mut work, bid, node_id, bundle)?;
+                apply_rule(&mut work, bid, node_id, bundle, &mut imports)?;
                 // Loop: re-scan after the rewrite.
             }
         }
@@ -166,7 +167,11 @@ pub fn determinize_with_roots(
 
 /// Visit each shared node once, without adding a recursion-depth limit.
 /// Only callees cross the boundary; the existing argument guards still apply.
-fn graft_application_callees(m: &mut Module, bundle: &ModuleBundle) -> Result<bool, RefuseError> {
+fn graft_application_callees(
+    m: &mut Module,
+    bundle: &ModuleBundle,
+    imports: &mut crate::crossmodule::GraftState,
+) -> Result<bool, RefuseError> {
     let bindings: Vec<_> = m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
     let mut mapped: Vec<Option<NodeId>> = vec![None; m.node_count()];
     let mut stack = Vec::new();
@@ -196,7 +201,7 @@ fn graft_application_callees(m: &mut Module, bundle: &ModuleBundle) -> Result<bo
             // separately, including bindings that occur later in source order.
             if matches!(m.node(rhs), Node::Call(c) if matches!(c.head, CallHead::User(_)))
                 && let Some(grafted) =
-                    crate::density::graft_kernel_application_callee(m, rhs, bundle)?
+                    crate::density::graft_kernel_application_callee(m, rhs, bundle, imports)?
             {
                 rhs = grafted;
                 changed = true;
@@ -369,6 +374,7 @@ fn apply_rule(
     bid: BindingId,
     target_node: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut crate::crossmodule::GraftState,
 ) -> Result<(), RefuseError> {
     // --- structural disintegration: get(disintegrate(sel, lawof(record …)), i) ---
     // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
@@ -411,7 +417,7 @@ fn apply_rule(
         // general scan never reaches the bare `disintegrate` and refuses — this is
         // what makes each rewrite strictly remove a `get`/`disintegrate` node and
         // the driver terminate.
-        sweep_dead_measure_bindings(m);
+        sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }
 
@@ -442,7 +448,7 @@ fn apply_rule(
         // `M = lawof(record(…))` joint binding is now unreferenced (dead
         // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
         // never reaches the bare `lawof(record(…))` and refuses.
-        sweep_dead_measure_bindings(m);
+        sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }
 
@@ -470,7 +476,9 @@ fn apply_rule(
         // in a single call (iid-size refuse / KernelNotBuiltinArg refuse).
         // `graft_query_target` rebuilds the deferred query with the SAME op name
         // (`logdensityof` or `densityof`) it was given, so this branch is shared.
-        if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
+        if let Some(new_query) =
+            crate::density::graft_query_target(m, target_node, bundle, imports)?
+        {
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
             // The initial standard-function pass could not see this dependency.
@@ -478,13 +486,13 @@ fn apply_rule(
             // The intermediate `x = m.L` self-ref binding (if any) and the
             // `helpers = load_module(…)` binding may now be dead; sweep the
             // measure-typed ones so the next scan is clean.
-            sweep_dead_measure_bindings(m);
+            sweep_dead_measure_bindings(m, imports);
             return Ok(());
         }
         let new_root = if is_logdensityof {
-            crate::density::lower_logdensityof(m, target_node, bundle)?
+            crate::density::lower_logdensityof(m, target_node, bundle, imports)?
         } else {
-            crate::density::lower_densityof(m, target_node, bundle)?
+            crate::density::lower_densityof(m, target_node, bundle, imports)?
         };
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
@@ -493,7 +501,7 @@ fn apply_rule(
         // and the combinator binding is no longer referenced.  Sweep them out now
         // so the outer scan loop does not encounter them as unhandled
         // measure-layer nodes on the next iteration.
-        sweep_dead_measure_bindings(m);
+        sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }
 
@@ -507,7 +515,7 @@ fn apply_rule(
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`
         // binding referenced by nothing (the sampled value is a fresh inline
         // node, not a ref to `x`) — sweep it out before the next scan.
-        sweep_dead_measure_bindings(m);
+        sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }
 
@@ -667,12 +675,17 @@ pub(crate) fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[
         .collect();
 
     use flatppl_core::Call;
-    m.alloc(Node::Call(Call {
+    let auto_inputs = m.auto_inputs_of(id).map(<[_]>::to_vec);
+    let rebuilt = m.alloc(Node::Call(Call {
         head: new_head,
         args: new_args.into(),
         named: new_named.into(),
         inputs,
-    }))
+    }));
+    if let Some(entries) = auto_inputs {
+        m.set_auto_inputs(rebuilt, entries.into());
+    }
+    rebuilt
 }
 
 /// True iff `id` is a builtin call whose head is named `op`.
@@ -801,7 +814,7 @@ const COMBINATOR_OPS: &[&str] = &[
 /// the conformance gate, and no others (a value-typed binding never matches).
 /// A query-pinned latent's PRIOR is exempt while another query is still unreduced —
 /// see [`referenced_binding_names`].
-fn sweep_dead_measure_bindings(m: &mut Module) {
+fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule::GraftState) {
     // §13 "Output reduction" reduces PER OUTPUT, so a second query over the same
     // measure re-reads the `draw(prior)` an earlier query's pin overwrote
     // (`Module::declared_binding_rhs`). Until the last query is lowered, that prior
@@ -850,6 +863,7 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
             );
             let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
             m.set_binding_rhs(bid, zero);
+            imports.discard(bid);
         }
     }
 }
@@ -982,7 +996,12 @@ pub(crate) fn collect_referenced_names(
             Node::Call(c) => {
                 // A reification input `(name, %ref self <name>)` references the
                 // binding just as a body ref does — but lives outside `children()`.
-                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+                let entries = match &c.inputs {
+                    Some(flatppl_core::Inputs::Spec(entries)) => Some(entries.as_ref()),
+                    Some(flatppl_core::Inputs::Auto) => m.auto_inputs_of(id),
+                    None => None,
+                };
+                if let Some(entries) = entries {
                     for (_, r) in entries.iter() {
                         match r.ns {
                             RefNs::SelfMod => {
@@ -1103,7 +1122,7 @@ mod tests {
             synthetic: false,
         });
 
-        sweep_dead_measure_bindings(&mut m);
+        sweep_dead_measure_bindings(&mut m, &mut crate::crossmodule::GraftState::default());
 
         // `g` must survive: still a `Normal` call, NOT the `0.0` sweep sentinel.
         let g_after = m.binding(g_bid).rhs;

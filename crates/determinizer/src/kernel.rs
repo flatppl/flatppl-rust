@@ -15,7 +15,7 @@
 //! functions and kernels") — `resolve_reified` accepts both, but `resolve_kernel`
 //! stays `kernelof`-only since `marginal.rs`/`jointchain.rs` depend on that.
 
-use crate::density::{draw_argument, resolve_ref_one};
+use crate::density::{draw_argument, resolve_ref_chain, resolve_ref_one};
 use flatppl_core::{
     Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
     Type,
@@ -69,7 +69,7 @@ fn boundary_inputs(
 /// both are read via [`boundary_inputs`]. Returns ALL inputs; callers that
 /// require exactly one check the length themselves.
 pub(crate) fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
-    let (resolved, _) = resolve_ref_one(m, k_arg);
+    let (resolved, _) = resolve_ref_chain(m, k_arg);
     let Node::Call(c) = m.node(resolved) else {
         return None;
     };
@@ -93,7 +93,7 @@ pub(crate) fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
 /// an `%autoinputs` callable to keyword-only application. Returns ALL inputs;
 /// callers that require exactly one check the length themselves.
 pub(crate) fn resolve_reified(m: &Module, k_arg: NodeId) -> Option<Kernel> {
-    let (resolved, _) = resolve_ref_one(m, k_arg);
+    let (resolved, _) = resolve_ref_chain(m, k_arg);
     let Node::Call(c) = m.node(resolved) else {
         return None;
     };

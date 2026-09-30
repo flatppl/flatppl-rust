@@ -144,6 +144,7 @@
 //! desugared into `bayesupdate(likelihoodof(kernel, x), marginal)` over the
 //! disintegration on `x`'s field names, §06 "Measure restriction".)
 
+use crate::crossmodule::GraftState;
 use crate::refuse::RefuseError;
 use flatppl_core::{
     BindingId, Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref,
@@ -168,9 +169,10 @@ pub(crate) fn lower_logdensityof(
     m: &mut Module,
     query: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     let (arg1, arg2) = parse_density_query_args(m, query, "logdensityof")?;
-    lower_density_core(m, arg1, arg2, bundle)
+    lower_density_core(m, arg1, arg2, bundle, imports)
 }
 
 /// Lower `densityof(M, x)` at `query` into a deterministic expression: the
@@ -184,9 +186,10 @@ pub(crate) fn lower_densityof(
     m: &mut Module,
     query: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     let (arg1, arg2) = parse_density_query_args(m, query, "densityof")?;
-    let log_density = lower_density_core(m, arg1, arg2, bundle)?;
+    let log_density = lower_density_core(m, arg1, arg2, bundle, imports)?;
     Ok(build_call(m, "exp", &[log_density]))
 }
 
@@ -216,6 +219,7 @@ fn lower_density_core(
     arg1: NodeId,
     arg2: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     // A cross-module *direct query target* (a submodule likelihood handle
     // `m.L` or a bare measure handle `m.d`) is already grafted to a local host
@@ -243,7 +247,7 @@ fn lower_density_core(
             Some("likelihoodof") | Some("joint_likelihood")
         )
     {
-        return lower_likelihood_density(m, resolved, arg2, bundle);
+        return lower_likelihood_density(m, resolved, arg2, bundle, imports);
     }
     // Unnormalized-posterior query: `bayesupdate(L, prior)` scores its
     // log-likelihood term via [`lower_likelihood_density`], which needs the
@@ -253,7 +257,7 @@ fn lower_density_core(
     // parameter point θ, shared by both the likelihood and the prior (§06
     // "Likelihoods and posteriors").
     if matches!(builtin_name(m, resolved), Some("bayesupdate")) {
-        return lower_bayesupdate(m, resolved, arg2, bundle);
+        return lower_bayesupdate(m, resolved, arg2, bundle, imports);
     }
     // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
     // (possibly grafted) measure node and hand it to the recursive dispatcher.
@@ -290,10 +294,11 @@ fn lower_likelihood_density(
     resolved: NodeId,
     theta: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     match builtin_name(m, resolved) {
-        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta, bundle),
-        _ => lower_likelihood_query(m, resolved, theta, bundle),
+        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta, bundle, imports),
+        _ => lower_likelihood_query(m, resolved, theta, bundle, imports),
     }
 }
 
@@ -316,6 +321,7 @@ fn lower_joint_likelihood(
     node: NodeId,
     theta: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     let components: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "joint_likelihood")
@@ -342,7 +348,13 @@ fn lower_joint_likelihood(
         // CHAIN and reuse the per-likelihood dispatch (also handles a nested
         // joint_likelihood). A component may itself be an alias.
         let (comp_resolved, _) = resolve_ref_chain(m, comp);
-        terms.push(lower_likelihood_density(m, comp_resolved, theta, bundle)?);
+        terms.push(lower_likelihood_density(
+            m,
+            comp_resolved,
+            theta,
+            bundle,
+            imports,
+        )?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -377,6 +389,7 @@ fn lower_bayesupdate(
     node: NodeId,
     v: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     let (l_arg, prior_arg) = {
         let c = expect_builtin_call(m, node, "bayesupdate")
@@ -397,7 +410,7 @@ fn lower_bayesupdate(
     // `(%ref self L)` hop to the likelihood op (likelihoodof / joint_likelihood)
     // and reuse the shared per-likelihood lowering (which threads the bundle so a
     // cross-module kernel in the posterior also lowers).
-    let l_d = lower_likelihood_density(m, resolve_ref_chain(m, l_arg).0, v, bundle)?;
+    let l_d = lower_likelihood_density(m, resolve_ref_chain(m, l_arg).0, v, bundle, imports)?;
     // Unnormalized log-posterior = log-likelihood + log-prior.
     Ok(build_call(m, "add", &[l_d, prior_d]))
 }
@@ -421,11 +434,8 @@ fn lower_bayesupdate(
 /// substitutions (a substituted submodule parameter is replaced by the host
 /// expression it was bound to).
 ///
-/// **Refuses** (rather than mislowering) when: the cross-module ref is
-/// unresolvable (dependency or member absent from the bundle); or a grafted
-/// submodule dependency's name collides with an unrelated pre-existing host
-/// binding (independent namespaces — reusing the host binding would score against
-/// the wrong value).
+/// Refuses unresolved or cyclic imports. Fresh names keep each imported
+/// dependency distinct from unrelated host bindings.
 ///
 /// The graft (see [`crate::crossmodule`]) also pulls the kernel's own parameter
 /// bindings into the host, so the caller's `theta_field_map` and the density
@@ -434,10 +444,19 @@ fn resolve_cross_module_kernel(
     m: &mut Module,
     bundle: &ModuleBundle,
     k: NodeId,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     // Same graft path as the direct-query-target case; a same-module `k`
     // (`Ok(None)`) is returned unchanged.
-    Ok(graft_cross_module_target(m, k, bundle)?.unwrap_or(k))
+    if let Some(grafted) = graft_cross_module_target(m, k, bundle, imports)? {
+        // This path grafts within a likelihood query, without the driver's
+        // defer-and-reinfer cycle. Type its imported kernel before lowering
+        // reads shapes and the dead-measure sweep classifies its owned slot.
+        let _ = flatppl_infer::infer(m);
+        Ok(grafted)
+    } else {
+        Ok(k)
+    }
 }
 
 /// If `target` is — or resolves via one `(%ref self …)` hop to — a cross-module
@@ -447,11 +466,8 @@ fn resolve_cross_module_kernel(
 /// (local) reference — the caller keeps its original node and dispatches
 /// unchanged.
 ///
-/// **Refuses** (`Err`, refuse-don't-mislower) when the cross-module ref is
-/// unresolvable (dependency or member absent from the bundle), or when the graft
-/// itself refuses (a grafted submodule dependency whose name collides with an
-/// unrelated pre-existing host binding — see
-/// [`crate::crossmodule::graft_subtree`]).
+/// Refuses unresolved or cyclic imports through
+/// [`crate::crossmodule::graft_subtree`].
 ///
 /// This is the ONE graft entry point shared by both cross-module cases:
 /// * a likelihood KERNEL argument (`likelihoodof(m.kernel, obs)`) via
@@ -470,6 +486,7 @@ fn graft_cross_module_target(
     m: &mut Module,
     target: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<Option<NodeId>, RefuseError> {
     let module_ref = if is_module_ref(m, target) {
         target
@@ -482,7 +499,7 @@ fn graft_cross_module_target(
         }
     };
     match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
-        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved, bundle)
+        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved, bundle, imports)
             .map(Some)
             .map_err(|reason| refuse(module_ref, m, &reason)),
         None => Err(refuse(
@@ -513,9 +530,7 @@ fn graft_cross_module_target(
 /// ran within a single call, before the next re-infer.
 ///
 /// `Ok(None)`: same-module target — nothing grafted; the driver lowers normally.
-/// `Err`: the cross-module ref is unresolvable, or the graft itself refuses (a
-/// grafted submodule dependency colliding with an unrelated host binding —
-/// refuse-don't-mislower).
+/// `Err`: the cross-module ref is unresolvable, or the import graph is cyclic.
 ///
 /// Termination: a graft here fires at most once per argument. It rewrites the
 /// argument from a `(%ref <alias> …)` (or a self-ref reaching one) to a local
@@ -526,6 +541,7 @@ pub(crate) fn graft_query_target(
     m: &mut Module,
     query: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<Option<NodeId>, RefuseError> {
     // `query` may be either a `logdensityof(...)` or a `densityof(...)` — both
     // share this grafting logic; rebuild with the SAME op name the query
@@ -542,7 +558,7 @@ pub(crate) fn graft_query_target(
     };
     // Case 1: the target IS (or resolves via one `(%ref self …)` hop to) a
     // cross-module measure / likelihood HANDLE — graft it directly.
-    if let Some(grafted) = graft_cross_module_target(m, arg1, bundle)? {
+    if let Some(grafted) = graft_cross_module_target(m, arg1, bundle, imports)? {
         return Ok(Some(build_call(m, op, &[grafted, arg2])));
     }
     // Case 2 (#194): the target is a cross-module kernel APPLICATION — a
@@ -551,12 +567,12 @@ pub(crate) fn graft_query_target(
     // rebuild the call with the grafted LOCAL callee, so the driver's re-infer
     // types the grafted kernel and `reduce_kernel_application` β-reduces the
     // now-local application next iteration.
-    if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle)? {
+    if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle, imports)? {
         return Ok(Some(build_call(m, op, &[new_call, arg2])));
     }
     // Density destructuring also needs imported observations to be local and
     // inferred. Use the same graft path and defer lowering until the next scan.
-    if let Some(grafted) = graft_cross_module_target(m, arg2, bundle)? {
+    if let Some(grafted) = graft_cross_module_target(m, arg2, bundle, imports)? {
         return Ok(Some(build_call(m, op, &[arg1, grafted])));
     }
     Ok(None) // same-module target — driver lowers normally
@@ -610,6 +626,7 @@ pub(crate) fn graft_kernel_application_callee(
     m: &mut Module,
     arg1: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<Option<NodeId>, RefuseError> {
     // The target may be inline (`logdensityof(m.k(input), pt)`) or bound by name
     // (`ka = m.k(input); logdensityof(ka, pt)`); resolve one ref hop to the call.
@@ -672,7 +689,7 @@ pub(crate) fn graft_kernel_application_callee(
     // Graft the cross-module callee into the host. `graft_cross_module_target`
     // returns `None` only for a same-module ref (excluded by the guard above), so
     // treat that defensively as "nothing to graft".
-    let Some(grafted_callee) = graft_cross_module_target(m, callee, bundle)? else {
+    let Some(grafted_callee) = graft_cross_module_target(m, callee, bundle, imports)? else {
         return Ok(None);
     };
     // Rebuild the `%call` with the grafted local callee as its head; the
@@ -701,6 +718,7 @@ fn lower_likelihood_query(
     likelihoodof_node: NodeId,
     theta: NodeId,
     bundle: &ModuleBundle,
+    imports: &mut GraftState,
 ) -> Result<NodeId, RefuseError> {
     let (k, obs) = {
         let c = expect_builtin_call(m, likelihoodof_node, "likelihoodof")
@@ -718,10 +736,9 @@ fn lower_likelihood_query(
     // graft the referenced kernel subtree into the host so the density lowering
     // below runs on a self-contained node (spec §04 — a measure/kernel crosses
     // module boundaries freely). Grafting brings the kernel's own parameter
-    // bindings into the host too, so `theta_field_map` (next line) can resolve
-    // the θ field names. A same-module `k` is returned unchanged.
-    let k = resolve_cross_module_kernel(m, bundle, k)?;
-    let theta_map = theta_field_map(m, theta)?;
+    // bindings into the host too. A same-module `k` is returned unchanged.
+    let k = resolve_cross_module_kernel(m, bundle, k, imports)?;
+    let theta_map = theta_field_map(m, k, theta)?;
     let density = lower_measure_density_at_point(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
     // reification *input* (a `(name, %ref self <name>)` boundary entry) is a name that
@@ -753,13 +770,15 @@ fn lower_likelihood_query(
     Ok(substitute_refs_by_name(m, density, &theta_map))
 }
 
-/// Build the `name → θ-value` map from the θ record's `%field name = value`
-/// entries. Refuses if θ is not a record, or names a parameter with no module
-/// binding (a θ field that does not correspond to a declared param is a
-/// mislowering hazard, not a valid point).
-fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
+/// Map public θ labels to their actual boundary bindings before validating
+/// them. An imported callable's labels survive renaming and alias adoption.
+fn theta_field_map(
+    m: &Module,
+    kernel: NodeId,
+    theta: NodeId,
+) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
     let (resolved, _) = resolve_ref_one(m, theta);
-    let fields: Vec<(Symbol, NodeId)> = {
+    let mut fields: Vec<(Symbol, NodeId)> = {
         let rec = expect_builtin_call(m, resolved, "record")
             .ok_or_else(|| refuse(theta, m, "logdensityof(L, θ): θ must be a record"))?;
         rec.named
@@ -768,7 +787,14 @@ fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, R
             .map(|n| (n.name, n.value))
             .collect()
     };
-    for (name, value) in &fields {
+    let kernel = crate::kernel::resolve_reified(m, resolve_ref_chain(m, kernel).0);
+    for (name, value) in &mut fields {
+        if let Some(kernel) = &kernel
+            && let Some((_, target)) = kernel.inputs.iter().find(|(label, _)| label == name)
+            && target.ns == RefNs::SelfMod
+        {
+            *name = target.name;
+        }
         if m.binding_by_name(*name).is_none() {
             return Err(refuse(
                 *value,
@@ -7229,7 +7255,7 @@ impl Coordinate {
 /// `lawof`, `kernelof` — or a stochastic constructor parameter) remains a single node of
 /// the composed trace". The two shapes differ only in where the coordinate comes from:
 ///
-/// * a REIFIED component — a bare `lawof(x)` call, one ref hop resolved — contributes the
+/// * a REIFIED component — a `lawof(x)` call reached through aliases — contributes the
 ///   reified value `x` itself, since §04 *Trace of the reified law* has a reified measure
 ///   carry "its traced sub-DAG as part of its value";
 /// * a CONSTRUCTOR component whose parameters reach a draw (`Normal(mu = z, sigma = s)`
@@ -7245,7 +7271,7 @@ impl Coordinate {
 /// The fresh draw is built over the RESOLVED constructor rather than the component as
 /// written, so the record law downstream reads the constructor directly instead of a ref hop.
 fn joint_component_coordinate(m: &mut Module, measure: NodeId) -> Option<Coordinate> {
-    let (resolved, _) = resolve_ref_one(m, measure);
+    let (resolved, _) = resolve_ref_chain(m, measure);
     if let Some(c) = expect_builtin_call(m, resolved, "lawof") {
         return (c.args.len() == 1).then_some(Coordinate::Reified(c.args[0]));
     }
@@ -7436,17 +7462,23 @@ fn lower_reified_measure(
     // conditioned-input stack for the duration of the body's lowering below and
     // popped straight after — a sibling measure outside the reification must keep
     // marginalizing over the same latent.
-    let declared_inputs: Vec<Symbol> = match m.node(node) {
+    let entries = match m.node(node) {
         Node::Call(Call {
-            inputs: Some(flatppl_core::Inputs::Spec(entries)),
+            inputs: Some(Inputs::Spec(entries)),
             ..
-        }) => entries
-            .iter()
-            .filter(|(_, r)| r.ns == RefNs::SelfMod)
-            .map(|&(name, _)| name)
-            .collect(),
-        _ => Vec::new(),
+        }) => Some(entries.as_ref()),
+        Node::Call(Call {
+            inputs: Some(Inputs::Auto),
+            ..
+        }) => m.auto_inputs_of(node),
+        _ => None,
     };
+    let declared_inputs: Vec<_> = entries
+        .into_iter()
+        .flatten()
+        .filter(|(_, target)| target.ns == RefNs::SelfMod)
+        .map(|(_, target)| target.name)
+        .collect();
     let body = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected functionof/kernelof"));

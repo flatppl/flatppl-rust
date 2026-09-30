@@ -1,115 +1,35 @@
-//! Resolve a `(%ref <loaded-module> member)` measure ref into the loaded
-//! submodule graph carried by the [`ModuleBundle`], then graft that subtree into
-//! the host module so the existing (bundle-free) lowering can proceed on a
-//! self-contained node.
+//! Import module members into the host graph before their existing lowering.
 //!
-//! Spec §04 "Reification and module scope": a *measure* crosses module
-//! boundaries freely (`lawof(draw(m)) ≡ m`), so resolving a cross-module measure
-//! ref is spec-legal. (Taking a cross-module *parameterized* value AS a
-//! reification input is the disallowed case — a static error — but that is a
-//! reification built in the host, not a reference to a submodule's own reified
-//! kernel, which is what we resolve here.)
-//!
-//! ## Why graft rather than thread the bundle through the lowering
-//!
-//! The referenced node lives in the *submodule's* arena and interner; the
-//! density lowering mutates (and interns into) the *host*. Rather than thread
-//! `&ModuleBundle` — and a `&submodule` — through the entire `lower_measure_*`
-//! recursion, we deep-copy the referenced subtree into the host once, at the
-//! resolution site (the likelihood-kernel resolution in `density.rs`),
-//! re-interning every symbol and recursively grafting the submodule bindings it
-//! closes over. The result is an ordinary host-local node; everything downstream
-//! runs unchanged and needs no bundle.
-//!
-//! The graft *itself* does carry the bundle ([`GraftCtx::bundle`]) — but only so
-//! it can resolve a NESTED cross-module ref (a submodule being grafted that has
-//! its own `load_module` and references it): that nested member is resolved
-//! against the bundle and grafted recursively, so a measure that crosses two or
-//! more module boundaries (§04 "measure crosses module boundaries transitively")
-//! still collapses to a self-contained host node the downstream lowering needs no
-//! bundle for.
-//!
-//! ## Load-time substitution and namespace independence (refuse-don't-mislower)
-//!
-//! Two host-vs-submodule interactions matter for correctness (§04 "Multi-file
-//! models"):
-//!
-//! * **`load_module` `%assign` parameters.** `load_module("h", center = <expr>)`
-//!   substitutes the submodule's input parameter `center` with the host `<expr>`
-//!   at the load boundary. The graft honors this: a `(%ref self center)` in the
-//!   grafted subtree naming a substituted parameter is replaced by the host
-//!   expression (not by a fresh copy of the submodule's own `center` binding).
-//!
-//! * **Independent namespaces.** A submodule binding and a same-named host
-//!   binding are unrelated unless the `%assign` above links them. So a grafted
-//!   submodule dependency whose name collides with an unrelated pre-existing host
-//!   binding must NOT reuse the host binding (that would silently score against
-//!   the wrong value) — the graft **refuses** instead.
-//!
-//! * **Distinct submodules are independent namespaces too.** A single graft
-//!   chain can now pull in bindings from more than one submodule (a NESTED
-//!   cross-module ref: host → A → B, with A and B distinct modules). Two
-//!   independent submodules that each define an unrelated binding of the SAME
-//!   bare name (e.g. both define `scale`) are just as unrelated as a
-//!   host/submodule pair — deduping the second graft onto the first submodule's
-//!   value by bare name alone would silently score against the wrong value. So
-//!   [`GraftCtx::grafted`] records not just the name but a COMPOSITE ORIGIN key
-//!   (`origin-path\0member-name`) it was grafted from: a re-request of the same
-//!   name from the SAME composite origin (a diamond — the same submodule binding
-//!   reached twice) dedups validly, but a re-request from a DIFFERENT one
-//!   **refuses** rather than mislower. The member name is part of the key because
-//!   the origin path alone is NOT enough to distinguish two re-exports of DIFFERENT
-//!   members of the SAME submodule under one host name (`a.foo = priors.x` and
-//!   `b.foo = priors.y` both have path `priors.flatppl` but score distinct values)
-//!   — dedup by path alone silently collapses them (a reopened #77 hole).
-//!
-//!   `preexisting` and `grafted` stay two separate checks: `preexisting` is
-//!   host-vs-submodule (a bare `HashSet`, since the host is a single fixed
-//!   namespace this pass), while `grafted` is submodule-vs-submodule (needs the
-//!   extra origin key because multiple submodule namespaces are in play).
+//! §04 Module composition distinguishes a source file from a loaded instance.
+//! One load shares its dependencies across uses; separate loads share no nodes.
+//! Imported bindings therefore belong to an instance and a source binding, not
+//! to a file/name pair. Host names are allocated independently of that identity.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use flatppl_core::{
-    Axis, Binding, BindingId, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId,
-    Ref, RefNs, Scalar, Symbol,
+    Axis, Binding, BindingId, Call, CallHead, Idx, Inputs, Module, NamedArg, NamedKind, Node,
+    NodeId, Ref, RefNs, Scalar, Symbol,
 };
 use flatppl_infer::ModuleBundle;
 
 use crate::refuse::RefuseError;
 
-/// A resolved cross-module kernel reference: the submodule that owns it, the
-/// member's node id in that submodule, and the host's load-time `%assign`
-/// substitutions (submodule-parameter name → host expression node id).
 pub(crate) struct ResolvedRef<'a> {
-    pub sub: &'a Module,
-    pub member_rhs: NodeId,
-    /// `(submodule-parameter-name, host-expr-node)` for each `%assign` on the
-    /// `load_module` call. The node ids are HOST nodes (already interned).
-    pub assign: Vec<(String, NodeId)>,
-    /// The bundle path string `sub` was loaded from — the ORIGIN key for
-    /// [`GraftCtx::grafted`]'s submodule-vs-submodule collision guard.
-    pub path: String,
+    sub: &'a Module,
+    member: BindingId,
+    load: BindingId,
+    /// Assignment nodes belong to the module containing the load.
+    assign: Vec<(String, NodeId)>,
+    path: String,
 }
 
-/// The `(module-name, member-name)` of a `(%ref <alias> member)` whose `<alias>`
-/// host binding is a `standard_module("name", "version")` call (spec §09), rather
-/// than the `load_module` of §04 *Multi-file models*.
-///
-/// A §09 member is a CATALOGUE entry, not a submodule binding: there is no
-/// subtree in the `ModuleBundle` to graft. Preserve its alias declaration and
-/// leave the member to standard-function or constructor lowering. Constructor
-/// lowering ([`crate::density::split_kernel_constructor`]) emits the bare member
-/// name as the kernel tag, as does `lower_broadcast_kernel`.
-///
-/// The requested `version` is NOT re-checked here: inference already rejects a
-/// version the catalogue does not provide ("standard module `X` has unknown
-/// version `V`"), and the CLI refuses to determinize a module with inference
-/// errors, so a ref reaching the determiniser has a matching name and version.
+/// Standard-module members are catalogue entries, not file-module graphs.
 pub(crate) fn std_module_member(host: &Module, id: NodeId) -> Option<(String, String)> {
     let Node::Ref(Ref {
         ns: RefNs::Module(alias),
-        name: member,
+        name,
     }) = *host.node(id)
     else {
         return None;
@@ -118,24 +38,15 @@ pub(crate) fn std_module_member(host: &Module, id: NodeId) -> Option<(String, St
     let Node::Call(c) = host.node(host.binding(bid).rhs) else {
         return None;
     };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
-    };
-    if host.resolve(sym) != "standard_module" {
+    if !matches!(c.head, CallHead::Builtin(s) if host.resolve(s) == "standard_module") {
         return None;
     }
-    let name = string_literal(host, *c.args.first()?)?;
-    Some((name, host.resolve(member).to_string()))
+    Some((
+        string_literal(host, *c.args.first()?)?,
+        host.resolve(name).to_string(),
+    ))
 }
 
-/// For a `Node::Ref { ns: RefNs::Module(alias), name: member }` at `id` in
-/// `host`, follow `alias` → its `load_module("path", …)` binding → `path` →
-/// `bundle.get(path)` → the submodule's `member` binding, and return the
-/// submodule, the member rhs, and the `load_module` `%assign` substitutions.
-///
-/// `None` (⇒ the caller refuses, per refuse-don't-mislower) when `id` is not a
-/// module ref, the alias is not a `load_module` binding, the path dependency is
-/// absent from the bundle, or the submodule has no such (member) binding.
 pub(crate) fn resolve_module_ref<'a>(
     bundle: &'a ModuleBundle,
     host: &Module,
@@ -143,117 +54,61 @@ pub(crate) fn resolve_module_ref<'a>(
 ) -> Option<ResolvedRef<'a>> {
     let Node::Ref(Ref {
         ns: RefNs::Module(alias),
-        name: member,
+        name,
     }) = *host.node(id)
     else {
         return None;
     };
-    // `alias` names a host binding whose rhs is `load_module("path", …)`.
-    let bid = host.binding_by_name(alias)?;
-    let load = host.binding(bid).rhs;
-    let Node::Call(c) = host.node(load) else {
-        return None;
+    resolve_member(bundle, bundle.root(), host, alias, name)
+}
+
+fn resolve_member<'a>(
+    bundle: &'a ModuleBundle,
+    importer: &str,
+    src: &Module,
+    alias: Symbol,
+    member: Symbol,
+) -> Option<ResolvedRef<'a>> {
+    let mut load = src.binding_by_name(alias)?;
+    let mut seen = HashSet::new();
+    let call = loop {
+        if !seen.insert(load) {
+            return None;
+        }
+        match src.node(src.binding(load).rhs) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => load = src.binding_by_name(*name)?,
+            Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if src.resolve(s) == "load_module") =>
+            {
+                break c;
+            }
+            _ => return None,
+        }
     };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
-    };
-    if host.resolve(sym) != "load_module" {
-        return None;
-    }
-    // First positional arg is the path string literal.
-    let path = string_literal(host, *c.args.first()?)?;
-    // Load-time `%assign` substitutions: `load_module("p", center = <host expr>)`
-    // binds the submodule input parameter `center` to `<host expr>`. Keyed by the
-    // submodule-parameter name (string, so it matches across interners); the value
-    // is a host node id.
-    let assign: Vec<(String, NodeId)> = c
+    let literal = string_literal(src, *call.args.first()?)?;
+    let path = bundle.identity_of(importer, &literal)?.to_string();
+    let sub = bundle.get_by_id(&path)?;
+    let member = sub
+        .bindings()
+        .find(|(_, b)| sub.resolve(b.name) == src.resolve(member))?
+        .0;
+    let assign = call
         .named
         .iter()
-        .filter(|na| na.kind == NamedKind::Assign)
-        .map(|na| (host.resolve(na.name).to_string(), na.value))
+        .filter(|arg| arg.kind == NamedKind::Assign)
+        .map(|arg| (src.resolve(arg.name).to_string(), arg.value))
         .collect();
-    let sub = bundle.get(&path)?;
-    // Cross-interner lookup: match the member by string, not by Symbol.
-    let member_name = host.resolve(member);
-    let member_rhs = sub
-        .bindings()
-        .find(|(_, b)| sub.resolve(b.name) == member_name)
-        .map(|(_, b)| b.rhs)?;
     Some(ResolvedRef {
         sub,
-        member_rhs,
+        member,
+        load,
         assign,
         path,
     })
 }
 
-/// A resolved NESTED cross-module ref: the nested submodule (`sub`) named by the
-/// CURRENT submodule's own `load_module(alias)`, the referenced member's node id
-/// and visibility in `sub`, and the nested `load_module` `%assign` substitutions
-/// as `(param-name, SRC node id)` — where the SRC nodes live in the submodule
-/// that owns the `load_module` call and must be grafted into the host by the
-/// caller before use.
-struct NestedResolved<'a> {
-    sub: &'a Module,
-    member_rhs: NodeId,
-    member_public: bool,
-    /// `(submodule-parameter-name, SRC node id of the `%assign` value)`.
-    assign_src: Vec<(String, NodeId)>,
-    /// Bundle path string of the nested submodule (the cycle-guard key uses it).
-    path: String,
-}
-
-/// Like [`resolve_module_ref`], but resolves a NESTED cross-module ref against
-/// the submodule `src` that is currently being grafted: `alias_sym` names `src`'s
-/// OWN `load_module("path", …)` binding, `path` → `bundle.get(path)` → the nested
-/// submodule's `member_sym` binding. Returns the nested submodule, the member's
-/// rhs + visibility, the nested `%assign` (values as SRC nodes — the caller
-/// grafts them), and `path` (for the cycle key).
-///
-/// `None` (⇒ caller refuses) when `alias_sym` is not a `load_module` binding in
-/// `src`, its path is absent from the bundle, or the nested submodule has no such
-/// member. The member is matched by STRING (cross-interner), like
-/// [`resolve_module_ref`].
-fn resolve_src_module_ref<'a>(
-    bundle: &'a ModuleBundle,
-    src: &Module,
-    alias_sym: Symbol,
-    member_sym: Symbol,
-) -> Option<NestedResolved<'a>> {
-    let bid = src.binding_by_name(alias_sym)?;
-    let load = src.binding(bid).rhs;
-    let Node::Call(c) = src.node(load) else {
-        return None;
-    };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
-    };
-    if src.resolve(sym) != "load_module" {
-        return None;
-    }
-    let path = string_literal(src, *c.args.first()?)?;
-    let assign_src: Vec<(String, NodeId)> = c
-        .named
-        .iter()
-        .filter(|na| na.kind == NamedKind::Assign)
-        .map(|na| (src.resolve(na.name).to_string(), na.value))
-        .collect();
-    let sub = bundle.get(&path)?;
-    let member_name = src.resolve(member_sym);
-    let (member_rhs, member_public) = sub
-        .bindings()
-        .find(|(_, b)| sub.resolve(b.name) == member_name)
-        .map(|(_, b)| (b.rhs, b.public))?;
-    Some(NestedResolved {
-        sub,
-        member_rhs,
-        member_public,
-        assign_src,
-        path,
-    })
-}
-
-/// The `Box<str>` payload of a `Node::Lit(Scalar::Str(_))`, else `None`.
 fn string_literal(m: &Module, id: NodeId) -> Option<String> {
     match m.node(id) {
         Node::Lit(Scalar::Str(s)) => Some(s.to_string()),
@@ -261,306 +116,212 @@ fn string_literal(m: &Module, id: NodeId) -> Option<String> {
     }
 }
 
-/// If `rhs` (a node in `src`) is EXACTLY a single cross-module ref
-/// `(%ref alias target)`, return `(alias, target)`. A submodule binding whose rhs
-/// is such a bare module ref (`common.theta1_dist = priors.theta1_dist`) is a
-/// candidate PURE RE-EXPORT: the same underlying value as the target module's
-/// `target` (§04 "a re-exported cross-module binding is the same value"), NOT an
-/// independent definition. The caller confirms it resolves to a real nested member
-/// (via [`resolve_src_module_ref`]) before treating it as a re-export — anything
-/// with a non-trivial rhs is not a re-export and keeps its own origin.
-fn as_pure_reexport(src: &Module, rhs: NodeId) -> Option<(Symbol, Symbol)> {
-    match *src.node(rhs) {
-        Node::Ref(Ref {
-            ns: RefNs::Module(alias),
-            name: target,
-        }) => Some((alias, target)),
-        _ => None,
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct InstanceId(usize);
+
+type Member = (InstanceId, BindingId);
+type SourceInputs = HashMap<NodeId, Box<[(Symbol, Ref)]>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Materialization {
+    Reserved,
+    Visiting,
+    Ready,
 }
 
-/// State threaded through the recursive graft.
-struct GraftCtx<'a> {
-    /// The host's dependency bundle (path → parsed submodule). Threaded so the
-    /// graft can resolve a NESTED cross-module ref — a `RefNs::Module(alias)` in
-    /// the submodule currently being grafted, naming that submodule's OWN
-    /// `load_module(alias)` — against the bundle and recursively graft it.
-    bundle: &'a ModuleBundle,
-    /// Load-time `%assign` substitutions for the CURRENT module level
-    /// (submodule-parameter name → host node). Owned so it can be swapped for the
-    /// nested level's own `%assign` context while recursing (and restored after).
-    assign: Vec<(String, NodeId)>,
-    /// Names of host bindings that existed BEFORE the graft began. A submodule
-    /// dependency whose name collides with one of these (and is not `%assign`-
-    /// linked) is an unrelated host binding: refuse rather than reuse it.
-    preexisting: HashSet<String>,
-    /// Grafted host-binding names → the COMPOSITE ORIGIN key
-    /// (`origin-path\0member-name`) they were grafted from. For a directly-grafted
-    /// member the key is `ctx.origin\0name`; for a re-export it is the TARGET's
-    /// `target-path\0target-member` (a re-export IS the target's value, §04). A
-    /// re-request of a name already present with the SAME composite origin is a
-    /// diamond — the same underlying binding reached twice — and dedups validly
-    /// (`Ok`, skip re-graft). A re-request with a DIFFERENT one means two distinct
-    /// submodule members define the same host name: refuse (independent namespaces,
-    /// same as the host/submodule case, but here neither name owns `preexisting`
-    /// status). The member name is IN the key because the path alone cannot tell
-    /// apart two re-exports of different members of one submodule (see the module
-    /// docs' #77 note) — dedup by path alone silently mislowers.
-    grafted: HashMap<String, String>,
-    /// The bundle-path string of the submodule CURRENTLY being grafted — the
-    /// origin key recorded into `grafted` for any binding grafted at this
-    /// recursion depth. Swapped (alongside `assign`) when the recursion
-    /// descends into a NESTED module via [`graft_nested_module_ref`], and
-    /// restored on return so the caller's own bindings are attributed to the
-    /// caller's origin, not the callee's.
-    origin: String,
-    /// `(submodule-path, member)` pairs for the nested cross-module members
-    /// currently ON the recursion stack. Re-entering one is a cyclic module graph
-    /// (A loads B, B loads A): refuse rather than recurse forever. A completed
-    /// member is popped, so a legitimate diamond (the same nested member reached
-    /// twice) is not mistaken for a cycle.
-    in_progress: HashSet<String>,
+#[derive(Clone, Copy)]
+struct ImportedBinding {
+    host: BindingId,
+    state: Materialization,
 }
 
-/// Deep-copy the subtree rooted at `root` from `src` into `host`, re-interning
-/// every symbol through the host interner and returning the new host `NodeId`.
-///
-/// A `(%ref self <name>)` in the copied subtree names a *submodule* binding.
-/// Handling depends on what `<name>` is:
-///
-/// * a load-time `%assign` parameter (`load_module("h", <name> = <host expr>)`) —
-///   the reference is replaced by the host `<expr>` (load-time substitution);
-/// * an ordinary submodule binding whose name does NOT collide with a
-///   pre-existing host binding — that binding is itself grafted into the host
-///   (recursively), keeping the grafted node self-contained;
-/// * an ordinary submodule binding whose name DOES collide with an unrelated
-///   pre-existing host binding — **refuse** (`Err`): modules are independent
-///   namespaces, so reusing the host binding would score against the wrong value.
-///
-/// Placeholder (`%local`) refs and boundary-input entries are re-interned in
-/// place; a nested cross-module (`%ref <alias> …`) ref — i.e. the submodule
-/// being grafted itself contains a `load_module` and the grafted body
-/// references that nested alias — is resolved against `bundle` and grafted
-/// **recursively** (see the `RefNs::Module` arm of `graft_ref`): the nested
-/// member and its transitive submodule dependencies land in the host too, with
-/// the nested module's OWN `%assign`, the host-collision refuse, and a cycle
-/// guard all applying at that level (a measure crosses module boundaries
-/// transitively, §04). A nested ref that cannot be resolved (the alias is not a
-/// `load_module`, its path is absent from `bundle`, or the member is absent), or
-/// a cyclic module graph, is **refused** (`Err`) rather than mislowered.
-pub(crate) fn graft_subtree(
-    host: &mut Module,
-    resolved: &ResolvedRef<'_>,
-    bundle: &ModuleBundle,
-) -> Result<NodeId, String> {
-    let mut state = GraftState::new(host);
-    graft_subtree_with(host, resolved, bundle, &mut state)
-}
-
-/// Cross-module graft state that can OUTLIVE a single [`graft_subtree_with`] call
-/// so several grafts (the whole [`resolve_crossmodule_aliases`] pre-pass) share
-/// ONE dedup + collision + cycle registry (Buffy #359). The per-call
-/// [`graft_subtree`] builds a fresh one; the pre-pass threads a single instance
-/// across every alias graft so a shared submodule dependency (`theta1_dist`, or a
-/// `prior` reached from both the `prior` and the `posterior` alias) is grafted
-/// once and reused rather than colliding with the earlier graft's copy.
-///
-/// The three fields are exactly the [`GraftCtx`] fields whose LIFETIME the fix
-/// lifts from per-call to per-pass; `bundle`, `assign`, and `origin` stay per-call
-/// (each alias graft has its own `load_module` `%assign` context and origin path)
-/// and are rebuilt inside [`graft_subtree_with`].
+/// One determinization owns this state, including all its lazy graft phases.
+#[derive(Default)]
 pub(crate) struct GraftState {
-    grafted: HashMap<String, String>,
-    preexisting: HashSet<String>,
-    in_progress: HashSet<String>,
+    instances: HashMap<(Option<InstanceId>, BindingId), InstanceId>,
+    bindings: HashMap<Member, ImportedBinding>,
+    owners: HashMap<BindingId, Member>,
+    /// Source recursion differs from instance sharing: recursive loads create
+    /// ever-new instances, so an instance-only guard cannot detect them.
+    expanding: HashSet<(String, BindingId)>,
+    preparing: HashSet<InstanceId>,
+    inferred_inputs: HashMap<String, Arc<SourceInputs>>,
+    next_name: usize,
 }
 
 impl GraftState {
-    /// Seed `preexisting` from the host bindings present when the pass begins — a
-    /// grafted submodule dependency whose name collides with one of these (and is
-    /// not `%assign`-linked or an alias slot) is an unrelated host binding: refuse.
-    pub(crate) fn new(host: &Module) -> Self {
-        let preexisting = host
-            .bindings()
-            .map(|(_, b)| host.resolve(b.name).to_string())
-            .collect();
-        GraftState {
-            grafted: HashMap::new(),
-            preexisting,
-            in_progress: HashSet::new(),
+    fn live_binding(&self, host: &Module, key: Member) -> Option<ImportedBinding> {
+        self.bindings
+            .get(&key)
+            .copied()
+            .filter(|entry| host.binding_by_name(host.binding(entry.host).name) == Some(entry.host))
+    }
+
+    fn instance(&mut self, parent: Option<InstanceId>, load: BindingId) -> InstanceId {
+        let next = InstanceId(self.instances.len());
+        *self.instances.entry((parent, load)).or_insert(next)
+    }
+
+    /// The measure sweep may discard a member needed by a later lazy import.
+    /// Canonical DCE is checked separately through the live name index.
+    pub(crate) fn discard(&mut self, bid: BindingId) {
+        if let Some(key) = self.owners.get(&bid)
+            && let Some(imported) = self.bindings.get_mut(key)
+        {
+            imported.state = Materialization::Reserved;
         }
     }
 
-    /// Record that host binding `host_name` already holds the value of submodule
-    /// member `member_name` loaded from `path`, so a later graft reaching the same
-    /// member DEDUPS onto this host binding (a diamond) instead of re-grafting or
-    /// refusing on the pre-existing host name. The composite origin key matches the
-    /// `origin-path\0member-name` key [`graft_binding`] computes for a directly-
-    /// grafted member (see [`GraftCtx::grafted`]).
-    pub(crate) fn seed_alias(&mut self, host_name: &str, path: &str, member_name: &str) {
-        self.grafted
-            .insert(host_name.to_string(), format!("{path}\u{0}{member_name}"));
+    fn adopt_alias(&mut self, host: &Module, resolved: &ResolvedRef<'_>, bid: BindingId) {
+        // Synthetic aliases can be zeroed by canonicalization. Own a separate
+        // non-synthetic slot instead, just as for an ordinary imported member.
+        if host.binding(bid).synthetic {
+            return;
+        }
+        let instance = self.instance(None, resolved.load);
+        let key = (instance, resolved.member);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.bindings.entry(key) {
+            entry.insert(ImportedBinding {
+                host: bid,
+                state: Materialization::Reserved,
+            });
+            self.owners.insert(bid, key);
+        }
+    }
+
+    fn fresh_name(&mut self, host: &mut Module, base: &str) -> Symbol {
+        let name = host.intern(base);
+        if host.binding_by_name(name).is_none() {
+            return name;
+        }
+        loop {
+            let name = host.intern(&format!("__import_{base}_{}", self.next_name));
+            self.next_name += 1;
+            if host.binding_by_name(name).is_none() {
+                return name;
+            }
+        }
     }
 }
 
-/// Like [`graft_subtree`], but the dedup/collision/cycle registry (`state`) is
-/// supplied by the caller so it can PERSIST across several grafts. `state`'s
-/// `grafted`/`preexisting`/`in_progress` are moved into a fresh [`GraftCtx`] for
-/// this graft (alongside the per-call `bundle`/`assign`/`origin`) and moved back
-/// out on return, so the accumulated dedup state carries to the next graft. With a
-/// freshly-`new`'d `state` this is byte-identical to the old per-call
-/// [`graft_subtree`].
-pub(crate) fn graft_subtree_with(
+struct GraftCtx<'a, 's> {
+    bundle: &'a ModuleBundle,
+    state: &'s mut GraftState,
+    instance: InstanceId,
+    assign: Vec<(String, NodeId)>,
+    path: String,
+}
+
+pub(crate) fn graft_subtree(
     host: &mut Module,
     resolved: &ResolvedRef<'_>,
     bundle: &ModuleBundle,
     state: &mut GraftState,
 ) -> Result<NodeId, String> {
+    let instance = state.instance(None, resolved.load);
+    if let Some(entry) = state.live_binding(host, (instance, resolved.member))
+        && entry.state == Materialization::Ready
+    {
+        let name = host.binding(entry.host).name;
+        return Ok(host.alloc(Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        })));
+    }
+    if !state.preparing.insert(instance) {
+        return Err("cyclic module load assignments".into());
+    }
+    let assign = resolved
+        .assign
+        .iter()
+        .map(|(name, value)| {
+            graft_host_value(host, *value, bundle, state).map(|value| (name.clone(), value))
+        })
+        .collect::<Result<_, _>>();
+    state.preparing.remove(&instance);
     let mut ctx = GraftCtx {
         bundle,
-        assign: resolved.assign.clone(),
-        preexisting: std::mem::take(&mut state.preexisting),
-        grafted: std::mem::take(&mut state.grafted),
-        origin: resolved.path.clone(),
-        in_progress: std::mem::take(&mut state.in_progress),
+        state,
+        instance,
+        assign: assign?,
+        path: resolved.path.clone(),
     };
-    let out = graft_node(host, resolved.sub, resolved.member_rhs, &mut ctx);
-    // Flush the (possibly grown) registry back so the next graft sees it.
-    state.grafted = ctx.grafted;
-    state.preexisting = ctx.preexisting;
-    state.in_progress = ctx.in_progress;
-    out
+    let name = graft_binding(host, resolved.sub, resolved.member, &mut ctx)?;
+    Ok(host.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    })))
 }
 
-/// Determiniser PRE-PASS (Buffy #359): resolve every top-level host binding whose
-/// RHS is a bare cross-module `(%ref <alias> member)` ref IN PLACE, once, before
-/// the measure-reduction loop. For each such alias, graft the referenced submodule
-/// member's subtree into the host and REWRITE the alias binding's RHS to the
-/// grafted-local root (never a fresh orphan copy), threading ONE shared
-/// [`GraftState`] so a dependency shared across aliases is grafted once and reused.
-///
-/// After this pass no `RefNs::Module` ref remains among the resolved aliases, so
-/// the measure-reduction loop and the density lowering run on a self-contained
-/// host — collision-free, and the density variate destructuring (which follows
-/// only `SelfMod` refs) now sees a local record where it used to hit a dangling
-/// module ref (`joint value must be a record`).
-///
-/// Closes four gaps that all stem from grafting being copy-per-query with
-/// per-call dedup: the variate is now local (not just the measure), the alias
-/// binding is rewritten rather than orphaned (no dangling module ref under
-/// no-roots), a shared dependency reached from two queries dedups instead of
-/// colliding, and an alias whose name equals its submodule member (`prior =
-/// model.prior`) becomes that member's local slot with no self-collision.
-///
-/// Bindings whose RHS is a bare module ref that does NOT resolve to a
-/// `load_module` member (e.g. a `standard_module` ref, or a missing dependency)
-/// are left untouched for the existing lowering / conformance path.
+/// Load assignments belong to the loading module. Resolve file-module values
+/// there before entering the loaded member's source expansion stack.
+fn graft_host_value(
+    host: &mut Module,
+    root: NodeId,
+    bundle: &ModuleBundle,
+    state: &mut GraftState,
+) -> Result<NodeId, String> {
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    let mut replacements = HashMap::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(resolved) = resolve_module_ref(bundle, host, id) {
+            replacements.insert(id, graft_subtree(host, &resolved, bundle, state)?);
+        } else {
+            host.for_each_child(id, |child| pending.push(child));
+        }
+    }
+    if replacements.is_empty() {
+        Ok(root)
+    } else {
+        Ok(crate::driver::map_tree(host, root, &mut |_, id| {
+            replacements.get(&id).copied()
+        }))
+    }
+}
+
+/// Resolve aliases and draw-measure refs before density destructuring. Other
+/// entry points remain lazy so simplification can discard unused arguments.
 pub(crate) fn resolve_crossmodule_aliases(
     host: &mut Module,
     bundle: &ModuleBundle,
+    state: &mut GraftState,
 ) -> Result<(), RefuseError> {
-    // 1. Collect top-level bindings whose RHS is a bare cross-module ref.
-    let alias_refs: Vec<(BindingId, NodeId)> = host
+    let plans: Vec<_> = host
         .bindings()
-        .filter_map(|(bid, b)| match host.node(b.rhs) {
-            Node::Ref(Ref {
-                ns: RefNs::Module(_),
-                ..
-            }) => Some((bid, b.rhs)),
-            _ => None,
+        .filter_map(|(bid, b)| {
+            resolve_module_ref(bundle, host, b.rhs).map(|resolved| (bid, b.rhs, resolved))
         })
         .collect();
-    // Nothing to do only when there are NO cross-module refs at all — neither a
-    // top-level alias binding nor a ref nested inside a binding subtree (the
-    // common single-file case). A nested-only case (`x ~ m.dist`, where `m` is a
-    // `load_module(...)` binding, not a bare alias ref) has `alias_refs` empty
-    // but is handled by phase 5 below.
-    if alias_refs.is_empty() && collect_draw_measure_module_refs(host).is_empty() {
-        return Ok(());
+    for (bid, _, resolved) in &plans {
+        state.adopt_alias(host, resolved, *bid);
     }
-
-    // 2. Resolve each alias against the bundle. `ResolvedRef` borrows only the
-    //    bundle (its `assign` node ids are owned host ids), so the plans outlive
-    //    the host reads below and coexist with the host mutation in step 4.
-    struct AliasPlan<'a> {
-        bid: BindingId,
-        ref_id: NodeId,
-        host_name: String,
-        member: String,
-        resolved: ResolvedRef<'a>,
-    }
-    let mut plans: Vec<AliasPlan<'_>> = Vec::new();
-    for (bid, ref_id) in alias_refs {
-        let (host_name, member) = {
-            let Node::Ref(Ref { name: member, .. }) = *host.node(ref_id) else {
-                continue;
-            };
-            (
-                host.resolve(host.binding(bid).name).to_string(),
-                host.resolve(member).to_string(),
-            )
-        };
-        // A ref that does not resolve to a `load_module` member (standard_module,
-        // missing dependency, absent member) is left for the existing path.
-        if let Some(resolved) = resolve_module_ref(bundle, host, ref_id) {
-            plans.push(AliasPlan {
-                bid,
-                ref_id,
-                host_name,
-                member,
-                resolved,
-            });
+    for (bid, ref_id, resolved) in plans {
+        let root = graft_subtree(host, &resolved, bundle, state)
+            .map_err(|reason| crate::density::refuse(ref_id, host, &reason))?;
+        // Grafting fills an adopted alias in place. Other aliases retain a
+        // reference to that slot rather than duplicating its stochastic graph.
+        if !matches!(host.node(root), Node::Ref(r) if r.ns == RefNs::SelfMod && r.name == host.binding(bid).name)
+        {
+            host.set_binding_rhs(bid, root);
         }
     }
-    // (No early return on empty `plans`: a nested-only model has no alias plans
-    // but still needs phase 5. `state` + step 4 are no-ops when `plans` empty.)
-
-    // 3. Seed the shared registry with the host slot each alias occupies BEFORE any
-    //    grafting, so a cross-reference from one alias's subtree to a sibling
-    //    alias's member (`posterior`'s body referencing the submodule `prior`)
-    //    dedups onto the sibling host alias binding instead of re-grafting it or
-    //    refusing on the pre-existing host name. Only a same-name alias (`prior =
-    //    model.prior`) can be reached this way: a grafted `(%ref self <member>)`
-    //    resolves to a host binding named `<member>`, which for a same-name alias
-    //    IS the alias binding.
-    let mut state = GraftState::new(host);
-    for p in &plans {
-        if p.host_name == p.member {
-            state.seed_alias(&p.host_name, &p.resolved.path, &p.member);
-        }
-    }
-
-    // 4. Graft each alias's subtree and rewrite its binding RHS in place.
-    for p in &plans {
-        let root = graft_subtree_with(host, &p.resolved, bundle, &mut state)
-            .map_err(|reason| crate::density::refuse(p.ref_id, host, &reason))?;
-        host.set_binding_rhs(p.bid, root);
-    }
-
-    // 5. Graft cross-module refs NESTED inside binding subtrees — the ones the
-    //    alias-binding rewrite (step 4) does not reach, e.g. `x ~ m.dist`
-    //    (`x = draw((%ref m dist))`) or `iid(m.dist, n)`. Collected AFTER step 4
-    //    (the already-rewritten alias roots are grafted-local by now, so only
-    //    genuinely-nested refs remain). Each resolvable ref is grafted through
-    //    the SAME shared `state` (dedup/collision-safe with the alias grafts),
-    //    then every binding RHS is rebuilt substituting the ref node for its
-    //    grafted-local root ([`crate::driver::map_tree`]). A ref that does not
-    //    resolve to a `load_module` member (standard_module, missing dependency)
-    //    is left untouched for the downstream module-member path.
-    let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut replacements = HashMap::new();
     for ref_id in collect_draw_measure_module_refs(host) {
         if let Some(resolved) = resolve_module_ref(bundle, host, ref_id) {
-            let root = graft_subtree_with(host, &resolved, bundle, &mut state)
+            let root = graft_subtree(host, &resolved, bundle, state)
                 .map_err(|reason| crate::density::refuse(ref_id, host, &reason))?;
             replacements.insert(ref_id, root);
         }
     }
     if !replacements.is_empty() {
-        let pairs: Vec<(BindingId, NodeId)> =
-            host.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+        let pairs: Vec<_> = host.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
         for (bid, root) in pairs {
             let new =
-                crate::driver::map_tree(host, root, &mut |_m, id| replacements.get(&id).copied());
+                crate::driver::map_tree(host, root, &mut |_, id| replacements.get(&id).copied());
             if new != root {
                 host.set_binding_rhs(bid, new);
             }
@@ -569,33 +330,19 @@ pub(crate) fn resolve_crossmodule_aliases(
     Ok(())
 }
 
-/// Every distinct module-namespace ref (`(%ref <alias> member)`) reachable
-/// inside a `draw(...)`'s MEASURE-argument subtree, anywhere in a binding RHS.
-/// Finds cross-module refs nested in a draw's primitive measure — `x ~ m.dist`
-/// (`x = draw((%ref m dist))`), `x ~ iid(m.dist, n)` — which the top-level
-/// alias-binding rewrite in [`resolve_crossmodule_aliases`] does not reach.
-///
-/// Scoped to draw-measure subtrees on purpose (spec §04): a cross-module
-/// *measure* ref grafts freely, but a cross-module *value* ref — a call
-/// argument or a reification input, which is NOT under a `draw` — must not be
-/// grafted here (it is left for the existing refuse / graft-query-target path;
-/// e.g. `m.k(m.rec)`'s value argument `m.rec` must refuse rather than splice a
-/// dangling ref). A module ref is a leaf (its graft replaces it wholesale), so
-/// the walk does not descend past one.
 fn collect_draw_measure_module_refs(host: &Module) -> Vec<NodeId> {
-    let mut seen: HashSet<NodeId> = HashSet::new();
-    let mut out: Vec<NodeId> = Vec::new();
-    let mut stack: Vec<(NodeId, bool)> = host.bindings().map(|(_, b)| (b.rhs, false)).collect();
+    let mut seen = HashSet::new();
+    let mut out = HashSet::new();
+    let mut stack: Vec<_> = host.bindings().map(|(_, b)| (b.rhs, false)).collect();
+    let mut refs = Vec::new();
     while let Some((id, under_draw)) = stack.pop() {
-        if !seen.insert(id) {
+        if !seen.insert((id, under_draw)) {
             continue;
         }
-        let is_draw = matches!(
-            host.node(id),
-            Node::Call(c) if matches!(c.head, CallHead::Builtin(sym) if host.resolve(sym) == "draw")
-        );
-        let now_under = under_draw || is_draw;
-        if now_under
+        let under_draw = under_draw
+            || matches!(host.node(id), Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(s) if host.resolve(s) == "draw"));
+        if under_draw
             && matches!(
                 host.node(id),
                 Node::Ref(Ref {
@@ -604,566 +351,251 @@ fn collect_draw_measure_module_refs(host: &Module) -> Vec<NodeId> {
                 })
             )
         {
-            out.push(id);
-            continue;
+            if out.insert(id) {
+                refs.push(id);
+            }
+        } else {
+            host.for_each_child(id, |child| stack.push((child, under_draw)));
         }
-        host.for_each_child(id, |c| stack.push((c, now_under)));
     }
-    out
+    refs
 }
 
 fn graft_node(
     host: &mut Module,
     src: &Module,
     id: NodeId,
-    ctx: &mut GraftCtx<'_>,
+    ctx: &mut GraftCtx<'_, '_>,
 ) -> Result<NodeId, String> {
-    // Clone the source node so the `src` borrow ends before we mutate `host`.
-    let node = src.node(id).clone();
-    let out = match node {
-        Node::Lit(s) => host.alloc(Node::Lit(s)),
-        Node::Hole => host.alloc(Node::Hole),
-        Node::Const(sym) => {
-            let hsym = host.intern(src.resolve(sym));
-            host.alloc(Node::Const(hsym))
-        }
-        Node::Axis(Axis { name, variance }) => {
-            let hname = host.intern(src.resolve(name));
-            host.alloc(Node::Axis(Axis {
-                name: hname,
-                variance,
-            }))
-        }
-        Node::Ref(r) => {
-            // Load-time `%assign` substitution: a `(%ref self <param>)` naming a
-            // substituted submodule parameter is replaced by the host expression
-            // it was bound to at `load_module`. The host node is already interned.
-            if r.ns == RefNs::SelfMod
-                && let Some((_, host_expr)) = ctx
-                    .assign
-                    .iter()
-                    .find(|(n, _)| n.as_str() == src.resolve(r.name))
-            {
-                return Ok(*host_expr);
-            }
-            let hr = graft_ref(host, src, r, ctx)?;
-            host.alloc(Node::Ref(hr))
-        }
+    let node = match src.node(id).clone() {
+        Node::Lit(s) => Node::Lit(s),
+        Node::Hole => Node::Hole,
+        Node::Const(s) => Node::Const(host.intern(src.resolve(s))),
+        Node::Axis(Axis { name, variance }) => Node::Axis(Axis {
+            name: host.intern(src.resolve(name)),
+            variance,
+        }),
+        Node::Ref(r) => Node::Ref(graft_ref(host, src, r, ctx)?),
         Node::Call(c) => {
             let head = match c.head {
-                CallHead::Builtin(sym) => CallHead::Builtin(host.intern(src.resolve(sym))),
+                CallHead::Builtin(s) => CallHead::Builtin(host.intern(src.resolve(s))),
                 CallHead::User(callee) => CallHead::User(graft_node(host, src, callee, ctx)?),
             };
-            let mut args: Vec<NodeId> = Vec::with_capacity(c.args.len());
-            for &a in c.args.iter() {
-                args.push(graft_node(host, src, a, ctx)?);
-            }
-            let mut named: Vec<NamedArg> = Vec::with_capacity(c.named.len());
-            for na in c.named.iter() {
-                named.push(NamedArg {
-                    kind: na.kind,
-                    name: host.intern(src.resolve(na.name)),
-                    value: graft_node(host, src, na.value, ctx)?,
-                });
-            }
-            let inputs = match c.inputs.as_ref() {
+            let args = c
+                .args
+                .iter()
+                .map(|&arg| graft_node(host, src, arg, ctx))
+                .collect::<Result<_, _>>()?;
+            let named = c
+                .named
+                .iter()
+                .map(|arg| {
+                    Ok(NamedArg {
+                        kind: arg.kind,
+                        name: host.intern(src.resolve(arg.name)),
+                        value: graft_node(host, src, arg.value, ctx)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let inputs = match &c.inputs {
                 Some(Inputs::Spec(entries)) => {
-                    let mut out = Vec::with_capacity(entries.len());
-                    for (nm, r) in entries.iter() {
-                        let hnm = host.intern(src.resolve(*nm));
-                        let hr = graft_input_ref(host, src, *r, ctx)?;
-                        out.push((hnm, hr));
-                    }
-                    Some(Inputs::Spec(out.into()))
+                    Some(Inputs::Spec(graft_inputs(host, src, entries, ctx)?))
                 }
                 Some(Inputs::Auto) => Some(Inputs::Auto),
                 None => None,
             };
-            host.alloc(Node::Call(Call {
+            let result = host.alloc(Node::Call(Call {
                 head,
-                args: args.into(),
-                named: named.into(),
+                args,
+                named,
                 inputs,
-            }))
+            }));
+            if matches!(c.inputs, Some(Inputs::Auto)) {
+                let entries = if let Some(entries) = src.auto_inputs_of(id) {
+                    graft_inputs(host, src, entries, ctx)?
+                } else {
+                    let source_inputs = ctx
+                        .state
+                        .inferred_inputs
+                        .entry(ctx.path.clone())
+                        .or_insert_with(|| {
+                            let mut inferred = src.clone();
+                            let mut bundle = ctx.bundle.clone();
+                            bundle.set_root(&ctx.path);
+                            // Only phases and callable inputs are consumed here;
+                            // the host resolves shapes after grafting.
+                            let _ = flatppl_infer::infer_module(
+                                &mut inferred,
+                                &bundle,
+                                flatppl_infer::Level::Type,
+                            );
+                            // Input refs use existing source symbols. Retain
+                            // them without retaining the annotated source DAG.
+                            let inputs = (0..src.node_count())
+                                .map(NodeId::from_usize)
+                                .filter_map(|id| {
+                                    inferred
+                                        .auto_inputs_of(id)
+                                        .map(|entries| (id, entries.into()))
+                                })
+                                .collect();
+                            Arc::new(inputs)
+                        })
+                        .clone();
+                    let entries = source_inputs
+                        .get(&id)
+                        .ok_or("cannot resolve imported callable's automatic inputs")?;
+                    graft_inputs(host, src, entries, ctx)?
+                };
+                host.set_auto_inputs(result, entries);
+            }
+            return Ok(result);
         }
     };
-    Ok(out)
+    Ok(host.alloc(node))
 }
 
-/// Re-intern a [`Ref`] into the host interner. For a `SelfMod` ref, also graft
-/// the submodule binding it names so the host is self-contained (refusing on an
-/// unrelated-host-binding collision). `%assign`-substituted names are handled by
-/// the caller ([`graft_node`]) before this is reached.
-///
-/// A standard-module ref keeps its catalogue alias, grafting the declaration
-/// so later standard-function/constructor lowering can resolve the member.
-/// Other `Module`-namespace refs are NESTED cross-module references: the submodule
-/// being grafted itself has its own `load_module`, and the grafted body names
-/// that nested alias. It is resolved against the bundle (`ctx.bundle`) via
-/// [`resolve_src_module_ref`] — reading the CURRENT submodule's own
-/// `load_module(alias)` binding — and the referenced nested member is grafted
-/// **recursively** into the host, returning a host-local `SelfMod` ref to it.
-/// The nested module's OWN `%assign` context, the host-collision refuse
-/// (`preexisting`), and the DAG-dedup (`grafted`) all apply at the nested level,
-/// and a cyclic module graph is caught by `in_progress` (refuse, not recurse
-/// forever). An unresolvable nested ref is refused (`Err`).
+fn graft_inputs(
+    host: &mut Module,
+    src: &Module,
+    entries: &[(Symbol, Ref)],
+    ctx: &mut GraftCtx<'_, '_>,
+) -> Result<Box<[(Symbol, Ref)]>, String> {
+    entries
+        .iter()
+        .map(|(label, r)| {
+            Ok((
+                host.intern(src.resolve(*label)),
+                graft_ref(host, src, *r, ctx)?,
+            ))
+        })
+        .collect()
+}
+
 fn graft_ref(
     host: &mut Module,
     src: &Module,
     r: Ref,
-    ctx: &mut GraftCtx<'_>,
+    ctx: &mut GraftCtx<'_, '_>,
 ) -> Result<Ref, String> {
-    let hname = host.intern(src.resolve(r.name));
+    let name = host.intern(src.resolve(r.name));
     match r.ns {
         RefNs::Local => Ok(Ref {
             ns: RefNs::Local,
-            name: hname,
+            name,
         }),
         RefNs::SelfMod => {
-            graft_binding(host, src, r.name, ctx)?;
+            let name = match src.binding_by_name(r.name) {
+                Some(bid) => graft_binding(host, src, bid, ctx)?,
+                None => name,
+            };
             Ok(Ref {
                 ns: RefNs::SelfMod,
-                name: hname,
+                name,
             })
         }
         RefNs::Module(alias) => {
-            let is_standard = src.binding_by_name(alias).is_some_and(|bid| {
-                crate::density::builtin_name(src, src.binding(bid).rhs) == Some("standard_module")
-            });
-            if is_standard {
-                graft_binding(host, src, alias, ctx)?;
-                Ok(Ref {
-                    ns: RefNs::Module(host.intern(src.resolve(alias))),
-                    name: hname,
-                })
-            } else {
-                graft_nested_module_ref(host, src, alias, r.name, ctx)
+            if let Some(bid) = src.binding_by_name(alias)
+                && crate::density::builtin_name(src, src.binding(bid).rhs)
+                    == Some("standard_module")
+            {
+                let alias = graft_binding(host, src, bid, ctx)?;
+                return Ok(Ref {
+                    ns: RefNs::Module(alias),
+                    name,
+                });
             }
+            let resolved =
+                resolve_member(ctx.bundle, &ctx.path, src, alias, r.name).ok_or_else(|| {
+                    format!(
+                        "nested cross-module ref `{}.{}` is unresolvable",
+                        src.resolve(alias),
+                        src.resolve(r.name)
+                    )
+                })?;
+            let instance = ctx.state.instance(Some(ctx.instance), resolved.load);
+            // Assignments run in the parent, before the child's source-cycle
+            // guard: another sibling instance of this same file is not a cycle.
+            let mut assign = Vec::with_capacity(resolved.assign.len());
+            for (name, value) in &resolved.assign {
+                assign.push((name.clone(), graft_node(host, src, *value, ctx)?));
+            }
+            let mut child = GraftCtx {
+                bundle: ctx.bundle,
+                state: ctx.state,
+                instance,
+                assign,
+                path: resolved.path,
+            };
+            let name = graft_binding(host, resolved.sub, resolved.member, &mut child)?;
+            Ok(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            })
         }
     }
 }
 
-/// Resolve and RECURSIVELY graft a NESTED cross-module ref `(%ref <alias> member)`
-/// found inside the submodule `src` currently being grafted — where `alias` names
-/// `src`'s OWN `load_module(alias)` — returning a host-local `SelfMod` ref to the
-/// grafted nested member.
-///
-/// The measure crosses one more module boundary (§04 "measure crosses module
-/// boundaries transitively"): resolve `alias` against `ctx.bundle` via
-/// [`resolve_src_module_ref`], graft the nested `load_module`'s own `%assign`
-/// values into the host under the CURRENT assign context, then graft the nested
-/// member (and its transitive submodule deps) under the NESTED assign context.
-///
-/// Refuse-don't-mislower, at this level too:
-/// * unresolvable nested ref (alias not a `load_module` in `src`, its path absent
-///   from the bundle, or the member absent) → `Err`;
-/// * a nested grafted binding whose name collides with an unrelated pre-existing
-///   host binding → `Err` (via [`graft_module_member`] / [`graft_binding`]);
-/// * a cyclic module graph (this `(path, member)` is already on the graft stack)
-///   → `Err`, guaranteeing termination.
-fn graft_nested_module_ref(
-    host: &mut Module,
-    src: &Module,
-    alias: Symbol,
-    member: Symbol,
-    ctx: &mut GraftCtx<'_>,
-) -> Result<Ref, String> {
-    let bundle = ctx.bundle;
-    let alias_name = src.resolve(alias).to_string();
-    let member_name = src.resolve(member).to_string();
-    let Some(resolved) = resolve_src_module_ref(bundle, src, alias, member) else {
-        return Err(format!(
-            "nested cross-module ref `{alias_name}.{member_name}` is unresolvable (the alias is \
-             not a `load_module` in the source submodule, its path is absent from the bundle, or \
-             the member is absent); refuse rather than mislower"
-        ));
-    };
-    // Cycle guard: a `(submodule-path, member)` already on the graft stack means
-    // the module graph loops (A loads B, B loads A). Refuse rather than recurse.
-    let cycle_key = format!("{}\u{0}{}", resolved.path, member_name);
-    if !ctx.in_progress.insert(cycle_key.clone()) {
-        return Err(format!(
-            "cyclic module graph: nested cross-module ref `{alias_name}.{member_name}` re-enters \
-             `{}` while it is still being grafted; refuse rather than recurse forever",
-            resolved.path
-        ));
-    }
-    // The nested `load_module`'s `%assign` values are expressions in `src`; graft
-    // them into the host under the CURRENT assign context so they become host
-    // nodes, then use them as the assign context for the nested subtree.
-    let mut nested_assign: Vec<(String, NodeId)> = Vec::with_capacity(resolved.assign_src.len());
-    for (name, src_val) in resolved.assign_src.iter() {
-        match graft_node(host, src, *src_val, ctx) {
-            Ok(hval) => nested_assign.push((name.clone(), hval)),
-            Err(e) => {
-                ctx.in_progress.remove(&cycle_key);
-                return Err(e);
-            }
-        }
-    }
-    // Graft the nested member (and its transitive submodule deps) with the nested
-    // assign context AND the nested origin; #75 safety (host collision /
-    // DAG-dedup) still applies, now origin-aware (see `GraftCtx::grafted`).
-    let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
-    let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
-    let graft_res = graft_module_member(
-        host,
-        resolved.sub,
-        &member_name,
-        resolved.member_rhs,
-        resolved.member_public,
-        ctx,
-    );
-    ctx.origin = saved_origin;
-    ctx.assign = saved_assign;
-    ctx.in_progress.remove(&cycle_key);
-    graft_res?;
-    Ok(Ref {
-        ns: RefNs::SelfMod,
-        name: host.intern(&member_name),
-    })
-}
-
-/// Re-intern a reification boundary-input SOURCE ref (an [`Inputs::Spec`] entry).
-///
-/// Unlike a body ref, a boundary-input source naming a `%assign` parameter is NOT
-/// replaced by the host expression: an `Inputs::Spec` entry can only hold a
-/// [`Ref`], and the host expression may be an arbitrary node. It is re-interned
-/// in place (naming the parameter), and NO submodule binding is grafted for it —
-/// the actual body references are already substituted by [`graft_node`], and the
-/// reification's `Inputs` bucket is consumed (dropped) when the reified measure is
-/// reduced in `density::lower_reified_measure`, so this source ref is cosmetic.
-fn graft_input_ref(
-    host: &mut Module,
-    src: &Module,
-    r: Ref,
-    ctx: &mut GraftCtx<'_>,
-) -> Result<Ref, String> {
-    if r.ns == RefNs::SelfMod
-        && ctx
-            .assign
-            .iter()
-            .any(|(n, _)| n.as_str() == src.resolve(r.name))
-    {
-        return Ok(Ref {
-            ns: RefNs::SelfMod,
-            name: host.intern(src.resolve(r.name)),
-        });
-    }
-    graft_ref(host, src, r, ctx)
-}
-
-/// Graft the submodule binding named `name_sym` (a `src` symbol) into `host`.
-///
-/// * Already grafted this pass from the SAME origin (`ctx.origin`) → nothing to
-///   do (diamond/repeat guard — legitimate sharing).
-/// * Already grafted this pass from a DIFFERENT origin → **refuse**: two
-///   distinct loaded modules define a binding of this name, and cross-module
-///   name collision is not yet namespaced (see [`GraftCtx::grafted`]).
-/// * Name collides with a pre-existing host binding → **refuse**: modules are
-///   independent namespaces and this binding is not `%assign`-linked (those are
-///   substituted before reaching here), so reusing the host binding would score
-///   against an unrelated value.
-/// * No submodule binding of that name (a dangling ref, e.g. a bare-builtin
-///   name) → nothing to graft; leave the re-interned ref for downstream handling.
-/// * Otherwise → deep-copy the binding's rhs and add it to the host.
 fn graft_binding(
     host: &mut Module,
     src: &Module,
-    name_sym: Symbol,
-    ctx: &mut GraftCtx<'_>,
-) -> Result<(), String> {
-    let name = src.resolve(name_sym).to_string();
-    // Pure re-export? A submodule binding `name = other.member` whose rhs is
-    // EXACTLY a cross-module ref that resolves to a real nested member is the SAME
-    // underlying value as `other.member` (§04), not an independent definition.
-    // Resolve it THROUGH to the target (origin = the target module's path) so the
-    // same-origin dedup applies and it does NOT false-collide with the target
-    // under THIS (re-exporting) module's origin. A non-trivial rhs is not a
-    // re-export and falls through to the origin guard below unchanged.
-    if let Some(src_bid) = src.binding_by_name(name_sym) {
-        let rhs = src.binding(src_bid).rhs;
-        if let Some((alias, target)) = as_pure_reexport(src, rhs)
-            && resolve_src_module_ref(ctx.bundle, src, alias, target).is_some()
-        {
-            return graft_reexport(host, src, &name, alias, target, ctx);
+    bid: BindingId,
+    ctx: &mut GraftCtx<'_, '_>,
+) -> Result<Symbol, String> {
+    let key = (ctx.instance, bid);
+    let cached = ctx.state.live_binding(host, key);
+    if let Some(entry) = cached {
+        match entry.state {
+            Materialization::Ready => return Ok(host.binding(entry.host).name),
+            Materialization::Visiting => return Err("cyclic module binding dependency".into()),
+            Materialization::Reserved => {}
         }
     }
-    // Origin key is COMPOSITE (`origin-path\0member-name`), matching the composite
-    // key `graft_reexport` records for a re-export's target. Here the grafted
-    // binding's name IS the real member name, so the composite is `ctx.origin\0name`
-    // — same behaviour as a bare-origin key for these sites (same name + same origin
-    // still same key; same name + different origin still differs), but comparable
-    // against a re-export's `target-path\0target-member` key so the two collision
-    // guards agree (see [`GraftCtx::grafted`]).
-    let origin_key = format!("{}\u{0}{}", ctx.origin, name);
-    if let Some(existing_origin) = ctx.grafted.get(&name) {
-        if *existing_origin == origin_key {
-            return Ok(()); // already grafted this pass, same origin (diamond)
-        }
+    let source_key = (ctx.path.clone(), bid);
+    if !ctx.state.expanding.insert(source_key.clone()) {
         return Err(format!(
-            "two distinct loaded modules define a binding named `{name}`; cross-module name \
-             collision is not yet namespaced — refuse rather than mislower"
+            "cyclic module graph: re-entered `{}` in `{}`",
+            src.resolve(src.binding(bid).name),
+            ctx.path
         ));
     }
-    ctx.grafted.insert(name.clone(), origin_key);
-    if ctx.preexisting.contains(&name) {
-        return Err(format!(
-            "grafted submodule kernel depends on a binding `{name}` whose name collides with an \
-             unrelated pre-existing host binding (modules are independent namespaces, and this \
-             dependency is not linked by a load_module `%assign`); refuse rather than reuse the \
-             host binding and mislower"
-        ));
-    }
-    let Some(src_bid) = src.binding_by_name(name_sym) else {
-        return Ok(()); // dangling ref (e.g. a bare-builtin name); nothing to graft
+    let binding = src.binding(bid);
+    let host_bid = if let Some(entry) = cached {
+        entry.host
+    } else {
+        let name = ctx.state.fresh_name(host, src.resolve(binding.name));
+        let rhs = host.alloc(Node::Lit(Scalar::Real(0.0)));
+        // Only explicit host aliases expose imported values in the host's
+        // interface. These slots must not enter the synthetic-value sweep.
+        host.add_binding(Binding {
+            name,
+            rhs,
+            doc: None,
+            public: false,
+            synthetic: false,
+        })
     };
-    let src_binding = src.binding(src_bid);
-    let src_rhs = src_binding.rhs;
-    let public = src_binding.public;
-    let host_rhs = graft_node(host, src, src_rhs, ctx)?;
-    let hname = host.intern(&name);
-    host.add_binding(Binding {
-        name: hname,
-        rhs: host_rhs,
-        doc: None,
-        public,
-        synthetic: false,
-    });
-    Ok(())
-}
-
-/// Graft a NESTED cross-module member `name` (its rhs `rhs` living in the nested
-/// submodule `src`) into the host as a standalone binding, then return via a
-/// host-local `SelfMod` ref (built by the caller). Mirrors [`graft_binding`]'s
-/// #75 safety — origin-aware DAG-dedup (`grafted`) and host-collision refuse
-/// (`preexisting`) — but the rhs is supplied directly (the member is known to
-/// exist, so there is no dangling case) and the source is the NESTED submodule.
-///
-/// The nested cross-module cycle guard is the caller's responsibility
-/// ([`graft_nested_module_ref`] pushes/pops `ctx.in_progress`, and swaps
-/// `ctx.origin` to this nested submodule's bundle path before calling here);
-/// this only guards against re-grafting the same (name, origin) pair (a
-/// legitimate diamond), a DIFFERENT origin already having grafted this name
-/// (two distinct submodules colliding — refuse), and a name collision with an
-/// unrelated host binding.
-fn graft_module_member(
-    host: &mut Module,
-    src: &Module,
-    name: &str,
-    rhs: NodeId,
-    public: bool,
-    ctx: &mut GraftCtx<'_>,
-) -> Result<(), String> {
-    // Pure re-export at the nested level too: a nested member `name = other.member`
-    // is the same value as `other.member` (§04). Resolve it THROUGH to the target's
-    // origin rather than record a distinct origin here (which would false-collide
-    // with the target). `public` (the re-exporting binding's own visibility) is not
-    // used on this branch — the resolve-through carries the target's visibility.
-    if let Some((alias, target)) = as_pure_reexport(src, rhs)
-        && resolve_src_module_ref(ctx.bundle, src, alias, target).is_some()
+    ctx.state.bindings.insert(
+        key,
+        ImportedBinding {
+            host: host_bid,
+            state: Materialization::Visiting,
+        },
+    );
+    ctx.state.owners.insert(host_bid, key);
+    // Assigned inputs need the same node identity in bodies and boundaries.
+    // An owned slot also accommodates assignments that are not plain refs.
+    let rhs = if let Some((_, value)) = ctx
+        .assign
+        .iter()
+        .find(|(name, _)| name == src.resolve(binding.name))
     {
-        return graft_reexport(host, src, name, alias, target, ctx);
-    }
-    // Composite origin key (`ctx.origin\0name`), consistent with `graft_binding`
-    // and `graft_reexport` so the three collision guards compare like-for-like.
-    let origin_key = format!("{}\u{0}{}", ctx.origin, name);
-    if let Some(existing_origin) = ctx.grafted.get(name) {
-        if *existing_origin == origin_key {
-            return Ok(()); // already grafted this pass, same origin (diamond)
-        }
-        return Err(format!(
-            "two distinct loaded modules define a binding named `{name}`; cross-module name \
-             collision is not yet namespaced — refuse rather than mislower"
-        ));
-    }
-    ctx.grafted.insert(name.to_string(), origin_key);
-    if ctx.preexisting.contains(name) {
-        return Err(format!(
-            "nested grafted submodule member `{name}` collides with an unrelated pre-existing \
-             host binding (modules are independent namespaces, and this member is not linked by a \
-             load_module `%assign`); refuse rather than reuse the host binding and mislower"
-        ));
-    }
-    let host_rhs = graft_node(host, src, rhs, ctx)?;
-    let hname = host.intern(name);
-    host.add_binding(Binding {
-        name: hname,
-        rhs: host_rhs,
-        doc: None,
-        public,
-        synthetic: false,
-    });
-    Ok(())
-}
-
-/// Graft a PURE RE-EXPORT `host_name = alias.target` — a submodule binding whose
-/// rhs is exactly a cross-module ref `(%ref alias target)` resolving to a real
-/// nested member — by resolving it THROUGH to the target and binding the grafted
-/// target value under `host_name` in the host.
-///
-/// The key correctness property (fixes the #77 false positive): a re-export IS the
-/// target's binding (§04 "a re-exported cross-module binding is the same value"),
-/// so its effective ORIGIN is the target module's path, NOT the re-exporting
-/// module's. Recording `host_name` under the target origin means a re-export and
-/// its target (`common.theta1_dist` and `priors.theta1_dist`) share an origin →
-/// the diamond/same-origin dedup applies → no false collision. Two GENUINELY-
-/// distinct same-name bindings (neither a bare re-export) keep their own origins
-/// and STILL refuse via [`graft_binding`] / [`graft_module_member`].
-///
-/// Mirrors [`graft_nested_module_ref`]'s recursion (nested `%assign`, nested
-/// origin, cycle guard) but ADDS the grafted value under `host_name` (which may
-/// differ from `target` for a renamed re-export) rather than under the target's
-/// own name. The #77 origin-dedup and #75 host-collision refuses both still apply,
-/// now keyed on `host_name` + the target's COMPOSITE origin (`path\0member`).
-///
-/// Chained re-exports (a re-export OF a re-export, `a.d = b.d`, `b.d = c.d`) are
-/// resolved THROUGH transitively: when the resolved target's own rhs is itself a
-/// pure re-export, this recurses to the next hop (under that hop's `%assign` +
-/// origin, guarded against a cyclic chain) and only the TERMINAL real binding is
-/// grafted and recorded — so the dedup key lands on the ULTIMATE origin
-/// consistently, and the chain lowers instead of refusing on an origin mismatch.
-fn graft_reexport(
-    host: &mut Module,
-    src: &Module,
-    host_name: &str,
-    alias: Symbol,
-    target: Symbol,
-    ctx: &mut GraftCtx<'_>,
-) -> Result<(), String> {
-    let bundle = ctx.bundle;
-    let alias_name = src.resolve(alias).to_string();
-    let target_name = src.resolve(target).to_string();
-    // The caller detected the re-export by resolving `(alias, target)`; re-resolve
-    // to read the target's origin/rhs. An unresolvable ref is refused, not
-    // mislowered (defensive — the caller only reaches here when this resolves).
-    let Some(resolved) = resolve_src_module_ref(bundle, src, alias, target) else {
-        return Err(format!(
-            "cross-module re-export `{host_name} = {alias_name}.{target_name}` is unresolvable \
-             (the alias is not a `load_module` in the source submodule, its path is absent from \
-             the bundle, or the member is absent); refuse rather than mislower"
-        ));
+        Ok(*value)
+    } else {
+        graft_node(host, src, binding.rhs, ctx)
     };
-    // Chained re-export (a re-export OF a re-export): if the resolved target's OWN
-    // rhs is itself a pure re-export that resolves, the whole chain is transitively
-    // ONE value (§04 "a re-exported cross-module binding is the same value"). Resolve
-    // THROUGH it: do this hop's nested `%assign` + origin swap + cycle guard, then
-    // recurse to the next hop, which records the ULTIMATE composite origin under
-    // `host_name`. (Taking a single hop and grafting the inner re-export via the
-    // ordinary nested path lands it on the ULTIMATE origin, which mismatches the
-    // NEARER origin recorded here — exactly what made a chain wrongly refuse.)
-    if let Some((next_alias, next_target)) = as_pure_reexport(resolved.sub, resolved.member_rhs)
-        .filter(|(a2, t2)| resolve_src_module_ref(bundle, resolved.sub, *a2, *t2).is_some())
-    {
-        // Cycle guard on THIS hop's `(path, member)`, matching the terminal path: a
-        // re-export loop (`a.d = b.d`, `b.d = a.d`) re-enters the same key and
-        // refuses rather than recurse forever.
-        let cycle_key = format!("{}\u{0}{}", resolved.path, target_name);
-        if !ctx.in_progress.insert(cycle_key.clone()) {
-            return Err(format!(
-                "cyclic module graph: cross-module re-export chain `{host_name} = \
-                 {alias_name}.{target_name}` re-enters `{}` while it is still being grafted; \
-                 refuse rather than recurse forever",
-                resolved.path
-            ));
-        }
-        // Graft this hop's `%assign` values under the CURRENT context, then recurse
-        // under the NESTED assign + origin (mirrors the terminal path below).
-        let mut nested_assign: Vec<(String, NodeId)> =
-            Vec::with_capacity(resolved.assign_src.len());
-        for (name, src_val) in resolved.assign_src.iter() {
-            match graft_node(host, src, *src_val, ctx) {
-                Ok(hval) => nested_assign.push((name.clone(), hval)),
-                Err(e) => {
-                    ctx.in_progress.remove(&cycle_key);
-                    return Err(e);
-                }
-            }
-        }
-        let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
-        let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
-        let res = graft_reexport(host, resolved.sub, host_name, next_alias, next_target, ctx);
-        ctx.origin = saved_origin;
-        ctx.assign = saved_assign;
-        ctx.in_progress.remove(&cycle_key);
-        return res;
-    }
-    // COMPOSITE origin key: the target's bundle-path AND the target member name.
-    // Path alone is NOT enough (CRITICAL — reopens the #77 silent-wrong-density
-    // hole): two INDEPENDENT re-exports of DIFFERENT members of the SAME submodule
-    // (`a.foo = priors.x` and `b.foo = priors.y`) share the path `priors.flatppl`
-    // but resolve to distinct values `x` and `y`. Keyed on path alone the second
-    // would dedup onto the first under the shared host name `foo` and silently
-    // score the wrong value. The composite (`path\0target-member`) distinguishes
-    // them (`priors.flatppl\0x` vs `priors.flatppl\0y`) so the second refuses. It
-    // also matches the composite key `graft_binding`/`graft_module_member` record
-    // for a directly-grafted member, so a legitimate diamond (a re-export and a
-    // direct ref to the SAME member) still dedups.
-    let target_origin = format!("{}\u{0}{}", resolved.path, target_name);
-    // Origin-aware dedup keyed on the HOST name and the TARGET's composite origin
-    // (the re-export's effective origin). Same target origin → diamond (the same
-    // underlying binding reached twice) → dedup validly, skipping the re-graft.
-    // A different origin → two distinct modules/members define this name → refuse.
-    if let Some(existing_origin) = ctx.grafted.get(host_name) {
-        if *existing_origin == target_origin {
-            return Ok(());
-        }
-        return Err(format!(
-            "two distinct loaded modules define a binding named `{host_name}`; cross-module name \
-             collision is not yet namespaced — refuse rather than mislower"
-        ));
-    }
-    ctx.grafted
-        .insert(host_name.to_string(), target_origin.clone());
-    if ctx.preexisting.contains(host_name) {
-        return Err(format!(
-            "grafted submodule kernel depends on a binding `{host_name}` whose name collides with \
-             an unrelated pre-existing host binding (modules are independent namespaces, and this \
-             dependency is not linked by a load_module `%assign`); refuse rather than reuse the \
-             host binding and mislower"
-        ));
-    }
-    // Cycle guard on the TARGET `(submodule-path, member)`, matching
-    // `graft_nested_module_ref`: a re-export chain that loops (A re-exports B's `d`,
-    // B re-exports A's `d`) re-enters the same key and refuses, not recurse forever.
-    let cycle_key = format!("{}\u{0}{}", resolved.path, target_name);
-    if !ctx.in_progress.insert(cycle_key.clone()) {
-        return Err(format!(
-            "cyclic module graph: cross-module re-export `{host_name} = {alias_name}.{target_name}` \
-             re-enters `{}` while it is still being grafted; refuse rather than recurse forever",
-            resolved.path
-        ));
-    }
-    // The target's nested `load_module` `%assign` values are expressions in `src`;
-    // graft them under the CURRENT context, then graft the target member's rhs
-    // under the NESTED assign + origin (mirrors `graft_nested_module_ref`).
-    let mut nested_assign: Vec<(String, NodeId)> = Vec::with_capacity(resolved.assign_src.len());
-    for (name, src_val) in resolved.assign_src.iter() {
-        match graft_node(host, src, *src_val, ctx) {
-            Ok(hval) => nested_assign.push((name.clone(), hval)),
-            Err(e) => {
-                ctx.in_progress.remove(&cycle_key);
-                return Err(e);
-            }
-        }
-    }
-    let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
-    let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
-    let host_rhs = graft_node(host, resolved.sub, resolved.member_rhs, ctx);
-    ctx.origin = saved_origin;
-    ctx.assign = saved_assign;
-    ctx.in_progress.remove(&cycle_key);
-    // Bind the resolved-through value under the HOST name (which may differ from
-    // the target name for a renamed re-export). The visibility carried is the
-    // target's — a re-export IS the target's value.
-    let host_rhs = host_rhs?;
-    let hname = host.intern(host_name);
-    host.add_binding(Binding {
-        name: hname,
-        rhs: host_rhs,
-        doc: None,
-        public: resolved.member_public,
-        synthetic: false,
-    });
-    Ok(())
+    ctx.state.expanding.remove(&source_key);
+    host.set_binding_rhs(host_bid, rhs?);
+    ctx.state.bindings.get_mut(&key).unwrap().state = Materialization::Ready;
+    Ok(host.binding(host_bid).name)
 }

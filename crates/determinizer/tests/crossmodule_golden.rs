@@ -9,6 +9,40 @@ fn parse(src: &str) -> flatppl_core::Module {
     flatppl_syntax::parse(src).unwrap()
 }
 
+fn assert_outputs(model: &str, bundle: &ModuleBundle, expected: &str) {
+    let mut model = parse(model);
+    let _ = flatppl_infer::infer_module(&mut model, bundle, flatppl_infer::Level::Shape);
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let actual = determinize_with_roots(&model, bundle, Some(&roots)).unwrap();
+    let mut expected = parse(expected);
+    let roots = [expected.intern("inputs"), expected.intern("outputs")];
+    let expected = determinize_with_roots(&expected, &ModuleBundle::new(), Some(&roots)).unwrap();
+    assert_eq!(
+        flatppl_flatpir::write(&actual),
+        flatppl_flatpir::write(&expected)
+    );
+}
+
+fn assert_normal_score(
+    mut model: flatppl_core::Module,
+    bundle: &ModuleBundle,
+    x: f64,
+    mu: f64,
+    sigma: f64,
+) {
+    let roots = [model.intern("lp")];
+    let actual = determinize_with_roots(&model, bundle, Some(&roots)).unwrap();
+    let mut expected = parse(&format!(
+        "lp = builtin_logdensityof(Normal, record(mu = {mu:?}, sigma = {sigma:?}), {x:?})"
+    ));
+    let roots = [expected.intern("lp")];
+    let expected = determinize_with_roots(&expected, &ModuleBundle::new(), Some(&roots)).unwrap();
+    assert_eq!(
+        flatppl_flatpir::write(&actual),
+        flatppl_flatpir::write(&expected)
+    );
+}
+
 /// T6 characterization: `determinize_with(&m, &empty_bundle)` produces
 /// byte-identical FlatPIR to `determinize(&m)` for a self-contained
 /// same-module model — the delegation keeps every existing caller's behaviour.
@@ -205,15 +239,9 @@ lp = logdensityof(helpers.d, 0.5)";
     );
 }
 
-/// GAP C, refuse-don't-mislower: a cross-module direct query TARGET whose graft
-/// hits a submodule-dependency name collision with an unrelated host binding still
-/// refuses cleanly (mirrors [`cross_module_name_collision_refuses`], but the
-/// colliding submodule likelihood is the `logdensityof` target `helpers.L`, not a
-/// kernel inside a host `likelihoodof`). The submodule kernel depends on an
-/// internal `scale = 2.0` whose name collides with an unrelated host `scale =
-/// 10.0`; grafting must NOT reuse the host binding — it refuses.
+/// An imported likelihood keeps its scale when the host defines the same name.
 #[test]
-fn cross_module_target_name_collision_refuses() {
+fn cross_module_target_name_collision_preserves_scale() {
     let helpers = "\
 flatppl_compat = \"0.1\"
 center = elementof(reals)
@@ -236,15 +264,7 @@ lp = logdensityof(helpers.L, record(center = 0.0))";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "a cross-module TARGET whose graft collides with an unrelated host binding must refuse, \
-         not silently reuse the host binding; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 2.5, 0.0, 2.0);
 }
 
 /// GAP D (Symptom 1 — iid size on a freshly-grafted target): a cross-module
@@ -384,14 +404,9 @@ lp = logdensityof(helpers.MissingThing, record(a = 0.0))";
     );
 }
 
-/// FIX for silent mislowering on a binding-name collision (refuse-don't-mislower):
-/// a submodule kernel depends on an INTERNAL binding (`scale = 2.0`) whose name
-/// collides with an UNRELATED host binding (`scale = 10.0`). Modules are
-/// independent namespaces, so grafting must NOT reuse the host binding (which
-/// would silently score `sigma = 10.0` instead of the submodule's `2.0`). The
-/// determiniser refuses rather than emit a wrong density with no diagnostic.
+/// A likelihood built from an imported kernel uses that module's scale.
 #[test]
-fn cross_module_name_collision_refuses() {
+fn cross_module_name_collision_preserves_scale() {
     let helpers = "\
 flatppl_compat = \"0.1\"
 center = elementof(reals)
@@ -414,15 +429,7 @@ lp = logdensityof(L, record(center = 0.0))";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "a submodule dependency colliding with an unrelated host binding must refuse, \
-         not silently reuse the host binding; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 2.5, 0.0, 2.0);
 }
 
 /// Refuse-don't-mislower for a TWO-LEVEL nested cross-module ref whose second
@@ -584,16 +591,9 @@ lp = logdensityof(outer.x, 0.5)";
     );
 }
 
-/// Refuse-don't-mislower at the NESTED level: a binding pulled in by the
-/// recursive nested graft whose name collides with an unrelated host binding
-/// refuses (the #75 namespace-independence guard applies at every nesting level).
-/// The leaf module's `d = Normal(mu = 0.0, sigma = scale)` depends on an internal
-/// `scale = 2.0`; the host defines a wholly UNRELATED `scale = 10.0`. Grafting
-/// `A.x` chases the nested `inner.d` ref into the leaf and must graft its `scale`
-/// dependency — whose name collides with the host `scale` — so it refuses rather
-/// than silently score `sigma = 10.0` instead of the leaf's `2.0`.
+/// Nested imports keep their own scale despite a same-named host binding.
 #[test]
-fn nested_graft_name_collision_refuses() {
+fn nested_graft_name_collision_preserves_scale() {
     let leaf = "\
 flatppl_compat = \"0.1\"
 scale = 2.0
@@ -620,38 +620,12 @@ lp = logdensityof(outer.x, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "a nested grafted binding colliding with an unrelated host binding must refuse, \
-         not silently reuse the host binding; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 0.0, 2.0);
 }
 
-/// CRITICAL fix (silent-wrong-density): the recursive nested graft used to
-/// dedup grafted submodule bindings by BARE NAME alone (`ctx.grafted` as a
-/// `HashSet<String>`), with no record of which submodule a name came from. Once
-/// a single graft chain can pull bindings from MULTIPLE DISTINCT submodules
-/// (here: `mid.flatppl` directly, and `leaf.flatppl` nested underneath it via
-/// `mid`'s own `load_module`), two independent submodules that each define an
-/// UNRELATED binding of the same bare name (`scale`) collided: the second graft
-/// saw `scale` already recorded and DAG-deduped onto the FIRST submodule's
-/// value, returning `Ok` with no diagnostic — silently scoring against the
-/// wrong submodule's `scale`.
-///
-/// `mid.flatppl`'s `d = Normal(mu = inner.val, sigma = scale)` references BOTH:
-/// nested `leaf.flatppl`'s `val` (which itself resolves to `leaf`'s OWN `scale =
-/// 99.0`) via `mu`, and `mid`'s OWN `scale = 2.0` via `sigma`. Grafting `mu`
-/// first pulls `leaf`'s `scale` in under the name `scale`; grafting `sigma`
-/// second then requests `scale` again, but from a DIFFERENT origin (`mid`, not
-/// `leaf`). Neither the host-vs-submodule `preexisting` guard (host defines no
-/// `scale`) nor the old bare-name DAG-dedup catches this — only origin-tracking
-/// does. This must REFUSE (`Err`), not silently lower.
+/// Same-named dependencies from different modules retain both values.
 #[test]
-fn nested_two_submodules_same_name_binding_refuses() {
+fn nested_submodule_names_preserve_each_value() {
     let leaf = "\
 flatppl_compat = \"0.1\"
 scale = 99.0
@@ -678,24 +652,10 @@ lp = logdensityof(outer.d, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "two distinct nested submodules each defining an unrelated binding named `scale` must \
-         refuse rather than DAG-dedup the second submodule's binding onto the first's value; \
-         got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 99.0, 2.0);
 }
 
-/// Companion to [`nested_two_submodules_same_name_binding_refuses`]: a
-/// LEGITIMATE diamond — the SAME nested submodule binding (`leaf.flatppl`'s
-/// `val`) reached TWICE via two independent paths in one graft — must STILL
-/// dedup validly and lower. This guards the origin-tracking fix against
-/// over-refusing: a same-origin re-visit is real sharing, not a collision, so
-/// it must not be confused with the distinct-origin case above.
+/// Two paths into one nested module share the same dependency.
 #[test]
 fn nested_same_module_diamond_still_lowers() {
     let leaf = "\
@@ -722,46 +682,14 @@ lp = logdensityof(outer.d, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let lowered = determinize_with(&mmod, &bundle).expect(
-        "a legitimate diamond (the SAME nested submodule binding reached twice via two paths) \
-         must still lower, not be mistaken for a cross-module name collision",
-    );
-    let pir = flatppl_flatpir::write(&lowered);
-    assert!(
-        pir.contains("builtin_logdensityof"),
-        "diamond-shared nested binding did not lower to builtin_logdensityof; got:\n{pir}"
-    );
-    // The nested `val` binding is grafted exactly ONCE (dedup, not a refuse and
-    // not a duplicate copy) and both `mu` and `sigma` reference it, resolving to
-    // the leaf's `1.0`.
-    assert_eq!(
-        pir.matches("(%bind val ").count(),
-        1,
-        "the diamond-shared nested binding must be grafted exactly once (dedup); got:\n{pir}"
-    );
-    assert!(
-        pir.contains("(%bind val 1.0)"),
-        "diamond-shared leaf `val = 1.0` did not survive the graft; got:\n{pir}"
-    );
-    // Canon Pass 1's `resolve_alias_refs` inlines the trivial literal alias
-    // `val = 1.0`, so `mu`/`sigma` no longer carry `(%ref self val)` — both
-    // fields hold the literal `1.0` directly. That inlining is only sound
-    // because the graft deduped `val` onto ONE shared binding in the first
-    // place (the `(%bind val ` count == 1 assertion above); if the graft had
-    // silently duplicated it, dedup would not be provable from the output at
-    // all once inlined, which is exactly why that assertion stays load-bearing.
-    assert!(
-        pir.contains("(%field mu 1.0)") && pir.contains("(%field sigma 1.0)"),
-        "both `mu` and `sigma` must resolve to the SAME deduped `val` value (1.0); got:\n{pir}"
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 1.0, 1.0);
 }
 
 /// Termination: a CYCLIC module graph refuses rather than recursing forever.
 /// `A` (`a.flatppl`) loads `B` and defines `x = b.d`; `B` (`b.flatppl`) loads `A`
 /// and defines `d = a.x` — so resolving `A.x` chases `x → B.d → A.x → …`. The
-/// recursive graft's cycle guard (`GraftCtx::in_progress`, keyed on
-/// (submodule-path, member)) detects the re-entry into a `(path, member)` still
-/// on the graft stack and refuses; it does not hang.
+/// source/member cycle guard detects re-entry even as each load creates a new
+/// instance.
 #[test]
 fn cyclic_module_graph_refuses() {
     let a = "\
@@ -853,15 +781,9 @@ lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
     );
 }
 
-/// GAP #194, refuse-don't-mislower: a cross-module kernel APPLICATION whose
-/// callee graft collides with an unrelated host binding refuses cleanly. The
-/// submodule kernel `k` depends on an internal `scale = 2.0` whose name collides
-/// with an UNRELATED host `scale = 10.0`. Modules are independent namespaces, so
-/// grafting the callee must NOT reuse the host binding (which would silently
-/// score `sigma = 10.0` instead of the submodule's `2.0`) — the graft refuses,
-/// and that refuse propagates out of the application-graft path.
+/// Applying an imported kernel also preserves its private dependency values.
 #[test]
-fn cross_module_kernel_application_collision_refuses() {
+fn cross_module_kernel_application_collision_preserves_scale() {
     let helpers = "\
 flatppl_compat = \"0.1\"
 center = elementof(reals)
@@ -881,32 +803,10 @@ lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "a cross-module kernel APPLICATION whose callee graft collides with an unrelated host \
-         binding must refuse, not silently reuse the host binding; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 0.0, 2.0);
 }
 
-/// A pure cross-module RE-EXPORT under the SAME name must resolve THROUGH to the
-/// target, not be refused as a name collision. The middle module `A`
-/// (`a.flatppl`) re-exports its own loaded module `B`'s (`b.flatppl`) binding `d`
-/// UNCHANGED: `d = inner.d`. `A` also exposes a measure `m = d` that the host
-/// queries: `logdensityof(A.m, 0.5)`.
-///
-/// Grafting `A.m` reaches `A.d` via a `(%ref self d)` (so `graft_binding` runs on
-/// `d`), whose rhs is the pure re-export `(%ref inner d)`. Before the fix,
-/// `graft_binding` recorded `d` under origin=A, then the nested resolution grafted
-/// `B.d` under origin=B → the #77 origin guard saw two origins for `d` and REFUSED
-/// ("two distinct loaded modules define a binding named `d`"). But `A.d` IS `B.d`
-/// (same underlying value, §04 "a re-exported cross-module binding is the same
-/// value"), so this is a FALSE collision. The fix detects the pure re-export and
-/// resolves it through to `B`'s `d` (origin = B's path) with NO distinct-origin
-/// record under `A`, so the same-origin dedup applies and the query lowers.
+/// Re-exporting a measure under the same name preserves its density.
 #[test]
 fn cross_module_reexport_same_name_lowers() {
     let leaf = "\
@@ -992,17 +892,9 @@ lp = logdensityof(outer.m, 0.5)";
     );
 }
 
-/// Guards the re-export fix against OVER-relaxing the #77 origin guard: two
-/// GENUINELY-DISTINCT submodules that each define an UNRELATED binding of the same
-/// bare name `d` (NOT a re-export — one is `99.0`, the other `2.0`) must STILL
-/// refuse. `mid.flatppl`'s `combo = Normal(mu = inner.d, sigma = d)` references
-/// both nested `leaf.flatppl`'s `d = 99.0` (via `mu`, origin=leaf) and `mid`'s OWN
-/// `d = 2.0` (via `sigma`, origin=mid). Neither rhs is a pure `(%ref M X)`
-/// re-export, so both keep their own origin → distinct-origin collision → refuse.
-/// (Sibling of the existing [`nested_two_submodules_same_name_binding_refuses`],
-/// pinned on the bare name `d` the re-export fix touches.)
+/// A local value and a nested imported value remain distinct despite their name.
 #[test]
-fn two_genuinely_distinct_same_name_still_refuses() {
+fn two_distinct_same_name_bindings_preserve_each_value() {
     let leaf = "\
 flatppl_compat = \"0.1\"
 d = 99.0";
@@ -1028,15 +920,7 @@ lp = logdensityof(outer.combo, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "two genuinely-distinct submodules each defining an UNRELATED binding named `d` (not a \
-         re-export) must still refuse rather than DAG-dedup onto the wrong origin; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 99.0, 2.0);
 }
 
 /// GAP #194 FIX 1, refuse-don't-mislower (CRITICAL — reproduces a silent wrong
@@ -1085,28 +969,9 @@ lp = logdensityof(m.k(m.rec), 0.5)";
     );
 }
 
-/// FIX 1 (CRITICAL — reopens the #77 silent-wrong-density hole): two INDEPENDENT
-/// re-exports of DIFFERENT target members that happen to share the SAME re-export
-/// name must REFUSE, not silently collapse onto one value.
-///
-/// `priors.flatppl` defines two unrelated scalars `x = 1.0` and `y = 9.0`. Two
-/// sibling modules each re-export a DIFFERENT one under the SAME local name `foo`:
-/// `a.foo = priors.x` (= 1.0) and `b.foo = priors.y` (= 9.0). `mid.flatppl`
-/// combines them: `combo = Normal(mu = amod.m, sigma = bmod.n)`, where `a.m = foo`
-/// and `b.n = foo`. The two `foo` bindings are DISTINCT values that merely share a
-/// name.
-///
-/// Before the fix, `graft_reexport` deduped by the re-export's SUBMODULE BUNDLE
-/// PATH ONLY (`priors.flatppl`), NOT the target member. So `b.foo` (target `y`)
-/// saw `a.foo`'s path (`priors.flatppl`) already recorded for host name `foo`,
-/// judged it the same origin, and DEDUPED — `n` silently resolved to `foo = 1.0`,
-/// making the density `Normal(mu = 1, sigma = 1)` instead of `Normal(mu = 1,
-/// sigma = 9)`, with NO refuse. The composite dedup key (`path\0target_member`)
-/// gives `a.foo` key `priors.flatppl\0x` and `b.foo` key `priors.flatppl\0y` —
-/// DIFFERENT — so the second `foo` graft sees a genuine distinct-value collision
-/// under one name and REFUSES.
+/// Different members re-exported under one spelling retain their own values.
 #[test]
-fn two_reexports_different_members_same_name_refuses() {
+fn two_reexports_with_same_name_preserve_each_value() {
     let priors = "\
 flatppl_compat = \"0.1\"
 x = 1.0
@@ -1149,28 +1014,10 @@ lp = logdensityof(outer.combo, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "two independent re-exports of DIFFERENT members (`a.foo = priors.x`, \
-         `b.foo = priors.y`) sharing the name `foo` must refuse, not silently dedup onto one \
-         value (which would score sigma = 1.0 instead of 9.0 — a silent wrong density); got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 1.0, 9.0);
 }
 
-/// FIX 1 regression pin (a LEGITIMATE diamond must still lower): a re-export
-/// `mid.d = inner.d` PLUS a DIRECT `inner.d` reference in the SAME queried measure
-/// must lower to a SINGLE shared host `d` binding — not refuse, not duplicate.
-///
-/// `mid.flatppl`'s `combo = Normal(mu = d, sigma = inner.d)` reaches the leaf's
-/// scalar `d = 3.0` two ways: via the re-export `mid.d = inner.d` (grafted under
-/// composite key `b.flatppl\0d`) and via the direct nested ref `inner.d` (grafted
-/// under composite key `b.flatppl\0d`). The keys MATCH (same underlying binding),
-/// so the second graft dedups onto the first: one binding, two refs. This locks
-/// that the composite-key change does not break the diamond.
+/// A re-export and a direct reference reach one loaded instance's value.
 #[test]
 fn diamond_reexport_plus_direct_lowers() {
     let leaf = "\
@@ -1198,45 +1045,10 @@ lp = logdensityof(outer.combo, 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let lowered = determinize_with(&mmod, &bundle).expect(
-        "a re-export plus a direct reference to the SAME underlying binding must dedup onto one \
-         shared host binding and lower, not refuse as a name collision",
-    );
-    let pir = flatppl_flatpir::write(&lowered);
-    assert!(
-        pir.contains("builtin_logdensityof"),
-        "diamond re-export + direct ref did not lower to builtin_logdensityof; got:\n{pir}"
-    );
-    // The shared leaf `d` is grafted exactly ONCE (dedup, not duplicated).
-    assert_eq!(
-        pir.matches("(%bind d ").count(),
-        1,
-        "the re-export and the direct ref must share ONE grafted `d` binding; got:\n{pir}"
-    );
-    // Canon Pass 1's `resolve_alias_refs` inlines the trivial literal alias
-    // `d = 3.0`, so `mu`/`sigma` no longer carry `(%ref self d)` — both fields
-    // hold the literal `3.0` directly. Sound only because the graft deduped
-    // `d` onto ONE shared binding first (the `(%bind d ` count == 1 assertion
-    // above remains the load-bearing dedup proof).
-    assert!(
-        pir.contains("(%field mu 3.0)") && pir.contains("(%field sigma 3.0)"),
-        "both `mu` and `sigma` must resolve to the SAME deduped `d` value (3.0); got:\n{pir}"
-    );
+    assert_normal_score(mmod, &bundle, 0.5, 3.0, 3.0);
 }
 
-/// FIX 2 (chained re-export — a re-export OF a re-export): `a.d = b.d`, `b.d =
-/// c.d`, `c.d = Normal(...)`. Since `a.d ≡ b.d ≡ c.d` are transitively the SAME
-/// value (§04 "a re-exported cross-module binding is the same value"), scoring the
-/// host's `outer.m` (= `a.d`) must resolve THROUGH the whole chain to `c.d` and
-/// lower — not refuse.
-///
-/// Before the resolve-through fix, `graft_reexport` took a SINGLE hop: it recorded
-/// the host name under the NEARER origin (`b.flatppl`), then grafted `b.d`'s rhs
-/// (itself the re-export `c.d`) via the ordinary nested path, which resolved to the
-/// ULTIMATE origin (`c.flatppl`) and mismatched the recorded nearer origin →
-/// REFUSED ("two distinct loaded modules define a binding named `d`"). The fix
-/// recurses the re-export resolution to the ultimate real binding, recording the
-/// ULTIMATE composite origin, so the chain terminates consistently on `c.d`.
+/// A chain of re-exports preserves the terminal measure.
 #[test]
 fn chained_reexport_lowers() {
     let c = "\
@@ -1288,11 +1100,9 @@ lp = logdensityof(outer.m, 0.5)";
     );
 }
 
-/// FIX 2 termination: a CYCLIC re-export chain refuses rather than recursing
+/// A cyclic re-export chain refuses rather than recursing
 /// forever. `a.d = b.d` and `b.d = a.d` form a re-export loop with no terminal
-/// binding. The resolve-through recursion's cycle guard (`GraftCtx::in_progress`,
-/// keyed on `(target-path, target-member)`) detects the re-entry into a
-/// `(path, member)` still on the graft stack and refuses; it does not hang.
+/// binding. The source/member cycle guard detects re-entry across instances.
 #[test]
 fn cyclic_reexport_chain_refuses() {
     let a = "\
@@ -1587,6 +1397,231 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
     assert!(
         ir.contains("builtin_logdensityof") && ir.contains("Normal"),
         "expected a Normal density term with the grafted-function-derived mean:\n{ir}"
+    );
+}
+
+#[test]
+fn nested_loads_keep_their_parent_instance() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "leaf.flatppl",
+        Arc::new(parse("k = external(reals)\nval = k + 1.0")),
+    );
+    bundle.insert("wrapper.flatppl", Arc::new(parse(
+        "k = external(reals)\nchild = load_module(\"leaf.flatppl\", k = k)\nf(x) = x + child.val",
+    )));
+    assert_outputs(
+        "a = load_module(\"wrapper.flatppl\", k = 1.0)\n\
+         b = load_module(\"wrapper.flatppl\", k = 10.0)\n\
+         x = elementof(reals)\ninputs = x\noutputs = [a.f(x), b.f(x)]",
+        &bundle,
+        "x = elementof(reals)\ninputs = x\noutputs = [x + 2.0, x + 11.0]",
+    );
+}
+
+#[test]
+fn reexported_laws_preserve_shared_stochastic_ancestors() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "leaf.flatppl",
+        Arc::new(parse(
+            "z ~ Normal(0.0, 1.0)\na ~ Normal(z, 1.0)\nb ~ Normal(z, 1.0)\n\
+             left = lawof(a)\nright = lawof(b)",
+        )),
+    );
+    bundle.insert(
+        "wrapper.flatppl",
+        Arc::new(parse(
+            "child = load_module(\"leaf.flatppl\")\nleft = child.left\nright = child.right",
+        )),
+    );
+    assert_outputs(
+        "w = load_module(\"wrapper.flatppl\")\nleft = w.left\nright = w.right\n\
+         outputs = logdensityof(joint(a = left, b = right), record(a = 0.0, b = 1.0))",
+        &bundle,
+        "z ~ Normal(0.0, 1.0)\na ~ Normal(z, 1.0)\nb ~ Normal(z, 1.0)\n\
+         outputs = logdensityof(lawof(record(a = a, b = b)), record(a = 0.0, b = 1.0))",
+    );
+}
+
+#[test]
+fn reexported_kernel_applies_through_aliases() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "leaf.flatppl",
+        Arc::new(parse(
+            "center = elementof(reals)\n\
+             k = functionof(Normal(center, 1.0), center = center)\nalias = k",
+        )),
+    );
+    bundle.insert(
+        "wrapper.flatppl",
+        Arc::new(parse(
+            "inner = load_module(\"leaf.flatppl\")\nk = inner.alias",
+        )),
+    );
+    assert_outputs(
+        "w = load_module(\"wrapper.flatppl\")\n\
+         outputs = logdensityof(w.k(record(center = 0.0)), 0.5)",
+        &bundle,
+        "outputs = logdensityof(Normal(0.0, 1.0), 0.5)",
+    );
+}
+
+#[test]
+fn reexported_measure_preserves_sample_and_rng_state() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helper.flatppl",
+        Arc::new(parse("d = Normal(0.0, 2.0)\nalias = d")),
+    );
+    assert_outputs(
+        "h = load_module(\"helper.flatppl\")\nm = h.alias\n\
+         s = rnginit(0)\nv, next = rand(s, m)\noutputs = (v, next)",
+        &bundle,
+        "s = rnginit(0)\nv, next = rand(s, Normal(0.0, 2.0))\noutputs = (v, next)",
+    );
+}
+
+#[test]
+fn sibling_load_assignments_are_not_import_cycles() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "leaf.flatppl",
+        Arc::new(parse("k = external(reals)\nval = k + 1.0")),
+    );
+    let chain = "a = load_module(\"leaf.flatppl\", k = 1.0)\n\
+                 b = load_module(\"leaf.flatppl\", k = a.val)\nval = b.val";
+    bundle.insert("wrapper.flatppl", Arc::new(parse(chain)));
+    assert_outputs(
+        &format!("{chain}\nw = load_module(\"wrapper.flatppl\")\nv = w.val\noutputs = [val, v]"),
+        &bundle,
+        "outputs = [3.0, 3.0]",
+    );
+}
+
+#[test]
+fn imported_automatic_inputs_keep_labels_through_simplification() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helper.flatppl",
+        Arc::new(parse(
+            "z = elementof(reals)\nc = 2.0\nf = functionof(z + c)\n\
+         second(a, b) = b\ng = functionof(second(z, 1.0))",
+        )),
+    );
+    assert_outputs(
+        "h = load_module(\"helper.flatppl\")\nz = elementof(reals)\ninputs = z\n\
+         outputs = [h.f(z = 2.0), h.g(z = 5.0), z]",
+        &bundle,
+        "z = elementof(reals)\ninputs = z\noutputs = [4.0, 1.0, z]",
+    );
+}
+
+#[test]
+fn imported_boundary_cuts_assigned_expression() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helper.flatppl",
+        Arc::new(parse(
+            "p = elementof(reals)\nf = functionof(p + 1.0, p = p)",
+        )),
+    );
+    assert_outputs(
+        "raw = elementof(reals)\ninputs = raw\n\
+         h = load_module(\"helper.flatppl\", p = raw + 9.0)\noutputs = h.f(p = 2.0)",
+        &bundle,
+        "raw = elementof(reals)\ninputs = raw\noutputs = 3.0",
+    );
+}
+
+#[test]
+fn import_names_do_not_overwrite_host_names() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helper.flatppl", Arc::new(parse("c = 3.0\nf(x) = x + c")));
+    assert_outputs(
+        "h = load_module(\"helper.flatppl\")\nc = 9.0\n__import_c_0 = 50.0\n\
+         x = elementof(reals)\ninputs = x\noutputs = [h.f(x), c, __import_c_0]",
+        &bundle,
+        "x = elementof(reals)\ninputs = x\noutputs = [x + 3.0, 9.0, 50.0]",
+    );
+}
+
+#[test]
+fn imported_likelihood_keeps_public_input_labels() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helper.flatppl",
+        Arc::new(parse(
+            "center = elementof(reals)\n\
+         k = functionof(Normal(center, 1.0), center = center)",
+        )),
+    );
+    let mut model = parse(
+        "center = 99.0\nh = load_module(\"helper.flatppl\")\n\
+         L = likelihoodof(h.k, 0.5)\nlp = logdensityof(L, record(center = 0.0))",
+    );
+    let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
+    assert_normal_score(model, &bundle, 0.5, 0.0, 1.0);
+}
+
+#[test]
+fn imported_likelihood_accepts_renamed_parameter_alias() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helper.flatppl",
+        Arc::new(parse(
+            "p = elementof(reals)\nk = functionof(Normal(p, 1.0))",
+        )),
+    );
+    let mut model = parse(
+        "h = load_module(\"helper.flatppl\")\nq = h.p\n\
+         L = likelihoodof(h.k, 0.5)\nlp = logdensityof(L, record(p = 0.0))",
+    );
+    let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
+    assert_normal_score(model, &bundle, 0.5, 0.0, 1.0);
+}
+
+#[test]
+fn repeated_imported_queries_restore_discarded_measure() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helper.flatppl", Arc::new(parse("d = Normal(0.0, 2.0)")));
+    assert_outputs(
+        "h = load_module(\"helper.flatppl\")\na = logdensityof(h.d, 0.0)\n\
+         b = logdensityof(h.d, 1.0)\noutputs = [a, b]",
+        &bundle,
+        "a = logdensityof(Normal(0.0, 2.0), 0.0)\n\
+         b = logdensityof(Normal(0.0, 2.0), 1.0)\noutputs = [a, b]",
+    );
+}
+
+#[test]
+fn configured_imports_keep_separate_dependencies() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "helpers.flatppl",
+        Arc::new(parse("k = external(reals)\nc = k + 1.0\nf(x) = x + c")),
+    );
+    assert_outputs(
+        "a = load_module(\"helpers.flatppl\", k = 1.0)\n\
+         b = load_module(\"helpers.flatppl\", k = 10.0)\n\
+         fa = a.f\nfb = b.f\nx = elementof(reals)\ninputs = x\n\
+         outputs = [fa(x), fb(x)]",
+        &bundle,
+        "x = elementof(reals)\ninputs = x\noutputs = [x + 2.0, x + 11.0]",
+    );
+}
+
+#[test]
+fn repeated_imported_calls_reuse_dependencies_across_phases() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(parse("c = 3.0\nf(x) = x + c")));
+    assert_outputs(
+        "h = load_module(\"helpers.flatppl\")\nx = elementof(reals)\ninputs = x\n\
+         a = h.f(x)\nb = h.f(x + 1.0)\noutputs = [a, b, h.f(x + 2.0)]",
+        &bundle,
+        "x = elementof(reals)\ninputs = x\na = x + 3.0\n\
+         b = (x + 1.0) + 3.0\noutputs = [a, b, (x + 2.0) + 3.0]",
     );
 }
 
