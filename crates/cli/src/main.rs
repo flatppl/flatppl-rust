@@ -734,7 +734,8 @@ fn load_and_infer(
     let resolver = CliResolver::cache_only();
     let in_loc = Location::Local(input.to_path_buf());
     let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
-    let diags = flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    let (diags, bundle) =
+        flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
     let mut errors = 0u32;
     for d in &diags {
         match d.severity {

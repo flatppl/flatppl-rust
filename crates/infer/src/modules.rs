@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use flatppl_core::{
-    BindingId, CallHead, Module, NamedKind, Node, NodeId, Phase, Scalar, Symbol, Type, ValueSet,
+    BindingId, CallHead, Idx, Module, NamedKind, Node, NodeId, Phase, Ref, Scalar, Symbol, Type,
+    ValueSet,
 };
 
 use crate::Diagnostic;
@@ -24,6 +25,9 @@ fn is_remote_source(source: &str) -> bool {
     use flatppl_core::text::starts_with_ascii_ignore_case as starts_with;
     starts_with(source, "http://") || starts_with(source, "https://")
 }
+
+type SourceInputs = HashMap<NodeId, Box<[(Symbol, Ref)]>>;
+pub(crate) type InputMetadata = HashMap<String, Arc<SourceInputs>>;
 
 /// Parsed dependency modules, keyed by **resolved file identity** — the host's
 /// canonical spelling of the file or URL, not the `load_module` literal.
@@ -56,6 +60,9 @@ pub struct ModuleBundle {
     /// Identity of the module handed to `infer_module`. Its own directives
     /// resolve against this key.
     root: String,
+    /// Auto-input lists from an opt-in inference run over this exact bundle.
+    /// Source/resolution edits invalidate all entries, including transitive ones.
+    pub(crate) input_metadata: InputMetadata,
 }
 
 impl ModuleBundle {
@@ -93,6 +100,7 @@ impl ModuleBundle {
     /// Record the identity of the module `infer_module` is called on, so its own
     /// directives resolve against the right importer.
     pub fn set_root(&mut self, identity: impl Into<String>) {
+        self.input_metadata.clear();
         self.root = identity.into();
     }
 
@@ -138,6 +146,16 @@ impl ModuleBundle {
         self.by_id.get(identity)
     }
 
+    /// Automatic callable inputs retained by [`crate::infer_module_with_inputs`].
+    /// The node and symbols belong to the source at resolved `identity`.
+    /// `None` means callers must infer them; `Some(&[])` is a known empty list.
+    pub fn auto_inputs_of(&self, identity: &str, node: NodeId) -> Option<&[(Symbol, Ref)]> {
+        self.input_metadata
+            .get(identity)?
+            .get(&node)
+            .map(AsRef::as_ref)
+    }
+
     /// The dependency for `path` with no importer context: the literal alias
     /// route. `None` when `path` denotes two different files in this bundle.
     pub fn get(&self, path: &str) -> Option<&Module> {
@@ -151,6 +169,7 @@ impl ModuleBundle {
     }
 
     fn insert_by_id(&mut self, literal: String, identity: String, module: Arc<Module>) {
+        self.input_metadata.clear();
         match self.by_literal.get(&literal) {
             // Already bound to a different file: the literal stops being a
             // usable key for importer-free lookups.
@@ -500,6 +519,27 @@ impl<'b> InferSession<'b> {
     pub(crate) fn finish_dependency(&self, key: (String, String), module: Module) {
         self.stack.borrow_mut().pop();
         self.memo.borrow_mut().insert(key, module);
+    }
+
+    pub(crate) fn input_metadata(&self) -> InputMetadata {
+        self.memo
+            .borrow()
+            .iter()
+            // Substituted instances may carry narrower annotations. Leave
+            // those sources on the existing unsubstituted inference fallback.
+            .filter(|((_, substitutions), _)| substitutions.is_empty())
+            .map(|((identity, _), module)| {
+                let inputs = (0..module.node_count())
+                    .map(NodeId::from_usize)
+                    .filter_map(|node| {
+                        module
+                            .auto_inputs_of(node)
+                            .map(|entries| (node, entries.into()))
+                    })
+                    .collect();
+                (identity.clone(), Arc::new(inputs))
+            })
+            .collect()
     }
 
     /// Returns the `%assign` substitutions of the `load_module` call bound to
