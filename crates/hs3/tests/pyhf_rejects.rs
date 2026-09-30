@@ -99,6 +99,63 @@ fn shapesys_name_shared_across_channels_errs() {
     );
 }
 
+#[test]
+fn shapesys_name_repeated_within_a_sample_errs() {
+    let source = serde_json::json!({
+        "channels": [{"name": "c", "samples": [{"name": "s", "data": [10.0],
+            "modifiers": [
+                {"name": "gamma", "type": "shapesys", "data": [2.0]},
+                {"name": "gamma", "type": "shapesys", "data": [3.0]}
+            ]
+        }]}],
+        "observations": [{"name": "c", "data": [10.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "gamma"}}]
+    });
+    // pyhf refuses a repeated non-shareable modifier before resolving payloads.
+    assert!(flatppl_hs3::read_pyhf(&source.to_string()).is_err());
+}
+
+#[test]
+fn replaced_pyhf_modifier_still_requires_well_typed_data() {
+    for (kind, bad, good) in [
+        (
+            "normsys",
+            serde_json::json!({"lo": 0.8}),
+            serde_json::json!({"lo": 0.7, "hi": 1.3}),
+        ),
+        (
+            "histosys",
+            serde_json::json!({"lo_data": [8.0], "hi_data": ["bad"]}),
+            serde_json::json!({"lo_data": [8.0], "hi_data": [12.0]}),
+        ),
+        (
+            "staterror",
+            serde_json::json!(["bad"]),
+            serde_json::json!([2.0]),
+        ),
+        (
+            "histosys",
+            serde_json::json!({"lo_data": [], "hi_data": [12.0]}),
+            serde_json::json!({"lo_data": [8.0], "hi_data": [12.0]}),
+        ),
+    ] {
+        let source = serde_json::json!({
+            "channels": [{"name": "c", "samples": [{"name": "s", "data": [10.0],
+                "modifiers": [
+                    {"name": "alpha", "type": kind, "data": bad},
+                    {"name": "alpha", "type": kind, "data": good}
+                ]
+            }]}],
+            "observations": [{"name": "c", "data": [10.0]}],
+            "measurements": [{"name": "m", "config": {"poi": "alpha"}}]
+        });
+        assert!(
+            flatppl_hs3::read_pyhf(&source.to_string()).is_err(),
+            "{kind}"
+        );
+    }
+}
+
 /// A measurement whose `poi` names a parameter no modifier declares.
 ///
 /// pyhf: `pyhf.exceptions.InvalidModel` — "The parameter of interest 'missing'
