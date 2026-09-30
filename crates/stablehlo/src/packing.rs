@@ -255,6 +255,11 @@ impl Packer<'_, '_> {
         if let Some(value) = self.originals.get(name) {
             return value.clone();
         }
+        if let Some(value) = self.reassembled_packet(name) {
+            // Keep the packet's recipe, not a concat of views back into itself.
+            self.originals.insert(name.to_owned(), value.ssa.clone());
+            return value.ssa;
+        }
         let out = if let Some(&(group, lane)) = self.members.get(name) {
             let value = self.groups[group].values[lane].clone();
             if let Pointwise::Broadcast(input, dims) = self.source.pointwise[name].op.clone() {
@@ -308,6 +313,55 @@ impl Packer<'_, '_> {
         }
         self.originals.insert(name.to_owned(), out.clone());
         out
+    }
+
+    /// Reuse a scalar packet assembled into a vector, keeping its lane order.
+    fn reassembled_packet(&mut self, name: &str) -> Option<Value> {
+        let producer = self.source.pointwise.get(name)?;
+        let Pointwise::Concat(parts, 0) = &producer.op else {
+            return None;
+        };
+        let axes = self.source.axes_of(&producer.value);
+        if parts.len() < 2
+            || axes.batch != 0
+            || axes.layers != [1]
+            || !matches!(&producer.value.ty, MlirTy::Ranked(dims)
+                if dims.as_slice() == [Some(parts.len() as u64)])
+        {
+            return None;
+        }
+        let elem = producer.value.elem;
+        let mut group = None;
+        let mut values = Vec::with_capacity(parts.len());
+        for part in parts {
+            if part.elem != elem
+                || self.source.axes_of(part) != axes
+                || !matches!(&part.ty, MlirTy::Ranked(dims) if dims.as_slice() == [Some(1)])
+            {
+                return None;
+            }
+            let Pointwise::Reshape(value) = &self.source.pointwise.get(&part.ssa)?.op else {
+                return None;
+            };
+            if value.ty != MlirTy::Scalar
+                || value.elem != elem
+                || self.source.axes_of(value) != Axes::default()
+            {
+                return None;
+            }
+            let current = self.members.get(&value.ssa)?.0;
+            if *group.get_or_insert(current) != current
+                || matches!(
+                    self.source.pointwise[&value.ssa].op,
+                    Pointwise::Broadcast(..)
+                )
+            {
+                return None;
+            }
+            values.push(value.clone());
+        }
+        let packet = self.packet(&values);
+        Some(self.out.axes_view(&packet, axes))
     }
 
     fn group_packet(&mut self, group: usize) -> Value {
