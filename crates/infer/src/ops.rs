@@ -6,7 +6,7 @@
 //! §07 functions (domains/results), §08 distributions (variate domains),
 //! §06 measure combinators, §04 reified callables.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol,
@@ -5925,6 +5925,7 @@ fn substituted_result(
     // that read it (every matching `%local` placeholder ref, or a self-bound
     // input binding's RHS) annotated with the argument's type/phase/value-set.
     let mut seeds: Vec<(NodeId, crate::modules::Resolved)> = Vec::new();
+    let mut local_refs = None;
     for (i, (sym, decl)) in inputs.iter().enumerate() {
         // Bind by keyword first (broadcast / named application), then by position.
         let arg = named
@@ -5943,7 +5944,12 @@ fn substituted_result(
             catalogue: None,
         };
         match decl.ns {
-            RefNs::Local => collect_local_ref_seeds(inf, body, decl.name, &res, &mut seeds),
+            RefNs::Local => {
+                let refs = local_refs.get_or_insert_with(|| collect_local_refs(inf, body));
+                if let Some(nodes) = refs.get(&decl.name) {
+                    seeds.extend(nodes.iter().map(|&node| (node, res.clone())));
+                }
+            }
             RefNs::SelfMod => {
                 if let Some(b) = inf.module.binding_by_name(decl.name) {
                     seeds.push((inf.module.binding(b).rhs, res));
@@ -5996,16 +6002,10 @@ fn input_entries(inf: &Inferencer<'_, '_>, reif_id: NodeId) -> Option<Vec<(Symbo
     }
 }
 
-/// Collect seeds for every `%local` placeholder ref in `body` whose name matches
-/// `param`, annotating each with `res`. The body reads a parameter through these
-/// placeholder refs, so seeding each makes the substituted annotation authoritative.
-fn collect_local_ref_seeds(
-    inf: &Inferencer<'_, '_>,
-    body: NodeId,
-    param: Symbol,
-    res: &crate::modules::Resolved,
-    out: &mut Vec<(NodeId, crate::modules::Resolved)>,
-) {
+/// Group the body's `%local` placeholder refs by name in traversal order.
+/// One call-local walk serves every parameter while seeds retain input order.
+fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol, Vec<NodeId>> {
+    let mut refs: HashMap<Symbol, Vec<NodeId>> = HashMap::new();
     let mut stack = vec![body];
     let mut seen = std::collections::HashSet::new();
     while let Some(id) = stack.pop() {
@@ -6013,8 +6013,8 @@ fn collect_local_ref_seeds(
             continue;
         }
         match inf.module.node(id) {
-            Node::Ref(r) if r.ns == RefNs::Local && r.name == param => {
-                out.push((id, res.clone()));
+            Node::Ref(r) if r.ns == RefNs::Local => {
+                refs.entry(r.name).or_default().push(id);
             }
             Node::Call(c) => {
                 if let CallHead::User(callee) = c.head {
@@ -6026,6 +6026,7 @@ fn collect_local_ref_seeds(
             _ => {}
         }
     }
+    refs
 }
 
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
