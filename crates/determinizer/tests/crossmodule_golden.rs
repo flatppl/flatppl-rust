@@ -11,9 +11,13 @@ fn parse(src: &str) -> flatppl_core::Module {
 
 fn assert_outputs(model: &str, bundle: &ModuleBundle, expected: &str) {
     let mut model = parse(model);
-    let _ = flatppl_infer::infer_module(&mut model, bundle, flatppl_infer::Level::Shape);
+    let (_, bundle) = flatppl_infer::infer_module_with_inputs(
+        &mut model,
+        bundle.clone(),
+        flatppl_infer::Level::Shape,
+    );
     let roots = [model.intern("inputs"), model.intern("outputs")];
-    let actual = determinize_with_roots(&model, bundle, Some(&roots)).unwrap();
+    let actual = determinize_with_roots(&model, &bundle, Some(&roots)).unwrap();
     let mut expected = parse(expected);
     let roots = [expected.intern("inputs"), expected.intern("outputs")];
     let expected = determinize_with_roots(&expected, &ModuleBundle::new(), Some(&roots)).unwrap();

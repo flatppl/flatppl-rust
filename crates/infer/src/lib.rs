@@ -198,6 +198,30 @@ pub fn infer_module(module: &mut Module, bundle: &ModuleBundle, level: Level) ->
     trace::Inferencer::new(module, level, &session).run()
 }
 
+/// Like [`infer_module`], retaining automatic callable inputs for later lowering.
+///
+/// The returned bundle owns only source-relative input lists, not inferred
+/// instance types or graph copies. Source/resolution edits invalidate them.
+/// Failed, phase-only, substituted-only and unvisited dependencies keep the
+/// normal inference fallback. Existing annotations on `module` behave unchanged.
+pub fn infer_module_with_inputs(
+    module: &mut Module,
+    mut bundle: ModuleBundle,
+    level: Level,
+) -> (Vec<Diagnostic>, ModuleBundle) {
+    let session = InferSession::new(&bundle);
+    let diagnostics = trace::Inferencer::new(module, level, &session).run();
+    let inputs =
+        if level >= Level::Type && !diagnostics.iter().any(|d| d.severity == Severity::Error) {
+            session.input_metadata()
+        } else {
+            Default::default()
+        };
+    drop(session);
+    bundle.input_metadata = inputs;
+    (diagnostics, bundle)
+}
+
 /// Infer types and phases for every binding of `module` at the given
 /// [`Level`], filling its type/phase side-tables in place. Best-effort:
 /// always annotates as much as it can; returned diagnostics report errors

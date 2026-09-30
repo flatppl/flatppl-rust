@@ -411,7 +411,10 @@ fn graft_node(
                 inputs,
             }));
             if matches!(c.inputs, Some(Inputs::Auto)) {
-                let entries = if let Some(entries) = src.auto_inputs_of(id) {
+                let entries = if let Some(entries) = src
+                    .auto_inputs_of(id)
+                    .or_else(|| ctx.bundle.auto_inputs_of(&ctx.path, id))
+                {
                     graft_inputs(host, src, entries, ctx)?
                 } else {
                     let source_inputs = ctx
