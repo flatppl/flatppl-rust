@@ -393,6 +393,7 @@ impl Packer<'_, '_> {
             }
             let result = match op {
                 Pointwise::Unary(op, _) => self.out.unary(&op, &inputs[0]),
+                Pointwise::ChloUnary(op, _) => self.out.chlo_unary(&op, &inputs[0]),
                 Pointwise::Binary(op, ..) => self.out.emit_binary(&op, &inputs[0], &inputs[1]),
                 Pointwise::Compare(dir, ..) => self.out.compare(&dir, &inputs[0], &inputs[1]),
                 Pointwise::Select(..) => self.out.select(&inputs[0], &inputs[1], &inputs[2]),

@@ -7,6 +7,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) enum Pointwise {
     Unary(String, Value),
+    ChloUnary(String, Value),
     Binary(String, Value, Value),
     Compare(String, Value, Value),
     Select(Value, Value, Value),
@@ -31,6 +32,7 @@ impl Pointwise {
     pub(super) fn inputs(&self) -> Vec<&Value> {
         match self {
             Self::Unary(_, a)
+            | Self::ChloUnary(_, a)
             | Self::Convert(a, _)
             | Self::Broadcast(a, _)
             | Self::Reshape(a)
@@ -46,7 +48,7 @@ impl Pointwise {
 
     pub(super) fn signature(&self) -> Option<(String, Vec<u64>)> {
         let name = match self {
-            Self::Unary(op, _) | Self::Binary(op, ..) => op.clone(),
+            Self::Unary(op, _) | Self::ChloUnary(op, _) | Self::Binary(op, ..) => op.clone(),
             Self::Compare(dir, ..) => format!("compare {dir}"),
             Self::Select(..) => "select".to_owned(),
             Self::Convert(..) => "convert".to_owned(),
@@ -137,7 +139,7 @@ impl Emitter<'_> {
         let out = match op {
             // Compute parameter-only functions once per point, then broadcast
             // their values instead of repeating them along every cell axis.
-            Pointwise::Unary(..) => return None,
+            Pointwise::Unary(..) | Pointwise::ChloUnary(..) => return None,
             Pointwise::Binary(op, a, b) => {
                 let a = expand(&a);
                 let b = expand(&b);
