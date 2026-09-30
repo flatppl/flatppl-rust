@@ -1492,6 +1492,7 @@ impl<'m> Emitter<'m> {
         }
         let ty_text = a.ty.render(self.dtype, a.elem);
         let ssa = self.pure_like(format!("{op} {} : {ty_text} -> {ty_text}", a.ssa), a);
+        self.remember_pointwise(&ssa, a, Pointwise::ChloUnary(op.to_owned(), a.clone()));
         Value {
             ssa,
             ty: a.ty.clone(),

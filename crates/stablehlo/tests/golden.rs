@@ -13061,23 +13061,54 @@ fn aggregate_composes_with_functionof_placeholders() {
 
 #[test]
 fn singleton_broadcast_computes_parameter_only_terms_once() {
+    for (function, opcode) in [("log", "stablehlo.log "), ("loggamma", "chlo.lgamma ")] {
+        let m = determinize_src(&format!(
+            "sigma = elementof(posreals)\n\
+            xs = elementof(cartpow(reals, 20))\n\
+            f(a, x) = {function}(a) + x\n\
+            score = sum(f.([sigma], xs))\n\
+            inputs = (sigma, xs)\noutputs = (score)",
+        ));
+        let out = emit_logdensity(&m);
+        let calls = out
+            .lines()
+            .filter(|line| line.contains(opcode))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{out}");
+        assert!(
+            calls[0].contains("tensor<f32>"),
+            "parameter function must stay scalar:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn special_function_siblings_form_one_ordered_packet() {
     let m = determinize_src(
-        "sigma = elementof(posreals)\n\
-        xs = elementof(cartpow(reals, 20))\n\
-        f(a, x) = log(a) + x\n\
-        score = sum(f.([sigma], xs))\n\
-        inputs = (sigma, xs)\noutputs = (score)",
+        "p = elementof(cartpow(nonnegintegers, 4))\n\
+        rate = elementof(posreals)\n\
+        f(x, s) = logdensityof(Poisson(s), x)\n\
+        inputs = (p, rate)\n\
+        outputs = [f(p[4], rate), f(p[1], rate), f(p[4], rate), f(p[3], rate)]",
     );
-    let out = emit_logdensity(&m);
-    let logs = out
-        .lines()
-        .filter(|line| line.contains("stablehlo.log "))
-        .collect::<Vec<_>>();
-    assert_eq!(logs.len(), 1, "{out}");
-    assert!(
-        logs[0].contains("tensor<f32>"),
-        "parameter log must stay scalar:\n{out}"
-    );
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let out = flatppl_stablehlo::emit(
+            &m,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions { dtype },
+        )
+        .unwrap();
+        let calls = out
+            .lines()
+            .filter(|line| line.contains("chlo.lgamma "))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{out}");
+        let ty = match dtype {
+            Dtype::F32 => "tensor<3xf32>",
+            Dtype::F64 => "tensor<3xf64>",
+        };
+        assert!(calls[0].contains(&format!(": {ty} -> {ty}")), "{out}");
+    }
 }
 
 #[test]
