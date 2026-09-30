@@ -13,7 +13,7 @@ use crate::histfactory::{
     emit_staterror_constraint, mod_spec, modifier_effect, require_param, require_spec,
     sample_nominal, staterror_gaussian,
 };
-use crate::model::{PyhfDocument, PyhfParam, SampleData};
+use crate::model::{Modifier, PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
 use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Node};
@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashSet};
 
 /// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
 pub fn pyhf_to_module(mut doc: PyhfDocument) -> Result<Module> {
+    resolve_sample_modifiers(&mut doc)?;
     let names = crate::pyhf_names::rename_parameters(&mut doc);
     let mut m = Module::new();
     {
@@ -31,6 +32,69 @@ pub fn pyhf_to_module(mut doc: PyhfDocument) -> Result<Module> {
         crate::pyhf_names::emit_metadata(&mut b, &names);
     }
     Ok(m)
+}
+
+/// pyhf indexes each sample by (type, name): the last payload wins. Keep the
+/// first slot so unrelated effects retain their order. Shapesys is not shareable
+/// and must reach validation intact, including any invalid repeated occurrence.
+fn resolve_sample_modifiers(doc: &mut PyhfDocument) -> Result<()> {
+    let channels = match doc {
+        PyhfDocument::Model(model) => &mut model.channels,
+        PyhfDocument::Workspace(workspace) => &mut workspace.channels,
+    };
+    for sample in channels.iter_mut().flat_map(|channel| &mut channel.samples) {
+        let mut slots = BTreeMap::new();
+        let mut modifiers = Vec::with_capacity(sample.modifiers.len());
+        for modifier in std::mem::take(&mut sample.modifiers) {
+            if modifier.kind != "shapesys" {
+                let key = (modifier.kind.clone(), modifier.effective_param());
+                if let Some(&slot) = slots.get(&key) {
+                    validate_replaced_modifier(&modifiers[slot])?;
+                    modifiers[slot] = modifier;
+                    continue;
+                }
+                slots.insert(key, modifiers.len());
+            }
+            modifiers.push(modifier);
+        }
+        sample.modifiers = modifiers;
+    }
+    Ok(())
+}
+
+/// Replacement must not hide malformed data. Array lengths belong to the
+/// retained effect, but pyhf's schema checks every occurrence's value types.
+fn validate_replaced_modifier(modifier: &Modifier) -> Result<()> {
+    let numbers = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty() && items.iter().all(serde_json::Value::is_number)
+            })
+    };
+    let data = modifier.data.as_ref();
+    let valid = match modifier.kind.as_str() {
+        "normsys" => data.is_some_and(|data| {
+            ["lo", "hi"]
+                .iter()
+                .all(|key| data.get(key).is_some_and(serde_json::Value::is_number))
+        }),
+        "histosys" => data.is_some_and(|data| {
+            ["lo_data", "hi_data"]
+                .iter()
+                .all(|key| numbers(data.get(key)))
+        }),
+        "staterror" => numbers(data),
+        _ => true,
+    };
+    if !valid {
+        return Err(Error::Unsupported(format!(
+            "{} `{}` has malformed data in a replaced occurrence",
+            modifier.kind,
+            modifier.effective_param().unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 /// How one modifier occurrence declares its free parameter. Two same-named
@@ -152,6 +216,13 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
                          parameter is per-channel and cannot be shared, so give each channel's \
                          modifier a distinct name",
                         modifier.kind, first.channel, channel.name, modifier.kind
+                    )));
+                }
+                if modifier.kind == "shapesys" {
+                    return Err(Error::Unsupported(format!(
+                        "`shapesys` modifier `{param}` repeats in channel `{}`; \
+                         each shapesys name must identify one sample",
+                        channel.name
                     )));
                 }
                 if first.channel != channel.name {

@@ -1,6 +1,36 @@
 //! Keep independent normalization effects on one tensor interpolation axis.
 
 #[test]
+fn repeated_pyhf_modifiers_keep_the_last_sample_local_payload() {
+    let mut doc = serde_json::json!({
+        "channels": [{"name": "c", "samples": [
+            {"name": "s", "data": [10.0], "modifiers": [
+                {"name": "alpha", "type": "normsys", "data": {"lo": 0.8, "hi": 1.2}},
+                {"name": "alpha", "type": "histosys", "data": {"lo_data": [8.0, 6.0], "hi_data": [12.0, 14.0]}},
+                {"name": "alpha", "type": "normsys", "data": {"lo": 0.7, "hi": 1.3}},
+                {"name": "alpha", "type": "histosys", "data": {"lo_data": [8.0], "hi_data": [12.0]}}
+            ]},
+            {"name": "other", "data": [20.0], "modifiers": [
+                {"name": "alpha", "type": "normsys", "data": {"lo": 0.9, "hi": 1.1}}
+            ]}
+        ]}],
+        "observations": [{"name": "c", "data": [30.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "alpha"}}]
+    });
+    let emit = |doc: &serde_json::Value| {
+        let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+        flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal)
+    };
+    let repeated = emit(&doc);
+    let modifiers = doc["channels"][0]["samples"][0]["modifiers"]
+        .as_array_mut()
+        .unwrap();
+    modifiers[1] = modifiers.pop().unwrap();
+    modifiers[0] = modifiers.pop().unwrap();
+    assert_eq!(repeated, emit(&doc));
+}
+
+#[test]
 fn long_scalar_products_keep_per_bin_factors_separate() {
     let sample = |name: &str, count: usize| {
         let mut modifiers: Vec<_> = (0..count)
