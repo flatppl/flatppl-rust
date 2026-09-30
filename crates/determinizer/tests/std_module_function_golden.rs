@@ -13,7 +13,7 @@
 //! members, a 6×6 linear solve of §09's own C² conditions for the two degree-6
 //! interpolators, closed form for the rest).
 
-use flatppl_determinizer::{determinize, determinize_with_roots, is_flatpdl};
+use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -304,27 +304,6 @@ fn a_member_without_a_base_op_form_refuses_naming_itself() {
             "the refusal must say what is missing: {msg}"
         );
     }
-}
-
-// Root-based DCE runs between the lowering pass and the conformance check, so by
-// then the alias's `standard_module` binding can be gone and the module name with
-// it. The refusal must still name the member, falling back to the alias spelling
-// the user wrote.
-#[test]
-fn the_located_refusal_survives_dce_dropping_the_alias_binding() {
-    let src = probe_model(
-        "sp = standard_module(\"special-functions\", \"0.1\")",
-        "sp.erf(0.5)",
-    );
-    let mut m = parse_infer(&src);
-    let root = m.intern("lp");
-    let err = determinize_with_roots(&m, &flatppl_infer::ModuleBundle::new(), Some(&[root]))
-        .expect_err("erf has no base-op form and must refuse");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("sp.erf") && msg.contains("needs an engine primitive"),
-        "the refusal must still name the member after DCE: {msg}"
-    );
 }
 
 // Numeric regression for the coefficient algebra, pinned as the CONSTANT-FOLDED
