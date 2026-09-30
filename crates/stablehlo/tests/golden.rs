@@ -13112,6 +13112,31 @@ fn special_function_siblings_form_one_ordered_packet() {
 }
 
 #[test]
+fn scalar_vector_outputs_reuse_their_packed_producer() {
+    let names = (1..=12).map(|i| format!("x{i}")).collect::<Vec<_>>();
+    let inputs = names.join(", ");
+    let declarations = names
+        .iter()
+        .map(|name| format!("{name} = elementof(posreals)\n"))
+        .collect::<String>();
+    let values = names
+        .iter()
+        .map(|name| format!("loggamma({name})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let m = determinize_src(&format!(
+        "{declarations}inputs = ({inputs})\noutputs = [{values}]"
+    ));
+    let out = emit_logdensity(&m);
+    let calls = out
+        .lines()
+        .filter(|line| line.contains("chlo.lgamma "))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "{out}");
+    assert!(calls[0].contains("tensor<12xf32>"), "{out}");
+}
+
+#[test]
 fn constant_special_functions_fold_before_backend_compilation() {
     let m = determinize_src(
         "p = elementof(reals)\n\
