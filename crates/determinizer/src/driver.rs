@@ -101,17 +101,9 @@ pub fn determinize_with_roots(
     // unused arguments may contain module refs that root-based DCE will drop.
     crate::stdfn::lower_std_module_functions(&mut work)?;
 
-    // Cross-module FUNCTION/kernel APPLICATION callees in regular bindings
-    // (`a = m.f(theta)`): graft the cross-module callee to a local node so the
-    // now-local application β-reduces normally in the loop below. This reuses the
-    // query-target grafter (`graft_kernel_application_callee` — which grafts only
-    // the callee and REFUSES a cross-module value argument, preserving the
-    // `m.k(m.rec)` refusal). Top-level alias bindings whose RHS IS a bare
-    // module ref, and cross-module refs in draw-measure position, are already
-    // handled by `resolve_crossmodule_aliases`; this covers a module-ref CALLEE
-    // nested inside a binding's application RHS, which that pass does not reach.
-    let app_bindings: Vec<(flatppl_core::BindingId, NodeId)> =
-        work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    // Resolve root applications before measure lowering, preserving the existing
+    // callee-only graft and its cross-module argument checks.
+    let app_bindings: Vec<_> = work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
     let mut grafted_application = false;
     for (bid, rhs) in app_bindings {
         if let Some(rebuilt) =
@@ -121,8 +113,6 @@ pub fn determinize_with_roots(
             grafted_application = true;
         }
     }
-
-    // Application grafts can introduce members absent from the initial pass.
     if grafted_application {
         crate::stdfn::lower_std_module_functions(&mut work)?;
     }
@@ -143,6 +133,16 @@ pub fn determinize_with_roots(
                 match crate::is_flatpdl(&work) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
+                        // Simplification must discard unused arguments and
+                        // bindings before nested import guards can refuse them.
+                        if violations
+                            .iter()
+                            .any(|v| v.kind == crate::NonConformKind::ResidualUserCall)
+                            && graft_application_callees(&mut work, bundle)?
+                        {
+                            crate::stdfn::lower_std_module_functions(&mut work)?;
+                            continue;
+                        }
                         // Residual conformance issue not covered by the
                         // measure-vocab scan (e.g. a stochastic-phase Ref that
                         // slipped through). Report the first violation as a
@@ -162,6 +162,53 @@ pub fn determinize_with_roots(
             }
         }
     }
+}
+
+/// Visit each shared node once, without adding a recursion-depth limit.
+/// Only callees cross the boundary; the existing argument guards still apply.
+fn graft_application_callees(m: &mut Module, bundle: &ModuleBundle) -> Result<bool, RefuseError> {
+    let bindings: Vec<_> = m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    let mut mapped: Vec<Option<NodeId>> = vec![None; m.node_count()];
+    let mut stack = Vec::new();
+    let mut changed = false;
+    for (bid, root) in bindings {
+        stack.push((root, false));
+        while let Some((id, finish)) = stack.pop() {
+            if mapped[id.index()].is_some() {
+                continue;
+            }
+            if !finish {
+                stack.push((id, true));
+                m.for_each_child(id, |child| stack.push((child, false)));
+                continue;
+            }
+            let children = m.node(id).children();
+            let replacements: Vec<_> = children
+                .iter()
+                .map(|child| mapped[child.index()].expect("children precede parents"))
+                .collect();
+            let mut rhs = if children == replacements {
+                id
+            } else {
+                rebuild_with_children(m, id, &replacements)
+            };
+            // References keep their identity; their binding roots are visited
+            // separately, including bindings that occur later in source order.
+            if matches!(m.node(rhs), Node::Call(c) if matches!(c.head, CallHead::User(_)))
+                && let Some(grafted) =
+                    crate::density::graft_kernel_application_callee(m, rhs, bundle)?
+            {
+                rhs = grafted;
+                changed = true;
+            }
+            mapped[id.index()] = Some(rhs);
+        }
+        let rhs = mapped[root.index()].expect("binding root visited");
+        if rhs != root {
+            m.set_binding_rhs(bid, rhs);
+        }
+    }
+    Ok(changed)
 }
 
 /// Scan bindings for the next measure-layer node to reduce. Returns
@@ -886,9 +933,8 @@ pub(crate) fn referenced_binding_names(
     referenced
 }
 
-/// Collect every `%ref self <name>` reachable in `root`'s subtree — as a body
-/// sub-node OR as a `functionof` / `kernelof` reification *input* boundary
-/// entry — into `out`.
+/// Collect referenced local bindings and module aliases in `root`'s subtree,
+/// including `functionof` / `kernelof` reification input boundaries.
 ///
 /// **`Inputs`-aware.** `for_each_child` / `children()` deliberately EXCLUDE a
 /// `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
@@ -925,13 +971,27 @@ pub(crate) fn collect_referenced_names(
             }) => {
                 out.insert(*name);
             }
+            Node::Ref(Ref {
+                ns: RefNs::Module(alias),
+                ..
+            }) => {
+                // A surviving imported call still needs its load_module binding
+                // and load-time substitutions after root-based DCE.
+                out.insert(*alias);
+            }
             Node::Call(c) => {
                 // A reification input `(name, %ref self <name>)` references the
                 // binding just as a body ref does — but lives outside `children()`.
                 if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
                     for (_, r) in entries.iter() {
-                        if r.ns == RefNs::SelfMod {
-                            out.insert(r.name);
+                        match r.ns {
+                            RefNs::SelfMod => {
+                                out.insert(r.name);
+                            }
+                            RefNs::Module(alias) => {
+                                out.insert(alias);
+                            }
+                            _ => {}
                         }
                     }
                 }

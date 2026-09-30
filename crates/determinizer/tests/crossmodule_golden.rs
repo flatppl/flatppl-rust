@@ -1590,6 +1590,54 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
     );
 }
 
+#[test]
+fn nested_imported_calls_preserve_arguments_and_result_shape() {
+    let helpers = parse("step = external(reals)\nf(x) = x + step");
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(helpers));
+    let mut model = parse(
+        "raw = external(reals)\nstep = raw + 1\n\
+         h = load_module(\"helpers.flatppl\", step = step)\n\
+         x = elementof(reals)\ninputs = (x, raw)\n\
+         outputs = record(values = [h.f(x), h.f(h.f(x))])",
+    );
+    let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let actual = determinize_with_roots(&model, &bundle, Some(&roots)).unwrap();
+    let mut expected = parse(
+        "raw = external(reals)\nstep = raw + 1\n\
+         x = elementof(reals)\ninputs = (x, raw)\n\
+         outputs = record(values = [x + step, (x + step) + step])",
+    );
+    let roots = [expected.intern("inputs"), expected.intern("outputs")];
+    let expected = determinize_with_roots(&expected, &ModuleBundle::new(), Some(&roots)).unwrap();
+    assert_eq!(
+        flatppl_flatpir::write(&actual),
+        flatppl_flatpir::write(&expected)
+    );
+}
+
+#[test]
+fn unused_nested_imported_calls_do_not_block_outputs() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(parse("c = 1\nf(x) = x + c")));
+    let mut model = parse(
+        "h = load_module(\"helpers.flatppl\")\nc = 9\n\
+         x = elementof(reals)\ninputs = x\nfirst(a, b) = a\n\
+         unused = [h.f(x)]\noutputs = first(x, [h.f(x)])",
+    );
+    let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let actual = determinize_with_roots(&model, &bundle, Some(&roots)).unwrap();
+    let mut expected = parse("x = elementof(reals)\ninputs = x\noutputs = x");
+    let roots = [expected.intern("inputs"), expected.intern("outputs")];
+    let expected = determinize_with_roots(&expected, &ModuleBundle::new(), Some(&roots)).unwrap();
+    assert_eq!(
+        flatppl_flatpir::write(&actual),
+        flatppl_flatpir::write(&expected)
+    );
+}
+
 /// Lower local members before graft checks and imported members after grafts.
 #[test]
 fn standard_functions_lower_before_and_after_module_grafts() {
