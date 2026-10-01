@@ -4888,7 +4888,9 @@ fn undeclared_placeholders(
             }
             _ => {}
         }
-        pending.extend(module.node(id).children().into_iter().rev());
+        let start = pending.len();
+        module.node(id).for_each_child(|child| pending.push(child));
+        pending[start..].reverse();
     }
     found
 }
