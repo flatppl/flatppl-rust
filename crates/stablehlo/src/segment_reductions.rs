@@ -520,6 +520,31 @@ fn padded_gather(
         extended_ty.render(out.dtype, source.elem),
     ));
     let count = segments.len() as u64;
+    // A complete sequential table is a view of the padded source. Preserve
+    // identity positions and the reduction axis, including the last short row.
+    if let Some(rows) = count.checked_mul(maximum as u64)
+        && rows <= width + 1
+        && segments
+            .iter()
+            .flat_map(|s| (0..maximum).map(move |i| s.indices.get(i).copied().unwrap_or(width)))
+            .eq(0..rows)
+    {
+        let input = Value {
+            ssa: extended,
+            ty: extended_ty,
+            elem: source.elem,
+        };
+        let mut limits = dims.iter().map(|d| d.unwrap()).collect::<Vec<_>>();
+        limits[axis] = rows;
+        let selected = out.slice(&input, &vec![0; dims.len()], &limits, &vec![1; dims.len()]);
+        let mut split = dims.to_vec();
+        split[axis] = Some(maximum as u64);
+        split.insert(axis, Some(count));
+        let view = out.reshape(&selected, MlirTy::Ranked(split));
+        let mut perm = vec![axis as u64];
+        perm.extend((0..dims.len() as u64 + 1).filter(|&d| d != axis as u64));
+        return out.transpose(&view, &perm);
+    }
     let index = out
         .folded_constant(
             segments
