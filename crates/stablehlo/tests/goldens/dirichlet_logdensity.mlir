@@ -8,7 +8,7 @@ module {
     %6 = stablehlo.negate %5 : tensor<f32>
     %7 = stablehlo.constant dense<1.0> : tensor<3xf32>
     %8 = stablehlo.subtract %arg0, %7 : tensor<3xf32>
-    %9 = stablehlo.constant dense<[-1.6094379425048828, -1.2039728164672852, -0.6931471824645996]> : tensor<3xf32>
+    %9 = stablehlo.constant dense<"0x1002CEBFC81B9ABF187231BF"> : tensor<3xf32>
     %10 = stablehlo.multiply %8, %9 : tensor<3xf32>
     %11 = stablehlo.reduce(%10 init: %1) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
     %12 = stablehlo.add %3, %6 : tensor<f32>

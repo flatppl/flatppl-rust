@@ -13,7 +13,7 @@ module {
     %10 = stablehlo.multiply %0, %arg0 : tensor<f32>
     %11 = chlo.lgamma %10 : tensor<f32> -> tensor<f32>
     %12 = stablehlo.negate %11 : tensor<f32>
-    %13 = stablehlo.constant dense<0.25> : tensor<f32>
+    %13 = stablehlo.constant dense<"0x0000803E"> : tensor<f32>
     %14 = stablehlo.divide %13, %arg0 : tensor<f32>
     %15 = stablehlo.add %1, %14 : tensor<f32>
     %16 = stablehlo.log %15 : tensor<f32>

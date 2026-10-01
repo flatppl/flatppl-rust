@@ -7,7 +7,7 @@ module {
     %6 = chlo.lgamma %arg0 : tensor<f32> -> tensor<f32>
     %7 = stablehlo.negate %6 : tensor<f32>
     %8 = stablehlo.add %arg0, %3 : tensor<f32>
-    %9 = stablehlo.constant dense<-0.6931471824645996> : tensor<f32>
+    %9 = stablehlo.constant dense<"0x187231BF"> : tensor<f32>
     %10 = stablehlo.multiply %8, %9 : tensor<f32>
     %11 = stablehlo.negate %10 : tensor<f32>
     %12 = stablehlo.divide %arg1, %0 : tensor<f32>

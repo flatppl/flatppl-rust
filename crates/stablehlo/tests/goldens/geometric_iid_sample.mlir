@@ -7,7 +7,7 @@ module {
     %7 = stablehlo.constant dense<1.1920929E-7> : tensor<4xf32>
     %8 = stablehlo.multiply %6, %7 : tensor<4xf32>
     %9 = stablehlo.log %8 : tensor<4xf32>
-    %11 = stablehlo.constant dense<-0.3566749691963196> : tensor<f32>
+    %11 = stablehlo.constant dense<"0x1A9EB6BE"> : tensor<f32>
     %12 = stablehlo.broadcast_in_dim %11, dims = [] : (tensor<f32>) -> tensor<4xf32>
     %13 = stablehlo.divide %9, %12 : tensor<4xf32>
     %14 = stablehlo.floor %13 : tensor<4xf32>

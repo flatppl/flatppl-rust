@@ -1,7 +1,7 @@
 module {
   func.func @logdensity() -> tensor<f32> {
     %0 = stablehlo.constant dense<[0.3, 1.2]> : tensor<2xf32>
-    %20 = stablehlo.constant dense<[-3.2479114532470703, -1.861617088317871]> : tensor<2xf32>
+    %20 = stablehlo.constant dense<"0xC8DD4FC07849EEBF"> : tensor<2xf32>
     %21 = stablehlo.constant dense<0xFF800000> : tensor<f32>
     %22 = stablehlo.reduce(%20 init: %21) applies stablehlo.maximum across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
     %23 = stablehlo.broadcast_in_dim %22, dims = [] : (tensor<f32>) -> tensor<2xf32>

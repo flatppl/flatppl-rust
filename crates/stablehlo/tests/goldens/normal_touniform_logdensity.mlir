@@ -2,7 +2,7 @@ module {
   func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
     %0 = stablehlo.constant dense<0.5> : tensor<f32>
     %2 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %3 = stablehlo.constant dense<0.0> : tensor<f32>
+    %3 = stablehlo.constant dense<"0x00000000"> : tensor<f32>
     %4 = stablehlo.constant dense<true> : tensor<i1>
     %5 = stablehlo.compare LE, %0, %2 : (tensor<f32>, tensor<f32>) -> tensor<i1>
     %6 = stablehlo.and %4, %5 : tensor<i1>

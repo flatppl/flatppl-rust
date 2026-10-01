@@ -5,8 +5,8 @@ module {
     %2 = stablehlo.convert %arg0 : (tensor<i32>) -> tensor<f32>
     %3 = stablehlo.add %2, %1 : tensor<f32>
     %4 = chlo.lgamma %3 : tensor<f32> -> tensor<f32>
-    %5 = stablehlo.constant dense<2.0> : tensor<f32>
-    %8 = stablehlo.constant dense<-0.6931471824645996> : tensor<f32>
+    %5 = stablehlo.constant dense<"0x00000040"> : tensor<f32>
+    %8 = stablehlo.constant dense<"0x187231BF"> : tensor<f32>
     %9 = stablehlo.subtract %arg0, %0 : tensor<i32>
     %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<f32>
     %11 = stablehlo.add %10, %1 : tensor<f32>

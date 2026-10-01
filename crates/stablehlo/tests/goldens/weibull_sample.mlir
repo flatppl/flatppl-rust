@@ -9,7 +9,7 @@ module {
     %9 = stablehlo.multiply %7, %8 : tensor<f32>
     %10 = stablehlo.log %9 : tensor<f32>
     %11 = stablehlo.negate %10 : tensor<f32>
-    %12 = stablehlo.constant dense<0.5> : tensor<f32>
+    %12 = stablehlo.constant dense<"0x0000003F"> : tensor<f32>
     %13 = stablehlo.power %11, %12 : tensor<f32>
     %14 = stablehlo.multiply %1, %13 : tensor<f32>
     return %14, %3 : tensor<f32>, tensor<2xui64>

@@ -3,8 +3,8 @@ module {
     %1 = stablehlo.constant dense<1.0> : tensor<f32>
     %2 = stablehlo.constant dense<0.0> : tensor<f32>
     %3 = stablehlo.constant dense<false> : tensor<i1>
-    %6 = stablehlo.constant dense<1.6666666269302368> : tensor<f32>
-    %10 = stablehlo.constant dense<0.25819888710975647> : tensor<f32>
+    %6 = stablehlo.constant dense<"0x5555D53F"> : tensor<f32>
+    %10 = stablehlo.constant dense<"0xA532843E"> : tensor<f32>
     %11, %12 = stablehlo.rng_bit_generator %key, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128xui32>)
     %13 = stablehlo.constant dense<9> : tensor<128xui32>
     %14 = stablehlo.shift_right_logical %12, %13 : tensor<128xui32>

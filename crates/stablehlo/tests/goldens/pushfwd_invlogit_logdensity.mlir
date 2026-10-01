@@ -10,21 +10,21 @@ module {
     %7 = stablehlo.subtract %2, %6 : tensor<f32>
     %8 = stablehlo.divide %6, %7 : tensor<f32>
     %9 = stablehlo.log %8 : tensor<f32>
-    %12 = stablehlo.subtract %9, %0 : tensor<f32>
-    %13 = stablehlo.divide %12, %2 : tensor<f32>
-    %14 = stablehlo.constant dense<-0.5> : tensor<f32>
-    %15 = stablehlo.multiply %13, %13 : tensor<f32>
-    %16 = stablehlo.multiply %14, %15 : tensor<f32>
-    %17 = stablehlo.constant dense<-0.9189385175704956> : tensor<f32>
-    %18 = stablehlo.add %17, %16 : tensor<f32>
-    %19 = stablehlo.log %6 : tensor<f32>
-    %20 = stablehlo.negate %6 : tensor<f32>
-    %21 = stablehlo.log_plus_one %20 : tensor<f32>
-    %22 = stablehlo.add %19, %21 : tensor<f32>
-    %23 = stablehlo.subtract %18, %22 : tensor<f32>
-    %24 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %25 = stablehlo.negate %24 : tensor<f32>
-    %26 = stablehlo.select %4, %23, %25 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %26 : tensor<f32>
+    %13 = stablehlo.subtract %9, %0 : tensor<f32>
+    %14 = stablehlo.divide %13, %2 : tensor<f32>
+    %15 = stablehlo.constant dense<-0.5> : tensor<f32>
+    %16 = stablehlo.multiply %14, %14 : tensor<f32>
+    %17 = stablehlo.multiply %15, %16 : tensor<f32>
+    %18 = stablehlo.constant dense<"0x8E3F6BBF"> : tensor<f32>
+    %19 = stablehlo.add %18, %17 : tensor<f32>
+    %20 = stablehlo.log %6 : tensor<f32>
+    %21 = stablehlo.negate %6 : tensor<f32>
+    %22 = stablehlo.log_plus_one %21 : tensor<f32>
+    %23 = stablehlo.add %20, %22 : tensor<f32>
+    %24 = stablehlo.subtract %19, %23 : tensor<f32>
+    %25 = stablehlo.constant dense<0x7F800000> : tensor<f32>
+    %26 = stablehlo.negate %25 : tensor<f32>
+    %27 = stablehlo.select %4, %24, %26 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %27 : tensor<f32>
   }
 }

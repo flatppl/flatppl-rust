@@ -7,7 +7,7 @@ module {
     %5 = stablehlo.convert %4 : (tensor<ui32>) -> tensor<f32>
     %6 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
     %7 = stablehlo.multiply %5, %6 : tensor<f32>
-    %9 = stablehlo.constant dense<0.018315639346837997> : tensor<f32>
+    %9 = stablehlo.constant dense<"0xAE0A963C"> : tensor<f32>
     %10 = stablehlo.constant dense<0.0> : tensor<f32>
     %11 = stablehlo.constant dense<false> : tensor<i1>
     %17:5 = stablehlo.while(%12 = %10, %13 = %9, %14 = %9, %15 = %11, %16 = %10) : tensor<f32>, tensor<f32>, tensor<f32>, tensor<i1>, tensor<f32>

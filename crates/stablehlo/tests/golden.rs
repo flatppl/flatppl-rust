@@ -491,7 +491,7 @@ fn emitter_scalar_add_produces_well_formed_module() {
     let c = e.add(&a, &b);
     let out = e.finish("logdensity", &[], &[&c]);
 
-    assert!(out.contains("stablehlo.constant dense<5.0>"));
+    assert!(out.contains("stablehlo.constant dense<\"0x0000A040\">"));
     assert!(out.contains("func.func @logdensity"));
     assert!(out.contains("return"));
     assert!(is_delimiter_balanced(&out));
@@ -1852,9 +1852,8 @@ fn lower_gt_and_lt_emit_matching_compare_directions() {
 
 /// §03 `pi` — the scalar constant in the EXACT shape the open-image gate builds it:
 /// `lt(y, divide(pi, 2.0))`, `atan`'s upper endpoint (`determinizer::invert::half_pi`, a
-/// `Node::Const` under §07 `divide`). The literal is `f64`'s shortest round-trip text,
-/// which the MLIR parser rounds to the nearest f32 in an f32 module, as every other real
-/// literal is.
+/// `Node::Const` under §07 `divide`). Constant folding rounds to the target
+/// precision before serializing the exact f32 bits.
 #[test]
 fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
     let mut m = Module::new();
@@ -1874,7 +1873,7 @@ fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
     );
 
     assert!(
-        out.contains("stablehlo.constant dense<1.5707963705062866> : tensor<f32>"),
+        out.contains("stablehlo.constant dense<\"0xDB0FC93F\"> : tensor<f32>"),
         "in:\n{out}"
     );
     assert!(!out.contains("stablehlo.divide"), "half pi folds:\n{out}");
@@ -5811,7 +5810,7 @@ fn emit_logdensity_categorical_has_expected_structure() {
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<-1.2039728164672852>"),
+        out.contains("stablehlo.constant dense<\"0xC81B9ABF\">"),
         "expected log(0.3) at f32 precision, in:\n{out}"
     );
     assert!(!out.contains("stablehlo.concatenate"), "{out}");
@@ -5866,7 +5865,7 @@ fn emit_logdensity_categorical0_has_expected_structure() {
         "missing func.func @logdensity() (no free params) in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<-1.2039728164672852>"),
+        out.contains("stablehlo.constant dense<\"0xC81B9ABF\">"),
         "expected 0-based k=1 to select p[1]=0.3 and fold its log, in:\n{out}"
     );
     assert!(!out.contains("stablehlo.concatenate"), "{out}");
@@ -6089,7 +6088,7 @@ fn categorical0_logpdf_at_floor_selects_first_element() {
     let result = e.lower_node(node).unwrap();
     let out = e.finish("f", &[], &[&result]);
     assert!(
-        out.contains("stablehlo.constant dense<-1.6094379425048828>"),
+        out.contains("stablehlo.constant dense<\"0x1002CEBF\">"),
         "expected k=0 to select p[0]=0.2 and fold its log, in:\n{out}"
     );
 }
@@ -11954,11 +11953,14 @@ outputs = (lp)\n";
         .expect("table field access must emit, not refuse the `table` head");
     assert!(out.contains("module {"));
     assert!(
-        out.contains("21.0"),
+        out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
         "bb[1] = 21.0 (the projected column) must appear:\n{out}"
     );
     assert!(
-        !out.contains("11.0") && !out.contains("12.0"),
+        !out.contains("11.0")
+            && !out.contains("12.0")
+            && !out.contains("00003041")
+            && !out.contains("00004041"),
         "the unused `aa` column (11.0/12.0) must not appear — wrong column projected:\n{out}"
     );
 }
@@ -13167,16 +13169,25 @@ fn folded_dense_constants_preserve_target_rounding_and_signed_zero() {
         values = neg.(rowstack([[-1.5, -2.0, 0.0], [-0.1, -3.0, -4.0]]))\n\
         inputs = p\noutputs = sum(values .+ p)",
     );
-    for (dtype, rounded) in [(Dtype::F32, "0.10000000149011612"), (Dtype::F64, "0.1")] {
+    for (dtype, bits) in [
+        (
+            Dtype::F32,
+            "0000C03F0000004000000080CDCCCC3D0000404000008040",
+        ),
+        (
+            Dtype::F64,
+            concat!(
+                "000000000000F83F00000000000000400000000000000080",
+                "9A9999999999B93F00000000000008400000000000001040"
+            ),
+        ),
+    ] {
         let out = flatppl_stablehlo::emit(
             &m,
             flatppl_stablehlo::Mode::LogDensity,
             &flatppl_stablehlo::EmitOptions { dtype },
         )
         .unwrap();
-        assert!(
-            out.contains(&format!("dense<[[1.5, 2.0, -0.0], [{rounded}, 3.0, 4.0]]>")),
-            "{out}"
-        );
+        assert!(out.contains(&format!("dense<\"0x{bits}\">")), "{out}");
     }
 }
