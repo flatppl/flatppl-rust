@@ -48,6 +48,32 @@ struct CallFrame {
     callee: Option<(NodeId, Type)>,
     args: Vec<(NodeId, Type, Phase)>,
     named: Vec<(Symbol, NodeId, Type, Phase)>,
+    body_result: Option<Box<InferredBody>>,
+}
+
+/// One completed type-stage request, consumed by the same call's value-set rule.
+/// Child annotations and auto-input discoveries never leave their original scope.
+struct InferredBody {
+    body: NodeId,
+    seeds: Vec<(NodeId, Resolved)>,
+    result: (Type, ValueSet),
+}
+
+impl InferredBody {
+    fn matches(&self, body: NodeId, seeds: &[(NodeId, Resolved)]) -> bool {
+        self.body == body
+            && self.seeds.len() == seeds.len()
+            && self.seeds.iter().zip(seeds).all(|((a, x), (b, y))| {
+                a == b
+                    && x.ty == y.ty
+                    && x.phase == y.phase
+                    && x.vset == y.vset
+                    && x.result.is_none()
+                    && y.result.is_none()
+                    && x.catalogue.is_none()
+                    && y.catalogue.is_none()
+            })
+    }
 }
 
 enum CallResume {
@@ -57,6 +83,7 @@ enum CallResume {
 
 struct BodyFrame {
     body: NodeId,
+    seeds: Vec<(NodeId, Resolved)>,
     scope: Scope,
     resume: CallResume,
 }
@@ -496,7 +523,14 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.auto_inputs.pop();
                     self.restore_scope(frame.scope);
                     match frame.resume {
-                        CallResume::Type(call, resume) => {
+                        CallResume::Type(mut call, resume) => {
+                            if self.level >= Level::Valueset {
+                                call.body_result = Some(Box::new(InferredBody {
+                                    body: frame.body,
+                                    seeds: frame.seeds,
+                                    result: (ty.clone(), vset.clone()),
+                                }));
+                            }
                             let step = resume(self, (ty, vset));
                             self.finish_call_type(call, step, work);
                         }
@@ -764,6 +798,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             callee,
             args,
             named,
+            body_result: None,
         };
         self.finish_call_type(frame, step, work);
     }
@@ -778,8 +813,14 @@ impl<'m, 's> Inferencer<'m, 's> {
         let scope = self.suspend_scope();
         self.seed_inputs(&seeds);
         self.auto_inputs.push(HashMap::new());
+        let seeds = if self.level >= Level::Valueset && matches!(&resume, CallResume::Type(..)) {
+            seeds
+        } else {
+            Vec::new()
+        };
         work.push(Work::ResumeBody(Box::new(BodyFrame {
             body,
+            seeds,
             scope,
             resume,
         })));
@@ -788,7 +829,7 @@ impl<'m, 's> Inferencer<'m, 's> {
 
     fn finish_call_type(
         &mut self,
-        call: CallFrame,
+        mut call: CallFrame,
         step: RuleStep<(Type, Phase)>,
         work: &mut Vec<Work>,
     ) {
@@ -813,6 +854,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                 seeds,
                 resume,
             } => {
+                call.body_result = None;
                 self.start_body(body, seeds, CallResume::Type(call, resume), work);
             }
         }
@@ -820,7 +862,7 @@ impl<'m, 's> Inferencer<'m, 's> {
 
     fn finish_call_valueset(
         &mut self,
-        call: CallFrame,
+        mut call: CallFrame,
         ty: Type,
         phase: Phase,
         step: RuleStep<ValueSet>,
@@ -849,6 +891,15 @@ impl<'m, 's> Inferencer<'m, 's> {
                 seeds,
                 resume,
             } => {
+                // Type and value-set rules can request the same substituted body.
+                // Retain their separate continuations, including broadcast lifting.
+                if let Some(previous) = call.body_result.take()
+                    && previous.matches(body, &seeds)
+                {
+                    let step = resume(self, previous.result);
+                    self.finish_call_valueset(call, ty, phase, step, work);
+                    return;
+                }
                 self.start_body(
                     body,
                     seeds,
