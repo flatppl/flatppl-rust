@@ -1230,8 +1230,8 @@ impl<'m> Emitter<'m> {
         out
     }
 
-    /// In-bounds increasing arithmetic progressions need no index tensor.
-    /// Retain the gather's provenance and fresh scheduling policy.
+    /// Increasing progressions and repeated contiguous blocks need no index
+    /// tensor. Retain the gather's provenance and fresh scheduling policy.
     fn regular_gather_slice(
         &mut self,
         operand: &Value,
@@ -1239,10 +1239,20 @@ impl<'m> Emitter<'m> {
         indices: &[u64],
     ) -> Option<Value> {
         let stride = indices.get(1)?.checked_sub(indices[0])?;
-        if stride == 0
-            || indices
-                .windows(2)
-                .any(|p| p[1].checked_sub(p[0]) != Some(stride))
+        if stride == 0 {
+            return None;
+        }
+        let block = indices
+            .windows(2)
+            .position(|p| p[1].checked_sub(p[0]) != Some(stride))
+            .map_or(indices.len(), |i| i + 1);
+        let repeated = block != indices.len();
+        if repeated
+            && (stride != 1
+                || !indices.len().is_multiple_of(block)
+                || indices
+                    .chunks_exact(block)
+                    .any(|part| part != &indices[..block]))
         {
             return None;
         }
@@ -1253,10 +1263,23 @@ impl<'m> Emitter<'m> {
         let mut starts = vec![0; limits.len()];
         let mut strides = vec![1; limits.len()];
         starts[axis] = indices[0];
-        limits[axis] = indices.last()?.checked_add(1)?;
+        limits[axis] = indices[block - 1].checked_add(1)?;
         strides[axis] = stride;
         // Reusable slices would join existing horizontal-packing regions.
-        let value = self.slice_value(operand, &starts, &limits, &strides, false);
+        let mut value = self.slice_value(operand, &starts, &limits, &strides, false);
+        if repeated {
+            // Insert the repetition axis before the selected block, so the
+            // final reshape repeats whole blocks rather than single entries.
+            let mut dims = shape(&value.ty).to_vec();
+            let mapping: Vec<_> = (0..dims.len())
+                .map(|i| (i + usize::from(i >= axis)) as u64)
+                .collect();
+            dims.insert(axis, Some((indices.len() / block) as u64));
+            value = self.broadcast_in_dim(&value, &mapping, MlirTy::Ranked(dims));
+            let mut result = shape(&operand.ty).to_vec();
+            result[axis] = Some(indices.len() as u64);
+            value = self.reshape_axes(&value, MlirTy::Ranked(result), self.axes_of(operand));
+        }
         self.remember_pointwise(
             &value.ssa,
             &value,
