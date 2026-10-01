@@ -19,6 +19,8 @@
 //! `metricsum(g, [.i^], e)`, so a binder and a spelled-out `output_axes`
 //! argument are the same IR position.
 
+use std::collections::HashSet;
+
 use flatppl_core::{CallHead, Module, Node, NodeId};
 
 use crate::Diagnostic;
@@ -38,34 +40,64 @@ enum Slot {
     Value,
 }
 
+enum Work {
+    Enter(NodeId, Slot, bool),
+    Leave(NodeId, usize),
+}
+
 /// Every §05 axis-position violation in `module`, as `(offending node,
 /// diagnostic)`. The caller marks each node `Failed` before the type trace runs,
 /// so a refused bracket raises exactly one error rather than a cascade.
 pub(crate) fn position_errors(module: &Module) -> Vec<(NodeId, Diagnostic)> {
     let mut out = Vec::new();
+    let mut axis_free = HashSet::new();
     for (_id, b) in module.bindings() {
-        scan(module, b.rhs, Slot::Value, false, &mut out);
+        scan(module, b.rhs, Slot::Value, false, &mut out, &mut axis_free);
     }
     out
 }
 
-fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(NodeId, Diagnostic)>) {
+fn scan(
+    m: &Module,
+    root: NodeId,
+    slot: Slot,
+    in_body: bool,
+    out: &mut Vec<(NodeId, Diagnostic)>,
+    axis_free: &mut HashSet<NodeId>,
+) {
     // Context belongs to each occurrence, not just its NodeId: a shared axis
     // can be legal in one position and illegal in another. Reverse scheduling
     // preserves the recursive walk's callee/positional/named diagnostic order.
-    let mut pending = vec![(root, slot, in_body)];
-    while let Some((id, slot, in_body)) = pending.pop() {
+    let mut axes = 0usize;
+    let mut pending = vec![Work::Enter(root, slot, in_body)];
+    while let Some(work) = pending.pop() {
+        let (id, slot, in_body) = match work {
+            Work::Enter(id, slot, in_body) => (id, slot, in_body),
+            Work::Leave(id, before) => {
+                // Even legal axes depend on occurrence context. Only completed
+                // subtrees with no axis or axis-list witness can be reused.
+                if axes == before && axes != usize::MAX {
+                    axis_free.insert(id);
+                }
+                continue;
+            }
+        };
         let node = m.node(id);
         let Node::Call(c) = node else {
-            if let Node::Axis(ax) = node
-                && slot != Slot::Index
-            {
-                out.push((id, axis_error(m, id, ax.name)));
+            if let Node::Axis(ax) = node {
+                axes = axes.saturating_add(1);
+                if slot != Slot::Index {
+                    out.push((id, axis_error(m, id, ax.name)));
+                }
             }
             continue;
         };
 
+        if axis_free.contains(&id) {
+            continue;
+        }
         if is_axis_list(m, c) {
+            axes = axes.saturating_add(1);
             if slot != Slot::OutputAxes {
                 out.push((id, axis_list_error(id, c.args.is_empty())));
             }
@@ -73,6 +105,8 @@ fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(Node
             // list are legal, and refused entries add nothing.
             continue;
         }
+
+        pending.push(Work::Leave(id, axes));
 
         let head = match c.head {
             CallHead::Builtin(h) => Some(m.resolve(h)),
@@ -88,7 +122,7 @@ fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(Node
                     } else {
                         Slot::Value
                     };
-                    pending.push((a, child, in_body || i == 2));
+                    pending.push(Work::Enter(a, child, in_body || i == 2));
                 }
                 // No keyword branch: distinguished inputs cannot be passed by
                 // keyword (§04 Calling conventions); special_arity_check
@@ -99,12 +133,12 @@ fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(Node
                     c.named
                         .iter()
                         .rev()
-                        .map(|n| (n.value, Slot::Value, in_body)),
+                        .map(|n| Work::Enter(n.value, Slot::Value, in_body)),
                 );
                 let index_slot = if in_body { Slot::Index } else { Slot::Value };
                 for (i, &a) in c.args.iter().enumerate().rev() {
                     let child = if i == 0 { Slot::Value } else { index_slot };
-                    pending.push((a, child, in_body));
+                    pending.push(Work::Enter(a, child, in_body));
                 }
             }
             _ => {
@@ -112,13 +146,18 @@ fn scan(m: &Module, root: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(Node
                     c.named
                         .iter()
                         .rev()
-                        .map(|n| (n.value, Slot::Value, in_body)),
+                        .map(|n| Work::Enter(n.value, Slot::Value, in_body)),
                 );
-                pending.extend(c.args.iter().rev().map(|&a| (a, Slot::Value, in_body)));
+                pending.extend(
+                    c.args
+                        .iter()
+                        .rev()
+                        .map(|&a| Work::Enter(a, Slot::Value, in_body)),
+                );
             }
         }
         if let CallHead::User(callee) = c.head {
-            pending.push((callee, Slot::Value, in_body));
+            pending.push(Work::Enter(callee, Slot::Value, in_body));
         }
     }
 }
