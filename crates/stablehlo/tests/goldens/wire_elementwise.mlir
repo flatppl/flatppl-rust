@@ -11,7 +11,7 @@ module {
     %8 = stablehlo.exponential %7 : tensor<f32>
     %9 = stablehlo.constant dense<2.0> : tensor<f32>
     %10 = stablehlo.minimum %arg0, %9 : tensor<f32>
-    %11 = stablehlo.constant dense<-2.0> : tensor<f32>
+    %11 = stablehlo.constant dense<"0x000000C0"> : tensor<f32>
     %12 = stablehlo.maximum %10, %11 : tensor<f32>
     return %0, %2, %6, %8, %12 : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
   }

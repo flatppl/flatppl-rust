@@ -6,10 +6,10 @@ module {
     %5 = stablehlo.convert %4 : (tensor<4xui32>) -> tensor<4xf32>
     %6 = stablehlo.constant dense<1.1920929E-7> : tensor<4xf32>
     %7 = stablehlo.multiply %5, %6 : tensor<4xf32>
-    %11 = stablehlo.constant dense<0.20000000298023224> : tensor<f32>
-    %14 = stablehlo.constant dense<0.5> : tensor<f32>
+    %11 = stablehlo.constant dense<"0xCDCC4C3E"> : tensor<f32>
+    %14 = stablehlo.constant dense<"0x0000003F"> : tensor<f32>
     %18 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %19 = stablehlo.constant dense<[0.0, 0.20000000298023224, 0.5]> : tensor<3xf32>
+    %19 = stablehlo.constant dense<"0x00000000CDCC4C3E0000003F"> : tensor<3xf32>
     %20 = stablehlo.reshape %11 : (tensor<f32>) -> tensor<1xf32>
     %21 = stablehlo.reshape %14 : (tensor<f32>) -> tensor<1xf32>
     %22 = stablehlo.reshape %18 : (tensor<f32>) -> tensor<1xf32>

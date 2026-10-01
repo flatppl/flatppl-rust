@@ -114,7 +114,11 @@ impl Emitter<'_> {
             }
             shape(&ty)
         };
-        let literal = dense_literal(&values, dims)?;
+        let literal = if elem == ElemKind::Real {
+            real_buffer_literal(&values, self.dtype)?
+        } else {
+            dense_literal(&values, dims)?
+        };
         let rendered = ty.render(self.dtype, elem);
         let ssa = self.pure_axes(
             format!("stablehlo.constant dense<{literal}> : {rendered}"),
@@ -265,6 +269,27 @@ fn element_count(ty: &MlirTy) -> Option<usize> {
     shape(ty)
         .iter()
         .try_fold(1usize, |n, d| n.checked_mul(usize::try_from((*d)?).ok()?))
+}
+
+fn real_buffer_literal(values: &[Scalar], dtype: Dtype) -> Option<String> {
+    let width = match dtype {
+        Dtype::F32 => 8,
+        Dtype::F64 => 16,
+    };
+    let mut out = String::with_capacity(values.len().checked_mul(width)?.checked_add(4)?);
+    out.push_str("\"0x");
+    for value in values {
+        let Scalar::Real(x) = value else {
+            return None;
+        };
+        // MLIR raw dense buffers use little-endian bytes on every host.
+        match dtype {
+            Dtype::F32 => write!(out, "{:08X}", (*x as f32).to_bits().swap_bytes()).ok()?,
+            Dtype::F64 => write!(out, "{:016X}", x.to_bits().swap_bytes()).ok()?,
+        }
+    }
+    out.push('"');
+    Some(out)
 }
 
 fn dense_literal(values: &[Scalar], dims: &[Option<u64>]) -> Option<String> {

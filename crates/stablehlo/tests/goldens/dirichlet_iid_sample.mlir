@@ -2,8 +2,8 @@ module {
   func.func @sample(%key: tensor<2xui64>) -> (tensor<5x3xf32>, tensor<2xui64>) {
     %1 = stablehlo.constant dense<1.0> : tensor<f32>
     %4 = stablehlo.constant dense<0.0> : tensor<f32>
-    %8 = stablehlo.constant dense<1.6666666269302368> : tensor<f32>
-    %12 = stablehlo.constant dense<0.25819888710975647> : tensor<f32>
+    %8 = stablehlo.constant dense<"0x5555D53F"> : tensor<f32>
+    %12 = stablehlo.constant dense<"0xA532843E"> : tensor<f32>
     %13, %14 = stablehlo.rng_bit_generator %key, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128x5xui32>)
     %15 = stablehlo.constant dense<9> : tensor<128x5xui32>
     %16 = stablehlo.shift_right_logical %14, %15 : tensor<128x5xui32>
@@ -79,8 +79,8 @@ module {
     %89 = stablehlo.broadcast_in_dim %1, dims = [] : (tensor<f32>) -> tensor<5xf32>
     %90 = stablehlo.multiply %40#2, %89 : tensor<5xf32>
     %91 = stablehlo.divide %90, %89 : tensor<5xf32>
-    %95 = stablehlo.constant dense<2.6666667461395264> : tensor<f32>
-    %98 = stablehlo.constant dense<0.20412413775920868> : tensor<f32>
+    %95 = stablehlo.constant dense<"0xABAA2A40"> : tensor<f32>
+    %98 = stablehlo.constant dense<"0xEB05513E"> : tensor<f32>
     %99, %100 = stablehlo.rng_bit_generator %79, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128x5xui32>)
     %101 = stablehlo.constant dense<9> : tensor<128x5xui32>
     %102 = stablehlo.shift_right_logical %100, %101 : tensor<128x5xui32>
@@ -151,8 +151,8 @@ module {
     %167 = stablehlo.multiply %165, %166 : tensor<5xf32>
     %171 = stablehlo.multiply %122#2, %89 : tensor<5xf32>
     %172 = stablehlo.divide %171, %89 : tensor<5xf32>
-    %176 = stablehlo.constant dense<3.6666667461395264> : tensor<f32>
-    %179 = stablehlo.constant dense<0.17407765984535217> : tensor<f32>
+    %176 = stablehlo.constant dense<"0xABAA6A40"> : tensor<f32>
+    %179 = stablehlo.constant dense<"0x6A41323E"> : tensor<f32>
     %180, %181 = stablehlo.rng_bit_generator %161, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128x5xui32>)
     %182 = stablehlo.constant dense<9> : tensor<128x5xui32>
     %183 = stablehlo.shift_right_logical %181, %182 : tensor<128x5xui32>
