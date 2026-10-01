@@ -166,6 +166,25 @@ outputs = sums.(points)
 }
 
 #[test]
+fn sequential_segments_keep_padding_as_a_tensor_view() {
+    let ir = emit(
+        r#"
+flatppl_compat = "0.1"
+planes(a) = aggregate(sum, [.k, .j], a[.i, .j, .k])
+sums(x) = [planes(x[[1, 2, 3], :, :]), planes(x[[4, 5, 6], :, :]), planes(x[[7, 8], :, :])]
+points = elementof(cartpow(cartpow(reals, [8, 2, 3]), 2))
+inputs = points
+outputs = sums.(points)
+"#,
+    );
+    assert_eq!(ir.matches("stablehlo.reduce(").count(), 1, "{ir}");
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+    assert!(ir.contains("dims = [1, 0, 2, 3, 4]"), "{ir}");
+    assert!(ir.contains("tensor<3x2x3x2x3xf32>"), "{ir}");
+    assert!(ir.contains("across dimensions = [2]"), "{ir}");
+}
+
+#[test]
 fn computed_selection_sums_and_products_keep_distinct_identities() {
     let ir = emit(
         r#"
