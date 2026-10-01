@@ -272,6 +272,7 @@ fn element_count(ty: &MlirTy) -> Option<usize> {
 }
 
 fn real_buffer_literal(values: &[Scalar], dtype: Dtype) -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let width = match dtype {
         Dtype::F32 => 8,
         Dtype::F64 => 16,
@@ -283,9 +284,13 @@ fn real_buffer_literal(values: &[Scalar], dtype: Dtype) -> Option<String> {
             return None;
         };
         // MLIR raw dense buffers use little-endian bytes on every host.
-        match dtype {
-            Dtype::F32 => write!(out, "{:08X}", (*x as f32).to_bits().swap_bytes()).ok()?,
-            Dtype::F64 => write!(out, "{:016X}", x.to_bits().swap_bytes()).ok()?,
+        let bits = match dtype {
+            Dtype::F32 => u64::from((*x as f32).to_bits()),
+            Dtype::F64 => x.to_bits(),
+        };
+        for byte in &bits.to_le_bytes()[..width / 2] {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 15)]));
         }
     }
     out.push('"');
