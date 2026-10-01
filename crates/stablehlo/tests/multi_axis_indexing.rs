@@ -114,6 +114,27 @@ fn regular_selection_uses_a_slice_with_exact_last_element() {
 }
 
 #[test]
+fn repeated_contiguous_selection_broadcasts_whole_blocks() {
+    let source = "matrices = elementof(cartpow(cartpow(reals, [5, 3]), 2))\n\
+         pick(matrix) = get(matrix, [2, 3, 2, 3], all)\n\
+         inputs = matrices\noutputs = pick.(matrices)\n";
+    let ir = emit(source).expect("repeated row selection must emit");
+
+    assert!(ir.contains("[0:2, 1:3, 0:3]"), "{ir}");
+    assert!(ir.contains("dims = [0, 2, 3]"), "{ir}");
+    assert!(ir.contains("-> tensor<2x2x2x3xf32>"), "{ir}");
+    assert!(ir.contains("-> tensor<2x4x3xf32>"), "{ir}");
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+
+    let irregular = emit(&source.replace("[2, 3, 2, 3]", "[2, 3, 2, 4]")).unwrap();
+    assert_eq!(
+        irregular.matches("\"stablehlo.gather\"").count(),
+        1,
+        "{irregular}"
+    );
+}
+
+#[test]
 fn literal_only_and_all_slice_and_collapse_axes() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\
