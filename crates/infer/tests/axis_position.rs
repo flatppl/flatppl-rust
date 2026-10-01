@@ -15,6 +15,7 @@
 //! the grammar admits `Axis` and `AxisList` as a `Primary`, so a stray one is
 //! not a parse error and nothing else looked at where it sat.
 
+use flatppl_core::Node;
 use flatppl_infer::{Severity, infer};
 
 const SETUP: &str = "g = eye(2)\nA = rowstack([[1.0, 0.0], [0.0, 1.0]])\nv = [1.0, 2.0]\n";
@@ -355,4 +356,42 @@ fn a_list_of_field_accesses_is_not_an_axis_list() {
 #[test]
 fn an_ordinary_array_literal_is_accepted() {
     accepts("x = [1.0, 2.0]\ny = sum([1, 2, 3])\n");
+}
+
+/// A shared expression still needs validation in each occurrence's position.
+#[test]
+fn shared_axis_expressions_keep_occurrence_diagnostics() {
+    let mut module = flatppl_syntax::parse(
+        "v = [1.0, 2.0]\ngood = aggregate(sum, [], v[.i])\n\
+         bad = 0\nbad_again = 0\nempty_bad = 0\n",
+    )
+    .unwrap();
+    assert!(infer(&mut module).is_empty());
+
+    let good = module.intern("good");
+    let rhs = module.binding(module.binding_by_name(good).unwrap()).rhs;
+    let Node::Call(aggregate) = module.node(rhs) else {
+        panic!("expected aggregation");
+    };
+    let (empty, indexed) = (aggregate.args[1], aggregate.args[2]);
+    let Node::Call(get) = module.node(indexed) else {
+        panic!("expected indexing");
+    };
+    let axis = get.args[1];
+    for (name, rhs) in [
+        ("bad", indexed),
+        ("bad_again", indexed),
+        ("empty_bad", empty),
+    ] {
+        let name = module.intern(name);
+        module.set_binding_rhs(module.binding_by_name(name).unwrap(), rhs);
+    }
+
+    let violations: Vec<_> = infer(&mut module)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .filter(|d| d.message.contains(AXIS) || d.message.contains(LIST))
+        .map(|d| d.node)
+        .collect();
+    assert_eq!(violations, [Some(axis), Some(axis), Some(empty)]);
 }
