@@ -937,8 +937,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     fn validate_load_assigns(&mut self, call: &Call) {
         let load_check: Option<(String, Vec<(Symbol, NodeId)>)> =
             if let CallHead::Builtin(head) = call.head {
-                let head_name = self.module.resolve(head).to_string();
-                if matches!(head_name.as_str(), "load_module" | "standard_module") {
+                if matches!(self.module.resolve(head), "load_module" | "standard_module") {
                     let path = call.args.first().and_then(|&a| {
                         if let Node::Lit(Scalar::Str(s)) = self.module.node(a) {
                             Some(s.to_string())
