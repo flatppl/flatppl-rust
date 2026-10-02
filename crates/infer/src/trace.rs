@@ -15,7 +15,7 @@ use flatppl_core::{
 
 use crate::modules::{Dependency, InferSession, Resolution, Resolved};
 use crate::ops;
-use crate::rule::{Resume, RuleStep};
+use crate::rule::{LocalTargets, Resume, RuleStep};
 use crate::{Diagnostic, Level};
 
 type AutoInputScope = HashMap<NodeId, Box<[(Symbol, Ref)]>>;
@@ -56,6 +56,7 @@ struct CallFrame {
 struct InferredBody {
     body: NodeId,
     seeds: Vec<(NodeId, Resolved)>,
+    targets: Option<Box<LocalTargets>>,
     result: (Type, ValueSet),
 }
 
@@ -84,6 +85,7 @@ enum CallResume {
 struct BodyFrame {
     body: NodeId,
     seeds: Vec<(NodeId, Resolved)>,
+    targets: Option<Box<LocalTargets>>,
     scope: Scope,
     resume: CallResume,
 }
@@ -528,6 +530,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                                 call.body_result = Some(Box::new(InferredBody {
                                     body: frame.body,
                                     seeds: frame.seeds,
+                                    targets: frame.targets,
                                     result: (ty.clone(), vset.clone()),
                                 }));
                             }
@@ -807,6 +810,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         &mut self,
         body: NodeId,
         seeds: Vec<(NodeId, Resolved)>,
+        targets: Option<Box<LocalTargets>>,
         resume: CallResume,
         work: &mut Vec<Work>,
     ) {
@@ -821,6 +825,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         work.push(Work::ResumeBody(Box::new(BodyFrame {
             body,
             seeds,
+            targets,
             scope,
             resume,
         })));
@@ -843,19 +848,26 @@ impl<'m, 's> Inferencer<'m, 's> {
                         &call.args,
                         &call.named,
                         &ty,
+                        call.body_result
+                            .as_ref()
+                            .and_then(|result| result.targets.as_deref()),
                     )
                 } else {
                     RuleStep::Ready(ValueSet::Unknown)
                 };
+                if let Some(result) = &mut call.body_result {
+                    result.targets = None;
+                }
                 self.finish_call_valueset(call, ty, phase, valueset, work);
             }
             RuleStep::InferBody {
                 body,
                 seeds,
+                targets,
                 resume,
             } => {
                 call.body_result = None;
-                self.start_body(body, seeds, CallResume::Type(call, resume), work);
+                self.start_body(body, seeds, targets, CallResume::Type(call, resume), work);
             }
         }
     }
@@ -889,6 +901,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             RuleStep::InferBody {
                 body,
                 seeds,
+                targets: _,
                 resume,
             } => {
                 // Type and value-set rules can request the same substituted body.
@@ -903,6 +916,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                 self.start_body(
                     body,
                     seeds,
+                    None,
                     CallResume::Valueset(call, ty, phase, resume),
                     work,
                 );

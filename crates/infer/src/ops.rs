@@ -15,8 +15,8 @@ use flatppl_core::{
 
 use crate::Level;
 use crate::consteval::{count_dims, count_dims_with_zero, resolve_count, resolve_dim, static_dim};
-use crate::rule::RuleStep;
 use crate::rule::RuleStep::Ready;
+use crate::rule::{LocalTargets, RuleStep};
 use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -4542,7 +4542,8 @@ fn ksuperpose_cell_variate(
         .collect();
     // A reified component reaches its variate by substitution, exactly as
     // `broadcast_type`'s `Type::Kernel` head does.
-    substituted_result(inf, component, &cell_args, &cell_named).map(inf, move |inf, sub| {
+    let step = substituted_result(inf, component, &cell_args, &cell_named, None, true);
+    step.map(inf, move |inf, sub| {
         if let Some(ty) = sub
             .map(|(ty, _)| ty)
             .or_else(|| reified_result_type(inf, component))
@@ -5644,7 +5645,7 @@ fn user_call_type(
     // cross-module callables and any case substitution can't bind.
     match callee_ty {
         Type::Function { .. } => {
-            substituted_result(inf, callee, args, named).map(inf, move |inf, sub| {
+            substituted_result(inf, callee, args, named, None, true).map(inf, move |inf, sub| {
                 sub.map(|(ty, _)| ty)
                     .or_else(|| reified_result_type(inf, callee))
                     .unwrap_or(Type::Deferred)
@@ -5667,7 +5668,7 @@ fn user_call_type(
             lifted
                 .and_then(inf, move |inf, lifted| match lifted {
                     Some(ty) => Ready(Some(ty)),
-                    None => substituted_result(inf, callee, &args, &named)
+                    None => substituted_result(inf, callee, &args, &named, None, true)
                         .map(inf, |_, sub| sub.map(|(ty, _)| ty)),
                 })
                 .map(inf, move |inf, result| {
@@ -5807,7 +5808,7 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<
         _ => None,
     };
     let sub = match seed {
-        Some(s) => substituted_result(inf, f_node, &s, &[]),
+        Some(s) => substituted_result(inf, f_node, &s, &[], None, true),
         None => Ready(None),
     };
     sub.map(inf, move |inf, sub| {
@@ -5915,6 +5916,8 @@ fn substituted_result(
     callee: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
+    previous: Option<&LocalTargets>,
+    retain_targets: bool,
 ) -> RuleStep<Option<(Type, ValueSet)>> {
     let Some((reif_id, body)) = local_reification(inf, callee) else {
         return Ready(None);
@@ -5928,6 +5931,7 @@ fn substituted_result(
     // input binding's RHS) annotated with the argument's type/phase/value-set.
     let mut seeds: Vec<(NodeId, crate::modules::Resolved)> = Vec::new();
     let mut local_refs = None;
+    let previous = previous.filter(|targets| targets.body == body);
     for (i, (sym, decl)) in inputs.iter().enumerate() {
         // Bind by keyword first (broadcast / named application), then by position.
         let arg = named
@@ -5947,8 +5951,13 @@ fn substituted_result(
         };
         match decl.ns {
             RefNs::Local => {
-                let refs = local_refs.get_or_insert_with(|| collect_local_refs(inf, body));
-                if let Some(nodes) = refs.get(&decl.name) {
+                let targets = previous.unwrap_or_else(|| {
+                    local_refs.get_or_insert_with(|| LocalTargets {
+                        body,
+                        refs: collect_local_refs(inf, body),
+                    })
+                });
+                if let Some(nodes) = targets.refs.get(&decl.name) {
                     seeds.extend(nodes.iter().map(|&node| (node, res.clone())));
                 }
             }
@@ -5971,6 +5980,11 @@ fn substituted_result(
     RuleStep::InferBody {
         body,
         seeds,
+        targets: if retain_targets && inf.level >= Level::Valueset {
+            local_refs.map(Box::new)
+        } else {
+            None
+        },
         resume: Box::new(|_, result| Ready(Some(result))),
     }
 }
@@ -6113,7 +6127,7 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
+            return substituted_result(inf, head_node, &cell_args, &cell_named, None, true).map(
                 inf,
                 move |inf, sub| {
                     let cell = sub
@@ -6150,7 +6164,7 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
+            return substituted_result(inf, head_node, &cell_args, &cell_named, None, true).map(
                 inf,
                 move |inf, sub| {
                     let cell = match sub
@@ -8453,6 +8467,7 @@ pub(crate) fn call_valueset(
     args: &[ArgInfo],
     named: &[NamedInfo],
     ty: &Type,
+    targets: Option<&LocalTargets>,
 ) -> RuleStep<ValueSet> {
     // User-callable application: the reified body's set rides over (for a
     // kernel call, the body set IS the output measure's support). A §09
@@ -8468,7 +8483,8 @@ pub(crate) fn call_valueset(
         // un-substituted body set when substitution binds nothing or yields no
         // finer set.
         let callee_node = *callee_node;
-        return substituted_result(inf, callee_node, args, named).map(inf, move |inf, sub| {
+        let step = substituted_result(inf, callee_node, args, named, targets, false);
+        return step.map(inf, move |inf, sub| {
             if let Some((_, vs)) = sub
                 && vs != ValueSet::Unknown
             {
@@ -8518,15 +8534,13 @@ pub(crate) fn call_valueset(
                 .map(|(s, n, t, p)| (*s, *n, cell(t), *p))
                 .collect();
             let dim = result_array_dim(ty);
-            return substituted_result(inf, head_node, &cell_args, &cell_named).map(
-                inf,
-                move |_, sub| match (sub, dim) {
-                    (Some((_, cell_vs)), Some(dim)) if cell_vs != ValueSet::Unknown => {
-                        ValueSet::CartPow(Box::new(cell_vs), dim)
-                    }
-                    _ => ValueSet::Unknown,
-                },
-            );
+            let step = substituted_result(inf, head_node, &cell_args, &cell_named, targets, false);
+            return step.map(inf, move |_, sub| match (sub, dim) {
+                (Some((_, cell_vs)), Some(dim)) if cell_vs != ValueSet::Unknown => {
+                    ValueSet::CartPow(Box::new(cell_vs), dim)
+                }
+                _ => ValueSet::Unknown,
+            });
         }
         // `load_data`'s value lies in the declared `valueset` itself (spec §07:
         // "`valueset` fully determines the result's shape") — no extra row axis.
