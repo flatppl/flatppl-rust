@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol,
-    Type, ValueSet, Variance,
+    Call, CallHead, Dim, Idx, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType,
+    Symbol, Type, ValueSet, Variance,
 };
 
 use crate::Level;
@@ -4861,12 +4861,15 @@ fn undeclared_placeholders(
     declared: &[Symbol],
 ) -> Vec<(Symbol, NodeId)> {
     let mut found = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = vec![0u64; module.node_count().div_ceil(64)];
     let mut pending = vec![body];
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+        let word = &mut visited[id.index() / 64];
+        let bit = 1u64 << (id.index() % 64);
+        if *word & bit != 0 {
             continue;
         }
+        *word |= bit;
         match module.node(id) {
             Node::Ref(r) if r.ns == RefNs::Local => {
                 if !declared.contains(&r.name) && !found.iter().any(|(p, _)| *p == r.name) {
