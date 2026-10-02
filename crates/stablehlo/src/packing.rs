@@ -202,6 +202,7 @@ pub(super) fn pack<'m>(
         })
         .collect();
     let mut out = Emitter::new(source.m, source.dtype);
+    out.pure_ops.reserve(lines.len());
     out.next = source.next;
     let mut packer = Packer {
         source,
