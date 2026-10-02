@@ -3,7 +3,9 @@
 //! Continuations capture only rule-local state. The trace driver owns nested
 //! inference scopes and restores the caller before invoking its continuation.
 
-use flatppl_core::{NodeId, Type, ValueSet};
+use std::collections::HashMap;
+
+use flatppl_core::{NodeId, Symbol, Type, ValueSet};
 
 use crate::modules::Resolved;
 use crate::trace::Inferencer;
@@ -11,11 +13,19 @@ use crate::trace::Inferencer;
 pub(crate) type Resume<T> =
     Box<dyn for<'m, 's> FnOnce(&mut Inferencer<'m, 's>, (Type, ValueSet)) -> RuleStep<T>>;
 
+/// Structural targets from one request, valid only in the same module and call.
+/// Argument annotations and scoped auto-inputs are always resolved afresh.
+pub(crate) struct LocalTargets {
+    pub(crate) body: NodeId,
+    pub(crate) refs: HashMap<Symbol, Vec<NodeId>>,
+}
+
 pub(crate) enum RuleStep<T> {
     Ready(T),
     InferBody {
         body: NodeId,
         seeds: Vec<(NodeId, Resolved)>,
+        targets: Option<Box<LocalTargets>>,
         resume: Resume<T>,
     },
 }
@@ -32,10 +42,12 @@ impl<T: 'static> RuleStep<T> {
             Self::InferBody {
                 body,
                 seeds,
+                targets,
                 resume,
             } => RuleStep::InferBody {
                 body,
                 seeds,
+                targets,
                 resume: Box::new(move |inf, result| resume(inf, result).map(inf, f)),
             },
         }
@@ -51,10 +63,12 @@ impl<T: 'static> RuleStep<T> {
             Self::InferBody {
                 body,
                 seeds,
+                targets,
                 resume,
             } => RuleStep::InferBody {
                 body,
                 seeds,
+                targets,
                 resume: Box::new(move |inf, result| resume(inf, result).and_then(inf, f)),
             },
         }
