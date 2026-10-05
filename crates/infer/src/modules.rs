@@ -377,6 +377,8 @@ pub(crate) struct Dependency {
 /// args) and its honest-degrade note.
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogueRef {
+    pub(crate) module: String,
+    pub(crate) member: String,
     pub(crate) sig: crate::catalogue::Sig,
     pub(crate) degraded: Option<String>,
 }
@@ -729,6 +731,8 @@ fn resolve_standard(
         vset: ValueSet::Unknown,
         result: None,
         catalogue: Some(CatalogueRef {
+            module: path.clone(),
+            member: binding_name.to_string(),
             sig: sig.clone(),
             degraded: degraded.map(str::to_string),
         }),

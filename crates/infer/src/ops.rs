@@ -19,6 +19,8 @@ use crate::rule::RuleStep::Ready;
 use crate::rule::{LocalTargets, RuleStep};
 use crate::trace::{Inferencer, join_phase};
 
+mod pyhf;
+
 /// `(node, type, phase)` of an inferred positional argument.
 type ArgInfo = (NodeId, Type, Phase);
 /// `(name, node, type, phase)` of an inferred named argument.
@@ -89,6 +91,9 @@ pub(crate) fn call_rule(
                 Type::Failed(format!("{name} is not callable").into()),
                 Phase::Fixed,
             ));
+        }
+        if let Some(ty) = pyhf::call_type(inf, id, callee_node, args, named, false) {
+            return Ready((ty, joined));
         }
         if let Some(ty) = user_arity_check(inf, id, callee_node, &callee_ty, args, named) {
             return Ready((ty, joined));
@@ -6063,6 +6068,10 @@ fn broadcast_type(
         return Ready(Type::Deferred);
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
+
+    if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {
+        return Ready(ty);
+    }
 
     // Common shape over every data input — positional and keyword alike;
     // mismatching array shapes are deferred until real shape-broadcasting.

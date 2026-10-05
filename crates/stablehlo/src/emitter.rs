@@ -44,6 +44,8 @@ mod packed_gathers;
 mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
+#[path = "pyhf.rs"]
+mod pyhf;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
 pub(crate) use batching::Axes;
@@ -1424,6 +1426,13 @@ impl<'m> Emitter<'m> {
         let parts = self.coalesce_input_slices(&parts, &axes);
         if parts.len() == 1 {
             return Ok(parts[0].clone());
+        }
+        // Unbatched concatenation keeps payloads in flat storage order. Retain
+        // fixed templates so downstream coefficients fold at target precision.
+        if axes.batch == 0
+            && let Some(value) = self.fold_vector(&parts, ty.clone(), axes.clone())
+        {
+            return Ok(value);
         }
         let names = parts
             .iter()
@@ -3441,6 +3450,9 @@ impl<'m> Emitter<'m> {
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
+        if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
+            return result;
+        }
         let fname = match self.m.node(f) {
             Node::Const(sym) => self.m.resolve(*sym).to_string(),
             _ => {
@@ -3802,10 +3814,11 @@ impl<'m> Emitter<'m> {
                         crate::ops::lower_builtin(self, id, &name, &call.args)
                     }
                 }
-                CallHead::User(_) => Err(EmitError::at(
-                    id,
-                    "user-callable application has no lowering (expected to be inlined by determinize)",
-                )),
+                CallHead::User(callee) => self.lower_pyhf_call(id, callee, &call.args, false)
+                    .unwrap_or_else(|| Err(EmitError::at(
+                        id,
+                        "user-callable application has no lowering (expected to be inlined by determinize)",
+                    ))),
             },
         }
     }

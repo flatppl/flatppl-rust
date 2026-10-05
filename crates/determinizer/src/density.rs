@@ -589,13 +589,11 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
     }
 }
 
-/// If the `logdensityof` target `arg1` is — or resolves via one `(%ref self …)`
-/// hop to — a reified-kernel APPLICATION `%call { head: User(callee), args }`
-/// whose `callee` (after one ref hop) is a cross-module `(%ref <alias> member)`
-/// ref, GRAFT the callee subtree into the host (via [`graft_cross_module_target`],
-/// which carries the load-time `%assign`, the host-collision refuse, and the
-/// nested-ref handling), rebuild the `%call` with the grafted LOCAL callee as its
-/// head, and return `Some(rebuilt_call)`.
+/// Graft a cross-module callee of a direct or broadcast application into the
+/// host. Follow one self-ref hop on the application and callee. Preserve the
+/// original call head, replacing only its callee slot with the local graft.
+/// [`graft_cross_module_target`] retains load-time assignments, collision
+/// checks and nested-ref handling.
 ///
 /// The application's arguments (`args` / `named` / reification `inputs`) are
 /// assumed host-local — only the callee is grafted — so they are carried over
@@ -612,7 +610,7 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
 /// callee going from a module-ref to a local grafted node bounds the graft to AT
 /// MOST ONCE per query (termination).
 ///
-/// `Ok(None)`: `arg1` is not a user-call application, or its callee is a LOCAL
+/// `Ok(None)`: `arg1` is not a direct/broadcast application, or its callee is a LOCAL
 /// (same-module) ref — the existing same-module `reduce_kernel_application`
 /// handles that untouched (no regression).
 ///
@@ -631,14 +629,25 @@ pub(crate) fn graft_kernel_application_callee(
     // The target may be inline (`logdensityof(m.k(input), pt)`) or bound by name
     // (`ka = m.k(input); logdensityof(ka, pt)`); resolve one ref hop to the call.
     let (call_node, _) = resolve_ref_one(m, arg1);
-    let (callee, args, named, inputs) = {
+    let (head, callee, mut args, named, inputs, arg_start) = {
         let Node::Call(c) = m.node(call_node) else {
             return Ok(None);
         };
-        let CallHead::User(callee) = c.head else {
-            return Ok(None); // a builtin-headed measure op, not a kernel application
+        let (callee, arg_start) = match c.head {
+            CallHead::User(callee) => (callee, 0),
+            CallHead::Builtin(s) if m.resolve(s) == "broadcast" && !c.args.is_empty() => {
+                (c.args[0], 1)
+            }
+            _ => return Ok(None),
         };
-        (callee, c.args.clone(), c.named.clone(), c.inputs.clone())
+        (
+            c.head,
+            callee,
+            c.args.clone(),
+            c.named.clone(),
+            c.inputs.clone(),
+            arg_start,
+        )
     };
     // Only a CROSS-MODULE callee triggers the graft. A local callee (directly, or
     // via one `(%ref self …)` hop) is left for `reduce_kernel_application`.
@@ -661,7 +670,7 @@ pub(crate) fn graft_kernel_application_callee(
     // (rather than just the callee) is a richer follow-up, not required here.
     let arg_is_cross_module =
         |id: NodeId| is_module_ref(m, id) || is_module_ref(m, resolve_ref_one(m, id).0);
-    if let Some(&bad) = args.iter().find(|&&a| arg_is_cross_module(a)) {
+    if let Some(&bad) = args[arg_start..].iter().find(|&&a| arg_is_cross_module(a)) {
         return Err(refuse(
             bad,
             m,
@@ -692,10 +701,17 @@ pub(crate) fn graft_kernel_application_callee(
     let Some(grafted_callee) = graft_cross_module_target(m, callee, bundle, imports)? else {
         return Ok(None);
     };
-    // Rebuild the `%call` with the grafted local callee as its head; the
-    // host-local args / named / reification inputs carry over unchanged.
+    // A broadcast stores its callee in the first argument, not in its head.
+    // Keep the collection operands and their scopes unchanged.
+    let head = match head {
+        CallHead::User(_) => CallHead::User(grafted_callee),
+        head => {
+            args[0] = grafted_callee;
+            head
+        }
+    };
     Ok(Some(m.alloc(Node::Call(Call {
-        head: CallHead::User(grafted_callee),
+        head,
         args,
         named,
         inputs,
