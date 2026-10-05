@@ -917,8 +917,13 @@ fn stablehlo_cmd(
     }
     let roots = Some(abi_syms);
 
-    let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
-        .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    let lowered = flatppl_determinizer::determinize_with_options(
+        &module,
+        &bundle,
+        roots.as_deref(),
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     let opts = flatppl_stablehlo::EmitOptions {
         dtype: if dtype == "f64" {
             flatppl_stablehlo::Dtype::F64

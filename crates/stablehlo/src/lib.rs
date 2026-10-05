@@ -242,9 +242,20 @@ impl Default for EmitOptions {
     }
 }
 
-/// Emit textual StableHLO for `m`, which must already be FlatPDL-conformant
-/// (i.e. the output of `flatppl_determinizer::determinize`). Refuses (never
-/// mis-lowers) if `m` still carries measure-layer constructs.
+/// Keep these calls intact so the emitter can use model and modifier structure.
+/// The default determinizer still expands their portable reference definitions.
+pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
+    flatppl_determinizer::LoweringOptions {
+        retain_standard_functions: &[
+            ("pyhf_helpers", "normsys_factor"),
+            ("pyhf_helpers", "histosys_shift"),
+        ],
+    };
+
+/// Emit textual StableHLO for a determinized module. Pass [`LOWERING_OPTIONS`]
+/// to `flatppl_determinizer::determinize_with_options` to retain calls with
+/// specialized lowering. Portable fully expanded FlatPDL also remains valid.
+/// Refuses if `m` still carries measure-layer constructs.
 ///
 /// Requires the `inputs`/`outputs` compilation ABI (`modes::read_abi` is
 /// `Some`) and routes to the mode builder for `mode`: [`Mode::LogDensity`] →
@@ -253,7 +264,7 @@ impl Default for EmitOptions {
 /// last-public-binding/source-order query heuristic has been removed, so there
 /// is no fallback.
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
-    flatppl_determinizer::is_flatpdl(m)
+    flatppl_determinizer::is_flatpdl_with_options(m, &LOWERING_OPTIONS)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     match modes::read_abi(m)? {
         Some(abi) => match mode {

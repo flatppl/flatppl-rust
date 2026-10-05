@@ -4,9 +4,8 @@
 //! Spec §09 "Standard modules" gives each of these members a closed form over the
 //! `base` module's own deterministic operations (§07 "Built-in functions"). A
 //! member call parses as a USER-headed call whose callee is a
-//! `(%ref <alias> member)`, and FlatPDL admits no residual user call
-//! (`conformance::is_flatpdl`), so without this pass every one of them refuses
-//! with the generic `ResidualUserCall`.
+//! `(%ref <alias> member)`. Portable FlatPDL expands these calls; a backend may
+//! explicitly retain a supported member for its own semantic lowering.
 //!
 //! This is the FUNCTION counterpart to the constructor-tag path: a §09
 //! DISTRIBUTION member keeps its module-qualified call and becomes a kernel tag in
@@ -37,6 +36,8 @@ use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Sca
 
 use crate::density::{build_call, resolve_ref_one};
 use crate::refuse::RefuseError;
+
+mod pyhf;
 
 /// Largest `polynomials` degree this pass will unroll. The lowering emits the
 /// three-term recursion node by node, so the emitted subtree grows linearly in
@@ -79,14 +80,24 @@ const BARRIER_CHI: [&[f64]; 8] = [
 /// ARGUMENTS over unchanged, so a member call nested inside another member call's
 /// argument (`hep.kallen(hep.kallen(x, y, z), y, z)`) surfaces as a top-level
 /// target on the next pass. Each pass replaces at least one call and introduces
-/// none, so the target count strictly decreases and the loop terminates; the bound
-/// is a guard, not the termination argument.
-pub(crate) fn lower_std_module_functions(m: &mut Module) -> Result<(), RefuseError> {
+/// none. Retained calls only normalize their arguments once. The number of
+/// calls needing expansion or argument normalization decreases each pass.
+pub(crate) fn lower_std_module_functions(
+    m: &mut Module,
+    options: &crate::LoweringOptions<'_>,
+) -> Result<(), RefuseError> {
+    let mut pyhf_functions = HashMap::new();
     for _ in 0..MAX_PASSES {
         let targets = collect_member_calls(m);
         let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
         for (id, module, member) in targets {
-            if let Some(new) = lower_member_call(m, id, &module, &member) {
+            if options.retains(&module, &member) {
+                if let Some(new) = normalize_member_call(m, id, &module, &member) {
+                    replacements.insert(id, new);
+                }
+                continue;
+            }
+            if let Some(new) = lower_member_call(m, id, &module, &member, &mut pyhf_functions) {
                 replacements.insert(id, new);
             }
         }
@@ -130,7 +141,7 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
                 CallHead::Builtin(s) if m.resolve(s) == "broadcast" => c.args.first().copied(),
                 _ => None,
             };
-            if let Some(hit) = callee.and_then(|callee| member_of_callee(m, callee)) {
+            if let Some(hit) = callee.and_then(|callee| standard_function(m, callee)) {
                 out.push((id, hit.0, hit.1));
             }
         }
@@ -148,21 +159,55 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
 
 /// The `(module, member)` a call callee names, directly or through one
 /// `(%ref self …)` hop.
-fn member_of_callee(m: &Module, callee: NodeId) -> Option<(String, String)> {
+pub fn standard_function(m: &Module, callee: NodeId) -> Option<(String, String)> {
     crate::crossmodule::std_module_member(m, callee).or_else(|| {
         let hop = resolve_ref_one(m, callee).0;
         crate::crossmodule::std_module_member(m, hop)
     })
 }
 
+/// Retain the resolved callee, but bind ordinary call forms once. Backend
+/// lowerings then receive the catalogue's positional order, including splats.
+fn normalize_member_call(m: &mut Module, id: NodeId, module: &str, member: &str) -> Option<NodeId> {
+    let Node::Call(call) = m.node(id) else {
+        return None;
+    };
+    let mut call = call.clone();
+    let names = flatppl_infer::builtin_catalogue().module_param_names(module, member)?;
+    let names: Vec<_> = names.iter().map(|name| m.intern(name)).collect();
+    let offset =
+        usize::from(matches!(call.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast"));
+    let bound = crate::kernel::bind_call_args(m, &names, &call.args[offset..], &call.named, false)?;
+    let args: Vec<_> = call.args[..offset].iter().copied().chain(bound).collect();
+    if call.named.is_empty() && call.args.as_ref() == args {
+        return None;
+    }
+    call.args = args.into();
+    call.named = Box::default();
+    Some(m.alloc(Node::Call(call)))
+}
+
 /// Build the base-op replacement for the member call at `id`, or `None` to leave
 /// the call alone (no base-op form for this member, or a call shape this pass
 /// cannot read: named arguments, wrong arity, or a non-literal integer degree).
-fn lower_member_call(m: &mut Module, id: NodeId, module: &str, member: &str) -> Option<NodeId> {
+fn lower_member_call(
+    m: &mut Module,
+    id: NodeId,
+    module: &str,
+    member: &str,
+    pyhf_functions: &mut HashMap<String, NodeId>,
+) -> Option<NodeId> {
     let c = match m.node(id) {
-        Node::Call(c) if c.named.is_empty() => c.clone(),
+        Node::Call(c) => c.clone(),
         _ => return None,
     };
+    if module == "pyhf_helpers" {
+        let args = pyhf::ordered_args(m, &c, member)?;
+        return pyhf::lower_call(m, &args, member, pyhf_functions);
+    }
+    if !c.named.is_empty() {
+        return None;
+    }
     if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast") {
         return lower_member_broadcast(m, &c.args[1..], module, member);
     }
@@ -228,6 +273,7 @@ fn lower_member_function(
     member: &str,
 ) -> Option<NodeId> {
     match (module, member) {
+        ("pyhf_helpers", member) => pyhf::lower_function(m, args, member),
         ("particle-physics", "interp_pwlin") => arity::<4>(args).map(|a| interp_pwlin(m, a)),
         ("particle-physics", "interp_pwexp") => arity::<4>(args).map(|a| interp_pwexp(m, a)),
         ("particle-physics", "interp_poly2_lin") => {
@@ -525,11 +571,14 @@ fn interp_poly6_exp(m: &mut Module, [left, center, right, alpha]: [NodeId; 4]) -
     let mid = mul(m, center, mod_val);
 
     let up_arg = mul(m, alpha, log_hi);
-    let neg_alpha = neg(m, alpha);
-    let dn_arg = mul(m, neg_alpha, log_lo);
-    // Select before exp so the unused opposite tail cannot overflow into
-    // reverse-mode derivatives. The polynomial region still selects `mid`.
-    let above = build_call(m, "gt", &[alpha, one]);
+    // Multiply by the Real logarithm before negation, so integer alpha cannot
+    // wrap at its minimum value before entering the exponential tail.
+    let dn_arg = mul(m, alpha, log_lo);
+    let dn_arg = neg(m, dn_arg);
+    // Choose by sign before exp, including inside the polynomial region, so
+    // an inactive reciprocal of a tiny anchor cannot poison the derivative.
+    let zero = lit(m, 0.0);
+    let above = build_call(m, "gt", &[alpha, zero]);
     let tail_arg = build_call(m, "ifelse", &[above, up_arg, dn_arg]);
     let tail_factor = exp(m, tail_arg);
     let tail = mul(m, center, tail_factor);
@@ -716,7 +765,7 @@ pub(crate) fn residual_std_member(m: &Module, call: NodeId) -> Option<String> {
     let CallHead::User(callee) = c.head else {
         return None;
     };
-    if let Some((module, member)) = member_of_callee(m, callee) {
+    if let Some((module, member)) = standard_function(m, callee) {
         return Some(format!("{module}.{member}"));
     }
     let ref_id = resolve_ref_one(m, callee).0;

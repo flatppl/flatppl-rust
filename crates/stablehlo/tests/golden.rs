@@ -13142,7 +13142,7 @@ fn scalar_vector_outputs_reuse_their_packed_producer() {
 fn constant_special_functions_fold_before_backend_compilation() {
     let m = determinize_src(
         "p = elementof(reals)\n\
-        counts = [0, 3, 7]\n\
+        counts = cat([0, 3], [7])\n\
         score = sum(loggamma.(counts .+ 1)) + p\n\
         inputs = (p)\noutputs = (score)",
     );
@@ -13160,6 +13160,38 @@ fn constant_special_functions_fold_before_backend_compilation() {
         out.contains("stablehlo.add"),
         "runtime parameter must remain:\n{out}"
     );
+}
+
+#[test]
+fn constant_concatenation_keeps_nested_storage_order() {
+    for (actual, expected) in [
+        ("cat([-0.0, 0.1], [1.5])", "[-0.0, 0.1, 1.5]"),
+        (
+            "cat([[-0.0, 0.1]], [[1.5, 2.0], [3.0, 4.0]])",
+            "[[-0.0, 0.1], [1.5, 2.0], [3.0, 4.0]]",
+        ),
+    ] {
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let emit = |value| {
+                let m = determinize_src(&format!(
+                    "p = elementof(reals)\ninputs = p\noutputs = neg.({value})"
+                ));
+                flatppl_stablehlo::emit(
+                    &m,
+                    flatppl_stablehlo::Mode::LogDensity,
+                    &flatppl_stablehlo::EmitOptions { dtype },
+                )
+                .unwrap()
+            };
+            let constants = |ir: String| {
+                ir.lines()
+                    .filter_map(|line| line.split_once(" = stablehlo.constant "))
+                    .map(|(_, payload)| payload.to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(constants(emit(actual)), constants(emit(expected)));
+        }
+    }
 }
 
 #[test]

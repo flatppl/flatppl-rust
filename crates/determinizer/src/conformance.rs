@@ -20,6 +20,15 @@ use std::collections::HashSet;
 /// checks, which read the call shape because `flatppl-infer` types both shapes
 /// without complaint.
 pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
+    is_flatpdl_with_options(m, &crate::LoweringOptions::default())
+}
+
+/// Check the same deterministic contract while admitting the target's resolved
+/// standard functions. This does not admit arbitrary residual user calls.
+pub fn is_flatpdl_with_options(
+    m: &Module,
+    options: &crate::LoweringOptions<'_>,
+) -> Result<(), Vec<NonConformance>> {
     let mut bad = Vec::new();
     let tags = kernel_tag_slots(m);
     let mut seen = HashSet::new();
@@ -32,7 +41,7 @@ pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
             if !seen.insert((id, kernel_allowed)) {
                 continue;
             }
-            check_node(m, id, kernel_allowed, &tags, &mut bad);
+            check_node(m, id, kernel_allowed, &tags, options, &mut bad);
             let node = m.node(id);
             let child_kernel_allowed = matches!(node, Node::Call(c)
                 if matches!(c.head, CallHead::Builtin(op)
@@ -97,6 +106,7 @@ fn check_node(
     id: NodeId,
     kernel_allowed: bool,
     tags: &HashSet<NodeId>,
+    options: &crate::LoweringOptions<'_>,
     bad: &mut Vec<NonConformance>,
 ) {
     if matches!(m.phase_of(id), Some(Phase::Stochastic)) {
@@ -194,7 +204,14 @@ fn check_node(
         // ops and the six `builtin_*` primitives (§07 "Measure kernel evaluation
         // primitives"), and the surface printer spells a user call `f(x)` exactly like a
         // builtin one, so nothing downstream can tell them apart.
-        if matches!(c.head, CallHead::User(_)) {
+        let retained = match c.head {
+            CallHead::User(callee) if !options.retain_standard_functions.is_empty() => {
+                crate::stdfn::standard_function(m, callee)
+                    .is_some_and(|(module, member)| options.retains(&module, &member))
+            }
+            _ => false,
+        };
+        if matches!(c.head, CallHead::User(_)) && !retained {
             // A §09 standard-module FUNCTION member with no base-op form
             // (`special-functions`, `ext-linear-algebra`, the Wigner functions, the
             // higher-order `distances` members) reaches here as an ordinary
