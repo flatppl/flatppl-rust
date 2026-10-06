@@ -125,7 +125,7 @@ pub struct Emitter<'m> {
     /// structure from outside this module).
     m: &'m Module,
     dtype: Dtype,
-    enzyme_compatible: bool,
+    restrict_enzyme_compatible: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
     /// its op line emitted) once — see [`Emitter::lower_node`]. Also the seed
@@ -178,7 +178,7 @@ impl<'m> Emitter<'m> {
         Emitter {
             m,
             dtype,
-            enzyme_compatible: crate::EmitOptions::default().enzyme_compatible,
+            restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             next: 0,
             memo: HashMap::new(),
             pure_ops: HashMap::new(),
@@ -197,26 +197,26 @@ impl<'m> Emitter<'m> {
 
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
-        emitter.enzyme_compatible = opts.enzyme_compatible;
+        emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter
     }
 
     /// A new region's scratch emitter must preserve target restrictions.
     pub(super) fn scratch_emitter(&self) -> Self {
         let mut emitter = Self::new(self.m, self.dtype);
-        emitter.enzyme_compatible = self.enzyme_compatible;
+        emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
         emitter
     }
 
-    pub(crate) fn enzyme_compatible(&self) -> bool {
-        self.enzyme_compatible
+    pub(crate) fn restrict_enzyme_compatible(&self) -> bool {
+        self.restrict_enzyme_compatible
     }
 
     pub(crate) fn require_static_shape(&self, id: NodeId, ty: &MlirTy) -> Result<(), EmitError> {
-        if self.enzyme_compatible && shape(ty).contains(&None) {
+        if self.restrict_enzyme_compatible && shape(ty).contains(&None) {
             return Err(EmitError::at(
                 id,
-                "Enzyme-compatible emission requires static tensor shapes",
+                "Enzyme restrictions require static tensor shapes",
             ));
         }
         Ok(())
@@ -398,13 +398,15 @@ impl<'m> Emitter<'m> {
         if let Some(value) = self.fold_binary(op, a, b) {
             return value;
         }
-        let ssa =
-            if self.enzyme_compatible && a.elem == ElemKind::Real && op == "stablehlo.multiply" {
-                self.product_pair(a, b).ssa
-            } else {
-                let ty_text = a.ty.render(self.dtype, a.elem);
-                self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a)
-            };
+        let ssa = if self.restrict_enzyme_compatible
+            && a.elem == ElemKind::Real
+            && op == "stablehlo.multiply"
+        {
+            self.product_pair(a, b).ssa
+        } else {
+            let ty_text = a.ty.render(self.dtype, a.elem);
+            self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a)
+        };
         self.remember_pointwise(
             &ssa,
             a,
@@ -1008,7 +1010,7 @@ impl<'m> Emitter<'m> {
         assert_eq!(dims.len(), limits.len(), "slice: limits rank mismatch");
         assert_eq!(dims.len(), strides.len(), "slice: strides rank mismatch");
 
-        if self.enzyme_compatible && strides.iter().any(|&stride| stride != 1) {
+        if self.restrict_enzyme_compatible && strides.iter().any(|&stride| stride != 1) {
             let mut value = self.slice_value(a, starts, limits, &vec![1; strides.len()], reusable);
             for (axis, &stride) in strides
                 .iter()
@@ -1803,7 +1805,7 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
-        if self.enzyme_compatible
+        if self.restrict_enzyme_compatible
             && combine_op == "stablehlo.multiply"
             && a.elem == ElemKind::Real
             && let Some(out) = self.product_tree(a, axis, &result_ty, &axes)
@@ -3943,7 +3945,7 @@ impl<'m> Emitter<'m> {
         );
         // Enzyme can invalidate adjoints after cross-expression packet packing.
         // Keep source tensor operations, but omit this extra fusion pass.
-        let packed = if self.enzyme_compatible {
+        let packed = if self.restrict_enzyme_compatible {
             None
         } else {
             packing::pack(&self, args, rets)

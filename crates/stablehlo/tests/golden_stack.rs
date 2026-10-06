@@ -43,7 +43,7 @@ fn emit_logdensity(m: &Module) -> String {
         m,
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )
@@ -56,7 +56,7 @@ fn emit_with_dtype(m: &Module, dtype: flatppl_stablehlo::Dtype) -> String {
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
             dtype,
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
         },
     )
     .expect("must emit @logdensity")
@@ -70,7 +70,7 @@ fn emit_err(src: &str) -> String {
         &m,
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )
@@ -526,7 +526,7 @@ fn stack_refuses_higher_rank_and_abi_matrix_arguments() {
         &m,
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )

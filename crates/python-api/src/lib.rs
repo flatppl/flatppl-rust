@@ -89,7 +89,7 @@ impl NativeModule {
         };
         let options = EmitOptions {
             dtype,
-            enzyme_compatible: autodiff,
+            restrict_enzyme_compatible: autodiff,
         };
         let exported = py.detach(|| self.inner.compile(&options)).map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))

@@ -15,7 +15,7 @@ fn emit(source: &str) -> String {
         &lowered,
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )

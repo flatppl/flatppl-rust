@@ -56,7 +56,7 @@ fn emit(src: &str) -> String {
         &determinize_abi(src),
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )
@@ -68,7 +68,7 @@ fn emit_err(src: &str) -> String {
         &determinize_abi(src),
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
             ..Default::default()
         },
     )
