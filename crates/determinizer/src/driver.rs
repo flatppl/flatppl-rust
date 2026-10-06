@@ -84,6 +84,17 @@ pub fn determinize_with_roots(
     bundle: &ModuleBundle,
     roots: Option<&[Symbol]>,
 ) -> Result<Module, RefuseError> {
+    determinize_with_options(m, bundle, roots, &crate::LoweringOptions::default())
+}
+
+/// Preserve a backend's supported standard functions until its own lowering.
+/// All other functions keep the ordinary portable expansion.
+pub fn determinize_with_options(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
 
@@ -100,7 +111,7 @@ pub fn determinize_with_roots(
 
     // Lower local §09 functions before the application-graft guards. Their
     // unused arguments may contain module refs that root-based DCE will drop.
-    crate::stdfn::lower_std_module_functions(&mut work)?;
+    crate::stdfn::lower_std_module_functions(&mut work, options)?;
 
     // Resolve root applications before measure lowering, preserving the existing
     // callee-only graft and its cross-module argument checks.
@@ -115,7 +126,7 @@ pub fn determinize_with_roots(
         }
     }
     if grafted_application {
-        crate::stdfn::lower_std_module_functions(&mut work)?;
+        crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
 
     loop {
@@ -131,17 +142,13 @@ pub fn determinize_with_roots(
                 // `roots` is given, drop bindings unreachable from them) before
                 // the conformance check and return (Buffy #263).
                 crate::canon::canonicalize(&mut work, roots);
-                match crate::is_flatpdl(&work) {
+                match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
                         // Simplification must discard unused arguments and
                         // bindings before nested import guards can refuse them.
-                        if violations
-                            .iter()
-                            .any(|v| v.kind == crate::NonConformKind::ResidualUserCall)
-                            && graft_application_callees(&mut work, bundle, &mut imports)?
-                        {
-                            crate::stdfn::lower_std_module_functions(&mut work)?;
+                        if graft_application_callees(&mut work, bundle, &mut imports)? {
+                            crate::stdfn::lower_std_module_functions(&mut work, options)?;
                             continue;
                         }
                         // Residual conformance issue not covered by the
@@ -158,7 +165,7 @@ pub fn determinize_with_roots(
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(&mut work, bid, node_id, bundle, &mut imports)?;
+                apply_rule(&mut work, bid, node_id, bundle, &mut imports, options)?;
                 // Loop: re-scan after the rewrite.
             }
         }
@@ -199,9 +206,8 @@ fn graft_application_callees(
             };
             // References keep their identity; their binding roots are visited
             // separately, including bindings that occur later in source order.
-            if matches!(m.node(rhs), Node::Call(c) if matches!(c.head, CallHead::User(_)))
-                && let Some(grafted) =
-                    crate::density::graft_kernel_application_callee(m, rhs, bundle, imports)?
+            if let Some(grafted) =
+                crate::density::graft_kernel_application_callee(m, rhs, bundle, imports)?
             {
                 rhs = grafted;
                 changed = true;
@@ -375,6 +381,7 @@ fn apply_rule(
     target_node: NodeId,
     bundle: &ModuleBundle,
     imports: &mut crate::crossmodule::GraftState,
+    options: &crate::LoweringOptions<'_>,
 ) -> Result<(), RefuseError> {
     // --- structural disintegration: get(disintegrate(sel, lawof(record …)), i) ---
     // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
@@ -482,7 +489,7 @@ fn apply_rule(
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
             // The initial standard-function pass could not see this dependency.
-            crate::stdfn::lower_std_module_functions(m)?;
+            crate::stdfn::lower_std_module_functions(m, options)?;
             // The intermediate `x = m.L` self-ref binding (if any) and the
             // `helpers = load_module(…)` binding may now be dead; sweep the
             // measure-typed ones so the next scan is clean.

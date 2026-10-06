@@ -502,6 +502,7 @@ pub(crate) fn builtin() -> &'static Catalogue {
 /// Per-module RON sources for the spec-§09 standard modules, embedded at build.
 const STD_MODULE_SRCS: &[&str] = &[
     include_str!("../../catalogues/particle-physics.ron"),
+    include_str!("../../catalogues/pyhf_helpers.ron"),
     include_str!("../../catalogues/ext-linear-algebra.ron"),
     include_str!("../../catalogues/special-functions.ron"),
     include_str!("../../catalogues/polynomials.ron"),

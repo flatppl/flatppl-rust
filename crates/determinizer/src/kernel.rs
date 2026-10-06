@@ -531,14 +531,8 @@ pub(crate) fn reduce_kernel_application_bound(
         return None;
     };
     let args: Vec<NodeId> = c.args.to_vec();
-    // Keyword arguments supplied at the application site (`k(name = value)`).
-    let kwargs: Vec<(Symbol, NodeId)> = c
-        .named
-        .iter()
-        .filter(|na| na.kind == NamedKind::Kwarg)
-        .map(|na| (na.name, na.value))
-        .collect();
-    if args.is_empty() && kwargs.is_empty() {
+    let named = c.named.to_vec();
+    if args.is_empty() && named.is_empty() {
         return None;
     }
     let kernel = resolve_reified(m, callee)?;
@@ -549,42 +543,56 @@ pub(crate) fn reduce_kernel_application_bound(
         None => resolved,
     };
 
-    // KEYWORD application: bind each boundary input by name. The only form an
-    // `%autoinputs` (keyword-only) kernel supports (§04); a `%specinputs` kernel
-    // supports it too. Refuse a keyword/positional mix, or any bijection failure
-    // (arity mismatch, or a boundary input with no matching keyword) rather than
-    // leave a boundary input free — a silent wrong density.
-    // The whole binding is computed BEFORE anything is substituted, so the
-    // substitution can run as one simultaneous pass ([`substitute_refs`]) rather than
-    // one pass per entry — which captures a sibling's applied value.
-    let mut bound: Vec<(Ref, NodeId)> = Vec::with_capacity(kernel.inputs.len());
-    if !kwargs.is_empty() {
-        if !args.is_empty() || kwargs.len() != kernel.inputs.len() {
-            return None;
-        }
-        for (name, target) in &kernel.inputs {
-            let value = kwargs.iter().find(|(n, _)| n == name).map(|(_, v)| *v)?;
-            bound.push((*target, value));
-        }
-    } else if args.len() == 1 && is_splattable(m, args[0]) {
-        for (name, target) in &kernel.inputs {
-            let value = record_field(m, args[0], *name)?;
-            bound.push((*target, value));
-        }
-    } else if !kernel.auto && args.len() == kernel.inputs.len() {
-        // POSITIONAL binding — `%specinputs`-only. An `%autoinputs` kernel is
-        // keyword-only (§04), so a positional application of one falls through to
-        // the refuse below rather than binding by an uninferable position.
-        for (arg, (_, target)) in args.iter().zip(kernel.inputs.iter()) {
-            bound.push((*target, *arg));
-        }
-    } else {
-        // Arity mismatch, or a positional application of a keyword-only
-        // `%autoinputs` kernel — refuse rather than mis-lower.
-        return None;
-    }
+    // Bind the complete boundary before substitution to avoid capturing a
+    // sibling's applied value. Auto-traced inputs remain keyword-only.
+    let names: Vec<_> = kernel.inputs.iter().map(|(name, _)| *name).collect();
+    let values = bind_call_args(m, &names, &args, &named, kernel.auto)?;
+    let bound: Vec<_> = kernel
+        .inputs
+        .iter()
+        .zip(values)
+        .map(|((_, target), value)| (*target, value))
+        .collect();
     body = substitute_admitted(m, body, &bound, mode);
     Some(AppliedReification { body, bound })
+}
+
+/// §04 calling convention: leading positionals, then keywords, or one record/table
+/// splatted by name. Every input must bind exactly once before any substitution.
+pub(crate) fn bind_call_args(
+    m: &mut Module,
+    names: &[Symbol],
+    args: &[NodeId],
+    named: &[NamedArg],
+    keyword_only: bool,
+) -> Option<Vec<NodeId>> {
+    if named.is_empty() && args.len() == 1 && is_splattable(m, args[0]) {
+        let fields = splat_fields(m, args[0])?;
+        if fields.len() != names.len() || !names.iter().all(|name| fields.contains(name)) {
+            return None;
+        }
+        return names
+            .iter()
+            .map(|name| record_field(m, args[0], *name))
+            .collect();
+    }
+    if args.len() + named.len() != names.len() || (keyword_only && !args.is_empty()) {
+        return None;
+    }
+    let mut values = vec![None; names.len()];
+    for (slot, arg) in values.iter_mut().zip(args) {
+        *slot = Some(*arg);
+    }
+    for arg in named {
+        if arg.kind != NamedKind::Kwarg {
+            return None;
+        }
+        let index = names.iter().position(|name| *name == arg.name)?;
+        if values[index].replace(arg.value).is_some() {
+            return None;
+        }
+    }
+    values.into_iter().collect()
 }
 
 /// Does `rec` (after one level of ref-resolution) denote a `record(...)` or `table(...)`
@@ -607,29 +615,24 @@ pub(crate) fn reduce_kernel_application_bound(
 /// bare-builtin callee never reaches this function: `canon` rewrites it to a direct
 /// builtin call, and the two `pushfwd` sites screen it off beforehand.
 pub(crate) fn is_splattable(m: &Module, rec: NodeId) -> bool {
-    matches!(splat_head(m, rec), Some("record") | Some("table")) || table_columns(m, rec).is_some()
+    splat_fields(m, rec).is_some()
 }
 
-/// The column names of an OPAQUE table — one with no syntactic `table(...)` head, such as a
-/// `load_data` result — read from its INFERRED TYPE. `None` for anything that is not a
-/// table, including a table whose type has not been inferred.
-///
-/// §13 `sec:determinization-signature` makes a `load_data`'s shape come from its declared
-/// `valueset`, so the columns of `load_data("x.csv", cartpow(cartprod(a = reals, b = reals),
-/// 4))` are statically known — they are right there in
-/// `(%table (%columns (a …) (b …)) (%nrows 4))`. That is what lets §04's splat apply to an
-/// opaque table exactly as to a literal one: the names the splat binds by do not depend on
-/// the file's contents. `determinize` re-infers before lowering, so the type is populated by
-/// the time this runs.
-///
-/// Type-based rather than syntax-based, so it stays permissive where the type is not known:
-/// a `%deferred` or absent type gives `None`, the value is not treated as splattable, and
-/// nothing is refused on a guess.
-fn table_columns(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
+/// Field names come from the literal or its inferred record/table type. Opaque
+/// inputs and loaded tables obey the same splat rule without reading their values.
+fn splat_fields(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
     let (resolved, _) = resolve_ref_one(m, rec);
+    if matches!(splat_head(m, rec), Some("record") | Some("table")) {
+        let Node::Call(c) = m.node(resolved) else {
+            return None;
+        };
+        return Some(c.named.iter().map(|arg| arg.name).collect());
+    }
     let ty = m.type_of(rec).or_else(|| m.type_of(resolved))?;
     match ty {
-        Type::Table { columns, .. } => Some(columns.iter().map(|(n, _)| *n).collect()),
+        Type::Table { columns, .. } | Type::Record(columns) => {
+            Some(columns.iter().map(|(n, _)| *n).collect())
+        }
         _ => None,
     }
 }
@@ -657,7 +660,7 @@ fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
 /// destructure it and the reduction refused — which left a §04-legal model
 /// (`g(t)` against a `g` whose parameters are `t`'s column names) refusing with the generic
 /// "residual user call", while its `table(...)` literal twin lowered. The columns are
-/// statically known from the type ([`table_columns`]), and §03 "Tables" already spells the
+/// statically known from the type ([`splat_fields`]), and §03 "Tables" already spells the
 /// per-column value: "Column access by name: `t.a` … returns the column with that name as a
 /// vector", which the parser lowers to `get(t, "a")`. So the splat IS constructible — it is
 /// the same set of column values the literal case binds, reached through `get` instead of
@@ -672,14 +675,14 @@ pub(crate) fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<
         };
         return c.named.iter().find(|na| na.name == name).map(|na| na.value);
     }
-    // Opaque table: bind the column access §03 defines, if the type declares that column.
+    // Opaque record/table: bind the field/column access declared by its type.
     //
     // A multi-column splat that refuses on a LATER column leaves the `get` nodes already
     // allocated for the earlier ones unreferenced. Benign: the arena is append-only and never
     // freed per node (`crates/core/src/id.rs`), nothing reaches them, and inference rejects a
     // name mismatch before the determiniser runs anyway — so the partial case is only reachable
     // when some other layer has already failed.
-    if !table_columns(m, rec)?.contains(&name) {
+    if !splat_fields(m, rec)?.contains(&name) {
         return None;
     }
     let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).into())));

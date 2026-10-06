@@ -16,6 +16,20 @@ mod refuse;
 mod sample;
 mod stdfn;
 pub use canon::prepare_serialization;
-pub use conformance::is_flatpdl;
-pub use driver::{determinize, determinize_with, determinize_with_roots};
+pub use conformance::{is_flatpdl, is_flatpdl_with_options};
+pub use driver::{determinize, determinize_with, determinize_with_options, determinize_with_roots};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
+pub use stdfn::standard_function;
+
+/// Deterministic standard functions a backend lowers without portable expansion.
+/// The default keeps the backend-independent FlatPDL form.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoweringOptions<'a> {
+    pub retain_standard_functions: &'a [(&'a str, &'a str)],
+}
+
+impl LoweringOptions<'_> {
+    pub(crate) fn retains(&self, module: &str, member: &str) -> bool {
+        self.retain_standard_functions.contains(&(module, member))
+    }
+}
