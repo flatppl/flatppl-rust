@@ -376,6 +376,12 @@ pub(crate) fn lower_cumulative(
     if n == 0 {
         return Ok(xs);
     }
+    if e.enzyme_compatible() && which == Cumulative::Prod && xs.elem == ElemKind::Real {
+        return Err(EmitError::at(
+            id,
+            "cumprod has no qualified Enzyme derivative lowering",
+        ));
+    }
     let (op, identity) = match (which, xs.elem) {
         (Cumulative::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
         (Cumulative::Sum, ElemKind::Int) => ("stablehlo.add", "0"),

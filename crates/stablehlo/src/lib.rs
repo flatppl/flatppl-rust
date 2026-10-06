@@ -234,11 +234,17 @@ pub enum Dtype {
 /// never assumes/hardcodes 64-bit floats.
 pub struct EmitOptions {
     pub dtype: Dtype,
+    /// Use Enzyme-oriented lowering for static, deterministic computations.
+    /// Refuse known unsupported paths. This does not invoke Enzyme or prove AD support.
+    pub enzyme_compatible: bool,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
-        Self { dtype: Dtype::F32 }
+        Self {
+            dtype: Dtype::F32,
+            enzyme_compatible: false,
+        }
     }
 }
 

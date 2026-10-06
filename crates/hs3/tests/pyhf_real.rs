@@ -55,10 +55,10 @@ fn multichan_old_converts() {
         "missing Normal (normsys/lumi/staterror aux), got:\n{text}"
     );
 
-    // hepphys.interp from normsys
+    // Qualified helper from normsys.
     assert!(
-        text.contains("hepphys.interp"),
-        "missing hepphys interp fn (normsys factor), got:\n{text}"
+        text.contains("pyhf_helpers.normsys_factor"),
+        "missing normsys helper, got:\n{text}"
     );
 
     // broadcast(Poisson from obs model
@@ -97,9 +97,9 @@ fn multichan_old_converts() {
 
     // Call or broadcast the module member, not a non-existent `call` builtin.
     assert!(
-        text.contains("hepphys.interp_poly6_exp(")
-            || text.contains("broadcast(hepphys.interp_poly6_exp,"),
-        "must call or broadcast `hepphys.interp_poly6_exp`, got:\n{text}"
+        text.contains("pyhf_helpers.normsys_factor(")
+            || text.contains("broadcast(pyhf_helpers.normsys_factor,"),
+        "must call or broadcast `pyhf_helpers.normsys_factor`, got:\n{text}"
     );
 
     // Round-trip: emitted FlatPPL must re-parse without error
