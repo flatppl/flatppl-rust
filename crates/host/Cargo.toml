@@ -1,0 +1,20 @@
+[package]
+name = "flatppl-host"
+description = "Immutable source contexts and typed StableHLO query exports for native FlatPPL hosts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-syntax = { path = "../syntax" }
+flatppl-infer = { path = "../infer" }
+flatppl-determinizer = { path = "../determinizer" }
+flatppl-stablehlo = { path = "../stablehlo" }
+flatppl-fileaccess = { path = "../fileaccess" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

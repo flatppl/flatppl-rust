@@ -17,6 +17,8 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-fileaccess`](crates/fileaccess) — resolve a `source` (local path or `http`/`https` URL) to a local file, with the shared remote-content cache (native host layer)
+* [`flatppl-host`](crates/host) — immutable source contexts and typed StableHLO query exports for native hosts
+* [`flatppl-python-api`](crates/python-api) — PyO3 bindings for the [Python package](https://github.com/flatppl/flatppl-python)
 * [`flatppl-mathdoc`](crates/mathdoc) — FlatPPL rendered as mathematics: a math AST over the typed module, printed as MathML (HTML pages, the viewer's Math pane); notation in [`NOTATION.md`](crates/mathdoc/NOTATION.md)
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
 * [`flatppl-lsp`](crates/lsp) — FlatPPL language server (diagnostics, hover, go-to-definition, completion)

@@ -52,6 +52,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Python for PyO3 bindings
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
       - name: Install flatppl-js engine dependencies
         # The parity shim require()s the engine package, which pulls its
         # @stdlib runtime deps from node_modules. npm ci at the workspace
