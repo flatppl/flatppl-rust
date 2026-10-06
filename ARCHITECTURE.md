@@ -203,6 +203,8 @@ Landed: `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔ core) �
 `flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-infer` (the type/phase
 trace + per-op rule catalogue) · `flatppl-lint` (lint rules over the IR) ·
 `flatppl-fileaccess` (resolve a `source` to a local file) ·
+`flatppl-host` (immutable source contexts and typed StableHLO query exports) ·
+`flatppl-python-api` (optional PyO3 adapter for the Python package) ·
 `flatppl-hs3` (HS³ / pyhf → FlatPPL importer) ·
 `flatppl-determinizer` (measure-elimination → FlatPDL; density side: MVP + `is_flatpdl`
 in #57, plus structural lowering in #60/#62; sample side is Phase-3 LEFT) ·

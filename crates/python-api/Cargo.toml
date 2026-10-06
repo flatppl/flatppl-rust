@@ -1,0 +1,16 @@
+[package]
+name = "flatppl-python-api"
+description = "PyO3 bindings for FlatPPL source contexts and StableHLO query exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+extension = ["dep:pyo3", "dep:serde_json", "dep:flatppl-host"]
+
+[dependencies]
+flatppl-host = { path = "../host", optional = true }
+serde_json = { workspace = true, optional = true }
+pyo3 = { version = "0.29", optional = true }
