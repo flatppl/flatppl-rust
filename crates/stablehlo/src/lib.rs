@@ -231,20 +231,20 @@ pub enum Dtype {
 }
 
 /// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter
-/// never assumes/hardcodes 64-bit floats. Enzyme-oriented lowering is enabled
-/// by default for differentiable deterministic queries.
+/// never assumes/hardcodes 64-bit floats. Restrictions for known Enzyme
+/// limitations are enabled by default.
 pub struct EmitOptions {
     pub dtype: Dtype,
-    /// Use Enzyme-oriented lowering for static, deterministic computations.
+    /// Restrict lowering to avoid known Enzyme limitations.
     /// Refuse known unsupported paths. This does not invoke Enzyme or prove AD support.
-    pub enzyme_compatible: bool,
+    pub restrict_enzyme_compatible: bool,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
         Self {
             dtype: Dtype::F32,
-            enzyme_compatible: true,
+            restrict_enzyme_compatible: true,
         }
     }
 }

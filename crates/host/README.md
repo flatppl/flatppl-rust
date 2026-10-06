@@ -25,6 +25,6 @@ let exported = query.compile(&EmitOptions::default())?;
 
 `LoadedModule` retains its resolved imports independently of the context's lifetime. Compilation requires explicit FlatPPL `inputs` and `outputs`. It returns StableHLO text, the entry point, input and output schemas, and authored output names. Records, tables, and tuples flatten into ordered tensor leaves. Each schema's `index` identifies a tensor argument or result.
 
-`EmitOptions` defaults to float32 and Enzyme-compatible lowering. Set `enzyme_compatible` to false for unrestricted emission. The host owns value packing, execution, and differentiation. Compilation does not run Enzyme or a sampler.
+`EmitOptions` defaults to float32 and restrictions for known Enzyme limitations. Set `restrict_enzyme_compatible` to false for unrestricted emission. The host owns value packing, execution, and differentiation. Compilation does not run Enzyme or a sampler, and neither setting guarantees or rules out Enzyme compatibility.
 
 The separate [`flatppl-python-api`](../python-api) crate maps this API into PyO3 classes for the [Python package](https://github.com/flatppl/flatppl-python).

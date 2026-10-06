@@ -717,10 +717,10 @@ pub(crate) fn lower_sample(
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
-    if e.enzyme_compatible() {
+    if e.restrict_enzyme_compatible() {
         return Err(EmitError::at(
             id,
-            "Enzyme-compatible emission requires a deterministic query",
+            "Enzyme restrictions require a deterministic query",
         ));
     }
     // The scalar form is `builtin_sample(rng, ctor, kernel_input)`; the fanned

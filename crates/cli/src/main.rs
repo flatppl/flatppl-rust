@@ -190,10 +190,12 @@ enum Command {
         /// Floating-point precision for emitted tensors.
         #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
         dtype: String,
-        /// Require Enzyme-oriented lowering; use --enzyme-compatible=false to opt out.
+        /// Restrict lowering to avoid known Enzyme limitations (not a compatibility guarantee).
+        ///
+        /// Use --restrict-enzyme-compatible=false for unrestricted emission.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
               num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        enzyme_compatible: bool,
+        restrict_enzyme_compatible: bool,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -324,9 +326,15 @@ fn main() -> ExitCode {
             input,
             mode,
             dtype,
-            enzyme_compatible,
+            restrict_enzyme_compatible,
             output,
-        } => stablehlo_cmd(&input, &mode, &dtype, enzyme_compatible, output.as_deref()),
+        } => stablehlo_cmd(
+            &input,
+            &mode,
+            &dtype,
+            restrict_enzyme_compatible,
+            output.as_deref(),
+        ),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -878,7 +886,7 @@ fn stablehlo_cmd(
     input: &Path,
     mode: &str,
     dtype: &str,
-    enzyme_compatible: bool,
+    restrict_enzyme_compatible: bool,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let (module, bundle, source) = load_and_infer(input)?;
@@ -931,7 +939,7 @@ fn stablehlo_cmd(
     )
     .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     let opts = flatppl_stablehlo::EmitOptions {
-        enzyme_compatible,
+        restrict_enzyme_compatible,
         dtype: if dtype == "f64" {
             flatppl_stablehlo::Dtype::F64
         } else {

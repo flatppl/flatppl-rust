@@ -376,7 +376,7 @@ pub(crate) fn lower_cumulative(
     if n == 0 {
         return Ok(xs);
     }
-    if e.enzyme_compatible() && which == Cumulative::Prod && xs.elem == ElemKind::Real {
+    if e.restrict_enzyme_compatible() && which == Cumulative::Prod && xs.elem == ElemKind::Real {
         return Err(EmitError::at(
             id,
             "cumprod has no qualified Enzyme derivative lowering",

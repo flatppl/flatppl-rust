@@ -138,7 +138,7 @@ pub(crate) fn lower_builtin(
         //   `atan` and `expm1` are needed too, even though nothing inverts to
         //   them.
         "logit" => unary(e, id, args, Emitter::logit),
-        "probit" if e.enzyme_compatible() => Err(EmitError::at(
+        "probit" if e.restrict_enzyme_compatible() => Err(EmitError::at(
             id,
             "probit has no qualified Enzyme derivative lowering",
         )),

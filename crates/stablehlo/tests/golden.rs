@@ -14,10 +14,10 @@ use flatppl_core::{
 use flatppl_stablehlo::{Dtype, ElemKind, Emitter, MlirTy, Value, mlir_type_of};
 
 // These goldens cover unrestricted code generation, including RNG and packet
-// packing. Native value/gradient tests exercise Enzyme-compatible emission.
+// packing. Native value/gradient tests exercise Enzyme-restricted emission.
 fn unrestricted_options() -> flatppl_stablehlo::EmitOptions {
     flatppl_stablehlo::EmitOptions {
-        enzyme_compatible: false,
+        restrict_enzyme_compatible: false,
         ..Default::default()
     }
 }
@@ -27,7 +27,7 @@ fn unrestricted_emitter(m: &Module, dtype: Dtype) -> Emitter<'_> {
         m,
         &flatppl_stablehlo::EmitOptions {
             dtype,
-            enzyme_compatible: false,
+            restrict_enzyme_compatible: false,
         },
     )
 }
@@ -7997,7 +7997,7 @@ fn sampler_loop_regions_do_not_share_local_constants() {
             flatppl_stablehlo::Mode::Sample,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                enzyme_compatible: false,
+                restrict_enzyme_compatible: false,
             },
         )
         .unwrap();
@@ -13117,7 +13117,7 @@ fn special_function_siblings_form_one_ordered_packet() {
             flatppl_stablehlo::Mode::LogDensity,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                enzyme_compatible: false,
+                restrict_enzyme_compatible: false,
             },
         )
         .unwrap();
@@ -13202,7 +13202,7 @@ fn constant_concatenation_keeps_nested_storage_order() {
                     flatppl_stablehlo::Mode::LogDensity,
                     &flatppl_stablehlo::EmitOptions {
                         dtype,
-                        enzyme_compatible: false,
+                        restrict_enzyme_compatible: false,
                     },
                 )
                 .unwrap()
@@ -13243,7 +13243,7 @@ fn folded_dense_constants_preserve_target_rounding_and_signed_zero() {
             flatppl_stablehlo::Mode::LogDensity,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                enzyme_compatible: false,
+                restrict_enzyme_compatible: false,
             },
         )
         .unwrap();

@@ -50,16 +50,18 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 
-StableHLO emission uses Enzyme-oriented lowering by default. This mode
-preserves zero-factor product derivatives and avoids known selection-adjoint
-failures. It retains source tensor operations but skips pointwise packet packing.
+StableHLO emission restricts lowering to avoid known Enzyme limitations by
+default. This mode preserves zero-factor product derivatives and avoids known
+selection-adjoint failures. It retains source tensor operations but skips
+pointwise packet packing.
 It requires static tensor shapes and deterministic queries, and refuses `probit`
-and real `cumprod`. Pass `--enzyme-compatible=false` for unrestricted emission,
+and real `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
 including sampling queries. The Rust API exposes the same choice through
-`EmitOptions::enzyme_compatible`, which defaults to `true`.
+`EmitOptions::restrict_enzyme_compatible`, which defaults to `true`.
 Qualification targets first-order real-input CPU derivatives with Enzyme-AD 0.0.15
 and JAX 0.10.2. The flag does not invoke Enzyme or guarantee every composition
-or compiler version supports differentiation.
+or compiler version supports differentiation. Unrestricted output may also work
+with Enzyme; disabling the restrictions does not imply incompatibility.
 
 Formats are inferred from the file extensions. FlatPPL output uses the full
 surface syntax (operators, indexing, lambdas, `:=`); pass `--syntax minimal`
