@@ -101,7 +101,7 @@ fn normsys_interpolation_reuses_factors_across_samples_and_channels() {
     // Scalar calls clone the degree-six interpolation body for every effect.
     // The published nuisance identities and per-sample responses remain distinct.
     assert_eq!(
-        text.matches("hepphys.interp_poly6_exp").count(),
+        text.matches("pyhf_helpers.normsys_factor").count(),
         1,
         "{text}"
     );

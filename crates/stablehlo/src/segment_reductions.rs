@@ -403,7 +403,7 @@ pub(super) fn finish(
         }
         // Fresh constants must dominate every replacement. The original cache
         // can hold an identical index tensor defined after the first segment.
-        let mut scratch = Emitter::new(out.m, out.dtype);
+        let mut scratch = out.scratch_emitter();
         scratch.next = next;
         let reduced = emit_reductions(&mut scratch, &group, maximum);
         let shared = scratch.body.clone();

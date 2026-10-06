@@ -75,6 +75,17 @@ fn metadata_name_does_not_shadow_a_parameter() {
 }
 
 #[test]
+fn helper_alias_does_not_capture_parameters() {
+    let text = convert(&workspace(["pyhf_helpers", "pyhf_helpers_2", "mu"]));
+    assert!(text.contains("pyhf_helpers_3 = standard_module(\"pyhf_helpers\", \"0.1\")"));
+    assert!(text.contains("pyhf_helpers = elementof(reals)"));
+    assert!(text.contains("pyhf_helpers_2 = elementof(reals)"));
+    assert!(text.contains("broadcast(pyhf_helpers_3.normsys_factor,"));
+    assert!(text.contains("[pyhf_helpers, pyhf_helpers]"));
+    assert!(text.contains("measurement = record(poi = pyhf_helpers_2)"));
+}
+
+#[test]
 fn empty_poi_stays_unset_when_an_empty_parameter_name_is_mapped() {
     let mut source = workspace(["", "_x_", "µ_rate"]);
     let mut canonical = workspace(["__2", "_x__2", "__rate"]);

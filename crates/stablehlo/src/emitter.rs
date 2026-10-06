@@ -38,6 +38,8 @@ use crate::refuse::EmitError;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
+#[path = "enzyme.rs"]
+mod enzyme;
 #[path = "packed_gathers.rs"]
 mod packed_gathers;
 #[path = "packing.rs"]
@@ -123,6 +125,7 @@ pub struct Emitter<'m> {
     /// structure from outside this module).
     m: &'m Module,
     dtype: Dtype,
+    enzyme_compatible: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
     /// its op line emitted) once — see [`Emitter::lower_node`]. Also the seed
@@ -175,6 +178,7 @@ impl<'m> Emitter<'m> {
         Emitter {
             m,
             dtype,
+            enzyme_compatible: false,
             next: 0,
             memo: HashMap::new(),
             pure_ops: HashMap::new(),
@@ -189,6 +193,33 @@ impl<'m> Emitter<'m> {
             batch_shape: None,
             columns: HashMap::new(),
         }
+    }
+
+    pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
+        let mut emitter = Self::new(m, opts.dtype);
+        emitter.enzyme_compatible = opts.enzyme_compatible;
+        emitter
+    }
+
+    /// A new region's scratch emitter must preserve target restrictions.
+    fn scratch_emitter(&self) -> Self {
+        let mut emitter = Self::new(self.m, self.dtype);
+        emitter.enzyme_compatible = self.enzyme_compatible;
+        emitter
+    }
+
+    pub(crate) fn enzyme_compatible(&self) -> bool {
+        self.enzyme_compatible
+    }
+
+    pub(crate) fn require_static_shape(&self, id: NodeId, ty: &MlirTy) -> Result<(), EmitError> {
+        if self.enzyme_compatible && shape(ty).contains(&None) {
+            return Err(EmitError::at(
+                id,
+                "Enzyme-compatible emission requires static tensor shapes",
+            ));
+        }
+        Ok(())
     }
 
     // ---- rng-key threading (spec §07 rng ABI) -------------------------------
@@ -367,8 +398,13 @@ impl<'m> Emitter<'m> {
         if let Some(value) = self.fold_binary(op, a, b) {
             return value;
         }
-        let ty_text = a.ty.render(self.dtype, a.elem);
-        let ssa = self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a);
+        let ssa =
+            if self.enzyme_compatible && a.elem == ElemKind::Real && op == "stablehlo.multiply" {
+                self.product_pair(a, b).ssa
+            } else {
+                let ty_text = a.ty.render(self.dtype, a.elem);
+                self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a)
+            };
         self.remember_pointwise(
             &ssa,
             a,
@@ -971,6 +1007,18 @@ impl<'m> Emitter<'m> {
         assert_eq!(dims.len(), starts.len(), "slice: starts rank mismatch");
         assert_eq!(dims.len(), limits.len(), "slice: limits rank mismatch");
         assert_eq!(dims.len(), strides.len(), "slice: strides rank mismatch");
+
+        if self.enzyme_compatible && strides.iter().any(|&stride| stride != 1) {
+            let mut value = self.slice_value(a, starts, limits, &vec![1; strides.len()], reusable);
+            for (axis, &stride) in strides
+                .iter()
+                .enumerate()
+                .filter(|(_, stride)| **stride != 1)
+            {
+                value = self.enzyme_strided_axis(&value, axis, stride);
+            }
+            return value;
+        }
 
         let ranges: Vec<String> = starts
             .iter()
@@ -1741,8 +1789,6 @@ impl<'m> Emitter<'m> {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
 
-        let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
-
         let mut axes = self.axes_of(a);
         if axis < axes.batch {
             axes.batch -= 1;
@@ -1757,6 +1803,19 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
+        if self.enzyme_compatible
+            && combine_op == "stablehlo.multiply"
+            && a.elem == ElemKind::Real
+            && let Some(out) = self.product_tree(a, axis, &result_ty, &axes)
+        {
+            self.remember_pointwise(
+                &out.ssa,
+                &out,
+                Pointwise::Reduce(a.clone(), axis, combine_op.to_owned(), init_lit.to_owned()),
+            );
+            return out;
+        }
+        let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
         let ssa = self.pure_axes(format!(
             "stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
             a.ssa
@@ -1816,6 +1875,7 @@ impl<'m> Emitter<'m> {
         if n == 0 {
             return Ok(a.clone());
         }
+        self.require_static_shape(id, &a.ty)?;
         let rank = match &a.ty {
             MlirTy::Ranked(dims) => dims.len(),
             other => {
@@ -3881,7 +3941,13 @@ impl<'m> Emitter<'m> {
             !rets.is_empty(),
             "finish requires at least one return value"
         );
-        let packed = packing::pack(&self, args, rets);
+        // Enzyme can invalidate adjoints after cross-expression packet packing.
+        // Keep source tensor operations, but omit this extra fusion pass.
+        let packed = if self.enzyme_compatible {
+            None
+        } else {
+            packing::pack(&self, args, rets)
+        };
         let rets = packed.as_ref().map_or_else(
             || rets.to_vec(),
             |(_, values)| values.iter().collect::<Vec<_>>(),

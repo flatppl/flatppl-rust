@@ -169,12 +169,13 @@ fn histosys_modifier_path_converts() {
         "measurements":[{"name":"m","config":{"poi":""}}]}"#;
     let m = flatppl_hs3::read_pyhf(json).expect("histosys must convert");
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
-    // histosys interpolates the nominal between lo/hi via the interp module call
+    // histosys adds its interpolation shift to the original nominal
     // (the sample's expected yields), then the channel model is a reified Poisson.
     assert!(
         text.contains(
             "c_sig_expected = \
-             hepphys.interp_poly6_lin([9.0, 11.0], c_sig_nominal, [11.0, 13.0], alpha_shape)"
+             broadcast(add, c_sig_nominal, broadcast(pyhf_helpers.histosys_shift, \
+             [9.0, 11.0], c_sig_nominal, [11.0, 13.0], alpha_shape))"
         ),
         "histosys interpolation mismatch, got:\n{text}"
     );

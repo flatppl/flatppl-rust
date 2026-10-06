@@ -717,6 +717,12 @@ pub(crate) fn lower_sample(
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
+    if e.enzyme_compatible() {
+        return Err(EmitError::at(
+            id,
+            "Enzyme-compatible emission requires a deterministic query",
+        ));
+    }
     // The scalar form is `builtin_sample(rng, ctor, kernel_input)`; the fanned
     // iid form (spec §07 size dims) appends a trailing static count `n`,
     // `builtin_sample(rng, ctor, kernel_input, n)` — the determiniser's

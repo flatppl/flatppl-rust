@@ -196,7 +196,7 @@ pub(crate) fn emit_logdensity_abi(
     abi: &Abi,
     opts: &EmitOptions,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::new(m, opts.dtype);
+    let mut e = Emitter::with_options(m, opts);
 
     // Exhaustiveness: every `elementof` parameter in the module must be
     // listed in `inputs` (design doc: "inputs ... is authoritative and
@@ -308,7 +308,7 @@ pub(crate) fn emit_sample_abi(
     abi: &Abi,
     opts: &EmitOptions,
 ) -> Result<String, EmitError> {
-    let mut e = Emitter::new(m, opts.dtype);
+    let mut e = Emitter::with_options(m, opts);
 
     if abi.outputs.is_empty() {
         return Err(EmitError::whole(
@@ -714,6 +714,7 @@ fn bind_input(
                     ),
                 )
             })?;
+            e.require_static_shape(rhs, &ty)?;
             let ssa = format!("%arg{next_arg}");
             *next_arg += 1;
             e.bind_column(
@@ -736,6 +737,7 @@ fn bind_input(
     // boolean `elementof` (or int `load_data`) input must arrive as an int/bool
     // tensor arg so the value-path widening reconciles correctly.
     let (ty, elem) = mlir_type_of(m, rhs, opts.dtype)?;
+    e.require_static_shape(rhs, &ty)?;
     e.bind(
         rhs,
         Value {

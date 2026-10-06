@@ -27,7 +27,7 @@ fn two_histosys_shifts_add_against_the_original_nominal() {
     // Keep the modifier axis through interpolation, then sum additive shifts.
     // Nesting interpolation around another modifier's result changes the model.
     assert_eq!(
-        text.matches("interp_poly6_lin").count(),
+        text.matches("pyhf_helpers.histosys_shift").count(),
         1,
         "expected one tensor interpolation, got:\n{text}"
     );
@@ -57,7 +57,11 @@ fn histosys_interpolation_is_shared_across_samples() {
     samples.push(extra);
     let module = flatppl_hs3::read(&doc.to_string()).unwrap();
     let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
-    assert_eq!(text.matches("interp_poly6_lin").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("pyhf_helpers.histosys_shift").count(),
+        1,
+        "{text}"
+    );
 }
 
 const HISTOSYS_AND_SHAPESYS: &str = r#"{

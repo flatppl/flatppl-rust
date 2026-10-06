@@ -48,6 +48,15 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 
+Pass `--enzyme-compatible` to select Enzyme-oriented lowering. This opt-in mode
+preserves zero-factor product derivatives and avoids known selection-adjoint
+failures. It retains source tensor operations but skips pointwise packet packing.
+It requires static tensor shapes and deterministic queries, and refuses `probit`
+and real `cumprod`. Generic emission remains the default.
+Qualification targets first-order real-input CPU derivatives with Enzyme-AD 0.0.15
+and JAX 0.10.2. The flag does not invoke Enzyme or guarantee every composition
+or compiler version supports differentiation.
+
 Formats are inferred from the file extensions. FlatPPL output uses the full
 surface syntax (operators, indexing, lambdas, `:=`); pass `--syntax minimal`
 for the lowered function-call form instead.
