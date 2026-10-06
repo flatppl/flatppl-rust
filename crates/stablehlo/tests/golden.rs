@@ -13,6 +13,25 @@ use flatppl_core::{
 };
 use flatppl_stablehlo::{Dtype, ElemKind, Emitter, MlirTy, Value, mlir_type_of};
 
+// These goldens cover unrestricted code generation, including RNG and packet
+// packing. Native value/gradient tests exercise Enzyme-compatible emission.
+fn unrestricted_options() -> flatppl_stablehlo::EmitOptions {
+    flatppl_stablehlo::EmitOptions {
+        enzyme_compatible: false,
+        ..Default::default()
+    }
+}
+
+fn unrestricted_emitter(m: &Module, dtype: Dtype) -> Emitter<'_> {
+    Emitter::with_options(
+        m,
+        &flatppl_stablehlo::EmitOptions {
+            dtype,
+            enzyme_compatible: false,
+        },
+    )
+}
+
 /// Every physical `{`/`(`/`[` in `s` has a matching close, and vice versa —
 /// a cheap structural well-formedness check for hand-assembled MLIR text
 /// (it does not parse the text, just counts bracket nesting).
@@ -40,8 +59,12 @@ fn emit_stub_on_flatpdl_returns_module() {
     let src = "flatppl_compat = \"0.1\"\na = draw(Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(lawof(record(a = a)), record(a = 0.5))\noutputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .unwrap();
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
     assert!(out.contains("module {"));
 }
 
@@ -68,8 +91,12 @@ inputs = (aa)\n\
 outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .unwrap();
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
     assert!(out.contains("module {") && is_delimiter_balanced(&out));
     // The 3-observation batch survives as a rank-1 tensor, is reduced (the iid
     // sum), and scalars are broadcast to it.
@@ -278,8 +305,12 @@ outputs = (score)\n";
         pdl.contains("broadcast(predict") && pdl.contains("rate.("),
         "determinised query broadcasts the user functions:\n{pdl}"
     );
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .unwrap();
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
     assert!(out.contains("module {") && is_delimiter_balanced(&out));
     // predict's body inlined over the length-5 covariate batch (rank-1), rate's
     // `exp` applied elementwise, then the iid Poisson log-likelihood reduced.
@@ -313,8 +344,12 @@ score = logdensityof(post, record(a = 0.7))\n\
 outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .unwrap();
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
     assert!(out.contains("module {") && is_delimiter_balanced(&out));
     assert!(
         out.contains("stablehlo.logistic"),
@@ -485,7 +520,7 @@ fn mlir_type_of_refuses_other_types_naming_the_type() {
 #[test]
 fn emitter_scalar_add_produces_well_formed_module() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = e.scalar(2.0);
     let b = e.scalar(3.0);
     let c = e.add(&a, &b);
@@ -500,7 +535,7 @@ fn emitter_scalar_add_produces_well_formed_module() {
 #[test]
 fn emitter_finish_wraps_args_and_return_type() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F64);
+    let mut e = unrestricted_emitter(&m, Dtype::F64);
     let arg = flatppl_stablehlo::Value {
         ssa: "%arg0".to_string(),
         ty: MlirTy::Scalar,
@@ -523,7 +558,7 @@ fn emitter_finish_wraps_args_and_return_type() {
 #[test]
 fn emitter_elementary_wrappers_emit_expected_ops() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = Value {
         ssa: "%arg0".into(),
         ty: MlirTy::Scalar,
@@ -563,7 +598,7 @@ fn emitter_elementary_wrappers_emit_expected_ops() {
 #[test]
 fn emitter_lgamma_emits_function_type_form() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = Value {
         ssa: "%arg0".into(),
         ty: MlirTy::Scalar,
@@ -591,7 +626,7 @@ fn emitter_lgamma_emits_function_type_form() {
 #[test]
 fn emitter_compare_and_select_type_check() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = Value {
         ssa: "%arg0".into(),
         ty: MlirTy::Scalar,
@@ -622,7 +657,7 @@ fn emitter_compare_and_select_type_check() {
 #[test]
 fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
     let s = e.reduce_sum(&v);
     assert_eq!(s.ty, MlirTy::Scalar);
@@ -656,7 +691,7 @@ fn emitter_reduce_sum_and_max_reduce_to_scalar() {
 #[test]
 fn emitter_reduce_max_f64_identity_is_dtype_exact_neg_inf() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F64);
+    let mut e = unrestricted_emitter(&m, Dtype::F64);
     let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
     let mx = e.reduce_max(&v);
     let out = e.finish("f", &[], &[&mx]);
@@ -671,7 +706,7 @@ fn emitter_reduce_sum_on_scalar_is_a_noop() {
     // A rank-0 operand has no axes to reduce: `reduce_sum` should hand back
     // the same value without emitting a spurious reduce op.
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let s = e.scalar(1.0);
     let summed = e.reduce_sum(&s);
     assert_eq!(summed.ssa, s.ssa);
@@ -681,7 +716,7 @@ fn emitter_reduce_sum_on_scalar_is_a_noop() {
 #[test]
 fn emitter_matrix_helpers_emit_expected_ops() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let mat = e.constant(1.0, MlirTy::Ranked(vec![Some(3), Some(3)]));
     let vec3 = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
 
@@ -716,7 +751,7 @@ fn emitter_matrix_helpers_emit_expected_ops() {
 #[test]
 fn emitter_matvec_result_type_is_lhs_leading_dim() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let mat = e.constant(1.0, MlirTy::Ranked(vec![Some(5), Some(3)]));
     let vec3 = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
 
@@ -733,7 +768,7 @@ fn emitter_matvec_result_type_is_lhs_leading_dim() {
 #[should_panic(expected = "does not match rhs length")]
 fn emitter_matvec_panics_on_shape_mismatch() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let mat = e.constant(1.0, MlirTy::Ranked(vec![Some(5), Some(3)]));
     let vec4 = e.constant(1.0, MlirTy::Ranked(vec![Some(4)]));
     e.matvec(&mat, &vec4);
@@ -742,7 +777,7 @@ fn emitter_matvec_panics_on_shape_mismatch() {
 #[test]
 fn emitter_fresh_ssa_names_never_repeat() {
     let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = e.scalar(1.0);
     let b = e.scalar(2.0);
     let c = e.add(&a, &b);
@@ -830,7 +865,7 @@ fn lower_node_add_mul_emits_multiply_before_add() {
     let mul_node = call(&mut m, "mul", &[x_ref, two]);
     let add_node = call(&mut m, "add", &[mul_node, one]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, x, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(add_node).unwrap();
     let out = e.finish(
@@ -869,7 +904,7 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
         let args: Vec<NodeId> = if arity == 1 { vec![a] } else { vec![a, b] };
         let node = call(&mut m, head, &args);
 
-        let mut e = Emitter::new(&m, Dtype::F32);
+        let mut e = unrestricted_emitter(&m, Dtype::F32);
         bind_arg(&mut e, a, "%arg0", MlirTy::Scalar);
         let result = e.lower_node(node).unwrap();
         let out = e.finish(
@@ -902,7 +937,7 @@ fn lower_node_mixed_int_real_add_converts_before_add() {
     let add_node = call(&mut m, "add", &[i, x]);
     m.set_type(add_node, Type::Scalar(ScalarType::Real));
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         i,
         Value {
@@ -965,8 +1000,12 @@ lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n\
 outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .unwrap();
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
     assert!(out.contains("module {") && is_delimiter_balanced(&out));
     // Integer literals may fold through their real conversion.
     for line in out.lines() {
@@ -1006,7 +1045,7 @@ fn sum_over_int_array_reduces_with_int_init_and_result() {
     );
     let total = call(&mut m, "sum", &[xs]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(total).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Int);
@@ -1040,7 +1079,7 @@ fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
     let set = const_node(&mut m, "posreals");
     let cond = call(&mut m, "in", &[k, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         k,
         Value {
@@ -1097,7 +1136,7 @@ fn int_ifelse_select_returns_int_tagged_value() {
     let b = int(&mut m, 7);
     let ifelse_node = call(&mut m, "ifelse", &[cond, a, b]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(ifelse_node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Int);
@@ -1127,7 +1166,7 @@ fn int_ifelse_select_returns_int_tagged_value() {
 fn compare_adds_signed_compare_type_for_int_operands_only() {
     let m = Module::new();
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let a = Value {
         ssa: "%arg0".into(),
         ty: MlirTy::Scalar,
@@ -1149,7 +1188,7 @@ fn compare_adds_signed_compare_type_for_int_operands_only() {
         "an Int compare must carry compare_type = SIGNED:\n{line}"
     );
 
-    let mut e2 = Emitter::new(&m, Dtype::F32);
+    let mut e2 = unrestricted_emitter(&m, Dtype::F32);
     let x = Value {
         ssa: "%arg0".into(),
         ty: MlirTy::Scalar,
@@ -1187,7 +1226,7 @@ fn div_lowers_to_floor_corrected_integer_divide() {
     let b = int(&mut m, 2);
     let node = call(&mut m, "div", &[a, b]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Int);
@@ -1220,7 +1259,7 @@ fn mod_lowers_to_floor_corrected_integer_remainder() {
     let b = int(&mut m, 2);
     let node = call(&mut m, "mod", &[a, b]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Int);
@@ -1255,7 +1294,7 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
     let neg_inf = call(&mut m, "neg", &[inf_node]);
     let ifelse_node = call(&mut m, "ifelse", &[cond, a, neg_inf]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1298,7 +1337,7 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     let v = local_ref(&mut m, "v");
     let node = call(&mut m, "logsumexp", &[v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1357,7 +1396,7 @@ fn emit_logsumexp_over_scalars(k: usize) -> String {
     let vec_node = call(&mut m, "vector", &terms);
     let node = call(&mut m, "logsumexp", &[vec_node]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let params: Vec<_> = (0..k)
         .map(|i| (format!("%arg{i}"), MlirTy::Scalar, ElemKind::Real))
         .collect();
@@ -1485,7 +1524,7 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
     let v = local_ref(&mut m, "v");
     let node = call(&mut m, "sum", &[v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1521,7 +1560,7 @@ fn lower_ifelse_refuses_non_predicate_condition() {
     let b = real(&mut m, 2.0);
     let node = call(&mut m, "ifelse", &[cond, a, b]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("boolean predicate"),
@@ -1547,7 +1586,7 @@ fn lower_in_interval_reduces_to_two_compares() {
     let interval = call(&mut m, "interval", &[lo, hi]);
     let node = call(&mut m, "in", &[v, interval]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1594,7 +1633,7 @@ fn lower_in_interval_with_infinite_upper_still_splits_the_compares() {
     let interval = call(&mut m, "interval", &[lo, hi]);
     let node = call(&mut m, "in", &[v, interval]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1627,7 +1666,7 @@ fn lower_in_refuses_non_interval_set() {
     let reals = const_node(&mut m, "reals");
     let node = call(&mut m, "in", &[v, reals]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -1676,7 +1715,7 @@ fn lower_in_posreals_compares_strictly_above_zero() {
     let set = const_node(&mut m, "posreals");
     let node = call(&mut m, "in", &[v, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -1703,7 +1742,7 @@ fn lower_in_nonnegreals_compares_at_or_above_zero() {
     let set = const_node(&mut m, "nonnegreals");
     let node = call(&mut m, "in", &[v, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -1732,7 +1771,7 @@ fn lower_in_cartpow_all_reduces_per_cell_membership() {
     let node = call(&mut m, "in", &[v, set]);
 
     let ty = MlirTy::Ranked(vec![Some(3)]);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", ty.clone());
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar, "the gate predicate is scalar");
@@ -1771,7 +1810,7 @@ fn lower_in_cartpow_refuses_length_mismatch() {
     let set = call(&mut m, "cartpow", &[elem, n]);
     let node = call(&mut m, "in", &[v, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -1792,7 +1831,7 @@ fn lower_in_cartpow_refuses_scalar_point() {
     let set = call(&mut m, "cartpow", &[elem, n]);
     let node = call(&mut m, "in", &[v, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -1812,7 +1851,7 @@ fn lower_in_still_refuses_unitinterval() {
     let set = const_node(&mut m, "unitinterval");
     let node = call(&mut m, "in", &[v, set]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -1834,7 +1873,7 @@ fn lower_gt_and_lt_emit_matching_compare_directions() {
         let b = real(&mut m, 1.0);
         let node = call(&mut m, head, &[a, b]);
 
-        let mut e = Emitter::new(&m, Dtype::F32);
+        let mut e = unrestricted_emitter(&m, Dtype::F32);
         bind_arg(&mut e, a, "%arg0", MlirTy::Scalar);
         let result = e.lower_node(node).unwrap();
         let out = e.finish(
@@ -1863,7 +1902,7 @@ fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
     let half_pi = call(&mut m, "divide", &[pi, two]);
     let node = call(&mut m, "lt", &[y, half_pi]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, y, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -1889,7 +1928,7 @@ fn lower_pi_lowers_the_same_as_a_zero_arity_call() {
     let mut m = Module::new();
     let node = call(&mut m, "pi", &[]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Real);
@@ -1909,7 +1948,7 @@ fn lower_land_ands_two_predicates() {
     let lattice = call(&mut m, "gt", &[v, zero]);
     let node = call(&mut m, "land", &[image, lattice]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -1938,7 +1977,7 @@ fn lower_land_refuses_a_non_predicate_operand() {
     let lit = real(&mut m, 1.0);
     let node = call(&mut m, "land", &[image, lit]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -1963,7 +2002,7 @@ fn lower_land_refuses_shape_mismatched_operands() {
     let b = call(&mut m, "in", &[vec, nonneg]);
     let node = call(&mut m, "land", &[a, b]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, s, "%arg0", MlirTy::Scalar);
     bind_arg(&mut e, vec, "%arg1", MlirTy::Ranked(vec![Some(3)]));
     let err = e.lower_node(node).unwrap_err();
@@ -1986,7 +2025,7 @@ fn lower_iszero_compares_eq_zero_with_no_epsilon() {
     let diff = call(&mut m, "sub", &[v, back]);
     let node = call(&mut m, "iszero", &[diff]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -2024,7 +2063,7 @@ fn lower_round_emits_round_nearest_even_in_the_float_dtype() {
     let v = local_ref(&mut m, "v");
     let node = call(&mut m, "round", &[v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.elem, ElemKind::Real);
@@ -2053,7 +2092,7 @@ fn lower_real_is_value_identity_on_a_real_operand() {
     let round = call(&mut m, "round", &[v]);
     let node = call(&mut m, "real", &[round]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -2082,7 +2121,7 @@ fn lower_real_converts_an_integer_operand() {
     let k = int(&mut m, 3);
     let node = call(&mut m, "real", &[k]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         k,
         Value {
@@ -2118,7 +2157,7 @@ fn lower_maximum_and_minimum_reduce_with_dtype_exact_identities() {
         let node = call(&mut m, head, &[xs]);
 
         let ty = MlirTy::Ranked(vec![Some(3)]);
-        let mut e = Emitter::new(&m, Dtype::F32);
+        let mut e = unrestricted_emitter(&m, Dtype::F32);
         bind_arg(&mut e, xs, "%arg0", ty.clone());
         let result = e.lower_node(node).unwrap();
         assert_eq!(result.ty, MlirTy::Scalar, "{head} reduces to a scalar");
@@ -2149,7 +2188,7 @@ fn lower_maximum_refuses_a_scalar_operand() {
     let x = local_ref(&mut m, "x");
     let node = call(&mut m, "maximum", &[x]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, x, "%arg0", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -2178,7 +2217,7 @@ fn lower_fill_broadcasts_the_scalar_to_the_inferred_shape() {
         },
     );
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Ranked(vec![Some(3)]));
@@ -2215,7 +2254,7 @@ fn lower_fill_refuses_a_narrowing_fill_value() {
         },
     );
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -2241,7 +2280,7 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
         },
     );
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, n, "%n", MlirTy::Scalar);
     let err = e.lower_node(node).unwrap_err();
     assert!(
@@ -2304,7 +2343,7 @@ fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
         let b = real(&mut m, 2.0);
         let node = call(&mut m, head, &[a, b]);
 
-        let mut e = Emitter::new(&m, Dtype::F32);
+        let mut e = unrestricted_emitter(&m, Dtype::F32);
         let err = match e.lower_node(node) {
             Err(err) => err,
             Ok(_) => panic!("'{head}' must still refuse"),
@@ -2333,7 +2372,7 @@ fn lower_unary_head(head: &str) -> String {
     let v = local_ref(&mut m, "v");
     let node = call(&mut m, head, &[v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
     let result = e
         .lower_node(node)
@@ -2587,7 +2626,7 @@ fn lower_get0_slices_and_reshapes_to_scalar() {
     let idx = int(&mut m, 2);
     let node = call(&mut m, "get0", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -2627,7 +2666,7 @@ fn lower_get_is_one_based() {
     let idx = int(&mut m, 1);
     let node = call(&mut m, "get", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -2659,7 +2698,7 @@ fn lower_get0_refuses_non_rank1_container() {
     let idx = int(&mut m, 0);
     let node = call(&mut m, "get0", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -2688,7 +2727,7 @@ fn lower_get0_refuses_non_literal_index() {
     let idx = local_ref(&mut m, "i");
     let node = call(&mut m, "get0", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -2727,7 +2766,7 @@ fn lower_get0_gather_lowers_runtime_index() {
     let idx = local_ref(&mut m, "idx");
     let node = call(&mut m, "get0", &[vals, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         vals,
         Value {
@@ -2812,7 +2851,7 @@ fn lower_get_gather_uses_base_one() {
     let idx = local_ref(&mut m, "idx");
     let node = call(&mut m, "get", &[vals, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         vals,
         Value {
@@ -2862,7 +2901,7 @@ fn lower_get_gather_preserves_int_operand_elem() {
     let idx = local_ref(&mut m, "idx");
     let node = call(&mut m, "get", &[vals, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         vals,
         Value {
@@ -2914,7 +2953,7 @@ fn lower_get_gather_refuses_non_int_index() {
     let idx = local_ref(&mut m, "idx");
     let node = call(&mut m, "get", &[vals, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         vals,
         Value {
@@ -2949,7 +2988,7 @@ fn lower_get_gather_refuses_rank2_operand() {
     let idx = local_ref(&mut m, "idx");
     let node = call(&mut m, "get", &[vals, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         vals,
         Value {
@@ -2981,7 +3020,7 @@ fn lower_get0_refuses_out_of_range_index() {
     let idx = int(&mut m, 5);
     let node = call(&mut m, "get0", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -3013,7 +3052,7 @@ fn lower_node_memoizes_shared_ancestor() {
     let doubled = call(&mut m, "mul", &[x_ref2, two]);
     let node = call(&mut m, "add", &[x_ref1, doubled]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     bind_arg(&mut e, input, "%arg0", MlirTy::Scalar);
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
@@ -3035,7 +3074,7 @@ fn lower_builtin_refuses_unknown_head() {
     let mut m = Module::new();
     let a = real(&mut m, 1.0);
     let node = call(&mut m, "frobnicate", &[a]);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("unsupported builtin head 'frobnicate'"),
@@ -3050,7 +3089,7 @@ fn lower_builtin_refuses_wrong_arity() {
     let mut m = Module::new();
     let a = real(&mut m, 1.0);
     let node = call(&mut m, "add", &[a]);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("expected 2 argument"),
@@ -3063,7 +3102,7 @@ fn lower_builtin_refuses_wrong_arity() {
 fn lower_builtin_refuses_record_in_tensor_position() {
     let mut m = Module::new();
     let node = call(&mut m, "record", &[]);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("record has no tensor form"));
 }
@@ -3079,7 +3118,7 @@ fn lower_node_refuses_user_callable_application() {
         named: Vec::new().into(),
         inputs: None,
     }));
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("user-callable"));
 }
@@ -3088,7 +3127,7 @@ fn lower_node_refuses_user_callable_application() {
 fn lower_node_refuses_unresolved_self_reference() {
     let mut m = Module::new();
     let node = self_ref(&mut m, "nope");
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("unresolved reference"));
 }
@@ -3097,7 +3136,7 @@ fn lower_node_refuses_unresolved_self_reference() {
 fn lower_node_refuses_unbound_local_reference() {
     let mut m = Module::new();
     let node = local_ref(&mut m, "theta");
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("%local"));
 }
@@ -3111,7 +3150,7 @@ fn lower_node_refuses_module_member_reference() {
         ns: RefNs::Module(alias),
         name,
     }));
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("module-member"));
 }
@@ -3120,7 +3159,7 @@ fn lower_node_refuses_module_member_reference() {
 fn lower_node_refuses_bare_hole() {
     let mut m = Module::new();
     let node = m.alloc(Node::Hole);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("hole"));
 }
@@ -3133,7 +3172,7 @@ fn lower_node_refuses_axis_label() {
         name,
         variance: None,
     }));
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("axis"));
 }
@@ -3142,7 +3181,7 @@ fn lower_node_refuses_axis_label() {
 fn lower_node_refuses_string_literal() {
     let mut m = Module::new();
     let node = m.alloc(Node::Lit(Scalar::Str("hi".into())));
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("string literal"));
 }
@@ -3156,7 +3195,7 @@ fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let mut m = Module::new();
     let i = int(&mut m, 7);
     let b = m.alloc(Node::Lit(Scalar::Bool(true)));
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let iv = e.lower_node(i).unwrap();
     let bv = e.lower_node(b).unwrap();
     assert_eq!(iv.ty, MlirTy::Scalar);
@@ -3190,7 +3229,7 @@ fn lower_nonfinite_reals_use_dtype_exact_bit_patterns() {
             real(&mut m, f64::NEG_INFINITY),
             real(&mut m, f64::NAN),
         ];
-        let mut e = Emitter::new(&m, dtype);
+        let mut e = unrestricted_emitter(&m, dtype);
         let results = nodes.map(|node| e.lower_node(node).unwrap());
         let out = e.finish("f", &[], &results.iter().collect::<Vec<_>>());
         for literal in bits {
@@ -3237,7 +3276,7 @@ fn emit_logdensity(m: &Module) -> String {
     flatppl_stablehlo::emit(
         m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .expect("must emit @logdensity")
 }
@@ -3355,7 +3394,7 @@ fn builtin_logdensityof_refuses_unregistered_ctor() {
     let v = real(&mut m, 1.0);
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no lowering for distribution 'Bogus'"),
@@ -3376,7 +3415,7 @@ fn builtin_logdensityof_refuses_non_const_kernel() {
     let v = real(&mut m, 1.0);
     let node = call(&mut m, "builtin_logdensityof", &[kernel, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("bare distribution constructor"),
@@ -3398,7 +3437,7 @@ fn normal_logpdf_refuses_missing_kernel_input_field() {
     let v = real(&mut m, 1.0);
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("sigma"), "unexpected message: {}", err.msg);
 }
@@ -4468,7 +4507,7 @@ fn uniform_logpdf_refuses_unbounded_support() {
     // No parse/infer pass ran over this hand-built fragment, so `support`
     // has no `valueset_of` entry at all (`None`) — exactly the same refusal
     // path as an inferred-but-`Unknown` set (e.g. non-literal bounds).
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -4814,12 +4853,8 @@ outputs = (draws)
 ";
 
 fn emit_sample(m: &Module) -> String {
-    flatppl_stablehlo::emit(
-        m,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .expect("must emit @sample")
+    flatppl_stablehlo::emit(m, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .expect("must emit @sample")
 }
 
 /// The brief's Step-1 structural test: `func.func @sample` with no args (a
@@ -4926,7 +4961,7 @@ fn emit_sample_query_reaches_sample_via_chained_self_refs() {
     let outputs_ref = self_ref(&mut m, "query");
     top_level(&mut m, "outputs", outputs_ref);
 
-    let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::Sample, &Default::default())
+    let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
         .expect("must emit @sample: query reaches builtin_sample via a 2-hop self-ref chain");
     assert_eq!(
         out.matches("stablehlo.rng").count(),
@@ -5002,7 +5037,7 @@ fn builtin_sample_refuses_unregistered_ctor() {
     let kernel_input = record_node(&mut m, &[("mu", mu_val), ("sigma", sigma_val)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no lowering for distribution 'Bogus'"),
@@ -5033,7 +5068,7 @@ fn builtin_sample_refuses_registered_ctor_without_sample_builder() {
     let kernel_input = record_node(&mut m, &[("mu", mu), ("kappa", kappa)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'VonMises'"),
@@ -5054,7 +5089,7 @@ fn builtin_sample_refuses_non_const_ctor() {
     let kernel_input = call(&mut m, "record", &[]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("bare distribution constructor"),
@@ -5075,7 +5110,7 @@ fn builtin_sample_refuses_wrong_arity() {
     let ctor = const_node(&mut m, "Normal");
     let node = call(&mut m, "builtin_sample", &[rng, ctor]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -5138,7 +5173,7 @@ fn emit_refuses_input_that_is_not_flatpdl() {
     let err = flatppl_stablehlo::emit(
         &m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -5170,7 +5205,7 @@ fn lower_get_of_sampled_tuple_yields_advanced_rng_key() {
     let one_idx = int(&mut m, 1);
     let node = call(&mut m, "get0", &[sample, one_idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     // Seed the source rng arg with `%key`, as `emit_sample` would.
     e.bind(
         rng,
@@ -5196,7 +5231,7 @@ fn lower_get_of_sampled_tuple_yields_advanced_rng_key() {
 fn lower_vector_refuses_empty_element_list() {
     let mut m = Module::new();
     let node = call(&mut m, "vector", &[]);
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("vector: expected at least one element"),
@@ -5221,7 +5256,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
     let t2 = local_ref(&mut m, "t2");
     let node = call(&mut m, "vector", &[t1, t2]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         t1,
         Value {
@@ -5282,7 +5317,7 @@ fn lower_vector_refuses_ragged_elements() {
     let t2 = local_ref(&mut m, "t2");
     let node = call(&mut m, "vector", &[t1, t2]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         t1,
         Value {
@@ -5326,7 +5361,7 @@ fn lower_in_refuses_shape_mismatched_bound() {
     let interval = call(&mut m, "interval", &[lo, hi]);
     let node = call(&mut m, "in", &[v, interval]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -5357,7 +5392,7 @@ fn lower_get_refuses_selector_below_one_based_floor() {
     let idx = int(&mut m, 0);
     let node = call(&mut m, "get", &[v, idx]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     e.bind(
         v,
         Value {
@@ -5385,7 +5420,7 @@ fn builtin_logdensityof_refuses_wrong_arity() {
     let kernel_input = call(&mut m, "record", &[]);
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -6034,7 +6069,7 @@ fn categorical_logpdf_refuses_non_literal_selector() {
     let v = self_ref(&mut m, "k");
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("dynamic gather is not supported"),
@@ -6058,7 +6093,7 @@ fn categorical_logpdf_refuses_out_of_range_category() {
     let v = int(&mut m, 4);
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("out of range"),
@@ -6084,7 +6119,7 @@ fn categorical0_logpdf_at_floor_selects_first_element() {
     let v = int(&mut m, 0);
     let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
     let out = e.finish("f", &[], &[&result]);
     assert!(
@@ -6196,7 +6231,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6226,7 +6261,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6253,7 +6288,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6521,7 +6556,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6614,7 +6649,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6709,7 +6744,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6740,7 +6775,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -6839,7 +6874,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -7549,12 +7584,8 @@ inputs = (m, alpha)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Dirichlet sample needs a statically-known vector length"),
@@ -7582,12 +7613,8 @@ inputs = (alpha)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Dirichlet sample: 'alpha' must be a rank-1 vector"),
@@ -7819,12 +7846,8 @@ inputs = (n)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Binomial sample needs a fixed-phase positive integer literal"),
@@ -7974,7 +7997,7 @@ fn sampler_loop_regions_do_not_share_local_constants() {
             flatppl_stablehlo::Mode::Sample,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                ..Default::default()
+                enzyme_compatible: false,
             },
         )
         .unwrap();
@@ -8041,12 +8064,8 @@ inputs = (n)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Multinomial sample needs a fixed-phase positive integer literal"),
@@ -8074,12 +8093,8 @@ inputs = (m, p)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Multinomial sample needs a statically-known vector length"),
@@ -8107,12 +8122,8 @@ inputs = (p)
 outputs = (draws)
 ";
     let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg
             .contains("Multinomial sample: 'p' must be a rank-1 vector"),
@@ -8151,7 +8162,7 @@ fn builtin_sample_refuses_wishart_without_sample_builder() {
     let kernel_input = record_node(&mut m, &[("nu", nu), ("scale", scale)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'Wishart'"),
@@ -8173,7 +8184,7 @@ fn builtin_sample_refuses_inverse_wishart_without_sample_builder() {
     let kernel_input = record_node(&mut m, &[("nu", nu), ("psi", psi)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'InverseWishart'"),
@@ -8195,7 +8206,7 @@ fn builtin_sample_refuses_lkj_without_sample_builder() {
     let kernel_input = record_node(&mut m, &[("n", n), ("eta", eta)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'LKJ'"),
@@ -8217,7 +8228,7 @@ fn builtin_sample_refuses_lkj_cholesky_without_sample_builder() {
     let kernel_input = record_node(&mut m, &[("n", n), ("eta", eta)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'LKJCholesky'"),
@@ -8351,7 +8362,7 @@ fn builtin_sample_refuses_poisson_process_unregistered() {
     let kernel_input = record_node(&mut m, &[("intensity", intensity)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -8374,7 +8385,7 @@ fn builtin_sample_refuses_binned_poisson_process_unregistered() {
     let kernel_input = record_node(&mut m, &[("bins", bins), ("intensity", intensity)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -9456,7 +9467,7 @@ outputs = q1
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -9490,7 +9501,7 @@ outputs = q1
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -9577,7 +9588,7 @@ outputs = y
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -9601,7 +9612,7 @@ outputs = y
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -9817,12 +9828,8 @@ draws = rand(s, lawof(x))
 inputs = s
 ";
     let d = determinize_abi_roots(src, &["inputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
+        .unwrap_err();
     assert!(
         err.msg.contains("at least one output"),
         "expected the empty-outputs refusal, got: {}",
@@ -9956,7 +9963,7 @@ outputs = q1
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10074,7 +10081,7 @@ outputs = q1
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10296,7 +10303,7 @@ outputs = lp
         let err = flatppl_stablehlo::emit(
             &d,
             flatppl_stablehlo::Mode::LogDensity,
-            &flatppl_stablehlo::EmitOptions::default(),
+            &unrestricted_options(),
         )
         .unwrap_err();
         assert!(
@@ -10536,7 +10543,7 @@ outputs = lp
         let err = flatppl_stablehlo::emit(
             &d,
             flatppl_stablehlo::Mode::LogDensity,
-            &flatppl_stablehlo::EmitOptions::default(),
+            &unrestricted_options(),
         )
         .unwrap_err();
         assert!(
@@ -10648,7 +10655,7 @@ outputs = lp
         let err = flatppl_stablehlo::emit(
             &d,
             flatppl_stablehlo::Mode::LogDensity,
-            &flatppl_stablehlo::EmitOptions::default(),
+            &unrestricted_options(),
         )
         .unwrap_err();
         assert!(
@@ -10675,7 +10682,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10704,7 +10711,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10731,7 +10738,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10834,7 +10841,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10860,7 +10867,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10891,7 +10898,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10924,7 +10931,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -10952,7 +10959,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11094,7 +11101,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11123,7 +11130,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11151,7 +11158,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11226,7 +11233,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11256,7 +11263,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11349,7 +11356,7 @@ outputs = lp
         let err = flatppl_stablehlo::emit(
             &d,
             flatppl_stablehlo::Mode::LogDensity,
-            &flatppl_stablehlo::EmitOptions::default(),
+            &unrestricted_options(),
         )
         .unwrap_err();
         assert!(
@@ -11375,7 +11382,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11589,7 +11596,7 @@ outputs = lp
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11726,7 +11733,7 @@ outputs = (lp)
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11756,7 +11763,7 @@ outputs = q1
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .unwrap_err();
     assert!(
@@ -11881,7 +11888,7 @@ fn builtin_touniform_refuses_dist_without_cdf() {
     let x = real(&mut m, 0.5);
     let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
@@ -11903,7 +11910,7 @@ fn builtin_touniform_refuses_unregistered_ctor() {
     let x = real(&mut m, 1.0);
     let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no lowering for distribution 'Bogus'"),
@@ -11923,7 +11930,7 @@ fn builtin_touniform_refuses_non_const_kernel() {
     let x = real(&mut m, 1.0);
     let node = call(&mut m, "builtin_touniform", &[kernel, kernel_input, x]);
 
-    let mut e = Emitter::new(&m, Dtype::F32);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("bare distribution constructor"),
@@ -11952,8 +11959,12 @@ inputs = (mu)\n\
 outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .expect("table field access must emit, not refuse the `table` head");
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .expect("table field access must emit, not refuse the `table` head");
     assert!(out.contains("module {"));
     assert!(
         out.contains("dense<\"0x0000A841\"> : tensor<1xf32>"),
@@ -11990,8 +12001,12 @@ lp = logdensityof(post, record(theta = [0.1, 0.2], b = [0.3, 0.4]))\n\
 outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
-        .expect("an all-broadcast-form density query must not refuse as 'no density term'");
+    let out = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .expect("an all-broadcast-form density query must not refuse as 'no density term'");
     assert!(out.contains("module {"));
 }
 
@@ -12007,7 +12022,7 @@ draws = rand(s, lawof(x))\n\
 outputs = (draws)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
-    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
         .expect("declared sample output must emit via emit_sample_abi");
     assert!(out.contains("func.func @sample"));
     assert!(out.contains("tensor<2xui64>"), "leading %key arg:\n{out}");
@@ -12026,7 +12041,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
         flatppl_stablehlo::Mode::LogDensity,
         flatppl_stablehlo::Mode::Sample,
     ] {
-        let err = flatppl_stablehlo::emit(&d, mode, &Default::default()).unwrap_err();
+        let err = flatppl_stablehlo::emit(&d, mode, &unrestricted_options()).unwrap_err();
         assert!(
             err.msg.contains("no inputs/outputs ABI"),
             "expected the ABI-required refusal, got: {}",
@@ -12400,7 +12415,7 @@ fn emit_logdensity_refuses_a_table_reduction_with_its_own_message() {
         let err = flatppl_stablehlo::emit(
             &d,
             flatppl_stablehlo::Mode::LogDensity,
-            &flatppl_stablehlo::EmitOptions::default(),
+            &unrestricted_options(),
         )
         .unwrap_err();
         assert!(
@@ -12447,7 +12462,7 @@ fn emit_logdensity_err(m: &Module) -> flatppl_stablehlo::EmitError {
     flatppl_stablehlo::emit(
         m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &unrestricted_options(),
     )
     .expect_err("must refuse, not emit")
 }
@@ -13003,7 +13018,7 @@ fn aggregate_refuses_chaining_through_an_already_scanned_site() {
     let sum = const_node(&mut m, "sum");
     let output_axes = call(&mut m, "vector", &[]);
     let aggregate = call(&mut m, "aggregate", &[sum, output_axes, body]);
-    let error = Emitter::new(&m, Dtype::F64)
+    let error = unrestricted_emitter(&m, Dtype::F64)
         .lower_node(aggregate)
         .unwrap_err();
     assert_eq!(error.node, Some(outer));
@@ -13102,7 +13117,7 @@ fn special_function_siblings_form_one_ordered_packet() {
             flatppl_stablehlo::Mode::LogDensity,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                ..Default::default()
+                enzyme_compatible: false,
             },
         )
         .unwrap();
@@ -13187,7 +13202,7 @@ fn constant_concatenation_keeps_nested_storage_order() {
                     flatppl_stablehlo::Mode::LogDensity,
                     &flatppl_stablehlo::EmitOptions {
                         dtype,
-                        ..Default::default()
+                        enzyme_compatible: false,
                     },
                 )
                 .unwrap()
@@ -13228,7 +13243,7 @@ fn folded_dense_constants_preserve_target_rounding_and_signed_zero() {
             flatppl_stablehlo::Mode::LogDensity,
             &flatppl_stablehlo::EmitOptions {
                 dtype,
-                ..Default::default()
+                enzyme_compatible: false,
             },
         )
         .unwrap();

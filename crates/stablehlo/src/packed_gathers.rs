@@ -110,7 +110,7 @@ impl Requests {
                 .collect::<Vec<_>>();
             // A fresh cache prevents reuse of an index constant defined after
             // the first request, where the shared gather must be inserted.
-            let mut scratch = Emitter::new(out.m, out.dtype);
+            let mut scratch = out.scratch_emitter();
             scratch.next = out.next;
             let (shared, _) = gather(
                 &mut scratch,

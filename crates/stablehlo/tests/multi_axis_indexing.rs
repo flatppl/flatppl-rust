@@ -14,7 +14,10 @@ fn emit(source: &str) -> Result<String, flatppl_stablehlo::EmitError> {
     flatppl_stablehlo::emit(
         &lowered,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
 }
 

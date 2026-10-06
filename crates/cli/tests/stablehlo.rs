@@ -204,7 +204,7 @@ fn stablehlo_dirichlet_sample_caps_static_unroll() {
     let out = flatppl()
         .arg("stablehlo")
         .arg(&input)
-        .args(["--mode", "sample"])
+        .args(["--mode", "sample", "--enzyme-compatible=false"])
         .output()
         .unwrap();
     assert_eq!(

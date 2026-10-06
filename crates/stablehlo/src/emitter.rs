@@ -178,7 +178,7 @@ impl<'m> Emitter<'m> {
         Emitter {
             m,
             dtype,
-            enzyme_compatible: false,
+            enzyme_compatible: crate::EmitOptions::default().enzyme_compatible,
             next: 0,
             memo: HashMap::new(),
             pure_ops: HashMap::new(),
@@ -202,7 +202,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// A new region's scratch emitter must preserve target restrictions.
-    fn scratch_emitter(&self) -> Self {
+    pub(super) fn scratch_emitter(&self) -> Self {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.enzyme_compatible = self.enzyme_compatible;
         emitter
