@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flatppl_core::{Node, NodeId, Ref, RefNs, Symbol};
 
 use crate::builder::Builder;
-use crate::histfactory::Multiplier;
+use crate::histfactory::{INTERP_NORMSYS_DEFAULT, Multiplier};
 
 pub(crate) const PRODUCT_THRESHOLD: usize = 96;
 
@@ -51,6 +51,7 @@ impl Factors {
         b: &mut Builder,
         channel: &str,
         samples: Vec<Vec<Multiplier>>,
+        pyhf_helpers: Option<&str>,
     ) -> Vec<Vec<NodeId>> {
         let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut pending = BTreeSet::new();
@@ -68,10 +69,14 @@ impl Factors {
 
         let one = b.lit_real(1.0);
         for (function, rows) in groups {
+            let helper = pyhf_helpers.filter(|_| function == INTERP_NORMSYS_DEFAULT);
             let inputs: Vec<_> = rows.iter().map(|row| row.inputs(b)).collect();
             if inputs.len() == 1 {
                 let [lo, hi, alpha] = inputs[0];
-                let factor = b.module_user_call("hepphys", function, &[lo, one, hi, alpha]);
+                let factor = match helper {
+                    Some(alias) => b.module_user_call(alias, "normsys_factor", &[lo, hi, alpha]),
+                    None => b.module_user_call("hepphys", function, &[lo, one, hi, alpha]),
+                };
                 self.values.insert(rows[0].key(), factor);
                 continue;
             }
@@ -79,8 +84,16 @@ impl Factors {
             let lo = b.array(&inputs.iter().map(|row| row[0]).collect::<Vec<_>>());
             let hi = b.array(&inputs.iter().map(|row| row[1]).collect::<Vec<_>>());
             let alpha = b.array(&inputs.iter().map(|row| row[2]).collect::<Vec<_>>());
-            let head = b.module_call("hepphys", function);
-            let factors = b.call("broadcast", &[head, lo, one, hi, alpha]);
+            let factors = match helper {
+                Some(alias) => {
+                    let head = b.module_call(alias, "normsys_factor");
+                    b.call("broadcast", &[head, lo, hi, alpha])
+                }
+                None => {
+                    let head = b.module_call("hepphys", function);
+                    b.call("broadcast", &[head, lo, one, hi, alpha])
+                }
+            };
             let name = b.bind_unique_doc(
                 &format!("{channel}_normsys_{function}"),
                 factors,

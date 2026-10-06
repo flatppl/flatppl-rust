@@ -370,9 +370,26 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
     // `hepphys = standard_module("particle-physics", "0.1")`
     emit_standard_module(b);
 
+    // Keep valid parameter names, even when one names the helper module.
+    let parameters: HashSet<_> = doc
+        .channels()
+        .iter()
+        .flat_map(|c| &c.samples)
+        .flat_map(|s| &s.modifiers)
+        .filter_map(|m| m.effective_param())
+        .collect();
+    let mut helpers = "pyhf_helpers".to_owned();
+    let mut suffix = 2;
+    while parameters.contains(&helpers) {
+        helpers = format!("pyhf_helpers_{suffix}");
+        suffix += 1;
+    }
+    bind_standard_module(b, &helpers, "pyhf_helpers", "0.1");
+
     // Per channel: declare free params, build expected, obs model, and accumulate
     // observation + constraint likelihood terms.
     let mut terms = Terms {
+        pyhf_helpers: Some(helpers),
         staterror_gaussian_default: true,
         param_overrides,
         ..Terms::default()
@@ -546,6 +563,8 @@ pub struct Terms {
     declared_params: HashSet<String>,
     /// Shared deterministic normalization factors across samples and channels.
     normsys_factors: crate::normsys::Factors,
+    /// pyhf's qualified interpolation helpers; native HS3 keeps its chosen codes.
+    pyhf_helpers: Option<String>,
     /// The staterror constraint form to use when the modifier does not name one.
     ///
     /// pyhf's staterror paramset is always `constrained_by_normal` and its
@@ -885,7 +904,13 @@ pub fn assemble_channel(
         nominal_names.push(nom_name);
         histosys.push(shifted);
     }
-    let shifted = crate::histosys::shifted_nominals(b, channel_name, &nominal_names, &histosys);
+    let shifted = crate::histosys::shifted_nominals(
+        b,
+        channel_name,
+        &nominal_names,
+        &histosys,
+        terms.pyhf_helpers.as_deref(),
+    );
     let mut multipliers = Vec::new();
     for ((_, nominal, modifiers), nom_name) in samples.iter().zip(&nominal_names) {
         let mut factors = Vec::new();
@@ -918,9 +943,12 @@ pub fn assemble_channel(
         }
         multipliers.push(factors);
     }
-    let multipliers = terms
-        .normsys_factors
-        .multipliers(b, channel_name, multipliers);
+    let multipliers = terms.normsys_factors.multipliers(
+        b,
+        channel_name,
+        multipliers,
+        terms.pyhf_helpers.as_deref(),
+    );
     let runs = samples
         .iter()
         .zip(&multipliers)
@@ -1364,7 +1392,7 @@ mod tests {
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "missing Normal aux, got:\n{text}");
         assert!(
-            text.contains("interp_poly6"),
+            text.contains("pyhf_helpers.normsys_factor"),
             "missing interp fn, got:\n{text}"
         );
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use flatppl_core::NodeId;
 
 use crate::builder::Builder;
-use crate::histfactory::Interpolation;
+use crate::histfactory::{INTERP_HISTOSYS_DEFAULT, Interpolation};
 
 /// Interpolate a channel's templates together, then reduce each sample's rows.
 /// Every shift uses the original nominal. Multiplicative modifiers and auxiliary
@@ -16,13 +16,26 @@ pub(crate) fn shifted_nominals(
     channel: &str,
     nominals: &[String],
     modifiers: &[Vec<Interpolation>],
+    pyhf_helpers: Option<&str>,
 ) -> Vec<NodeId> {
     let mut results: Vec<_> = nominals.iter().map(|name| b.self_ref(name)).collect();
     let count: usize = modifiers.iter().map(Vec::len).sum();
     if count < 2 {
         for (sample, rows) in modifiers.iter().enumerate() {
             if let Some(row) = rows.first() {
-                results[sample] = row.apply(b, results[sample]);
+                results[sample] =
+                    match pyhf_helpers.filter(|_| row.function == INTERP_HISTOSYS_DEFAULT) {
+                        Some(alias) => {
+                            let head = b.module_call(alias, "histosys_shift");
+                            let shift = b.call(
+                                "broadcast",
+                                &[head, row.lo, results[sample], row.hi, row.alpha],
+                            );
+                            let add = b.call_head("add");
+                            b.call("broadcast", &[add, results[sample], shift])
+                        }
+                        None => row.apply(b, results[sample]),
+                    };
             }
         }
         return results;
@@ -54,10 +67,18 @@ pub(crate) fn shifted_nominals(
         let zero = b.lit_int(0);
         let one = b.lit_int(1);
         let alpha = b.call("addaxes", &[alpha, zero, one]);
-        let function = b.module_call("hepphys", function);
-        let interpolated = b.call("broadcast", &[function, lo, nominal, hi, alpha]);
-        let sub = b.call_head("sub");
-        let shifts = b.call("broadcast", &[sub, interpolated, nominal]);
+        let shifts = match pyhf_helpers.filter(|_| function == INTERP_HISTOSYS_DEFAULT) {
+            Some(alias) => {
+                let head = b.module_call(alias, "histosys_shift");
+                b.call("broadcast", &[head, lo, nominal, hi, alpha])
+            }
+            None => {
+                let head = b.module_call("hepphys", function);
+                let interpolated = b.call("broadcast", &[head, lo, nominal, hi, alpha]);
+                let sub = b.call_head("sub");
+                b.call("broadcast", &[sub, interpolated, nominal])
+            }
+        };
         let name = b.bind_unique_doc(
             &format!("{channel}_histosys_shifts"),
             shifts,
