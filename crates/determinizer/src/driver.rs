@@ -87,8 +87,8 @@ pub fn determinize_with_roots(
     determinize_with_options(m, bundle, roots, &crate::LoweringOptions::default())
 }
 
-/// Preserve a backend's supported standard functions until its own lowering.
-/// All other functions keep the ordinary portable expansion.
+/// Transform `m` using the host's lowering options, including retained standard
+/// functions and intact `rand` tuples. Defaults preserve ordinary lowering.
 pub fn determinize_with_options(
     m: &Module,
     bundle: &ModuleBundle,
@@ -516,7 +516,7 @@ fn apply_rule(
     // `rand(rng, lawof(M))` threads an RNG through M's generative subgraph,
     // replacing each `draw(mᵢ)` with `builtin_sample(rngᵢ, mᵢ, inputᵢ)` (spec §07).
     if is_op(m, target_node, "rand") {
-        let new_root = crate::sample::lower_rand(m, bid, target_node)?;
+        let new_root = crate::sample::lower_rand(m, bid, target_node, options.preserve_rand_tuple)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`

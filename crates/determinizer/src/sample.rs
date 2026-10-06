@@ -57,6 +57,7 @@ pub(crate) fn lower_rand(
     m: &mut Module,
     bid: BindingId,
     rand_node: NodeId,
+    preserve_tuple: bool,
 ) -> Result<NodeId, RefuseError> {
     let (rng, measure) = {
         let c = expect_builtin_call(m, rand_node, "rand")
@@ -67,10 +68,9 @@ pub(crate) fn lower_rand(
         (c.args[0], c.args[1])
     };
     let (value, rng_out) = lower_closed_measure_sample(m, measure, rng)?;
-    if rand_result_is_destructured(m, bid) {
-        // Full spec §07 (value, new_rstate) contract: the caller destructures
-        // both slots (or feeds s2 into another rand). Build the 2-tuple so the
-        // parser's `get(_,1)`/`get(_,2)` (1-based) project value/rng.
+    if preserve_tuple || rand_result_is_destructured(m, bid) {
+        // Full spec §07 (value, new_rstate) contract: retain both slots for
+        // host outputs or the parser's get(_,1)/get(_,2) projections.
         Ok(build_call(m, "tuple", &[value, rng_out]))
     } else {
         // Value-terminal shortcut: `draws = rand(...)` used as a bare value /
