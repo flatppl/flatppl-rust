@@ -61,15 +61,22 @@ fn record_broadcast_collects_table_rows() {
         "y",
     );
     assert!(line.contains("(%scalar integer)"), "{line}");
+    let line = bind_line("t = broadcast(record, a = [1,2], b = 3.0)\ny = t[2].b", "y");
+    assert!(line.contains("(%scalar real)"), "{line}");
 }
 
 #[test]
 fn record_broadcast_requires_one_axis() {
-    let errs = errors("f(a) = record(x = a)\nt = broadcast(f, addaxes([1,2], 1, 0))");
-    assert!(
-        errs.iter().any(|e| e.contains("requires one axis")),
-        "{errs:?}"
-    );
+    for source in [
+        "f(a) = record(x = a)\nt = broadcast(f, addaxes([1,2], 1, 0))",
+        "t = broadcast(record, x = addaxes([1,2], 1, 0))",
+    ] {
+        let errs = errors(source);
+        assert!(
+            errs.iter().any(|e| e.contains("requires one axis")),
+            "{errs:?}"
+        );
+    }
 }
 
 /// The vector operand whose elements are scalars — the shape every witness below

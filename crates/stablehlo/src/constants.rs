@@ -9,6 +9,22 @@ use std::sync::Arc;
 pub(super) type Constant = Arc<[Scalar]>;
 
 impl Emitter<'_> {
+    pub(crate) fn constant_integer_vector(&self, value: &Value) -> Option<Vec<i64>> {
+        let MlirTy::Ranked(dims) = &value.ty else {
+            return None;
+        };
+        let [Some(n)] = dims.as_slice() else {
+            return None;
+        };
+        let data = self.constants.get(&value.ssa)?;
+        (0..usize::try_from(*n).ok()?)
+            .map(|i| match data.get(if data.len() == 1 { 0 } else { i })? {
+                Scalar::Int(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn constant_extent(&self, value: &Value) -> Option<u64> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;

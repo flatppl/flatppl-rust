@@ -132,6 +132,7 @@ fn the_rest_of_the_two_new_tables_refuse_under_a_broadcast() {
         "addaxes",
         "blockdiagmat",
         "bandedmat",
+        "array",
     ] {
         let err = emit_err(&nested_src(head, "reals"));
         assert!(
@@ -157,7 +158,6 @@ fn the_unlowered_collection_heads_refuse_as_unsupported_not_on_the_domain_rule()
         "polynomial",
         "bernstein",
         "stepwise",
-        "array",
     ] {
         let err = emit_err(&nested_src(head, "reals"));
         assert!(

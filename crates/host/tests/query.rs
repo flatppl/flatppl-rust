@@ -9,9 +9,10 @@ fn registered_module_exports_a_typed_query_abi() -> Result<(), Box<dyn std::erro
     let query = context.parse(
         r#"
         m = load_module("model.flatppl")
+        distribution = m.distribution
         p = elementof(cartprod(z = reals, a = cartpow(reals, 2)))
         inputs = p
-        result = record(total = logdensityof(m.distribution, p.z), original = p.a)
+        result = record(total = p.z + logdensityof(iid(distribution, 2), p.a), original = p.a)
         outputs = result
         "#,
         None,

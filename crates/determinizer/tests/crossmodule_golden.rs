@@ -1424,6 +1424,28 @@ fn nested_loads_keep_their_parent_instance() {
 }
 
 #[test]
+fn imported_values_inside_expressions_keep_load_substitutions() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "values.flatppl",
+        Arc::new(parse(
+            "offset = 3.0\nx = external(reals)\nvalue = x + offset",
+        )),
+    );
+    assert_outputs(
+        "p = elementof(cartprod(z = reals, a = cartpow(reals, 2)))\ninputs = p\n\
+         left = load_module(\"values.flatppl\", x = 1.0)\n\
+         right = load_module(\"values.flatppl\", x = 10.0)\n\
+         outputs = record(total = p.z + sum(p.a) + left.offset,\n\
+                          values = [left.value + 1.0, right.value + 1.0])",
+        &bundle,
+        "p = elementof(cartprod(z = reals, a = cartpow(reals, 2)))\ninputs = p\n\
+         outputs = record(total = p.z + sum(p.a) + 3.0,\n\
+                          values = [5.0, 14.0])",
+    );
+}
+
+#[test]
 fn reexported_laws_preserve_shared_stochastic_ancestors() {
     let mut bundle = ModuleBundle::new();
     bundle.insert(
