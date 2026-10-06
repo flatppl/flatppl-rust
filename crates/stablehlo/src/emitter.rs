@@ -40,6 +40,10 @@ mod batching;
 mod constants;
 #[path = "enzyme.rs"]
 mod enzyme;
+#[path = "integration.rs"]
+mod integration;
+#[path = "linalg.rs"]
+mod linalg;
 #[path = "packed_gathers.rs"]
 mod packed_gathers;
 #[path = "packing.rs"]
@@ -50,6 +54,8 @@ mod pointwise;
 mod pyhf;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
+#[path = "sequences.rs"]
+mod sequences;
 pub(crate) use batching::Axes;
 use batching::shape;
 use pointwise::Pointwise;
@@ -126,6 +132,7 @@ pub struct Emitter<'m> {
     m: &'m Module,
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
+    integration: Option<crate::IntegrationOptions>,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
     /// its op line emitted) once — see [`Emitter::lower_node`]. Also the seed
@@ -133,6 +140,10 @@ pub struct Emitter<'m> {
     /// pre-bound to its `%argN` `Value` via [`Emitter::bind`]) before the body
     /// graph that references it is walked.
     memo: HashMap<NodeId, Value>,
+    /// Concrete callback annotations are scoped to the current application.
+    scoped_types: HashMap<NodeId, Type>,
+    scoped_inputs: HashMap<NodeId, Type>,
+    inference_module: Option<Module>,
     /// Exact pure-operation RHS -> SSA, confined to the current region.
     pure_ops: HashMap<(String, Option<Axes>), String>,
     /// Typed numeric producers; their SSA operands never change.
@@ -179,8 +190,12 @@ impl<'m> Emitter<'m> {
             m,
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
+            integration: None,
             next: 0,
             memo: HashMap::new(),
+            scoped_types: HashMap::new(),
+            scoped_inputs: HashMap::new(),
+            inference_module: None,
             pure_ops: HashMap::new(),
             pointwise: HashMap::new(),
             expanded: HashMap::new(),
@@ -198,6 +213,7 @@ impl<'m> Emitter<'m> {
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
+        emitter.integration = opts.integration;
         emitter
     }
 
@@ -205,6 +221,7 @@ impl<'m> Emitter<'m> {
     pub(super) fn scratch_emitter(&self) -> Self {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
+        emitter.integration = self.integration;
         emitter
     }
 
@@ -398,9 +415,13 @@ impl<'m> Emitter<'m> {
         if let Some(value) = self.fold_binary(op, a, b) {
             return value;
         }
+        // Scalar dots through slice/reshape chains crash Enzyme's adjoint.
+        // Keep scalar multiplies native; tensor products still need the dot
+        // lowering to preserve zero-factor derivatives.
         let ssa = if self.restrict_enzyme_compatible
             && a.elem == ElemKind::Real
             && op == "stablehlo.multiply"
+            && !shape(&a.ty).is_empty()
         {
             self.product_pair(a, b).ssa
         } else {
@@ -3126,6 +3147,17 @@ impl<'m> Emitter<'m> {
         cond: impl FnOnce(&mut Self, &[Value]) -> Value,
         body: impl FnOnce(&mut Self, &[Value]) -> Vec<Value>,
     ) -> Vec<Value> {
+        self.try_while_loop(inits, carried_tys, cond, |e, args| Ok(body(e, args)))
+            .expect("infallible loop body")
+    }
+
+    fn try_while_loop(
+        &mut self,
+        inits: &[Value],
+        carried_tys: &[String],
+        cond: impl FnOnce(&mut Self, &[Value]) -> Value,
+        body: impl FnOnce(&mut Self, &[Value]) -> Result<Vec<Value>, EmitError>,
+    ) -> Result<Vec<Value>, EmitError> {
         assert_eq!(
             inits.len(),
             carried_tys.len(),
@@ -3144,7 +3176,7 @@ impl<'m> Emitter<'m> {
             .map(|(n, init)| Value {
                 ssa: n.clone(),
                 ty: init.ty.clone(),
-                elem: ElemKind::Real,
+                elem: init.elem,
             })
             .collect();
         // The multi-result group name (%r:N -> %r#0, %r#1, ...).
@@ -3167,6 +3199,7 @@ impl<'m> Emitter<'m> {
         let do_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
         self.expanded = saved_expanded;
+        let next = next?;
         assert_eq!(
             next.len(),
             inits.len(),
@@ -3208,13 +3241,13 @@ impl<'m> Emitter<'m> {
         text.push('}');
         self.push(&text);
 
-        (0..arity)
+        Ok((0..arity)
             .map(|k| Value {
                 ssa: format!("{result_name}#{k}"),
                 ty: inits[k].ty.clone(),
-                elem: ElemKind::Real,
+                elem: inits[k].elem,
             })
-            .collect()
+            .collect())
     }
 
     /// If `args` is `get0`/`get`'s `[container, index]` pair and `container`
@@ -3281,7 +3314,8 @@ impl<'m> Emitter<'m> {
     /// The aggregate node itself is never bound in the memo (it has no monolithic
     /// tensor form), so this side table is the ONLY way a column access can reach
     /// its argument; [`Emitter::column_arg`] is the read side.
-    pub(crate) fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+    pub fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+        let container = self.resolve_ref_one(container);
         self.columns.insert((container, name), value);
     }
 
@@ -3422,7 +3456,7 @@ impl<'m> Emitter<'m> {
     /// operands' ranks to tell a matrix product from an elementwise one WITHOUT
     /// lowering either operand first.
     pub(crate) fn type_of(&self, id: NodeId) -> Option<&Type> {
-        self.m.type_of(id)
+        self.scoped_types.get(&id).or_else(|| self.m.type_of(id))
     }
 
     /// Apply the inferred array nesting for an operation that must distinguish
@@ -3457,9 +3491,7 @@ impl<'m> Emitter<'m> {
     /// a bare bool is not a meaningful signal to propagate as an
     /// [`EmitError`] from a `Result`-less accessor.
     pub(crate) fn node_kind(&self, id: NodeId) -> ElemKind {
-        crate::types::mlir_type_of(self.m, id, self.dtype)
-            .map(|(_, k)| k)
-            .unwrap_or(ElemKind::Real)
+        self.node_ty(id).map(|(_, k)| k).unwrap_or(ElemKind::Real)
     }
 
     /// The full [`crate::types::mlir_type_of`] result for `id`, propagating the
@@ -3468,7 +3500,10 @@ impl<'m> Emitter<'m> {
     /// it off instead (`ops::lower_fill`, whose `size` argument is the
     /// determiniser's `lengthof(v)` rather than a literal).
     pub(crate) fn node_ty(&self, id: NodeId) -> Result<(MlirTy, ElemKind), EmitError> {
-        crate::types::mlir_type_of(self.m, id, self.dtype)
+        let ty = self
+            .type_of(id)
+            .ok_or_else(|| EmitError::at(id, "node has no inferred type"))?;
+        crate::types::mlir_type_of_ty(id, ty, self.dtype)
     }
 
     /// Lower one FlatPDL node to a [`Value`], memoizing the result so a
@@ -3625,46 +3660,8 @@ impl<'m> Emitter<'m> {
         fn_id: NodeId,
         positional_rest: &[NodeId],
     ) -> Result<Value, EmitError> {
-        // The reified callable: `functionof(body, %specinputs ((param placeholder)…))`.
-        // Read its body + ordered input list out up front (dropping the borrow
-        // before the `&mut self` lowering below).
-        let (body, entries) = match self.m.node(fn_id) {
-            Node::Call(c) => {
-                let body = *c.args.first().ok_or_else(|| {
-                    EmitError::at(fn_id, "broadcast: reified function has no body")
-                })?;
-                let entries: Vec<(Symbol, Ref)> = match &c.inputs {
-                    Some(Inputs::Spec(es)) => es.to_vec(),
-                    Some(Inputs::Auto) => self
-                        .m
-                        .auto_inputs_of(fn_id)
-                        .ok_or_else(|| {
-                            EmitError::at(
-                                fn_id,
-                                "broadcast: reified function has an unresolved (%autoinputs) \
-                                 input list",
-                            )
-                        })?
-                        .to_vec(),
-                    None => {
-                        return Err(EmitError::at(
-                            fn_id,
-                            "broadcast: callable is not a reified function (no input list)",
-                        ));
-                    }
-                };
-                (body, entries)
-            }
-            _ => {
-                return Err(EmitError::at(
-                    fn_id,
-                    "broadcast: callable did not resolve to a reified function",
-                ));
-            }
-        };
-
-        // The broadcast call's `%kwarg` entries — the by-name argument binding.
-        let kwargs: Vec<(Symbol, NodeId)> = match self.m.node(id) {
+        let (body, entries) = self.callable_parts(fn_id)?;
+        let kwargs: Vec<_> = match self.m.node(id) {
             Node::Call(c) => c
                 .named
                 .iter()
@@ -3673,91 +3670,48 @@ impl<'m> Emitter<'m> {
                 .collect(),
             _ => Vec::new(),
         };
-
-        // Bind each declared input to its argument, keyed by the body-side
-        // `%local` placeholder name (`entry.1.name`), lowering the argument now
-        // (it lives outside the body subtree — the caller's own expression).
-        let mut local_values = Vec::with_capacity(entries.len());
+        let mut args = Vec::with_capacity(entries.len());
+        let mut types = Vec::with_capacity(entries.len());
+        let mut mapped = Vec::with_capacity(entries.len());
+        let mut leaves = Vec::new();
         for (i, (param, _)) in entries.iter().enumerate() {
             let arg = kwargs
                 .iter()
-                .find(|(k, _)| k == param)
-                .map(|(_, v)| *v)
+                .find(|(name, _)| name == param)
+                .map(|(_, value)| *value)
                 .or_else(|| positional_rest.get(i).copied())
                 .ok_or_else(|| {
                     EmitError::at(
                         id,
-                        format!(
-                            "broadcast: no argument for input '{}'",
-                            self.m.resolve(*param)
-                        ),
+                        format!("broadcast: missing input '{}'", self.m.resolve(*param)),
                     )
                 })?;
-            let value = self.lower_node(arg)?;
-            let value = self.typed_axes(arg, value);
-            local_values.push(value);
-        }
-        let parent_frame = self.enter_broadcast(id, &mut local_values)?;
-        let local_values: HashMap<_, _> = entries
-            .iter()
-            .zip(local_values)
-            .map(|((_, placeholder), value)| (placeholder.name, value))
-            .collect();
-
-        // Collect the body subtree's `NodeId`s (the walk stops at ref/lit leaves
-        // — `for_each_child` yields nothing for a non-`Call`, so a `SelfMod` ref
-        // is a leaf and its target binding is NOT pulled in and stays memoized).
-        let mut subtree = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack = vec![body];
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) {
-                continue;
+            let parts = self.lower_components(arg)?;
+            let is_collection = !matches!(self.type_of(arg), Some(Type::Record(_)));
+            types.push(self.sequence_item_type(arg)?);
+            if is_collection {
+                leaves.extend(parts.values.clone());
             }
-            subtree.push(n);
-            self.m.node(n).for_each_child(|c| stack.push(c));
+            mapped.push(is_collection);
+            args.push(parts);
         }
-
-        // Snapshot the subtree's prior memo state, then seed each body `%local`
-        // ref with its bound argument value.
-        let snapshot: Vec<(NodeId, Option<Value>)> = subtree
-            .iter()
-            .map(|&n| (n, self.memo.get(&n).cloned()))
-            .collect();
-        for &n in &subtree {
-            self.memo.remove(&n);
-            if let Node::Ref(Ref {
-                ns: RefNs::Local,
-                name,
-            }) = self.m.node(n)
-                && let Some(v) = local_values.get(name)
-            {
-                self.bind(n, v.clone());
-            }
-            // A `%local` not among the declared inputs is a malformed
-            // reification; leaving it unbound lets the body walk hit
-            // `lower_ref`'s `Local` refusal — refuse-don't-mislower.
-        }
-
-        let result = self.lower_node(body).map(|value| {
-            let value = self.typed_axes(body, value);
-            let frame = self.broadcast_frame.clone();
-            self.finish_broadcast(&value, &frame, parent_frame.len())
-        });
-        self.broadcast_frame = parent_frame;
-
-        // Restore memo isolation (whatever the outcome) so a second application
-        // of the same `functionof` re-lowers against its own arguments.
-        for (n, prev) in snapshot {
-            match prev {
-                Some(v) => {
-                    self.memo.insert(n, v);
-                }
-                None => {
-                    self.memo.remove(&n);
+        let parent = self.enter_broadcast(id, &mut leaves)?;
+        let mut leaves = leaves.into_iter();
+        for (arg, mapped) in args.iter_mut().zip(mapped) {
+            if mapped {
+                for value in &mut arg.values {
+                    *value = leaves.next().expect("one mapped value per leaf");
                 }
             }
         }
+        let result = self
+            .call_components(body, &entries, &args, &types)
+            .and_then(|parts| parts.tensor(id))
+            .map(|value| {
+                let frame = self.broadcast_frame.clone();
+                self.finish_broadcast(&value, &frame, parent.len())
+            });
+        self.broadcast_frame = parent;
         result
     }
 
@@ -3802,6 +3756,8 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
+                    } else if name == "scan" {
+                        self.lower_scan(id, &call.args)?.tensor(id)
                     } else if name == "mul" {
                         // A BARE `mul` is the surface `*`, which spec §07 "Linear
                         // algebra" defines as the MATRIX product ("Matrix
@@ -3846,6 +3802,9 @@ impl<'m> Emitter<'m> {
                         }
                         if let Some(field) = self.named_field_projection(&call.args) {
                             return self.lower_node(field);
+                        }
+                        if let Some(field) = self.sequence_field(&call.args) {
+                            return field;
                         }
                         if let Some(elem) = self.tuple_projection(&call.args, base) {
                             return self.lower_node(elem);

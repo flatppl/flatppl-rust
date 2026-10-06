@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
+    Call, CallHead, Dim, Idx, Inputs, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
     Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, mlir_type_of,
@@ -67,8 +67,8 @@ pub fn emit_query(
     options: &EmitOptions,
 ) -> Result<Export, EmitError> {
     let dtype = options.dtype;
-    flatppl_determinizer::is_flatpdl_with_options(&module, &flatppl_stablehlo::LOWERING_OPTIONS)
-        .map_err(|errors| {
+    flatppl_determinizer::is_flatpdl_with_options(&module, &options.lowering_options()).map_err(
+        |errors| {
             EmitError::whole(
                 errors
                     .into_iter()
@@ -76,7 +76,8 @@ pub fn emit_query(
                     .collect::<Vec<_>>()
                     .join("; "),
             )
-        })?;
+        },
+    )?;
     let output_node = binding(&module, "outputs")
         .ok_or_else(|| EmitError::whole("declare at least one output"))?;
     let input_nodes = binding(&module, "inputs")
@@ -174,6 +175,13 @@ pub fn emit_query(
             && let Some(value) = values.get(&path)
         {
             emitter.bind(node, value.clone());
+            if let Node::Call(call) = module.node(node)
+                && matches!(call.head, CallHead::Builtin(head) if matches!(module.resolve(head), "get" | "get0"))
+                && let [container, selector] = call.args.as_ref()
+                && let Node::Lit(Scalar::Str(field)) = module.node(*selector)
+            {
+                emitter.bind_column(*container, field.to_string(), value.clone());
+            }
         }
     }
     let mut returned = Vec::new();
@@ -241,19 +249,37 @@ fn check_dependencies(
     output: NodeId,
     inputs: &HashSet<Symbol>,
 ) -> Result<(), EmitError> {
-    let mut pending = vec![output];
+    let mut pending = vec![(output, Vec::<Symbol>::new())];
     let mut seen = HashSet::new();
-    while let Some(node) = pending.pop() {
-        if !seen.insert(node) {
+    while let Some((node, mut bound)) = pending.pop() {
+        if !seen.insert((node, bound.clone())) {
+            continue;
+        }
+        if let Node::Call(call) = module.node(node)
+            && builtin(module, node, "functionof")
+            && let Some(&body) = call.args.first()
+            && let Some(declared) = &call.inputs
+        {
+            let entries = match declared {
+                Inputs::Spec(entries) => entries.as_ref(),
+                Inputs::Auto => module.auto_inputs_of(node).unwrap_or_default(),
+            };
+            for (_, reference) in entries {
+                if reference.ns == RefNs::SelfMod && !bound.contains(&reference.name) {
+                    bound.push(reference.name);
+                }
+            }
+            pending.push((body, bound));
             continue;
         }
         if let Node::Ref(r) = module.node(node)
             && r.ns == RefNs::SelfMod
         {
             if !inputs.contains(&r.name)
+                && !bound.contains(&r.name)
                 && let Some(binding) = module.binding_by_name(r.name)
             {
-                pending.push(module.binding(binding).rhs);
+                pending.push((module.binding(binding).rhs, bound));
             }
             continue;
         }
@@ -266,7 +292,7 @@ fn check_dependencies(
                 "a reached runtime value must be declared in inputs",
             ));
         }
-        module.for_each_child(node, |child| pending.push(child));
+        module.for_each_child(node, |child| pending.push((child, bound.clone())));
     }
     Ok(())
 }

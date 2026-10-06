@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Symbol};
 
 mod dce;
+pub(crate) use dce::retain_reachable;
 mod flatten;
 mod fold;
 mod inline;

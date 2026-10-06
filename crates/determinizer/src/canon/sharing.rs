@@ -51,7 +51,11 @@ pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
         } else {
             crate::driver::rebuild_with_children(m, id, &replacements)
         };
-        let rhs = if lift_scopes && let Some(lifted) = scoped::lift_broadcast(m, rhs) {
+        let rhs = if lift_scopes
+            && is_numeric_broadcast(m, rhs)
+            && !contains_integral(m, rhs)
+            && let Some(lifted) = scoped::lift_broadcast(m, rhs)
+        {
             changed = true;
             lifted
         } else {
@@ -61,6 +65,7 @@ pub(super) fn share_broadcasts(m: &mut Module, lift_scopes: bool) -> bool {
             && is_numeric_broadcast(m, id)
             && !crate::kernel::has_free_local(m, rhs)
             && !contains_axis(m, rhs)
+            && !contains_integral(m, rhs)
         {
             changed = true;
             bind(m, rhs)
@@ -118,6 +123,30 @@ fn contains_axis(m: &Module, root: NodeId) -> bool {
             return true;
         }
         m.for_each_child(id, |child| stack.push(child));
+    }
+    false
+}
+
+fn contains_integral(m: &Module, root: NodeId) -> bool {
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Node::Call(c) = m.node(id)
+            && matches!(c.head, CallHead::Builtin(h)
+                if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT))
+        {
+            return true;
+        }
+        if let Node::Ref(r) = m.node(id)
+            && r.ns == RefNs::SelfMod
+            && let Some(binding) = m.binding_by_name(r.name)
+        {
+            pending.push(m.binding(binding).rhs);
+        }
+        m.for_each_child(id, |child| pending.push(child));
     }
     false
 }

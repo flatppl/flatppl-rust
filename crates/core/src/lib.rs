@@ -33,3 +33,11 @@ pub use ty::{Dim, Mass, Phase, ScalarType, Type, ValueSet};
 /// is pinned to `0.1` pre-release (see `flatppl-dev/CONVENTIONS.md`, "Version
 /// state"); this constant is the single source of truth for that value.
 pub const FLATPPL_COMPAT: &str = "0.1";
+
+/// Compiler-only positive integral: `(log_body, bound_point, lower, upper)`.
+/// Backends must explicitly admit numerical evaluation. This is not FlatPDL.
+pub const LOG_INTEGRAL: &str = "%log_integral";
+
+/// A real coordinate owned by one `LOG_INTEGRAL`, with a unique integer token.
+/// It has no value outside its owning integral and no source-language spelling.
+pub const INTEGRATION_POINT: &str = "%integration_point";

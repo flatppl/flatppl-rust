@@ -48,12 +48,12 @@
 //! (`A[.i, .i]`, a diagonal — `stablehlo.broadcast_in_dim` requires distinct
 //! dimensions), a dynamic extent (the frame's shape is static text), or a
 //! chained axis index (`A[.i][.j]`). Each refuses with a located diagnostic
-//! rather than lowering something else. `metricsum` refuses too, with its own
-//! reason — see [`metricsum_refusal`].
+//! rather than lowering something else. `metricsum` applies inverse-metric
+//! contractions before indexing and raises output axes after reduction.
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{Axis, CallHead, Node, NodeId, Scalar, Symbol, Variance};
 
 use crate::emitter::{Axes, AxisReduce, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -112,9 +112,10 @@ impl Reduction {
 }
 
 /// One index selector of an axis-indexed `get`/`get0` in the body.
+#[derive(Clone, Copy)]
 enum Sel {
     /// An axis name — this operand dimension maps to that frame dimension.
-    Axis(Symbol),
+    Axis(Axis),
     /// A literal index (already 0-based) — this operand dimension is sliced
     /// away before the operand enters the frame.
     Lit(u64),
@@ -171,67 +172,100 @@ pub(crate) fn lower_aggregate(
     })?;
 
     let reduction = read_reduction(e, f_id)?;
-    let output_axes = read_output_axes(e, axes_id)?;
+    let output_axes = read_output_axes(e, axes_id, false)?;
+    let output_axes = output_axes.iter().map(|axis| axis.name).collect::<Vec<_>>();
 
     let mut sites = Vec::new();
-    collect_sites(e, body, &mut sites, &mut HashSet::new())?;
+    collect_sites(e, body, &mut sites, &mut HashSet::new(), false)?;
 
     let frame = build_frame(e, id, &output_axes, &sites)?;
 
-    // Bound WITHOUT snapshotting the body subtree's memo, unlike the crate's
-    // other `bind`-seeding site (`Emitter::lower_broadcast_userfn`, which restores
-    // it so one `functionof` re-lowers freshly under different arguments): a
-    // frame-shaped value here can never be read under a different frame, because
-    // `flatppl-core` interns NAMES only and hash-conses no nodes, so two
-    // aggregates over identical body text still hold distinct `NodeId`s — and an
-    // axis index cannot occur in a top-level binding, so no `Ref` can share one
-    // across aggregates either.
+    let mut bindings = Vec::with_capacity(sites.len());
     for site in &sites {
         let v = frame_operand(e, site, &frame)?;
-        e.bind(site.get_id, v);
+        bindings.push((site.get_id, v));
     }
 
-    let cell = e.lower_node(body)?;
+    let cell = e.lower_with_bindings(body, bindings)?;
     let cell = require_frame_shaped(e, id, &cell, &frame)?;
     reduce(e, id, reduction, &cell, &frame)
 }
 
-/// The refusal for `metricsum(metric, output_axes, expr)` (spec §04
-/// "Metric-aware Einstein summation"), which this backend does NOT lower — as a
-/// CONSTRUCT, whatever variances one particular call happens to use.
-///
-/// The blocker is the general case. §04 "Lowering to `aggregate`" turns each
-/// lower-variance axis into an `inv(metric)` contraction, so a metricsum needs
-/// the INVERSE of an arbitrary square symmetric invertible matrix — §04 requires
-/// only that the metric be "square, symmetric, and invertible", not
-/// positive-definite, and the section's own worked example is a Lorentz metric,
-/// which is indefinite. StableHLO has no matrix-inverse or LU op, and
-/// `stablehlo.cholesky` (this crate's only factorization) needs
-/// positive-definiteness, so the missing piece is a general indefinite inverse —
-/// different machinery from the frame model above, not a missing arm of it.
-///
-/// The all-upper degenerate case (`g: r[.mu^] := v[.mu^]`) needs no inverse and
-/// would reduce to a plain `aggregate(sum, …)`, but it is refused with everything
-/// else rather than carved out: supporting it would still need §04's
-/// metricsum-only static checks (every repeated non-output index exactly twice,
-/// once upper and once lower; no bare neutral axes), and a backend that accepted
-/// some variance patterns and refused others would be a worse contract than one
-/// that declines the construct. The message therefore states what a metricsum
-/// needs IN GENERAL, and names the rewrite that works for every case including
-/// the degenerate one. Refused here rather than left to `ops::lower_builtin`'s
-/// generic "unsupported builtin head".
-pub(crate) fn metricsum_refusal(id: NodeId) -> EmitError {
-    EmitError::at(
-        id,
-        "metricsum has no lowering in this backend: in general §04 \"Lowering to `aggregate`\" \
-         makes each lower-variance axis an `inv(metric)` contraction, and §04 requires the metric \
-         only to be \"square, symmetric, and invertible\" — not positive-definite — so it needs a \
-         general indefinite matrix inverse, which StableHLO has no op for (`stablehlo.cholesky` \
-         requires positive-definiteness). The construct is declined as a whole rather than for \
-         some variance patterns only, so this call is refused even if its own indices need no \
-         inverse. Contract any metric factors explicitly and write the result as \
-         `aggregate(sum, …)`, which does lower",
-    )
+/// §04 lowers each covariant input axis with inv(g), then raises covariant
+/// output axes with g. All tensor axes retain their original storage order.
+pub(crate) fn lower_metricsum(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [metric, axes_id, body] = crate::ops::args_exact(id, args)?;
+    let metric = e.lower_node(metric)?;
+    let inverse = e.matrix_inverse(id, &metric)?;
+    let MlirTy::Ranked(metric_dims) = e.cell_ty(&metric) else {
+        unreachable!()
+    };
+    let dimension = metric_dims[0].unwrap();
+    let output_axes = read_output_axes(e, axes_id, true)?;
+    let mut sites = Vec::new();
+    collect_sites(e, body, &mut sites, &mut HashSet::new(), true)?;
+    let mut occurrences: HashMap<Symbol, Vec<Variance>> = HashMap::new();
+    for site in &sites {
+        for selector in &site.sels {
+            if let Sel::Axis(axis) = selector {
+                occurrences
+                    .entry(axis.name)
+                    .or_default()
+                    .push(axis.variance.unwrap());
+            }
+        }
+    }
+    for (&name, variances) in &occurrences {
+        let valid = if let Some(output) = output_axes.iter().find(|a| a.name == name) {
+            variances
+                .iter()
+                .all(|variance| Some(*variance) == output.variance)
+        } else {
+            variances.len() == 1 || (variances.len() == 2 && variances[0] != variances[1])
+        };
+        if !valid {
+            return Err(EmitError::at(
+                id,
+                "metricsum: contracted axes must occur once upper and once lower; output axes must match their declared variance",
+            ));
+        }
+    }
+    let names = output_axes.iter().map(|a| a.name).collect::<Vec<_>>();
+    let frame = build_frame(e, id, &names, &sites)?;
+    if frame.lens.iter().any(|&n| n != dimension) {
+        return Err(EmitError::at(
+            id,
+            "metricsum: tensor axes must match the metric dimension",
+        ));
+    }
+    let mut bindings = Vec::with_capacity(sites.len());
+    for site in &sites {
+        let mut value = e.lower_node(site.container)?;
+        for (axis, selector) in site.sels.iter().enumerate() {
+            if let Sel::Axis(Axis {
+                variance: Some(Variance::Lower),
+                ..
+            }) = selector
+            {
+                value = e.transform_axis(&value, &inverse, axis);
+            }
+        }
+        let value = frame_value(e, site, &frame, value)?;
+        bindings.push((site.get_id, value));
+    }
+    let cell = e.lower_with_bindings(body, bindings)?;
+    let cell = require_frame_shaped(e, id, &cell, &frame)?;
+    let mut result = reduce(e, id, Reduction::Sum, &cell, &frame)?;
+    for (position, axis) in output_axes.iter().enumerate() {
+        if axis.variance == Some(Variance::Lower) {
+            result = e.transform_axis(&result, &metric, position);
+        }
+    }
+    Ok(result)
 }
 
 /// §04's eligible `f_reduction`s that this module does NOT lower — a DIFFERENT
@@ -297,7 +331,7 @@ fn read_reduction(e: &Emitter, f_id: NodeId) -> Result<Reduction, EmitError> {
 /// The list is the `vector(...)` call the parser builds for the bracket
 /// literal; anything else (a computed value, a vector of non-axes) refuses,
 /// since the result RANK would not be statically known.
-fn read_output_axes(e: &Emitter, axes_id: NodeId) -> Result<Vec<Symbol>, EmitError> {
+fn read_output_axes(e: &Emitter, axes_id: NodeId, metric: bool) -> Result<Vec<Axis>, EmitError> {
     let refuse = || {
         EmitError::at(
             axes_id,
@@ -310,12 +344,12 @@ fn read_output_axes(e: &Emitter, axes_id: NodeId) -> Result<Vec<Symbol>, EmitErr
     if !matches!(c.head, CallHead::Builtin(sym) if e.resolve(sym) == "vector") {
         return Err(refuse());
     }
-    let mut out: Vec<Symbol> = Vec::with_capacity(c.args.len());
+    let mut out: Vec<Axis> = Vec::with_capacity(c.args.len());
     for &a in c.args.iter() {
         let Node::Axis(ax) = e.node(a) else {
             return Err(refuse());
         };
-        if ax.variance.is_some() {
+        if !metric && ax.variance.is_some() {
             return Err(EmitError::at(
                 a,
                 format!(
@@ -325,7 +359,13 @@ fn read_output_axes(e: &Emitter, axes_id: NodeId) -> Result<Vec<Symbol>, EmitErr
                 ),
             ));
         }
-        if out.contains(&ax.name) {
+        if metric && ax.variance.is_none() {
+            return Err(EmitError::at(
+                a,
+                "metricsum: an axis requires a variance marker",
+            ));
+        }
+        if out.iter().any(|axis| axis.name == ax.name) {
             return Err(EmitError::at(
                 a,
                 format!(
@@ -335,7 +375,7 @@ fn read_output_axes(e: &Emitter, axes_id: NodeId) -> Result<Vec<Symbol>, EmitErr
                 ),
             ));
         }
-        out.push(ax.name);
+        out.push(*ax);
     }
     Ok(out)
 }
@@ -352,6 +392,7 @@ fn collect_sites(
     node: NodeId,
     out: &mut Vec<Site>,
     empty: &mut HashSet<NodeId>,
+    metric: bool,
 ) -> Result<(), EmitError> {
     let Node::Call(c) = e.node(node) else {
         return Ok(());
@@ -377,7 +418,7 @@ fn collect_sites(
         // A chained axis index (`A[.i][.j]`) would need this operand's own frame
         // value before the frame exists — refuse rather than order it wrongly.
         let mut inner = Vec::new();
-        collect_sites(e, container, &mut inner, empty)?;
+        collect_sites(e, container, &mut inner, empty, metric)?;
         if !inner.is_empty() {
             return Err(EmitError::at(
                 node,
@@ -389,7 +430,7 @@ fn collect_sites(
         for &sel in c.args.iter().skip(1) {
             match e.node(sel) {
                 Node::Axis(ax) => {
-                    if ax.variance.is_some() {
+                    if !metric && ax.variance.is_some() {
                         return Err(EmitError::at(
                             sel,
                             format!(
@@ -399,9 +440,10 @@ fn collect_sites(
                             ),
                         ));
                     }
-                    if sels
-                        .iter()
-                        .any(|s| matches!(s, Sel::Axis(n) if *n == ax.name))
+                    if !metric
+                        && sels
+                            .iter()
+                            .any(|s| matches!(s, Sel::Axis(a) if a.name == ax.name))
                     {
                         return Err(EmitError::at(
                             node,
@@ -413,7 +455,13 @@ fn collect_sites(
                             ),
                         ));
                     }
-                    sels.push(Sel::Axis(ax.name));
+                    if metric && ax.variance.is_none() {
+                        return Err(EmitError::at(
+                            sel,
+                            "metricsum: an axis requires a variance marker",
+                        ));
+                    }
+                    sels.push(Sel::Axis(*ax));
                 }
                 Node::Lit(Scalar::Int(i)) => {
                     let idx = *i - base as i64;
@@ -453,10 +501,10 @@ fn collect_sites(
     }
     let start = out.len();
     for &a in c.args.iter() {
-        collect_sites(e, a, out, empty)?;
+        collect_sites(e, a, out, empty, metric)?;
     }
     for named in c.named.iter() {
-        collect_sites(e, named.value, out, empty)?;
+        collect_sites(e, named.value, out, empty, metric)?;
     }
     if out.len() == start {
         // Only successful zero-site scans are reusable. Positive scans must
@@ -543,7 +591,7 @@ fn build_frame(
                         ));
                     }
                 }
-                Sel::Axis(name) => match lens.get(name) {
+                Sel::Axis(Axis { name, .. }) => match lens.get(name) {
                     Some(&prev) if prev != len => {
                         return Err(EmitError::at(
                             site.get_id,
@@ -601,7 +649,37 @@ fn build_frame(
 /// separate and the emitted map is always increasing.
 fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, EmitError> {
     let operand = e.lower_node(site.container)?;
+    frame_value(e, site, frame, operand)
+}
+
+fn frame_value(
+    e: &mut Emitter,
+    site: &Site,
+    frame: &Frame,
+    operand: Value,
+) -> Result<Value, EmitError> {
     let batch = e.batch_rank(&operand);
+    for (second, sel) in site.sels.iter().enumerate() {
+        if let Sel::Axis(axis) = sel
+            && let Some(first) = site.sels[..second]
+                .iter()
+                .position(|sel| matches!(sel, Sel::Axis(previous) if previous.name == axis.name))
+        {
+            let diagonal = e.diagonal_axes(&operand, batch + first, batch + second);
+            let mut sels = site.sels.clone();
+            sels.remove(second);
+            return frame_value(
+                e,
+                &Site {
+                    get_id: site.get_id,
+                    container: site.container,
+                    sels,
+                },
+                frame,
+                diagonal,
+            );
+        }
+    }
     let MlirTy::Ranked(dims) = operand.ty.clone() else {
         // `build_frame` already refused a non-ranked operand.
         return Err(EmitError::at(
@@ -661,7 +739,7 @@ fn frame_operand(e: &mut Emitter, site: &Site, frame: &Frame) -> Result<Value, E
     // 2. The frame position of each surviving operand dimension, in order.
     let positions: Vec<usize> = (0..batch)
         .chain(site.sels.iter().filter_map(|s| match s {
-            Sel::Axis(name) => frame.pos(*name).map(|position| batch + position),
+            Sel::Axis(axis) => frame.pos(axis.name).map(|position| batch + position),
             Sel::Lit(_) | Sel::Only => None,
         }))
         .collect();

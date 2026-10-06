@@ -132,7 +132,7 @@ impl LoadedModule {
             Some(&roots),
             &flatppl_determinizer::LoweringOptions {
                 preserve_rand_tuple: true,
-                ..flatppl_stablehlo::LOWERING_OPTIONS
+                ..options.lowering_options()
             },
         )
         .map_err(|e| {

@@ -29,6 +29,8 @@ pub struct LoweringOptions<'a> {
     /// Keep rand's (value, state) result even without a tuple projection.
     /// False preserves the legacy value-terminal convention.
     pub preserve_rand_tuple: bool,
+    /// Admit compiler-only numerical integrals. Exact FlatPDL remains the default.
+    pub numerical_integrals: bool,
 }
 
 impl LoweringOptions<'_> {

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
-use flatppl_host::{Constant, Context, Diagnostic, Dtype, EmitOptions, LoadedModule};
+use flatppl_host::{
+    Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
+};
 
 pyo3::create_exception!(_native, Error, PyException);
 
@@ -90,7 +92,14 @@ impl NativeModule {
             .expect("binding metadata contains only JSON values")
     }
 
-    fn export(&self, py: Python<'_>, dtype: &str, autodiff: bool) -> PyResult<String> {
+    #[pyo3(signature = (dtype, autodiff, integration=None))]
+    fn export(
+        &self,
+        py: Python<'_>,
+        dtype: &str,
+        autodiff: bool,
+        integration: Option<(f64, f64, u32)>,
+    ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
             "float64" => Dtype::F64,
@@ -99,6 +108,11 @@ impl NativeModule {
         let options = EmitOptions {
             dtype,
             restrict_enzyme_compatible: autodiff,
+            integration: integration.map(|(rtol, atol, max_intervals)| IntegrationOptions {
+                rtol,
+                atol,
+                max_intervals,
+            }),
         };
         let exported = py.detach(|| self.inner.compile(&options)).map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))

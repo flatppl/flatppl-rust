@@ -136,3 +136,24 @@ draws = rand(s, pushfwd(f, lawof(record(p = d1, q = d2))))",
          got:\n{printed}"
     );
 }
+
+/// A captured draw stays the enclosing graph's one realization even if its
+/// law depends on a boundary. Applications add offsets to that same sample.
+#[test]
+fn calls_preserve_a_captured_draw_with_a_parameterized_law() {
+    let m = parse_infer(
+        "\
+s = rnginit(0)
+z = elementof(reals)
+a ~ Normal(z, 1)
+f = functionof(a + z, z=z)
+draws = rand(s, lawof(record(original=a, left=f(3), right=f(5))))",
+    );
+    let out = determinize(&m).expect("captured shared sample must lower");
+    let printed = flatppl_syntax::print(&out);
+    assert_eq!(printed.matches("builtin_sample").count(), 1, "{printed}");
+    assert!(
+        printed.contains("left = a + 3") && printed.contains("right = a + 5"),
+        "{printed}"
+    );
+}

@@ -270,6 +270,29 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.finish_module()
     }
 
+    pub(crate) fn run_expression(
+        mut self,
+        root: NodeId,
+        inputs: &[(NodeId, Type)],
+    ) -> (HashMap<NodeId, Type>, Vec<Diagnostic>) {
+        self.seeds = inputs
+            .iter()
+            .map(|(id, ty)| {
+                (
+                    *id,
+                    (ty.clone(), Phase::Parameterized, ValueSet::natural_of(ty)),
+                )
+            })
+            .collect();
+        self.drain_work(&mut vec![Work::Enter(root)]);
+        let types = self
+            .inferred
+            .into_iter()
+            .map(|(id, (ty, _))| (id, ty))
+            .collect();
+        (types, self.diags)
+    }
+
     fn schedule_bindings(&self, work: &mut Vec<Work>) {
         let ids: Vec<_> = self.module.bindings().map(|(id, _)| id).collect();
         work.extend(ids.into_iter().rev().map(Work::Binding));

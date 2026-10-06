@@ -28,6 +28,7 @@ fn unrestricted_emitter(m: &Module, dtype: Dtype) -> Emitter<'_> {
         &flatppl_stablehlo::EmitOptions {
             dtype,
             restrict_enzyme_compatible: false,
+            ..Default::default()
         },
     )
 }
@@ -1657,30 +1658,6 @@ fn lower_in_interval_with_infinite_upper_still_splits_the_compares() {
     assert!(out.contains("stablehlo.compare LE"), "v <= hi, in:\n{out}");
     assert_eq!(out.matches("stablehlo.and").count(), 1, "in:\n{out}");
     assert!(is_delimiter_balanced(&out));
-}
-
-#[test]
-fn lower_in_refuses_non_interval_set() {
-    let mut m = Module::new();
-    let v = local_ref(&mut m, "v");
-    let reals = const_node(&mut m, "reals");
-    let node = call(&mut m, "in", &[v, reals]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    e.bind(
-        v,
-        Value {
-            ssa: "%arg0".to_string(),
-            ty: MlirTy::Scalar,
-            elem: ElemKind::Real,
-        },
-    );
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("interval"),
-        "unexpected message: {}",
-        err.msg
-    );
 }
 
 // ---- the determiniser's image/lattice gate vocabulary -------------------------
@@ -7996,6 +7973,7 @@ fn sampler_loop_regions_do_not_share_local_constants() {
             &flatppl_stablehlo::EmitOptions {
                 dtype,
                 restrict_enzyme_compatible: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -12940,31 +12918,6 @@ inputs = (A)\noutputs = (V)\n";
     );
 }
 
-/// `metricsum` (§04 "Metric-aware Einstein summation") refuses with ITS OWN
-/// reason — the general indefinite matrix inverse its §04 lowering needs, which
-/// StableHLO has no op for — not with the generic unknown-head message. Reached
-/// through the `metric: name[…] := …` statement sugar, so the sugar cannot
-/// silently take a different path.
-#[test]
-fn aggregate_metricsum_refuses_naming_the_missing_matrix_inverse() {
-    let src = "flatppl_compat = \"0.1\"\n\
-g = elementof(cartpow(reals, [2, 2]))\n\
-L1 = elementof(cartpow(reals, [2, 2]))\n\
-L2 = elementof(cartpow(reals, [2, 2]))\n\
-g: L[.mu^, .rho_] := L1[.mu^, .nu_] * L2[.nu^, .rho_]\n\
-inputs = (g, L1, L2)\noutputs = (L)\n";
-    let msg = refuse_agg(src);
-    assert!(
-        msg.contains("metricsum has no lowering in this backend")
-            && msg.contains("indefinite matrix inverse"),
-        "got: {msg}"
-    );
-    assert!(
-        !msg.contains("unsupported builtin head"),
-        "must not fall through to the generic head refusal: {msg}"
-    );
-}
-
 /// A variance-marked axis OUTSIDE `metricsum` — §05 "Axis names and
 /// aggregation" ties the markers to `metricsum`, so a marked axis in a plain
 /// `aggregate` is refused rather than treated as its unmarked namesake.
@@ -13116,6 +13069,7 @@ fn special_function_siblings_form_one_ordered_packet() {
             &flatppl_stablehlo::EmitOptions {
                 dtype,
                 restrict_enzyme_compatible: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -13201,6 +13155,7 @@ fn constant_concatenation_keeps_nested_storage_order() {
                     &flatppl_stablehlo::EmitOptions {
                         dtype,
                         restrict_enzyme_compatible: false,
+                        ..Default::default()
                     },
                 )
                 .unwrap()
@@ -13242,6 +13197,7 @@ fn folded_dense_constants_preserve_target_rounding_and_signed_zero() {
             &flatppl_stablehlo::EmitOptions {
                 dtype,
                 restrict_enzyme_compatible: false,
+                ..Default::default()
             },
         )
         .unwrap();

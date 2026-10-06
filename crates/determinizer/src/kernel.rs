@@ -15,6 +15,8 @@
 //! functions and kernels") — `resolve_reified` accepts both, but `resolve_kernel`
 //! stays `kernelof`-only since `marginal.rs`/`jointchain.rs` depend on that.
 
+use std::collections::HashMap;
+
 use crate::density::{draw_argument, resolve_ref_chain, resolve_ref_one};
 use flatppl_core::{
     Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
@@ -358,14 +360,14 @@ pub(crate) fn substitute_refs(m: &mut Module, root: NodeId, map: &[(Symbol, Node
     crate::driver::rebuild_with_children(m, root, &new_children)
 }
 
-/// [`substitute_refs`] over the boundary entries `mode` admits, in ONE pass. See
-/// [`Substitute`] for the mode split, and [`substitute_refs`] for why the pass must
-/// cover every admitted entry at once rather than one entry at a time.
+/// Substitute every admitted boundary entry simultaneously. `All` follows the
+/// ancestor DAG; density callers finish same-module substitution after lowering.
 pub(crate) fn substitute_admitted(
     m: &mut Module,
     body: NodeId,
     bound: &[(Ref, NodeId)],
     mode: Substitute,
+    absorbed: bool,
 ) -> NodeId {
     let map: Vec<(Symbol, NodeId)> = bound
         .iter()
@@ -375,7 +377,84 @@ pub(crate) fn substitute_admitted(
         })
         .map(|(target, value)| (target.name, *value))
         .collect();
-    substitute_refs(m, body, &map)
+    match mode {
+        Substitute::All => {
+            substitute_dependencies(m, body, 0, absorbed, &mut vec![map], &mut HashMap::new())
+        }
+        Substitute::LocalOnly => substitute_refs(m, body, &map),
+    }
+}
+
+/// Instantiate only ancestors changed by this application. Memoization preserves
+/// sharing within each active boundary scope, including sibling reifications.
+fn substitute_dependencies(
+    m: &mut Module,
+    root: NodeId,
+    scope: usize,
+    absorbed: bool,
+    scopes: &mut Vec<Vec<(Symbol, NodeId)>>,
+    memo: &mut HashMap<(NodeId, usize, bool), NodeId>,
+) -> NodeId {
+    if scopes[scope].is_empty() {
+        return root;
+    }
+    let key = (root, scope, absorbed);
+    if let Some(&result) = memo.get(&key) {
+        return result;
+    }
+    // Cycles retain their original reference. Applied arguments are returned
+    // untouched so one boundary cannot capture another boundary's argument.
+    memo.insert(key, root);
+    let result = if let Node::Ref(Ref { ns, name }) = *m.node(root) {
+        if matches!(ns, RefNs::SelfMod | RefNs::Local)
+            && let Some((_, value)) = scopes[scope].iter().find(|(target, _)| *target == name)
+        {
+            *value
+        } else if ns == RefNs::SelfMod
+            && let Some(binding) = m.binding_by_name(name)
+        {
+            let rhs = m.binding(binding).rhs;
+            let changed = substitute_dependencies(m, rhs, scope, absorbed, scopes, memo);
+            if changed == rhs { root } else { changed }
+        } else {
+            root
+        }
+    } else if !absorbed
+        && (draw_argument(m, root).is_some()
+            || matches!(m.node(root), Node::Call(c) if matches!(c.head,
+            CallHead::Builtin(head) if m.resolve(head) == "builtin_sample")))
+    {
+        // A captured draw denotes the enclosing graph's one realization,
+        // even when an input occurs in its law (§04 Captured draws).
+        root
+    } else {
+        let absorbed = absorbed
+            || matches!(m.node(root), Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(head) if matches!(m.resolve(head), "lawof" | "kernelof")));
+        let active: Vec<_> = scopes[scope]
+            .iter()
+            .copied()
+            .filter(|(name, _)| !shadows_name(m, root, *name))
+            .collect();
+        let children = m.node(root).children();
+        let child_scope = if let Some(existing) = scopes.iter().position(|s| *s == active) {
+            existing
+        } else {
+            scopes.push(active);
+            scopes.len() - 1
+        };
+        let changed: Vec<_> = children
+            .iter()
+            .map(|&child| substitute_dependencies(m, child, child_scope, absorbed, scopes, memo))
+            .collect();
+        if changed == children {
+            root
+        } else {
+            crate::driver::rebuild_with_children(m, root, &changed)
+        }
+    };
+    memo.insert(key, result);
+    result
 }
 
 /// True iff `id` is a reification (`functionof`/`kernelof`) whose OWN
@@ -536,9 +615,11 @@ pub(crate) fn reduce_kernel_application_bound(
         return None;
     }
     let kernel = resolve_reified(m, callee)?;
+    let absorbed = resolve_kernel(m, callee).is_some();
 
     let (resolved, _) = resolve_ref_one(m, kernel.body);
     let mut body = match draw_argument(m, resolved) {
+        _ if mode == Substitute::All && !absorbed => kernel.body,
         Some(law) => resolve_ref_one(m, law).0,
         None => resolved,
     };
@@ -553,7 +634,7 @@ pub(crate) fn reduce_kernel_application_bound(
         .zip(values)
         .map(|((_, target), value)| (*target, value))
         .collect();
-    body = substitute_admitted(m, body, &bound, mode);
+    body = substitute_admitted(m, body, &bound, mode, absorbed);
     Some(AppliedReification { body, bound })
 }
 
@@ -699,6 +780,48 @@ pub(crate) fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<
 mod tests {
     use super::*;
     use flatppl_core::Call;
+
+    #[test]
+    fn sibling_reifications_preserve_one_captured_draw() {
+        let mut m = flatppl_syntax::parse(
+            "\
+            z = elementof(reals)\n\
+            w = elementof(reals)\n\
+            a ~ Normal(z, 1.0)\n\
+            pair = record(left = functionof(a, w = w), right = functionof(a, w = w))",
+        )
+        .unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let pair = m.intern("pair");
+        let root = m.binding(m.binding_by_name(pair).unwrap()).rhs;
+        let z = Ref {
+            ns: RefNs::SelfMod,
+            name: m.intern("z"),
+        };
+        let w = Ref {
+            ns: RefNs::SelfMod,
+            name: m.intern("w"),
+        };
+        let three = m.alloc(Node::Lit(Scalar::Real(3.0)));
+        let five = m.alloc(Node::Lit(Scalar::Real(5.0)));
+        let bound = [(z, three), (w, five)];
+        let result = substitute_admitted(&mut m, root, &bound, Substitute::All, false);
+        let Node::Call(pair) = m.node(result) else {
+            panic!("record expected")
+        };
+        let bodies: Vec<_> = pair
+            .named
+            .iter()
+            .map(|field| match m.node(field.value) {
+                Node::Call(function) => function.args[0],
+                _ => panic!("function expected"),
+            })
+            .collect();
+        let a = m.intern("a");
+        let original = m.binding(m.binding_by_name(a).unwrap()).rhs;
+        assert_eq!(resolve_ref_chain(&m, bodies[0]).0, original);
+        assert_eq!(resolve_ref_chain(&m, bodies[1]).0, original);
+    }
 
     /// An `%autoinputs` boundary whose side-table entry is absent means the inputs are
     /// UNKNOWN, not none. Reading it as none would unwrap a reification that may well

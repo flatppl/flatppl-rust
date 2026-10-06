@@ -14,7 +14,9 @@
 //! Two shapes reach it: an unresolved callee, and an arity mismatch at the call
 //! site.
 
-use flatppl_core::{CallHead, Idx, Module, Node, NodeId};
+use std::collections::HashMap;
+
+use flatppl_core::{CallHead, Module, Node, NodeId};
 
 use crate::driver::rebuild_with_children;
 use crate::kernel::reduce_kernel_application;
@@ -28,14 +30,14 @@ use crate::kernel::reduce_kernel_application;
 /// engine that cannot evaluate it.
 pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
     let mut changed = false;
-    let mut call_free = vec![false; m.node_count()];
+    let mut mapped = HashMap::new();
     let pairs: Vec<(flatppl_core::BindingId, NodeId)> =
         m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
     for (bid, root) in pairs {
         // `reduce_kernel_application` needs `&mut Module` and returns a fresh
         // body `NodeId`, so apply it via a manual bottom-up walk rather than
         // `map_tree` (whose closure only gets `&Module`, no `alloc`).
-        let new = inline_walk(m, root, &mut call_free);
+        let new = inline_walk(m, root, &mut mapped);
         if new != root {
             m.set_binding_rhs(bid, new);
             changed = true;
@@ -50,31 +52,22 @@ pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
 /// the child layer — the same rebuild `map_tree` uses, kept in one place so
 /// both stay consistent in how a `Call`'s children decode back into
 /// head/args/named.
-fn inline_walk(m: &mut Module, id: NodeId, call_free: &mut [bool]) -> NodeId {
-    if call_free.get(id.index()) == Some(&true) {
-        return id;
+fn inline_walk(m: &mut Module, id: NodeId, mapped: &mut HashMap<NodeId, NodeId>) -> NodeId {
+    if let Some(&result) = mapped.get(&id) {
+        return result;
     }
     let children: Vec<NodeId> = m.node(id).children();
     let mut any_child_changed = false;
     let new_children: Vec<NodeId> = children
         .iter()
         .map(|&c| {
-            let nc = inline_walk(m, c, call_free);
+            let nc = inline_walk(m, c, mapped);
             any_child_changed |= nc != c;
             nc
         })
         .collect();
-    // Certify the original subtree, not its rewritten children. Immutable
-    // child edges make this independent of later binding-root changes.
-    if !matches!(m.node(id), Node::Call(c) if matches!(c.head, CallHead::User(_)))
-        && children
-            .iter()
-            .all(|c| call_free.get(c.index()) == Some(&true))
-        && let Some(entry) = call_free.get_mut(id.index())
-    {
-        *entry = true;
-    }
-    let id = if any_child_changed {
+    let original = id;
+    let mut id = if any_child_changed {
         rebuild_with_children(m, id, &new_children)
     } else {
         id
@@ -84,14 +77,14 @@ fn inline_walk(m: &mut Module, id: NodeId, call_free: &mut [bool]) -> NodeId {
         && matches!(c.head, CallHead::User(_))
     {
         if let Some(head) = builtin_callee_head(m, id) {
-            return rebuild_with_head(m, id, head);
-        }
-        if let Some(reduced) = reduce_kernel_application(m, id) {
+            id = rebuild_with_head(m, id, head);
+        } else if let Some(reduced) = reduce_kernel_application(m, id) {
             // The reduced body may itself contain further user calls
             // (e.g. a function whose body calls another function).
-            return inline_walk(m, reduced, call_free);
+            id = inline_walk(m, reduced, mapped);
         }
     }
+    mapped.insert(original, id);
     id
 }
 
