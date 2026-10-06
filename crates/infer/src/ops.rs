@@ -1562,6 +1562,11 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("median", "Reductions", "real arrays"),
     ("quantile", "Reductions", "real arrays, `interval(0, 1)`"),
     ("lengthof", "Reductions", "vectors, tables"),
+    (
+        "array",
+        "Array and table generation",
+        "vector, integer vector, integer vector",
+    ),
     ("sizeof", "Reductions", "vectors, arrays"),
     ("indicesof", "Reductions", "vectors, arrays, tables"),
     ("indicesof0", "Reductions", "vectors, arrays, tables"),
@@ -6249,6 +6254,19 @@ fn broadcast_type(
         return Ready(Type::Deferred);
     };
     let op_name = inf.module.resolve(*op).to_string();
+    if op_name == "record" && args.len() == 1 && !named.is_empty() {
+        if shape.len() != 1 {
+            inf.diags.push(crate::Diagnostic::error_at(
+                id,
+                "record-valued broadcast requires one axis (spec §04)",
+            ));
+            return Ready(Type::Failed("multi-axis record broadcast".into()));
+        }
+        return Ready(Type::Table {
+            columns: named.iter().map(|(n, _, t, _)| (*n, cell_arg(t))).collect(),
+            nrows: shape[0],
+        });
+    }
     if let Some(cell_domain) = distribution_domain(inf, &op_name, &[], &[]) {
         return Ready(Type::Measure {
             domain: Box::new(Type::Array {
@@ -6285,6 +6303,7 @@ fn broadcast_type(
     }
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
+        ("builtin_logdensityof", [_, _, _]) => Type::Scalar(ScalarType::Real),
         ("add" | "sub" | "mul" | "divide" | "pow" | "min" | "max", [a, b]) => {
             promote2(Some(a), Some(b))
         }

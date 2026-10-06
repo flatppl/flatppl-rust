@@ -2319,8 +2319,6 @@ fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
         "eye",
         "onehot",
         "linspace",
-        "array",
-        "lengthof",
         "sizeof",
         "conj",
         "cis",

@@ -1,4 +1,4 @@
-//! Pass 3: resolve statically-known structural projections — `get(record, k)`
+//! Pass 3: resolve statically-known structural projections — `get(record/table, k)`
 //! and `get0(vector, i)` over literal constructors (Buffy #263).
 //!
 //! Density lowering routinely builds a `get`/`get0` accessor onto a container
@@ -9,19 +9,22 @@
 //! constructor (a literal-variate score), the accessor's container becomes
 //! statically known — the projection can be resolved to the element directly
 //! rather than left for a consuming engine to evaluate. Dynamic containers
-//! (a `Ref`, a still-opaque call, a computed index) are left untouched:
+//! (a promoted input, a still-opaque call, a computed index) are left untouched:
 //! refuse-free, matching every other canon pass.
 
-use flatppl_core::{CallHead, Idx, Module, NamedKind, Node, NodeId, Scalar};
+use std::collections::HashSet;
+
+use flatppl_core::{CallHead, Idx, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol};
 
 use crate::driver::rebuild_with_children;
 
 pub(crate) fn flatten_structural(m: &mut Module) -> bool {
+    let promoted = super::promoted_input_names(m);
     let mut changed = false;
     let pairs: Vec<(flatppl_core::BindingId, NodeId)> =
         m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
-    // Projection reads only immutable nodes, not binding RHSs or parent scopes.
-    // Reuse mapped results across roots, but keep whole-node replacements as
+    // Projection preserves constructor children and their identity. Reuse mapped
+    // results across roots, but keep whole-node replacements as
     // leaves: their children belong to the next canonicalization sweep.
     let mut mapped = vec![None; m.node_count()];
     let mut pending = Vec::new();
@@ -42,7 +45,7 @@ pub(crate) fn flatten_structural(m: &mut Module) -> bool {
                 } else {
                     rebuild_with_children(m, id, &replacements)
                 });
-            } else if let Some(replacement) = project(m, id) {
+            } else if let Some(replacement) = project(m, id, &promoted) {
                 mapped[id.index()] = Some(replacement);
             } else {
                 pending.push((id, true));
@@ -64,10 +67,10 @@ pub(crate) fn flatten_structural(m: &mut Module) -> bool {
     changed
 }
 
-/// `get(record(%field k v ...), "k") -> v`; `get0(vector(e0, e1, ...), i) -> ei`
+/// `get(record/table(%field k v ...), "k") -> v`; `get0(vector(e0, e1, ...), i) -> ei`
 /// for a literal `i`. Returns an EXISTING child NodeId (no alloc needed), so the
 /// `&Module` signature suffices. Dynamic index/field → None.
-fn project(m: &Module, id: NodeId) -> Option<NodeId> {
+fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Option<NodeId> {
     let Node::Call(c) = m.node(id) else {
         return None;
     };
@@ -80,7 +83,19 @@ fn project(m: &Module, id: NodeId) -> Option<NodeId> {
             let Node::Lit(Scalar::Str(field)) = m.node(key) else {
                 return None;
             };
-            let rec = expect_builtin(m, container, "record")?;
+            // A declared input overrides its authored constructor at runtime.
+            let container = match m.node(container) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) if !promoted.contains(name) => m
+                    .binding_by_name(*name)
+                    .map(|bid| m.binding(bid).rhs)
+                    .unwrap_or(container),
+                _ => container,
+            };
+            let rec = expect_builtin(m, container, "record")
+                .or_else(|| expect_builtin(m, container, "table"))?;
             rec.named
                 .iter()
                 .find(|na| na.kind == NamedKind::Field && m.resolve(na.name) == &**field)

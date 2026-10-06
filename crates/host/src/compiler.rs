@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use flatppl_core::{CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
+use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
 use flatppl_infer::{Level, ModuleBundle, Severity};
 use flatppl_stablehlo::EmitOptions;
 use serde::Serialize;
 
+use crate::Constant;
 use crate::export::{Export, emit_query};
 
 #[derive(Debug, Serialize)]
@@ -154,6 +155,111 @@ pub struct Context {
 }
 
 impl Context {
+    /// Bind fixed values to declared externals in a new immutable module.
+    pub fn set(
+        &mut self,
+        module: &LoadedModule,
+        constants: &[(String, Constant)],
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let fail = |message: String| Diagnostic::new("constants", module.source_name(), message);
+        if !Arc::ptr_eq(&self.owner, &module.owner) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let mut parsed = (*module.definition.parsed).clone();
+        let mut declarations = Vec::new();
+        let mut seen = HashSet::new();
+        for (name, value) in constants {
+            if !seen.insert(name.as_str()) {
+                return Err(fail(format!("constant `{name}` was supplied twice")));
+            }
+            let bid = parsed
+                .public_bindings()
+                .find(|(_, b)| parsed.resolve(b.name) == name)
+                .map(|(bid, _)| bid)
+                .ok_or_else(|| fail(format!("no external binding named `{name}`")))?;
+            if !matches!(parsed.node(parsed.binding(bid).rhs), Node::Call(c)
+                if matches!(c.head, CallHead::Builtin(s) if parsed.resolve(s) == "external"))
+            {
+                return Err(fail(format!("`{name}` is not an unbound external")));
+            }
+            declarations.push((bid, parsed.binding(bid).rhs));
+            let ty = module
+                .typed
+                .type_of(module.typed.binding(bid).rhs)
+                .ok_or_else(|| fail(format!("unresolved type for `{name}`")))?;
+            let value = value
+                .normalized(&module.typed, ty)
+                .map_err(|error| fail(format!("constant `{name}`: {error}")))?;
+            let node = value.alloc(&mut parsed).map_err(fail)?;
+            parsed.set_binding_rhs(bid, node);
+        }
+        // Resolve every declaration after simultaneous substitution, including
+        // dimensions supplied in this call. Keep these roots out of the snapshot.
+        let mut validation = parsed.clone();
+        for (i, &(_, rhs)) in declarations.iter().enumerate() {
+            let name = validation.intern(&format!("<constant-domain-{i}>"));
+            validation.add_binding(Binding {
+                name,
+                rhs,
+                synthetic: true,
+                public: false,
+                doc: None,
+            });
+        }
+        if let Some(d) = flatppl_infer::infer_module(&mut validation, &module.bundle, Level::Shape)
+            .into_iter()
+            .find(|d| d.severity == Severity::Error)
+        {
+            return Err(fail(d.message));
+        }
+        for ((name, value), (bid, declaration)) in constants.iter().zip(declarations) {
+            let value = value
+                .validated(&validation, declaration)
+                .map_err(|error| fail(format!("constant `{name}`: {error}")))?;
+            let node = value.alloc(&mut parsed).map_err(fail)?;
+            parsed.set_binding_rhs(bid, node);
+        }
+        let inputs = parsed
+            .public_bindings()
+            .find(|(_, b)| parsed.resolve(b.name) == "inputs")
+            .map(|(bid, b)| (bid, b.clone()));
+        if let Some((bid, binding)) = inputs {
+            let entries = match parsed.node(binding.rhs) {
+                Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if parsed.resolve(s) == "tuple") => {
+                    c.args.to_vec()
+                }
+                _ => vec![binding.rhs],
+            };
+            let remaining: Vec<_> = entries.into_iter().filter(|&id| {
+                !matches!(parsed.node(id), Node::Ref(r) if r.ns == RefNs::SelfMod && seen.contains(parsed.resolve(r.name)))
+            }).collect();
+            match remaining.as_slice() {
+                [] => {
+                    let keep = parsed
+                        .bindings()
+                        .filter(|(id, _)| *id != bid)
+                        .map(|(id, _)| id)
+                        .collect();
+                    parsed.retain_bindings(&keep);
+                }
+                [only] => parsed.set_binding_rhs(bid, *only),
+                _ => {
+                    let rhs = crate::constants::call(&mut parsed, "tuple", remaining, vec![]);
+                    parsed.set_binding_rhs(bid, rhs);
+                }
+            }
+        }
+        let identity = format!("bound:{}", self.next_inline);
+        self.next_inline += 1;
+        self.instantiate(Arc::new(Definition {
+            identity,
+            label: module.definition.label.clone(),
+            source: module.definition.source.clone(),
+            parsed: Arc::new(parsed),
+            imports: module.definition.imports.clone(),
+        }))
+    }
+
     pub fn parse(
         &mut self,
         source: &str,

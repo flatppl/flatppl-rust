@@ -8,8 +8,10 @@
 //! StableHLO plus a tensor ABI. The host chooses execution and differentiation.
 
 mod compiler;
+mod constants;
 mod export;
 
 pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule};
+pub use constants::Constant;
 pub use export::{Export, Field, Schema};
 pub use flatppl_stablehlo::{Dtype, EmitOptions};

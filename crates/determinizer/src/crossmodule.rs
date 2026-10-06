@@ -283,6 +283,25 @@ fn graft_host_value(
     }
 }
 
+/// Resolve retained value expressions after simplification and callee guards.
+pub(crate) fn resolve_crossmodule_values(
+    host: &mut Module,
+    bundle: &ModuleBundle,
+    state: &mut GraftState,
+) -> Result<bool, RefuseError> {
+    let bindings: Vec<_> = host.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    let mut changed = false;
+    for (bid, root) in bindings {
+        let rhs = graft_host_value(host, root, bundle, state)
+            .map_err(|reason| crate::density::refuse(root, host, &reason))?;
+        if rhs != root {
+            host.set_binding_rhs(bid, rhs);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Resolve aliases and draw-measure refs before density destructuring. Other
 /// entry points remain lazy so simplification can discard unused arguments.
 pub(crate) fn resolve_crossmodule_aliases(

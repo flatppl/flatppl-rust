@@ -53,7 +53,7 @@
 //! primitives, still unimplemented until a later task adds a matching
 //! registry gate for it).
 
-use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
+use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Type};
 
 use crate::emitter::{Axes, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -186,8 +186,25 @@ pub(crate) fn lower_builtin(
         "pi" => lower_pi(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),
         "vector" => lower_vector(e, id, args),
+        "array" => lower_array(e, id, args),
         "cat" => lower_cat(e, id, args),
         "sum" => lower_sum(e, id, args),
+        "lengthof" => {
+            let [value] = args_exact(id, args)?;
+            let length = match e.type_of(value) {
+                Some(Type::Array { shape, .. }) if shape.len() == 1 => Some(shape[0]),
+                Some(Type::TVector { len, .. }) => Some(*len),
+                Some(Type::Table { nrows, .. }) => Some(*nrows),
+                _ => None,
+            };
+            match length {
+                Some(Dim::Static(n)) => Ok(e.int_value_const(n.into())),
+                _ => Err(EmitError::at(
+                    id,
+                    "lengthof requires a statically-sized vector or table",
+                )),
+            }
+        }
         // §07 reductions `maximum`/`minimum` ($\max_i x_i$ / $\min_i x_i$ over
         // a real array) — NOT §07's binary `max`/`min`, which this map does not
         // lower.
@@ -855,6 +872,47 @@ enum Stack {
     Rows,
     /// `colstack(vs)` — "a matrix whose columns are the vectors in `vs`".
     Cols,
+}
+
+fn lower_array(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [data, size, order] = args_exact(id, args)?;
+    let data = e.lower_node(data)?;
+    let size = e.lower_node(size)?;
+    let order = e.lower_node(order)?;
+    let size = e
+        .constant_integer_vector(&size)
+        .ok_or_else(|| EmitError::at(id, "array size must be fixed integers"))?;
+    let order = e
+        .constant_integer_vector(&order)
+        .ok_or_else(|| EmitError::at(id, "array dimorder must be fixed integers"))?;
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    if size.is_empty()
+        || size.iter().any(|&n| n <= 0)
+        || sorted != (1..=size.len() as i64).collect::<Vec<_>>()
+    {
+        return Err(EmitError::at(
+            id,
+            "array requires positive sizes and a permutation of its axes",
+        ));
+    }
+    let count = size.iter().try_fold(1_u64, |n, &d| n.checked_mul(d as u64));
+    if !matches!(&data.ty, MlirTy::Ranked(dims) if dims.as_slice() == [count] && count.is_some()) {
+        return Err(EmitError::at(
+            id,
+            "array data length must equal the product of its sizes",
+        ));
+    }
+    let shape = order
+        .iter()
+        .map(|&axis| Some(size[axis as usize - 1] as u64))
+        .collect();
+    let reshaped = e.reshape(&data, MlirTy::Ranked(shape));
+    let mut permutation = vec![0; order.len()];
+    for (position, &axis) in order.iter().enumerate() {
+        permutation[axis as usize - 1] = position as u64;
+    }
+    Ok(e.transpose(&reshaped, &permutation))
 }
 
 /// Lower §07 "Array and table operations"'s `rowstack(vs)` / `colstack(vs)`,
@@ -1670,6 +1728,11 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("median", "Reductions", "real arrays"),
     ("quantile", "Reductions", "real arrays, `interval(0, 1)`"),
     ("lengthof", "Reductions", "vectors, tables"),
+    (
+        "array",
+        "Array and table generation",
+        "vector, integer vector, integer vector",
+    ),
     ("sizeof", "Reductions", "vectors, arrays"),
     ("indicesof", "Reductions", "vectors, arrays, tables"),
     ("indicesof0", "Reductions", "vectors, arrays, tables"),
@@ -2119,8 +2182,8 @@ fn lower_binary_extremum(
 /// `x`", one `stablehlo.broadcast_in_dim` of the scalar `x`.
 ///
 /// The result shape is read off `id`'s OWN inferred type, not by lowering
-/// `size`: the determiniser spells the size as `lengthof(v)`, which has no
-/// tensor form, while inference has already resolved the result shape. An
+/// `size`: inference has already resolved the result shape, including sizes
+/// spelled as `lengthof(v)` by the determiniser. An
 /// unknown scalar extent can also be recovered from a folded size expression.
 /// Runtime extents refuse — `broadcast_in_dim` needs a static result shape.
 ///

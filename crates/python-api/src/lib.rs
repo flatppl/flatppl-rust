@@ -10,7 +10,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
-use flatppl_host::{Context, Diagnostic, Dtype, EmitOptions, LoadedModule};
+use flatppl_host::{Constant, Context, Diagnostic, Dtype, EmitOptions, LoadedModule};
 
 pyo3::create_exception!(_native, Error, PyException);
 
@@ -56,6 +56,15 @@ impl NativeContext {
 
     fn register(&mut self, name: &str, module: &NativeModule) -> PyResult<()> {
         self.inner.register(name, &module.inner).map_err(error)
+    }
+
+    fn set(&mut self, module: &NativeModule, constants: &str) -> PyResult<NativeModule> {
+        let constants: Vec<(String, Constant)> =
+            serde_json::from_str(constants).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.inner
+            .set(&module.inner, &constants)
+            .map(|inner| NativeModule { inner })
+            .map_err(error)
     }
 }
 

@@ -147,7 +147,13 @@ pub fn determinize_with_options(
                     Err(violations) => {
                         // Simplification must discard unused arguments and
                         // bindings before nested import guards can refuse them.
-                        if graft_application_callees(&mut work, bundle, &mut imports)? {
+                        if graft_application_callees(&mut work, bundle, &mut imports)?
+                            || crate::crossmodule::resolve_crossmodule_values(
+                                &mut work,
+                                bundle,
+                                &mut imports,
+                            )?
+                        {
                             crate::stdfn::lower_std_module_functions(&mut work, options)?;
                             continue;
                         }
