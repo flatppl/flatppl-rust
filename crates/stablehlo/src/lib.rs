@@ -257,6 +257,8 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
         retain_standard_functions: &[
             ("pyhf_helpers", "normsys_factor"),
             ("pyhf_helpers", "histosys_shift"),
+            ("pyhf_helpers", "sample_yields"),
+            ("pyhf_helpers", "expected_counts"),
         ],
     };
 
