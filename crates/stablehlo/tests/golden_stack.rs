@@ -51,7 +51,10 @@ fn emit_with_dtype(m: &Module, dtype: flatppl_stablehlo::Dtype) -> String {
     flatppl_stablehlo::emit(
         m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions { dtype },
+        &flatppl_stablehlo::EmitOptions {
+            dtype,
+            ..Default::default()
+        },
     )
     .expect("must emit @logdensity")
 }
