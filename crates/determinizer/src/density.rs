@@ -91,7 +91,7 @@
 //! - `joint(name₁ = M₁, …, nameₖ = Mₖ)` (**keyword/record**) → `Σᵢ
 //!   density(Mᵢ, v.nameᵢ)` — the variate is a RECORD keyed by the SAME field
 //!   names as the joint's components (§04 example, §06 "Density of composed
-//!   measures"); the value must itself be a `record(...)` node,
+//!   measures"); the value must have a known record shape,
 //!   and every field the joint names must be present in it (refuses
 //!   otherwise — refuse-don't-mislower). Unlike positional `joint`, there is
 //!   **no scalar-component restriction**: a record field may itself be any
@@ -789,11 +789,11 @@ fn lower_likelihood_query(
 /// Map public θ labels to their actual boundary bindings before validating
 /// them. An imported callable's labels survive renaming and alias adoption.
 fn theta_field_map(
-    m: &Module,
+    m: &mut Module,
     kernel: NodeId,
     theta: NodeId,
 ) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, theta);
+    let resolved = materialize_record_value(m, theta);
     let mut fields: Vec<(Symbol, NodeId)> = {
         let rec = expect_builtin_call(m, resolved, "record")
             .ok_or_else(|| refuse(theta, m, "logdensityof(L, θ): θ must be a record"))?;
@@ -2861,11 +2861,12 @@ fn carry_types(m: &mut Module, old: NodeId, new: NodeId, subs: &[(Symbol, NodeId
 /// Match `record(%field nameᵢ valueᵢ ...)` and pair each component with the
 /// matching field of `v`. Returns one `Component` per field.
 fn match_independent_record(
-    m: &Module,
+    m: &mut Module,
     record_node: NodeId,
     v: NodeId,
 ) -> Result<Vec<Component>, RefuseError> {
     let rec = expect_builtin_call(m, record_node, "record")
+        .cloned()
         .ok_or_else(|| refuse(record_node, m, "expected record"))?;
     if !rec.args.is_empty() {
         return Err(refuse(
@@ -2875,13 +2876,7 @@ fn match_independent_record(
         ));
     }
 
-    // The scored value may be a NAMED binding referring to a record literal
-    // (`theta = record(...)`, i.e. a `Ref(SelfMod, theta)`), not an inline
-    // `record(...)`. Resolve one ref level — as the measure side does in
-    // `lower_measure_density` — so a ref-to-record variate destructures the same
-    // as the inline form. A deeper ref-to-ref chain still refuses (one level,
-    // matching the measure side).
-    let (v, _) = resolve_ref_one(m, v);
+    let v = materialize_record_value(m, v);
     let vrec = expect_builtin_call(m, v, "record")
         .ok_or_else(|| refuse(v, m, "value must be a record"))?;
     if !vrec.args.is_empty() {
@@ -7347,8 +7342,8 @@ fn needs_record_wrapper(coordinates: &[Coordinate]) -> bool {
 /// non-empty and `args` is empty, so `named` here is always non-empty.
 ///
 /// **Refuses** (rather than mislowering) when: a named component is not a
-/// `%field` (a malformed named arg); the value `v` is not a `record(...)`
-/// node; `v`'s record carries a positional (non-named) element alongside its
+/// `%field` (a malformed named arg); the value `v` has no known record shape;
+/// `v`'s record carries a positional (non-named) element alongside its
 /// named fields; `v`'s record is missing a field that one of the joint's
 /// named components expects; or — via the record-law dispatch — the reified
 /// group turns out to be a singular joint.
@@ -7374,10 +7369,7 @@ fn lower_keyword_joint(
         }
     }
 
-    // As in `match_independent_record`: the scored value may be a ref to a record
-    // binding (`theta = record(...)`), not an inline `record(...)`. Resolve one
-    // ref level before destructuring.
-    let (v, _) = resolve_ref_one(m, v);
+    let v = materialize_record_value(m, v);
     let vrec = expect_builtin_call(m, v, "record")
         .ok_or_else(|| refuse(v, m, "joint value must be a record"))?;
     // A stray positional element mixed with the named fields (e.g. `record(0.9,
@@ -8009,6 +8001,28 @@ fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Option<NodeId>
         .iter()
         .find(|n| n.kind == NamedKind::Field && n.name == name)
         .map(|n| n.value)
+}
+
+/// Expose a typed record input through projections, as for a literal query point.
+/// Keep the field types: density rules use them before the next inference pass.
+fn materialize_record_value(m: &mut Module, v: NodeId) -> NodeId {
+    let (resolved, _) = resolve_ref_one(m, v);
+    let promoted = matches!(m.node(v), Node::Ref(r)
+        if r.ns == RefNs::SelfMod && crate::canon::promoted_input_names(m).contains(&r.name));
+    if !promoted && expect_builtin_call(m, resolved, "record").is_some() {
+        return resolved;
+    }
+    let Some(Type::Record(fields)) = m.type_of(v).or_else(|| m.type_of(resolved)).cloned() else {
+        return resolved;
+    };
+    let mut values = Vec::with_capacity(fields.len());
+    for (name, ty) in fields.iter() {
+        let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(*name).into())));
+        let field = build_call(m, "get", &[v, key]);
+        m.set_type(field, ty.clone());
+        values.push((*name, field));
+    }
+    build_record(m, &values)
 }
 
 /// If `id` is a builtin call with head named `name`, return its [`Call`].

@@ -26,6 +26,9 @@ pub use stdfn::standard_function;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoweringOptions<'a> {
     pub retain_standard_functions: &'a [(&'a str, &'a str)],
+    /// Keep rand's (value, state) result even without a tuple projection.
+    /// False preserves the legacy value-terminal convention.
+    pub preserve_rand_tuple: bool,
 }
 
 impl LoweringOptions<'_> {

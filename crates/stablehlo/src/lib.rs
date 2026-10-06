@@ -246,6 +246,7 @@ impl Default for EmitOptions {
 /// The default determinizer still expands their portable reference definitions.
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
+        preserve_rand_tuple: false,
         retain_standard_functions: &[
             ("pyhf_helpers", "normsys_factor"),
             ("pyhf_helpers", "histosys_shift"),
