@@ -231,7 +231,8 @@ pub enum Dtype {
 }
 
 /// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter
-/// never assumes/hardcodes 64-bit floats.
+/// never assumes/hardcodes 64-bit floats. Enzyme-oriented lowering is enabled
+/// by default for differentiable deterministic queries.
 pub struct EmitOptions {
     pub dtype: Dtype,
     /// Use Enzyme-oriented lowering for static, deterministic computations.
@@ -243,7 +244,7 @@ impl Default for EmitOptions {
     fn default() -> Self {
         Self {
             dtype: Dtype::F32,
-            enzyme_compatible: false,
+            enzyme_compatible: true,
         }
     }
 }
@@ -256,6 +257,8 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
         retain_standard_functions: &[
             ("pyhf_helpers", "normsys_factor"),
             ("pyhf_helpers", "histosys_shift"),
+            ("pyhf_helpers", "sample_yields"),
+            ("pyhf_helpers", "expected_counts"),
         ],
     };
 

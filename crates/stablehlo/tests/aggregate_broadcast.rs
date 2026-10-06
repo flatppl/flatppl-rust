@@ -14,7 +14,10 @@ fn emit(source: &str) -> String {
     flatppl_stablehlo::emit(
         &lowered,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect("aggregate inside a callable broadcast must emit")
 }

@@ -42,7 +42,10 @@ fn emit_logdensity(m: &Module) -> String {
     flatppl_stablehlo::emit(
         m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect("must emit @logdensity")
 }
@@ -53,7 +56,7 @@ fn emit_with_dtype(m: &Module, dtype: flatppl_stablehlo::Dtype) -> String {
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
             dtype,
-            ..Default::default()
+            enzyme_compatible: false,
         },
     )
     .expect("must emit @logdensity")
@@ -66,7 +69,10 @@ fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect_err("must refuse in the emitter")
     .msg
@@ -519,7 +525,10 @@ fn stack_refuses_higher_rank_and_abi_matrix_arguments() {
     let err = flatppl_stablehlo::emit(
         &m,
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect_err("a matrix ABI input must refuse")
     .msg;

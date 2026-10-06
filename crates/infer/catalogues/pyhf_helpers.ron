@@ -1,4 +1,4 @@
-// pyhf interpolation helpers. See the portable definitions in determinizer.
+// pyhf helpers. See the portable definitions in determinizer.
 Module(
     name: "pyhf_helpers",
     version: "0.1",
@@ -14,6 +14,16 @@ Module(
             names: ["lo", "nominal", "hi", "alpha"],
             param_sets: [Reals, Reals, Reals, Reals],
             result: Scalar(Real),
+        )),
+        Binding(name: "sample_yields", sig: Function(
+            params: [Matrix, Any, Any],
+            names: ["nominal", "shifts", "factors"],
+            result: RealOfArgShape(0),
+        )),
+        Binding(name: "expected_counts", sig: Function(
+            params: [Matrix],
+            names: ["samples"],
+            result: Vector(len: Axis(0, 1), elem: Real),
         )),
     ],
 )

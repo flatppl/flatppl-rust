@@ -3,7 +3,7 @@
 //! helper call never construct this fallback body.
 
 use super::*;
-use flatppl_core::ScalarType;
+use flatppl_core::{Axis, ScalarType};
 
 /// Share only the closed reference callable, never its arguments or results.
 /// Declared Real formals make this independent of the first call's shape/type.
@@ -12,8 +12,18 @@ pub(super) fn lower_call(
     m: &mut Module,
     args: &[NodeId],
     member: &str,
+    broadcast: bool,
     functions: &mut HashMap<String, NodeId>,
 ) -> Option<NodeId> {
+    // Direct collection calls bind whole arrays. Explicit broadcast binds
+    // one array-valued cell per application and retains its outer axes.
+    if !matches!(member, "normsys_factor" | "histosys_shift") {
+        return if broadcast {
+            lower_member_broadcast(m, args, "pyhf_helpers", member)
+        } else {
+            lower_function(m, args, member)
+        };
+    }
     let function = if let Some(&function) = functions.get(member) {
         function
     } else {
@@ -75,6 +85,53 @@ pub(super) fn lower_function(m: &mut Module, args: &[NodeId], member: &str) -> O
             let zero = lit(m, 0.0);
             Some(interp_poly6_lin(m, [lo, zero, hi, alpha]))
         }
+        "sample_yields" => {
+            let [nominal, shifts, factors] = arity::<3>(args)?;
+            let [sample, modifier, bin] = axes(m);
+            let sums = aggregate(m, "sum", shifts, &[sample, modifier, bin], &[sample, bin]);
+            let products = aggregate(m, "prod", factors, &[sample, modifier, bin], &[sample, bin]);
+            let add = m.intern("add");
+            let add = m.alloc(Node::Const(add));
+            let shifted = build_call(m, "broadcast", &[add, nominal, sums]);
+            let mul = m.intern("mul");
+            let mul = m.alloc(Node::Const(mul));
+            Some(build_call(m, "broadcast", &[mul, shifted, products]))
+        }
+        "expected_counts" => {
+            let [samples] = arity::<1>(args)?;
+            let [sample, _, bin] = axes(m);
+            Some(aggregate(m, "sum", samples, &[sample, bin], &[bin]))
+        }
         _ => None,
     }
+}
+
+/// Fresh labels keep model axes separate from caller axes.
+fn axes(m: &mut Module) -> [NodeId; 3] {
+    let scope = m.node_count();
+    ["sample", "modifier", "bin"].map(|label| {
+        let name = m.intern(&format!("pyhf_{scope}_{label}"));
+        m.alloc(Node::Axis(Axis {
+            name,
+            variance: None,
+        }))
+    })
+}
+
+fn aggregate(
+    m: &mut Module,
+    reducer: &str,
+    input: NodeId,
+    axes: &[NodeId],
+    output: &[NodeId],
+) -> NodeId {
+    let mut indices = vec![input];
+    indices.extend_from_slice(axes);
+    let body = build_call(m, "get", &indices);
+    let one = lit(m, 1.0);
+    let body = divide(m, body, one);
+    let output = build_call(m, "vector", output);
+    let reducer = m.intern(reducer);
+    let reducer = m.alloc(Node::Const(reducer));
+    build_call(m, "aggregate", &[reducer, output, body])
 }

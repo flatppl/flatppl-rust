@@ -55,7 +55,10 @@ fn emit(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect("must emit @logdensity")
 }
@@ -64,7 +67,10 @@ fn emit_err(src: &str) -> String {
     let err = flatppl_stablehlo::emit(
         &determinize_abi(src),
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            enzyme_compatible: false,
+            ..Default::default()
+        },
     )
     .expect_err("must refuse");
     format!("{err:?}")

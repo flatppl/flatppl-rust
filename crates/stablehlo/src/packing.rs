@@ -201,7 +201,7 @@ pub(super) fn pack<'m>(
                 .map(move |(lane, v)| (v.ssa.clone(), (group, lane)))
         })
         .collect();
-    let mut out = Emitter::new(source.m, source.dtype);
+    let mut out = source.scratch_emitter();
     out.pure_ops.reserve(lines.len());
     out.next = source.next;
     let mut packer = Packer {

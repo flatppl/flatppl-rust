@@ -190,8 +190,9 @@ enum Command {
         /// Floating-point precision for emitted tensors.
         #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
         dtype: String,
-        /// Require Enzyme-oriented lowering for static, deterministic queries.
-        #[arg(long)]
+        /// Require Enzyme-oriented lowering; use --enzyme-compatible=false to opt out.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         enzyme_compatible: bool,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
