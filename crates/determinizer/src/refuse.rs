@@ -18,6 +18,8 @@ pub struct NonConformance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonConformKind {
+    /// A numerical extension was not admitted, or a bound coordinate escaped.
+    NumericalIntegral,
     MeasureTyped,
     LikelihoodTyped,
     StochasticPhase,

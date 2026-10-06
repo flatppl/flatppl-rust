@@ -199,6 +199,7 @@
 //! every refusal rule and query-module usage.
 
 mod aggregate;
+mod complex;
 mod emitter;
 mod indexing;
 mod mlir;
@@ -238,6 +239,35 @@ pub struct EmitOptions {
     /// Restrict lowering to avoid known Enzyme limitations.
     /// Refuse known unsupported paths. This does not invoke Enzyme or prove AD support.
     pub restrict_enzyme_compatible: bool,
+    /// Opt in to adaptive numerical integration. `None` requires exact lowering.
+    pub integration: Option<IntegrationOptions>,
+}
+
+/// Error estimates for positive scalar integrals, evaluated in log space.
+#[derive(Clone, Copy, Debug)]
+pub struct IntegrationOptions {
+    pub rtol: f64,
+    pub atol: f64,
+    pub max_intervals: u32,
+}
+
+impl Default for IntegrationOptions {
+    fn default() -> Self {
+        Self {
+            rtol: 1e-5,
+            atol: 0.0,
+            max_intervals: 128,
+        }
+    }
+}
+
+impl EmitOptions {
+    pub fn lowering_options(&self) -> flatppl_determinizer::LoweringOptions<'static> {
+        flatppl_determinizer::LoweringOptions {
+            numerical_integrals: self.integration.is_some(),
+            ..LOWERING_OPTIONS
+        }
+    }
 }
 
 impl Default for EmitOptions {
@@ -245,6 +275,7 @@ impl Default for EmitOptions {
         Self {
             dtype: Dtype::F32,
             restrict_enzyme_compatible: true,
+            integration: None,
         }
     }
 }
@@ -254,6 +285,7 @@ impl Default for EmitOptions {
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         preserve_rand_tuple: false,
+        numerical_integrals: false,
         retain_standard_functions: &[
             ("pyhf_helpers", "normsys_factor"),
             ("pyhf_helpers", "histosys_shift"),
@@ -274,7 +306,7 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
 /// last-public-binding/source-order query heuristic has been removed, so there
 /// is no fallback.
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
-    flatppl_determinizer::is_flatpdl_with_options(m, &LOWERING_OPTIONS)
+    flatppl_determinizer::is_flatpdl_with_options(m, &opts.lowering_options())
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     match modes::read_abi(m)? {
         Some(abi) => match mode {

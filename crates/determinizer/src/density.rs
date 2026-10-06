@@ -155,6 +155,9 @@ use flatppl_infer::ModuleBundle;
 #[path = "density_broadcast.rs"]
 mod broadcast;
 
+#[path = "density_integral.rs"]
+mod integral;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -1772,6 +1775,7 @@ fn lower_applied_kernel_joint_inner(
                     k.body,
                     &component_bound,
                     crate::kernel::Substitute::LocalOnly,
+                    false,
                 );
                 bound.extend(component_bound);
                 let coordinate = build_call(m, "lawof", &[body]);
@@ -2445,6 +2449,9 @@ fn marginalize_or_refuse_stochastic_law(
                  admitted a value. The blocker is that value-versus-measure \
                  discrimination, not a missing conjugate row",
             ));
+        }
+        if let Some(numerical) = integral::marginal(m, resolved, v) {
+            return numerical.map(Some);
         }
         return Err(refuse(
             resolved,
@@ -3254,6 +3261,17 @@ fn lower_value_law(
             }
             return Some(scored);
         }
+        if transform.is_none()
+            && let Some(scored) = integral::marginal(m, measure, v)
+        {
+            if scored.is_ok()
+                && origin == VariateOrigin::Point
+                && let Some(bid) = binding
+            {
+                m.pin_binding_to_query_point(bid, v);
+            }
+            return Some(scored);
+        }
         return Some(Err(refuse(
             measure,
             m,
@@ -4007,7 +4025,16 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         return Ok(build_call(m, "sub", &[density, log_z]));
     }
 
-    // No closed-form mass rule for an unnormalized measure in this MVP.
+    if let Some(normalizer) = integral::mass(m, m_inner) {
+        let log_z = normalizer?;
+        let density = lower_measure_density(m, m_inner, v)?;
+        let score = build_call(m, "sub", &[density, log_z]);
+        let finite = build_call(m, "isfinite", &[log_z]);
+        let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
+        return Ok(build_call(m, "ifelse", &[finite, score, nan]));
+    }
+
+    // No closed-form or numerical rule covers this measure.
     Err(RefuseError {
         node,
         construct: "normalize".to_string(),

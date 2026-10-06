@@ -378,15 +378,9 @@
 //!   (not test-locked: a zero-length `cartpow` axis)
 //! - `var`/`std` over a single element — "aggregate: '...' over 1 element(s) is
 //!   undefined — §07 defines it with the $n-1$ denominator"
-//! - `metricsum` — "metricsum has no lowering in this backend: in general ... it
-//!   needs a general indefinite matrix inverse, which StableHLO has no op for".
-//!   §04's own lowering makes each lower-variance axis an `inv(metric)`
-//!   contraction, and §04 requires the metric only to be "square, symmetric, and
-//!   invertible"; `stablehlo.cholesky` needs positive-definiteness, so the
-//!   missing piece is different machinery from the frame model, not a missing arm
-//!   of it. UNCONDITIONAL by design — it declines the construct, not one variance
-//!   pattern, so the message says so rather than implying every call needs an
-//!   inverse (the all-upper degenerate case does not)
+//! - `metricsum` requires static tensor extents. Covariant operand axes use the
+//!   inverse metric before indexing; covariant output axes are raised after
+//!   reduction. Pivoted elimination supports indefinite runtime metrics.
 //!
 //! **`emitter.rs`** (`Emitter::reduce_trailing_axes`, the aggregate
 //! contraction):

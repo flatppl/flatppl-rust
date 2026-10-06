@@ -31,7 +31,8 @@ mod trace;
 
 use crate::modules::InferSession;
 
-use flatppl_core::{Module, NodeId};
+use flatppl_core::{Module, NodeId, Type};
+use std::collections::HashMap;
 
 pub use catalogue::{Catalogue, parse_catalogue};
 pub use modules::ModuleBundle;
@@ -196,6 +197,20 @@ pub fn infer(module: &mut Module) -> Vec<Diagnostic> {
 pub fn infer_module(module: &mut Module, bundle: &ModuleBundle, level: Level) -> Vec<Diagnostic> {
     let session = InferSession::new(bundle);
     trace::Inferencer::new(module, level, &session).run()
+}
+
+/// Infer a local expression with substituted input types, without replacing the
+/// module's annotations. The module must already contain its dependencies.
+/// This preserves array nesting and vector orientation when lowering a callable
+/// body at a concrete application site.
+pub fn infer_expression(
+    module: &mut Module,
+    root: NodeId,
+    inputs: &[(NodeId, Type)],
+) -> (HashMap<NodeId, Type>, Vec<Diagnostic>) {
+    let bundle = ModuleBundle::new();
+    let session = InferSession::new(&bundle);
+    trace::Inferencer::new(module, Level::Shape, &session).run_expression(root, inputs)
 }
 
 /// Like [`infer_module`], retaining automatic callable inputs for later lowering.

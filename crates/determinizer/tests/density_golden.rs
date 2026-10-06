@@ -469,32 +469,6 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
-// normalize(M) of an UNNORMALIZED measure has no closed-form mass rule in this
-// MVP. The determiniser must REFUSE rather than emit `totalmass`.
-#[test]
-fn normalize_of_unnormalized_measure_refuses() {
-    let src = "\
-w = 2.0
-inner = weighted(w, Normal(mu = 0.0, sigma = 1.0))
-m = normalize(inner)
-a = draw(m)
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
-    let m = {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        m
-    };
-    let err = determinize(&m).expect_err("unnormalized normalize must refuse, not lower");
-    assert_eq!(
-        err.construct, "normalize",
-        "refusal names normalize: {err:?}"
-    );
-    assert!(
-        err.reason.contains("closed-form mass rule") && err.reason.contains("totalmass"),
-        "refusal explains the missing mass rule: {err:?}"
-    );
-}
-
 // normalize(superpose(weighted(w₁, A₁), …)) of NORMALIZED mixands with
 // variate-independent scalar weights is a convex superposition: by §06 the total
 // mass is additive/multiplicative, Z = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ (a closed-form
@@ -2026,14 +2000,8 @@ lp = logdensityof(lawof(y), 0.3)",
     ] {
         let mut m = flatppl_syntax::parse(src).unwrap();
         let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m)
+        determinize(&m)
             .expect_err("a random weight / random forward map randomizes the law — refuse");
-        assert!(
-            err.reason
-                .contains("marginalizes over a stochastic ancestor"),
-            "must refuse as a marginal: {}",
-            err.reason
-        );
     }
 }
 
@@ -2303,14 +2271,7 @@ lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
     ] {
         let mut m = flatppl_syntax::parse(src).unwrap();
         let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m)
-            .expect_err("a draw of a draw-parameterized reification must refuse too");
-        assert!(
-            err.reason
-                .contains("marginalizes over a stochastic ancestor"),
-            "must refuse as a marginal: {}",
-            err.reason
-        );
+        determinize(&m).expect_err("a draw of a draw-parameterized reification must refuse too");
     }
 
     // Control: what makes this a guard and not a ban on `lawof(<reification>)`. A

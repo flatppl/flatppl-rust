@@ -133,6 +133,15 @@ pub fn determinize_with_options(
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
 
+        // Once every query has consumed its declared draw provenance, named
+        // deterministic intermediates may also be dead. Prune their draws
+        // before the generic scan can reject an unreachable measure node.
+        if let Some(roots) = roots
+            && find_op_node(&work, &["logdensityof", "densityof", "rand"]).is_none()
+        {
+            crate::canon::retain_reachable(&mut work, roots);
+        }
+
         // Check for measure-layer nodes.
         let target = find_measure_node(&work);
 

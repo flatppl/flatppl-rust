@@ -192,6 +192,9 @@ pub(crate) fn call_rule(
     }
 
     let ty = match name.as_str() {
+        flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT => {
+            Type::Scalar(ScalarType::Real)
+        }
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
@@ -638,22 +641,7 @@ pub(crate) fn call_rule(
             domain: Box::new(jointchain_domain(inf, args, named)),
             mass: Mass::Deferred,
         },
-        // `scan(f, init, xs)` (spec §04) is the DETERMINISTIC left scan — a value,
-        // not a measure: `array[lengthof(xs)]` of the accumulator type (= init's
-        // type). The stochastic analogue is `kscan`.
-        "scan" => match arg_ty(args, 1) {
-            Some(t @ (Type::Scalar(_) | Type::Array { .. })) => {
-                let len = match arg_ty(args, 2) {
-                    Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
-                    _ => Dim::Dynamic,
-                };
-                Type::Array {
-                    shape: Box::new([len]),
-                    elem: Box::new(t.clone()),
-                }
-            }
-            _ => Type::Deferred,
-        },
+        "scan" => return scan_type(inf, args).map(inf, move |_, ty| (ty, joined)),
         // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
         // result is a function with `f1`'s input signature (output type is not
         // tracked by `Type::Function`).
@@ -884,6 +872,9 @@ pub(crate) fn call_rule(
     };
 
     let phase = match name.as_str() {
+        // A bound coordinate is internal to the integral, not a host parameter.
+        // Its value set stays unknown, so constant evaluation cannot read it.
+        flatppl_core::INTEGRATION_POINT => Phase::Fixed,
         "elementof" => Phase::Parameterized,
         "external" | "load_data" | "load_module" | "standard_module" => Phase::Fixed,
         "draw" => Phase::Stochastic,
@@ -902,6 +893,96 @@ pub(crate) fn call_rule(
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
+}
+
+/// A scan has one fixed state type, including the numeric embedding of an
+/// integer initial value into a real-valued recurrence. Infer the step with
+/// state and row types, just as broadcast infers its callable on cell types.
+fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
+    let [function, init, xs] = args else {
+        return Ready(Type::Deferred);
+    };
+    let (len, item) = match &xs.1 {
+        Type::Array { shape, elem } if shape.len() == 1 => (shape[0], (**elem).clone()),
+        Type::Table { columns, nrows } => (*nrows, Type::Record(columns.clone())),
+        _ => return Ready(Type::Deferred),
+    };
+    let seed = (xs.0, item, xs.2);
+    scan_state_type(inf, function.0, init.clone(), seed).map(inf, move |_, state| match state {
+        Type::Record(columns) => Type::Table {
+            columns,
+            nrows: len,
+        },
+        state @ (Type::Scalar(_) | Type::Array { .. }) => Type::Array {
+            shape: Box::new([len]),
+            elem: Box::new(state),
+        },
+        _ => Type::Deferred,
+    })
+}
+
+fn scan_state_type(
+    inf: &mut Inferencer<'_, '_>,
+    function: NodeId,
+    state: ArgInfo,
+    item: ArgInfo,
+) -> RuleStep<Type> {
+    substituted_result(
+        inf,
+        function,
+        &[state.clone(), item.clone()],
+        &[],
+        None,
+        false,
+    )
+    .and_then(inf, move |inf, result| {
+        let result = result
+            .map(|(ty, _)| ty)
+            .or_else(|| reified_result_type(inf, function));
+        let Some(joined) = result
+            .as_ref()
+            .and_then(|next| scan_state_join(&state.1, next))
+        else {
+            return Ready(Type::Deferred);
+        };
+        if joined == state.1 {
+            Ready(joined)
+        } else {
+            // The structure cannot change. Every leaf only widens through
+            // the finite boolean/integer/real/complex inclusion chain.
+            scan_state_type(inf, function, (state.0, joined, state.2), item)
+        }
+    })
+}
+
+fn scan_state_join(state: &Type, next: &Type) -> Option<Type> {
+    if state == next {
+        return Some(state.clone());
+    }
+    match (state, next) {
+        (Type::Scalar(_), Type::Scalar(_)) => Some(promote2(Some(state), Some(next))),
+        (
+            Type::Array { shape, elem },
+            Type::Array {
+                shape: other,
+                elem: next,
+            },
+        ) if shape == other => Some(Type::Array {
+            shape: shape.clone(),
+            elem: Box::new(scan_state_join(elem, next)?),
+        }),
+        (Type::Record(fields), Type::Record(other)) if fields.len() == other.len() => {
+            let fields = fields
+                .iter()
+                .map(|(name, ty)| {
+                    let next = &other.iter().find(|(field, _)| field == name)?.1;
+                    Some((*name, scan_state_join(ty, next)?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::Record(fields.into()))
+        }
+        _ => None,
+    }
 }
 
 /// A positional argument vector with each keyword argument moved to its DECLARED position,
@@ -9102,7 +9183,14 @@ fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> b
 pub(crate) fn is_opaque_value_source(name: &str) -> bool {
     matches!(
         name,
-        "draw" | "rand" | "elementof" | "external" | "load_data" | "rnginit" | "rngstate"
+        "draw"
+            | "rand"
+            | "elementof"
+            | "external"
+            | "load_data"
+            | "rnginit"
+            | "rngstate"
+            | flatppl_core::INTEGRATION_POINT
     )
 }
 

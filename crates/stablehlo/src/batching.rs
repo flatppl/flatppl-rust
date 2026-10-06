@@ -153,7 +153,7 @@ impl Emitter<'_> {
         if !matches!(v.ty, MlirTy::Scalar | MlirTy::Ranked(_)) {
             return v;
         }
-        let mut ty = self.m.type_of(id);
+        let mut ty = self.type_of(id);
         let mut layers = Vec::new();
         loop {
             match ty {

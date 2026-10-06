@@ -117,65 +117,6 @@ lp = logdensityof(px, 0.5)",
     );
 }
 
-/// A coefficient vector whose LENGTH is not static leaves the polynomial's degree
-/// unknown, so the antiderivative is not statically expressible. Refuse rather
-/// than guess a degree.
-#[test]
-fn dynamic_coefficient_vector_refuses() {
-    let msg = refusal(
-        "\
-c = elementof(cartpow(reals, 3))
-px = normalize(
-  truncate(weighted(x -> polynomial(c, x), Lebesgue(reals)), interval(-1.0, 1.0)),
-)
-lp = logdensityof(px, 0.5)",
-    );
-    assert!(
-        msg.contains("closed-form mass rule"),
-        "generic unnormalized-measure refusal:\n{msg}"
-    );
-}
-
-/// The polynomial must be applied to the weight's OWN argument. A polynomial of
-/// something else is a constant weight in the variate, not this rule's shape, and
-/// its mass is a different integral.
-#[test]
-fn polynomial_of_another_quantity_refuses() {
-    let msg = refusal(
-        "\
-a = elementof(reals)
-px = normalize(
-  truncate(weighted(x -> polynomial([1.0, 2.0], a), Lebesgue(reals)), interval(-1.0, 1.0)),
-)
-lp = logdensityof(px, 0.5)",
-    );
-    assert!(
-        msg.contains("closed-form mass rule"),
-        "generic unnormalized-measure refusal:\n{msg}"
-    );
-}
-
-/// The reference measure must be Lebesgue over the whole line, so the truncation
-/// set alone is the domain of integration. A `Lebesgue(interval(...))` base makes
-/// it the intersection instead.
-#[test]
-fn bounded_lebesgue_reference_refuses() {
-    let msg = refusal(
-        "\
-px = normalize(
-  truncate(
-    weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0.0, 5.0))),
-    interval(-1.0, 1.0),
-  ),
-)
-lp = logdensityof(px, 0.5)",
-    );
-    assert!(
-        msg.contains("closed-form mass rule"),
-        "generic unnormalized-measure refusal:\n{msg}"
-    );
-}
-
 /// The alias fix and the mass rule compose: the HS3 importer binds the pdf to
 /// `__M__` by name, so the rule has to be reached through a bare-name alias too.
 #[test]

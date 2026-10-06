@@ -28,3 +28,9 @@ let exported = query.compile(&EmitOptions::default())?;
 `EmitOptions` defaults to float32 and restrictions for known Enzyme limitations. Set `restrict_enzyme_compatible` to false for unrestricted emission. The host owns value packing, execution, and differentiation. Compilation does not run Enzyme or a sampler, and neither setting guarantees or rules out Enzyme compatibility.
 
 The separate [`flatppl-python-api`](../python-api) crate maps this API into PyO3 classes for the [Python package](https://github.com/flatppl/flatppl-python).
+
+Set `EmitOptions.integration` to `Some(IntegrationOptions::default())` to allow
+adaptive numerical integration when exact scalar marginal or normalizer rules
+do not apply. The default remains `None`. The emitted program evaluates the
+integral on the execution device. Read the
+[integration contract](../stablehlo/docs/integration.md) before enabling it.

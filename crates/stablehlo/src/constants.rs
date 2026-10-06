@@ -9,6 +9,38 @@ use std::sync::Arc;
 pub(super) type Constant = Arc<[Scalar]>;
 
 impl Emitter<'_> {
+    /// A fixed diagonal metric can be inverted without a matrix factorization.
+    /// Query arguments have no constant entry, even when their source is fixed.
+    pub(crate) fn constant_diagonal(&self, value: &Value) -> Option<Vec<f64>> {
+        let [Some(rows), Some(cols)] = shape(&value.ty) else {
+            return None;
+        };
+        if rows != cols || *rows == 0 || self.batch_rank(value) != 0 {
+            return None;
+        }
+        let n = usize::try_from(*rows).ok()?;
+        let data = self.constants.get(&value.ssa)?;
+        let mut diagonal = Vec::with_capacity(n);
+        for i in 0..n {
+            for j in 0..n {
+                let x = match data.get(if data.len() == 1 { 0 } else { i * n + j })? {
+                    Scalar::Real(x) => *x,
+                    Scalar::Int(x) => *x as f64,
+                    _ => return None,
+                };
+                if i == j {
+                    if !x.is_finite() || x == 0.0 {
+                        return None;
+                    }
+                    diagonal.push(x);
+                } else if x != 0.0 {
+                    return None;
+                }
+            }
+        }
+        Some(diagonal)
+    }
+
     pub(crate) fn constant_integer_vector(&self, value: &Value) -> Option<Vec<i64>> {
         let MlirTy::Ranked(dims) = &value.ty else {
             return None;

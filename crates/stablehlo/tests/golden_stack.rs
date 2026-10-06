@@ -57,6 +57,7 @@ fn emit_with_dtype(m: &Module, dtype: flatppl_stablehlo::Dtype) -> String {
         &flatppl_stablehlo::EmitOptions {
             dtype,
             restrict_enzyme_compatible: false,
+            ..Default::default()
         },
     )
     .expect("must emit @logdensity")

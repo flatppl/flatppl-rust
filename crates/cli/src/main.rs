@@ -196,6 +196,18 @@ enum Command {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
               num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         restrict_enzyme_compatible: bool,
+        /// Allow adaptive numerical scalar marginals and normalizers.
+        #[arg(long)]
+        numerical_integrals: bool,
+        /// Relative integral error tolerance (does not bound derivative error).
+        #[arg(long, default_value_t = 1e-5, requires = "numerical_integrals")]
+        integration_rtol: f64,
+        /// Absolute integral error tolerance.
+        #[arg(long, default_value_t = 0.0, requires = "numerical_integrals")]
+        integration_atol: f64,
+        /// Maximum adaptive quadrature intervals. Failed convergence returns NaN.
+        #[arg(long, default_value_t = 128, requires = "numerical_integrals")]
+        integration_max_intervals: u32,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -327,12 +339,27 @@ fn main() -> ExitCode {
             mode,
             dtype,
             restrict_enzyme_compatible,
+            numerical_integrals,
+            integration_rtol,
+            integration_atol,
+            integration_max_intervals,
             output,
         } => stablehlo_cmd(
             &input,
             &mode,
-            &dtype,
-            restrict_enzyme_compatible,
+            &flatppl_stablehlo::EmitOptions {
+                dtype: if dtype == "f64" {
+                    flatppl_stablehlo::Dtype::F64
+                } else {
+                    flatppl_stablehlo::Dtype::F32
+                },
+                restrict_enzyme_compatible,
+                integration: numerical_integrals.then_some(flatppl_stablehlo::IntegrationOptions {
+                    rtol: integration_rtol,
+                    atol: integration_atol,
+                    max_intervals: integration_max_intervals,
+                }),
+            },
             output.as_deref(),
         ),
         Command::Completions { shell } => {
@@ -885,8 +912,7 @@ fn determinize_cmd(
 fn stablehlo_cmd(
     input: &Path,
     mode: &str,
-    dtype: &str,
-    restrict_enzyme_compatible: bool,
+    opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let (module, bundle, source) = load_and_infer(input)?;
@@ -935,18 +961,10 @@ fn stablehlo_cmd(
         &module,
         &bundle,
         roots.as_deref(),
-        &flatppl_stablehlo::LOWERING_OPTIONS,
+        &opts.lowering_options(),
     )
     .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    let opts = flatppl_stablehlo::EmitOptions {
-        restrict_enzyme_compatible,
-        dtype: if dtype == "f64" {
-            flatppl_stablehlo::Dtype::F64
-        } else {
-            flatppl_stablehlo::Dtype::F32
-        },
-    };
-    let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
+    let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {

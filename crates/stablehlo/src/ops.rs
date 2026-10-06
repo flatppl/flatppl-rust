@@ -71,6 +71,7 @@ pub(crate) fn lower_builtin(
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     match head {
+        flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args),
         "add" => binary(e, id, args, Emitter::add),
         "sub" => binary(e, id, args, Emitter::sub),
         "mul" => binary(e, id, args, Emitter::mul),
@@ -90,7 +91,6 @@ pub(crate) fn lower_builtin(
         "log" => unary(e, id, args, Emitter::log),
         "exp" => unary(e, id, args, Emitter::exp),
         "sqrt" => unary(e, id, args, Emitter::sqrt),
-        "abs" => unary(e, id, args, Emitter::abs),
         "cos" => unary(e, id, args, Emitter::cos),
         "invlogit" => unary(e, id, args, Emitter::invlogit),
         // §07 "Elementary functions", the entries whose op or `Emitter` helper
@@ -106,7 +106,17 @@ pub(crate) fn lower_builtin(
         "ceil" => unary(e, id, args, Emitter::ceil),
         "log2" => unary(e, id, args, Emitter::log2),
         "log10" => unary(e, id, args, Emitter::log10),
+        "abs2" | "abs" | "real" | "imag"
+            if args.len() == 1
+                && matches!(
+                    e.type_of(args[0]),
+                    Some(Type::Scalar(flatppl_core::ScalarType::Complex))
+                ) =>
+        {
+            crate::complex::project(e, id, head, args[0])
+        }
         "abs2" => unary(e, id, args, Emitter::abs2),
+        "abs" => unary(e, id, args, Emitter::abs),
         "asin" => unary(e, id, args, Emitter::asin),
         "acos" => unary(e, id, args, Emitter::acos),
         "acosh" => unary(e, id, args, Emitter::acosh),
@@ -253,10 +263,7 @@ pub(crate) fn lower_builtin(
         // lowering (it binds the body's axis-indexed operands before walking the
         // body, so it cannot be composed out of the elementwise entries above).
         "aggregate" => crate::aggregate::lower_aggregate(e, id, args),
-        // §04 "Metric-aware Einstein summation" — refused with its own reason
-        // rather than falling through to the generic unknown-head message; see
-        // `aggregate::metricsum_refusal`.
-        "metricsum" => Err(crate::aggregate::metricsum_refusal(id)),
+        "metricsum" => crate::aggregate::lower_metricsum(e, id, args),
         "in" => lower_in(e, id, args),
         // §07 comparison functions `lt`/`gt`/`le`/`ge` ($a < b$, $a > b$, $a \le b$,
         // $a \ge b$ over `reals`). The inclusive pair is the image gate's vocabulary
@@ -2521,8 +2528,9 @@ fn lower_get_literal(
     let idx = idx as u64;
 
     let v = e.lower_node(container)?;
+    let v = e.with_typed_axes(container, v);
     let len = match &e.cell_ty(&v) {
-        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+        MlirTy::Ranked(dims) if e.axes_of(&v).layers.first() == Some(&1) => dims[0],
         other => {
             return Err(EmitError::at(
                 id,
@@ -2539,7 +2547,7 @@ fn lower_get_literal(
     }
 
     let batch = e.batch_rank(&v);
-    if batch == 0 {
+    if batch == 0 && matches!(&v.ty, MlirTy::Ranked(dims) if dims.len() == 1) {
         let sliced = e.slice(&v, &[idx], &[idx + 1], &[1]);
         return Ok(e.reshape(&sliced, MlirTy::Scalar));
     }
@@ -2552,8 +2560,13 @@ fn lower_get_literal(
     starts[batch] = idx;
     limits[batch] = idx + 1;
     let sliced = e.slice(&v, &starts, &limits, &vec![1; limits.len()]);
-    let result_ty = MlirTy::Ranked(limits[..batch].iter().copied().map(Some).collect());
-    Ok(e.reshape(&sliced, result_ty))
+    let mut result_dims = match &v.ty {
+        MlirTy::Ranked(dims) => dims.clone(),
+        _ => unreachable!(),
+    };
+    result_dims.remove(batch);
+    let result = e.reshape(&sliced, MlirTy::Ranked(result_dims));
+    Ok(e.with_typed_axes(id, result))
 }
 
 /// The runtime-index fallback — see [`lower_get`]. Reached once
@@ -2615,6 +2628,7 @@ fn literal_index(e: &Emitter, id: NodeId, index: NodeId) -> Result<i64, EmitErro
 /// set expression refuses.
 #[derive(Clone, Copy)]
 enum ElemSet {
+    Reals,
     /// §03 `interval(lo, hi)` — "denotes the closed interval $[lo, hi]$".
     Interval(NodeId, NodeId),
     /// §03 `posreals` — "$(0, +\infty]$, the positive reals including
@@ -2629,12 +2643,36 @@ enum ElemSet {
 /// or over `cartpow(S, n)` of one for a vector variate.
 ///
 /// A supported `S` is [`ElemSet`]: `interval(lo, hi)`, `posreals`,
-/// `nonnegreals`. Every other set expression (`reals`, `unitinterval`,
-/// `integers`, a `cartprod`, a `stdsimplex`) refuses rather than lowering an
-/// approximation — the determiniser's image gates emit only these.
+/// `nonnegreals`. Positional `cartprod` checks each scalar coordinate against
+/// its own element set. Other set expressions refuse.
 fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v_id, set_id] = args_exact(id, args)?;
     let v = e.lower_node(v_id)?;
+    let set_id = e.resolve_ref_one(set_id);
+
+    if let Node::Call(c) = e.node(set_id)
+        && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
+        && c.named.is_empty()
+    {
+        let sets = c.args.clone();
+        if v.ty != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
+            return Err(EmitError::at(
+                id,
+                "'in' over cartprod needs a vector with one scalar per set",
+            ));
+        }
+        let mut members = Vec::with_capacity(sets.len());
+        for (i, set) in sets.into_iter().enumerate() {
+            let set = classify_elem_set(e, id, set)?;
+            let cell = e.slice(&v, &[i as u64], &[i as u64 + 1], &[1]);
+            let cell = e.reshape(&cell, MlirTy::Scalar);
+            members.push(elem_membership(e, id, &cell, set)?);
+        }
+        return members
+            .into_iter()
+            .reduce(|a, b| e.and(&a, &b))
+            .ok_or_else(|| EmitError::at(id, "'in' over an empty cartprod is unsupported"));
+    }
 
     // §03 `cartpow(S, size)`: "the Cartesian power of `S` with shape `size`" —
     // membership holds when EVERY cell is in `S`, so the per-cell predicate is
@@ -2692,6 +2730,7 @@ fn elem_membership(
     set: ElemSet,
 ) -> Result<Value, EmitError> {
     match set {
+        ElemSet::Reals => Ok(e.compare("EQ", v, v)),
         ElemSet::PosReals => {
             let zero = e.constant_like(0.0, v);
             Ok(e.compare("GT", v, &zero))
@@ -2722,12 +2761,13 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
     let refuse = || {
         EmitError::at(
             id,
-            "'in': only an interval(lo, hi), posreals or nonnegreals set is supported \
+            "'in': only an interval(lo, hi), reals, posreals or nonnegreals set is supported \
              (optionally under one cartpow)",
         )
     };
     match e.node(set_id) {
         Node::Const(sym) => match e.resolve(*sym) {
+            "reals" => Ok(ElemSet::Reals),
             "posreals" => Ok(ElemSet::PosReals),
             "nonnegreals" => Ok(ElemSet::NonNegReals),
             _ => Err(refuse()),

@@ -30,6 +30,7 @@ pub fn is_flatpdl_with_options(
     options: &crate::LoweringOptions<'_>,
 ) -> Result<(), Vec<NonConformance>> {
     let mut bad = Vec::new();
+    check_integrals(m, options, &mut bad);
     let tags = kernel_tag_slots(m);
     let mut seen = HashSet::new();
     let mut pending = Vec::new();
@@ -189,7 +190,11 @@ fn check_node(
         // params or rngstate argument, and `kallen` (a §09 non-constructor) is
         // caught in every position.
         let is_tag = tags.contains(&id) && flatppl_infer::builtins::is_kernel_tag_name(name);
-        if !is_tag && !flatppl_infer::builtins::is_base_name(name) {
+        let intrinsic = matches!(
+            name,
+            flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT
+        );
+        if !is_tag && !intrinsic && !flatppl_infer::builtins::is_base_name(name) {
             bad.push(NonConformance {
                 node: id,
                 kind: NonConformKind::FreeBareName,
@@ -269,5 +274,81 @@ fn check_node(
                 }
             }
         }
+    }
+}
+
+/// Numerical coordinates are lexical binders, never ordinary fixed inputs.
+fn check_integrals(
+    m: &Module,
+    options: &crate::LoweringOptions<'_>,
+    bad: &mut Vec<NonConformance>,
+) {
+    let mut seen = HashSet::new();
+    let mut pending = m.bindings().map(|(_, b)| (b.rhs, None)).collect::<Vec<_>>();
+    while let Some((id, bound)) = pending.pop() {
+        if !seen.insert((id, bound)) {
+            continue;
+        }
+        if let Node::Ref(r) = m.node(id)
+            && r.ns == RefNs::SelfMod
+            && let Some(binding) = m.binding_by_name(r.name)
+        {
+            pending.push((m.binding(binding).rhs, bound));
+            continue;
+        }
+        if let Node::Call(c) = m.node(id)
+            && let CallHead::Builtin(head) = c.head
+        {
+            match m.resolve(head) {
+                flatppl_core::LOG_INTEGRAL => {
+                    if !options.numerical_integrals {
+                        bad.push(NonConformance { node: id, kind: NonConformKind::NumericalIntegral,
+                            reason: "no closed form covers this marginal or normalizer; numerical integration requires explicit opt-in".into() });
+                        continue;
+                    }
+                    if c.args.len() != 4 || !c.named.is_empty() || bound.is_some() {
+                        bad.push(NonConformance {
+                            node: id,
+                            kind: NonConformKind::NumericalIntegral,
+                            reason: "numerical integration requires a nonnested scalar integral"
+                                .into(),
+                        });
+                        continue;
+                    }
+                    let point = c.args[1];
+                    let valid = matches!(m.node(point), Node::Call(p)
+                        if matches!(p.head, CallHead::Builtin(h) if m.resolve(h) == flatppl_core::INTEGRATION_POINT));
+                    if !valid {
+                        bad.push(NonConformance {
+                            node: id,
+                            kind: NonConformKind::NumericalIntegral,
+                            reason: "numerical integral has no bound coordinate".into(),
+                        });
+                        continue;
+                    }
+                    pending.push((c.args[0], Some(point)));
+                    pending.push((point, Some(point)));
+                    pending.extend(c.args[2..].iter().map(|&node| (node, None)));
+                    continue;
+                }
+                flatppl_core::INTEGRATION_POINT
+                    if bound != Some(id)
+                        || c.args.len() != 1
+                        || !c.named.is_empty()
+                        || !matches!(
+                            c.args.first().map(|&n| m.node(n)),
+                            Some(Node::Lit(flatppl_core::Scalar::Int(_)))
+                        ) =>
+                {
+                    bad.push(NonConformance {
+                        node: id,
+                        kind: NonConformKind::NumericalIntegral,
+                        reason: "integration coordinate escaped its integral".into(),
+                    });
+                }
+                _ => (),
+            }
+        }
+        m.for_each_child(id, |child| pending.push((child, bound)));
     }
 }

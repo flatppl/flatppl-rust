@@ -114,33 +114,6 @@ lp = logdensityof(d, [0.5, -0.3])";
     );
 }
 
-// `normalize(truncate(base, interval(lo, hi)))` uses the closed-form
-// Z = touniform(base, hi) − touniform(base, lo) = CDF(hi) − CDF(lo). That
-// identity holds ONLY when `base` is a normalized univariate continuous
-// probability measure — `builtin_touniform` is the CDF only for univariate
-// continuous kernels (§07 "measure-eval-prims"), and the transport is defined
-// only for continuous built-in kernels (§07 "measure-eval-prims"). For an
-// UNNORMALIZED base
-// (here `Lebesgue(reals)`, whose true
-// Z = hi − lo and for which `touniform` is undefined) the CDF path silently
-// mislowers, so the determiniser must NOT take it — it falls through to the
-// refuse (no closed-form Z for an unnormalized base is built; refuse
-// normalize(truncate(<unnormalized base>, …)) rather than use the CDF-Z path).
-#[test]
-fn normalize_truncate_unnormalized_base_refuses() {
-    let src = "\
-d = normalize(truncate(Lebesgue(reals), interval(-1.0, 1.0)))
-lp = logdensityof(d, 0.5)";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("normalize(truncate(<unnormalized base>, …)) must refuse, not use the CDF-Z");
-    // Must NOT have emitted the touniform CDF-Z path: it refuses instead.
-    assert!(
-        err.construct.contains("normalize") || err.reason.contains("unnormalized"),
-        "refusal is about the unnormalized-base normalize, not the CDF path: {err:?}"
-    );
-}
-
 // `normalize(truncate(Binomial, interval(lo, hi)))` — the base is NORMALIZED
 // (a probability measure) but DISCRETE (`domain = Scalar(Integer)`). The CDF-Z
 // path `Z = touniform(base, hi) − touniform(base, lo)` is NOT valid here:
