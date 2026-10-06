@@ -18,6 +18,13 @@ pub(super) fn call_type(
     }
     let member = origin.member.clone();
     let sig = origin.sig.clone();
+    let ranks: &[usize] = match member.as_str() {
+        "normsys_factor" => &[0, 0, 0],
+        "histosys_shift" => &[0, 0, 0, 0],
+        "sample_yields" => &[2, 3, 3],
+        "expected_counts" => &[2],
+        _ => return None,
+    };
     if let Some(failed) = module_member_arity_check(inf, id, callee, &sig, args, named) {
         return Some(failed);
     }
@@ -50,19 +57,31 @@ pub(super) fn call_type(
             *ty = cell;
         }
     }
-    for ((_, ty, _), name) in args.iter().zip(names) {
-        if !matches!(
-            ty,
-            Type::Any
-                | Type::Deferred
-                | Type::Scalar(ScalarType::Boolean | ScalarType::Integer | ScalarType::Real)
-        ) {
-            return Some(fail(
-                inf,
-                id,
-                &member,
-                &format!("`{name}` requires a real scalar, got {ty:?}"),
-            ));
+    let mut shapes = Vec::with_capacity(args.len());
+    for ((_, ty, _), (&rank, name)) in args.iter().zip(ranks.iter().zip(names)) {
+        let shape = match cell_shape(ty, rank) {
+            Ok(shape) => shape,
+            Err(()) => {
+                return Some(fail(
+                    inf,
+                    id,
+                    &member,
+                    &format!("`{name}` requires a real-valued rank-{rank} cell, got {ty:?}"),
+                ));
+            }
+        };
+        shapes.push(shape);
+    }
+    if member == "sample_yields" {
+        for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+            if known_mismatch(&shapes[left], 0, &shapes[right], 0) {
+                return Some(fail(inf, id, &member, "unequal sample extents"));
+            }
+        }
+        for (left, li, right, ri) in [(0, 1, 1, 2), (0, 1, 2, 2), (1, 2, 2, 2)] {
+            if known_mismatch(&shapes[left], li, &shapes[right], ri) {
+                return Some(fail(inf, id, &member, "unequal bin extents"));
+            }
         }
     }
     let cell = catalogue_lower(inf.module, &sig, &args).0;
@@ -135,6 +154,28 @@ fn ordered_args(
         slots[index] = Some((*node, ty.clone(), *phase));
     }
     slots.into_iter().collect()
+}
+
+fn cell_shape(ty: &Type, rank: usize) -> Result<Option<&[Dim]>, ()> {
+    match ty {
+        Type::Any | Type::Deferred | Type::Failed(_) => Ok(None),
+        Type::Scalar(ScalarType::Boolean | ScalarType::Integer | ScalarType::Real) if rank == 0 => {
+            Ok(Some(&[]))
+        }
+        Type::Array { shape, elem } if shape.len() == rank => match elem.as_ref() {
+            Type::Scalar(ScalarType::Boolean | ScalarType::Integer | ScalarType::Real) => {
+                Ok(Some(shape))
+            }
+            Type::Any | Type::Deferred => Ok(None),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+fn known_mismatch(a: &Option<&[Dim]>, ai: usize, b: &Option<&[Dim]>, bi: usize) -> bool {
+    matches!((a.and_then(|s| s.get(ai)), b.and_then(|s| s.get(bi))),
+        (Some(Dim::Static(a)), Some(Dim::Static(b))) if a != b)
 }
 
 fn fail(inf: &mut Inferencer<'_, '_>, id: NodeId, member: &str, reason: &str) -> Type {

@@ -44,6 +44,8 @@ mod packed_gathers;
 mod packing;
 #[path = "pointwise.rs"]
 mod pointwise;
+#[path = "product_reductions.rs"]
+mod product_reductions;
 #[path = "pyhf.rs"]
 mod pyhf;
 #[path = "segment_reductions.rs"]
@@ -1741,8 +1743,6 @@ impl<'m> Emitter<'m> {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
 
-        let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
-
         let mut axes = self.axes_of(a);
         if axis < axes.batch {
             axes.batch -= 1;
@@ -1757,6 +1757,18 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
+        if combine_op == "stablehlo.multiply"
+            && a.elem == ElemKind::Real
+            && let Some(out) = self.product_tree(a, axis, &result_ty, &axes)
+        {
+            self.remember_pointwise(
+                &out.ssa,
+                &out,
+                Pointwise::Reduce(a.clone(), axis, combine_op.to_owned(), init_lit.to_owned()),
+            );
+            return out;
+        }
+        let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
         let ssa = self.pure_axes(format!(
             "stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
             a.ssa

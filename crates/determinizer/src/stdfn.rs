@@ -203,7 +203,8 @@ fn lower_member_call(
     };
     if module == "pyhf_helpers" {
         let args = pyhf::ordered_args(m, &c, member)?;
-        return pyhf::lower_call(m, &args, member, pyhf_functions);
+        let broadcast = matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast");
+        return pyhf::lower_call(m, &args, member, broadcast, pyhf_functions);
     }
     if !c.named.is_empty() {
         return None;

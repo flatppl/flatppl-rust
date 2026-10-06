@@ -48,6 +48,13 @@ impl Emitter<'_> {
             ("histosys_shift", [lo, nominal, hi, alpha]) => {
                 Ok(self.histosys_shift(lo, nominal, hi, alpha))
             }
+            ("sample_yields", [nominal, shifts, factors]) => {
+                let sums = self.pyhf_reduce(shifts, 1, false);
+                let products = self.pyhf_reduce(factors, 1, true);
+                let shifted = self.add(nominal, &sums);
+                Ok(self.mul(&shifted, &products))
+            }
+            ("expected_counts", [samples]) => Ok(self.pyhf_reduce(samples, 0, false)),
             _ => Err(EmitError::at(
                 id,
                 format!("unsupported pyhf helper call `{member}`"),
@@ -63,6 +70,27 @@ impl Emitter<'_> {
             }
             None => result,
         }
+    }
+
+    /// Reduce a model axis without transposing it past bin or batch axes.
+    fn pyhf_reduce(&mut self, value: &Value, axis: usize, product: bool) -> Value {
+        let value = if value.elem == ElemKind::Bool {
+            self.convert(value, ElemKind::Int)
+        } else {
+            value.clone()
+        };
+        let identity = match (product, value.elem) {
+            (true, ElemKind::Real) => "1.000000e+00",
+            (true, _) => "1",
+            (false, ElemKind::Real) => "0.000000e+00",
+            (false, _) => "0",
+        };
+        let op = if product {
+            "stablehlo.multiply"
+        } else {
+            "stablehlo.add"
+        };
+        self.reduce_axis_lit(op, identity, &value, self.batch_rank(&value) + axis)
     }
 
     /// HistFactory code4p returns the additive shift, not the shifted template.
