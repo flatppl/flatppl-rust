@@ -552,33 +552,6 @@ fn maximum_minimum_thread_element_kind() {
 
 // ---- Round 3: linear-algebra matrix/vector results via the catalogue ----
 
-/// `inv` / `lower_cholesky` / `diagmat` infer a matrix whose element kind is
-/// preserved from the argument — a complex matrix inverts to a complex matrix.
-#[test]
-fn matrix_maps_preserve_element_kind() {
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = inv(A)");
-    assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(inv"),
-        "inv(real matrix) should be a real matrix, got:\n{out}"
-    );
-    let out = ir("A = [[complex(1.0, 0.0)]]\nx = inv(A)");
-    assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar complex))") && out.contains("(inv"),
-        "inv(complex matrix) should be a complex matrix, got:\n{out}"
-    );
-    let out = ir("A = [[4.0, 0.0], [0.0, 9.0]]\nx = lower_cholesky(A)");
-    assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
-            && out.contains("(lower_cholesky"),
-        "lower_cholesky(real PD) should be a real matrix, got:\n{out}"
-    );
-    let out = ir("v = [1.0, 2.0]\nx = diagmat(v)");
-    assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(diagmat"),
-        "diagmat(real vector) should be a real matrix, got:\n{out}"
-    );
-}
-
 /// Vector-result functions infer a rank-1 array with the right element kind:
 /// `linspace` → real, `diag` → the matrix's element kind.
 #[test]

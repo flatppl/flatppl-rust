@@ -289,8 +289,8 @@ Catalogue(
         Builtin(name: "eye",            sig: Function(params: [Scalar(Integer)], names: ["n"], result: Matrix(rows: Dyn, cols: Dyn))),
         // inv / lower_cholesky: square matrix, element kind preserved (a complex
         // matrix inverts to a complex matrix).
-        Builtin(name: "inv",            sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
-        Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "inv",            sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: OfArg(0)))),
+        Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: OfArg(0)))),
         // qr(A) → record(Q, R): both matrices with A's element kind (spec §07).
         Builtin(name: "qr", sig: Function(params: [Matrix], names: ["A"], result: Record([
             ("Q", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),

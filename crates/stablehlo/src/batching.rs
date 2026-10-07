@@ -369,39 +369,64 @@ impl Emitter<'_> {
         name: &str,
         args: &[NodeId],
     ) -> Result<Value, EmitError> {
-        let [arg] = crate::ops::args_exact(id, args)?;
-        let value = self.lower_node(arg)?;
-        let mut values = [self.typed_axes(arg, value)];
-        let parent = self.enter_broadcast(id, &mut values)?;
-        let saved = self
-            .memo
-            .insert(arg, values[0].clone())
-            .expect("the argument was lowered before entering the map");
-        let result = if name == "sizeof" {
-            let axes = self.axes_of(&values[0]);
-            let sizes = axes.layers.first().and_then(|&rank| {
-                shape(&values[0].ty)[axes.batch..axes.batch + rank]
-                    .iter()
-                    .copied()
-                    .collect::<Option<Vec<_>>>()
-            });
-            sizes
-                .ok_or_else(|| EmitError::at(id, "sizeof requires a statically-shaped array"))
-                .map(|sizes| {
-                    let values = sizes
+        let [_] = crate::ops::args_exact(id, args)?;
+        self.lower_broadcast_cells(id, args, |e, values| {
+            if name == "sizeof" {
+                let axes = e.axes_of(&values[0]);
+                let sizes = axes.layers.first().and_then(|&rank| {
+                    shape(&values[0].ty)[axes.batch..axes.batch + rank]
                         .iter()
-                        .map(|&n| self.int_value_const(n as i64))
-                        .collect::<Vec<_>>();
-                    self.vector(&values)
-                })
-        } else {
-            crate::ops::lower_builtin(self, id, name, args)
+                        .copied()
+                        .collect::<Option<Vec<_>>>()
+                });
+                sizes
+                    .ok_or_else(|| EmitError::at(id, "sizeof requires a statically-shaped array"))
+                    .map(|sizes| {
+                        let values = sizes
+                            .iter()
+                            .map(|&n| e.int_value_const(n as i64))
+                            .collect::<Vec<_>>();
+                        e.vector(&values)
+                    })
+            } else {
+                crate::ops::lower_builtin(e, id, name, args)
+            }
+        })
+    }
+
+    /// Lower tensor operands in a callable frame, restoring their enclosing
+    /// bindings even when the cell builder reports an error.
+    pub(crate) fn lower_broadcast_cells(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+        build: impl FnOnce(&mut Self, &[Value]) -> Result<Value, EmitError>,
+    ) -> Result<Value, EmitError> {
+        let mut values = Vec::with_capacity(args.len());
+        for &arg in args {
+            let value = self.lower_node(arg)?;
+            values.push(self.typed_axes(arg, value));
         }
-        .map(|value| {
+        let parent = self.enter_broadcast(id, &mut values)?;
+        let saved = args
+            .iter()
+            .zip(&values)
+            .map(|(&arg, value)| {
+                (
+                    arg,
+                    self.memo
+                        .insert(arg, value.clone())
+                        .expect("lowered broadcast operand"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let result = build(self, &values).map(|value| {
             let frame = self.broadcast_frame.clone();
             self.finish_broadcast(&value, &frame, parent.len())
         });
-        self.memo.insert(arg, saved);
+        for (arg, value) in saved.into_iter().rev() {
+            self.memo.insert(arg, value);
+        }
         self.broadcast_frame = parent;
         result
     }

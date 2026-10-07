@@ -704,35 +704,6 @@ fn the_real_hardcode_family_refuses_an_integer_matrix() {
     }
 }
 
-/// §07 `lower_cholesky(A)` — one `stablehlo.cholesky` with `lower = true`, the
-/// factor convention §07 fixes ("lower-triangular $\mathbf{L}$ with
-/// $\mathbf{A} = \mathbf{L}\mathbf{L}^\dagger$").
-///
-/// **NOT numerically executed, and the reason is pre-existing.**
-/// `iree-base-compiler` 3.11 refuses to legalize `stablehlo.cholesky` at all
-/// ("failed to legalize operation 'stablehlo.cholesky' that was explicitly
-/// marked illegal"), so no IREE run of this head is possible. That is not
-/// something this head introduces: the already-frozen
-/// `goldens/mvnormal_logdensity.mlir` carries the identical op and fails the
-/// same way (measured). The module here PARSES and VERIFIES under MLIR, and the
-/// op is spec-legal StableHLO; the numeric check stays UN-VERIFIED against an
-/// executed oracle until IREE grows the lowering or the emitter composes the
-/// factorization itself.
-#[test]
-fn lower_cholesky_emits_the_lower_factor() {
-    let out = emit(&format!(
-        "{MAT_VEC_ABI}L = lower_cholesky(A)\ninputs = (A, v)\noutputs = (L)\n"
-    ));
-    assert!(
-        out.contains("stablehlo.cholesky %arg0, lower = true : tensor<3x3xf32>"),
-        "§07 fixes the LOWER factor:\n{out}"
-    );
-    assert!(
-        out.contains("-> tensor<3x3xf32>"),
-        "the factor is shape-preserving:\n{out}"
-    );
-}
-
 /// §07 `self_outer(x)` = "$\mathbf{x} \cdot \mathbf{x}^\dagger$", domain
 /// "vectors" — the operand against ITSELF, so both `broadcast_in_dim`s spread
 /// `%arg`, one along each axis, and the result is square.

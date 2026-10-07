@@ -1875,6 +1875,22 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
         "sizeof" => Some(sizeof_type(Some(cell))),
+        "det" | "logabsdet" => (flatten_dims(cell).len() == 2).then(|| {
+            Type::Scalar(if name == "logabsdet" {
+                ScalarType::Real
+            } else {
+                elem_scalar_kind_of(cell).unwrap_or(ScalarType::Real)
+            })
+        }),
+        "lower_cholesky" | "inv" => {
+            let shape = flatten_dims(cell);
+            (shape.len() == 2).then(|| Type::Array {
+                shape: shape.into_boxed_slice(),
+                elem: Box::new(Type::Scalar(
+                    elem_scalar_kind_of(cell).unwrap_or(ScalarType::Real),
+                )),
+            })
+        }
         _ => None,
     }
 }

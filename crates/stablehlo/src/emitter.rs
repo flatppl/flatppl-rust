@@ -2094,9 +2094,12 @@ impl<'m> Emitter<'m> {
 
     // ---- matrix helpers -----------------------------------------------------
 
-    /// `%N = stablehlo.cholesky %a, lower = true : ty` — the lower-triangular
-    /// Cholesky factor of `a` (shape-preserving: same square-matrix `MlirTy`).
+    /// Lower Cholesky factor with the input's matrix-cell and batch shapes.
+    /// Enzyme compatibility decomposes the native op for first derivatives.
     pub fn cholesky(&mut self, a: &Value) -> Value {
+        if self.restrict_enzyme_compatible {
+            return self.cholesky_decomposed(a);
+        }
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
@@ -2392,23 +2395,14 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Solve the lower-triangular system `l @ y = b` for `y`, via
-    /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n, k]` -> `y: [n,
-    /// k]`). `b` must be a rank-2 MATRIX right-hand side — the real
-    /// StableHLO parser (jax 0.10.2's `ir.Module.parse`) rejects a rank-1 `b`
-    /// outright, unlike genuinely rank-generic ops such as [`Emitter::mul`];
-    /// `k = n` solves `l @ Y = B` column-by-column (`registry.rs`'s
-    /// `trace_via_frobenius`, Task 13 Wishart/InverseWishart, calls this with
-    /// a square matrix `b`), and `k = 1` solves for a single vector reshaped
-    /// to a `[n, 1]` column (`registry.rs`'s `mvnormal_logpdf`, Task 12,
-    /// reshapes `x-mu` to `[n, 1]` before calling this and reshapes the
-    /// `[n, 1]` result back to `[n]` afterwards — this fn does not reshape
-    /// for the caller). `y`'s result type is always `b.ty` unchanged.
-    /// `triangular_solve` has no pretty form, so this emits its parser-
-    /// validated *generic* form verbatim (quoted op name, `<{...}>`
-    /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
+    /// Solve `l @ y = b` for matrix cells `[n, n]` and `[n, k]`, preserving
+    /// the RHS shape. Enzyme compatibility uses forward substitution because
+    /// the imported native triangular solve has no adjoint.
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let (l, b) = self.broadcast_batches(l, b);
+        if self.restrict_enzyme_compatible {
+            return self.tri_solve_decomposed(&l, &b);
+        }
         let ssa = self.fresh();
         let l_ty = l.ty.render(self.dtype, l.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
@@ -3653,6 +3647,10 @@ impl<'m> Emitter<'m> {
                 | "lany"
                 | "lall"
                 | "sizeof"
+                | "lower_cholesky"
+                | "inv"
+                | "det"
+                | "logabsdet"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {

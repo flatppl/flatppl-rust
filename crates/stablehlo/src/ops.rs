@@ -177,6 +177,25 @@ pub(crate) fn lower_builtin(
         // for `lower_transpose`'s reason: this crate has no complex element type,
         // so over the elements it emits conjugation is the identity.
         "lower_cholesky" => lower_cholesky_head(e, id, args),
+        "inv" => {
+            let [arg] = args_exact(id, args)?;
+            let a = e.lower_node(arg)?;
+            require_real_matrix(id, &a, "inv")?;
+            e.matrix_inverse(id, &a)
+        }
+        "det" | "logabsdet" => {
+            let [arg] = args_exact(id, args)?;
+            let a = e.lower_node(arg)?;
+            let n = square_dim(id, &e.cell_ty(&a), head)?;
+            if n == 0 || n > i32::MAX as u64 {
+                return Err(EmitError::at(
+                    id,
+                    "determinant requires a nonempty static matrix",
+                ));
+            }
+            require_real_matrix(id, &a, head)?;
+            Ok(e.matrix_determinant(&a, n, head == "logabsdet"))
+        }
         "diag" => lower_diag(e, id, args),
         "trace" => lower_trace(e, id, args),
         "self_outer" => lower_self_outer(e, id, args),
@@ -684,15 +703,15 @@ fn lower_transpose(
 /// squareness, to size a result, or to reject a rank the helper would panic on
 /// — so a dynamic (`?`) axis refuses here rather than emitting a module whose
 /// shape contract cannot be checked.
-fn matrix_dims(id: NodeId, v: &Value, head: &str) -> Result<(u64, u64), EmitError> {
-    match &v.ty {
+fn matrix_dims(id: NodeId, ty: &MlirTy, head: &str) -> Result<(u64, u64), EmitError> {
+    match ty {
         MlirTy::Ranked(d) if d.len() == 2 => match (d[0], d[1]) {
             (Some(m), Some(n)) => Ok((m, n)),
             _ => Err(EmitError::at(
                 id,
                 format!(
                     "`{head}`: a dynamic matrix axis has no lowering, got {:?}",
-                    v.ty
+                    ty
                 ),
             )),
         },
@@ -707,8 +726,8 @@ fn matrix_dims(id: NodeId, v: &Value, head: &str) -> Result<(u64, u64), EmitErro
 }
 
 /// [`matrix_dims`] plus §07's SQUARE requirement, returning the single extent.
-fn square_dim(id: NodeId, v: &Value, head: &str) -> Result<u64, EmitError> {
-    let (m, n) = matrix_dims(id, v, head)?;
+fn square_dim(id: NodeId, ty: &MlirTy, head: &str) -> Result<u64, EmitError> {
+    let (m, n) = matrix_dims(id, ty, head)?;
     if m != n {
         return Err(EmitError::at(
             id,
@@ -745,7 +764,8 @@ fn require_real_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitErro
 
 /// §07 `lower_cholesky(A)` — "lower-triangular $\mathbf{L}$ with
 /// $\mathbf{A} = \mathbf{L}\mathbf{L}^\dagger$ and positive diagonal entries",
-/// domain "positive definite `A`". One `stablehlo.cholesky` with `lower = true`.
+/// domain "positive definite `A`". Enzyme compatibility uses a decomposition;
+/// unrestricted emission uses native `stablehlo.cholesky` with `lower = true`.
 ///
 /// Positive-definiteness is §07's precondition on the CALLER, not something a
 /// static emitter can check: `stablehlo.cholesky` is documented to produce
@@ -754,7 +774,7 @@ fn require_real_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitErro
 fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
-    square_dim(id, &a, "lower_cholesky")?;
+    square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
     require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
 }
@@ -803,7 +823,7 @@ fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         }
     }
     let a = e.lower_node(a_id)?;
-    square_dim(id, &a, "diag")?;
+    square_dim(id, &a.ty, "diag")?;
     require_real_matrix(id, &a, "diag")?;
     Ok(e.diag(&a))
 }
@@ -814,7 +834,7 @@ fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
 fn lower_trace(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
-    square_dim(id, &a, "trace")?;
+    square_dim(id, &a.ty, "trace")?;
     require_real_matrix(id, &a, "trace")?;
     let d = e.diag(&a);
     Ok(e.reduce_sum(&d))
@@ -870,7 +890,7 @@ fn lower_gram(
     };
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
-    matrix_dims(id, &a, head)?;
+    matrix_dims(id, &a.ty, head)?;
     let at = e.transpose(&a, &[1, 0]);
     Ok(match which {
         Gram::Row => e.matmat(&a, &at),
@@ -887,7 +907,7 @@ fn lower_quadform(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value,
     let [a_id, x_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     let x = e.lower_node(x_id)?;
-    let n = square_dim(id, &a, "quadform")?;
+    let n = square_dim(id, &a.ty, "quadform")?;
     let len = match &x.ty {
         MlirTy::Ranked(d) if d.len() == 1 => d[0],
         other => {
