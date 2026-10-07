@@ -563,7 +563,7 @@ pub struct Terms {
     declared_params: HashSet<String>,
     /// Shared deterministic normalization factors across samples and channels.
     normsys_factors: crate::normsys::Factors,
-    /// pyhf's qualified interpolation helpers; native HS3 keeps its chosen codes.
+    /// pyhf's qualified helpers; native HS3 keeps its chosen interpolation codes.
     pyhf_helpers: Option<String>,
     /// The staterror constraint form to use when the modifier does not name one.
     ///
@@ -1002,7 +1002,10 @@ pub fn assemble_channel(
         _ => {
             let rows = b.array(&sample_expected);
             let matrix = b.call("rowstack", &[rows]);
-            b.column_sums(matrix)
+            match terms.pyhf_helpers.as_deref() {
+                Some(alias) => b.module_user_call(alias, "expected_counts", &[matrix]),
+                None => b.column_sums(matrix),
+            }
         }
     };
     let expected_name = b.bind_unique_doc(
