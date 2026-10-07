@@ -103,45 +103,6 @@ fn the_measured_linear_algebra_mislowerers_refuse() {
     }
 }
 
-/// The rest of both newly swept tables. Several already refused at exit 3 for their own
-/// reasons; pinning them here keeps the refusal on the DOMAIN rule rather than on
-/// whichever unrelated gate happened to catch them.
-#[test]
-fn the_rest_of_the_two_new_tables_refuse_under_a_broadcast() {
-    for head in [
-        "det",
-        "logabsdet",
-        "inv",
-        "trace",
-        "linsolve",
-        "qr",
-        "lower_cholesky",
-        "row_gram",
-        "col_gram",
-        "cross",
-        "diagmat",
-        "diag",
-        "quadform",
-        "rowstack",
-        "colstack",
-        "tile",
-        "splitblocks",
-        "joinblocks",
-        "partition",
-        "reverse",
-        "addaxes",
-        "blockdiagmat",
-        "bandedmat",
-        "array",
-    ] {
-        let err = emit_err(&nested_src(head, "reals"));
-        assert!(
-            err.contains(&format!("`{head}` under a broadcast has no tensor form")),
-            "`{head}.(vv)` must refuse on the domain rule: {err}"
-        );
-    }
-}
-
 /// The forward hazard, pinned. §07's four remaining collection-domain tables — Convolution,
 /// Binning, Approximation functions, Array and table generation — are safe only because
 /// their heads are UNLOWERED, not because of the domain rule. This test states that

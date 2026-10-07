@@ -536,6 +536,7 @@ fn batched_logpdf(ctor: &str) -> Option<LogpdfBuilder> {
     match ctor {
         "Categorical" => Some(categorical_logpdf_batched),
         "Categorical0" => Some(categorical0_logpdf_batched),
+        "MvNormal" => Some(mvnormal_logpdf_batched),
         _ => None,
     }
 }
@@ -2504,17 +2505,10 @@ fn categorical0_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result
 // directly with the operand's own `MlirTy` to get an already-shaped splat
 // constant instead.
 
-/// The statically-known length of a rank-1 vector `Value`, or a precise
-/// refusal naming `blame` — [`mvnormal_logpdf`]'s `n` (task brief: "the
-/// vector length, a static dim of `mu`/`x`") is baked into a scalar literal
-/// constant (`-(n/2) * log(2*pi)`), which needs `n` known at EMIT time, not
-/// merely well-typed. A `Dim::Dynamic` vector length is a legitimate FlatPDL
-/// type elsewhere in the language (`elementof(cartpow(reals, m))` with an
-/// unbound `m`), so this refuses precisely — refuse-don't-mislower — rather
-/// than only surfacing as a downstream panic from some later op that assumes
-/// a static shape.
-fn static_vector_len(blame: NodeId, v: &Value) -> Result<u64, EmitError> {
-    match &v.ty {
+/// MvNormal's normalization uses the static vector-cell length, excluding
+/// any active broadcast axes.
+fn static_vector_len(e: &Emitter, blame: NodeId, v: &Value) -> Result<u64, EmitError> {
+    match e.cell_ty(v) {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
             EmitError::at(
                 blame,
@@ -2528,19 +2522,10 @@ fn static_vector_len(blame: NodeId, v: &Value) -> Result<u64, EmitError> {
     }
 }
 
-/// `cov`'s `MlirTy` must be a square `n`x`n` matrix, matching `mu`'s own
-/// statically-known length `n` — a refusal, not a downstream panic
-/// (refuse-don't-mislower). Neither [`Emitter::cholesky`] nor
-/// [`Emitter::tri_solve`] checks this: `cholesky` renders `a.ty` verbatim
-/// with no shape validation at all, and [`Emitter::diag`] only asserts rank
-/// 2 (`dims.len() == 2`), never `dims[0] == dims[1]` — so a wrong-size square
-/// `cov` (e.g. `[3, 3]` against a length-2 `mu`) sails through `cholesky`/
-/// `diag` and only produces operand-shape-incompatible StableHLO at the
-/// final `tri_solve(L, x-mu)`, and a non-square `cov` (e.g. `[2, 3]`) reaches
-/// `stablehlo.cholesky` on a non-square operand — neither is valid input to
-/// any real StableHLO consumer. This guard catches both shapes up front.
-fn require_square_cov(blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitError> {
-    match &cov.ty {
+/// Check each covariance cell against the mean's length before emitting
+/// Cholesky and the triangular solve.
+fn require_square_cov(e: &Emitter, blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitError> {
+    match e.cell_ty(cov) {
         MlirTy::Ranked(dims) if dims.len() == 2 && dims[0] == Some(n) && dims[1] == Some(n) => {
             Ok(())
         }
@@ -2554,35 +2539,17 @@ fn require_square_cov(blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitErro
 }
 
 /// §08 MvNormal, verbatim: `log f = -(n/2)*log(2*pi) - 1/2*log|Sigma| -
-/// 1/2*(x-mu)^T Sigma^-1 (x-mu)`, with `L = cholesky(Sigma)` (lower),
-/// `log|Sigma| = 2 * sum(log(diag(L)))`, and the quadratic form via `y =
-/// tri_solve(L, x-mu)`, `(x-mu)^T Sigma^-1 (x-mu) = y^T y = sum(y*y)` — the
-/// task brief's closed form exactly (never `Sigma^-1` explicitly: a full
-/// matrix inverse has no `Emitter` helper, and solving the triangular system
-/// `L y = (x-mu)` is the numerically standard way to get the same quadratic
-/// form). `n`, the vector length, comes from `mu`'s own statically-known
-/// shape ([`static_vector_len`]); `cov` is then checked against that same
-/// `n` by [`require_square_cov`] BEFORE any matrix op runs — neither
-/// `cholesky` nor `tri_solve` validates `cov`'s shape itself (see that
-/// function's doc comment), so this builder must.
-///
-/// `stablehlo.triangular_solve`'s real parser (jax 0.10.2's `ir.Module.parse`)
-/// rejects a rank-1 RHS outright — unlike [`Emitter::matvec`]/[`Emitter::mul`],
-/// which are genuinely rank-generic, `triangular_solve` requires its `b`
-/// operand to be a MATRIX (`[n, k]`), even when solving for a single vector
-/// (`k = 1`). So `x-mu` (a `[n]` vector) is [`Emitter::reshape`]d to `[n, 1]`
-/// before `tri_solve`, and the `[n, 1]` result reshaped straight back to
-/// `[n]` before squaring/summing — the quadratic form is otherwise unchanged,
-/// and reshaping `y` back to rank-1 (rather than reducing the `[n, 1]` result
-/// directly) keeps `reduce_sum`'s single-`reduce_axis` shape, matching this
-/// builder's frozen golden/structural op counts exactly.
+/// 1/2*(x-mu)^T Sigma^-1 (x-mu)`. Cholesky supplies the log determinant;
+/// solving `L y = x-mu` supplies the quadratic form without an inverse.
+/// The solve requires matrix RHS cells, so reshape each vector to `[n, 1]`
+/// and restore `[n]` before reduction. Broadcast axes remain separate.
 fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu_id = p.field_id(e, "mu")?;
     let mu = e.lower_node(mu_id)?;
     let cov_id = p.field_id(e, "cov")?;
     let cov = e.lower_node(cov_id)?;
-    let n = static_vector_len(mu_id, &mu)?;
-    require_square_cov(cov_id, &cov, n)?;
+    let n = static_vector_len(e, mu_id, &mu)?;
+    require_square_cov(e, cov_id, &cov, n)?;
 
     let l = e.cholesky(&cov);
     let diag_l = e.diag(&l);
@@ -2609,6 +2576,14 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     Ok(e.add(&t1, &neg_half_quad))
 }
 
+fn mvnormal_logpdf_batched(e: &mut Emitter, p: &Params, _: &Value) -> Result<Value, EmitError> {
+    let variate = p.variate_id()?;
+    let args = [p.field_id(e, "mu")?, p.field_id(e, "cov")?, variate];
+    e.lower_broadcast_cells(variate, &args, |e, values| {
+        mvnormal_logpdf(e, p, &values[2])
+    })
+}
+
 /// §08 MvNormal's sampling transform, verbatim: `mu + L @ z`, `L =
 /// cholesky(cov)` (lower, [`Emitter::cholesky`] — reused rather than
 /// recomputed via a second `stablehlo.cholesky` op, mirroring
@@ -2623,8 +2598,8 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = e.lower_node(mu_id)?;
     let cov_id = p.field_id(e, "cov")?;
     let cov = e.lower_node(cov_id)?;
-    let d = static_vector_len(mu_id, &mu)?;
-    require_square_cov(cov_id, &cov, d)?;
+    let d = static_vector_len(e, mu_id, &mu)?;
+    require_square_cov(e, cov_id, &cov, d)?;
 
     // Cholesky ONCE on the `[d, d]` cov, shared across every draw (scalar or
     // fanned): `L` is a deterministic function of `cov`, not of the rng.
@@ -4121,7 +4096,7 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{batched_logpdf, is_batch_safe};
+    use super::is_batch_safe;
 
     #[test]
     fn batch_safe_allows_univariate_arithmetic_dists() {
@@ -4169,28 +4144,6 @@ mod tests {
             "SomeFutureDistribution",
         ] {
             assert!(!is_batch_safe(d), "{d} must not be batch-safe");
-        }
-    }
-
-    #[test]
-    fn only_the_categoricals_carry_a_dedicated_batched_builder() {
-        for d in ["Categorical", "Categorical0"] {
-            assert!(batched_logpdf(d).is_some(), "{d} needs a batched builder");
-        }
-        // A batch-safe dist must NOT also carry one: two builders for one dist
-        // is two places for its density to drift.
-        for d in [
-            "Normal",
-            "Uniform",
-            "MvNormal",
-            "Dirichlet",
-            "LKJ",
-            "SomeFutureDistribution",
-        ] {
-            assert!(
-                batched_logpdf(d).is_none(),
-                "{d} must have no batched builder"
-            );
         }
     }
 }
