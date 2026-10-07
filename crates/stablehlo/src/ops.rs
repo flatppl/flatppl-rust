@@ -215,6 +215,28 @@ pub(crate) fn lower_builtin(
                 )),
             }
         }
+        "sizeof" => {
+            let [value] = args_exact(id, args)?;
+            let dims = match e.type_of(value) {
+                Some(Type::Array { shape, .. }) => shape.to_vec(),
+                Some(Type::TVector { len, .. }) => vec![*len],
+                _ => vec![],
+            };
+            if dims.is_empty() || dims.contains(&Dim::Dynamic) {
+                return Err(EmitError::at(
+                    id,
+                    "sizeof requires a statically-shaped array",
+                ));
+            }
+            let values = dims
+                .iter()
+                .map(|dim| {
+                    let Dim::Static(n) = dim else { unreachable!() };
+                    e.int_value_const((*n).into())
+                })
+                .collect::<Vec<_>>();
+            Ok(e.vector(&values))
+        }
         // §07 reductions `maximum`/`minimum` ($\max_i x_i$ / $\min_i x_i$ over
         // a real array) — NOT §07's binary `max`/`min`, which this map does not
         // lower.
@@ -256,6 +278,22 @@ pub(crate) fn lower_builtin(
             crate::order::OrderStatistic::Quantile,
         )),
         "fill" => lower_fill(e, id, args),
+        "zeros" | "ones" | "eye" => {
+            let [_] = args_exact(id, args)?;
+            let (ty, _) = e.node_ty(id)?;
+            if !matches!(&ty, MlirTy::Ranked(dims) if dims.iter().all(Option::is_some)) {
+                return Err(EmitError::at(id, format!("{head} requires a static size")));
+            }
+            let value = e.scalar(if head == "ones" { 1.0 } else { 0.0 });
+            let value = e.fill_cell(&value, ty);
+            if head != "eye" {
+                return Ok(value);
+            }
+            let rows = e.axis_indices(&value, 0);
+            let cols = e.axis_indices(&value, 1);
+            let diagonal = e.compare("EQ", &rows, &cols);
+            Ok(e.convert(&diagonal, ElemKind::Real))
+        }
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
         // §04 "Multi-axis aggregation" — the einsum-style contraction, and what
@@ -2485,22 +2523,20 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 }
 
 /// `get0(container, selectors...)` / `get(container, selectors...)` (spec §07):
-/// zero- vs one-based element access. Three cases are implemented:
+/// zero- vs one-based element access. These cases are implemented:
 ///
 /// - A **literal-integer** selector into a rank-1 tensor container (the
 ///   shape the determiniser itself emits) — [`lower_get_literal`], via
 ///   `slice` (extract the one element) + `reshape` (drop the now-length-1
 ///   axis, yielding a `Scalar`).
-/// - A **runtime rank-1 `Int`-tensor** selector into a rank-1 tensor
-///   container (the `theta[person]`-style vector-index case) —
-///   [`lower_get_gather`], via [`Emitter::gather`].
+/// - A runtime scalar integer selector, including per-batch selectors and nested cells.
+/// - A runtime vector integer selector, including per-batch selectors and nested cells.
 /// - Multi-axis numeric tensor selection with one shared rank-1 integer-vector
 ///   selector and literal integer / `all` / `only` selectors on the remaining
 ///   axes — [`crate::indexing::lower_multi_axis`].
 ///
 /// Named-field forms (record, table, tuple), multiple integer-vector selectors,
-/// batch-varying selectors, nested cells, and non-numeric tensors remain
-/// refused, not guessed.
+/// and non-numeric tensors remain refused, not guessed.
 fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<Value, EmitError> {
     if args.len() != 2 {
         return crate::indexing::lower_multi_axis(e, id, args, base);
@@ -2570,9 +2606,8 @@ fn lower_get_literal(
 }
 
 /// The runtime-index fallback — see [`lower_get`]. Reached once
-/// `literal_index` fails on `index`. A rank-1 `Int` tensor selects vector
-/// cells. Batched cells require static batch extents and a shared selector.
-/// Other shapes, including batch-varying selectors over batched cells, refuse.
+/// `literal_index` fails on `index`. Scalar selectors consume one outer vector
+/// axis per batch. Vector selectors retain that axis with the selected extent.
 fn lower_get_gather(
     e: &mut Emitter,
     id: NodeId,
@@ -2581,7 +2616,19 @@ fn lower_get_gather(
     base: i64,
 ) -> Result<Value, EmitError> {
     let operand = e.lower_node(container)?;
+    let operand = e.with_typed_axes(container, operand);
     let idx = e.lower_node(index)?;
+
+    let scalar = e.cell_ty(&idx) == MlirTy::Scalar;
+    let vector = matches!(e.cell_ty(&idx), MlirTy::Ranked(dims) if dims.len() == 1);
+    if idx.elem == ElemKind::Int
+        && (scalar || vector)
+        && e.axes_of(&operand).layers.first() == Some(&1)
+        && matches!(&operand.ty, MlirTy::Ranked(dims) if dims.iter().all(Option::is_some))
+        && (scalar || e.batch_rank(&idx) != 0 || e.axes_of(&operand).layers.len() > 1)
+    {
+        return Ok(e.gather_cells(&operand, &idx, base));
+    }
 
     let is_rank1 = |ty: &MlirTy| matches!(ty, MlirTy::Ranked(dims) if dims.len() == 1);
     let batch = e.batch_rank(&operand);
@@ -2598,8 +2645,8 @@ fn lower_get_gather(
         return Err(EmitError::at(
             id,
             format!(
-                "get/get0: selector must be a literal integer, or (for a runtime index) \
-                 a rank-1 Int tensor indexing vector cells (one shared selector for batched cells); got container \
+                "get/get0: a runtime selector must be an integer scalar or vector \
+                 indexing statically sized outer vector cells; got container \
                  {:?} index {:?} ({:?})",
                 operand.ty, idx.ty, idx.elem
             ),

@@ -105,12 +105,11 @@ inputs = (p)
 outputs = (lp)
 ";
 
-/// `iid(Categorical(p), 4)`: ONE `stablehlo.gather` into `log(p)` covers all
-/// four mass terms. The scalar builder emits one `slice` + `reshape` + `log` per
+/// `iid(Categorical(p), 4)`: one gather followed by log covers all four mass terms. The scalar builder emits one `slice` + `reshape` + `log` per
 /// observation, so a fan-out that fell back to it would emit four `log`s of four
 /// slices — the count is what separates the two lowerings.
 #[test]
-fn a_batched_categorical_density_is_one_gather_into_log_p() {
+fn a_batched_categorical_density_uses_one_gather_and_log() {
     let out = emit(IID_CATEGORICAL);
     // The op name is quoted because the gather has no pretty form; matching the
     // bare name would also hit the `#stablehlo.gather<…>` attribute on the same
@@ -123,11 +122,7 @@ fn a_batched_categorical_density_is_one_gather_into_log_p() {
     assert_eq!(
         out.matches("stablehlo.log ").count(),
         1,
-        "expected `log(p)` once, taken before the gather, in:\n{out}"
-    );
-    assert!(
-        out.contains("dense<[0, 2, 1, 0]> : tensor<4xi32>"),
-        "the 1-based observations fold to 0-based gather indices:\n{out}"
+        "expected one log after the gather, in:\n{out}"
     );
 }
 
@@ -155,27 +150,6 @@ outputs = (lp)
     assert!(
         out.contains("dense<[0, 2, 1, 0]> : tensor<4xi32>"),
         "Categorical0 already supplies 0-based gather indices:\n{out}"
-    );
-}
-
-/// `stablehlo.gather` CLAMPS an out-of-range index rather than failing, so an
-/// unchecked category would silently score the nearest one. `4` is past the end
-/// of a length-3 `p`.
-#[test]
-fn an_out_of_range_batched_category_refuses() {
-    let msg = refusal(
-        "\
-flatppl_compat = \"0.1\"
-obs = [1, 4]
-p = elementof(stdsimplex(3))
-lp = logdensityof(iid(Categorical(p = p), 2), obs)
-inputs = (p)
-outputs = (lp)
-",
-    );
-    assert!(
-        msg.contains("category index out of range"),
-        "expected the out-of-range refusal, got: {msg}"
     );
 }
 

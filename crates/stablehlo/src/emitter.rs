@@ -1196,6 +1196,69 @@ impl<'m> Emitter<'m> {
         out
     }
 
+    /// Select outer vector elements per callable batch, retaining inner cells.
+    /// A scalar selector removes the outer axis; a vector replaces its extent.
+    pub(crate) fn gather_cells(&mut self, operand: &Value, idx: &Value, base: i64) -> Value {
+        if let MlirTy::Ranked(dims) = &operand.ty
+            && dims.len() == 1
+            && self.batch_rank(operand) == 0
+            && let Some(index) = self
+                .constant_extent(idx)
+                .and_then(|i| i.checked_sub(base as u64))
+            && dims[0].is_some_and(|n| index < n)
+        {
+            let selected = self.slice(operand, &[index], &[index + 1], &[1]);
+            return self.reshape(&selected, MlirTy::Scalar);
+        }
+        let (operand, idx) = self.broadcast_batches(operand, idx);
+        let batch = self.batch_rank(&operand);
+        let index_rank = shape(&idx.ty).len();
+        let scalar = index_rank == batch;
+        let base = self.int_value_const(base);
+        let idx = self.sub(&idx, &base);
+        let mut index_dims = shape(&idx.ty).to_vec();
+        index_dims.push(Some(1));
+        let idx = self.reshape(&idx, MlirTy::Ranked(index_dims));
+        let mut result_dims = shape(&idx.ty)[..index_rank].to_vec();
+        result_dims.extend_from_slice(&shape(&operand.ty)[batch + 1..]);
+        let ty = batching::tensor(result_dims);
+        let offsets = (index_rank..shape(&ty).len())
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let batches = (0..batch)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sizes = shape(&operand.ty)
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if i <= batch {
+                    1
+                } else {
+                    d.expect("static gather cell")
+                }
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut axes = self.axes_of(&operand);
+        if scalar {
+            axes.layers.remove(0);
+        }
+        let ssa = self.pure_axes(format!(
+            "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<offset_dims = [{offsets}], collapsed_slice_dims = [{batch}], operand_batching_dims = [{batches}], start_indices_batching_dims = [{batches}], start_index_map = [{batch}], index_vector_dim = {index_rank}>, indices_are_sorted = false, slice_sizes = array<i64: {sizes}>}}> : ({}, {}) -> {}",
+            operand.ssa, idx.ssa, operand.ty.render(self.dtype, operand.elem),
+            idx.ty.render(self.dtype, idx.elem), ty.render(self.dtype, operand.elem),
+        ), axes);
+        Value {
+            ssa,
+            ty,
+            elem: operand.elem,
+        }
+    }
+
     /// Select one cell axis with a shared rank-1 integer index, replacing that
     /// axis by the index length. Callable batch axes remain leading offset
     /// dimensions and are never indexed. [`Emitter::gather`] is the rank-1
@@ -3580,7 +3643,16 @@ impl<'m> Emitter<'m> {
             crate::registry::lower_logdensityof_batched(self, id, rest)
         } else if matches!(
             fname.as_str(),
-            "sum" | "prod" | "mean" | "var" | "std" | "maximum" | "minimum" | "lany" | "lall"
+            "sum"
+                | "prod"
+                | "mean"
+                | "var"
+                | "std"
+                | "maximum"
+                | "minimum"
+                | "lany"
+                | "lall"
+                | "sizeof"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {

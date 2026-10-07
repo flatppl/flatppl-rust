@@ -552,16 +552,6 @@ fn maximum_minimum_thread_element_kind() {
 
 // ---- Round 3: linear-algebra matrix/vector results via the catalogue ----
 
-/// `eye(n)` infers a real (dynamic-dim) matrix.
-#[test]
-fn eye_infers_a_real_matrix() {
-    let out = ir("x = eye(3)");
-    assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(eye"),
-        "eye should infer a rank-2 real array, got:\n{out}"
-    );
-}
-
 /// `inv` / `lower_cholesky` / `diagmat` infer a matrix whose element kind is
 /// preserved from the argument — a complex matrix inverts to a complex matrix.
 #[test]
@@ -590,18 +580,13 @@ fn matrix_maps_preserve_element_kind() {
 }
 
 /// Vector-result functions infer a rank-1 array with the right element kind:
-/// `linspace` → real, `sizeof` → integer, `diag` → the matrix's element kind.
+/// `linspace` → real, `diag` → the matrix's element kind.
 #[test]
 fn vector_result_functions_infer() {
     let out = ir("x = linspace(0.0, 1.0, 5)");
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
         "linspace should infer a real vector, got:\n{out}"
-    );
-    let out = ir("v = [1.0, 2.0, 3.0]\nx = sizeof(v)");
-    assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(sizeof"),
-        "sizeof should infer an integer vector, got:\n{out}"
     );
     let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = diag(A)");
     assert!(

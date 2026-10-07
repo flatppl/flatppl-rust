@@ -377,7 +377,27 @@ impl Emitter<'_> {
             .memo
             .insert(arg, values[0].clone())
             .expect("the argument was lowered before entering the map");
-        let result = crate::ops::lower_builtin(self, id, name, args).map(|value| {
+        let result = if name == "sizeof" {
+            let axes = self.axes_of(&values[0]);
+            let sizes = axes.layers.first().and_then(|&rank| {
+                shape(&values[0].ty)[axes.batch..axes.batch + rank]
+                    .iter()
+                    .copied()
+                    .collect::<Option<Vec<_>>>()
+            });
+            sizes
+                .ok_or_else(|| EmitError::at(id, "sizeof requires a statically-shaped array"))
+                .map(|sizes| {
+                    let values = sizes
+                        .iter()
+                        .map(|&n| self.int_value_const(n as i64))
+                        .collect::<Vec<_>>();
+                    self.vector(&values)
+                })
+        } else {
+            crate::ops::lower_builtin(self, id, name, args)
+        }
+        .map(|value| {
             let frame = self.broadcast_frame.clone();
             self.finish_broadcast(&value, &frame, parent.len())
         });
