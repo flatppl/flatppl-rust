@@ -132,31 +132,6 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
-// Refuse-don't-mislower (detection contract (b)): the SAME Normal prior +
-// Normal likelihood, but the latent feeds `sigma` — not the conjugating mean
-// parameter `mu`. A Normal prior on a standard deviation is NOT the Normal–Normal
-// (mean) conjugacy, so no row's conjugating-parameter check passes and the
-// determiniser must REFUSE, never emit the mean-conjugate marginal.
-#[test]
-fn conjugate_marginal_refuses_when_latent_feeds_sigma() {
-    let src = "\
-z = draw(Normal(mu = 0.0, sigma = 2.0))
-k = kernelof(record(y = draw(Normal(mu = 1.0, sigma = z))), z = z)
-pp = kchain(lawof(record(z = z)), k)
-lp = logdensityof(pp, record(y = 0.5))";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("latent feeding sigma is not the Normal–Normal mean conjugacy — refuse");
-    assert!(
-        err.construct.contains("kchain"),
-        "refusal names kchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("non-enumerable"),
-        "refusal explains the non-enumerable marginal: {err:?}"
-    );
-}
-
 // kchain(M, K) with a CONTINUOUS latent that forms a Gamma–Poisson conjugate
 // pair marginalizes IN CLOSED FORM: NegativeBinomial(alpha, beta) (§08) IS the
 // Gamma(shape=α, rate=β)–Poisson(rate=λ) mixture
@@ -233,29 +208,6 @@ lp = logdensityof(pp, record(y = 5))";
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl failed:\n{pir}"
-    );
-}
-
-// Refuse-don't-mislower (detection contract (a)): a continuous latent whose
-// prior family has NO conjugate row for the likelihood. A Gamma prior feeding a
-// Normal likelihood mean is not a table entry, so no row matches and the
-// determiniser must REFUSE rather than fabricate a marginal.
-#[test]
-fn conjugate_marginal_refuses_non_conjugate_family() {
-    let src = "\
-z = draw(Gamma(shape = 2.0, rate = 1.0))
-k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
-lp = logdensityof(pp, record(y = 0.5))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("a Gamma–Normal pair has no conjugate row — refuse");
-    assert!(
-        err.construct.contains("kchain"),
-        "refusal names kchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("non-enumerable"),
-        "refusal explains the non-enumerable marginal: {err:?}"
     );
 }
 
@@ -341,26 +293,6 @@ lp = logdensityof(pp, record(y = 5.0))",
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl failed:\n{pir}"
-    );
-}
-
-// Refuse-don't-mislower for the `sqrt` path in the EXPLICIT spelling: the same
-// Exponential prior feeding `sigma` as a bare ref is a prior on the standard deviation,
-// not on the variance, so Row 4's `LatentPath::Sqrt` must reject it.
-#[test]
-fn kchain_conjugate_marginal_refuses_a_bare_ref_where_a_row_wants_sqrt() {
-    let m = parse_infer(
-        "\
-v = draw(Exponential(rate = 0.5))
-kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = v))), v = v)
-pp = kchain(lawof(record(v = v)), kk)
-lp = logdensityof(pp, record(y = 4.0))",
-    );
-    let err = determinize(&m)
-        .expect_err("a prior on the standard deviation is not the variance-mixture row — refuse");
-    assert!(
-        err.reason.contains("non-enumerable"),
-        "refusal explains the non-enumerable marginal: {err:?}"
     );
 }
 

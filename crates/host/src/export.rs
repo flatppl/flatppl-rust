@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Call, CallHead, Dim, Idx, Inputs, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
+    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
-    Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, mlir_type_of,
+    Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
+    mlir_type_of,
 };
 use serde::Serialize;
 
@@ -110,7 +111,7 @@ pub fn emit_query(
         }
         declared.push((module.resolve(r.name).to_string(), node));
     }
-    check_dependencies(&module, output_node, &names)?;
+    check_query_inputs(&module, &[output_node], &names, &[])?;
     let roots = names;
     let mut arguments = Vec::new();
     let mut inputs = Vec::new();
@@ -242,59 +243,6 @@ fn dimension(node: NodeId, dim: Dim) -> Result<u64, EmitError> {
             "the query interface requires a static input and output shape",
         )),
     }
-}
-
-fn check_dependencies(
-    module: &Module,
-    output: NodeId,
-    inputs: &HashSet<Symbol>,
-) -> Result<(), EmitError> {
-    let mut pending = vec![(output, Vec::<Symbol>::new())];
-    let mut seen = HashSet::new();
-    while let Some((node, mut bound)) = pending.pop() {
-        if !seen.insert((node, bound.clone())) {
-            continue;
-        }
-        if let Node::Call(call) = module.node(node)
-            && builtin(module, node, "functionof")
-            && let Some(&body) = call.args.first()
-            && let Some(declared) = &call.inputs
-        {
-            let entries = match declared {
-                Inputs::Spec(entries) => entries.as_ref(),
-                Inputs::Auto => module.auto_inputs_of(node).unwrap_or_default(),
-            };
-            for (_, reference) in entries {
-                if reference.ns == RefNs::SelfMod && !bound.contains(&reference.name) {
-                    bound.push(reference.name);
-                }
-            }
-            pending.push((body, bound));
-            continue;
-        }
-        if let Node::Ref(r) = module.node(node)
-            && r.ns == RefNs::SelfMod
-        {
-            if !inputs.contains(&r.name)
-                && !bound.contains(&r.name)
-                && let Some(binding) = module.binding_by_name(r.name)
-            {
-                pending.push((module.binding(binding).rhs, bound));
-            }
-            continue;
-        }
-        if ["elementof", "external", "load_data"]
-            .iter()
-            .any(|head| builtin(module, node, head))
-        {
-            return Err(EmitError::at(
-                node,
-                "a reached runtime value must be declared in inputs",
-            ));
-        }
-        module.for_each_child(node, |child| pending.push((child, bound.clone())));
-    }
-    Ok(())
 }
 
 fn layout(

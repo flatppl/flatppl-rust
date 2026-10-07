@@ -133,6 +133,7 @@ pub struct Emitter<'m> {
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
     integration: Option<crate::IntegrationOptions>,
+    integrating: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
     /// its op line emitted) once — see [`Emitter::lower_node`]. Also the seed
@@ -191,6 +192,7 @@ impl<'m> Emitter<'m> {
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             integration: None,
+            integrating: false,
             next: 0,
             memo: HashMap::new(),
             scoped_types: HashMap::new(),
@@ -3215,6 +3217,36 @@ impl<'m> Emitter<'m> {
         cond: impl FnOnce(&mut Self, &[Value]) -> Value,
         body: impl FnOnce(&mut Self, &[Value]) -> Result<Vec<Value>, EmitError>,
     ) -> Result<Vec<Value>, EmitError> {
+        let typed = |names: &[String]| {
+            names
+                .iter()
+                .zip(inits)
+                .map(|(ssa, init)| Value {
+                    ssa: ssa.clone(),
+                    ty: init.ty.clone(),
+                    elem: init.elem,
+                })
+                .collect::<Vec<_>>()
+        };
+        let names = inits.iter().map(|v| v.ssa.clone()).collect::<Vec<_>>();
+        self.try_while_ssa(
+            &names,
+            carried_tys,
+            |e, args| cond(e, &typed(args)).ssa,
+            |e, args| body(e, &typed(args)).map(|next| next.into_iter().map(|v| v.ssa).collect()),
+        )
+        .map(|names| typed(&names))
+    }
+
+    // The region writer also supports compiler counters whose type is independent
+    // of query precision. Such counters never need a public Value element kind.
+    fn try_while_ssa(
+        &mut self,
+        inits: &[String],
+        carried_tys: &[String],
+        cond: impl FnOnce(&mut Self, &[String]) -> String,
+        body: impl FnOnce(&mut Self, &[String]) -> Result<Vec<String>, EmitError>,
+    ) -> Result<Vec<String>, EmitError> {
         assert_eq!(
             inits.len(),
             carried_tys.len(),
@@ -3227,15 +3259,6 @@ impl<'m> Emitter<'m> {
 
         // Region block-argument names (the iterArgs), shared by cond and body.
         let arg_names: Vec<String> = inits.iter().map(|_| self.fresh()).collect();
-        let arg_values: Vec<Value> = arg_names
-            .iter()
-            .zip(inits)
-            .map(|(n, init)| Value {
-                ssa: n.clone(),
-                ty: init.ty.clone(),
-                elem: init.elem,
-            })
-            .collect();
         // The multi-result group name (%r:N -> %r#0, %r#1, ...).
         let result_name = self.fresh();
 
@@ -3243,7 +3266,7 @@ impl<'m> Emitter<'m> {
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
-        let pred = cond(&mut *self, &arg_values);
+        let pred = cond(&mut *self, &arg_names);
         let cond_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
         self.expanded = saved_expanded;
@@ -3252,7 +3275,7 @@ impl<'m> Emitter<'m> {
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
-        let next = body(&mut *self, &arg_values);
+        let next = body(&mut *self, &arg_names);
         let do_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
         self.expanded = saved_expanded;
@@ -3267,7 +3290,7 @@ impl<'m> Emitter<'m> {
         let bindings = arg_names
             .iter()
             .zip(inits)
-            .map(|(n, init)| format!("{n} = {}", init.ssa))
+            .map(|(n, init)| format!("{n} = {init}"))
             .collect::<Vec<_>>()
             .join(", ");
         let tys = carried_tys.join(", ");
@@ -3282,29 +3305,19 @@ impl<'m> Emitter<'m> {
             text.push_str(line);
             text.push('\n');
         }
-        text.push_str(&format!("  stablehlo.return {} : tensor<i1>\n", pred.ssa));
+        text.push_str(&format!("  stablehlo.return {pred} : tensor<i1>\n"));
         text.push_str("} do {\n");
         for line in do_body.lines() {
             text.push_str("  ");
             text.push_str(line);
             text.push('\n');
         }
-        let ret_ssas = next
-            .iter()
-            .map(|v| v.ssa.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let ret_ssas = next.join(", ");
         text.push_str(&format!("  stablehlo.return {ret_ssas} : {tys}\n"));
         text.push('}');
         self.push(&text);
 
-        Ok((0..arity)
-            .map(|k| Value {
-                ssa: format!("{result_name}#{k}"),
-                ty: inits[k].ty.clone(),
-                elem: inits[k].elem,
-            })
-            .collect())
+        Ok((0..arity).map(|k| format!("{result_name}#{k}")).collect())
     }
 
     /// If `args` is `get0`/`get`'s `[container, index]` pair and `container`

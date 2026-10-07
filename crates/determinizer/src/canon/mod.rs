@@ -12,6 +12,7 @@ pub(crate) use dce::retain_reachable;
 mod flatten;
 mod fold;
 mod inline;
+mod integrals;
 mod sharing;
 
 /// Whether `bid` is the reserved `inputs` binding (spec §13
@@ -109,7 +110,8 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
     if let Some(roots) = roots {
         dce::retain_reachable(m, roots);
     }
-    if sharing::share_broadcasts(m, false) {
+    let integrals_changed = integrals::hoist_integrals(m);
+    if sharing::share_broadcasts(m, false) || integrals_changed {
         let _ = flatppl_infer::infer(m);
     }
 }

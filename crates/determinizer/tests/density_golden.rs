@@ -574,56 +574,6 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
-// Recognizer boundary (refuse-don't-mislower): a superposition of BARE
-// (unweighted) mixands is NOT the convex-combination shape the rule handles —
-// each component must be an explicit `weighted(wᵢ, Aᵢ)` so the weights `wᵢ` are
-// available to form Z = Σ wᵢ. A bare `superpose(A, B)` keeps the unnormalized
-// refuse. (Its Z = 2 is closed-form too, but out of the chosen scope.)
-#[test]
-fn normalize_superpose_bare_mixands_refuses() {
-    let src = "\
-m = normalize(superpose(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0)))
-a = draw(m)
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
-    let m = {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        m
-    };
-    let err = determinize(&m).expect_err("bare-mixand superpose must refuse, not lower");
-    assert_eq!(
-        err.construct, "normalize",
-        "refusal names normalize: {err:?}"
-    );
-    assert!(
-        err.reason.contains("closed-form mass rule"),
-        "refusal explains the missing mass rule: {err:?}"
-    );
-}
-
-// Recognizer boundary: a weighted mixand whose base is NOT a probability measure
-// (here `Lebesgue`, locally-finite) has no unit total mass, so Z ≠ Σ wᵢ and the
-// convex-superposition rule does not apply — refuse rather than mislower.
-#[test]
-fn normalize_superpose_non_normalized_mixand_refuses() {
-    let src = "\
-m = normalize(superpose(\
-weighted(0.5, Lebesgue(support = reals)), \
-weighted(0.5, Normal(mu = 0.0, sigma = 1.0))))
-a = draw(m)
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
-    let m = {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        m
-    };
-    let err = determinize(&m).expect_err("non-normalized mixand must refuse, not lower");
-    assert_eq!(
-        err.construct, "normalize",
-        "refusal names normalize: {err:?}"
-    );
-}
-
 // The scored VALUE of a record-variate density may be a NAMED binding referring
 // to a record literal (`theta = record(...)`, a `Ref(SelfMod, theta)`), not an
 // inline `record(...)`. `match_independent_record` resolves one ref level (as the
@@ -1476,35 +1426,6 @@ lp = logdensityof(post, record(mu = 0.3))";
         "loglik + logprior, got:\n{pir}"
     );
     assert!(pir.contains("(add "), "log-posterior is a sum, got:\n{pir}");
-}
-
-// Refuse-don't-mislower: a `bayesupdate` whose PRIOR cannot lower (here a prior
-// that marginalizes an internal CONTINUOUS non-conjugate latent — a
-// non-enumerable `kchain` marginal) must propagate that sub-lowering Err and
-// refuse the whole posterior, never emit a partial density.
-#[test]
-fn bayesupdate_with_non_lowerable_prior_refuses() {
-    let src = "\
-mu = elementof(reals)
-z = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(mu = draw(Normal(mu = 0.0, sigma = z))), z = z)
-badprior = kchain(lawof(record(z = z)), k)
-model = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
-L = likelihoodof(model, 0.5)
-post = bayesupdate(L, badprior)
-lp = logdensityof(post, record(mu = 0.3))";
-    let m = {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        m
-    };
-    let err =
-        determinize(&m).expect_err("a bayesupdate whose prior cannot lower must refuse, not lower");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("kchain") || msg.contains("non-enumerable"),
-        "refusal should propagate the prior's sub-lowering failure: {msg}"
-    );
 }
 
 // A `bayesupdate` prior that is a `lawof`-wrapped record of `~`-bound draws

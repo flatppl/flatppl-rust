@@ -38,8 +38,8 @@
 //! [`Module`]'s own doc disclaims that binding order carries spec meaning —
 //! has been removed: a module declaring neither `inputs` nor `outputs` is
 //! refused by [`crate::emit`] rather than guessed at. [`emit_logdensity_abi`]
-//! lowers each declared output; `inputs` is exhaustive over the module's
-//! `elementof` parameters (a parameter missing from `inputs` refuses).
+//! lowers each declared output; `inputs` is exhaustive over its free runtime
+//! leaves. Reified callable boundaries bind their own parameters.
 //!
 //! **`@sample`.** [`emit_sample_abi`] mirrors [`emit_logdensity_abi`] but
 //! threads the rng key: the `%key : tensor<2xui64>` argument (spec §07
@@ -67,7 +67,7 @@
 use std::collections::HashSet;
 
 use flatppl_core::{
-    CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
+    CallHead, Inputs, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
 use crate::EmitOptions;
@@ -169,6 +169,74 @@ fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
     vec![rhs]
 }
 
+/// Check that every runtime leaf reached by the outputs is a declared input.
+/// Reified callable boundaries bind their own parameters within the body.
+/// `bound_nodes` names additional roots already bound by the emitter, such as
+/// the sample mode's inline RNG source.
+pub fn check_query_inputs(
+    module: &Module,
+    outputs: &[NodeId],
+    inputs: &HashSet<Symbol>,
+    bound_nodes: &[NodeId],
+) -> Result<(), EmitError> {
+    let mut pending = outputs
+        .iter()
+        .map(|&id| (id, Vec::<Symbol>::new()))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some((node, mut bound)) = pending.pop() {
+        if bound_nodes.contains(&node) || !seen.insert((node, bound.clone())) {
+            continue;
+        }
+        if let Node::Call(call) = module.node(node)
+            && is_builtin_call(module, node, "functionof")
+            && let Some(&body) = call.args.first()
+            && let Some(declared) = &call.inputs
+        {
+            let entries = match declared {
+                Inputs::Spec(entries) => entries.as_ref(),
+                Inputs::Auto => module.auto_inputs_of(node).unwrap_or_default(),
+            };
+            for (_, reference) in entries {
+                if reference.ns == RefNs::SelfMod && !bound.contains(&reference.name) {
+                    bound.push(reference.name);
+                }
+            }
+            pending.push((body, bound));
+            continue;
+        }
+        if let Node::Ref(r) = module.node(node)
+            && r.ns == RefNs::SelfMod
+        {
+            if !inputs.contains(&r.name)
+                && !bound.contains(&r.name)
+                && let Some(binding) = module.binding_by_name(r.name)
+            {
+                let rhs = module.binding(binding).rhs;
+                if is_free_param(module, rhs) || is_fixed_input(module, rhs) {
+                    return Err(EmitError::at(
+                        rhs,
+                        format!(
+                            "runtime binding `{}` is not listed in `inputs`; list it in inputs to pass it as a runtime argument",
+                            module.resolve(r.name)
+                        ),
+                    ));
+                }
+                pending.push((rhs, bound));
+            }
+            continue;
+        }
+        if is_builtin_call(module, node, "elementof") || is_fixed_input(module, node) {
+            return Err(EmitError::at(
+                node,
+                "a reached runtime value must be declared in inputs",
+            ));
+        }
+        module.for_each_child(node, |child| pending.push((child, bound.clone())));
+    }
+    Ok(())
+}
+
 /// Emit `@logdensity` for a determinized module `m` that declares the
 /// `inputs`/`outputs` ABI (see [`Abi`]/[`read_abi`]) — the `LogDensity`-mode
 /// ABI path. Replaces the removed source-order free-param loop and
@@ -185,10 +253,9 @@ fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
 /// replacing the computed value". [`bind_input`] builds each entry's
 /// argument(s). A parameterized binding that is not an `elementof` declaration
 /// is a function OF the parameters, not an argument, and refuses. `inputs` is
-/// authoritative and exhaustive for `elementof`: every `elementof` binding in
-/// `m` must appear in `abi.inputs`, else this refuses naming the missing
-/// parameter. A fixed-phase binding (`external`/`load_data`) that an output
-/// reaches but that is NOT listed in `inputs` also refuses, pointing at the
+/// authoritative and exhaustive for runtime leaves reached by the outputs,
+/// respecting reified callable boundaries. A fixed-phase binding
+/// (`external`/`load_data`) reached but NOT listed in `inputs` also refuses, pointing at the
 /// ABI — data is passed as a runtime argument, never baked (design doc
 /// phase→ABI table).
 pub(crate) fn emit_logdensity_abi(
@@ -198,43 +265,7 @@ pub(crate) fn emit_logdensity_abi(
 ) -> Result<String, EmitError> {
     let mut e = Emitter::with_options(m, opts);
 
-    // Exhaustiveness: every `elementof` parameter in the module must be
-    // listed in `inputs` (design doc: "inputs ... is authoritative and
-    // exhaustive"). Checked before building any args — a missing parameter
-    // is a malformed ABI, refuse rather than emit a partial signature.
-    for (_, binding) in m.bindings() {
-        if is_free_param(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "elementof parameter `{}` is not listed in `inputs`; the inputs \
-                     ABI is exhaustive — every elementof parameter must appear in `inputs`",
-                    m.resolve(binding.name)
-                ),
-            ));
-        }
-    }
-
-    // A fixed-phase input construct (`external`/`load_data`) that survived
-    // root-DCE (i.e. an output reaches it) but is NOT declared in `inputs`
-    // refuses, pointing at the ABI: fixed data becomes a runtime argument only
-    // by being listed in `inputs`; its values are never baked (spec §13
-    // `sec:determinization-signature`'s phase table). A fixed binding no
-    // output reaches was already pruned by DCE, so it never gets here — the
-    // refusal fires exactly when the value would actually be needed.
-    for (_, binding) in m.bindings() {
-        if is_fixed_input(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "fixed-phase binding `{}` is reached by an output but is not listed in \
-                     `inputs`; list it in inputs to pass it as a runtime argument (its shape \
-                     is pinned at compile time; its values are never baked)",
-                    m.resolve(binding.name)
-                ),
-            ));
-        }
-    }
+    check_query_inputs(m, &abi.outputs, &abi.inputs.iter().copied().collect(), &[])?;
 
     if abi.outputs.is_empty() {
         return Err(EmitError::whole(
@@ -368,36 +399,9 @@ pub(crate) fn emit_sample_abi(
             },
         );
     }
-    for (_, binding) in m.bindings() {
-        if Some(binding.name) == rng_src_sym {
-            continue;
-        }
-        // Every `elementof` parameter must be listed in `inputs`.
-        if is_free_param(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "elementof parameter `{}` is not listed in `inputs`; the inputs \
-                     ABI is exhaustive",
-                    m.resolve(binding.name)
-                ),
-            ));
-        }
-        // A fixed-phase input (`external`/`load_data`) reached by the sample
-        // output but not listed in `inputs` refuses, pointing at the ABI: data
-        // is passed as a runtime argument, never baked.
-        if is_fixed_input(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "fixed-phase binding `{}` is reached by the sample output but is not \
-                     listed in `inputs`; list it in inputs to pass it as a runtime argument \
-                     (its shape is pinned at compile time; its values are never baked)",
-                    m.resolve(binding.name)
-                ),
-            ));
-        }
-    }
+    let mut inputs = abi.inputs.iter().copied().collect::<HashSet<_>>();
+    inputs.extend(rng_src_sym);
+    check_query_inputs(m, &abi.outputs, &inputs, &[src])?;
 
     // Build the argument list from `inputs` in declared order. `%key` occupies
     // the rng-source entry's own position when it is declared, and is prepended

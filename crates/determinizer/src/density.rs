@@ -156,7 +156,7 @@ use flatppl_infer::ModuleBundle;
 mod broadcast;
 
 #[path = "density_integral.rs"]
-mod integral;
+pub(crate) mod integral;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -2052,7 +2052,9 @@ fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Op
                     && let Some(bid) = m.binding_by_name(r.name)
                     && visited_bindings.insert(bid)
                 {
-                    stack.push(m.binding(bid).rhs);
+                    // A prior query pin must not hide a boundary dependency
+                    // that reified-law substitution will recover.
+                    stack.push(m.declared_binding_rhs(bid));
                 }
             }
             Node::Call(c) => {
@@ -2598,6 +2600,9 @@ fn marginalize_or_refuse_record_law(
                         );
                         return lower_shared_latent_record_law(m, record_node, v, &law).map(Some);
                     }
+                    if let Some(numerical) = integral::record_marginal(m, record_node, v) {
+                        return numerical.map(Some);
+                    }
                     return Err(refuse(
                         measure,
                         m,
@@ -2610,6 +2615,9 @@ fn marginalize_or_refuse_record_law(
                 marginals.push((name, built.form));
             }
             None => {
+                if let Some(numerical) = integral::record_marginal(m, record_node, v) {
+                    return numerical.map(Some);
+                }
                 return Err(refuse(
                     measure,
                     m,
@@ -2833,8 +2841,7 @@ fn lower_record_of_draws_with(
     Ok(fold_add(m, &terms))
 }
 
-/// [`crate::kernel::substitute_refs`], carrying the original nodes' inferred types onto
-/// the copy the substitution rebuilt.
+/// Substitute through derived sibling dependencies, preserving inferred shapes.
 ///
 /// Substituting a sibling's value for a `(%ref self sibling)` changes no shape, so the
 /// original type still describes the copy — and lowerings READ that type: `lower_iid`
@@ -2842,7 +2849,20 @@ fn lower_record_of_draws_with(
 /// untyped copy of `iid(Normal(mu, tau), J)` refuses as a dynamic size. Inference does not
 /// re-run until the driver's next iteration, which is after this rule finishes.
 fn substitute_siblings(m: &mut Module, root: NodeId, subs: &[(Symbol, NodeId)]) -> NodeId {
-    let rebuilt = crate::kernel::substitute_refs(m, root, subs);
+    let bound: Vec<_> = subs
+        .iter()
+        .map(|&(name, value)| {
+            (
+                Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                },
+                value,
+            )
+        })
+        .collect();
+    let rebuilt =
+        crate::kernel::substitute_admitted(m, root, &bound, crate::kernel::Substitute::All, false);
     carry_types(m, root, rebuilt, subs);
     rebuilt
 }
@@ -2856,6 +2876,16 @@ fn carry_types(m: &mut Module, old: NodeId, new: NodeId, subs: &[(Symbol, NodeId
     }
     if let Some(ty) = m.type_of(old).cloned() {
         m.set_type(new, ty);
+    }
+    // Follow the same model definition as dependency substitution, not a query pin.
+    if let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = m.node(old)
+        && let Some(binding) = m.binding_by_name(*name)
+    {
+        carry_types(m, m.declared_binding_rhs(binding), new, subs);
+        return;
     }
     let (olds, news) = (m.node(old).children(), m.node(new).children());
     if olds.len() == news.len() {
@@ -3659,6 +3689,22 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         c.args.to_vec()
     };
 
+    let references: Vec<_> = inner_measures
+        .iter()
+        .map(|&measure| superposition_reference(m, measure, &mut Vec::new()))
+        .collect();
+    if references.contains(&Some(Reference::Counting))
+        && references
+            .iter()
+            .any(|reference| *reference != Some(Reference::Counting))
+    {
+        return Err(refuse(
+            node,
+            m,
+            "superpose densities need a common reference; atomic or counting components cannot be added to an unproven continuous density",
+        ));
+    }
+
     let mut density_terms: Vec<NodeId> = Vec::with_capacity(inner_measures.len());
     for &mi in &inner_measures {
         density_terms.push(lower_measure_density(m, mi, v)?);
@@ -3669,6 +3715,75 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     // `vector` literal (`[t₁, …, tₖ]`) so the emitted call is `logsumexp([…])`.
     let terms_vec = build_call(m, "vector", &density_terms);
     Ok(build_call(m, "logsumexp", &[terms_vec]))
+}
+
+/// Follow output measures only. A Dirac among a Normal's parameters does not
+/// make that Normal atomic, while a real-valued Dirac is never Lebesgue density.
+fn superposition_reference(
+    m: &mut Module,
+    node: NodeId,
+    path: &mut Vec<NodeId>,
+) -> Option<Reference> {
+    if path.contains(&node) {
+        return None;
+    }
+    path.push(node);
+    let result = (|| {
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(node)
+        {
+            let rhs = m.declared_binding_rhs(m.binding_by_name(*name)?);
+            return superposition_reference(m, rhs, path);
+        }
+        if let Some(body) = crate::kernel::resolve_closed_reification(m, node) {
+            return superposition_reference(m, body, path);
+        }
+        if let Some(app) =
+            crate::kernel::reduce_kernel_application_bound(m, node, crate::kernel::Substitute::All)
+        {
+            let body = crate::kernel::substitute_admitted(
+                m,
+                app.body,
+                &app.bound,
+                crate::kernel::Substitute::All,
+                false,
+            );
+            return superposition_reference(m, body, path);
+        }
+        let Node::Call(call) = m.node(node).clone() else {
+            return None;
+        };
+        let name = builtin_name(m, node)?;
+        match name {
+            "Dirac" | "Counting" => Some(Reference::Counting),
+            "Lebesgue" => Some(Reference::Lebesgue),
+            "weighted" | "logweighted" | "pushfwd" => {
+                superposition_reference(m, *call.args.get(1)?, path)
+            }
+            "normalize" | "truncate" | "iid" | "locscale" | "lawof" | "draw" => {
+                superposition_reference(m, *call.args.first()?, path)
+            }
+            "superpose" => {
+                let reference = superposition_reference(m, *call.args.first()?, path)?;
+                call.args
+                    .iter()
+                    .skip(1)
+                    .all(|&arg| superposition_reference(m, arg, path) == Some(reference))
+                    .then_some(reference)
+            }
+            _ if flatppl_infer::distribution_param_names(name).is_some() => {
+                let Type::Measure { domain, .. } = m.type_of(node)? else {
+                    return None;
+                };
+                reference_measure(domain)
+            }
+            _ => None,
+        }
+    })();
+    path.pop();
+    result
 }
 
 /// `logdensityof(normalize(M), v)` = `logdensityof(M, v) - logZ`, where
@@ -3867,11 +3982,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         }
         if base_univariate_continuous {
             let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
-            let (kernel, input) = kernel_and_input(m, base)?; // helper below
-            let cdf_hi = build_touniform(m, kernel, input, hi);
-            let cdf_lo = build_touniform(m, kernel, input, lo);
-            let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
-            let log_z = build_call(m, "log", &[z]);
+            let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
             return Ok(build_call(m, "sub", &[density, log_z]));
         }
         if base_normalized {
@@ -4028,10 +4139,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     if let Some(normalizer) = integral::mass(m, m_inner) {
         let log_z = normalizer?;
         let density = lower_measure_density(m, m_inner, v)?;
-        let score = build_call(m, "sub", &[density, log_z]);
-        let finite = build_call(m, "isfinite", &[log_z]);
-        let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
-        return Ok(build_call(m, "ifelse", &[finite, score, nan]));
+        return Ok(normalized_logdensity(m, density, log_z));
     }
 
     // No closed-form or numerical rule covers this measure.
@@ -4042,6 +4150,16 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                  `totalmass` is not FlatPDL"
             .to_string(),
     })
+}
+
+fn normalized_logdensity(m: &mut Module, density: NodeId, log_z: NodeId) -> NodeId {
+    let score = build_call(m, "sub", &[density, log_z]);
+    let finite = build_call(m, "isfinite", &[log_z]);
+    // FlatPIR has no NaN literal. Keep the undefined result as arithmetic.
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let negative = build_call(m, "neg", &[one]);
+    let nan = build_call(m, "log", &[negative]);
+    build_call(m, "ifelse", &[finite, score, nan])
 }
 
 /// Recognize an APPLIED `ksuperpose(K, w)(θ)` whose component `K` is a
@@ -4914,6 +5032,7 @@ fn refuse_variate_kind_mismatch(m: &Module, domain: &Type, v: NodeId) -> Result<
 /// convention": "All density formulas in this section are with respect to a
 /// reference measure implied by the constituent distribution types: Lebesgue for
 /// continuous variates, counting measure for discrete variates."
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Reference {
     /// Continuous variate — Lebesgue reference; the §06 change of variables
     /// subtracts `logvol(f_inv(v))`.

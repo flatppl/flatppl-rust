@@ -213,6 +213,7 @@ mod types;
 
 pub use emitter::Emitter;
 pub use mlir::{ElemKind, MlirTy, Value};
+pub use modes::check_query_inputs;
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
 
@@ -286,6 +287,9 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         preserve_rand_tuple: false,
         numerical_integrals: false,
+        supports_cdf: Some(|ctor| {
+            registry::lookup(ctor).is_some_and(|dist| dist.touniform.is_some())
+        }),
         retain_standard_functions: &[
             ("pyhf_helpers", "normsys_factor"),
             ("pyhf_helpers", "histosys_shift"),
