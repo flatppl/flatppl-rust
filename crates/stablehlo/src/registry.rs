@@ -1564,8 +1564,8 @@ fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
 /// is zero" — so `-inf` off `S`. `support`'s raw kernel-input [`NodeId`] — not
 /// its lowered [`Value`]: a set expression like `interval(lo, hi)` has no
 /// tensor form of its own, see `Emitter::valueset_of`'s doc comment — is read
-/// via [`unbatch_field_id`], then its statically-known [`ValueSet`] via
-/// [`Emitter::valueset_of`] and reduced to bounds via [`uniform_bounds`].
+/// via [`unbatch_field_id`]. Static supports use [`uniform_bounds`]; a dynamic
+/// interval keeps its endpoints live for values and differentiation.
 ///
 /// §03 "Interval" makes `interval(lo, hi)` the CLOSED $[lo, hi]$, hence the
 /// `GE`/`LE` guard rather than Beta's strict one: the constant density has no
@@ -1578,26 +1578,47 @@ fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
 /// the bare constant made the caller's `sum` count one term instead of `n`.
 fn uniform_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let support = unbatch_field_id(e, p, "support")?;
-    let (lo, hi) = e
-        .valueset_of(support)
-        .and_then(uniform_bounds)
-        .ok_or_else(|| {
-            EmitError::at(
-                support,
-                "Uniform logpdf needs a measurable interval/box support",
-            )
-        })?;
-
-    let lo_c = e.scalar(lo);
-    let hi_c = e.scalar(hi);
+    let refuse = || {
+        EmitError::at(
+            support,
+            "Uniform logpdf needs a measurable interval/box support",
+        )
+    };
+    let (lo_c, hi_c, dens) = if let Some((lo, hi)) = e.valueset_of(support).and_then(uniform_bounds)
+    {
+        (e.scalar(lo), e.scalar(hi), e.scalar(-(hi - lo).ln()))
+    } else {
+        if !matches!(
+            e.valueset_of(support),
+            None | Some(ValueSet::Anything | ValueSet::Unknown | ValueSet::Deferred)
+        ) {
+            return Err(refuse());
+        }
+        let Node::Call(c) = e.node(e.resolve_ref_one(support)) else {
+            return Err(refuse());
+        };
+        if !matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "interval")
+            || c.args.len() != 2
+        {
+            return Err(refuse());
+        }
+        let (lo, hi) = (c.args[0], c.args[1]);
+        let lo = e.lower_node(lo)?;
+        let hi = e.lower_node(hi)?;
+        let lo = e.convert(&lo, ElemKind::Real);
+        let hi = e.convert(&hi, ElemKind::Real);
+        let width = e.sub(&hi, &lo);
+        let log_width = e.log(&width);
+        let density = e.neg(&log_width);
+        (lo, hi, density)
+    };
     let above = e.compare("GE", v, &lo_c);
     let below = e.compare("LE", v, &hi_c);
     let in_support = e.and(&above, &below);
 
-    // The [`mask_support`] tail, written out: this density is a CONSTANT, so
+    // The [`mask_support`] tail, written out: this density is constant in v, so
     // there is no formula to feed a domain-safe variate to, and routing through
     // that helper would emit a `select` onto a `safe` value nothing reads.
-    let dens = e.scalar(-(hi - lo).ln());
     let pos_inf = e.inf_like(&dens);
     let neg_inf = e.neg(&pos_inf);
     Ok(e.select(&in_support, &dens, &neg_inf))
@@ -1759,18 +1780,25 @@ fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
 fn von_mises_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let kappa = p.get(e, "kappa")?;
+    let lo = e.scalar(-std::f64::consts::PI);
+    let hi = e.scalar(std::f64::consts::PI);
+    let above = e.compare("GE", v, &lo);
+    let below = e.compare("LE", v, &hi);
+    let supported = e.and(&above, &below);
+    let safe = e.scalar(0.0);
+    mask_support(e, v, &supported, &safe, |e, v| {
+        let diff = e.sub(v, &mu);
+        let cos_diff = e.cos(&diff);
+        let kappa_cos = e.mul(&kappa, &cos_diff);
 
-    let diff = e.sub(v, &mu);
-    let cos_diff = e.cos(&diff);
-    let kappa_cos = e.mul(&kappa, &cos_diff);
+        let neg_log_two_pi = e.scalar(-(2.0 * std::f64::consts::PI).ln());
 
-    let neg_log_two_pi = e.scalar(-(2.0 * std::f64::consts::PI).ln());
+        let log_i0 = log_bessel_i0(e, &kappa);
+        let neg_log_i0 = e.neg(&log_i0);
 
-    let log_i0 = log_bessel_i0(e, &kappa);
-    let neg_log_i0 = e.neg(&log_i0);
-
-    let t1 = e.add(&kappa_cos, &neg_log_two_pi);
-    Ok(e.add(&t1, &neg_log_i0))
+        let t1 = e.add(&kappa_cos, &neg_log_two_pi);
+        Ok(e.add(&t1, &neg_log_i0))
+    })
 }
 
 /// `log I_0(kappa)` via the Abramowitz & Stegun 9.8.1 (small-`kappa`) /
@@ -1871,21 +1899,21 @@ fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 // a per-observation formula built from arithmetic on `v` — see
 // [`categorical_logpdf`]'s doc comment.
 
-/// §08 Bernoulli, verbatim: `log f = k * log(p) + (1 - k) * log(1 - p)`. Its
-/// `@sample` builder is [`bernoulli_sample`] (Task 16).
+/// Select the observed probability before taking its log, including p=0 and p=1.
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
-
-    let log_p = e.log(&prob);
-    let k_log_p = e.mul(v, &log_p);
-
     let one = e.scalar(1.0);
-    let one_minus_k = e.sub(&one, v);
+    let zero = e.scalar(0.0);
     let one_minus_p = e.sub(&one, &prob);
-    let log_one_minus_p = e.log(&one_minus_p);
-    let term2 = e.mul(&one_minus_k, &log_one_minus_p);
-
-    Ok(e.add(&k_log_p, &term2))
+    let success = e.compare("EQ", v, &one);
+    let failure = e.compare("EQ", v, &zero);
+    let supported = e.or(&success, &failure);
+    let selected = e.select(&success, &prob, &one_minus_p);
+    let safe = e.select(&supported, &selected, &one);
+    let score = e.log(&safe);
+    let inf = e.inf_like(&score);
+    let outside = e.neg(&inf);
+    Ok(e.select(&supported, &score, &outside))
 }
 
 /// §08 Poisson uses the same expression as §09 ContinuedPoisson on its
@@ -1905,17 +1933,23 @@ fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
 fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let prob = p.get(e, "p")?;
-
+    let zero = e.scalar(0.0);
+    let above = e.compare("GE", v, &zero);
+    let below = e.compare("LE", v, &n);
+    let supported = e.and(&above, &below);
+    let v = e.select(&supported, v, &zero);
+    let half = e.scalar(0.5);
+    let prob = e.select(&supported, &prob, &half);
     let one = e.scalar(1.0);
 
     let n_plus_one = e.add(&n, &one);
     let lgamma_n1 = e.lgamma(&n_plus_one);
 
-    let k_plus_one = e.add(v, &one);
+    let k_plus_one = e.add(&v, &one);
     let lgamma_k1 = e.lgamma(&k_plus_one);
     let neg_lgamma_k1 = e.neg(&lgamma_k1);
 
-    let n_minus_k = e.sub(&n, v);
+    let n_minus_k = e.sub(&n, &v);
     let n_minus_k_plus_one = e.add(&n_minus_k, &one);
     let lgamma_nmk1 = e.lgamma(&n_minus_k_plus_one);
     let neg_lgamma_nmk1 = e.neg(&lgamma_nmk1);
@@ -1923,15 +1957,24 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let t1 = e.add(&lgamma_n1, &neg_lgamma_k1);
     let log_choose_nk = e.add(&t1, &neg_lgamma_nmk1);
 
-    let log_p = e.log(&prob);
-    let k_log_p = e.mul(v, &log_p);
+    // A zero exponent contributes log(1), even when its probability is zero.
+    // Guard before log so its unused singular derivative cannot poison AD.
+    let no_successes = e.compare("EQ", &v, &zero);
+    let safe_prob = e.select(&no_successes, &one, &prob);
+    let log_p = e.log(&safe_prob);
+    let k_log_p = e.mul(&v, &log_p);
 
     let one_minus_p = e.sub(&one, &prob);
-    let log_one_minus_p = e.log(&one_minus_p);
+    let no_failures = e.compare("EQ", &n_minus_k, &zero);
+    let safe_complement = e.select(&no_failures, &one, &one_minus_p);
+    let log_one_minus_p = e.log(&safe_complement);
     let n_minus_k_log_one_minus_p = e.mul(&n_minus_k, &log_one_minus_p);
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
-    Ok(e.add(&t2, &n_minus_k_log_one_minus_p))
+    let score = e.add(&t2, &n_minus_k_log_one_minus_p);
+    let inf = e.inf_like(&score);
+    let outside = e.neg(&inf);
+    Ok(e.select(&supported, &score, &outside))
 }
 
 /// §06 Dirac (the measure monad's unit, `Dirac(value = v)`), verbatim: the

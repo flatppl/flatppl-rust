@@ -17,8 +17,8 @@
 //!
 //! which is **generally intractable**. The spec says an engine evaluates it "in
 //! closed form, or by enumeration of a discrete latent, and otherwise reports a
-//! static error." This module implements two of the three branches and refuses the
-//! rest:
+//! static error." Exact rules stay first. An opt-in numerical extension handles
+//! a supported scalar continuous prior when no exact rule applies:
 //!
 //! - **Discrete-finite latent** (a statically-known, small atom set `{a₀, …, a_{N-1}}`):
 //!   the integral becomes a finite **mass-weighted** sum, in log space the
@@ -35,8 +35,10 @@
 //!   integral collapses to one closed-form distribution. Continuity is no obstacle
 //!   here: the Normal–Normal row integrates a `Normal` latent exactly.
 //!
-//! - **Any other continuous or infinite-discrete latent** (`Normal` on a scale
-//!   parameter, `Poisson` with no matching row, …): **refused**.
+//! - **A supported scalar continuous prior**: integrate the conditional density
+//!   against the prior. Ordinary FlatPDL conformance rejects this extension.
+//!
+//! - **Other continuous or infinite-discrete latents**: refused.
 //!
 //! Both spellings of the integral reach the table. `kchain(prior, kernelof(…))` is the
 //! explicit one; `lawof(y)` over a `y ~ Dist(param = z, …)` with `z` latent is the
@@ -55,22 +57,22 @@
 //! | constructor       | support     | atoms                       | finite when            |
 //! |-------------------|-------------|-----------------------------|------------------------|
 //! | `Bernoulli(p)`    | `booleans`  | `{0, 1}` (integer variate)  | always (2 atoms)       |
-//! | `Categorical(p)`  | `[1, n]`    | `{1, …, n}`                 | `p` a static vector(n) |
-//! | `Categorical0(p)` | `[0, n-1]`  | `{0, …, n-1}`               | `p` a static vector(n) |
+//! | `Categorical(p)`  | `[1, n]`    | `{1, …, n}`                 | `p` has fixed length n |
+//! | `Categorical0(p)` | `[0, n-1]`  | `{0, …, n-1}`               | `p` has fixed length n |
 //! | `Binomial(n, p)`  | `[0, n]`    | `{0, …, n}`                 | `n` a static int       |
 //!
 //! `Poisson`, `Geometric`, `NegativeBinomial*` (support `nonnegintegers`) and any
 //! continuous distribution are **not** enumerable → refused.
 
 use crate::density::{
-    Ancestor, build_call, build_density_term, build_record, draw_argument, expect_builtin_call,
-    lower_measure_density, measure_stochastic_ancestors, refuse, resolve_ref_one,
-    split_kernel_constructor,
+    Ancestor, build_call, build_record, draw_argument, expect_builtin_call, lower_measure_density,
+    measure_stochastic_ancestors, refuse, resolve_ref_one, split_kernel_constructor,
 };
-use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
+use crate::kernel::{Kernel, resolve_reified};
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet,
+    Call, CallHead, Dim, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
+    Symbol, Type, ValueSet,
 };
 
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
@@ -111,7 +113,7 @@ pub(crate) fn lower_kchain_marginal(
     // --- 3. Resolve the kernel: kernelof(body, %specinputs([(input, ref)])). ---
     // Resolved before classification because both the discrete-enumeration path
     // and the continuous conjugate path need the kernel body.
-    let kernel = resolve_kernel(m, k_arg)
+    let kernel = resolve_reified(m, k_arg)
         .ok_or_else(|| refuse_kchain(node, "kchain kernel is not a recognisable kernelof(...)"))?;
     // The kchain marginal substitutes the enumerated latent's atoms into
     // `kernel.inputs[0]`, ASSUMING that boundary input IS the latent dependency —
@@ -136,52 +138,25 @@ pub(crate) fn lower_kchain_marginal(
             "single-input kernel only; multi-input kchain kernels are out of scope",
         ));
     }
-    let kernel_input_sym = kernel.inputs[0].1.name;
-
-    // --- 4. Classify the latent. A discrete-finite latent enumerates (below); a
-    //        continuous / infinite-discrete latent first tries the closed-form
-    //        conjugate table, and only refuses if no conjugate row applies. ---
-    let atoms = match classify_atoms(m, latent.dist) {
-        Some(atoms) => atoms,
-        None => {
-            if let Some(result) = try_conjugate_marginal(m, latent.dist, &kernel, v) {
-                return result;
-            }
-            return Err(refuse_kchain(
-                node,
-                "non-enumerable marginal (continuous / infinite-discrete); \
-                 no conjugate closed-form applies",
-            ));
-        }
-    };
-
-    // --- 5. Per atom: mass term + kernel term, summed; then logsumexp. ---
-    let mut branches: Vec<NodeId> = Vec::with_capacity(atoms.len());
-    for &atom_val in &atoms {
-        let atom_node = m.alloc(Node::Lit(Scalar::Int(atom_val)));
-
-        // logdensityof(M, aᵢ): the latent's log-pmf at the atom, scored against
-        // its OWN distribution constructor. `build_density_term` emits
-        // `builtin_logdensityof(dist, dist_input, atom)`.
-        let mass_term = build_density_term(m, latent.dist, atom_node)?;
-
-        // K(aᵢ): substitute the atom for the kernel's boundary-input ref inside a
-        // fresh copy of the kernel body, then score that measure at `v`.
-        let applied_body = substitute_ref(m, kernel.body, kernel_input_sym, atom_node);
-        let kernel_term = lower_measure_density(m, applied_body, v)?;
-
-        branches.push(build_call(m, "add", &[mass_term, kernel_term]));
+    if latent.field.is_some_and(|name| name != kernel.inputs[0].0) {
+        return Err(refuse_kchain(
+            node,
+            "latent record field must match the kernel input name",
+        ));
     }
-
-    // logsumexp over the per-atom mass-weighted branches. A single atom degenerates
-    // to that one branch (logsumexp of one term = identity), which is still correct.
-    if branches.len() == 1 {
-        return Ok(branches[0]);
+    if let Some(result) = try_conjugate_marginal(m, latent.dist, &kernel, v) {
+        return result;
     }
-    // §07 `logsumexp(v)` takes a single real VECTOR, not variadic scalars: wrap the
-    // per-atom branches in a `vector` literal so the emitted call is `logsumexp([…])`.
-    let branches_vec = build_call(m, "vector", &branches);
-    Ok(build_call(m, "logsumexp", &[branches_vec]))
+    if let Some(result) =
+        crate::density::integral::kernel_marginal(m, latent.dist, k_arg, &kernel, v)
+    {
+        return result;
+    }
+    Err(refuse_kchain(
+        node,
+        "non-enumerable marginal (continuous / infinite-discrete); \
+         no conjugate closed-form applies",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +168,7 @@ pub(crate) fn lower_kchain_marginal(
 struct Latent {
     /// The distribution-constructor node, e.g. `Bernoulli(p = 0.3)`.
     dist: NodeId,
+    field: Option<Symbol>,
 }
 
 /// Resolve `M` (the kchain's first argument) to the latent's distribution
@@ -214,14 +190,14 @@ fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
     };
 
     // `record(name = X)` with exactly one field → X is the latent value.
-    let value = if let Some(rec) = expect_builtin_call(m, inner, "record") {
+    let (value, field) = if let Some(rec) = expect_builtin_call(m, inner, "record") {
         if !rec.args.is_empty() || rec.named.len() != 1 {
             return None;
         }
         let (v, _) = resolve_ref_one(m, rec.named[0].value);
-        v
+        (v, Some(rec.named[0].name))
     } else {
-        inner
+        (inner, None)
     };
 
     // `draw(dist)` → dist; or a bare `dist` constructor.
@@ -239,7 +215,7 @@ fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
     if !matches!(m.node(dist), Node::Call(c) if matches!(c.head, CallHead::Builtin(_))) {
         return None;
     }
-    Some(Latent { dist })
+    Some(Latent { dist, field })
 }
 
 // ---------------------------------------------------------------------------
@@ -255,12 +231,13 @@ fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
 /// the support `ValueSet` alone: a finite `Categorical`'s support infers to the
 /// *infinite* `posintegers`, so the bound must come from `p`'s length. We *do*
 /// cross-check the support against `booleans` for `Bernoulli` as a guard.
-fn classify_atoms(m: &Module, dist: NodeId) -> Option<Vec<i64>> {
-    let Node::Call(c) = m.node(dist) else {
-        return None;
-    };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
+pub(crate) fn classify_atoms(m: &mut Module, dist: NodeId) -> Option<Vec<i64>> {
+    let (sym, parameters) = split_kernel_constructor(m, dist)?;
+    let parameter = |name: &str| {
+        parameters
+            .iter()
+            .find(|(key, _)| m.resolve(*key) == name)
+            .map(|(_, value)| *value)
     };
     let name = m.resolve(sym);
 
@@ -278,17 +255,16 @@ fn classify_atoms(m: &Module, dist: NodeId) -> Option<Vec<i64>> {
         // n = the static length of `p`. The support is the infinite `posintegers`
         // (Categorical) — finiteness comes from `p`'s vector length.
         "Categorical" | "Categorical0" => {
-            let n = static_vector_len(m, kwarg(m, c, "p")?)?;
-            bounded(n).then(|| {
-                let base = if name == "Categorical" { 1 } else { 0 };
-                (0..n).map(|i| base + i).collect()
-            })
+            let p = parameter("p")?;
+            let base = if name == "Categorical" { 1 } else { 0 };
+            let n = static_vector_len(m, p)?;
+            bounded(n).then(|| (0..n).map(|i| base + i).collect())
         }
         // Binomial(n, p): atoms {0, …, n}, n+1 of them; n must be a static int.
         "Binomial" => {
-            let n = static_int(m, kwarg(m, c, "n")?)?;
+            let n = static_int(m, parameter("n")?)?;
             // n+1 atoms (inclusive of 0 and n).
-            bounded(n + 1).then(|| (0..=n).collect())
+            (0..MAX_ATOMS).contains(&n).then(|| (0..=n).collect())
         }
         // Everything else — continuous (`Normal`, `Beta`, …) or infinite-discrete
         // (`Poisson`, `Geometric`, `NegativeBinomial*`, `Categorical` with a
@@ -311,34 +287,55 @@ fn support_subset_of(m: &Module, node: NodeId, want: &ValueSet) -> bool {
         .unwrap_or(false)
 }
 
-/// The value node of a `%kwarg` named `name` on call `c`, if present.
-fn kwarg(m: &Module, c: &Call, name: &str) -> Option<NodeId> {
-    c.named
-        .iter()
-        .find(|na| m.resolve(na.name) == name)
-        .map(|na| na.value)
+/// The ABI fixes a vector's length even when its weights remain runtime inputs.
+fn static_vector_len(m: &mut Module, id: NodeId) -> Option<i64> {
+    let ty = m.type_of(id).cloned().or_else(|| {
+        // Constructor record splats may have just created this projection.
+        flatppl_infer::infer_expression(m, id, &[]).0.remove(&id)
+    })?;
+    let Type::Array { shape, .. } = ty else {
+        return None;
+    };
+    let [Dim::Static(n)] = shape.as_ref() else {
+        return None;
+    };
+    Some(i64::from(*n))
 }
 
-/// If `id` (through one ref level) is a `vector(...)` literal, its statically
-/// known element count; otherwise `None` (a dynamically-sized / non-literal `p`).
-fn static_vector_len(m: &Module, id: NodeId) -> Option<i64> {
-    let (resolved, _) = resolve_ref_one(m, id);
-    let vec = expect_builtin_call(m, resolved, "vector")?;
-    // A vector literal carries its elements as positional args.
-    if vec.named.is_empty() {
-        Some(vec.args.len() as i64)
-    } else {
-        None
-    }
-}
-
-/// If `id` (through one ref level) is a static integer literal, its value.
+/// Follow constant aliases without folding through a promoted runtime input.
 fn static_int(m: &Module, id: NodeId) -> Option<i64> {
-    let (resolved, _) = resolve_ref_one(m, id);
-    match m.node(resolved) {
-        Node::Lit(Scalar::Int(n)) => Some(*n),
-        _ => None,
+    let mut dynamic = crate::canon::promoted_input_names(m);
+    // A surviving callable may rebind a module name that has a literal default.
+    // Its cardinality must not be fixed before that boundary is applied.
+    let mut pending: Vec<_> = m.bindings().map(|(_, binding)| binding.rhs).collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Node::Call(call) = m.node(node)
+            && let Some(Inputs::Spec(inputs)) = &call.inputs
+        {
+            dynamic.extend(
+                inputs
+                    .iter()
+                    .filter_map(|(_, r)| (r.ns == RefNs::SelfMod).then_some(r.name)),
+            );
+        }
+        m.for_each_child(node, |child| pending.push(child));
     }
+    let mut id = id;
+    seen.clear();
+    while seen.insert(id) {
+        match m.node(id) {
+            Node::Lit(Scalar::Int(n)) => return Some(*n),
+            Node::Ref(r) if r.ns == RefNs::SelfMod && !dynamic.contains(&r.name) => {
+                id = m.binding(m.binding_by_name(r.name)?).rhs;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

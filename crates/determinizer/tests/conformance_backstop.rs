@@ -211,6 +211,25 @@ fn flatpir_rendering_of_flatpdl_round_trips() {
     );
 }
 
+#[test]
+fn finite_latent_normalization_round_trips_through_flatpir() {
+    let m = infer_module(
+        "p = elementof(unitinterval)
+         tilt = elementof(posreals)
+         point = elementof(reals)
+         prior = normalize(weighted(z -> 1+tilt*z, Bernoulli(p)))
+         z ~ prior
+         y ~ Normal(2*z, 1.0)
+         outputs = logdensityof(lawof(y), point)",
+    );
+    let out = determinize(&m).expect("finite latent normalization must be exact");
+    let pir = flatppl_flatpir::write(&out);
+    let mut reparsed = flatppl_flatpir::read(&pir).expect("exact FlatPDL must round-trip");
+    assert_eq!(pir, flatppl_flatpir::write(&reparsed));
+    let diagnostics = flatppl_infer::infer(&mut reparsed);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
 /// A FREE VARIABLE — a bare atom naming nothing in the `base` namespace and no
 /// binding — must never reach `Ok(())`. `flatppl-infer` now rejects one at its
 /// source (spec §04 "Name resolution"), so in practice the module below never

@@ -285,7 +285,8 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     if let Some(hit) = find_op_node(m, &["rand"]) {
         return Some(hit);
     }
-    find_node(m, |id| is_measure_layer(m, id))
+    find_op_node(m, &[flatppl_core::LOG_INTERVAL_MASS])
+        .or_else(|| find_node(m, |id| is_measure_layer(m, id)))
 }
 
 /// Find the first node (outermost, BFS) whose builtin head is named one of
@@ -537,6 +538,14 @@ fn apply_rule(
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`
         // binding referenced by nothing (the sampled value is a fresh inline
         // node, not a ref to `x`) — sweep it out before the next scan.
+        sweep_dead_measure_bindings(m, imports);
+        return Ok(());
+    }
+
+    if is_op(m, target_node, flatppl_core::LOG_INTERVAL_MASS) {
+        let mass = crate::density::integral::lower_interval_mass(m, target_node, options)?;
+        let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, mass);
+        m.set_binding_rhs(bid, rhs);
         sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }

@@ -192,9 +192,9 @@ pub(crate) fn call_rule(
     }
 
     let ty = match name.as_str() {
-        flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT => {
-            Type::Scalar(ScalarType::Real)
-        }
+        flatppl_core::LOG_INTEGRAL
+        | flatppl_core::LOG_INTERVAL_MASS
+        | flatppl_core::INTEGRATION_POINT => Type::Scalar(ScalarType::Real),
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),

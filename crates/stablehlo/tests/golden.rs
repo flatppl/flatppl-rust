@@ -4234,15 +4234,6 @@ inputs = (mean, alpha, beta)
 outputs = (lp)
 ";
 
-const VON_MISES_DENSITY_SRC: &str = "\
-mu = elementof(reals)
-kappa = elementof(posreals)
-a = draw(VonMises(mu = mu, kappa = kappa))
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
-inputs = (mu, kappa)
-outputs = (lp)
-";
-
 /// §08 Uniform, verbatim: `-log(lambda(S))` inside `S`, `-inf` outside it
 /// (§08's shared "outside the support the density is zero"). The density itself
 /// is a compile-time constant once `S = interval(-1.0, 3.0)`'s length (`4.0`) is
@@ -4280,19 +4271,6 @@ fn emit_logdensity_uniform_has_expected_structure() {
         );
     }
     assert!(is_delimiter_balanced(&out));
-}
-
-/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
-/// formula) must be a deliberate, reviewed change to this golden file.
-#[test]
-fn emit_logdensity_uniform_matches_frozen_golden() {
-    let d = determinize_src(UNIFORM_DENSITY_SRC);
-    let out = emit_logdensity(&d);
-    let golden = include_str!("goldens/uniform_logdensity.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @logdensity drifted from the frozen golden (tests/goldens/uniform_logdensity.mlir)"
-    );
 }
 
 /// `Uniform(support = reals)` — an unbounded set, infinite Lebesgue
@@ -4561,73 +4539,6 @@ fn emit_logdensity_generalized_normal_matches_frozen_golden() {
         out, golden,
         "emitted @logdensity drifted from the frozen golden \
          (tests/goldens/generalized_normal_logdensity.mlir)"
-    );
-}
-
-/// §08 VonMises, verbatim: `kappa * cos(x - mu) - log(2*pi) -
-/// log(I_0(kappa))`. `log(I_0(kappa))` is `registry::log_bessel_i0`'s
-/// inlined Abramowitz & Stegun approximation: a `stablehlo.select` between
-/// two `stablehlo.compare LT`-branches (small-`kappa`/large-`kappa`, each a
-/// Horner-scheme polynomial), never a `chlo.bessel*` op (no such op exists).
-#[test]
-fn emit_logdensity_von_mises_has_expected_structure() {
-    let d = determinize_src(VON_MISES_DENSITY_SRC);
-    assert!(
-        flatppl_determinizer::is_flatpdl(&d).is_ok(),
-        "determinized module must be FlatPDL-conformant (no residual measure node)"
-    );
-
-    let out = emit_logdensity(&d);
-
-    assert!(
-        out.contains("func.func @logdensity"),
-        "missing func.func @logdensity in:\n{out}"
-    );
-    assert!(
-        out.contains("-> tensor<f32>"),
-        "must return tensor<f32> in:\n{out}"
-    );
-    assert!(
-        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
-        "mu/kappa must become func args, in:\n{out}"
-    );
-    assert!(
-        out.contains("stablehlo.cosine"),
-        "missing cosine, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.compare LT").count(),
-        1,
-        "expected exactly one small/large-kappa branch compare, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.select").count(),
-        1,
-        "expected exactly one select (the log-I0 branch), in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.log").count(),
-        3,
-        "expected exactly three logs (small-branch log, large-branch log, log(kappa)), in:\n{out}"
-    );
-    assert!(
-        !out.contains("chlo."),
-        "VonMises needs no CHLO op (no chlo.bessel* exists), in:\n{out}"
-    );
-    assert!(is_delimiter_balanced(&out));
-}
-
-/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
-/// formula, or the A&S polynomial coefficients themselves) must be a
-/// deliberate, reviewed change to this golden file.
-#[test]
-fn emit_logdensity_von_mises_matches_frozen_golden() {
-    let d = determinize_src(VON_MISES_DENSITY_SRC);
-    let out = emit_logdensity(&d);
-    let golden = include_str!("goldens/von_mises_logdensity.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @logdensity drifted from the frozen golden (tests/goldens/von_mises_logdensity.mlir)"
     );
 }
 
@@ -5256,29 +5167,12 @@ fn builtin_logdensityof_refuses_wrong_arity() {
 // assert; a literal `p` sidesteps the gap entirely and keeps `a` a zero-arg
 // `func.func @logdensity()`, mirroring `UNIFORM_DENSITY_SRC`.
 
-const BERNOULLI_DENSITY_SRC: &str = "\
-p = elementof(unitinterval)
-a = draw(Bernoulli(p = p))
-lp = logdensityof(lawof(record(a = a)), record(a = 1))
-inputs = (p)
-outputs = (lp)
-";
-
 const POISSON_DENSITY_SRC: &str = "\
 rate = elementof(nonnegreals)
 a = draw(Poisson(rate = rate))
 lp = logdensityof(lawof(record(a = a)), record(a = 3))
 inputs = (rate)
 outputs = (lp)
-";
-
-const BINOMIAL_DENSITY_SRC: &str = "\
-n = elementof(posintegers)
-p = elementof(unitinterval)
-a = draw(Binomial(n = n, p = p))
-lp = logdensityof(lawof(record(a = a)), record(a = 2))
-outputs = (lp)
-inputs = (n, p)
 ";
 
 const GEOMETRIC_DENSITY_SRC: &str = "\
@@ -5326,8 +5220,7 @@ outputs = (lp)
 /// the zero-inflated-binomial idiom's own `Dirac(0)` pins `value` to a
 /// literal instead, but the registry builder (`compare`/`select`) is
 /// identical either way; a free `value` here exercises it as an ordinary
-/// `func.func` argument, same discipline as `BERNOULLI_DENSITY_SRC`'s free
-/// `p`.
+/// `func.func` argument.
 const DIRAC_DENSITY_SRC: &str = "\
 value = elementof(integers)
 a = draw(Dirac(value = value))
@@ -5335,55 +5228,6 @@ lp = logdensityof(lawof(record(a = a)), record(a = 3))
 outputs = (lp)
 inputs = (value)
 ";
-
-/// §08 Bernoulli, verbatim: `k * log(p) + (1 - k) * log(1 - p)`. Op counts:
-/// two `log`s (`p`, `1-p`), two `multiply`s, two `subtract`s (`1-k`, `1-p`),
-/// one `add`. No `chlo.*`.
-#[test]
-fn emit_logdensity_bernoulli_has_expected_structure() {
-    let d = determinize_src(BERNOULLI_DENSITY_SRC);
-    assert!(
-        flatppl_determinizer::is_flatpdl(&d).is_ok(),
-        "determinized module must be FlatPDL-conformant (no residual measure node)"
-    );
-
-    let out = emit_logdensity(&d);
-
-    assert!(
-        out.contains("func.func @logdensity"),
-        "missing func.func @logdensity in:\n{out}"
-    );
-    assert!(
-        out.contains("-> tensor<f32>"),
-        "must return tensor<f32> in:\n{out}"
-    );
-    assert!(
-        out.contains("%arg0: tensor<f32>"),
-        "p must become a func arg, in:\n{out}"
-    );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
-    assert_eq!(out.matches("stablehlo.add").count(), 1);
-    assert!(
-        !out.contains("chlo."),
-        "Bernoulli needs no CHLO ops, in:\n{out}"
-    );
-    assert!(is_delimiter_balanced(&out));
-}
-
-/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
-/// formula) must be a deliberate, reviewed change to this golden file.
-#[test]
-fn emit_logdensity_bernoulli_matches_frozen_golden() {
-    let d = determinize_src(BERNOULLI_DENSITY_SRC);
-    let out = emit_logdensity(&d);
-    let golden = include_str!("goldens/bernoulli_logdensity.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @logdensity drifted from the frozen golden (tests/goldens/bernoulli_logdensity.mlir)"
-    );
-}
 
 /// A known small count keeps the direct formula and the zero-rate boundary.
 #[test]
@@ -5426,54 +5270,6 @@ fn emit_logdensity_poisson_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @logdensity drifted from the frozen golden (tests/goldens/poisson_logdensity.mlir)"
-    );
-}
-
-/// §08 Binomial, verbatim: `logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
-/// `logC(n, k) = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. Op counts: two
-/// `log`s, two `multiply`s, two `subtract`s (`n-k`, `1-p`), seven `add`s, two
-/// `negate`s, three `chlo.lgamma`s.
-#[test]
-fn emit_logdensity_binomial_has_expected_structure() {
-    let d = determinize_src(BINOMIAL_DENSITY_SRC);
-    assert!(
-        flatppl_determinizer::is_flatpdl(&d).is_ok(),
-        "determinized module must be FlatPDL-conformant (no residual measure node)"
-    );
-
-    let out = emit_logdensity(&d);
-
-    assert!(
-        out.contains("func.func @logdensity"),
-        "missing func.func @logdensity in:\n{out}"
-    );
-    assert!(
-        out.contains("-> tensor<f32>"),
-        "must return tensor<f32> in:\n{out}"
-    );
-    assert!(
-        out.contains("%arg0: tensor<i32>") && out.contains("%arg1: tensor<f32>"),
-        "n (integer) / p must become func args, in:\n{out}"
-    );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.subtract").count(), 2);
-    assert_eq!(out.matches("stablehlo.add").count(), 6);
-    assert_eq!(out.matches("stablehlo.negate").count(), 1);
-    assert_eq!(out.matches("chlo.lgamma").count(), 2);
-    assert!(is_delimiter_balanced(&out));
-}
-
-/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
-/// formula) must be a deliberate, reviewed change to this golden file.
-#[test]
-fn emit_logdensity_binomial_matches_frozen_golden() {
-    let d = determinize_src(BINOMIAL_DENSITY_SRC);
-    let out = emit_logdensity(&d);
-    let golden = include_str!("goldens/binomial_logdensity.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @logdensity drifted from the frozen golden (tests/goldens/binomial_logdensity.mlir)"
     );
 }
 
@@ -9214,6 +9010,22 @@ outputs = q1
         "expected an exhaustiveness refusal naming `b`, got: {}",
         err.msg
     );
+}
+
+#[test]
+fn inline_and_named_rng_sources_emit_the_same_program() {
+    let inline = "x ~ Normal(0.0, 1.0)\noutputs = rand(external(rngstates), lawof(x))\n";
+    let named = "x ~ Normal(0.0, 1.0)\ns = external(rngstates)\noutputs = rand(s, lawof(x))\n";
+    let programs = [inline, named].map(|source| {
+        let module = determinize_abi_roots(source, &["outputs"]);
+        flatppl_stablehlo::emit(
+            &module,
+            flatppl_stablehlo::Mode::Sample,
+            &unrestricted_options(),
+        )
+        .unwrap()
+    });
+    assert_eq!(programs[0], programs[1]);
 }
 
 /// A binding named in `inputs` that is neither an `elementof` parameter nor

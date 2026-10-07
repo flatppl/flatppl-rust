@@ -31,6 +31,9 @@ pub struct LoweringOptions<'a> {
     pub preserve_rand_tuple: bool,
     /// Admit compiler-only numerical integrals. Exact FlatPDL remains the default.
     pub numerical_integrals: bool,
+    /// Target CDF support for scalar continuous constructors. None keeps the
+    /// portable CDF rule. Missing CDFs use quadrature only with numerical_integrals.
+    pub supports_cdf: Option<fn(&str) -> bool>,
 }
 
 impl LoweringOptions<'_> {

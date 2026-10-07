@@ -293,7 +293,7 @@ fn check_integrals(
             && r.ns == RefNs::SelfMod
             && let Some(binding) = m.binding_by_name(r.name)
         {
-            pending.push((m.binding(binding).rhs, bound));
+            pending.push((m.binding(binding).rhs, None));
             continue;
         }
         if let Node::Call(c) = m.node(id)

@@ -38,6 +38,10 @@ pub const FLATPPL_COMPAT: &str = "0.1";
 /// Backends must explicitly admit numerical evaluation. This is not FlatPDL.
 pub const LOG_INTEGRAL: &str = "%log_integral";
 
+/// Deferred log mass of a continuous constructor on `(lower, upper)`.
+/// Determinization resolves `(constructor, lower, upper)` before FlatPDL checks.
+pub const LOG_INTERVAL_MASS: &str = "%log_interval_mass";
+
 /// A real coordinate owned by one `LOG_INTEGRAL`, with a unique integer token.
 /// It has no value outside its owning integral and no source-language spelling.
 pub const INTEGRATION_POINT: &str = "%integration_point";

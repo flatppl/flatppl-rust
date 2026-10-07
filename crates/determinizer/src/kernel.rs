@@ -413,7 +413,9 @@ fn substitute_dependencies(
         } else if ns == RefNs::SelfMod
             && let Some(binding) = m.binding_by_name(name)
         {
-            let rhs = m.binding(binding).rhs;
+            // Trace the model rather than another query's point. An unchanged
+            // captured draw keeps its reference and reads the ambient realization.
+            let rhs = m.declared_binding_rhs(binding);
             let changed = substitute_dependencies(m, rhs, scope, absorbed, scopes, memo);
             if changed == rhs { root } else { changed }
         } else {
