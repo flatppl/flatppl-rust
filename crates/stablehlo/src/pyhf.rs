@@ -96,6 +96,20 @@ impl Emitter<'_> {
         let left = self.sub(lo, nominal);
         let zero = self.scalar(0.0);
         let down = self.sub(&zero, &left);
+        // §09 requires finite alpha. Fixed positive-zero shifts reduce to
+        // alpha * 0 in both regions, including the sign of a zero result.
+        // Runtime anchors must retain their derivatives even when equal.
+        if [&up, &down].iter().all(|value| {
+            self.constants.get(&value.ssa).is_some_and(|data| {
+                data.iter()
+                    .all(|x| matches!(x, Scalar::Real(v) if v.to_bits() == 0))
+            })
+        }) {
+            let (shape, _) = self.broadcast_pair(&up, &down);
+            let (shape, _) = self.broadcast_pair(&shape, alpha);
+            let zero = self.constant_like(0.0, &shape);
+            return self.mul(alpha, &zero);
+        }
         let sum = self.add(&up, &down);
         let half = self.scalar(0.5);
         let symmetric = self.mul(&sum, &half);
