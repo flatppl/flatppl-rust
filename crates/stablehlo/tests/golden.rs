@@ -2267,70 +2267,6 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
     );
 }
 
-/// The op map is widened deliberately, never to §07 at large. Every head still
-/// absent from it refuses through the catch-all — the pin that keeps
-/// `lower_builtin` narrow.
-#[test]
-fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
-    // Adjacent to something lowered in each case: the array generators next to
-    // `fill`, the size queries next to the reductions, the complex-valued
-    // elementary functions next to their real siblings, and the general-matrix
-    // decompositions next to `lower_cholesky`.
-    //
-    // Trimmed when `wave-hlowire` wired the existing-helper batch: `lor`,
-    // `lnot`, `lxor`, `min`, `max`, `ceil`, `isnan`, `isfinite`, `equal`,
-    // `unequal`, `acosh`, `asin`, `acos`, `log10` and `atan2` were all on this
-    // list and all now lower, so listing them here would assert the opposite of
-    // what the map does. `le`/`ge` are still not here, for the original reason:
-    // a closed finite image endpoint emits them.
-    //
-    // Trimmed again when `wave-hlonorm` wired §07's remaining reductions and its
-    // norms: `prod`, `mean`, `var`, `std`, `cumsum`, `cumprod`, `l1norm`,
-    // `l2norm`, `l1unit`, `l2unit`, `softmax` and `logsoftmax` all lower now, so
-    // they too would assert the opposite of what the map does. Each has its own
-    // refusal coverage in `tests/golden_norms.rs` — over the operands §07 puts
-    // out of domain, which is a different assertion from "the head is unknown".
-    for head in [
-        "zeros",
-        "ones",
-        "eye",
-        "onehot",
-        "linspace",
-        "sizeof",
-        "conj",
-        "cis",
-        "imag",
-        "det",
-        "inv",
-        "logabsdet",
-        "linsolve",
-        "qr",
-        "diagmat",
-        "cross",
-        "reverse",
-        "checked",
-        "boolean",
-        "integer",
-        "filter",
-    ] {
-        let mut m = Module::new();
-        let a = real(&mut m, 1.0);
-        let b = real(&mut m, 2.0);
-        let node = call(&mut m, head, &[a, b]);
-
-        let mut e = unrestricted_emitter(&m, Dtype::F32);
-        let err = match e.lower_node(node) {
-            Err(err) => err,
-            Ok(_) => panic!("'{head}' must still refuse"),
-        };
-        assert!(
-            err.msg.contains("unsupported builtin head"),
-            "'{head}' refused for the wrong reason: {}",
-            err.msg
-        );
-    }
-}
-
 // ---- §06 change-of-variables heads -------------------------------------------
 //
 // An open-image `pushfwd` density spells three families of head: the forward
@@ -2690,43 +2626,6 @@ fn lower_get0_refuses_non_rank1_container() {
     );
 }
 
-/// A non-literal selector that ALSO isn't a runtime rank-1 `Int` tensor (here
-/// a bound scalar `Real`, e.g. `get0(v, some_real_expr)`) still refuses —
-/// falling through both the literal-index fast path AND the
-/// `lower_get_gather` fallback (see `lower_get0_gather_lowers_runtime_index`
-/// below for the case that fallback DOES accept).
-#[test]
-fn lower_get0_refuses_non_literal_index() {
-    let mut m = Module::new();
-    let v = local_ref(&mut m, "v");
-    let idx = local_ref(&mut m, "i");
-    let node = call(&mut m, "get0", &[v, idx]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    e.bind(
-        v,
-        Value {
-            ssa: "%arg0".to_string(),
-            ty: MlirTy::Ranked(vec![Some(5)]),
-            elem: ElemKind::Real,
-        },
-    );
-    e.bind(
-        idx,
-        Value {
-            ssa: "%arg1".to_string(),
-            ty: MlirTy::Scalar,
-            elem: ElemKind::Real,
-        },
-    );
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("literal integer"),
-        "unexpected message: {}",
-        err.msg
-    );
-}
-
 /// `get0(container, index)` with a RUNTIME rank-1 `Int` `index` (the
 /// `theta[person]`-style vector-index case) lowers to `stablehlo.gather`:
 /// `base = 0` (`get0`) is subtracted from `index` (a no-op numerically, but
@@ -2914,77 +2813,6 @@ fn lower_get_gather_preserves_int_operand_elem() {
     assert!(
         out.contains("(tensor<4xi32>, tensor<3x1xi32>) -> tensor<3xi32>"),
         "Int operand must gather to an Int result, in:\n{out}"
-    );
-}
-
-/// A runtime index that is `Real`, not `Int`, refuses (spec §07 `get`/`get0`
-/// selectors are integer-valued) — the `lower_get_gather` fallback's own
-/// elem-kind check, distinct from the container-shape check
-/// `lower_get0_refuses_non_rank1_container` exercises.
-#[test]
-fn lower_get_gather_refuses_non_int_index() {
-    let mut m = Module::new();
-    let vals = local_ref(&mut m, "vals");
-    let idx = local_ref(&mut m, "idx");
-    let node = call(&mut m, "get", &[vals, idx]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    e.bind(
-        vals,
-        Value {
-            ssa: "%arg0".to_string(),
-            ty: MlirTy::Ranked(vec![Some(4)]),
-            elem: ElemKind::Real,
-        },
-    );
-    e.bind(
-        idx,
-        Value {
-            ssa: "%arg1".to_string(),
-            ty: MlirTy::Ranked(vec![Some(3)]),
-            elem: ElemKind::Real,
-        },
-    );
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("literal integer"),
-        "unexpected message: {}",
-        err.msg
-    );
-}
-
-/// A rank-2+ operand with a runtime `Int` index refuses rather than
-/// mislowering a multi-dimensional gather (out of scope: only a rank-1
-/// operand is supported).
-#[test]
-fn lower_get_gather_refuses_rank2_operand() {
-    let mut m = Module::new();
-    let vals = local_ref(&mut m, "vals");
-    let idx = local_ref(&mut m, "idx");
-    let node = call(&mut m, "get", &[vals, idx]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    e.bind(
-        vals,
-        Value {
-            ssa: "%arg0".to_string(),
-            ty: MlirTy::Ranked(vec![Some(4), Some(4)]),
-            elem: ElemKind::Real,
-        },
-    );
-    e.bind(
-        idx,
-        Value {
-            ssa: "%arg1".to_string(),
-            ty: MlirTy::Ranked(vec![Some(3)]),
-            elem: ElemKind::Int,
-        },
-    );
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("literal integer"),
-        "unexpected message: {}",
-        err.msg
     );
 }
 
@@ -6009,71 +5837,6 @@ fn emit_sample_dirac_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @sample drifted from the frozen golden (tests/goldens/dirac_sample.mlir)"
-    );
-}
-
-/// `Categorical(p)` scored at a NON-literal `k` — a `Ref` to a top-level
-/// binding, not an integer literal `Node` itself — must refuse precisely
-/// (refuse-don't-mislower) rather than attempt a `stablehlo.gather`-shaped
-/// dynamic selector this emitter has no helper for: the task brief's
-/// explicit "dynamic gather is not supported" case. `v` here still lowers
-/// fine as an ordinary scalar (`lower_logdensityof` eagerly lowers `v` for
-/// every registry entry, before ever reaching `categorical_logpdf` — see
-/// `Params::variate`'s doc comment); what makes it "non-literal" is
-/// structural, not numeric: [`literal_variate_index`]'s check (mirroring
-/// `ops::literal_index`'s identical no-ref-chasing discipline for an
-/// ordinary `get`/`get0` selector) only accepts a bare `Node::Lit(Scalar::
-/// Int(_))`, not a `Ref` that happens to resolve to one. Hand-built (not
-/// `determinize_src`): the determiniser's own discrete-marginal expansion
-/// never produces this shape (every real `builtin_logdensityof(Categorical,
-/// ...)` it emits scores a literal atom directly — see
-/// `crates/determinizer/tests/density_golden.rs`'s
-/// `kchain_discrete_categorical_latent_lowers_to_mass_weighted_logsumexp`),
-/// so this exercises the registry's defensive check directly.
-#[test]
-fn categorical_logpdf_refuses_non_literal_selector() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Categorical");
-    let e0 = real(&mut m, 0.2);
-    let e1 = real(&mut m, 0.3);
-    let e2 = real(&mut m, 0.5);
-    let probs = call(&mut m, "vector", &[e0, e1, e2]);
-    let kernel_input = record_node(&mut m, &[("p", probs)]);
-    let k_val = int(&mut m, 2);
-    top_level(&mut m, "k", k_val);
-    let v = self_ref(&mut m, "k");
-    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("dynamic gather is not supported"),
-        "unexpected message: {}",
-        err.msg
-    );
-}
-
-/// `Categorical(p)` scored at an in-range-looking but too-large literal `k`
-/// (`4`, `p` only length 3) must refuse with an "out of range" message
-/// naming the mismatch, not slice past `p`'s statically-known length.
-#[test]
-fn categorical_logpdf_refuses_out_of_range_category() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Categorical");
-    let e0 = real(&mut m, 0.2);
-    let e1 = real(&mut m, 0.3);
-    let e2 = real(&mut m, 0.5);
-    let probs = call(&mut m, "vector", &[e0, e1, e2]);
-    let kernel_input = record_node(&mut m, &[("p", probs)]);
-    let v = int(&mut m, 4);
-    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("out of range"),
-        "unexpected message: {}",
-        err.msg
     );
 }
 

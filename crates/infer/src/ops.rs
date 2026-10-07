@@ -334,6 +334,14 @@ pub(crate) fn call_rule(
         // size arg's shape (vector literal → one dim per element, else a single
         // dim), resolving fixed-integer dims at Level::Shape (§17.1).
         // `zeros`/`ones` are real-valued; `fill(x, size)` takes x's element kind.
+        "eye" => {
+            let n = args.first().map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0));
+            Type::Array {
+                shape: Box::new([n, n]),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            }
+        }
+        "sizeof" => sizeof_type(arg_ty(args, 0)),
         "zeros" | "ones" => Type::Array {
             shape: args.first().map_or_else(
                 || Box::new([Dim::Dynamic]) as Box<[Dim]>,
@@ -1845,7 +1853,7 @@ fn scalar_word(s: ScalarType) -> &'static str {
 /// reductions", `lengthof` counts.
 ///
 /// The SHAPE-PRESERVING heads (the four cumulative ops, the four normalizations) and
-/// the shape-reporting ones (`sizeof`, `indicesof`, `indicesof0`) return `None` and
+/// the index-reporting ones (`indicesof`, `indicesof0`) return `None` and
 /// stay `%deferred`. §07 does pin their results, but there is no tensor form for a
 /// nested array to lower into — `stablehlo` refuses the whole nested family — so
 /// pinning the type would buy a number nothing can produce. Recorded in
@@ -1866,7 +1874,20 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         }
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
+        "sizeof" => Some(sizeof_type(Some(cell))),
         _ => None,
+    }
+}
+
+fn sizeof_type(array: Option<&Type>) -> Type {
+    let rank = match array {
+        Some(Type::Array { shape, .. }) => shape.len(),
+        Some(Type::TVector { .. }) => 1,
+        _ => return Type::Deferred,
+    };
+    Type::Array {
+        shape: Box::new([Dim::Static(rank as u32)]),
+        elem: Box::new(Type::Scalar(ScalarType::Integer)),
     }
 }
 

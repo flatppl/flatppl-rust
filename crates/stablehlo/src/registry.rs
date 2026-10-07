@@ -357,15 +357,7 @@ pub fn lookup(ctor: &str) -> Option<&'static DistLowering> {
 /// field at a time.
 pub struct Params {
     kernel_input: NodeId,
-    /// The raw (pre-[`Emitter::lower_node`]) [`NodeId`] of the scored variate
-    /// `v`, when there is one. [`lower_logdensityof`] already lowers `v` to
-    /// the `&Value` every `LogpdfBuilder` receives directly (so the ordinary
-    /// arithmetic builders above never need this field), but
-    /// [`categorical_logpdf`]/[`categorical0_logpdf`] need the pre-lowered
-    /// NodeId too: their `get`/`get0` selector into `p` must be a literal
-    /// integer, and a lowered `Value` (an opaque SSA name) carries no such
-    /// structural information — see [`Params::variate_id`]. `None` for a
-    /// [`lower_sample`]-built `Params` (`@sample` scores no variate).
+    /// Scored node for shape checks and diagnostics. Sampling has no variate.
     variate: Option<NodeId>,
 }
 
@@ -423,17 +415,7 @@ impl Params {
         })
     }
 
-    /// The raw (pre-[`Emitter::lower_node`]) [`NodeId`] of the scored variate
-    /// `v` — the variate-side mirror of [`Params::field_id`]. Needed by
-    /// [`categorical_logpdf`]/[`categorical0_logpdf`], whose `get`/`get0`
-    /// selector into `p` must be inspected structurally (is it a literal
-    /// integer?) before it can be used as a static slice bound; see
-    /// `ops::literal_index`'s identical discipline for an ordinary `get`/
-    /// `get0` call's selector. Refuses (rather than panicking) if this
-    /// `Params` was built by [`lower_sample`], which has no scored variate at
-    /// all — an internal-contract violation (only a `@logdensity` builder
-    /// should ever call this), reported the same way as every other
-    /// caller-contract mismatch in this module.
+    /// Scored node for density diagnostics, absent in sampling contexts.
     pub fn variate_id(&self) -> Result<NodeId, EmitError> {
         self.variate.ok_or_else(|| {
             EmitError::at(
@@ -2416,207 +2398,89 @@ fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
     Ok(e.add(&t3, &psi_log_ratio_psi))
 }
 
-/// Extract element `idx` (0-based, into the underlying `p` array) of the
-/// rank-1 tensor `probs` as a `Scalar`, via `stablehlo.slice` + `stablehlo.
-/// reshape` — the same slice+reshape idiom `ops::lower_get` uses for an
-/// ordinary `get`/`get0` call, reimplemented here (rather than calling that
-/// private-to-`ops.rs` function) because this caller already has the integer
-/// index in hand, not an unlowered selector `NodeId` to re-derive it from.
-/// Refuses (never panics) on a negative or out-of-(statically-known-)range
-/// index, or a `probs` that isn't rank-1 — reachable from arbitrary
-/// FlatPDL, not just the determiniser's own well-formed output.
-fn slice_indexed_prob(
+/// Category scores gather probabilities before taking logarithms, so unused zero
+/// probabilities cannot poison reverse mode. Invalid categories select a safe
+/// probability and then return -inf, never the gather's clamped category.
+fn categorical_score(
     e: &mut Emitter,
-    blame: NodeId,
+    id: NodeId,
     probs: &Value,
-    idx: i64,
+    idx: &Value,
+    base: i64,
 ) -> Result<Value, EmitError> {
-    if idx < 0 {
-        return Err(EmitError::at(
-            blame,
-            "Categorical/Categorical0 logdensity: category index out of range",
-        ));
-    }
-    let idx = idx as u64;
-    let len = match &probs.ty {
+    let n = match e.cell_ty(probs) {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
-        other => {
-            return Err(EmitError::at(
-                blame,
-                format!(
-                    "Categorical/Categorical0 logdensity: 'p' must be a rank-1 tensor, got {other:?}"
-                ),
-            ));
-        }
-    };
-    if let Some(len) = len
-        && idx >= len
-    {
-        return Err(EmitError::at(
-            blame,
-            "Categorical/Categorical0 logdensity: category index out of range",
-        ));
+        _ => None,
     }
-    let sliced = e.slice(probs, &[idx], &[idx + 1], &[1]);
-    Ok(e.reshape(&sliced, MlirTy::Scalar))
-}
-
-/// The literal-integer value of the scored variate `k`, or a precise refusal
-/// naming the unsupported dynamic-gather case — [`categorical_logpdf`]/
-/// [`categorical0_logpdf`]'s shared selector check, mirroring `ops::
-/// literal_index`'s identical literal-only discipline for an ordinary `get`/
-/// `get0` call (the determiniser's own discrete-marginal expansion,
-/// `flatppl_determinizer::marginal`, always scores a `Categorical`/
-/// `Categorical0` mass term at a literal atom value — see that module's doc
-/// comment — so this is the shape every real caller reaching this registry
-/// entry already has; a *dynamic* `k` would need a `stablehlo.gather` this
-/// emitter has no helper for yet).
-fn literal_variate_index(e: &Emitter, p: &Params) -> Result<i64, EmitError> {
-    let id = p.variate_id()?;
-    match e.node(id) {
-        Node::Lit(Scalar::Int(i)) => Ok(*i),
-        _ => Err(EmitError::at(
-            id,
-            "Categorical/Categorical0 logdensity: observed category must be a literal integer \
-             (dynamic gather is not supported)",
-        )),
-    }
-}
-
-/// §08 Categorical, verbatim: `log f = log(p_k)`, `k` 1-based (`p_k` = `get(p,
-/// k)`'s convention, spec-matching: `ops::lower_get`'s `get` head is already
-/// 1-based, so `k`'s 1-based selector reduces to the same 0-based array
-/// position `k - 1` that `get(p, k)` itself would slice). `v` (the eagerly-
-/// [`Emitter::lower_node`]d variate `Value` every `LogpdfBuilder` receives) is
-/// unused here — unlike every arithmetic-formula builder above, this density
-/// is a lookup, not a function of `v`'s lowered tensor form; the un-lowered
-/// selector integer read via [`Params::variate_id`] is what actually drives
-/// the slice. Its `@sample` builder is [`categorical_sample`] (Task 16) — the
-/// shared [`draw_categorical`] inverse-CDF index draw, `base = 1.0`.
-fn categorical_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
-    let probs = p.get(e, "p")?;
-    let variate = p.variate_id()?;
-    let k = literal_variate_index(e, p)?;
-    let elem = slice_indexed_prob(e, variate, &probs, k - 1)?;
-    Ok(e.log(&elem))
-}
-
-/// §08 Categorical0, verbatim: `log f = log(p_{k+1})`, `k` 0-based. Under
-/// `Categorical`'s 1-based `p_j` numbering, `p_{k+1}` is exactly `get(p, k +
-/// 1)`'s slice, i.e. array position `(k + 1) - 1 = k` — the same 0-based
-/// array position `get0(p, k)` would slice directly. See
-/// [`categorical_logpdf`]'s doc comment for the shared `v`-unused /
-/// selector-read shape.
-fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
-    let probs = p.get(e, "p")?;
-    let variate = p.variate_id()?;
-    let k = literal_variate_index(e, p)?;
-    let elem = slice_indexed_prob(e, variate, &probs, k)?;
-    Ok(e.log(&elem))
-}
-
-/// The literal integer elements of a `vector(...)` variate — the batched
-/// counterpart of [`literal_variate_index`], with the same literal-only
-/// discipline and the same reason: an index is a *selector*, and only a static
-/// one can be range-checked against `p`'s length before it reaches
-/// `stablehlo.gather`, which CLAMPS an out-of-range index instead of failing.
-/// Reading a clamped index as the observed category would answer a different
-/// question, so a dynamic variate vector refuses here rather than lowering.
-fn literal_variate_indices(e: &Emitter, p: &Params) -> Result<Vec<i64>, EmitError> {
-    let id = e.resolve_ref_one(p.variate_id()?);
-    let refuse = || {
+    .ok_or_else(|| {
         EmitError::at(
             id,
-            "Categorical/Categorical0 batched logdensity: the observed categories must be a \
-             literal integer vector (a dynamic gather cannot be range-checked)",
+            "Categorical requires statically-sized probability vectors",
         )
-    };
-    let Node::Call(c) = e.node(id) else {
-        return Err(refuse());
-    };
-    if !matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "vector") || !c.named.is_empty() {
-        return Err(refuse());
+    })?;
+    let scalar = e.cell_ty(idx) == MlirTy::Scalar;
+    if n == 0
+        || idx.elem != ElemKind::Int
+        || (!scalar && !matches!(e.cell_ty(idx), MlirTy::Ranked(dims) if dims.len() == 1))
+    {
+        return Err(EmitError::at(
+            id,
+            "Categorical requires integer scalar or vector observations",
+        ));
     }
-    c.args
-        .iter()
-        .map(|&a| match e.node(e.resolve_ref_one(a)) {
-            Node::Lit(Scalar::Int(i)) => Ok(*i),
-            _ => Err(refuse()),
-        })
-        .collect()
+    if let Some(category) = e.constant_extent(idx)
+        && category >= base as u64
+        && category - (base as u64) < n
+    {
+        let selected = e.gather_cells(probs, idx, base);
+        return Ok(e.log(&selected));
+    }
+    let lower = e.int_value_const(base);
+    let upper = e.int_value_const(base + n as i64);
+    let ge = e.compare("GE", idx, &lower);
+    let lt = e.compare("LT", idx, &upper);
+    let valid = e.and(&ge, &lt);
+    let safe_idx = e.select(&valid, idx, &lower);
+    let selected = if scalar || e.batch_rank(probs) != 0 || e.batch_rank(idx) != 0 {
+        e.gather_cells(probs, &safe_idx, base)
+    } else {
+        e.gather(probs, &safe_idx, base)
+    };
+    let one = e.scalar(1.0);
+    let safe_prob = e.select(&valid, &selected, &one);
+    let score = e.log(&safe_prob);
+    let outside = e.inf(MlirTy::Scalar);
+    let outside = e.neg(&outside);
+    Ok(e.select(&valid, &score, &outside))
 }
 
-/// §08 Categorical/Categorical0 under a BATCH (`iid(Categorical(p), n)`):
-/// `log p_k` at every entry of the variate vector, in ONE
-/// `stablehlo.gather` into `log(p)` — the same lookup
-/// [`slice_indexed_prob`] performs one index at a time, vectorised, so the
-/// per-observation mass terms come back as the rank-1 vector the caller's `sum`
-/// reduces to the iid log-likelihood.
-///
-/// The scalar builders cannot serve this call: `p` arrives wrapped by the batch
-/// record ([`unbatch_field_id`]) and the variate is a vector rather than one
-/// integer, which is why `Categorical`/`Categorical0` stay out of
-/// [`is_batch_safe`] and route here instead.
-///
-/// `base` is 1 for `Categorical` (1-based `p_k`) and 0 for `Categorical0`,
-/// matching the two scalar builders' `k - 1` / `k` slice positions.
+fn categorical_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let probs = p.get(e, "p")?;
+    categorical_score(e, p.variate_id()?, &probs, v, 1)
+}
+
+fn categorical0_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let probs = p.get(e, "p")?;
+    categorical_score(e, p.variate_id()?, &probs, v, 0)
+}
+
 fn categorical_batched(
     e: &mut Emitter,
     p: &Params,
+    v: &Value,
     base: i64,
-    idx: &Value,
 ) -> Result<Value, EmitError> {
     let probs_id = unbatch_field_id(e, p, "p")?;
     let probs = e.lower_node(probs_id)?;
-    let len = match &probs.ty {
-        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
-        other => {
-            return Err(EmitError::at(
-                probs_id,
-                format!(
-                    "Categorical/Categorical0 batched logdensity: 'p' must be a rank-1 tensor, \
-                     got {other:?}"
-                ),
-            ));
-        }
-    };
-
-    // Range-check every observed category against `p`'s static length, exactly
-    // as `slice_indexed_prob` does for a single index: `stablehlo.gather` clamps
-    // rather than refusing, so an unchecked out-of-range index would silently
-    // score the nearest category.
-    let variate = p.variate_id()?;
-    for k in literal_variate_indices(e, p)? {
-        let pos = k - base;
-        if pos < 0 || len.is_some_and(|n| pos as u64 >= n) {
-            return Err(EmitError::at(
-                variate,
-                "Categorical/Categorical0 batched logdensity: category index out of range",
-            ));
-        }
-    }
-
-    if !matches!(&idx.ty, MlirTy::Ranked(dims) if dims.len() == 1) || idx.elem != ElemKind::Int {
-        return Err(EmitError::at(
-            variate,
-            format!(
-                "Categorical/Categorical0 batched logdensity: the observed categories must \
-                 lower to a rank-1 integer tensor, got {:?} of {:?}",
-                idx.ty, idx.elem
-            ),
-        ));
-    }
-
-    let log_p = e.log(&probs);
-    Ok(e.gather(&log_p, idx, base))
+    categorical_score(e, p.variate_id()?, &probs, v, base)
 }
 
 fn categorical_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    categorical_batched(e, p, 1, v)
+    categorical_batched(e, p, v, 1)
 }
 
 fn categorical0_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    categorical_batched(e, p, 0, v)
+    categorical_batched(e, p, v, 0)
 }
 
 // ---- §08/§09 multivariate vector batch (Task 12) ----------------------------
@@ -3105,8 +2969,7 @@ fn log_cn_lkj(e: &mut Emitter, n: u64, eta: &Value) -> Value {
 
 /// Extract element `idx` (0-based) of a rank-1 tensor `vec` as a `Scalar`,
 /// via `stablehlo.slice` + `stablehlo.reshape` — the same idiom
-/// [`slice_indexed_prob`] uses for `Categorical`/`Categorical0`,
-/// reimplemented narrowly here (no bounds-check/refuse plumbing) because
+/// used for fixed components. No bounds-check plumbing is needed because
 /// [`lkj_cholesky_logpdf`]'s `idx` always ranges over `0..n` for the ALREADY
 /// statically-known `n` (its own caller's loop bound), never an arbitrary
 /// selector reachable from untrusted FlatPDL.
