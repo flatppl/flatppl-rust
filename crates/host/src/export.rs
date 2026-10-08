@@ -189,10 +189,13 @@ pub fn emit_query(
     }
     let returned = returned.iter().collect::<Vec<_>>();
     let stablehlo = if let Some(batch) = batch {
+        let primitives = emitter.tensorize_batched("main", &args, &returned, batch);
         // Validate and retain a complete scalar lowering before tensorizing.
         // Unsupported batch/cell combinations use the same scalar program.
         let mapped = emitter.finish_batched("main", &args, &returned, batch)?;
-        let tensorized = if tensorize && !batch.shape.is_empty() {
+        let tensorized = if primitives.is_some() {
+            primitives
+        } else if tensorize && !batch.shape.is_empty() {
             let mut e = Emitter::with_options(&module, options);
             let mut physical = Vec::new();
             let mut bound = HashMap::new();

@@ -56,6 +56,8 @@ mod pyhf;
 mod segment_reductions;
 #[path = "sequences.rs"]
 mod sequences;
+#[path = "tensor_batch.rs"]
+mod tensor_batch;
 pub(crate) use batching::Axes;
 use batching::shape;
 use pointwise::Pointwise;
@@ -1238,7 +1240,9 @@ impl<'m> Emitter<'m> {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                if i <= batch {
+                if i < batch {
+                    d.expect("static gather batch").min(1)
+                } else if i == batch {
                     1
                 } else {
                     d.expect("static gather cell")
@@ -1256,11 +1260,41 @@ impl<'m> Emitter<'m> {
             operand.ssa, idx.ssa, operand.ty.render(self.dtype, operand.elem),
             idx.ty.render(self.dtype, idx.elem), ty.render(self.dtype, operand.elem),
         ), axes);
-        Value {
+        let out = Value {
             ssa,
             ty,
             elem: operand.elem,
-        }
+        };
+        self.remember_pointwise(
+            &out.ssa,
+            &out,
+            Pointwise::DynamicGather(
+                operand.clone(),
+                idx.clone(),
+                pointwise::GatherDimensions {
+                    offsets: (index_rank..shape(&out.ty).len()).collect(),
+                    collapsed: vec![batch],
+                    operand_batches: (0..batch).collect(),
+                    index_batches: (0..batch).collect(),
+                    index_map: vec![batch],
+                    index_vector: index_rank,
+                    slice_sizes: shape(&operand.ty)
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| {
+                            if i < batch {
+                                d.unwrap().min(1)
+                            } else if i == batch {
+                                1
+                            } else {
+                                d.unwrap()
+                            }
+                        })
+                        .collect(),
+                },
+            ),
+        );
+        out
     }
 
     /// Select one cell axis with a shared rank-1 integer index, replacing that
@@ -1365,6 +1399,28 @@ impl<'m> Emitter<'m> {
                 &out.ssa,
                 &out,
                 Pointwise::Gather(operand.clone(), axis, indices),
+            );
+        } else {
+            self.remember_pointwise(
+                &out.ssa,
+                &out,
+                Pointwise::DynamicGather(
+                    operand.clone(),
+                    idx2d.clone(),
+                    pointwise::GatherDimensions {
+                        offsets: (0..operand_dims.len()).filter(|&d| d != axis).collect(),
+                        collapsed: vec![axis],
+                        operand_batches: vec![],
+                        index_batches: vec![],
+                        index_map: vec![axis],
+                        index_vector: 1,
+                        slice_sizes: operand_dims
+                            .iter()
+                            .enumerate()
+                            .map(|(d, n)| if d == axis { 1 } else { n.unwrap() })
+                            .collect(),
+                    },
+                ),
             );
         }
         out

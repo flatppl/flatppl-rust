@@ -104,6 +104,57 @@ fn batch_axes_preserve_cell_shapes_in_the_host_abi() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn batched_gathers_do_not_loop_over_rows() -> Result<(), Box<dyn std::error::Error>> {
+    for selection in ["[1, 3, 5]", "indices"] {
+        let query = Context::default().parse(
+            &format!(
+                "x = elementof(cartpow(reals, 5))\nindices = external(cartpow(integers, 3))\ninputs = (x, indices)\noutputs = sum(x[{selection}])"
+            ),
+            None,
+            None,
+        )?;
+        for index_axis in [None, Some(0)] {
+            let exported = query.compile_batched(
+                &EmitOptions::default(),
+                &BatchSpec {
+                    shape: vec![7],
+                    input_axes: vec![vec![Some(0)], vec![index_axis]],
+                },
+            )?;
+            assert!(
+                !exported.stablehlo.contains("stablehlo.while"),
+                "{}",
+                exported.stablehlo
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn primitive_batching_composes_without_function_name_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "rows = external(cartpow(cartpow(reals, 4), 3))\nscore(x) = atan(x) + loggamma(1.0 + x*x)\ninputs = rows\noutputs = score(sum(sum.(rows)))",
+        None,
+        None,
+    )?;
+    let exported = query.compile_batched(
+        &EmitOptions::default(),
+        &BatchSpec {
+            shape: vec![2, 5],
+            input_axes: vec![vec![Some(0), Some(2)]],
+        },
+    )?;
+    assert!(
+        !exported.stablehlo.contains("stablehlo.while"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}
+
+#[test]
 fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         "alpha = 0.5\nxs = external(cartpow(reals, 8))\nupdate(s, x) = tanh(alpha*s+x)\nstates = scan(update, 0.2, xs)\ninputs = (alpha, xs)\noutputs = sum(states)",
