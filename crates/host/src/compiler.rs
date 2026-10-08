@@ -302,6 +302,23 @@ impl Context {
         self.instantiate(definition)
     }
 
+    /// Import a pyhf model or workspace into this context.
+    ///
+    /// The returned source is generated FlatPPL. Names, source origins, and
+    /// registration follow the same rules as [`Self::parse`].
+    pub fn import_pyhf(
+        &mut self,
+        json: &str,
+        name: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let module = flatppl_hs3::read_pyhf(json).map_err(|error| {
+            Diagnostic::new("pyhf", source_path.or(name).unwrap_or("<pyhf>"), error)
+        })?;
+        let source = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+        self.parse(&source, name, source_path)
+    }
+
     pub fn load(&mut self, path: &str) -> Result<Arc<LoadedModule>, Diagnostic> {
         let location = absolute_location(path)?;
         let definition = self.file(location, None, &mut Vec::new())?;

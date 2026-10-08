@@ -14,6 +14,7 @@ flatppl-infer = { path = "../infer" }
 flatppl-determinizer = { path = "../determinizer" }
 flatppl-stablehlo = { path = "../stablehlo" }
 flatppl-fileaccess = { path = "../fileaccess" }
+flatppl-hs3 = { path = "../hs3" }
 serde.workspace = true
 
 [dev-dependencies]
