@@ -5,6 +5,17 @@
 use super::*;
 
 #[derive(Clone)]
+pub(super) struct GatherDimensions {
+    pub offsets: Vec<usize>,
+    pub collapsed: Vec<usize>,
+    pub operand_batches: Vec<usize>,
+    pub index_batches: Vec<usize>,
+    pub index_map: Vec<usize>,
+    pub index_vector: usize,
+    pub slice_sizes: Vec<u64>,
+}
+
+#[derive(Clone)]
 pub(super) enum Pointwise {
     Unary(String, Value),
     ChloUnary(String, Value),
@@ -18,6 +29,7 @@ pub(super) enum Pointwise {
     Transpose(Value, Vec<u64>),
     // In-bounds, zero-based selections, including equivalent vector concatenations.
     Gather(Value, usize, Vec<u64>),
+    DynamicGather(Value, Value, GatherDimensions),
     Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
 }
@@ -40,7 +52,9 @@ impl Pointwise {
             | Self::Transpose(a, _)
             | Self::Gather(a, ..)
             | Self::Reduce(a, ..) => vec![a],
-            Self::Binary(_, a, b) | Self::Compare(_, a, b) => vec![a, b],
+            Self::Binary(_, a, b) | Self::Compare(_, a, b) | Self::DynamicGather(a, b, _) => {
+                vec![a, b]
+            }
             Self::Select(c, a, b) => vec![c, a, b],
             Self::Concat(values, _) => values.iter().collect(),
         }
@@ -60,6 +74,7 @@ impl Pointwise {
             | Self::Slice(..)
             | Self::Transpose(..)
             | Self::Gather(..)
+            | Self::DynamicGather(..)
             | Self::Concat(..) => {
                 return None;
             }
@@ -165,6 +180,7 @@ impl Emitter<'_> {
             | Pointwise::Slice(..)
             | Pointwise::Transpose(..)
             | Pointwise::Gather(..)
+            | Pointwise::DynamicGather(..)
             | Pointwise::Concat(..)
             | Pointwise::Reduce(..) => return None,
         };
