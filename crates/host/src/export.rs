@@ -6,7 +6,7 @@ use flatppl_core::{
     Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
-    Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
+    BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
     mlir_type_of,
 };
 use serde::Serialize;
@@ -19,6 +19,9 @@ pub struct Export {
     pub output: Schema,
     pub multiple_outputs: bool,
     pub output_names: Vec<Option<String>>,
+    /// Host batch dimensions precede every result's authored cell dimensions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batch_shape: Vec<u64>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +69,7 @@ pub fn emit_query(
     mut module: Module,
     source: &Module,
     options: &EmitOptions,
+    batch: Option<&BatchSpec>,
 ) -> Result<Export, EmitError> {
     let dtype = options.dtype;
     flatppl_determinizer::is_flatpdl_with_options(&module, &options.lowering_options()).map_err(
@@ -133,7 +137,7 @@ pub fn emit_query(
         .collect();
     let output_type = inferred(&module, output_node)?;
     let mut results = Vec::new();
-    let output = layout(
+    let mut output = layout(
         &mut module,
         output_node,
         output_type,
@@ -168,11 +172,99 @@ pub fn emit_query(
         values.insert(path, value);
     }
     let mut emitter = Emitter::with_options(&module, options);
+    bind_inputs(&mut emitter, &module, &roots, &mut paths, &values);
+    let tensorize = emitter
+        .can_tensorize_call(&results.iter().map(|leaf| leaf.node).collect::<Vec<_>>())
+        && arguments.iter().all(|leaf| !matches!(leaf.ty, MlirTy::Key));
+    let mut returned = Vec::new();
+    for leaf in &results {
+        let value = emitter.lower_node(leaf.node)?;
+        if value.ty != leaf.ty || value.elem != leaf.elem {
+            return Err(EmitError::at(
+                leaf.node,
+                "emitted result type disagrees with the query schema",
+            ));
+        }
+        returned.push(value);
+    }
+    let returned = returned.iter().collect::<Vec<_>>();
+    let stablehlo = if let Some(batch) = batch {
+        // Validate and retain a complete scalar lowering before tensorizing.
+        // Unsupported batch/cell combinations use the same scalar program.
+        let mapped = emitter.finish_batched("main", &args, &returned, batch)?;
+        let tensorized = if tensorize && !batch.shape.is_empty() {
+            let mut e = Emitter::with_options(&module, options);
+            let mut physical = Vec::new();
+            let mut bound = HashMap::new();
+            for (index, leaf) in arguments.iter().enumerate() {
+                let path = input_path(&module, leaf.node, &roots, &mut paths).unwrap();
+                let (input, internal) =
+                    e.batch_input(&values[&path], batch, &batch.input_axes[index])?;
+                physical.push((input.ssa, input.ty, input.elem));
+                bound.insert(path, internal);
+            }
+            bind_inputs(&mut e, &module, &roots, &mut paths, &bound);
+            results
+                .iter()
+                .map(|leaf| {
+                    let value = e.lower_node(leaf.node)?;
+                    let value = e.batch_output(&value, batch);
+                    let mut expected = batch.shape.iter().copied().map(Some).collect::<Vec<_>>();
+                    match &leaf.ty {
+                        MlirTy::Scalar => {}
+                        MlirTy::Ranked(dims) => expected.extend(dims),
+                        _ => {
+                            return Err(EmitError::at(
+                                leaf.node,
+                                "batched output requires a numeric tensor",
+                            ));
+                        }
+                    }
+                    if value.ty != MlirTy::Ranked(expected) || value.elem != leaf.elem {
+                        return Err(EmitError::at(
+                            leaf.node,
+                            "batched result type disagrees with the query schema",
+                        ));
+                    }
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| e.finish("main", &physical, &values.iter().collect::<Vec<_>>()))
+                .ok()
+        } else {
+            None
+        };
+        for field in &mut inputs {
+            batch_schema(&mut field.value, batch, true)?;
+        }
+        batch_schema(&mut output, batch, false)?;
+        tensorized.unwrap_or(mapped)
+    } else {
+        emitter.finish("main", &args, &returned)
+    };
+    Ok(Export {
+        stablehlo,
+        entry_point: "main",
+        inputs,
+        output,
+        multiple_outputs,
+        output_names,
+        batch_shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
+    })
+}
+
+fn bind_inputs(
+    emitter: &mut Emitter<'_>,
+    module: &Module,
+    roots: &HashSet<Symbol>,
+    paths: &mut HashMap<NodeId, Option<InputPath>>,
+    values: &HashMap<InputPath, Value>,
+) {
     // A declared aggregate has no tensor value. Bind its leaf projections,
     // including aliases and the output projections created by layout().
     for i in 0..module.node_count() {
         let node = NodeId::from_usize(i);
-        if let Some(path) = input_path(&module, node, &roots, &mut paths)
+        if let Some(path) = input_path(module, node, roots, paths)
             && let Some(value) = values.get(&path)
         {
             emitter.bind(node, value.clone());
@@ -185,26 +277,29 @@ pub fn emit_query(
             }
         }
     }
-    let mut returned = Vec::new();
-    for leaf in results {
-        let value = emitter.lower_node(leaf.node)?;
-        if value.ty != leaf.ty || value.elem != leaf.elem {
-            return Err(EmitError::at(
-                leaf.node,
-                "emitted result type disagrees with the query schema",
-            ));
+}
+
+fn batch_schema(schema: &mut Schema, batch: &BatchSpec, input: bool) -> Result<(), EmitError> {
+    match schema {
+        Schema::Tensor { index, shape, .. } => {
+            *shape = if input {
+                batch.input_shape(shape, &batch.input_axes[*index])?
+            } else {
+                batch.shape.iter().chain(shape.iter()).copied().collect()
+            };
         }
-        returned.push(value);
+        Schema::Tuple { items } => {
+            for item in items {
+                batch_schema(item, batch, input)?;
+            }
+        }
+        Schema::Record { fields } | Schema::Table { fields, .. } => {
+            for field in fields {
+                batch_schema(&mut field.value, batch, input)?;
+            }
+        }
     }
-    let stablehlo = emitter.finish("main", &args, &returned.iter().collect::<Vec<_>>());
-    Ok(Export {
-        stablehlo,
-        entry_point: "main",
-        inputs,
-        output,
-        multiple_outputs,
-        output_names,
-    })
+    Ok(())
 }
 
 fn binding(module: &Module, name: &str) -> Option<NodeId> {
