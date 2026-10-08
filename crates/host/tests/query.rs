@@ -1,4 +1,4 @@
-use flatppl_host::{Context, EmitOptions};
+use flatppl_host::{BatchSpec, Context, EmitOptions};
 use serde_json::json;
 
 #[test]
@@ -65,5 +65,40 @@ fn registered_module_exports_a_typed_query_abi() -> Result<(), Box<dyn std::erro
         signature,
         "func.func @main(%arg0: tensor<f32>, %arg1: tensor<2xf32>) -> (tensor<f32>, tensor<2xf32>) {"
     );
+    Ok(())
+}
+
+#[test]
+fn batch_axes_preserve_cell_shapes_in_the_host_abi() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "p = elementof(cartprod(x = cartpow(reals, 3), scale = reals))\ninputs = p\noutputs = (p.scale * sum(p.x), p.x)",
+        None,
+        None,
+    )?;
+    let options = EmitOptions::default();
+    let batch = BatchSpec {
+        shape: vec![2, 4],
+        input_axes: vec![vec![Some(1), Some(0)], vec![None, None]],
+    };
+    let exported = serde_json::to_value(query.compile_batched(&options, &batch)?)?;
+    assert_eq!(exported["batch_shape"], json!([2, 4]));
+    assert_eq!(
+        exported["inputs"][0]["value"]["fields"][0]["value"]["shape"],
+        json!([4, 2, 3])
+    );
+    assert_eq!(
+        exported["inputs"][0]["value"]["fields"][1]["value"]["shape"],
+        json!([])
+    );
+    assert_eq!(exported["output"]["items"][0]["shape"], json!([2, 4]));
+    assert_eq!(exported["output"]["items"][1]["shape"], json!([2, 4, 3]));
+    let identity = query.compile_batched(
+        &options,
+        &BatchSpec {
+            shape: vec![],
+            input_axes: vec![vec![], vec![]],
+        },
+    )?;
+    assert_eq!(identity.stablehlo, query.compile(&options)?.stablehlo);
     Ok(())
 }

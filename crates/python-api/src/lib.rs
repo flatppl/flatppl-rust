@@ -11,10 +11,12 @@ use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
 use flatppl_host::{
-    Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
+    BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
+
+type BatchArguments = (Vec<u64>, Vec<Vec<Option<usize>>>);
 
 fn error(diagnostic: Diagnostic) -> PyErr {
     Error::new_err(
@@ -92,13 +94,14 @@ impl NativeModule {
             .expect("binding metadata contains only JSON values")
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None))]
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None))]
     fn export(
         &self,
         py: Python<'_>,
         dtype: &str,
         autodiff: bool,
         integration: Option<(f64, f64, u32)>,
+        batch: Option<BatchArguments>,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -114,7 +117,14 @@ impl NativeModule {
                 max_intervals,
             }),
         };
-        let exported = py.detach(|| self.inner.compile(&options)).map_err(error)?;
+        let exported = py
+            .detach(|| match batch {
+                Some((shape, input_axes)) => self
+                    .inner
+                    .compile_batched(&options, &BatchSpec { shape, input_axes }),
+                None => self.inner.compile(&options),
+            })
+            .map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))
     }
 }

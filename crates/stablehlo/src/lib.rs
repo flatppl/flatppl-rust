@@ -199,6 +199,7 @@
 //! every refusal rule and query-module usage.
 
 mod aggregate;
+mod call_batch;
 mod complex;
 mod emitter;
 mod indexing;
@@ -211,6 +212,7 @@ mod refuse;
 mod registry;
 mod types;
 
+pub use call_batch::BatchSpec;
 pub use emitter::Emitter;
 pub use mlir::{ElemKind, MlirTy, Value};
 pub use modes::check_query_inputs;

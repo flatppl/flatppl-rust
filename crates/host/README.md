@@ -29,6 +29,39 @@ let exported = query.compile(&EmitOptions::default())?;
 
 The separate [`flatppl-python-api`](../python-api) crate maps this API into PyO3 classes for the [Python package](https://github.com/flatppl/flatppl-python).
 
+## Batch independent calls
+
+`LoadedModule::compile_batched` accepts a `BatchSpec` from the StableHLO crate.
+Any host can use this API without Python or JAX:
+
+```rust
+use flatppl_host::BatchSpec;
+
+let batch = BatchSpec {
+    shape: vec![64],
+    input_axes: vec![vec![Some(0)]],
+};
+let exported = query.compile_batched(&EmitOptions::default(), &batch)?;
+```
+
+This compiles 64 independent calls to the scalar density above. Each row of
+`input_axes` describes one flattened tensor input, in schema index order.
+Each entry identifies the physical axis for that batch dimension. `None` shares
+the input across that dimension. Axes must be distinct and in range.
+
+Multiple batch dimensions form a Cartesian frame. For a vector cell of length 3,
+`shape: vec![2, 4]` and axes `[Some(1), Some(0)]` require an input of shape
+`[4, 2, 3]`. Every output receives the leading batch prefix `[2, 4]`.
+Tensor schemas describe these physical shapes. `batch_shape` records the frame.
+Table row counts and `value_type` still describe each authored cell.
+FlatPPL reductions and `lengthof` retain their cell meaning.
+
+The emitter tensorizes supported pointwise operations and cell reductions.
+Other operations use a StableHLO loop around the scalar program, preserving
+control flow and explicit random states. All execution remains on the host's
+selected device. Batch sizes are static and their product must fit an i32 index.
+Zero-size batches produce empty outputs. An empty frame is the ordinary export.
+
 Set `EmitOptions.integration` to `Some(IntegrationOptions::default())` to allow
 adaptive numerical integration when exact scalar marginal or normalizer rules
 do not apply. The default remains `None`. The emitted program evaluates the

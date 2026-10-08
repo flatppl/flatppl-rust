@@ -7,7 +7,7 @@ use std::sync::Arc;
 use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
 use flatppl_infer::{Level, ModuleBundle, Severity};
-use flatppl_stablehlo::EmitOptions;
+use flatppl_stablehlo::{BatchSpec, EmitOptions};
 use serde::Serialize;
 
 use crate::Constant;
@@ -113,6 +113,23 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None)
+    }
+
+    /// Compile independent calls over explicit host batch axes.
+    pub fn compile_batched(
+        &self,
+        options: &EmitOptions,
+        batch: &BatchSpec,
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, Some(batch))
+    }
+
+    fn compile_export(
+        &self,
+        options: &EmitOptions,
+        batch: Option<&BatchSpec>,
+    ) -> Result<Export, Diagnostic> {
         let roots: Vec<_> = self
             .typed
             .public_bindings()
@@ -139,7 +156,7 @@ impl LoadedModule {
             Diagnostic::new("determinize", self.source_name(), e.reason)
                 .at(&self.typed, Some(e.node))
         })?;
-        emit_query(lowered, &self.typed, options)
+        emit_query(lowered, &self.typed, options, batch)
             .map_err(|e| Diagnostic::new("stablehlo", self.source_name(), e.msg))
     }
 }

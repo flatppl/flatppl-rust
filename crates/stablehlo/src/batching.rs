@@ -27,6 +27,192 @@ pub(super) fn tensor(dims: Vec<Option<u64>>) -> MlirTy {
 }
 
 impl Emitter<'_> {
+    /// Whether reachable operations have a tensor lowering over host batch axes.
+    /// Other programs retain their scalar lowering inside a device-side map.
+    pub fn can_tensorize_call(&self, outputs: &[NodeId]) -> bool {
+        let mut pending = outputs.to_vec();
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if self.memo.contains_key(&id) || !seen.insert(id) {
+                continue;
+            }
+            match self.m.node(id) {
+                Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                    let Some(binding) = self.m.binding_by_name(r.name) else {
+                        return false;
+                    };
+                    pending.push(self.m.binding(binding).rhs);
+                }
+                Node::Call(call) => {
+                    let CallHead::Builtin(name) = call.head else {
+                        return false;
+                    };
+                    let name = self.m.resolve(name);
+                    if name == "mul" && !matches!(self.type_of(id), Some(Type::Scalar(_))) {
+                        return false;
+                    }
+                    if matches!(name, "get" | "get0")
+                        && !call
+                            .args
+                            .get(1)
+                            .is_some_and(|&index| matches!(self.m.node(index), Node::Lit(_)))
+                    {
+                        return false;
+                    }
+                    if !matches!(
+                        name,
+                        "add"
+                            | "sub"
+                            | "mul"
+                            | "divide"
+                            | "pow"
+                            | "neg"
+                            | "log"
+                            | "exp"
+                            | "sqrt"
+                            | "sin"
+                            | "cos"
+                            | "tanh"
+                            | "invlogit"
+                            | "logit"
+                            | "log1p"
+                            | "expm1"
+                            | "abs"
+                            | "abs2"
+                            | "real"
+                            | "min"
+                            | "max"
+                            | "ifelse"
+                            | "eq"
+                            | "ne"
+                            | "lt"
+                            | "le"
+                            | "gt"
+                            | "ge"
+                            | "and"
+                            | "or"
+                            | "not"
+                            | "sum"
+                            | "prod"
+                            | "maximum"
+                            | "minimum"
+                            | "mean"
+                            | "logsumexp"
+                            | "vector"
+                            | "record"
+                            | "tuple"
+                            | "get"
+                            | "get0"
+                            | "lengthof"
+                            | "sizeof"
+                            | "identity"
+                            | "broadcast"
+                            | "functionof"
+                            | "Normal"
+                            | "Uniform"
+                            | "Exponential"
+                            | "builtin_logdensityof"
+                            | "inf"
+                            | "pi"
+                    ) {
+                        return false;
+                    }
+                    pending.extend(self.m.node(id).children());
+                }
+                Node::Const(name)
+                    if !matches!(
+                        self.m.resolve(*name),
+                        "add"
+                            | "sub"
+                            | "mul"
+                            | "divide"
+                            | "pow"
+                            | "neg"
+                            | "log"
+                            | "exp"
+                            | "sqrt"
+                            | "sin"
+                            | "cos"
+                            | "abs"
+                            | "abs2"
+                            | "sum"
+                            | "prod"
+                            | "maximum"
+                            | "minimum"
+                            | "mean"
+                            | "Normal"
+                            | "Uniform"
+                            | "Exponential"
+                    ) =>
+                {
+                    return false;
+                }
+                Node::Hole | Node::Axis(_) => return false,
+                Node::Lit(_) | Node::Const(_) | Node::Ref(_) => {}
+            }
+        }
+        true
+    }
+
+    /// Give an ABI input its physical batch axes while retaining its cell type.
+    /// Missing frame axes stay singleton so shared work need not be duplicated.
+    pub fn batch_input(
+        &mut self,
+        value: &Value,
+        batch: &crate::BatchSpec,
+        axes: &[Option<usize>],
+    ) -> Result<(Value, Value), EmitError> {
+        let cell = shape(&value.ty)
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| EmitError::whole("batching requires static input shapes"))?;
+        let physical = batch.input_shape(&cell, axes)?;
+        let input = Value {
+            ty: tensor(physical.iter().copied().map(Some).collect()),
+            ..value.clone()
+        };
+        let batch_rank = axes.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        let permutation = axes
+            .iter()
+            .flatten()
+            .copied()
+            .chain((0..physical.len()).filter(|axis| !axes.contains(&Some(*axis))))
+            .map(|axis| axis as u64)
+            .collect::<Vec<_>>();
+        let ordered = if permutation.iter().copied().eq(0..physical.len() as u64) {
+            input.clone()
+        } else {
+            self.transpose(&input, &permutation)
+        };
+        let mut dims = axes[..batch_rank]
+            .iter()
+            .enumerate()
+            .map(|(axis, mapped)| {
+                Some(if mapped.is_some() {
+                    batch.shape[axis]
+                } else {
+                    1
+                })
+            })
+            .collect::<Vec<_>>();
+        dims.extend(cell.into_iter().map(Some));
+        let axes = Axes {
+            batch: batch_rank,
+            layers: self.axes_of(value).layers,
+        };
+        let internal = self.reshape_axes(&ordered, tensor(dims), axes);
+        self.call_frame = batch.shape.iter().copied().map(Some).collect();
+        self.broadcast_frame = self.call_frame.clone();
+        Ok((input, internal))
+    }
+
+    /// Restore invariant results and partial batch prefixes to the full ABI frame.
+    pub fn batch_output(&mut self, value: &Value, batch: &crate::BatchSpec) -> Value {
+        let frame = batch.shape.iter().copied().map(Some).collect::<Vec<_>>();
+        self.finish_broadcast(value, &frame, 0)
+    }
+
     pub(crate) fn batch_rank(&self, v: &Value) -> usize {
         self.axes.get(&v.ssa).map_or(0, |a| a.batch)
     }

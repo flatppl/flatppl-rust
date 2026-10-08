@@ -154,6 +154,7 @@ pub struct Emitter<'m> {
     axes: HashMap<String, Axes>,
     constants: HashMap<String, constants::Constant>,
     broadcast_frame: Vec<Option<u64>>,
+    call_frame: Vec<Option<u64>>,
     body: String,
     /// The threaded rng-state key (spec §07 rng ABI). Set by
     /// [`crate::registry::lower_sample`] from a `builtin_sample`'s rng arg
@@ -204,6 +205,7 @@ impl<'m> Emitter<'m> {
             axes: HashMap::new(),
             constants: HashMap::new(),
             broadcast_frame: Vec::new(),
+            call_frame: Vec::new(),
             body: String::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
@@ -3946,7 +3948,7 @@ impl<'m> Emitter<'m> {
                 let rhs = self.m.binding(bid).rhs;
                 // Module bindings have no lexical broadcast frame. Cache their
                 // value at module scope, not with the first caller's batch axes.
-                let frame = std::mem::take(&mut self.broadcast_frame);
+                let frame = std::mem::replace(&mut self.broadcast_frame, self.call_frame.clone());
                 let value = self.lower_node(rhs);
                 self.broadcast_frame = frame;
                 value
@@ -3980,6 +3982,45 @@ impl<'m> Emitter<'m> {
         func_name: &str,
         args: &[(String, MlirTy, ElemKind)],
         rets: &[&Value],
+    ) -> String {
+        format!(
+            "module {{\n{}}}\n",
+            self.finish_function(func_name, args, rets, false)
+        )
+    }
+
+    /// Map a compiled call over host batch axes entirely inside StableHLO.
+    /// This preserves per-lane control flow and exact RNG-state semantics.
+    pub fn finish_batched(
+        self,
+        func_name: &str,
+        args: &[(String, MlirTy, ElemKind)],
+        rets: &[&Value],
+        batch: &crate::BatchSpec,
+    ) -> Result<String, EmitError> {
+        let types = rets.iter().map(|v| (&v.ty, v.elem)).collect::<Vec<_>>();
+        if batch.shape.is_empty() {
+            if batch.input_axes.len() != args.len()
+                || batch.input_axes.iter().any(|axes| !axes.is_empty())
+            {
+                return Err(EmitError::whole(
+                    "one empty axis row is required per unbatched ABI input",
+                ));
+            }
+            return Ok(self.finish(func_name, args, rets));
+        }
+        let callee = format!("{func_name}_cell");
+        let wrapper = batch.wrapper(func_name, &callee, args, &types, self.dtype)?;
+        let cell = self.finish_function(&callee, args, rets, true);
+        Ok(format!("module {{\n{wrapper}{cell}}}\n"))
+    }
+
+    fn finish_function(
+        self,
+        func_name: &str,
+        args: &[(String, MlirTy, ElemKind)],
+        rets: &[&Value],
+        private: bool,
     ) -> String {
         debug_assert!(
             !rets.is_empty(),
@@ -4015,9 +4056,10 @@ impl<'m> Emitter<'m> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut out = String::from("module {\n");
+        let mut out = String::new();
+        let visibility = if private { "private " } else { "" };
         out.push_str(&format!(
-            "  func.func @{func_name}({arg_list}) -> {ret_ty_text} {{\n"
+            "  func.func {visibility}@{func_name}({arg_list}) -> {ret_ty_text} {{\n"
         ));
         let emitter = packed.as_ref().map_or(&self, |(emitter, _)| emitter);
         let body = segment_reductions::finish(emitter, args, &rets);
@@ -4028,7 +4070,6 @@ impl<'m> Emitter<'m> {
         }
         out.push_str(&format!("    return {ret_ssas} : {ret_tys_joined}\n"));
         out.push_str("  }\n");
-        out.push_str("}\n");
         out
     }
 
