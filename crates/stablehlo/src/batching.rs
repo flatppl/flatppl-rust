@@ -3,6 +3,7 @@
 //! array. Nesting survives independently of MLIR's flattened tensor shape.
 
 use super::*;
+use flatppl_core::Idx;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Axes {
@@ -30,6 +31,16 @@ impl Emitter<'_> {
     /// Whether reachable operations have a tensor lowering over host batch axes.
     /// Other programs retain their scalar lowering inside a device-side map.
     pub fn can_tensorize_call(&self, outputs: &[NodeId]) -> bool {
+        self.can_tensorize_nodes(outputs, &[], &HashMap::new())
+    }
+
+    fn can_tensorize_nodes(
+        &self,
+        outputs: &[NodeId],
+        bound: &[Ref],
+        types: &HashMap<NodeId, Type>,
+    ) -> bool {
+        let type_of = |id| types.get(&id).or_else(|| self.type_of(id));
         let mut pending = outputs.to_vec();
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {
@@ -37,6 +48,7 @@ impl Emitter<'_> {
                 continue;
             }
             match self.m.node(id) {
+                Node::Ref(r) if bound.contains(r) => {}
                 Node::Ref(r) if r.ns == RefNs::SelfMod => {
                     let Some(binding) = self.m.binding_by_name(r.name) else {
                         return false;
@@ -48,7 +60,51 @@ impl Emitter<'_> {
                         return false;
                     };
                     let name = self.m.resolve(name);
-                    if name == "mul" && !matches!(self.type_of(id), Some(Type::Scalar(_))) {
+                    if name == "scan" {
+                        let [function, init, xs] = call.args.as_ref() else {
+                            return false;
+                        };
+                        let Ok((body, entries)) = self.callable_parts(*function) else {
+                            return false;
+                        };
+                        if entries.len() != 2 {
+                            return false;
+                        }
+                        let item = |ty: &Type| match ty {
+                            Type::Array { elem, .. } | Type::TVector { elem, .. } => {
+                                (**elem).clone()
+                            }
+                            Type::Table { columns, .. } => Type::Record(columns.clone()),
+                            ty => ty.clone(),
+                        };
+                        let (Some(state), Some(input)) = (type_of(id), type_of(*xs)) else {
+                            return false;
+                        };
+                        let arguments = [item(state), item(input)];
+                        let mut seeds = types.clone();
+                        for i in 0..self.m.node_count() {
+                            let node = NodeId::from_usize(i);
+                            if let Node::Ref(r) = self.m.node(node)
+                                && let Some(index) = entries.iter().position(|(_, arg)| arg == r)
+                            {
+                                seeds.insert(node, arguments[index].clone());
+                            }
+                        }
+                        let mut module = self.m.clone();
+                        let (types, _) = flatppl_infer::infer_expression(
+                            &mut module,
+                            body,
+                            &seeds.into_iter().collect::<Vec<_>>(),
+                        );
+                        let mut scope = bound.to_vec();
+                        scope.extend(entries.iter().map(|(_, r)| *r));
+                        if !self.can_tensorize_nodes(&[body], &scope, &types) {
+                            return false;
+                        }
+                        pending.extend([*init, *xs]);
+                        continue;
+                    }
+                    if name == "mul" && !matches!(type_of(id), Some(Type::Scalar(_))) {
                         return false;
                     }
                     if matches!(name, "get" | "get0")

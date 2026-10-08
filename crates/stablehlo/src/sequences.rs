@@ -319,7 +319,7 @@ impl Emitter<'_> {
         let [function, init, xs] = crate::ops::args_exact(id, args)?;
         let item_type = self.sequence_item_type(xs)?;
         let state_type = self.sequence_item_type(id)?;
-        if !self.broadcast_frame.is_empty() {
+        if self.broadcast_frame != self.call_frame {
             return Err(EmitError::at(id, "scan inside broadcast has no lowering"));
         }
         let (body, entries) = self.callable_parts(function)?;
@@ -331,7 +331,7 @@ impl Emitter<'_> {
         let Some(Some(n)) = xs
             .values
             .first()
-            .and_then(|v| shape(&v.ty).first())
+            .and_then(|v| shape(&v.ty).get(self.batch_rank(v)))
             .copied()
         else {
             return Err(EmitError::at(
@@ -340,7 +340,7 @@ impl Emitter<'_> {
             ));
         };
         if xs.values.iter().any(|v| {
-            shape(&v.ty).first() != Some(&Some(n))
+            shape(&v.ty).get(self.batch_rank(v)) != Some(&Some(n))
                 || shape(&v.ty).iter().any(Option::is_none)
                 || self.axes_of(v).layers.first() != Some(&1)
         }) {
@@ -381,18 +381,22 @@ impl Emitter<'_> {
         };
         for (value, ty) in state.values.iter_mut().zip(carry_types) {
             let (shape, kind) = crate::types::mlir_type_of_ty(id, &ty, self.dtype)?;
-            if value.ty != shape || elem_rank(value.elem) > elem_rank(kind) {
+            if self.cell_ty(value) != shape || elem_rank(value.elem) > elem_rank(kind) {
                 return Err(EmitError::at(
                     id,
                     "scan: initial value does not fit the state type",
                 ));
             }
             *value = self.convert(value, kind);
+            // A captured mapped argument may enter the state at any step.
+            // Fix the full host frame before creating the loop carry types.
+            let frame = self.call_frame.clone();
+            *value = self.finish_broadcast(value, &frame, frame.len());
         }
         let mut buffers = Vec::with_capacity(state.values.len());
         for value in &state.values {
-            let mut dims = vec![Some(n)];
-            dims.extend_from_slice(shape(&value.ty));
+            let mut dims = shape(&value.ty).to_vec();
+            dims.insert(self.batch_rank(value), Some(n));
             let zero = match value.elem {
                 ElemKind::Real => self.scalar(0.0),
                 ElemKind::Int => self.int_value_const(0),
@@ -445,12 +449,14 @@ impl Emitter<'_> {
                     next.push(e.add(&args[0], &one));
                     next.extend_from_slice(&args[1..start]);
                     for (value, expected) in output.values.iter().zip(&state.values) {
+                        let frame = e.call_frame.clone();
+                        let value = e.finish_broadcast(value, &frame, frame.len());
                         if value.ty != expected.ty
                             || elem_rank(value.elem) > elem_rank(expected.elem)
                         {
                             return Err(EmitError::at(id, "scan: step changes the state type"));
                         }
-                        next.push(e.convert(value, expected.elem));
+                        next.push(e.convert(&value, expected.elem));
                     }
                     let updates = args[out_start..]
                         .iter()
@@ -480,13 +486,13 @@ impl Emitter<'_> {
 
     pub(super) fn scan_slice(&mut self, input: &Value, index: &Value) -> Value {
         let mut dims = shape(&input.ty).to_vec();
-        dims[0] = Some(1);
+        let axis = self.batch_rank(input);
+        dims[axis] = Some(1);
         let sliced_ty = tensor(dims.clone());
         let zero = self.int_value_const(0);
-        let starts = std::iter::once(index.ssa.as_str())
-            .chain(std::iter::repeat_n(zero.ssa.as_str(), dims.len() - 1))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut starts = vec![zero.ssa.as_str(); dims.len()];
+        starts[axis] = &index.ssa;
+        let starts = starts.join(", ");
         let indices = vec![index.ty.render(self.dtype, index.elem); dims.len()].join(", ");
         let sizes = dims
             .iter()
@@ -499,7 +505,7 @@ impl Emitter<'_> {
             "stablehlo.dynamic_slice {}, {starts}, sizes = [{sizes}] : ({from}, {indices}) -> {to}",
             input.ssa
         ));
-        dims.remove(0);
+        dims.remove(axis);
         let value = self.reshape(
             &Value {
                 ssa,
@@ -514,15 +520,15 @@ impl Emitter<'_> {
     }
 
     pub(super) fn scan_update(&mut self, buffer: &Value, value: &Value, index: &Value) -> Value {
-        let mut dims = vec![Some(1)];
-        dims.extend_from_slice(shape(&value.ty));
+        let axis = self.batch_rank(value);
+        let mut dims = shape(&value.ty).to_vec();
+        dims.insert(axis, Some(1));
         let update = self.reshape(value, tensor(dims));
         let zero = self.int_value_const(0);
         let rank = shape(&buffer.ty).len();
-        let starts = std::iter::once(index.ssa.as_str())
-            .chain(std::iter::repeat_n(zero.ssa.as_str(), rank - 1))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut starts = vec![zero.ssa.as_str(); rank];
+        starts[axis] = &index.ssa;
+        let starts = starts.join(", ");
         let indices = vec![index.ty.render(self.dtype, index.elem); rank].join(", ");
         let ty = buffer.ty.render(self.dtype, buffer.elem);
         let update_ty = update.ty.render(self.dtype, update.elem);

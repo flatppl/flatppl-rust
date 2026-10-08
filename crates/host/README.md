@@ -56,7 +56,10 @@ Tensor schemas describe these physical shapes. `batch_shape` records the frame.
 Table row counts and `value_type` still describe each authored cell.
 FlatPPL reductions and `lengthof` retain their cell meaning.
 
-The emitter tensorizes supported pointwise operations and cell reductions.
+The emitter tensorizes supported pointwise operations, cell reductions, and
+fixed-shape scans whose steps use supported operations. A batched scan retains
+one time loop and updates all lanes together. Its time axis stays separate from
+host batch axes, including shared inputs and record states.
 Other operations use a StableHLO loop around the scalar program, preserving
 control flow and explicit random states. All execution remains on the host's
 selected device. Batch sizes are static and their product must fit an i32 index.

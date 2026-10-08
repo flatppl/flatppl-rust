@@ -102,3 +102,34 @@ fn batch_axes_preserve_cell_shapes_in_the_host_abi() -> Result<(), Box<dyn std::
     assert_eq!(identity.stablehlo, query.compile(&options)?.stablehlo);
     Ok(())
 }
+
+#[test]
+fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "alpha = 0.5\nxs = external(cartpow(reals, 8))\nupdate(s, x) = tanh(alpha*s+x)\nstates = scan(update, 0.2, xs)\ninputs = (alpha, xs)\noutputs = sum(states)",
+        None,
+        None,
+    )?;
+    for axes in [
+        vec![Some(0), None],
+        vec![None, Some(1)],
+        vec![Some(0), Some(0)],
+    ] {
+        let exported = query.compile_batched(
+            &EmitOptions::default(),
+            &BatchSpec {
+                shape: vec![3],
+                input_axes: axes.into_iter().map(|axis| vec![axis]).collect(),
+            },
+        )?;
+        assert_eq!(
+            exported.stablehlo.matches("stablehlo.while").count(),
+            1,
+            "{}",
+            exported.stablehlo
+        );
+        assert!(!exported.stablehlo.contains("main_cell"));
+        assert!(exported.stablehlo.contains("tensor<3x8xf32>"));
+    }
+    Ok(())
+}
