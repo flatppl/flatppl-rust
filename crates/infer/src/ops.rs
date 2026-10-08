@@ -2707,23 +2707,16 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
         return Type::Deferred;
     };
     let mut current = container.clone();
-    for (node, sel_ty, _) in &args[1..] {
+    for (index, (node, _, _)) in args[1..].iter().enumerate() {
+        if let Type::Array { shape, elem } = &current {
+            return get_array_type(inf, shape, elem, &args[index + 1..], base);
+        }
         let selector = inf.module.node(*node).clone();
         current = match (&current, &selector) {
             (Type::Tuple(comps), Node::Lit(Scalar::Int(k))) => {
                 match usize::try_from(k - base).ok().and_then(|i| comps.get(i)) {
                     Some(t) => t.clone(),
                     None => return failed_get(inf, *node, "tuple index out of range".into()),
-                }
-            }
-            (Type::Array { shape, elem }, Node::Lit(Scalar::Int(_))) => {
-                if shape.len() == 1 {
-                    elem.as_ref().clone()
-                } else {
-                    Type::Array {
-                        shape: shape[1..].into(),
-                        elem: elem.clone(),
-                    }
                 }
             }
             (Type::TVector { elem, .. }, Node::Lit(Scalar::Int(_))) => elem.as_ref().clone(),
@@ -2760,37 +2753,54 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                 }
             }
             (Type::Any | Type::Deferred, _) => return current.clone(),
-            // A non-literal selector: fall back to its inferred TYPE. Indexing
-            // an array by an integer ARRAY is a GATHER (`a[idxs]` — result has
-            // the index's shape and the container's element, spec §07 "array of
-            // indices subset selection"); a scalar-integer selector consumes
-            // the leading axis like a literal `Int`.
-            _ => match (&current, sel_ty) {
-                (
-                    Type::Array { elem, .. },
-                    Type::Array {
-                        shape: ish,
-                        elem: ie,
-                    },
-                ) if matches!(ie.as_ref(), Type::Scalar(ScalarType::Integer)) => Type::Array {
-                    shape: ish.clone(),
-                    elem: elem.clone(),
-                },
-                (Type::Array { shape, elem }, Type::Scalar(ScalarType::Integer)) => {
-                    if shape.len() == 1 {
-                        elem.as_ref().clone()
-                    } else {
-                        Type::Array {
-                            shape: shape[1..].into(),
-                            elem: elem.clone(),
-                        }
-                    }
-                }
-                _ => return Type::Deferred,
-            },
+            _ => return Type::Deferred,
         };
     }
     current
+}
+
+/// Each selector consumes one source axis. Gather and `all` retain result
+/// axes; later selectors address subsequent source axes, not retained ones.
+fn get_array_type(
+    inf: &mut Inferencer<'_, '_>,
+    shape: &[Dim],
+    elem: &Type,
+    selectors: &[ArgInfo],
+    base: i64,
+) -> Type {
+    let mut retained = Vec::new();
+    for (dim, (node, ty, _)) in shape.iter().zip(selectors) {
+        match inf.module.node(*node) {
+            Node::Const(name) if inf.module.resolve(*name) == "all" => retained.push(*dim),
+            Node::Axis(_) | Node::Lit(Scalar::Int(_)) => {}
+            _ => match ty {
+                Type::Scalar(ScalarType::Integer) => {}
+                Type::Array { shape, elem }
+                    if matches!(elem.as_ref(), Type::Scalar(ScalarType::Integer)) =>
+                {
+                    retained.extend_from_slice(shape);
+                }
+                _ => return Type::Deferred,
+            },
+        }
+    }
+    let consumed = shape.len().min(selectors.len());
+    retained.extend_from_slice(&shape[consumed..]);
+    let elem = if selectors.len() > consumed {
+        let mut args = vec![(selectors[consumed].0, elem.clone(), Phase::Fixed)];
+        args.extend_from_slice(&selectors[consumed..]);
+        get_type(inf, &args, base)
+    } else {
+        elem.clone()
+    };
+    if retained.is_empty() {
+        elem
+    } else {
+        Type::Array {
+            shape: retained.into(),
+            elem: Box::new(elem),
+        }
+    }
 }
 
 /// A single-axis power of a RECORD set is the set of tables, so its member is
