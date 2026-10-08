@@ -29,6 +29,13 @@ let exported = query.compile(&EmitOptions::default())?;
 
 The separate [`flatppl-python-api`](../python-api) crate maps this API into PyO3 classes for the [Python package](https://github.com/flatppl/flatppl-python).
 
+`Context::import_pyhf(json, name, source_path)` converts a pyhf model or workspace
+using `flatppl-hs3` and returns an ordinary context-owned module. The host supplies
+JSON text and handles any file IO. `LoadedModule::source()` exposes the generated
+FlatPPL. Register the module and write explicit queries for its expected counts
+or likelihood. Model-only documents expose observations as external inputs.
+Conversion errors use the `pyhf` diagnostic stage.
+
 ## Batch independent calls
 
 `LoadedModule::compile_batched` accepts a `BatchSpec` from the StableHLO crate.

@@ -51,6 +51,19 @@ impl NativeContext {
             .map_err(error)
     }
 
+    #[pyo3(signature = (source, name=None, source_path=None))]
+    fn import_pyhf(
+        &mut self,
+        source: &str,
+        name: Option<&str>,
+        source_path: Option<&str>,
+    ) -> PyResult<NativeModule> {
+        self.inner
+            .import_pyhf(source, name, source_path)
+            .map(|inner| NativeModule { inner })
+            .map_err(error)
+    }
+
     fn load(&mut self, path: &str) -> PyResult<NativeModule> {
         self.inner
             .load(path)
