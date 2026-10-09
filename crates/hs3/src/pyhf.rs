@@ -16,8 +16,8 @@ use crate::histfactory::{
 use crate::model::{Modifier, PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
 use flatppl_core::id::NodeId;
-use flatppl_core::node::{Call, CallHead, Node};
-use std::collections::{BTreeMap, HashSet};
+use flatppl_core::node::{Call, CallHead, Inputs, Node, Ref, RefNs};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
 pub fn pyhf_to_module(mut doc: PyhfDocument) -> Result<Module> {
@@ -548,7 +548,9 @@ fn emit_channel(
 #[derive(Default)]
 pub struct Terms {
     /// One observation likelihood term per channel.
-    observation: Vec<NodeId>,
+    observation: Vec<Observation>,
+    /// First-occurrence union of each channel's sorted parameter names.
+    observation_params: Vec<String>,
     /// Constraint (auxiliary-measurement) likelihood terms.
     constraints: Vec<crate::auxiliary::Constraint>,
     /// Parameters whose constraint has already been emitted — a constraint
@@ -584,6 +586,13 @@ pub struct Terms {
     staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
     /// Resolved constraint family per staterror parameter (`true` means Gaussian).
     staterror_gaussian: BTreeMap<String, bool>,
+}
+
+struct Observation {
+    likelihood: NodeId,
+    expected: NodeId,
+    observed: NodeId,
+    fractional: bool,
 }
 
 /// One staterror parameter's layout across the channels that carry it.
@@ -677,7 +686,55 @@ impl Terms {
 /// constraint terms…)`. A single term is aliased directly; nothing is emitted
 /// when there are no terms.
 pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
-    let mut all = terms.observation.clone();
+    let mut all = Vec::new();
+    // Keep channel order: it determines the likelihood's input label order.
+    for rows in terms
+        .observation
+        .chunk_by(|a, b| terms.pyhf_helpers.is_some() && a.fractional == b.fractional)
+    {
+        if rows.len() == 1 {
+            all.push(rows[0].likelihood);
+            continue;
+        }
+        let expected = b.call(
+            "cat",
+            &rows.iter().map(|row| row.expected).collect::<Vec<_>>(),
+        );
+        let observed = b.call(
+            "cat",
+            &rows.iter().map(|row| row.observed).collect::<Vec<_>>(),
+        );
+        let distribution = if rows[0].fractional {
+            b.module_call("hepphys", "ContinuedPoisson")
+        } else {
+            b.call_head("Poisson")
+        };
+        let measures = b.call("broadcast", &[distribution, expected]);
+        // A bare functionof would sort the merged inputs again. Use the full
+        // original order, including earlier parameters retained by shared factors.
+        let inputs = terms
+            .observation_params
+            .iter()
+            .map(|name| {
+                let name = b.m.intern(name);
+                (
+                    name,
+                    Ref {
+                        ns: RefNs::SelfMod,
+                        name,
+                    },
+                )
+            })
+            .collect();
+        let head = CallHead::Builtin(b.m.intern("functionof"));
+        let kernel = b.m.alloc(Node::Call(Call {
+            head,
+            args: Box::new([measures]),
+            named: Box::new([]),
+            inputs: Some(Inputs::Spec(inputs)),
+        }));
+        all.push(b.call("likelihoodof", &[kernel, observed]));
+    }
     all.extend(crate::auxiliary::likelihoods(b, &terms.constraints));
     let node = match all.len() {
         0 => return,
@@ -838,6 +895,7 @@ pub fn assemble_channel(
     }
 
     // ---- Pass 2: declare free params (idempotent by name) ----
+    let mut new_params = BTreeSet::new();
     for (_name, _nominal, modifiers) in samples {
         for modifier in *modifiers {
             // `declare_modifier_param` validates the modifier kind and requires a
@@ -855,9 +913,12 @@ pub fn assemble_channel(
             }
             let param_name =
                 declare_modifier_param(b, modifier, n_components, &terms.declared_params)?;
-            terms.declared_params.insert(param_name);
+            if terms.declared_params.insert(param_name.clone()) {
+                new_params.insert(param_name);
+            }
         }
     }
+    terms.observation_params.extend(new_params);
 
     // ---- Observed counts for this channel ----
     let observed_name = b.bind_unique_doc(
@@ -1048,7 +1109,12 @@ pub fn assemble_channel(
         obs_term,
         &format!("Observation likelihood term for channel \"{channel_name}\"."),
     );
-    terms.observation.push(b.self_ref(&obs_term_name));
+    terms.observation.push(Observation {
+        likelihood: b.self_ref(&obs_term_name),
+        expected: expected_ref,
+        observed: observed_ref,
+        fractional: fractional_observed,
+    });
 
     // ---- Per-sample constraint terms (parameter-keyed, once per parameter) ----
     for (param, pending_c, nominal) in pending {
