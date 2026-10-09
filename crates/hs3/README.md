@@ -34,5 +34,9 @@ the likelihood. Model-only input declares no parameter of interest.
 Workspace imports still require observations for every channel. Integer-count
 workspaces keep `Poisson`; fractional-count channels use `ContinuedPoisson`.
 
+The full pyhf likelihood batches consecutive channels with the same count
+distribution. It preserves parameter order and shared nuisance parameters.
+Named channel models and likelihoods remain available for individual queries.
+
 [`ORACLES.md`](ORACLES.md) holds one independently-derived checkpoint per HS3 kind — what to reach
 for when an end-to-end score moves and you need to know which construct moved.
