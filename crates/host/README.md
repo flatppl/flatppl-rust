@@ -67,6 +67,8 @@ The emitter tensorizes supported pointwise operations, cell reductions, and
 fixed-shape scans whose steps use supported operations. A batched scan retains
 one time loop and updates all lanes together. Its time axis stays separate from
 host batch axes, including shared inputs and record states.
+Scans can feed dotted `invlogit` and Bernoulli likelihoods with Uniform interval
+priors without adding a loop over host batch lanes.
 Other operations use a StableHLO loop around the scalar program, preserving
 control flow and explicit random states. All execution remains on the host's
 selected device. Batch sizes are static and their product must fit an i32 index.
