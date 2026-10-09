@@ -54,6 +54,8 @@ StableHLO emission restricts lowering to avoid known Enzyme limitations by
 default. This mode preserves zero-factor product derivatives and avoids known
 selection-adjoint failures. It retains source tensor operations but skips
 pointwise packet packing.
+It shares identical gathers and their slice lowerings within each region to
+avoid rebuilding the same tensor.
 It requires static tensor shapes and deterministic queries, and refuses `probit`
 and real `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
 including sampling queries. The Rust API exposes the same choice through
