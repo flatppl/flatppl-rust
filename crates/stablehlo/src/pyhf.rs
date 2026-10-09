@@ -129,8 +129,10 @@ impl Emitter<'_> {
         let term = self.add(&minus_ten, &term);
         let term = self.mul(&x2, &term);
         let term = self.add(&fifteen, &term);
-        let scale = self.mul(&x, &asymmetric);
-        let term = self.mul(&scale, &term);
+        // Share the alpha-only scale across bins. Keep the outer x so tiny
+        // shifts survive large anchors and negative zero keeps its sign.
+        let scale = self.mul(&x, &term);
+        let term = self.mul(&asymmetric, &scale);
         let term = self.add(&symmetric, &term);
         let polynomial = self.mul(&x, &term);
         let positive = self.compare("GT", &alpha, &zero);
