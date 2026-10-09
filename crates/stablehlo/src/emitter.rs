@@ -2408,11 +2408,13 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
-        Value {
+        let result = Value {
             ssa,
             ty: result_ty,
             elem: kind,
-        }
+        };
+        self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb));
+        result
     }
 
     /// Batched row-wise mat-vec: apply the shared `[d, d]` matrix `l` to every
