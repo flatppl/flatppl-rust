@@ -422,12 +422,14 @@ impl<'m> Emitter<'m> {
             return value;
         }
         // Scalar dots through slice/reshape chains crash Enzyme's adjoint.
-        // Keep scalar multiplies native; tensor products still need the dot
-        // lowering to preserve zero-factor derivatives.
+        // Only products of two dynamic tensors need the dot lowering to
+        // preserve zero-factor derivatives.
         let ssa = if self.restrict_enzyme_compatible
             && a.elem == ElemKind::Real
             && op == "stablehlo.multiply"
             && !shape(&a.ty).is_empty()
+            && !self.constants.contains_key(&a.ssa)
+            && !self.constants.contains_key(&b.ssa)
         {
             self.product_pair(a, b).ssa
         } else {
