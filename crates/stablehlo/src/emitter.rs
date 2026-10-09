@@ -1381,21 +1381,27 @@ impl<'m> Emitter<'m> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let ssa = self.fresh();
         let operand_ty = operand.ty.render(self.dtype, operand.elem);
         let idx_ty = idx2d.ty.render(self.dtype, idx2d.elem);
         let result_ty_text = result_ty.render(self.dtype, operand.elem);
-        self.push(&format!(
-            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<{offsets}collapsed_slice_dims = [{axis}], start_index_map = [{axis}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {slice_sizes}>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
+        let rhs = format!(
+            "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<{offsets}collapsed_slice_dims = [{axis}], start_index_map = [{axis}], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: {slice_sizes}>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
             operand.ssa, idx2d.ssa
-        ));
+        );
+        let ssa = if self.restrict_enzyme_compatible {
+            self.pure_like(rhs, operand)
+        } else {
+            let ssa = self.fresh();
+            self.push(&format!("{ssa} = {rhs}"));
+            ssa
+        };
         self.remember_axes(&ssa, self.axes_of(operand));
         let out = Value {
             ssa,
             ty: result_ty,
             elem: operand.elem,
         };
-        // Retain provenance without changing the gather's scheduling or CSE.
+        // Preserve selection provenance for reductions and tensor packing.
         if let Some(indices) = indices {
             self.remember_pointwise(
                 &out.ssa,
@@ -1429,7 +1435,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// Increasing progressions and repeated contiguous blocks need no index
-    /// tensor. Retain the gather's provenance and fresh scheduling policy.
+    /// tensor. Retain the gather's provenance and packing boundaries.
     fn regular_gather_slice(
         &mut self,
         operand: &Value,
@@ -1463,8 +1469,14 @@ impl<'m> Emitter<'m> {
         starts[axis] = indices[0];
         limits[axis] = indices[block - 1].checked_add(1)?;
         strides[axis] = stride;
-        // Reusable slices would join existing horizontal-packing regions.
-        let mut value = self.slice_value(operand, &starts, &limits, &strides, false);
+        // Unrestricted emission retains existing horizontal-packing regions.
+        let mut value = self.slice_value(
+            operand,
+            &starts,
+            &limits,
+            &strides,
+            self.restrict_enzyme_compatible,
+        );
         if repeated {
             // Insert the repetition axis before the selected block, so the
             // final reshape repeats whole blocks rather than single entries.
