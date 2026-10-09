@@ -775,7 +775,11 @@ impl Emitter<'_> {
 
     /// Recover ordered singleton slices without expanding compact multi-cell slices.
     /// `cat` retains the selected axis; a vector constructor inserts it.
-    fn static_selections(&self, elems: &[Value], keep_axis: bool) -> Option<(Value, Vec<u64>)> {
+    pub(super) fn static_selections(
+        &self,
+        elems: &[Value],
+        keep_axis: bool,
+    ) -> Option<(Value, Vec<u64>)> {
         if elems.len() < 2 {
             return None;
         }
@@ -822,7 +826,7 @@ impl Emitter<'_> {
 
     /// Assemble input selections directly. Computed sources keep their concat
     /// boundary, with selection provenance available to explicit reductions.
-    fn gather_input_selection(
+    pub(super) fn gather_input_selection(
         &mut self,
         source: &Value,
         indices: &[u64],

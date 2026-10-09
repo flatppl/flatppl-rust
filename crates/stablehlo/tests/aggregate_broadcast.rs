@@ -55,6 +55,36 @@ outputs = combined.(a, b)
 }
 
 #[test]
+fn input_vector_uses_one_ordered_gather() {
+    let ir = emit(
+        r#"
+points = elementof(cartpow(reals, [7, 2, 3]))
+inputs = points
+outputs = [points[4, :, :], points[1, :, :], points[4, :, :], points[2, :, :], points[1, :, :]]
+"#,
+    );
+    assert_eq!(ir.matches("\"stablehlo.gather\"").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.concatenate"), "{ir}");
+    assert!(ir.contains("-> tensor<5x2x3xf32>"), "{ir}");
+    assert!(ir.contains("dense<[3, 0, 3, 1, 0]>"), "{ir}");
+}
+
+#[test]
+fn computed_vector_selections_keep_the_concat_boundary() {
+    let ir = emit(
+        r#"
+points = elementof(cartpow(reals, [7, 2, 3]))
+mapped = exp.(points)
+inputs = points
+outputs = [mapped[4, :, :], mapped[1, :, :], mapped[4, :, :]]
+"#,
+    );
+    assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+    assert!(ir.contains("stablehlo.concatenate"), "{ir}");
+    assert!(ir.contains("-> tensor<3x2x3xf32>"), "{ir}");
+}
+
+#[test]
 fn batched_input_vector_uses_one_ordered_gather() {
     let ir = emit(
         r#"
