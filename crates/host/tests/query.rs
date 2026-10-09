@@ -168,6 +168,28 @@ fn primitive_batching_composes_without_function_name_checks()
 }
 
 #[test]
+fn batched_boolean_guards_do_not_loop_over_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "x = elementof(reals)\ninputs = x\nguard = lor(land(x >= 0.0, x <= 1.0), lxor(x < -1.0, lnot(x < 2.0)))\noutputs = ifelse(guard, x*x, -x)",
+        None,
+        None,
+    )?;
+    let exported = query.compile_batched(
+        &EmitOptions::default(),
+        &BatchSpec {
+            shape: vec![2, 4],
+            input_axes: vec![vec![Some(1), Some(0)]],
+        },
+    )?;
+    assert!(
+        !exported.stablehlo.contains("stablehlo.while"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}
+
+#[test]
 fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         "alpha = 0.5\nxs = external(cartpow(reals, 8))\nupdate(s, x) = tanh(alpha*s+x)\nstates = scan(update, 0.2, xs)\ninputs = (alpha, xs)\noutputs = sum(states)",

@@ -2914,6 +2914,13 @@ impl<'m> Emitter<'m> {
             a.ssa, b.ssa
         ));
         self.remember_axes(&ssa, self.axes_of(&a));
+        if a.elem == ElemKind::Bool && b.elem == ElemKind::Bool {
+            self.remember_pointwise(
+                &ssa,
+                &a,
+                Pointwise::Binary("stablehlo.and".to_owned(), a.clone(), b.clone()),
+            );
+        }
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2933,6 +2940,13 @@ impl<'m> Emitter<'m> {
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.or {}, {} : {ty}", a.ssa, b.ssa));
         self.remember_axes(&ssa, self.axes_of(&a));
+        if a.elem == ElemKind::Bool && b.elem == ElemKind::Bool {
+            self.remember_pointwise(
+                &ssa,
+                &a,
+                Pointwise::Binary("stablehlo.or".to_owned(), a.clone(), b.clone()),
+            );
+        }
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2953,6 +2967,13 @@ impl<'m> Emitter<'m> {
             a.ssa, b.ssa
         ));
         self.remember_axes(&ssa, self.axes_of(&a));
+        if a.elem == ElemKind::Bool && b.elem == ElemKind::Bool {
+            self.remember_pointwise(
+                &ssa,
+                &a,
+                Pointwise::Binary("stablehlo.xor".to_owned(), a.clone(), b.clone()),
+            );
+        }
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2968,6 +2989,13 @@ impl<'m> Emitter<'m> {
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.not {} : {ty}", a.ssa));
         self.remember_axes(&ssa, self.axes_of(a));
+        if a.elem == ElemKind::Bool {
+            self.remember_pointwise(
+                &ssa,
+                a,
+                Pointwise::Unary("stablehlo.not".to_owned(), a.clone()),
+            );
+        }
         Value {
             ssa,
             ty: a.ty.clone(),
