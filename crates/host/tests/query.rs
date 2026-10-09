@@ -132,6 +132,19 @@ fn batched_gathers_do_not_loop_over_rows() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn constant_products_keep_native_tensor_multiplication() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "x = elementof(cartpow(reals, 3))\ny = [1.0, 2.0, 3.0]\nc = [2.0, 0.0, -3.0]\ninputs = (x, y)\noutputs = (c .* x, y .* c, x .* y)",
+        None,
+        None,
+    )?;
+    let ir = query.compile(&EmitOptions::default())?.stablehlo;
+    assert_eq!(ir.matches("stablehlo.multiply").count(), 2, "{ir}");
+    assert_eq!(ir.matches("stablehlo.dot_general").count(), 1, "{ir}");
+    Ok(())
+}
+
+#[test]
 fn primitive_batching_composes_without_function_name_checks()
 -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
