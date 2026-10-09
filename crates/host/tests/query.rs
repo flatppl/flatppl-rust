@@ -243,3 +243,37 @@ fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> 
     }
     Ok(())
 }
+
+#[test]
+fn batched_scan_density_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        r#"
+        alpha ~ Uniform(interval(-2.0, 2.0))
+        update(s, x) = record(mean = s.mean + alpha*x)
+        states = scan(update, record(mean = 0.0), [1.0, 2.0])
+        read_mean(s) = s.mean
+        probabilities = invlogit.(read_mean.(states))
+        choice ~ Bernoulli.(probabilities)
+        joint = lawof(record(alpha = alpha, choice = choice))
+        theta = 0.5
+        inputs = theta
+        outputs = logdensityof(joint, record(alpha = theta, choice = [1, 0]))
+        "#,
+        None,
+        None,
+    )?;
+    let exported = query.compile_batched(
+        &EmitOptions::default(),
+        &BatchSpec {
+            shape: vec![4],
+            input_axes: vec![vec![Some(0)]],
+        },
+    )?;
+    assert_eq!(
+        exported.stablehlo.matches("stablehlo.while").count(),
+        1,
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}
