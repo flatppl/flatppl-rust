@@ -472,6 +472,7 @@ impl Packer<'_, '_> {
                 | Pointwise::Transpose(..)
                 | Pointwise::Gather(..)
                 | Pointwise::DynamicGather(..)
+                | Pointwise::Dot(..)
                 | Pointwise::Concat(..) => unreachable!(),
             };
             return match hoisted {

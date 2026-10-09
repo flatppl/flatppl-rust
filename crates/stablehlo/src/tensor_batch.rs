@@ -180,11 +180,39 @@ impl TensorBatch<'_, '_> {
             Pointwise::DynamicGather(_, _, dimensions) => {
                 self.gather(value, a, &inputs[1], dimensions)?
             }
+            Pointwise::Dot(_, _, left, right) => self.dot(value, a, &inputs[1], *left, *right),
             Pointwise::Reduce(_, axis, op, init) => {
                 self.out.reduce_axis_lit(op, init, a, batch + axis)
             }
             Pointwise::Concat(_, axis) => self.concatenate(inputs, *axis)?,
         })
+    }
+
+    fn dot(&mut self, value: &Value, a: &Value, b: &Value, left: usize, right: usize) -> Value {
+        let (a, b) = self.out.broadcast_batches(a, b);
+        let batch = self.out.batch_rank(&a);
+        let ty = batching::tensor(
+            shape(&a.ty)[..batch]
+                .iter()
+                .chain(shape(&value.ty))
+                .copied()
+                .collect(),
+        );
+        let dimensions = (0..batch)
+            .map(|axis| axis.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let left = left + batch;
+        let right = right + batch;
+        let ssa = self.out.pure_axes(format!(
+            "stablehlo.dot_general {}, {}, batching_dims = [{dimensions}] x [{dimensions}], contracting_dims = [{left}] x [{right}], precision = [DEFAULT, DEFAULT] : ({}, {}) -> {}",
+            a.ssa, b.ssa, a.ty.render(self.out.dtype, a.elem), b.ty.render(self.out.dtype, b.elem), ty.render(self.out.dtype, value.elem)
+        ), Axes { batch, layers: vec![shape(&value.ty).len()] });
+        Value {
+            ssa,
+            ty,
+            elem: value.elem,
+        }
     }
 
     fn gather(

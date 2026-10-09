@@ -30,6 +30,7 @@ pub(super) enum Pointwise {
     // In-bounds, zero-based selections, including equivalent vector concatenations.
     Gather(Value, usize, Vec<u64>),
     DynamicGather(Value, Value, GatherDimensions),
+    Dot(Value, Value, usize, usize),
     Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
 }
@@ -52,7 +53,10 @@ impl Pointwise {
             | Self::Transpose(a, _)
             | Self::Gather(a, ..)
             | Self::Reduce(a, ..) => vec![a],
-            Self::Binary(_, a, b) | Self::Compare(_, a, b) | Self::DynamicGather(a, b, _) => {
+            Self::Binary(_, a, b)
+            | Self::Compare(_, a, b)
+            | Self::DynamicGather(a, b, _)
+            | Self::Dot(a, b, ..) => {
                 vec![a, b]
             }
             Self::Select(c, a, b) => vec![c, a, b],
@@ -75,6 +79,7 @@ impl Pointwise {
             | Self::Transpose(..)
             | Self::Gather(..)
             | Self::DynamicGather(..)
+            | Self::Dot(..)
             | Self::Concat(..) => {
                 return None;
             }
@@ -181,6 +186,7 @@ impl Emitter<'_> {
             | Pointwise::Transpose(..)
             | Pointwise::Gather(..)
             | Pointwise::DynamicGather(..)
+            | Pointwise::Dot(..)
             | Pointwise::Concat(..)
             | Pointwise::Reduce(..) => return None,
         };

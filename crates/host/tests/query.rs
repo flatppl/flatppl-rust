@@ -132,6 +132,30 @@ fn batched_gathers_do_not_loop_over_rows() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn batched_matrix_products_do_not_loop_over_points() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "a = external(cartpow(reals, [2, 3]))\nb = external(cartpow(reals, [3, 4]))\nx = external(cartpow(reals, 4))\nr = (a*b)*x\ninputs = (a, b, x)\noutputs = (r, transpose(r)*r)",
+        None,
+        None,
+    )?;
+    for shape in [vec![5, 7], vec![5, 0]] {
+        let exported = query.compile_batched(
+            &EmitOptions::default(),
+            &BatchSpec {
+                shape,
+                input_axes: vec![vec![Some(1), None], vec![None, Some(2)], vec![None, None]],
+            },
+        )?;
+        assert!(
+            !exported.stablehlo.contains("stablehlo.while"),
+            "{}",
+            exported.stablehlo
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn constant_products_keep_native_tensor_multiplication() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         "x = elementof(cartpow(reals, 3))\ny = [1.0, 2.0, 3.0]\nc = [2.0, 0.0, -3.0]\ninputs = (x, y)\noutputs = (c .* x, y .* c, x .* y)",
