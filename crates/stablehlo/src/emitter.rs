@@ -1552,6 +1552,11 @@ impl<'m> Emitter<'m> {
         if let Some(value) = self.fold_vector(elems, result_ty.clone(), axes.clone()) {
             return value;
         }
+        if let Some((source, indices)) = self.static_selections(elems, false)
+            && let Some(value) = self.gather_input_selection(&source, &indices, axes.clone())
+        {
+            return value;
+        }
 
         let reshaped: Vec<Value> = elems
             .iter()
