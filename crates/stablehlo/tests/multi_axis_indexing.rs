@@ -1,6 +1,13 @@
 //! Numeric multi-axis subset selection keeps array axes and callable batches.
 
 fn emit(source: &str) -> Result<String, flatppl_stablehlo::EmitError> {
+    emit_with(source, false)
+}
+
+fn emit_with(
+    source: &str,
+    restrict_enzyme_compatible: bool,
+) -> Result<String, flatppl_stablehlo::EmitError> {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -15,7 +22,7 @@ fn emit(source: &str) -> Result<String, flatppl_stablehlo::EmitError> {
         &lowered,
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
-            restrict_enzyme_compatible: false,
+            restrict_enzyme_compatible,
             ..Default::default()
         },
     )
@@ -114,6 +121,19 @@ fn regular_selection_uses_a_slice_with_exact_last_element() {
         "{irregular}"
     );
     assert!(!irregular.contains("stablehlo.slice"), "{irregular}");
+}
+
+#[test]
+fn single_row_selection_is_a_slice_in_both_modes() {
+    let source = "matrices = elementof(cartpow(cartpow(reals, [5, 3]), 2))\n\
+         pick(matrix) = get(matrix, [4], all)\n\
+         inputs = matrices\noutputs = pick.(matrices)\n";
+    for restricted in [false, true] {
+        let ir = emit_with(source, restricted).expect("single row selection must emit");
+        assert!(ir.contains("[0:2, 3:4, 0:3]"), "{ir}");
+        assert!(ir.contains("-> tensor<2x1x3xf32>"), "{ir}");
+        assert!(!ir.contains("\"stablehlo.gather\""), "{ir}");
+    }
 }
 
 #[test]

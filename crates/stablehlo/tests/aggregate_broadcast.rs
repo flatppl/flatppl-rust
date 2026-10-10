@@ -118,7 +118,8 @@ outputs = mapped.(points)
 
 #[test]
 fn input_cat_keeps_existing_gather_boundaries() {
-    for (selection, gathers) in [("x[[3]]", 3), ("x[[1, 4]]", 2)] {
+    // A one-element selection lowers to a slice and adds no gather.
+    for (selection, gathers) in [("x[[3]]", 2), ("x[[1, 4]]", 2)] {
         let ir = emit(&format!(
             r#"
 pick(x) = cat([x[4]], [x[1]], {selection}, [x[2]], [x[1]])
