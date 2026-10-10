@@ -8,6 +8,13 @@ use flatppl_core::NodeId;
 use crate::builder::Builder;
 use crate::histfactory::{INTERP_HISTOSYS_DEFAULT, Interpolation};
 
+/// A sample's template after its additive modifiers.
+pub(crate) struct Shifted {
+    pub template: NodeId,
+    /// The additive shift when `template` is `nominal .+ delta`.
+    pub delta: Option<NodeId>,
+}
+
 /// Interpolate a channel's templates together, then reduce each sample's rows.
 /// Every shift uses the original nominal. Multiplicative modifiers and auxiliary
 /// constraints remain the caller's responsibility.
@@ -17,24 +24,31 @@ pub(crate) fn shifted_nominals(
     nominals: &[String],
     modifiers: &[Vec<Interpolation>],
     pyhf_helpers: Option<&str>,
-) -> Vec<NodeId> {
-    let mut results: Vec<_> = nominals.iter().map(|name| b.self_ref(name)).collect();
+) -> Vec<Shifted> {
+    let mut results: Vec<_> = nominals
+        .iter()
+        .map(|name| Shifted {
+            template: b.self_ref(name),
+            delta: None,
+        })
+        .collect();
     let count: usize = modifiers.iter().map(Vec::len).sum();
     if count < 2 {
         for (sample, rows) in modifiers.iter().enumerate() {
             if let Some(row) = rows.first() {
+                let nominal = results[sample].template;
                 results[sample] =
                     match pyhf_helpers.filter(|_| row.function == INTERP_HISTOSYS_DEFAULT) {
                         Some(alias) => {
                             let head = b.module_call(alias, "histosys_shift");
-                            let shift = b.call(
-                                "broadcast",
-                                &[head, row.lo, results[sample], row.hi, row.alpha],
-                            );
-                            let add = b.call_head("add");
-                            b.call("broadcast", &[add, results[sample], shift])
+                            let shift =
+                                b.call("broadcast", &[head, row.lo, nominal, row.hi, row.alpha]);
+                            add_shift(b, nominal, shift)
                         }
-                        None => row.apply(b, results[sample]),
+                        None => Shifted {
+                            template: row.apply(b, nominal),
+                            delta: None,
+                        },
                     };
             }
         }
@@ -96,10 +110,22 @@ pub(crate) fn shifted_nominals(
             let all = b.call_head("all");
             let selected = b.call("get", &[shifts, indices, all]);
             let delta = b.column_sums(selected);
-            let add = b.call_head("add");
-            results[sample] = b.call("broadcast", &[add, results[sample], delta]);
+            let mut shifted = add_shift(b, results[sample].template, delta);
+            // A second interpolation kind leaves no single additive delta.
+            if results[sample].delta.is_some() {
+                shifted.delta = None;
+            }
+            results[sample] = shifted;
             offset += sample_rows.len();
         }
     }
     results
+}
+
+fn add_shift(b: &mut Builder, nominal: NodeId, delta: NodeId) -> Shifted {
+    let add = b.call_head("add");
+    Shifted {
+        template: b.call("broadcast", &[add, nominal, delta]),
+        delta: Some(delta),
+    }
 }

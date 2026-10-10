@@ -173,10 +173,10 @@ fn histosys_modifier_path_converts() {
     // (the sample's expected yields), then the channel model is a reified Poisson.
     assert!(
         text.contains(
-            "c_sig_expected = \
-             broadcast(add, c_sig_nominal, broadcast(pyhf_helpers.histosys_shift, \
-             [9.0, 11.0], c_sig_nominal, [11.0, 13.0], alpha_shape))"
-        ),
+            "c_yields = pyhf_helpers.sample_yields(rowstack([c_sig_nominal]), \
+             array(cat(broadcast(pyhf_helpers.histosys_shift, [9.0, 11.0], c_sig_nominal, \
+             [11.0, 13.0], alpha_shape)), [1, 1, 2], [1, 2, 3]), c_factors)"
+        ) && text.contains("c_factors = fill(1.0, [1, 1, 2])"),
         "histosys interpolation mismatch, got:\n{text}"
     );
     assert!(
@@ -210,7 +210,7 @@ fn shapefactor_modifier_path_converts() {
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
     // shapefactor is an unconstrained per-bin multiplicative scale: no aux term.
     assert!(
-        text.contains("c_sig_expected = broadcast(mul, c_sig_nominal, sf)")
+        text.contains("c_factors = array(cat(sf), [1, 1, 2], [1, 2, 3])")
             && text.contains("c_model = functionof(broadcast(Poisson, c_expected))"),
         "shapefactor obs model mismatch, got:\n{text}"
     );

@@ -43,7 +43,10 @@ fn two_histosys_shifts_add_against_the_original_nominal() {
         );
     }
     assert!(
-        text.contains("ch1_bkg_expected = broadcast(add, ch1_bkg_nominal, aggregate(sum,"),
+        text.contains(
+            "ch1_yields_2 = pyhf_helpers.sample_yields(rowstack([ch1_bkg_nominal]), \
+             array(cat(aggregate(sum,"
+        ),
         "expected nominal plus modifier-axis reduction, got:\n{text}"
     );
 }
@@ -132,11 +135,9 @@ fn a_staterror_name_spans_the_channels_that_carry_it() {
     // Each channel multiplies in its own disjoint slice. `get` is 1-based.
     assert!(
         text.contains(
-            "chA_s_expected = broadcast(mul, chA_s_nominal, \
-                       [get(mcstat, 1), get(mcstat, 2)])"
+            "chA_factors = array(cat([get(mcstat, 1), get(mcstat, 2)]), [1, 1, 2], [1, 2, 3])"
         ) && text.contains(
-            "chB_s_expected = broadcast(mul, chB_s_nominal, \
-                              [get(mcstat, 3), get(mcstat, 4)])"
+            "chB_factors = array(cat([get(mcstat, 3), get(mcstat, 4)]), [1, 1, 2], [1, 2, 3])"
         ),
         "expected per-channel slices, got:\n{text}"
     );

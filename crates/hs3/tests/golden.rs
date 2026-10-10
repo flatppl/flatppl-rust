@@ -262,30 +262,16 @@ const FIXTURE_2BIN: &str = include_str!("fixtures/2bin_1channel.json");
 fn golden_pyhf_2bin_assembly() {
     let m = flatppl_hs3::read(FIXTURE_2BIN).expect("2bin fixture must convert");
     let text = print_with(&m, Syntax::Minimal);
-    // Per-sample expected: each nominal template scaled by its modifier
-    // (signal * mu, background * gamma).
-    assert!(
-        text.contains(
-            "singlechannel_signal_expected = broadcast(mul, singlechannel_signal_nominal, mu)"
-        ),
-        "signal expected mismatch, got:\n{text}"
-    );
-    assert!(
-        text.contains(
-            "singlechannel_background_expected = \
-             broadcast(mul, singlechannel_background_nominal, uncorr_bkguncrt)"
-        ),
-        "background expected mismatch, got:\n{text}"
-    );
-    // Total expected = sum over samples, per bin.
-    assert!(
-        text.contains(
-            "singlechannel_expected = \
-             pyhf_helpers.expected_counts(rowstack([singlechannel_signal_expected, \
-             singlechannel_background_expected]))"
-        ),
-        "total expected mismatch, got:\n{text}"
-    );
+    // Each sample's factors in multiplication order (signal * mu, background
+    // * gamma), and the channel total as the helper sum over samples.
+    for line in [
+        "singlechannel_factors = array(cat(fill(mu, 2), uncorr_bkguncrt), [2, 1, 2], [1, 2, 3])",
+        "singlechannel_yields = pyhf_helpers.sample_yields(rowstack([singlechannel_signal_nominal, \
+         singlechannel_background_nominal]), fill(0.0, [2, 1, 2]), singlechannel_factors)",
+        "singlechannel_expected = pyhf_helpers.expected_counts(singlechannel_yields)",
+    ] {
+        assert!(text.contains(line), "{line}\ngot:\n{text}");
+    }
     // The observation model is a reified kernel (functionof), as likelihoodof
     // requires; the observation term binds it to the observed counts.
     assert!(
