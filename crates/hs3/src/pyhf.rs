@@ -934,7 +934,6 @@ pub fn assemble_channel(
     // Per-sample constraints are collected here and emitted *after* the
     // observation term, so the file reads observation-first then constraints
     // (each carries the sample nominal its `tau` needs).
-    let mut sample_expected: Vec<NodeId> = Vec::new();
     let mut pending: Vec<(String, PendingConstraint, NodeId)> = Vec::new();
     let mut nominal_names = Vec::new();
     let mut histosys = Vec::new();
@@ -1030,44 +1029,70 @@ pub fn assemble_channel(
         });
     let gathered = terms.normsys_factors.gathered_products(b, runs);
     let products = crate::normsys::products(b, channel_name, gathered.values().cloned());
-    for ((sname, _, modifiers), (nom, factors)) in
-        samples.iter().zip(shifted.into_iter().zip(multipliers))
-    {
-        let mut acc = nom;
-        let mut scalars = Vec::new();
+    // Each sample's factors in multiplication order: per-bin factors keep their
+    // place and each scalar run contributes its operands.
+    let mut operands = Vec::new();
+    for ((_, _, modifiers), factors) in samples.iter().zip(multipliers) {
         let kinds = modifiers
             .iter()
             .filter_map(|modifier| mod_spec(&modifier.kind).filter(|spec| !spec.replaces_nominal));
+        let mut sample = Vec::new();
+        let mut scalars = Vec::new();
         for (factor, spec) in factors.into_iter().zip(kinds) {
             if spec.param_domain == ParamDomain::PosRealsPow {
-                acc = multiply_scalar_factors(b, acc, &gathered[&scalars], &products);
+                sample.extend(scalar_operands(b, &gathered[&scalars], &products));
                 scalars.clear();
-                let mul = b.call_head("mul");
-                acc = b.call("broadcast", &[mul, acc, factor]);
+                sample.push(Operand::PerBin(factor));
             } else {
                 scalars.push(factor);
             }
         }
-        acc = multiply_scalar_factors(b, acc, &gathered[&scalars], &products);
-
-        let exp_name = b.bind_unique_doc(
-            &format!("{channel_name}_{sname}_expected"),
-            acc,
-            &format!("Expected yields for sample \"{sname}\" (nominal x modifiers)."),
-        );
-        sample_expected.push(b.self_ref(&exp_name));
+        sample.extend(scalar_operands(b, &gathered[&scalars], &products));
+        operands.push(sample);
     }
 
     // ---- Total expected per bin (sum over samples) ----
-    let total = match sample_expected.as_slice() {
-        [] => b.array(&[]),
-        [single] => *single,
-        _ => {
-            let rows = b.array(&sample_expected);
-            let matrix = b.call("rowstack", &[rows]);
-            match terms.pyhf_helpers.as_deref() {
-                Some(alias) => b.module_user_call(alias, "expected_counts", &[matrix]),
-                None => b.column_sums(matrix),
+    // The helper form needs each template as the nominal plus one delta.
+    let helpers = terms.pyhf_helpers.clone().filter(|_| {
+        shifted
+            .iter()
+            .all(|s| s.delta.is_some() || matches!(b.m.node(s.template), Node::Ref(_)))
+    });
+    let total = match helpers {
+        Some(alias) => sample_yields(
+            b,
+            &alias,
+            channel_name,
+            &nominal_names,
+            &shifted,
+            &operands,
+            n_bins,
+        ),
+        None => {
+            let mut sample_expected = Vec::new();
+            for (((sname, _, _), shifted), operands) in samples.iter().zip(shifted).zip(operands) {
+                let acc = operands.into_iter().fold(shifted.template, |acc, operand| {
+                    let mul = b.call_head("mul");
+                    b.call("broadcast", &[mul, acc, operand.node()])
+                });
+                let exp_name = b.bind_unique_doc(
+                    &format!("{channel_name}_{sname}_expected"),
+                    acc,
+                    &format!("Expected yields for sample \"{sname}\" (nominal x modifiers)."),
+                );
+                sample_expected.push(b.self_ref(&exp_name));
+            }
+            match sample_expected.as_slice() {
+                [] => b.array(&[]),
+                [single] => *single,
+                _ => {
+                    let rows = b.array(&sample_expected);
+                    let matrix = b.call("rowstack", &[rows]);
+                    match terms.pyhf_helpers.as_deref() {
+                        Some(alias) => b.module_user_call(alias, "expected_counts", &[matrix]),
+                        None => b.column_sums(matrix),
+                    }
+                }
             }
         }
     };
@@ -1164,31 +1189,203 @@ pub fn assemble_channel(
     Ok(())
 }
 
+/// A multiplication operand of a sample's yield chain.
+#[derive(Clone, Copy)]
+enum Operand {
+    Scalar(NodeId),
+    PerBin(NodeId),
+}
+
+impl Operand {
+    fn node(self) -> NodeId {
+        match self {
+            Operand::Scalar(node) | Operand::PerBin(node) => node,
+        }
+    }
+}
+
 /// Retain a consecutive scalar factor axis instead of a deep multiply chain.
 /// Vector modifiers stay outside the reduction and preserve their positions.
-fn multiply_scalar_factors(
+fn scalar_operands(
     b: &mut Builder,
-    values: NodeId,
     factors: &[NodeId],
     products: &BTreeMap<Vec<NodeId>, NodeId>,
-) -> NodeId {
+) -> Vec<Operand> {
     // Short products cost less as fused pointwise operations than as a gathered
     // tensor plus reduction. Keep their original multiplication order.
     let factor = match products.get(factors) {
         Some(&product) => product,
         None if factors.len() < crate::normsys::PRODUCT_THRESHOLD => {
-            return factors.iter().fold(values, |acc, factor| {
-                let mul = b.call_head("mul");
-                b.call("broadcast", &[mul, acc, *factor])
-            });
+            return factors
+                .iter()
+                .map(|&factor| Operand::Scalar(factor))
+                .collect();
         }
         None => {
             let factors = b.array(factors);
             b.call("prod", &[factors])
         }
     };
-    let mul = b.call_head("mul");
-    b.call("broadcast", &[mul, values, factor])
+    vec![Operand::Scalar(factor)]
+}
+
+/// One channel's yields as `pyhf_helpers` calls. Each sample contributes its
+/// summed additive shift and its factor rows in multiplication order: each
+/// per-bin factor, and one row per run of scalar factors. Samples group into
+/// width classes so unit pad rows stay within [`MAX_PADDING`] of the factor
+/// block, and the channel sums all classes' rows in sample order.
+///
+/// [`MAX_PADDING`]: crate::normsys
+fn sample_yields(
+    b: &mut Builder,
+    alias: &str,
+    channel_name: &str,
+    nominal_names: &[String],
+    shifted: &[crate::histosys::Shifted],
+    operands: &[Vec<Operand>],
+    n_bins: usize,
+) -> NodeId {
+    let samples: Vec<_> = nominal_names
+        .iter()
+        .zip(shifted)
+        .zip(operands)
+        .map(|((name, shifted), operands)| {
+            // Each run of scalars between per-bin factors folds into one row, so
+            // the rows keep the chain's multiplication order.
+            let mut factors = Vec::new();
+            let mut run: Option<NodeId> = None;
+            for operand in operands {
+                match *operand {
+                    Operand::Scalar(node) => {
+                        run = Some(match run {
+                            Some(acc) => b.call("mul", &[acc, node]),
+                            None => node,
+                        });
+                    }
+                    Operand::PerBin(node) => {
+                        if let Some(scale) = run.take() {
+                            factors.push(fill(b, scale, &[n_bins]));
+                        }
+                        factors.push(node);
+                    }
+                }
+            }
+            if let Some(scale) = run {
+                factors.push(fill(b, scale, &[n_bins]));
+            }
+            (name.as_str(), shifted.delta, factors)
+        })
+        .collect();
+    // Samples sorted by factor count, so each class pads to its first member.
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    order.sort_by_key(|&s| std::cmp::Reverse(samples[s].2.len()));
+    let floor: usize = samples.iter().map(|(_, _, factors)| factors.len()).sum();
+    let ends = crate::normsys::padded_classes(samples.len(), floor, |range| {
+        range.len() * samples[order[range.start]].2.len()
+    });
+    let mut start = 0;
+    let mut classes = Vec::new();
+    // Where each sample's row sits: its class's yields and the row index.
+    let mut places = vec![None; samples.len()];
+    for end in ends {
+        let mut members = order[start..end].to_vec();
+        members.sort_unstable();
+        start = end;
+        let rows: Vec<_> = members.iter().map(|&s| b.self_ref(samples[s].0)).collect();
+        let rows = b.array(&rows);
+        let nominal = b.call("rowstack", &[rows]);
+        let shifts = if members.iter().any(|&s| samples[s].1.is_some()) {
+            let deltas: Vec<_> = members
+                .iter()
+                .map(|&s| samples[s].1.unwrap_or_else(|| fill_real(b, 0.0, &[n_bins])))
+                .collect();
+            block(b, deltas, [members.len(), 1, n_bins])
+        } else {
+            fill_real(b, 0.0, &[members.len(), 1, n_bins])
+        };
+        let factors: Vec<_> = members.iter().map(|&s| samples[s].2.as_slice()).collect();
+        let factors = padded_block(b, &factors, 1.0, n_bins);
+        let factors = b.bind_unique_doc(
+            &format!("{channel_name}_factors"),
+            factors,
+            "Multiplicative factors: sample, factors in multiplication order, bin.",
+        );
+        let factors = b.self_ref(&factors);
+        let yields = b.module_user_call(alias, "sample_yields", &[nominal, shifts, factors]);
+        let yields = b.bind_unique_doc(
+            &format!("{channel_name}_yields"),
+            yields,
+            "Expected yields: sample rows, bin columns.",
+        );
+        for (row, &s) in members.iter().enumerate() {
+            places[s] = Some((classes.len(), row));
+        }
+        classes.push(yields);
+    }
+    // Several classes sum their rows in sample order, as one sum over the
+    // channel's samples.
+    let samples = match classes.as_slice() {
+        [yields] => b.self_ref(yields),
+        _ => {
+            let rows: Vec<_> = places
+                .into_iter()
+                .map(|place| {
+                    let (class, row) = place.expect("every sample has a class");
+                    let yields = b.self_ref(&classes[class]);
+                    let row = b.lit_int(row as i64 + 1);
+                    let all = b.call_head("all");
+                    b.call("get", &[yields, row, all])
+                })
+                .collect();
+            let rows = b.array(&rows);
+            b.call("rowstack", &[rows])
+        }
+    };
+    b.module_user_call(alias, "expected_counts", &[samples])
+}
+
+/// The `[samples, width, bins]` block of each sample's rows, padded with
+/// `pad`, or one uniform fill when no sample has a row.
+fn padded_block(b: &mut Builder, samples: &[&[NodeId]], pad: f64, n_bins: usize) -> NodeId {
+    let width = samples.iter().map(|rows| rows.len()).max().unwrap_or(0);
+    if width == 0 {
+        return fill_real(b, pad, &[samples.len(), 1, n_bins]);
+    }
+    let mut cells = Vec::with_capacity(samples.len() * width);
+    for rows in samples {
+        cells.extend_from_slice(rows);
+        for _ in rows.len()..width {
+            cells.push(fill_real(b, pad, &[n_bins]));
+        }
+    }
+    block(b, cells, [samples.len(), width, n_bins])
+}
+
+/// `fill(value, shape)`, with a bare length for one axis.
+fn fill(b: &mut Builder, value: NodeId, shape: &[usize]) -> NodeId {
+    let size = match shape {
+        [length] => b.lit_int(*length as i64),
+        _ => {
+            let size: Vec<_> = shape.iter().map(|&n| b.lit_int(n as i64)).collect();
+            b.array(&size)
+        }
+    };
+    b.call("fill", &[value, size])
+}
+
+fn fill_real(b: &mut Builder, value: f64, shape: &[usize]) -> NodeId {
+    let value = b.lit_real(value);
+    fill(b, value, shape)
+}
+
+/// A rank-3 array whose cells are the given bin vectors in row-major order.
+fn block(b: &mut Builder, cells: Vec<NodeId>, shape: [usize; 3]) -> NodeId {
+    let data = b.call("cat", &cells);
+    let size: Vec<_> = shape.iter().map(|&n| b.lit_int(n as i64)).collect();
+    let size = b.array(&size);
+    let order: Vec<_> = (1..=3).map(|axis| b.lit_int(axis)).collect();
+    let order = b.array(&order);
+    b.call("array", &[data, size, order])
 }
 
 /// Validate a channel's observed bin contents and report whether any is fractional.

@@ -332,24 +332,38 @@ fn class_width(length: usize, rows: usize) -> usize {
 fn width_classes(lengths: &[usize]) -> Vec<usize> {
     // Tree rounding alone can exceed the bound, as one row per class shows.
     let floor: usize = lengths.iter().map(|&length| tree_width(length)).sum();
-    // Fewest lanes covering the first i rows with the current class count.
-    let mut best: Vec<Option<(usize, Vec<usize>)>> = vec![None; lengths.len() + 1];
+    padded_classes(lengths.len(), floor, |rows| {
+        class_width(lengths[rows.start], rows.len()) * rows.len()
+    })
+}
+
+/// Fewest contiguous classes over `count` items whose total `lanes` exceed
+/// the unpadded `floor` by at most [`MAX_PADDING`] of the lanes. `lanes` gives
+/// one class's padded lanes and must equal the floor's share for one item.
+/// Returns the end of each class.
+pub(crate) fn padded_classes(
+    count: usize,
+    floor: usize,
+    lanes: impl Fn(std::ops::Range<usize>) -> usize,
+) -> Vec<usize> {
+    // Fewest lanes covering the first i items with the current class count.
+    let mut best: Vec<Option<(usize, Vec<usize>)>> = vec![None; count + 1];
     best[0] = Some((0, Vec::new()));
     loop {
-        if let Some((lanes, ends)) = &best[lengths.len()]
-            && lanes.saturating_sub(floor) as f64 <= MAX_PADDING * *lanes as f64
+        if let Some((total, ends)) = &best[count]
+            && total.saturating_sub(floor) as f64 <= MAX_PADDING * *total as f64
         {
             return ends.clone();
         }
-        best = (0..=lengths.len())
+        best = (0..=count)
             .map(|i| {
                 (0..i)
                     .filter_map(|j| {
-                        let (lanes, ends) = best[j].as_ref()?;
-                        Some((lanes + class_width(lengths[j], i - j) * (i - j), ends))
+                        let (total, ends) = best[j].as_ref()?;
+                        Some((total + lanes(j..i), ends))
                     })
-                    .min_by_key(|(lanes, _)| *lanes)
-                    .map(|(lanes, ends)| (lanes, [ends.as_slice(), &[i]].concat()))
+                    .min_by_key(|(total, _)| *total)
+                    .map(|(total, ends)| (total, [ends.as_slice(), &[i]].concat()))
             })
             .collect();
     }

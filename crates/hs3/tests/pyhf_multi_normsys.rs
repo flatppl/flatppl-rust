@@ -47,13 +47,20 @@ fn long_scalar_products_keep_per_bin_factors_separate() {
     });
     let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
     let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
-    let factors = (0..96)
+    // Each run of scalars between per-bin factors folds into one row, so the
+    // rows keep the chain's order. A run of 96 reduces with `prod`.
+    let short = (1..95).fold("f0".to_owned(), |acc, i| format!("mul({acc}, f{i})"));
+    let long = (0..96)
         .map(|i| format!("f{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    assert!(text.contains(&format!(
-        "c_long_expected = broadcast(mul, broadcast(mul, broadcast(mul, c_long_nominal, prod([{factors}])), gamma), last)"
-    )), "{text}");
+    assert!(
+        text.contains(&format!(
+            "c_factors = array(cat(fill({short}, 2), gamma, fill(last, 2), \
+         fill(prod([{long}]), 2), gamma, fill(last, 2)), [2, 3, 2], [1, 2, 3])"
+        )),
+        "{text}"
+    );
     assert_eq!(text.matches("prod(").count(), 1, "{text}");
 }
 
@@ -201,14 +208,16 @@ fn scalar_runs_multiply_rows_of_one_lane_tensor() {
          get(normsys_interp_poly6_exp_products_4, 1)]",
         "normsys_interp_poly6_exp_singles = get(normsys_interp_poly6_exp_lanes, [13])",
         // The product takes the first factor's place; a per-bin factor still
-        // splits the run, and a lone factor reads its own lane.
-        "c_signal_expected = broadcast(mul, broadcast(mul, broadcast(mul, \
-         broadcast(mul, c_signal_nominal, get(normsys_interp_poly6_exp_products, 1)), mu), g), \
-         get(normsys_interp_poly6_exp_singles, 1))",
-        "c_background_expected = broadcast(mul, c_background_nominal, \
-         get(normsys_interp_poly6_exp_products, 2))",
-        "c_other_expected = broadcast(mul, c_other_nominal, get(normsys_interp_poly6_exp_products, 3))",
-        "d_signal_expected = broadcast(mul, d_signal_nominal, get(normsys_interp_poly6_exp_products, 4))",
+        // splits the run, and a lone factor reads its own lane. Each run folds
+        // into one row; the one-row samples form their own class rather than
+        // pad, and the channel sums all rows in sample order.
+        "c_factors = array(cat(fill(mul(get(normsys_interp_poly6_exp_products, 1), mu), 2), g, \
+         fill(get(normsys_interp_poly6_exp_singles, 1), 2)), [1, 3, 2], [1, 2, 3])",
+        "c_factors_2 = array(cat(fill(get(normsys_interp_poly6_exp_products, 2), 2), \
+         fill(get(normsys_interp_poly6_exp_products, 3), 2)), [2, 1, 2], [1, 2, 3])",
+        "c_expected = pyhf_helpers.expected_counts(rowstack([get(c_yields, 1, all), \
+         get(c_yields_2, 1, all), get(c_yields_2, 2, all)]))",
+        "d_factors = array(cat(fill(get(normsys_interp_poly6_exp_products, 4), 1)), [1, 1, 1], [1, 2, 3])",
     ] {
         assert!(text.contains(line), "missing `{line}` in:\n{text}");
     }
@@ -236,6 +245,37 @@ fn a_lone_run_keeps_its_own_width() {
             "normsys_interp_poly6_exp_lanes = broadcast(pyhf_helpers.normsys_factor, \
              [0.9, 0.8, 0.7, 0.6, 0.5], [1.1, 1.2, 1.3, 1.4, 1.5], [a, b, c, d, e])"
         ),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_width_class_pads_short_samples_within_the_padding_bound() {
+    let sample = |name: &str, per_bin: bool| {
+        let mut modifiers = vec![
+            serde_json::json!({"name": format!("n_{name}"), "type": "normfactor", "data": null}),
+        ];
+        if per_bin {
+            modifiers.push(serde_json::json!({"name": "g", "type": "shapefactor", "data": null}));
+        }
+        serde_json::json!({"name": name, "data": [1.0, 2.0], "modifiers": modifiers})
+    };
+    let samples: Vec<_> = (0..8).map(|i| sample(&format!("s{i}"), i < 7)).collect();
+    let doc = serde_json::json!({
+        "channels": [{"name": "c", "samples": samples}],
+        "observations": [{"name": "c", "data": [8.0, 16.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "n_s0"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    // One unit row in 16 stays under the bound, so all samples share a call.
+    assert_eq!(
+        text.matches("pyhf_helpers.sample_yields(").count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        text.contains("fill(n_s7, 2), fill(1.0, 2)), [8, 2, 2], [1, 2, 3])"),
         "{text}"
     );
 }
