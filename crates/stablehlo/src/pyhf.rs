@@ -44,7 +44,11 @@ impl Emitter<'_> {
             None
         };
         let result = match (member, values.as_slice()) {
-            ("normsys_factor", [lo, hi, alpha]) => Ok(self.normsys_factor(lo, hi, alpha)),
+            // Converted normsys lanes carry one alpha per lane, so no product
+            // broadcasts an operand and native products add no contraction.
+            ("normsys_factor", [lo, hi, alpha]) => {
+                Ok(self.native_products(|e| e.normsys_factor(lo, hi, alpha)))
+            }
             ("histosys_shift", [lo, nominal, hi, alpha]) => {
                 Ok(self.histosys_shift(lo, nominal, hi, alpha))
             }
@@ -121,17 +125,22 @@ impl Emitter<'_> {
         let minus_one = self.scalar(-1.0);
         let x = self.max(&alpha, &minus_one);
         let x = self.min(&x, &one);
-        let x2 = self.mul(&x, &x);
-        let three = self.scalar(3.0);
-        let minus_ten = self.scalar(-10.0);
-        let fifteen = self.scalar(15.0);
-        let term = self.mul(&x2, &three);
-        let term = self.add(&minus_ten, &term);
-        let term = self.mul(&x2, &term);
-        let term = self.add(&fifteen, &term);
         // Share the alpha-only scale across bins. Keep the outer x so tiny
         // shifts survive large anchors and negative zero keeps its sign.
-        let scale = self.mul(&x, &term);
+        // Native products here never broadcast over bins. The bin products
+        // below keep the dot form, whose alpha adjoint is one contraction per
+        // channel rather than one per selected sample run.
+        let scale = self.native_products(|e| {
+            let x2 = e.mul(&x, &x);
+            let three = e.scalar(3.0);
+            let minus_ten = e.scalar(-10.0);
+            let fifteen = e.scalar(15.0);
+            let term = e.mul(&x2, &three);
+            let term = e.add(&minus_ten, &term);
+            let term = e.mul(&x2, &term);
+            let term = e.add(&fifteen, &term);
+            e.mul(&x, &term)
+        });
         let term = self.mul(&asymmetric, &scale);
         let term = self.add(&symmetric, &term);
         let polynomial = self.mul(&x, &term);
