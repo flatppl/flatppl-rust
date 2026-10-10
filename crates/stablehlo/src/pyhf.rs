@@ -125,10 +125,26 @@ impl Emitter<'_> {
                     .collect()
             }
         };
+        let [_, bins] = self.shape_of(nominal)?[..] else {
+            return None;
+        };
+        let scalars = factors
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|factor| match *factor {
+                        YieldFactor::Scalar(node) => self.factor_leaves(node).len(),
+                        YieldFactor::PerBin(_) => 0,
+                    })
+                    .sum()
+            })
+            .collect();
         Some(YieldBlock {
             nominals,
             shifts,
             factors,
+            bins,
+            scalars,
         })
     }
 
@@ -207,8 +223,10 @@ impl Emitter<'_> {
         }
     }
 
-    /// Lower converter-form yields: each row as the per-sample chain, in the
-    /// order the rows are summed.
+    /// Lower converter-form yields. The CPU target multiplies each row as the
+    /// per-sample chain in the order the rows are summed. The GPU target takes
+    /// the summed rows as one block, whatever class they came from, and scales
+    /// the stacked templates by its scalar column where that pays.
     fn lower_yield_rows(
         &mut self,
         member: &str,
@@ -216,15 +234,22 @@ impl Emitter<'_> {
         blocks: &[YieldBlock],
         rows: &[(usize, usize)],
     ) -> Result<Value, EmitError> {
-        let mut values = Vec::with_capacity(rows.len());
-        for &(block, row) in rows {
-            values.push(self.chained_row(&blocks[block], row)?);
-        }
-        // A one-sample sum is that sample's row, as in the chain.
-        if member == "expected_counts" && values.len() == 1 {
-            return Ok(values.remove(0));
-        }
-        let samples = self.stack_rows(&values);
+        let gpu = self.target == crate::Target::Gpu;
+        let merged = gpu.then(|| YieldBlock::merge(blocks, rows));
+        let samples = match merged {
+            Some(block) if block.takes_column() => self.scaled_stack(&block)?,
+            _ => {
+                let mut values = Vec::with_capacity(rows.len());
+                for &(block, row) in rows {
+                    values.push(self.chained_row(&blocks[block], row)?);
+                }
+                // A one-sample sum is that sample's row, as in the chain.
+                if member == "expected_counts" && values.len() == 1 {
+                    return Ok(values.remove(0));
+                }
+                self.stack_rows(&values)
+            }
+        };
         Ok(if member == "expected_counts" {
             let samples = self.typed_axes(args[0], samples);
             self.pyhf_reduce(&samples, 0, false)
@@ -243,21 +268,74 @@ impl Emitter<'_> {
         Ok(template)
     }
 
-    /// Multiply a sample's template by its factors in the chain's order.
+    /// Multiply a sample's template by its factors. The CPU target keeps the
+    /// chain's order, factor by factor. The GPU target applies the per-bin
+    /// factors, then the product of all scalar factors once, so the reverse
+    /// pass contracts the bins once per sample.
     fn chained_row(&mut self, block: &YieldBlock, sample: usize) -> Result<Value, EmitError> {
         let mut row = self.shifted_template(block, sample)?;
+        let fold = self.target == crate::Target::Gpu;
+        let mut scale: Option<Value> = None;
         for factor in &block.factors[sample] {
-            // A folded run multiplies factor by factor.
-            let nodes = match *factor {
-                YieldFactor::Scalar(node) => self.factor_leaves(node),
-                YieldFactor::PerBin(node) => vec![node],
-            };
-            for node in nodes {
-                let factor = self.lower_node(node)?;
-                row = self.mul(&row, &factor);
+            match *factor {
+                YieldFactor::PerBin(node) => {
+                    let factor = self.lower_node(node)?;
+                    row = self.mul(&row, &factor);
+                }
+                YieldFactor::Scalar(node) if fold => {
+                    let factor = self.lower_node(node)?;
+                    scale = Some(match scale {
+                        Some(scale) => self.mul(&scale, &factor),
+                        None => factor,
+                    });
+                }
+                YieldFactor::Scalar(node) => {
+                    for node in self.factor_leaves(node) {
+                        let factor = self.lower_node(node)?;
+                        row = self.mul(&row, &factor);
+                    }
+                }
             }
         }
+        if let Some(scale) = scale {
+            row = self.mul(&row, &scale);
+        }
         Ok(self.convert(&row, ElemKind::Real))
+    }
+
+    /// Apply each sample's shift and per-bin factors, then multiply the stacked
+    /// templates once by the column of per-sample scalar products. Products
+    /// commute, so this equals the chain. The reverse pass then contracts the
+    /// bins once per channel instead of once per scalar factor.
+    fn scaled_stack(&mut self, block: &YieldBlock) -> Result<Value, EmitError> {
+        let mut templates = Vec::with_capacity(block.nominals.len());
+        let mut scales = Vec::with_capacity(block.nominals.len());
+        for (sample, factors) in block.factors.iter().enumerate() {
+            let mut template = self.shifted_template(block, sample)?;
+            let mut scale: Option<Value> = None;
+            for factor in factors {
+                match *factor {
+                    YieldFactor::PerBin(node) => {
+                        let factor = self.lower_node(node)?;
+                        template = self.mul(&template, &factor);
+                    }
+                    YieldFactor::Scalar(node) => {
+                        let factor = self.lower_node(node)?;
+                        scale = Some(match scale {
+                            Some(scale) => self.mul(&scale, &factor),
+                            None => factor,
+                        });
+                    }
+                }
+            }
+            let scale = scale.unwrap_or_else(|| self.scalar(1.0));
+            let scale = self.convert(&scale, ElemKind::Real);
+            scales.push(self.vector(&[scale]));
+            templates.push(self.convert(&template, ElemKind::Real));
+        }
+        let templates = self.stack_rows(&templates);
+        let column = self.vector(&scales);
+        Ok(self.mul(&templates, &column))
     }
 
     fn stack_rows(&mut self, rows: &[Value]) -> Value {
@@ -527,6 +605,38 @@ struct YieldBlock {
     /// Each sample's non-zero shift rows.
     shifts: Vec<Vec<NodeId>>,
     factors: Vec<Vec<YieldFactor>>,
+    bins: u64,
+    /// Each sample's count of scalar factors.
+    scalars: Vec<usize>,
+}
+
+impl YieldBlock {
+    /// The given rows of several blocks as one block, in that order.
+    fn merge(blocks: &[YieldBlock], rows: &[(usize, usize)]) -> YieldBlock {
+        let pick = |&(block, row): &(usize, usize)| (&blocks[block], row);
+        YieldBlock {
+            nominals: rows.iter().map(pick).map(|(b, r)| b.nominals[r]).collect(),
+            shifts: rows
+                .iter()
+                .map(pick)
+                .map(|(b, r)| b.shifts[r].clone())
+                .collect(),
+            factors: rows
+                .iter()
+                .map(pick)
+                .map(|(b, r)| b.factors[r].clone())
+                .collect(),
+            bins: blocks[0].bins,
+            scalars: rows.iter().map(pick).map(|(b, r)| b.scalars[r]).collect(),
+        }
+    }
+
+    /// A scalar column pays on GPU once samples average two scalar factors.
+    /// A one-bin stack times a column never finishes Enzyme's pass pipeline.
+    fn takes_column(&self) -> bool {
+        let samples = self.nominals.len();
+        samples > 1 && self.bins > 1 && self.scalars.iter().sum::<usize>() >= 2 * samples
+    }
 }
 
 #[derive(Clone, Copy)]
