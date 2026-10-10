@@ -2256,7 +2256,7 @@ fn poisson_large_logpdf(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
         ],
     );
     let correction = e.mul(&inverse, &correction);
-    let deviance = poisson_deviance(e, x, rate);
+    let deviance = e.native_products(|e| poisson_deviance(e, x, rate));
     let half = e.scalar(0.5);
     let log_x = e.log(x);
     let half_log_x = e.mul(&half, &log_x);

@@ -6,6 +6,16 @@
 use super::*;
 
 impl Emitter<'_> {
+    /// Slice-product fusion reassociates chains whose factors are slices of one
+    /// tensor. Closed-form polynomial helpers have at most one slice factor per
+    /// chain, so the dot form there would only add lift reshapes.
+    pub(crate) fn native_products(&mut self, lower: impl FnOnce(&mut Self) -> Value) -> Value {
+        let restricted = std::mem::replace(&mut self.restrict_enzyme_compatible, false);
+        let value = lower(self);
+        self.restrict_enzyme_compatible = restricted;
+        value
+    }
+
     /// Select every `stride`th cell without Enzyme's faulty strided-slice adjoint.
     /// Reshape complete stride blocks; at most one selected tail remains.
     pub(super) fn enzyme_strided_axis(&mut self, input: &Value, axis: usize, stride: u64) -> Value {
