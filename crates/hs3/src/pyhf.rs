@@ -1280,7 +1280,7 @@ fn sample_yields(
     let mut order: Vec<usize> = (0..samples.len()).collect();
     order.sort_by_key(|&s| std::cmp::Reverse(samples[s].2.len()));
     let floor: usize = samples.iter().map(|(_, _, factors)| factors.len()).sum();
-    let ends = crate::normsys::padded_classes(samples.len(), floor, |range| {
+    let ends = flatppl_core::width_classes::padded_classes(samples.len(), floor, |range| {
         range.len() * samples[order[range.start]].2.len()
     });
     let mut start = 0;
