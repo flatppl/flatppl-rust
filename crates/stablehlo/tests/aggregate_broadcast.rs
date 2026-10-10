@@ -1,6 +1,18 @@
 //! Aggregation contracts model axes, never the enclosing callable's batch axes.
 
 fn emit(source: &str) -> String {
+    emit_for(
+        source,
+        flatppl_stablehlo::Target::Cpu,
+        flatppl_stablehlo::Dtype::F32,
+    )
+}
+
+fn emit_for(
+    source: &str,
+    target: flatppl_stablehlo::Target,
+    dtype: flatppl_stablehlo::Dtype,
+) -> String {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -16,6 +28,8 @@ fn emit(source: &str) -> String {
         flatppl_stablehlo::Mode::LogDensity,
         &flatppl_stablehlo::EmitOptions {
             restrict_enzyme_compatible: false,
+            target,
+            dtype,
             ..Default::default()
         },
     )
@@ -287,6 +301,56 @@ fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
              inputs = (x, index)\noutputs = {outputs}\n"
         ));
         assert_eq!(ir.matches("stablehlo.reduce(").count(), count, "{ir}");
+    }
+}
+
+#[test]
+fn ragged_segment_sums_pack_by_width_class_on_cpu_f32() {
+    use flatppl_stablehlo::{Dtype, Target};
+    // Five sums of runs from one source of `size` elements reread 5 * size.
+    let runs = |lengths: &[usize], size: usize, target, dtype| {
+        let mut start = 1;
+        let sums = lengths
+            .iter()
+            .map(|&length| {
+                let rows = (start..start + length)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>();
+                start += length;
+                format!("sum(x[[{}]])", rows.join(", "))
+            })
+            .collect::<Vec<_>>();
+        emit_for(
+            &format!(
+                "x = elementof(cartpow(reals, {size}))\ninputs = x\noutputs = ({})\n",
+                sums.join(", ")
+            ),
+            target,
+            dtype,
+        )
+    };
+    let reductions = |ir: &str| ir.matches("stablehlo.reduce(").count();
+    let ragged = [29, 2, 3, 1, 2];
+    // Padding to 29 rows would quadruple the live rows. On CPU in f32 with
+    // 10,000 reread elements the long run keeps its own reduction and the
+    // short runs stack as padded slices.
+    let split = runs(&ragged, 2000, Target::Cpu, Dtype::F32);
+    assert_eq!(reductions(&split), 2, "{split}");
+    assert!(!split.contains("\"stablehlo.gather\""), "{split}");
+    // Below the work bound, in f64 and on GPU each run keeps its reduction.
+    for (size, target, dtype) in [
+        (1999, Target::Cpu, Dtype::F32),
+        (2000, Target::Cpu, Dtype::F64),
+        (2000, Target::Gpu, Dtype::F32),
+    ] {
+        let unsplit = runs(&ragged, size, target, dtype);
+        assert_eq!(reductions(&unsplit), 5, "{unsplit}");
+    }
+    // Within the padding bound both targets keep one gathered reduction.
+    for target in [Target::Cpu, Target::Gpu] {
+        let packed = runs(&[2, 3, 1, 2], 40, target, Dtype::F32);
+        assert_eq!(reductions(&packed), 1, "{packed}");
+        assert!(packed.contains("\"stablehlo.gather\""), "{packed}");
     }
 }
 

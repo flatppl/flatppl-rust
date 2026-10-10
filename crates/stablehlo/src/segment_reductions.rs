@@ -3,6 +3,8 @@
 //! This terminal pass reads typed provenance and edits only exclusive view chains.
 
 use super::*;
+use crate::Target;
+use flatppl_core::width_classes::width_classes;
 
 struct Segment {
     result: Value,
@@ -380,16 +382,16 @@ pub(super) fn finish(
     let mut edits = HashMap::new();
     let mut removed = HashSet::new();
     let mut next = out.next;
-    for group in groups.into_iter().filter(|g| g.len() > 1) {
+    let split_profile = out.target == Target::Cpu && matches!(out.dtype, Dtype::F32);
+    for (group, ragged) in groups
+        .into_iter()
+        .flat_map(|group| {
+            let split = split_profile && duplicated_work(out, &group) >= MIN_DUPLICATED_WORK;
+            packed_classes(group, split)
+        })
+        .filter(|(g, _)| g.len() > 1)
+    {
         let maximum = group.iter().map(|s| s.indices.len()).max().unwrap();
-        let rows = group.iter().map(|s| s.indices.len()).sum::<usize>();
-        let Some(padded) = maximum.checked_mul(group.len()) else {
-            continue;
-        };
-        // Bound extra reduction work to the number of live rows.
-        if padded - rows > rows {
-            continue;
-        }
         let first = &group[0];
         let Some(width) = first.sources.iter().try_fold(0_u64, |width, source| {
             width.checked_add(shape(&source.ty)[first.axis]?)
@@ -405,7 +407,7 @@ pub(super) fn finish(
         // can hold an identical index tensor defined after the first segment.
         let mut scratch = out.scratch_emitter();
         scratch.next = next;
-        let reduced = emit_reductions(&mut scratch, &group, maximum);
+        let reduced = emit_reductions(&mut scratch, &group, maximum, ragged);
         let shared = scratch.body.clone();
         scratch.body.clear();
         for (lane, segment) in group.iter().enumerate() {
@@ -446,7 +448,67 @@ pub(super) fn finish(
     out.live_lines(&body, rets).join("\n")
 }
 
-fn emit_reductions(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) -> Value {
+/// Separate reductions of one source let XLA:CPU copy the source's producer
+/// into each reduction, so a ragged group rereads the source once per run.
+/// The split pays only for f32 groups that reread at least this many source
+/// elements per point. In a 2026-10-10 profile of the pyhf four-top model on
+/// M4, the 15 duplicated f32 reduce fusions over the 161x17 histosys block cost
+/// 88 us per step and the f64 ones 15 us, while packing costs about the same
+/// in both. Drop the f32 guard once XLA:CPU compiles those f32 fusions as well.
+const MIN_DUPLICATED_WORK: usize = 10_000;
+
+/// Source elements per point that the group's separate reductions reread.
+fn duplicated_work(out: &Emitter<'_>, group: &[Segment]) -> usize {
+    let cells = group.first().map_or(0, |first| {
+        first
+            .sources
+            .iter()
+            .map(|source| {
+                shape(&source.ty)[out.batch_rank(source)..]
+                    .iter()
+                    .map(|d| d.unwrap_or(0) as usize)
+                    .product::<usize>()
+            })
+            .sum::<usize>()
+    });
+    cells.saturating_mul(group.len())
+}
+
+/// Keep a group whose padding at most doubles its live rows as one reduction.
+/// With `split`, pack a ragged group by the shared width classes over
+/// decreasing lengths and mark the classes ragged. Otherwise a ragged group
+/// stays unpacked: on GPU each padded class costs extra kernels.
+fn packed_classes(mut group: Vec<Segment>, split: bool) -> Vec<(Vec<Segment>, bool)> {
+    let maximum = group.iter().map(|s| s.indices.len()).max().unwrap_or(0);
+    let rows = group.iter().map(|s| s.indices.len()).sum::<usize>();
+    if maximum.saturating_mul(group.len()) - rows <= rows {
+        return vec![(group, false)];
+    }
+    if !split {
+        return Vec::new();
+    }
+    group.sort_by_key(|s| std::cmp::Reverse(s.indices.len()));
+    let lengths = group.iter().map(|s| s.indices.len()).collect::<Vec<_>>();
+    let mut segments = group.into_iter();
+    let mut start = 0;
+    width_classes(&lengths)
+        .into_iter()
+        .map(|end| {
+            let mut class = segments.by_ref().take(end - start).collect::<Vec<_>>();
+            start = end;
+            // The shared reduction lands on the first segment's line.
+            class.sort_by_key(|s| s.line);
+            (class, true)
+        })
+        .collect()
+}
+
+fn emit_reductions(
+    out: &mut Emitter<'_>,
+    segments: &[Segment],
+    maximum: usize,
+    ragged: bool,
+) -> Value {
     let first = &segments[0];
     let source = &first.sources[0];
     let axis = first.axis;
@@ -460,7 +522,7 @@ fn emit_reductions(out: &mut Emitter<'_>, segments: &[Segment], maximum: usize) 
         ty: MlirTy::Scalar,
         elem: source.elem,
     };
-    let gathered = padded_gather(out, segments, maximum, &identity);
+    let gathered = padded_gather(out, segments, maximum, &identity, ragged);
     let reduced = out.reduce_axis_lit(&first.op, &first.init, &gathered, axis + 1);
     let mut perm = vec![0];
     perm.extend(
@@ -481,6 +543,7 @@ fn padded_gather(
     segments: &[Segment],
     maximum: usize,
     identity: &Value,
+    ragged: bool,
 ) -> Value {
     let first = &segments[0];
     let source = &first.sources[0];
@@ -544,6 +607,76 @@ fn padded_gather(
         let mut perm = vec![axis as u64];
         perm.extend((0..dims.len() as u64 + 1).filter(|&d| d != axis as u64));
         return out.transpose(&view, &perm);
+    }
+    // Contiguous ragged runs stack as padded slices, whose adjoint slices the
+    // cotangent instead of scattering it back through a gather. The batched
+    // forward graph of a packed group runs faster from the gather.
+    if ragged
+        && segments
+            .iter()
+            .all(|s| s.indices.windows(2).all(|p| p[1] == p[0] + 1))
+    {
+        let input = Value {
+            ssa: extended,
+            ty: extended_ty,
+            elem: source.elem,
+        };
+        let ones = vec![1; dims.len()];
+        let mut stacked_dims = dims.to_vec();
+        stacked_dims[axis] = Some(maximum as u64);
+        stacked_dims.insert(0, Some(1));
+        let pieces = segments
+            .iter()
+            .map(|segment| {
+                let length = segment.indices.len() as u64;
+                let mut starts = vec![0; dims.len()];
+                let mut limits = dims.iter().map(|d| d.unwrap()).collect::<Vec<_>>();
+                starts[axis] = segment.indices[0];
+                limits[axis] = segment.indices[0] + length;
+                let mut piece = out.slice(&input, &starts, &limits, &ones);
+                if length < maximum as u64 {
+                    let mut pad_dims = dims.to_vec();
+                    pad_dims[axis] = Some(maximum as u64 - length);
+                    let pad = out.broadcast_in_dim(identity, &[], MlirTy::Ranked(pad_dims));
+                    let mut padded_dims = dims.to_vec();
+                    padded_dims[axis] = Some(maximum as u64);
+                    let padded_ty = MlirTy::Ranked(padded_dims);
+                    piece = Value {
+                        ssa: out.pure(format!(
+                            "stablehlo.concatenate {}, {}, dim = {axis} : ({}, {}) -> {}",
+                            piece.ssa,
+                            pad.ssa,
+                            piece.ty.render(out.dtype, source.elem),
+                            pad.ty.render(out.dtype, source.elem),
+                            padded_ty.render(out.dtype, source.elem),
+                        )),
+                        ty: padded_ty,
+                        elem: source.elem,
+                    };
+                }
+                out.reshape(&piece, MlirTy::Ranked(stacked_dims.clone()))
+            })
+            .collect::<Vec<_>>();
+        stacked_dims[0] = Some(count);
+        let ty = MlirTy::Ranked(stacked_dims);
+        return Value {
+            ssa: out.pure(format!(
+                "stablehlo.concatenate {}, dim = 0 : ({}) -> {}",
+                pieces
+                    .iter()
+                    .map(|p| p.ssa.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pieces
+                    .iter()
+                    .map(|p| p.ty.render(out.dtype, source.elem))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ty.render(out.dtype, source.elem),
+            )),
+            ty,
+            elem: source.elem,
+        };
     }
     let index = out
         .folded_constant(
