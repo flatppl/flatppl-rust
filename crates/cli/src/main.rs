@@ -190,6 +190,9 @@ enum Command {
         /// Floating-point precision for emitted tensors.
         #[arg(long, default_value = "f32", value_parser = ["f32", "f64"])]
         dtype: String,
+        /// Lowering profile for the executing backend; the output runs on any backend.
+        #[arg(long, default_value = "cpu", value_parser = ["cpu", "gpu"])]
+        target: String,
         /// Restrict lowering to avoid known Enzyme limitations (not a compatibility guarantee).
         ///
         /// Use --restrict-enzyme-compatible=false for unrestricted emission.
@@ -338,6 +341,7 @@ fn main() -> ExitCode {
             input,
             mode,
             dtype,
+            target,
             restrict_enzyme_compatible,
             numerical_integrals,
             integration_rtol,
@@ -359,6 +363,11 @@ fn main() -> ExitCode {
                     atol: integration_atol,
                     max_intervals: integration_max_intervals,
                 }),
+                target: if target == "gpu" {
+                    flatppl_stablehlo::Target::Gpu
+                } else {
+                    flatppl_stablehlo::Target::Cpu
+                },
             },
             output.as_deref(),
         ),

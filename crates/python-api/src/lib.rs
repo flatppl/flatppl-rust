@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 
 use flatppl_host::{
     BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
+    Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -107,7 +108,7 @@ impl NativeModule {
             .expect("binding metadata contains only JSON values")
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None))]
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu"))]
     fn export(
         &self,
         py: Python<'_>,
@@ -115,11 +116,17 @@ impl NativeModule {
         autodiff: bool,
         integration: Option<(f64, f64, u32)>,
         batch: Option<BatchArguments>,
+        target: &str,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
             "float64" => Dtype::F64,
             _ => return Err(PyValueError::new_err("dtype must be float32 or float64")),
+        };
+        let target = match target {
+            "cpu" => Target::Cpu,
+            "gpu" => Target::Gpu,
+            _ => return Err(PyValueError::new_err("target must be cpu or gpu")),
         };
         let options = EmitOptions {
             dtype,
@@ -129,6 +136,7 @@ impl NativeModule {
                 atol,
                 max_intervals,
             }),
+            target,
         };
         let exported = py
             .detach(|| match batch {

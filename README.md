@@ -60,6 +60,10 @@ It requires static tensor shapes and deterministic queries, and refuses `probit`
 and real `cumprod`. Pass `--restrict-enzyme-compatible=false` for unrestricted emission,
 including sampling queries. The Rust API exposes the same choice through
 `EmitOptions::restrict_enzyme_compatible`, which defaults to `true`.
+`--target cpu|gpu` (`EmitOptions::target`, default `cpu`) picks a lowering
+profile for the executing backend. It changes only how equivalent operations
+are lowered: the output keeps the same entry point, inputs and values, and runs
+on any backend.
 Qualification targets first-order real-input CPU derivatives with Enzyme-AD 0.0.15
 and JAX 0.10.2. The flag does not invoke Enzyme or guarantee every composition
 or compiler version supports differentiation. Unrestricted output may also work

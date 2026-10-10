@@ -14,4 +14,4 @@ mod export;
 pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule};
 pub use constants::Constant;
 pub use export::{Export, Field, Schema};
-pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions};
+pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};

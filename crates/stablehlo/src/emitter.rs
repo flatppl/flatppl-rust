@@ -135,6 +135,7 @@ pub struct Emitter<'m> {
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
     integration: Option<crate::IntegrationOptions>,
+    target: crate::Target,
     integrating: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
@@ -195,6 +196,7 @@ impl<'m> Emitter<'m> {
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             integration: None,
+            target: crate::Target::Cpu,
             integrating: false,
             next: 0,
             memo: HashMap::new(),
@@ -220,6 +222,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.integration = opts.integration;
+        emitter.target = opts.target;
         emitter
     }
 
@@ -228,6 +231,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
         emitter.integration = self.integration;
+        emitter.target = self.target;
         emitter
     }
 
@@ -2007,6 +2011,19 @@ impl<'m> Emitter<'m> {
                 cell_axis -= *rank;
             }
             axes.layers.retain(|&rank| rank != 0);
+        }
+        if self.restrict_enzyme_compatible
+            && self.target == crate::Target::Cpu
+            && combine_op == "stablehlo.multiply"
+            && a.elem == ElemKind::Real
+            && let Some(out) = self.product_tree(a, axis, &result_ty, &axes)
+        {
+            self.remember_pointwise(
+                &out.ssa,
+                &out,
+                Pointwise::Reduce(a.clone(), axis, combine_op.to_owned(), init_lit.to_owned()),
+            );
+            return out;
         }
         let init_ssa = self.pure(format!("stablehlo.constant dense<{init_lit}> : {elem_ty}"));
         let ssa = self.pure_axes(format!(

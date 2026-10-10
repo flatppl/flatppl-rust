@@ -1,9 +1,13 @@
 //! Lowerings selected by the Enzyme compatibility option. Enzyme rewrites sliced
 //! multiply trees into product reductions. Extent-one tensor dots keep binary
-//! products out of that rewrite. A `prod` reduction lowers to one
-//! `stablehlo.reduce`, whose zero-safe adjoint needs the fork's halving tree.
+//! products out of that rewrite. For the GPU profile a `prod` reduction lowers
+//! to one `stablehlo.reduce`, whose zero-safe adjoint needs the fork's halving
+//! tree. The CPU profile keeps a pairwise tree of extent-one dots.
 
 use super::*;
+
+/// Narrowest `prod` row the CPU profile lowers as a pairwise tree.
+const CPU_PRODUCT_TREE_MIN_WIDTH: u64 = 64;
 
 impl Emitter<'_> {
     /// Slice-product fusion reassociates chains whose factors are slices of one
@@ -79,6 +83,82 @@ impl Emitter<'_> {
             };
         }
         output
+    }
+
+    /// The CPU profile pairs `prod` factors of wide rows in logarithmic depth,
+    /// keeping every other axis tensorized. On XLA:CPU the fork's reduction
+    /// adjoint costs more than the tree only for rows of at least
+    /// [`CPU_PRODUCT_TREE_MIN_WIDTH`] factors; narrower rows keep the reduction.
+    /// Public mode rejects dynamic shapes.
+    pub(super) fn product_tree(
+        &mut self,
+        input: &Value,
+        axis: usize,
+        result_ty: &MlirTy,
+        result_axes: &Axes,
+    ) -> Option<Value> {
+        let mut dims = shape(&input.ty)
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()?;
+        if dims[axis] < CPU_PRODUCT_TREE_MIN_WIDTH {
+            return None;
+        }
+        let mut current = input.clone();
+        let strides = vec![1; dims.len()];
+        while dims[axis] > 1 {
+            let half = dims[axis] / 2;
+            let mut starts = vec![0; dims.len()];
+            let mut limits = dims.clone();
+            limits[axis] = 2 * half;
+            let prefix = self.slice(&current, &starts, &limits, &strides);
+            let mut paired_dims = dims.clone();
+            paired_dims[axis] = half;
+            paired_dims.insert(axis + 1, 2);
+            let paired = self.reshape(
+                &prefix,
+                MlirTy::Ranked(paired_dims.iter().copied().map(Some).collect()),
+            );
+            let mut pair_starts = vec![0; paired_dims.len()];
+            let pair_strides = vec![1; paired_dims.len()];
+            paired_dims[axis + 1] = 1;
+            let left = self.slice(&paired, &pair_starts, &paired_dims, &pair_strides);
+            pair_starts[axis + 1] = 1;
+            paired_dims[axis + 1] = 2;
+            let right = self.slice(&paired, &pair_starts, &paired_dims, &pair_strides);
+            let product = self.product_pair(&left, &right);
+            paired_dims.remove(axis + 1);
+            let mut product = self.reshape(
+                &product,
+                MlirTy::Ranked(paired_dims.into_iter().map(Some).collect()),
+            );
+            if dims[axis] % 2 != 0 {
+                starts[axis] = 2 * half;
+                limits[axis] = dims[axis];
+                let tail = self.slice(&current, &starts, &limits, &strides);
+                let mut next_dims = dims.clone();
+                next_dims[axis] = half + 1;
+                let ty = MlirTy::Ranked(next_dims.into_iter().map(Some).collect());
+                let lhs_ty = product.ty.render(self.dtype, product.elem);
+                let rhs_ty = tail.ty.render(self.dtype, tail.elem);
+                let output_ty = ty.render(self.dtype, product.elem);
+                let ssa = self.pure_like(
+                    format!(
+                        "stablehlo.concatenate {}, {}, dim = {axis} : ({lhs_ty}, {rhs_ty}) -> {output_ty}",
+                        product.ssa, tail.ssa
+                    ),
+                    &product,
+                );
+                product = Value {
+                    ssa,
+                    ty,
+                    elem: input.elem,
+                };
+            }
+            dims[axis] = dims[axis].div_ceil(2);
+            current = product;
+        }
+        Some(self.reshape_axes(&current, result_ty.clone(), result_axes.clone()))
     }
 
     /// A one-element contraction is multiplication, with no quotient in its

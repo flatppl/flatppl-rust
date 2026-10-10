@@ -234,6 +234,15 @@ pub enum Dtype {
     F64,
 }
 
+/// Lowering profile for the backend that runs the StableHLO. It selects
+/// between equivalent lowerings; the output runs on any backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Target {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
 /// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter
 /// never assumes/hardcodes 64-bit floats. Restrictions for known Enzyme
 /// limitations are enabled by default.
@@ -244,6 +253,8 @@ pub struct EmitOptions {
     pub restrict_enzyme_compatible: bool,
     /// Opt in to adaptive numerical integration. `None` requires exact lowering.
     pub integration: Option<IntegrationOptions>,
+    /// Lowering profile. Values and derivatives do not depend on it.
+    pub target: Target,
 }
 
 /// Error estimates for positive scalar integrals, evaluated in log space.
@@ -279,6 +290,7 @@ impl Default for EmitOptions {
             dtype: Dtype::F32,
             restrict_enzyme_compatible: true,
             integration: None,
+            target: Target::Cpu,
         }
     }
 }
