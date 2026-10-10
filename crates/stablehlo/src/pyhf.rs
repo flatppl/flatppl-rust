@@ -31,6 +31,9 @@ impl Emitter<'_> {
         args: &[NodeId],
         broadcast: bool,
     ) -> Result<Value, EmitError> {
+        if !broadcast && let Some(YieldRows { blocks, rows }) = self.yield_rows(member, args) {
+            return self.lower_yield_rows(member, args, &blocks, &rows);
+        }
         let mut values = args
             .iter()
             .map(|&arg| {
@@ -73,6 +76,282 @@ impl Emitter<'_> {
                 result
             }
             None => result,
+        }
+    }
+
+    /// Read converter-form `sample_yields` arguments: nominal rows, one shift
+    /// per sample, and each sample's factors in multiplication order, where
+    /// `fill(x, bins)` carries a scalar and a unit fill pads. `None` for any
+    /// other spelling, which takes the dense lowering.
+    fn yield_block(&self, nominal: NodeId, shifts: NodeId, factors: NodeId) -> Option<YieldBlock> {
+        let nominals = self.call_args(nominal, "rowstack")?;
+        let [rows] = nominals else { return None };
+        let nominals = self.call_args(*rows, "vector")?.to_vec();
+        let samples = nominals.len();
+        let shifts = match self.uniform_fill(shifts) {
+            Some(0.0) => vec![Vec::new(); samples],
+            Some(_) => return None,
+            None => {
+                let (cells, width) = self.rank3_cells(shifts, samples)?;
+                cells
+                    .chunks(width)
+                    .map(|row| {
+                        row.iter()
+                            .copied()
+                            .filter(|&cell| self.scalar_fill(cell) != Some(Some(0.0)))
+                            .collect()
+                    })
+                    .collect()
+            }
+        };
+        let factors = match self.uniform_fill(factors) {
+            Some(1.0) => vec![Vec::new(); samples],
+            Some(_) => return None,
+            None => {
+                let (cells, width) = self.rank3_cells(factors, samples)?;
+                cells
+                    .chunks(width)
+                    .map(|row| {
+                        row.iter()
+                            .filter_map(|&cell| match self.scalar_fill(cell) {
+                                Some(Some(1.0)) => None,
+                                Some(_) => Some(YieldFactor::Scalar(
+                                    self.call_args(cell, "fill").unwrap()[0],
+                                )),
+                                None => Some(YieldFactor::PerBin(cell)),
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+        };
+        Some(YieldBlock {
+            nominals,
+            shifts,
+            factors,
+        })
+    }
+
+    /// The converter-form blocks behind `sample_yields(…)`,
+    /// `expected_counts(sample_yields(…))` or `expected_counts` of a stack of
+    /// such blocks' rows, with the (block, row) of each summed sample in order.
+    fn yield_rows(&self, member: &str, args: &[NodeId]) -> Option<YieldRows> {
+        let whole = |block: YieldBlock| {
+            let rows = (0..block.nominals.len()).map(|row| (0, row)).collect();
+            YieldRows {
+                blocks: vec![block],
+                rows,
+            }
+        };
+        match (member, args) {
+            ("sample_yields", &[nominal, shifts, factors]) => {
+                self.yield_block(nominal, shifts, factors).map(whole)
+            }
+            ("expected_counts", &[samples]) => {
+                if let Some(block) = self.yields_call(samples) {
+                    return Some(whole(block));
+                }
+                let [rows] = self.call_args(samples, "rowstack")? else {
+                    return None;
+                };
+                let mut sources: Vec<NodeId> = Vec::new();
+                let mut blocks = Vec::new();
+                let mut cells = Vec::new();
+                for &cell in self.call_args(*rows, "vector")? {
+                    let [yields, row, all] = self.call_args(cell, "get")? else {
+                        return None;
+                    };
+                    if !matches!(self.node(*all), Node::Const(sym) if self.resolve(*sym) == "all") {
+                        return None;
+                    }
+                    let yields = self.resolve_ref_one(*yields);
+                    let block = match sources.iter().position(|&source| source == yields) {
+                        Some(block) => block,
+                        None => {
+                            blocks.push(self.yields_call(yields)?);
+                            sources.push(yields);
+                            blocks.len() - 1
+                        }
+                    };
+                    let row = self.literal(*row)? as usize;
+                    if row == 0 || row > blocks[block].nominals.len() {
+                        return None;
+                    }
+                    cells.push((block, row - 1));
+                }
+                Some(YieldRows {
+                    blocks,
+                    rows: cells,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The converter-form block of a `pyhf_helpers.sample_yields(…)` call.
+    fn yields_call(&self, id: NodeId) -> Option<YieldBlock> {
+        let Node::Call(call) = self.node(self.resolve_ref_one(id)) else {
+            return None;
+        };
+        let CallHead::User(callee) = call.head else {
+            return None;
+        };
+        let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
+        match (module.as_str(), member.as_str(), &call.args[..]) {
+            ("pyhf_helpers", "sample_yields", &[nominal, shifts, factors])
+                if call.named.is_empty() =>
+            {
+                self.yield_block(nominal, shifts, factors)
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower converter-form yields: each row as the per-sample chain, in the
+    /// order the rows are summed.
+    fn lower_yield_rows(
+        &mut self,
+        member: &str,
+        args: &[NodeId],
+        blocks: &[YieldBlock],
+        rows: &[(usize, usize)],
+    ) -> Result<Value, EmitError> {
+        let mut values = Vec::with_capacity(rows.len());
+        for &(block, row) in rows {
+            values.push(self.chained_row(&blocks[block], row)?);
+        }
+        // A one-sample sum is that sample's row, as in the chain.
+        if member == "expected_counts" && values.len() == 1 {
+            return Ok(values.remove(0));
+        }
+        let samples = self.stack_rows(&values);
+        Ok(if member == "expected_counts" {
+            let samples = self.typed_axes(args[0], samples);
+            self.pyhf_reduce(&samples, 0, false)
+        } else {
+            samples
+        })
+    }
+
+    /// A sample's nominal plus its shift rows.
+    fn shifted_template(&mut self, block: &YieldBlock, sample: usize) -> Result<Value, EmitError> {
+        let mut template = self.lower_node(block.nominals[sample])?;
+        for &row in &block.shifts[sample] {
+            let row = self.lower_node(row)?;
+            template = self.add(&template, &row);
+        }
+        Ok(template)
+    }
+
+    /// Multiply a sample's template by its factors in the chain's order.
+    fn chained_row(&mut self, block: &YieldBlock, sample: usize) -> Result<Value, EmitError> {
+        let mut row = self.shifted_template(block, sample)?;
+        for factor in &block.factors[sample] {
+            // A folded run multiplies factor by factor.
+            let nodes = match *factor {
+                YieldFactor::Scalar(node) => self.factor_leaves(node),
+                YieldFactor::PerBin(node) => vec![node],
+            };
+            for node in nodes {
+                let factor = self.lower_node(node)?;
+                row = self.mul(&row, &factor);
+            }
+        }
+        Ok(self.convert(&row, ElemKind::Real))
+    }
+
+    fn stack_rows(&mut self, rows: &[Value]) -> Value {
+        match self.contiguous_rows(rows) {
+            Some(value) => value,
+            None => self.vector(rows),
+        }
+    }
+
+    /// The factors of a left-folded scalar `mul` tree, in order.
+    fn factor_leaves(&self, id: NodeId) -> Vec<NodeId> {
+        match self.call_args(id, "mul") {
+            Some(&[left, right]) => {
+                let mut leaves = self.factor_leaves(left);
+                leaves.push(right);
+                leaves
+            }
+            _ => vec![id],
+        }
+    }
+
+    /// The arguments of `id`, followed through bindings, when it calls `head`.
+    fn call_args(&self, id: NodeId, head: &str) -> Option<&[NodeId]> {
+        match self.node(self.resolve_ref_one(id)) {
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(sym) if self.resolve(sym) == head) => {
+                Some(&call.args)
+            }
+            _ => None,
+        }
+    }
+
+    fn literal(&self, id: NodeId) -> Option<f64> {
+        match self.node(self.resolve_ref_one(id)) {
+            Node::Lit(Scalar::Real(value)) => Some(*value),
+            Node::Lit(Scalar::Int(value)) => Some(*value as f64),
+            _ => None,
+        }
+    }
+
+    fn literals(&self, id: NodeId) -> Option<Vec<f64>> {
+        self.call_args(id, "vector")?
+            .iter()
+            .map(|&arg| self.literal(arg))
+            .collect()
+    }
+
+    /// The value of `fill(value, size)` with a literal value and a size list.
+    fn uniform_fill(&self, id: NodeId) -> Option<f64> {
+        let [value, size] = self.call_args(id, "fill")? else {
+            return None;
+        };
+        self.literals(*size)?;
+        self.literal(*value)
+    }
+
+    /// `Some(literal)` for `fill(x, bins)`, with `literal` set when `x` is one.
+    fn scalar_fill(&self, id: NodeId) -> Option<Option<f64>> {
+        let [value, _] = self.call_args(id, "fill")? else {
+            return None;
+        };
+        Some(self.literal(*value))
+    }
+
+    /// The cells of `array(cat(cells…), [samples, width, bins], [1, 2, 3])`,
+    /// each a bin vector or a scalar filling the bins.
+    fn rank3_cells(&self, id: NodeId, samples: usize) -> Option<(Vec<NodeId>, usize)> {
+        let [data, size, order] = self.call_args(id, "array")? else {
+            return None;
+        };
+        let [s, width, bins] = self.literals(*size)?[..] else {
+            return None;
+        };
+        if self.literals(*order)? != [1.0, 2.0, 3.0] || s as usize != samples || width < 1.0 {
+            return None;
+        }
+        let cells = self.call_args(*data, "cat")?.to_vec();
+        let bins = bins as u64;
+        let fits = |cell: NodeId| match self.call_args(cell, "fill") {
+            Some(&[value, size]) => {
+                self.literal(size) == Some(bins as f64) && self.shape_of(value) == Some(vec![])
+            }
+            _ => self.shape_of(cell) == Some(vec![bins]),
+        };
+        (cells.len() == samples * width as usize && cells.iter().all(|&cell| fits(cell)))
+            .then_some((cells, width as usize))
+    }
+
+    /// The static tensor shape of a node's inferred type.
+    fn shape_of(&self, id: NodeId) -> Option<Vec<u64>> {
+        let ty = self.type_of(id)?;
+        match crate::types::mlir_type_of_ty(id, ty, self.dtype).ok()?.0 {
+            MlirTy::Scalar => Some(vec![]),
+            MlirTy::Ranked(dims) => dims.into_iter().collect(),
+            _ => None,
         }
     }
 
@@ -234,4 +513,24 @@ impl Emitter<'_> {
         let scale = self.scalar(scale);
         self.mul(&result, &scale)
     }
+}
+
+/// Converter-form blocks and the (block, row) of each summed sample in order.
+struct YieldRows {
+    blocks: Vec<YieldBlock>,
+    rows: Vec<(usize, usize)>,
+}
+
+/// One channel's `sample_yields` operands in multiplication order.
+struct YieldBlock {
+    nominals: Vec<NodeId>,
+    /// Each sample's non-zero shift rows.
+    shifts: Vec<Vec<NodeId>>,
+    factors: Vec<Vec<YieldFactor>>,
+}
+
+#[derive(Clone, Copy)]
+enum YieldFactor {
+    Scalar(NodeId),
+    PerBin(NodeId),
 }
