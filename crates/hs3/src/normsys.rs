@@ -200,7 +200,7 @@ impl Factors {
             let mut start = 0;
             for end in width_classes(&lengths) {
                 let members = &order[start..end];
-                let width = tree_width(lanes.rows[members[0]].len());
+                let width = class_width(lanes.rows[members[0]].len(), members.len());
                 classes.push((inputs.len(), width, members));
                 for &member in members {
                     let row = &lanes.rows[member];
@@ -313,9 +313,20 @@ fn tree_width(length: usize) -> usize {
     }
 }
 
+/// Width of a class whose widest row has `length` lanes. A lone row needs no
+/// common width: padding it would repeat its parameter in alpha, and repeated
+/// indices turn the alpha gradient from a concatenate into a scatter.
+fn class_width(length: usize, rows: usize) -> usize {
+    if rows == 1 {
+        length
+    } else {
+        tree_width(length)
+    }
+}
+
 /// Fewest contiguous classes over `lengths`, sorted in decreasing order, whose
-/// rows padded to the tree width of each class's first length keep the lanes
-/// beyond each row's own tree width under [`MAX_PADDING`]. One row per class
+/// rows padded to each class's width keep the lanes beyond each row's own
+/// tree width under [`MAX_PADDING`]. One row per class
 /// meets the bound, so the search ends.
 /// Returns the end of each class.
 fn width_classes(lengths: &[usize]) -> Vec<usize> {
@@ -326,7 +337,7 @@ fn width_classes(lengths: &[usize]) -> Vec<usize> {
     best[0] = Some((0, Vec::new()));
     loop {
         if let Some((lanes, ends)) = &best[lengths.len()]
-            && (lanes - floor) as f64 <= MAX_PADDING * *lanes as f64
+            && lanes.saturating_sub(floor) as f64 <= MAX_PADDING * *lanes as f64
         {
             return ends.clone();
         }
@@ -335,7 +346,7 @@ fn width_classes(lengths: &[usize]) -> Vec<usize> {
                 (0..i)
                     .filter_map(|j| {
                         let (lanes, ends) = best[j].as_ref()?;
-                        Some((lanes + tree_width(lengths[j]) * (i - j), ends))
+                        Some((lanes + class_width(lengths[j], i - j) * (i - j), ends))
                     })
                     .min_by_key(|(lanes, _)| *lanes)
                     .map(|(lanes, ends)| (lanes, [ends.as_slice(), &[i]].concat()))

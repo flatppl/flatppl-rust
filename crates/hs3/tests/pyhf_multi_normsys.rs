@@ -215,3 +215,27 @@ fn scalar_runs_multiply_rows_of_one_lane_tensor() {
     // No per-channel factor vector is bound once runs read the lane tensor.
     assert!(!text.contains("_normsys_interp_poly6_exp ="), "{text}");
 }
+
+#[test]
+fn a_lone_run_keeps_its_own_width() {
+    let normsys = |name: &str, lo: f64, hi: f64| serde_json::json!({"name": name, "type": "normsys", "data": {"lo": lo, "hi": hi}});
+    let doc = serde_json::json!({
+        "channels": [{"name": "c", "samples": [{"name": "s", "data": [10.0], "modifiers": [
+            normsys("a", 0.9, 1.1), normsys("b", 0.8, 1.2), normsys("c", 0.7, 1.3),
+            normsys("d", 0.6, 1.4), normsys("e", 0.5, 1.5),
+            {"name": "mu", "type": "normfactor", "data": null}
+        ]}]}],
+        "observations": [{"name": "c", "data": [11.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "mu"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    // Padding a lone row to a tree width would repeat its parameter in alpha.
+    assert!(
+        text.contains(
+            "normsys_interp_poly6_exp_lanes = broadcast(pyhf_helpers.normsys_factor, \
+             [0.9, 0.8, 0.7, 0.6, 0.5], [1.1, 1.2, 1.3, 1.4, 1.5], [a, b, c, d, e])"
+        ),
+        "{text}"
+    );
+}
