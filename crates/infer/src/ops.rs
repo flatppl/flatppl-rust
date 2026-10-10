@@ -6455,6 +6455,10 @@ fn broadcast_type(
             | "in" | "isfinite" | "isinf" | "isnan" | "iszero",
             [_] | [_, _],
         ) => Type::Scalar(ScalarType::Boolean),
+        // §07 gives `ifelse` a boolean `cond`, so a cell select is the dotted form.
+        // The cell is the common type of the branches, as for a direct call.
+        ("ifelse", [Type::Scalar(ScalarType::Boolean), a, b]) if a == b => a.clone(),
+        ("ifelse", [Type::Scalar(ScalarType::Boolean), a, b]) => promote2(Some(a), Some(b)),
         _ => return Ready(Type::Deferred),
     };
     Ready(Type::Array {

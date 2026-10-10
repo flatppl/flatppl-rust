@@ -154,6 +154,23 @@ r = land.(m1, m2)
     );
 }
 
+/// A dotted `ifelse` selects per cell, so a mask over a real vector types a real
+/// array, with a scalar branch broadcast against it.
+#[test]
+fn a_dotted_ifelse_over_a_mask_types_its_branches() {
+    for expr in [
+        "ifelse.(v .> 1.0, v, 1.0)",
+        "broadcast(ifelse, [true, false, true], v, 1)",
+    ] {
+        let src = format!("v = elementof(cartpow(reals, [3]))\nr = {expr}\n");
+        let line = call_line(&src, "broadcast ifelse");
+        assert!(
+            line.contains("(%meta ((%array 1 (3) (%scalar real))"),
+            "`{expr}` must type a [3] real array; got: {line}"
+        );
+    }
+}
+
 /// The mask is what §07 "Boolean reductions" hands `lany`/`lall`, so the whole route
 /// must type end to end. This is the reason the two halves above belong in one
 /// change: without the dotted typing, the new boolean reductions would have had no

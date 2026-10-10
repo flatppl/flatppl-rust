@@ -146,3 +146,62 @@ fn singleton_factors_keep_native_interpolation_kinds() {
         "{text}"
     );
 }
+
+#[test]
+fn scalar_runs_multiply_gathered_factors_of_their_channel() {
+    let normsys = |name: &str, lo: f64, hi: f64| serde_json::json!({"name": name, "type": "normsys", "data": {"lo": lo, "hi": hi}});
+    let doc = serde_json::json!({
+        "channels": [
+            {"name": "c", "samples": [
+                {"name": "signal", "data": [10.0, 20.0], "modifiers": [
+                    normsys("a", 0.9, 1.1),
+                    {"name": "mu", "type": "normfactor", "data": null},
+                    normsys("b", 0.8, 1.2),
+                    {"name": "g", "type": "shapefactor", "data": null},
+                    normsys("c", 0.7, 1.3)
+                ]},
+                {"name": "background", "data": [30.0, 40.0], "modifiers": [
+                    normsys("a", 0.9, 1.1), normsys("c", 0.7, 1.3)
+                ]},
+                {"name": "other", "data": [1.0, 2.0], "modifiers": [
+                    normsys("c", 0.7, 1.3), normsys("b", 0.8, 1.2), normsys("a", 0.9, 1.1)
+                ]}
+            ]},
+            {"name": "d", "samples": [
+                {"name": "signal", "data": [5.0], "modifiers": [
+                    normsys("a", 0.9, 1.1), normsys("c", 0.7, 1.3),
+                    normsys("e", 0.6, 1.4), normsys("f", 0.5, 1.5)
+                ]}
+            ]}
+        ],
+        "observations": [{"name": "c", "data": [42.0, 58.0]}, {"name": "d", "data": [6.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "mu"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    for line in [
+        // Shorter runs pad with the index of a trailing unit lane.
+        "c_normsys_interp_poly6_exp_padded = cat(c_normsys_interp_poly6_exp, [1.0])",
+        // One gathered row per run with two or more batched factors, one
+        // reduction per vector.
+        "c_normsys_products = broadcast(prod, [get(c_normsys_interp_poly6_exp_padded, [1, 2, 4]), \
+         get(c_normsys_interp_poly6_exp_padded, [1, 2, 3]), \
+         get(c_normsys_interp_poly6_exp_padded, [1, 3, 4])])",
+        // The product takes the first factor's place; a per-bin factor still splits
+        // the run, and a lone factor keeps its scalar selection.
+        "c_signal_expected = broadcast(mul, broadcast(mul, broadcast(mul, \
+         broadcast(mul, c_signal_nominal, get(c_normsys_products, 1)), mu), g), \
+         get(c_normsys_interp_poly6_exp, 3))",
+        "c_background_expected = broadcast(mul, c_background_nominal, \
+         get(c_normsys_products, 3))",
+        "c_other_expected = broadcast(mul, c_other_nominal, get(c_normsys_products, 2))",
+        // Factors that an earlier channel batched reduce over that channel's
+        // vector. Equal-length runs gather without padding.
+        "d_normsys_products = broadcast(prod, [get(c_normsys_interp_poly6_exp, [1, 3])])",
+        "d_normsys_products_2 = broadcast(prod, [get(d_normsys_interp_poly6_exp, [1, 2])])",
+        "d_signal_expected = broadcast(mul, broadcast(mul, d_signal_nominal, \
+         get(d_normsys_products, 1)), get(d_normsys_products_2, 1))",
+    ] {
+        assert!(text.contains(line), "missing `{line}` in:\n{text}");
+    }
+}
