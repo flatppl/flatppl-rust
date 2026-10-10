@@ -46,6 +46,8 @@ pub(crate) struct Factors {
     vectors: Vec<(String, usize)>,
     /// Vector index and zero-based offset of each batched factor.
     slots: BTreeMap<NodeId, (usize, usize)>,
+    /// Binding of each vector with a trailing unit lane, once a run needs padding.
+    padded: BTreeMap<usize, String>,
 }
 
 impl Factors {
@@ -130,27 +132,30 @@ impl Factors {
             .collect()
     }
 
-    /// Replace the batched factors of each scalar run by one masked product.
+    /// Replace the batched factors of each scalar run by one gathered product.
     ///
     /// A scalar `get` per factor and an ordered multiply chain emit one tiny
     /// contraction per factor, which dominates the lowered graph and its
-    /// derivative. One row per run, `ifelse.(mask, factors, 1.0)`, keeps the
-    /// factor vector dense. §07 defines `prod` as the product, with no order.
-    /// A mask has no multiplicity, so a repeated factor stays in the chain.
+    /// derivative. Each run gathers its factor indices from the channel factor
+    /// vector, and one `prod` reduces all runs of that vector. Shorter runs pad
+    /// with the index of a trailing unit lane, so the work follows the run
+    /// lengths. §07 defines `prod` as the product, with no order.
+    /// A repeated factor stays in the chain, as the index set has no multiplicity.
     /// Factors that an earlier channel batched reduce over that vector.
-    /// The product takes the place of the run's first masked factor, and the
+    /// The product takes the place of the run's first gathered factor, and the
     /// other factors keep their order around it.
-    pub(crate) fn masked_products(
-        &self,
+    pub(crate) fn gathered_products(
+        &mut self,
         b: &mut Builder,
         channel: &str,
         runs: impl IntoIterator<Item = Vec<NodeId>>,
     ) -> BTreeMap<Vec<NodeId>, Vec<NodeId>> {
         let runs: BTreeSet<Vec<NodeId>> = runs.into_iter().collect();
+        let slots = &self.slots;
         let masks_of = |run: &[NodeId]| {
             let mut masks: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
             for factor in run {
-                if let Some(&(vector, offset)) = self.slots.get(factor) {
+                if let Some(&(vector, offset)) = slots.get(factor) {
                     masks.entry(vector).or_default().insert(offset);
                 }
             }
@@ -166,17 +171,38 @@ impl Factors {
         let mut products = BTreeMap::new();
         for (vector, masks) in rows {
             let (name, length) = self.vectors[vector].clone();
-            let one = b.lit_real(1.0);
+            let width = masks.iter().map(BTreeSet::len).max().unwrap_or(0);
+            let source = if masks.iter().all(|offsets| offsets.len() == width) {
+                name
+            } else {
+                self.padded
+                    .entry(vector)
+                    .or_insert_with(|| {
+                        let factors = b.self_ref(&name);
+                        let one = b.lit_real(1.0);
+                        let unit = b.array(&[one]);
+                        let padded = b.call("cat", &[factors, unit]);
+                        b.bind_unique_doc(
+                            &format!("{name}_padded"),
+                            padded,
+                            "Normalization factors with a trailing unit lane for padded gathers.",
+                        )
+                    })
+                    .clone()
+            };
             let arrays: Vec<_> = masks
                 .iter()
                 .map(|offsets| {
-                    let mask: Vec<_> = (0..length)
-                        .map(|offset| b.lit_bool(offsets.contains(&offset)))
+                    let indices: Vec<_> = offsets
+                        .iter()
+                        .map(|&offset| offset + 1)
+                        .chain(std::iter::repeat(length + 1))
+                        .take(width)
+                        .map(|index| b.lit_int(index as i64))
                         .collect();
-                    let mask = b.array(&mask);
-                    let ifelse = b.call_head("ifelse");
-                    let factors = b.self_ref(&name);
-                    b.call("broadcast", &[ifelse, mask, factors, one])
+                    let indices = b.array(&indices);
+                    let factors = b.self_ref(&source);
+                    b.call("get", &[factors, indices])
                 })
                 .collect();
             let arrays = b.array(&arrays);
@@ -185,7 +211,7 @@ impl Factors {
             let bound = b.bind_unique_doc(
                 &format!("{channel}_normsys_products"),
                 values,
-                "Products of masked normalization factors, one per modifier run.",
+                "Products of gathered normalization factors, one per modifier run.",
             );
             let values = b.self_ref(&bound);
             for (index, offsets) in masks.into_iter().enumerate() {
@@ -200,7 +226,7 @@ impl Factors {
                 let mut placed = BTreeSet::new();
                 let mut reduced = Vec::new();
                 for &factor in &run {
-                    match self.slots.get(&factor) {
+                    match slots.get(&factor) {
                         Some(&(vector, _))
                             if masks.contains_key(&vector) && seen.insert(factor) =>
                         {
