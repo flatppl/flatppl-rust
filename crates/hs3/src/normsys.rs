@@ -125,9 +125,10 @@ impl Factors {
     /// reverse pass one scatter per row, each its own GPU kernel. Here every run
     /// owns a contiguous row of interpolated lanes, so rows are slices and the
     /// whole model shares one interpolation and one `prod`. A unit lane is
-    /// `normsys(1, 1, alpha) = 1` for every alpha, the identity of `prod` (§07), and a repeated
-    /// factor repeats its lane. The product takes the place of the run's first
-    /// batched factor, and the other factors keep their order around it.
+    /// `normsys(1, 1, alpha) = 1` for every alpha, the identity of `prod`
+    /// (§07), and a repeated factor repeats its lane. The product takes the
+    /// place of the run's first batched factor, and the other factors keep
+    /// their order around it.
     pub(crate) fn gathered_products(
         &mut self,
         b: &mut Builder,
@@ -326,9 +327,8 @@ fn class_width(length: usize, rows: usize) -> usize {
 
 /// Fewest contiguous classes over `lengths`, sorted in decreasing order, whose
 /// rows padded to each class's width keep the lanes beyond each row's own
-/// tree width under [`MAX_PADDING`]. One row per class
-/// meets the bound, so the search ends.
-/// Returns the end of each class.
+/// tree width under [`MAX_PADDING`]. One row per class meets the bound, so
+/// the search ends. Returns the end of each class.
 fn width_classes(lengths: &[usize]) -> Vec<usize> {
     // Tree rounding alone can exceed the bound, as one row per class shows.
     let floor: usize = lengths.iter().map(|&length| tree_width(length)).sum();
