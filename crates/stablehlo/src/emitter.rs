@@ -1478,7 +1478,11 @@ impl<'m> Emitter<'m> {
         axis: usize,
         indices: &[u64],
     ) -> Option<Value> {
-        let stride = indices.get(1)?.checked_sub(indices[0])?;
+        // One index is a unit-stride slice. A gather would cost a scatter adjoint.
+        let stride = match indices {
+            [_] => 1,
+            _ => indices.get(1)?.checked_sub(indices[0])?,
+        };
         if stride == 0 {
             return None;
         }
