@@ -58,3 +58,35 @@ fn pyhf_helper_splats_an_opaque_record_by_name() {
         emit(&expected, &ModuleBundle::new())
     );
 }
+
+#[test]
+fn pyhf_helpers_keep_dots_only_for_bin_broadcast_products() {
+    let prefix = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+                  theta = elementof(cartpow(reals, 2))\n\
+                  inputs = theta\n";
+    // Per-row alphas broadcast over three bins in the three bin products.
+    let histosys = emit(
+        &format!(
+            "{prefix}a = addaxes([theta[1], theta[2]], 0, 1)\n\
+             outputs = sum(sum(broadcast(pyhf.histosys_shift, \
+             rowstack([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]]), \
+             rowstack([[2.0, 3.0, 4.0], [2.0, 3.0, 4.0]]), \
+             rowstack([[3.0, 4.0, 5.0], [2.5, 3.5, 4.5]]), a)))"
+        ),
+        &ModuleBundle::new(),
+    );
+    assert_eq!(
+        histosys.matches("stablehlo.dot_general").count(),
+        3,
+        "{histosys}"
+    );
+    // One alpha per lane leaves no broadcast product.
+    let normsys = emit(
+        &format!(
+            "{prefix}outputs = sum(broadcast(pyhf.normsys_factor, \
+             [0.9, 0.8], [1.1, 1.3], [theta[1], theta[2]]))"
+        ),
+        &ModuleBundle::new(),
+    );
+    assert!(!normsys.contains("stablehlo.dot_general"), "{normsys}");
+}
