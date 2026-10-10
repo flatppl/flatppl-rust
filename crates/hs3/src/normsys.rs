@@ -65,7 +65,6 @@ impl Factors {
     pub(crate) fn multipliers(
         &mut self,
         b: &mut Builder,
-        channel: &str,
         samples: Vec<Vec<Multiplier>>,
         pyhf_helpers: Option<&str>,
     ) -> Vec<Vec<NodeId>> {
@@ -86,41 +85,20 @@ impl Factors {
         let one = b.lit_real(1.0);
         for (function, rows) in groups {
             let helper = pyhf_helpers.filter(|_| function == INTERP_NORMSYS_DEFAULT);
-            let inputs: Vec<_> = rows.iter().map(|row| row.inputs(b)).collect();
-            if inputs.len() == 1 {
-                let [lo, hi, alpha] = inputs[0];
+            // A lone factor of its kind stays a scalar call. Batched factors are
+            // scalar calls too, which `gathered_products` replaces by lanes of
+            // the model-wide tensor.
+            let batch = rows.len() > 1;
+            for row in rows {
+                let [lo, hi, alpha] = row.inputs(b);
                 let factor = match helper {
                     Some(alias) => b.module_user_call(alias, "normsys_factor", &[lo, hi, alpha]),
                     None => b.module_user_call("hepphys", function, &[lo, one, hi, alpha]),
                 };
-                self.values.insert(rows[0].key(), factor);
-                continue;
-            }
-            // Native HS3 can mix interpolation kinds, so each has its own batch.
-            let lo = b.array(&inputs.iter().map(|row| row[0]).collect::<Vec<_>>());
-            let hi = b.array(&inputs.iter().map(|row| row[1]).collect::<Vec<_>>());
-            let alpha = b.array(&inputs.iter().map(|row| row[2]).collect::<Vec<_>>());
-            let factors = match helper {
-                Some(alias) => {
-                    let head = b.module_call(alias, "normsys_factor");
-                    b.call("broadcast", &[head, lo, hi, alpha])
-                }
-                None => {
-                    let head = b.module_call("hepphys", function);
-                    b.call("broadcast", &[head, lo, one, hi, alpha])
-                }
-            };
-            let name = b.bind_unique_doc(
-                &format!("{channel}_normsys_{function}"),
-                factors,
-                "Distinct normalization factors.",
-            );
-            let factors = b.self_ref(&name);
-            for (offset, row) in rows.into_iter().enumerate() {
-                let index = b.lit_int(offset as i64 + 1);
-                let factor = b.call("get", &[factors, index]);
                 self.values.insert(row.key(), factor);
-                self.batched.insert(factor, row);
+                if batch {
+                    self.batched.insert(factor, row);
+                }
             }
         }
 

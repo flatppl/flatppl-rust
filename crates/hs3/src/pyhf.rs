@@ -1007,12 +1007,10 @@ pub fn assemble_channel(
         }
         multipliers.push(factors);
     }
-    let multipliers = terms.normsys_factors.multipliers(
-        b,
-        channel_name,
-        multipliers,
-        terms.pyhf_helpers.as_deref(),
-    );
+    let multipliers =
+        terms
+            .normsys_factors
+            .multipliers(b, multipliers, terms.pyhf_helpers.as_deref());
     let runs = samples
         .iter()
         .zip(&multipliers)
