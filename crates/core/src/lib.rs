@@ -19,6 +19,7 @@ mod module;
 pub mod node;
 pub mod text;
 pub mod ty;
+pub mod width_classes;
 
 pub use depth::{DEFAULT_MAX_DEPTH, Depth, TooDeep};
 pub use id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
