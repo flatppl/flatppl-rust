@@ -222,7 +222,7 @@ impl Factors {
             let mut start = 0;
             for end in width_classes(&lengths) {
                 let members = &order[start..end];
-                let width = lanes.rows[members[0]].len();
+                let width = tree_width(lanes.rows[members[0]].len());
                 classes.push((inputs.len(), width, members));
                 for &member in members {
                     let row = &lanes.rows[member];
@@ -322,17 +322,33 @@ impl Factors {
 /// Padding costs lanes on CPU and each class costs kernel launches on GPU.
 const MAX_PADDING: f64 = 0.15;
 
+/// Smallest width of the form 2^k or 3 * 2^k that holds `length` lanes.
+/// The pairwise product tree then halves without an odd tail, except once at
+/// width 3, and each odd tail costs a slice and a concatenate that split GPU
+/// fusions.
+fn tree_width(length: usize) -> usize {
+    let power = length.next_power_of_two();
+    if power / 4 * 3 >= length {
+        power / 4 * 3
+    } else {
+        power
+    }
+}
+
 /// Fewest contiguous classes over `lengths`, sorted in decreasing order, whose
-/// rows padded to each class's first length keep padding under [`MAX_PADDING`].
+/// rows padded to the tree width of each class's first length keep the lanes
+/// beyond each row's own tree width under [`MAX_PADDING`]. One row per class
+/// meets the bound, so the search ends.
 /// Returns the end of each class.
 fn width_classes(lengths: &[usize]) -> Vec<usize> {
-    let real: usize = lengths.iter().sum();
+    // Tree rounding alone can exceed the bound, as one row per class shows.
+    let floor: usize = lengths.iter().map(|&length| tree_width(length)).sum();
     // Fewest lanes covering the first i rows with the current class count.
     let mut best: Vec<Option<(usize, Vec<usize>)>> = vec![None; lengths.len() + 1];
     best[0] = Some((0, Vec::new()));
     loop {
         if let Some((lanes, ends)) = &best[lengths.len()]
-            && (lanes - real) as f64 <= MAX_PADDING * *lanes as f64
+            && (lanes - floor) as f64 <= MAX_PADDING * *lanes as f64
         {
             return ends.clone();
         }
@@ -341,7 +357,7 @@ fn width_classes(lengths: &[usize]) -> Vec<usize> {
                 (0..i)
                     .filter_map(|j| {
                         let (lanes, ends) = best[j].as_ref()?;
-                        Some((lanes + lengths[j] * (i - j), ends))
+                        Some((lanes + tree_width(lengths[j]) * (i - j), ends))
                     })
                     .min_by_key(|(lanes, _)| *lanes)
                     .map(|(lanes, ends)| (lanes, [ends.as_slice(), &[i]].concat()))
