@@ -686,6 +686,9 @@ impl Terms {
 /// constraint terms…)`. A single term is aliased directly; nothing is emitted
 /// when there are no terms.
 pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
+    terms
+        .normsys_factors
+        .finish(b, terms.pyhf_helpers.as_deref());
     let mut all = Vec::new();
     // Keep channel order: it determines the likelihood's input label order.
     for rows in terms
@@ -1004,12 +1007,10 @@ pub fn assemble_channel(
         }
         multipliers.push(factors);
     }
-    let multipliers = terms.normsys_factors.multipliers(
-        b,
-        channel_name,
-        multipliers,
-        terms.pyhf_helpers.as_deref(),
-    );
+    let multipliers =
+        terms
+            .normsys_factors
+            .multipliers(b, multipliers, terms.pyhf_helpers.as_deref());
     let runs = samples
         .iter()
         .zip(&multipliers)
@@ -1027,9 +1028,7 @@ pub fn assemble_channel(
             }
             runs
         });
-    let gathered = terms
-        .normsys_factors
-        .gathered_products(b, channel_name, runs);
+    let gathered = terms.normsys_factors.gathered_products(b, runs);
     let products = crate::normsys::products(b, channel_name, gathered.values().cloned());
     for ((sname, _, modifiers), (nom, factors)) in
         samples.iter().zip(shifted.into_iter().zip(multipliers))

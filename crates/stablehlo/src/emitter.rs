@@ -1434,6 +1434,42 @@ impl<'m> Emitter<'m> {
         out
     }
 
+    /// Stack rows that select adjacent equal-width blocks of one vector's
+    /// cells as one slice and a reshape. One slice per row lets XLA:CPU
+    /// duplicate the shared producer into every row's fusion.
+    pub(crate) fn contiguous_rows(&mut self, rows: &[Value]) -> Option<Value> {
+        let selection = |row: &Value| match &self.pointwise.get(&row.ssa)?.op {
+            Pointwise::Gather(base, axis, indices) => Some((base.clone(), *axis, indices.clone())),
+            _ => None,
+        };
+        let (base, axis, first) = selection(rows.first()?)?;
+        let width = first.len() as u64;
+        if rows.len() < 2
+            || width < 2
+            || axis + 1 != shape(&base.ty).len()
+            || axis != self.batch_rank(&base)
+        {
+            return None;
+        }
+        for (k, row) in rows.iter().enumerate() {
+            let (source, row_axis, indices) = selection(row)?;
+            let start = first[0] + k as u64 * width;
+            if source != base
+                || row_axis != axis
+                || !indices.iter().copied().eq(start..start + width)
+            {
+                return None;
+            }
+        }
+        let indices: Vec<u64> = (first[0]..first[0] + rows.len() as u64 * width).collect();
+        let block = self.regular_gather_slice(&base, axis, &indices)?;
+        let mut dims = shape(&base.ty).to_vec();
+        dims.splice(axis.., [Some(rows.len() as u64), Some(width)]);
+        let mut axes = self.axes_of(&rows[0]);
+        axes.layers.insert(0, 1);
+        Some(self.reshape_axes(&block, MlirTy::Ranked(dims), axes))
+    }
+
     /// Increasing progressions and repeated contiguous blocks need no index
     /// tensor. Retain the gather's provenance and packing boundaries.
     fn regular_gather_slice(

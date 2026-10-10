@@ -2519,6 +2519,9 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
         ));
     }
     let elems: Vec<Value> = elems.iter().map(|v| e.convert(v, target)).collect();
+    if let Some(value) = e.contiguous_rows(&elems) {
+        return Ok(value);
+    }
     Ok(e.vector(&elems))
 }
 

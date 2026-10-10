@@ -148,7 +148,7 @@ fn singleton_factors_keep_native_interpolation_kinds() {
 }
 
 #[test]
-fn scalar_runs_multiply_gathered_factors_of_their_channel() {
+fn scalar_runs_multiply_rows_of_one_lane_tensor() {
     let normsys = |name: &str, lo: f64, hi: f64| serde_json::json!({"name": name, "type": "normsys", "data": {"lo": lo, "hi": hi}});
     let doc = serde_json::json!({
         "channels": [
@@ -180,28 +180,62 @@ fn scalar_runs_multiply_gathered_factors_of_their_channel() {
     let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
     let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
     for line in [
-        // Shorter runs pad with the index of a trailing unit lane.
-        "c_normsys_interp_poly6_exp_padded = cat(c_normsys_interp_poly6_exp, [1.0])",
-        // One gathered row per run with two or more batched factors, one
-        // reduction per vector.
-        "c_normsys_products = broadcast(prod, [get(c_normsys_interp_poly6_exp_padded, [1, 2, 4]), \
-         get(c_normsys_interp_poly6_exp_padded, [1, 2, 3]), \
-         get(c_normsys_interp_poly6_exp_padded, [1, 3, 4])])",
-        // The product takes the first factor's place; a per-bin factor still splits
-        // the run, and a lone factor keeps its scalar selection.
+        // One lane tensor for the model. Each run with two or more batched
+        // factors owns a contiguous row, padded with normsys(1, 1, alpha) = 1
+        // lanes on the row's own parameter; lone factors follow the rows.
+        "normsys_interp_poly6_exp_lanes = broadcast(pyhf_helpers.normsys_factor, \
+         [0.9, 0.7, 0.6, 0.5, 0.7, 0.8, 0.9, 1.0, 0.9, 0.8, 0.9, 0.7, 0.7], \
+         [1.1, 1.3, 1.4, 1.5, 1.3, 1.2, 1.1, 1.0, 1.1, 1.2, 1.1, 1.3, 1.3], \
+         [a, c, e, f, c, b, a, c, a, b, a, c, c])",
+        // Rows sorted by length form width classes, one prod per class over
+        // slices of the lanes. A run may span factors of several channels.
+        "normsys_interp_poly6_exp_products_4 = broadcast(prod, \
+         [get(normsys_interp_poly6_exp_lanes, [1, 2, 3, 4]), \
+         get(normsys_interp_poly6_exp_lanes, [5, 6, 7, 8])])",
+        "normsys_interp_poly6_exp_products_2 = broadcast(prod, \
+         [get(normsys_interp_poly6_exp_lanes, [9, 10]), \
+         get(normsys_interp_poly6_exp_lanes, [11, 12])])",
+        // Run products keep the order in which channels requested them.
+        "normsys_interp_poly6_exp_products = [get(normsys_interp_poly6_exp_products_2, 1), \
+         get(normsys_interp_poly6_exp_products_2, 2), get(normsys_interp_poly6_exp_products_4, 2), \
+         get(normsys_interp_poly6_exp_products_4, 1)]",
+        "normsys_interp_poly6_exp_singles = get(normsys_interp_poly6_exp_lanes, [13])",
+        // The product takes the first factor's place; a per-bin factor still
+        // splits the run, and a lone factor reads its own lane.
         "c_signal_expected = broadcast(mul, broadcast(mul, broadcast(mul, \
-         broadcast(mul, c_signal_nominal, get(c_normsys_products, 1)), mu), g), \
-         get(c_normsys_interp_poly6_exp, 3))",
+         broadcast(mul, c_signal_nominal, get(normsys_interp_poly6_exp_products, 1)), mu), g), \
+         get(normsys_interp_poly6_exp_singles, 1))",
         "c_background_expected = broadcast(mul, c_background_nominal, \
-         get(c_normsys_products, 3))",
-        "c_other_expected = broadcast(mul, c_other_nominal, get(c_normsys_products, 2))",
-        // Factors that an earlier channel batched reduce over that channel's
-        // vector. Equal-length runs gather without padding.
-        "d_normsys_products = broadcast(prod, [get(c_normsys_interp_poly6_exp, [1, 3])])",
-        "d_normsys_products_2 = broadcast(prod, [get(d_normsys_interp_poly6_exp, [1, 2])])",
-        "d_signal_expected = broadcast(mul, broadcast(mul, d_signal_nominal, \
-         get(d_normsys_products, 1)), get(d_normsys_products_2, 1))",
+         get(normsys_interp_poly6_exp_products, 2))",
+        "c_other_expected = broadcast(mul, c_other_nominal, get(normsys_interp_poly6_exp_products, 3))",
+        "d_signal_expected = broadcast(mul, d_signal_nominal, get(normsys_interp_poly6_exp_products, 4))",
     ] {
         assert!(text.contains(line), "missing `{line}` in:\n{text}");
     }
+    // No per-channel factor vector is bound once runs read the lane tensor.
+    assert!(!text.contains("_normsys_interp_poly6_exp ="), "{text}");
+}
+
+#[test]
+fn a_lone_run_keeps_its_own_width() {
+    let normsys = |name: &str, lo: f64, hi: f64| serde_json::json!({"name": name, "type": "normsys", "data": {"lo": lo, "hi": hi}});
+    let doc = serde_json::json!({
+        "channels": [{"name": "c", "samples": [{"name": "s", "data": [10.0], "modifiers": [
+            normsys("a", 0.9, 1.1), normsys("b", 0.8, 1.2), normsys("c", 0.7, 1.3),
+            normsys("d", 0.6, 1.4), normsys("e", 0.5, 1.5),
+            {"name": "mu", "type": "normfactor", "data": null}
+        ]}]}],
+        "observations": [{"name": "c", "data": [11.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "mu"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    // Padding a lone row to a tree width would repeat its parameter in alpha.
+    assert!(
+        text.contains(
+            "normsys_interp_poly6_exp_lanes = broadcast(pyhf_helpers.normsys_factor, \
+             [0.9, 0.8, 0.7, 0.6, 0.5], [1.1, 1.2, 1.3, 1.4, 1.5], [a, b, c, d, e])"
+        ),
+        "{text}"
+    );
 }

@@ -42,12 +42,22 @@ impl Interpolation {
 #[derive(Default)]
 pub(crate) struct Factors {
     values: BTreeMap<Key, NodeId>,
-    /// Batched factor vectors as (binding name, length).
-    vectors: Vec<(String, usize)>,
-    /// Vector index and zero-based offset of each batched factor.
-    slots: BTreeMap<NodeId, (usize, usize)>,
-    /// Binding of each vector with a trailing unit lane, once a run needs padding.
-    padded: BTreeMap<usize, String>,
+    /// Interpolation behind each batched factor.
+    batched: BTreeMap<NodeId, Interpolation>,
+    /// One run-ordered lane tensor per interpolation function, for the whole model.
+    lanes: BTreeMap<&'static str, Lanes>,
+}
+
+/// Rows are contiguous blocks of one width, padded with unit lanes, so each
+/// row is a slice and the reverse pass needs no scatter. Single factors follow
+/// the rows.
+#[derive(Default)]
+struct Lanes {
+    /// Bindings of the lanes, the row products and the single factors.
+    names: Option<[String; 3]>,
+    rows: Vec<Vec<Interpolation>>,
+    singles: Vec<Interpolation>,
+    index: BTreeMap<Vec<Key>, usize>,
 }
 
 impl Factors {
@@ -55,7 +65,6 @@ impl Factors {
     pub(crate) fn multipliers(
         &mut self,
         b: &mut Builder,
-        channel: &str,
         samples: Vec<Vec<Multiplier>>,
         pyhf_helpers: Option<&str>,
     ) -> Vec<Vec<NodeId>> {
@@ -76,43 +85,20 @@ impl Factors {
         let one = b.lit_real(1.0);
         for (function, rows) in groups {
             let helper = pyhf_helpers.filter(|_| function == INTERP_NORMSYS_DEFAULT);
-            let inputs: Vec<_> = rows.iter().map(|row| row.inputs(b)).collect();
-            if inputs.len() == 1 {
-                let [lo, hi, alpha] = inputs[0];
+            // A lone factor of its kind stays a scalar call. Batched factors are
+            // scalar calls too, which `gathered_products` replaces by lanes of
+            // the model-wide tensor.
+            let batch = rows.len() > 1;
+            for row in rows {
+                let [lo, hi, alpha] = row.inputs(b);
                 let factor = match helper {
                     Some(alias) => b.module_user_call(alias, "normsys_factor", &[lo, hi, alpha]),
                     None => b.module_user_call("hepphys", function, &[lo, one, hi, alpha]),
                 };
-                self.values.insert(rows[0].key(), factor);
-                continue;
-            }
-            // Native HS3 can mix interpolation kinds, so each has its own batch.
-            let lo = b.array(&inputs.iter().map(|row| row[0]).collect::<Vec<_>>());
-            let hi = b.array(&inputs.iter().map(|row| row[1]).collect::<Vec<_>>());
-            let alpha = b.array(&inputs.iter().map(|row| row[2]).collect::<Vec<_>>());
-            let factors = match helper {
-                Some(alias) => {
-                    let head = b.module_call(alias, "normsys_factor");
-                    b.call("broadcast", &[head, lo, hi, alpha])
-                }
-                None => {
-                    let head = b.module_call("hepphys", function);
-                    b.call("broadcast", &[head, lo, one, hi, alpha])
-                }
-            };
-            let name = b.bind_unique_doc(
-                &format!("{channel}_normsys_{function}"),
-                factors,
-                "Distinct normalization factors.",
-            );
-            let factors = b.self_ref(&name);
-            let vector = self.vectors.len();
-            self.vectors.push((name, rows.len()));
-            for (offset, row) in rows.into_iter().enumerate() {
-                let index = b.lit_int(offset as i64 + 1);
-                let factor = b.call("get", &[factors, index]);
                 self.values.insert(row.key(), factor);
-                self.slots.insert(factor, (vector, offset));
+                if batch {
+                    self.batched.insert(factor, row);
+                }
             }
         }
 
@@ -132,114 +118,240 @@ impl Factors {
             .collect()
     }
 
-    /// Replace the batched factors of each scalar run by one gathered product.
+    /// Replace the batched factors of each scalar run by one product row of a
+    /// model-wide lane tensor.
     ///
-    /// A scalar `get` per factor and an ordered multiply chain emit one tiny
-    /// contraction per factor, which dominates the lowered graph and its
-    /// derivative. Each run gathers its factor indices from the channel factor
-    /// vector, and one `prod` reduces all runs of that vector. Shorter runs pad
-    /// with the index of a trailing unit lane, so the work follows the run
-    /// lengths. §07 defines `prod` as the product, with no order.
-    /// A repeated factor stays in the chain, as the index set has no multiplicity.
-    /// Factors that an earlier channel batched reduce over that vector.
-    /// The product takes the place of the run's first gathered factor, and the
-    /// other factors keep their order around it.
+    /// Per-channel vectors with gathered rows emit one gather per row, and the
+    /// reverse pass one scatter per row, each its own GPU kernel. Here every run
+    /// owns a contiguous row of interpolated lanes, so rows are slices and the
+    /// whole model shares one interpolation and one `prod`. A unit lane is
+    /// `normsys(1, 1, alpha) = 1` for every alpha, the identity of `prod`
+    /// (§07), and a repeated factor repeats its lane. The product takes the
+    /// place of the run's first batched factor, and the other factors keep
+    /// their order around it.
     pub(crate) fn gathered_products(
         &mut self,
         b: &mut Builder,
-        channel: &str,
         runs: impl IntoIterator<Item = Vec<NodeId>>,
     ) -> BTreeMap<Vec<NodeId>, Vec<NodeId>> {
         let runs: BTreeSet<Vec<NodeId>> = runs.into_iter().collect();
-        let slots = &self.slots;
-        let masks_of = |run: &[NodeId]| {
-            let mut masks: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-            for factor in run {
-                if let Some(&(vector, offset)) = slots.get(factor) {
-                    masks.entry(vector).or_default().insert(offset);
-                }
-            }
-            masks.retain(|_, offsets| offsets.len() >= 2);
-            masks
-        };
-        let mut rows: BTreeMap<usize, BTreeSet<BTreeSet<usize>>> = BTreeMap::new();
-        for run in &runs {
-            for (vector, offsets) in masks_of(run) {
-                rows.entry(vector).or_default().insert(offsets);
-            }
-        }
-        let mut products = BTreeMap::new();
-        for (vector, masks) in rows {
-            let (name, length) = self.vectors[vector].clone();
-            let width = masks.iter().map(BTreeSet::len).max().unwrap_or(0);
-            let source = if masks.iter().all(|offsets| offsets.len() == width) {
-                name
-            } else {
-                self.padded
-                    .entry(vector)
-                    .or_insert_with(|| {
-                        let factors = b.self_ref(&name);
-                        let one = b.lit_real(1.0);
-                        let unit = b.array(&[one]);
-                        let padded = b.call("cat", &[factors, unit]);
-                        b.bind_unique_doc(
-                            &format!("{name}_padded"),
-                            padded,
-                            "Normalization factors with a trailing unit lane for padded gathers.",
-                        )
-                    })
-                    .clone()
-            };
-            let arrays: Vec<_> = masks
-                .iter()
-                .map(|offsets| {
-                    let indices: Vec<_> = offsets
-                        .iter()
-                        .map(|&offset| offset + 1)
-                        .chain(std::iter::repeat(length + 1))
-                        .take(width)
-                        .map(|index| b.lit_int(index as i64))
-                        .collect();
-                    let indices = b.array(&indices);
-                    let factors = b.self_ref(&source);
-                    b.call("get", &[factors, indices])
-                })
-                .collect();
-            let arrays = b.array(&arrays);
-            let prod = b.call_head("prod");
-            let values = b.call("broadcast", &[prod, arrays]);
-            let bound = b.bind_unique_doc(
-                &format!("{channel}_normsys_products"),
-                values,
-                "Products of gathered normalization factors, one per modifier run.",
-            );
-            let values = b.self_ref(&bound);
-            for (index, offsets) in masks.into_iter().enumerate() {
-                let index = b.lit_int(index as i64 + 1);
-                products.insert((vector, offsets), b.call("get", &[values, index]));
-            }
-        }
         runs.into_iter()
             .map(|run| {
-                let masks = masks_of(&run);
-                let mut seen = BTreeSet::new();
-                let mut placed = BTreeSet::new();
+                let row: Vec<_> = run
+                    .iter()
+                    .filter_map(|f| self.batched.get(f).copied())
+                    .collect();
                 let mut reduced = Vec::new();
+                let mut placed = false;
                 for &factor in &run {
-                    match slots.get(&factor) {
-                        Some(&(vector, _))
-                            if masks.contains_key(&vector) && seen.insert(factor) =>
-                        {
-                            if placed.insert(vector) {
-                                reduced.push(products[&(vector, masks[&vector].clone())]);
-                            }
-                        }
-                        _ => reduced.push(factor),
+                    if !self.batched.contains_key(&factor) {
+                        reduced.push(factor);
+                    } else if !placed {
+                        placed = true;
+                        reduced.push(self.row(b, row.clone()));
                     }
                 }
                 (run, reduced)
             })
             .collect()
+    }
+
+    fn row(&mut self, b: &mut Builder, row: Vec<Interpolation>) -> NodeId {
+        let lanes = self.lanes.entry(row[0].function).or_default();
+        let [_, products_name, singles_name] = lanes
+            .names
+            .get_or_insert_with(|| {
+                ["lanes", "products", "singles"]
+                    .map(|part| b.alloc_name(&format!("normsys_{}_{part}", row[0].function)))
+            })
+            .clone();
+        let key: Vec<_> = row.iter().map(|r| r.key()).collect();
+        let (source, index) = if let [single] = row[..] {
+            let next = lanes.singles.len();
+            let index = *lanes.index.entry(key).or_insert(next);
+            if index == next {
+                lanes.singles.push(single);
+            }
+            (singles_name, index)
+        } else {
+            let next = lanes.rows.len();
+            let index = *lanes.index.entry(key).or_insert(next);
+            if index == next {
+                lanes.rows.push(row);
+            }
+            (products_name, index)
+        };
+        let values = b.self_ref(&source);
+        let index = b.lit_int(index as i64 + 1);
+        b.call("get", &[values, index])
+    }
+
+    /// Bind the lane tensors once every channel has requested its rows.
+    pub(crate) fn finish(&self, b: &mut Builder, pyhf_helpers: Option<&str>) {
+        for (&function, lanes) in &self.lanes {
+            let Some([lanes_name, products_name, singles_name]) = &lanes.names else {
+                continue;
+            };
+            let mut order: Vec<usize> = (0..lanes.rows.len()).collect();
+            order.sort_by_key(|&row| std::cmp::Reverse(lanes.rows[row].len()));
+            let lengths: Vec<_> = order.iter().map(|&row| lanes.rows[row].len()).collect();
+            let mut inputs = Vec::new();
+            // (first lane, width, rows) per class, rows in decreasing length.
+            let mut classes = Vec::new();
+            let mut start = 0;
+            for end in width_classes(&lengths) {
+                let members = &order[start..end];
+                let width = class_width(lanes.rows[members[0]].len(), members.len());
+                classes.push((inputs.len(), width, members));
+                for &member in members {
+                    let row = &lanes.rows[member];
+                    inputs.extend(row.iter().map(|r| r.inputs(b)));
+                    // The row's own parameter keeps alpha one input gather; a
+                    // literal lane would split it into one concatenate per lane.
+                    let unit = Interpolation {
+                        lo: 1.0,
+                        hi: 1.0,
+                        ..row[0]
+                    };
+                    (row.len()..width).for_each(|_| inputs.push(unit.inputs(b)));
+                }
+                start = end;
+            }
+            let inputs_before_singles = inputs.len();
+            inputs.extend(lanes.singles.iter().map(|r| r.inputs(b)));
+            let [lo, hi, alpha] =
+                [0, 1, 2].map(|i| b.array(&inputs.iter().map(|row| row[i]).collect::<Vec<_>>()));
+            let factors = match pyhf_helpers.filter(|_| function == INTERP_NORMSYS_DEFAULT) {
+                Some(alias) => {
+                    let head = b.module_call(alias, "normsys_factor");
+                    b.call("broadcast", &[head, lo, hi, alpha])
+                }
+                None => {
+                    let head = b.module_call("hepphys", function);
+                    let one = b.lit_real(1.0);
+                    b.call("broadcast", &[head, lo, one, hi, alpha])
+                }
+            };
+            b.bind_doc(
+                lanes_name,
+                factors,
+                &["Normalization factors, one padded row per modifier run, then single factors."],
+            );
+            let mut places = vec![None; lanes.rows.len()];
+            for (first, width, members) in classes {
+                let rows: Vec<_> = (0..members.len())
+                    .map(|k| {
+                        let lanes = first + k * width;
+                        let indices: Vec<_> = (lanes + 1..=lanes + width)
+                            .map(|i| b.lit_int(i as i64))
+                            .collect();
+                        let indices = b.array(&indices);
+                        let values = b.self_ref(lanes_name);
+                        b.call("get", &[values, indices])
+                    })
+                    .collect();
+                let rows = b.array(&rows);
+                let prod = b.call_head("prod");
+                let products = b.call("broadcast", &[prod, rows]);
+                let class = b.bind_unique_doc(
+                    &format!("{products_name}_{width}"),
+                    products,
+                    "Products of normalization factor rows of one width class.",
+                );
+                for (k, &member) in members.iter().enumerate() {
+                    places[member] = Some((class.clone(), k));
+                }
+            }
+            if !places.is_empty() {
+                let products: Vec<_> = places
+                    .into_iter()
+                    .map(|place| {
+                        let (class, k) = place.expect("every row has a class");
+                        let values = b.self_ref(&class);
+                        let index = b.lit_int(k as i64 + 1);
+                        b.call("get", &[values, index])
+                    })
+                    .collect();
+                let products = b.array(&products);
+                b.bind_doc(
+                    products_name,
+                    products,
+                    &["Products of normalization factor rows, one per modifier run."],
+                );
+            }
+            if !lanes.singles.is_empty() {
+                let start = inputs_before_singles;
+                let indices: Vec<_> = (start + 1..=start + lanes.singles.len())
+                    .map(|i| b.lit_int(i as i64))
+                    .collect();
+                let indices = b.array(&indices);
+                let values = b.self_ref(lanes_name);
+                let singles = b.call("get", &[values, indices]);
+                b.bind_doc(
+                    singles_name,
+                    singles,
+                    &["Normalization factors that no run multiplies with another."],
+                );
+            }
+        }
+    }
+}
+
+/// Padding share above which a lane tensor splits into another width class.
+/// Padding costs lanes on CPU and each class costs kernel launches on GPU.
+const MAX_PADDING: f64 = 0.15;
+
+/// Smallest width of the form 2^k or 3 * 2^k that holds `length` lanes.
+/// The pairwise product tree then halves without an odd tail, except once at
+/// width 3, and each odd tail costs a slice and a concatenate that split GPU
+/// fusions.
+fn tree_width(length: usize) -> usize {
+    let power = length.next_power_of_two();
+    if power / 4 * 3 >= length {
+        power / 4 * 3
+    } else {
+        power
+    }
+}
+
+/// Width of a class whose widest row has `length` lanes. A lone row needs no
+/// common width: padding it would repeat its parameter in alpha, and repeated
+/// indices turn the alpha gradient from a concatenate into a scatter.
+fn class_width(length: usize, rows: usize) -> usize {
+    if rows == 1 {
+        length
+    } else {
+        tree_width(length)
+    }
+}
+
+/// Fewest contiguous classes over `lengths`, sorted in decreasing order, whose
+/// rows padded to each class's width keep the lanes beyond each row's own
+/// tree width under [`MAX_PADDING`]. One row per class meets the bound, so
+/// the search ends. Returns the end of each class.
+fn width_classes(lengths: &[usize]) -> Vec<usize> {
+    // Tree rounding alone can exceed the bound, as one row per class shows.
+    let floor: usize = lengths.iter().map(|&length| tree_width(length)).sum();
+    // Fewest lanes covering the first i rows with the current class count.
+    let mut best: Vec<Option<(usize, Vec<usize>)>> = vec![None; lengths.len() + 1];
+    best[0] = Some((0, Vec::new()));
+    loop {
+        if let Some((lanes, ends)) = &best[lengths.len()]
+            && lanes.saturating_sub(floor) as f64 <= MAX_PADDING * *lanes as f64
+        {
+            return ends.clone();
+        }
+        best = (0..=lengths.len())
+            .map(|i| {
+                (0..i)
+                    .filter_map(|j| {
+                        let (lanes, ends) = best[j].as_ref()?;
+                        Some((lanes + class_width(lengths[j], i - j) * (i - j), ends))
+                    })
+                    .min_by_key(|(lanes, _)| *lanes)
+                    .map(|(lanes, ends)| (lanes, [ends.as_slice(), &[i]].concat()))
+            })
+            .collect();
     }
 }
 
