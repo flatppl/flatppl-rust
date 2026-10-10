@@ -146,3 +146,56 @@ fn singleton_factors_keep_native_interpolation_kinds() {
         "{text}"
     );
 }
+
+#[test]
+fn scalar_runs_multiply_masked_rows_of_their_channel_factors() {
+    let normsys = |name: &str, lo: f64, hi: f64| serde_json::json!({"name": name, "type": "normsys", "data": {"lo": lo, "hi": hi}});
+    let doc = serde_json::json!({
+        "channels": [
+            {"name": "c", "samples": [
+                {"name": "signal", "data": [10.0, 20.0], "modifiers": [
+                    normsys("a", 0.9, 1.1),
+                    {"name": "mu", "type": "normfactor", "data": null},
+                    normsys("b", 0.8, 1.2),
+                    {"name": "g", "type": "shapefactor", "data": null},
+                    normsys("c", 0.7, 1.3)
+                ]},
+                {"name": "background", "data": [30.0, 40.0], "modifiers": [
+                    normsys("a", 0.9, 1.1), normsys("c", 0.7, 1.3)
+                ]}
+            ]},
+            {"name": "d", "samples": [
+                {"name": "signal", "data": [5.0], "modifiers": [
+                    normsys("a", 0.9, 1.1), normsys("c", 0.7, 1.3),
+                    normsys("e", 0.6, 1.4), normsys("f", 0.5, 1.5)
+                ]}
+            ]}
+        ],
+        "observations": [{"name": "c", "data": [42.0, 58.0]}, {"name": "d", "data": [6.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "mu"}}]
+    });
+    let module = flatppl_hs3::read_pyhf(&doc.to_string()).unwrap();
+    let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+    for line in [
+        // One row per run with two or more batched factors, one reduction per vector.
+        "c_normsys_products = broadcast(prod, [broadcast(ifelse, [true, true, false], \
+         c_normsys_interp_poly6_exp, 1.0), broadcast(ifelse, [true, false, true], \
+         c_normsys_interp_poly6_exp, 1.0)])",
+        // The product takes the first factor's place; a per-bin factor still splits
+        // the run, and a lone factor keeps its scalar selection.
+        "c_signal_expected = broadcast(mul, broadcast(mul, broadcast(mul, \
+         broadcast(mul, c_signal_nominal, get(c_normsys_products, 1)), mu), g), \
+         get(c_normsys_interp_poly6_exp, 3))",
+        "c_background_expected = broadcast(mul, c_background_nominal, \
+         get(c_normsys_products, 2))",
+        // Factors that an earlier channel batched reduce over that channel's vector.
+        "d_normsys_products = broadcast(prod, [broadcast(ifelse, [true, false, true], \
+         c_normsys_interp_poly6_exp, 1.0)])",
+        "d_normsys_products_2 = broadcast(prod, [broadcast(ifelse, [true, true], \
+         d_normsys_interp_poly6_exp, 1.0)])",
+        "d_signal_expected = broadcast(mul, broadcast(mul, d_signal_nominal, \
+         get(d_normsys_products, 1)), get(d_normsys_products_2, 1))",
+    ] {
+        assert!(text.contains(line), "missing `{line}` in:\n{text}");
+    }
+}

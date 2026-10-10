@@ -1027,7 +1027,8 @@ pub fn assemble_channel(
             }
             runs
         });
-    let products = crate::normsys::products(b, channel_name, runs);
+    let masked = terms.normsys_factors.masked_products(b, channel_name, runs);
+    let products = crate::normsys::products(b, channel_name, masked.values().cloned());
     for ((sname, _, modifiers), (nom, factors)) in
         samples.iter().zip(shifted.into_iter().zip(multipliers))
     {
@@ -1038,7 +1039,7 @@ pub fn assemble_channel(
             .filter_map(|modifier| mod_spec(&modifier.kind).filter(|spec| !spec.replaces_nominal));
         for (factor, spec) in factors.into_iter().zip(kinds) {
             if spec.param_domain == ParamDomain::PosRealsPow {
-                acc = multiply_scalar_factors(b, acc, &scalars, &products);
+                acc = multiply_scalar_factors(b, acc, &masked[&scalars], &products);
                 scalars.clear();
                 let mul = b.call_head("mul");
                 acc = b.call("broadcast", &[mul, acc, factor]);
@@ -1046,7 +1047,7 @@ pub fn assemble_channel(
                 scalars.push(factor);
             }
         }
-        acc = multiply_scalar_factors(b, acc, &scalars, &products);
+        acc = multiply_scalar_factors(b, acc, &masked[&scalars], &products);
 
         let exp_name = b.bind_unique_doc(
             &format!("{channel_name}_{sname}_expected"),
