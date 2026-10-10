@@ -135,6 +135,7 @@ pub struct Emitter<'m> {
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
     integration: Option<crate::IntegrationOptions>,
+    target: crate::Target,
     integrating: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
@@ -195,6 +196,7 @@ impl<'m> Emitter<'m> {
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             integration: None,
+            target: crate::Target::Cpu,
             integrating: false,
             next: 0,
             memo: HashMap::new(),
@@ -220,6 +222,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.integration = opts.integration;
+        emitter.target = opts.target;
         emitter
     }
 
@@ -228,6 +231,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
         emitter.integration = self.integration;
+        emitter.target = self.target;
         emitter
     }
 

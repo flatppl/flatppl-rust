@@ -83,6 +83,41 @@ fn stablehlo_abi_model_preserves_precision_and_order() {
     }
 }
 
+/// Both lowering profiles keep the ABI. An unknown profile is a usage error.
+#[test]
+fn stablehlo_target_selects_a_profile_with_the_same_abi() {
+    let input = write_model(
+        "target",
+        "a = elementof(reals)\n\
+         m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))\n\
+         inputs = a\n\
+         outputs = logdensityof(m, record(a = a))\n",
+    );
+    for target in ["cpu", "gpu"] {
+        let out = flatppl()
+            .args(["stablehlo", "--target", target])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("func.func @logdensity(%arg0: tensor<f32>) -> tensor<f32>"),
+            "{stdout}"
+        );
+    }
+    let out = flatppl()
+        .args(["stablehlo", "--target", "tpu"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
 /// A `load_data` ABI input is shaped from its declared `valueset` end-to-end
 /// through the real CLI binary, and THE SOURCE FILE NEED NOT EXIST: nothing in
 /// the pipeline opens it (spec §07 `load_data`: "`valueset` fully determines the
