@@ -213,19 +213,32 @@ impl Factors {
             let Some([lanes_name, products_name, singles_name]) = &lanes.names else {
                 continue;
             };
-            let width = lanes.rows.iter().map(Vec::len).max().unwrap_or(0);
+            let mut order: Vec<usize> = (0..lanes.rows.len()).collect();
+            order.sort_by_key(|&row| std::cmp::Reverse(lanes.rows[row].len()));
+            let lengths: Vec<_> = order.iter().map(|&row| lanes.rows[row].len()).collect();
             let mut inputs = Vec::new();
-            for row in &lanes.rows {
-                inputs.extend(row.iter().map(|r| r.inputs(b)));
-                // The row's own parameter keeps alpha one input gather; a
-                // literal lane would split it into one concatenate per lane.
-                let unit = Interpolation {
-                    lo: 1.0,
-                    hi: 1.0,
-                    ..row[0]
-                };
-                (row.len()..width).for_each(|_| inputs.push(unit.inputs(b)));
+            // (first lane, width, rows) per class, rows in decreasing length.
+            let mut classes = Vec::new();
+            let mut start = 0;
+            for end in width_classes(&lengths) {
+                let members = &order[start..end];
+                let width = lanes.rows[members[0]].len();
+                classes.push((inputs.len(), width, members));
+                for &member in members {
+                    let row = &lanes.rows[member];
+                    inputs.extend(row.iter().map(|r| r.inputs(b)));
+                    // The row's own parameter keeps alpha one input gather; a
+                    // literal lane would split it into one concatenate per lane.
+                    let unit = Interpolation {
+                        lo: 1.0,
+                        hi: 1.0,
+                        ..row[0]
+                    };
+                    (row.len()..width).for_each(|_| inputs.push(unit.inputs(b)));
+                }
+                start = end;
             }
+            let inputs_before_singles = inputs.len();
             inputs.extend(lanes.singles.iter().map(|r| r.inputs(b)));
             let [lo, hi, alpha] =
                 [0, 1, 2].map(|i| b.array(&inputs.iter().map(|row| row[i]).collect::<Vec<_>>()));
@@ -245,10 +258,12 @@ impl Factors {
                 factors,
                 &["Normalization factors, one padded row per modifier run, then single factors."],
             );
-            if !lanes.rows.is_empty() {
-                let rows: Vec<_> = (0..lanes.rows.len())
+            let mut places = vec![None; lanes.rows.len()];
+            for (first, width, members) in classes {
+                let rows: Vec<_> = (0..members.len())
                     .map(|k| {
-                        let indices: Vec<_> = (k * width + 1..=(k + 1) * width)
+                        let lanes = first + k * width;
+                        let indices: Vec<_> = (lanes + 1..=lanes + width)
                             .map(|i| b.lit_int(i as i64))
                             .collect();
                         let indices = b.array(&indices);
@@ -259,6 +274,26 @@ impl Factors {
                 let rows = b.array(&rows);
                 let prod = b.call_head("prod");
                 let products = b.call("broadcast", &[prod, rows]);
+                let class = b.bind_unique_doc(
+                    &format!("{products_name}_{width}"),
+                    products,
+                    "Products of normalization factor rows of one width class.",
+                );
+                for (k, &member) in members.iter().enumerate() {
+                    places[member] = Some((class.clone(), k));
+                }
+            }
+            if !places.is_empty() {
+                let products: Vec<_> = places
+                    .into_iter()
+                    .map(|place| {
+                        let (class, k) = place.expect("every row has a class");
+                        let values = b.self_ref(&class);
+                        let index = b.lit_int(k as i64 + 1);
+                        b.call("get", &[values, index])
+                    })
+                    .collect();
+                let products = b.array(&products);
                 b.bind_doc(
                     products_name,
                     products,
@@ -266,7 +301,7 @@ impl Factors {
                 );
             }
             if !lanes.singles.is_empty() {
-                let start = lanes.rows.len() * width;
+                let start = inputs_before_singles;
                 let indices: Vec<_> = (start + 1..=start + lanes.singles.len())
                     .map(|i| b.lit_int(i as i64))
                     .collect();
@@ -280,6 +315,38 @@ impl Factors {
                 );
             }
         }
+    }
+}
+
+/// Padding share above which a lane tensor splits into another width class.
+/// Padding costs lanes on CPU and each class costs kernel launches on GPU.
+const MAX_PADDING: f64 = 0.15;
+
+/// Fewest contiguous classes over `lengths`, sorted in decreasing order, whose
+/// rows padded to each class's first length keep padding under [`MAX_PADDING`].
+/// Returns the end of each class.
+fn width_classes(lengths: &[usize]) -> Vec<usize> {
+    let real: usize = lengths.iter().sum();
+    // Fewest lanes covering the first i rows with the current class count.
+    let mut best: Vec<Option<(usize, Vec<usize>)>> = vec![None; lengths.len() + 1];
+    best[0] = Some((0, Vec::new()));
+    loop {
+        if let Some((lanes, ends)) = &best[lengths.len()]
+            && (lanes - real) as f64 <= MAX_PADDING * *lanes as f64
+        {
+            return ends.clone();
+        }
+        best = (0..=lengths.len())
+            .map(|i| {
+                (0..i)
+                    .filter_map(|j| {
+                        let (lanes, ends) = best[j].as_ref()?;
+                        Some((lanes + lengths[j] * (i - j), ends))
+                    })
+                    .min_by_key(|(lanes, _)| *lanes)
+                    .map(|(lanes, ends)| (lanes, [ends.as_slice(), &[i]].concat()))
+            })
+            .collect();
     }
 }
 
