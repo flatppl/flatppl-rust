@@ -277,3 +277,40 @@ fn batched_scan_density_keeps_one_time_loop() -> Result<(), Box<dyn std::error::
     );
     Ok(())
 }
+
+#[test]
+fn gpu_segment_slices_stay_out_of_batched_exports() -> Result<(), Box<dyn std::error::Error>> {
+    // Contiguous runs within the padding bound share one reduction.
+    let rows =
+        |range: std::ops::Range<usize>| range.map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let query = Context::default().parse(
+        &format!(
+            "x = elementof(cartpow(reals, 40))\ninputs = x\noutputs = (sum(x[[{}]]), sum(x[[{}]]), sum(x[[{}]]), sum(x[[{}]]))",
+            rows(1..3),
+            rows(3..6),
+            rows(6..7),
+            rows(7..9)
+        ),
+        None,
+        None,
+    )?;
+    let options = EmitOptions {
+        target: flatppl_host::Target::Gpu,
+        ..EmitOptions::default()
+    };
+    let gather = "\"stablehlo.gather\"";
+    // The gradient differentiates the unbatched export, whose slices have a
+    // sliced adjoint. The batched forward graph keeps the gather.
+    assert!(!query.compile(&options)?.stablehlo.contains(gather));
+    let batch = BatchSpec {
+        shape: vec![4],
+        input_axes: vec![vec![Some(0)]],
+    };
+    assert!(
+        query
+            .compile_batched(&options, &batch)?
+            .stablehlo
+            .contains(gather)
+    );
+    Ok(())
+}

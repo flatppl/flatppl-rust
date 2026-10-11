@@ -407,7 +407,14 @@ pub(super) fn finish(
         // can hold an identical index tensor defined after the first segment.
         let mut scratch = out.scratch_emitter();
         scratch.next = next;
-        let reduced = emit_reductions(&mut scratch, &group, maximum, ragged);
+        // Contiguous runs stack as padded slices, whose adjoint slices the
+        // cotangent instead of scattering it back through a gather. A batched
+        // forward graph runs faster from the gather, so outside ragged CPU
+        // classes only an unbatched GPU group, the one the gradient
+        // differentiates, takes the slices.
+        let slices = ragged
+            || (out.target == Target::Gpu && first.sources.iter().all(|s| out.batch_rank(s) == 0));
+        let reduced = emit_reductions(&mut scratch, &group, maximum, slices);
         let shared = scratch.body.clone();
         scratch.body.clear();
         for (lane, segment) in group.iter().enumerate() {
@@ -507,7 +514,7 @@ fn emit_reductions(
     out: &mut Emitter<'_>,
     segments: &[Segment],
     maximum: usize,
-    ragged: bool,
+    slices: bool,
 ) -> Value {
     let first = &segments[0];
     let source = &first.sources[0];
@@ -522,7 +529,7 @@ fn emit_reductions(
         ty: MlirTy::Scalar,
         elem: source.elem,
     };
-    let gathered = padded_gather(out, segments, maximum, &identity, ragged);
+    let gathered = padded_gather(out, segments, maximum, &identity, slices);
     let reduced = out.reduce_axis_lit(&first.op, &first.init, &gathered, axis + 1);
     let mut perm = vec![0];
     perm.extend(
@@ -543,7 +550,7 @@ fn padded_gather(
     segments: &[Segment],
     maximum: usize,
     identity: &Value,
-    ragged: bool,
+    slices: bool,
 ) -> Value {
     let first = &segments[0];
     let source = &first.sources[0];
@@ -608,10 +615,7 @@ fn padded_gather(
         perm.extend((0..dims.len() as u64 + 1).filter(|&d| d != axis as u64));
         return out.transpose(&view, &perm);
     }
-    // Contiguous ragged runs stack as padded slices, whose adjoint slices the
-    // cotangent instead of scattering it back through a gather. The batched
-    // forward graph of a packed group runs faster from the gather.
-    if ragged
+    if slices
         && segments
             .iter()
             .all(|s| s.indices.windows(2).all(|p| p[1] == p[0] + 1))
