@@ -165,6 +165,26 @@ impl LoadedModule {
             .collect()
     }
 
+    /// Read a public binding's right-hand side back as a value.
+    ///
+    /// The read is structural. See [`Constant`] for what reads back. Any other
+    /// expression is refused, because the host evaluates nothing.
+    pub fn constant(&self, name: &str) -> Result<Constant, Diagnostic> {
+        let module = &self.typed;
+        let fail = |message: String| Diagnostic::new("constant", self.source_name(), message);
+        let (_, binding) = module
+            .public_bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)
+            .ok_or_else(|| fail(format!("no public binding named `{name}`")))?;
+        Constant::read(module, binding.rhs).map_err(|message| {
+            fail(format!("`{name}` does not read back as a value: {message}")).at(
+                module,
+                Some(binding.rhs),
+                self.source(),
+            )
+        })
+    }
+
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
         self.compile_export(options, None)
     }
