@@ -26,6 +26,8 @@ pub struct PyhfOptions {
     pub measurement: Option<String>,
     /// Whether a workspace's observed counts are bound or left as externals.
     pub observations: Observations,
+    /// Whether constraint centres are literals or fields of one record external.
+    pub auxiliary: Auxiliary,
 }
 
 /// The form of each channel's observed counts.
@@ -38,12 +40,24 @@ pub enum Observations {
     External,
 }
 
+/// The form of each auxiliary constraint's centre.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Auxiliary {
+    /// Each centre is a literal: the measurement's `auxdata` or the modifier's.
+    #[default]
+    Bound,
+    /// Each centre is a field of `pyhf_auxdata`, a record external keyed by
+    /// parameter in pyhf's `auxdata_order`. The nominal values are the
+    /// settings record's `auxdata`.
+    External,
+}
+
 /// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
 pub fn pyhf_to_module(doc: PyhfDocument) -> Result<Module> {
     pyhf_to_module_with(doc, &PyhfOptions::default())
 }
 
-/// [`pyhf_to_module`] with a chosen measurement and observation form.
+/// [`pyhf_to_module`] with a chosen measurement, observation and centre form.
 pub fn pyhf_to_module_with(mut doc: PyhfDocument, options: &PyhfOptions) -> Result<Module> {
     if let Some(name) = &options.measurement {
         doc.select_measurement(name).map_err(Error::Unsupported)?;
@@ -69,6 +83,9 @@ pub fn pyhf_to_module_with(mut doc: PyhfDocument, options: &PyhfOptions) -> Resu
             channels: &terms.channels,
             staterror: &terms.staterror_acc,
         };
+        if let Some(name) = &terms.auxdata {
+            crate::pyhf_measurement::emit_auxdata(&mut b, &doc, &emitted, &order, name)?;
+        }
         crate::pyhf_measurement::emit_records(&mut b, &doc, &emitted, &order, &original)?;
         crate::pyhf_names::emit_metadata(&mut b, &names);
     }
@@ -399,6 +416,7 @@ fn collect_param_overrides(
                 auxdata: p.auxdata.clone(),
                 sigmas: p.sigmas.clone(),
                 factors: p.factors.clone(),
+                centre: None,
             },
         );
     }
@@ -426,6 +444,17 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument, options: &PyhfOptions) -> Resu
         suffix += 1;
     }
     bind_standard_module(b, &helpers, "pyhf_helpers", "0.1");
+    // The centres' record is bound after the constraints that read it, so its
+    // name must already avoid every parameter.
+    let auxdata = (options.auxiliary == Auxiliary::External).then(|| {
+        let mut name = "pyhf_auxdata".to_owned();
+        let mut suffix = 2;
+        while parameters.contains(&name) {
+            name = format!("pyhf_auxdata_{suffix}");
+            suffix += 1;
+        }
+        name
+    });
 
     // Per channel: declare free params, build expected, obs model, and accumulate
     // observation + constraint likelihood terms.
@@ -433,6 +462,7 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument, options: &PyhfOptions) -> Resu
         pyhf_helpers: Some(helpers),
         staterror_gaussian_default: true,
         param_overrides,
+        auxdata,
         ..Terms::default()
     };
     // Every channel's staterror layout first: a shared name's component count
@@ -597,6 +627,8 @@ pub struct Terms {
     pub(crate) staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
     /// Resolved constraint family per staterror parameter (`true` means Gaussian).
     staterror_gaussian: BTreeMap<String, bool>,
+    /// The record external that constraint centres read, when they are external.
+    auxdata: Option<String>,
     /// Each channel's layout and binding names, in document order.
     pub(crate) channels: Vec<crate::pyhf_measurement::ChannelRecord>,
 }
@@ -689,9 +721,19 @@ pub fn register_staterror_layout(
 
 impl Terms {
     /// The override for `param`, or the empty one when the measurement config
-    /// says nothing about it.
-    fn aux_override(&self, param: &str) -> AuxOverride {
-        self.param_overrides.get(param).cloned().unwrap_or_default()
+    /// says nothing about it, with the external centre when there is one.
+    fn aux_override(&self, b: &mut Builder, param: &str) -> AuxOverride {
+        let mut ov = self.param_overrides.get(param).cloned().unwrap_or_default();
+        ov.centre = self.centre(b, param);
+        ov
+    }
+
+    /// `get(<auxdata record>, "<param>")` when centres are external.
+    fn centre(&self, b: &mut Builder, param: &str) -> Option<NodeId> {
+        let record = self.auxdata.as_deref()?;
+        let record = b.self_ref(record);
+        let field = b.str_lit(param);
+        Some(b.call("get", &[record, field]))
     }
 }
 
@@ -1171,7 +1213,8 @@ pub fn assemble_channel(
     if let Some(LumiConfig { sigma, nom }) = lumi
         && terms.emitted_params.insert("lumi".to_string())
     {
-        let term = emit_lumi_constraint(b, "lumi", sigma, nom);
+        let centre = terms.centre(b, "lumi");
+        let term = emit_lumi_constraint(b, "lumi", sigma, nom, centre);
         terms.constraints.push(term);
     }
 
@@ -1199,7 +1242,7 @@ pub fn assemble_channel(
                 .get(param_name)
                 .copied()
                 .unwrap_or(terms.staterror_gaussian_default);
-            let ov = terms.aux_override(param_name);
+            let ov = terms.aux_override(b, param_name);
             let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian, &ov);
             terms.constraints.push(term);
         }
@@ -1439,7 +1482,7 @@ fn emit_pending_constraint(
     if !terms.emitted_params.insert(param.clone()) {
         return; // already emitted (shared parameter)
     }
-    let ov = terms.aux_override(&param);
+    let ov = terms.aux_override(b, &param);
     let term = match pending {
         PendingConstraint::Shapesys {
             sigma,

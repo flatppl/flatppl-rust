@@ -25,7 +25,7 @@ pub(crate) mod pyhf;
 mod pyhf_measurement;
 mod pyhf_names;
 
-pub use pyhf::{Observations, PyhfOptions};
+pub use pyhf::{Auxiliary, Observations, PyhfOptions};
 
 use flatppl_core::Module;
 use flatppl_syntax::{Syntax, parse, print_with};

@@ -11,8 +11,8 @@ use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
 use flatppl_host::{
-    BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
-    MathFormat, Observations, PyhfOptions, Target,
+    Auxiliary, BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions,
+    LoadedModule, MathFormat, Observations, PyhfOptions, Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -52,7 +52,10 @@ impl NativeContext {
             .map_err(error)
     }
 
-    #[pyo3(signature = (source, name=None, source_path=None, measurement=None, observations="bound"))]
+    #[pyo3(signature = (
+        source, name=None, source_path=None, measurement=None, observations="bound",
+        auxiliary="bound",
+    ))]
     fn import_pyhf(
         &mut self,
         source: &str,
@@ -60,6 +63,7 @@ impl NativeContext {
         source_path: Option<&str>,
         measurement: Option<String>,
         observations: &str,
+        auxiliary: &str,
     ) -> PyResult<NativeModule> {
         let observations = match observations {
             "bound" => Observations::Bound,
@@ -70,9 +74,15 @@ impl NativeContext {
                 ));
             }
         };
+        let auxiliary = match auxiliary {
+            "bound" => Auxiliary::Bound,
+            "external" => Auxiliary::External,
+            _ => return Err(PyValueError::new_err("auxiliary must be bound or external")),
+        };
         let options = PyhfOptions {
             measurement,
             observations,
+            auxiliary,
         };
         self.inner
             .import_pyhf(source, &options, name, source_path)

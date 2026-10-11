@@ -6,8 +6,8 @@ Import HS3 (HEP Statistics Serialization Standard) and pyhf JSON models into
 * `read_hs3(json)` — native HS3 documents (`distributions`, `functions`, `domains`,
   `parameter_points`, `likelihoods`).
 * `read_pyhf(json)` — pyhf models or workspaces (top-level `channels`).
-* `read_pyhf_with(json, &PyhfOptions)` — the same, with a selected measurement or
-  external observations.
+* `read_pyhf_with(json, &PyhfOptions)` — the same, with a selected measurement,
+  external observations or external constraint centres.
 * `read(json)` — dispatch on the `channels` key.
 
 Covers most of the HS3 distribution catalogue, the `functions` block, and histfactory (both pyhf
@@ -36,11 +36,17 @@ the likelihood. Model-only input declares no parameter of interest.
 Workspace imports with bound observations require observations for every channel.
 Integer-count workspaces keep `Poisson`; fractional-count channels use `ContinuedPoisson`.
 
-`PyhfOptions` changes two things. `measurement` selects a workspace measurement
+`PyhfOptions` changes three things. `measurement` selects a workspace measurement
 by name, where pyhf takes the first. `Observations::External` leaves a workspace's
 observed counts as external inputs, like a model-only document, with
-`ContinuedPoisson`. The CLI flags are `--measurement NAME` and
-`--observations external` on `flatppl convert --from pyhf`.
+`ContinuedPoisson`. `Auxiliary::External` makes each constraint's centre a field
+of one record external, for example
+`pyhf_auxdata = external(cartprod(alpha = reals, gamma = cartpow(nonnegreals, 2)))`.
+Its fields follow pyhf's `auxdata_order`, so its flat layout is pyhf's
+`config.auxdata`. Gaussian centres are reals and Poisson centres are non-negative
+reals. The nominal values are the settings record's `auxdata`. The CLI flags are
+`--measurement NAME`, `--observations external` and `--auxiliary external` on
+`flatppl convert --from pyhf`.
 
 Each workspace measurement becomes a literal record named
 `pyhf_measurement_<name>`, with the name sanitized like a channel name. A
