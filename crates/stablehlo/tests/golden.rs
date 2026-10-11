@@ -1818,6 +1818,83 @@ fn lower_in_cartpow_refuses_scalar_point() {
     );
 }
 
+/// Lower `in(v, <head>(3))` for a length-3 point; the emitted module text.
+fn lower_in_vector_set(head: &str) -> String {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let n = int(&mut m, 3);
+    let set = call(&mut m, head, &[n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let ty = MlirTy::Ranked(vec![Some(3)]);
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", ty.clone());
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar, "the gate predicate is scalar");
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), ty, ElemKind::Real)],
+        &[&result],
+    );
+    assert!(is_delimiter_balanced(&out));
+    out
+}
+
+/// §03 "Ordered vectors": the two consecutive differences must be `> 0`.
+#[test]
+fn lower_in_ordered_compares_consecutive_differences() {
+    let out = lower_in_vector_set("ordered");
+    assert!(out.contains("stablehlo.slice %arg0 [1:3]"), "in:\n{out}");
+    assert!(out.contains("stablehlo.slice %arg0 [0:2]"), "in:\n{out}");
+    assert!(out.contains("stablehlo.subtract"), "in:\n{out}");
+    assert!(
+        out.contains("stablehlo.compare GT") && out.contains("-> tensor<2xi1>"),
+        "in:\n{out}"
+    );
+    assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
+}
+
+/// §03 "Standard simplex": entries `>= 0`. The unit sum is not checked.
+#[test]
+fn lower_in_stdsimplex_checks_signs_not_the_sum() {
+    let out = lower_in_vector_set("stdsimplex");
+    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    assert!(!out.contains("applies stablehlo.add"), "in:\n{out}");
+    assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
+}
+
+/// §03 "Zero-sum vectors": the zero sum is not checked, only that every
+/// entry is a real number.
+#[test]
+fn lower_in_zerosum_checks_only_real_entries() {
+    let out = lower_in_vector_set("zerosum");
+    assert!(
+        out.contains("stablehlo.compare EQ, %arg0, %arg0"),
+        "in:\n{out}"
+    );
+    assert!(!out.contains("applies stablehlo.add"), "in:\n{out}");
+    assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
+}
+
+/// A literal size that disagrees with the point's static length refuses.
+#[test]
+fn lower_in_vector_set_refuses_length_mismatch() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let n = int(&mut m, 4);
+    let set = call(&mut m, "ordered", &[n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("size 4") && err.msg.contains("length 3"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
 /// The gate emits no `unitinterval` membership, so `in` still refuses it —
 /// this stays the gate's vocabulary, not a general-purpose §03 set-membership
 /// lowering.
