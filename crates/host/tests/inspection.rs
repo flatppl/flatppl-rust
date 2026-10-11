@@ -83,6 +83,17 @@ fn bindings_report_kind_domain_shape_size_and_position() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn ordered_and_zerosum_domains_report_their_length() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings("o = elementof(ordered(3))\nz = elementof(zerosum(4))\n")?;
+    assert_eq!(rows["o"]["domain"], json!({"set": "ordered", "n": 3}));
+    assert_eq!(rows["o"]["shape"], json!([3]));
+    assert_eq!(rows["z"]["domain"], json!({"set": "zerosum", "n": 4}));
+    // Four stored values, three free coordinates: the size is the stored length.
+    assert_eq!(rows["z"]["size"], 4);
+    Ok(())
+}
+
+#[test]
 fn dependencies_follow_private_bindings_and_module_aliases()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();

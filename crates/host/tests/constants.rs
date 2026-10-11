@@ -151,6 +151,27 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
             },
             "[0.5, 2.0]",
         ),
+        (
+            "ordered(3)",
+            Constant::Array {
+                shape: vec![3],
+                data: vec![
+                    Constant::Real(0.5),
+                    Constant::Integer(1),
+                    Constant::Real(2.5),
+                ],
+            },
+            // Strictly increasing: a tie is outside the set.
+            Constant::Array {
+                shape: vec![3],
+                data: vec![
+                    Constant::Real(0.0),
+                    Constant::Real(0.0),
+                    Constant::Real(1.0),
+                ],
+            },
+            "[0.5, 1.0, 2.5]",
+        ),
     ] {
         let source = format!("x = external({domain})\noutputs = x");
         let module = context.parse(&source, None, None)?;
@@ -164,6 +185,37 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
             context.set(&module, &[("x".into(), invalid)]).is_err(),
             "{domain}"
         );
+    }
+    Ok(())
+}
+
+/// A zero-sum vector needs a negative entry, which a literal spells as a `neg`
+/// call, so compare against the same value bound under `cartpow(reals, 3)`.
+#[test]
+fn zerosum_values_must_sum_to_zero() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let vector = |data: [f64; 3]| Constant::Array {
+        shape: vec![3],
+        data: data.into_iter().map(Constant::Real).collect(),
+    };
+    let module = context.parse("x = external(zerosum(3))\noutputs = x", None, None)?;
+    let reals = context.parse("x = external(cartpow(reals, 3))\noutputs = x", None, None)?;
+    let valid = vector([0.5, 0.25, -0.75]);
+    assert_eq!(
+        context
+            .set(&module, &[("x".into(), valid.clone())])?
+            .compile(&EmitOptions::default())?
+            .stablehlo,
+        context
+            .set(&reals, &[("x".into(), valid)])?
+            .compile(&EmitOptions::default())?
+            .stablehlo
+    );
+    for invalid in [
+        vector([1.0, 1.0, -1.0]),
+        vector([f64::INFINITY, 0.0, f64::NEG_INFINITY]),
+    ] {
+        assert!(context.set(&module, &[("x".into(), invalid)]).is_err());
     }
     Ok(())
 }

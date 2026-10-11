@@ -536,6 +536,18 @@ fn read_valueset(module: &mut Module, form: &Sexpr) -> Result<Option<ValueSet>> 
                     }
                     Ok(Some(ValueSet::StdSimplex(parse_dim(&items[1])?)))
                 }
+                "ordered" => {
+                    if items.len() != 2 {
+                        return Err(err(form, "(ordered <n>) takes one size"));
+                    }
+                    Ok(Some(ValueSet::Ordered(parse_dim(&items[1])?)))
+                }
+                "zerosum" => {
+                    if items.len() != 2 {
+                        return Err(err(form, "(zerosum <n>) takes one size"));
+                    }
+                    Ok(Some(ValueSet::ZeroSum(parse_dim(&items[1])?)))
+                }
                 "interval" => {
                     if items.len() != 3 {
                         return Err(err(form, "(interval <lo> <hi>) takes two bounds"));

@@ -125,6 +125,10 @@ pub enum ValueSet {
     Anything,
     /// `stdsimplex(n)` — the standard probability simplex.
     StdSimplex(Dim),
+    /// `ordered(n)` — strictly increasing real n-vectors, open in ℝⁿ.
+    Ordered(Dim),
+    /// `zerosum(n)` — real n-vectors summing to zero, an (n-1)-dim subspace.
+    ZeroSum(Dim),
     /// `interval(lo, hi)` with static literal bounds.
     Interval(f64, f64),
     /// `cartpow(set, n)` — arrays with every element in `set`.
@@ -192,6 +196,10 @@ impl ValueSet {
         use ValueSet::*;
         match self {
             UnitInterval | Booleans | StdSimplex(_) => Some(true),
+            // `ordered(1)` is all of ℝ; `zerosum(1)` is the single point {[0]}.
+            Ordered(Dim::Static(n)) => Some(*n == 0),
+            ZeroSum(Dim::Static(n)) => Some(*n <= 1),
+            Ordered(Dim::Dynamic) | ZeroSum(Dim::Dynamic) => None,
             Interval(lo, hi) => Some(lo.is_finite() && hi.is_finite()),
             Reals | PosReals | NonNegReals | Integers | PosIntegers | NonNegIntegers
             | Complexes => Some(false),
@@ -228,6 +236,9 @@ impl ValueSet {
             (StdSimplex(n), CartPow(elem, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && UnitInterval.subset_of(elem.as_ref())
             }
+            (Ordered(n) | ZeroSum(n), CartPow(elem, d)) => {
+                (n == d || matches!(d, Dim::Dynamic)) && Reals.subset_of(elem.as_ref())
+            }
             (CartPow(a, n), CartPow(b, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
             }
@@ -254,9 +265,16 @@ impl ValueSet {
                         total += *n;
                         UnitInterval.subset_of(elem)
                     }
+                    Ordered(Dim::Static(n)) | ZeroSum(Dim::Static(n)) => {
+                        total += *n;
+                        Reals.subset_of(elem)
+                    }
                     // A block whose flattened length isn't statically known
                     // (a dynamic power / simplex) can't prove a length match.
-                    CartPow(_, Dim::Dynamic) | StdSimplex(Dim::Dynamic) => false,
+                    CartPow(_, Dim::Dynamic)
+                    | StdSimplex(Dim::Dynamic)
+                    | Ordered(Dim::Dynamic)
+                    | ZeroSum(Dim::Dynamic) => false,
                     // Otherwise treat the component as a single rank-0 position:
                     // scalar sets refine directly; nested products / record sets
                     // fail `subset_of(elem)` (they don't cat into a scalar power).
@@ -426,6 +444,8 @@ impl fmt::Display for ValueSet {
             RngStates => f.write_str("rngstates"),
             Anything => f.write_str("anything"),
             StdSimplex(d) => write!(f, "stdsimplex({d})"),
+            Ordered(d) => write!(f, "ordered({d})"),
+            ZeroSum(d) => write!(f, "zerosum({d})"),
             Interval(lo, hi) => write!(f, "interval({lo}, {hi})"),
             CartPow(set, d) => write!(f, "cartpow({set}, {d})"),
             CartProd(parts) => {
@@ -632,6 +652,15 @@ mod tests {
             CartProd(Box::new([StdSimplex(Dim::Static(3)), Reals]))
                 .subset_of(&CartPow(Box::new(Reals), Dim::Static(4)))
         );
+        // `ordered(n)` and `zerosum(n)` blocks contribute n real positions each.
+        assert!(
+            CartProd(Box::new([Ordered(Dim::Static(2)), ZeroSum(Dim::Static(3))]))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(5)))
+        );
+        assert!(
+            !CartProd(Box::new([Ordered(Dim::Static(2)), Reals]))
+                .subset_of(&CartPow(Box::new(PosReals), Dim::Static(3)))
+        );
         // Wrong total length is not a subset (2 + 3 = 5, not 6).
         assert!(
             !CartProd(Box::new([
@@ -691,6 +720,16 @@ mod tests {
         // The simplex sits inside nonnegative unit vectors.
         let nn = CartPow(Box::new(NonNegReals), Dim::Dynamic);
         assert!(StdSimplex(Dim::Static(3)).subset_of(&nn));
+        // ordered(n) and zerosum(n) are real n-vectors with no sign constraint.
+        let r3 = CartPow(Box::new(Reals), Dim::Static(3));
+        assert!(Ordered(Dim::Static(3)).subset_of(&r3));
+        assert!(ZeroSum(Dim::Static(3)).subset_of(&r3));
+        assert!(ZeroSum(Dim::Static(3)).subset_of(&CartPow(Box::new(Reals), Dim::Dynamic)));
+        assert!(!Ordered(Dim::Static(3)).subset_of(&CartPow(Box::new(Reals), Dim::Static(4))));
+        assert!(
+            !ZeroSum(Dim::Static(3)).subset_of(&CartPow(Box::new(NonNegReals), Dim::Static(3)))
+        );
+        assert!(!Ordered(Dim::Static(3)).subset_of(&ZeroSum(Dim::Static(3))));
         assert!(
             CartPow(Box::new(UnitInterval), Dim::Static(3))
                 .subset_of(&CartPow(Box::new(Reals), Dim::Static(3)))
@@ -706,6 +745,11 @@ mod tests {
         use ValueSet::*;
         assert_eq!(UnitInterval.is_bounded(), Some(true));
         assert_eq!(StdSimplex(Dim::Dynamic).is_bounded(), Some(true));
+        assert_eq!(Ordered(Dim::Static(1)).is_bounded(), Some(false));
+        assert_eq!(Ordered(Dim::Static(3)).is_bounded(), Some(false));
+        assert_eq!(ZeroSum(Dim::Static(1)).is_bounded(), Some(true));
+        assert_eq!(ZeroSum(Dim::Static(2)).is_bounded(), Some(false));
+        assert_eq!(ZeroSum(Dim::Dynamic).is_bounded(), None);
         assert_eq!(Interval(0.0, 1.0).is_bounded(), Some(true));
         assert_eq!(Interval(0.0, f64::INFINITY).is_bounded(), Some(false));
         assert_eq!(Reals.is_bounded(), Some(false));
@@ -731,6 +775,8 @@ mod tests {
         assert_eq!(Dim::Dynamic.to_string(), "?");
         assert_eq!(Reals.to_string(), "reals");
         assert_eq!(StdSimplex(Dim::Static(4)).to_string(), "stdsimplex(4)");
+        assert_eq!(Ordered(Dim::Static(4)).to_string(), "ordered(4)");
+        assert_eq!(ZeroSum(Dim::Dynamic).to_string(), "zerosum(?)");
         assert_eq!(Interval(0.0, 1.0).to_string(), "interval(0, 1)");
         assert_eq!(
             CartPow(Box::new(Reals), Dim::Dynamic).to_string(),

@@ -118,6 +118,34 @@ fn stablehlo_target_selects_a_profile_with_the_same_abi() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// `elementof(ordered(n))` and `elementof(zerosum(n))` are real n-vector inputs
+/// (§03): the emitter shapes them like `stdsimplex(n)` and checks no constraint.
+#[test]
+fn stablehlo_ordered_and_zerosum_parameters_are_real_vector_inputs() {
+    let input = write_model(
+        "abi-ordered-zerosum",
+        "c = elementof(ordered(3))\n\
+         z = elementof(zerosum(4))\n\
+         a = draw(Normal(mu = sum(c) + sum(z), sigma = 1.0))\n\
+         lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n\
+         inputs = (c, z)\n\
+         outputs = lp\n",
+    );
+    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "func.func @logdensity(%arg0: tensor<3xf32>, %arg1: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "{stdout}"
+    );
+}
+
 /// A `load_data` ABI input is shaped from its declared `valueset` end-to-end
 /// through the real CLI binary, and THE SOURCE FILE NEED NOT EXIST: nothing in
 /// the pipeline opens it (spec §07 `load_data`: "`valueset` fully determines the

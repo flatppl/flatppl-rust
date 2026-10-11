@@ -228,6 +228,7 @@ pub const BUILTINS: &[&str] = &[
     "onehot",
     "ones",
     "only",
+    "ordered",
     "partition",
     "pi",
     "polynomial",
@@ -289,6 +290,7 @@ pub const BUILTINS: &[&str] = &[
     "vector",
     "weighted",
     "zeros",
+    "zerosum",
 ];
 
 /// True iff `name` resolves in the `base` namespace — spec §04 "Name resolution"

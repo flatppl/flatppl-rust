@@ -111,6 +111,16 @@ fn every_written_size_position_refuses_a_zero() {
             "§03 \"Standard simplex\"",
         ),
         (
+            "ordered",
+            "x = elementof(ordered(0))",
+            "§03 \"Ordered vectors\"",
+        ),
+        (
+            "zerosum",
+            "x = elementof(zerosum(0))",
+            "§03 \"Zero-sum vectors\"",
+        ),
+        (
             "iid",
             "x = iid(Normal(mu = 0.0, sigma = 1.0), 0)",
             "§06 `iid`",

@@ -548,6 +548,33 @@ fn array_in_set(
             }
             Ok(sum == 1.0)
         }
+        Ordered(Dim::Static(n)) if shape == [*n] => {
+            let mut previous = f64::NEG_INFINITY;
+            for (i, value) in data.iter().enumerate() {
+                let Constant::Real(value) = value else {
+                    return Ok(false);
+                };
+                if value.is_nan() || (i > 0 && *value <= previous) {
+                    return Ok(false);
+                }
+                previous = *value;
+            }
+            Ok(true)
+        }
+        // Exact, as for `stdsimplex`: the host does not pick a tolerance.
+        ZeroSum(Dim::Static(n)) if shape == [*n] => {
+            let mut sum = 0.0;
+            for value in data {
+                let Constant::Real(value) = value else {
+                    return Ok(false);
+                };
+                if !value.is_finite() {
+                    return Ok(false);
+                }
+                sum += value;
+            }
+            Ok(sum == 0.0)
+        }
         CartProd(parts) if shape.len() == 1 => {
             let mut offset = 0;
             for part in parts {
@@ -556,7 +583,9 @@ fn array_in_set(
                     return Ok(false);
                 };
                 let dims = match part {
-                    CartPow(_, _) | CartProd(_) | StdSimplex(_) => vec![width as u32],
+                    CartPow(_, _) | CartProd(_) | StdSimplex(_) | Ordered(_) | ZeroSum(_) => {
+                        vec![width as u32]
+                    }
                     _ => vec![],
                 };
                 if !array_in_set(module, &dims, values, part)? {
@@ -566,7 +595,12 @@ fn array_in_set(
             }
             Ok(offset == data.len())
         }
-        Deferred | Unknown | CartPow(_, Dim::Dynamic) | StdSimplex(Dim::Dynamic) => {
+        Deferred
+        | Unknown
+        | CartPow(_, Dim::Dynamic)
+        | StdSimplex(Dim::Dynamic)
+        | Ordered(Dim::Dynamic)
+        | ZeroSum(Dim::Dynamic) => {
             Err("external domain cannot be resolved after substitution".into())
         }
         _ => Ok(false),
@@ -575,9 +609,10 @@ fn array_in_set(
 
 fn product_width(set: &ValueSet) -> Option<usize> {
     match set {
-        ValueSet::CartPow(_, Dim::Static(n)) | ValueSet::StdSimplex(Dim::Static(n)) => {
-            Some(*n as usize)
-        }
+        ValueSet::CartPow(_, Dim::Static(n))
+        | ValueSet::StdSimplex(Dim::Static(n))
+        | ValueSet::Ordered(Dim::Static(n))
+        | ValueSet::ZeroSum(Dim::Static(n)) => Some(*n as usize),
         ValueSet::CartProd(parts) => parts
             .iter()
             .try_fold(0_usize, |n, set| n.checked_add(product_width(set)?)),

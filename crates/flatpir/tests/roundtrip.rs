@@ -179,6 +179,8 @@ fn mass_and_valueset_strictness() {
         "(%module (%bind x (%meta ((%scalar real) %fixed %sometimes) (add 1 2))))",
         // Malformed set forms.
         "(%module (%bind x (%meta ((%scalar real) %fixed (stdsimplex)) (add 1 2))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (ordered)) (add 1 2))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (zerosum 2 3)) (add 1 2))))",
         "(%module (%bind x (%meta ((%scalar real) %fixed (cartpow reals)) (add 1 2))))",
     ];
     for src in cases {
@@ -193,7 +195,9 @@ fn valueset_forms_roundtrip() {
   (%bind a (%meta ((%scalar real) %fixed (interval 0.0 inf)) (add 1.0 2.0)))
   (%bind b (%meta ((%scalar real) %fixed (stdsimplex %dynamic)) (add 1.0 2.0)))
   (%bind c (%meta ((%scalar real) %fixed (cartpow posintegers 4)) (add 1.0 2.0)))
-  (%bind d (%meta ((%scalar real) %fixed anything) (add 1.0 2.0))))"#;
+  (%bind d (%meta ((%scalar real) %fixed anything) (add 1.0 2.0)))
+  (%bind e (%meta ((%scalar real) %fixed (ordered 3)) (add 1.0 2.0)))
+  (%bind f (%meta ((%scalar real) %fixed (zerosum %dynamic)) (add 1.0 2.0))))"#;
     let m = read(src).unwrap();
     let out = write(&m);
     for needle in [
@@ -201,6 +205,8 @@ fn valueset_forms_roundtrip() {
         "(stdsimplex %dynamic)",
         "(cartpow posintegers 4)",
         " anything)",
+        "(ordered 3)",
+        "(zerosum %dynamic)",
     ] {
         assert!(out.contains(needle), "missing {needle} in:\n{out}");
     }

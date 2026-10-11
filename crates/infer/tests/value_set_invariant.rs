@@ -53,6 +53,8 @@ fn value_sets_are_refinements_of_natural_extent() {
         "x = elementof(posreals)",
         "v = elementof(cartpow(reals, 3))",
         "s = elementof(stdsimplex(4))",
+        "o = elementof(ordered(4))",
+        "zs = elementof(zerosum(4))",
         "w = [0.2, 0.3, 0.5]\nsm = softmax(w)",
         // positional cartprod: CartProd value-set vs an array type (CartPow nat)
         "p = elementof(cartprod(reals, integers))",
