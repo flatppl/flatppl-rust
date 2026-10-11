@@ -20,7 +20,7 @@ use crate::rule::{LocalTargets, RuleStep};
 use crate::trace::{Inferencer, join_phase};
 
 mod pyhf;
-mod rebase;
+mod tilt;
 
 /// `(node, type, phase)` of an inferred positional argument.
 type ArgInfo = (NodeId, Type, Phase);
@@ -559,7 +559,7 @@ pub(crate) fn call_rule(
         // normalization-level rules (inheriting it via the type clone would
         // smuggle the base's class through `fill_mass`).
         "truncate" | "normalize" => fresh_measure(arg_ty(args, 0)),
-        "rebase" => rebase::call_type(inf, id, args),
+        "tilt" => tilt::call_type(inf, id, args),
         // Domain-preserving measure-algebra ops (spec §06): the result is a
         // measure over the SAME value domain as its measure argument, with a
         // fresh (recomputed) mass — like truncate/normalize.
@@ -5818,7 +5818,7 @@ fn user_call_type(
                     match result
                         .or_else(|| reified_result_type(inf, callee))
                         .or_else(|| kernel_joint_result_type(inf, callee))
-                        .or_else(|| rebase::result_type(inf, callee))
+                        .or_else(|| tilt::result_type(inf, callee))
                     {
                         Some(Type::Measure { domain, .. }) => Type::Measure { domain, mass },
                         // A rejected application (the `ksuperpose` family-axis rule)
@@ -7231,9 +7231,9 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
              modules\": \"`standard_module` only accepts positional arguments, not \
              keyword arguments\"",
         ),
-        "rebase" => (
+        "tilt" => (
             Distinguished(2),
-            "§06 `rebase(M, B)` takes two positional arguments",
+            "§06 `tilt(M, B)` takes two positional arguments",
         ),
         "aggregate" | "metricsum" | "markovchain" | "kscan" => (
             Distinguished(3),
@@ -8783,7 +8783,7 @@ pub(crate) fn call_valueset(
         "normalize" | "bayesupdate" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
-        "weighted" | "logweighted" | "rebase" => args
+        "weighted" | "logweighted" | "tilt" => args
             .get(1)
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
         // Drawing yields a value in the measure's support.
@@ -9725,7 +9725,7 @@ fn kernel_mass_is_own_rules(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
                 };
                 return matches!(
                     inf.module.resolve(op),
-                    "kernelof" | "functionof" | "lawof" | "joint" | "ksuperpose" | "rebase"
+                    "kernelof" | "functionof" | "lawof" | "joint" | "ksuperpose" | "tilt"
                 );
             }
             _ => return false,

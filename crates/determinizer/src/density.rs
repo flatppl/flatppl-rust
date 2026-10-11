@@ -161,8 +161,8 @@ pub(crate) use broadcast::{
 #[path = "density_integral.rs"]
 pub(crate) mod integral;
 
-#[path = "density_rebase.rs"]
-pub(crate) mod rebase;
+#[path = "density_tilt.rs"]
+pub(crate) mod tilt;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -2209,7 +2209,7 @@ fn lower_measure_density_at(
     if let Some(lowered) = lower_applied_ksuperpose(m, measure_node, v) {
         return lowered;
     }
-    if let Some(lowered) = rebase::lower_application(m, measure_node, v) {
+    if let Some(lowered) = tilt::lower_application(m, measure_node, v) {
         return lowered;
     }
 
@@ -2231,7 +2231,7 @@ fn lower_measure_density_at(
         Some("logweighted") => lower_logweighted(m, measure_node, v),
         Some("superpose") => lower_superpose(m, measure_node, v),
         Some("normalize") => lower_normalize(m, measure_node, v),
-        Some("rebase") => rebase::lower_density(m, measure_node, v),
+        Some("tilt") => tilt::lower_density(m, measure_node, v),
         Some("truncate") => lower_truncate(m, measure_node, v, origin),
         Some("pushfwd") => lower_pushfwd(m, measure_node, v, origin),
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
@@ -3782,7 +3782,7 @@ fn superposition_reference(
         match name {
             "Dirac" | "Counting" => Some(Reference::Counting),
             "Lebesgue" => Some(Reference::Lebesgue),
-            "weighted" | "logweighted" | "pushfwd" | "rebase" => {
+            "weighted" | "logweighted" | "pushfwd" | "tilt" => {
                 superposition_reference(m, *call.args.get(1)?, path)
             }
             "normalize" | "truncate" | "iid" | "locscale" | "lawof" | "draw" => {
@@ -4503,7 +4503,7 @@ pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "logweighted",
     "superpose",
     "normalize",
-    "rebase",
+    "tilt",
     "truncate",
     "joint",
     "jointchain",

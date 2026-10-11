@@ -317,8 +317,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn untyped_rebase_keeps_its_measure_kind() {
-        let module = flatppl_syntax::parse("q = rebase(Normal(0, 1), Lebesgue(reals))").unwrap();
+    fn untyped_tilt_keeps_its_measure_kind() {
+        let module = flatppl_syntax::parse("q = tilt(Normal(0, 1), Lebesgue(reals))").unwrap();
         let rendered = render(&module);
         assert_eq!(rendered.bindings[0].kind, lower::Kind::Measure);
     }
