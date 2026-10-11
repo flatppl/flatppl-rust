@@ -213,6 +213,28 @@ pub(crate) fn dependencies(module: &Module, binding: BindingId) -> Vec<String> {
         .collect()
 }
 
+/// Every binding that `roots` reach, transitively and including private ones.
+pub(crate) fn reachable(module: &Module, roots: &[Symbol]) -> HashSet<BindingId> {
+    let mut keep = HashSet::new();
+    let mut work: Vec<_> = roots
+        .iter()
+        .filter_map(|&r| module.binding_by_name(r))
+        .collect();
+    keep.extend(work.iter().copied());
+    while let Some(id) = work.pop() {
+        let mut names = HashSet::new();
+        module.collect_referenced_names(module.binding(id).rhs, &mut names);
+        for name in names {
+            if let Some(dep) = module.binding_by_name(name)
+                && keep.insert(dep)
+            {
+                work.push(dep);
+            }
+        }
+    }
+    keep
+}
+
 /// A byte offset as a 1-based line and 1-based column in Unicode characters,
 /// with the text of that line.
 pub(crate) fn locate(text: &str, offset: u32) -> Option<(u32, u32, String)> {

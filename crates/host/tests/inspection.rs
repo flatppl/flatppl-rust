@@ -128,6 +128,35 @@ fn bound_values_keep_their_binding_without_a_position() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn slices_keep_what_the_outputs_reach_and_their_imports() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut context = Context::default();
+    let model = context.parse("scale = 2.0", None, None)?;
+    context.register("model.flatppl", &model)?;
+    let module = context.parse(
+        "lib = load_module(\"model.flatppl\")\nn = external(posintegers)\nx = elementof(reals)\n_h = x * lib.scale\nunused = elementof(reals)\ninputs = x\noutputs = _h + 1.0",
+        None,
+        None,
+    )?;
+    let bound = context.set(&module, &[("n".into(), flatppl_host::Constant::Integer(2))])?;
+    let slice = context.slice(&bound, &["inputs", "outputs"])?;
+    let names: Vec<_> = slice.bindings().into_iter().map(|b| b.name).collect();
+    assert_eq!(names, ["lib", "x", "inputs", "outputs"]);
+    // Positions index the printed slice.
+    let rows = slice.bindings();
+    let (start, end) = rows[1].span.ok_or("x has a span")?;
+    assert_eq!(
+        &slice.source()[start as usize..end as usize],
+        "elementof(reals)"
+    );
+    let full = module.compile(&EmitOptions::default())?;
+    let sliced = slice.compile(&EmitOptions::default())?;
+    assert_eq!(full.stablehlo, sliced.stablehlo);
+    assert!(context.slice(&module, &["absent"]).is_err());
+    Ok(())
+}
+
+#[test]
 fn diagnostics_locate_parse_infer_and_emission_errors() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();
     let mut located = |source: &str| -> Result<Value, Box<dyn std::error::Error>> {

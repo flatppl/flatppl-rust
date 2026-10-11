@@ -91,6 +91,7 @@ struct Definition {
     identity: String,
     label: String,
     source: String,
+    origin: Origin,
     parsed: Arc<Module>,
     imports: Vec<(String, Arc<Definition>)>,
 }
@@ -356,9 +357,50 @@ impl Context {
             identity,
             label: module.definition.label.clone(),
             source: module.definition.source.clone(),
+            origin: module.definition.origin.clone(),
             parsed: Arc::new(parsed),
             imports: module.definition.imports.clone(),
         }))
+    }
+
+    /// Keep the bindings that `outputs` reach, transitively, in a new module.
+    ///
+    /// The result's source is the printed slice, so its positions index that
+    /// text. Imports resolve as they did for `module`, and values bound by
+    /// [`Self::set`] carry over.
+    pub fn slice(
+        &mut self,
+        module: &LoadedModule,
+        outputs: &[&str],
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let fail = |message: String| Diagnostic::new("slice", module.source_name(), message);
+        if !Arc::ptr_eq(&self.owner, &module.owner) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let mut parsed = (*module.definition.parsed).clone();
+        let roots = outputs
+            .iter()
+            .map(|name| {
+                parsed
+                    .public_bindings()
+                    .find(|(_, b)| parsed.resolve(b.name) == *name)
+                    .map(|(_, b)| b.name)
+                    .ok_or_else(|| fail(format!("no public binding named `{name}`")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let keep = inspect::reachable(&parsed, &roots);
+        parsed.retain_bindings(&keep);
+        let source = flatppl_syntax::print(&parsed);
+        let identity = format!("slice:{}", self.next_inline);
+        self.next_inline += 1;
+        let definition = self.definition(
+            identity,
+            module.definition.label.clone(),
+            source,
+            module.definition.origin.clone(),
+            &mut Vec::new(),
+        )?;
+        self.instantiate(definition)
     }
 
     pub fn parse(
@@ -513,6 +555,7 @@ impl Context {
             identity,
             label,
             source,
+            origin,
             parsed: Arc::new(parsed),
             imports: imports?,
         }))
