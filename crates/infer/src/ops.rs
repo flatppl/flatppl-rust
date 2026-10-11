@@ -789,7 +789,7 @@ pub(crate) fn call_rule(
 
         // ---- set constructors (spec §03) — set objects have no first-class
         // type; consumers (`elementof`, `truncate`, …) read them structurally.
-        "interval" | "cartprod" | "ordered" | "zerosum" => Type::Any,
+        "interval" | "cartprod" | "stdsimplex" | "ordered" | "zerosum" => Type::Any,
         // `cartpow(S, size)` takes exactly a set and a size; the size is an
         // integer (1-D) or a vector of positive integers (multi-axis), §03
         // "Cartesian power". The legacy variadic `cartpow(S, d1, d2, …)` form

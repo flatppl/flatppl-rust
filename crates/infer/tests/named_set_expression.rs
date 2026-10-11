@@ -31,9 +31,7 @@
 
 use flatppl_infer::infer;
 
-/// The `(%bind name …)` line of `src`, with inference asserted error-free. Notes are
-/// tolerated: `stdsimplex` still has no type rule for the SET BINDING itself, which is
-/// a separate gap from the element type read here.
+/// The `(%bind name …)` line of `src`, with inference asserted error-free.
 fn bind_line(src: &str, name: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let diags: Vec<_> = infer(&mut m)
