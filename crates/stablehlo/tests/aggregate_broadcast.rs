@@ -346,12 +346,26 @@ fn ragged_segment_sums_pack_by_width_class_on_cpu_f32() {
         let unsplit = runs(&ragged, size, target, dtype);
         assert_eq!(reductions(&unsplit), 5, "{unsplit}");
     }
-    // Within the padding bound both targets keep one gathered reduction.
-    for target in [Target::Cpu, Target::Gpu] {
+    // Within the padding bound both targets keep one reduction. CPU gathers
+    // the contiguous runs; GPU stacks them as padded slices.
+    for (target, gathered) in [(Target::Cpu, true), (Target::Gpu, false)] {
         let packed = runs(&[2, 3, 1, 2], 40, target, Dtype::F32);
         assert_eq!(reductions(&packed), 1, "{packed}");
-        assert!(packed.contains("\"stablehlo.gather\""), "{packed}");
+        assert_eq!(
+            packed.contains("\"stablehlo.gather\""),
+            gathered,
+            "{packed}"
+        );
     }
+    // Runs that skip rows keep the gather on GPU too.
+    let gapped = emit_for(
+        "x = elementof(cartpow(reals, 9))\ninputs = x\n\
+         outputs = (sum(x[[1, 3]]), sum(x[[4, 5, 7]]), sum(x[[8]]))\n",
+        Target::Gpu,
+        Dtype::F32,
+    );
+    assert_eq!(reductions(&gapped), 1, "{gapped}");
+    assert!(gapped.contains("\"stablehlo.gather\""), "{gapped}");
 }
 
 #[test]
