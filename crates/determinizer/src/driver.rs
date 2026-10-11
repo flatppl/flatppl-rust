@@ -727,6 +727,9 @@ pub(crate) fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[
     if let Some(entries) = auto_inputs {
         m.set_auto_inputs(rebuilt, entries.into());
     }
+    if m.is_sample_result(id) {
+        m.mark_sample_result(rebuilt);
+    }
     rebuilt
 }
 

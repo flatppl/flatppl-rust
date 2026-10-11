@@ -61,6 +61,10 @@ pub struct Module {
     /// latent out needs its `draw(prior)`, which the pin overwrote. Not projected
     /// into any output format.
     query_pinned: HashMap<BindingId, NodeId>,
+    /// Concrete results of lowered `rand` queries. A later sample can reuse this
+    /// value, but must not reopen its draw provenance when restoring its own law.
+    /// Per expression: one binding may contain several queries. Not serialized.
+    sample_results: HashSet<NodeId>,
     /// Binding names the reification currently being scored declares as its
     /// INPUTS (`flatppl-determinizer`). A measure parameterized by one of these
     /// is CONDITIONED on it, so a density lowering must not marginalize it out:
@@ -170,6 +174,16 @@ impl Module {
     pub fn declared_binding_rhs(&self, id: BindingId) -> NodeId {
         self.query_pinned_rhs(id)
             .unwrap_or_else(|| self.binding(id).rhs)
+    }
+
+    /// Record the concrete result of one lowered `rand` call.
+    pub fn mark_sample_result(&mut self, id: NodeId) {
+        self.sample_results.insert(id);
+    }
+
+    /// Whether `id` is a concrete `rand` result rather than a generative trace.
+    pub fn is_sample_result(&self, id: NodeId) -> bool {
+        self.sample_results.contains(&id)
     }
 
     /// Declare `names` as the inputs of the reification whose body is about to be

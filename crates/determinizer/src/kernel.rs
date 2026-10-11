@@ -372,15 +372,21 @@ pub(crate) fn substitute_admitted(
     let map: Vec<(Symbol, NodeId)> = bound
         .iter()
         .filter(|(target, _)| match mode {
-            Substitute::All => true,
+            Substitute::All | Substitute::DeclaredDraws => true,
             Substitute::LocalOnly => target.ns == RefNs::Local,
         })
         .map(|(target, value)| (target.name, *value))
         .collect();
     match mode {
-        Substitute::All => {
-            substitute_dependencies(m, body, 0, absorbed, &mut vec![map], &mut HashMap::new())
-        }
+        Substitute::All | Substitute::DeclaredDraws => substitute_dependencies(
+            m,
+            body,
+            0,
+            absorbed,
+            mode,
+            &mut vec![map],
+            &mut HashMap::new(),
+        ),
         Substitute::LocalOnly => substitute_refs(m, body, &map),
     }
 }
@@ -392,10 +398,13 @@ fn substitute_dependencies(
     root: NodeId,
     scope: usize,
     absorbed: bool,
+    mode: Substitute,
     scopes: &mut Vec<Vec<(Symbol, NodeId)>>,
     memo: &mut HashMap<(NodeId, usize, bool), NodeId>,
 ) -> NodeId {
-    if scopes[scope].is_empty() {
+    if scopes[scope].is_empty()
+        || (mode == Substitute::DeclaredDraws && crate::sample::is_rand_boundary(m, root))
+    {
         return root;
     }
     let key = (root, scope, absorbed);
@@ -416,7 +425,7 @@ fn substitute_dependencies(
             // Trace the model rather than another query's point. An unchanged
             // captured draw keeps its reference and reads the ambient realization.
             let rhs = m.declared_binding_rhs(binding);
-            let changed = substitute_dependencies(m, rhs, scope, absorbed, scopes, memo);
+            let changed = substitute_dependencies(m, rhs, scope, absorbed, mode, scopes, memo);
             if changed == rhs { root } else { changed }
         } else {
             root
@@ -447,7 +456,9 @@ fn substitute_dependencies(
         };
         let changed: Vec<_> = children
             .iter()
-            .map(|&child| substitute_dependencies(m, child, child_scope, absorbed, scopes, memo))
+            .map(|&child| {
+                substitute_dependencies(m, child, child_scope, absorbed, mode, scopes, memo)
+            })
             .collect();
         if changed == children {
             root
@@ -573,6 +584,9 @@ pub(crate) enum Substitute {
     /// `canon::inline`, the sampler, and the change-of-variables sites, none of which
     /// emit a density to finish over.
     All,
+    /// Restore a sample's declared draws, preserving values from explicit `rand`
+    /// queries. Those values belong to their own state, not the law being restored.
+    DeclaredDraws,
     /// `%local` placeholder targets ONLY, leaving every same-module target to the
     /// caller's own finish.
     ///
