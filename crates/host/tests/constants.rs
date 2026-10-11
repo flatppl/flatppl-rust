@@ -189,34 +189,104 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
     Ok(())
 }
 
-/// A zero-sum vector needs a negative entry, which a literal spells as a `neg`
-/// call, so compare against the same value bound under `cartpow(reals, 3)`.
 #[test]
-fn zerosum_values_must_sum_to_zero() -> Result<(), Box<dyn std::error::Error>> {
+fn fixed_vector_equalities_allow_roundoff_without_projection()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();
     let vector = |data: [f64; 3]| Constant::Array {
         shape: vec![3],
         data: data.into_iter().map(Constant::Real).collect(),
     };
-    let module = context.parse("x = external(zerosum(3))\noutputs = x", None, None)?;
-    let reals = context.parse("x = external(cartpow(reals, 3))\noutputs = x", None, None)?;
-    let valid = vector([0.5, 0.25, -0.75]);
+    for (set, values, outside) in [
+        (
+            "zerosum(3)",
+            [0.1, 0.2, -0.3],
+            [0.1, 0.2, -0.30000000000001],
+        ),
+        (
+            "stdsimplex(3)",
+            [0.1, 0.2, 0.7000000000000001],
+            [0.1, 0.2, 0.70000000000001],
+        ),
+    ] {
+        let module = context.parse(&format!("x = external({set})"), None, None)?;
+        let valid = vector(values);
+        let bound = context.set(&module, &[("x".into(), valid.clone())])?;
+        assert_eq!(bound.constant("x")?, valid);
+        for invalid in [outside, [f64::INFINITY, 0.0, f64::NEG_INFINITY]] {
+            assert!(
+                context
+                    .set(&module, &[("x".into(), vector(invalid))])
+                    .is_err()
+            );
+        }
+    }
+    let simplex = context.parse("x = external(stdsimplex(3))", None, None)?;
+    for invalid in [[-f64::EPSILON, 0.5, 0.5], [0.0; 3]] {
+        assert!(
+            context
+                .set(&simplex, &[("x".into(), vector(invalid))])
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn packed_f32_constants_use_their_source_precision() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let module = context.parse("x = external(zerosum(3))", None, None)?;
+    let values = [0.1_f32, 0.2, -0.3].map(f64::from);
+    let residual = values.iter().sum::<f64>().abs();
+    let scale = 8.0 * 3.0 * values.iter().map(|v| v.abs()).sum::<f64>();
+    assert!(residual <= scale * f64::from(f32::EPSILON) / 2.0);
+    assert!(residual > scale * f64::EPSILON / 2.0);
+
+    let packed = serde_json::json!({"kind": "array", "value": {
+        "shape": [3], "dtype": "real32", "data": values
+    }});
+    let single: Constant = serde_json::from_value(packed.clone())?;
+    assert_eq!(serde_json::to_value(&single)?, packed);
+    let bound = context.set(&module, &[("x".into(), single)])?;
+    let double = Constant::Array {
+        shape: vec![3],
+        data: values.map(Constant::Real).to_vec(),
+    };
+    assert_eq!(bound.constant("x")?, double);
+    assert!(context.set(&module, &[("x".into(), double)]).is_err());
+    let outside: Constant = serde_json::from_value(serde_json::json!({"kind": "array", "value": {
+        "shape": [3], "dtype": "real32", "data": [0.1, 0.2, -0.3001]
+    }}))?;
+    assert!(context.set(&module, &[("x".into(), outside)]).is_err());
+    Ok(())
+}
+
+#[test]
+fn fixed_vector_equalities_handle_finite_overflow() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let module = context.parse("x = external(zerosum(4))", None, None)?;
+    let vector = |values: [f64; 4]| Constant::Array {
+        shape: vec![4],
+        data: values.map(Constant::Real).to_vec(),
+    };
+    let valid = vector([f64::MAX, f64::MAX, -f64::MAX, -f64::MAX]);
+    let bound = context.set(&module, &[("x".into(), valid.clone())])?;
+    assert_eq!(bound.constant("x")?, valid);
+    let zero = vector([0.0; 4]);
     assert_eq!(
         context
-            .set(&module, &[("x".into(), valid.clone())])?
-            .compile(&EmitOptions::default())?
-            .stablehlo,
-        context
-            .set(&reals, &[("x".into(), valid)])?
-            .compile(&EmitOptions::default())?
-            .stablehlo
+            .set(&module, &[("x".into(), zero.clone())])?
+            .constant("x")?,
+        zero
     );
-    for invalid in [
-        vector([1.0, 1.0, -1.0]),
-        vector([f64::INFINITY, 0.0, f64::NEG_INFINITY]),
-    ] {
-        assert!(context.set(&module, &[("x".into(), invalid)]).is_err());
-    }
+    assert!(
+        context
+            .set(
+                &module,
+                &[("x".into(), vector([f64::MAX, f64::MAX, -f64::MAX, 0.0]))]
+            )
+            .is_err()
+    );
     Ok(())
 }
 
