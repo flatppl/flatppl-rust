@@ -172,6 +172,9 @@ pub fn emit_query(
         values.insert(path, value);
     }
     let mut emitter = Emitter::with_options(&module, options);
+    if batch.is_some_and(|batch| !batch.shape.is_empty()) {
+        emitter.lower_for_host_batch();
+    }
     bind_inputs(&mut emitter, &module, &roots, &mut paths, &values);
     let tensorize = emitter
         .can_tensorize_call(&results.iter().map(|leaf| leaf.node).collect::<Vec<_>>())
@@ -197,6 +200,7 @@ pub fn emit_query(
             primitives
         } else if tensorize && !batch.shape.is_empty() {
             let mut e = Emitter::with_options(&module, options);
+            e.lower_for_host_batch();
             let mut physical = Vec::new();
             let mut bound = HashMap::new();
             for (index, leaf) in arguments.iter().enumerate() {

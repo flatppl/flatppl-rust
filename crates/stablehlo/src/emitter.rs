@@ -136,6 +136,8 @@ pub struct Emitter<'m> {
     restrict_enzyme_compatible: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
+    /// The program is replayed over host batch axes after lowering.
+    host_batch: bool,
     integrating: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
@@ -197,6 +199,7 @@ impl<'m> Emitter<'m> {
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             integration: None,
             target: crate::Target::Cpu,
+            host_batch: false,
             integrating: false,
             next: 0,
             memo: HashMap::new(),
@@ -232,7 +235,14 @@ impl<'m> Emitter<'m> {
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
         emitter.integration = self.integration;
         emitter.target = self.target;
+        emitter.host_batch = self.host_batch;
         emitter
+    }
+
+    /// Mark a lowering whose program is replayed over host batch axes, so
+    /// layout choices can favour the batched graph.
+    pub fn lower_for_host_batch(&mut self) {
+        self.host_batch = true;
     }
 
     pub(crate) fn restrict_enzyme_compatible(&self) -> bool {
