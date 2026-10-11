@@ -853,15 +853,10 @@ pub(crate) fn lower_sample(
 ///     auto-broadcasting [`Emitter::compare`]/[`Emitter::select`]/
 ///     [`Emitter::add`] (a single-category `p` — an empty unroll — is lifted to
 ///     `[m]` explicitly, see [`draw_categorical`]).
-/// - Fan-out **Tier 4 (discrete inverse-CDF `while`)** — Poisson and the two
-///   NegativeBinomial Gamma–Poisson mixtures, batched via
-///   [`draw_poisson_batched`]'s PER-LANE bounded CDF walk (the same masked-while
-///   plus [`Emitter::reduce_all`] pattern [`draw_gamma_batched`] uses): one
-///   scalar counter `k` walked in lockstep across `[m]` per-lane
-///   `cum`/`pmf`/`done`/`result`, latching each lane's first `U <= F(k)`. The
-///   NegativeBinomial mixtures need NO extra machinery — [`draw_gamma_batched`]
-///   already yields the `[m]` per-lane `lambda`, which [`draw_poisson_batched`]
-///   accepts as its `[m]` rate.
+/// - Fan-out **Tier 4 (discrete rejection `while`)** — [`draw_poisson`] uses
+///   per-lane acceptance masks and loop-carried RNG state for both waiting-time
+///   and PTRS sampling. The NegativeBinomial mixtures feed the `[m]` per-lane
+///   rates from [`draw_gamma_batched`] into the same sampler.
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
 /// - The one `while` discrete sampler still not batched: Multinomial (a bounded
@@ -906,13 +901,7 @@ const FANOUT_SAFE: &[&str] = &[
     "Binomial",
     "Categorical",
     "Categorical0",
-    // Tier 4 (batched discrete inverse-CDF `while` — draw_poisson_batched):
-    // Poisson's bounded CDF walk done PER LANE (`[m]` cum/pmf/done/result, one
-    // scalar counter, `reduce_all` over the done mask — the `draw_gamma_batched`
-    // masked-while pattern), plus the two NegativeBinomial Gamma–Poisson
-    // mixtures, which reduce with NO extra machinery to `draw_gamma_batched`
-    // (the `[m]` per-lane `lambda`) feeding `draw_poisson_batched` (that `[m]`
-    // rate).
+    // Tier 4: masked Poisson loops, also used by the Gamma–Poisson mixtures.
     "Poisson",
     "NegativeBinomial",
     "NegativeBinomial2",
@@ -3643,11 +3632,8 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 //   prefix-sum comparisons at emit time (`n` the statically-known length of
 //   `p`); Binomial draws a length-`n` uniform batch (`n` a FIXED literal) and
 //   sums the `select`-ed Bernoulli indicators.
-// - Poisson: a bounded inverse-CDF `stablehlo.while` ([`draw_poisson`]) — one
-//   uniform `U` drawn before the loop, the loop walking the incremental Poisson
-//   CDF until `U <= F(k)`. Same bounded-`MAXITER`/clamp design as
-//   [`draw_gamma`], but CDF inversion of a SINGLE uniform (no per-iteration
-//   randomness), so nothing is pre-drawn.
+// - Poisson: waiting-time sampling below rate 10 and PTRS rejection above it
+//   ([`draw_poisson`]), with fresh random bits and no count or retry cutoff.
 // - Gamma–Poisson mixture (NegativeBinomial/NegativeBinomial2): a
 //   [`draw_gamma`] (Task 15) feeding a [`draw_poisson`] — the standard NegBin
 //   construction (§08 equivalence). Multinomial: a bounded `while` over `n`
@@ -3825,190 +3811,185 @@ fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     }
 }
 
-/// The bounded inverse-CDF `Poisson(rate)` `MAXITER` — see [`draw_poisson`].
-/// Larger than [`MAXITER`] (the Gamma rejection loop's 128) because it bounds a
-/// COUNT (`k` walks `0, 1, 2, …` up the CDF), not a rejection-retry count:
-/// `F(256)` is `1.0` to f32 precision for every `rate` a NegBin Gamma-mixture
-/// or a direct Poisson prior realistically produces (`P(X >= 256)` for
-/// `rate ~ 12` is ~1e-180), so the clamp is never reached in practice.
-const POISSON_MAXITER: u64 = 256;
-
-/// Draw a `Poisson(rate)` variate via bounded inverse-CDF (the shared core
-/// Poisson itself and the NegativeBinomial Gamma–Poisson mixtures reduce to).
-/// Dispatches on the [`Emitter::batch_shape`] fan-out override: a scalar draw
-/// (`None`) takes the unchanged [`draw_poisson_scalar`] path (one scalar
-/// `Value`, byte-identical to before); a batched `iid(K, m)` draw (`Some([m])`)
-/// takes the per-lane [`draw_poisson_batched`] path (a `tensor<m×f32>` of iid
-/// draws). `rate` is a `Scalar` for a direct `Poisson` prior (broadcast over
-/// the `[m]` lanes) or already a `[m]` per-lane vector for the NegativeBinomial
-/// Gamma–Poisson mixture (each lane its own `lambda_i` from
-/// [`draw_gamma_batched`]) — [`draw_poisson_batched`] handles both.
+/// Knuth's waiting-time sampler below rate 10, Hörmann's PTRS above it.
+/// Both are exact sampling algorithms; neither truncates the count or retries.
+/// The key is a loop-carried value, so rejected proposals consume fresh bits.
 fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
-    match e.batch_shape() {
-        Some(dims) if dims.len() == 1 => draw_poisson_batched(e, rate, dims[0]),
-        _ => draw_poisson_scalar(e, rate),
-    }
-}
-
-/// Draw one scalar `Poisson(rate)` variate via bounded inverse-CDF (one
-/// `stablehlo.while`, via [`Emitter::while_loop`]). One `U ~ Uniform(0, 1)` is
-/// drawn BEFORE the loop; the loop then walks the incremental Poisson CDF until
-/// `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`], this inverts a
-/// SINGLE uniform (no per-iteration randomness), so nothing is pre-drawn into a
-/// batch.
-///
-/// The loop carries `(k: f32, cum = F(k): f32, pmf = P(X = k): f32, done: i1,
-/// result: f32)`, initialized `k = 0`, `pmf = cum = exp(-rate)` (`= P(X = 0) =
-/// F(0)`). Its condition is `!done && k < MAXITER`; the body (running only
-/// while `!done`) sets `result := k` unconditionally and `done :=
-/// (U <= cum)` — so `result` holds the accepted `k` on success and, on the
-/// (astronomically unlikely) all-walk path, the last `k = MAXITER - 1` (a
-/// clamp to the tail, not a wrong `0`) — then advances `k += 1`, `pmf *=
-/// rate/(k+1)` (the Poisson recurrence `P(X=k+1) = P(X=k)·rate/(k+1)`), `cum +=
-/// pmf`. `k` is carried as an f32 (it is both the counter AND the returned
-/// value), so the `k < MAXITER` bound is a float compare and no `i32`/`convert`
-/// is needed at all.
-fn draw_poisson_scalar(e: &mut Emitter, rate: &Value) -> Value {
-    let u = e.rng("UNIFORM", &MlirTy::Scalar);
-
-    let neg_rate = e.neg(rate);
-    let exp_neg_rate = e.exp(&neg_rate); // P(X=0) = F(0) = exp(-rate)
-    let k0 = e.scalar(0.0);
-    let cum0 = exp_neg_rate.clone();
-    let pmf0 = exp_neg_rate;
-    let done0 = e.bool_const(false);
-    let res0 = e.scalar(0.0);
-
-    let float_ty = MlirTy::Scalar.render(e.dtype(), ElemKind::Real);
-    let carried_tys = [
-        float_ty.clone(),         // k
-        float_ty.clone(),         // cum = F(k)
-        float_ty.clone(),         // pmf = P(X = k)
-        "tensor<i1>".to_string(), // done
-        float_ty,                 // result
-    ];
-
-    let results = e.while_loop(
-        &[k0, cum0, pmf0, done0, res0],
-        &carried_tys,
-        // cond: !done && k < MAXITER
-        |e, args| {
-            let max = e.scalar(POISSON_MAXITER as f64);
-            let lt = e.compare("LT", &args[0], &max);
-            let not_done = e.not(&args[3]);
-            e.and(&not_done, &lt)
-        },
-        // do: result := k, done := (U <= cum); advance k/pmf/cum for next iter
-        |e, args| {
-            let k = &args[0];
-            let cum = &args[1];
-            let pmf = &args[2];
-
-            let accept = e.compare("LE", &u, cum);
-            let new_result = k.clone();
-
-            let one = e.scalar(1.0);
-            let k1 = e.add(k, &one);
-            let rate_over_k1 = e.div(rate, &k1);
-            let pmf_next = e.mul(pmf, &rate_over_k1);
-            let cum_next = e.add(cum, &pmf_next);
-            vec![k1, cum_next, pmf_next, accept, new_result]
-        },
-    );
-    results[4].clone()
-}
-
-/// The batched (fan-out) bounded inverse-CDF draw: `m` iid `Poisson(rate)`
-/// variates as a `tensor<m×f32>`, one `stablehlo.while`. Same maths as
-/// [`draw_poisson_scalar`]; the difference is the CDF walk is done PER LANE.
-/// One `U` is drawn as a genuine `tensor<m>` (one `rng_bit_generator` advance,
-/// the `[m]` lanes independent — [`Emitter::rng`]'s size-dims override), and the
-/// per-lane state `cum = F_i(k)`, `pmf = P_i(X = k)`, `done`, `result` are each
-/// `[m]`. The loop counter `k` stays a SCALAR: every lane walks the SAME
-/// `k = 0, 1, 2, …` in lockstep, and a lane latches its `result` on its FIRST
-/// hit exactly as [`draw_gamma_batched`]'s accept mask latches its candidate
-/// (`result := select(done, result, k)`, `done := done || (U <= cum)`) — so an
-/// unfinished all-walk lane ends on the last-walked `k = MAXITER - 1`, matching
-/// [`draw_poisson_scalar`]'s bounded-tail clamp, not a spurious `0`. The loop
-/// runs until `all(done)` (via [`Emitter::reduce_all`] over the `[m]` mask) or
-/// `MAXITER`.
-///
-/// `rate` may be a `Scalar` (a direct `Poisson` prior — the same rate on every
-/// lane) or already a `[m]` per-lane vector (the NegativeBinomial Gamma–Poisson
-/// mixture's `lambda_i` from [`draw_gamma_batched`]). It is broadcast to `[m]`
-/// up front so the per-lane `cum`/`pmf` recurrence is uniform either way.
-fn draw_poisson_batched(e: &mut Emitter, rate: &Value, m: u64) -> Value {
-    let batch_ty = MlirTy::Ranked(vec![Some(m)]);
-
-    // U as a genuine [m] draw (one rng_bit_generator advance; batch_shape is
-    // already [m] here, so `rng` sizes the draw to the batch — the lanes are
-    // independent, NOT a scalar broadcast).
-    let u = e.rng("UNIFORM", &MlirTy::Scalar);
-
-    // Broadcast `rate` to [m]: a scalar prior rate is the same on every lane; a
-    // NegBin per-lane `lambda` is already [m] (used as-is). Either way the
-    // per-lane cum/pmf recurrence below is uniformly [m].
-    let rate_m = match &rate.ty {
-        MlirTy::Scalar => e.broadcast_in_dim(rate, &[], batch_ty.clone()),
+    let rate = match (&rate.ty, e.batch_shape()) {
+        (MlirTy::Scalar, Some(dims)) => {
+            let ty = MlirTy::Ranked(dims.iter().map(|n| Some(*n)).collect());
+            e.broadcast_in_dim(rate, &[], ty)
+        }
         _ => rate.clone(),
     };
+    let zero = e.scalar(0.0);
+    let ten = e.scalar(10.0);
+    let infinity = e.inf(MlirTy::Scalar);
+    let nonnegative = e.compare("GE", &rate, &zero);
+    let finite = e.compare("LT", &rate, &infinity);
+    let valid = e.and(&nonnegative, &finite);
+    // Invalid inputs must not keep an unbounded rejection loop alive.
+    let rate = e.select(&valid, &rate, &zero);
+    let small = e.compare("LT", &rate, &ten);
+    let small_rate = e.select(&small, &rate, &zero);
+    let small_draw = poisson_knuth(e, &small_rate);
+    let large = e.not(&small);
+    let large_rate = e.select(&large, &rate, &ten);
+    let large_draw = poisson_ptrs(e, &large_rate, &large);
+    let result = e.select(&small, &small_draw, &large_draw);
+    let invalid = e.scalar(-1.0);
+    e.select(&valid, &result, &invalid)
+}
 
-    let neg_rate = e.neg(&rate_m);
-    let exp_neg_rate = e.exp(&neg_rate); // P_i(X=0) = F_i(0) = exp(-rate_i), [m]
-    let k0 = e.scalar(0.0); // scalar counter (all lanes walk k together)
-    let cum0 = exp_neg_rate.clone();
-    let pmf0 = exp_neg_rate;
-    let done0 = e.bool_batch_const(m, false);
-    let res0 = e.constant(0.0, batch_ty.clone());
+fn poisson_pending(e: &mut Emitter, done: &Value) -> Value {
+    let all = if matches!(done.ty, MlirTy::Scalar) {
+        done.clone()
+    } else {
+        e.reduce_all(done)
+    };
+    e.not(&all)
+}
 
-    let float_scalar = MlirTy::Scalar.render(e.dtype(), ElemKind::Real);
-    let batch_i1 = format!("tensor<{m}xi1>");
-    let batch_f = batch_ty.render(e.dtype(), ElemKind::Real);
-    let carried_tys = [
-        float_scalar,    // k (scalar counter)
-        batch_f.clone(), // cum = F(k) per lane
-        batch_f.clone(), // pmf = P(X = k) per lane
-        batch_i1,        // done per lane
-        batch_f,         // result per lane
+/// Count arrivals before time `rate`; sums of -log(U) are arrival times.
+/// An all-zero rate batch is deterministic and consumes no RNG state.
+/// Zero lanes in a mixed batch share the key advances of its active lanes.
+fn poisson_knuth(e: &mut Emitter, rate: &Value) -> Value {
+    let zero = e.constant(0.0, rate.ty.clone());
+    let one = e.scalar(1.0);
+    let done = e.compare("EQ", rate, &zero);
+    let minus_one = e.constant(-1.0, rate.ty.clone());
+    let count = e.select(&done, &zero, &minus_one);
+    let threshold = e.neg(rate);
+    let float_ty = rate.ty.render(e.dtype(), ElemKind::Real);
+    let types = [
+        rate.ty.render(e.dtype(), ElemKind::Bool),
+        float_ty.clone(),
+        float_ty,
+        MlirTy::Key.render(e.dtype(), ElemKind::Real),
     ];
-
     let results = e.while_loop(
-        &[k0, cum0, pmf0, done0, res0],
-        &carried_tys,
-        // cond: k < MAXITER && !all(done)
+        &[done, count, zero, e.cur_key()],
+        &types,
+        |e, args| poisson_pending(e, &args[0]),
         |e, args| {
-            let max = e.scalar(POISSON_MAXITER as f64);
-            let lt = e.compare("LT", &args[0], &max);
-            let all_done = e.reduce_all(&args[3]);
-            let not_all = e.not(&all_done);
-            e.and(&lt, &not_all)
-        },
-        // do: test U <= F(k) per lane, latch each lane's first hit; advance
-        // k/pmf/cum for the next iteration (the Poisson recurrence, per lane).
-        |e, args| {
-            let k = &args[0];
-            let cum = &args[1];
-            let pmf = &args[2];
-            let done = &args[3];
-            let result = &args[4];
-
-            let hit = e.compare("LE", &u, cum);
-            // Per-lane latch (`done` is the OLD flag): a lane already done keeps
-            // its FIRST accepted `k`; a not-yet-done lane tracks the current `k`
-            // (so an all-walk lane ends on the last k — matching the scalar
-            // path's tail clamp). `k` (scalar) broadcasts over the [m] result.
-            let new_result = e.select(done, result, k);
-            let new_done = e.or(done, &hit);
-
-            let one = e.scalar(1.0);
-            let k1 = e.add(k, &one);
-            let rate_over_k1 = e.div(&rate_m, &k1);
-            let pmf_next = e.mul(pmf, &rate_over_k1);
-            let cum_next = e.add(cum, &pmf_next);
-            vec![k1, cum_next, pmf_next, new_done, new_result]
+            e.set_cur_key(args[3].clone());
+            let uniform = e.rng("UNIFORM", &rate.ty);
+            let log_uniform = e.log(&uniform);
+            let log_product = e.add(&args[2], &log_uniform);
+            let count = e.add(&args[1], &one);
+            let count = e.select(&args[0], &args[1], &count);
+            let accepted = e.compare("LE", &log_product, &threshold);
+            let done = e.or(&args[0], &accepted);
+            vec![done, count, log_product, e.cur_key()]
         },
     );
-    results[4].clone()
+    e.set_cur_key(results[3].clone());
+    results[1].clone()
+}
+
+/// Hörmann (1993), transformed rejection with a squeeze (PTRS), rate >= 10.
+/// The proposal and squeeze match JAX's `_poisson_rejection`. The acceptance
+/// test reuses the stable Poisson log mass, avoiding large-rate cancellation.
+fn poisson_ptrs(e: &mut Emitter, rate: &Value, active: &Value) -> Value {
+    let zero = e.constant(0.0, rate.ty.clone());
+    let one = e.scalar(1.0);
+    let half = e.scalar(0.5);
+    let two = e.scalar(2.0);
+    let sqrt_rate = e.sqrt(rate);
+    let scale = e.scalar(2.53);
+    let b = e.mul(&scale, &sqrt_rate);
+    let shift = e.scalar(0.931);
+    let b = e.add(&shift, &b);
+    let scale = e.scalar(0.02483);
+    let a = e.mul(&scale, &b);
+    let shift = e.scalar(-0.059);
+    let a = e.add(&shift, &a);
+    let shift = e.scalar(3.4);
+    let denominator = e.sub(&b, &shift);
+    let numerator = e.scalar(1.1328);
+    let inverse_alpha = e.div(&numerator, &denominator);
+    let shift = e.scalar(1.1239);
+    let inverse_alpha = e.add(&shift, &inverse_alpha);
+    let denominator = e.sub(&b, &two);
+    let numerator = e.scalar(3.6224);
+    let tail = e.div(&numerator, &denominator);
+    let shift = e.scalar(0.9277);
+    let squeeze_bound = e.sub(&shift, &tail);
+    let log_rate = e.log(rate);
+    let done = e.not(active);
+    let types = [
+        rate.ty.render(e.dtype(), ElemKind::Bool),
+        rate.ty.render(e.dtype(), ElemKind::Real),
+        MlirTy::Key.render(e.dtype(), ElemKind::Real),
+    ];
+    let results = e.while_loop(
+        &[done, zero.clone(), e.cur_key()],
+        &types,
+        |e, args| poisson_pending(e, &args[0]),
+        |e, args| {
+            e.set_cur_key(args[2].clone());
+            let uniform = e.rng("UNIFORM", &rate.ty);
+            let u = e.sub(&uniform, &half);
+            let v = e.rng("UNIFORM", &rate.ty);
+            let abs_u = e.abs(&u);
+            let distance = e.sub(&half, &abs_u);
+            let positive_distance = e.compare("GT", &distance, &zero);
+            let safe_distance = e.select(&positive_distance, &distance, &one);
+            let twice_a = e.mul(&two, &a);
+            let scale = e.div(&twice_a, &safe_distance);
+            let scale = e.add(&scale, &b);
+            let offset = e.mul(&scale, &u);
+            let candidate = e.add(rate, &offset);
+            let rounding = e.scalar(0.43);
+            let candidate = e.add(&candidate, &rounding);
+            let candidate = e.floor(&candidate);
+
+            let nonnegative = e.compare("GE", &candidate, &zero);
+            let infinity = e.inf(MlirTy::Scalar);
+            let finite = e.compare("LT", &candidate, &infinity);
+            let supported = e.and(&nonnegative, &finite);
+            let supported = e.and(&supported, &positive_distance);
+            let safe = e.select(&supported, &candidate, &one);
+            let cutoff = e.scalar(64.0);
+            let large = e.compare("GE", &safe, &cutoff);
+            let small_x = e.select(&large, &one, &safe);
+            let product = e.mul(&small_x, &log_rate);
+            let small_score = e.sub(&product, rate);
+            let next_x = e.add(&small_x, &one);
+            let factorial = e.lgamma(&next_x);
+            let small_score = e.sub(&small_score, &factorial);
+            let large_x = e.select(&large, &safe, &cutoff);
+            let large_score = poisson_large_logpdf(e, &large_x, rate);
+            let score = e.select(&large, &large_score, &small_score);
+
+            let numerator = e.mul(&v, &inverse_alpha);
+            let distance2 = e.mul(&safe_distance, &safe_distance);
+            let denominator = e.div(&a, &distance2);
+            let denominator = e.add(&denominator, &b);
+            let ratio = e.div(&numerator, &denominator);
+            let proposal = e.log(&ratio);
+            let accept = e.compare("LE", &proposal, &score);
+            let narrow = e.scalar(0.013);
+            let narrow = e.compare("LT", &distance, &narrow);
+            let outside = e.compare("GT", &v, &distance);
+            let reject = e.and(&narrow, &outside);
+            let not_reject = e.not(&reject);
+            let accept = e.and(&accept, &not_reject);
+            let middle = e.scalar(0.07);
+            let middle = e.compare("GE", &distance, &middle);
+            let squeezed = e.compare("LE", &v, &squeeze_bound);
+            let squeezed = e.and(&middle, &squeezed);
+            let accept = e.or(&squeezed, &accept);
+            let accept = e.and(&supported, &accept);
+            let pending = e.not(&args[0]);
+            let accept = e.and(&pending, &accept);
+            let result = e.select(&accept, &candidate, &args[1]);
+            let done = e.or(&args[0], &accept);
+            vec![done, result, e.cur_key()]
+        },
+    );
+    e.set_cur_key(results[2].clone());
+    results[1].clone()
 }
 
 /// §08 Poisson's sampler: [`draw_poisson`] on the `rate` kwarg directly.
