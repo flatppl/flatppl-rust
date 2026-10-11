@@ -458,7 +458,7 @@ fn lower_sample_output(
     node: NodeId,
     out: &mut Vec<Value>,
 ) -> Result<(), EmitError> {
-    let resolved = query_value_component(m, resolve_self_ref(m, node));
+    let resolved = query_value_component(m, e.resolve_tuple_projections(node));
     if let Node::Call(c) = m.node(resolved)
         && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "record")
     {

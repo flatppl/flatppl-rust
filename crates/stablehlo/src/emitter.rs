@@ -3563,6 +3563,33 @@ impl<'m> Emitter<'m> {
         Some(elems[idx as usize])
     }
 
+    /// Resolve refs and literal tuple projections before inspecting a record.
+    /// Destructured `rand` values reach their record through `get(tuple, 1)`;
+    /// lowering that projection as a tensor would lose the record's fields.
+    pub(crate) fn resolve_tuple_projections(&self, mut id: NodeId) -> NodeId {
+        let mut seen = HashSet::new();
+        while seen.insert(id) && !self.memo.contains_key(&id) {
+            let resolved = self.resolve_ref_one(id);
+            if resolved != id {
+                id = resolved;
+                continue;
+            }
+            let Node::Call(call) = self.m.node(id) else {
+                break;
+            };
+            let base = match call.head {
+                CallHead::Builtin(sym) if self.m.resolve(sym) == "get" => 1,
+                CallHead::Builtin(sym) if self.m.resolve(sym) == "get0" => 0,
+                _ => break,
+            };
+            let Some(projected) = self.tuple_projection(&call.args, base) else {
+                break;
+            };
+            id = projected;
+        }
+        id
+    }
+
     /// Record `value` as the `func.func` argument holding column/field `name` of
     /// the aggregate ABI input `container` — the per-column destructuring
     /// `crate::modes::bind_input` performs for a table/record `load_data` input.
@@ -3601,8 +3628,8 @@ impl<'m> Emitter<'m> {
     }
 
     /// If `args` is `get`/`get0`'s `[container, selector]` pair and
-    /// `container` resolves (one `(%ref self x)` hop,
-    /// [`Emitter::resolve_ref_one`]) to a `table(...)` or `record(...)`
+    /// `container` resolves through refs and literal tuple projections to a
+    /// `table(...)` or `record(...)`
     /// literal with a named entry matching the `selector`, return that
     /// entry's value [`NodeId`]. The parser lowers field access `obj.name`
     /// to `get(obj, "name")` with a string-literal selector
@@ -3617,7 +3644,12 @@ impl<'m> Emitter<'m> {
     /// ordinary tensor `get`).
     fn named_field_projection(&self, args: &[NodeId]) -> Option<NodeId> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.resolve_ref_one(container);
+        let field = match self.m.node(selector) {
+            Node::Lit(Scalar::Str(s)) => s.as_ref(),
+            Node::Const(sym) => self.m.resolve(*sym),
+            _ => return None,
+        };
+        let resolved = self.resolve_tuple_projections(container);
         let named = match self.m.node(resolved) {
             Node::Call(c) => match c.head {
                 CallHead::Builtin(sym) if matches!(self.m.resolve(sym), "table" | "record") => {
@@ -3625,11 +3657,6 @@ impl<'m> Emitter<'m> {
                 }
                 _ => return None,
             },
-            _ => return None,
-        };
-        let field = match self.m.node(selector) {
-            Node::Lit(Scalar::Str(s)) => s.as_ref(),
-            Node::Const(sym) => self.m.resolve(*sym),
             _ => return None,
         };
         named
