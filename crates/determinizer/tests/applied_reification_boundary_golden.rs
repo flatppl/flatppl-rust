@@ -32,6 +32,59 @@ fn lower(src: &str) -> String {
     flatppl_syntax::print(&out)
 }
 
+/// At s = 2 and x = [-1, 0, 1], the conditional log density is
+/// -3*log(2) - 1.5*log(2*pi) - 2/8 = -5.086257141293854,
+/// and its scale derivative is -1.25. The Exponential prior is not a factor.
+#[test]
+fn applied_kernel_conditions_a_drawn_scale_before_marginalization() {
+    let applied = lower(
+        "scale ~ Exponential(1)\n\
+         effects ~ iid(Normal(0, scale), 3)\n\
+         k = kernelof(effects, scale = scale)\n\
+         s = elementof(posreals)\n\
+         lp = logdensityof(k(s), [-1, 0, 1])",
+    );
+    let conditional = lower(
+        "s = elementof(posreals)\n\
+         lp = logdensityof(iid(Normal(0, s), 3), [-1, 0, 1])",
+    );
+    assert_eq!(applied, conditional);
+}
+
+/// The normalized product is Normal(0, s/sqrt(1+s*s)). At s = 2 and x = 0.5,
+/// log density is -0.9636167575475678 and the scale derivative is -0.06875.
+#[test]
+fn applied_kernel_keeps_a_drawn_scales_normalizer() {
+    let applied = lower(
+        "scale ~ Exponential(1)\n\
+         effect ~ normalize(logweighted(fn(logdensityof(Normal(0, scale), _)), Normal(0, 1)))\n\
+         k = kernelof(effect, scale = scale)\n\
+         s = elementof(posreals)\n\
+         lp = logdensityof(k(s), 0.5)",
+    );
+    let conditional = lower(
+        "s = elementof(posreals)\n\
+         q = normalize(logweighted(fn(logdensityof(Normal(0, s), _)), Normal(0, 1)))\n\
+         lp = logdensityof(q, 0.5)",
+    );
+    assert_eq!(applied, conditional);
+}
+
+#[test]
+fn applied_kernel_still_marginalizes_a_scale_outside_its_boundary() {
+    let mut model = parse_infer(
+        "scale ~ Exponential(1)\n\
+         center = elementof(reals)\n\
+         effects ~ iid(Normal(center, scale), 3)\n\
+         k = kernelof(effects, center = center)\n\
+         lp = logdensityof(k(0), [-1, 0, 1])",
+    );
+    let lp = model.intern("lp");
+    let error = determinize_with_roots(&model, &ModuleBundle::new(), Some(&[lp]))
+        .expect_err("the unbound scale still needs integration");
+    assert_eq!(error.construct, "NumericalIntegral");
+}
+
 /// The boundary is reached through a derived binding, so the syntactic substitution
 /// stopped at `(%ref self mu2)`.
 ///
