@@ -83,3 +83,28 @@ fn broadcast_affine_pushforward_retains_shared_runtime_parameters() {
         emit(&source.replace("(z .* tau) .+ mu", "mu .+ (tau .* z)"))
     );
 }
+
+#[test]
+fn scalar_only_measure_broadcast_is_an_ordinary_call() {
+    let source = "mu = external(reals)\n\
+                  tau = external(posreals)\n\
+                  x = external(reals)\n\
+                  M = locscale.(Normal(0, 1), mu, tau)\n\
+                  inputs = (mu, tau, x)\noutputs = logdensityof(M, x)";
+    assert_eq!(
+        emit(source),
+        emit(&source.replace("locscale.(", "locscale("))
+    );
+}
+
+#[test]
+fn scalar_only_broadcast_preserves_the_scored_draw() {
+    let source = "z ~ Normal(0, 1)\n\
+                  y = external(reals)\n\
+                  M = locscale.(lawof(z), 1, 2)\n\
+                  inputs = y\noutputs = (logdensityof(M, y), z)";
+    assert_eq!(
+        emit(source),
+        emit(&source.replace("locscale.(", "locscale("))
+    );
+}
