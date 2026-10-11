@@ -7262,8 +7262,8 @@ outputs = (draws)
 // Bernoulli/Geometric/Categorical/Categorical0/Binomial/Poisson/
 // NegativeBinomial/NegativeBinomial2 + Multinomial — the last `@sample`
 // batch, completing the §08 sampler set (see `registry.rs`'s Task-16 batch
-// doc comment for the three sampler shapes: straight-line, Poisson's bounded
-// inverse-CDF `while`, and the Gamma-Poisson mixture). Every fixture below
+// doc comment for the three sampler shapes: straight-line, Poisson's rejection
+// loops, and the Gamma-Poisson mixture). Every fixture below
 // uses FIXED literal hyperparameters (no `elementof`), so `emit_sample`
 // produces a zero-arg `func.func @sample()` — same convention as
 // `NORMAL_SAMPLE_SRC`/`GAMMA_SAMPLE_SRC`, not the free-parameter convention
@@ -7486,124 +7486,45 @@ outputs = (draws)
     );
 }
 
-const POISSON_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-x = draw(Poisson(rate = 4.0))
-draws = rand(lawof(x), s)
-outputs = (draws)
-";
-
-/// §08 Poisson's bounded inverse-CDF sampler ([`draw_poisson`]): exactly one
-/// `stablehlo.rng` (the single pre-loop `U`, `distribution = UNIFORM`) and
-/// exactly one `stablehlo.while` (the incremental-CDF walk) — no second `rng`
-/// inside the loop (CDF inversion of a SINGLE uniform, unlike the Gamma
-/// rejection loop's per-iteration batches).
+/// Public scalar and iid queries retain their sample shape and explicit key ABI.
+/// Numerical law and RNG-continuation checks run in the testsuite StableHLO gate.
 #[test]
-fn emit_sample_poisson_has_expected_structure() {
-    let d = determinize_src(POISSON_SAMPLE_SRC);
-    let out = emit_sample(&d);
-
-    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
-    assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("stablehlo.rng_bit_generator"));
-    assert_eq!(out.matches("stablehlo.while").count(), 1);
-    assert!(is_delimiter_balanced(&out));
-}
-
-#[test]
-fn emit_sample_poisson_matches_frozen_golden() {
-    let d = determinize_src(POISSON_SAMPLE_SRC);
-    let out = emit_sample(&d);
-    let golden = include_str!("goldens/poisson_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @sample drifted from the frozen golden (tests/goldens/poisson_sample.mlir)"
-    );
-}
-
-const NEGATIVE_BINOMIAL_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-x = draw(NegativeBinomial(alpha = 5.0, beta = 2.0))
-draws = rand(lawof(x), s)
-outputs = (draws)
-";
-
-/// §08 NegativeBinomial's Gamma-Poisson mixture: [`draw_gamma`] (Task 15,
-/// three `stablehlo.rng` — `Z`/`U`/boost `U0` — plus one `stablehlo.while`)
-/// feeding [`draw_poisson`] (one more `stablehlo.rng` plus one more
-/// `stablehlo.while`) — four `stablehlo.rng` and two `stablehlo.while` total.
-#[test]
-fn emit_sample_negative_binomial_has_expected_structure() {
-    let d = determinize_src(NEGATIVE_BINOMIAL_SAMPLE_SRC);
-    let out = emit_sample(&d);
-
-    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
-    assert_eq!(
-        out.matches("stablehlo.rng").count(),
-        4,
-        "expected Gamma's Z/U/U0 + Poisson's U, in:\n{out}"
-    );
-    assert!(
-        out.contains("chlo.erf_inv") && out.contains("stablehlo.rng_bit_generator"),
-        "expected both a NORMAL (Gamma's Z) and UNIFORM batch, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.while").count(),
-        2,
-        "expected the Gamma rejection loop plus the Poisson inverse-CDF loop, in:\n{out}"
-    );
-    assert!(is_delimiter_balanced(&out));
-}
-
-#[test]
-fn emit_sample_negative_binomial_matches_frozen_golden() {
-    let d = determinize_src(NEGATIVE_BINOMIAL_SAMPLE_SRC);
-    let out = emit_sample(&d);
-    let golden = include_str!("goldens/negative_binomial_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @sample drifted from the frozen golden (tests/goldens/negative_binomial_sample.mlir)"
-    );
-}
-
-const NEGATIVE_BINOMIAL2_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-x = draw(NegativeBinomial2(mu = 3.0, psi = 5.0))
-draws = rand(lawof(x), s)
-outputs = (draws)
-";
-
-/// §08 NegativeBinomial2's Gamma-Poisson mixture: same op-count shape as
-/// [`emit_sample_negative_binomial_has_expected_structure`], plus the extra
-/// `stablehlo.divide` computing `rate = psi / mu` before [`draw_gamma`].
-#[test]
-fn emit_sample_negative_binomial2_has_expected_structure() {
-    let d = determinize_src(NEGATIVE_BINOMIAL2_SAMPLE_SRC);
-    let out = emit_sample(&d);
-
-    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
-    assert_eq!(out.matches("stablehlo.rng").count(), 4);
-    assert!(out.contains("chlo.erf_inv") && out.contains("stablehlo.rng_bit_generator"));
-    assert_eq!(out.matches("stablehlo.while").count(), 2);
-    assert!(
-        out.matches("stablehlo.divide").count() >= 1,
-        "expected at least the rate = psi / mu divide, in:\n{out}"
-    );
-    assert!(is_delimiter_balanced(&out));
-}
-
-#[test]
-fn emit_sample_negative_binomial2_matches_frozen_golden() {
-    let d = determinize_src(NEGATIVE_BINOMIAL2_SAMPLE_SRC);
-    let out = emit_sample(&d);
-    let golden = include_str!("goldens/negative_binomial2_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted @sample drifted from the frozen golden (tests/goldens/negative_binomial2_sample.mlir)"
-    );
+fn poisson_and_mixture_samples_preserve_the_public_abi() {
+    for measure in [
+        "Poisson(400)",
+        "NegativeBinomial(20, 0.05)",
+        "NegativeBinomial2(1000, 40)",
+    ] {
+        for batched in [false, true] {
+            let law = if batched {
+                format!("iid({measure}, 4)")
+            } else {
+                measure.to_string()
+            };
+            let source =
+                format!("x ~ {law}\ndraws = rand(lawof(x), rnginit(0))\noutputs = (draws)\n");
+            let module = determinize_src(&source);
+            for dtype in [Dtype::F32, Dtype::F64] {
+                let options = flatppl_stablehlo::EmitOptions {
+                    dtype,
+                    ..unrestricted_options()
+                };
+                let emitted =
+                    flatppl_stablehlo::emit(&module, flatppl_stablehlo::Mode::Sample, &options)
+                        .unwrap();
+                let shape = if batched { "4x" } else { "" };
+                let precision = match dtype {
+                    Dtype::F32 => "f32",
+                    Dtype::F64 => "f64",
+                };
+                let signature = format!(
+                    "func.func @sample(%key: tensor<2xui64>) -> (tensor<{shape}{precision}>, tensor<2xui64>)"
+                );
+                assert!(emitted.contains(&signature), "{law}: {emitted}");
+                assert!(is_delimiter_balanced(&emitted), "{law}: {emitted}");
+            }
+        }
+    }
 }
 
 const MULTINOMIAL_SAMPLE_SRC: &str = "\
@@ -8424,153 +8345,6 @@ fn emit_sample_dirichlet_iid_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted fanned Dirichlet @sample drifted from tests/goldens/dirichlet_iid_sample.mlir"
-    );
-}
-
-// ---- fan-out for discrete inverse-CDF Poisson + NegativeBinomial ------------
-//
-// Poisson's scalar draw is a bounded inverse-CDF `stablehlo.while` (walk the CDF
-// until `U <= F(k)`). The fanned draw batches that walk PER LANE via
-// `draw_poisson_batched`: one `U` drawn as a genuine `[m]` tensor, `[m]` per-lane
-// `cum`/`pmf`/`done`/`result`, ONE scalar counter `k` walked in lockstep, and a
-// per-lane latch (the `draw_gamma_batched` masked-while + `reduce_all(done)`
-// pattern). The two NegativeBinomial Gamma–Poisson mixtures fan out with NO
-// extra machinery — `draw_gamma_batched` yields the `[m]` per-lane `lambda`,
-// which `draw_poisson_batched` accepts as its `[m]` rate (so a NegBin fan-out is
-// the batched Gamma `while` feeding the batched Poisson `while`). All three
-// goldens are parse-validated against the real StableHLO parser (jax 0.10.2).
-// The one `while` discrete sampler still refusing is Multinomial.
-
-/// A fanned Poisson draw: `iid(Poisson(rate=3), 4)`, the discrete inverse-CDF
-/// batched-walk case.
-const POISSON_IID_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-xs ~ iid(Poisson(rate = 3.0), 4)
-draws = rand(lawof(xs), s)
-outputs = (draws)
-";
-
-/// A fanned NegativeBinomial draw: `iid(NegativeBinomial(alpha=5, beta=2), 4)`,
-/// the Gamma–Poisson mixture — batched Gamma `while` feeding batched Poisson
-/// `while`.
-const NEGATIVE_BINOMIAL_IID_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-xs ~ iid(NegativeBinomial(alpha = 5.0, beta = 2.0), 4)
-draws = rand(lawof(xs), s)
-outputs = (draws)
-";
-
-/// A fanned NegativeBinomial2 draw: `iid(NegativeBinomial2(mu=3, psi=5), 4)`,
-/// the mean-dispersion mixture (same shape as the `NegativeBinomial` case, with
-/// the `rate = psi/mu` reparameterization).
-const NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC: &str = "\
-s = rnginit(0)
-xs ~ iid(NegativeBinomial2(mu = 3.0, psi = 5.0), 4)
-draws = rand(lawof(xs), s)
-outputs = (draws)
-";
-
-/// The fanned Poisson draw returns a `tensor<4xf32>` (not a scalar) alongside
-/// the advanced key, drawn from EXACTLY ONE `rng_bit_generator` sized to the
-/// `[4]` batch (a genuine `tensor<4xui32>` output — one advance, one advanced
-/// key returned — not a scalar broadcast), via ONE masked `stablehlo.while`
-/// carrying a `tensor<4xi1>` per-lane `done` mask, with `reduce_all(done)` in
-/// the loop condition and an `or` carry.
-#[test]
-fn emit_sample_poisson_iid_has_expected_structure() {
-    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
-    let out = emit_sample(&d);
-
-    assert!(
-        out.contains("func.func @sample(%key: tensor<2xui64>)"),
-        "missing @sample(%key) (no free params) in:\n{out}"
-    );
-    assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
-        "fanned Poisson must return the [4] batch + advanced key, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.rng_bit_generator").count(),
-        1,
-        "one rng_bit_generator advance (one advanced key) for the whole [4] batch, in:\n{out}"
-    );
-    assert!(
-        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
-        "the single rng_bit_generator must be sized to the [4] batch (genuine tensor<4> draw), in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.while").count(),
-        1,
-        "one masked while for the whole [4] batch, in:\n{out}"
-    );
-    assert!(
-        out.contains("tensor<4xi1>"),
-        "per-lane done mask must be tensor<4xi1>, in:\n{out}"
-    );
-    assert!(
-        out.contains("stablehlo.reduce(") && out.contains("stablehlo.or "),
-        "the batched walk needs an all-reduce over the done mask + an OR carry, in:\n{out}"
-    );
-    assert!(is_delimiter_balanced(&out));
-}
-
-/// Freeze the exact emitted text (parse-validated against the real StableHLO
-/// parser): any drift must be a deliberate, reviewed change to this golden.
-#[test]
-fn emit_sample_poisson_iid_matches_frozen_golden() {
-    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
-    let out = emit_sample(&d);
-    let golden = include_str!("goldens/poisson_iid_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted fanned @sample drifted from tests/goldens/poisson_iid_sample.mlir"
-    );
-}
-
-/// NegativeBinomial fans out to the batched Gamma `while` (its `[4]` per-lane
-/// `lambda`) feeding the batched Poisson `while` (that `[4]` rate): TWO
-/// `stablehlo.while`s, one `[4]` value return, one advanced key.
-#[test]
-fn emit_sample_negative_binomial_iid_has_expected_structure() {
-    let d = determinize_src(NEGATIVE_BINOMIAL_IID_SAMPLE_SRC);
-    let out = emit_sample(&d);
-
-    assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
-        "fanned NegativeBinomial must return the [4] batch + advanced key, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.while").count(),
-        2,
-        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
-    );
-    assert!(
-        out.contains("tensor<4xi1>"),
-        "both batched loops carry a tensor<4xi1> per-lane mask, in:\n{out}"
-    );
-
-    let golden = include_str!("goldens/negative_binomial_iid_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted fanned @sample drifted from tests/goldens/negative_binomial_iid_sample.mlir"
-    );
-}
-
-/// The `rate = psi/mu` mirror of the NegativeBinomial fan-out: same
-/// batched-Gamma-then-batched-Poisson shape, frozen against its golden.
-#[test]
-fn emit_sample_negative_binomial2_iid_matches_frozen_golden() {
-    let d = determinize_src(NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC);
-    let out = emit_sample(&d);
-    assert_eq!(
-        out.matches("stablehlo.while").count(),
-        2,
-        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
-    );
-    let golden = include_str!("goldens/negative_binomial2_iid_sample.mlir");
-    assert_eq!(
-        out, golden,
-        "emitted fanned @sample drifted from tests/goldens/negative_binomial2_iid_sample.mlir"
     );
 }
 
