@@ -2226,6 +2226,29 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Ascending sort of one real vector cell, preserving any callable batches.
+    pub(crate) fn sort_vector(&mut self, value: &Value) -> Value {
+        let dimension = self.batch_rank(value);
+        let scalar_ty = MlirTy::Scalar.render(self.dtype, value.elem);
+        let vector_ty = value.ty.render(self.dtype, value.elem);
+        let (left, right, predicate) = (self.fresh(), self.fresh(), self.fresh());
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = \"stablehlo.sort\"({}) ({{\n\
+             ^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n\
+               {predicate} = stablehlo.compare LT, {left}, {right}, FLOAT : ({scalar_ty}, {scalar_ty}) -> tensor<i1>\n\
+               stablehlo.return {predicate} : tensor<i1>\n\
+             }}) {{dimension = {dimension} : i64, is_stable = true}} : ({vector_ty}) -> {vector_ty}",
+            value.ssa
+        ));
+        self.remember_axes(&ssa, self.axes_of(value));
+        Value {
+            ssa,
+            ty: value.ty.clone(),
+            elem: value.elem,
+        }
+    }
+
     // ---- matrix helpers -----------------------------------------------------
 
     /// Lower Cholesky factor with the input's matrix-cell and batch shapes.

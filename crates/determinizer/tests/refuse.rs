@@ -6,6 +6,15 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
+#[test]
+fn rebase_without_a_mass_rule_refuses() {
+    let model = parse_infer(
+        "q = rebase(iid(Laplace(0, 1), 3), Lebesgue(zerosum(3)))\nlp = logdensityof(q, [-1, 0, 1])",
+    );
+    let error = determinize(&model).expect_err("rebase must not drop an unknown normalizer");
+    assert!(error.reason.contains("closed-form mass rule"), "{error:?}");
+}
+
 // Note: `rand` no longer refuses unconditionally — a single-draw
 // `rand(rng, lawof(record(x = draw(M))))` now lowers to `builtin_sample`
 // (`tests/sample_golden.rs::single_draw_samples_via_builtin_sample`). The

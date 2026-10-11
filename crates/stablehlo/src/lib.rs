@@ -301,6 +301,7 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
         preserve_rand_tuple: false,
         numerical_integrals: false,
+        vector_sort: true,
         supports_cdf: Some(|ctor| {
             registry::lookup(ctor).is_some_and(|dist| dist.touniform.is_some())
         }),
