@@ -2172,11 +2172,24 @@ fn lower_measure_density_at(
         // `lawof(record(…))` spelling gets, so the two agree instead of the applied one
         // silently conditioning on the latent (or, for a record body, leaving its `draw`
         // for the driver's generic refusal).
-        let density = match marginalize_or_refuse_stochastic_law(m, app.body, v)? {
-            Some(marginal) => marginal,
-            None => lower_measure_density_at(m, app.body, v, origin)?,
-        };
-        return substitute_applied_boundary(m, measure_node, density, &app.bound);
+        // LocalOnly leaves named boundaries for the substitution finish below.
+        // They are already given here, even when their ambient bindings are draws.
+        let conditioned: Vec<_> = app
+            .bound
+            .iter()
+            .filter(|(reference, _)| reference.ns == RefNs::SelfMod)
+            .map(|(reference, _)| reference.name)
+            .collect();
+        m.push_conditioned_inputs(&conditioned);
+        let density =
+            marginalize_or_refuse_stochastic_law(m, app.body, v).and_then(
+                |marginal| match marginal {
+                    Some(density) => Ok(density),
+                    None => lower_measure_density_at(m, app.body, v, origin),
+                },
+            );
+        m.pop_conditioned_inputs(conditioned.len());
+        return substitute_applied_boundary(m, measure_node, density?, &app.bound);
     }
 
     // An applied fan-out kernel `joint(K1, K2, …)(a)` — not a reification, so the
