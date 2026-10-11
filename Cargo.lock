@@ -410,6 +410,7 @@ dependencies = [
  "flatppl-fileaccess",
  "flatppl-hs3",
  "flatppl-infer",
+ "flatppl-mathdoc",
  "flatppl-stablehlo",
  "flatppl-syntax",
  "serde",

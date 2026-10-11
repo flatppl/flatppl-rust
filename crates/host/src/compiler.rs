@@ -126,6 +126,25 @@ pub struct BindingInfo {
     pub dependencies: Vec<String>,
 }
 
+/// One binding rendered as mathematics.
+#[derive(Debug, Serialize)]
+pub struct MathRow {
+    pub name: String,
+    /// Every binding the row binds: one, or a decomposition's targets.
+    pub names: Vec<String>,
+    /// `draw`, `value`, `measure`, `callable`, `likelihood` or `module`.
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// The notation [`LoadedModule::math`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathFormat {
+    Tex,
+    MathMl,
+    Typst,
+}
+
 impl LoadedModule {
     pub fn source(&self) -> &str {
         &self.definition.source
@@ -184,6 +203,24 @@ impl LoadedModule {
                 self.source(),
             )
         })
+    }
+
+    /// Render every binding as mathematics, in source order.
+    pub fn math(&self, format: MathFormat) -> Vec<MathRow> {
+        flatppl_mathdoc::render_with_source(&self.typed, Some(self.source()))
+            .bindings
+            .into_iter()
+            .map(|row| MathRow {
+                text: match format {
+                    MathFormat::Tex => flatppl_mathdoc::tex::statement(&row.statement),
+                    MathFormat::MathMl => row.mathml,
+                    MathFormat::Typst => flatppl_mathdoc::typst::statement(&row.statement),
+                },
+                name: row.name,
+                names: row.names,
+                kind: row.kind.as_str(),
+            })
+            .collect()
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {

@@ -1,4 +1,4 @@
-use flatppl_host::{Context, EmitOptions};
+use flatppl_host::{Context, EmitOptions, MathFormat};
 use serde_json::{Value, json};
 
 const MODEL: &str = "# ünïcode comment
@@ -153,6 +153,22 @@ fn slices_keep_what_the_outputs_reach_and_their_imports() -> Result<(), Box<dyn 
     let sliced = slice.compile(&EmitOptions::default())?;
     assert_eq!(full.stablehlo, sliced.stablehlo);
     assert!(context.slice(&module, &["absent"]).is_err());
+    Ok(())
+}
+
+#[test]
+fn math_renders_each_binding_in_the_requested_notation() -> Result<(), Box<dyn std::error::Error>> {
+    let module = Context::default().parse(
+        "theta ~ Normal(mu = 0.0, sigma = 1.0)\ny = 2.0 * theta",
+        None,
+        None,
+    )?;
+    let tex = module.math(MathFormat::Tex);
+    let rows: Vec<_> = tex.iter().map(|r| (r.name.as_str(), r.kind)).collect();
+    assert_eq!(rows, [("theta", "draw"), ("y", "value")]);
+    assert!(tex[0].text.contains(r"\sim \mathcal{N}"), "{}", tex[0].text);
+    assert!(module.math(MathFormat::MathMl)[0].text.starts_with("<math"));
+    assert!(module.math(MathFormat::Typst)[0].text.contains("∼ cal(N)"));
     Ok(())
 }
 

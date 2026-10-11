@@ -12,7 +12,7 @@ mod constants;
 mod export;
 mod inspect;
 
-pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, Position};
+pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position};
 pub use constants::Constant;
 pub use export::{Export, Field, Schema};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
