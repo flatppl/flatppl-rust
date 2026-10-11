@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
+use flatppl_hs3::PyhfOptions;
 use flatppl_infer::{Level, ModuleBundle, Severity};
 use flatppl_stablehlo::{BatchSpec, EmitOptions};
 use serde::Serialize;
@@ -467,15 +468,17 @@ impl Context {
 
     /// Import a pyhf model or workspace into this context.
     ///
+    /// `options` selects the measurement and whether observations are bound.
     /// The returned source is generated FlatPPL. Names, source origins, and
     /// registration follow the same rules as [`Self::parse`].
     pub fn import_pyhf(
         &mut self,
         json: &str,
+        options: &PyhfOptions,
         name: Option<&str>,
         source_path: Option<&str>,
     ) -> Result<Arc<LoadedModule>, Diagnostic> {
-        let module = flatppl_hs3::read_pyhf(json).map_err(|error| {
+        let module = flatppl_hs3::read_pyhf_with(json, options).map_err(|error| {
             Diagnostic::new("pyhf", source_path.or(name).unwrap_or("<pyhf>"), error)
         })?;
         let source = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);

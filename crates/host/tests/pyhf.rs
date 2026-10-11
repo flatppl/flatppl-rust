@@ -1,4 +1,4 @@
-use flatppl_host::{Context, EmitOptions};
+use flatppl_host::{Context, EmitOptions, PyhfOptions};
 
 #[test]
 fn pyhf_observation_batches_preserve_input_order_and_channel_scope()
@@ -40,7 +40,7 @@ fn pyhf_observation_batches_preserve_input_order_and_channel_scope()
     })
     .to_string();
     let mut context = Context::default();
-    let model = context.import_pyhf(&source, None, None)?;
+    let model = context.import_pyhf(&source, &PyhfOptions::default(), None, None)?;
     let likelihood = model
         .bindings()
         .into_iter()
@@ -73,6 +73,7 @@ fn pyhf_import_composes_with_registered_queries() -> Result<(), Box<dyn std::err
     let mut context = Context::default();
     let model = context.import_pyhf(
         include_str!("../../hs3/tests/fixtures/2bin_1channel.json"),
+        &PyhfOptions::default(),
         Some("workspace.json"),
         None,
     )?;

@@ -53,10 +53,19 @@ fn model_parameter_config_matches_workspace_config() {
         {"name": "alpha", "data": [11.5]},
         {"name": "zeta", "data": [24.5, 36.0]}
     ]);
-    // Both spellings must lower the same expected yields and auxiliary terms.
-    // The channel data alone changes from a fixed vector to an external input.
+    // Both spellings must lower the same expected yields, auxiliary terms and
+    // settings record. The channel data alone changes from a fixed vector to
+    // an external input, and only a workspace measurement has a name.
     let model = convert(source);
-    let workspace = convert(&workspace.to_string());
+    let workspace = convert(&workspace.to_string())
+        .replace(
+            "% pyhf measurement \"measurement\": fit settings",
+            "% pyhf fit settings",
+        )
+        .replace(
+            "pyhf_measurement_measurement = record(name = \"measurement\", ",
+            "pyhf_measurement = record(",
+        );
     let without_observations = |text: &str| {
         text.lines()
             .filter(|line| {
@@ -237,9 +246,13 @@ fn the_first_measurement_wins_a_disagreement() {
         text.contains("t_constraint_likelihood = likelihoodof(t_constraint, 0.5)"),
         "expected the first measurement's auxdata, got:\n{text}"
     );
-    // Both measurements still declare their parameter of interest.
+    // Both measurements keep a settings record, and only the first is selected.
     assert!(
-        text.contains("meas_a = record(poi = mu)") && text.contains("meas_b = record(poi = mu)"),
+        text.contains(
+            "pyhf_measurement_meas_a = record(name = \"meas_a\", selected = true, poi = \"mu\""
+        ) && text.contains(
+            "pyhf_measurement_meas_b = record(name = \"meas_b\", selected = false, poi = \"mu\""
+        ),
         "got:\n{text}"
     );
 }

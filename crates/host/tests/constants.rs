@@ -167,3 +167,28 @@ fn fixed_values_obey_declared_domains_and_preserve_real_embedding()
     }
     Ok(())
 }
+
+#[test]
+fn an_empty_array_is_refused_with_the_source_rule() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let module = context.parse(
+        "data = external(cartpow(reals, external(nonnegintegers)))\noutputs = sum(data)",
+        None,
+        None,
+    )?;
+    let empty = Constant::Array {
+        shape: vec![0],
+        data: vec![],
+    };
+    let Err(error) = context.set(&module, &[("data".into(), empty)]) else {
+        panic!("an empty array was bound");
+    };
+    assert!(
+        error.to_string().contains(
+            "a constant array with a zero extent has no FlatPPL literal: \
+             `array` sizes must be positive (spec §07)"
+        ),
+        "{error}"
+    );
+    Ok(())
+}

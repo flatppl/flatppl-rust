@@ -1,5 +1,5 @@
-//! Bug 3b: the measurement's parameter-of-interest (`config.poi`) is emitted as
-//! a FlatPPL record rather than silently dropped.
+//! Bug 3b: the measurement's parameter-of-interest (`config.poi`) is emitted in
+//! the measurement's settings record rather than silently dropped.
 //!
 //! (Bug 3a — normfactor bounds — was intentionally NOT changed: spec §12:206
 //! keeps a normfactor's support as `reals`; pyhf's `[0, 10]` is a fit domain,
@@ -26,8 +26,10 @@ fn poi_emitted_as_record() {
     let m = flatppl_hs3::read(PYHF).unwrap();
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains("record(poi = mu)"),
-        "POI `mu` should be emitted as a record, got:\n{text}"
+        text.contains(
+            "pyhf_measurement_Measurement = record(name = \"Measurement\", selected = true, poi = \"mu\","
+        ),
+        "POI `mu` should be emitted in the settings record, got:\n{text}"
     );
 }
 
@@ -48,19 +50,20 @@ fn measurement_labels_preserve_parameter_and_likelihood_bindings() {
     let text = print_with(&module, Syntax::Minimal);
     let metadata: Vec<_> = text
         .lines()
-        .filter(|line| line.contains(" = record(poi = mu)"))
+        .filter(|line| line.starts_with("pyhf_measurement"))
+        .filter_map(|line| line.split_once(", selected").map(|(head, _)| head))
         .collect();
     assert_eq!(
         metadata,
         [
-            "cross_section = record(poi = mu)",
-            "cross_section_2 = record(poi = mu)",
-            "mu_2 = record(poi = mu)",
-            "likelihood_2 = record(poi = mu)",
-            "inputs_2 = record(poi = mu)",
-            "_x__2 = record(poi = mu)",
-            "__2 = record(poi = mu)",
-            "pi_2 = record(poi = mu)",
+            "pyhf_measurement_cross_section = record(name = \"cross-section\"",
+            "pyhf_measurement_cross_section_2 = record(name = \"cross_section\"",
+            "pyhf_measurement_mu = record(name = \"mu\"",
+            "pyhf_measurement_likelihood = record(name = \"likelihood\"",
+            "pyhf_measurement_inputs = record(name = \"inputs\"",
+            "pyhf_measurement__x_ = record(name = \"_x_\"",
+            "pyhf_measurement__ = record(name = \"_\"",
+            "pyhf_measurement_pi = record(name = \"pi\"",
         ]
     );
     assert!(text.contains("mu = elementof(reals)"));

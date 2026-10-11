@@ -22,7 +22,10 @@ pub(crate) mod model;
 mod normsys;
 pub(crate) mod presets;
 pub(crate) mod pyhf;
+mod pyhf_measurement;
 mod pyhf_names;
+
+pub use pyhf::{Observations, PyhfOptions};
 
 use flatppl_core::Module;
 use flatppl_syntax::{Syntax, parse, print_with};
@@ -94,7 +97,12 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
 /// The output is print→reparse checked in every build profile. Use
 /// [`read_pyhf_unchecked`] to skip that check.
 pub fn read_pyhf(json: &str) -> Result<Module> {
-    validate_round_trip(read_pyhf_unchecked(json)?)
+    read_pyhf_with(json, &PyhfOptions::default())
+}
+
+/// Like [`read_pyhf`], with a chosen measurement and observation form.
+pub fn read_pyhf_with(json: &str, options: &PyhfOptions) -> Result<Module> {
+    validate_round_trip(read_pyhf_unchecked_with(json, options)?)
 }
 
 /// Like [`read_pyhf`] but without the print→reparse self-check.
@@ -104,6 +112,11 @@ pub fn read_pyhf(json: &str) -> Result<Module> {
 /// Callers must trust or separately validate the source before exposing the
 /// result to untrusted JSON.
 pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
+    read_pyhf_unchecked_with(json, &PyhfOptions::default())
+}
+
+/// Like [`read_pyhf_with`] but without the print→reparse self-check.
+pub fn read_pyhf_unchecked_with(json: &str, options: &PyhfOptions) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_none() {
         return Err(Error::Unsupported(
@@ -113,7 +126,7 @@ pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
         ));
     }
     let doc = model::PyhfDocument::from_value(value)?;
-    pyhf::pyhf_to_module(doc)
+    pyhf::pyhf_to_module_with(doc, options)
 }
 
 /// Whether the document carries a *non-empty* `analyses` block. That block is
