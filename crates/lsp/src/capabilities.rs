@@ -656,7 +656,12 @@ fn build_static_completion_items() -> Vec<lsp_types::CompletionItem> {
         }
     }
     let builtin = flatppl_infer::builtin_catalogue();
-    for name in builtin.base_names() {
+    for name in builtin.base_names().chain(
+        flatppl_infer::builtins::BUILTINS
+            .iter()
+            .copied()
+            .filter(|name| flatppl_infer::builtins::is_base_name(name)),
+    ) {
         if seen.insert(name.to_string()) {
             items.push(CompletionItem {
                 label: name.to_string(),
@@ -1417,6 +1422,13 @@ mod tests {
         let items = completion(&db, file, fs, cats, CompletionContext::Other, false);
         // Full set still present; no AfterTilde bias applied.
         assert!(items.iter().any(|i| i.label == "Normal"));
+        for name in ["ordered", "zerosum", "rebase", "in"] {
+            assert_eq!(
+                items.iter().filter(|i| i.label == name).count(),
+                1,
+                "completion must offer {name} exactly once"
+            );
+        }
         assert!(
             items.iter().all(|i| i.sort_text.is_none()),
             "Other context sets no sort_text"
