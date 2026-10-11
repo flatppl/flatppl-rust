@@ -150,6 +150,9 @@ pub(super) fn lower_density(
     node: NodeId,
     point: NodeId,
 ) -> Result<NodeId, RefuseError> {
+    if let Some(law) = exponential_tilt::recognize(m, node) {
+        return exponential_tilt::density(m, law, point);
+    }
     if let Some(law) = on_set(m, node)? {
         return match law {
             SetLaw::IidNormal(normal) => Ok(normal_density(m, normal, point)),

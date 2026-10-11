@@ -272,6 +272,9 @@ fn lower_closed_measure_sample(
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let (resolved, _) = resolve_ref_one(m, measure);
+    if let Some(law) = crate::density::exponential_tilt::recognize(m, resolved) {
+        return sample_exponential_tilt(m, law, rng, None);
+    }
     match builtin_name(m, resolved) {
         Some("lawof") => {
             let inner = strip_lawof(m, resolved)
@@ -720,6 +723,9 @@ fn lower_draw(
         c.args[0]
     };
     let (inner_resolved, _) = resolve_ref_one(m, inner_measure);
+    if let Some(law) = crate::density::exponential_tilt::recognize(m, inner_resolved) {
+        return sample_exponential_tilt(m, law, rng, sample_name);
+    }
     if let Some(err) = classify_drawn_measure(m, inner_resolved) {
         return Err(err);
     }
@@ -749,6 +755,9 @@ fn lower_tilt_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
+    if let Some(law) = crate::density::exponential_tilt::recognize(m, measure) {
+        return sample_exponential_tilt(m, law, rng, sample_name);
+    }
     use crate::density::tilt::{SetLaw, elementwise, normal_parameters, on_set, project_sum};
 
     let law = on_set(m, measure)?.ok_or_else(|| {
@@ -782,6 +791,38 @@ fn lower_tilt_sample(
             Ok((elementwise(m, "add", &[center, noise]), rng_out))
         }
     }
+}
+
+fn sample_exponential_tilt(
+    m: &mut Module,
+    law: crate::density::exponential_tilt::Law,
+    rng: NodeId,
+    sample_name: Option<Symbol>,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (ctor, parameters) = exponential_tilt_constructor(m, &law)
+        .ok_or_else(|| refuse(law.measure, m, "exponential tilt needs a primitive law"))?;
+    let (value, next) = build_sample_term(m, ctor, parameters, rng, sample_name);
+    Ok((
+        crate::density::exponential_tilt::guard_sample(m, value, law.valid, law.integer),
+        next,
+    ))
+}
+
+fn exponential_tilt_constructor(
+    m: &mut Module,
+    law: &crate::density::exponential_tilt::Law,
+) -> Option<(NodeId, NodeId)> {
+    let (ctor, mut parameters) = split_kernel_constructor(m, law.measure)?;
+    if let Some(log_beta) = law.log_beta {
+        // Sampling-only metadata retains a Gamma mixing rate that need not
+        // be representable. This is not a public constructor parameter.
+        let name = m.intern("log_beta");
+        let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let safe = build_call(m, "ifelse", &[law.valid, log_beta, zero]);
+        parameters.push((name, safe));
+    }
+    let ctor = m.alloc(Node::Const(ctor));
+    Some((ctor, build_record(m, &parameters)))
 }
 
 /// Keep the iid Normal arithmetic and RNG consumption unchanged.
@@ -850,6 +891,15 @@ fn lower_iid_sample(
              multi-axis, or unresolved domain); only a 1-D static fan-out is built",
         )
     })?;
+    if let Some(law) = crate::density::exponential_tilt::recognize(m, kernel) {
+        let (ctor, parameters) = exponential_tilt_constructor(m, &law)
+            .ok_or_else(|| refuse(law.measure, m, "exponential tilt needs a primitive law"))?;
+        let (value, next) = build_iid_sample_term(m, ctor, parameters, n, rng, sample_name);
+        return Ok((
+            crate::density::exponential_tilt::guard_sample(m, value, law.valid, law.integer),
+            next,
+        ));
+    }
     let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
         refuse(
             kernel,

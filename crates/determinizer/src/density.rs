@@ -164,6 +164,9 @@ pub(crate) mod integral;
 #[path = "density_tilt.rs"]
 pub(crate) mod tilt;
 
+#[path = "density_exponential_tilt.rs"]
+pub(crate) mod exponential_tilt;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -3875,6 +3878,9 @@ fn superposition_reference(
 /// degenerate/empty interval collapses `Z → 0`, so `logZ → −∞`. That is the
 /// backend's concern (a runtime `log(0)`), not statically checked here.
 fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    if let Some(law) = exponential_tilt::recognize(m, node) {
+        return exponential_tilt::density(m, law, v);
+    }
     let m_inner = {
         let c = expect_builtin_call(m, node, "normalize")
             .ok_or_else(|| refuse(node, m, "expected normalize"))?;

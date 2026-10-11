@@ -50,6 +50,14 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
 
+The Rust determinizer lowers affine log weights to closed distribution laws for
+Normal, MvNormal, Gamma, Exponential, ChiSquared, Bernoulli, Binomial, Poisson,
+Geometric and both NegativeBinomial parameterizations. This applies to
+`normalize(logweighted(...))` and equivalent `tilt` expressions with a
+unit-density source reference. Runtime parameters remain live in density and
+sampling queries. Nonlinear weights and restricted references retain their
+existing lowering paths.
+
 StableHLO emission restricts lowering to avoid known Enzyme limitations by
 default. This mode preserves zero-factor product derivatives and avoids known
 selection-adjoint failures. It retains source tensor operations but skips

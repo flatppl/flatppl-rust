@@ -4006,7 +4006,25 @@ fn poisson_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 fn negative_binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
-    let lambda = draw_gamma(e, &alpha, &beta);
+    let lambda = if let Ok(log_beta) = p.field_id(e, "log_beta") {
+        // A tilt's rate may overflow or underflow while its sampled counts
+        // remain representable. Scale a unit-rate Gamma draw in log space.
+        let log_beta = e.lower_node(log_beta)?;
+        let infinity = e.inf_like(&beta);
+        let finite = e.compare("LT", &beta, &infinity);
+        let zero = e.scalar(0.0);
+        let positive = e.compare("GT", &beta, &zero);
+        let finite = e.and(&finite, &positive);
+        let one = e.scalar(1.0);
+        let rate = e.select(&finite, &beta, &one);
+        let gamma = draw_gamma(e, &alpha, &rate);
+        let log_gamma = e.log(&gamma);
+        let log_lambda = e.sub(&log_gamma, &log_beta);
+        let scaled = e.exp(&log_lambda);
+        e.select(&finite, &gamma, &scaled)
+    } else {
+        draw_gamma(e, &alpha, &beta)
+    };
     Ok(draw_poisson(e, &lambda))
 }
 
