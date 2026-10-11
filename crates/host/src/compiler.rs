@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::Constant;
 use crate::export::{Export, emit_query};
+use crate::inspect::{self, BindingKind, Domain};
 
 #[derive(Debug, Serialize)]
 pub struct Diagnostic {
@@ -77,12 +78,26 @@ pub struct LoadedModule {
     bundle: ModuleBundle,
 }
 
+/// One public binding as hosts see it. Positions refer to the right-hand side
+/// in the module's source text. A value bound by [`Context::set`] has none.
 #[derive(Serialize)]
 pub struct BindingInfo {
     pub name: String,
+    pub kind: BindingKind,
     pub value_type: Option<String>,
     pub phase: Option<String>,
+    pub domain: Option<Domain>,
+    /// Array extents, `None` per dynamic extent. Absent for records, tuples,
+    /// tables and non-values.
+    pub shape: Option<Vec<Option<u32>>>,
+    /// The number of scalar elements, when every extent is known.
+    pub size: Option<u64>,
     pub span: Option<(u32, u32)>,
+    pub source: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    /// The public bindings this one references directly.
+    pub dependencies: Vec<String>,
 }
 
 impl LoadedModule {
@@ -95,19 +110,32 @@ impl LoadedModule {
     }
 
     pub fn bindings(&self) -> Vec<BindingInfo> {
-        self.typed
+        let module = &self.typed;
+        let text = self.source();
+        module
             .public_bindings()
-            .map(|(_, b)| BindingInfo {
-                name: self.typed.resolve(b.name).into(),
-                value_type: self
-                    .typed
-                    .type_of(b.rhs)
-                    .map(|t| self.typed.display_type(t)),
-                phase: self
-                    .typed
-                    .phase_of(b.rhs)
-                    .map(|p| format!("{p:?}").to_lowercase()),
-                span: self.typed.span_of(b.rhs).map(|s| (s.start, s.end)),
+            .map(|(id, b)| {
+                let span = module.span_of(b.rhs).map(|s| (s.start, s.end));
+                let position = span.and_then(|(start, _)| inspect::locate(text, start));
+                let ty = module.type_of(b.rhs);
+                BindingInfo {
+                    name: module.resolve(b.name).into(),
+                    kind: inspect::kind(module, b.rhs),
+                    value_type: ty.map(|t| module.display_type(t)),
+                    phase: module
+                        .phase_of(b.rhs)
+                        .map(|p| format!("{p:?}").to_lowercase()),
+                    domain: module.valueset_of(b.rhs).map(|s| Domain::of(module, s)),
+                    shape: ty.and_then(inspect::shape),
+                    size: ty.and_then(inspect::size),
+                    span,
+                    source: span
+                        .and_then(|(start, end)| text.get(start as usize..end as usize))
+                        .map(String::from),
+                    line: position.as_ref().map(|p| p.0),
+                    column: position.as_ref().map(|p| p.1),
+                    dependencies: inspect::dependencies(module, id),
+                }
             })
             .collect()
     }
