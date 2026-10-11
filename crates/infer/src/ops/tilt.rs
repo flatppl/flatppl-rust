@@ -1,4 +1,4 @@
-//! §06 rebase preserves the base variate and normalizes at each kernel input.
+//! §06 tilt preserves the base variate and normalizes at each kernel input.
 
 use super::*;
 
@@ -63,7 +63,7 @@ pub(super) fn result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<
             }
             Node::Call(call)
                 if matches!(call.head, CallHead::Builtin(op)
-                if inf.module.resolve(op) == "rebase") =>
+                if inf.module.resolve(op) == "tilt") =>
             {
                 let base = *call.args.get(1)?;
                 let ty = inf.lookup_type(base)?.clone();
@@ -117,7 +117,7 @@ fn compatible(a: &Type, b: &Type) -> bool {
 fn failed(inf: &mut Inferencer<'_, '_>, id: NodeId, reason: &str) -> Type {
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("`rebase`: {reason} (spec §06)"),
+        format!("`tilt`: {reason} (spec §06)"),
     ));
-    Type::Failed(format!("rebase: {reason}").into())
+    Type::Failed(format!("tilt: {reason}").into())
 }

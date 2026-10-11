@@ -18,7 +18,7 @@ pub(crate) struct NormalOnSet {
 }
 
 pub(crate) fn normal_on_set(m: &mut Module, node: NodeId) -> Option<NormalOnSet> {
-    let call = expect_builtin_call(m, node, "rebase")?;
+    let call = expect_builtin_call(m, node, "tilt")?;
     let [source, base] = *call.args else {
         return None;
     };
@@ -74,16 +74,16 @@ pub(super) fn lower_density(
         return Ok(normal_density(m, normal, point));
     }
     let call =
-        expect_builtin_call(m, node, "rebase").ok_or_else(|| refuse(node, m, "expected rebase"))?;
+        expect_builtin_call(m, node, "tilt").ok_or_else(|| refuse(node, m, "expected tilt"))?;
     let [source, base] = *call.args else {
-        return Err(refuse(node, m, "rebase expects two positional measures"));
+        return Err(refuse(node, m, "tilt expects two positional measures"));
     };
     let (base_node, _) = resolve_ref_chain(m, base);
     let Some(Type::Measure { domain, .. }) = m.type_of(base_node).cloned() else {
         return Err(refuse(
             node,
             m,
-            "rebase requires closed measures at the query point",
+            "tilt requires closed measures at the query point",
         ));
     };
     let (label, reference, value) = broadcast::placeholder(m, *domain.clone());
@@ -159,13 +159,13 @@ pub(super) fn lower_application(
         return None;
     };
     let (callee, _) = resolve_ref_chain(m, callee);
-    let rebase = expect_builtin_call(m, callee, "rebase")?.clone();
+    let tilt = expect_builtin_call(m, callee, "tilt")?.clone();
     Some((|| {
-        let [source, base] = *rebase.args else {
-            return Err(refuse(callee, m, "rebase expects two operands"));
+        let [source, base] = *tilt.args else {
+            return Err(refuse(callee, m, "tilt expects two operands"));
         };
         let Some(Type::Kernel { inputs, .. }) = m.type_of(callee).cloned() else {
-            return Err(refuse(callee, m, "rebase has no resolved kernel interface"));
+            return Err(refuse(callee, m, "tilt has no resolved kernel interface"));
         };
         let keyword_only = [source, base]
             .into_iter()
@@ -181,14 +181,14 @@ pub(super) fn lower_application(
             keyword_only,
         )
         .ok_or_else(|| refuse(node, m, if keyword_only {
-            "rebase application must bind each input once by name; its automatic interface is keyword-only"
+            "tilt application must bind each input once by name; its automatic interface is keyword-only"
         } else {
-            "rebase application must bind each input once"
+            "tilt application must bind each input once"
         }))?;
         let supplied: Vec<_> = inputs.iter().copied().zip(values).collect();
         let source = apply_operand(m, source, &supplied, point)?;
         let base = apply_operand(m, base, &supplied, point)?;
-        let closed = build_call(m, "rebase", &[source, base]);
+        let closed = build_call(m, "tilt", &[source, base]);
         lower_density(m, closed, point)
     })())
 }
@@ -207,7 +207,7 @@ fn apply_operand(
         refuse(
             operand,
             m,
-            "rebase kernel operand is not a supported reification",
+            "tilt kernel operand is not a supported reification",
         )
     })?;
     let bound = kernel
@@ -224,7 +224,7 @@ fn apply_operand(
             refuse(
                 operand,
                 m,
-                "rebase kernels must share their named input interface",
+                "tilt kernels must share their named input interface",
             )
         })?;
     refuse_boundary_named_query_point(m, point, &bound)?;

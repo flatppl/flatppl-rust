@@ -7,11 +7,11 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
 }
 
 #[test]
-fn rebase_without_a_mass_rule_refuses() {
+fn tilt_without_a_mass_rule_refuses() {
     let model = parse_infer(
-        "q = rebase(iid(Laplace(0, 1), 3), Lebesgue(zerosum(3)))\nlp = logdensityof(q, [-1, 0, 1])",
+        "q = tilt(iid(Laplace(0, 1), 3), Lebesgue(zerosum(3)))\nlp = logdensityof(q, [-1, 0, 1])",
     );
-    let error = determinize(&model).expect_err("rebase must not drop an unknown normalizer");
+    let error = determinize(&model).expect_err("tilt must not drop an unknown normalizer");
     assert!(error.reason.contains("closed-form mass rule"), "{error:?}");
 }
 

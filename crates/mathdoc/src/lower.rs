@@ -514,7 +514,7 @@ impl<'m> Lowerer<'m> {
                 | "logweighted"
                 | "superpose"
                 | "normalize"
-                | "rebase"
+                | "tilt"
                 | "truncate"
                 | "pushfwd"
                 | "locscale"

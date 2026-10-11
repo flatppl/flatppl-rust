@@ -8,8 +8,8 @@ fn infer(source: &str) -> Module {
 }
 
 #[test]
-fn rebase_is_normalized_and_keeps_the_base_support() {
-    let mut module = infer("q = rebase(iid(Normal(0, 1), 3), Lebesgue(zerosum(3)))\nx ~ q");
+fn tilt_is_normalized_and_keeps_the_base_support() {
+    let mut module = infer("q = tilt(iid(Normal(0, 1), 3), Lebesgue(zerosum(3)))\nx ~ q");
     let q = module.intern("q");
     let q = module.binding(module.binding_by_name(q).unwrap()).rhs;
     assert_eq!(
@@ -29,13 +29,13 @@ fn rebase_is_normalized_and_keeps_the_base_support() {
 }
 
 #[test]
-fn rebase_kernel_uses_the_first_nonnullary_input_order() {
+fn tilt_kernel_uses_the_first_nonnullary_input_order() {
     let source = "a = elementof(reals)\nb = elementof(posreals)\n\
                   left = functionof(Normal(a, b), a = a, b = b)\n\
                   right = functionof(Normal(a, b), b = b, a = a)\n";
     for (expression, order) in [
-        ("rebase(left, right)", ["a", "b"]),
-        ("rebase(Normal(0, 1), right)", ["b", "a"]),
+        ("tilt(left, right)", ["a", "b"]),
+        ("tilt(Normal(0, 1), right)", ["b", "a"]),
     ] {
         let mut module = infer(&format!("{source}q = {expression}\nx ~ q(a = 0, b = 1)"));
         let q = module.intern("q");
@@ -52,14 +52,14 @@ fn rebase_kernel_uses_the_first_nonnullary_input_order() {
 }
 
 #[test]
-fn rebase_rejects_wrong_operands_shapes_and_interfaces() {
+fn tilt_rejects_wrong_operands_shapes_and_interfaces() {
     for source in [
-        "q = rebase(Normal(0, 1))",
-        "q = rebase(M = Normal(0, 1), B = Normal(0, 1))",
-        "q = rebase(1, Normal(0, 1))",
-        "q = rebase(iid(Normal(0, 1), 2), Lebesgue(zerosum(3)))",
-        "a = elementof(reals)\nb = elementof(reals)\nq = rebase(functionof(Normal(a, 1), a = a), functionof(Normal(b, 1), b = b))",
-        "a = elementof(reals)\nb = elementof(cartpow(reals, 2))\nq = rebase(functionof(Normal(a, 1), x = a), functionof(Normal(sum(b), 1), x = b))",
+        "q = tilt(Normal(0, 1))",
+        "q = tilt(M = Normal(0, 1), B = Normal(0, 1))",
+        "q = tilt(1, Normal(0, 1))",
+        "q = tilt(iid(Normal(0, 1), 2), Lebesgue(zerosum(3)))",
+        "a = elementof(reals)\nb = elementof(reals)\nq = tilt(functionof(Normal(a, 1), a = a), functionof(Normal(b, 1), b = b))",
+        "a = elementof(reals)\nb = elementof(cartpow(reals, 2))\nq = tilt(functionof(Normal(a, 1), x = a), functionof(Normal(sum(b), 1), x = b))",
     ] {
         let mut module = flatppl_syntax::parse(source).unwrap();
         let diagnostics = flatppl_infer::infer(&mut module);

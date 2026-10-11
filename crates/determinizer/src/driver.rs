@@ -30,7 +30,7 @@ const MEASURE_VOCAB: &[&str] = &[
     "weighted",
     "logweighted",
     "normalize",
-    "rebase",
+    "tilt",
     "truncate",
     "pushfwd",
     "locscale",
@@ -776,7 +776,7 @@ fn op_name(m: &Module, id: NodeId) -> String {
 /// combinator classification. A new measure-algebra op may need adding to
 /// both lists — check `density.rs` too.
 const COMBINATOR_OPS: &[&str] = &[
-    "rebase",
+    "tilt",
     "weighted",
     "logweighted",
     "superpose",

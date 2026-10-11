@@ -1422,7 +1422,7 @@ mod tests {
         let items = completion(&db, file, fs, cats, CompletionContext::Other, false);
         // Full set still present; no AfterTilde bias applied.
         assert!(items.iter().any(|i| i.label == "Normal"));
-        for name in ["ordered", "zerosum", "rebase", "in"] {
+        for name in ["ordered", "zerosum", "tilt", "in"] {
             assert_eq!(
                 items.iter().filter(|i| i.label == name).count(),
                 1,

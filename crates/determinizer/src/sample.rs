@@ -295,7 +295,7 @@ fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
-        Some("rebase") => lower_rebase_sample(m, resolved, rng, None),
+        Some("tilt") => lower_tilt_sample(m, resolved, rng, None),
         // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
         // SAME [`lower_iid_sample`] as the `draw(iid(K, n))` spelling, so both emit
@@ -728,8 +728,8 @@ fn lower_draw(
     if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
         return lower_iid_sample(m, kernel, iid_node, rng, sample_name);
     }
-    if builtin_name(m, inner_resolved) == Some("rebase") {
-        return lower_rebase_sample(m, inner_resolved, rng, sample_name);
+    if builtin_name(m, inner_resolved) == Some("tilt") {
+        return lower_tilt_sample(m, inner_resolved, rng, sample_name);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
@@ -743,19 +743,19 @@ fn lower_draw(
 
 /// Centering iid normals gives covariance sigma²(I - 11'/n); sorting them
 /// gives the normalized ordered chamber. Both consume one batched RNG draw.
-fn lower_rebase_sample(
+fn lower_tilt_sample(
     m: &mut Module,
     measure: NodeId,
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    use crate::density::rebase::{NormalSet, elementwise, normal_on_set};
+    use crate::density::tilt::{NormalSet, elementwise, normal_on_set};
 
     let normal = normal_on_set(m, measure).ok_or_else(|| {
         refuse(
             measure,
             m,
-            "rebase sampling currently requires fixed-size iid Normal on Lebesgue(ordered(n)) or Lebesgue(zerosum(n))",
+            "tilt sampling currently requires fixed-size iid Normal on Lebesgue(ordered(n)) or Lebesgue(zerosum(n))",
         )
     })?;
     let mu = match normal.kind {
@@ -1157,7 +1157,7 @@ fn requires_shared_binding_rewrite(m: &Module, field_bids: &[Option<BindingId>])
 /// Sample a record whose fields reference (possibly shared) `draw`-bindings,
 /// preserving shared-ancestor identity. Each latent in the generative cone is
 /// rewritten to a SINGLE `builtin_sample` bound to a fresh synthetic name; its
-/// value (including any rebase transformation) replaces the latent's
+/// value (including any tilt transformation) replaces the latent's
 /// `draw`-binding RHS and its advanced rng threads to the next latent. Consumers keep
 /// referencing the latent as `(%ref self mu)`, so the shared latent is sampled
 /// once and read by name everywhere.
@@ -1189,7 +1189,7 @@ fn lower_shared_record_sample(
     for &bid in &cone {
         // Use the ordinary draw dispatcher, naming its primitive tuple before
         // any value transformation. Later latents resolve their parent's binding
-        // to this sampled value; rebase and iid keep their usual batched draw.
+        // to this sampled value; tilt and iid keep their usual batched draw.
         let sample_name = fresh_latent_name(m, bid, "sample");
         let (value, next) = lower_draw(m, m.binding(bid).rhs, cur, Some(sample_name))?;
 
