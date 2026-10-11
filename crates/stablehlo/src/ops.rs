@@ -2872,7 +2872,14 @@ fn vector_set_membership(
             e.compare("GT", &gap, &zero)
         }
     };
-    Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell))
+    let membership = e.reduce_boolean("stablehlo.and", "true", &per_cell);
+    if matches!(e.node(n_id), Node::Lit(Scalar::Int(_))) {
+        return Ok(membership);
+    }
+    let declared_size = e.lower_node(n_id)?;
+    let point_size = e.int_value_const(len as i64);
+    let size_matches = e.compare("EQ", &declared_size, &point_size);
+    Ok(e.and(&membership, &size_matches))
 }
 
 /// The membership predicate for one [`ElemSet`], elementwise at `v`'s shape.
