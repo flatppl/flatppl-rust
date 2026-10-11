@@ -14,13 +14,26 @@ use crate::Constant;
 use crate::export::{Export, emit_query};
 use crate::inspect::{self, BindingKind, Domain};
 
+/// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
 pub struct Diagnostic {
     pub stage: &'static str,
-    pub source: String,
+    pub source: Box<str>,
     pub message: String,
     pub span: Option<(u32, u32)>,
+    /// Written as the keys `line`, `column` and `excerpt` when the span is known.
+    #[serde(flatten)]
+    pub position: Option<Position>,
     pub import_chain: Vec<String>,
+}
+
+/// Where a span starts: the line and column count from 1, the column in
+/// Unicode characters, and `excerpt` is the text of that line.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
+    pub excerpt: Box<str>,
 }
 
 impl Diagnostic {
@@ -30,14 +43,26 @@ impl Diagnostic {
             source: source.into(),
             message: message.to_string(),
             span: None,
+            position: None,
             import_chain: Vec::new(),
         }
     }
 
-    fn at(mut self, module: &Module, node: Option<NodeId>) -> Self {
-        self.span = node
-            .and_then(|id| module.span_of(id))
-            .map(|s| (s.start, s.end));
+    /// Locate the error at `node`, whose span indexes `text`.
+    fn at(self, module: &Module, node: Option<NodeId>, text: &str) -> Self {
+        let span = node.and_then(|id| module.span_of(id));
+        self.spanned(span.map(|s| (s.start, s.end)), text)
+    }
+
+    fn spanned(mut self, span: Option<(u32, u32)>, text: &str) -> Self {
+        self.span = span;
+        self.position = span
+            .and_then(|(start, _)| inspect::locate(text, start))
+            .map(|(line, column, excerpt)| Position {
+                line,
+                column,
+                excerpt: excerpt.into(),
+            });
         self
     }
 }
@@ -181,11 +206,22 @@ impl LoadedModule {
             },
         )
         .map_err(|e| {
-            Diagnostic::new("determinize", self.source_name(), e.reason)
-                .at(&self.typed, Some(e.node))
+            Diagnostic::new("determinize", self.source_name(), e.reason).at(
+                &self.typed,
+                Some(e.node),
+                self.source(),
+            )
         })?;
-        emit_query(lowered, &self.typed, options, batch)
-            .map_err(|e| Diagnostic::new("stablehlo", self.source_name(), e.msg))
+        emit_query(lowered, &self.typed, options, batch).map_err(|e| {
+            // Lowering appends nodes and never renumbers, so only nodes of the
+            // typed root module index its source.
+            let node = e.node.filter(|id| id.index() < self.typed.node_count());
+            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(
+                &self.typed,
+                node,
+                self.source(),
+            )
+        })
     }
 }
 
@@ -399,7 +435,11 @@ impl Context {
             .into_iter()
             .find(|d| d.severity == Severity::Error)
         {
-            return Err(Diagnostic::new("infer", &definition.label, d.message).at(&typed, d.node));
+            return Err(Diagnostic::new("infer", &definition.label, d.message).at(
+                &typed,
+                d.node,
+                &definition.source,
+            ));
         }
         Ok(Arc::new(LoadedModule {
             owner: self.owner.clone(),
@@ -420,11 +460,8 @@ impl Context {
         if stack.contains(&identity) {
             return Err(Diagnostic::new("resolve", &label, "cyclic module imports"));
         }
-        let parsed = flatppl_syntax::parse(&source).map_err(|e| {
-            let mut d = Diagnostic::new("parse", &label, e.message);
-            d.span = e.span;
-            d
-        })?;
+        let parsed = flatppl_syntax::parse(&source)
+            .map_err(|e| Diagnostic::new("parse", &label, e.message).spanned(e.span, &source))?;
         let mut literals = Vec::new();
         for i in 0..parsed.node_count() {
             if let Node::Call(c) = parsed.node(NodeId::from_usize(i))

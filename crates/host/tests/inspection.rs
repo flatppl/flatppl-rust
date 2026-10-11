@@ -1,4 +1,4 @@
-use flatppl_host::Context;
+use flatppl_host::{Context, EmitOptions};
 use serde_json::{Value, json};
 
 const MODEL: &str = "# ünïcode comment
@@ -124,5 +124,64 @@ fn bound_values_keep_their_binding_without_a_position() -> Result<(), Box<dyn st
     assert_eq!(rows[0]["source"], Value::Null);
     assert_eq!(rows[0]["line"], Value::Null);
     assert_eq!(rows[1]["size"], 3);
+    Ok(())
+}
+
+#[test]
+fn diagnostics_locate_parse_infer_and_emission_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let mut located = |source: &str| -> Result<Value, Box<dyn std::error::Error>> {
+        let error = match context.parse(source, None, None) {
+            Err(error) => error,
+            Ok(module) => module
+                .compile(&EmitOptions::default())
+                .err()
+                .ok_or("the source should fail")?,
+        };
+        let error = serde_json::to_value(&error)?;
+        Ok(json!([
+            error["stage"],
+            error["line"],
+            error["column"],
+            error["excerpt"]
+        ]))
+    };
+    // Columns count characters, so the two-byte `é` counts once.
+    assert_eq!(
+        located("a = 1.0\nx = \"é\" = 1")?,
+        json!(["parse", 2, 9, "x = \"é\" = 1"])
+    );
+    assert_eq!(
+        located("a = 1.0\nb = a + missing")?,
+        json!(["infer", 2, 9, "b = a + missing"])
+    );
+    assert_eq!(
+        located("a = elementof(reals)\nx = 2.0 * a\ninputs = x\noutputs = x")?,
+        json!(["stablehlo", 2, 5, "x = 2.0 * a"])
+    );
+    Ok(())
+}
+
+#[test]
+fn import_errors_locate_in_the_imported_text() -> Result<(), Box<dyn std::error::Error>> {
+    let directory =
+        std::env::temp_dir().join(format!("flatppl-host-locate-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(directory.join("child.flatppl"), "a = 1.0\nb = = 2")?;
+    let host = directory.join("host.py");
+    let error = Context::default()
+        .parse(
+            "m = load_module(\"child.flatppl\")",
+            None,
+            Some(host.to_str().ok_or("utf-8 path")?),
+        )
+        .err()
+        .ok_or("the import should fail")?;
+    std::fs::remove_dir_all(&directory)?;
+    assert_eq!(error.stage, "parse");
+    let position = error.position.ok_or("the error is located")?;
+    assert_eq!((position.line, position.column), (2, 5));
+    assert_eq!(&*position.excerpt, "b = = 2");
+    assert_eq!(error.import_chain.len(), 1);
     Ok(())
 }
