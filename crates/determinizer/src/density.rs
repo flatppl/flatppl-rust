@@ -2247,7 +2247,7 @@ fn lower_measure_density_at(
         // density is the support gate, not a backend density builder. Lowering
         // it here keeps it out of FlatPDL ([`lower_lebesgue`]).
         Some("Lebesgue") => lower_lebesgue(m, measure_node, v),
-        Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
+        Some("broadcast") => lower_broadcast_kernel(m, measure_node, v, origin),
         Some("joint") => lower_joint(m, measure_node, v, origin),
         // A reified measure (`functionof` / `kernelof`) used AS a measure — its
         // body is the measure expression it reifies. Unwrap to the body and recurse
@@ -7037,6 +7037,7 @@ fn lower_broadcast_kernel(
     m: &mut Module,
     measure: NodeId,
     obs: NodeId,
+    origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
     // Read the broadcast: args[0] is the head being broadcast; args[1..] the
     // positional data-args; `named` the keyword data-args.
@@ -7053,6 +7054,44 @@ fn lower_broadcast_kernel(
 
     if let Some(kernel) = crate::kernel::resolve_reified(m, head) {
         return broadcast::kernel_density(m, head, &kernel, &pos_args, &kw_args, obs);
+    }
+
+    // With no collection operands §04 makes broadcast an ordinary call. In
+    // particular, a measure operand is constant even when its variate is a vector.
+    if pos_args
+        .iter()
+        .chain(kw_args.iter().map(|(_, v)| v))
+        .all(|&arg| {
+            let (resolved, _) = resolve_ref_chain(m, arg);
+            matches!(
+                m.type_of(arg).or_else(|| m.type_of(resolved)),
+                Some(
+                    Type::Scalar(_)
+                        | Type::Measure { .. }
+                        | Type::Function { .. }
+                        | Type::Kernel { .. }
+                        | Type::Likelihood { .. }
+                )
+            )
+        })
+        && let Node::Const(op) = *m.node(head)
+        && flatppl_infer::constructor_param_names(m.resolve(op)).is_none()
+    {
+        let named = kw_args
+            .iter()
+            .map(|&(name, value)| NamedArg {
+                kind: NamedKind::Kwarg,
+                name,
+                value,
+            })
+            .collect::<Vec<_>>();
+        let call = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(op),
+            args: pos_args.into(),
+            named: named.into(),
+            inputs: None,
+        }));
+        return lower_measure_density_at(m, call, obs, origin);
     }
 
     // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
