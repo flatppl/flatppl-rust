@@ -15,6 +15,8 @@ pub enum Constant {
     Bool(bool),
     Integer(i64),
     Real(#[serde(with = "real")] f64),
+    /// Preserve binary32 source precision until fixed-data validation.
+    Real32(#[serde(with = "real32")] f32),
     String(String),
     /// Flat data in axis order from slowest to fastest (C order).
     #[serde(
@@ -71,11 +73,15 @@ mod packed {
     struct Real(#[serde(with = "real")] f64);
 
     #[derive(Deserialize, Serialize)]
+    struct Real32(#[serde(with = "real32")] f32);
+
+    #[derive(Deserialize, Serialize)]
     #[serde(tag = "dtype", content = "data", rename_all = "snake_case")]
     enum Data {
         Bool(Vec<bool>),
         Integer(Vec<i64>),
         Real(Vec<Real>),
+        Real32(Vec<Real32>),
     }
 
     #[derive(Deserialize, Serialize)]
@@ -125,6 +131,17 @@ mod packed {
                 })
                 .collect::<Option<_>>()
                 .map(Data::Real),
+            Some(Constant::Real32(_)) => data
+                .iter()
+                .map(|x| {
+                    if let Constant::Real32(v) = x {
+                        Some(Real32(*v))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()
+                .map(Data::Real32),
             Some(_) => None,
         }
         .ok_or_else(fail)?;
@@ -146,8 +163,24 @@ mod packed {
                 .into_iter()
                 .map(|Real(v)| Constant::Real(v))
                 .collect(),
+            Data::Real32(values) => values
+                .into_iter()
+                .map(|Real32(v)| Constant::Real32(v))
+                .collect(),
         };
         Ok((shape, data))
+    }
+}
+
+mod real32 {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+        real::serialize(&f64::from(*value), serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+        real::deserialize(deserializer).map(|value| value as f32)
     }
 }
 
@@ -171,7 +204,7 @@ impl Constant {
             (_, Type::Any) => Ok(self.clone()),
             (Self::Bool(_), Type::Scalar(ScalarType::Boolean))
             | (Self::Integer(_), Type::Scalar(ScalarType::Integer))
-            | (Self::Real(_), Type::Scalar(ScalarType::Real)) => Ok(self.clone()),
+            | (Self::Real(_) | Self::Real32(_), Type::Scalar(ScalarType::Real)) => Ok(self.clone()),
             (Self::Bool(value), Type::Scalar(ScalarType::Integer)) => {
                 Ok(Self::Integer(i64::from(*value)))
             }
@@ -248,6 +281,7 @@ impl Constant {
             Self::Bool(v) => Some(f64::from(*v)),
             Self::Integer(v) => Some(*v as f64),
             Self::Real(v) => Some(*v),
+            Self::Real32(v) => Some(f64::from(*v)),
             _ => None,
         };
         if let Some(value) = number {
@@ -317,6 +351,7 @@ impl Constant {
             Self::Bool(value) => Some(Scalar::Bool(*value)),
             Self::Integer(value) => Some(Scalar::Int(*value)),
             Self::Real(value) => Some(Scalar::Real(*value)),
+            Self::Real32(value) => Some(Scalar::Real(f64::from(*value))),
             Self::String(value) => Some(Scalar::Str(value.clone().into())),
             _ => None,
         };
@@ -395,6 +430,14 @@ impl Constant {
             _ => unreachable!("scalars handled above"),
         };
         Ok(call(module, head, args, named))
+    }
+
+    fn real_value(&self) -> Option<f64> {
+        match self {
+            Self::Real(value) => Some(*value),
+            Self::Real32(value) => Some(f64::from(*value)),
+            _ => None,
+        }
     }
 
     /// Read a binding's right-hand side back as a value, structurally.
@@ -536,45 +579,27 @@ fn array_in_set(
             Ok(true)
         }
         StdSimplex(Dim::Static(n)) if shape == [*n] => {
-            let mut sum = 0.0;
             for value in data {
-                let Constant::Real(value) = value else {
-                    return Ok(false);
-                };
-                if !value.is_finite() || *value < 0.0 {
+                if !value.real_value().is_some_and(|v| v >= 0.0) {
                     return Ok(false);
                 }
-                sum += value;
             }
-            Ok(sum == 1.0)
+            Ok(sum_matches(data, 1.0))
         }
         Ordered(Dim::Static(n)) if shape == [*n] => {
             let mut previous = f64::NEG_INFINITY;
             for (i, value) in data.iter().enumerate() {
-                let Constant::Real(value) = value else {
+                let Some(value) = value.real_value() else {
                     return Ok(false);
                 };
-                if value.is_nan() || (i > 0 && *value <= previous) {
+                if value.is_nan() || (i > 0 && value <= previous) {
                     return Ok(false);
                 }
-                previous = *value;
+                previous = value;
             }
             Ok(true)
         }
-        // Exact, as for `stdsimplex`: the host does not pick a tolerance.
-        ZeroSum(Dim::Static(n)) if shape == [*n] => {
-            let mut sum = 0.0;
-            for value in data {
-                let Constant::Real(value) = value else {
-                    return Ok(false);
-                };
-                if !value.is_finite() {
-                    return Ok(false);
-                }
-                sum += value;
-            }
-            Ok(sum == 0.0)
-        }
+        ZeroSum(Dim::Static(n)) if shape == [*n] => Ok(sum_matches(data, 0.0)),
         CartProd(parts) if shape.len() == 1 => {
             let mut offset = 0;
             for part in parts {
@@ -605,6 +630,33 @@ fn array_in_set(
         }
         _ => Ok(false),
     }
+}
+
+/// Fixed-data acceptance only: |sum(x) - target| <= 8 n u sum(|x|).
+/// The factor eight allows a short producing chain per entry. Scaling avoids
+/// overflow without changing the stored values; mixed reals promote to f64.
+fn sum_matches(data: &[Constant], target: f64) -> bool {
+    let mut scale = 0.0_f64;
+    let mut epsilon = f64::from(f32::EPSILON);
+    for value in data {
+        let Some(number) = value.real_value().filter(|v| v.is_finite()) else {
+            return false;
+        };
+        scale = scale.max(number.abs());
+        if matches!(value, Constant::Real(_)) {
+            epsilon = f64::EPSILON;
+        }
+    }
+    if scale == 0.0 {
+        return target == 0.0;
+    }
+    let (mut sum, mut abs_sum) = (0.0, 0.0);
+    for value in data {
+        let number = value.real_value().unwrap() / scale;
+        sum += number;
+        abs_sum += number.abs();
+    }
+    (sum - target / scale).abs() <= 8.0 * data.len() as f64 * (epsilon / 2.0) * abs_sum
 }
 
 fn product_width(set: &ValueSet) -> Option<usize> {
