@@ -104,6 +104,14 @@ enum Command {
         /// override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
+        /// pyhf input only: the workspace measurement whose configuration the
+        /// model uses. pyhf takes the first.
+        #[arg(long)]
+        measurement: Option<String>,
+        /// pyhf input only: `external` leaves every channel's observed counts
+        /// as an external input of a workspace, to supply when loading.
+        #[arg(long, value_enum, default_value_t = ObservationsArg::Bound)]
+        observations: ObservationsArg,
         /// Omit the leading "do not edit" banner comment (a single line, no
         /// timestamp/user/host/platform/command — included by default). The
         /// targeted FlatPPL version is recorded in-model as `flatppl_compat`,
@@ -290,6 +298,23 @@ enum FromFormat {
     Pyhf,
 }
 
+/// Observed-count form for `--observations`.
+#[cfg(feature = "convert")]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ObservationsArg {
+    /// A workspace's observed counts become literal arrays.
+    Bound,
+    /// Every channel's observed counts become an external input.
+    External,
+}
+
+/// The pyhf-only `convert` flags.
+#[cfg(feature = "convert")]
+struct PyhfArgs {
+    measurement: Option<String>,
+    observations: ObservationsArg,
+}
+
 /// Resolve `--from auto` against the input filename: `*.hs3.json` / `*.pyhf.json`
 /// select the HS3 / pyhf importers (mirroring the `*.flatpir.json` convention);
 /// any other name stays `Auto` (extension-inferred). An explicit `--from`
@@ -318,8 +343,20 @@ fn main() -> ExitCode {
             output,
             syntax,
             from,
+            measurement,
+            observations,
             no_header,
-        } => convert(&input, &output, syntax.into(), from, no_header),
+        } => convert(
+            &input,
+            &output,
+            syntax.into(),
+            from,
+            &PyhfArgs {
+                measurement,
+                observations,
+            },
+            no_header,
+        ),
         #[cfg(feature = "infer")]
         Command::Infer {
             input,
@@ -411,12 +448,20 @@ fn convert(
     output: &Path,
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
+    pyhf: &PyhfArgs,
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
     // `--from auto` keys off the input name: `*.hs3.json` / `*.pyhf.json` select
     // the importers; an explicit `--from` overrides.
     let from_format = resolve_from_format(from_format, input);
+    if from_format != FromFormat::Pyhf
+        && (pyhf.measurement.is_some() || pyhf.observations != ObservationsArg::Bound)
+    {
+        return Err(Failure::Plain(
+            "`--measurement` and `--observations` apply to pyhf input only".into(),
+        ));
+    }
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path. The input is a local file — a model
@@ -436,7 +481,14 @@ fn convert(
         FromFormat::Pyhf => {
             let source = flatppl_cli::read_regular_utf8(input)
                 .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
-            let module = flatppl_hs3::read_pyhf(&source)
+            let options = flatppl_hs3::PyhfOptions {
+                measurement: pyhf.measurement.clone(),
+                observations: match pyhf.observations {
+                    ObservationsArg::Bound => flatppl_hs3::Observations::Bound,
+                    ObservationsArg::External => flatppl_hs3::Observations::External,
+                },
+            };
+            let module = flatppl_hs3::read_pyhf_with(&source, &options)
                 .map_err(|e| Failure::Plain(format!("pyhf: {e}")))?;
             note_dropped_analyses(&source);
             module

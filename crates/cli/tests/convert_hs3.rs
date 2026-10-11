@@ -212,6 +212,65 @@ fn convert_from_pyhf_fixture() {
 }
 
 #[test]
+fn convert_from_pyhf_selects_a_measurement_and_external_observations() {
+    let inp = fixture("pyhf_measurements.json");
+    let dir = scratch("pyhfflags");
+    let out = dir.join("pyhf_flags_cli.flatppl");
+    let run = |args: &[&str], output: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .args(["convert", "--from", "pyhf", "--syntax", "minimal"])
+            .args(args)
+            .args([inp.to_str().unwrap(), output.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+    let converted = run(
+        &["--measurement", "second set", "--observations", "external"],
+        &out,
+    );
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        text.contains("b_observed = external(cartpow(nonnegreals, 2))"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "pyhf_measurement_second_set = record(name = \"second set\", selected = true"
+        ),
+        "{text}"
+    );
+
+    let unknown = run(&["--measurement", "third"], &out);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr)
+            .contains("the workspace has no measurement named `third`"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    let flatppl = dir.join("model.flatppl");
+    std::fs::write(&flatppl, "x = 1.0\n").unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args(["convert", "--measurement", "m"])
+        .args([flatppl.to_str().unwrap(), out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("`--measurement` and `--observations` apply to pyhf input only"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
 fn convert_from_hs3_fixture() {
     let inp = fixture("paper_gaussian.json");
     let out = scratch("papergauss").join("hs3_paper_gaussian_cli.flatppl");
