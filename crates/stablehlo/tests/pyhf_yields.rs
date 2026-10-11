@@ -7,6 +7,18 @@ fn emit(source: &str) -> String {
 }
 
 fn emit_for(source: &str, target: flatppl_stablehlo::Target) -> String {
+    flatppl_stablehlo::emit(
+        &determinized(source),
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions {
+            target,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn determinized(source: &str) -> flatppl_core::Module {
     let mut model = flatppl_syntax::parse(source).unwrap();
     let (_, bundle) = flatppl_infer::infer_module_with_inputs(
         &mut model,
@@ -14,20 +26,11 @@ fn emit_for(source: &str, target: flatppl_stablehlo::Target) -> String {
         flatppl_infer::Level::Shape,
     );
     let roots = [model.intern("inputs"), model.intern("outputs")];
-    let model = flatppl_determinizer::determinize_with_options(
+    flatppl_determinizer::determinize_with_options(
         &model,
         &bundle,
         Some(&roots),
         &flatppl_stablehlo::LOWERING_OPTIONS,
-    )
-    .unwrap();
-    flatppl_stablehlo::emit(
-        &model,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions {
-            target,
-            ..Default::default()
-        },
     )
     .unwrap()
 }
@@ -149,4 +152,29 @@ fn gpu_target_scales_the_rows_of_several_classes_once() {
     );
     let gpu = emit_for(&source, flatppl_stablehlo::Target::Gpu);
     assert!(gpu.contains("tensor<2x2x1xf32>"), "{gpu}");
+}
+
+#[test]
+fn gpu_target_interpolates_every_histosys_call_in_one_lane_tensor() {
+    let source = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+        theta = elementof(cartpow(reals, 3))\ninputs = theta\n\
+        wide = pyhf.histosys_shift.(rowstack([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]]), \
+        rowstack([[2.0, 3.0, 4.0], [2.0, 3.0, 4.0]]), \
+        rowstack([[3.0, 4.0, 5.0], [2.5, 3.5, 4.5]]), addaxes([theta[1], theta[3]], 0, 1))\n\
+        outputs = sum(sum(wide)) + sum(wide[1, :]) \
+        + sum(pyhf.histosys_shift.([0.5, 1.5], [1.0, 2.0], [1.5, 2.5], theta[2]))";
+    // Two uses keep `wide` bound. The second call is inlined into `outputs`.
+    let module = flatppl_syntax::print(&determinized(source));
+    assert!(module.contains("wide = pyhf.histosys_shift.("), "{module}");
+    let outputs = &module[module.find("outputs =").unwrap()..];
+    assert!(outputs.contains("pyhf.histosys_shift.("), "{module}");
+    let gpu = emit_for(source, flatppl_stablehlo::Target::Gpu);
+    // Both calls share one clamp of alpha. The 8-lane gather holds the 2 x 3
+    // lanes of `wide` once, despite its two uses, and the 2 inlined lanes.
+    assert_eq!(gpu.matches("stablehlo.maximum").count(), 1, "{gpu}");
+    assert!(
+        gpu.contains("(tensor<3xf32>, tensor<8x1xi32>) -> tensor<8xf32>"),
+        "{gpu}"
+    );
+    assert_eq!(emit(source).matches("stablehlo.maximum").count(), 2);
 }

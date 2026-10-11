@@ -34,6 +34,13 @@ impl Emitter<'_> {
         if !broadcast && let Some(YieldRows { blocks, rows }) = self.yield_rows(member, args) {
             return self.lower_yield_rows(member, args, &blocks, &rows);
         }
+        if broadcast
+            && member == "histosys_shift"
+            && self.target == crate::Target::Gpu
+            && let Some(view) = self.histosys_lane_view(id)
+        {
+            return view;
+        }
         let mut values = args
             .iter()
             .map(|&arg| {
@@ -449,6 +456,168 @@ impl Emitter<'_> {
         self.reduce_axis_lit(op, identity, &value, self.batch_rank(&value) + axis)
     }
 
+    /// The GPU target interpolates the rows of every `histosys_shift.(…)`
+    /// call in one lane tensor, one lane per row and bin, with alpha one
+    /// gather of each row's parameter per lane. The reverse pass then sums each
+    /// parameter's lanes in one scatter, not in a bin reduction per channel
+    /// inside the gradient assembly. Each call reads its block of lanes as its
+    /// own rows × bins view. `None` keeps the per-channel lowering.
+    fn histosys_lane_view(&mut self, id: NodeId) -> Option<Result<Value, EmitError>> {
+        // The views are memoized for every call, so build them in module scope.
+        if self.broadcast_frame != self.call_frame {
+            return None;
+        }
+        let calls: Vec<_> = self
+            .histosys_calls()
+            .into_iter()
+            .filter(|call| call.id == id || !self.memo.contains_key(&call.id))
+            .collect();
+        calls
+            .iter()
+            .any(|call| call.id == id)
+            .then(|| self.lower_histosys_lanes(id, &calls))
+    }
+
+    /// The module's histosys calls, bound or inlined, outside callable bodies.
+    fn histosys_calls(&self) -> Vec<HistosysCall> {
+        let mut pending: Vec<_> = self.m.bindings().map(|(_, b)| b.rhs).collect();
+        pending.reverse();
+        let mut seen = HashSet::new();
+        let mut calls = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(call) = self.histosys_call(id) {
+                calls.push(call);
+                continue;
+            }
+            if matches!(self.node(id), Node::Call(call)
+                if matches!(call.head, CallHead::Builtin(head) if self.resolve(head) == "functionof"))
+            {
+                continue;
+            }
+            let mut children = Vec::new();
+            self.m.for_each_child(id, |child| children.push(child));
+            pending.extend(children.into_iter().rev());
+        }
+        calls
+    }
+
+    /// `histosys_shift.(lo, nominal, hi, alpha)` over `[rows, bins]` anchors
+    /// with `alpha = addaxes([a1, …], …)` of shape `[rows, 1]`, or over bin
+    /// vectors with a scalar alpha.
+    fn histosys_call(&self, id: NodeId) -> Option<HistosysCall> {
+        let Node::Call(call) = self.node(id) else {
+            return None;
+        };
+        let CallHead::Builtin(head) = call.head else {
+            return None;
+        };
+        let &[callee, lo, nominal, hi, alpha] = &call.args[..] else {
+            return None;
+        };
+        if self.resolve(head) != "broadcast"
+            || !call.named.is_empty()
+            || flatppl_determinizer::standard_function(self.m, callee)
+                != Some(("pyhf_helpers".into(), "histosys_shift".into()))
+        {
+            return None;
+        }
+        let anchors = self.shape_of(lo)?;
+        if [nominal, hi]
+            .iter()
+            .any(|&anchor| self.shape_of(anchor).as_ref() != Some(&anchors))
+        {
+            return None;
+        }
+        let (alphas, bins) = match anchors[..] {
+            [bins] if self.shape_of(alpha)?.is_empty() => (vec![alpha], bins),
+            [rows, bins] if self.shape_of(alpha)? == [rows, 1] => {
+                let [column, ..] = self.call_args(alpha, "addaxes")? else {
+                    return None;
+                };
+                (self.call_args(*column, "vector")?.to_vec(), bins)
+            }
+            _ => return None,
+        };
+        let rows = if anchors.len() == 2 { anchors[0] } else { 1 };
+        (alphas.len() as u64 == rows
+            && alphas
+                .iter()
+                .all(|&alpha| self.shape_of(alpha) == Some(vec![])))
+        .then_some(HistosysCall {
+            id,
+            anchors: [lo, nominal, hi],
+            alphas,
+            bins,
+            matrix: anchors.len() == 2,
+        })
+    }
+
+    fn lower_histosys_lanes(
+        &mut self,
+        id: NodeId,
+        calls: &[HistosysCall],
+    ) -> Result<Value, EmitError> {
+        let mut anchors: [Vec<Value>; 3] = Default::default();
+        let mut alphas = Vec::new();
+        for call in calls {
+            let width = call.alphas.len() as u64 * call.bins;
+            for (lanes, &anchor) in anchors.iter_mut().zip(&call.anchors) {
+                let value = self.lower_node(anchor)?;
+                let value = self.typed_axes(anchor, value);
+                let batch = self.batch_rank(&value);
+                let mut dims = shape(&value.ty)[..batch].to_vec();
+                dims.push(Some(width));
+                let layers = vec![1];
+                lanes.push(self.reshape_axes(&value, MlirTy::Ranked(dims), Axes { batch, layers }));
+            }
+            for &alpha in &call.alphas {
+                let value = self.lower_node(alpha)?;
+                let value = self.typed_axes(alpha, value);
+                alphas.extend(std::iter::repeat_n(value, call.bins as usize));
+            }
+        }
+        let mut values = Vec::with_capacity(4);
+        for lanes in &anchors {
+            values.push(self.concatenate(id, lanes)?);
+        }
+        values.push(self.vector(&alphas));
+        let parent = self.enter_broadcast(id, &mut values)?;
+        let lanes = self.histosys_shift(&values[0], &values[1], &values[2], &values[3]);
+        let frame = self.broadcast_frame.clone();
+        let lanes = self.finish_broadcast(&lanes, &frame, parent.len());
+        self.broadcast_frame = parent;
+
+        let batch = self.batch_rank(&lanes);
+        let dims = shape(&lanes.ty).to_vec();
+        let mut starts = vec![0; dims.len()];
+        let mut limits = dims
+            .iter()
+            .map(|&d| d.expect("static histosys lanes"))
+            .collect::<Vec<_>>();
+        let strides = vec![1; dims.len()];
+        for call in calls {
+            let rows = call.alphas.len() as u64;
+            limits[batch] = starts[batch] + rows * call.bins;
+            let block = self.slice(&lanes, &starts, &limits, &strides);
+            starts[batch] = limits[batch];
+            let mut cell = dims[..batch].to_vec();
+            if call.matrix {
+                cell.push(Some(rows));
+            }
+            cell.push(Some(call.bins));
+            let axes = Axes {
+                batch,
+                layers: vec![1 + usize::from(call.matrix)],
+            };
+            let view = self.reshape_axes(&block, MlirTy::Ranked(cell), axes);
+            self.memo.insert(call.id, view);
+        }
+        Ok(self.memo[&id].clone())
+    }
+
     /// HistFactory code4p returns the additive shift, not the shifted template.
     /// Keep modifier/bin axes intact and avoid cancellation against the nominal.
     fn histosys_shift(&mut self, lo: &Value, nominal: &Value, hi: &Value, alpha: &Value) -> Value {
@@ -637,6 +806,16 @@ impl YieldBlock {
         let samples = self.nominals.len();
         samples > 1 && self.bins > 1 && self.scalars.iter().sum::<usize>() >= 2 * samples
     }
+}
+
+/// One `histosys_shift.(…)` call: its anchors, one alpha per row, and
+/// whether it returns rows × bins or one bin vector.
+struct HistosysCall {
+    id: NodeId,
+    anchors: [NodeId; 3],
+    alphas: Vec<NodeId>,
+    bins: u64,
+    matrix: bool,
 }
 
 #[derive(Clone, Copy)]
