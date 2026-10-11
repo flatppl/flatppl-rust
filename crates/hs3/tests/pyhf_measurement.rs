@@ -3,7 +3,7 @@
 //! The expected values are pyhf's own: `Workspace.model(measurement_name=...)`
 //! then `config.par_order` and each paramset's `suggested_init`,
 //! `suggested_bounds`, `suggested_fixed`, `width()` and `auxdata`.
-use flatppl_hs3::{Observations, PyhfOptions};
+use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 use flatppl_syntax::{Syntax, print_with};
 
 /// Two channels and two measurements. The fixture covers a name shared by
@@ -165,4 +165,77 @@ fn a_wrong_length_override_is_refused() {
             .contains("configuration sets 1 `inits` value(s) on parameter `sh`, which has 2"),
         "{error}"
     );
+}
+
+fn external_centres() -> PyhfOptions {
+    PyhfOptions {
+        auxiliary: Auxiliary::External,
+        ..PyhfOptions::default()
+    }
+}
+
+#[test]
+fn external_centres_follow_pyhf_auxdata_order() {
+    let text = convert(&external_centres());
+    // pyhf: `config.auxdata_order` is ['z', 'lumi', 'sh', 'stat_a', 'stat_b'],
+    // the constrained parameters of `par_order`, for both measurements.
+    assert_eq!(
+        line(&text, "pyhf_auxdata"),
+        "pyhf_auxdata = external(cartprod(z = reals, lumi = reals, \
+         sh = cartpow(nonnegreals, 2), stat_a = cartpow(reals, 1), stat_b = cartpow(reals, 2)))"
+    );
+    // Every constraint reads its centre, including the zero-error staterror bin.
+    for param in ["z", "sh", "lumi", "stat_a", "stat_b"] {
+        assert!(
+            line(&text, &format!("{param}_constraint_likelihood"))
+                .ends_with(&format!("get(pyhf_auxdata, \"{param}\"))")),
+            "{param}"
+        );
+    }
+    assert!(text.contains(
+        "cat([get(pyhf_auxdata, \"z\")], [get(pyhf_auxdata, \"lumi\")], \
+         get(pyhf_auxdata, \"stat_b\"), get(pyhf_auxdata, \"stat_a\")))"
+    ));
+    // The nominal centres stay in the settings record.
+    assert!(text.contains("auxdata = [25.0, 1.0]"));
+    // Only the centres change.
+    let strip = |text: &str| {
+        text.lines()
+            .filter(|line| {
+                !line.contains("pyhf_auxdata")
+                    && !line.contains("constraint_likelihood = ")
+                    && !line.contains("constraints_likelihood = ")
+                    && !line.contains("Auxiliary-measurement centres")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(&text), strip(&convert(&PyhfOptions::default())));
+}
+
+#[test]
+fn external_centres_avoid_a_parameter_name() {
+    let source = WORKSPACE.replace("\"k\"", "\"pyhf_auxdata\"");
+    let text = print_with(
+        &flatppl_hs3::read_pyhf_with(&source, &external_centres()).unwrap(),
+        Syntax::Minimal,
+    );
+    assert!(text.contains("pyhf_auxdata = elementof(reals)"), "{text}");
+    assert!(
+        text.contains("pyhf_auxdata_2 = external(cartprod(z = reals,"),
+        "{text}"
+    );
+    assert!(text.contains("likelihoodof(z_constraint, get(pyhf_auxdata_2, \"z\"))"));
+}
+
+#[test]
+fn a_model_without_constraints_has_no_centres() {
+    let model = r#"{"channels": [{"name": "c", "samples": [
+        {"name": "s", "data": [5.0], "modifiers": [
+            {"name": "mu", "type": "normfactor", "data": null}]}]}]}"#;
+    let text = print_with(
+        &flatppl_hs3::read_pyhf_with(model, &external_centres()).unwrap(),
+        Syntax::Minimal,
+    );
+    assert!(!text.contains("pyhf_auxdata"), "{text}");
 }

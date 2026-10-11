@@ -225,7 +225,14 @@ fn convert_from_pyhf_selects_a_measurement_and_external_observations() {
             .unwrap()
     };
     let converted = run(
-        &["--measurement", "second set", "--observations", "external"],
+        &[
+            "--measurement",
+            "second set",
+            "--observations",
+            "external",
+            "--auxiliary",
+            "external",
+        ],
         &out,
     );
     assert!(
@@ -236,6 +243,10 @@ fn convert_from_pyhf_selects_a_measurement_and_external_observations() {
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(
         text.contains("b_observed = external(cartpow(nonnegreals, 2))"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pyhf_auxdata = external(cartprod(z = reals,"),
         "{text}"
     );
     assert!(
@@ -263,8 +274,9 @@ fn convert_from_pyhf_selects_a_measurement_and_external_observations() {
         .unwrap();
     assert!(!refused.status.success());
     assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("`--measurement` and `--observations` apply to pyhf input only"),
+        String::from_utf8_lossy(&refused.stderr).contains(
+            "`--measurement`, `--observations` and `--auxiliary` apply to pyhf input only"
+        ),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );

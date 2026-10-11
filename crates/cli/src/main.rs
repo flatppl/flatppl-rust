@@ -112,6 +112,10 @@ enum Command {
         /// as an external input of a workspace, to supply when loading.
         #[arg(long, value_enum, default_value_t = ObservationsArg::Bound)]
         observations: ObservationsArg,
+        /// pyhf input only: `external` makes every auxiliary constraint's
+        /// centre a field of one record external, `pyhf_auxdata`.
+        #[arg(long, value_enum, default_value_t = ObservationsArg::Bound)]
+        auxiliary: ObservationsArg,
         /// Omit the leading "do not edit" banner comment (a single line, no
         /// timestamp/user/host/platform/command — included by default). The
         /// targeted FlatPPL version is recorded in-model as `flatppl_compat`,
@@ -298,13 +302,13 @@ enum FromFormat {
     Pyhf,
 }
 
-/// Observed-count form for `--observations`.
+/// Bound or external form for `--observations` and `--auxiliary`.
 #[cfg(feature = "convert")]
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ObservationsArg {
-    /// A workspace's observed counts become literal arrays.
+    /// Literal values.
     Bound,
-    /// Every channel's observed counts become an external input.
+    /// External inputs.
     External,
 }
 
@@ -313,6 +317,7 @@ enum ObservationsArg {
 struct PyhfArgs {
     measurement: Option<String>,
     observations: ObservationsArg,
+    auxiliary: ObservationsArg,
 }
 
 /// Resolve `--from auto` against the input filename: `*.hs3.json` / `*.pyhf.json`
@@ -345,6 +350,7 @@ fn main() -> ExitCode {
             from,
             measurement,
             observations,
+            auxiliary,
             no_header,
         } => convert(
             &input,
@@ -354,6 +360,7 @@ fn main() -> ExitCode {
             &PyhfArgs {
                 measurement,
                 observations,
+                auxiliary,
             },
             no_header,
         ),
@@ -456,10 +463,12 @@ fn convert(
     // the importers; an explicit `--from` overrides.
     let from_format = resolve_from_format(from_format, input);
     if from_format != FromFormat::Pyhf
-        && (pyhf.measurement.is_some() || pyhf.observations != ObservationsArg::Bound)
+        && (pyhf.measurement.is_some()
+            || pyhf.observations != ObservationsArg::Bound
+            || pyhf.auxiliary != ObservationsArg::Bound)
     {
         return Err(Failure::Plain(
-            "`--measurement` and `--observations` apply to pyhf input only".into(),
+            "`--measurement`, `--observations` and `--auxiliary` apply to pyhf input only".into(),
         ));
     }
 
@@ -486,6 +495,10 @@ fn convert(
                 observations: match pyhf.observations {
                     ObservationsArg::Bound => flatppl_hs3::Observations::Bound,
                     ObservationsArg::External => flatppl_hs3::Observations::External,
+                },
+                auxiliary: match pyhf.auxiliary {
+                    ObservationsArg::Bound => flatppl_hs3::Auxiliary::Bound,
+                    ObservationsArg::External => flatppl_hs3::Auxiliary::External,
                 },
             };
             let module = flatppl_hs3::read_pyhf_with(&source, &options)

@@ -219,6 +219,51 @@ fn derive(doc: &PyhfDocument, param: &str, emitted: &Emitted<'_>) -> Result<Deri
     })
 }
 
+/// Bind `name = external(cartprod(<param> = <set>, ...))`, one field per
+/// constrained parameter in `order`, which is pyhf's `auxdata_order`. Gaussian
+/// centres are reals. Poisson centres are counts, possibly fractional.
+pub(crate) fn emit_auxdata(
+    b: &mut Builder,
+    doc: &PyhfDocument,
+    emitted: &Emitted<'_>,
+    order: &[String],
+    name: &str,
+) -> Result<()> {
+    let mut fields = Vec::new();
+    for param in order {
+        let derived = derive(doc, param, emitted)?;
+        let (set, poisson) = match &derived.constraint {
+            None => continue,
+            Some(Constraint::Normal { .. }) => ("reals", false),
+            Some(Constraint::Poisson { .. }) => ("nonnegreals", true),
+        };
+        let set = b.call_head(set);
+        let domain = if derived.scalar && !poisson {
+            set
+        } else {
+            let n = b.lit_int(derived.n as i64);
+            b.call("cartpow", &[set, n])
+        };
+        fields.push((param.as_str(), domain));
+    }
+    if fields.is_empty() {
+        return Ok(());
+    }
+    if b.alloc_name(name) != name {
+        return Err(Error::Unsupported(format!(
+            "the auxiliary-data binding `{name}` collides with a generated binding"
+        )));
+    }
+    let set = b.call_fields("cartprod", &fields);
+    let external = b.call("external", &[set]);
+    b.bind_doc(
+        name,
+        external,
+        &["Auxiliary-measurement centres, one per constrained parameter in pyhf's `auxdata_order`."],
+    );
+    Ok(())
+}
+
 fn numbers(modifier: &Modifier) -> Result<Vec<f64>> {
     modifier
         .data

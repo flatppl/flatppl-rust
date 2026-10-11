@@ -54,6 +54,8 @@ pub struct AuxOverride {
     pub sigmas: Vec<f64>,
     /// Poisson rate factor.
     pub factors: Vec<f64>,
+    /// An external centre, which replaces `auxdata` and the derived value.
+    pub centre: Option<NodeId>,
 }
 
 /// The per-bin Poisson rate factor for a shapesys parameter:
@@ -146,7 +148,7 @@ pub fn emit_shapesys_constraint(
     );
     let constraint_ref = b.self_ref(&constraint_name);
     let derived_obs = b.self_ref(&tau_name);
-    let obs = observed_aux(b, &ov.auxdata, derived_obs);
+    let obs = observed_aux(b, ov, derived_obs);
     let term = b.call("likelihoodof", &[constraint_ref, obs]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
@@ -159,13 +161,16 @@ pub fn emit_shapesys_constraint(
     }
 }
 
-/// The node the constraint is observed at: the measurement's `auxdata` when it
-/// set one, otherwise whatever the modifier derived.
-fn observed_aux(b: &mut Builder, auxdata: &[f64], derived: NodeId) -> NodeId {
-    if auxdata.is_empty() {
+/// The node the constraint is observed at: an external centre, else the
+/// measurement's `auxdata` when it set one, else whatever the modifier derived.
+fn observed_aux(b: &mut Builder, ov: &AuxOverride, derived: NodeId) -> NodeId {
+    if let Some(centre) = ov.centre {
+        return centre;
+    }
+    if ov.auxdata.is_empty() {
         return derived;
     }
-    let elems: Vec<NodeId> = auxdata.iter().map(|&v| b.lit_real(v)).collect();
+    let elems: Vec<NodeId> = ov.auxdata.iter().map(|&v| b.lit_real(v)).collect();
     b.array(&elems)
 }
 
@@ -185,7 +190,9 @@ pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) 
     );
     let constraint_ref = b.self_ref(&constraint_name);
     // Scalar parameter, so the measurement's `auxdata` is one number.
-    let obs_zero = b.lit_real(ov.auxdata.first().copied().unwrap_or(0.0));
+    let obs_zero = ov
+        .centre
+        .unwrap_or_else(|| b.lit_real(ov.auxdata.first().copied().unwrap_or(0.0)));
     let term = b.call("likelihoodof", &[constraint_ref, obs_zero]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
@@ -203,8 +210,15 @@ pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) 
 }
 
 /// Emit the **luminosity** constraint `Normal(lumi, sigma) observed at nom` for
-/// parameter `param`, returning its constraint-likelihood term.
-pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) -> Constraint {
+/// parameter `param`, returning its constraint-likelihood term. An external
+/// `centre` replaces `nom`.
+pub fn emit_lumi_constraint(
+    b: &mut Builder,
+    param: &str,
+    sigma: f64,
+    nom: f64,
+    centre: Option<NodeId>,
+) -> Constraint {
     let lam = b.self_ref(param);
     let sigma_node = b.lit_real(sigma);
     let normal = b.call_kw("Normal", &[("mu", lam), ("sigma", sigma_node)]);
@@ -215,7 +229,7 @@ pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) 
         "Auxiliary luminosity constraint.",
     );
     let constraint_ref = b.self_ref(&constraint_name);
-    let nom_node = b.lit_real(nom);
+    let nom_node = centre.unwrap_or_else(|| b.lit_real(nom));
     let term = b.call("likelihoodof", &[constraint_ref, nom_node]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
@@ -273,7 +287,7 @@ pub fn emit_staterror_constraint(
         );
         let ones: Vec<NodeId> = sum_nom.iter().map(|_| b.lit_real(1.0)).collect();
         let derived_obs = b.array(&ones);
-        let obs = observed_aux(b, &ov.auxdata, derived_obs);
+        let obs = observed_aux(b, ov, derived_obs);
         let constraint_ref = b.self_ref(&constraint_name);
         let term = b.call("likelihoodof", &[constraint_ref, obs]);
         let term_name = b.bind_unique_doc(
@@ -321,7 +335,7 @@ pub fn emit_staterror_constraint(
     );
     let constraint_ref = b.self_ref(&constraint_name);
     let tau_ref2 = b.self_ref(&tau_name);
-    let obs = observed_aux(b, &ov.auxdata, tau_ref2);
+    let obs = observed_aux(b, ov, tau_ref2);
     let term = b.call("likelihoodof", &[constraint_ref, obs]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),

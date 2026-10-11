@@ -34,8 +34,9 @@ workspace using `flatppl-hs3` and returns an ordinary context-owned module. The 
 supplies JSON text and handles any file IO. `LoadedModule::source()` exposes the
 generated FlatPPL. Register the module and write explicit queries for its expected
 counts or likelihood. Model-only documents expose observations as external inputs.
-`PyhfOptions` selects a workspace measurement by name, and `Observations::External`
-leaves workspace observations as external inputs too. Each measurement's fit
+`PyhfOptions` selects a workspace measurement by name, `Observations::External`
+leaves workspace observations as external inputs too, and `Auxiliary::External`
+makes the constraint centres one `pyhf_auxdata` record input. Each measurement's fit
 settings and channel layout are a `pyhf_measurement_<name>` record. Conversion
 errors use the `pyhf` diagnostic stage.
 
