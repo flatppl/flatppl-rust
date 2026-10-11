@@ -288,6 +288,9 @@ fn derive_vector_bijection(
             if let Some(bij) = derive_matrix_affine(m, body, ph)? {
                 return Ok(Some(bij));
             }
+            if let Some(bij) = derive_broadcast_affine(m, body, ph, &elem_domain)? {
+                return Ok(Some(bij));
+            }
             if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
                 return Ok(Some(bij));
             }
@@ -300,6 +303,49 @@ fn derive_vector_bijection(
         }
         Recognized::Unrecognized => Ok(None),
     }
+}
+
+/// A scalar location-scale map broadcast over a vector has a diagonal Jacobian.
+/// Keep the captured scalar parameters shared and reuse the scalar inverse.
+fn derive_broadcast_affine(
+    m: &mut Module,
+    body: NodeId,
+    ph: Symbol,
+    elem_domain: &Type,
+) -> Result<Option<Bijection>, RefuseError> {
+    fn operands(m: &Module, node: NodeId, op: &str) -> Option<(NodeId, NodeId)> {
+        let call = expect_builtin_call(m, node, "broadcast")?;
+        let [head, a, b] = *call.args else {
+            return None;
+        };
+        if !call.named.is_empty()
+            || !matches!(m.node(head), Node::Const(name) if m.resolve(*name) == op)
+        {
+            return None;
+        }
+        Some((a, b))
+    }
+
+    let Some((a, b)) = operands(m, body, "add") else {
+        return Ok(None);
+    };
+    for (linear, shift) in [(a, b), (b, a)] {
+        let Some((a, b)) = operands(m, linear, "mul") else {
+            continue;
+        };
+        for (input, scale) in [(a, b), (b, a)] {
+            if is_placeholder_ref(m, input, ph)
+                && !refs_placeholder(m, shift, ph)
+                && !refs_placeholder(m, scale, ph)
+                && matches!(m.type_of(shift), Some(Type::Scalar(_)))
+                && matches!(m.type_of(scale), Some(Type::Scalar(_)))
+            {
+                let scalar = derive_locscale(m, shift, scale, elem_domain)?;
+                return Ok(Some(wrap_elementwise(m, &scalar)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Lift a PER-CELL scalar change of variables to a vector variate whose forward

@@ -62,3 +62,24 @@ fn ordered_prior_applies_the_sum_to_the_whole_variate() {
         )),
     );
 }
+
+#[test]
+fn broadcast_affine_pushforward_retains_shared_runtime_parameters() {
+    let source = "mu = external(reals)\n\
+                  tau = external(posreals)\n\
+                  x = external(cartpow(reals, 8))\n\
+                  M = pushfwd(z -> (z .* tau) .+ mu, iid(Normal(0, 1), 8))\n\
+                  inputs = (mu, tau, x)\noutputs = logdensityof(M, x)";
+    let expected = emit(source);
+    assert_eq!(
+        expected,
+        emit(&source.replace(
+            "(z .* tau) .+ mu",
+            "broadcast(add, broadcast(mul, z, tau), mu)"
+        )),
+    );
+    assert_eq!(
+        expected,
+        emit(&source.replace("(z .* tau) .+ mu", "mu .+ (tau .* z)"))
+    );
+}
