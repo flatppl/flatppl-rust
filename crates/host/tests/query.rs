@@ -314,3 +314,34 @@ fn gpu_segment_slices_stay_out_of_batched_exports() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+#[test]
+fn gpu_scalar_column_stays_out_of_batched_exports() -> Result<(), Box<dyn std::error::Error>> {
+    // Two samples with two scalar factors each take the scalar column on GPU.
+    let query = Context::default().parse(
+        "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+         theta = elementof(cartpow(reals, 4))\ninputs = theta\n\
+         a = theta[1]\ng = theta[[2, 3]]\ns = theta[4]\n\
+         factors = array(cat(fill(a, 2), fill(s, 2), g, fill(a, 2), fill(s, 2), fill(1.0, 2)), [2, 3, 2], [1, 2, 3])\n\
+         outputs = pyhf.expected_counts(pyhf.sample_yields(rowstack([[1.0, 2.0], [3.0, 4.0]]), \
+         fill(0.0, [2, 1, 2]), factors))",
+        None,
+        None,
+    )?;
+    let options = EmitOptions {
+        target: flatppl_host::Target::Gpu,
+        ..EmitOptions::default()
+    };
+    let column = "2x2x1xf32>";
+    // The gradient differentiates the unbatched export, where the column
+    // contracts the bins once per channel. In a batched forward graph XLA
+    // builds the folded rows' expected counts in one kernel.
+    assert!(query.compile(&options)?.stablehlo.contains(column));
+    let batch = BatchSpec {
+        shape: vec![4],
+        input_axes: vec![vec![Some(0)]],
+    };
+    let batched = query.compile_batched(&options, &batch)?.stablehlo;
+    assert!(!batched.contains(column), "{batched}");
+    Ok(())
+}

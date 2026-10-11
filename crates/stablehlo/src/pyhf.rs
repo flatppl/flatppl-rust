@@ -233,7 +233,9 @@ impl Emitter<'_> {
     /// Lower converter-form yields. The CPU target multiplies each row as the
     /// per-sample chain in the order the rows are summed. The GPU target takes
     /// the summed rows as one block, whatever class they came from, and scales
-    /// the stacked templates by its scalar column where that pays.
+    /// the stacked templates by its scalar column where that pays. A host
+    /// batch keeps the folded rows: XLA builds their expected counts in one
+    /// kernel, while each channel's scaled stack takes kernels of its own.
     fn lower_yield_rows(
         &mut self,
         member: &str,
@@ -244,7 +246,7 @@ impl Emitter<'_> {
         let gpu = self.target == crate::Target::Gpu;
         let merged = gpu.then(|| YieldBlock::merge(blocks, rows));
         let samples = match merged {
-            Some(block) if block.takes_column() => self.scaled_stack(&block)?,
+            Some(block) if block.takes_column() && !self.host_batch => self.scaled_stack(&block)?,
             _ => {
                 let mut values = Vec::with_capacity(rows.len());
                 for &(block, row) in rows {
