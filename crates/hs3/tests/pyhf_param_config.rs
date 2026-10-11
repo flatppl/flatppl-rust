@@ -112,6 +112,18 @@ fn shapesys_factors_replace_the_derived_rate_factor() {
 }
 
 #[test]
+fn shapesys_factors_alone_keep_the_default_centre() {
+    // pyhf 0.7.6: `config.auxdata` stays [100.0, 100.0], the default
+    // (nominal/sigma)^2, while the paramset's factors become [50.0, 80.0].
+    let text = convert(&ws(SHAPESYS, r#"{ "name": "g", "factors": [50.0, 80.0] }"#));
+    assert!(
+        text.contains("g_tau = [50.0, 80.0]")
+            && text.contains("likelihoodof(g_constraint, [100.0, 100.0])"),
+        "expected the configured factors and the default centre, got:\n{text}"
+    );
+}
+
+#[test]
 fn duplicate_parameter_configs_are_refused() {
     for params in [
         r#"{ "name": "g", "factors": [50.0, 80.0] },
