@@ -9415,6 +9415,50 @@ fn emit_sample_abi_flattens_a_record_output_into_positional_results() {
     assert!(is_delimiter_balanced(&out));
 }
 
+#[test]
+fn emit_sample_abi_projects_destructured_records_without_resampling() {
+    let prior = "\
+scale ~ Exponential(1)
+effect ~ Normal(0, scale)
+prior = lawof(record(scale = scale, effect = effect))
+value, next_state = rand(prior, rnginit(0))
+";
+    let sequential = "\
+scale, state1 = rand(Exponential(1), rnginit(0))
+effect, next_state = rand(Normal(0, scale), state1)
+";
+    for (output, expected) in [
+        ("(value, next_state)", "(scale, effect, next_state)"),
+        (
+            "(value.effect, value.scale, next_state)",
+            "(effect, scale, next_state)",
+        ),
+    ] {
+        let actual = determinize_abi_roots(&format!("{prior}outputs = {output}"), &["outputs"]);
+        let expected =
+            determinize_abi_roots(&format!("{sequential}outputs = {expected}"), &["outputs"]);
+        assert_eq!(emit_sample(&actual), emit_sample(&expected));
+    }
+}
+
+#[test]
+fn emit_sample_abi_keeps_projected_fixed_input_runtime_bound() {
+    let model = "\
+inputs = parameter
+value, state = rand(Normal(parameter, 1.0), rnginit(0))
+outputs = (value, parameter, state)
+";
+    let actual = determinize_abi_roots(
+        &format!("parameter = get0((0.0, 1.0), 1)\n{model}"),
+        &["inputs", "outputs"],
+    );
+    let expected = determinize_abi_roots(
+        &format!("parameter = external(reals)\n{model}"),
+        &["inputs", "outputs"],
+    );
+    assert_eq!(emit_sample(&actual), emit_sample(&expected));
+}
+
 /// Results are positional, NEVER a `stablehlo.tuple`. Measured in the
 /// testsuite's `stablehlo` pixi env: a hand-written
 /// `-> tuple<tensor<f32>, tensor<f32>>` module fails Enzyme-JAX `hlo_call`
