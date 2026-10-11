@@ -12,7 +12,24 @@ fn tilt_without_a_mass_rule_refuses() {
         "q = tilt(iid(Laplace(0, 1), 3), Lebesgue(zerosum(3)))\nlp = logdensityof(q, [-1, 0, 1])",
     );
     let error = determinize(&model).expect_err("tilt must not drop an unknown normalizer");
-    assert!(error.reason.contains("closed-form mass rule"), "{error:?}");
+    assert!(error.reason.contains("sum law for Laplace"), "{error:?}");
+}
+
+#[test]
+fn tilt_refuses_nonexchangeable_ordering_and_unknown_sum_laws() {
+    for (source, set, reason) in [
+        ("Normal.([1, 2, 3], 1)", "ordered", "requires iid"),
+        ("iid(Dirac(1.0), 3)", "ordered", "continuous scalar law"),
+        ("iid(StudentT(4), 3)", "zerosum", "sum law for StudentT"),
+    ] {
+        for query in ["logdensityof(q, [-1, 0, 1])", "rand(q, rnginit(0))"] {
+            let model = parse_infer(&format!(
+                "q = tilt({source}, Lebesgue({set}(3)))\nresult = {query}"
+            ));
+            let error = determinize(&model).expect_err("unsupported tilt must refuse");
+            assert!(error.reason.contains(reason), "{error:?}");
+        }
+    }
 }
 
 // Note: `rand` no longer refuses unconditionally — a single-draw

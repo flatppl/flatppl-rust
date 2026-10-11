@@ -1,5 +1,5 @@
-//! Normalization on an explicit base. Exact vector Normal rules precede the
-//! ordinary normalize/logweighted path; unsupported masses retain its refusal.
+//! Closed normalizers on ordered and zero-sum sets. Other bases retain the
+//! ordinary normalize/logweighted path.
 
 use super::*;
 
@@ -17,52 +17,132 @@ pub(crate) struct NormalOnSet {
     support: NodeId,
 }
 
-pub(crate) fn normal_on_set(m: &mut Module, node: NodeId) -> Option<NormalOnSet> {
-    let call = expect_builtin_call(m, node, "tilt")?;
-    let [source, base] = *call.args else {
-        return None;
+pub(crate) enum SetLaw {
+    IidNormal(NormalOnSet),
+    OrderedIid {
+        source: NodeId,
+        kernel: NodeId,
+        n: usize,
+        support: NodeId,
+    },
+    ZeroSumNormals(NormalOnSet),
+}
+
+pub(crate) fn on_set(m: &mut Module, node: NodeId) -> Result<Option<SetLaw>, RefuseError> {
+    let Some(call) = expect_builtin_call(m, node, "tilt") else {
+        return Ok(None);
     };
+    let [source, base] = *call.args else {
+        return Ok(None);
+    };
+    let (base, _) = resolve_ref_chain(m, base);
+    let Some(lebesgue) = expect_builtin_call(m, base, "Lebesgue") else {
+        return Ok(None);
+    };
+    let Some(support) = named_or_positional(m, lebesgue, "support") else {
+        return Ok(None);
+    };
+    let (set, _) = resolve_ref_chain(m, support);
+    let kind = match builtin_name(m, set) {
+        Some("ordered") => NormalSet::Ordered,
+        Some("zerosum") => NormalSet::ZeroSum,
+        _ => return Ok(None),
+    };
+    let n = iid_static_size(m, base).filter(|&n| n > 0).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            "tilt on ordered/zerosum requires a positive static size",
+        )
+    })?;
     let (mut source, _) = resolve_ref_chain(m, source);
     if let Some(law) = expect_builtin_call(m, source, "lawof") {
-        source = resolve_ref_chain(m, *law.args.first()?).0;
+        let Some(&value) = law.args.first() else {
+            return Ok(None);
+        };
+        source = resolve_ref_chain(m, value).0;
         if let Some(measure) = draw_argument(m, source) {
             source = resolve_ref_chain(m, measure).0;
         }
         if measure_reaches_draw(m, source, &[]) {
-            return None;
+            return Ok(None);
         }
     }
-    let iid = expect_builtin_call(m, source, "iid")?;
-    let inner = *iid.args.first()?;
-    let n = iid_static_size(m, source)?;
-    if n == 0 {
-        return None;
+    if iid_static_size(m, source) != Some(n) {
+        return Err(refuse(
+            node,
+            m,
+            "tilt source must have the same static vector size as its base",
+        ));
     }
-    let (base, _) = resolve_ref_chain(m, base);
-    let lebesgue = expect_builtin_call(m, base, "Lebesgue")?;
-    let support = named_or_positional(m, lebesgue, "support")?;
-    let (set, _) = resolve_ref_chain(m, support);
-    let kind = match builtin_name(m, set)? {
-        "ordered" => NormalSet::Ordered,
-        "zerosum" => NormalSet::ZeroSum,
-        _ => return None,
-    };
-    let Type::Measure { domain, .. } = m.type_of(base)? else {
-        return None;
-    };
-    if !matches!(domain.as_ref(), Type::Array { shape, .. }
-        if shape.as_ref() == [Dim::Static(n as u32)])
+    let inner = expect_builtin_call(m, source, "iid")
+        .and_then(|c| c.args.first())
+        .copied();
+    if let Some(inner) = inner {
+        if let Some((_, parameters)) = normal_ctor(m, inner)
+            && let (Some(mu), Some(sigma)) = (
+                find_kwarg(m, &parameters, "mu"),
+                find_kwarg(m, &parameters, "sigma"),
+            )
+        {
+            return Ok(Some(SetLaw::IidNormal(NormalOnSet {
+                kind,
+                n,
+                mu,
+                sigma,
+                support,
+            })));
+        }
+        let (inner, _) = resolve_ref_chain(m, inner);
+        if matches!(kind, NormalSet::Ordered)
+            && matches!(m.type_of(inner), Some(Type::Measure { domain, mass: Mass::Normalized })
+                if matches!(domain.as_ref(), Type::Scalar(ScalarType::Real)))
+            && superposition_reference(m, inner, &mut Vec::new()) == Some(Reference::Lebesgue)
+        {
+            return Ok(Some(SetLaw::OrderedIid {
+                source,
+                kernel: inner,
+                n,
+                support,
+            }));
+        }
+    }
+    if matches!(kind, NormalSet::ZeroSum)
+        && let Some((mu, sigma)) = broadcast_normal(m, source)
     {
+        return Ok(Some(SetLaw::ZeroSumNormals(NormalOnSet {
+            kind,
+            n,
+            mu,
+            sigma,
+            support,
+        })));
+    }
+    let law = inner
+        .map(|inner| resolve_ref_chain(m, inner).0)
+        .unwrap_or(source);
+    let law = builtin_name(m, law).unwrap_or("source measure");
+    let reason = match kind {
+        NormalSet::Ordered => {
+            format!("tilt on ordered requires iid of a continuous scalar law; {law} is unsupported")
+        }
+        NormalSet::ZeroSum => format!(
+            "tilt on zerosum has no implemented closed-form sum law for {law}; independent Normals are supported"
+        ),
+    };
+    Err(refuse(node, m, &reason))
+}
+
+fn broadcast_normal(m: &mut Module, source: NodeId) -> Option<(NodeId, NodeId)> {
+    let call = expect_builtin_call(m, source, "broadcast")?.clone();
+    let (&head, parameters) = call.args.split_first()?;
+    let head = resolve_ref_chain(m, head).0;
+    if !is_normal_const(m, head) {
         return None;
     }
-    let (_, parameters) = normal_ctor(m, inner)?;
-    Some(NormalOnSet {
-        kind,
-        n,
-        mu: find_kwarg(m, &parameters, "mu")?,
-        sigma: find_kwarg(m, &parameters, "sigma")?,
-        support,
-    })
+    let names = [m.intern("mu"), m.intern("sigma")];
+    let parameters = crate::kernel::bind_call_args(m, &names, parameters, &call.named, false)?;
+    Some((parameters[0], parameters[1]))
 }
 
 pub(super) fn lower_density(
@@ -70,8 +150,21 @@ pub(super) fn lower_density(
     node: NodeId,
     point: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    if let Some(normal) = normal_on_set(m, node) {
-        return Ok(normal_density(m, normal, point));
+    if let Some(law) = on_set(m, node)? {
+        return match law {
+            SetLaw::IidNormal(normal) => Ok(normal_density(m, normal, point)),
+            SetLaw::ZeroSumNormals(normal) => Ok(zerosum_density(m, normal, point)),
+            SetLaw::OrderedIid {
+                source, n, support, ..
+            } => {
+                let density = lower_measure_density(m, source, point)?;
+                let n = m.alloc(Node::Lit(Scalar::Real(n as f64 + 1.0)));
+                let constant = build_call(m, "loggamma", &[n]);
+                let density = build_call(m, "add", &[density, constant]);
+                let support = build_call(m, "in", &[point, support]);
+                Ok(gate_density(m, support, density))
+            }
+        };
     }
     let call =
         expect_builtin_call(m, node, "tilt").ok_or_else(|| refuse(node, m, "expected tilt"))?;
@@ -136,6 +229,69 @@ fn normal_density(m: &mut Module, normal: NormalOnSet, point: NodeId) -> NodeId 
     let density = build_call(m, "sub", &[density, penalty]);
     let support = build_call(m, "in", &[point, normal.support]);
     gate_density(m, support, density)
+}
+
+/// Complete the square about the conditional mean. This avoids cancellation
+/// between the source log density and the log density of its sum at zero.
+fn zerosum_density(m: &mut Module, normal: NormalOnSet, point: NodeId) -> NodeId {
+    if normal.n == 1 {
+        let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let support = build_call(m, "in", &[point, normal.support]);
+        return gate_density(m, support, zero);
+    }
+    let (mu, sigma, variance, total) = normal_parameters(m, &normal);
+    let center = project_sum(m, mu, variance, total);
+    let delta = elementwise(m, "sub", &[point, center]);
+    let standard = elementwise(m, "divide", &[delta, sigma]);
+    let square = elementwise(m, "mul", &[standard, standard]);
+    let sum = build_call(m, "sum", &[square]);
+    let log_sigma = elementwise(m, "log", &[sigma]);
+    let log_sigma = build_call(m, "sum", &[log_sigma]);
+    let log_total = build_call(m, "log", &[total]);
+    let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+    let half_log_total = build_call(m, "mul", &[half, log_total]);
+    let scale = build_call(m, "maximum", &[sigma]);
+    let log_scale = build_call(m, "log", &[scale]);
+    let normalizer = build_call(m, "add", &[log_scale, half_log_total]);
+    let constant = m.alloc(Node::Lit(Scalar::Real(
+        (normal.n as f64 - 1.0) * std::f64::consts::TAU.ln() / 2.0,
+    )));
+    let density = build_call(m, "sub", &[normalizer, log_sigma]);
+    let density = build_call(m, "sub", &[density, constant]);
+    let penalty = build_call(m, "mul", &[half, sum]);
+    let density = build_call(m, "sub", &[density, penalty]);
+    let support = build_call(m, "in", &[point, normal.support]);
+    gate_density(m, support, density)
+}
+
+pub(crate) fn normal_parameters(
+    m: &mut Module,
+    normal: &NormalOnSet,
+) -> (NodeId, NodeId, NodeId, NodeId) {
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let n = m.alloc(Node::Lit(Scalar::Int(normal.n as i64)));
+    let zeros = build_call(m, "fill", &[zero, n]);
+    let mu = elementwise(m, "add", &[normal.mu, zeros]);
+    let sigma = elementwise(m, "add", &[normal.sigma, zeros]);
+    // Only variance ratios enter the projection. Scale before squaring so
+    // finite standard deviations need not have representable variances.
+    let scale = build_call(m, "maximum", &[sigma]);
+    let relative = elementwise(m, "divide", &[sigma, scale]);
+    let variance = elementwise(m, "mul", &[relative, relative]);
+    let total = build_call(m, "sum", &[variance]);
+    (mu, sigma, variance, total)
+}
+
+pub(crate) fn project_sum(
+    m: &mut Module,
+    value: NodeId,
+    variance: NodeId,
+    total: NodeId,
+) -> NodeId {
+    let sum = build_call(m, "sum", &[value]);
+    let ratio = build_call(m, "divide", &[sum, total]);
+    let correction = elementwise(m, "mul", &[variance, ratio]);
+    elementwise(m, "sub", &[value, correction])
 }
 
 pub(crate) fn elementwise(m: &mut Module, name: &str, args: &[NodeId]) -> NodeId {
