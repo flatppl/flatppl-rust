@@ -2774,8 +2774,105 @@ fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
         return Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell));
     }
 
+    if let Some((set, n_id)) = vector_set_parts(e, set_id) {
+        return vector_set_membership(e, id, &v, set, n_id);
+    }
+
     let set = classify_elem_set(e, id, set_id)?;
     elem_membership(e, id, &v, set)
+}
+
+/// The §03 sets of real n-vectors that `in` tests as a whole.
+#[derive(Clone, Copy)]
+enum VectorSet {
+    /// §03 "Standard simplex": entries `>= 0` summing to 1.
+    StdSimplex,
+    /// §03 "Ordered vectors": strictly increasing entries.
+    Ordered,
+    /// §03 "Zero-sum vectors": entries summing to 0.
+    ZeroSum,
+}
+
+/// Destructure `stdsimplex(n)`, `ordered(n)` or `zerosum(n)`; `None` otherwise.
+fn vector_set_parts(e: &Emitter, set_id: NodeId) -> Option<(VectorSet, NodeId)> {
+    let Node::Call(c) = e.node(set_id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    let set = match e.resolve(sym) {
+        "stdsimplex" => VectorSet::StdSimplex,
+        "ordered" => VectorSet::Ordered,
+        "zerosum" => VectorSet::ZeroSum,
+        _ => return None,
+    };
+    match &c.args[..] {
+        [n] if c.named.is_empty() => Some((set, *n)),
+        _ => None,
+    }
+}
+
+/// Membership of a rank-1 point in a [`VectorSet`], all-reduced to one `i1`.
+///
+/// Only the inequalities are checked: `stdsimplex` entries `>= 0`, `ordered`
+/// consecutive differences `> 0`. The linear equality (`stdsimplex` sum 1,
+/// `zerosum` sum 0) is not. §03 "Standard simplex" and "Zero-sum vectors" make
+/// `Lebesgue(support = S)` the coordinate measure of the n-1 free coordinates,
+/// with the last coordinate determined by them. The density is a function of
+/// the free coordinates, and a float sum is rarely exact, so an exact equality
+/// test would reject the points a chart produces. Every entry must still be a
+/// real number: `NaN` is outside every set.
+fn vector_set_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: &Value,
+    set: VectorSet,
+    n_id: NodeId,
+) -> Result<Value, EmitError> {
+    let len = match &v.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "'in' over a vector set: only a rank-1 (vector) point is supported, got {other:?}"
+                ),
+            ));
+        }
+    };
+    let Some(len) = len else {
+        return Err(EmitError::at(
+            id,
+            "'in' over a vector set: the point's length must be static",
+        ));
+    };
+    if let Node::Lit(Scalar::Int(n)) = e.node(n_id)
+        && (*n < 0 || *n as u64 != len)
+    {
+        return Err(EmitError::at(
+            id,
+            format!("'in' over a vector set of size {n}: point has length {len}"),
+        ));
+    }
+    let real = e.compare("EQ", v, v);
+    let per_cell = match set {
+        VectorSet::ZeroSum => real,
+        VectorSet::StdSimplex => {
+            let zero = e.constant_like(0.0, v);
+            e.compare("GE", v, &zero)
+        }
+        VectorSet::Ordered if len < 2 => real,
+        VectorSet::Ordered => {
+            // `NaN` makes a difference `NaN`, and `NaN > 0` is false.
+            let upper = e.slice(v, &[1], &[len], &[1]);
+            let lower = e.slice(v, &[0], &[len - 1], &[1]);
+            let gap = e.sub(&upper, &lower);
+            let zero = e.constant_like(0.0, &gap);
+            e.compare("GT", &gap, &zero)
+        }
+    };
+    Ok(e.reduce_boolean("stablehlo.and", "true", &per_cell))
 }
 
 /// The membership predicate for one [`ElemSet`], elementwise at `v`'s shape.
@@ -2832,7 +2929,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
         EmitError::at(
             id,
             "'in': only an interval(lo, hi), reals, posreals or nonnegreals set is supported \
-             (optionally under one cartpow)",
+             (optionally under one cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
         )
     };
     match e.node(set_id) {
