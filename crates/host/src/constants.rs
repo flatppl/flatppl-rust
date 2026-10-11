@@ -328,7 +328,15 @@ impl Constant {
                 let size = shape
                     .iter()
                     .try_fold(1_usize, |n, &d| n.checked_mul(d as usize));
-                if shape.is_empty() || shape.contains(&0) || size != Some(data.len()) {
+                if shape.contains(&0) {
+                    // `set` substitutes a literal, and a literal cannot be empty.
+                    return Err(
+                        "a constant array with a zero extent has no FlatPPL literal: \
+                         `array` sizes must be positive (spec §07)"
+                            .into(),
+                    );
+                }
+                if shape.is_empty() || size != Some(data.len()) {
                     return Err("constant array shape must match its nonempty flat data".into());
                 }
                 let values = data
