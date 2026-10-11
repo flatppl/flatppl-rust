@@ -27,20 +27,33 @@ fn convert(value: &Value) -> String {
     )
 }
 
+/// The settings record differs between spellings only in its `pyhf` names.
+fn without_settings(text: &str) -> String {
+    text.split("% Original pyhf")
+        .next()
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("pyhf_measurement"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn parameter_names_preserve_shared_effects_config_and_poi() {
     let source = workspace(["rw-oneside", "rw.oneside", "rw_oneside"]);
     let canonical = workspace(["rw_oneside_3", "rw_oneside_4", "rw_oneside"]);
     let text = convert(&source);
     let expected = convert(&canonical);
-    assert_eq!(
-        text.trim_end(),
-        format!(
-            "{}\n% Original pyhf parameter names for renamed bindings.\n\
-             pyhf_parameter_names = record(rw_oneside_3 = \"rw-oneside\", rw_oneside_4 = \"rw.oneside\")",
-            expected.trim_end()
-        )
-    );
+    assert_eq!(without_settings(&text), without_settings(&expected));
+    assert!(text.trim_end().ends_with(
+        "% Original pyhf parameter names for renamed bindings.\n\
+         pyhf_parameter_names = record(rw_oneside_3 = \"rw-oneside\", rw_oneside_4 = \"rw.oneside\")"
+    ));
+    assert!(text.contains(
+        "poi = \"rw_oneside_4\", parameters = record(rw_oneside = record(pyhf = \"rw_oneside\","
+    ));
+    assert!(text.contains("rw_oneside_4 = record(pyhf = \"rw.oneside\","));
+    assert!(text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.25)"));
 
     // A model-only document carries the same overrides without a measurement.
     let model = |workspace: &Value| {
@@ -52,13 +65,10 @@ fn parameter_names_preserve_shared_effects_config_and_poi() {
     let model_text = convert(&model(&source));
     let model_expected = convert(&model(&canonical));
     assert_eq!(
-        model_text
-            .split("% Original pyhf")
-            .next()
-            .unwrap()
-            .trim_end(),
-        model_expected.trim_end()
+        without_settings(&model_text),
+        without_settings(&model_expected)
     );
+    assert!(model_text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.25)"));
 }
 
 #[test]
@@ -67,10 +77,7 @@ fn metadata_name_does_not_shadow_a_parameter() {
     let canonical = workspace(["pi_2", "_2_rate", "pyhf_parameter_names"]);
     let text = convert(&source);
     let expected = convert(&canonical);
-    assert_eq!(
-        text.split("% Original pyhf").next().unwrap().trim_end(),
-        expected.trim_end()
-    );
+    assert_eq!(without_settings(&text), without_settings(&expected));
     assert!(text.contains("pyhf_parameter_names_2 = record(_2_rate = \"2 rate\", pi_2 = \"pi\")"));
 }
 
@@ -82,7 +89,9 @@ fn helper_alias_does_not_capture_parameters() {
     assert!(text.contains("pyhf_helpers_2 = elementof(reals)"));
     assert!(text.contains("broadcast(pyhf_helpers_3.normsys_factor,"));
     assert!(text.contains("[pyhf_helpers, pyhf_helpers]"));
-    assert!(text.contains("measurement = record(poi = pyhf_helpers_2)"));
+    assert!(text.contains(
+        "pyhf_measurement_measurement = record(name = \"measurement\", selected = true, poi = \"pyhf_helpers_2\","
+    ));
 }
 
 #[test]
@@ -93,7 +102,10 @@ fn empty_poi_stays_unset_when_an_empty_parameter_name_is_mapped() {
     canonical["measurements"][0]["config"]["poi"] = json!("");
     let text = convert(&source);
     assert_eq!(
-        text.split("% Original pyhf").next().unwrap().trim_end(),
-        convert(&canonical).trim_end()
+        without_settings(&text),
+        without_settings(&convert(&canonical))
     );
+    assert!(text.contains(
+        "pyhf_measurement_measurement = record(name = \"measurement\", selected = true, parameters ="
+    ));
 }

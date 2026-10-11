@@ -17,18 +17,59 @@ use crate::model::{Modifier, PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
 use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Inputs, Node, Ref, RefNs};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// How a pyhf document converts.
+#[derive(Debug, Clone, Default)]
+pub struct PyhfOptions {
+    /// The measurement whose configuration the model uses. pyhf takes the first.
+    pub measurement: Option<String>,
+    /// Whether a workspace's observed counts are bound or left as externals.
+    pub observations: Observations,
+}
+
+/// The form of each channel's observed counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Observations {
+    /// A workspace's counts become literal arrays. A model has none to bind.
+    #[default]
+    Bound,
+    /// Every channel's counts become an `external` input, supplied later.
+    External,
+}
 
 /// Convert a pyhf model or workspace document into a FlatPPL [`Module`].
-pub fn pyhf_to_module(mut doc: PyhfDocument) -> Result<Module> {
+pub fn pyhf_to_module(doc: PyhfDocument) -> Result<Module> {
+    pyhf_to_module_with(doc, &PyhfOptions::default())
+}
+
+/// [`pyhf_to_module`] with a chosen measurement and observation form.
+pub fn pyhf_to_module_with(mut doc: PyhfDocument, options: &PyhfOptions) -> Result<Module> {
+    if let Some(name) = &options.measurement {
+        doc.select_measurement(name).map_err(Error::Unsupported)?;
+    }
     resolve_sample_modifiers(&mut doc)?;
+    let order = crate::pyhf_measurement::registration_order(&doc);
     let names = crate::pyhf_names::rename_parameters(&mut doc);
+    let order: Vec<String> = order
+        .into_iter()
+        .map(|name| names.get(&name).cloned().unwrap_or(name))
+        .collect();
+    let original: HashMap<String, String> = names
+        .iter()
+        .map(|(source, target)| (target.clone(), source.clone()))
+        .collect();
     let mut m = Module::new();
     {
         let mut b = Builder::new(&mut m);
         // `flatppl_compat` leads the generated module (spec §11).
         b.stamp_compat();
-        emit_pyhf(&mut b, &doc)?;
+        let terms = emit_pyhf(&mut b, &doc, options)?;
+        let emitted = crate::pyhf_measurement::Emitted {
+            channels: &terms.channels,
+            staterror: &terms.staterror_acc,
+        };
+        crate::pyhf_measurement::emit_records(&mut b, &doc, &emitted, &order, &original)?;
         crate::pyhf_names::emit_metadata(&mut b, &names);
     }
     Ok(m)
@@ -364,7 +405,7 @@ fn collect_param_overrides(
     Ok(out)
 }
 
-fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
+fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument, options: &PyhfOptions) -> Result<Terms> {
     let param_overrides = validate_workspace(doc)?;
 
     // `hepphys = standard_module("particle-physics", "0.1")`
@@ -409,44 +450,13 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
         register_staterror_layout(&mut terms, &channel.name, n_bins, &params);
     }
     for channel in doc.channels() {
-        emit_channel(b, doc, channel, &mut terms)?;
+        emit_channel(b, doc, channel, options.observations, &mut terms)?;
     }
 
     // The flat top-level `likelihood` = joint of every channel's observation term
     // and all constraint terms.
     bind_likelihood(b, &terms);
-
-    // Allocate metadata after the model so labels cannot shadow its bindings.
-    emit_poi(b, doc);
-
-    Ok(())
-}
-
-/// Preserve each measurement's parameter-of-interest in a named record.
-///
-/// pyhf's `config.poi` names a free parameter already declared by a modifier; a
-/// record preserves the association without inventing a language construct.
-/// Measurement labels are not parameter names: allocate a valid, unique binding
-/// and retain the original label in its doc comment.
-/// Measurements from either schema (top-level `measurements` or old-format
-/// `toplvl.measurements`) are covered.
-fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
-    for meas in doc.measurements() {
-        match &meas.config.poi {
-            // An empty `poi` string means "no POI declared" — skip it (emitting
-            // `record(poi = )` would be syntactically invalid).
-            Some(poi) if !poi.is_empty() => {
-                let poi_ref = b.self_ref(poi);
-                let rec = b.call_kw("record", &[("poi", poi_ref)]);
-                b.bind_unique_doc(
-                    &meas.name,
-                    rec,
-                    &format!("pyhf measurement {:?}", meas.name),
-                );
-            }
-            _ => {}
-        }
-    }
+    Ok(terms)
 }
 
 /// Emit `alias = standard_module("<module>", "<version>")`.
@@ -498,6 +508,7 @@ fn emit_channel(
     b: &mut Builder,
     doc: &PyhfDocument,
     channel: &crate::model::PyhfChannel,
+    observations: Observations,
     terms: &mut Terms,
 ) -> Result<()> {
     let channel_name = &channel.name;
@@ -510,7 +521,7 @@ fn emit_channel(
         .collect();
 
     // Resolve observation for this channel into an array node (and its bin count).
-    let observed = find_obs(b, doc, channel)?;
+    let observed = find_obs(b, doc, channel, observations)?;
 
     // Resolve lumi config (sigma) if any sample carries a lumi modifier.
     let has_lumi = channel.samples.iter().any(|s| {
@@ -583,9 +594,11 @@ pub struct Terms {
     staterror_layout: BTreeMap<String, StaterrorLayout>,
     /// Channel-summed nominal and squared error per staterror parameter, over
     /// the full spanning vector. Each channel writes its own slice.
-    staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
+    pub(crate) staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
     /// Resolved constraint family per staterror parameter (`true` means Gaussian).
     staterror_gaussian: BTreeMap<String, bool>,
+    /// Each channel's layout and binding names, in document order.
+    pub(crate) channels: Vec<crate::pyhf_measurement::ChannelRecord>,
 }
 
 struct Observation {
@@ -1101,6 +1114,12 @@ pub fn assemble_channel(
         total,
         "Total expected counts per bin (sum over samples).",
     );
+    terms.channels.push(crate::pyhf_measurement::ChannelRecord {
+        name: channel_name.to_owned(),
+        bins: n_bins,
+        observed: observed_name.clone(),
+        expected: expected_name.clone(),
+    });
 
     // ---- Observation model + likelihood term ----
     // `functionof` reifies the parameter-dependent measure into a kernel, as
@@ -1478,9 +1497,16 @@ fn find_obs(
     b: &mut Builder,
     doc: &PyhfDocument,
     channel: &crate::model::PyhfChannel,
+    observations: Observations,
 ) -> Result<Observed> {
     let channel_name = channel.name.as_str();
-    let PyhfDocument::Workspace(doc) = doc else {
+    let workspace = match doc {
+        PyhfDocument::Workspace(workspace) if observations == Observations::Bound => {
+            Some(workspace)
+        }
+        _ => None,
+    };
+    let Some(doc) = workspace else {
         let n_bins = channel.samples.first().map_or(0, |s| s.data.len());
         let counts = b.call_head("nonnegreals");
         let size = b.lit_int(n_bins as i64);
@@ -1569,6 +1595,7 @@ mod tests {
             }],
             data: None,
             toplvl: None,
+            selected: 0,
         }
     }
 
@@ -1655,6 +1682,7 @@ mod tests {
             measurements: vec![],
             data: None,
             toplvl: None,
+            selected: 0,
         };
         let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
@@ -1694,6 +1722,7 @@ mod tests {
             measurements: vec![],
             data: None,
             toplvl: None,
+            selected: 0,
         };
         assert!(
             pyhf_to_module(PyhfDocument::Workspace(doc)).is_err(),
@@ -1735,11 +1764,13 @@ mod tests {
                         auxdata: vec![1.0],
                         sigmas: vec![0.1],
                         factors: vec![],
+                        ..Default::default()
                     }],
                 },
             }],
             data: None,
             toplvl: None,
+            selected: 0,
         };
         let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);

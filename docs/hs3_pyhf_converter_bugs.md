@@ -32,7 +32,8 @@ Fixes implemented on branch `converter-hs3-fixes` (TDD; full `flatppl-hs3` suite
       to the JSON, so left as `reals`.
 - [x] **Bug 3b** — `crates/hs3/src/pyhf.rs` `emit_poi`: emit `config.poi` as a record binding
       `<measurement> = record(poi = <param>)` (FlatPPL has no POI construct). Empty-string poi
-      skipped. *Density unchanged (still matches pyhf).*
+      skipped. *Density unchanged (still matches pyhf).* Superseded by the
+      `pyhf_measurement_<name>` settings record, which carries `poi` as a string.
 - [x] **Bug 4** — `crates/hs3/src/convert.rs` `emit_histfactory_channels`: HS3 `shapesys` `vals` are
       RELATIVE uncertainties (RooFit/HS3 convention), so the native-HS3 path now scales them by the
       sample nominal (σ_abs = vals × nominal) before the shared assembler; the pyhf path keeps

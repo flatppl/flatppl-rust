@@ -339,7 +339,7 @@ pub fn emit_staterror_constraint(
 /// channel-summed nominal. A bin with no nominal or no uncertainty gets 1.0:
 /// pyhf fixes such a bin's gamma and substitutes a unit width for the zero that
 /// would make the Normal degenerate (`pyhf.modifiers.staterror.staterror_builder`).
-fn staterror_delta(sum_nom: &[f64], sum_sq: &[f64]) -> Vec<f64> {
+pub(crate) fn staterror_delta(sum_nom: &[f64], sum_sq: &[f64]) -> Vec<f64> {
     sum_nom
         .iter()
         .zip(sum_sq.iter())

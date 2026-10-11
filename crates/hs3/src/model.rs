@@ -350,14 +350,38 @@ impl PyhfDocument {
             .chain(toplvl.into_iter().flat_map(|t| &t.measurements))
     }
 
+    /// The selected measurement's parameter configuration, or the model's own.
     pub fn parameters(&self) -> &[PyhfParam] {
         match self {
             Self::Model(model) => &model.parameters,
-            // pyhf selects the first measurement unless the caller names one.
-            Self::Workspace(_) => self
+            Self::Workspace(workspace) => self
                 .measurements()
-                .next()
+                .nth(workspace.selected)
                 .map_or(&[], |m| m.config.parameters.as_slice()),
+        }
+    }
+
+    /// Select the measurement whose configuration the model uses. pyhf takes
+    /// the first unless the caller names one.
+    pub fn select_measurement(&mut self, name: &str) -> Result<(), String> {
+        if matches!(self, Self::Model(_)) {
+            return Err("a pyhf model has no measurements to select".into());
+        }
+        let index = self
+            .measurements()
+            .position(|m| m.name == name)
+            .ok_or_else(|| format!("the workspace has no measurement named `{name}`"))?;
+        if let Self::Workspace(workspace) = self {
+            workspace.selected = index;
+        }
+        Ok(())
+    }
+
+    /// The index of the selected measurement within [`Self::measurements`].
+    pub fn selected_measurement(&self) -> usize {
+        match self {
+            Self::Model(_) => 0,
+            Self::Workspace(workspace) => workspace.selected,
         }
     }
 }
@@ -400,6 +424,10 @@ pub struct PyhfWorkspace {
     /// Old-format measurements nested under `toplvl`.
     #[serde(default)]
     pub toplvl: Option<PyhfToplvl>,
+    /// The measurement the model uses, an index into
+    /// [`PyhfDocument::measurements`]. Not part of the JSON.
+    #[serde(skip)]
+    pub selected: usize,
 }
 
 /// Old-format `toplvl` wrapper holding measurements.
@@ -433,7 +461,7 @@ pub struct PyhfObservation {
 }
 
 /// A parameter entry in a measurement config (for lumi and other constrained params).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct PyhfParam {
     pub name: String,
     // Lumi observed nominal: `auxdata.first()` is used (default 1.0 when absent).
@@ -444,6 +472,15 @@ pub struct PyhfParam {
     /// Poisson rate factors, for a `constrained_by_poisson` parameter (shapesys).
     #[serde(default)]
     pub factors: Vec<f64>,
+    /// Suggested initial values, one per component.
+    #[serde(default)]
+    pub inits: Vec<f64>,
+    /// Suggested bounds `[lo, hi]`, one pair per component.
+    #[serde(default)]
+    pub bounds: Vec<[f64; 2]>,
+    /// Whether a fit holds every component of the parameter fixed.
+    #[serde(default)]
+    pub fixed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
