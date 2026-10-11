@@ -8,8 +8,6 @@ use std::collections::HashSet;
 
 use flatppl_core::{BindingId, Module, Symbol};
 
-use crate::driver::collect_referenced_names;
-
 /// Keep exactly the bindings reachable from `roots` (transitively via `%ref self`
 /// leaves and reification `Inputs`); remove the rest. A root named in `roots` is
 /// always kept, even if unreferenced (it is the requested output — this is what
@@ -30,7 +28,7 @@ pub(crate) fn retain_reachable(m: &mut Module, roots: &[Symbol]) {
     while let Some(bid) = work.pop() {
         let rhs = m.binding(bid).rhs;
         let mut names: HashSet<Symbol> = HashSet::new();
-        collect_referenced_names(m, rhs, &mut names);
+        m.collect_referenced_names(rhs, &mut names);
         for name in names {
             if let Some(dep) = m.binding_by_name(name)
                 && keep.insert(dep)

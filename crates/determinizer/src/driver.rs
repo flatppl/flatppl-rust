@@ -10,7 +10,7 @@
 //! table (`apply_rule`) is the single extension point.
 
 use crate::refuse::RefuseError;
-use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
+use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Scalar, Symbol};
 use flatppl_infer::ModuleBundle;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
@@ -968,9 +968,9 @@ pub(crate) fn referenced_binding_names(
     let mut names = std::collections::HashSet::new();
     for (bid, binding) in m.bindings() {
         names.clear();
-        collect_referenced_names(m, binding.rhs, &mut names);
+        m.collect_referenced_names(binding.rhs, &mut names);
         if include_pinned_priors && let Some(rhs) = m.query_pinned_rhs(bid) {
-            collect_referenced_names(m, rhs, &mut names);
+            m.collect_referenced_names(rhs, &mut names);
         }
         // A binding's own self-reference never kept it alive in either sweep.
         referenced.extend(names.iter().copied().filter(|name| *name != binding.name));
@@ -978,84 +978,10 @@ pub(crate) fn referenced_binding_names(
     referenced
 }
 
-/// Collect referenced local bindings and module aliases in `root`'s subtree,
-/// including `functionof` / `kernelof` reification input boundaries.
-///
-/// **`Inputs`-aware.** `for_each_child` / `children()` deliberately EXCLUDE a
-/// `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
-/// constructor/kernel binding referenced ONLY through a `(name, %ref self <name>)`
-/// reification input — e.g. `k = kernelof(pushfwd(f, g), …)` closing over `g =
-/// Normal(…)` — would look UNREFERENCED to a body-only walk. A body-only walk
-/// would let the dead-binding sweep zero it, leaving the live reification closing
-/// over a zeroed constructor, and would let root-based DCE drop it despite the
-/// still-live reification needing it. So this walk additionally scans each
-/// `Call`'s `inputs` entries. It only makes "referenced" MORE inclusive, so a
-/// caller keying eligibility on this (sweep, or DCE reachability) is sound.
-///
-/// The forward-reachability primitive for root-based DCE
-/// ([`crate::canon::dce::retain_reachable`]); shares its traversal with
-/// [`referenced_binding_names`] so the Inputs-awareness lives in one place.
-///
-/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` (via
-/// [`referenced_binding_names`]) and `canon::dce::retain_reachable`.
-pub(crate) fn collect_referenced_names(
-    m: &Module,
-    root: NodeId,
-    out: &mut std::collections::HashSet<Symbol>,
-) {
-    let mut pending = vec![root];
-    let mut visited = std::collections::HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
-            continue;
-        }
-        match m.node(id) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) => {
-                out.insert(*name);
-            }
-            Node::Ref(Ref {
-                ns: RefNs::Module(alias),
-                ..
-            }) => {
-                // A surviving imported call still needs its load_module binding
-                // and load-time substitutions after root-based DCE.
-                out.insert(*alias);
-            }
-            Node::Call(c) => {
-                // A reification input `(name, %ref self <name>)` references the
-                // binding just as a body ref does — but lives outside `children()`.
-                let entries = match &c.inputs {
-                    Some(flatppl_core::Inputs::Spec(entries)) => Some(entries.as_ref()),
-                    Some(flatppl_core::Inputs::Auto) => m.auto_inputs_of(id),
-                    None => None,
-                };
-                if let Some(entries) = entries {
-                    for (_, r) in entries.iter() {
-                        match r.ns {
-                            RefNs::SelfMod => {
-                                out.insert(r.name);
-                            }
-                            RefNs::Module(alias) => {
-                                out.insert(alias);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        m.for_each_child(id, |c| pending.push(c));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Type};
+    use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Ref, RefNs, Type};
 
     /// A `Measure`-typed constructor binding referenced ONLY through another
     /// binding's `functionof` / `kernelof` reification `Inputs` boundary entry

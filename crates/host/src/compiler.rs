@@ -12,14 +12,28 @@ use serde::Serialize;
 
 use crate::Constant;
 use crate::export::{Export, emit_query};
+use crate::inspect::{self, BindingKind, Domain};
 
+/// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
 pub struct Diagnostic {
     pub stage: &'static str,
-    pub source: String,
+    pub source: Box<str>,
     pub message: String,
     pub span: Option<(u32, u32)>,
+    /// Written as the keys `line`, `column` and `excerpt` when the span is known.
+    #[serde(flatten)]
+    pub position: Option<Position>,
     pub import_chain: Vec<String>,
+}
+
+/// Where a span starts: the line and column count from 1, the column in
+/// Unicode characters, and `excerpt` is the text of that line.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
+    pub excerpt: Box<str>,
 }
 
 impl Diagnostic {
@@ -29,14 +43,26 @@ impl Diagnostic {
             source: source.into(),
             message: message.to_string(),
             span: None,
+            position: None,
             import_chain: Vec::new(),
         }
     }
 
-    fn at(mut self, module: &Module, node: Option<NodeId>) -> Self {
-        self.span = node
-            .and_then(|id| module.span_of(id))
-            .map(|s| (s.start, s.end));
+    /// Locate the error at `node`, whose span indexes `text`.
+    fn at(self, module: &Module, node: Option<NodeId>, text: &str) -> Self {
+        let span = node.and_then(|id| module.span_of(id));
+        self.spanned(span.map(|s| (s.start, s.end)), text)
+    }
+
+    fn spanned(mut self, span: Option<(u32, u32)>, text: &str) -> Self {
+        self.span = span;
+        self.position = span
+            .and_then(|(start, _)| inspect::locate(text, start))
+            .map(|(line, column, excerpt)| Position {
+                line,
+                column,
+                excerpt: excerpt.into(),
+            });
         self
     }
 }
@@ -65,6 +91,7 @@ struct Definition {
     identity: String,
     label: String,
     source: String,
+    origin: Origin,
     parsed: Arc<Module>,
     imports: Vec<(String, Arc<Definition>)>,
 }
@@ -77,12 +104,45 @@ pub struct LoadedModule {
     bundle: ModuleBundle,
 }
 
+/// One public binding as hosts see it. Positions refer to the right-hand side
+/// in the module's source text. A value bound by [`Context::set`] has none.
 #[derive(Serialize)]
 pub struct BindingInfo {
     pub name: String,
+    pub kind: BindingKind,
     pub value_type: Option<String>,
     pub phase: Option<String>,
+    pub domain: Option<Domain>,
+    /// Array extents, `None` per dynamic extent. Absent for records, tuples,
+    /// tables and non-values.
+    pub shape: Option<Vec<Option<u32>>>,
+    /// The number of scalar elements, when every extent is known.
+    pub size: Option<u64>,
     pub span: Option<(u32, u32)>,
+    pub source: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    /// The public bindings this one references directly.
+    pub dependencies: Vec<String>,
+}
+
+/// One binding rendered as mathematics.
+#[derive(Debug, Serialize)]
+pub struct MathRow {
+    pub name: String,
+    /// Every binding the row binds: one, or a decomposition's targets.
+    pub names: Vec<String>,
+    /// `draw`, `value`, `measure`, `callable`, `likelihood` or `module`.
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// The notation [`LoadedModule::math`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathFormat {
+    Tex,
+    MathMl,
+    Typst,
 }
 
 impl LoadedModule {
@@ -95,19 +155,70 @@ impl LoadedModule {
     }
 
     pub fn bindings(&self) -> Vec<BindingInfo> {
-        self.typed
+        let module = &self.typed;
+        let text = self.source();
+        module
             .public_bindings()
-            .map(|(_, b)| BindingInfo {
-                name: self.typed.resolve(b.name).into(),
-                value_type: self
-                    .typed
-                    .type_of(b.rhs)
-                    .map(|t| self.typed.display_type(t)),
-                phase: self
-                    .typed
-                    .phase_of(b.rhs)
-                    .map(|p| format!("{p:?}").to_lowercase()),
-                span: self.typed.span_of(b.rhs).map(|s| (s.start, s.end)),
+            .map(|(id, b)| {
+                let span = module.span_of(b.rhs).map(|s| (s.start, s.end));
+                let position = span.and_then(|(start, _)| inspect::locate(text, start));
+                let ty = module.type_of(b.rhs);
+                BindingInfo {
+                    name: module.resolve(b.name).into(),
+                    kind: inspect::kind(module, b.rhs),
+                    value_type: ty.map(|t| module.display_type(t)),
+                    phase: module
+                        .phase_of(b.rhs)
+                        .map(|p| format!("{p:?}").to_lowercase()),
+                    domain: module.valueset_of(b.rhs).map(|s| Domain::of(module, s)),
+                    shape: ty.and_then(inspect::shape),
+                    size: ty.and_then(inspect::size),
+                    span,
+                    source: span
+                        .and_then(|(start, end)| text.get(start as usize..end as usize))
+                        .map(String::from),
+                    line: position.as_ref().map(|p| p.0),
+                    column: position.as_ref().map(|p| p.1),
+                    dependencies: inspect::dependencies(module, id),
+                }
+            })
+            .collect()
+    }
+
+    /// Read a public binding's right-hand side back as a value.
+    ///
+    /// The read is structural. See [`Constant`] for what reads back. Any other
+    /// expression is refused, because the host evaluates nothing.
+    pub fn constant(&self, name: &str) -> Result<Constant, Diagnostic> {
+        let module = &self.typed;
+        let fail = |message: String| Diagnostic::new("constant", self.source_name(), message);
+        let (_, binding) = module
+            .public_bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)
+            .ok_or_else(|| fail(format!("no public binding named `{name}`")))?;
+        Constant::read(module, binding.rhs).map_err(|message| {
+            fail(format!("`{name}` does not read back as a value: {message}")).at(
+                module,
+                Some(binding.rhs),
+                self.source(),
+            )
+        })
+    }
+
+    /// Render every binding as mathematics, in source order.
+    pub fn math(&self, format: MathFormat) -> Vec<MathRow> {
+        flatppl_mathdoc::render_with_source(&self.typed, Some(self.source()))
+            .bindings
+            .into_iter()
+            .map(|row| MathRow {
+                text: match format {
+                    MathFormat::Tex => flatppl_mathdoc::tex::statement(&row.statement),
+                    MathFormat::MathMl => row.mathml,
+                    MathFormat::Typst => flatppl_mathdoc::typst::statement(&row.statement),
+                },
+                name: row.name,
+                names: row.names,
+                kind: row.kind.as_str(),
             })
             .collect()
     }
@@ -153,11 +264,22 @@ impl LoadedModule {
             },
         )
         .map_err(|e| {
-            Diagnostic::new("determinize", self.source_name(), e.reason)
-                .at(&self.typed, Some(e.node))
+            Diagnostic::new("determinize", self.source_name(), e.reason).at(
+                &self.typed,
+                Some(e.node),
+                self.source(),
+            )
         })?;
-        emit_query(lowered, &self.typed, options, batch)
-            .map_err(|e| Diagnostic::new("stablehlo", self.source_name(), e.msg))
+        emit_query(lowered, &self.typed, options, batch).map_err(|e| {
+            // Lowering appends nodes and never renumbers, so only nodes of the
+            // typed root module index its source.
+            let node = e.node.filter(|id| id.index() < self.typed.node_count());
+            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(
+                &self.typed,
+                node,
+                self.source(),
+            )
+        })
     }
 }
 
@@ -272,9 +394,50 @@ impl Context {
             identity,
             label: module.definition.label.clone(),
             source: module.definition.source.clone(),
+            origin: module.definition.origin.clone(),
             parsed: Arc::new(parsed),
             imports: module.definition.imports.clone(),
         }))
+    }
+
+    /// Keep the bindings that `outputs` reach, transitively, in a new module.
+    ///
+    /// The result's source is the printed slice, so its positions index that
+    /// text. Imports resolve as they did for `module`, and values bound by
+    /// [`Self::set`] carry over.
+    pub fn slice(
+        &mut self,
+        module: &LoadedModule,
+        outputs: &[&str],
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let fail = |message: String| Diagnostic::new("slice", module.source_name(), message);
+        if !Arc::ptr_eq(&self.owner, &module.owner) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let mut parsed = (*module.definition.parsed).clone();
+        let roots = outputs
+            .iter()
+            .map(|name| {
+                parsed
+                    .public_bindings()
+                    .find(|(_, b)| parsed.resolve(b.name) == *name)
+                    .map(|(_, b)| b.name)
+                    .ok_or_else(|| fail(format!("no public binding named `{name}`")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let keep = inspect::reachable(&parsed, &roots);
+        parsed.retain_bindings(&keep);
+        let source = flatppl_syntax::print(&parsed);
+        let identity = format!("slice:{}", self.next_inline);
+        self.next_inline += 1;
+        let definition = self.definition(
+            identity,
+            module.definition.label.clone(),
+            source,
+            module.definition.origin.clone(),
+            &mut Vec::new(),
+        )?;
+        self.instantiate(definition)
     }
 
     pub fn parse(
@@ -371,7 +534,11 @@ impl Context {
             .into_iter()
             .find(|d| d.severity == Severity::Error)
         {
-            return Err(Diagnostic::new("infer", &definition.label, d.message).at(&typed, d.node));
+            return Err(Diagnostic::new("infer", &definition.label, d.message).at(
+                &typed,
+                d.node,
+                &definition.source,
+            ));
         }
         Ok(Arc::new(LoadedModule {
             owner: self.owner.clone(),
@@ -392,11 +559,8 @@ impl Context {
         if stack.contains(&identity) {
             return Err(Diagnostic::new("resolve", &label, "cyclic module imports"));
         }
-        let parsed = flatppl_syntax::parse(&source).map_err(|e| {
-            let mut d = Diagnostic::new("parse", &label, e.message);
-            d.span = e.span;
-            d
-        })?;
+        let parsed = flatppl_syntax::parse(&source)
+            .map_err(|e| Diagnostic::new("parse", &label, e.message).spanned(e.span, &source))?;
         let mut literals = Vec::new();
         for i in 0..parsed.node_count() {
             if let Node::Call(c) = parsed.node(NodeId::from_usize(i))
@@ -428,6 +592,7 @@ impl Context {
             identity,
             label,
             source,
+            origin,
             parsed: Arc::new(parsed),
             imports: imports?,
         }))

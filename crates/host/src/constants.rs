@@ -1,19 +1,26 @@
-//! Fixed host values become ordinary FlatPPL literal and constructor nodes.
+//! Fixed host values become ordinary FlatPPL literal and constructor nodes, and
+//! literal bindings read back as host values.
 
 use flatppl_core::{
-    Call, CallHead, Dim, Module, NamedArg, NamedKind, Node, NodeId, Scalar, ScalarType, Symbol,
-    Type, ValueSet,
+    Call, CallHead, Dim, Module, NamedArg, NamedKind, Node, NodeId, RefNs, Scalar, ScalarType,
+    Symbol, Type, ValueSet,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Debug, Deserialize)]
+/// A fixed value. JSON writes infinite reals as `"inf"` and `"-inf"`, and an
+/// array as one typed flat list, `{"shape", "dtype", "data"}`.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Constant {
     Bool(bool),
     Integer(i64),
-    Real(f64),
+    Real(#[serde(with = "real")] f64),
     String(String),
     /// Flat data in axis order from slowest to fastest (C order).
+    #[serde(
+        serialize_with = "packed::serialize",
+        deserialize_with = "packed::deserialize"
+    )]
     Array {
         shape: Vec<u32>,
         data: Vec<Constant>,
@@ -21,6 +28,127 @@ pub enum Constant {
     Record(Vec<(String, Constant)>),
     Table(Vec<(String, Constant)>),
     Tuple(Vec<Constant>),
+    /// A `fixed(value)` marker read from source. It binds no external.
+    Fixed(Box<Constant>),
+    /// A reference to another binding read from source. It binds no external.
+    Reference(String),
+}
+
+mod real {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Json {
+        Number(f64),
+        Text(String),
+    }
+
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        match *value {
+            f64::INFINITY => serializer.serialize_str("inf"),
+            f64::NEG_INFINITY => serializer.serialize_str("-inf"),
+            value => serializer.serialize_f64(value),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        match Json::deserialize(deserializer)? {
+            Json::Number(value) => Ok(value),
+            Json::Text(text) if text == "inf" => Ok(f64::INFINITY),
+            Json::Text(text) if text == "-inf" => Ok(f64::NEG_INFINITY),
+            Json::Text(text) => Err(serde::de::Error::custom(format!(
+                "expected a number, \"inf\" or \"-inf\", got {text:?}"
+            ))),
+        }
+    }
+}
+
+mod packed {
+    use super::*;
+
+    #[derive(Deserialize, Serialize)]
+    struct Real(#[serde(with = "real")] f64);
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "dtype", content = "data", rename_all = "snake_case")]
+    enum Data {
+        Bool(Vec<bool>),
+        Integer(Vec<i64>),
+        Real(Vec<Real>),
+    }
+
+    #[derive(Deserialize, Serialize)]
+    struct Array {
+        shape: Vec<u32>,
+        #[serde(flatten)]
+        data: Data,
+    }
+
+    pub fn serialize<S: Serializer>(
+        shape: &[u32],
+        data: &[Constant],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let fail = || serde::ser::Error::custom("array elements must be scalars of one kind");
+        let packed = match data.first() {
+            Some(Constant::Bool(_)) | None => data
+                .iter()
+                .map(|x| {
+                    if let Constant::Bool(v) = x {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()
+                .map(Data::Bool),
+            Some(Constant::Integer(_)) => data
+                .iter()
+                .map(|x| {
+                    if let Constant::Integer(v) = x {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()
+                .map(Data::Integer),
+            Some(Constant::Real(_)) => data
+                .iter()
+                .map(|x| {
+                    if let Constant::Real(v) = x {
+                        Some(Real(*v))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()
+                .map(Data::Real),
+            Some(_) => None,
+        }
+        .ok_or_else(fail)?;
+        Array {
+            shape: shape.to_vec(),
+            data: packed,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<(Vec<u32>, Vec<Constant>), D::Error> {
+        let Array { shape, data } = Array::deserialize(deserializer)?;
+        let data = match data {
+            Data::Bool(values) => values.into_iter().map(Constant::Bool).collect(),
+            Data::Integer(values) => values.into_iter().map(Constant::Integer).collect(),
+            Data::Real(values) => values
+                .into_iter()
+                .map(|Real(v)| Constant::Real(v))
+                .collect(),
+        };
+        Ok((shape, data))
+    }
 }
 
 impl Constant {
@@ -253,10 +381,106 @@ impl Constant {
                     .collect::<Result<_, _>>()?,
                 vec![],
             ),
+            Self::Fixed(_) | Self::Reference(_) => {
+                return Err("`fixed` markers and references are not values".into());
+            }
             _ => unreachable!("scalars handled above"),
         };
         Ok(call(module, head, args, named))
     }
+
+    /// Read a binding's right-hand side back as a value, structurally.
+    ///
+    /// Literals, `neg` of a number, `inf`, `pi`, and the `vector`, `array`,
+    /// `record`, `table`, `tuple` and `fixed` constructors read back. A
+    /// reference to another binding reads as [`Constant::Reference`]. Nothing
+    /// is evaluated, so any other expression is refused.
+    pub(crate) fn read(module: &Module, node: NodeId) -> Result<Self, String> {
+        let name = |s: Symbol| module.resolve(s);
+        match module.node(node) {
+            Node::Lit(Scalar::Bool(v)) => Ok(Self::Bool(*v)),
+            Node::Lit(Scalar::Int(v)) => Ok(Self::Integer(*v)),
+            Node::Lit(Scalar::Real(v)) => Ok(Self::Real(*v)),
+            Node::Lit(Scalar::Str(v)) => Ok(Self::String(v.to_string())),
+            Node::Const(s) if name(*s) == "inf" => Ok(Self::Real(f64::INFINITY)),
+            Node::Const(s) if name(*s) == "pi" => Ok(Self::Real(std::f64::consts::PI)),
+            Node::Ref(r) if r.ns == RefNs::SelfMod => Ok(Self::Reference(name(r.name).into())),
+            Node::Call(c) => {
+                let CallHead::Builtin(head) = c.head else {
+                    return Err("a call is not a literal".into());
+                };
+                let args = || {
+                    c.args
+                        .iter()
+                        .map(|&a| Self::read(module, a))
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let fields = || {
+                    c.named
+                        .iter()
+                        .map(|f| Ok((name(f.name).to_string(), Self::read(module, f.value)?)))
+                        .collect::<Result<Vec<_>, String>>()
+                };
+                match (name(head), c.args.len(), c.named.is_empty()) {
+                    ("neg", 1, true) => match Self::read(module, c.args[0])? {
+                        Self::Integer(v) => Ok(Self::Integer(-v)),
+                        Self::Real(v) => Ok(Self::Real(-v)),
+                        _ => Err("`neg` of a non-number is not a literal".into()),
+                    },
+                    ("fixed", 1, true) => Ok(Self::Fixed(Box::new(Self::read(module, c.args[0])?))),
+                    ("tuple", _, true) => Ok(Self::Tuple(args()?)),
+                    ("record", 0, _) => Ok(Self::Record(fields()?)),
+                    ("table", 0, _) => Ok(Self::Table(fields()?)),
+                    ("vector", n, true) => Ok(Self::Array {
+                        shape: vec![u32::try_from(n).map_err(|_| "vector is too long")?],
+                        data: scalars(args()?)?,
+                    }),
+                    ("array", 3, true) => read_array(module, &c.args),
+                    (other, _, _) => Err(format!("`{other}(...)` is not a literal")),
+                }
+            }
+            _ => Err("the expression is not a literal".into()),
+        }
+    }
+}
+
+fn scalars(values: Vec<Constant>) -> Result<Vec<Constant>, String> {
+    let kind = std::mem::discriminant;
+    match values.first() {
+        Some(first @ (Constant::Bool(_) | Constant::Integer(_) | Constant::Real(_)))
+            if values.iter().all(|v| kind(v) == kind(first)) =>
+        {
+            Ok(values)
+        }
+        None => Ok(values),
+        _ => Err("array elements must be literal numbers or booleans of one kind".into()),
+    }
+}
+
+fn read_array(module: &Module, args: &[NodeId]) -> Result<Constant, String> {
+    let integers = |node| match Constant::read(module, node)? {
+        Constant::Array { data, .. } => data
+            .into_iter()
+            .map(|v| match v {
+                Constant::Integer(v) => u32::try_from(v).map_err(|_| "negative array extent"),
+                _ => Err("array extents must be integers"),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(String::from),
+        _ => Err("array extents must be a vector".to_string()),
+    };
+    let Constant::Array { data, .. } = Constant::read(module, args[0])? else {
+        return Err("array data must be a vector".into());
+    };
+    let shape = integers(args[1])?;
+    let order = integers(args[2])?;
+    if !order.iter().copied().eq(1..=shape.len() as u32) {
+        return Err("only arrays in the default axis order read back".into());
+    }
+    if shape.iter().map(|&d| d as usize).product::<usize>() != data.len() {
+        return Err("array data does not match its shape".into());
+    }
+    Ok(Constant::Array { shape, data })
 }
 
 fn normalize_fields(

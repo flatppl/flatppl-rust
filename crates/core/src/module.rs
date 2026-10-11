@@ -537,6 +537,62 @@ impl Module {
     pub fn set_auto_inputs(&mut self, id: NodeId, entries: Box<[(Symbol, Ref)]>) {
         self.auto_inputs.insert(id, entries);
     }
+
+    /// Collect the local bindings and module aliases that `root`'s subtree
+    /// references, including `functionof` / `kernelof` reification inputs.
+    ///
+    /// [`Module::for_each_child`] deliberately excludes a `Call`'s
+    /// [`Inputs`](crate::Inputs) bucket, so a binding referenced only through a
+    /// `(name, %ref self <name>)` reification input, such as `g` in
+    /// `k = kernelof(pushfwd(f, g), …)`, would look unreferenced to a body-only
+    /// walk. This walk also scans each call's inputs, so it only makes
+    /// "referenced" more inclusive. A module alias counts as referenced through
+    /// any `%ref <alias> member`. Dead-binding sweeps, root-based pruning and
+    /// dependency edges all use it.
+    pub fn collect_referenced_names(&self, root: NodeId, out: &mut HashSet<Symbol>) {
+        use crate::node::{Inputs, RefNs};
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            match self.node(id) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => {
+                    out.insert(*name);
+                }
+                Node::Ref(Ref {
+                    ns: RefNs::Module(alias),
+                    ..
+                }) => {
+                    out.insert(*alias);
+                }
+                Node::Call(c) => {
+                    let entries = match &c.inputs {
+                        Some(Inputs::Spec(entries)) => Some(entries.as_ref()),
+                        Some(Inputs::Auto) => self.auto_inputs_of(id),
+                        None => None,
+                    };
+                    for (_, r) in entries.into_iter().flatten() {
+                        match r.ns {
+                            RefNs::SelfMod => {
+                                out.insert(r.name);
+                            }
+                            RefNs::Module(alias) => {
+                                out.insert(alias);
+                            }
+                            RefNs::Local => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.for_each_child(id, |c| pending.push(c));
+        }
+    }
 }
 
 #[cfg(test)]
