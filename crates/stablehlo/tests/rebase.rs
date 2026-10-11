@@ -185,3 +185,40 @@ fn closed_ordered_sampling_uses_one_sort_and_one_rng_draw() {
         "the internal sort must not pass ordinary FlatPDL conformance"
     );
 }
+
+/// A captured scale is drawn once before its vector, including when the vector
+/// is returned twice and consumed by a derived field. The exported successor
+/// state must agree with explicit sequential draws.
+#[test]
+fn shared_rebase_prior_samples_in_dependency_order() {
+    for (support, vector_sample) in [
+        (
+            "zerosum",
+            "z, next_state = rand(iid(Normal(0.0, 1.0), 3), state1)\n\
+             effects = (z .- sum(z)/3.0) .* scale",
+        ),
+        (
+            "ordered",
+            "effects, next_state = rand(rebase(iid(Normal(0, scale), 3), Lebesgue(ordered(3))), state1)",
+        ),
+    ] {
+        let fields =
+            "record(scale = scale, effects = effects, same = effects, twice = effects .* 2)";
+        let source = format!(
+            "scale ~ Exponential(1)\n\
+             effects ~ rebase(iid(Normal(0, scale), 3), Lebesgue({support}(3)))\n\
+             prior = lawof({fields})\n\
+             value = rand(prior, rnginit(0))\noutputs = value"
+        );
+        let expected = format!(
+            "scale, state1 = rand(Exponential(1), rnginit(0))\n\
+             {vector_sample}\noutputs = ({fields}, next_state)"
+        );
+        let output = emit_mode(&source, flatppl_stablehlo::Mode::Sample);
+        assert_eq!(output.matches("stablehlo.rng_bit_generator").count(), 2);
+        assert_eq!(
+            output,
+            emit_mode(&expected, flatppl_stablehlo::Mode::Sample)
+        );
+    }
+}
