@@ -1041,6 +1041,29 @@ mod tests {
         );
     }
 
+    /// §03 `ordered(n)` and `zerosum(n)` reach hover in the set vocabulary.
+    #[test]
+    fn hover_reports_ordered_and_zerosum_value_sets() {
+        for (src, want) in [
+            ("c = elementof(ordered(3))", "`ordered(3)`"),
+            ("c = elementof(zerosum(3))", "`zerosum(3)`"),
+        ] {
+            let db = Database::default();
+            let cats = Catalogues::new(&db, vec![]);
+            let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+            let fs = FileSet::new(&db, vec![f]);
+            let index = crate::queries::node_span_index(&db, f, fs, cats);
+            let s = [4_u32, 9, 14]
+                .iter()
+                .find_map(|&off| hover(&db, f, fs, cats, off, &index))
+                .expect("an elementof binding must yield hover info");
+            assert!(
+                s.contains(&format!("**value-set:** {want}")),
+                "{src}: got {s:?}"
+            );
+        }
+    }
+
     // ── hover doc-comment tests ──────────────────────────────────────────────
 
     /// Hovering a use of a documented binding shows that binding's own

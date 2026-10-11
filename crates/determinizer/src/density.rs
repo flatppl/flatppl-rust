@@ -4656,9 +4656,9 @@ fn set_element_kind(set: &ValueSet) -> Option<VariateKind> {
         Reals | PosReals | NonNegReals | UnitInterval | Integers | PosIntegers | NonNegIntegers
         | Booleans | Complexes | Interval(..) => Some(VariateKind::Scalar),
         // §03: a positional `cartprod`'s members are `cat`s of one element per
-        // component — "a set of arrays, not a set of tuples"; `stdsimplex(n)` is a
-        // set of n-vectors.
-        CartProd(_) | StdSimplex(_) => Some(VariateKind::Vector),
+        // component — "a set of arrays, not a set of tuples"; `stdsimplex(n)`,
+        // `ordered(n)` and `zerosum(n)` are sets of n-vectors.
+        CartProd(_) | StdSimplex(_) | Ordered(_) | ZeroSum(_) => Some(VariateKind::Vector),
         // §03 keyword form: "produces a set of records".
         RecordSet(_) => Some(VariateKind::Record),
         // §03: "When `S` is a record set, the power is the set of tables" — but

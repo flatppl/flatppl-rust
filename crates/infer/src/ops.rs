@@ -789,7 +789,7 @@ pub(crate) fn call_rule(
 
         // ---- set constructors (spec §03) — set objects have no first-class
         // type; consumers (`elementof`, `truncate`, …) read them structurally.
-        "interval" | "cartprod" => Type::Any,
+        "interval" | "cartprod" | "ordered" | "zerosum" => Type::Any,
         // `cartpow(S, size)` takes exactly a set and a size; the size is an
         // integer (1-D) or a vector of positive integers (multi-axis), §03
         // "Cartesian power". The legacy variadic `cartpow(S, d1, d2, …)` form
@@ -3216,7 +3216,10 @@ fn set_element_type_at(
                         }
                     }
                 }
-                "stdsimplex" => {
+                // `ordered(n)` and `zerosum(n)` are subsets of ℝⁿ (§03 "Ordered
+                // vectors", "Zero-sum vectors"): the element is a length-n real
+                // vector and the constraint lives in the value-set slot.
+                "stdsimplex" | "ordered" | "zerosum" => {
                     // `stdsimplex(n)` is the (n-1)-simplex {x ∈ ℝⁿ : xᵢ ≥ 0,
                     // Σxᵢ = 1} embedded in ℝⁿ (§03 "Standard simplex"): an
                     // element is a length-n real vector. The ≥0 / sum-to-1
@@ -6746,6 +6749,8 @@ const WRITTEN_SIZE_ARGS: &[(&str, &str, usize, &str)] = &[
     ("bandedmat", "rows", 1, "§07 \"Array and table operations\""),
     ("cartpow", "size", 1, "§03 \"Cartesian power\""),
     ("stdsimplex", "n", 0, "§03 \"Standard simplex\""),
+    ("ordered", "n", 0, "§03 \"Ordered vectors\""),
+    ("zerosum", "n", 0, "§03 \"Zero-sum vectors\""),
     ("iid", "size", 1, "§06 `iid`"),
     ("markovchain", "n", 2, "§06 `markovchain`"),
     ("LKJ", "n", 0, "§08 `LKJ`"),
@@ -8671,7 +8676,9 @@ pub(crate) fn call_valueset(
         // A set-constructor used directly as a value binding is a PRESET (spec
         // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
         // is not a value type — set in the `cartprod`/`interval`/… type arms.)
-        "interval" | "stdsimplex" | "cartpow" | "cartprod" => set_call_valueset(inf, call),
+        "interval" | "stdsimplex" | "ordered" | "zerosum" | "cartpow" | "cartprod" => {
+            set_call_valueset(inf, call)
+        }
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         // `broadcast(head, data…)` over a user callable: the cell value-set is
@@ -8854,7 +8861,8 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
 }
 
 /// The value-set denoted by a set-constructor CALL (`interval(...)`,
-/// `stdsimplex(n)`, `cartpow(S, size)`, `cartprod(...)`). Shared by
+/// `stdsimplex(n)`, `ordered(n)`, `zerosum(n)`, `cartpow(S, size)`,
+/// `cartprod(...)`). Shared by
 /// `set_expr_valueset` (set-expression argument position) and `call_valueset`
 /// (a set-constructor used directly as a preset binding, spec §03). `Unknown`
 /// for any non-set-constructor head or unresolvable component.
@@ -8892,6 +8900,16 @@ fn set_call_valueset_at(
             }
         }
         "stdsimplex" => ValueSet::StdSimplex(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
+        "ordered" => ValueSet::Ordered(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
+        "zerosum" => ValueSet::ZeroSum(
             c.args
                 .first()
                 .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),

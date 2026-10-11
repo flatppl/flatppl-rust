@@ -41,6 +41,12 @@ pub enum Domain {
     StdSimplex {
         n: Option<u32>,
     },
+    Ordered {
+        n: Option<u32>,
+    },
+    ZeroSum {
+        n: Option<u32>,
+    },
     /// Nested per-axis powers flatten into one shape. `None` is a dynamic extent.
     CartPow {
         of: Box<Domain>,
@@ -94,6 +100,8 @@ impl Domain {
                 hi: Bound(*hi),
             },
             ValueSet::StdSimplex(n) => Self::StdSimplex { n: extent(*n) },
+            ValueSet::Ordered(n) => Self::Ordered { n: extent(*n) },
+            ValueSet::ZeroSum(n) => Self::ZeroSum { n: extent(*n) },
             ValueSet::CartPow(elem, n) => {
                 let mut shape = vec![extent(*n)];
                 let mut elem = elem.as_ref();
