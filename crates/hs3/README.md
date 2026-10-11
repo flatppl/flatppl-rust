@@ -56,8 +56,12 @@ it never changes emitted StableHLO. Its fields:
 * `name`, `selected` (the measurement the likelihood uses), and `poi`, the
   emitted parameter name as a string. `poi` is absent when none is declared.
 * `parameters`, in pyhf's registration order (`config.par_order`). Each entry
-  has `pyhf` (the original name), `init`, `lo`, `hi` and `fixed`, and for a
-  constrained parameter `width` and nominal `auxdata`. pyhf's per-modifier
+  has `pyhf` (the original name), `type` (the pyhf modifier type: `normfactor`,
+  `normsys`, `histosys`, `shapesys`, `staterror`, `shapefactor` or `lumi`),
+  `init`, `lo`, `hi` and `fixed`, and for a constrained parameter `constraint`
+  (`"normal"` or `"poisson"`), `width` and nominal `auxdata`. A name that
+  normsys and histosys share is one parameter of type `histosys`, the first in
+  pyhf's registration order of types. pyhf's per-modifier
   defaults apply first, then the measurement's `inits`, `bounds`, `fixed`,
   `auxdata`, `sigmas` and `factors`. Scalar parameters have scalar values,
   vector parameters one value per component.

@@ -1,8 +1,9 @@
 //! pyhf measurement metadata: one literal record per measurement.
 //!
 //! The record carries what a fit needs and pyhf derives: parameters in pyhf's
-//! registration order, with suggested initial values, bounds and fixed flags,
-//! constraint widths and nominal auxiliary data, plus the channel layout. It is
+//! registration order, with their modifier type, suggested initial values,
+//! bounds and fixed flags, constraint family, widths and nominal auxiliary
+//! data, plus the channel layout. It is
 //! dead code for every query, so the emitted StableHLO does not change.
 use crate::builder::{Builder, sanitize_ident};
 use crate::error::{Error, Result};
@@ -437,6 +438,7 @@ fn record(
         let mut fields: Vec<(String, NodeId)> = Vec::new();
         let pyhf_name = original.get(*param).map_or(param.as_str(), String::as_str);
         fields.push(("pyhf".into(), b.str_lit(pyhf_name)));
+        fields.push(("type".into(), b.str_lit(d.kind)));
         if let Some(init) = &values.init {
             fields.push(("init".into(), reals(b, init)));
         }
@@ -453,6 +455,14 @@ fn record(
             b.array(&items)
         };
         fields.push(("fixed".into(), fixed));
+        let constraint = match d.constraint {
+            None => None,
+            Some(Constraint::Normal { .. }) => Some("normal"),
+            Some(Constraint::Poisson { .. }) => Some("poisson"),
+        };
+        if let Some(constraint) = constraint {
+            fields.push(("constraint".into(), b.str_lit(constraint)));
+        }
         if let Some(width) = &values.width {
             fields.push(("width".into(), reals(b, width)));
         }
