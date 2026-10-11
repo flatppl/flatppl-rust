@@ -53,7 +53,7 @@ fn parameter_names_preserve_shared_effects_config_and_poi() {
         "poi = \"rw_oneside_4\", parameters = record(rw_oneside = record(pyhf = \"rw_oneside\","
     ));
     assert!(text.contains("rw_oneside_4 = record(pyhf = \"rw.oneside\","));
-    assert!(text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.25)"));
+    assert!(text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", type = \"normsys\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, constraint = \"normal\", width = 1.0, auxdata = 0.25)"));
 
     // A model-only document carries the same overrides without a measurement.
     let model = |workspace: &Value| {
@@ -68,7 +68,7 @@ fn parameter_names_preserve_shared_effects_config_and_poi() {
         without_settings(&model_text),
         without_settings(&model_expected)
     );
-    assert!(model_text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.25)"));
+    assert!(model_text.contains("rw_oneside_3 = record(pyhf = \"rw-oneside\", type = \"normsys\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, constraint = \"normal\", width = 1.0, auxdata = 0.25)"));
 }
 
 #[test]

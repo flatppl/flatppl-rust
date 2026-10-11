@@ -38,12 +38,12 @@ const CHANNELS: &str = "channels = record(\
 
 /// Parameters that both measurements leave at pyhf's defaults.
 const SHARED: [&str; 4] = [
-    "a_norm = record(pyhf = \"a_norm\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
-    "k = record(pyhf = \"k\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
-    "stat_a = record(pyhf = \"stat_a\", init = [1.0], lo = [0.0000000001], hi = [10.0], \
-     fixed = [false], width = [0.25], auxdata = [1.0])",
-    "stat_b = record(pyhf = \"stat_b\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
-     hi = [10.0, 10.0], fixed = [false, true], width = [0.1, 1.0], auxdata = [1.0, 1.0])",
+    "a_norm = record(pyhf = \"a_norm\", type = \"normfactor\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
+    "k = record(pyhf = \"k\", type = \"normfactor\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
+    "stat_a = record(pyhf = \"stat_a\", type = \"staterror\", init = [1.0], lo = [0.0000000001], hi = [10.0], \
+     fixed = [false], constraint = \"normal\", width = [0.25], auxdata = [1.0])",
+    "stat_b = record(pyhf = \"stat_b\", type = \"staterror\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
+     hi = [10.0, 10.0], fixed = [false, true], constraint = \"normal\", width = [0.1, 1.0], auxdata = [1.0, 1.0])",
 ];
 
 fn expected(head: &str, z: &str, lumi: &str, mu: &str, sf: &str, sh: &str) -> String {
@@ -61,12 +61,12 @@ fn records_follow_pyhf_order_defaults_and_overrides() {
         line(&text, "pyhf_measurement_first"),
         expected(
             "pyhf_measurement_first = record(name = \"first\", selected = true, poi = \"mu\"",
-            "z = record(pyhf = \"z\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.0)",
-            "lumi = record(pyhf = \"lumi\", init = 1.0, lo = 0.9, hi = 1.1, fixed = false, width = 0.02, auxdata = 1.0)",
-            "mu = record(pyhf = \"mu\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
-            "sf = record(pyhf = \"sf\", init = [1.0], lo = [0.0], hi = [10.0], fixed = [false])",
-            "sh = record(pyhf = \"sh\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
-             hi = [10.0, 10.0], fixed = [false, true], width = [0.2, 1.0], auxdata = [25.0, 1.0])",
+            "z = record(pyhf = \"z\", type = \"histosys\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, constraint = \"normal\", width = 1.0, auxdata = 0.0)",
+            "lumi = record(pyhf = \"lumi\", type = \"lumi\", init = 1.0, lo = 0.9, hi = 1.1, fixed = false, constraint = \"normal\", width = 0.02, auxdata = 1.0)",
+            "mu = record(pyhf = \"mu\", type = \"normfactor\", init = 1.0, lo = 0.0, hi = 10.0, fixed = false)",
+            "sf = record(pyhf = \"sf\", type = \"shapefactor\", init = [1.0], lo = [0.0], hi = [10.0], fixed = [false])",
+            "sh = record(pyhf = \"sh\", type = \"shapesys\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
+             hi = [10.0, 10.0], fixed = [false, true], constraint = \"poisson\", width = [0.2, 1.0], auxdata = [25.0, 1.0])",
         )
     );
     // The measurement name needs sanitizing. The overrides set inits, bounds
@@ -76,12 +76,12 @@ fn records_follow_pyhf_order_defaults_and_overrides() {
         line(&text, "pyhf_measurement_second_set"),
         expected(
             "pyhf_measurement_second_set = record(name = \"second set\", selected = false, poi = \"k\"",
-            "z = record(pyhf = \"z\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, width = 1.0, auxdata = 0.5)",
-            "lumi = record(pyhf = \"lumi\", init = 1.0, lo = 0.5, hi = 1.5, fixed = false, width = 0.05, auxdata = 1.0)",
-            "mu = record(pyhf = \"mu\", init = 2.0, lo = -1.0, hi = 5.0, fixed = true)",
-            "sf = record(pyhf = \"sf\", init = [1.0], lo = [0.0], hi = [10.0], fixed = [true])",
-            "sh = record(pyhf = \"sh\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
-             hi = [10.0, 10.0], fixed = [false, true], width = [0.1, 1.0], auxdata = [25.0, 1.0])",
+            "z = record(pyhf = \"z\", type = \"histosys\", init = 0.0, lo = -5.0, hi = 5.0, fixed = false, constraint = \"normal\", width = 1.0, auxdata = 0.5)",
+            "lumi = record(pyhf = \"lumi\", type = \"lumi\", init = 1.0, lo = 0.5, hi = 1.5, fixed = false, constraint = \"normal\", width = 0.05, auxdata = 1.0)",
+            "mu = record(pyhf = \"mu\", type = \"normfactor\", init = 2.0, lo = -1.0, hi = 5.0, fixed = true)",
+            "sf = record(pyhf = \"sf\", type = \"shapefactor\", init = [1.0], lo = [0.0], hi = [10.0], fixed = [true])",
+            "sh = record(pyhf = \"sh\", type = \"shapesys\", init = [1.0, 1.0], lo = [0.0000000001, 0.0000000001], \
+             hi = [10.0, 10.0], fixed = [false, true], constraint = \"poisson\", width = [0.1, 1.0], auxdata = [25.0, 1.0])",
         )
     );
 }
