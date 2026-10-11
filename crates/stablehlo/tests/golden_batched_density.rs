@@ -19,8 +19,6 @@ use flatppl_core::Module;
 
 fn determinize_src(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
-    // Notes are kept: `stdsimplex` has no type rule yet, so every fixture with a
-    // simplex parameter carries one, and it is honest rather than a failure.
     let diags: Vec<_> = flatppl_infer::infer(&mut m)
         .into_iter()
         .filter(|d| d.severity == flatppl_infer::Severity::Error)

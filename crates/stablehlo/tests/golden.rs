@@ -5234,15 +5234,9 @@ fn builtin_logdensityof_refuses_wrong_arity() {
 // and Categorical/Categorical0 additionally need that literal to drive a
 // static `get`/`get0` slice — see `registry::categorical_logpdf`'s doc
 // comment). Categorical/Categorical0's `p` is a literal array (`[0.2, 0.3,
-// 0.5]`), not an `elementof`-declared free parameter, same reasoning as
-// `UNIFORM_DENSITY_SRC`'s literal `support`: `elementof(stdsimplex(N))`
-// currently leaves `stdsimplex` typed `%deferred` with a `Severity::Note`
-// diagnostic (`crates/infer`'s `stdsimplex` type rule is not yet
-// implemented — see `crates/infer/tests/spec_coverage_shape_gaps.rs`'s
-// `stdsimplex_size_from_fixed_ref` for the same gap acknowledged there),
-// which trips this file's `determinize_src` helper's strict `diags.is_empty()`
-// assert; a literal `p` sidesteps the gap entirely and keeps `a` a zero-arg
-// `func.func @logdensity()`, mirroring `UNIFORM_DENSITY_SRC`.
+// 0.5]`) so these fixtures expose a zero-arg `func.func @logdensity()`,
+// mirroring `UNIFORM_DENSITY_SRC`. Free simplex parameters are covered in
+// `golden_batched_density.rs`.
 
 const POISSON_DENSITY_SRC: &str = "\
 rate = elementof(nonnegreals)
@@ -7250,7 +7244,7 @@ outputs = (draws)
 // `NORMAL_SAMPLE_SRC`/`GAMMA_SAMPLE_SRC`, not the free-parameter convention
 // `MVNORMAL_SAMPLE_SRC`/`DIRICHLET_SAMPLE_SRC` use. Categorical/Categorical0's
 // `p` is a literal array (`[0.2, 0.3, 0.5]`), same reasoning as
-// `CATEGORICAL_DENSITY_SRC`'s (the `stdsimplex` typing gap noted there);
+// `CATEGORICAL_DENSITY_SRC`'s zero-argument fixture;
 // Binomial/Multinomial's `n` is a FIXED top-level literal binding (`n = 5`),
 // same convention as `LKJ_DENSITY_SRC`'s `n = 3` (`literal_fixed_positive_int`
 // needs it at EMIT time, not merely well-typed — see `registry.rs`'s doc
