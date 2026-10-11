@@ -201,7 +201,7 @@ fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
-        Some("rebase") => lower_rebase_sample(m, resolved, rng),
+        Some("rebase") => lower_rebase_sample(m, resolved, rng, None),
         // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
         // SAME [`lower_iid_sample`] as the `draw(iid(K, n))` spelling, so both emit
@@ -209,10 +209,10 @@ fn lower_closed_measure_sample(
         Some("iid") => {
             let (kernel, iid_node) = split_iid(m, resolved)
                 .ok_or_else(|| refuse(resolved, m, "iid expects 2 args (kernel, count)"))?;
-            lower_iid_sample(m, kernel, iid_node, rng)
+            lower_iid_sample(m, kernel, iid_node, rng, None)
         }
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
-        Some("draw") => lower_draw(m, resolved, rng),
+        Some("draw") => lower_draw(m, resolved, rng, None),
         _ => {
             // The intractable/deferred set first — `weighted(w, M)` and friends
             // carry positional args, so `split_constructor` would reject them
@@ -226,7 +226,7 @@ fn lower_closed_measure_sample(
             // `lawof` wrapper. This is also what terminates [`lower_pushfwd_sample`]'s
             // recursion on its base.
             if let Some((ctor, kernel_input)) = split_constructor(m, resolved) {
-                return Ok(build_sample_term(m, ctor, kernel_input, rng));
+                return Ok(build_sample_term(m, ctor, kernel_input, rng, None));
             }
             Err(refuse(
                 resolved,
@@ -388,7 +388,7 @@ fn lower_measure_sample(
     let op = builtin_name(m, resolved);
     match op {
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
-        Some("draw") => lower_draw(m, resolved, rng),
+        Some("draw") => lower_draw(m, resolved, rng, None),
         // Intractable (§07's `rand` exclusion clause + §13 "Refused constructs") /
         // deferred (simply not built in this vertical) — see
         // `classify_intractable_or_deferred`.
@@ -609,10 +609,13 @@ fn refuse_deferred_combinator(m: &Module, id: NodeId) -> RefuseError {
 /// message: true (a `weighted(...)` call is not a leaf constructor), but not
 /// the ACTIONABLE reason. Classify the resolved inner measure the same way
 /// [`lower_measure_sample`] does first, so this shape gets the same message.
+/// A shared record supplies `sample_name` to bind the primitive tuple before
+/// either slot is projected or the sampled value is transformed.
 fn lower_draw(
     m: &mut Module,
     draw_node: NodeId,
     rng: NodeId,
+    sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let inner_measure = {
         let c = expect_builtin_call(m, draw_node, "draw")
@@ -629,10 +632,10 @@ fn lower_draw(
     // Fan-out: `draw(iid(K, n))` → ONE batched `builtin_sample`, via the same
     // [`lower_iid_sample`] the measure-position `rand(iid(K, n), s)` spelling uses.
     if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
-        return lower_iid_sample(m, kernel, iid_node, rng);
+        return lower_iid_sample(m, kernel, iid_node, rng, sample_name);
     }
     if builtin_name(m, inner_resolved) == Some("rebase") {
-        return lower_rebase_sample(m, inner_resolved, rng);
+        return lower_rebase_sample(m, inner_resolved, rng, sample_name);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
@@ -641,7 +644,7 @@ fn lower_draw(
             "sample leaf: expected a built-in kernel constructor",
         )
     })?;
-    Ok(build_sample_term(m, ctor, kernel_input, rng))
+    Ok(build_sample_term(m, ctor, kernel_input, rng, sample_name))
 }
 
 /// Centering iid normals gives covariance sigma²(I - 11'/n); sorting them
@@ -650,6 +653,7 @@ fn lower_rebase_sample(
     m: &mut Module,
     measure: NodeId,
     rng: NodeId,
+    sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     use crate::density::rebase::{NormalSet, elementwise, normal_on_set};
 
@@ -672,7 +676,7 @@ fn lower_rebase_sample(
     let input = build_record(m, &parameters);
     let ctor = m.intern("Normal");
     let ctor = m.alloc(Node::Const(ctor));
-    let (value, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng);
+    let (value, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng, sample_name);
     let value = match normal.kind {
         NormalSet::Ordered => build_call(m, flatppl_core::SORT_VECTOR, &[value]),
         NormalSet::ZeroSum => {
@@ -707,6 +711,7 @@ fn lower_iid_sample(
     kernel: NodeId,
     iid_node: NodeId,
     rng: NodeId,
+    sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let n = iid_static_size(m, iid_node).ok_or_else(|| {
         refuse(
@@ -724,7 +729,14 @@ fn lower_iid_sample(
              form is not lowered here",
         )
     })?;
-    Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng))
+    Ok(build_iid_sample_term(
+        m,
+        ctor,
+        kernel_input,
+        n,
+        rng,
+        sample_name,
+    ))
 }
 
 /// `iid(K, n)` → `(K, iid_node)`, resolving one level of ref indirection first
@@ -764,13 +776,10 @@ fn build_sample_term(
     ctor: NodeId,
     kernel_input: NodeId,
     rng: NodeId,
+    sample_name: Option<Symbol>,
 ) -> (NodeId, NodeId) {
     let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input]);
-    let zero = m.alloc(Node::Lit(Scalar::Int(0)));
-    let one = m.alloc(Node::Lit(Scalar::Int(1)));
-    let value = build_call(m, "get0", &[sample, zero]);
-    let new_rng = build_call(m, "get0", &[sample, one]);
-    (value, new_rng)
+    sample_slots(m, sample, sample_name)
 }
 
 /// Emit `builtin_sample(rng, ctor, kernel_input, n)` → `(get0(sample, 0)` = the
@@ -784,9 +793,31 @@ fn build_iid_sample_term(
     kernel_input: NodeId,
     n: usize,
     rng: NodeId,
+    sample_name: Option<Symbol>,
 ) -> (NodeId, NodeId) {
     let n_lit = m.alloc(Node::Lit(Scalar::Int(n as i64)));
     let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input, n_lit]);
+    sample_slots(m, sample, sample_name)
+}
+
+/// Bind a shared latent's primitive tuple before projecting either slot or
+/// transforming its value, so every consumer reads the same draw by name.
+fn sample_slots(m: &mut Module, sample: NodeId, name: Option<Symbol>) -> (NodeId, NodeId) {
+    let sample = if let Some(name) = name {
+        m.add_binding(Binding {
+            name,
+            rhs: sample,
+            doc: None,
+            public: false,
+            synthetic: true,
+        });
+        m.alloc(Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }))
+    } else {
+        sample
+    };
     let zero = m.alloc(Node::Lit(Scalar::Int(0)));
     let one = m.alloc(Node::Lit(Scalar::Int(1)));
     let value = build_call(m, "get0", &[sample, zero]);
@@ -1032,8 +1063,8 @@ fn requires_shared_binding_rewrite(m: &Module, field_bids: &[Option<BindingId>])
 /// Sample a record whose fields reference (possibly shared) `draw`-bindings,
 /// preserving shared-ancestor identity. Each latent in the generative cone is
 /// rewritten to a SINGLE `builtin_sample` bound to a fresh synthetic name; its
-/// value (`get0(sample, 0)`) replaces the latent's `draw`-binding RHS and its
-/// advanced rng (`get0(sample, 1)`) threads to the next latent. Consumers keep
+/// value (including any rebase transformation) replaces the latent's
+/// `draw`-binding RHS and its advanced rng threads to the next latent. Consumers keep
 /// referencing the latent as `(%ref self mu)`, so the shared latent is sampled
 /// once and read by name everywhere.
 ///
@@ -1062,39 +1093,11 @@ fn lower_shared_record_sample(
 
     let mut cur = rng;
     for &bid in &cone {
-        // Read the draw's inner measure BEFORE rewriting the binding (the measure
-        // node is a distinct arena node from the `draw` binding RHS, so it survives
-        // the rewrite; a later latent's `(%ref self mu)` resolves by name to the
-        // now-sampled value).
-        let measure = draw_argument(m, m.binding(bid).rhs)
-            .ok_or_else(|| refuse(m.binding(bid).rhs, m, "shared-sample: expected a draw"))?;
-        // Same classification `lower_draw` applies to its own inner measure, so a
-        // shared latent drawing an intractable/deferred measure (or a `pushfwd`)
-        // gets the ACTIONABLE reason rather than the generic "not a constructor"
-        // one below.
-        let (measure_resolved, _) = resolve_ref_one(m, measure);
-        if let Some(err) = classify_drawn_measure(m, measure_resolved) {
-            return Err(err);
-        }
-        let (ctor, kernel_input) = split_constructor(m, measure).ok_or_else(|| {
-            refuse(
-                measure,
-                m,
-                "shared-sample latent: expected a built-in kernel constructor",
-            )
-        })?;
-
-        // sample = builtin_sample(rng_cur, ctor, input), bound to a fresh name so
-        // both slots reference it by name (no CSE re-expansion — see fn doc).
-        let sample = build_call(m, "builtin_sample", &[cur, ctor, kernel_input]);
+        // Use the ordinary draw dispatcher, naming its primitive tuple before
+        // any value transformation. Later latents resolve their parent's binding
+        // to this sampled value; rebase and iid keep their usual batched draw.
         let sample_name = fresh_sample_name(m, bid);
-        m.add_binding(Binding {
-            name: sample_name,
-            rhs: sample,
-            doc: None,
-            public: false,
-            synthetic: true,
-        });
+        let (value, next) = lower_draw(m, m.binding(bid).rhs, cur, Some(sample_name))?;
 
         // Rewrite the latent's draw-BINDING to the sampled value; consumers keep
         // their `(%ref self <latent>)` and resolve to it by name. Recorded as
@@ -1102,11 +1105,10 @@ fn lower_shared_record_sample(
         // (`density::measure_reaches_draw`): the binding is no longer a `draw` and a
         // LATER density query must not read the realization as a model constant and
         // score the conditional at it.
-        let value = get_slot(m, sample_name, 0);
         m.pin_binding_to_query_point(bid, value);
 
         // Thread the advanced rng from the SAME sample binding into the next latent.
-        cur = get_slot(m, sample_name, 1);
+        cur = next;
     }
 
     // Assemble the record. A field that references a (now-rewritten) latent keeps
@@ -1127,19 +1129,6 @@ fn lower_shared_record_sample(
         }
     }
     Ok((build_record(m, &out_fields), cur))
-}
-
-/// `get0((%ref self <name>), slot)` — project slot `slot` of the sample tuple
-/// bound to `name`, referencing the binding BY NAME (so the writer does not
-/// re-expand the underlying `builtin_sample`). `get0` is the zero-based container
-/// accessor; there is no separate `get1` primitive (see [`build_sample_term`]).
-fn get_slot(m: &mut Module, name: Symbol, slot: i64) -> NodeId {
-    let sample_ref = m.alloc(Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }));
-    let idx = m.alloc(Node::Lit(Scalar::Int(slot)));
-    build_call(m, "get0", &[sample_ref, idx])
 }
 
 /// A fresh private synthetic binding name for a latent's sample tuple, following
