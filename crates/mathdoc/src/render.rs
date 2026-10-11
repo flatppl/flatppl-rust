@@ -317,6 +317,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn untyped_rebase_keeps_its_measure_kind() {
+        let module = flatppl_syntax::parse("q = rebase(Normal(0, 1), Lebesgue(reals))").unwrap();
+        let rendered = render(&module);
+        assert_eq!(rendered.bindings[0].kind, lower::Kind::Measure);
+    }
+
+    #[test]
     fn statistical_symbols_keep_parameter_roles_and_extended_support() {
         let r = render_source("s = elementof(reals)\nx ~ StudentT(5)\ny ~ ChiSquared(3)\nu = Uniform(unitinterval)\ng = Gamma(2, 3)\nL = lawof(x)", "m.flatppl", &HashMap::new()).unwrap();
         for (name, markup) in [
