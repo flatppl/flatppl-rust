@@ -76,7 +76,7 @@ fn captures(m: &Module, root: NodeId) -> Vec<(Ref, NodeId)> {
     result
 }
 
-fn placeholder(m: &mut Module, cell: Type) -> (Symbol, Ref, NodeId) {
+pub(super) fn placeholder(m: &mut Module, cell: Type) -> (Symbol, Ref, NodeId) {
     let used: std::collections::HashSet<_> = (0..m.node_count())
         .filter_map(|i| match m.node(NodeId::from_usize(i)) {
             Node::Ref(Ref {

@@ -46,3 +46,7 @@ pub const LOG_INTERVAL_MASS: &str = "%log_interval_mass";
 /// A real coordinate owned by one `LOG_INTEGRAL`, with a unique integer token.
 /// It has no value outside its owning integral and no source-language spelling.
 pub const INTEGRATION_POINT: &str = "%integration_point";
+
+/// Compiler-only ascending vector sort used by exact ordered-law sampling.
+/// A backend must admit this intrinsic; it has no source-language spelling.
+pub const SORT_VECTOR: &str = "%sort_vector";

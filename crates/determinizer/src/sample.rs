@@ -200,6 +200,7 @@ fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
+        Some("rebase") => lower_rebase_sample(m, resolved, rng),
         // §07's own worked `rand` example is `rand(rstate, iid(Normal(0, 1), 10))`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
         // SAME [`lower_iid_sample`] as the `draw(iid(K, n))` spelling, so both emit
@@ -629,6 +630,9 @@ fn lower_draw(
     if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
         return lower_iid_sample(m, kernel, iid_node, rng);
     }
+    if builtin_name(m, inner_resolved) == Some("rebase") {
+        return lower_rebase_sample(m, inner_resolved, rng);
+    }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
             inner_measure,
@@ -637,6 +641,48 @@ fn lower_draw(
         )
     })?;
     Ok(build_sample_term(m, ctor, kernel_input, rng))
+}
+
+/// Centering iid normals gives covariance sigma²(I - 11'/n); sorting them
+/// gives the normalized ordered chamber. Both consume one batched RNG draw.
+fn lower_rebase_sample(
+    m: &mut Module,
+    measure: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    use crate::density::rebase::{NormalSet, elementwise, normal_on_set};
+
+    let normal = normal_on_set(m, measure).ok_or_else(|| {
+        refuse(
+            measure,
+            m,
+            "rebase sampling currently requires fixed-size iid Normal on Lebesgue(ordered(n)) or Lebesgue(zerosum(n))",
+        )
+    })?;
+    let mu = match normal.kind {
+        NormalSet::Ordered => normal.mu,
+        NormalSet::ZeroSum => m.alloc(Node::Lit(Scalar::Real(0.0))),
+    };
+    let sigma = match normal.kind {
+        NormalSet::Ordered => normal.sigma,
+        NormalSet::ZeroSum => m.alloc(Node::Lit(Scalar::Real(1.0))),
+    };
+    let parameters = [(m.intern("mu"), mu), (m.intern("sigma"), sigma)];
+    let input = build_record(m, &parameters);
+    let ctor = m.intern("Normal");
+    let ctor = m.alloc(Node::Const(ctor));
+    let (value, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng);
+    let value = match normal.kind {
+        NormalSet::Ordered => build_call(m, flatppl_core::SORT_VECTOR, &[value]),
+        NormalSet::ZeroSum => {
+            let sum = build_call(m, "sum", &[value]);
+            let n = m.alloc(Node::Lit(Scalar::Real(normal.n as f64)));
+            let mean = build_call(m, "divide", &[sum, n]);
+            let centered = elementwise(m, "sub", &[value, mean]);
+            elementwise(m, "mul", &[centered, normal.sigma])
+        }
+    };
+    Ok((value, rng_out))
 }
 
 /// `iid(K, n)` with a FIXED kernel `K` and a static length `n` → ONE batched

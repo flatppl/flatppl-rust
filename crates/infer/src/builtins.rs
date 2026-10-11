@@ -244,6 +244,7 @@ pub const BUILTINS: &[&str] = &[
     "rand",
     "real",
     "reals",
+    "rebase",
     "record",
     "reduce",
     "relabel",

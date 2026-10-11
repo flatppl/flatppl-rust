@@ -16,8 +16,9 @@
 //! arithmetic context — so `stablehlo.or`/`stablehlo.and` over `i1` compute exactly
 //! what §07 says, and widening would be the mistake.
 //!
-//! **`median`/`quantile` refuse.** Both are order statistics, and this crate has no
-//! sort: it emits no `stablehlo.sort` anywhere, and no top-k. See
+//! **`median`/`quantile` refuse.** Their interpolation rules are not lowered.
+//! The compiler-only vector sort used by ordered-law sampling does not add a
+//! public sort or an order-statistic lowering. See
 //! [`refuse_order_statistic`] for what a lowering would cost and why answering
 //! without one would be worse than refusing.
 
@@ -214,15 +215,13 @@ pub(crate) fn lower_linf_norm(
 /// Both are ORDER statistics: §07 defines `median` on "the order statistics
 /// $x_{(1)} \le \dots \le x_{(n)}$" and `quantile` as "linear interpolation between
 /// the order statistics of `xs`". Every route to an order statistic needs the input
-/// ranked, and this crate has no ranking primitive — it emits no `stablehlo.sort`
-/// anywhere, and no top-k. (The name occurs only in prose like this and inside the
-/// refusal message below; no builder produces the op.)
+/// ranked. The compiler-only sort used by ordered-law sampling does not implement
+/// their NaN handling, interpolation, or runtime rank selection.
 ///
 /// The two ways to add one, and why neither is taken here rather than deliberately:
 ///
-/// - **A `stablehlo.sort` builder.** A new region-carrying op (the shape
-///   [`Emitter::prefix_scan`] has for `reduce_window`) plus a comparator region,
-///   plus a decision about where NaN sorts, plus a `p`-dependent index that is a
+/// - **Extend the internal sort.** This needs a decision about where NaN sorts,
+///   plus a `p`-dependent index that is a
 ///   RUNTIME value in general — so a `dynamic_slice`, not a static one. That is a
 ///   feature, not a wiring.
 /// - **Rank-select without a sort**: $\mathrm{rank}(i) = \#\{j : x_j < x_i\} +
@@ -255,9 +254,8 @@ pub(crate) fn refuse_order_statistic(id: NodeId, which: OrderStatistic) -> EmitE
         id,
         format!(
             "{head} has no lowering here: §07 defines it as {defn}, which needs the operand \
-             RANKED, and this emitter has no sort — `stablehlo.sort` is not in its vocabulary and \
-             neither is a top-k. Adding one is a feature (a region-carrying op, a NaN ordering \
-             rule, and a runtime index for `p`), and the sort-free rank-select alternative \
+             RANKED. The internal ordered-sampling sort does not implement a NaN ordering \
+             rule or a runtime index for `p`, and the sort-free rank-select alternative \
              fabricates an element on a NaN input unless it is guarded, which it is not here, so \
              this refuses rather than answering. The js engine implements both heads"
         ),

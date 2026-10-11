@@ -72,6 +72,20 @@ pub(crate) fn lower_builtin(
 ) -> Result<Value, EmitError> {
     match head {
         flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args),
+        flatppl_core::SORT_VECTOR => {
+            let [arg] = args_exact(id, args)?;
+            let value = e.lower_node(arg)?;
+            if value.elem != ElemKind::Real
+                || !matches!(e.cell_ty(&value), MlirTy::Ranked(dims)
+                    if dims.len() == 1 && dims[0].is_some())
+            {
+                return Err(EmitError::at(
+                    id,
+                    "ordered sampling requires a fixed-size real vector",
+                ));
+            }
+            Ok(e.sort_vector(&value))
+        }
         "add" => binary(e, id, args, Emitter::add),
         "sub" => binary(e, id, args, Emitter::sub),
         "mul" => binary(e, id, args, Emitter::mul),

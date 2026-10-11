@@ -193,7 +193,7 @@ fn check_node(
         let intrinsic = matches!(
             name,
             flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT
-        );
+        ) || (options.vector_sort && name == flatppl_core::SORT_VECTOR);
         if !is_tag && !intrinsic && !flatppl_infer::builtins::is_base_name(name) {
             bad.push(NonConformance {
                 node: id,

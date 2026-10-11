@@ -607,9 +607,9 @@ outputs = (y)
 
 // ---- §07 the order statistics: refused ----------------------------------------
 
-/// `median`/`quantile` refuse, localized to the call. Both are ORDER statistics and
-/// this crate has no sort — it emits no `stablehlo.sort` and no top-k. The refusal
-/// says so and names the reason a sort-free rank-select is not substituted here: it
+/// `median`/`quantile` refuse, localized to the call. The internal sampling sort
+/// does not implement their NaN handling or runtime rank selection. The refusal
+/// names the reason a sort-free rank-select is not substituted here: it
 /// fabricates an element whenever the input contains NaN, and a wrong number with no
 /// diagnostic is worse than refusing. The NaN guard that would make it safe is
 /// unbuilt and out of this wave's scope, not unbuildable — `order.rs` says which ops
@@ -627,7 +627,7 @@ fn the_order_statistics_refuse_with_a_located_message() {
         let msg = emit_err(&src);
         assert!(
             msg.contains(&format!("{head} has no lowering here"))
-                && msg.contains("this emitter has no sort")
+                && msg.contains("internal ordered-sampling sort")
                 && msg.contains("NaN"),
             "`{head}` must refuse and say why, got: {msg}"
         );
