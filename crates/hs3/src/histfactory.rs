@@ -147,7 +147,17 @@ pub fn emit_shapesys_constraint(
         "Auxiliary Poisson constraint on the nuisance parameter.",
     );
     let constraint_ref = b.self_ref(&constraint_name);
-    let derived_obs = b.self_ref(&tau_name);
+    // pyhf observes the default rate factors unless the measurement sets
+    // `auxdata`. A `factors` override moves the rate only.
+    let derived_obs = if ov.factors.is_empty() {
+        b.self_ref(&tau_name)
+    } else {
+        let elems: Vec<NodeId> = shapesys_tau(nominal_vals, sigma_vals)
+            .iter()
+            .map(|&v| b.lit_real(v))
+            .collect();
+        b.array(&elems)
+    };
     let obs = observed_aux(b, ov, derived_obs);
     let term = b.call("likelihoodof", &[constraint_ref, obs]);
     let term_name = b.bind_unique_doc(

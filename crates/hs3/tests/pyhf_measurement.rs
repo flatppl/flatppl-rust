@@ -93,6 +93,10 @@ fn measurement_option_selects_the_likelihood_and_the_record() {
     assert!(first.contains("lumi_constraint = functionof(Normal(mu = lumi, sigma = 0.02))"));
     assert!(second.contains("lumi_constraint = functionof(Normal(mu = lumi, sigma = 0.05))"));
     assert!(second.contains("z_constraint_likelihood = likelihoodof(z_constraint, 0.5)"));
+    // `factors` alone moves the rate, and the centre stays the default
+    // (nominal/sigma)^2, as pyhf's `config.auxdata` and the settings record say.
+    assert!(second.contains("sh_tau = [100.0, 1.0]"));
+    assert!(second.contains("sh_constraint_likelihood = likelihoodof(sh_constraint, [25.0, 1.0])"));
     assert!(second.contains("pyhf_measurement_first = record(name = \"first\", selected = false,"));
     assert!(
         second.contains(
