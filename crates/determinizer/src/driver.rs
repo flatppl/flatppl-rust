@@ -254,7 +254,7 @@ fn graft_application_callees(
 /// probe covered it too (only `logdensityof` was probed).
 ///
 /// **`rand` gets the same early-probe treatment**, for the identical reason: a
-/// `rand(rng, lawof(record(x = x)))` query samples (and thereby legalises) the
+/// `rand(lawof(record(x = x)), rng)` query samples (and thereby legalises) the
 /// `x = draw(...)` binding it closes over, so it must fire before the
 /// source-order scan reaches that `draw` binding on its own and refuses it.
 fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
@@ -540,7 +540,7 @@ fn apply_rule(
     }
 
     // --- rand / builtin_sample: sampling-side slice ---
-    // `rand(rng, lawof(M))` threads an RNG through M's generative subgraph,
+    // `rand(lawof(M), rng)` threads an RNG through M's generative subgraph,
     // replacing each `draw(mᵢ)` with `builtin_sample(rngᵢ, mᵢ, inputᵢ)` (spec §07).
     if is_op(m, target_node, "rand") {
         let new_root = crate::sample::lower_rand(m, bid, target_node, options.preserve_rand_tuple)?;

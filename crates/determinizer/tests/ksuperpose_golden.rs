@@ -465,7 +465,7 @@ fn sampling_a_mixture_refuses_as_unimplemented_not_intractable() {
          w = [0.3, 1.2]\n\
          mix = normalize(ksuperpose(Normal, w)(mu = [-1.0, 2.0], sigma = 1.0))\n\
          x = draw(mix)\n\
-         draws = rand(s, lawof(x))\n",
+         draws = rand(lawof(x), s)\n",
     );
     assert!(
         msg.contains("ksuperpose") && msg.contains("not implemented"),

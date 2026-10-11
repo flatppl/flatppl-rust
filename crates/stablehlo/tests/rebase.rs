@@ -138,9 +138,9 @@ fn rebase_kernelof_conditions_source_and_closed_operands_ignore_inputs() {
 fn closed_zerosum_sampling_centers_one_normal_vector_and_threads_its_rng() {
     let source = "state = rnginit(0)\nsigma = external(posreals)\n\
                   q = rebase(iid(Normal(1e300, sigma), 3), Lebesgue(zerosum(3)))\n\
-                  value, next_state = rand(state, q)\ninputs = sigma\noutputs = (value, next_state)";
+                  value, next_state = rand(q, state)\ninputs = sigma\noutputs = (value, next_state)";
     let expected = "state = rnginit(0)\nsigma = external(posreals)\n\
-                    z, next_state = rand(state, iid(Normal(0.0, 1.0), 3))\n\
+                    z, next_state = rand(iid(Normal(0.0, 1.0), 3), state)\n\
                     inputs = sigma\noutputs = ((z .- sum(z)/3.0) .* sigma, next_state)";
     let output = emit_mode(source, flatppl_stablehlo::Mode::Sample);
     assert_eq!(output, emit_mode(expected, flatppl_stablehlo::Mode::Sample));
@@ -148,7 +148,7 @@ fn closed_zerosum_sampling_centers_one_normal_vector_and_threads_its_rng() {
     assert_eq!(
         output,
         emit_mode(
-            &source.replace("rand(state, q)", "rand(state, lawof(draw(q)))"),
+            &source.replace("rand(q, state)", "rand(lawof(draw(q)), state)"),
             flatppl_stablehlo::Mode::Sample
         )
     );
@@ -158,7 +158,7 @@ fn closed_zerosum_sampling_centers_one_normal_vector_and_threads_its_rng() {
 fn closed_ordered_sampling_uses_one_sort_and_one_rng_draw() {
     let source = "state = rnginit(0)\n\
                   q = rebase(iid(Normal(0, 2), 3), Lebesgue(ordered(3)))\n\
-                  value, next_state = rand(state, q)\noutputs = (value, next_state)";
+                  value, next_state = rand(q, state)\noutputs = (value, next_state)";
     let output = emit_mode(source, flatppl_stablehlo::Mode::Sample);
     assert_eq!(output.matches("stablehlo.rng_bit_generator").count(), 1);
     assert_eq!(output.matches("\"stablehlo.sort\"").count(), 1);
@@ -166,7 +166,7 @@ fn closed_ordered_sampling_uses_one_sort_and_one_rng_draw() {
     assert_eq!(
         output,
         emit_mode(
-            &source.replace("rand(state, q)", "rand(state, lawof(draw(q)))"),
+            &source.replace("rand(q, state)", "rand(lawof(draw(q)), state)"),
             flatppl_stablehlo::Mode::Sample
         )
     );

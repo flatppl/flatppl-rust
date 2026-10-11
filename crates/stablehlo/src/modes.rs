@@ -43,13 +43,13 @@
 //!
 //! **`@sample`.** [`emit_sample_abi`] mirrors [`emit_logdensity_abi`] but
 //! threads the rng key: the `%key : tensor<2xui64>` argument (spec §07
-//! `rand(rstate, m) -> (value, new_rstate)`) is bound from the rng source
+//! `rand(m, rstate) -> (value, new_rstate)`) is bound from the rng source
 //! reachable from the declared outputs ([`find_rng_source`]). §13 calls that
 //! state "a promoted fixed input", so when `inputs` lists the source binding,
 //! `%key` IS that declared argument at its declared position; a module that
 //! does not list it gets `%key` prepended as arg 0 and the binding stays exempt
 //! from the inputs-exhaustiveness check. Each declared sample output's value
-//! component (a value-terminal `rand(rng, lawof(x))` lowers to
+//! component (a value-terminal `rand(lawof(x), rng)` lowers to
 //! `get0(builtin_sample(rng, ctor, kernel_input), 0)`) is projected by
 //! [`Emitter::lower_node`]'s dispatch, which recognizes a `get0`/`get`
 //! projection of a `builtin_sample` call structurally and reads the registry's
@@ -323,7 +323,7 @@ fn check_arity(abi: &Abi, emitted: usize) -> Result<(), EmitError> {
 /// name the final RNG state, it is appended as the trailing result so a caller
 /// can always thread the next call.
 ///
-/// **`%key`.** The threaded RNG state (spec §07's `rand(rstate, m) -> (value,
+/// **`%key`.** The threaded RNG state (spec §07's `rand(m, rstate) -> (value,
 /// new_rstate)`) is the argument the rng source reachable from the outputs is
 /// bound to ([`find_rng_source`]). §13 calls it "a promoted fixed input", so
 /// when `inputs` lists that binding, `%key` IS that declared argument, at its

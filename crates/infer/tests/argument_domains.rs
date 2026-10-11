@@ -302,6 +302,24 @@ fn measure_and_deferred_operands_still_type() {
 
 // ---- §07 `rnginit`: a byte vector or a single integer -----------------------
 
+#[test]
+fn rand_takes_a_measure_then_an_rng_state() {
+    for args in [
+        "Normal(0, 1), s",
+        "m = Normal(0, 1), rstate = s",
+        "rstate = s, m = Normal(0, 1)",
+        "record(rstate = s, m = Normal(0, 1))",
+    ] {
+        assert_clean(&format!("s = rnginit(0)\nx = rand({args})"));
+    }
+    for (args, message) in [
+        ("s, Normal(0, 1)", "argument 1 must be a closed measure"),
+        ("Normal(0, 1), 0", "argument 2 must be an RNG state"),
+    ] {
+        assert_refuses(&format!("s = rnginit(0)\nx = rand({args})"), message);
+    }
+}
+
 /// §07 `rnginit`: "`rngseed` must be a seed vector of bytes (integers in
 /// $\{0, \ldots, 255\}$)", and "A single integer
 /// $n \in \{0, \ldots, 2^{64} - 1\}$ is also accepted, and denotes the byte

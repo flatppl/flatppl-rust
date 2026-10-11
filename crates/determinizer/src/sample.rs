@@ -1,4 +1,4 @@
-//! Sample-side determinisation (spec §07 measure-eval-prims). `rand(rng, lawof(x))`
+//! Sample-side determinisation (spec §07 measure-eval-prims). `rand(lawof(x), rng)`
 //! re-runs `x`'s generative subgraph with each `draw(mᵢ)` replaced by
 //! `builtin_sample(rngᵢ, mᵢ, inputᵢ)`,
 //! threading one RNG state sequentially in dependency order.
@@ -19,7 +19,7 @@
 //! `density::lower_measure_density`'s dispatch.
 //!
 //! **Two dispatchers, two admissible sets.** [`lower_closed_measure_sample`]
-//! handles MEASURE position — `rand`'s second argument, which §07 types as "a
+//! handles MEASURE position — `rand`'s first argument, which §07 types as "a
 //! closed measure `m`", so a bare `Normal(…)` or a `pushfwd(f, M)` is admissible
 //! there, not just a `lawof`. [`lower_measure_sample`] handles FIELD position,
 //! where §04 says a record field is a declared variate or a deterministic
@@ -37,7 +37,7 @@ use flatppl_core::{
     Symbol, Type,
 };
 
-/// `rand(rng, m)` → a deterministic sample of the closed measure `m`.
+/// `rand(m, rng)` → a deterministic sample of the closed measure `m`.
 ///
 /// The measure is handed straight to [`lower_closed_measure_sample`], which
 /// dispatches on its head — `lawof(x)` (re-run `x`'s generative subgraph),
@@ -59,13 +59,14 @@ pub(crate) fn lower_rand(
     rand_node: NodeId,
     preserve_tuple: bool,
 ) -> Result<NodeId, RefuseError> {
-    let (rng, measure) = {
+    let (measure, rng) = {
         let c = expect_builtin_call(m, rand_node, "rand")
-            .ok_or_else(|| refuse(rand_node, m, "expected rand"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(rand_node, m, "rand expects 2 args (rng, measure)"));
-        }
-        (c.args[0], c.args[1])
+            .ok_or_else(|| refuse(rand_node, m, "expected rand"))?
+            .clone();
+        let names = [m.intern("m"), m.intern("rstate")];
+        let args = crate::kernel::bind_call_args(m, &names, &c.args, &c.named, false)
+            .ok_or_else(|| refuse(rand_node, m, "rand expects 2 args (measure, rng)"))?;
+        (args[0], args[1])
     };
     let (value, rng_out) = lower_closed_measure_sample(m, measure, rng)?;
     if preserve_tuple || rand_result_is_destructured(m, bid) {
@@ -82,7 +83,7 @@ pub(crate) fn lower_rand(
 /// Is `rand_bid`'s value DESTRUCTURED — read via an INTEGER-literal tuple
 /// projection (`get(_, k)` / `get0(_, k)`) rather than used as a bare value?
 ///
-/// `rand(rng, lawof(x))` infers to `Tuple([domain(x), RngState])` (spec §07;
+/// `rand(lawof(x), rng)` infers to `Tuple([domain(x), RngState])` (spec §07;
 /// `crates/infer/src/ops.rs`'s `"rand"` phase arm). [`lower_rand`] uses this
 /// predicate to DISPATCH the result shape: true builds the full 2-tuple
 /// `tuple(value, advanced_rng)`; false returns the bare sampled value, dropping
@@ -155,10 +156,10 @@ fn strip_lawof(m: &Module, node: NodeId) -> Option<NodeId> {
     (c.args.len() == 1).then(|| c.args[0])
 }
 
-/// Sample a MEASURE-POSITION measure — `rand`'s second argument, or the base of
+/// Sample a MEASURE-POSITION measure — `rand`'s first argument, or the base of
 /// a `pushfwd` — threading `rng`; returns `(value_node, advanced_rng_node)`.
 ///
-/// §07 `rand(rstate, m)` types this argument as "a closed measure `m`", and §06
+/// §07 `rand(m, rstate)` types this argument as "a closed measure `m`", and §06
 /// ("Fundamental measures and measure algebra") makes a primitive constructor
 /// call a nullary kernel, i.e. closed; measure-to-measure operations preserve
 /// arity, so `pushfwd(f, <closed>)` is closed too. §07's only stated exclusions
@@ -201,7 +202,7 @@ fn lower_closed_measure_sample(
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
         Some("rebase") => lower_rebase_sample(m, resolved, rng),
-        // §07's own worked `rand` example is `rand(rstate, iid(Normal(0, 1), 10))`:
+        // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
         // SAME [`lower_iid_sample`] as the `draw(iid(K, n))` spelling, so both emit
         // the identical batched term.
@@ -221,7 +222,7 @@ fn lower_closed_measure_sample(
                 return Err(err);
             }
             // The leaf: a primitive constructor call IS a closed measure (§06), so
-            // `rand(s, Normal(mu = 0.0, sigma = 1.0))` samples it directly with no
+            // `rand(Normal(mu = 0.0, sigma = 1.0), s)` samples it directly with no
             // `lawof` wrapper. This is also what terminates [`lower_pushfwd_sample`]'s
             // recursion on its base.
             if let Some((ctor, kernel_input)) = split_constructor(m, resolved) {
@@ -626,7 +627,7 @@ fn lower_draw(
         return Err(err);
     }
     // Fan-out: `draw(iid(K, n))` → ONE batched `builtin_sample`, via the same
-    // [`lower_iid_sample`] the measure-position `rand(s, iid(K, n))` spelling uses.
+    // [`lower_iid_sample`] the measure-position `rand(iid(K, n), s)` spelling uses.
     if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
         return lower_iid_sample(m, kernel, iid_node, rng);
     }
@@ -692,8 +693,8 @@ fn lower_rebase_sample(
 ///
 /// Shared by BOTH spellings of the same measure, so they emit the identical term:
 /// [`lower_draw`]'s `draw(iid(K, n))` and [`lower_closed_measure_sample`]'s
-/// measure-position `rand(s, iid(K, n))` — §07's own worked `rand` example
-/// (`random_data, rstate2 = rand(rstate, iid(Normal(0, 1), 10))`), admissible
+/// measure-position `rand(iid(K, n), s)` — §07's own worked `rand` example
+/// (`random_data, rstate2 = rand(iid(Normal(0, 1), 10), rstate)`), admissible
 /// because a fixed-kernel `iid` is itself a nullary kernel, i.e. a closed measure.
 ///
 /// [`split_constructor`] is what rejects a kernel that is not a bare built-in

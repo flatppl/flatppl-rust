@@ -167,7 +167,7 @@ fn a_sampled_latent_is_not_a_fixed_parameter() {
 s = rngstate(7)
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
-zs, s2 = rand(s, lawof(record(z = z)))
+zs, s2 = rand(lawof(record(z = z)), s)
 lp_y = logdensityof(lawof(y), 0.5)";
     let text = pir(src);
     let lp_y = pir_binding(&text, "lp_y");

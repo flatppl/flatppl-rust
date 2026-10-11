@@ -1503,9 +1503,9 @@ fn reexported_measure_preserves_sample_and_rng_state() {
     );
     assert_outputs(
         "h = load_module(\"helper.flatppl\")\nm = h.alias\n\
-         s = rnginit(0)\nv, next = rand(s, m)\noutputs = (v, next)",
+         s = rnginit(0)\nv, next = rand(m, s)\noutputs = (v, next)",
         &bundle,
-        "s = rnginit(0)\nv, next = rand(s, Normal(0.0, 2.0))\noutputs = (v, next)",
+        "s = rnginit(0)\nv, next = rand(Normal(0.0, 2.0), s)\noutputs = (v, next)",
     );
 }
 

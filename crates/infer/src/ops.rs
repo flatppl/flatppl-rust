@@ -724,7 +724,7 @@ pub(crate) fn call_rule(
         "rnginit" => Type::RngState,
         "rand" => match rand_mass_gate(inf, args) {
             Some(failed) => failed,
-            None => match measure_domain(arg_ty(args, 1)) {
+            None => match measure_domain(arg_ty(args, 0)) {
                 Type::Deferred => Type::Deferred,
                 domain => Type::Tuple(Box::new([domain, Type::RngState])),
             },
@@ -2918,9 +2918,7 @@ fn lawof_type(arg: Option<&Type>) -> Type {
 /// The mass class of the slice's first argument, when that argument is a MEASURE
 /// whose normalization cannot be established, as the `%name` to quote in a
 /// diagnostic — `None` when the argument is not a measure, or is one whose mass
-/// the caller must accept. Callers whose measure argument sits at a fixed offset
-/// (`rand_mass_gate`, arg 1) pass the sub-slice starting there, so "first" means
-/// "first of what was handed in", not "first of the call's own arguments".
+/// the caller must accept. All callers take the measure as their first argument.
 ///
 /// Shared by [`lawof_mass_gate`], [`draw_mass_gate`], and [`rand_mass_gate`] so
 /// the three cannot drift: all three implement "reject unless proven
@@ -3021,15 +3019,13 @@ fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
     Some(Type::Failed("draw from an unnormalized measure".into()))
 }
 
-/// `rand(rstate, m)`'s total-mass gate: the same rule as [`draw_mass_gate`]
+/// `rand(m, rstate)`'s total-mass gate: the same rule as [`draw_mass_gate`]
 /// (§07's `rand` draws from a normalized measure exactly as `draw` does — #73's
 /// equation is agnostic to which spelling produced the draw), reused via
-/// [`unprovable_normalization`] and adapted only for `rand`'s argument order:
-/// the measure is arg 1, not arg 0 (arg 0 is the rngstate).
+/// [`unprovable_normalization`]. Both take their measure as argument 0.
 fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    let measure_arg = args.get(1..)?;
-    let offending = unprovable_normalization(measure_arg)?;
-    let (arg_node, _, _) = measure_arg.first()?;
+    let offending = unprovable_normalization(args)?;
+    let (arg_node, _, _) = args.first()?;
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
         format!(
@@ -7481,8 +7477,47 @@ fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> O
     refuse_nonboolean_domain(inf, name, args)
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
+        .or_else(|| refuse_bad_rand_operands(inf, name, args))
         .or_else(|| refuse_bad_rng_seed(inf, name, args))
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
+}
+
+/// `rand(m, rstate)` accepts one closed measure and one explicit RNG state.
+fn refuse_bad_rand_operands(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    if name != "rand" {
+        return None;
+    }
+    for (index, (node, ty, _)) in args.iter().enumerate() {
+        let valid = match ty {
+            Type::Deferred | Type::Failed(_) | Type::Any | Type::Var(_) => true,
+            Type::Measure { .. } => index == 0,
+            Type::Kernel { inputs, .. } => index == 0 && inputs.is_empty(),
+            Type::RngState => index == 1,
+            _ => false,
+        };
+        if !valid {
+            let required = if index == 0 {
+                "a closed measure"
+            } else {
+                "an RNG state"
+            };
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`rand(m, rstate)` argument {} must be {required} (spec §07)",
+                    index + 1
+                ),
+            ));
+            return Some(Type::Failed(
+                format!("rand: argument {} must be {required}", index + 1).into(),
+            ));
+        }
+    }
+    None
 }
 
 /// 2^64 — the exclusive upper bound on `rnginit`'s integer seed. An `i64`

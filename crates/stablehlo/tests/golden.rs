@@ -4626,7 +4626,7 @@ fn emit_logdensity_generalized_normal_matches_frozen_golden() {
 // (`modes.rs`), wired up as `emit`'s `Mode::Sample` route.
 
 /// The Task-6 anchor fixture: a fixed-hyperparameter scalar Normal forward
-/// model, sampled via the value-terminal `rand(rng, lawof(x))` convention
+/// model, sampled via the value-terminal `rand(lawof(x), rng)` convention
 /// (`flatppl_determinizer::sample`). Verified (via a throwaway determinize +
 /// `flatppl_flatpir::write` dump) to determinize to `draws`'s RHS being
 /// exactly `get0(builtin_sample(s, Normal, record(mu=0.0, sigma=1.0)), 0)` —
@@ -4639,7 +4639,7 @@ fn emit_logdensity_generalized_normal_matches_frozen_golden() {
 const NORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -4773,7 +4773,7 @@ const HIERARCHICAL_SAMPLE_SRC: &str = "\
 mu = draw(Normal(mu = 0.0, sigma = 1.0))
 y  = draw(Normal(mu = mu, sigma = 1.0))
 s  = rnginit(0)
-draws = rand(s, lawof(record(mu = mu, y = y)))
+draws = rand(lawof(record(mu = mu, y = y)), s)
 outputs = (draws)
 ";
 
@@ -5648,7 +5648,7 @@ fn emit_logdensity_dirac_matches_frozen_golden() {
     );
 }
 
-/// §06 Dirac `@sample`: `rand(rng, Dirac(value = v))` returns the atom `v`
+/// §06 Dirac `@sample`: `rand(Dirac(value = v), rng)` returns the atom `v`
 /// deterministically, consuming NO randomness. Fixed-hyperparameter forward
 /// model (`value = 3.0`), so — like `NORMAL_SAMPLE_SRC` — `emit_sample`
 /// produces a `func.func @sample(%key)` with no free params. The single draw
@@ -5656,7 +5656,7 @@ fn emit_logdensity_dirac_matches_frozen_golden() {
 const DIRAC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Dirac(value = 3.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6499,7 +6499,7 @@ outputs = (lp)
 // rejection sampling — see each batch's own doc comment); MvNormal gets
 // `mu + cholesky(cov) @ z`. Same anchor-fixture shape as `NORMAL_SAMPLE_SRC`
 // above: FIXED (literal, not `elementof`) hyperparameters via `s =
-// rnginit(0)`/`draw(...)`/`rand(s, lawof(x))`, so every `func.func @sample`
+// rnginit(0)`/`draw(...)`/`rand(lawof(x), s)`, so every `func.func @sample`
 // below is zero-arg — except MvNormal, whose `mu`/`cov` stay free
 // (`elementof`-declared) parameters, exactly like `MVNORMAL_DENSITY_SRC`
 // (Task 12), sidestepping any question about a literal nested-array (matrix)
@@ -6515,7 +6515,7 @@ outputs = (lp)
 const LOGNORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(LogNormal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6556,7 +6556,7 @@ fn emit_sample_lognormal_matches_frozen_golden() {
 const EXPONENTIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Exponential(rate = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6591,7 +6591,7 @@ fn emit_sample_exponential_matches_frozen_golden() {
 const UNIFORM_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Uniform(support = interval(-1.0, 3.0)))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6631,7 +6631,7 @@ fn emit_sample_uniform_matches_frozen_golden() {
 const CAUCHY_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Cauchy(location = 0.0, scale = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6676,7 +6676,7 @@ fn emit_sample_cauchy_matches_frozen_golden() {
 const LOGISTIC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Logistic(mu = 0.0, s = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6710,7 +6710,7 @@ fn emit_sample_logistic_matches_frozen_golden() {
 const LAPLACE_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Laplace(location = 0.0, scale = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6755,7 +6755,7 @@ fn emit_sample_laplace_matches_frozen_golden() {
 const WEIBULL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Weibull(shape = 2.0, scale = 3.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6789,7 +6789,7 @@ fn emit_sample_weibull_matches_frozen_golden() {
 const PARETO_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Pareto(shape = 3.0, scale = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6830,7 +6830,7 @@ mu = elementof(cartpow(reals, 2))
 cov = elementof(cartpow(reals, [2, 2]))
 s = rnginit(0)
 x = draw(MvNormal(mu = mu, cov = cov))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (mu, cov)
 outputs = (draws)
 ";
@@ -6880,7 +6880,7 @@ fn emit_sample_mvnormal_matches_frozen_golden() {
 // Gamma rejection loop (`stablehlo.while`, via `Emitter::while_loop`) that
 // every one of them reduces to (§08 equivalences — see `registry.rs`'s Task-15
 // batch doc comment). Same anchor-fixture shape as `NORMAL_SAMPLE_SRC` (FIXED
-// literal hyperparameters via `s = rnginit(0)`/`draw(...)`/`rand(s, lawof(x))`,
+// literal hyperparameters via `s = rnginit(0)`/`draw(...)`/`rand(lawof(x), s)`,
 // so each `func.func @sample` is zero-arg) — except Dirichlet, whose `alpha`
 // stays a free (`elementof`-declared) length-3 vector parameter, exactly like
 // `DIRICHLET_DENSITY_SRC`, so it becomes a `tensor<3xf32>` func arg.
@@ -6897,7 +6897,7 @@ fn emit_sample_mvnormal_matches_frozen_golden() {
 const GAMMA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Gamma(shape = 2.0, rate = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6950,7 +6950,7 @@ fn emit_sample_gamma_matches_frozen_golden() {
 const BETA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Beta(alpha = 2.0, beta = 3.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -6987,7 +6987,7 @@ fn emit_sample_beta_matches_frozen_golden() {
 const CHI_SQUARED_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(ChiSquared(k = 3.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7018,7 +7018,7 @@ fn emit_sample_chi_squared_matches_frozen_golden() {
 const STUDENTT_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(StudentT(nu = 5.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7051,7 +7051,7 @@ fn emit_sample_studentt_matches_frozen_golden() {
 const INVERSE_GAMMA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(InverseGamma(shape = 3.0, scale = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7084,7 +7084,7 @@ fn emit_sample_inverse_gamma_matches_frozen_golden() {
 const GENERALIZED_NORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7124,7 +7124,7 @@ const DIRICHLET_SAMPLE_SRC: &str = "\
 alpha = elementof(cartpow(posreals, 3))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (alpha)
 outputs = (draws)
 ";
@@ -7184,7 +7184,7 @@ m = elementof(posintegers)
 alpha = elementof(cartpow(posreals, m))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (m, alpha)
 outputs = (draws)
 ";
@@ -7213,7 +7213,7 @@ fn dirichlet_sample_refuses_nonrank1_alpha() {
 alpha = elementof(cartpow(posreals, [2, 2]))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (alpha)
 outputs = (draws)
 ";
@@ -7254,7 +7254,7 @@ outputs = (draws)
 const BERNOULLI_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Bernoulli(p = 0.3))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7289,7 +7289,7 @@ fn emit_sample_bernoulli_matches_frozen_golden() {
 const GEOMETRIC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Geometric(p = 0.3))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7324,7 +7324,7 @@ fn emit_sample_geometric_matches_frozen_golden() {
 const CATEGORICAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Categorical(p = [0.2, 0.3, 0.5]))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7360,7 +7360,7 @@ fn emit_sample_categorical_matches_frozen_golden() {
 const CATEGORICAL0_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Categorical0(p = [0.2, 0.3, 0.5]))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7396,7 +7396,7 @@ const BINOMIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 n = 5
 x = draw(Binomial(n = n, p = 0.3))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7446,7 +7446,7 @@ fn binomial_sample_refuses_parameterized_n() {
 n = elementof(posintegers)
 s = rnginit(0)
 x = draw(Binomial(n = n, p = 0.3))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (n)
 outputs = (draws)
 ";
@@ -7464,7 +7464,7 @@ outputs = (draws)
 const POISSON_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Poisson(rate = 4.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7500,7 +7500,7 @@ fn emit_sample_poisson_matches_frozen_golden() {
 const NEGATIVE_BINOMIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(NegativeBinomial(alpha = 5.0, beta = 2.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7546,7 +7546,7 @@ fn emit_sample_negative_binomial_matches_frozen_golden() {
 const NEGATIVE_BINOMIAL2_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(NegativeBinomial2(mu = 3.0, psi = 5.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7585,7 +7585,7 @@ const MULTINOMIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 n = 4
 x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 outputs = (draws)
 ";
 
@@ -7593,7 +7593,7 @@ outputs = (draws)
 fn sampler_loop_regions_do_not_share_local_constants() {
     let d = determinize_src(
         "s = rnginit(0)\nx = draw(Multinomial(n = 1, p = [1.0]))\n\
-         draws = rand(s, lawof(x))\nzero = 0\nflag = false\n\
+         draws = rand(lawof(x), s)\nzero = 0\nflag = false\n\
          outputs = (zero, flag, draws)\n",
     );
     for dtype in [Dtype::F32, Dtype::F64] {
@@ -7665,7 +7665,7 @@ fn multinomial_sample_refuses_parameterized_n() {
 n = elementof(posintegers)
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (n)
 outputs = (draws)
 ";
@@ -7694,7 +7694,7 @@ m = elementof(posintegers)
 p = elementof(cartpow(unitinterval, m))
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = p))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (m, p)
 outputs = (draws)
 ";
@@ -7723,7 +7723,7 @@ n = 4
 p = elementof(cartpow(unitinterval, [3, 1]))
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = p))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = (p)
 outputs = (draws)
 ";
@@ -7857,8 +7857,8 @@ const CHAINED_RAND_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = 1.0, sigma = 1.0))
-d1, s2 = rand(s, lawof(x))
-d2, s3 = rand(s2, lawof(y))
+d1, s2 = rand(lawof(x), s)
+d2, s3 = rand(lawof(y), s2)
 out = d2
 outputs = (out)
 ";
@@ -8013,12 +8013,12 @@ fn builtin_sample_refuses_binned_poisson_process_unregistered() {
 // (jax 0.10.2). Rejection/multivariate fan-out (Tier 2) refuses here.
 
 /// A fanned scalar-Normal iid draw: `iid(Normal(mu=0, sigma=1), 4)`, sampled
-/// value-terminal (`draws = rand(s, lawof(xs))`). Fixed hyperparameters, so no
+/// value-terminal (`draws = rand(lawof(xs), s)`). Fixed hyperparameters, so no
 /// free-param args beyond `%key`.
 const NORMAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8026,7 +8026,7 @@ outputs = (draws)
 const EXPONENTIAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Exponential(rate = 2.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8120,7 +8120,7 @@ fn emit_sample_exponential_iid_matches_frozen_golden() {
 const GAMMA_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Gamma(shape = 2.0, rate = 1.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8129,7 +8129,7 @@ outputs = (draws)
 const BETA_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Beta(alpha = 2.0, beta = 3.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8213,19 +8213,19 @@ fn emit_sample_iid_gamma_reducers_fan_out() {
     let cases = [
         (
             "ChiSquared",
-            "s = rnginit(0)\nxs ~ iid(ChiSquared(k = 3.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
+            "s = rnginit(0)\nxs ~ iid(ChiSquared(k = 3.0), 4)\ndraws = rand(lawof(xs), s)\noutputs = (draws)\n",
         ),
         (
             "StudentT",
-            "s = rnginit(0)\nxs ~ iid(StudentT(nu = 5.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
+            "s = rnginit(0)\nxs ~ iid(StudentT(nu = 5.0), 4)\ndraws = rand(lawof(xs), s)\noutputs = (draws)\n",
         ),
         (
             "InverseGamma",
-            "s = rnginit(0)\nxs ~ iid(InverseGamma(shape = 3.0, scale = 1.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
+            "s = rnginit(0)\nxs ~ iid(InverseGamma(shape = 3.0, scale = 1.0), 4)\ndraws = rand(lawof(xs), s)\noutputs = (draws)\n",
         ),
         (
             "GeneralizedNormal",
-            "s = rnginit(0)\nxs ~ iid(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
+            "s = rnginit(0)\nxs ~ iid(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0), 4)\ndraws = rand(lawof(xs), s)\noutputs = (draws)\n",
         ),
     ];
     for (name, src) in cases {
@@ -8264,7 +8264,7 @@ mu = elementof(cartpow(reals, 2))
 cov = elementof(cartpow(reals, [2, 2]))
 s = rnginit(0)
 xs ~ iid(MvNormal(mu = mu, cov = cov), 3)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 inputs = (mu, cov)
 outputs = (draws)
 ";
@@ -8342,7 +8342,7 @@ fn emit_sample_mvnormal_iid_matches_frozen_golden() {
 const DIRICHLET_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Dirichlet(alpha = [2.0, 3.0, 4.0]), 5)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8421,7 +8421,7 @@ fn emit_sample_dirichlet_iid_matches_frozen_golden() {
 const POISSON_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Poisson(rate = 3.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8431,7 +8431,7 @@ outputs = (draws)
 const NEGATIVE_BINOMIAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(NegativeBinomial(alpha = 5.0, beta = 2.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8441,7 +8441,7 @@ outputs = (draws)
 const NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(NegativeBinomial2(mu = 3.0, psi = 5.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8568,7 +8568,7 @@ fn emit_sample_negative_binomial2_iid_matches_frozen_golden() {
 const LAPLACE_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Laplace(location = 0.0, scale = 1.0), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8577,7 +8577,7 @@ outputs = (draws)
 const BERNOULLI_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Bernoulli(p = 0.3), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8586,7 +8586,7 @@ outputs = (draws)
 const GEOMETRIC_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Geometric(p = 0.3), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8733,7 +8733,7 @@ const BINOMIAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 n = 5
 xs ~ iid(Binomial(n = n, p = 0.3), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8742,7 +8742,7 @@ outputs = (draws)
 const CATEGORICAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical(p = [0.2, 0.3, 0.5]), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8751,7 +8751,7 @@ outputs = (draws)
 const CATEGORICAL0_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical0(p = [0.2, 0.3, 0.5]), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -8764,7 +8764,7 @@ outputs = (draws)
 const CATEGORICAL_SINGLE_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical(p = [1.0]), 4)
-draws = rand(s, lawof(xs))
+draws = rand(lawof(xs), s)
 outputs = (draws)
 ";
 
@@ -9085,8 +9085,8 @@ outputs = q1
 
 #[test]
 fn inline_and_named_rng_sources_emit_the_same_program() {
-    let inline = "x ~ Normal(0.0, 1.0)\noutputs = rand(external(rngstates), lawof(x))\n";
-    let named = "x ~ Normal(0.0, 1.0)\ns = external(rngstates)\noutputs = rand(s, lawof(x))\n";
+    let inline = "x ~ Normal(0.0, 1.0)\noutputs = rand(lawof(x), external(rngstates))\n";
+    let named = "x ~ Normal(0.0, 1.0)\ns = external(rngstates)\noutputs = rand(lawof(x), s)\n";
     let programs = [inline, named].map(|source| {
         let module = determinize_abi_roots(source, &["outputs"]);
         flatppl_stablehlo::emit(
@@ -9281,7 +9281,7 @@ fn emit_sample_abi_binds_a_declared_rng_state_once() {
     let src = "\
 s = elementof(rngstates)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-v1, s2 = rand(s, lawof(x))
+v1, s2 = rand(lawof(x), s)
 inputs = s
 outputs = (v1)
 ";
@@ -9315,7 +9315,7 @@ fn emit_sample_abi_promotes_an_rnginit_input() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = s
 outputs = (draws)
 ";
@@ -9346,8 +9346,8 @@ fn emit_sample_abi_emits_one_result_per_declared_output() {
 s = external(rngstates)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = 0.0, sigma = 1.0))
-v1, s2 = rand(s, lawof(x))
-v2, s3 = rand(s2, lawof(y))
+v1, s2 = rand(lawof(x), s)
+v2, s3 = rand(lawof(y), s2)
 inputs = s
 outputs = (v1, v2)
 ";
@@ -9373,8 +9373,8 @@ fn emit_sample_abi_exports_a_declared_rng_state_without_duplicating_it() {
 s = elementof(rngstates)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = 0.0, sigma = 1.0))
-v1, s2 = rand(s, lawof(x))
-v2, s3 = rand(s2, lawof(y))
+v1, s2 = rand(lawof(x), s)
+v2, s3 = rand(lawof(y), s2)
 inputs = s
 outputs = (v1, v2, s3)
 ";
@@ -9427,8 +9427,8 @@ fn emit_sample_abi_never_emits_a_tuple_typed_result() {
 s = external(rngstates)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = 0.0, sigma = 1.0))
-v1, s2 = rand(s, lawof(x))
-v2, s3 = rand(s2, lawof(y))
+v1, s2 = rand(lawof(x), s)
+v2, s3 = rand(lawof(y), s2)
 inputs = s
 outputs = (v1, v2, s3)
 ";
@@ -9446,7 +9446,7 @@ fn emit_sample_abi_refuses_empty_outputs() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(x))
+draws = rand(lawof(x), s)
 inputs = s
 ";
     let d = determinize_abi_roots(src, &["inputs"]);
@@ -11640,7 +11640,7 @@ fn emit_sample_abi_emits_threaded_key_two_result() {
     let src = "flatppl_compat = \"0.1\"\n\
 s = rnginit(0)\n\
 x = draw(Beta(alpha = 2.0, beta = 3.0))\n\
-draws = rand(s, lawof(x))\n\
+draws = rand(lawof(x), s)\n\
 outputs = (draws)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();

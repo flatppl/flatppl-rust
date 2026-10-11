@@ -16,7 +16,7 @@ fn destructured_rand_lowers_to_tuple() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-v, s2 = rand(s, lawof(record(x = x)))
+v, s2 = rand(lawof(record(x = x)), s)
 out = v";
     let m = parse_infer(src);
     let out = determinize(&m).expect("destructured rand must lower to a tuple");
@@ -35,14 +35,14 @@ out = v";
     );
 }
 
-// rand(rng, lawof(record(x = draw(Normal)))) samples the one draw via
+// rand(lawof(record(x = draw(Normal))), rng) samples the one draw via
 // builtin_sample, threads the rng, and eliminates the measure/stochastic layer.
 #[test]
 fn single_draw_samples_via_builtin_sample() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("single-draw rand must lower to builtin_sample");
     let pir = flatppl_flatpir::write(&out);
@@ -94,11 +94,11 @@ fn sample_draw_positional_constructor_lowers_same_as_keyword() {
     let positional = "\
 s = rnginit(0)
 x = draw(Normal(0.0, 1.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let keyword = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let out_pos = determinize(&parse_infer(positional)).expect("positional sample leaf must lower");
     let out_kw = determinize(&parse_infer(keyword)).expect("keyword sample leaf must lower");
     let pir_pos = flatppl_flatpir::write(&out_pos);
@@ -124,11 +124,11 @@ fn sample_draw_positional_beta_lowers_same_as_keyword() {
     let positional = "\
 s = rnginit(0)
 x = draw(Beta(2.0, 5.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let keyword = "\
 s = rnginit(0)
 x = draw(Beta(alpha = 2.0, beta = 5.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let out_pos =
         determinize(&parse_infer(positional)).expect("positional Beta sample leaf must lower");
     let out_kw = determinize(&parse_infer(keyword)).expect("keyword Beta sample leaf must lower");
@@ -165,7 +165,7 @@ fn two_independent_draws_thread_the_rng() {
 s = rnginit(0)
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 b = draw(Normal(mu = 5.0, sigma = 1.0))
-draws = rand(s, lawof(record(a = a, b = b)))";
+draws = rand(lawof(record(a = a, b = b)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("two draws must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -231,7 +231,7 @@ s = rnginit(0)
 mu = draw(Normal(mu = 0.0, sigma = 10.0))
 y1 = draw(Normal(mu = mu, sigma = 1.0))
 y2 = draw(Normal(mu = mu, sigma = 1.0))
-draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2)))";
+draws = rand(lawof(record(mu = mu, y1 = y1, y2 = y2)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("hierarchical model must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -305,7 +305,7 @@ fn positional_measure_record_sample_refuses() {
     let src = "\
 s = rnginit(0)
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(a)))";
+draws = rand(lawof(record(a)), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("a positional measure record is not a field-keyed product — refuse");
@@ -325,7 +325,7 @@ fn latent_shared_by_two_fields_sampled_once() {
     let src = "\
 s = rnginit(0)
 mu = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(a = mu, b = mu)))";
+draws = rand(lawof(record(a = mu, b = mu)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("shared-by-two-fields must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -376,9 +376,9 @@ fn chained_rand_threads_advanced_rng_not_source() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-v, s2 = rand(s, lawof(record(x = x)))
+v, s2 = rand(lawof(record(x = x)), s)
 y = draw(Normal(mu = 1.0, sigma = 1.0))
-w, s3 = rand(s2, lawof(record(y = y)))
+w, s3 = rand(lawof(record(y = y)), s2)
 out = record(v = v, w = w)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("chained destructured rand must lower");
@@ -467,7 +467,7 @@ fn iid_fixed_kernel_sample_fans_out() {
     let src = "\
 s = rnginit(0)
 xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 10)
-draws, s2 = rand(s, lawof(xs))
+draws, s2 = rand(lawof(xs), s)
 out = draws";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid(K,n) sample must fan out to one builtin_sample");
@@ -514,7 +514,7 @@ fn iid_nonstatic_n_sample_refuses() {
 s = rnginit(0)
 n = external(posintegers)
 xs ~ iid(Normal(mu = 0.0, sigma = 1.0), n)
-draws, s2 = rand(s, lawof(xs))
+draws, s2 = rand(lawof(xs), s)
 out = draws";
     let m = parse_infer(src);
     determinize(&m).expect_err("non-static iid length must refuse rather than mislower");
@@ -532,7 +532,7 @@ fn iid_broadcast_kernel_sample_refuses() {
 s = rnginit(0)
 mus = [0.0, 1.0, 2.0]
 xs ~ iid(broadcast(Normal, mus, 1.0), 3)
-draws, s2 = rand(s, lawof(xs))
+draws, s2 = rand(lawof(xs), s)
 out = draws";
     let m = parse_infer(src);
     determinize(&m)
@@ -543,7 +543,7 @@ out = draws";
 // Sample path: composed measures in measure position, and derived record fields
 // ---------------------------------------------------------------------------
 
-// §07 `rand(rstate, m)`: "generates a random value from a closed measure `m`".
+// §07 `rand(m, rstate)`: "generates a random value from a closed measure `m`".
 // A primitive constructor call is a nullary kernel — a CLOSED measure (§06
 // "Fundamental measures and measure algebra": operations that map measures to
 // values "require closed measures (i.e. nullary kernels)") — so it needs no
@@ -556,7 +556,7 @@ out = draws";
 fn rand_of_a_bare_closed_measure_samples() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
-draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
+draws = rand(Normal(mu = 0.0, sigma = 1.0), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("a bare closed measure is admissible per §07");
     let pir = flatppl_flatpir::write(&out);
@@ -568,7 +568,7 @@ draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
-// §07 types `rand`'s second argument as a "closed measure", and §06 makes
+// §07 types `rand`'s first argument as a "closed measure", and §06 makes
 // `pushfwd(f, M)` of a closed measure closed. Sampling a pushforward is the
 // textbook easy case — sample the base, apply the map, no inverse and no Jacobian
 // — but `lower_rand` gated on a literal `lawof` head before dispatching, so no
@@ -577,7 +577,7 @@ draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
 fn rand_of_pushfwd_samples_base_then_applies_map() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
-draws = rand(s, pushfwd(exp, Normal(mu = 0.0, sigma = 1.0)))";
+draws = rand(pushfwd(exp, Normal(mu = 0.0, sigma = 1.0)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("rand of a pushfwd must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -607,7 +607,7 @@ mu = draw(Normal(mu = 0.0, sigma = 10.0))
 y1 = draw(Normal(mu = mu, sigma = 1.0))
 y2 = draw(Normal(mu = mu, sigma = 1.0))
 d = y1 - y2
-draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)))";
+draws = rand(lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("a derived record field must sample");
     let pir = flatppl_flatpir::write(&out);
@@ -625,23 +625,23 @@ draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)))";
 
 // §07's own worked `rand` example is a bare `iid` in measure position:
 //
-//   random_data, rstate2 = rand(rstate, iid(Normal(0, 1), 10))
-//   more_random_data, rstate3 = rand(rstate2, iid(Exponential(1), 5))
+//   random_data, rstate2 = rand(iid(Normal(0, 1), 10), rstate)
+//   more_random_data, rstate3 = rand(iid(Exponential(1), 5), rstate2)
 //
 // A fixed-kernel `iid(K, n)` is itself a nullary kernel, hence a closed measure. It must
-// lower to the SAME batched term as the `xs ~ iid(...); rand(s, lawof(xs))` spelling: ONE
+// lower to the SAME batched term as the `xs ~ iid(...); rand(lawof(xs), s)` spelling: ONE
 // `builtin_sample` carrying the size dim, with a SINGLE advanced rngstate (§07
 // measure-eval-prims), never one sample per element.
 #[test]
 fn rand_of_bare_iid_matches_the_draw_spelling() {
     let measure_position = "\
 s = rnginit(0)
-draws, s2 = rand(s, iid(Normal(mu = 0.0, sigma = 1.0), 10))
+draws, s2 = rand(iid(Normal(mu = 0.0, sigma = 1.0), 10), s)
 out = draws";
     let draw_position = "\
 s = rnginit(0)
 xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 10)
-draws, s2 = rand(s, lawof(xs))
+draws, s2 = rand(lawof(xs), s)
 out = draws";
 
     let pir_of = |src: &str| {
@@ -742,7 +742,7 @@ s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
 f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
-draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("pushfwd over a record law with a field-named map must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -798,7 +798,7 @@ mu = draw(Normal(mu = 0.0, sigma = 10.0))
 y1 = draw(Normal(mu = mu, sigma = 1.0))
 y2 = draw(Normal(mu = mu, sigma = 1.0))
 f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
-draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
     let out =
         determinize(&m).expect("pushfwd over a shared-latent record law must lower, sampling once");

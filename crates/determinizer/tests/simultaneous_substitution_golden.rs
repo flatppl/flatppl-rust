@@ -120,7 +120,7 @@ q  = elementof(reals)
 d1 ~ Normal(mu = q, sigma = 1.0)
 d2 ~ Normal(mu = 0.0, sigma = 1.0)
 f  = functionof(p * q, p = p, q = q)
-draws = rand(s, pushfwd(f, lawof(record(p = d1, q = d2))))",
+draws = rand(pushfwd(f, lawof(record(p = d1, q = d2))), s)",
     );
     let out = determinize(&m).expect("a record-splatting pushfwd map must lower");
     let printed = flatppl_syntax::print(&out);
@@ -147,7 +147,7 @@ s = rnginit(0)
 z = elementof(reals)
 a ~ Normal(z, 1)
 f = functionof(a + z, z=z)
-draws = rand(s, lawof(record(original=a, left=f(3), right=f(5))))",
+draws = rand(lawof(record(original=a, left=f(3), right=f(5))), s)",
     );
     let out = determinize(&m).expect("captured shared sample must lower");
     let printed = flatppl_syntax::print(&out);

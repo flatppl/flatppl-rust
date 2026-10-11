@@ -293,7 +293,7 @@ fn spot_checked_names_match_the_spec_arguments_column() {
         ("complex", &["re", "im"][..]),
         ("checked", &["value", "condition"][..]),
         ("load_data", &["source", "valueset"][..]),
-        ("rand", &["rstate", "m"][..]),
+        ("rand", &["m", "rstate"][..]),
         ("filter", &["pred", "data"][..]),
         ("diag", &["A", "k"][..]),
         ("onehot", &["i", "n"][..]),

@@ -959,15 +959,15 @@ lp = logdensityof(lawof(y), 0.5)";
 // `rand` requires a probability measure (#425 class; mirrors the `draw` gate)
 // ============================================================
 //
-// §07: `rand(rstate, m)` draws a variate from a normalized measure `m`. Same
+// §07: `rand(m, rstate)` draws a variate from a normalized measure `m`. Same
 // owner ruling as `draw`, same `unprovable_normalization` gate, adapted to
-// `rand`'s second argument (the first is the rngstate).
+// `rand`'s first argument (the second is the rngstate).
 
 /// The unprovable classes are rejected and the message names the mass class
 /// and the `normalize(...)` escape, exactly like the `draw` gate.
 #[test]
 fn rand_rejects_a_measure_that_is_not_a_probability() {
-    let src = "s = rnginit(0)\ny = rand(s, Lebesgue(support = reals))";
+    let src = "s = rnginit(0)\ny = rand(Lebesgue(support = reals), s)";
     assert!(rejects(src, "`rand` requires a probability measure"));
     assert!(rejects(src, "total mass is `%locallyfinite`"));
     assert!(rejects(src, "normalize(...)"));
@@ -977,7 +977,7 @@ fn rand_rejects_a_measure_that_is_not_a_probability() {
 /// infers the `(domain, %rngstate)` tuple untouched by the gate.
 #[test]
 fn rand_still_accepts_a_probability_measure() {
-    let out = ir("s = rnginit(0)\ny = rand(s, Normal(0.0, 1.0))");
+    let out = ir("s = rnginit(0)\ny = rand(Normal(0.0, 1.0), s)");
     assert!(
         out.lines()
             .find(|l| l.contains("%bind y"))
@@ -992,7 +992,7 @@ fn rand_still_accepts_a_probability_measure() {
 #[test]
 fn rand_accepts_normalize_of_a_finite_measure() {
     let src = "s = rnginit(0)\n\
-               y = rand(s, normalize(truncate(Lebesgue(support = reals), interval(0.0, 1.0))))";
+               y = rand(normalize(truncate(Lebesgue(support = reals), interval(0.0, 1.0))), s)";
     assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
 }
 
@@ -1004,7 +1004,7 @@ fn rand_accepts_normalize_of_a_finite_measure() {
 /// in `golden.rs`.
 #[test]
 fn rand_accepts_a_deferred_mass_measure() {
-    let src = "s = rnginit(0)\ny = rand(s, Normal(0.0, 1.0))";
+    let src = "s = rnginit(0)\ny = rand(Normal(0.0, 1.0), s)";
     let mut module = flatppl_syntax::parse(src).unwrap();
     let diags = flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Valueset);
     let out = flatppl_flatpir::write(&module);
@@ -1115,7 +1115,7 @@ fn draw_of_positional_joint_two_lebesgue_refuses() {
 #[test]
 fn rand_of_positional_joint_two_lebesgue_refuses() {
     assert!(rejects(
-        "s = rnginit(0)\ny = rand(s, joint(Lebesgue(reals), Lebesgue(reals)))",
+        "s = rnginit(0)\ny = rand(joint(Lebesgue(reals), Lebesgue(reals)), s)",
         "requires a probability measure"
     ));
 }
