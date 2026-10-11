@@ -260,7 +260,7 @@ fn stablehlo_dirichlet_sample_caps_static_unroll() {
         "alpha = elementof(cartpow(posreals, 4294967295))\n\
          s = rnginit(0)\n\
          x = draw(Dirichlet(alpha = alpha))\n\
-         draws = rand(s, lawof(x))\n\
+         draws = rand(lawof(x), s)\n\
          inputs = (alpha)\n\
          outputs = (draws)\n",
     );

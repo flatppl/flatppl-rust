@@ -161,12 +161,12 @@ fn external_is_fixed_with_element_type() {
     );
 }
 
-/// Spec §04 / §07: `rnginit` returns an rngstate; `rand(s, M)` returns a tuple
+/// Spec §04 / §07: `rnginit` returns an rngstate; `rand(M, s)` returns a tuple
 /// of the variate type and a fresh rngstate. The tuple renders as
 /// `(%tuple (%scalar real) %rngstate)`.
 #[test]
 fn rand_returns_variate_and_rngstate() {
-    let out = ir("s = rnginit(42)\nr = rand(s, Normal(0.0, 1.0))");
+    let out = ir("s = rnginit(42)\nr = rand(Normal(0.0, 1.0), s)");
 
     // rnginit node
     assert!(

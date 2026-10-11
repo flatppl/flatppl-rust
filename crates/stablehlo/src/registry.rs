@@ -2179,7 +2179,7 @@ fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
 ///
 /// §09 makes this measure NOT normalized and NOT a probability measure, so
 /// there is no normalizing constant to derive, and `sample` stays `None`: §09
-/// says `rand(rstate, ContinuedPoisson(rate))` is not a well-defined operation
+/// says `rand(ContinuedPoisson(rate), rstate)` is not a well-defined operation
 /// in FlatPPL.
 ///
 /// Masked to `nonnegreals`, §09's stated support, per §08's shared rule
@@ -2332,7 +2332,7 @@ fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
     Ok(e.select(&eq, &zero, &neg_inf))
 }
 
-/// §06 Dirac's sampling transform: `rand(rng, Dirac(value = v))` returns the
+/// §06 Dirac's sampling transform: `rand(Dirac(value = v), rng)` returns the
 /// atom `v` deterministically, consuming NO randomness — the point mass is
 /// supported only at `v`, so a draw is `v` with probability 1. The builder
 /// simply lowers the `value` param and returns it; it makes no [`Emitter::rng`]

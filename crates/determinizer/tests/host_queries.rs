@@ -58,12 +58,25 @@ fn record_queries_match_explicit_field_projections() {
 
 #[test]
 fn intact_rand_result_preserves_state_without_changing_legacy_default() {
-    let query = "state = rnginit(0)\noutputs = rand(state, Normal(mu = 0.0, sigma = 1.0))";
+    let query = "state = rnginit(0)\noutputs = rand(Normal(mu = 0.0, sigma = 1.0), state)";
     let strict = LoweringOptions {
         preserve_rand_tuple: true,
         ..Default::default()
     };
     let pair = output(query, &strict);
+    for args in [
+        "m = Normal(mu = 0.0, sigma = 1.0), rstate = state",
+        "rstate = state, m = Normal(mu = 0.0, sigma = 1.0)",
+        "record(rstate = state, m = Normal(mu = 0.0, sigma = 1.0))",
+    ] {
+        assert_eq!(
+            pair,
+            output(
+                &format!("state = rnginit(0)\noutputs = rand({args})"),
+                &strict
+            )
+        );
+    }
     let value = common::call_arg(&pair, "tuple", 0);
     let state = common::call_arg(&pair, "tuple", 1);
     let legacy = output(query, &LoweringOptions::default());

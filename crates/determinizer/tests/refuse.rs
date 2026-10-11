@@ -16,7 +16,7 @@ fn rebase_without_a_mass_rule_refuses() {
 }
 
 // Note: `rand` no longer refuses unconditionally — a single-draw
-// `rand(rng, lawof(record(x = draw(M))))` now lowers to `builtin_sample`
+// `rand(lawof(record(x = draw(M))), rng)` now lowers to `builtin_sample`
 // (`tests/sample_golden.rs::single_draw_samples_via_builtin_sample`). The
 // construct-specific sample-side refuse tests (the intractable/deferred
 // measure set, malformed `rand`/`draw` arity, etc.) live in the "sample path"
@@ -579,7 +579,7 @@ s = rnginit(0)
 w = functionof(mul(2.0, _x_), x = _x_)
 m = weighted(w, Normal(mu = 0.0, sigma = 1.0))
 d = draw(m)
-draws = rand(s, lawof(record(d = d)))";
+draws = rand(lawof(record(d = d)), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("sampling a weighted measure is intractable — refuse");
     assert!(
@@ -599,7 +599,7 @@ fn sample_lawof_of_nonstochastic_refuses() {
     let src = "\
 s = rnginit(0)
 c = 3.0
-draws = rand(s, lawof(c))";
+draws = rand(lawof(c), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("lawof of a non-stochastic value must refuse");
     assert!(
@@ -620,7 +620,7 @@ fn sample_truncate_multivariate_refuses() {
     let src = "\
 s = rnginit(0)
 d = draw(truncate(MvNormal(mu = [0.0, 0.0], cov = eye(2)), interval(-1.0, 1.0)))
-draws = rand(s, lawof(record(d = d)))";
+draws = rand(lawof(record(d = d)), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("sampling a multivariate truncated measure is intractable — refuse");
@@ -641,7 +641,7 @@ fn sample_truncate_univariate_deferred_refuses() {
     let src = "\
 s = rnginit(0)
 d = draw(truncate(Normal(mu = 0.0, sigma = 1.0), interval(-1.0, 1.0)))
-draws = rand(s, lawof(record(d = d)))";
+draws = rand(lawof(record(d = d)), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("univariate truncate sampling is not yet built — refuse");
     assert!(
@@ -668,7 +668,7 @@ fn sample_deferred_combinator_refuses() {
     let src = "\
 s = rnginit(0)
 d = draw(superpose(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0)))
-draws = rand(s, lawof(record(d = d)))";
+draws = rand(lawof(record(d = d)), s)";
     let m = parse_infer(src);
     let err =
         determinize(&m).expect_err("sample lowering for superpose is deferred — refuse, not lower");
@@ -686,7 +686,7 @@ draws = rand(s, lawof(record(d = d)))";
 // had no dedicated test — added here per the same TDD discipline as the rest
 // of this file.
 
-// `rand` takes exactly 2 args (rng, measure); a 1-arg call is malformed.
+// `rand` takes exactly 2 args (measure, rng); a 1-arg call is malformed.
 #[test]
 fn sample_rand_wrong_arity_refuses() {
     let src = "\
@@ -696,11 +696,11 @@ draws = rand(s)";
     let err = determinize(&m).expect_err("rand with the wrong arity must refuse");
     assert!(
         err.reason.contains("rand expects 2 args"),
-        "refusal explains the (rng, measure) arity: {err:?}"
+        "refusal explains the (measure, rng) arity: {err:?}"
     );
 }
 
-// A `rand` whose measure is a bare closed measure (`rand(s, Normal(...))`) is
+// A `rand` whose measure is a bare closed measure (`rand(Normal(...), s)`) is
 // NOT refused — §07 types the second argument as "a closed measure `m`" and §06
 // makes a primitive constructor call a nullary kernel, i.e. closed. That golden
 // lives in `sample_golden.rs::rand_of_a_bare_closed_measure_samples`; the
@@ -723,7 +723,7 @@ fn sample_draw_wrong_arity_refuses() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let mut m = flatppl_syntax::parse(src).unwrap();
     let diags = flatppl_infer::infer(&mut m);
     assert!(
@@ -746,7 +746,7 @@ fn sample_draw_over_arity_positional_constructor_refuses() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(0.0, 1.0, 2.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("more positional args than parameters is not a valid sample leaf — refuse");
@@ -765,7 +765,7 @@ fn sample_draw_double_bound_constructor_refuses() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(0.0, mu = 1.0))
-draws = rand(s, lawof(record(x = x)))";
+draws = rand(lawof(record(x = x)), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err(
         "a parameter bound positionally and by keyword is not a valid sample leaf — refuse",
@@ -804,7 +804,7 @@ fn sample_inline_hierarchical_shared_latent_refuses() {
     let src = "\
 s = rnginit(0)
 mu = draw(Normal(mu = 0.0, sigma = 10.0))
-draws = rand(s, lawof(record(c = draw(Normal(mu = mu, sigma = 1.0)))))";
+draws = rand(lawof(record(c = draw(Normal(mu = mu, sigma = 1.0)))), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err(
         "an inline-hierarchical shared latent (mu referenced only from inside c's inline draw) \
@@ -840,7 +840,7 @@ fn destructured_rand_in_refuse_suite_lowers_to_tuple() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-v, s2 = rand(s, lawof(record(x = x)))";
+v, s2 = rand(lawof(record(x = x)), s)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("a destructured rand must lower to a tuple");
     let pir = flatppl_flatpir::write(&out);
@@ -869,9 +869,9 @@ fn destructured_rand_rng_threaded_into_second_rand_lowers() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-v, s2 = rand(s, lawof(record(x = x)))
+v, s2 = rand(lawof(record(x = x)), s)
 y = draw(Normal(mu = 1.0, sigma = 1.0))
-w = rand(s2, lawof(record(y = y)))";
+w = rand(lawof(record(y = y)), s2)";
     let m = parse_infer(src);
     let out = determinize(&m)
         .expect("threading a destructured rand's rngstate into a second rand must lower");
@@ -897,7 +897,7 @@ fn get0_tuple_projection_of_rand_lowers() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(x = x)))
+draws = rand(lawof(record(x = x)), s)
 v = get0(draws, 0)";
     let m = parse_infer(src);
     let out = determinize(&m)
@@ -928,7 +928,7 @@ fn value_terminal_rand_field_access_by_string_still_lowers() {
     let src = "\
 s = rnginit(0)
 mu = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(mu = mu)))
+draws = rand(lawof(record(mu = mu)), s)
 out = draws.mu";
     let m = parse_infer(src);
     let out = determinize(&m)
@@ -1055,7 +1055,7 @@ fn undrawn_measure_in_a_record_field_still_refuses() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
 y = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, lawof(record(y = y, a = Normal(mu = 0.0, sigma = 1.0))))";
+draws = rand(lawof(record(y = y, a = Normal(mu = 0.0, sigma = 1.0))), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("an un-drawn measure in a record field is not a variate — must refuse");
@@ -1090,7 +1090,7 @@ s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
 d = draw(pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))))
-draws = rand(s, lawof(record(y1 = y1, y2 = y2, d = d)))";
+draws = rand(lawof(record(y1 = y1, y2 = y2, d = d)), s)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("draw of a pushfwd is a FRESH draw — must refuse");
     assert!(
@@ -1113,7 +1113,7 @@ fn rand_of_pushfwd_with_mismatched_record_map_refuses() {
 s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))))";
+draws = rand(pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("a map whose parameters do not match the record variate's fields must refuse");
@@ -1143,7 +1143,7 @@ s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
 f = functionof(mul(2.0, _a_), y1 = _a_)
-draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("a map covering only some of the record's fields must refuse, not project");
@@ -1162,7 +1162,7 @@ fn rand_of_pushfwd_with_unreducible_map_refuses() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
 f = functionof(_a_ + _b_, x = _a_, y = _b_)
-draws = rand(s, pushfwd(f, Normal(mu = 0.0, sigma = 1.0)))";
+draws = rand(pushfwd(f, Normal(mu = 0.0, sigma = 1.0)), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("a pushfwd map that does not reduce must refuse, not emit an unreduced call");
@@ -1182,7 +1182,7 @@ fn rand_of_pushfwd_bare_builtin_map_over_record_refuses() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(s, pushfwd(exp, lawof(record(y = y1))))";
+draws = rand(pushfwd(exp, lawof(record(y = y1))), s)";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("a bare builtin map over a record variate must refuse, not emit exp(record)");
