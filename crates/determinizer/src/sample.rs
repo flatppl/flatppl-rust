@@ -50,9 +50,8 @@ use flatppl_core::{
 /// `bid` is the binding whose subtree contains `rand_node` (the driver's
 /// `apply_rule` already has it) — i.e. the name a `v, s2 = rand(...)`
 /// decomposition or a bare `draws = rand(...)` assignment binds the `rand`
-/// call to. It is used ONLY to check [`rand_result_is_destructured`], which
-/// dispatches the result shape (tuple vs bare value); see that function's doc
-/// for why.
+/// call to. It names a restored law and selects the result shape through
+/// [`rand_result_is_destructured`] (tuple vs bare value).
 pub(crate) fn lower_rand(
     m: &mut Module,
     bid: BindingId,
@@ -68,16 +67,111 @@ pub(crate) fn lower_rand(
             .ok_or_else(|| refuse(rand_node, m, "rand expects 2 args (measure, rng)"))?;
         (args[0], args[1])
     };
+    let measure = instantiate_declared_draws(m, measure, bid);
     let (value, rng_out) = lower_closed_measure_sample(m, measure, rng)?;
-    if preserve_tuple || rand_result_is_destructured(m, bid) {
+    let result = if preserve_tuple || rand_result_is_destructured(m, bid) {
         // Full spec §07 (value, new_rstate) contract: retain both slots for
         // host outputs or the parser's get(_,1)/get(_,2) projections.
-        Ok(build_call(m, "tuple", &[value, rng_out]))
+        build_call(m, "tuple", &[value, rng_out])
     } else {
         // Value-terminal shortcut: `draws = rand(...)` used as a bare value /
         // read by string selector — return the bare value (unchanged).
-        Ok(value)
+        value
+    };
+    m.mark_sample_result(result);
+    Ok(result)
+}
+
+/// A previous query's pins are realizations, not this sample's generative law.
+/// Copy an affected draw cone under private names so lowering this query cannot
+/// replace the values read by an earlier sampled output. Unpinned graphs keep
+/// their existing bindings and lowering path.
+fn instantiate_declared_draws(m: &mut Module, measure: NodeId, query: BindingId) -> NodeId {
+    let mut pending = vec![measure];
+    let mut seen = std::collections::HashSet::new();
+    let mut seen_bindings = std::collections::HashSet::new();
+    let mut draws = Vec::new();
+    let mut pinned = false;
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) || is_rand_boundary(m, node) {
+            continue;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(node)
+            && let Some(binding) = m.binding_by_name(*name)
+            && seen_bindings.insert(binding)
+        {
+            pinned |= m.query_pinned_rhs(binding).is_some();
+            let rhs = m.declared_binding_rhs(binding);
+            if draw_argument(m, rhs).is_some() {
+                draws.push((binding, rhs));
+            }
+            pending.push(rhs);
+        }
+        m.for_each_child(node, |child| pending.push(child));
     }
+    if !pinned || draws.is_empty() {
+        return measure;
+    }
+
+    let mut replacements = Vec::with_capacity(draws.len());
+    let mut copies = Vec::with_capacity(draws.len());
+    for (binding, rhs) in draws {
+        let original = Ref {
+            ns: RefNs::SelfMod,
+            name: m.binding(binding).name,
+        };
+        let name = fresh_latent_name(m, binding, "draw");
+        copies.push(m.add_binding(Binding {
+            name,
+            rhs,
+            doc: None,
+            public: false,
+            synthetic: true,
+        }));
+        let value = m.alloc(Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }));
+        replacements.push((original, value));
+    }
+    for binding in copies {
+        let rhs = crate::kernel::substitute_admitted(
+            m,
+            m.binding(binding).rhs,
+            &replacements,
+            crate::kernel::Substitute::DeclaredDraws,
+            true,
+        );
+        m.set_binding_rhs(binding, rhs);
+    }
+    let measure = crate::kernel::substitute_admitted(
+        m,
+        measure,
+        &replacements,
+        crate::kernel::Substitute::DeclaredDraws,
+        true,
+    );
+    let name = fresh_latent_name(m, query, "law");
+    m.add_binding(Binding {
+        name,
+        rhs: measure,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    // Recompute phase and static iid shapes on the restored graph. The temporary
+    // law binding makes its copied expression reachable to inference and is swept
+    // once this query lowers.
+    let _ = flatppl_infer::infer(m);
+    measure
+}
+
+/// An explicit query is a concrete value, before or after its own lowering.
+pub(crate) fn is_rand_boundary(m: &Module, node: NodeId) -> bool {
+    m.is_sample_result(node) || expect_builtin_call(m, node, "rand").is_some()
 }
 
 /// Is `rand_bid`'s value DESTRUCTURED — read via an INTEGER-literal tuple
@@ -1096,7 +1190,7 @@ fn lower_shared_record_sample(
         // Use the ordinary draw dispatcher, naming its primitive tuple before
         // any value transformation. Later latents resolve their parent's binding
         // to this sampled value; rebase and iid keep their usual batched draw.
-        let sample_name = fresh_sample_name(m, bid);
+        let sample_name = fresh_latent_name(m, bid, "sample");
         let (value, next) = lower_draw(m, m.binding(bid).rhs, cur, Some(sample_name))?;
 
         // Rewrite the latent's draw-BINDING to the sampled value; consumers keep
@@ -1131,20 +1225,19 @@ fn lower_shared_record_sample(
     Ok((build_record(m, &out_fields), cur))
 }
 
-/// A fresh private synthetic binding name for a latent's sample tuple, following
-/// the parser's `__`-prefixed synthetic convention (`bind_name`) and deduped
-/// against existing names.
-fn fresh_sample_name(m: &mut Module, latent: BindingId) -> Symbol {
+/// A fresh private name for a copied draw, its sample tuple, or a query's law,
+/// following the parser's `__`-prefixed convention and deduped against bindings.
+fn fresh_latent_name(m: &mut Module, latent: BindingId, kind: &str) -> Symbol {
     let latent_name = m.binding(latent).name;
     let base = m.resolve(latent_name).to_string();
-    let mut candidate = format!("__sample_{base}");
+    let mut candidate = format!("__{kind}_{base}");
     let mut n = 1;
     loop {
         let sym = m.intern(&candidate);
         if m.binding_by_name(sym).is_none() {
             return sym;
         }
-        candidate = format!("__sample_{base}_{n}");
+        candidate = format!("__{kind}_{base}_{n}");
         n += 1;
     }
 }

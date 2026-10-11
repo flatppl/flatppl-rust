@@ -4800,6 +4800,31 @@ fn emit_sample_hierarchical_record_reaches_the_sample_and_emits() {
     );
 }
 
+/// Density points and each explicit RNG stream belong to their own query.
+#[test]
+fn sampled_prior_uses_declared_draws_after_density_queries() {
+    let model = "scale ~ Exponential(1)\neffect ~ Normal(0, scale)\n\
+                 prior = lawof(record(scale = scale, effect = effect))\n\
+                 s = external(posreals)\nx = external(reals)\nstate = rnginit(0)\n";
+    let score = "score = logdensityof(prior, record(scale = s, effect = x))\n";
+    let samples = "first = rand(prior, state)\nnext_state = first[2]\n\
+                   second = rand(prior, next_state)\n";
+    let oracle = "s = external(posreals)\nx = external(reals)\nstate = rnginit(0)\n\
+                  a, r1 = rand(Exponential(1), state)\nb, r2 = rand(Normal(0, a), r1)\n\
+                  c, r3 = rand(Exponential(1), r2)\nd, r4 = rand(Normal(0, c), r3)\n\
+                  first = record(scale = a, effect = b)\n\
+                  second = record(scale = c, effect = d)\n\
+                  score = logdensityof(Exponential(1), s) + logdensityof(Normal(0, s), x)\n\
+                  inputs = (s, x)\noutputs = (first, second, score, r4)";
+    let expected = emit_sample(&determinize_abi_roots(oracle, &["inputs", "outputs"]));
+    for queries in [format!("{score}{samples}"), format!("{samples}{score}")] {
+        let source = format!("{model}{queries}inputs = (s, x)\noutputs = (first, second, score)");
+        let actual = emit_sample(&determinize_abi_roots(&source, &["inputs", "outputs"]));
+        assert_eq!(actual, expected);
+        assert_eq!(actual.matches("stablehlo.rng_bit_generator").count(), 4);
+    }
+}
+
 // ---- Task 6 review fix: `lower_sample` refuse tests (Finding 2) -----------
 //
 // Task 6 shipped `registry::lower_sample`'s three refuse-don't-mislower

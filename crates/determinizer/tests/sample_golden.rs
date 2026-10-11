@@ -6,6 +6,46 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
+#[test]
+fn sampled_parameter_remains_a_realized_value() {
+    let model = "a ~ Normal(0, 1)\nb ~ Normal(a, 1)\n\
+                 prior = lawof(record(a = a, b = b))\nstate = rnginit(0)\n";
+    let first = "first = rand(prior, state)\n";
+    let second = "second = rand(Normal(first[1].a, 1), first[2])\n";
+    for queries in [format!("{first}{second}"), format!("{second}{first}")] {
+        let source = format!("{model}{queries}outputs = (first, second)");
+        let out = determinize(&parse_infer(&source)).expect("rand results are fixed query inputs");
+        let pir = flatppl_flatpir::write(&out);
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok(), "{pir}");
+        // Two hierarchical draws, then one conditional draw from their realized value.
+        assert_eq!(pir.matches("builtin_sample").count(), 3, "{pir}");
+    }
+}
+
+#[test]
+fn restored_law_preserves_nested_sample_results() {
+    let model = "a ~ Normal(0, 1)\nb ~ Normal(a, 1)\n\
+                 prior = lawof(record(a = a, b = b))\nstate = rnginit(0)\n\
+                 score = logdensityof(prior, record(a = 2, b = 3))\n\
+                 c ~ Normal(first[1], 1)\nlater = lawof(record(a = a, c = c))\n";
+    let first = "first = rand(Normal(rand(prior, state)[1].a, 1), state)\n";
+    let second = "second = rand(later, first[2])\n";
+    for queries in [format!("{first}{second}"), format!("{second}{first}")] {
+        let source = format!("{model}{queries}outputs = (first, second, score)");
+        let out = flatppl_determinizer::determinize_with_options(
+            &parse_infer(&source),
+            &flatppl_infer::ModuleBundle::new(),
+            None,
+            &flatppl_determinizer::LoweringOptions {
+                preserve_rand_tuple: true,
+                ..Default::default()
+            },
+        )
+        .expect("restoring a law must stop at nested rand results");
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    }
+}
+
 // A DESTRUCTURED rand (`v, s2 = rand(...)`) now lowers to the full spec §07
 // `tuple(value, advanced_rng)` — the parser's `v, s2 = rand(...)` sugar
 // desugars to `__0x1 = rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)`
