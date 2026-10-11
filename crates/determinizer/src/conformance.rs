@@ -144,7 +144,7 @@ fn check_node(
     // Dangling self-ref check: a `(%ref self <name>)` — as this node itself, or
     // as one of the current node's reification `Inputs` boundary entries (which
     // `children()`/`for_each_child` deliberately exclude, see
-    // `driver::collect_referenced_names`) — must name a binding still present
+    // `Module::collect_referenced_names`) — must name a binding still present
     // in the module. A miss here means some earlier pass (a binding-removal
     // pass, first introduced by root-based DCE) dropped a binding something
     // else still points at.

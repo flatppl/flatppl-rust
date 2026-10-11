@@ -91,7 +91,7 @@ fn bare_likelihoodof_of_kernel_reports_likelihood_and_kernel_violations() {
 //
 // Root-based DCE (Buffy #263 Pass 4-A, `canon::dce::retain_reachable`) is the
 // FIRST capability that removes bindings outright. A latent miss in its
-// reachability walk (`driver::collect_referenced_names`) could drop a binding
+// reachability walk (`Module::collect_referenced_names`) could drop a binding
 // something else still points at, leaving a `(%ref self <name>)` — as an
 // ordinary body sub-node or a `functionof`/`kernelof` reification `Inputs`
 // boundary entry — dangling. `is_flatpdl` is the conformance gate every
