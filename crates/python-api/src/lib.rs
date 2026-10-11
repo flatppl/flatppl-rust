@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 
 use flatppl_host::{
     BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions, LoadedModule,
-    Target,
+    MathFormat, Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -84,6 +84,14 @@ impl NativeContext {
             .map(|inner| NativeModule { inner })
             .map_err(error)
     }
+
+    fn slice(&mut self, module: &NativeModule, outputs: Vec<String>) -> PyResult<NativeModule> {
+        let outputs: Vec<&str> = outputs.iter().map(String::as_str).collect();
+        self.inner
+            .slice(&module.inner, &outputs)
+            .map(|inner| NativeModule { inner })
+            .map_err(error)
+    }
 }
 
 #[pyclass(name = "Module", module = "flatppl._native", frozen)]
@@ -106,6 +114,21 @@ impl NativeModule {
     fn bindings(&self) -> String {
         serde_json::to_string(&self.inner.bindings())
             .expect("binding metadata contains only JSON values")
+    }
+
+    fn constant(&self, name: &str) -> PyResult<String> {
+        let value = self.inner.constant(name).map_err(error)?;
+        serde_json::to_string(&value).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn math(&self, format: &str) -> PyResult<String> {
+        let format = match format {
+            "tex" => MathFormat::Tex,
+            "mathml" => MathFormat::MathMl,
+            "typst" => MathFormat::Typst,
+            _ => return Err(PyValueError::new_err("format must be tex, mathml or typst")),
+        };
+        Ok(serde_json::to_string(&self.inner.math(format)).expect("rows contain only JSON values"))
     }
 
     #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu"))]
