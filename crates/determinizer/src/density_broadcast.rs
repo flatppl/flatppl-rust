@@ -4,6 +4,52 @@
 use super::*;
 use flatppl_core::Idx;
 
+pub(crate) fn query_head(m: &Module, id: NodeId) -> Option<Symbol> {
+    let call = expect_builtin_call(m, id, "broadcast")?;
+    let (head, _) = resolve_ref_chain(m, *call.args.first()?);
+    match m.node(head) {
+        Node::Const(head) if matches!(m.resolve(*head), "logdensityof" | "densityof") => {
+            Some(*head)
+        }
+        _ => None,
+    }
+}
+
+/// A measure is held constant, never passed to the numeric broadcast. Reify
+/// the scalar query so the ordinary density rules eliminate it before emission.
+pub(crate) fn lower_query(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    let op = query_head(m, id)?;
+    let call = expect_builtin_call(m, id, "broadcast")?;
+    let [_, measure, values] = *call.args else {
+        return None;
+    };
+    if !call.named.is_empty() {
+        return None;
+    }
+    let (resolved, _) = resolve_ref_chain(m, values);
+    let cell = match m.type_of(values).or_else(|| m.type_of(resolved)).cloned() {
+        Some(Type::Array { elem, .. }) => *elem,
+        Some(Type::Table { columns, .. }) => Type::Record(columns),
+        Some(ty) => ty,
+        None => Type::Any,
+    };
+    let (label, reference, point) = placeholder(m, cell);
+    let query = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(op),
+        args: vec![measure, point].into(),
+        named: vec![].into(),
+        inputs: None,
+    }));
+    let head = CallHead::Builtin(m.intern("functionof"));
+    let function = m.alloc(Node::Call(Call {
+        head,
+        args: vec![query].into(),
+        named: vec![].into(),
+        inputs: Some(Inputs::Spec(vec![(label, reference)].into())),
+    }));
+    Some(build_call(m, "broadcast", &[function, values]))
+}
+
 fn captures(m: &Module, root: NodeId) -> Vec<(Ref, NodeId)> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();

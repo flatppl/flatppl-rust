@@ -290,11 +290,15 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
 }
 
 /// Find the first node (outermost, BFS) whose builtin head is named one of
-/// `ops`, scanning bindings in source order.
+/// `ops`, including broadcast density queries, scanning bindings in source order.
 fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
+    let density_queries = ops.contains(&"logdensityof") || ops.contains(&"densityof");
     find_node(m, |id| {
         matches!(m.node(id), Node::Call(c)
             if matches!(c.head, CallHead::Builtin(sym) if ops.contains(&m.resolve(sym))))
+            || (density_queries
+                && crate::density::broadcast_query_head(m, id)
+                    .is_some_and(|head| ops.contains(&m.resolve(head))))
     })
 }
 
@@ -399,6 +403,12 @@ fn apply_rule(
     imports: &mut crate::crossmodule::GraftState,
     options: &crate::LoweringOptions<'_>,
 ) -> Result<(), RefuseError> {
+    if let Some(query) = crate::density::lower_broadcast_query(m, target_node) {
+        let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, query);
+        m.set_binding_rhs(bid, rhs);
+        return Ok(());
+    }
+
     // --- structural disintegration: get(disintegrate(sel, lawof(record …)), i) ---
     // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
     // `forward_kernel = get(D, 1)` (the KERNEL, tuple elem 1) and
