@@ -85,6 +85,22 @@ fn applied_kernel_still_marginalizes_a_scale_outside_its_boundary() {
     assert_eq!(error.construct, "NumericalIntegral");
 }
 
+#[test]
+fn applied_kernel_reads_its_declared_draw_after_a_joint_query() {
+    let applied = lower(
+        "scale ~ Exponential(1)\n\
+         effect ~ Normal(0, scale)\n\
+         k = kernelof(effect, scale = scale)\n\
+         s = elementof(posreals)\n\
+         lp = (logdensityof(lawof(record(scale = scale, effect = effect)), record(scale = s, effect = 0.5)), logdensityof(k(s), 0.5))",
+    );
+    let conditional = lower(
+        "s = elementof(posreals)\n\
+         lp = (logdensityof(Exponential(1), s) + logdensityof(Normal(0, s), 0.5), logdensityof(Normal(0, s), 0.5))",
+    );
+    assert_eq!(applied, conditional);
+}
+
 /// The boundary is reached through a derived binding, so the syntactic substitution
 /// stopped at `(%ref self mu2)`.
 ///

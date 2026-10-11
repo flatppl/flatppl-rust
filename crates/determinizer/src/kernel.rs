@@ -619,7 +619,7 @@ pub(crate) fn reduce_kernel_application_bound(
     let kernel = resolve_reified(m, callee)?;
     let absorbed = resolve_kernel(m, callee).is_some();
 
-    let (resolved, _) = resolve_ref_one(m, kernel.body);
+    let resolved = declared_body(m, kernel.body);
     let mut body = match draw_argument(m, resolved) {
         _ if mode == Substitute::All && !absorbed => kernel.body,
         Some(law) => resolve_ref_one(m, law).0,
@@ -638,6 +638,24 @@ pub(crate) fn reduce_kernel_application_bound(
         .collect();
     body = substitute_admitted(m, body, &bound, mode, absorbed);
     Some(AppliedReification { body, bound })
+}
+
+/// A query may have pinned this draw already. Reification still denotes its
+/// declared law, not the value supplied to that earlier query.
+pub(crate) fn declared_body(m: &Module, mut node: NodeId) -> NodeId {
+    for _ in 0..m.binding_count() {
+        let Node::Ref(reference) = m.node(node) else {
+            break;
+        };
+        if reference.ns != RefNs::SelfMod {
+            break;
+        }
+        let Some(binding) = m.binding_by_name(reference.name) else {
+            break;
+        };
+        node = m.declared_binding_rhs(binding);
+    }
+    node
 }
 
 /// §04 calling convention: leading positionals, then keywords, or one record/table
