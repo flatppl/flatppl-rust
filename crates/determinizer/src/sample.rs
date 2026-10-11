@@ -741,23 +741,58 @@ fn lower_draw(
     Ok(build_sample_term(m, ctor, kernel_input, rng, sample_name))
 }
 
-/// Centering iid normals gives covariance sigma²(I - 11'/n); sorting them
-/// gives the normalized ordered chamber. Both consume one batched RNG draw.
+/// Sort iid samples for an ordered law, or project independent Normals onto
+/// zero sum. Each rule retains the primitive sample's successor state.
 fn lower_tilt_sample(
     m: &mut Module,
     measure: NodeId,
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    use crate::density::tilt::{NormalSet, elementwise, normal_on_set};
+    use crate::density::tilt::{SetLaw, elementwise, normal_parameters, on_set, project_sum};
 
-    let normal = normal_on_set(m, measure).ok_or_else(|| {
+    let law = on_set(m, measure)?.ok_or_else(|| {
         refuse(
             measure,
             m,
-            "tilt sampling currently requires fixed-size iid Normal on Lebesgue(ordered(n)) or Lebesgue(zerosum(n))",
+            "tilt sampling requires a supported closed law on Lebesgue(ordered(n)) or Lebesgue(zerosum(n))",
         )
     })?;
+    match law {
+        SetLaw::IidNormal(normal) => Ok(lower_iid_normal_on_set(m, normal, rng, sample_name)),
+        SetLaw::OrderedIid { source, kernel, .. } => {
+            let (value, rng_out) = lower_iid_sample(m, kernel, source, rng, sample_name)?;
+            Ok((build_call(m, flatppl_core::SORT_VECTOR, &[value]), rng_out))
+        }
+        SetLaw::ZeroSumNormals(normal) => {
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+            let parameters = [(m.intern("mu"), zero), (m.intern("sigma"), one)];
+            let input = build_record(m, &parameters);
+            let ctor = m.intern("Normal");
+            let ctor = m.alloc(Node::Const(ctor));
+            let (z, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng, sample_name);
+            if normal.n == 1 {
+                return Ok((build_call(m, "vector", &[zero]), rng_out));
+            }
+            let (mu, sigma, variance, total) = normal_parameters(m, &normal);
+            let center = project_sum(m, mu, variance, total);
+            let noise = elementwise(m, "mul", &[z, sigma]);
+            let noise = project_sum(m, noise, variance, total);
+            Ok((elementwise(m, "add", &[center, noise]), rng_out))
+        }
+    }
+}
+
+/// Keep the iid Normal arithmetic and RNG consumption unchanged.
+fn lower_iid_normal_on_set(
+    m: &mut Module,
+    normal: crate::density::tilt::NormalOnSet,
+    rng: NodeId,
+    sample_name: Option<Symbol>,
+) -> (NodeId, NodeId) {
+    use crate::density::tilt::{NormalSet, elementwise};
+
     let mu = match normal.kind {
         NormalSet::Ordered => normal.mu,
         NormalSet::ZeroSum => m.alloc(Node::Lit(Scalar::Real(0.0))),
@@ -781,7 +816,7 @@ fn lower_tilt_sample(
             elementwise(m, "mul", &[centered, normal.sigma])
         }
     };
-    Ok((value, rng_out))
+    (value, rng_out)
 }
 
 /// `iid(K, n)` with a FIXED kernel `K` and a static length `n` → ONE batched

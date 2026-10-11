@@ -54,6 +54,55 @@ fn ordered_normal_tilt_keeps_the_iid_scale_and_factorial() {
     assert_eq!(emit(source), emit(&expected));
 }
 
+/// The independent fixture gives -0.8082405307719451 for Exponential(1)
+/// and -5.1161667816817715 for Gamma(2.5, 1), at [0.1, 0.5, 2.0].
+#[test]
+fn ordered_continuous_iid_tilt_adds_the_permutation_normalizer() {
+    for law in ["Exponential(p)", "Gamma(p, 1)"] {
+        let source = format!(
+            "p = external(posreals)\nx = external(cartpow(reals, 3))\n\
+             source_law = iid({law}, 3)\nq = tilt(source_law, Lebesgue(ordered(3)))\n\
+             inputs = (p, x)\noutputs = logdensityof(q, x)"
+        );
+        let expected = source.replace(
+            "logdensityof(q, x)",
+            "ifelse(x in ordered(3), logdensityof(source_law, x) + loggamma(4.0), -inf)",
+        );
+        assert_eq!(emit(&source), emit(&expected));
+        let sample = source.replace(
+            "outputs = logdensityof(q, x)",
+            "outputs = rand(q, rnginit(0))",
+        );
+        let ir = emit_mode(&sample, flatppl_stablehlo::Mode::Sample);
+        assert_eq!(ir.matches("\"stablehlo.sort\"").count(), 1);
+    }
+}
+
+/// The conditional Gaussian density is -1.6912035042980555 at
+/// mu=[1,-2,0.5], sigma=[1,2,0.5], x=[0.3,-0.5,0.2].
+#[test]
+fn zerosum_independent_normals_use_the_sum_variance() {
+    let source = "mu = external(cartpow(reals, 3))\n\
+                  sigma = external(cartpow(posreals, 3))\n\
+                  x = external(cartpow(reals, 3))\n\
+                  q = tilt(Normal.(mu, sigma), Lebesgue(zerosum(3)))\n\
+                  inputs = (mu, sigma, x)\noutputs = logdensityof(q, x)";
+    let expected = source.replace("outputs = logdensityof(q, x)",
+        "mu_v = mu .+ fill(0.0, 3)\nsigma_v = sigma .+ fill(0.0, 3)\n\
+         scale = maximum(sigma_v)\nr = sigma_v ./ scale\n\
+         v = r .* r\nS = sum(v)\n\
+         center = mu_v .- v .* (sum(mu_v) / S)\n\
+         delta = (x .- center) ./ sigma_v\n\
+         outputs = ifelse(x in zerosum(3), log(scale) + 0.5*log(S) - sum(log.(sigma_v)) - 1.8378770664093453 - 0.5*sum(delta .* delta), -inf)");
+    assert_eq!(emit(source), emit(&expected));
+    let sample = source.replace(
+        "outputs = logdensityof(q, x)",
+        "outputs = rand(q, rnginit(0))",
+    );
+    let ir = emit_mode(&sample, flatppl_stablehlo::Mode::Sample);
+    assert_eq!(ir.matches("stablehlo.rng_bit_generator").count(), 1);
+}
+
 #[test]
 fn tilt_falls_back_to_generic_normalization() {
     for base in ["Normal(1, 3)", "Dirac(0.0)"] {
