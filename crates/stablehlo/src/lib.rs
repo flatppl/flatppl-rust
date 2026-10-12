@@ -306,10 +306,10 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
             registry::lookup(ctor).is_some_and(|dist| dist.touniform.is_some())
         }),
         retain_standard_functions: &[
-            ("pyhf_helpers", "normsys_factor"),
-            ("pyhf_helpers", "histosys_shift"),
-            ("pyhf_helpers", "sample_yields"),
-            ("pyhf_helpers", "expected_counts"),
+            ("pyhf-helpers", "normsys_factor"),
+            ("pyhf-helpers", "histosys_shift"),
+            ("pyhf-helpers", "sample_yields"),
+            ("pyhf-helpers", "expected_counts"),
         ],
     };
 

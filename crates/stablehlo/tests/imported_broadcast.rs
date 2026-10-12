@@ -48,7 +48,7 @@ fn imported_function_broadcasts_at_root_and_inside_expression() {
 
 #[test]
 fn pyhf_helper_splats_an_opaque_record_by_name() {
-    let prefix = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+    let prefix = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
                   pars = elementof(cartprod(alpha = reals, hi = posreals, lo = posreals))\n\
                   inputs = pars\noutputs = ";
     let actual = format!("{prefix}pyhf.normsys_factor(pars)");
@@ -61,7 +61,7 @@ fn pyhf_helper_splats_an_opaque_record_by_name() {
 
 #[test]
 fn pyhf_helpers_keep_dots_only_for_bin_broadcast_products() {
-    let prefix = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+    let prefix = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
                   theta = elementof(cartpow(reals, 2))\n\
                   inputs = theta\n";
     // Per-row alphas broadcast over three bins in the three bin products.

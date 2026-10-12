@@ -1,6 +1,6 @@
 // pyhf helpers. See the portable definitions in determinizer.
 Module(
-    name: "pyhf_helpers",
+    name: "pyhf-helpers",
     version: "0.1",
     bindings: [
         Binding(name: "normsys_factor", sig: Function(

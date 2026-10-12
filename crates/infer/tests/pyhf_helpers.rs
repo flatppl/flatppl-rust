@@ -2,7 +2,7 @@ use flatppl_core::{Dim, Module, ScalarType, Type};
 use flatppl_infer::{Diagnostic, Level, ModuleBundle, Severity, infer_module};
 
 fn infer(body: &str) -> (Module, Vec<Diagnostic>) {
-    let source = format!("p = standard_module(\"pyhf_helpers\", \"0.1\")\n{body}");
+    let source = format!("p = standard_module(\"pyhf-helpers\", \"0.1\")\n{body}");
     let mut module = flatppl_syntax::parse(&source).unwrap();
     let diagnostics = infer_module(&mut module, &ModuleBundle::new(), Level::Shape);
     (module, diagnostics)
