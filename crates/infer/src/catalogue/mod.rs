@@ -476,6 +476,8 @@ pub(crate) enum DimExpr {
     /// Product of two dim expressions (e.g. `kron`'s pq × mn). Static only when
     /// both operands are static (overflow falls back to dynamic).
     Mul(Box<DimExpr>, Box<DimExpr>),
+    /// A fixed number of appended entries, as in a spline's affine columns.
+    Add(Box<DimExpr>, u32),
 }
 
 /// Parse a catalogue from RON source.
@@ -509,6 +511,7 @@ const STD_MODULE_SRCS: &[&str] = &[
     include_str!("../../catalogues/ext-linear-algebra.ron"),
     include_str!("../../catalogues/special-functions.ron"),
     include_str!("../../catalogues/polynomials.ron"),
+    include_str!("../../catalogues/splines.ron"),
     include_str!("../../catalogues/distances.ron"),
     include_str!("../../catalogues/regression.ron"),
 ];

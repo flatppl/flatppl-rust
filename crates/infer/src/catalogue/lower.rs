@@ -30,6 +30,10 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
             (Dim::Static(x), Dim::Static(y)) => x.checked_mul(y).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
         },
+        DimExpr::Add(a, offset) => match dim_of(a, ctx) {
+            Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
+            _ => Dim::Dynamic,
+        },
     }
 }
 
