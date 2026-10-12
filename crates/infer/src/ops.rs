@@ -276,7 +276,7 @@ pub(crate) fn call_rule(
             (true, [(_, Type::Table { .. }, _)]) => refuse_same_kind_constructor(inf, id, "table"),
             _ => table_type(inf, named),
         },
-        "rowstack" => rowstack_type(arg_ty(args, 0)),
+        "rowstack" | "colstack" => stack_type(arg_ty(args, 0), name == "colstack"),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
         // §07 gives every comparison ("Operator-equivalent functions") and every
@@ -1955,15 +1955,19 @@ fn record_from_table(columns: &[(Symbol, Type)], nrows: Dim) -> Type {
     )
 }
 
-/// `rowstack([rows…])`: an array of equal-length vectors becomes a matrix.
-fn rowstack_type(a: Option<&Type>) -> Type {
+/// An array of equal-length vectors becomes the rows or columns of a matrix.
+fn stack_type(a: Option<&Type>, columns: bool) -> Type {
     match a {
         Some(Type::Array { shape, elem }) if shape.len() == 1 => match elem.as_ref() {
             Type::Array {
                 shape: inner,
                 elem: cell,
             } if inner.len() == 1 => Type::Array {
-                shape: Box::new([shape[0], inner[0]]),
+                shape: Box::new(if columns {
+                    [inner[0], shape[0]]
+                } else {
+                    [shape[0], inner[0]]
+                }),
                 elem: cell.clone(),
             },
             _ => Type::Deferred,
