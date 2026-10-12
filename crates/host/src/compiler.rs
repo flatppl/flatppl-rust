@@ -38,7 +38,7 @@ pub struct Position {
 }
 
 impl Diagnostic {
-    fn new(stage: &'static str, source: &str, message: impl ToString) -> Self {
+    pub(crate) fn new(stage: &'static str, source: &str, message: impl ToString) -> Self {
         Self {
             stage,
             source: source.into(),

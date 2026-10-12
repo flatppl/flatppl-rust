@@ -78,11 +78,12 @@ enum Command {
     ///
     /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
     /// `.flatpir.json`, `.html` / `.md` / `.markdown` / `.tex` / `.typ` for
-    /// mathematics, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
+    /// mathematics, and `.hs3.json` / `.pyhf.json` / `.formula.json` for import).
     /// Converting to the same format canonicalizes the file. `.flatpir.json` is
     /// an alternate representation of FlatPIR (same content, including `%meta`
     /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
     /// JSON file (and override the extension); both need the optional `hs3` feature.
+    /// Formula input needs the `formula` feature and includes its table in JSON.
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
@@ -100,8 +101,8 @@ enum Command {
         /// Input format: `auto` infers from the file extension (`.flatppl` /
         /// `.flatpir`, and `.hs3.json` / `.pyhf.json`); `hs3` reads a native HS3
         /// JSON document (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf
-        /// model or workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
-        /// override the extension.
+        /// model or workspace JSON document (top-level `channels` array). `formula`
+        /// reads a Gaussian formula specification. Explicit formats override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
         /// pyhf input only: the workspace measurement whose configuration the
@@ -292,7 +293,7 @@ enum EmitForm {
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum FromFormat {
     /// Infer the input format from the file extension: `.flatppl`, `.flatpir`,
-    /// `.flatpir.json`, `.hs3.json` (HS3), `.pyhf.json` (pyhf).
+    /// `.flatpir.json`, `.hs3.json`, `.pyhf.json`, `.formula.json`.
     Auto,
     /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
     /// Requires the optional `hs3` build feature.
@@ -300,6 +301,8 @@ enum FromFormat {
     /// Read a pyhf model or workspace JSON document (top-level `channels` array).
     /// Requires the optional `hs3` build feature.
     Pyhf,
+    /// Read a formula specification with an inline table. Requires `formula`.
+    Formula,
 }
 
 /// Bound or external form for `--observations` and `--auxiliary`.
@@ -334,6 +337,8 @@ fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
         FromFormat::Hs3
     } else if name.ends_with(".pyhf.json") {
         FromFormat::Pyhf
+    } else if name.ends_with(".formula.json") {
+        FromFormat::Formula
     } else {
         FromFormat::Auto
     }
@@ -472,11 +477,39 @@ fn convert(
         ));
     }
 
-    // Read the module: HS3/pyhf paths (feature-gated) or the standard
+    #[cfg(feature = "formula")]
+    let mut formula_sidecars = None;
+
+    // Read the module: importer paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path. The input is a local file — a model
     // with remote `load_module` deps is pre-fetched with `flatppl prepare`.
     #[cfg_attr(not(feature = "fmtlint"), allow(unused_mut))]
     let mut module = match from_format {
+        #[cfg(feature = "formula")]
+        FromFormat::Formula => {
+            if to.is_document() {
+                return Err(Failure::Plain(
+                    "convert formula input to FlatPPL before rendering a document".into(),
+                ));
+            }
+            let source = flatppl_cli::read_regular_utf8(input)
+                .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
+            let spec = flatppl_formula::read(&source)
+                .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
+            let data = spec.data.as_ref().ok_or_else(|| {
+                Failure::Plain("formula input requires a `data` table in the specification".into())
+            })?;
+            let converted = flatppl_formula::build(&spec, data)
+                .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
+            formula_sidecars = Some((converted.data, converted.recipe, converted.info));
+            converted.module
+        }
+        #[cfg(not(feature = "formula"))]
+        FromFormat::Formula => {
+            return Err(Failure::Plain(
+                "formula import is not compiled in — rebuild with `--features formula`".into(),
+            ));
+        }
         #[cfg(feature = "hs3")]
         FromFormat::Hs3 => {
             let source = flatppl_cli::read_regular_utf8(input)
@@ -575,8 +608,30 @@ fn convert(
         flatppl_cli::lint_generated(&mut module, output);
     }
     // Gate the text before it reaches disk (see `check_generated`).
-    let imported = matches!(from_format, FromFormat::Hs3 | FromFormat::Pyhf);
+    let imported = matches!(
+        from_format,
+        FromFormat::Hs3 | FromFormat::Pyhf | FromFormat::Formula
+    );
     check_generated(&text, to, input, output, imported)?;
+    #[cfg(feature = "formula")]
+    if let Some((data, recipe, info)) = formula_sidecars {
+        for (extension, value) in [
+            ("data.json", serde_json::to_value(data)),
+            ("recipe.json", serde_json::to_value(recipe)),
+            ("model.json", serde_json::to_value(info)),
+        ] {
+            let value = value.map_err(|e| Failure::Plain(format!("formula sidecar: {e}")))?;
+            let text =
+                serde_json::to_string_pretty(&value).map_err(|e| Failure::Plain(e.to_string()))?;
+            let path = output.with_extension(extension);
+            fs::write(&path, text).map_err(|e| {
+                Failure::Plain(format!(
+                    "writing `{}`: {e}",
+                    flatppl_cli::terminal_path(&path)
+                ))
+            })?;
+        }
+    }
     fs::write(output, text).map_err(|e| {
         Failure::Plain(format!(
             "writing `{}`: {e}",
