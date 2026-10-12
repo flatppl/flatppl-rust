@@ -604,10 +604,6 @@ fn matrix_constructors_infer_matrices() {
         ("row_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = row_gram(A)"),
         ("col_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = col_gram(A)"),
         ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
-        (
-            "colstack",
-            "vs = [[1.0, 2.0], [3.0, 4.0]]\nx = colstack(vs)",
-        ),
     ] {
         let out = ir(src);
         assert!(
@@ -616,6 +612,11 @@ fn matrix_constructors_infer_matrices() {
             "{op} should infer a real matrix, got:\n{out}"
         );
     }
+    let out = ir("vs = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\nx = colstack(vs)");
+    assert!(
+        out.contains("(%bind x (%meta ((%array 2 (3 2) (%scalar real))"),
+        "{out}"
+    );
 }
 
 /// Vector-result constructors: `onehot`/`conv` → real, `bincounts` → integer.

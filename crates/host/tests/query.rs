@@ -2,6 +2,44 @@ use flatppl_host::{BatchSpec, Context, EmitOptions};
 use serde_json::json;
 
 #[test]
+fn bound_columns_export_their_matrix_shape() -> Result<(), Box<dyn std::error::Error>> {
+    use flatppl_host::Constant;
+    let mut context = Context::default();
+    let model = context.parse(
+        "N = external(posintegers)\nx = external(cartpow(reals, N))\nX = colstack([x .- 2.0, x .* 2.0])",
+        None, None,
+    )?;
+    let model = context.set(
+        &model,
+        &[
+            ("N".into(), Constant::Integer(3)),
+            (
+                "x".into(),
+                Constant::Array {
+                    shape: vec![3],
+                    data: vec![
+                        Constant::Real(1.0),
+                        Constant::Real(2.0),
+                        Constant::Real(3.0),
+                    ],
+                },
+            ),
+        ],
+    )?;
+    context.register("columns.flatppl", &model)?;
+    let query = context.parse(
+        "m = load_module(\"columns.flatppl\")\noutputs = m.X",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let schema = serde_json::to_value(&exported)?;
+    assert_eq!(schema["output"]["shape"], json!([3, 2]));
+    assert_eq!(schema["output"]["value_type"], "real[3, 2]");
+    Ok(())
+}
+
+#[test]
 fn registered_module_exports_a_typed_query_abi() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();
     let model = context.parse("distribution = Normal(3.0, 1.0)", None, None)?;
