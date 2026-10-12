@@ -173,6 +173,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "Gamma",
         "exponential",
         "weibull",
+        "beta",
     ] {
         let formula = if family == "binomial" {
             "y | trials(n) ~ x"
@@ -180,15 +181,17 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "y ~ x"
         };
         let y = if family == "bernoulli" {
-            vec![0, 1, 1, 0]
+            vec![0.0, 1.0, 1.0, 0.0]
+        } else if family == "beta" {
+            vec![0.1, 0.4, 0.8, 0.7]
         } else {
-            vec![2, 4, 8, 7]
+            vec![2.0, 4.0, 8.0, 7.0]
         };
         let spec = flatppl_formula::read(
             &serde_json::json!({
                 "formula": formula, "family": family,
                 "data": {"nrows": 4, "columns": [
-                    {"name": "y", "values": {"kind": "int", "values": y}},
+                    {"name": "y", "values": {"kind": "real64", "values": y}},
                     {"name": "x", "values": {"kind": "real32", "values": [1, 2, 3, 4]}},
                     {"name": "n", "values": {"kind": "int", "values": [3, 5, 8, 9]}}
                 ]}
@@ -202,6 +205,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "gaussian" | "lognormal" => ", sigma = posreals",
             "student" => ", sigma = posreals, nu = interval(1, inf)",
             "Gamma" | "negbinomial" | "weibull" => ", shape = posreals",
+            "beta" => ", phi = posreals",
             _ => "",
         };
         let parameter = format!(
@@ -226,13 +230,18 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         ]}))?;
         let prediction = model.prepare(&mut context, &data, DataMode::Prediction)?;
         context.register("prediction.flatppl", &prediction)?;
+        let observation = if family == "beta" {
+            "[0.2, 0.8]"
+        } else {
+            "[1, 1]"
+        };
         let forward = context.parse(
             &format!(
                 r#"
             m = load_module("prediction.flatppl")
             {parameter}
             inputs = p
-            outputs = logdensityof(m.K_model(p), record(y = [1, 1]))
+            outputs = logdensityof(m.K_model(p), record(y = {observation}))
         "#
             ),
             None,

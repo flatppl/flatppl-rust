@@ -16,13 +16,13 @@ The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma`, `exponential` or `weibull`. `link` is optional:
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull` or `beta`. `link` is optional:
 
 | Family | Default link | Other links |
 | --- | --- | --- |
 | Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
 | Lognormal | identity | inverse |
-| Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
+| Bernoulli, binomial, beta | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
 | Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 
@@ -33,6 +33,8 @@ Geometric models count failures before the first success and use
 `NegativeBinomial(1, 1 / mu)`, so `mu` is the expected count.
 Weibull models use a direct `shape` and mean `mu`, with scale
 `mu / gamma(1 + 1 / shape)` and a Gamma(0.01, 0.01) shape prior.
+Beta models use mean `mu` and direct precision `phi`, with a Gamma(0.01, 0.01)
+prior and response values strictly between zero and one.
 Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
 integer or a numeric column of counts. Trials remain required for prediction.
 Counts must be nonnegative integers, and binomial responses cannot exceed
@@ -67,7 +69,7 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`) with
+Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.

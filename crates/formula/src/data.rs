@@ -536,6 +536,16 @@ pub(crate) fn response(
             "Gamma, exponential, lognormal and Weibull responses must be strictly positive".into(),
         ));
     }
+    if family == Family::Beta
+        && column
+            .numeric(rows)?
+            .iter()
+            .any(|&value| value <= 0.0 || value >= 1.0)
+    {
+        return Err(Error(
+            "beta responses must lie strictly between 0 and 1".into(),
+        ));
+    }
     column.data(rows)
 }
 

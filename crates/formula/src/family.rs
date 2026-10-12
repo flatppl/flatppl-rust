@@ -19,6 +19,7 @@ pub enum Family {
     Gamma,
     Exponential,
     Weibull,
+    Beta,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -53,11 +54,12 @@ impl Family {
             "Gamma" | "gamma" => Self::Gamma,
             "exponential" => Self::Exponential,
             "weibull" => Self::Weibull,
+            "beta" => Self::Beta,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
             Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
-            Self::Bernoulli | Self::Binomial => Link::Logit,
+            Self::Bernoulli | Self::Binomial | Self::Beta => Link::Logit,
             _ => Link::Log,
         };
         let link = link
@@ -71,7 +73,7 @@ impl Family {
         let supported = match family {
             Self::Gaussian | Self::Student => link != Sqrt,
             Self::Lognormal => matches!(link, Identity | Inverse),
-            Self::Bernoulli | Self::Binomial => {
+            Self::Bernoulli | Self::Binomial | Self::Beta => {
                 matches!(
                     link,
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
@@ -105,6 +107,7 @@ impl Family {
             Self::Gaussian | Self::Lognormal => &["sigma"],
             Self::Student => &["sigma", "nu"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
+            Self::Beta => &["phi"],
             _ => &[],
         }
     }
@@ -122,7 +125,7 @@ impl Family {
             "sigma" => format!("student_t(3, 0, {sigma_scale})"),
             "nu" => "gamma(2, 0.1)".into(),
             "shape" if self == Self::Negbinomial => "InverseGamma(0.4, 0.3)".into(),
-            "shape" => "Gamma(0.01, 0.01)".into(),
+            "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -185,6 +188,14 @@ impl Family {
                 let gamma = b.call("gamma", &[argument]);
                 let scale = broadcast(b, "divide", &[mu, gamma]);
                 broadcast(b, "Weibull", &[shape, scale])
+            }
+            Self::Beta => {
+                let phi = b.self_ref("phi");
+                let alpha = broadcast(b, "mul", &[mu, phi]);
+                let one = b.lit_real(1.0);
+                let complement = broadcast(b, "sub", &[one, mu]);
+                let beta = broadcast(b, "mul", &[complement, phi]);
+                broadcast(b, "Beta", &[alpha, beta])
             }
         }
     }
