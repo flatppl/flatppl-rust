@@ -285,7 +285,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         mut self,
         root: NodeId,
         inputs: &[(NodeId, Type)],
-    ) -> (HashMap<NodeId, Type>, Vec<Diagnostic>) {
+    ) -> (HashMap<NodeId, Type>, ValueSet, Vec<Diagnostic>) {
         self.seeds = inputs
             .iter()
             .map(|(id, ty)| {
@@ -296,12 +296,13 @@ impl<'m, 's> Inferencer<'m, 's> {
             })
             .collect();
         self.drain_work(&mut vec![Work::Enter(root)]);
+        let support = self.lookup_valueset(root);
         let types = self
             .inferred
             .into_iter()
             .map(|(id, (ty, _))| (id, ty))
             .collect();
-        (types, self.diags)
+        (types, support, self.diags)
     }
 
     fn schedule_bindings(&self, work: &mut Vec<Work>) {

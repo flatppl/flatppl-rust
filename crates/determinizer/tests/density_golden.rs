@@ -387,7 +387,7 @@ fn unary_record_weights_receive_the_whole_variate() {
         ("logweighted(p -> p.a - 2 * p.b, prior)", "x - 2 * y"),
         (
             "weighted(p -> exp(p.a - 2 * p.b), prior)",
-            "log(exp(x - 2 * y))",
+            "log(ifelse(logdensityof(prior, point) <= -inf, 1.0, exp(x - 2 * y)))",
         ),
     ] {
         let actual = determinize_src(&format!("{prefix}lp = logdensityof({measure}, point)"));
@@ -573,8 +573,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        2,
-        "one density term per mixand:\n{pir}"
+        3,
+        "the weight guard serializes the shared Gamma density twice:\n{pir}"
     );
     // No normalizer at all: the mixture is `%normalized` before `normalize` is
     // lowered, so nothing is subtracted. The per-mixand `(add (log 0.4) …)` terms

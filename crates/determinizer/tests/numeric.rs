@@ -464,15 +464,15 @@ lp = logdensityof(d, 0.5)";
         "must be FlatPDL"
     );
     let pir = flatppl_flatpir::write(&out);
-    // One density term (g); the applied weight is `log(w(0.5))`, not a
-    // `builtin_logdensityof`. The weight application itself is a residual
+    // The shared density of g appears twice in text, once in the inactive-weight
+    // guard and once in the sum. The weight application itself is a residual
     // user-function `%call` beta-reduced away by canon Pass 2 (Buffy #263) —
     // `w(0.5) = exp(0.5)` (unfolded: `exp` is excluded from const-fold, see
     // `canon/fold.rs`), so no `(%call` survives.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        1,
-        "single density term:\n{pir}"
+        2,
+        "one shared density used in the weight guard and sum:\n{pir}"
     );
     assert!(
         !pir.contains("(weighted ") && !pir.contains("(logdensityof ") && !pir.contains("(%call"),

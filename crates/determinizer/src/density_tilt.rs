@@ -97,7 +97,8 @@ pub(crate) fn on_set(m: &mut Module, node: NodeId) -> Result<Option<SetLaw>, Ref
         if matches!(kind, NormalSet::Ordered)
             && matches!(m.type_of(inner), Some(Type::Measure { domain, mass: Mass::Normalized })
                 if matches!(domain.as_ref(), Type::Scalar(ScalarType::Real)))
-            && superposition_reference(m, inner, &mut Vec::new()) == Some(Reference::Lebesgue)
+            && superposition_reference(m, inner, &mut Vec::new())
+                == Some(SuperpositionReference::Lebesgue)
         {
             return Ok(Some(SetLaw::OrderedIid {
                 source,
@@ -200,7 +201,7 @@ pub(super) fn lower_density(
         },
     );
     let normalized = build_call(m, "normalize", &[weighted]);
-    lower_normalize(m, normalized, point)
+    lower_normalize(m, normalized, point, &[])
 }
 
 fn normal_density(m: &mut Module, normal: NormalOnSet, point: NodeId) -> NodeId {

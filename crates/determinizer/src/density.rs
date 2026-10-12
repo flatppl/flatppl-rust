@@ -2157,6 +2157,18 @@ fn lower_measure_density_at(
     v: NodeId,
     origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
+    lower_measure_density_in_reference(m, measure_expr, v, origin, &[])
+}
+
+/// Fixed scalar atoms extend the continuous reference throughout a mixture.
+/// Pass them through weights so an inactive weight sees zero base density.
+fn lower_measure_density_in_reference(
+    m: &mut Module,
+    measure_expr: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
     // Resolve `(%ref self x)` indirection on the measure side. A CHAIN, not one
     // level: `M = g1` is a §04 bare-name alias of `g1`'s expression, so stopping
     // at `M`'s ref-node right-hand side would refuse it as a non-constructor.
@@ -2171,6 +2183,21 @@ fn lower_measure_density_at(
         crate::kernel::Substitute::LocalOnly,
     ) {
         refuse_boundary_named_query_point(m, v, &app.bound)?;
+        // Reference proof uses the actual named arguments; density lowering
+        // still substitutes their boundaries after scoring, as before.
+        let application_atoms = if atoms.is_empty() {
+            match superposition_reference(m, measure_node, &mut Vec::new()) {
+                Some(SuperpositionReference::Mixed(atoms)) => atoms,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let atoms = if atoms.is_empty() {
+            application_atoms.as_slice()
+        } else {
+            atoms
+        };
         // §04 *Kernels and `kernelof`* makes `kernelof(x, kwargs...)` equivalent to
         // `functionof(lawof(x), kwargs...)`, so the APPLIED body sits under a `lawof`
         // whose boundary is now bound. Every stochastic node still free in it is
@@ -2193,12 +2220,47 @@ fn lower_measure_density_at(
         let density =
             marginalize_or_refuse_stochastic_law(m, app.body, v).and_then(
                 |marginal| match marginal {
-                    Some(density) => Ok(density),
-                    None => lower_measure_density_at(m, app.body, v, origin),
+                    Some(density) => marginal_in_reference(m, app.body, v, density, atoms),
+                    None => lower_measure_density_in_reference(m, app.body, v, origin, atoms),
                 },
             );
         m.pop_conditioned_inputs(conditioned.len());
         return substitute_applied_boundary(m, measure_node, density?, &app.bound);
+    }
+
+    // Dispatch on the measure op.
+    if !atoms.is_empty()
+        && !matches!(
+            builtin_name(m, measure_node),
+            Some(
+                "weighted"
+                    | "logweighted"
+                    | "superpose"
+                    | "normalize"
+                    | "truncate"
+                    | "lawof"
+                    | "functionof"
+                    | "kernelof"
+                    | "Dirac"
+                    | "Counting"
+            )
+        )
+    {
+        match superposition_reference(m, measure_node, &mut Vec::new()) {
+            Some(SuperpositionReference::Lebesgue) => {
+                let (away, point) = continuous_reference_point(m, measure_node, v, atoms)?;
+                let density = lower_measure_density_at(m, measure_expr, point, origin)?;
+                return Ok(gate_density(m, away, density));
+            }
+            Some(SuperpositionReference::Atoms(_) | SuperpositionReference::Counting) => {}
+            _ => {
+                return Err(refuse(
+                    measure_node,
+                    m,
+                    "mixed reference conversion needs a proven scalar component",
+                ));
+            }
+        }
     }
 
     // An applied fan-out kernel `joint(K1, K2, …)(a)` — not a reification, so the
@@ -2219,10 +2281,7 @@ fn lower_measure_density_at(
         return lowered;
     }
 
-    // Dispatch on the measure op.
-    let op = builtin_name(m, measure_node);
-
-    match op {
+    match builtin_name(m, measure_node) {
         Some("record") => lower_record_of_draws(m, measure_node, v),
         // A `lawof`-wrapped measure reached as a SUB-measure (e.g. a
         // `bayesupdate` prior — `lower_bayesupdate` hands its prior straight to
@@ -2232,13 +2291,13 @@ fn lower_measure_density_at(
         // already-stripped `lawof` never re-enters this arm, since the entry
         // point's strip means `measure_node` is `M` itself by the time it's
         // dispatched, so there's no double count.
-        Some("lawof") => lower_lawof(m, measure_node, v, origin),
-        Some("weighted") => lower_weighted(m, measure_node, v),
-        Some("logweighted") => lower_logweighted(m, measure_node, v),
-        Some("superpose") => lower_superpose(m, measure_node, v),
-        Some("normalize") => lower_normalize(m, measure_node, v),
+        Some("lawof") => lower_lawof(m, measure_node, v, origin, atoms),
+        Some("weighted") => lower_weighted(m, measure_node, v, atoms),
+        Some("logweighted") => lower_logweighted(m, measure_node, v, atoms),
+        Some("superpose") => lower_superpose(m, measure_node, v, atoms),
+        Some("normalize") => lower_normalize(m, measure_node, v, atoms),
         Some("tilt") => tilt::lower_density(m, measure_node, v),
-        Some("truncate") => lower_truncate(m, measure_node, v, origin),
+        Some("truncate") => lower_truncate(m, measure_node, v, origin, atoms),
         Some("pushfwd") => lower_pushfwd(m, measure_node, v, origin),
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
@@ -2257,7 +2316,9 @@ fn lower_measure_density_at(
         // so a `broadcast(K, params)` body reaches the broadcast-kernel arm and a
         // bare constructor body reaches `build_density_term` (histfactory's
         // `functionof(Poisson.(expected))` scored via `likelihoodof`).
-        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v, origin),
+        Some("functionof") | Some("kernelof") => {
+            lower_reified_measure(m, measure_node, v, origin, atoms)
+        }
         // Refused combinators — refused here rather than mis-lowered.
         // `likelihoodof` / `joint_likelihood` / `bayesupdate` are normally
         // intercepted at the `logdensityof` entry (where the `bundle` needed to
@@ -2336,6 +2397,7 @@ fn lower_lawof(
     node: NodeId,
     v: NodeId,
     origin: VariateOrigin,
+    atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
     let arg = {
         let c = expect_builtin_call(m, node, "lawof")
@@ -2346,9 +2408,9 @@ fn lower_lawof(
         c.args[0]
     };
     if let Some(marginal) = marginalize_or_refuse_stochastic_law(m, arg, v)? {
-        return Ok(marginal);
+        return marginal_in_reference(m, arg, v, marginal, atoms);
     }
-    lower_measure_density_at(m, arg, v, origin)
+    lower_measure_density_in_reference(m, arg, v, origin, atoms)
 }
 
 /// Marginalize — or refuse — `lawof(<measure expression>)` whose measure is
@@ -3574,7 +3636,12 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
 /// weight is used as-is (`log(w) + density`); a variate-dependent (function)
 /// weight is **applied at the variate** per §06 "Weight arity" — see
 /// [`build_weight_call`].
-fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_weighted(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
     let (w_node, m_inner) = {
         let c = expect_builtin_call(m, node, "weighted")
             .ok_or_else(|| refuse(node, m, "expected weighted"))?;
@@ -3583,14 +3650,29 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
         }
         (c.args[0], c.args[1])
     };
-    let inner_density = lower_measure_density(m, m_inner, v)?;
+    let inner_density =
+        lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
     let w_scored = if weight_is_variate_dependent(m, w_node) {
         build_weight_call(m, w_node, v)?
     } else {
         w_node
     };
-    let log_w = build_call(m, "log", &[w_scored]);
+    // Outside the base measure's support the product is zero for every weight.
+    // Do not differentiate an inactive log(0) at a zero mixture weight.
+    let positive = static_real(m, w_scored).is_some_and(|w| w > 0.0 && w.is_finite())
+        || matches!(m.valueset_of(w_scored), Some(ValueSet::PosReals));
+    let safe_weight = if positive {
+        w_scored
+    } else {
+        let inf = m.intern("inf");
+        let inf = m.alloc(Node::Const(inf));
+        let neg_inf = build_call(m, "neg", &[inf]);
+        let absent = build_call(m, "le", &[inner_density, neg_inf]);
+        let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        build_call(m, "ifelse", &[absent, one, w_scored])
+    };
+    let log_w = build_call(m, "log", &[safe_weight]);
     Ok(build_call(m, "add", &[log_w, inner_density]))
 }
 
@@ -3600,7 +3682,12 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 /// already in log space, so there is no outer `log`: a constant/scalar `ℓ` is used
 /// as-is, and a variate-dependent (function) log-weight is **applied at the
 /// variate** per §06 "Weight arity" — see [`build_weight_call`].
-fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_logweighted(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
     let (lw_node, m_inner) = {
         let c = expect_builtin_call(m, node, "logweighted")
             .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
@@ -3609,7 +3696,8 @@ fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, 
         }
         (c.args[0], c.args[1])
     };
-    let inner_density = lower_measure_density(m, m_inner, v)?;
+    let inner_density =
+        lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
     let lw_scored = if weight_is_variate_dependent(m, lw_node) {
         build_weight_call(m, lw_node, v)?
     } else {
@@ -3722,8 +3810,13 @@ fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId
     Ok(build_user_call_n(m, w_node, components))
 }
 
-/// `logdensityof(superpose(M₁, …, Mₖ), v)` = `logsumexp([density(M₁,v), …, density(Mₖ,v)])`
-fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+/// Add component densities only after expressing them against a common reference.
+fn lower_superpose(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
     // Read the args list before any mutable borrow.
     let inner_measures: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "superpose")
@@ -3734,25 +3827,36 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         c.args.to_vec()
     };
 
-    let references: Vec<_> = inner_measures
-        .iter()
-        .map(|&measure| superposition_reference(m, measure, &mut Vec::new()))
-        .collect();
-    if references.contains(&Some(Reference::Counting))
-        && references
+    let own_atoms = if atoms.is_empty() {
+        let references: Option<Vec<_>> = inner_measures
             .iter()
-            .any(|reference| *reference != Some(Reference::Counting))
-    {
-        return Err(refuse(
-            node,
-            m,
-            "superpose densities need a common reference; atomic or counting components cannot be added to an unproven continuous density",
-        ));
-    }
+            .map(|&measure| superposition_reference(m, measure, &mut Vec::new()))
+            .collect();
+        let common = references.and_then(|r| SuperpositionReference::common(&r))
+            .ok_or_else(|| refuse(node, m,
+                "superpose densities need a fixed common reference; continuous components may mix only with proven finite fixed scalar atoms"))?;
+        match common {
+            SuperpositionReference::Mixed(atoms) => atoms,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let atoms = if atoms.is_empty() {
+        own_atoms.as_slice()
+    } else {
+        atoms
+    };
 
     let mut density_terms: Vec<NodeId> = Vec::with_capacity(inner_measures.len());
-    for &mi in &inner_measures {
-        density_terms.push(lower_measure_density(m, mi, v)?);
+    for measure in inner_measures {
+        density_terms.push(lower_measure_density_in_reference(
+            m,
+            measure,
+            v,
+            VariateOrigin::Other,
+            atoms,
+        )?);
     }
 
     // §07 "Reductions and norms": `logsumexp(v)` takes a single real VECTOR, not
@@ -3762,13 +3866,94 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     Ok(build_call(m, "logsumexp", &[terms_vec]))
 }
 
+#[derive(Clone, PartialEq)]
+enum SuperpositionReference {
+    Lebesgue,
+    Counting,
+    Atoms(Vec<f64>),
+    Mixed(Vec<f64>),
+}
+
+fn continuous_reference_point(
+    m: &mut Module,
+    measure: NodeId,
+    v: NodeId,
+    atoms: &[f64],
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let witness = support_witness_point(m, measure, v)
+        .ok_or_else(|| refuse(measure, m, "mixed density needs a proven support witness"))?;
+    let mut away = m.alloc(Node::Lit(Scalar::Bool(true)));
+    for atom in atoms {
+        let atom = m.alloc(Node::Lit(Scalar::Real(*atom)));
+        let difference = build_call(m, "sub", &[v, atom]);
+        let equal = build_call(m, "iszero", &[difference]);
+        let unequal = build_call(m, "lnot", &[equal]);
+        away = build_call(m, "land", &[away, unequal]);
+    }
+    Ok((away, gate_point(m, away, v, Some(witness))))
+}
+
+fn marginal_in_reference(
+    m: &mut Module,
+    measure: NodeId,
+    v: NodeId,
+    density: NodeId,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
+    if atoms.is_empty() {
+        return Ok(density);
+    }
+    match superposition_reference(m, measure, &mut Vec::new()) {
+        Some(SuperpositionReference::Lebesgue) => {
+            let (away, point) = continuous_reference_point(m, measure, v, atoms)?;
+            let density = crate::driver::substitute_in_tree(m, density, v, point);
+            Ok(gate_density(m, away, density))
+        }
+        Some(SuperpositionReference::Atoms(_) | SuperpositionReference::Counting) => Ok(density),
+        _ => Err(refuse(
+            measure,
+            m,
+            "marginal density needs a proven common reference",
+        )),
+    }
+}
+
+impl SuperpositionReference {
+    fn common(references: &[Self]) -> Option<Self> {
+        let continuous = references
+            .iter()
+            .any(|r| matches!(r, Self::Lebesgue | Self::Mixed(_)));
+        let counting = references.contains(&Self::Counting);
+        if continuous && counting {
+            return None;
+        }
+        let mut atoms = Vec::new();
+        for reference in references {
+            if let Self::Atoms(points) | Self::Mixed(points) = reference {
+                atoms.extend(points);
+            }
+        }
+        atoms.sort_by(f64::total_cmp);
+        atoms.dedup();
+        Some(if continuous && !atoms.is_empty() {
+            Self::Mixed(atoms)
+        } else if continuous {
+            Self::Lebesgue
+        } else if counting {
+            Self::Counting
+        } else {
+            Self::Atoms(atoms)
+        })
+    }
+}
+
 /// Follow output measures only. A Dirac among a Normal's parameters does not
 /// make that Normal atomic, while a real-valued Dirac is never Lebesgue density.
 fn superposition_reference(
     m: &mut Module,
     node: NodeId,
     path: &mut Vec<NodeId>,
-) -> Option<Reference> {
+) -> Option<SuperpositionReference> {
     if path.contains(&node) {
         return None;
     }
@@ -3800,23 +3985,49 @@ fn superposition_reference(
         let Node::Call(call) = m.node(node).clone() else {
             return None;
         };
-        let name = builtin_name(m, node)?;
+        let name = builtin_name(m, node).or_else(|| match call.head {
+            CallHead::User(callee) => std_module_ctor_sym(m, callee).map(|sym| m.resolve(sym)),
+            _ => None,
+        })?;
         match name {
-            "Dirac" | "Counting" => Some(Reference::Counting),
-            "Lebesgue" => Some(Reference::Lebesgue),
-            "weighted" | "logweighted" | "pushfwd" | "tilt" => {
+            "Dirac" => {
+                let value = named_or_positional(m, &call, "value")?;
+                if let Some(atom) = static_real(m, value).filter(|x| x.is_finite()) {
+                    Some(SuperpositionReference::Atoms(vec![atom]))
+                } else if matches!(
+                    m.type_of(value),
+                    Some(Type::Scalar(ScalarType::Integer | ScalarType::Boolean))
+                ) {
+                    Some(SuperpositionReference::Counting)
+                } else {
+                    None
+                }
+            }
+            "Counting" => Some(SuperpositionReference::Counting),
+            "Lebesgue" => Some(SuperpositionReference::Lebesgue),
+            "weighted" | "logweighted" | "tilt" => {
                 superposition_reference(m, *call.args.get(1)?, path)
             }
-            "normalize" | "truncate" | "iid" | "locscale" | "lawof" | "draw" => {
+            "normalize" | "truncate" | "lawof" | "draw" => {
                 superposition_reference(m, *call.args.first()?, path)
             }
+            "pushfwd" | "locscale" | "iid" => {
+                let base = *call.args.get(usize::from(name == "pushfwd"))?;
+                match superposition_reference(m, base, path)? {
+                    SuperpositionReference::Lebesgue => Some(SuperpositionReference::Lebesgue),
+                    SuperpositionReference::Counting => Some(SuperpositionReference::Counting),
+                    // The image atom locations or product reference need their
+                    // own proof; forwarding the input points would be wrong.
+                    _ => None,
+                }
+            }
             "superpose" => {
-                let reference = superposition_reference(m, *call.args.first()?, path)?;
-                call.args
+                let references: Option<Vec<_>> = call
+                    .args
                     .iter()
-                    .skip(1)
-                    .all(|&arg| superposition_reference(m, arg, path) == Some(reference))
-                    .then_some(reference)
+                    .map(|&arg| superposition_reference(m, arg, path))
+                    .collect();
+                SuperpositionReference::common(&references?)
             }
             _ if flatppl_infer::distribution_param_names(name).is_some() => {
                 // Applying a row kernel rebuilds its constructor without the
@@ -3829,7 +4040,10 @@ fn superposition_reference(
                 let Type::Measure { domain, .. } = ty else {
                     return None;
                 };
-                reference_measure(&domain)
+                reference_measure(&domain).map(|reference| match reference {
+                    Reference::Lebesgue => SuperpositionReference::Lebesgue,
+                    Reference::Counting => SuperpositionReference::Counting,
+                })
             }
             _ => None,
         }
@@ -3903,12 +4117,22 @@ fn superposition_reference(
 /// `Z = totalmass(M)` finite and nonzero", §06 "Density of composed measures"): a
 /// degenerate/empty interval collapses `Z → 0`, so `logZ → −∞`. That is the
 /// backend's concern (a runtime `log(0)`), not statically checked here.
-fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_normalize(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    atoms: &[f64],
+) -> Result<NodeId, RefuseError> {
     if let Some(law) = exponential_tilt::recognize(m, node) {
+        if !atoms.is_empty() && !law.integer {
+            let score =
+                lower_measure_density_in_reference(m, law.measure, v, VariateOrigin::Other, atoms)?;
+            return Ok(exponential_tilt::guard(m, score, law.valid));
+        }
         return exponential_tilt::density(m, law, v);
     }
     if let Some((base, valid)) = normalized_scalar_weight(m, node) {
-        let score = lower_measure_density(m, base, v)?;
+        let score = lower_measure_density_in_reference(m, base, v, VariateOrigin::Other, atoms)?;
         return Ok(exponential_tilt::guard(m, score, valid));
     }
     let m_inner = {
@@ -3931,7 +4155,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 
     if inner_mass == Some(Mass::Normalized) {
         // Probability measure: Z = 1, logZ = 0. `normalize(M)` ≡ density(M, v).
-        return lower_measure_density(m, m_inner, v);
+        return lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms);
     }
 
     // Closed-form Z for a truncated univariate measure: Z = CDF(hi) − CDF(lo),
@@ -4044,7 +4268,8 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
             });
         }
         if base_univariate_continuous {
-            let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
+            let density =
+                lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?; // truncate handles the -inf gate
             let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
             return Ok(build_call(m, "sub", &[density, log_z]));
         }
@@ -4090,12 +4315,12 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         // if the variate is somehow not the Gaussians' scalar domain — the product
         // here is over a scalar variate, so a non-scalar `v` refuses (both factors
         // share `v`, so g1's guard suffices).
-        let t1 = build_density_term(m, gp.g1, v)?;
+        let t1 = lower_measure_density_in_reference(m, gp.g1, v, VariateOrigin::Other, atoms)?;
         // g2's density at the variate. g2's factor is read as `(μ2, σ2)` value
         // nodes (the reified body may already be lowered to `builtin_logdensityof`,
         // so there is no g2 constructor node to reuse); rebuild the constructor.
         let g2_ctor = build_normal_ctor(m, gp.mu2, gp.sigma2);
-        let t2 = build_density_term(m, g2_ctor, v)?;
+        let t2 = lower_measure_density_in_reference(m, g2_ctor, v, VariateOrigin::Other, atoms)?;
         // logZ stddev = sqrt(add(pow(σ1, 2), pow(σ2, 2))): the overlap variance is
         // the SUM of the two variances (§08 Normal), not their difference.
         let two_a = m.alloc(Node::Lit(Scalar::Real(2.0)));
@@ -4137,7 +4362,8 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     // violates §06's Z finite & nonzero precondition and is the backend's runtime
     // concern, consistent with the truncate and Gaussian-product arms above.
     if let Some(weights) = recognize_convex_superposition(m, m_inner_resolved) {
-        let sup_density = lower_measure_density(m, m_inner, v)?;
+        let sup_density =
+            lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
         let z = fold_add(m, &weights);
         let log_z = build_call(m, "log", &[z]);
         return Ok(build_call(m, "sub", &[sup_density, log_z]));
@@ -4161,7 +4387,8 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     // both violate its "Z finite and nonzero" precondition and stay the backend's
     // runtime concern, exactly as the three arms above leave them.
     if let Some(weights) = recognize_markov_ksuperpose(m, m_inner_resolved) {
-        let mix_density = lower_measure_density(m, m_inner, v)?;
+        let mix_density =
+            lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
         let z = build_call(m, "sum", &[weights]);
         let log_z = build_call(m, "log", &[z]);
         return Ok(build_call(m, "sub", &[mix_density, log_z]));
@@ -4193,7 +4420,8 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                     .to_string(),
             });
         };
-        let density = lower_measure_density(m, m_inner, v)?;
+        let density =
+            lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
         let z = polynomial_interval_mass(m, &shape.coefficients, lo, hi);
         let log_z = build_call(m, "log", &[z]);
         return Ok(build_call(m, "sub", &[density, log_z]));
@@ -4201,7 +4429,8 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 
     if let Some(normalizer) = integral::mass(m, m_inner) {
         let log_z = normalizer?;
-        let density = lower_measure_density(m, m_inner, v)?;
+        let density =
+            lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
         return Ok(normalized_logdensity(m, density, log_z));
     }
 
@@ -4707,6 +4936,7 @@ fn lower_truncate(
     node: NodeId,
     v: NodeId,
     origin: VariateOrigin,
+    atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
     let (m_inner, s_node) = {
         let c = expect_builtin_call(m, node, "truncate")
@@ -4724,7 +4954,7 @@ fn lower_truncate(
     // does not move the variate, so outside `S` a draw the point determines still takes
     // that value — the gate is about the measure's density, not about the draw. The
     // sanitised point goes into the emitted ARM only.
-    let inner_density = lower_measure_density_at(m, m_inner, v, origin)?;
+    let inner_density = lower_measure_density_in_reference(m, m_inner, v, origin, atoms)?;
     // The dangerous op in a truncation's gated arm is the base density itself, so the
     // witness is a point in the BASE's support. It need not be in `S` — it is never the
     // gate's value, only the point the excluded arm is differentiated at.
@@ -4887,11 +5117,16 @@ fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
 /// `None` where the support or the variate names no such point (a record or table
 /// variate, an unproven support): no sanitisation then.
 fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
-    let support = m.valueset_of(measure).cloned()?;
+    let (ty, support) = match (m.type_of(measure), m.valueset_of(measure)) {
+        (Some(ty), Some(support)) if crate::invert::support_witness(support).is_some() => {
+            (ty.clone(), support.clone())
+        }
+        _ => flatppl_infer::infer_expression_support(m, measure)?,
+    };
     let w = crate::invert::support_witness(&support)?;
     let scalar = m.alloc(Node::Lit(Scalar::Real(w)));
-    match m.type_of(measure) {
-        Some(Type::Measure { domain, .. }) => match &**domain {
+    match ty {
+        Type::Measure { domain, .. } => match &*domain {
             Type::Scalar(_) => Some(scalar),
             Type::Array { shape, .. } if shape.len() == 1 => {
                 let n = build_call(m, "lengthof", &[v]);
@@ -7900,6 +8135,7 @@ fn lower_reified_measure(
     node: NodeId,
     v: NodeId,
     origin: VariateOrigin,
+    atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
     // The names this reification declares as inputs. Scoring its body conditions
     // on them (§04 "Reification to measures"), so they are held on the module's
@@ -7971,7 +8207,7 @@ fn lower_reified_measure(
         ));
     }
     m.push_conditioned_inputs(&declared_inputs);
-    let scored = lower_measure_density_at(m, body, v, origin);
+    let scored = lower_measure_density_in_reference(m, body, v, origin, atoms);
     m.pop_conditioned_inputs(declared_inputs.len());
     scored
 }
@@ -8652,7 +8888,7 @@ mod tests {
         let normalize = build_call(&mut m, "normalize", &[truncate]);
         let v = m.alloc(Node::Lit(Scalar::Real(2.0)));
 
-        let err = lower_normalize(&mut m, normalize, v)
+        let err = lower_normalize(&mut m, normalize, v, &[])
             .expect_err("composed (pushfwd) base must refuse, not emit builtin_touniform(pushfwd)");
         assert!(
             err.reason.contains("leaf built-in distribution"),
