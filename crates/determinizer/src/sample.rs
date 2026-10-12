@@ -29,7 +29,7 @@
 //! referenced by name.
 use crate::density::{
     build_call, build_record, build_user_call, builtin_name, draw_argument, expect_builtin_call,
-    iid_static_size, refuse, resolve_ref_one, split_kernel_constructor,
+    iid_static_shape, refuse, resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -780,7 +780,7 @@ fn lower_tilt_sample(
             let input = build_record(m, &parameters);
             let ctor = m.intern("Normal");
             let ctor = m.alloc(Node::Const(ctor));
-            let (z, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng, sample_name);
+            let (z, rng_out) = build_iid_sample_term(m, ctor, input, &[normal.n], rng, sample_name);
             if normal.n == 1 {
                 return Ok((build_call(m, "vector", &[zero]), rng_out));
             }
@@ -846,7 +846,7 @@ fn lower_iid_normal_on_set(
     let input = build_record(m, &parameters);
     let ctor = m.intern("Normal");
     let ctor = m.alloc(Node::Const(ctor));
-    let (value, rng_out) = build_iid_sample_term(m, ctor, input, normal.n, rng, sample_name);
+    let (value, rng_out) = build_iid_sample_term(m, ctor, input, &[normal.n], rng, sample_name);
     let value = match normal.kind {
         NormalSet::Ordered => build_call(m, flatppl_core::SORT_VECTOR, &[value]),
         NormalSet::ZeroSum => {
@@ -860,9 +860,9 @@ fn lower_iid_normal_on_set(
     (value, rng_out)
 }
 
-/// `iid(K, n)` with a FIXED kernel `K` and a static length `n` → ONE batched
-/// `builtin_sample(rng, ctor, input, n)` (spec §07 measure-eval-prims:
-/// `builtin_sample`'s size-dims form returns an IID array `X` of size `n` with a
+/// `iid(K, size)` with a fixed kernel and static product axes → one batched
+/// `builtin_sample(rng, ctor, input, n, m, ...)` (spec §07 measure-eval-prims:
+/// `builtin_sample`'s size-dims form returns an IID array with a
 /// SINGLE advanced `new_rngstate`, not one per element).
 ///
 /// Shared by BOTH spellings of the same measure, so they emit the identical term:
@@ -883,18 +883,17 @@ fn lower_iid_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let n = iid_static_size(m, iid_node).ok_or_else(|| {
+    let shape = iid_static_shape(m, iid_node).ok_or_else(|| {
         refuse(
             iid_node,
             m,
-            "iid sample length is not a statically-resolved 1-D count (dynamic, \
-             multi-axis, or unresolved domain); only a 1-D static fan-out is built",
+            "iid sample size is not a statically-resolved shape (dynamic or unresolved domain)",
         )
     })?;
     if let Some(law) = crate::density::exponential_tilt::recognize(m, kernel) {
         let (ctor, parameters) = exponential_tilt_constructor(m, &law)
             .ok_or_else(|| refuse(law.measure, m, "exponential tilt needs a primitive law"))?;
-        let (value, next) = build_iid_sample_term(m, ctor, parameters, n, rng, sample_name);
+        let (value, next) = build_iid_sample_term(m, ctor, parameters, &shape, rng, sample_name);
         return Ok((
             crate::density::exponential_tilt::guard_sample(m, value, law.valid, law.integer),
             next,
@@ -912,16 +911,16 @@ fn lower_iid_sample(
         m,
         ctor,
         kernel_input,
-        n,
+        &shape,
         rng,
         sample_name,
     ))
 }
 
-/// `iid(K, n)` → `(K, iid_node)`, resolving one level of ref indirection first
-/// (mirroring `split_constructor`'s convention). The repeat count is read from
-/// `iid_node`'s own inferred domain shape by `density::iid_static_size` — NOT
-/// the raw `n` argument here — since a shape-dependent size (`lengthof(obs)`,
+/// `iid(K, size)` → `(K, iid_node)`, resolving one level of ref indirection first
+/// (mirroring `split_constructor`'s convention). The product axes are read from
+/// `iid_node`'s inferred domain by `density::iid_static_shape`, since a
+/// shape-dependent size (`lengthof(obs)`,
 /// arithmetic, …) is already const-folded onto the type (see that function's
 /// doc); callers pass `iid_node` straight to it.
 fn split_iid(m: &Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
@@ -961,21 +960,25 @@ fn build_sample_term(
     sample_slots(m, sample, sample_name)
 }
 
-/// Emit `builtin_sample(rng, ctor, kernel_input, n)` → `(get0(sample, 0)` = the
-/// length-`n` IID array, `get0(sample, 1)` = new rng`)` — the spec §07
-/// size-dims form of `builtin_sample`: ONE call over the fixed kernel
-/// `ctor(kernel_input)` produces `n` iid draws and ONE advanced rngstate
-/// (mirrors [`build_sample_term`]'s single-draw shape, plus the trailing `n`).
+/// Emit `builtin_sample(rng, ctor, kernel_input, n, m, ...)` → `(get0(sample, 0)`
+/// = the IID array, `get0(sample, 1)` = new rng`)` — the spec §07
+/// size-dims form of `builtin_sample`: one call over the fixed kernel
+/// `ctor(kernel_input)` produces the IID array and one advanced rngstate.
 fn build_iid_sample_term(
     m: &mut Module,
     ctor: NodeId,
     kernel_input: NodeId,
-    n: usize,
+    shape: &[usize],
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> (NodeId, NodeId) {
-    let n_lit = m.alloc(Node::Lit(Scalar::Int(n as i64)));
-    let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input, n_lit]);
+    let mut args = vec![rng, ctor, kernel_input];
+    args.extend(
+        shape
+            .iter()
+            .map(|&n| m.alloc(Node::Lit(Scalar::Int(n as i64)))),
+    );
+    let sample = build_call(m, "builtin_sample", &args);
     sample_slots(m, sample, sample_name)
 }
 
