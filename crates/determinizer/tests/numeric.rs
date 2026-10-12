@@ -929,7 +929,7 @@ fn empty_record_is_zero() {
 // may not write a degenerate shape, data may turn out empty".
 //   * A WRITTEN size of `0` is a static error (§06 `iid`, the positivity rule).
 //   * A DERIVED size resolving to 0 types `%dynamic`, never `Dim::Static(0)`
-//     (sub-ruling 3), and the unroll needs a static 1-D count — so it refuses.
+//     (sub-ruling 3), and the lowering needs a static shape — so it refuses.
 //
 // Which leaves the static empty product with no legal spelling: a derived size
 // only turns out to be 0 at data-load time, and that is the js engine's job, not
@@ -961,10 +961,10 @@ n = sub(lengthof(xs), lengthof(xs))
 d = iid(Normal(mu = 0.0, sigma = 1.0), n)
 lp = logdensityof(d, keep)";
     let m = parse_infer(derived);
-    let err = determinize(&m).expect_err("a %dynamic iid size must refuse, not unroll");
+    let err = determinize(&m).expect_err("a %dynamic iid size must refuse");
     assert!(
-        format!("{err:?}").contains("not a statically-resolved 1-D count"),
-        "a derived zero size stays %dynamic and the unroll refuses it: {err:?}"
+        format!("{err:?}").contains("not a statically-resolved shape"),
+        "a derived zero size stays %dynamic and the lowering refuses it: {err:?}"
     );
 }
 

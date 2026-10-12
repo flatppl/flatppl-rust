@@ -4905,10 +4905,7 @@ fn builtin_sample_refuses_non_const_ctor() {
     assert_eq!(err.node, Some(ctor));
 }
 
-/// `builtin_sample` with the wrong number of arguments must refuse (naming
-/// the exact expected/actual count), not panic on the arg-count match. The
-/// scalar form takes 3 args and the fanned iid form 4 (spec §07 size dims),
-/// so a 2-arg call refuses with the "3 or 4 arguments" message.
+/// `builtin_sample` needs three arguments before its optional size dimensions.
 #[test]
 fn builtin_sample_refuses_wrong_arity() {
     let mut m = Module::new();
@@ -4920,7 +4917,7 @@ fn builtin_sample_refuses_wrong_arity() {
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
-            .contains("builtin_sample: expected 3 or 4 arguments, got 2"),
+            .contains("builtin_sample expects RNG state, constructor and parameters"),
         "unexpected message: {}",
         err.msg
     );

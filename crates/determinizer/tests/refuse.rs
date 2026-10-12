@@ -247,24 +247,6 @@ lp = logdensityof(lawof(t), [0.1, 0.2, 0.3, 0.4])";
     );
 }
 
-// `iid(M, [2, 3])` — a MULTI-AXIS (vector) `size`. §06 "Independent composition"
-// admits `size` as "an integer (1-D length) or a vector of positive integers
-// (multi-axis shape)", so this is a VALID model. But the determiniser's O(N)
-// static unroll (`literal_usize` + `lower_iid`) reads only a literal SCALAR
-// integer `N`; the vectorized broadcast+reduce over a multi-axis shape is the
-// noted scale path, not built. So a vector `size` is a CONSERVATIVE refuse
-// (refuse-don't-mislower), not a bug — this pins that behavior.
-#[test]
-fn iid_multi_axis_size_refuses() {
-    let src = "\
-d = iid(Normal(mu = 0.0, sigma = 1.0), [2, 3])
-lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
-    let m = parse_infer(src);
-    determinize(&m).expect_err(
-        "iid with a multi-axis / vector size must refuse (only a literal scalar N is unrolled)",
-    );
-}
-
 // A GENUINELY dynamic iid size must still refuse (refuse-don't-mislower). The
 // determiniser now resolves an iid's repeat count from its const-evaluated
 // static domain shape (so a `lengthof(fixed_array)` size lowers), but an

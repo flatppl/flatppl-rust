@@ -4105,7 +4105,10 @@ impl<'m> Emitter<'m> {
                             return self.lower_node(elem);
                         }
                         match self.sample_tuple_slot(&call.args, base) {
-                            Some(0) => self.lower_node(call.args[0]),
+                            Some(0) => {
+                                let value = self.lower_node(call.args[0])?;
+                                Ok(self.with_typed_axes(id, value))
+                            }
                             Some(1) => {
                                 // Advanced rng key: lower the sample first
                                 // (populating `sample_keys` — a `get0(_, 1)` may

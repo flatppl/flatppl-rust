@@ -723,36 +723,32 @@ pub(crate) fn lower_sample(
             "Enzyme restrictions require a deterministic query",
         ));
     }
-    // The scalar form is `builtin_sample(rng, ctor, kernel_input)`; the fanned
-    // iid form (spec §07 size dims) appends a trailing static count `n`,
-    // `builtin_sample(rng, ctor, kernel_input, n)` — the determiniser's
-    // `iid(K, n)` fan-out (see `flatppl_determinizer::sample`).
-    let (rng, ctor, kernel_input, batch_n) = match *args {
-        [rng, ctor, kernel_input] => (rng, ctor, kernel_input, None),
-        [rng, ctor, kernel_input, n_arg] => {
-            // Read `n` from the trailing literal — a static positive-integer
-            // invariant the batched draw shape needs at emit time (refuses a
-            // non-literal `n` below), independent of the inferred variate type.
-            let n = match e.node(n_arg) {
-                Node::Lit(Scalar::Int(i)) if *i > 0 => *i as u64,
-                _ => {
-                    return Err(EmitError::at(
-                        n_arg,
-                        "builtin_sample fan-out size must be a positive integer literal",
-                    ));
-                }
-            };
-            (rng, ctor, kernel_input, Some(n))
-        }
-        _ => {
-            return Err(EmitError::at(
-                id,
-                format!(
-                    "builtin_sample: expected 3 or 4 arguments, got {}",
-                    args.len()
-                ),
-            ));
-        }
+    let [rng, ctor, kernel_input, size_args @ ..] = args else {
+        return Err(EmitError::at(
+            id,
+            "builtin_sample expects RNG state, constructor and parameters",
+        ));
+    };
+    let (rng, ctor, kernel_input) = (*rng, *ctor, *kernel_input);
+    let batch_shape = size_args
+        .iter()
+        .map(|&dim| match e.node(dim) {
+            Node::Lit(Scalar::Int(n)) if *n > 0 => Ok(*n as u64),
+            _ => Err(EmitError::at(
+                dim,
+                "builtin_sample fan-out dimensions must be positive integer literals",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch_n = if batch_shape.is_empty() {
+        None
+    } else {
+        Some(
+            batch_shape
+                .iter()
+                .try_fold(1u64, |n, &dim| n.checked_mul(dim))
+                .ok_or_else(|| EmitError::at(id, "builtin_sample fan-out size overflows"))?,
+        )
     };
 
     let ctor_name = match e.node(ctor) {
@@ -795,14 +791,28 @@ pub(crate) fn lower_sample(
         kernel_input,
         variate: None,
     };
-    // Size the draw by the batch dim for a fanned iid sample; clear it after
-    // (even on a builder error) so a later scalar sample is unaffected.
+    // Existing samplers consume a flat product batch. Restore its outer axes
+    // after sampling, keeping the inner event axes and RNG advances unchanged.
     if let Some(n) = batch_n {
         e.set_batch_shape(vec![n]);
     }
     let result = sample(e, &params);
     e.clear_batch_shape();
-    let value = result?;
+    let mut value = result?;
+    if batch_shape.len() > 1 {
+        let MlirTy::Ranked(dims) = &value.ty else {
+            return Err(EmitError::at(id, "iid sampler did not return a batch"));
+        };
+        if dims.first() != Some(&batch_n) {
+            return Err(EmitError::at(
+                id,
+                "iid sampler returned the wrong batch size",
+            ));
+        }
+        let mut shape: Vec<_> = batch_shape.iter().copied().map(Some).collect();
+        shape.extend_from_slice(&dims[1..]);
+        value = e.reshape(&value, MlirTy::Ranked(shape));
+    }
 
     // The builder advanced the key via `Emitter::rng`; record it for this
     // node's advanced-rng slot. Fan-out draws ONE `[n]` batch, so a fanned
