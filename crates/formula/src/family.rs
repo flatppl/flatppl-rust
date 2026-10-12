@@ -14,6 +14,7 @@ pub enum Family {
     Binomial,
     Poisson,
     Negbinomial,
+    Geometric,
     #[serde(rename = "Gamma")]
     Gamma,
     Exponential,
@@ -47,6 +48,7 @@ impl Family {
             "binomial" => Self::Binomial,
             "poisson" => Self::Poisson,
             "negbinomial" => Self::Negbinomial,
+            "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
             "exponential" => Self::Exponential,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
@@ -73,7 +75,7 @@ impl Family {
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
                 )
             }
-            Self::Poisson | Self::Negbinomial => {
+            Self::Poisson | Self::Negbinomial | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
             Self::Gamma | Self::Exponential => {
@@ -92,7 +94,7 @@ impl Family {
     pub(crate) fn discrete(self) -> bool {
         matches!(
             self,
-            Self::Bernoulli | Self::Binomial | Self::Poisson | Self::Negbinomial
+            Self::Bernoulli | Self::Binomial | Self::Poisson | Self::Negbinomial | Self::Geometric
         )
     }
 
@@ -154,8 +156,12 @@ impl Family {
                 broadcast(b, "Binomial", &[n, mu])
             }
             Self::Poisson => broadcast(b, "Poisson", &[mu]),
-            Self::Negbinomial | Self::Gamma => {
-                let shape = b.self_ref("shape");
+            Self::Negbinomial | Self::Geometric | Self::Gamma => {
+                let shape = if self == Self::Geometric {
+                    b.lit_real(1.0)
+                } else {
+                    b.self_ref("shape")
+                };
                 let rate = broadcast(b, "divide", &[shape, mu]);
                 let law = if self == Self::Gamma {
                     "Gamma"

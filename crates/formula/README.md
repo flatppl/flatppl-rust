@@ -16,19 +16,21 @@ The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `Gamma` or `exponential`. `link` is optional:
+`negbinomial`, `geometric`, `Gamma` or `exponential`. `link` is optional:
 
 | Family | Default link | Other links |
 | --- | --- | --- |
 | Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
 | Lognormal | identity | inverse |
 | Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
-| Poisson, negative binomial | log | identity, sqrt, softplus, squareplus |
+| Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential | log | identity, inverse, softplus, squareplus |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
 the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
+Geometric models count failures before the first success and use
+`NegativeBinomial(1, 1 / mu)`, so `mu` is the expected count.
 Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
 integer or a numeric column of counts. Trials remain required for prediction.
 Counts must be nonnegative integers, and binomial responses cannot exceed

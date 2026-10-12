@@ -5,7 +5,10 @@ use serde_json::json;
 
 #[test]
 fn response_support_matches_brms() {
-    for (family, valid, invalid) in [("lognormal", vec![0.1, 1.0, 2.0], vec![0.0, -0.1])] {
+    for (family, valid, invalid) in [
+        ("lognormal", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
+        ("geometric", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
+    ] {
         let mut spec = read(
             &json!({
                 "formula": "y ~ 1", "family": family,

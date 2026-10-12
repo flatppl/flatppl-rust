@@ -169,6 +169,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "binomial",
         "poisson",
         "negbinomial",
+        "geometric",
         "Gamma",
         "exponential",
     ] {
