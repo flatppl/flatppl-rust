@@ -70,16 +70,10 @@
 //!   variables is wrapped in the same `ifelse` gate `truncate` emits — outside the
 //!   image the preimage is empty and the density −∞ ([`gate_density`]) — and reads a
 //!   point sanitised against that gate ([`gate_point`]).
-//! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
-//!   1-D repeat count read from the iid node's own const-evaluated domain
-//!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
-//!   lengthof(obs))`, `sizeof(M)`, arithmetic on lengths, or a named/inline
-//!   literal) resolves as readily as a raw literal — `flatppl_infer` (at
-//!   `Level::Shape`) folds the size into that shape (static unroll; corpus `N`
-//!   is small). A genuinely dynamic size, or a multi-axis / vector `size` (e.g.
-//!   `iid(M, [2, 3])` — a valid §06 shape), is **refused** (the O(N) unroll
-//!   handles only 1-D `N`; the vectorized broadcast+reduce over a multi-axis
-//!   shape is the noted scale path, not built).
+//! - `iid(M, size)` sums the density of each whole `M`-variate across the
+//!   product axes. [`iid_static_shape`] reads const-evaluated dimensions from
+//!   the inferred domain, so computed sizes work too. A shared density body
+//!   broadcasts over all product cells; dynamic or unresolved sizes refuse.
 //! - `joint(M₁,…,Mₖ)` (**positional**) → `Σᵢ density(Mᵢ, get0(v, i))` —
 //!   **scalar-variate components only**; a component is accepted ONLY when its
 //!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
@@ -6388,37 +6382,6 @@ fn select_projection_fields(
     Ok(out)
 }
 
-/// Resolve the static repeat count `N` of an `iid(M, size)` from the iid node's
-/// own INFERRED domain type — general over any const-resolvable size, not just a
-/// raw literal.
-///
-/// `iid(M, size)` infers to `Measure { domain: Array { shape, elem }, .. }` where
-/// `shape` is the const-evaluated `size` (`crates/infer/src/consteval.rs`): the
-/// determiniser re-runs `flatppl_infer::infer` — which runs at `Level::Shape` —
-/// each driver iteration, so a shape-dependent size (`lengthof(obs)`,
-/// `sizeof(M)`, or fixed-value arithmetic over lengths — engine-concepts §17.1)
-/// is already folded into a static `Dim` on the iid measure's domain. Reading it
-/// here (rather than pattern-matching the raw size node) is the do-it-once,
-/// reuse-existing-API mechanism: the const knowledge lives on the type, exposed
-/// via [`Module::type_of`].
-///
-/// **Only a 1-D STATIC leading axis is accepted.** §06 "Independent composition"
-/// admits an `iid` `size` as "an integer (1-D length) or a vector of positive
-/// integers (multi-axis shape)":
-/// * a genuinely dynamic size (`external`/runtime — `Dim::Dynamic`) is not
-///   statically unrollable → `None` → refuse;
-/// * a multi-axis / vector size (`iid(M, [2, 3])` → `shape.len() != 1`) is
-///   refused → `None`: the O(N) static unroll in [`lower_iid`] handles only a
-///   1-D `N`; the vectorized broadcast+reduce over a multi-axis shape is the
-///   noted scale path, not built (conservative refuse-don't-mislower, not a bug).
-///
-/// A `%deferred` iid type (inference did not resolve `M`'s domain, so
-/// `iid_type` returned `Type::Deferred`) also yields `None` — refuse, never
-/// guess a size.
-///
-/// Shared with `sample::lower_draw`'s `iid(K, n)` sample fan-out, which needs
-/// the identical static-length read before batching a `builtin_sample` over
-/// `n` — see that call site for why it reuses this rather than re-deriving it.
 /// The statically-known trajectory length of a `markovchain` / `kscan` node,
 /// read from its own inferred domain shape. `flatppl_infer`'s
 /// `trajectory_measure` types the node as `Measure{Array{[len], init-type}}`,
@@ -6447,20 +6410,32 @@ pub(crate) fn trajectory_static_len(m: &Module, chain_node: NodeId) -> Option<us
     }
 }
 
-pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
+/// Static outer product axes, excluding the inner measure's event shape.
+/// Shape inference has already resolved fixed expressions such as lengthof;
+/// genuinely dynamic dimensions and unresolved domains remain unsupported.
+pub(crate) fn iid_static_shape(m: &Module, iid_node: NodeId) -> Option<Vec<usize>> {
     let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
         return None;
     };
     let Type::Array { shape, .. } = domain.as_ref() else {
         return None;
     };
-    if shape.len() != 1 {
-        return None; // multi-axis / vector size — not the 1-D unroll case
-    }
-    match shape[0] {
-        Dim::Static(n) => Some(n as usize),
-        Dim::Dynamic => None,
-    }
+    shape
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(n) => Some(*n as usize),
+            Dim::Dynamic => None,
+        })
+        .collect()
+}
+
+/// One-dimensional repeat count for position-based projections and set laws.
+pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
+    let shape = iid_static_shape(m, iid_node)?;
+    let [n] = shape.as_slice() else {
+        return None;
+    };
+    Some(*n)
 }
 
 /// The static ROW COUNT of an `iid` whose variate is a **table** — a
@@ -6502,24 +6477,17 @@ fn iid_static_table_rows(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// Primitive scalar kernels use a direct axis expression. Nested primitive
 /// products flatten independent sums. Other array-valued observations map one
 /// reified density over the outer collection, preserving each observation cell.
-/// Static one-dimensional counts are required; zero returns the empty sum.
+/// Static product axes are required; an empty product returns the empty sum.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    // The repeat count comes from the iid node's own const-evaluated domain shape
-    // (see `iid_static_size`), so a `lengthof(obs)` / `sizeof(M)` / arithmetic
-    // size resolves as readily as a raw literal. A genuinely dynamic or
-    // multi-axis size yields `None` and refuses.
-    // A record-valued `M` under a scalar size types a TABLE, not an array
-    // (§06 `iid`), so the row count comes from a second reader; the unroll below
-    // is identical either way — `get0(v, i)` is the i-th row for a table and the
-    // i-th element for an array (§03 "Indexing").
-    let n = iid_static_size(m, node)
-        .or_else(|| iid_static_table_rows(m, node))
+    // Record-valued products with a scalar size are tables, whose row count
+    // comes from a separate reader. Their row remains the whole inner event.
+    let shape = iid_static_shape(m, node)
+        .or_else(|| iid_static_table_rows(m, node).map(|n| vec![n]))
         .ok_or_else(|| {
             refuse(
                 node,
                 m,
-                "iid size is not a statically-resolved 1-D count (dynamic, multi-axis, \
-                 or unresolved domain); only a 1-D static size is unrolled",
+                "iid size is not a statically-resolved shape (dynamic or unresolved domain)",
             )
         })?;
     let m_inner = {
@@ -6531,22 +6499,31 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         c.args[0]
     };
     let (resolved, _) = resolve_ref_one(m, v);
-    let observed_count = match m.type_of(v).or_else(|| m.type_of(resolved)) {
-        Some(Type::Array { shape, .. }) if shape.len() == 1 => Some(shape[0]),
-        Some(Type::Table { nrows, .. }) => Some(*nrows),
+    let observed_shape = match m.type_of(v).or_else(|| m.type_of(resolved)) {
+        Some(Type::Array { shape, .. }) => Some(shape.to_vec()),
+        Some(Type::Table { nrows, .. }) => Some(vec![*nrows]),
         _ => None,
     };
     // Synthesized inverse maps have no annotation until the next infer pass.
-    if observed_count.is_some() && observed_count != Some(Dim::Static(n as u32)) {
+    if observed_shape.is_some_and(|observed| {
+        observed
+            != shape
+                .iter()
+                .map(|&n| Dim::Static(n as u32))
+                .collect::<Vec<_>>()
+    }) {
         return Err(refuse(
             v,
             m,
-            "iid observation count must match its static size",
+            "iid observation shape must match its static size",
         ));
     }
     // The empty product has log density zero without evaluating a density body.
-    if n == 0 {
+    if shape.contains(&0) {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+    if shape.len() > 1 {
+        return broadcast::sum_density(m, m_inner, v);
     }
 
     // Primitive-kernel fast path: M is a bare distribution constructor

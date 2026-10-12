@@ -232,6 +232,7 @@ module {
     %260 = stablehlo.reduce(%258 init: %259) applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>, tensor<f32>) -> tensor<5xf32>
     %261 = stablehlo.broadcast_in_dim %260, dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>
     %262 = stablehlo.divide %258, %261 : tensor<5x3xf32>
-    return %262, %242 : tensor<5x3xf32>, tensor<2xui64>
+    %263 = stablehlo.reshape %262 : (tensor<5x3xf32>) -> tensor<5x3xf32>
+    return %263, %242 : tensor<5x3xf32>, tensor<2xui64>
   }
 }

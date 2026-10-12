@@ -192,7 +192,7 @@ fn cell_input(
     let (resolved, _) = resolve_ref_one(m, values);
     let ty = m.type_of(values).or_else(|| m.type_of(resolved)).cloned();
     let point = match ty {
-        Some(Type::Array { shape, elem }) if shape.len() == 1 => {
+        Some(Type::Array { elem, .. }) => {
             let (label, reference, value) = placeholder(m, *elem);
             inputs.push((label, reference));
             args.push(values);
@@ -235,7 +235,7 @@ fn cell_input(
             return Err(refuse(
                 values,
                 m,
-                "density broadcast needs a one-dimensional array or table",
+                "density broadcast needs an array or table",
             ));
         }
     };
@@ -249,6 +249,11 @@ fn sum_density_with(
     mut inputs: Vec<(Symbol, Ref)>,
     mut args: Vec<NodeId>,
 ) -> Result<NodeId, RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, values);
+    let rank = match m.type_of(values).or_else(|| m.type_of(resolved)) {
+        Some(Type::Array { shape, .. }) => shape.len(),
+        _ => 1,
+    };
     let point = cell_input(m, values, &mut inputs, &mut args)?;
     let body = lower_measure_density(m, measure, point)?;
     let mut replacements = Vec::new();
@@ -277,7 +282,13 @@ fn sum_density_with(
         replacements.push((reference, replacement));
         let actual = m.alloc(Node::Ref(reference));
         m.set_type(actual, ty);
-        args.push(build_call(m, "vector", &[actual]));
+        let mut singleton = build_call(m, "vector", &[actual]);
+        if rank > 1 {
+            let leading = m.alloc(Node::Lit(Scalar::Int((rank - 1) as i64)));
+            let trailing = m.alloc(Node::Lit(Scalar::Int(0)));
+            singleton = build_call(m, "addaxes", &[singleton, leading, trailing]);
+        }
+        args.push(singleton);
     }
     let body = crate::driver::map_tree(m, body, &mut |m, id| match m.node(id) {
         Node::Ref(reference) => replacements
