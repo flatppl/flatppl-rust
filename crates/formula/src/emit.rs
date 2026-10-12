@@ -307,9 +307,13 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         b.bind("b_Intercept", intercept);
     }
     let mu = b.self_ref("mu");
+    let trials = recipe.formula.trials.as_ref().map(|trials| match trials {
+        Trials::Constant(n) => b.lit_int(*n),
+        Trials::Column(_) => b.self_ref("trials_data"),
+    });
     let law = recipe
         .family
-        .observation(&mut b, mu, recipe.formula.trials.as_ref(), thresholds);
+        .observation(&mut b, mu, trials, thresholds, false);
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");

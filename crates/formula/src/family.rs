@@ -1,4 +1,4 @@
-use crate::{Error, Result, Trials, emit::broadcast};
+use crate::{Error, Result, emit::broadcast};
 use flatppl_convert::Builder;
 use flatppl_core::NodeId;
 use serde::{Deserialize, Serialize};
@@ -150,9 +150,17 @@ impl Family {
         self,
         b: &mut Builder<'_>,
         mu: NodeId,
-        trials: Option<&Trials>,
+        trials: Option<NodeId>,
         thresholds: usize,
+        scalar: bool,
     ) -> NodeId {
+        let apply = |b: &mut Builder<'_>, name, args: &[NodeId]| {
+            if scalar {
+                b.call(name, args)
+            } else {
+                broadcast(b, name, args)
+            }
+        };
         match self {
             Self::Gaussian | Self::Lognormal => {
                 let sigma = b.self_ref("sigma");
@@ -161,41 +169,38 @@ impl Family {
                 } else {
                     "Normal"
                 };
-                broadcast(b, law, &[mu, sigma])
+                apply(b, law, &[mu, sigma])
             }
             Self::Student => {
                 let nu = b.self_ref("nu");
                 let standard = b.call("StudentT", &[nu]);
                 let sigma = b.self_ref("sigma");
-                broadcast(b, "locscale", &[standard, mu, sigma])
+                apply(b, "locscale", &[standard, mu, sigma])
             }
-            Self::Bernoulli => broadcast(b, "Bernoulli", &[mu]),
+            Self::Bernoulli => apply(b, "Bernoulli", &[mu]),
             Self::Binomial => {
-                let n = match trials.expect("binomial trials were validated") {
-                    Trials::Constant(n) => b.lit_int(*n),
-                    Trials::Column(_) => b.self_ref("trials_data"),
-                };
-                broadcast(b, "Binomial", &[n, mu])
+                let n = trials.expect("binomial trials were validated");
+                apply(b, "Binomial", &[n, mu])
             }
-            Self::Poisson => broadcast(b, "Poisson", &[mu]),
+            Self::Poisson => apply(b, "Poisson", &[mu]),
             Self::Negbinomial | Self::Geometric | Self::Gamma => {
                 let shape = if self == Self::Geometric {
                     b.lit_real(1.0)
                 } else {
                     b.self_ref("shape")
                 };
-                let rate = broadcast(b, "divide", &[shape, mu]);
+                let rate = apply(b, "divide", &[shape, mu]);
                 let law = if self == Self::Gamma {
                     "Gamma"
                 } else {
                     "NegativeBinomial"
                 };
-                broadcast(b, law, &[shape, rate])
+                apply(b, law, &[shape, rate])
             }
             Self::Exponential => {
                 let one = b.lit_real(1.0);
-                let rate = broadcast(b, "divide", &[one, mu]);
-                broadcast(b, "Exponential", &[rate])
+                let rate = apply(b, "divide", &[one, mu]);
+                apply(b, "Exponential", &[rate])
             }
             Self::Weibull => {
                 let shape = b.self_ref("shape");
@@ -203,20 +208,20 @@ impl Family {
                 let inverse = b.call("divide", &[one, shape]);
                 let argument = b.call("add", &[one, inverse]);
                 let gamma = b.call("gamma", &[argument]);
-                let scale = broadcast(b, "divide", &[mu, gamma]);
-                broadcast(b, "Weibull", &[shape, scale])
+                let scale = apply(b, "divide", &[mu, gamma]);
+                apply(b, "Weibull", &[shape, scale])
             }
             Self::Beta => {
                 let phi = b.self_ref("phi");
-                let alpha = broadcast(b, "mul", &[mu, phi]);
+                let alpha = apply(b, "mul", &[mu, phi]);
                 let one = b.lit_real(1.0);
-                let complement = broadcast(b, "sub", &[one, mu]);
-                let beta = broadcast(b, "mul", &[complement, phi]);
-                broadcast(b, "Beta", &[alpha, beta])
+                let complement = apply(b, "sub", &[one, mu]);
+                let beta = apply(b, "mul", &[complement, phi]);
+                apply(b, "Beta", &[alpha, beta])
             }
             Self::VonMises => {
                 let kappa = b.self_ref("kappa");
-                broadcast(b, "VonMises", &[mu, kappa])
+                apply(b, "VonMises", &[mu, kappa])
             }
             Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
         }
