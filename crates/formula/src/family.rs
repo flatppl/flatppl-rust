@@ -1,6 +1,6 @@
 use crate::{Error, Result, emit::broadcast};
 use flatppl_convert::Builder;
-use flatppl_core::NodeId;
+use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub enum Family {
     Bernoulli,
     Binomial,
     Poisson,
+    #[serde(rename = "zero_inflated_poisson")]
+    ZeroInflatedPoisson,
     Negbinomial,
     Geometric,
     #[serde(rename = "Gamma")]
@@ -53,6 +55,7 @@ impl Family {
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
             "poisson" => Self::Poisson,
+            "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
             "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
@@ -86,7 +89,7 @@ impl Family {
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
                 )
             }
-            Self::Poisson | Self::Negbinomial | Self::Geometric => {
+            Self::Poisson | Self::ZeroInflatedPoisson | Self::Negbinomial | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
             Self::Gamma | Self::Exponential | Self::Weibull => {
@@ -110,6 +113,7 @@ impl Family {
             Self::Bernoulli
                 | Self::Binomial
                 | Self::Poisson
+                | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
                 | Self::Geometric
                 | Self::Cumulative
@@ -123,6 +127,7 @@ impl Family {
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
             Self::VonMises => &["kappa"],
+            Self::ZeroInflatedPoisson => &["zi"],
             _ => &[],
         }
     }
@@ -142,6 +147,7 @@ impl Family {
             "shape" if self == Self::Negbinomial => "InverseGamma(0.4, 0.3)".into(),
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             "kappa" => "Gamma(2, 0.01)".into(),
+            "zi" => "Beta(1, 1)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -155,6 +161,26 @@ impl Family {
         thresholds: usize,
         scalar: bool,
     ) -> NodeId {
+        if self == Self::ZeroInflatedPoisson && !scalar {
+            let local = Ref {
+                ns: RefNs::Local,
+                name: b.sym("_mu_"),
+            };
+            let mean = b.m.alloc(Node::Ref(local));
+            let law = self.observation(b, mean, trials, scale, thresholds, true);
+            let input = b.sym("mu");
+            let head = b.sym("functionof");
+            let kernel = b.m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(head),
+                args: vec![law].into(),
+                named: Box::default(),
+                inputs: Some(Inputs::Spec(vec![(input, local)].into())),
+            }));
+            let name = b.alloc_name("response_law");
+            b.bind(&name, kernel);
+            let kernel = b.self_ref(&name);
+            return b.call("broadcast", &[kernel, mu]);
+        }
         let apply = |b: &mut Builder<'_>, name, args: &[NodeId]| {
             if scalar {
                 b.call(name, args)
@@ -184,6 +210,18 @@ impl Family {
                 apply(b, "Binomial", &[n, mu])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
+            Self::ZeroInflatedPoisson => {
+                let poisson = b.call("Poisson", &[mu]);
+                let zi = b.self_ref("zi");
+                let zero = b.lit_int(0);
+                let atom = b.call("Dirac", &[zero]);
+                let atom = b.call("weighted", &[zi, atom]);
+                let one = b.lit_real(1.0);
+                let complement = b.call("sub", &[one, zi]);
+                let count = b.call("weighted", &[complement, poisson]);
+                let law = b.call("superpose", &[atom, count]);
+                b.call("normalize", &[law])
+            }
             Self::Negbinomial | Self::Geometric | Self::Gamma => {
                 let shape = if self == Self::Geometric {
                     b.lit_real(1.0)

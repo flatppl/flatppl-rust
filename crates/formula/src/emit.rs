@@ -225,7 +225,13 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             b.bind(name, zero);
             continue;
         }
-        let support = lower_bound(&mut b, if name == "nu" { 1.0 } else { 0.0 });
+        let support = if name == "zi" {
+            let zero = b.lit_real(0.0);
+            let one = b.lit_real(1.0);
+            b.call("interval", &[zero, one])
+        } else {
+            lower_bound(&mut b, if name == "nu" { 1.0 } else { 0.0 })
+        };
         parameter(
             &mut b,
             name,
