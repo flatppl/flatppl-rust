@@ -140,6 +140,11 @@ pub fn determinize_with_options(
         if let Some(roots) = roots
             && find_op_node(&work, &["logdensityof", "densityof", "rand"]).is_none()
         {
+            // Applying an explicit stochastic boundary can remove the final
+            // draw dependency from a deterministic derived-value query.
+            if crate::canon::inline_user_calls(&mut work) {
+                let _ = flatppl_infer::infer(&mut work);
+            }
             crate::canon::retain_reachable(&mut work, roots);
         }
 
