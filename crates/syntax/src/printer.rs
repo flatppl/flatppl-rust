@@ -989,6 +989,9 @@ fn print_axis(module: &Module, a: &Axis) -> String {
 fn print_scalar(s: &Scalar) -> String {
     match s {
         Scalar::Int(n) => n.to_string(),
+        // NaN is an internal real value, not a surface-language identifier.
+        Scalar::Real(r) if r.is_nan() => "divide(0.0, 0.0)".to_string(),
+        Scalar::Real(r) if *r == f64::NEG_INFINITY => "neg(inf)".to_string(),
         Scalar::Real(r) => print_real(*r),
         Scalar::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Scalar::Str(s) => quote_string(s),

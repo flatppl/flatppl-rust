@@ -18,6 +18,25 @@ use std::path::PathBuf;
 use flatppl_core::{CallHead, Node};
 use flatppl_syntax::{Syntax, parse, print, print_with};
 
+#[test]
+fn nonfinite_ir_values_print_as_existing_expressions() {
+    for (value, expression) in [
+        (f64::NAN, "divide(0.0, 0.0)"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "neg(inf)"),
+    ] {
+        let mut module = parse("x = 0.0").unwrap();
+        let binding = module.bindings().next().unwrap().0;
+        let value = module.alloc(Node::Lit(flatppl_core::Scalar::Real(value)));
+        module.set_binding_rhs(binding, value);
+        let expected = flatppl_flatpir::write(&parse(&format!("x = {expression}")).unwrap());
+        for syntax in [Syntax::Full, Syntax::Minimal] {
+            let reparsed = parse(&print_with(&module, syntax)).unwrap();
+            assert_eq!(flatppl_flatpir::write(&reparsed), expected);
+        }
+    }
+}
+
 fn fixture(name: &str) -> String {
     let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "../../fixtures/flatppl", name]
         .iter()

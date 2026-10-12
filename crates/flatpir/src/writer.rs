@@ -196,6 +196,10 @@ fn render_node(module: &Module, id: NodeId) -> String {
 fn render_scalar(lit: &Scalar) -> String {
     match lit {
         Scalar::Int(n) => n.to_string(),
+        // FlatPIR has no NaN atom or signed literal. Preserve compiler-produced
+        // nonfinite values using existing expressions, including in JSON.
+        Scalar::Real(r) if r.is_nan() => "(divide 0.0 0.0)".to_string(),
+        Scalar::Real(r) if *r == f64::NEG_INFINITY => "(neg inf)".to_string(),
         Scalar::Real(r) => render_real(*r),
         Scalar::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Scalar::Str(s) => quote_string(s),
