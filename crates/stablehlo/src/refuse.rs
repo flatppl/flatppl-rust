@@ -609,9 +609,8 @@
 //!   sampler not in Task 15's batch; Task 15 gave `Gamma`/`InverseGamma`/
 //!   `ChiSquared`/`Beta`/`StudentT`/`GeneralizedNormal`/`Dirichlet` rejection
 //!   `@sample` builders, so — like `Cauchy`/`Logistic`/`Laplace` after Task
-//!   14 — they no longer exercise this arm). Task 16's still-pending discrete
-//!   batch (`Bernoulli`/`Poisson`/…/`Multinomial`) and the matrix batch
-//!   (`Wishart`/`InverseWishart`/`LKJ`/`LKJCholesky`) keep the arm reachable.
+//!   14 — they no longer exercise this arm). The matrix distributions
+//!   `Wishart`/`InverseWishart`/`LKJ` keep the arm reachable.
 //! - `Uniform`'s `support` parameter has no closed-form measurable
 //!   interval/box `ValueSet` (`registry::uniform_bounds` returns `None`) —
 //!   "Uniform logpdf needs a measurable interval/box support" (Task 10).
