@@ -144,7 +144,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             )));
         }
     }
-    Ok(Formula {
+    let formula = Formula {
         response,
         trials,
         weights,
@@ -156,7 +156,24 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         smooths,
         expressions,
         offsets,
-    })
+    };
+    if formula.intercept && formula.uses_intercept_column() {
+        return Err(Error(
+            "reserved `Intercept` requires removing the population intercept with `0 +` or `- 1`"
+                .into(),
+        ));
+    }
+    if formula.uses_intercept_column()
+        && !formula
+            .expressions
+            .values()
+            .any(ColumnExpression::uses_intercept)
+    {
+        return Err(Error(
+            "reserved `Intercept` must appear in population-level terms".into(),
+        ));
+    }
+    Ok(formula)
 }
 
 type FixedTerms = (Vec<String>, Vec<Term>, BTreeMap<String, ColumnExpression>);
@@ -517,6 +534,8 @@ impl<'a> Parser<'a> {
                         "offset" => Atom::Offset(expression),
                         _ => unreachable!(),
                     })?
+                } else if text == "Intercept" {
+                    self.atom(Atom::Expression(ColumnExpression::Intercept))?
                 } else {
                     self.atom(Atom::Variable(name(text)?))?
                 }
@@ -781,6 +800,19 @@ fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
 }
 
 impl Formula {
+    pub(crate) fn uses_intercept_column(&self) -> bool {
+        self.expressions
+            .values()
+            .chain(&self.offsets)
+            .chain(self.se.as_ref().map(|se| &se.value))
+            .chain(
+                self.groups
+                    .iter()
+                    .flat_map(|group| group.expressions.values()),
+            )
+            .any(ColumnExpression::uses_intercept)
+    }
+
     pub(crate) fn predictor_columns(&self) -> Vec<&str> {
         let mut names = Vec::new();
         for (variables, expressions) in std::iter::once((&self.variables, &self.expressions)).chain(

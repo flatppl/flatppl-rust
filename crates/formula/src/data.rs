@@ -343,6 +343,23 @@ pub(crate) fn model_rows(
     mode: DataMode,
 ) -> Result<Vec<usize>> {
     table.validate()?;
+    if predictors
+        .iter()
+        .any(|formula| formula.uses_intercept_column())
+        && let Some(column) = table
+            .columns
+            .iter()
+            .find(|column| column.name == "Intercept")
+    {
+        let rows: Vec<_> = (0..table.nrows).collect();
+        if rows.iter().any(|&row| !column.present(row))
+            || column.numeric(&rows)?.iter().any(|&value| value != 1.0)
+        {
+            return Err(Error(
+                "reserved data column `Intercept` must contain only ones".into(),
+            ));
+        }
+    }
     let mut se_columns = Vec::new();
     if let Some(se) = &formula.se {
         se.value.columns(&mut se_columns);
