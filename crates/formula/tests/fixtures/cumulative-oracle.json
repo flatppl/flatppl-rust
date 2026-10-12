@@ -1,0 +1,111 @@
+{
+  "oracle": "Actual brms 2.23.2 normalized Stan, jacobian=false and propto=false. Shared ordered prior adds log(2!).",
+  "brms_version": "2.23.2",
+  "stan_flags": {
+    "jacobian": false,
+    "propto": false
+  },
+  "data": {
+    "N": 4,
+    "Y": [
+      2,
+      1,
+      3,
+      2
+    ],
+    "nthres": 2,
+    "K": 1,
+    "Kc": 1,
+    "X": [
+      [
+        1
+      ],
+      [
+        2
+      ],
+      [
+        4
+      ],
+      [
+        5
+      ]
+    ],
+    "disc": 1,
+    "prior_only": 0
+  },
+  "score_offset": 0.6931471805599453,
+  "original_thresholds": [
+    0.6,
+    2
+  ],
+  "cases": [
+    {
+      "name": "normal",
+      "source": "query",
+      "b": [
+        0.4
+      ],
+      "cuts": [
+        -0.6,
+        0.8
+      ],
+      "stan_lp": -8.882198854773355,
+      "gradient": {
+        "b": [
+          -0.397328662362816
+        ],
+        "cuts": [
+          -0.7024377472440476,
+          0.5239155905562529
+        ]
+      },
+      "log_density": -8.18905167421341
+    },
+    {
+      "name": "tail",
+      "source": "query",
+      "stan_model_id": "73f54df5fbbef86e",
+      "b": [
+        10
+      ],
+      "cuts": [
+        -0.6,
+        0.8
+      ],
+      "stan_lp": -66.06229096425213,
+      "gradient": {
+        "b": [
+          -8.444260677227344
+        ],
+        "cuts": [
+          -1.5045389159552962,
+          1.454520602947676
+        ]
+      },
+      "log_density": -65.36914378369218
+    },
+    {
+      "name": "default",
+      "source": "default-query",
+      "stan_model_id": "5e766f6a76a42f02",
+      "b": [
+        0.4
+      ],
+      "cuts": [
+        -0.6,
+        0.8
+      ],
+      "stan_lp": -8.11259083871886,
+      "gradient": {
+        "b": [
+          -0.21955088458503824
+        ],
+        "cuts": [
+          -0.7268490502267793,
+          0.5588820681220085
+        ]
+      },
+      "log_density": -7.419443658158915
+    }
+  ]
+}

@@ -169,7 +169,7 @@ pub(crate) fn resolve(
     formula: &Formula,
     design: &Design,
     groups: &[Group],
-    (family, link): (Family, Link),
+    (family, link, thresholds): (Family, Link, usize),
     response: Option<&[f64]>,
     offset_mean: f64,
 ) -> Result<Priors> {
@@ -185,7 +185,15 @@ pub(crate) fn resolve(
         .map(|c| crate::emit::coefficient_name(&c.name))
         .collect();
     let mut targets = Vec::new();
-    if formula.intercept {
+    let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
+    if thresholds > 0 {
+        targets.extend(threshold_names.iter().map(|name| PriorTarget {
+            class: "Intercept",
+            coef: Some(name),
+            group: None,
+            dpar: None,
+        }));
+    } else if formula.intercept {
         targets.push(PriorTarget {
             class: "Intercept",
             coef: None,
@@ -215,7 +223,17 @@ pub(crate) fn resolve(
             student(location)
         }
     };
-    let intercept = if formula.intercept {
+    let intercept = if thresholds > 0 {
+        let mut priors =
+            (0..thresholds).map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)));
+        let first = priors.next().unwrap();
+        for prior in priors {
+            if !crate::prior_expr::equivalent(&first, &prior)? {
+                return Err(Error("cumulative thresholds require one shared continuous prior; unequal threshold priors are not supported".into()));
+            }
+        }
+        first
+    } else if formula.intercept {
         selected.next().unwrap().unwrap_or_else(default_intercept)
     } else {
         default_intercept()

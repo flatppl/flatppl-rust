@@ -22,6 +22,7 @@ pub enum Family {
     Beta,
     #[serde(rename = "von_mises")]
     VonMises,
+    Cumulative,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -59,11 +60,12 @@ impl Family {
             "weibull" => Self::Weibull,
             "beta" => Self::Beta,
             "von_mises" => Self::VonMises,
+            "cumulative" => Self::Cumulative,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
             Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
-            Self::Bernoulli | Self::Binomial | Self::Beta => Link::Logit,
+            Self::Bernoulli | Self::Binomial | Self::Beta | Self::Cumulative => Link::Logit,
             Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
@@ -91,6 +93,7 @@ impl Family {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
+            Self::Cumulative => link == Logit,
         };
         if !supported {
             return Err(Error(format!(
@@ -104,7 +107,12 @@ impl Family {
     pub(crate) fn discrete(self) -> bool {
         matches!(
             self,
-            Self::Bernoulli | Self::Binomial | Self::Poisson | Self::Negbinomial | Self::Geometric
+            Self::Bernoulli
+                | Self::Binomial
+                | Self::Poisson
+                | Self::Negbinomial
+                | Self::Geometric
+                | Self::Cumulative
         )
     }
 
@@ -143,6 +151,7 @@ impl Family {
         b: &mut Builder<'_>,
         mu: NodeId,
         trials: Option<&Trials>,
+        thresholds: usize,
     ) -> NodeId {
         match self {
             Self::Gaussian | Self::Lognormal => {
@@ -209,6 +218,7 @@ impl Family {
                 let kappa = b.self_ref("kappa");
                 broadcast(b, "VonMises", &[mu, kappa])
             }
+            Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
         }
     }
 }

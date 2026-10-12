@@ -1,5 +1,5 @@
 use crate::{
-    DataDocument, DataValue, Design, DesignComponent, Error, ModelInfo, Parameter, Recipe,
+    DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter, Recipe,
     ResolvedPrior, Result, Spec, Trials,
     priors::{self, PriorNode},
 };
@@ -75,7 +75,24 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             .collect();
     }
     let mut parameters = Vec::new();
-    if recipe.formula.intercept {
+    let thresholds = recipe.thresholds();
+    if thresholds > 0 {
+        let names = scope(&b);
+        let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+        let PriorNode::Measure(prior) =
+            priors::emit(&mut b, &recipe.priors.intercept, None, None, &bindings)?
+        else {
+            return Err(Error(
+                "cumulative thresholds require a shared continuous prior".into(),
+            ));
+        };
+        let count = b.lit_int(thresholds as i64);
+        let prior = b.call("iid", &[prior, count]);
+        let domain = b.call("ordered", &[count]);
+        let reference = b.call("Lebesgue", &[domain]);
+        let prior = b.call("tilt", &[prior, reference]);
+        draw(&mut b, "cuts", prior, &mut parameters);
+    } else if recipe.formula.intercept {
         parameter(
             &mut b,
             "temp_Intercept",
@@ -213,10 +230,13 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let n = b.self_ref("N");
     let zero = b.lit_real(0.0);
     let mut eta = b.call("fill", &[zero, n]);
-    let mut intercept = recipe
-        .formula
-        .intercept
-        .then(|| b.self_ref("temp_Intercept"));
+    let mut intercept = recipe.formula.intercept.then(|| {
+        b.self_ref(if thresholds > 0 {
+            "cuts"
+        } else {
+            "temp_Intercept"
+        })
+    });
     if !recipe.design.columns.is_empty() {
         let mut columns = design_columns(&mut b, &recipe.design, &fixed_inputs);
         if recipe.center {
@@ -236,10 +256,16 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             let means = b.array(&means);
             let products = broadcast(&mut b, "mul", &[means, coefficients]);
             let dot = b.call("sum", &[products]);
-            intercept = intercept.map(|value| b.call("sub", &[value, dot]));
+            intercept = intercept.map(|value| {
+                if thresholds > 0 {
+                    broadcast(&mut b, "add", &[value, dot])
+                } else {
+                    b.call("sub", &[value, dot])
+                }
+            });
         }
     }
-    if recipe.formula.intercept {
+    if recipe.formula.intercept && thresholds == 0 {
         let value = b.self_ref("temp_Intercept");
         eta = broadcast(&mut b, "add", &[eta, value]);
     }
@@ -271,7 +297,11 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     }
     b.bind("eta_mu", eta);
     let eta = b.self_ref("eta_mu");
-    let mu = recipe.link.inverse(&mut b, eta);
+    let mu = if recipe.family == Family::Cumulative {
+        eta
+    } else {
+        recipe.link.inverse(&mut b, eta)
+    };
     b.bind("mu", mu);
     if let Some(intercept) = intercept {
         b.bind("b_Intercept", intercept);
@@ -279,7 +309,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let mu = b.self_ref("mu");
     let law = recipe
         .family
-        .observation(&mut b, mu, recipe.formula.trials.as_ref());
+        .observation(&mut b, mu, recipe.formula.trials.as_ref(), thresholds);
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");
@@ -318,6 +348,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let family = b.str_lit(&spec.family);
     let link = b.str_lit(recipe.link.name());
     let improper = b.lit_bool(false);
+    let score_offset = b.lit_real((1..=thresholds).map(|i| (i as f64).ln()).sum());
     let metadata = b.call_fields(
         "record",
         &[
@@ -325,6 +356,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             ("family", family),
             ("link", link),
             ("has_improper_prior", improper),
+            ("score_offset", score_offset),
         ],
     );
     b.bind("formula_model", metadata);
@@ -410,7 +442,7 @@ pub(crate) fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> Nod
 fn scope(b: &Builder<'_>) -> Vec<String> {
     b.m.public_bindings()
         .map(|(_, binding)| b.m.resolve(binding.name).to_owned())
-        .chain(["temp_Intercept", "b", "sigma", "nu", "shape"].map(str::to_owned))
+        .chain(["temp_Intercept", "cuts", "b", "sigma", "nu", "shape"].map(str::to_owned))
         .collect()
 }
 
@@ -529,7 +561,12 @@ pub(crate) fn info(
             derived,
         })
     };
-    if recipe.formula.intercept {
+    if recipe.thresholds() > 0 {
+        for i in 1..=recipe.thresholds() {
+            add(format!("Intercept[{i}]"), "cuts", &[i], false);
+            add(format!("b_Intercept[{i}]"), "b_Intercept", &[i], true);
+        }
+    } else if recipe.formula.intercept {
         add(
             "Intercept".into(),
             "temp_Intercept",
@@ -650,7 +687,7 @@ pub(crate) fn info(
                 )
         }),
         training_rows: data.rows.clone(),
-        score_offset: 0.0,
+        score_offset: (1..=recipe.thresholds()).map(|i| (i as f64).ln()).sum(),
     })
 }
 

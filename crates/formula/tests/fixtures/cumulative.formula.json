@@ -1,0 +1,17 @@
+{
+  "formula": "y ~ x",
+  "family": "cumulative",
+  "priors": [
+    {"class": "Intercept", "prior": "normal(0, 2)"},
+    {"class": "b", "prior": "normal(0, 1.5)"}
+  ],
+  "data": {
+    "nrows": 4,
+    "columns": [
+      {"name": "y", "values": {"kind": "factor", "values": {
+        "levels": ["low", "medium", "high"], "codes": [1, 0, 2, 1], "ordered": true
+      }}},
+      {"name": "x", "values": {"kind": "real64", "values": [1, 2, 4, 5]}}
+    ]
+  }
+}

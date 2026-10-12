@@ -16,7 +16,7 @@ The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta` or `von_mises`.
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises` or `cumulative`.
 `link` is optional:
 
 | Family | Default link | Other links |
@@ -27,6 +27,7 @@ Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `po
 | Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 | von Mises | tan_half | identity |
+| Cumulative ordinal | logit | — |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
@@ -47,6 +48,21 @@ Counts must be nonnegative integers, and binomial responses cannot exceed
 their trials. Gamma, exponential, lognormal and Weibull responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
+
+Cumulative responses use ordered factors or positive integer category codes.
+Unused factor levels are dropped; integer codes retain gaps up to their maximum.
+The recipe saves that category order for prediction. Ordered `cuts` replace the
+ordinary intercept, so removing the intercept is not supported. `Intercept[1]`,
+`Intercept[2]`, etc. map to the centred thresholds; derived `b_Intercept[i]` adds
+the training predictor-mean contribution to report the original design scale.
+Thresholds share a continuous prior, by default Student-t(3, 0, 2.5), conditioned
+on their order with `tilt`. This normalized law adds `log(m!)` to brms's target
+for `m` thresholds; `score_offset` records the difference. Class `Intercept`
+sets their common prior. Coefficient selectors `"1"`, `"2"`, etc. are accepted
+when they match after alias expansion and exact numeric-literal comparison.
+Different parameterizations of the same law may still be refused, such as
+`cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
+priors and other ordinal links or threshold parameterizations are not supported.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
@@ -205,3 +221,7 @@ design matrices, prediction matrices and brms coefficient names using base R.
 [The Gaussian oracle](tests/fixtures/gaussian-oracle.stan) independently defines
 the target and its normalized score. A successful print round trip alone does
 not establish numerical correctness.
+[The ordinal oracle](tests/fixtures/cumulative-oracle.json) freezes actual
+brms-generated Stan scores and gradients, including the ordering offset and a
+float32 tail case. Its [R script](tests/fixtures/cumulative-oracle.R) reproduces
+the category coding, generated Stan, and independent density values.

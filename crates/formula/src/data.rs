@@ -462,6 +462,32 @@ pub(crate) fn response_levels(
     column: &Column,
     rows: &[usize],
 ) -> Result<Option<Vec<GroupLevel>>> {
+    if family == Family::Cumulative {
+        let levels = match &column.values {
+            ColumnValues::Factor { ordered: true, .. } => column.levels(rows)?,
+            ColumnValues::Factor { .. } | ColumnValues::Bool(_) => {
+                return Err(Error(
+                    "cumulative responses require ordered factors or positive integer codes".into(),
+                ));
+            }
+            _ => {
+                let values = column.counts(rows)?;
+                if values.contains(&0) {
+                    return Err(Error("cumulative response codes must be positive".into()));
+                }
+                // Integer category labels retain gaps, unlike dropped factor levels.
+                (1..=*values.iter().max().unwrap())
+                    .map(GroupLevel::Integer)
+                    .collect()
+            }
+        };
+        if levels.len() < 2 {
+            return Err(Error(
+                "cumulative responses require at least two categories".into(),
+            ));
+        }
+        return Ok(Some(levels));
+    }
     if family != Family::Bernoulli {
         return Ok(None);
     }
@@ -489,12 +515,13 @@ pub(crate) fn response(
     rows: &[usize],
 ) -> Result<DataValue> {
     let column = table.column(&formula.response)?;
-    if family == Family::Bernoulli {
+    if matches!(family, Family::Bernoulli | Family::Cumulative) {
+        let first = i64::from(family == Family::Cumulative);
         let indices: HashMap<_, _> = levels
-            .expect("binary response levels were saved")
+            .expect("response levels were saved")
             .iter()
             .enumerate()
-            .map(|(i, level)| (level_key(level), i as i64))
+            .map(|(i, level)| (level_key(level), i as i64 + first))
             .collect();
         return Ok(DataValue::Integers(
             rows.iter()
