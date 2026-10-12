@@ -10,8 +10,8 @@ R term expansion and brms fixed-term ordering determine the design columns.
 Numeric and explicit factor grouping columns retain their training levels.
 Grouping terms are ordered with C collation for stable brms parameter names.
 Missing model rows are omitted. Unused columns do not affect row selection.
-Offsets, expression calls, random slopes, other families and coefficient-specific
-priors are not yet supported. The response cannot also be a fixed predictor.
+Offsets, formula expression calls, random slopes and other families are not yet
+supported. The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
@@ -29,10 +29,40 @@ no such level limit.
 
 Defaults match the Gaussian brms rules: a centred Student-t intercept,
 half-Student-t scales, and improper `regression.Flat()` coefficients.
-Supply `Normal(mean, sd)` or `normal(mean, sd)` priors by class (`b`,
-`Intercept`, `sd`, `sigma`). Group-specific `sd` entries override the class prior.
-Scale priors are normalized restrictions to positive values. A flat prior cannot
-be sampled. An improper prior does not imply an improper posterior.
+Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_t`,
+`cauchy`, `exponential`, `gamma`, `inv_gamma`, `beta`, `lognormal`, `logistic`,
+`weibull`, `double_exponential`, `chi_square` and `uniform` accept their usual
+positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
+correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
+
+Select priors by `class` (`b`, `Intercept`, `sd`, `sigma`) with optional `coef`,
+`group` and `dpar`. Selectors must identify existing parameters. A coefficient
+prior overrides its class prior; a group prior overrides the global group-scale
+prior. A coefficient-specific `sd` prior also needs `group`.
+
+```json
+[
+  {"class": "b", "prior": "normal(0, 2)", "lb": 0, "ub": 2},
+  {"class": "b", "coef": "x", "prior": "normal(1, 1.5)"},
+  {"class": "b", "coef": "z", "prior": "constant(0.5)"}
+]
+```
+
+Coefficient overrides inherit the class row's bounds; bounds cannot be attached
+to coefficient rows. Bounds can be numbers or scalar FlatPPL expressions using
+the generated parameter names. Proper restrictions retain their normalization,
+including parameter-dependent normalizers. Flat restrictions retain unit density.
+An explicit open Flat support with a finite upper bound is currently refused:
+the required `truncate(Flat(...), ...)` draw is not yet admitted by the engines.
+Use `Flat(interval(...))` when a closed interval is intended.
+
+`constant(c)` requires a finite numeric literal and creates a fixed coefficient
+without a sampled coordinate. It requires fixed bounds when bounds are supplied;
+the model must retain at least one sampled parameter.
+Expressions use the ordinary FlatPPL type and phase validation. Shared coefficient
+priors use `iid`; differing priors use scalar declarations and a combined vector.
+A Flat prior cannot be sampled. An improper prior does not imply an improper
+posterior.
 
 ```rust
 let spec = flatppl_formula::read(spec_json)?;
@@ -46,8 +76,7 @@ let prediction = flatppl_formula::prepare_data(
 recipe, and parameter metadata. The recipe retains training means, factor
 contrasts and levels, design terms, and group levels. Numeric source columns
 remain raw. The emitted FlatPPL selects contrast values and computes interaction
-products. Metadata records the default-prior rule and group collation. Generated
-default priors carry short comments identifying the response summary rules.
+products. Metadata records the default-prior rule and group collation.
 Prediction requires no response column. It reuses the training contrast matrices
 and remaps factor labels even when new data uses a different level order.
 It rejects unseen factor and group levels.

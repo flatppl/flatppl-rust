@@ -1,6 +1,8 @@
-use crate::{Error, Formula, Result, Spec};
-use flatppl_core::{CallHead, Module, Node, NodeId, Scalar};
+use crate::{Design, Error, Formula, Result, Spec};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+
+pub(crate) use crate::prior_expr::{PriorNode, emit};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -8,78 +10,237 @@ pub struct Prior {
     pub class: String,
     pub prior: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coef: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lb: Option<PriorBound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ub: Option<PriorBound>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct NormalPrior {
-    pub mean: f64,
-    pub sd: f64,
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum PriorBound {
+    Number(f64),
+    Expression(String),
+}
+
+/// One parameter's prior after class and coefficient selectors have resolved.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResolvedPrior {
+    pub prior: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lb: Option<PriorBound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ub: Option<PriorBound>,
+}
+
+impl ResolvedPrior {
+    pub fn new(prior: impl Into<String>) -> Self {
+        Self {
+            prior: prior.into(),
+            lb: None,
+            ub: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Priors {
     pub intercept_location: f64,
     pub scale: f64,
-    pub b: Option<NormalPrior>,
-    pub intercept: Option<NormalPrior>,
-    pub sigma: Option<NormalPrior>,
-    pub sd: Vec<Option<NormalPrior>>,
+    pub sigma_scale: f64,
+    pub intercept: ResolvedPrior,
+    pub b: Vec<ResolvedPrior>,
+    pub sd: Vec<ResolvedPrior>,
+    pub aux: BTreeMap<String, ResolvedPrior>,
 }
 
-pub(crate) fn resolve(spec: &Spec, formula: &Formula, response: &[f64]) -> Result<Priors> {
-    let location = median(response.to_vec());
-    let mad = 1.4826 * median(response.iter().map(|y| (y - location).abs()).collect());
-    let mut out = Priors {
-        intercept_location: round_decimal(location),
-        scale: round_decimal(mad).max(2.5),
-        b: None,
-        intercept: None,
-        sigma: None,
-        sd: vec![None; formula.groups.len()],
-    };
-    let mut selected = std::collections::HashSet::new();
-    for prior in &spec.priors {
-        if !selected.insert((&prior.class, &prior.group)) {
+pub(crate) struct PriorTarget<'a> {
+    pub class: &'a str,
+    pub coef: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub dpar: Option<&'a str>,
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+impl Prior {
+    fn matches(&self, target: &PriorTarget<'_>) -> bool {
+        self.class == target.class
+            && [
+                (self.coef.as_deref(), target.coef),
+                (self.group.as_deref(), target.group),
+                (self.dpar.as_deref(), target.dpar),
+            ]
+            .iter()
+            .all(|&(selector, value)| nonempty(selector).is_none_or(|s| Some(s) == value))
+    }
+
+    fn specificity(&self) -> (bool, bool, bool) {
+        (
+            nonempty(self.coef.as_deref()).is_some(),
+            nonempty(self.group.as_deref()).is_some(),
+            nonempty(self.dpar.as_deref()).is_some(),
+        )
+    }
+}
+
+pub(crate) fn select(
+    priors: &[Prior],
+    targets: &[PriorTarget<'_>],
+) -> Result<Vec<Option<ResolvedPrior>>> {
+    let mut seen = HashSet::new();
+    for prior in priors {
+        let selector = (
+            &prior.class,
+            nonempty(prior.coef.as_deref()),
+            nonempty(prior.group.as_deref()),
+            nonempty(prior.dpar.as_deref()),
+        );
+        if !seen.insert(selector) {
             return Err(Error(format!(
-                "duplicate prior for class `{}` and group {:?}",
-                prior.class, prior.group
+                "duplicate prior selector for class `{}`",
+                prior.class
             )));
         }
-        let normal = normal(&prior.prior)?;
-        match (prior.class.as_str(), prior.group.as_deref()) {
-            ("b", None) if !formula.fixed.is_empty() => out.b = Some(normal),
-            ("Intercept", None) if formula.intercept => out.intercept = Some(normal),
-            ("sigma", None) => out.sigma = Some(normal),
-            ("sd", None) if !formula.groups.is_empty() => {}
-            ("sd", Some(group)) if formula.groups.iter().any(|v| v == group) => {}
-            _ => {
-                return Err(Error(format!(
-                    "prior selector class `{}` group {:?} matches no supported parameter",
-                    prior.class, prior.group
-                )));
-            }
+        if nonempty(prior.coef.as_deref()).is_some() && (prior.lb.is_some() || prior.ub.is_some()) {
+            return Err(Error(
+                "coefficient-specific priors inherit bounds from their class prior".into(),
+            ));
+        }
+        if prior.class == "sd"
+            && nonempty(prior.coef.as_deref()).is_some()
+            && nonempty(prior.group.as_deref()).is_none()
+        {
+            return Err(Error(
+                "a coefficient-specific sd prior requires a group".into(),
+            ));
+        }
+        if !targets.iter().any(|target| prior.matches(target)) {
+            return Err(Error(format!(
+                "prior selector class `{}` coef {:?} group {:?} dpar {:?} matches no parameter",
+                prior.class, prior.coef, prior.group, prior.dpar
+            )));
         }
     }
-    // Group-specific priors override the class prior, independent of input order.
-    for (index, group) in formula.groups.iter().enumerate() {
-        let prior = spec
-            .priors
-            .iter()
-            .find(|p| p.class == "sd" && p.group.as_deref() == Some(group))
-            .or_else(|| {
-                spec.priors
-                    .iter()
-                    .find(|p| p.class == "sd" && p.group.is_none())
-            });
-        out.sd[index] = prior.map(|p| normal(&p.prior)).transpose()?;
-    }
-    if !out.scale.is_finite() || !out.intercept_location.is_finite() {
+    Ok(targets
+        .iter()
+        .map(|target| {
+            let matched: Vec<_> = priors
+                .iter()
+                .filter(|prior| prior.matches(target))
+                .collect();
+            let selected = matched
+                .iter()
+                .copied()
+                .max_by_key(|prior| prior.specificity())?;
+            // brms takes both bounds from the most specific base row, independently
+            // of a coefficient-specific distribution override.
+            let bounds = matched
+                .iter()
+                .copied()
+                .filter(|prior| {
+                    nonempty(prior.coef.as_deref()).is_none()
+                        && (prior.lb.is_some() || prior.ub.is_some())
+                })
+                .max_by_key(|prior| prior.specificity());
+            Some(ResolvedPrior {
+                prior: selected.prior.clone(),
+                lb: bounds.and_then(|prior| prior.lb.clone()),
+                ub: bounds.and_then(|prior| prior.ub.clone()),
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn resolve(
+    spec: &Spec,
+    formula: &Formula,
+    design: &Design,
+    response: &[f64],
+    offset_mean: f64,
+) -> Result<Priors> {
+    let location = median(response.to_vec());
+    let mad = 1.4826 * median(response.iter().map(|y| (y - location).abs()).collect());
+    let location = round_decimal(location) - offset_mean;
+    let scale = round_decimal(mad).max(2.5);
+    if !scale.is_finite() || !location.is_finite() {
         return Err(Error(
             "response statistics exceed the finite Gaussian prior range".into(),
         ));
     }
-    Ok(out)
+    let names: Vec<_> = design
+        .columns
+        .iter()
+        .map(|c| crate::emit::coefficient_name(&c.name))
+        .collect();
+    let mut targets = Vec::new();
+    if formula.intercept {
+        targets.push(PriorTarget {
+            class: "Intercept",
+            coef: None,
+            group: None,
+            dpar: None,
+        });
+    }
+    targets.extend(names.iter().map(|name| PriorTarget {
+        class: "b",
+        coef: Some(name),
+        group: None,
+        dpar: None,
+    }));
+    targets.extend(formula.groups.iter().map(|name| PriorTarget {
+        class: "sd",
+        coef: Some("Intercept"),
+        group: Some(name),
+        dpar: None,
+    }));
+    targets.push(PriorTarget {
+        class: "sigma",
+        coef: None,
+        group: None,
+        dpar: None,
+    });
+    let mut selected = select(&spec.priors, &targets)?.into_iter();
+    let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
+    let intercept = if formula.intercept {
+        selected
+            .next()
+            .unwrap()
+            .unwrap_or_else(|| student(location))
+    } else {
+        student(location)
+    };
+    let b = names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
+        })
+        .collect();
+    let sd = formula
+        .groups
+        .iter()
+        .map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)))
+        .collect();
+    let sigma = selected.next().unwrap().unwrap_or_else(|| student(0.0));
+    Ok(Priors {
+        intercept_location: location,
+        scale,
+        sigma_scale: scale,
+        intercept,
+        b,
+        sd,
+        aux: BTreeMap::from([("sigma".into(), sigma)]),
+    })
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -92,8 +253,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
-// Compare distances in the input scale rather than rounding x*10, which can
-// erase the binary rounding difference relevant to R's round(x, digits=1).
+// R rounds at the input scale: multiplying first can erase a rounding tie.
 fn round_decimal(value: f64) -> f64 {
     let x = value.abs();
     let index = (x * 10.0).floor();
@@ -106,54 +266,4 @@ fn round_decimal(value: f64) -> f64 {
         lower
     };
     rounded.copysign(value)
-}
-
-fn normal(text: &str) -> Result<NormalPrior> {
-    let text = text.trim();
-    let text = text
-        .strip_prefix("normal(")
-        .map(|rest| format!("Normal({rest}"))
-        .unwrap_or_else(|| text.into());
-    let parsed = flatppl_syntax::parse(&format!("prior = {text}"))
-        .map_err(|e| Error(format!("invalid prior `{text}`: {e}")))?;
-    let fail = || {
-        Error(format!(
-            "unsupported prior `{text}`; this slice accepts Normal(mean, sd)"
-        ))
-    };
-    let bindings: Vec<_> = parsed.public_bindings().collect();
-    if bindings.len() != 1 {
-        return Err(fail());
-    }
-    let Node::Call(call) = parsed.node(bindings[0].1.rhs) else {
-        return Err(fail());
-    };
-    if !matches!(call.head, CallHead::Builtin(s) if parsed.resolve(s) == "Normal")
-        || call.args.len() != 2
-        || !call.named.is_empty()
-    {
-        return Err(fail());
-    }
-    let mean = scalar(&parsed, call.args[0]).ok_or_else(fail)?;
-    let sd = scalar(&parsed, call.args[1]).ok_or_else(fail)?;
-    if !mean.is_finite() || !sd.is_finite() || sd <= 0.0 {
-        return Err(Error(format!(
-            "prior `{text}` requires finite mean and positive finite scale"
-        )));
-    }
-    Ok(NormalPrior { mean, sd })
-}
-
-fn scalar(module: &Module, id: NodeId) -> Option<f64> {
-    match module.node(id) {
-        Node::Lit(Scalar::Real(v)) => Some(*v),
-        Node::Lit(Scalar::Int(v)) => Some(*v as f64),
-        Node::Call(call)
-            if matches!(call.head, CallHead::Builtin(s) if module.resolve(s) == "neg")
-                && call.args.len() == 1 =>
-        {
-            scalar(module, call.args[0]).map(|v| -v)
-        }
-        _ => None,
-    }
 }

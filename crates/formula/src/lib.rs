@@ -12,6 +12,7 @@ mod design;
 mod emit;
 mod expression;
 mod formula;
+mod prior_expr;
 mod priors;
 
 use flatppl_core::Module;
@@ -22,7 +23,7 @@ pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, p
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use formula::{Formula, Term, parse_formula};
-pub use priors::{NormalPrior, Prior, Priors};
+pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -175,11 +176,12 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let rows = data::model_rows(&formula, table, DataMode::Training)?;
     let (design, means) = design::build(&formula, table, &rows, &spec.options.contrasts)?;
     let response = table.column(&formula.response)?.numeric(&rows)?;
-    let mut priors = priors::resolve(spec, &formula, &response)?;
-    if let Some(offset) = formula.offset() {
-        priors.intercept_location -=
-            offset.values(table, &rows)?.iter().sum::<f64>() / rows.len() as f64;
-    }
+    let offset_mean = formula
+        .offset()
+        .map(|offset| offset.values(table, &rows))
+        .transpose()?
+        .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
+    let priors = priors::resolve(spec, &formula, &design, &response, offset_mean)?;
     let groups = formula
         .groups
         .iter()
@@ -210,9 +212,18 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         module
     };
     let text = flatppl_syntax::print(&module);
-    let module = flatppl_syntax::parse(&text)
+    let mut module = flatppl_syntax::parse(&text)
         .map_err(|e| Error(format!("generated module failed to reparse: {e}")))?;
-    let info = emit::info(spec, &recipe, &data)?;
+    let mut validation = emit::inline(module.clone(), &data)?;
+    let diagnostics = flatppl_infer::infer(&mut validation);
+    if let Some(diagnostic) = diagnostics.first() {
+        return Err(Error(format!(
+            "generated formula model: {}",
+            diagnostic.message
+        )));
+    }
+    let info = emit::info(spec, &recipe, &data, &validation)?;
+    emit::mark_improper(&mut module, info.has_improper_prior);
     Ok(Conversion {
         module,
         data,
