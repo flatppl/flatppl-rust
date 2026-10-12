@@ -50,6 +50,93 @@ impl Components {
 }
 
 impl Emitter<'_> {
+    /// Dirac scores equality of one whole variate. Records retain their declared
+    /// field order; tensor leaves contract cell axes, never callable batch axes.
+    pub(crate) fn dirac_equal(&mut self, atom: NodeId, point: NodeId) -> Result<Value, EmitError> {
+        let literal_fields = |id| {
+            let id = self.resolve_tuple_projections(id);
+            // A declared input replaces even a literal record's computation.
+            // Its ABI field bindings take precedence over the source fields.
+            if self.columns.keys().any(|(container, _)| *container == id) {
+                return None;
+            }
+            match self.m.node(id) {
+                Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if self.m.resolve(s) == "record") => {
+                    Some(
+                        c.named
+                            .iter()
+                            .map(|f| (f.name, f.value))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            }
+        };
+        // Recurse before lowering fields: a nested literal record itself has no
+        // tensor form. External flat records use the existing column bindings.
+        if let (Some(atom), Some(point_fields)) = (literal_fields(atom), literal_fields(point)) {
+            if !atom
+                .iter()
+                .map(|f| f.0)
+                .eq(point_fields.iter().map(|f| f.0))
+            {
+                return Err(EmitError::at(
+                    point,
+                    "Dirac: record fields must match in order",
+                ));
+            }
+            let mut equal = None;
+            for ((_, a), (_, b)) in atom.into_iter().zip(point_fields) {
+                let field = self.dirac_equal(a, b)?;
+                equal = Some(match equal {
+                    Some(previous) => self.and(&previous, &field),
+                    None => field,
+                });
+            }
+            return Ok(equal.unwrap_or_else(|| self.bool_value_const(true)));
+        }
+        let atom = self.lower_components(atom)?;
+        let value = self.lower_components(point)?;
+        if atom.fields != value.fields {
+            return Err(EmitError::at(
+                point,
+                "Dirac: record fields must match in order",
+            ));
+        }
+        let mut equal = None;
+        for (a, b) in atom.values.iter().zip(&value.values) {
+            let field = self.dirac_tensor_equal(point, a, b)?;
+            equal = Some(match equal {
+                Some(previous) => self.and(&previous, &field),
+                None => field,
+            });
+        }
+        Ok(equal.unwrap_or_else(|| self.bool_value_const(true)))
+    }
+
+    pub(crate) fn dirac_tensor_equal(
+        &mut self,
+        id: NodeId,
+        atom: &Value,
+        point: &Value,
+    ) -> Result<Value, EmitError> {
+        if self.cell_ty(atom) != self.cell_ty(point)
+            || self.axes_of(atom).layers != self.axes_of(point).layers
+        {
+            return Err(EmitError::at(
+                id,
+                "Dirac: atom and point must have the same cell shape",
+            ));
+        }
+        let (atom, point) = self.broadcast_batches(atom, point);
+        let eq = self.compare("EQ", &point, &atom);
+        Ok(if matches!(self.cell_ty(&eq), MlirTy::Scalar) {
+            eq
+        } else {
+            self.reduce_boolean("stablehlo.and", "true", &eq)
+        })
+    }
+
     /// Axis substitutions belong to one aggregate application. Shared body
     /// nodes must not retain a previous metric or frame's intermediate values.
     pub(crate) fn lower_with_bindings(

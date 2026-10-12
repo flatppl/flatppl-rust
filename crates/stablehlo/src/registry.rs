@@ -514,7 +514,6 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "Binomial"
             | "Geometric"
             | "NegativeBinomial"
-            | "Dirac"
             | "Uniform"
             // §09 particle-physics.
             | "CrystalBall"
@@ -562,6 +561,19 @@ pub(crate) fn lower_logdensityof_batched(
             ));
         }
     };
+    if ctor == "Dirac" {
+        let [_, kernel_input, v] = <[NodeId; 3]>::try_from(args)
+            .map_err(|_| EmitError::at(id, "builtin_logdensityof: expected 3 arguments"))?;
+        let params = Params {
+            kernel_input,
+            variate: Some(v),
+        };
+        let atom = params.field_id(e, "value")?;
+        return e.lower_broadcast_cells(id, &[atom, v], |e, values| {
+            let eq = e.dirac_tensor_equal(id, &values[0], &values[1])?;
+            Ok(dirac_score(e, &eq))
+        });
+    }
     if is_batch_safe(&ctor) {
         return lower_logdensityof(e, id, args);
     }
@@ -623,6 +635,11 @@ pub(crate) fn lower_logdensityof(
         kernel_input,
         variate: Some(v),
     };
+    if ctor == "Dirac" {
+        let atom = params.field_id(e, "value")?;
+        let eq = e.dirac_equal(atom, v)?;
+        return Ok(dirac_score(e, &eq));
+    }
     let value = e.lower_node(v)?;
     (dist.logpdf)(e, &params, &value)
 }
@@ -1966,18 +1983,6 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     Ok(e.select(&supported, &score, &outside))
 }
 
-/// §06 Dirac (the measure monad's unit, `Dirac(value = v)`), verbatim: the
-/// point-mass measure at `value` — density 1 (log 0) at `v == value`, 0 (log
-/// -inf) elsewhere, w.r.t. whatever reference measure the surrounding
-/// combinator shares it against (e.g. `Counting` in a mixture over an integer
-/// variate, per `06-measure-algebra.md`'s "`Dirac(value = v)` — point-mass
-/// probability measure at `v` for any variate type"). Rank-agnostic (pure
-/// `compare`/`select`, no matrix/gather/literal-index machinery), so it is
-/// listed in [`is_batch_safe`] alongside the other §08 discrete arithmetic
-/// dists — needed for e.g. `iid(superpose(weighted(w, Binomial(..)),
-/// weighted(1-w, Dirac(0))), n)`'s batched mixture density (the zero-inflated
-/// binomial idiom). Its `@sample` builder is [`dirac_sample`] — the identity
-/// `value`.
 /// §09 `CrystalBall(m0, sigma, alpha, n)` — a Gaussian core with a power-law
 /// tail below `-alpha` standard deviations, normalized.
 ///
@@ -2312,13 +2317,21 @@ fn poisson_deviance(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
     e.select(&near, &close, &far)
 }
 
+/// §06 Dirac scores the whole variate: log-density 0 at the atom and -inf elsewhere.
+/// Record dispatch precedes tensor lowering; the dedicated broadcast path
+/// establishes batch axes before reducing event axes, including scalar iid
+/// mixtures. Sampling remains the identity [`dirac_sample`].
 fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let value = p.get(e, "value")?;
-    let eq = e.compare("EQ", v, &value);
+    let eq = e.dirac_tensor_equal(p.variate_id()?, &value, v)?;
+    Ok(dirac_score(e, &eq))
+}
+
+fn dirac_score(e: &mut Emitter, eq: &Value) -> Value {
     let zero = e.scalar(0.0);
     let pos_inf = e.inf(MlirTy::Scalar);
     let neg_inf = e.neg(&pos_inf);
-    Ok(e.select(&eq, &zero, &neg_inf))
+    e.select(eq, &zero, &neg_inf)
 }
 
 /// §06 Dirac's sampling transform: `rand(Dirac(value = v), rng)` returns the
@@ -4154,7 +4167,6 @@ mod tests {
             "Binomial",
             "Geometric",
             "NegativeBinomial",
-            "Dirac",
             // Rank-agnostic because its density is masked to its support, and
             // the mask carries the variate's shape.
             "Uniform",
@@ -4173,6 +4185,7 @@ mod tests {
         // (Categorical/Categorical0), and any future/unknown ctor are NOT
         // rank-agnostic, so none may reuse its scalar builder under broadcast.
         for d in [
+            "Dirac",
             "Categorical",
             "Categorical0",
             "MvNormal",
