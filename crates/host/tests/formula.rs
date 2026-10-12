@@ -4,6 +4,36 @@ use flatppl_host::{
 };
 
 #[test]
+fn coefficient_priors_can_reference_later_family_auxiliaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spec = flatppl_formula::read(
+        &serde_json::json!({
+            "formula": "y ~ 0 + x", "family": "beta",
+            "priors": [
+                {"class": "b", "prior": "normal(0, phi)"},
+                {"class": "phi", "prior": "constant(2.5)"}
+            ],
+            "data": {"nrows": 2, "columns": [
+                {"name": "y", "values": {"kind": "real64", "values": [0.2, 0.6]}},
+                {"name": "x", "values": {"kind": "real64", "values": [1, 2]}}
+            ]}
+        })
+        .to_string(),
+    )?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    context.register("model.flatppl", &model.module)?;
+    let query = context.parse(
+        "m = load_module(\"model.flatppl\")\np = elementof(cartpow(reals, 1))\n\
+                 inputs = p\noutputs = logdensityof(m.Pi_post, record(b = p))",
+        None,
+        None,
+    )?;
+    query.compile(&EmitOptions::default())?;
+    Ok(())
+}
+
+#[test]
 fn formula_training_and_prediction_compile_from_distinct_snapshots()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut spec = flatppl_formula::read(include_str!(
@@ -164,28 +194,42 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
     for family in [
         "gaussian",
         "student",
+        "lognormal",
         "bernoulli",
         "binomial",
+        "zero_inflated_binomial",
         "poisson",
+        "zero_inflated_poisson",
+        "zero_inflated_negbinomial",
         "negbinomial",
+        "geometric",
         "Gamma",
         "exponential",
+        "weibull",
+        "beta",
+        "von_mises",
     ] {
-        let formula = if family == "binomial" {
+        let formula = if matches!(family, "binomial" | "zero_inflated_binomial") {
             "y | trials(n) ~ x"
         } else {
             "y ~ x"
         };
         let y = if family == "bernoulli" {
-            vec![0, 1, 1, 0]
+            vec![0.0, 1.0, 1.0, 0.0]
+        } else if family == "beta" {
+            vec![0.1, 0.4, 0.8, 0.7]
+        } else if family == "von_mises" {
+            vec![-2.0, -0.4, 0.8, 2.0]
+        } else if family.starts_with("zero_inflated_") {
+            vec![0.0, 2.0, 4.0, 0.0]
         } else {
-            vec![2, 4, 8, 7]
+            vec![2.0, 4.0, 8.0, 7.0]
         };
         let spec = flatppl_formula::read(
             &serde_json::json!({
                 "formula": formula, "family": family,
                 "data": {"nrows": 4, "columns": [
-                    {"name": "y", "values": {"kind": "int", "values": y}},
+                    {"name": "y", "values": {"kind": "real64", "values": y}},
                     {"name": "x", "values": {"kind": "real32", "values": [1, 2, 3, 4]}},
                     {"name": "n", "values": {"kind": "int", "values": [3, 5, 8, 9]}}
                 ]}
@@ -196,9 +240,13 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
         context.register("training.flatppl", &model.module)?;
         let auxiliaries = match family {
-            "gaussian" => ", sigma = posreals",
+            "gaussian" | "lognormal" => ", sigma = posreals",
             "student" => ", sigma = posreals, nu = interval(1, inf)",
-            "Gamma" | "negbinomial" => ", shape = posreals",
+            "Gamma" | "negbinomial" | "weibull" => ", shape = posreals",
+            "beta" => ", phi = posreals",
+            "von_mises" => ", kappa = posreals",
+            "zero_inflated_poisson" | "zero_inflated_binomial" => ", zi = unitinterval",
+            "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
             _ => "",
         };
         let parameter = format!(
@@ -223,13 +271,20 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         ]}))?;
         let prediction = model.prepare(&mut context, &data, DataMode::Prediction)?;
         context.register("prediction.flatppl", &prediction)?;
+        let observation = if family == "beta" {
+            "[0.2, 0.8]"
+        } else if family.starts_with("zero_inflated_") {
+            "[0, 2]"
+        } else {
+            "[1, 1]"
+        };
         let forward = context.parse(
             &format!(
                 r#"
             m = load_module("prediction.flatppl")
             {parameter}
             inputs = p
-            outputs = logdensityof(m.K_model(p), record(y = [1, 1]))
+            outputs = logdensityof(m.K_model(p), record(y = {observation}))
         "#
             ),
             None,
@@ -260,9 +315,12 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         "cloglog",
         "cauchit",
         "softit",
+        "tan_half",
     ] {
         let family = if link == "sqrt" {
             "poisson"
+        } else if link == "tan_half" {
+            "von_mises"
         } else {
             "gaussian"
         };
@@ -275,6 +333,8 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         context.register("model.flatppl", &model.module)?;
         let parameters = if family == "gaussian" {
             "record(temp_Intercept = eta, sigma = 1)"
+        } else if family == "von_mises" {
+            "record(temp_Intercept = eta, kappa = 1)"
         } else {
             "record(temp_Intercept = eta)"
         };
@@ -292,5 +352,65 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         )?;
         query.compile(&EmitOptions::default())?;
     }
+    Ok(())
+}
+
+#[test]
+fn weighted_training_retains_unweighted_diagnostics_and_prediction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spec = flatppl_formula::read(
+        &serde_json::json!({
+            "formula": "y | weights(w) ~ x",
+            "priors": [
+                {"class": "b", "prior": "normal(0, 2)"},
+                {"class": "Intercept", "prior": "normal(0, 3)"},
+                {"class": "sigma", "prior": "exponential(1.2)"}
+            ],
+            "data": {"nrows": 4, "columns": [
+                {"name": "y", "values": {"kind": "int", "values": [1, 2, 4, 7]}},
+                {"name": "x", "values": {"kind": "real32", "values": [-1, 0, 1, 2]}},
+                {"name": "w", "values": {"kind": "real32", "values": [0, 0.5, 2, 3]}}
+            ]}
+        })
+        .to_string(),
+    )?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    context.register("training.flatppl", &model.module)?;
+    let score = context.parse(
+        r#"
+        m = load_module("training.flatppl")
+        p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 1), sigma = posreals))
+        inputs = p
+        outputs = record(
+            posterior = logdensityof(m.Pi_post, p),
+            pointwise = m.log_lik(temp_Intercept = p.temp_Intercept, b = p.b, sigma = p.sigma),
+            weights = m.weights_data,
+            forward = logdensityof(m.K_model(p), record(y = m.y_data)))
+    "#,
+        None,
+        None,
+    )?;
+    let training = score.compile(&EmitOptions::default())?;
+    let data = serde_json::from_value(serde_json::json!({"nrows": 2, "columns": [
+        {"name": "x", "values": {"kind": "real32", "values": [2, 5]}}
+    ]}))?;
+    let prediction = model.prepare(&mut context, &data, DataMode::Prediction)?;
+    context.register("prediction.flatppl", &prediction)?;
+    let forward = context.parse(
+        r#"
+        m = load_module("prediction.flatppl")
+        p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 1), sigma = posreals))
+        inputs = p
+        outputs = logdensityof(m.K_model(p), record(y = [1, 1]))
+    "#,
+        None,
+        None,
+    )?;
+    forward.compile(&EmitOptions::default())?;
+    assert_eq!(
+        score.compile(&EmitOptions::default())?.stablehlo,
+        training.stablehlo
+    );
     Ok(())
 }

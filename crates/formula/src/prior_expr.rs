@@ -1,11 +1,97 @@
 //! Prior text uses the language parser; only brms constructor names are lowered.
 use crate::{Error, PriorBound, ResolvedPrior, Result};
 use flatppl_convert::Builder;
-use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar};
+use flatppl_core::{
+    Call, CallHead, Idx, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
+};
 
 pub(crate) enum PriorNode {
     Measure(NodeId),
     Constant(NodeId),
+}
+
+pub(crate) fn equivalent(left: &ResolvedPrior, right: &ResolvedPrior) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    if left.lb != right.lb || left.ub != right.ub {
+        return Ok(false);
+    }
+    let (left, a) = parse_expression(&left.prior)?;
+    let (right, z) = parse_expression(&right.prior)?;
+    // Comparison resolves aliases but does not authorize references. The retained
+    // shared law still goes through ordinary scoped emission and inference.
+    let bindings: Vec<_> = [&left, &right]
+        .into_iter()
+        .flat_map(|module| {
+            (0..module.node_count()).filter_map(|i| match module.node(NodeId::from_usize(i)) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => Some(module.resolve(*name)),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut module = Module::new();
+    let mut b = Builder::new(&mut module);
+    let a = copy(&mut b, &left, a, None, &bindings)?;
+    let z = copy(&mut b, &right, z, None, &bindings)?;
+    Ok(same_law(&module, a, z))
+}
+
+fn same_law(m: &Module, a: NodeId, b: NodeId) -> bool {
+    if m.structural_eq(a, b) {
+        return true;
+    }
+    let (Node::Call(a), Node::Call(b)) = (m.node(a), m.node(b)) else {
+        return false;
+    };
+    let CallHead::Builtin(name) = a.head else {
+        return false;
+    };
+    // Only real parameters of these continuous laws admit numeric coercion.
+    // Nested parameter expressions retain their language-level type semantics.
+    if !matches!(
+        m.resolve(name),
+        "Normal"
+            | "StudentT"
+            | "Cauchy"
+            | "Exponential"
+            | "Gamma"
+            | "InverseGamma"
+            | "Beta"
+            | "LogNormal"
+            | "Logistic"
+            | "Weibull"
+            | "Laplace"
+            | "ChiSquared"
+            | "locscale"
+    ) || a.head != b.head
+        || a.inputs != b.inputs
+        || a.args.len() != b.args.len()
+        || a.named.len() != b.named.len()
+    {
+        return false;
+    }
+    let same = |x, y| {
+        m.structural_eq(x, y)
+            || match (m.node(x), m.node(y)) {
+                (Node::Lit(Scalar::Int(i)), Node::Lit(Scalar::Real(r)))
+                | (Node::Lit(Scalar::Real(r)), Node::Lit(Scalar::Int(i))) => {
+                    r.fract() == 0.0
+                        && *r >= i64::MIN as f64
+                        && *r < -(i64::MIN as f64)
+                        && *r as i64 == *i
+                }
+                _ => false,
+            }
+    };
+    a.args.iter().zip(&b.args).all(|(&x, &y)| same(x, y))
+        && a.named
+            .iter()
+            .zip(&b.named)
+            .all(|(x, y)| x.kind == y.kind && x.name == y.name && same(x.value, y.value))
 }
 
 pub(crate) fn emit_correlation(
@@ -215,6 +301,11 @@ fn expression(
     dimension: Option<usize>,
     bindings: &[&str],
 ) -> Result<NodeId> {
+    let (parsed, root) = parse_expression(text)?;
+    copy(b, &parsed, root, dimension, bindings)
+}
+
+fn parse_expression(text: &str) -> Result<(Module, NodeId)> {
     let parsed = flatppl_syntax::parse(&format!(
         "reg = standard_module(\"regression\", \"0.1\")\n__prior_expr = ({text})"
     ))
@@ -226,7 +317,8 @@ fn expression(
     {
         return Err(Error("a prior must contain exactly one expression".into()));
     }
-    copy(b, &parsed, rows[1].1.rhs, dimension, bindings)
+    let root = rows[1].1.rhs;
+    Ok((parsed, root))
 }
 
 fn reference(b: &mut Builder<'_>, source: &Module, r: Ref, bindings: &[&str]) -> Result<Ref> {

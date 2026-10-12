@@ -15,25 +15,78 @@ Group terms support random slopes, nested groups and independent `||` effects.
 The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
-Set `family` to `gaussian`, `student`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `Gamma` or `exponential`. `link` is optional:
+Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises` or `cumulative`.
+`link` is optional:
 
 | Family | Default link | Other links |
 | --- | --- | --- |
 | Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
-| Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
-| Poisson, negative binomial | log | identity, sqrt, softplus, squareplus |
-| Gamma, exponential | log | identity, inverse, softplus, squareplus |
+| Lognormal | identity | inverse |
+| Bernoulli, binomial, beta | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
+| Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
+| Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
+| von Mises | tan_half | identity |
+| Cumulative ordinal | logit | — |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
 the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
+Geometric models count failures before the first success and use
+`NegativeBinomial(1, 1 / mu)`, so `mu` is the expected count.
+Weibull models use a direct `shape` and mean `mu`, with scale
+`mu / gamma(1 + 1 / shape)` and a Gamma(0.01, 0.01) shape prior.
+Beta models use mean `mu` and direct precision `phi`, with a Gamma(0.01, 0.01)
+prior and response values strictly between zero and one.
+von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
+Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
+The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the
+ordinary response-based Student-t prior.
 Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
 integer or a numeric column of counts. Trials remain required for prediction.
 Counts must be nonnegative integers, and binomial responses cannot exceed
-their trials. Gamma and exponential responses must be strictly positive.
+their trials. Gamma, exponential, lognormal and Weibull responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
+
+Cumulative responses use ordered factors or positive integer category codes.
+Unused factor levels are dropped; integer codes retain gaps up to their maximum.
+The recipe saves that category order for prediction. Ordered `cuts` replace the
+ordinary intercept, so removing the intercept is not supported. `Intercept[1]`,
+`Intercept[2]`, etc. map to the centred thresholds; derived `b_Intercept[i]` adds
+the training predictor-mean contribution to report the original design scale.
+Thresholds share a continuous prior, by default Student-t(3, 0, 2.5), conditioned
+on their order with `tilt`. This normalized law adds `log(m!)` to brms's target
+for `m` thresholds; `score_offset` records the difference. Class `Intercept`
+sets their common prior. Coefficient selectors `"1"`, `"2"`, etc. are accepted
+when they match after alias expansion and exact numeric-literal comparison.
+Different parameterizations of the same law may still be refused, such as
+`cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
+priors and other ordinal links or threshold parameterizations are not supported.
+
+Response weights use `y | weights(w) ~ ...`, or
+`y | trials(n) + weights(w) ~ ...` for binomial data. `w` names a numeric
+column. After omitting incomplete model rows, retained weights must be finite
+and nonnegative. Zero weights, including an all-zero vector, are allowed.
+Weights are not rescaled. Weight expressions, constants and `scale = TRUE`
+are outside this subset; unlike brms, infinite weights are refused under the
+converter's finite numeric input policy.
+
+The generated `K_model` and `L` keep the ordinary unweighted observation law.
+`log_lik` returns unweighted pointwise log likelihoods for the retained training
+rows, with the same parameter arguments as `K_model`. `weights_data` stores
+the aligned weights. `Pi_post` adds `sum(weights_data .* log_lik(...))` once
+to the prior log density. Prediction requires neither responses nor weights;
+it uses the existing predictor-row filtering and saved training recipe.
+
+Gaussian and Student formulas accept `y | se(s) ~ ...`, where `s` is a numeric
+column, constant or supported column expression. The supplied values replace
+residual `sigma`; its prior is unavailable. `se(s, sigma=TRUE)` retains `sigma`
+and uses `sqrt(s^2 + sigma^2)`. Student models interpret this as scale, without a
+degrees-of-freedom correction. Values must be finite and nonnegative. Conversion
+rejects zero when `sigma=FALSE`, because the total likelihood scale would be zero;
+with `sigma=TRUE`, zero known error is allowed. Prediction requires the columns used in `se()` and
+reuses the saved expression. Separate response additions with `+`.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
@@ -51,7 +104,9 @@ no such level limit.
 Defaults follow brms: a centred Student-t intercept, half-Student-t scales,
 and improper `regression.Flat()` coefficients. Numeric response statistics use
 the selected link for the intercept and group scales; direct `sigma` uses the
-identity-link response scale. The default Student degrees of freedom has a
+identity-link response scale. Lognormal uses log-response statistics for the
+intercept, group scales and direct `sigma`, including with its inverse link.
+The default Student degrees of freedom has a
 Gamma(2, 0.1) prior normalized above 1. Gamma shape has Gamma(0.01, 0.01),
 and negative-binomial shape has inverse-Gamma(0.4, 0.3).
 Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_t`,
@@ -60,7 +115,7 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`) with
+Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.
@@ -190,3 +245,12 @@ design matrices, prediction matrices and brms coefficient names using base R.
 [The Gaussian oracle](tests/fixtures/gaussian-oracle.stan) independently defines
 the target and its normalized score. A successful print round trip alone does
 not establish numerical correctness.
+[The ordinal oracle](tests/fixtures/cumulative-oracle.json) freezes actual
+brms-generated Stan scores and gradients, including the ordering offset and a
+float32 tail case. Its [R script](tests/fixtures/cumulative-oracle.R) reproduces
+the category coding, generated Stan, and independent density values.
+
+[The standard-error fixture](tests/fixtures/standard-errors.json) records actual
+normalized brms-generated Stan scores and gradients for Gaussian and Student
+models with both `se()` residual-scale settings; its adjacent R script regenerates
+the models.

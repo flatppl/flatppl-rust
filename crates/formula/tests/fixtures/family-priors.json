@@ -5,6 +5,32 @@
   "formula": "y ~ x + (1 | g)",
   "cases": [
     {
+      "family": "zero_inflated_binomial", "link": "logit", "formula": "y | trials(8) ~ x + (1 | g)",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": 0.0, "scale": 2.5
+    },
+    {
+      "family": "zero_inflated_negbinomial", "link": "log",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": -0.8, "scale": 2.5
+    },
+    {
+      "family": "zero_inflated_poisson", "link": "log",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": -0.8, "scale": 2.5
+    },
+    {
+      "family": "von_mises", "link": "tan_half",
+      "response": {"kind": "real64", "values": [-2, -0.4, 0.8, 2]},
+      "intercept_location": 0.0, "scale": 2.5,
+      "intercept_prior": "student_t(1, 0, 1)"
+    },
+    {
+      "family": "lognormal", "link": "inverse",
+      "response": {"kind": "real64", "values": [0.01831563888873418, 0.36787944117144233, 7.38905609893065, 20.085536923187668]},
+      "intercept_location": 0.5, "scale": 3.0, "sigma_scale": 3.0
+    },
+    {
       "family": "gaussian", "link": "log",
       "response": {"kind": "real64", "values": [-2, 4, 8, 7]},
       "intercept_location": 0.0, "scale": 2.5, "sigma_scale": 3.0

@@ -338,6 +338,10 @@ impl Column {
 
 pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Result<Vec<usize>> {
     table.validate()?;
+    let mut se_columns = Vec::new();
+    if let Some(se) = &formula.se {
+        se.value.columns(&mut se_columns);
+    }
     let names = formula
         .predictor_columns()
         .into_iter()
@@ -351,6 +355,12 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
             Some(Trials::Column(name)) => Some(name.as_str()),
             _ => None,
         })
+        .chain(
+            (mode == DataMode::Training)
+                .then_some(formula.weights.as_deref())
+                .flatten(),
+        )
+        .chain(se_columns)
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
@@ -358,12 +368,18 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
-    for expression in formula.expressions.values().chain(&formula.offsets).chain(
-        formula
-            .groups
-            .iter()
-            .flat_map(|group| group.expressions.values()),
-    ) {
+    for expression in formula
+        .expressions
+        .values()
+        .chain(&formula.offsets)
+        .chain(
+            formula
+                .groups
+                .iter()
+                .flat_map(|group| group.expressions.values()),
+        )
+        .chain(formula.se.as_ref().map(|se| &se.value))
+    {
         let values = expression.values(table, &rows)?;
         rows = rows
             .into_iter()
@@ -378,7 +394,7 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
 }
 
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
-/// Prediction does not require a response column and never refits the recipe.
+/// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
     let rows = model_rows(&recipe.formula, table, mode)?;
     let mut constants = BTreeMap::new();
@@ -409,12 +425,34 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
                 &rows,
             )?,
         );
+        if let Some(name) = &recipe.formula.weights {
+            let weights = table.column(name)?;
+            if weights.numeric(&rows)?.iter().any(|&value| value < 0.0) {
+                return Err(Error("response weights must be nonnegative".into()));
+            }
+            constants.insert("weights_data".into(), weights.data(&rows)?);
+        }
     }
     if let Some(Trials::Column(name)) = &recipe.formula.trials {
         constants.insert(
             "trials_data".into(),
             DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
+    }
+    if let Some(se) = &recipe.formula.se {
+        let values = se.value.data(table, &rows)?;
+        let valid = |value: f64| value >= 0.0 && (se.sigma || value > 0.0);
+        let valid = match &values {
+            DataValue::Real32(values) => values.iter().all(|&value| valid(f64::from(value))),
+            DataValue::Real64(values) => values.iter().all(|&value| valid(value)),
+            _ => unreachable!("numeric expressions produce real vectors"),
+        };
+        if !valid {
+            return Err(Error(
+                "se values must be nonnegative, and positive when sigma=FALSE".into(),
+            ));
+        }
+        constants.insert("se_data".into(), values);
     }
     for (group, term) in recipe.groups.iter().zip(&recipe.formula.groups) {
         for (predictor, name) in group.design.predictors.iter().zip(&group.inputs) {
@@ -462,6 +500,32 @@ pub(crate) fn response_levels(
     column: &Column,
     rows: &[usize],
 ) -> Result<Option<Vec<GroupLevel>>> {
+    if family == Family::Cumulative {
+        let levels = match &column.values {
+            ColumnValues::Factor { ordered: true, .. } => column.levels(rows)?,
+            ColumnValues::Factor { .. } | ColumnValues::Bool(_) => {
+                return Err(Error(
+                    "cumulative responses require ordered factors or positive integer codes".into(),
+                ));
+            }
+            _ => {
+                let values = column.counts(rows)?;
+                if values.contains(&0) {
+                    return Err(Error("cumulative response codes must be positive".into()));
+                }
+                // Integer category labels retain gaps, unlike dropped factor levels.
+                (1..=*values.iter().max().unwrap())
+                    .map(GroupLevel::Integer)
+                    .collect()
+            }
+        };
+        if levels.len() < 2 {
+            return Err(Error(
+                "cumulative responses require at least two categories".into(),
+            ));
+        }
+        return Ok(Some(levels));
+    }
     if family != Family::Bernoulli {
         return Ok(None);
     }
@@ -489,12 +553,13 @@ pub(crate) fn response(
     rows: &[usize],
 ) -> Result<DataValue> {
     let column = table.column(&formula.response)?;
-    if family == Family::Bernoulli {
+    if matches!(family, Family::Bernoulli | Family::Cumulative) {
+        let first = i64::from(family == Family::Cumulative);
         let indices: HashMap<_, _> = levels
-            .expect("binary response levels were saved")
+            .expect("response levels were saved")
             .iter()
             .enumerate()
-            .map(|(i, level)| (level_key(level), i as i64))
+            .map(|(i, level)| (level_key(level), i as i64 + first))
             .collect();
         return Ok(DataValue::Integers(
             rows.iter()
@@ -510,7 +575,7 @@ pub(crate) fn response(
     }
     if family.discrete() {
         let values = column.counts(rows)?;
-        if family == Family::Binomial {
+        if family.uses_trials() {
             let trials = match formula
                 .trials
                 .as_ref()
@@ -527,11 +592,33 @@ pub(crate) fn response(
         }
         return Ok(DataValue::Integers(values));
     }
-    if matches!(family, Family::Gamma | Family::Exponential)
-        && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
+    if matches!(
+        family,
+        Family::Gamma | Family::Exponential | Family::Lognormal | Family::Weibull
+    ) && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
     {
         return Err(Error(
-            "Gamma and exponential responses must be strictly positive".into(),
+            "Gamma, exponential, lognormal and Weibull responses must be strictly positive".into(),
+        ));
+    }
+    if family == Family::Beta
+        && column
+            .numeric(rows)?
+            .iter()
+            .any(|&value| value <= 0.0 || value >= 1.0)
+    {
+        return Err(Error(
+            "beta responses must lie strictly between 0 and 1".into(),
+        ));
+    }
+    if family == Family::VonMises
+        && column
+            .numeric(rows)?
+            .iter()
+            .any(|value| !(-std::f64::consts::PI..=std::f64::consts::PI).contains(value))
+    {
+        return Err(Error(
+            "von Mises responses must lie between -pi and pi".into(),
         ));
     }
     column.data(rows)

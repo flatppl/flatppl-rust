@@ -169,22 +169,37 @@ pub(crate) fn resolve(
     formula: &Formula,
     design: &Design,
     groups: &[Group],
-    (family, link): (Family, Link),
+    (family, link, thresholds): (Family, Link, usize),
     response: Option<&[f64]>,
     offset_mean: f64,
 ) -> Result<Priors> {
-    let (mut location, scale) = default_scale(link, response);
-    if response.is_some() && link.uses_response_scale() {
+    let scale_link = family.prior_scale_link(link);
+    let (mut location, scale) = default_scale(scale_link, response);
+    if response.is_some() && scale_link.uses_response_scale() {
         location -= offset_mean;
     }
-    let (_, sigma_scale) = default_scale(Link::Identity, response);
+    let (_, sigma_scale) = default_scale(family.prior_scale_link(Link::Identity), response);
     let names: Vec<_> = design
         .columns
         .iter()
         .map(|c| crate::emit::coefficient_name(&c.name))
         .collect();
     let mut targets = Vec::new();
-    if formula.intercept {
+    let auxiliaries: Vec<_> = family
+        .auxiliaries()
+        .iter()
+        .copied()
+        .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
+        .collect();
+    let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
+    if thresholds > 0 {
+        targets.extend(threshold_names.iter().map(|name| PriorTarget {
+            class: "Intercept",
+            coef: Some(name),
+            group: None,
+            dpar: None,
+        }));
+    } else if formula.intercept {
         targets.push(PriorTarget {
             class: "Intercept",
             coef: None,
@@ -199,7 +214,7 @@ pub(crate) fn resolve(
         dpar: None,
     }));
     targets.extend(group_targets(groups, formula));
-    targets.extend(family.auxiliaries().iter().map(|name| PriorTarget {
+    targets.extend(auxiliaries.iter().map(|name| PriorTarget {
         class: name,
         coef: None,
         group: None,
@@ -207,13 +222,27 @@ pub(crate) fn resolve(
     }));
     let mut selected = select(&spec.priors, &targets)?.into_iter();
     let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
-    let intercept = if formula.intercept {
-        selected
-            .next()
-            .unwrap()
-            .unwrap_or_else(|| student(location))
+    let default_intercept = || {
+        if family == Family::VonMises && link == Link::TanHalf {
+            ResolvedPrior::new("student_t(1, 0, 1)")
+        } else {
+            student(location)
+        }
+    };
+    let intercept = if thresholds > 0 {
+        let mut priors =
+            (0..thresholds).map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)));
+        let first = priors.next().unwrap();
+        for prior in priors {
+            if !crate::prior_expr::equivalent(&first, &prior)? {
+                return Err(Error("cumulative thresholds require one shared continuous prior; unequal threshold priors are not supported".into()));
+            }
+        }
+        first
+    } else if formula.intercept {
+        selected.next().unwrap().unwrap_or_else(default_intercept)
     } else {
-        student(location)
+        default_intercept()
     };
     let b = names
         .iter()
@@ -241,8 +270,7 @@ pub(crate) fn resolve(
                 .unwrap_or_else(|| ResolvedPrior::new("lkj(1)"))
         }));
     }
-    let aux = family
-        .auxiliaries()
+    let aux = auxiliaries
         .iter()
         .map(|&name| {
             let prior = selected

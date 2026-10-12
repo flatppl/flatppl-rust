@@ -1,6 +1,6 @@
-use crate::{Error, Result, Trials, emit::broadcast};
+use crate::{Error, Result, emit::broadcast};
 use flatppl_convert::Builder;
-use flatppl_core::NodeId;
+use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -9,13 +9,26 @@ pub enum Family {
     #[default]
     Gaussian,
     Student,
+    Lognormal,
     Bernoulli,
     Binomial,
+    #[serde(rename = "zero_inflated_binomial")]
+    ZeroInflatedBinomial,
     Poisson,
+    #[serde(rename = "zero_inflated_poisson")]
+    ZeroInflatedPoisson,
     Negbinomial,
+    #[serde(rename = "zero_inflated_negbinomial")]
+    ZeroInflatedNegbinomial,
+    Geometric,
     #[serde(rename = "Gamma")]
     Gamma,
     Exponential,
+    Weibull,
+    Beta,
+    #[serde(rename = "von_mises")]
+    VonMises,
+    Cumulative,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -34,6 +47,7 @@ pub enum Link {
     Cloglog,
     Cauchit,
     Softit,
+    TanHalf,
 }
 
 impl Family {
@@ -41,17 +55,31 @@ impl Family {
         let family = match name {
             "gaussian" => Self::Gaussian,
             "student" => Self::Student,
+            "lognormal" => Self::Lognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
+            "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
             "poisson" => Self::Poisson,
+            "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
+            "zero_inflated_negbinomial" => Self::ZeroInflatedNegbinomial,
+            "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
             "exponential" => Self::Exponential,
+            "weibull" => Self::Weibull,
+            "beta" => Self::Beta,
+            "von_mises" => Self::VonMises,
+            "cumulative" => Self::Cumulative,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
-            Self::Gaussian | Self::Student => Link::Identity,
-            Self::Bernoulli | Self::Binomial => Link::Logit,
+            Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
+            Self::Bernoulli
+            | Self::Binomial
+            | Self::ZeroInflatedBinomial
+            | Self::Beta
+            | Self::Cumulative => Link::Logit,
+            Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
         let link = link
@@ -63,19 +91,26 @@ impl Family {
             .unwrap_or(default);
         use Link::*;
         let supported = match family {
-            Self::Gaussian | Self::Student => link != Sqrt,
-            Self::Bernoulli | Self::Binomial => {
+            Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf),
+            Self::Lognormal => matches!(link, Identity | Inverse),
+            Self::Bernoulli | Self::Binomial | Self::ZeroInflatedBinomial | Self::Beta => {
                 matches!(
                     link,
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
                 )
             }
-            Self::Poisson | Self::Negbinomial => {
+            Self::Poisson
+            | Self::ZeroInflatedPoisson
+            | Self::Negbinomial
+            | Self::ZeroInflatedNegbinomial
+            | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
-            Self::Gamma | Self::Exponential => {
+            Self::Gamma | Self::Exponential | Self::Weibull => {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
+            Self::VonMises => matches!(link, TanHalf | Identity),
+            Self::Cumulative => link == Logit,
         };
         if !supported {
             return Err(Error(format!(
@@ -89,16 +124,40 @@ impl Family {
     pub(crate) fn discrete(self) -> bool {
         matches!(
             self,
-            Self::Bernoulli | Self::Binomial | Self::Poisson | Self::Negbinomial
+            Self::Bernoulli
+                | Self::Binomial
+                | Self::ZeroInflatedBinomial
+                | Self::Poisson
+                | Self::ZeroInflatedPoisson
+                | Self::Negbinomial
+                | Self::ZeroInflatedNegbinomial
+                | Self::Geometric
+                | Self::Cumulative
         )
+    }
+
+    pub(crate) fn uses_trials(self) -> bool {
+        matches!(self, Self::Binomial | Self::ZeroInflatedBinomial)
     }
 
     pub(crate) fn auxiliaries(self) -> &'static [&'static str] {
         match self {
-            Self::Gaussian => &["sigma"],
+            Self::Gaussian | Self::Lognormal => &["sigma"],
             Self::Student => &["sigma", "nu"],
-            Self::Gamma | Self::Negbinomial => &["shape"],
+            Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
+            Self::Beta => &["phi"],
+            Self::VonMises => &["kappa"],
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
+            Self::ZeroInflatedNegbinomial => &["shape", "zi"],
             _ => &[],
+        }
+    }
+
+    pub(crate) fn prior_scale_link(self, link: Link) -> Link {
+        if self == Self::Lognormal {
+            Link::Log
+        } else {
+            link
         }
     }
 
@@ -106,8 +165,12 @@ impl Family {
         match name {
             "sigma" => format!("student_t(3, 0, {sigma_scale})"),
             "nu" => "gamma(2, 0.1)".into(),
-            "shape" if self == Self::Negbinomial => "InverseGamma(0.4, 0.3)".into(),
-            "shape" => "Gamma(0.01, 0.01)".into(),
+            "shape" if matches!(self, Self::Negbinomial | Self::ZeroInflatedNegbinomial) => {
+                "InverseGamma(0.4, 0.3)".into()
+            }
+            "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
+            "kappa" => "Gamma(2, 0.01)".into(),
+            "zi" => "Beta(1, 1)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -116,43 +179,135 @@ impl Family {
         self,
         b: &mut Builder<'_>,
         mu: NodeId,
-        trials: Option<&Trials>,
+        trials: Option<NodeId>,
+        scale: Option<NodeId>,
+        thresholds: usize,
+        scalar: bool,
     ) -> NodeId {
+        if matches!(
+            self,
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial | Self::ZeroInflatedBinomial
+        ) && !scalar
+        {
+            let local = Ref {
+                ns: RefNs::Local,
+                name: b.sym("_mu_"),
+            };
+            let mean = b.m.alloc(Node::Ref(local));
+            let mut inputs = vec![(b.sym("mu"), local)];
+            let mut args = vec![mu];
+            let trials = trials.map(|value| {
+                let local = Ref {
+                    ns: RefNs::Local,
+                    name: b.sym("_trials_"),
+                };
+                inputs.push((b.sym("trials"), local));
+                args.push(value);
+                b.m.alloc(Node::Ref(local))
+            });
+            let law = self.observation(b, mean, trials, scale, thresholds, true);
+            let head = b.sym("functionof");
+            let kernel = b.m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(head),
+                args: vec![law].into(),
+                named: Box::default(),
+                inputs: Some(Inputs::Spec(inputs.into())),
+            }));
+            let name = b.alloc_name("response_law");
+            b.bind(&name, kernel);
+            let kernel = b.self_ref(&name);
+            args.insert(0, kernel);
+            return b.call("broadcast", &args);
+        }
+        let apply = |b: &mut Builder<'_>, name, args: &[NodeId]| {
+            if scalar {
+                b.call(name, args)
+            } else {
+                broadcast(b, name, args)
+            }
+        };
         match self {
-            Self::Gaussian => {
-                let sigma = b.self_ref("sigma");
-                broadcast(b, "Normal", &[mu, sigma])
+            Self::Gaussian | Self::Lognormal => {
+                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+                let law = if self == Self::Lognormal {
+                    "LogNormal"
+                } else {
+                    "Normal"
+                };
+                apply(b, law, &[mu, sigma])
             }
             Self::Student => {
                 let nu = b.self_ref("nu");
                 let standard = b.call("StudentT", &[nu]);
-                let sigma = b.self_ref("sigma");
-                broadcast(b, "locscale", &[standard, mu, sigma])
+                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+                apply(b, "locscale", &[standard, mu, sigma])
             }
-            Self::Bernoulli => broadcast(b, "Bernoulli", &[mu]),
+            Self::Bernoulli => apply(b, "Bernoulli", &[mu]),
             Self::Binomial => {
-                let n = match trials.expect("binomial trials were validated") {
-                    Trials::Constant(n) => b.lit_int(*n),
-                    Trials::Column(_) => b.self_ref("trials_data"),
-                };
-                broadcast(b, "Binomial", &[n, mu])
+                let n = trials.expect("binomial trials were validated");
+                apply(b, "Binomial", &[n, mu])
             }
-            Self::Poisson => broadcast(b, "Poisson", &[mu]),
-            Self::Negbinomial | Self::Gamma => {
-                let shape = b.self_ref("shape");
-                let rate = broadcast(b, "divide", &[shape, mu]);
+            Self::Poisson => apply(b, "Poisson", &[mu]),
+            Self::ZeroInflatedPoisson
+            | Self::ZeroInflatedNegbinomial
+            | Self::ZeroInflatedBinomial => {
+                let base = match self {
+                    Self::ZeroInflatedPoisson => Self::Poisson,
+                    Self::ZeroInflatedNegbinomial => Self::Negbinomial,
+                    _ => Self::Binomial,
+                };
+                let base = base.observation(b, mu, trials, scale, thresholds, true);
+                let zi = b.self_ref("zi");
+                let zero = b.lit_int(0);
+                let atom = b.call("Dirac", &[zero]);
+                let atom = b.call("weighted", &[zi, atom]);
+                let one = b.lit_real(1.0);
+                let complement = b.call("sub", &[one, zi]);
+                let count = b.call("weighted", &[complement, base]);
+                let law = b.call("superpose", &[atom, count]);
+                b.call("normalize", &[law])
+            }
+            Self::Negbinomial | Self::Geometric | Self::Gamma => {
+                let shape = if self == Self::Geometric {
+                    b.lit_real(1.0)
+                } else {
+                    b.self_ref("shape")
+                };
+                let rate = apply(b, "divide", &[shape, mu]);
                 let law = if self == Self::Gamma {
                     "Gamma"
                 } else {
                     "NegativeBinomial"
                 };
-                broadcast(b, law, &[shape, rate])
+                apply(b, law, &[shape, rate])
             }
             Self::Exponential => {
                 let one = b.lit_real(1.0);
-                let rate = broadcast(b, "divide", &[one, mu]);
-                broadcast(b, "Exponential", &[rate])
+                let rate = apply(b, "divide", &[one, mu]);
+                apply(b, "Exponential", &[rate])
             }
+            Self::Weibull => {
+                let shape = b.self_ref("shape");
+                let one = b.lit_real(1.0);
+                let inverse = b.call("divide", &[one, shape]);
+                let argument = b.call("add", &[one, inverse]);
+                let gamma = b.call("gamma", &[argument]);
+                let scale = apply(b, "divide", &[mu, gamma]);
+                apply(b, "Weibull", &[shape, scale])
+            }
+            Self::Beta => {
+                let phi = b.self_ref("phi");
+                let alpha = apply(b, "mul", &[mu, phi]);
+                let one = b.lit_real(1.0);
+                let complement = apply(b, "sub", &[one, mu]);
+                let beta = apply(b, "mul", &[complement, phi]);
+                apply(b, "Beta", &[alpha, beta])
+            }
+            Self::VonMises => {
+                let kappa = b.self_ref("kappa");
+                apply(b, "VonMises", &[mu, kappa])
+            }
+            Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
         }
     }
 }
@@ -172,6 +327,7 @@ impl Link {
             Self::Cloglog => "cloglog",
             Self::Cauchit => "cauchit",
             Self::Softit => "softit",
+            Self::TanHalf => "tan_half",
         }
     }
 
@@ -230,6 +386,11 @@ impl Link {
                 let one = b.lit_real(1.0);
                 let denominator = broadcast(b, "add", &[one, value]);
                 broadcast(b, "divide", &[value, denominator])
+            }
+            Self::TanHalf => {
+                let atan = broadcast(b, "atan", &[eta]);
+                let two = b.lit_real(2.0);
+                broadcast(b, "mul", &[two, atan])
             }
         }
     }

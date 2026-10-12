@@ -13,6 +13,7 @@ mod emit;
 mod expression;
 mod family;
 mod formula;
+mod ordinal;
 mod prior_expr;
 mod priors;
 mod text;
@@ -25,7 +26,7 @@ pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, p
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
-pub use formula::{Formula, GroupTerm, Term, Trials, parse_formula};
+pub use formula::{Formula, GroupTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -153,6 +154,16 @@ pub struct Recipe {
     pub priors: Priors,
 }
 
+impl Recipe {
+    pub(crate) fn thresholds(&self) -> usize {
+        if self.family == Family::Cumulative {
+            self.response_levels.as_ref().unwrap().len() - 1
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Group {
     pub column: String,
@@ -207,7 +218,7 @@ pub struct ModelInfo {
     pub parameters: Vec<Parameter>,
     pub has_improper_prior: bool,
     pub training_rows: Vec<usize>,
-    /// The comparison target uses normalized Stan density functions.
+    /// Additive difference from the target using normalized Stan density functions.
     pub score_offset: f64,
 }
 
@@ -233,9 +244,20 @@ pub fn read(json: &str) -> Result<Spec> {
 pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let (family, link) = Family::resolve(&spec.family, spec.link.as_deref())?;
     let formula = parse_formula(&spec.formula)?;
-    if (family == Family::Binomial) != formula.trials.is_some() {
+    if family == Family::Cumulative && !formula.intercept {
         return Err(Error(
-            "`trials(...)` is required for binomial and is unavailable for other families".into(),
+            "cumulative models require threshold intercepts".into(),
+        ));
+    }
+    if formula.se.is_some() && !matches!(family, Family::Gaussian | Family::Student) {
+        return Err(Error(
+            "`se(...)` is available for Gaussian and Student families".into(),
+        ));
+    }
+    if family.uses_trials() != formula.trials.is_some() {
+        return Err(Error(
+            "`trials(...)` is required for binomial families and is unavailable for other families"
+                .into(),
         ));
     }
     if formula
@@ -262,6 +284,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let (design, means) = design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
     let response_column = table.column(&formula.response)?;
     let response_levels = data::response_levels(family, response_column, &rows)?;
+    let thresholds = if family == Family::Cumulative {
+        response_levels.as_ref().unwrap().len() - 1
+    } else {
+        0
+    };
     data::response(family, response_levels.as_deref(), &formula, table, &rows)?;
     let response = if response_column.like_factor() {
         None
@@ -326,7 +353,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         &formula,
         &design,
         &groups,
-        (family, link),
+        (family, link, thresholds),
         response.as_deref(),
         offset_mean,
     )?;
