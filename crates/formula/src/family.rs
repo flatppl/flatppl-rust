@@ -26,6 +26,8 @@ pub enum Family {
     Exponential,
     Weibull,
     Beta,
+    #[serde(rename = "zero_inflated_beta")]
+    ZeroInflatedBeta,
     #[serde(rename = "von_mises")]
     VonMises,
     Cumulative,
@@ -78,6 +80,7 @@ impl Family {
             "exponential" => Self::Exponential,
             "weibull" => Self::Weibull,
             "beta" => Self::Beta,
+            "zero_inflated_beta" => Self::ZeroInflatedBeta,
             "von_mises" => Self::VonMises,
             "cumulative" => Self::Cumulative,
             "categorical" => Self::Categorical,
@@ -89,6 +92,7 @@ impl Family {
             | Self::Binomial
             | Self::ZeroInflatedBinomial
             | Self::Beta
+            | Self::ZeroInflatedBeta
             | Self::Cumulative
             | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
@@ -105,7 +109,11 @@ impl Family {
         let supported = match family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
             Self::Lognormal => matches!(link, Identity | Inverse),
-            Self::Bernoulli | Self::Binomial | Self::ZeroInflatedBinomial | Self::Beta => {
+            Self::Bernoulli
+            | Self::Binomial
+            | Self::ZeroInflatedBinomial
+            | Self::Beta
+            | Self::ZeroInflatedBeta => {
                 matches!(
                     link,
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
@@ -159,6 +167,7 @@ impl Family {
             Self::Student => &["sigma", "nu"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
+            Self::ZeroInflatedBeta => &["phi", "zi"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
@@ -250,6 +259,7 @@ impl Family {
                     | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
+                    | Self::ZeroInflatedBeta
             ))
             && !scalar
         {
@@ -352,21 +362,27 @@ impl Family {
             Self::Poisson => apply(b, "Poisson", &[mu]),
             Self::ZeroInflatedPoisson
             | Self::ZeroInflatedNegbinomial
-            | Self::ZeroInflatedBinomial => {
+            | Self::ZeroInflatedBinomial
+            | Self::ZeroInflatedBeta => {
                 let base = match self {
                     Self::ZeroInflatedPoisson => Self::Poisson,
                     Self::ZeroInflatedNegbinomial => Self::Negbinomial,
+                    Self::ZeroInflatedBeta => Self::Beta,
                     _ => Self::Binomial,
                 };
                 let base = base.observation(b, observation, thresholds, true);
                 let zi = auxiliary(b, "zi");
-                let zero = b.lit_int(0);
+                let zero = if self.discrete() {
+                    b.lit_int(0)
+                } else {
+                    b.lit_real(0.0)
+                };
                 let atom = b.call("Dirac", &[zero]);
                 let atom = b.call("weighted", &[zi, atom]);
                 let one = b.lit_real(1.0);
                 let complement = b.call("sub", &[one, zi]);
-                let count = b.call("weighted", &[complement, base]);
-                let law = b.call("superpose", &[atom, count]);
+                let component = b.call("weighted", &[complement, base]);
+                let law = b.call("superpose", &[atom, component]);
                 b.call("normalize", &[law])
             }
             Self::Negbinomial | Self::Geometric | Self::Gamma => {

@@ -309,6 +309,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "exponential",
         "weibull",
         "beta",
+        "zero_inflated_beta",
         "von_mises",
     ] {
         let formula = if matches!(family, "binomial" | "zero_inflated_binomial") {
@@ -320,6 +321,8 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.0, 1.0, 1.0, 0.0]
         } else if family == "beta" {
             vec![0.1, 0.4, 0.8, 0.7]
+        } else if family == "zero_inflated_beta" {
+            vec![0.0, 0.2, 0.8, 0.0]
         } else if family == "von_mises" {
             vec![-2.0, -0.4, 0.8, 2.0]
         } else if family.starts_with("zero_inflated_") {
@@ -349,6 +352,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "von_mises" => ", kappa = posreals",
             "zero_inflated_poisson" | "zero_inflated_binomial" => ", zi = unitinterval",
             "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
+            "zero_inflated_beta" => ", phi = posreals, zi = unitinterval",
             _ => "",
         };
         let parameter = format!(
@@ -375,6 +379,8 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         context.register("prediction.flatppl", &prediction)?;
         let observation = if family == "beta" {
             "[0.2, 0.8]"
+        } else if family == "zero_inflated_beta" {
+            "[0.0, 0.8]"
         } else if family.starts_with("zero_inflated_") {
             "[0, 2]"
         } else {

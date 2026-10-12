@@ -20,6 +20,7 @@ fn response_support_matches_brms() {
         ),
         ("weibull", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
         ("beta", vec![0.1, 0.5, 0.9], vec![0.0, 1.0]),
+        ("zero_inflated_beta", vec![0.0, 0.2, 0.8], vec![-0.1, 1.0]),
         (
             "von_mises",
             vec![-std::f64::consts::PI, 0.0, std::f64::consts::PI],

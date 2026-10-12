@@ -652,14 +652,15 @@ pub(crate) fn response(
             "Gamma, exponential, lognormal and Weibull responses must be strictly positive".into(),
         ));
     }
-    if family == Family::Beta
+    if matches!(family, Family::Beta | Family::ZeroInflatedBeta)
         && column
             .numeric(rows)?
             .iter()
-            .any(|&value| value <= 0.0 || value >= 1.0)
+            .any(|&value| !(0.0..1.0).contains(&value) || (value == 0.0 && family == Family::Beta))
     {
         return Err(Error(
-            "beta responses must lie strictly between 0 and 1".into(),
+            "beta responses must lie between 0 and 1, with zero allowed only for zero inflation"
+                .into(),
         ));
     }
     if family == Family::VonMises

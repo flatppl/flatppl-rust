@@ -86,6 +86,10 @@ Weibull models use a direct `shape` and mean `mu`, with scale
 `mu / gamma(1 + 1 / shape)` and a Gamma(0.01, 0.01) shape prior.
 Beta models use mean `mu` and direct precision `phi`, with a Gamma(0.01, 0.01)
 prior and response values strictly between zero and one.
+`zero_inflated_beta` adds a probability `zi` of an exact zero; positive values
+follow the same beta law. Its `phi` prior is unchanged and `zi` defaults to
+Beta(1, 1). Responses lie in `[0, 1)`. The observation is an ordinary
+superposition of a fixed atom and a continuous law, with their common reference.
 von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
 Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
 The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the
