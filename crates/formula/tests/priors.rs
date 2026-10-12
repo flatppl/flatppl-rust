@@ -1,4 +1,4 @@
-use flatppl_formula::{DataPlacement, build, read};
+use flatppl_formula::{build, read};
 use serde_json::json;
 
 fn spec(priors: serde_json::Value) -> flatppl_formula::Spec {
@@ -13,7 +13,6 @@ fn spec(priors: serde_json::Value) -> flatppl_formula::Spec {
             values: flatppl_formula::ColumnValues::Real64(vec![2.0, 3.0, 5.0]),
             valid: None,
         });
-    spec.options.data_placement = DataPlacement::Inline;
     spec.priors = serde_json::from_value(priors).unwrap();
     spec
 }

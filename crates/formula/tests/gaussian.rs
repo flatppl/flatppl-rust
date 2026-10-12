@@ -1,6 +1,4 @@
-use flatppl_formula::{
-    DataMode, DataPlacement, DataValue, GroupLevel, build, parse_formula, prepare_data, read,
-};
+use flatppl_formula::{DataMode, DataValue, GroupLevel, build, parse_formula, prepare_data, read};
 
 const SPEC: &str = r#"{
   "formula": "y ~ x + (1 | g)",
@@ -19,6 +17,20 @@ const SPEC: &str = r#"{
 fn gaussian_model_frame_preserves_brms_coordinates() {
     let spec = read(SPEC).unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+    for name in converted.data.constants.keys() {
+        let module = &converted.module;
+        let rhs = module
+            .bindings()
+            .find(|(_, binding)| module.resolve(binding.name) == name)
+            .unwrap()
+            .1
+            .rhs;
+        let flatppl_core::Node::Call(call) = module.node(rhs) else {
+            panic!("data binding `{name}` must remain external");
+        };
+        assert!(matches!(call.head, flatppl_core::CallHead::Builtin(head)
+            if module.resolve(head) == "external"));
+    }
     // R model.frame drops only the last response row. The numeric grouping
     // labels sort to 10,20. X=[1,2,3], Xc=[-1,0,1], median(y)=4,
     // mad(y)=1.4826*2=2.9652, hence brms's rounded prior scale is 3.
@@ -86,10 +98,9 @@ fn prediction_reuses_training_recipe_without_response() {
 }
 
 #[test]
-fn explicit_normal_priors_and_inline_no_intercept_model() {
+fn explicit_normal_priors_in_a_no_intercept_model() {
     let mut spec = read(SPEC).unwrap();
     spec.formula = "y ~ 0 + x".into();
-    spec.options.data_placement = DataPlacement::Inline;
     spec.priors = serde_json::from_value(serde_json::json!([
         {"class": "b", "prior": "normal(-1, 2)"},
         {"class": "sigma", "prior": "Normal(0, 3)"}

@@ -23,8 +23,8 @@
 /// `"flatppl"` (the only target for now). Returns the rendered FlatPPL text,
 /// or an error message (the importer/printer diagnostic). This is the
 /// plain-Rust core — host-testable, no wasm — that the wasm entry point wraps.
-/// Formula specifications contain typed data and produce an inline snapshot;
-/// use [`import_formula_str`] for external data and a reusable recipe.
+/// Formula source retains external data bindings. Use [`import_formula_str`]
+/// to obtain the prepared data and reusable recipe alongside the source.
 pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> {
     if to != "flatppl" {
         return Err(format!(
@@ -34,7 +34,7 @@ pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> 
     let module = match from {
         "pyhf" => flatppl_hs3::read_pyhf(input).map_err(|e| format!("pyhf import: {e}"))?,
         "hs3" => flatppl_hs3::read_hs3(input).map_err(|e| format!("hs3 import: {e}"))?,
-        "formula" => convert_formula(input, None, flatppl_formula::DataPlacement::Inline)?.module,
+        "formula" => convert_formula(input, None)?.module,
         other => {
             return Err(format!(
                 "unsupported source '{other}' (expected 'pyhf', 'hs3' or 'formula')"
@@ -54,7 +54,7 @@ pub fn import_formula_str(input: &str, data_ipc: Option<&[u8]>) -> Result<String
         recipe: flatppl_formula::Recipe,
         info: flatppl_formula::ModelInfo,
     }
-    let converted = convert_formula(input, data_ipc, flatppl_formula::DataPlacement::External)?;
+    let converted = convert_formula(input, data_ipc)?;
     serde_json::to_string(&Imported {
         source: flatppl_syntax::print(&converted.module),
         data: converted.data,
@@ -84,10 +84,8 @@ pub fn prepare_formula_str(recipe: &str, data_ipc: &[u8], mode: &str) -> Result<
 fn convert_formula(
     input: &str,
     data_ipc: Option<&[u8]>,
-    placement: flatppl_formula::DataPlacement,
 ) -> Result<flatppl_formula::Conversion, String> {
-    let mut spec = flatppl_formula::read(input).map_err(|error| error.to_string())?;
-    spec.options.data_placement = placement;
+    let spec = flatppl_formula::read(input).map_err(|error| error.to_string())?;
     let table = data_ipc
         .map(flatppl_formula::Table::from_arrow_ipc)
         .transpose()

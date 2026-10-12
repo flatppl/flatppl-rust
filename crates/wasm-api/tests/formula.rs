@@ -42,7 +42,7 @@ fn formula_template_and_recipe_survive_the_json_boundary() -> Result<(), Box<dyn
         "formula",
         "flatppl",
     )?;
-    let module = flatppl_syntax::parse(&format!("{source}\nexpected_N = 3\n"))?;
+    let module = flatppl_syntax::parse(&format!("{source}\nexpected_N = external(posintegers)\n"))?;
     let rhs = |name| {
         module
             .bindings()

@@ -58,6 +58,15 @@ fn typed_precision_and_json_numeric_boundaries_are_preserved()
         model.data.constants["x_1"],
         DataValue::Real32(vec![0.1, 0.2])
     );
+    let (loaded, sidecar) = model.with_data_source("model.data.json")?;
+    assert_eq!(
+        sidecar["x_1"],
+        serde_json::json!([f64::from(0.1_f32), f64::from(0.2_f32)])
+    );
+    assert_eq!(sidecar["y_data"], serde_json::json!([1, 2]));
+    assert!(!sidecar.as_object().unwrap().contains_key("N"));
+    let mut parsed = flatppl_syntax::parse(&flatppl_syntax::print(&loaded))?;
+    assert!(flatppl_infer::infer(&mut parsed).is_empty());
     let exact = Table::from_json(r#"{"y":[1,2],"x":[9007199254740994,1e0]}"#)?;
     assert_eq!(
         build(&spec, &exact)?.data.constants["x_1"],

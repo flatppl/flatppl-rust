@@ -71,7 +71,6 @@ fn gaussian() -> String {
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub center: bool,
-    pub data_placement: DataPlacement,
     pub contrasts: std::collections::BTreeMap<String, Contrast>,
 }
 
@@ -79,18 +78,9 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             center: true,
-            data_placement: DataPlacement::External,
             contrasts: std::collections::BTreeMap::new(),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataPlacement {
-    #[default]
-    External,
-    Inline,
 }
 
 pub struct Conversion {
@@ -98,6 +88,16 @@ pub struct Conversion {
     pub data: DataDocument,
     pub recipe: Recipe,
     pub info: ModelInfo,
+}
+
+impl Conversion {
+    /// Export a file-backed module and its prepared numeric JSON sidecar.
+    /// `source` is the sidecar path as resolved from the generated module.
+    /// The caller writes both files. The original module remains external for
+    /// in-memory data binding; only the structural row count is literal here.
+    pub fn with_data_source(&self, source: &str) -> Result<(Module, serde_json::Value)> {
+        emit::with_data_source(self.module.clone(), &self.data, source)
+    }
 }
 
 /// Training preprocessing state. A new fit builds a new recipe.
@@ -307,11 +307,6 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     let module = emit::model(spec, &mut recipe)?;
     let data = prepare_data(&recipe, table, DataMode::Training)?;
-    let module = if spec.options.data_placement == DataPlacement::Inline {
-        emit::inline(module, &data)?
-    } else {
-        module
-    };
     let text = flatppl_syntax::print(&module);
     let mut module = flatppl_syntax::parse(&text)
         .map_err(|e| Error(format!("generated module failed to reparse: {e}")))?;

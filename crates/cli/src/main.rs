@@ -121,10 +121,6 @@ enum Command {
         /// combined with data embedded in the specification. Arrow needs `formula-arrow`.
         #[arg(long)]
         data: Option<PathBuf>,
-        /// Formula input only: override options.data_placement. Inline embeds
-        /// training constants; external leaves named inputs for the data sidecar.
-        #[arg(long, value_enum)]
-        data_placement: Option<DataPlacementArg>,
         /// Omit the leading "do not edit" banner comment (a single line, no
         /// timestamp/user/host/platform/command — included by default). The
         /// targeted FlatPPL version is recorded in-model as `flatppl_compat`,
@@ -331,19 +327,6 @@ struct PyhfArgs {
     auxiliary: ObservationsArg,
 }
 
-#[cfg(feature = "convert")]
-#[derive(Clone, Copy, ValueEnum)]
-enum DataPlacementArg {
-    Inline,
-    External,
-}
-
-#[cfg(feature = "convert")]
-struct FormulaArgs {
-    data: Option<PathBuf>,
-    data_placement: Option<DataPlacementArg>,
-}
-
 /// Resolve `--from auto` against the input filename: `*.hs3.json` / `*.pyhf.json`
 /// select the HS3 / pyhf importers (mirroring the `*.flatpir.json` convention);
 /// any other name stays `Auto` (extension-inferred). An explicit `--from`
@@ -378,7 +361,6 @@ fn main() -> ExitCode {
             observations,
             auxiliary,
             data,
-            data_placement,
             no_header,
         } => convert(
             &input,
@@ -390,10 +372,7 @@ fn main() -> ExitCode {
                 observations,
                 auxiliary,
             },
-            &FormulaArgs {
-                data,
-                data_placement,
-            },
+            data.as_deref(),
             no_header,
         ),
         #[cfg(feature = "infer")]
@@ -488,7 +467,7 @@ fn convert(
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
     pyhf: &PyhfArgs,
-    formula: &FormulaArgs,
+    data: Option<&Path>,
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
@@ -504,11 +483,9 @@ fn convert(
             "`--measurement`, `--observations` and `--auxiliary` apply to pyhf input only".into(),
         ));
     }
-    if from_format != FromFormat::Formula
-        && (formula.data.is_some() || formula.data_placement.is_some())
-    {
+    if from_format != FromFormat::Formula && data.is_some() {
         return Err(Failure::Plain(
-            "`--data` and `--data-placement` apply to formula input only".into(),
+            "`--data` applies to formula input only".into(),
         ));
     }
 
@@ -531,7 +508,7 @@ fn convert(
                 .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
             let mut spec = flatppl_formula::read(&source)
                 .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
-            if let Some(path) = &formula.data {
+            if let Some(path) = data {
                 if spec.data.is_some() {
                     return Err(Failure::Plain(
                         "formula input cannot combine embedded `data` with `--data`".into(),
@@ -539,19 +516,23 @@ fn convert(
                 }
                 spec.data = Some(read_formula_table(path)?);
             }
-            if let Some(placement) = formula.data_placement {
-                spec.options.data_placement = match placement {
-                    DataPlacementArg::Inline => flatppl_formula::DataPlacement::Inline,
-                    DataPlacementArg::External => flatppl_formula::DataPlacement::External,
-                };
-            }
             let data = spec.data.as_ref().ok_or_else(|| {
                 Failure::Plain("formula input requires embedded `data` or `--data`".into())
             })?;
             let converted = flatppl_formula::build(&spec, data)
                 .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
-            formula_sidecars = Some((converted.data, converted.recipe, converted.info));
-            converted.module
+            let data_path = output.with_extension("data.json");
+            let data_name = data_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    Failure::Plain("formula output filename must be valid UTF-8".into())
+                })?;
+            let (module, data) = converted
+                .with_data_source(data_name)
+                .map_err(|e| Failure::Plain(format!("formula data source: {e}")))?;
+            formula_sidecars = Some((data, converted.recipe, converted.info));
+            module
         }
         #[cfg(not(feature = "formula"))]
         FromFormat::Formula => {
