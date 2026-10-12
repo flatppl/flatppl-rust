@@ -638,8 +638,7 @@ fn count_log(m: &mut Module, count: NodeId, log: NodeId) -> NodeId {
 
 /// An undefined normalizer gives an undefined score/value, not a different law.
 pub(crate) fn guard(m: &mut Module, value: NodeId, valid: NodeId) -> NodeId {
-    let negative = real(m, -1.0);
-    let nan = build_call(m, "log", &[negative]);
+    let nan = real(m, f64::NAN);
     build_call(m, "ifelse", &[valid, value, nan])
 }
 
