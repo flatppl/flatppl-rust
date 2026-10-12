@@ -10,4 +10,7 @@ d$z[2] <- -1
 frame <- suppressWarnings(model.frame(y ~ log(z) + offset(x) - offset(x), d))
 stopifnot(identical(as.integer(rownames(frame)), c(1L,3L,4L)))
 stopifnot(identical(model.offset(frame), c(1,3,4)))
+matrix <- model.matrix(y ~ I(+x) + I(-x), d)
+stopifnot(identical(colnames(matrix), c("(Intercept)", "I(+x)", "I(-x)")))
+stopifnot(identical(unname(matrix[,2]), d$x), identical(unname(matrix[,3]), -d$x))
 print(R.version.string)

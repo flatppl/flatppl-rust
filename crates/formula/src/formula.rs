@@ -550,7 +550,9 @@ fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
         ExprKind::Parentheses(x) => {
             ColumnExpression::Parentheses(Box::new(column_expression(x, atoms)?))
         }
-        ExprKind::Unary(Op::Add, x) => column_expression(x, atoms)?,
+        ExprKind::Unary(Op::Add, x) => {
+            ColumnExpression::Positive(Box::new(column_expression(x, atoms)?))
+        }
         ExprKind::Unary(Op::Subtract, x) => {
             ColumnExpression::Negate(Box::new(column_expression(x, atoms)?))
         }

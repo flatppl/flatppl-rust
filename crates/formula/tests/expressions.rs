@@ -70,3 +70,21 @@ fn offset_subtraction_and_expression_missing_rows_follow_r() {
     );
     assert_eq!(result.recipe.priors.intercept_location, 7.0 - 8.0 / 3.0);
 }
+
+#[test]
+fn unary_expression_names_preserve_r_coefficient_identity() {
+    let mut spec = read(INPUT).unwrap();
+    spec.formula = "y ~ I(+x) + I(-x)".into();
+    let result = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+    assert_eq!(result.info.design_columns, ["I(+x)", "I(-x)"]);
+    assert_eq!(result.info.parameters[2].name, "b_IPx");
+    assert_eq!(result.info.parameters[3].name, "b_IMx");
+    assert_eq!(
+        result.data.constants["x_1"],
+        DataValue::Real32(vec![1.0, 2.0, 3.0, 4.0])
+    );
+    assert_eq!(
+        result.data.constants["x_2"],
+        DataValue::Real32(vec![-1.0, -2.0, -3.0, -4.0])
+    );
+}

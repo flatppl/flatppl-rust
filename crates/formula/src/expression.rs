@@ -10,6 +10,7 @@ pub enum ColumnExpression {
     Number(f64),
     Identity(Box<Self>),
     Log(Box<Self>),
+    Positive(Box<Self>),
     Negate(Box<Self>),
     Parentheses(Box<Self>),
     Binary(Arithmetic, Box<Self>, Box<Self>),
@@ -34,7 +35,11 @@ impl ColumnExpression {
                 }
             }
             Self::Number(_) => {}
-            Self::Identity(x) | Self::Log(x) | Self::Negate(x) | Self::Parentheses(x) => {
+            Self::Identity(x)
+            | Self::Log(x)
+            | Self::Positive(x)
+            | Self::Negate(x)
+            | Self::Parentheses(x) => {
                 x.columns(out);
             }
             Self::Binary(_, x, y) => {
@@ -48,7 +53,9 @@ impl ColumnExpression {
         let values = match self {
             Self::Column(name) => table.column(name)?.numeric(rows)?,
             Self::Number(value) => vec![*value; rows.len()],
-            Self::Identity(x) | Self::Parentheses(x) => x.values(table, rows)?,
+            Self::Identity(x) | Self::Positive(x) | Self::Parentheses(x) => {
+                x.values(table, rows)?
+            }
             Self::Log(x) => x.values(table, rows)?.into_iter().map(f64::ln).collect(),
             Self::Negate(x) => x.values(table, rows)?.into_iter().map(|v| -v).collect(),
             Self::Binary(op, x, y) => x
@@ -102,6 +109,7 @@ impl fmt::Display for ColumnExpression {
             Self::Number(value) => write!(f, "{value}"),
             Self::Identity(x) => write!(f, "I({x})"),
             Self::Log(x) => write!(f, "log({x})"),
+            Self::Positive(x) => write!(f, "+{x}"),
             Self::Negate(x) => write!(f, "-{x}"),
             Self::Parentheses(x) => write!(f, "({x})"),
             Self::Binary(op, x, y) => {
