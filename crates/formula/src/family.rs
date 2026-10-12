@@ -151,6 +151,7 @@ impl Family {
         b: &mut Builder<'_>,
         mu: NodeId,
         trials: Option<NodeId>,
+        scale: Option<NodeId>,
         thresholds: usize,
         scalar: bool,
     ) -> NodeId {
@@ -163,7 +164,7 @@ impl Family {
         };
         match self {
             Self::Gaussian | Self::Lognormal => {
-                let sigma = b.self_ref("sigma");
+                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
                 let law = if self == Self::Lognormal {
                     "LogNormal"
                 } else {
@@ -174,7 +175,7 @@ impl Family {
             Self::Student => {
                 let nu = b.self_ref("nu");
                 let standard = b.call("StudentT", &[nu]);
-                let sigma = b.self_ref("sigma");
+                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
                 apply(b, "locscale", &[standard, mu, sigma])
             }
             Self::Bernoulli => apply(b, "Bernoulli", &[mu]),

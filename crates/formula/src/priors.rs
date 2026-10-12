@@ -185,6 +185,12 @@ pub(crate) fn resolve(
         .map(|c| crate::emit::coefficient_name(&c.name))
         .collect();
     let mut targets = Vec::new();
+    let auxiliaries: Vec<_> = family
+        .auxiliaries()
+        .iter()
+        .copied()
+        .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
+        .collect();
     let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
     if thresholds > 0 {
         targets.extend(threshold_names.iter().map(|name| PriorTarget {
@@ -208,7 +214,7 @@ pub(crate) fn resolve(
         dpar: None,
     }));
     targets.extend(group_targets(groups, formula));
-    targets.extend(family.auxiliaries().iter().map(|name| PriorTarget {
+    targets.extend(auxiliaries.iter().map(|name| PriorTarget {
         class: name,
         coef: None,
         group: None,
@@ -264,8 +270,7 @@ pub(crate) fn resolve(
                 .unwrap_or_else(|| ResolvedPrior::new("lkj(1)"))
         }));
     }
-    let aux = family
-        .auxiliaries()
+    let aux = auxiliaries
         .iter()
         .map(|&name| {
             let prior = selected

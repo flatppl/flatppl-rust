@@ -1,0 +1,59 @@
+{
+  "brms_version": "2.23.2",
+  "brms_source": "c89c4c05ef52fefb4b78d5fb80df0cf6352f48b4",
+  "coordinates": "temp_Intercept, b, then sigma when estimated; divide the Stan log-sigma gradient by sigma",
+  "spec": {
+    "formula": "y | se(s) ~ x",
+    "priors": [{"class":"Intercept","prior":"normal(0, 2)"},{"class":"b","prior":"normal(0, 1)"}],
+    "data": {
+      "nrows": 3,
+      "columns": [
+        {"name":"y","values":{"kind":"real64","values":[1,2,4]}},
+        {"name":"x","values":{"kind":"real64","values":[0,1,3]}},
+        {"name":"s","values":{"kind":"real64","values":[0.3,0.6,0.9]}}
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "gaussian-default",
+      "family": "gaussian",
+      "sigma": false,
+      "nu": 5,
+      "stan": {"theta_unc":[0.7,1.2],"jacobian":false,"propto":false,"lp":-10.0101363212149,"gradient":[-9.160219478737993,12.73497942386831]},
+      "point": [1.2,[0.7]],
+      "score": -10.0101363212149,
+      "gradient": [12.73497942386831,[-9.160219478737993]]
+    },
+    {
+      "name": "gaussian-residual",
+      "family": "gaussian",
+      "sigma": true,
+      "nu": 5,
+      "stan": {"theta_unc":[0.7,1.2,-0.6931471805599453],"jacobian":false,"propto":false,"lp":-8.23067576583718,"gradient":[-1.5723458452357126,5.091732319280945,0.8430129099154495]},
+      "point": [1.2,[0.7],0.5],
+      "score": -8.23067576583718,
+      "gradient": [5.091732319280945,[-1.5723458452357126],1.686025819830899]
+    },
+    {
+      "name": "student-default",
+      "family": "student",
+      "sigma": false,
+      "nu": 5,
+      "stan": {"theta_unc":[0.7,1.2],"jacobian":false,"propto":false,"lp":-9.315728482772291,"gradient":[-4.92854892672115,7.775211672047827]},
+      "point": [1.2,[0.7]],
+      "score": -9.315728482772291,
+      "gradient": [7.775211672047827,[-4.92854892672115]]
+    },
+    {
+      "name": "student-residual",
+      "family": "student",
+      "sigma": true,
+      "nu": 5,
+      "stan": {"theta_unc":[0.7,1.2,-0.6931471805599453],"jacobian":false,"propto":false,"lp":-8.403433594628488,"gradient":[-1.773613987511269,4.401856813672755,0.540694911336238]},
+      "point": [1.2,[0.7],0.5],
+      "score": -8.403433594628488,
+      "gradient": [4.401856813672755,[-1.773613987511269],1.081389822672476]
+    }
+  ]
+}

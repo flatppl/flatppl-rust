@@ -9,6 +9,8 @@ pub struct Formula {
     pub trials: Option<Trials>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weights: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se: Option<StandardError>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
@@ -22,6 +24,12 @@ pub struct Formula {
 pub enum Trials {
     Constant(i64),
     Column(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StandardError {
+    pub value: ColumnExpression,
+    pub sigma: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -57,7 +65,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
         .ok_or_else(|| Error("formula must contain `response ~ terms`".into()))?;
-    let (response, trials, weights) = response_additions(response)?;
+    let (response, trials, weights, se) = response_additions(response)?;
     let mut parser = Parser {
         tokens: tokenize(rhs)?,
         at: 0,
@@ -106,6 +114,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         response,
         trials,
         weights,
+        se,
         intercept,
         variables,
         fixed,
@@ -152,15 +161,23 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     (variables, fixed, expressions)
 }
 
-fn response_additions(text: &str) -> Result<(String, Option<Trials>, Option<String>)> {
+type ResponseAdditions = (
+    String,
+    Option<Trials>,
+    Option<String>,
+    Option<StandardError>,
+);
+
+fn response_additions(text: &str) -> Result<ResponseAdditions> {
     let Some((response, addition)) = text.split_once('|') else {
-        return Ok((name(text.trim())?, None, None));
+        return Ok((name(text.trim())?, None, None, None));
     };
     let fail = || {
-        Error("response additions support `trials(column_or_integer)` and `weights(column)`".into())
+        Error("response additions support `trials(...)`, `weights(column)` and `se(..., sigma=FALSE)`".into())
     };
     let mut trials = None;
     let mut weights = None;
+    let mut se = None;
     let mut depth = 0i32;
     for addition in addition.split(|c| {
         match c {
@@ -194,10 +211,45 @@ fn response_additions(text: &str) -> Result<(String, Option<Trials>, Option<Stri
                 }
                 weights = Some(value);
             }
+            "se" => {
+                let value = standard_error(argument)?;
+                if se.as_ref().is_some_and(|old| *old != value) {
+                    return Err(Error("conflicting se additions".into()));
+                }
+                se = Some(value);
+            }
             _ => return Err(fail()),
         }
     }
-    Ok((name(response.trim())?, trials, weights))
+    Ok((name(response.trim())?, trials, weights, se))
+}
+
+fn standard_error(text: &str) -> Result<StandardError> {
+    let (value, sigma) = text
+        .split_once(',')
+        .map_or((text, "FALSE"), |(value, flag)| (value, flag.trim()));
+    let sigma = match sigma.split_once('=') {
+        Some((name, value)) if name.trim() == "sigma" => value.trim(),
+        _ => sigma,
+    };
+    let sigma = match sigma {
+        "TRUE" => true,
+        "FALSE" => false,
+        _ => return Err(Error("se() sigma must be TRUE or FALSE".into())),
+    };
+    let mut parser = Parser {
+        tokens: tokenize(value)?,
+        at: 0,
+        atoms: Vec::new(),
+    };
+    let expr = parser.expression(0, 0)?;
+    if parser.peek() != Token::End {
+        return Err(Error("unexpected token in se() expression".into()));
+    }
+    Ok(StandardError {
+        value: column_expression(&expr, &parser.atoms)?,
+        sigma,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]

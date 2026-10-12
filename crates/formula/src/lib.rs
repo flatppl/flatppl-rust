@@ -26,7 +26,7 @@ pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, p
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
-pub use formula::{Formula, GroupTerm, Term, Trials, parse_formula};
+pub use formula::{Formula, GroupTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -247,6 +247,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     if family == Family::Cumulative && !formula.intercept {
         return Err(Error(
             "cumulative models require threshold intercepts".into(),
+        ));
+    }
+    if formula.se.is_some() && !matches!(family, Family::Gaussian | Family::Student) {
+        return Err(Error(
+            "`se(...)` is available for Gaussian and Student families".into(),
         ));
     }
     if (family == Family::Binomial) != formula.trials.is_some() {

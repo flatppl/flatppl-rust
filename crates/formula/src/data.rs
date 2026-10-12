@@ -338,6 +338,10 @@ impl Column {
 
 pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Result<Vec<usize>> {
     table.validate()?;
+    let mut se_columns = Vec::new();
+    if let Some(se) = &formula.se {
+        se.value.columns(&mut se_columns);
+    }
     let names = formula
         .predictor_columns()
         .into_iter()
@@ -356,6 +360,7 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
                 .then_some(formula.weights.as_deref())
                 .flatten(),
         )
+        .chain(se_columns)
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
@@ -363,12 +368,18 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
-    for expression in formula.expressions.values().chain(&formula.offsets).chain(
-        formula
-            .groups
-            .iter()
-            .flat_map(|group| group.expressions.values()),
-    ) {
+    for expression in formula
+        .expressions
+        .values()
+        .chain(&formula.offsets)
+        .chain(
+            formula
+                .groups
+                .iter()
+                .flat_map(|group| group.expressions.values()),
+        )
+        .chain(formula.se.as_ref().map(|se| &se.value))
+    {
         let values = expression.values(table, &rows)?;
         rows = rows
             .into_iter()
@@ -427,6 +438,21 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             "trials_data".into(),
             DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
+    }
+    if let Some(se) = &recipe.formula.se {
+        let values = se.value.data(table, &rows)?;
+        let valid = |value: f64| value >= 0.0 && (se.sigma || value > 0.0);
+        let valid = match &values {
+            DataValue::Real32(values) => values.iter().all(|&value| valid(f64::from(value))),
+            DataValue::Real64(values) => values.iter().all(|&value| valid(value)),
+            _ => unreachable!("numeric expressions produce real vectors"),
+        };
+        if !valid {
+            return Err(Error(
+                "se values must be nonnegative, and positive when sigma=FALSE".into(),
+            ));
+        }
+        constants.insert("se_data".into(), values);
     }
     for (group, term) in recipe.groups.iter().zip(&recipe.formula.groups) {
         for (predictor, name) in group.design.predictors.iter().zip(&group.inputs) {

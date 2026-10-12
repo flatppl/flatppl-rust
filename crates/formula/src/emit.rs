@@ -32,6 +32,9 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     if recipe.formula.weights.is_some() {
         external_vector(&mut b, "weights_data", "nonnegreals");
     }
+    if recipe.formula.se.is_some() {
+        external_vector(&mut b, "se_data", "nonnegreals");
+    }
     if !recipe.formula.offsets.is_empty() {
         external_vector(&mut b, "offset", "reals");
     }
@@ -217,6 +220,11 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         b.bind(&group.r, effect);
     }
     for &name in recipe.family.auxiliaries() {
+        if name == "sigma" && !recipe.priors.aux.contains_key(name) {
+            let zero = b.lit_real(0.0);
+            b.bind(name, zero);
+            continue;
+        }
         let support = lower_bound(&mut b, if name == "nu" { 1.0 } else { 0.0 });
         parameter(
             &mut b,
@@ -324,9 +332,20 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         Trials::Constant(n) => b.lit_int(*n),
         Trials::Column(_) => b.self_ref("trials_data"),
     });
+    let scale = recipe.formula.se.as_ref().map(|se| {
+        let known = b.self_ref("se_data");
+        if !se.sigma {
+            return known;
+        }
+        let sigma = b.self_ref("sigma");
+        let residual = b.call("mul", &[sigma, sigma]);
+        let known = broadcast(&mut b, "mul", &[known, known]);
+        let variance = broadcast(&mut b, "add", &[known, residual]);
+        broadcast(&mut b, "sqrt", &[variance])
+    });
     let law = recipe
         .family
-        .observation(&mut b, mu, trials, thresholds, false);
+        .observation(&mut b, mu, trials, scale, thresholds, false);
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");
@@ -338,7 +357,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let kernel = b.self_ref("K_model");
     let likelihood = b.call("likelihoodof", &[kernel, observation]);
     b.bind("L", likelihood);
-    let pointwise = pointwise_log_likelihood(&mut b, recipe);
+    let pointwise = pointwise_log_likelihood(&mut b, recipe, scale);
     let log_lik = parameter_function(&mut b, "functionof", pointwise, &parameters);
     b.bind_doc(
         "log_lik",
@@ -435,7 +454,7 @@ fn parameter_function(
     }))
 }
 
-fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe) -> NodeId {
+fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<NodeId>) -> NodeId {
     let mut inputs = Vec::new();
     let mut argument = |b: &mut Builder<'_>, name: &str| {
         let value = Ref {
@@ -452,9 +471,10 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe) -> NodeId {
         Some(Trials::Column(_)) => Some(argument(b, "trials")),
         None => None,
     };
+    let row_scale = scale.map(|_| argument(b, "scale"));
     let law = recipe
         .family
-        .observation(b, mu, trials, recipe.thresholds(), true);
+        .observation(b, mu, trials, row_scale, recipe.thresholds(), true);
     let score = b.call("logdensityof", &[law, value]);
     let head = b.sym("functionof");
     let row_score = b.m.alloc(Node::Call(Call {
@@ -466,6 +486,9 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe) -> NodeId {
     let mut args = vec![row_score, b.self_ref("mu"), b.self_ref("y_data")];
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         args.push(b.self_ref("trials_data"));
+    }
+    if let Some(scale) = scale {
+        args.push(scale);
     }
     b.call("broadcast", &args)
 }

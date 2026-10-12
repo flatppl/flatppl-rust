@@ -79,6 +79,15 @@ the aligned weights. `Pi_post` adds `sum(weights_data .* log_lik(...))` once
 to the prior log density. Prediction requires neither responses nor weights;
 it uses the existing predictor-row filtering and saved training recipe.
 
+Gaussian and Student formulas accept `y | se(s) ~ ...`, where `s` is a numeric
+column, constant or supported column expression. The supplied values replace
+residual `sigma`; its prior is unavailable. `se(s, sigma=TRUE)` retains `sigma`
+and uses `sqrt(s^2 + sigma^2)`. Student models interpret this as scale, without a
+degrees-of-freedom correction. Values must be finite and nonnegative. Conversion
+rejects zero when `sigma=FALSE`, because the total likelihood scale would be zero;
+with `sigma=TRUE`, zero known error is allowed. Prediction requires the columns used in `se()` and
+reuses the saved expression. Separate response additions with `+`.
+
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
 `{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and
@@ -240,3 +249,8 @@ not establish numerical correctness.
 brms-generated Stan scores and gradients, including the ordering offset and a
 float32 tail case. Its [R script](tests/fixtures/cumulative-oracle.R) reproduces
 the category coding, generated Stan, and independent density values.
+
+[The standard-error fixture](tests/fixtures/standard-errors.json) records actual
+normalized brms-generated Stan scores and gradients for Gaussian and Student
+models with both `se()` residual-scale settings; its adjacent R script regenerates
+the models.
