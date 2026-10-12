@@ -98,6 +98,24 @@ fn scalar_only_measure_broadcast_is_an_ordinary_call() {
 }
 
 #[test]
+fn collection_locscale_matches_its_reified_kernel() {
+    let source = "mu = external(cartpow(reals, 3))\n\
+                  sigma = external(posreals)\n\
+                  nu = external(posreals)\n\
+                  x = external(cartpow(reals, 3))\n\
+                  M = locscale.(StudentT(nu), mu, sigma)\n\
+                  inputs = (mu, sigma, nu, x)\noutputs = logdensityof(M, x)";
+    let reference = source.replace(
+        "M = locscale.(StudentT(nu), mu, sigma)",
+        "location = elementof(reals)\n\
+         value ~ locscale(StudentT(nu), location, sigma)\n\
+         K = kernelof(value, location = location)\n\
+         M = K.(mu)",
+    );
+    assert_eq!(emit(source), emit(&reference));
+}
+
+#[test]
 fn scalar_only_broadcast_preserves_the_scored_draw() {
     let source = "z ~ Normal(0, 1)\n\
                   y = external(reals)\n\
