@@ -3811,10 +3811,17 @@ fn superposition_reference(
                     .then_some(reference)
             }
             _ if flatppl_infer::distribution_param_names(name).is_some() => {
-                let Type::Measure { domain, .. } = m.type_of(node)? else {
+                // Applying a row kernel rebuilds its constructor without the
+                // original annotations. Infer that expression, not the module.
+                let ty = m.type_of(node).cloned().or_else(|| {
+                    flatppl_infer::infer_expression(m, node, &[])
+                        .0
+                        .remove(&node)
+                })?;
+                let Type::Measure { domain, .. } = ty else {
                     return None;
                 };
-                reference_measure(domain)
+                reference_measure(&domain)
             }
             _ => None,
         }
@@ -4250,8 +4257,8 @@ fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
 /// `Mass::Normalized` (`fill_mass`). A bare (unweighted) component, a mixand that
 /// is not statically normalized, or a variate-dependent weight all yield `None` —
 /// the recognizer never assumes a mass it cannot read off the type. Structural,
-/// immutable read of `m`.
-fn recognize_convex_superposition(m: &Module, node: NodeId) -> Option<Vec<NodeId>> {
+/// with local re-inference when substitution rebuilt a component.
+fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<NodeId>> {
     let components: Vec<NodeId> = {
         let sup = expect_builtin_call(m, node, "superpose")?;
         if sup.args.len() < 2 {
@@ -4274,8 +4281,13 @@ fn recognize_convex_superposition(m: &Module, node: NodeId) -> Option<Vec<NodeId
         // not statically `Mass::Normalized` (Finite/LocallyFinite/Unknown) has no
         // closed-form unit mass, so bail.
         let (base_resolved, _) = resolve_ref_one(m, base);
+        let base_ty = m.type_of(base_resolved).cloned().or_else(|| {
+            flatppl_infer::infer_expression(m, base_resolved, &[])
+                .0
+                .remove(&base_resolved)
+        });
         let base_normalized = matches!(
-            m.type_of(base_resolved),
+            base_ty,
             Some(Type::Measure {
                 mass: Mass::Normalized,
                 ..
