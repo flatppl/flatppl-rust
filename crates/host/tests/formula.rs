@@ -4,6 +4,36 @@ use flatppl_host::{
 };
 
 #[test]
+fn coefficient_priors_can_reference_later_family_auxiliaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spec = flatppl_formula::read(
+        &serde_json::json!({
+            "formula": "y ~ 0 + x", "family": "beta",
+            "priors": [
+                {"class": "b", "prior": "normal(0, phi)"},
+                {"class": "phi", "prior": "constant(2.5)"}
+            ],
+            "data": {"nrows": 2, "columns": [
+                {"name": "y", "values": {"kind": "real64", "values": [0.2, 0.6]}},
+                {"name": "x", "values": {"kind": "real64", "values": [1, 2]}}
+            ]}
+        })
+        .to_string(),
+    )?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    context.register("model.flatppl", &model.module)?;
+    let query = context.parse(
+        "m = load_module(\"model.flatppl\")\np = elementof(cartpow(reals, 1))\n\
+                 inputs = p\noutputs = logdensityof(m.Pi_post, record(b = p))",
+        None,
+        None,
+    )?;
+    query.compile(&EmitOptions::default())?;
+    Ok(())
+}
+
+#[test]
 fn formula_training_and_prediction_compile_from_distinct_snapshots()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut spec = flatppl_formula::read(include_str!(

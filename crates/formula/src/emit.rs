@@ -80,7 +80,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
     if thresholds > 0 {
-        let names = scope(&b);
+        let names = scope(&b, recipe.family);
         let bindings: Vec<_> = names.iter().map(String::as_str).collect();
         let PriorNode::Measure(prior) =
             priors::emit(&mut b, &recipe.priors.intercept, None, None, &bindings)?
@@ -102,11 +102,12 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             &recipe.priors.intercept,
             None,
             &mut parameters,
+            recipe.family,
         )?;
     }
     if !recipe.design.columns.is_empty() {
         if recipe.priors.b.iter().all(|p| *p == recipe.priors.b[0]) {
-            let scope = scope(&b);
+            let scope = scope(&b, recipe.family);
             let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
             let prior = priors::emit(&mut b, &recipe.priors.b[0], None, None, &bindings)?;
             let count = b.lit_int(recipe.design.columns.len() as i64);
@@ -124,7 +125,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             let mut values = Vec::new();
             for (i, prior) in recipe.priors.b.iter().enumerate() {
                 let name = format!("b_{}", i + 1);
-                parameter(&mut b, &name, prior, None, &mut parameters)?;
+                parameter(&mut b, &name, prior, None, &mut parameters, recipe.family)?;
                 values.push(b.self_ref(&name));
             }
             let coefficients = b.array(&values);
@@ -144,9 +145,10 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
                 &sd_priors[0],
                 Some(support),
                 &mut parameters,
+                recipe.family,
             )?;
         } else if sd_priors.iter().all(|prior| *prior == sd_priors[0]) {
-            let names = scope(&b);
+            let names = scope(&b, recipe.family);
             let bindings: Vec<_> = names.iter().map(String::as_str).collect();
             match priors::emit(&mut b, &sd_priors[0], Some(support), None, &bindings)? {
                 PriorNode::Measure(law) => {
@@ -162,7 +164,14 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             let mut values = Vec::new();
             for (j, prior) in sd_priors.iter().enumerate() {
                 let name = b.alloc_name(&format!("{}_{}", group.sd, j + 1));
-                parameter(&mut b, &name, prior, Some(support), &mut parameters)?;
+                parameter(
+                    &mut b,
+                    &name,
+                    prior,
+                    Some(support),
+                    &mut parameters,
+                    recipe.family,
+                )?;
                 values.push(b.self_ref(&name));
             }
             let value = b.array(&values);
@@ -189,7 +198,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             let mut scale = b.call("diagmat", &[sd]);
             if let Some(prior) = &recipe.priors.cor[i] {
                 let name = b.alloc_name(&format!("L_{}", group.column));
-                let names = scope(&b);
+                let names = scope(&b, recipe.family);
                 let bindings: Vec<_> = names.iter().map(String::as_str).collect();
                 let law = priors::emit_correlation(&mut b, prior, dimensions, &bindings)?;
                 draw(&mut b, &name, law, &mut parameters);
@@ -215,6 +224,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             &recipe.priors.aux[name],
             Some(support),
             &mut parameters,
+            recipe.family,
         )?;
     }
     if parameters.is_empty() {
@@ -536,10 +546,11 @@ pub(crate) fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> Nod
     b.call("broadcast", &args)
 }
 
-fn scope(b: &Builder<'_>) -> Vec<String> {
+fn scope(b: &Builder<'_>, family: Family) -> Vec<String> {
     b.m.public_bindings()
         .map(|(_, binding)| b.m.resolve(binding.name).to_owned())
-        .chain(["temp_Intercept", "cuts", "b", "sigma", "nu", "shape"].map(str::to_owned))
+        .chain(["temp_Intercept", "cuts", "b"].map(str::to_owned))
+        .chain(family.auxiliaries().iter().map(|name| (*name).to_owned()))
         .collect()
 }
 
@@ -549,8 +560,9 @@ fn parameter(
     prior: &ResolvedPrior,
     support: Option<NodeId>,
     parameters: &mut Vec<String>,
+    family: Family,
 ) -> Result<()> {
-    let names = scope(b);
+    let names = scope(b, family);
     let bindings: Vec<_> = names.iter().map(String::as_str).collect();
     match priors::emit(b, prior, support, None, &bindings)? {
         PriorNode::Measure(law) => draw(b, name, law, parameters),
