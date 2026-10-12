@@ -39,7 +39,7 @@ impl Context {
     }
 
     /// Import a formula model, retaining its Rust preprocessing recipe.
-    /// Data placement in the specification controls printed exports only.
+    /// The source template keeps data external; the loaded snapshot binds it.
     pub fn import_formula(
         &mut self,
         spec: &Spec,
@@ -47,9 +47,7 @@ impl Context {
         name: Option<&str>,
         source_path: Option<&str>,
     ) -> Result<FormulaModel, Diagnostic> {
-        let mut spec = spec.clone();
-        spec.options.data_placement = flatppl_formula::DataPlacement::External;
-        let converted = flatppl_formula::build(&spec, data).map_err(|error| {
+        let converted = flatppl_formula::build(spec, data).map_err(|error| {
             Diagnostic::new(
                 "formula",
                 source_path.or(name).unwrap_or("<formula>"),

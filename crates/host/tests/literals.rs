@@ -49,20 +49,23 @@ fn expressions_and_absent_names_do_not_read_back() -> Result<(), Box<dyn std::er
 
 #[test]
 fn packed_arrays_round_trip_and_bind_externals() -> Result<(), Box<dyn std::error::Error>> {
-    let packed = json!({"kind": "array", "value": {"shape": [2, 2], "dtype": "real", "data": [1.0, 2.0, "inf", 4.0]}});
-    let value: Constant = serde_json::from_value(packed.clone())?;
+    let packed = json!({"kind": "array", "value": {"shape": [2, 2], "dtype": "real", "data": [1.5, 2.0, "inf", "-inf"]}});
+    let value: Constant = serde_json::from_str(&packed.to_string())?;
     assert_eq!(serde_json::to_value(&value)?, packed);
+    assert!(serde_json::from_str::<Constant>(r#"{"kind":"real","value":1e999}"#).is_err());
     let mut context = Context::default();
     let module = context.parse(
-        "x = external(cartpow(reals, [2, 2]))\nflags = external(cartpow(booleans, 3))\noutputs = sum(x)",
+        "x = external(cartpow(reals, [2, 2]))\nflags = external(cartpow(booleans, 3))\nscale = external(reals)\noutputs = sum(x)",
         None,
         None,
     )?;
-    let constants: Vec<(String, Constant)> = serde_json::from_value(json!([
+    let constants: Vec<(String, Constant)> = serde_json::from_str(&json!([
         ["x", {"kind": "array", "value": {"shape": [2, 2], "dtype": "integer", "data": [1, 2, 3, 4]}}],
-        ["flags", {"kind": "array", "value": {"shape": [3], "dtype": "bool", "data": [true, false, true]}}]
-    ]))?;
+        ["flags", {"kind": "array", "value": {"shape": [3], "dtype": "bool", "data": [true, false, true]}}],
+        ["scale", {"kind": "real", "value": 2.5}]
+    ]).to_string())?;
     let bound = context.set(&module, &constants)?;
+    assert_eq!(bound.constant("scale")?, Constant::Real(2.5));
     assert_eq!(
         bound.constant("x")?,
         Constant::Array {

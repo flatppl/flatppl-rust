@@ -39,6 +39,7 @@ infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
 prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/net"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
 formula = ["dep:flatppl-formula", "convert"]
+formula-arrow = ["formula", "flatppl-formula/arrow"]
 fmtlint = ["dep:flatppl-lint"]
 # `determinize` legalizes a FlatPPL model to the deterministic FlatPDL profile
 # (eliminate the measure layer), refusing constructs it cannot lower. It needs

@@ -1,0 +1,11 @@
+{
+  "nrows":4,
+  "columns":[
+    {"name":"y","values":{"kind":"int","values":[2,4,8,7]}},
+    {"name":"x","values":{"kind":"real64","values":[1,0,3,4]},"valid":[true,false,true,true]},
+    {"name":"g","values":{"kind":"int","values":[9223372036854775807,-9223372036854775808,9223372036854775807,-9223372036854775808]}},
+    {"name":"f","values":{"kind":"factor","values":{"levels":["a","b, \"quoted\""],"codes":[1,0,1,0]}}},
+    {"name":"flag","values":{"kind":"bool","values":[true,false,false,true]}},
+    {"name":"unused","values":{"kind":"real64","values":[0,0,0,0]},"valid":[false,false,false,false]}
+  ]
+}

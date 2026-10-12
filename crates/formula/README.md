@@ -105,7 +105,17 @@ let prediction = flatppl_formula::prepare_data(
 ```
 
 `Conversion` contains a module, named data constants, a serializable training
-recipe, and parameter metadata. The recipe retains family and link, response
+recipe, and parameter metadata. Generated source keeps observations and prepared
+columns in external bindings; the data document supplies their values separately.
+For a file export, `conversion.with_data_source("model.data.json")` returns a
+module using `load_data` and its prepared numeric JSON sidecar. The caller writes
+both files. The sidecar path resolves from the generated module; it references
+prepared rows and encoded columns, not the original raw table. Data columns are
+separate; shape and fitted model constants remain in source. The original
+conversion remains external for dataframe binding and prediction. JSON has no
+dtype; float32 columns retain their exact
+stored values when written as JSON numbers.
+The recipe retains family and link, response
 coding, training means, factor contrasts and levels, design terms, and group
 levels. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
 products. Metadata records the default-prior rule and group collation.
@@ -113,6 +123,24 @@ Prediction requires no response column. It reuses the training contrast matrices
 and remaps factor labels even when new data uses a different level order.
 It rejects unseen factor and group levels.
 Build a new recipe for a new fit or cross-validation fold.
+
+`Table::from_json(text)` accepts the typed table format, an array of row objects,
+or an object of column arrays. Missing record fields and `null` cells remain
+missing until model-frame construction. String columns become unordered factors
+with sorted levels. Boolean, numeric and string values cannot be mixed in a
+column. Integer columns preserve signed 64-bit values. Mixing integers with
+decimal or exponent numbers produces float64 only when each integer remains
+exactly representable; overflow and lossy promotion are errors. Typed tables
+retain explicit float32, factor levels and orderedness. All-null columns remain
+nullable numeric columns, so unused missing columns do not remove model rows.
+
+`Table::from_csv(reader)` accepts a headered CSV. Empty fields and the exact token
+`NA` are null, including quoted fields. Other whitespace and text are preserved.
+Columns infer `true`/`false` or `TRUE`/`FALSE` booleans, signed 64-bit integers,
+finite float64 numbers, then unordered string factors with sorted levels.
+Numeric columns reject integer overflow and lossy integer-to-float promotion.
+CSV quoting supports commas, quotes and newlines in fields. Use typed JSON or
+Arrow when inference or these null tokens are unsuitable for a column.
 
 The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` for uncompressed
 IPC files and streams. It preserves float32, float64, integers, logical values,
@@ -132,15 +160,23 @@ With the CLI `formula` feature:
 
 ```sh
 flatppl convert model.formula.json model.flatppl
+flatppl convert model.formula.json model.flatppl --data observations.csv
+flatppl convert model.formula.json model.flatppl --data observations.json
 ```
 
-The JSON specification embeds a typed table. See
-[the Gaussian fixture](tests/fixtures/gaussian.formula.json).
+Embed a typed `data` table in the specification, as in
+[the Gaussian fixture](tests/fixtures/gaussian.formula.json), or provide `--data`;
+using both is an error. External JSON accepts all three table formats above.
+Paths are local regular files and relative paths resolve from the current working
+directory. Build the CLI with `formula-arrow` to read Arrow IPC files or streams
+with `.arrow`, `.arrows`, `.ipc` or `.feather` extensions through `--data`.
 The command writes `model.data.json`, `model.recipe.json` and `model.model.json`
-alongside the source. Consumers bind the named data constants explicitly.
-Set `options.data_placement` to `inline` for a self-contained source snapshot.
-The data document preserves float32 columns. StableHLO precision remains a
-compiler option.
+alongside the source. Its `load_data` declaration reads the prepared numeric
+sidecar relative to `model.flatppl`; keep these files together. Row selection is
+recorded in model metadata. Training data is never embedded in generated source.
+For migration, the old JSON `data_placement` option is temporarily accepted and
+ignored; the CLI flag has been removed. StableHLO precision remains a compiler
+option.
 
 The factor and term fixtures come from base R, with the fixed formula
 reconstruction used by brms 2.23.2. The Gaussian default-prior test values are

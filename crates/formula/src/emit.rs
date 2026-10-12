@@ -470,6 +470,60 @@ pub(crate) fn inline(mut module: Module, data: &DataDocument) -> Result<Module> 
     Ok(module)
 }
 
+pub(crate) fn with_data_source(
+    mut module: Module,
+    data: &DataDocument,
+    source: &str,
+) -> Result<(Module, serde_json::Value)> {
+    let mut b = Builder::new(&mut module);
+    let name = b.alloc_name("formula_data");
+    let mut fields = Vec::new();
+    let mut columns = serde_json::Map::new();
+    for (column, value) in &data.constants {
+        let (id, rhs) =
+            b.m.public_bindings()
+                .find(|(_, v)| b.m.resolve(v.name) == column)
+                .map(|(id, v)| (id, v.rhs))
+                .ok_or_else(|| Error(format!("missing prepared data binding `{column}`")))?;
+        if let DataValue::Integer(value) = value {
+            if column != "N" {
+                return Err(Error(format!("unexpected scalar data binding `{column}`")));
+            }
+            let value = b.lit_int(*value);
+            b.m.set_binding_rhs(id, value);
+            continue;
+        }
+        let Node::Call(call) = b.m.node(rhs) else {
+            return Err(Error(format!("data binding `{column}` is not external")));
+        };
+        if !matches!(call.head, CallHead::Builtin(head) if b.m.resolve(head) == "external")
+            || call.args.len() != 1
+        {
+            return Err(Error(format!("data binding `{column}` is not external")));
+        }
+        fields.push((column.as_str(), call.args[0]));
+        let value = match value {
+            DataValue::Real32(values) => {
+                // JSON has no dtype; preserve the exact stored f32 values.
+                serde_json::to_value(values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>())?
+            }
+            DataValue::Real64(values) => serde_json::to_value(values)?,
+            DataValue::Integers(values) => serde_json::to_value(values)?,
+            DataValue::Integer(_) => unreachable!("scalar count handled above"),
+        };
+        columns.insert(column.clone(), value);
+        let data = b.self_ref(&name);
+        let field = b.str_lit(column);
+        let value = b.call("get", &[data, field]);
+        b.m.set_binding_rhs(id, value);
+    }
+    let domain = b.call_fields("cartprod", &fields);
+    let source = b.str_lit(source);
+    let data = b.call("load_data", &[source, domain]);
+    b.bind(&name, data);
+    Ok((module, serde_json::Value::Object(columns)))
+}
+
 pub(crate) fn info(
     spec: &Spec,
     recipe: &Recipe,

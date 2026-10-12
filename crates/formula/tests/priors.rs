@@ -1,4 +1,4 @@
-use flatppl_formula::{DataPlacement, build, read};
+use flatppl_formula::{build, read};
 use serde_json::json;
 
 fn spec(priors: serde_json::Value) -> flatppl_formula::Spec {
@@ -13,8 +13,7 @@ fn spec(priors: serde_json::Value) -> flatppl_formula::Spec {
             values: flatppl_formula::ColumnValues::Real64(vec![2.0, 3.0, 5.0]),
             valid: None,
         });
-    spec.options.data_placement = DataPlacement::Inline;
-    spec.priors = serde_json::from_value(priors).unwrap();
+    spec.priors = serde_json::from_str(&priors.to_string()).unwrap();
     spec
 }
 
@@ -48,11 +47,15 @@ fn coefficient_overrides_remove_fixed_values_from_sampled_coordinates() {
 #[test]
 fn scoped_prior_expressions_use_the_parameter_graph() {
     let mut spec = spec(json!([
-        {"class": "b", "prior": "normal(0, sigma)", "lb": 0, "ub": "sigma"},
+        {"class": "b", "prior": "normal(0, sigma)", "lb": 0.25, "ub": "sigma"},
         {"class": "b", "coef": "z", "prior": "Normal(1, 2)"},
         {"class": "sigma", "prior": "exponential(2)"}
     ]));
     let conversion = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        conversion.recipe.priors.b[0].lb,
+        Some(flatppl_formula::PriorBound::Number(0.25))
+    );
     assert_eq!(
         conversion
             .info
