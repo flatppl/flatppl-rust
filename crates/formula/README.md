@@ -3,14 +3,29 @@
 This crate converts a small brms formula subset into ordinary FlatPPL.
 It performs no inference and has no R or Python dependency.
 
-The first slice supports Gaussian identity-link models, additive numeric
-predictors, intercept controls, and random intercepts such as `y ~ x + (1 | g)`.
+The supported subset uses Gaussian identity-link models, numeric, logical and
+factor predictors, and random intercepts such as `y ~ x * treatment + (1 | g)`.
+Formula terms support `+`, `-`, `:`, `*`, `/`, `%in%`, powers and parentheses.
+R term expansion and brms fixed-term ordering determine the design columns.
 Numeric and explicit factor grouping columns retain their training levels.
 Grouping terms are ordered with C collation for stable brms parameter names.
 Missing model rows are omitted. Unused columns do not affect row selection.
-Factor predictors, interactions, offsets, other families and coefficient-specific
+Offsets, expression calls, random slopes, other families and coefficient-specific
 priors are not yet supported. The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
+
+Unordered factors use treatment contrasts. Ordered factors use polynomial
+contrasts. Set `options.contrasts` per column, for example
+`{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and
+`polynomial`. Factor values carry explicit `levels`, zero-based `codes` and
+an optional `ordered` flag. Training drops unused factor levels and preserves
+the remaining order. Logical predictors use the levels `FALSE`, `TRUE`.
+No-intercept formulas use R's cell coding, including full columns for `0 + f`.
+Polynomial contrasts support at most 16 observed levels. Higher-degree R
+contrasts become sensitive to QR rank decisions and rounding; use treatment,
+sum or Helmert contrasts for larger factors.
+Indicator-only terms such as `0 + o` do not need polynomial contrasts and have
+no such level limit.
 
 Defaults match the Gaussian brms rules: a centred Student-t intercept,
 half-Student-t scales, and improper `regression.Flat()` coefficients.
@@ -28,10 +43,14 @@ let prediction = flatppl_formula::prepare_data(
 ```
 
 `Conversion` contains a module, named data constants, a serializable training
-recipe, and parameter metadata. The recipe retains training means and group
-levels. Metadata records the default-prior rule and group collation. Generated
+recipe, and parameter metadata. The recipe retains training means, factor
+contrasts and levels, design terms, and group levels. Numeric source columns
+remain raw. The emitted FlatPPL selects contrast values and computes interaction
+products. Metadata records the default-prior rule and group collation. Generated
 default priors carry short comments identifying the response summary rules.
-Prediction requires no response column. It rejects unseen groups.
+Prediction requires no response column. It reuses the training contrast matrices
+and remaps factor labels even when new data uses a different level order.
+It rejects unseen factor and group levels.
 Build a new recipe for a new fit or cross-validation fold.
 
 `flatppl_host::Context::import_formula` returns a `FormulaModel` with a bound
@@ -52,8 +71,12 @@ Set `options.data_placement` to `inline` for a self-contained source snapshot.
 The data document preserves float32 columns. StableHLO precision remains a
 compiler option.
 
-The design and default-prior test values are hand-derived from R/brms rules.
-[The R script](tests/fixtures/brms-oracle.R) checks them with brms 2.23.2.
+The factor and term fixtures come from base R, with the fixed formula
+reconstruction used by brms 2.23.2. The Gaussian default-prior test values are
+hand-derived from brms rules. [The R script](tests/fixtures/brms-oracle.R) checks
+those defaults with brms 2.23.2.
+[The factor oracle script](tests/fixtures/factor-matrix.R) regenerates the
+design matrices, prediction matrices and brms coefficient names using base R.
 [The Gaussian oracle](tests/fixtures/gaussian-oracle.stan) independently defines
 the target and its normalized score. A successful print round trip alone does
 not establish numerical correctness.

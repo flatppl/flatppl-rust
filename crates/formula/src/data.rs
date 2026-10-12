@@ -24,10 +24,13 @@ pub enum ColumnValues {
     Real32(Vec<f32>),
     Real64(Vec<f64>),
     Int(Vec<i64>),
+    Bool(Vec<bool>),
     /// Zero-based codes. Explicit level order is preserved.
     Factor {
         levels: Vec<String>,
         codes: Vec<u32>,
+        #[serde(default)]
+        ordered: bool,
     },
 }
 
@@ -71,7 +74,8 @@ impl Table {
                 ColumnValues::Real32(v) => v.len(),
                 ColumnValues::Real64(v) => v.len(),
                 ColumnValues::Int(v) => v.len(),
-                ColumnValues::Factor { levels, codes } => {
+                ColumnValues::Bool(v) => v.len(),
+                ColumnValues::Factor { levels, codes, .. } => {
                     if levels.iter().collect::<HashSet<_>>().len() != levels.len() {
                         return Err(Error(format!("duplicate levels in `{}`", column.name)));
                     }
@@ -113,11 +117,8 @@ impl Column {
             ColumnValues::Real32(v) => rows.iter().map(|&i| f64::from(v[i])).collect(),
             ColumnValues::Real64(v) => rows.iter().map(|&i| v[i]).collect(),
             ColumnValues::Int(v) => rows.iter().map(|&i| v[i] as f64).collect(),
-            ColumnValues::Factor { .. } => {
-                return Err(Error(format!(
-                    "factor predictor or response `{}` is unsupported in the Gaussian numeric subset",
-                    self.name
-                )));
+            ColumnValues::Factor { .. } | ColumnValues::Bool(_) => {
+                return Err(Error(format!("column `{}` must be numeric", self.name)));
             }
         };
         if values.iter().any(|v| !v.is_finite()) {
@@ -129,28 +130,13 @@ impl Column {
         Ok(values)
     }
 
-    pub(crate) fn mean(&self, rows: &[usize]) -> Result<f64> {
-        let values = self.numeric(rows)?;
-        let mean = values.iter().sum::<f64>() / rows.len() as f64;
-        if !mean.is_finite() {
-            return Err(Error(format!(
-                "column `{}` has an unrepresentable mean",
-                self.name
-            )));
-        }
-        Ok(mean)
-    }
-
     fn data(&self, rows: &[usize]) -> Result<DataValue> {
         let values = match &self.values {
             ColumnValues::Real32(v) => DataValue::Real32(rows.iter().map(|&i| v[i]).collect()),
             ColumnValues::Real64(v) => DataValue::Real64(rows.iter().map(|&i| v[i]).collect()),
             ColumnValues::Int(v) => DataValue::Integers(rows.iter().map(|&i| v[i]).collect()),
-            ColumnValues::Factor { .. } => {
-                return Err(Error(format!(
-                    "factor predictor or response `{}` is unsupported in the Gaussian numeric subset",
-                    self.name
-                )));
+            ColumnValues::Factor { .. } | ColumnValues::Bool(_) => {
+                return Err(Error(format!("column `{}` must be numeric", self.name)));
             }
         };
         let finite = match &values {
@@ -167,12 +153,74 @@ impl Column {
         Ok(values)
     }
 
+    pub(crate) fn factor_levels(&self, rows: &[usize]) -> Option<(Vec<String>, bool)> {
+        match &self.values {
+            ColumnValues::Factor {
+                levels,
+                codes,
+                ordered,
+            } => {
+                let observed: HashSet<_> = rows.iter().map(|&row| codes[row] as usize).collect();
+                Some((
+                    levels
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| observed.contains(i))
+                        .map(|(_, level)| level.clone())
+                        .collect(),
+                    *ordered,
+                ))
+            }
+            // R logical contrasts retain both possible values even when only
+            // one occurs in the training data.
+            ColumnValues::Bool(_) => Some((vec!["FALSE".into(), "TRUE".into()], false)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn factor_codes(&self, levels: &[String], rows: &[usize]) -> Result<Vec<i64>> {
+        let indices: HashMap<_, _> = levels
+            .iter()
+            .enumerate()
+            .map(|(index, level)| (level.as_str(), index as i64 + 1))
+            .collect();
+        rows.iter()
+            .map(|&row| {
+                let level = match &self.values {
+                    ColumnValues::Factor { levels, codes, .. } => {
+                        levels[codes[row] as usize].as_str()
+                    }
+                    ColumnValues::Bool(values) => {
+                        if values[row] {
+                            "TRUE"
+                        } else {
+                            "FALSE"
+                        }
+                    }
+                    _ => {
+                        return Err(Error(format!(
+                            "predictor `{}` must be a factor or logical column",
+                            self.name
+                        )));
+                    }
+                };
+                indices.get(level).copied().ok_or_else(|| {
+                    Error(format!(
+                        "unseen level `{level}` in predictor `{}`",
+                        self.name
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn level(&self, row: usize) -> Result<GroupLevel> {
         Ok(match &self.values {
             ColumnValues::Real32(v) if v[row].is_finite() => GroupLevel::Real(f64::from(v[row])),
             ColumnValues::Real64(v) if v[row].is_finite() => GroupLevel::Real(v[row]),
             ColumnValues::Int(v) => GroupLevel::Integer(v[row]),
-            ColumnValues::Factor { levels, codes } => {
+            ColumnValues::Bool(v) => GroupLevel::Text(if v[row] { "TRUE" } else { "FALSE" }.into()),
+            ColumnValues::Factor { levels, codes, .. } => {
                 GroupLevel::Text(levels[codes[row] as usize].clone())
             }
             _ => {
@@ -185,7 +233,7 @@ impl Column {
     }
 
     pub(crate) fn levels(&self, rows: &[usize]) -> Result<Vec<GroupLevel>> {
-        if let ColumnValues::Factor { levels, codes } = &self.values {
+        if let ColumnValues::Factor { levels, codes, .. } = &self.values {
             let observed: HashSet<_> = rows.iter().map(|&row| codes[row] as usize).collect();
             return Ok(levels
                 .iter()
@@ -205,6 +253,12 @@ impl Column {
                 };
                 *value
             }),
+            ColumnValues::Bool(_) => levels.sort_by(|a, b| {
+                let (GroupLevel::Text(a), GroupLevel::Text(b)) = (a, b) else {
+                    unreachable!()
+                };
+                a.cmp(b)
+            }),
             _ => levels.sort_by(|a, b| {
                 let (GroupLevel::Real(a), GroupLevel::Real(b)) = (a, b) else {
                     unreachable!()
@@ -220,7 +274,7 @@ impl Column {
 pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Result<Vec<usize>> {
     table.validate()?;
     let names = formula
-        .fixed
+        .variables
         .iter()
         .chain(&formula.groups)
         .chain((mode == DataMode::Training).then_some(&formula.response));
@@ -242,8 +296,13 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
     let rows = model_rows(&recipe.formula, table, mode)?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
-    for (i, name) in recipe.formula.fixed.iter().enumerate() {
-        constants.insert(format!("x_{}", i + 1), table.column(name)?.data(&rows)?);
+    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
+        let column = table.column(&predictor.column)?;
+        let values = match &predictor.factor {
+            Some(factor) => DataValue::Integers(column.factor_codes(&factor.levels, &rows)?),
+            None => column.data(&rows)?,
+        };
+        constants.insert(format!("x_{}", i + 1), values);
     }
     if mode == DataMode::Training {
         constants.insert(

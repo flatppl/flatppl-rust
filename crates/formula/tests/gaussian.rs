@@ -128,6 +128,7 @@ fn factor_group_order_and_specific_priors_survive_name_collisions() {
         values: flatppl_formula::ColumnValues::Factor {
             levels: vec!["B".into(), "A".into(), "unused".into()],
             codes: vec![1, 0, 1, 2],
+            ordered: false,
         },
         valid: None,
     });

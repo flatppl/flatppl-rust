@@ -1,4 +1,7 @@
-use crate::{DataDocument, DataValue, ModelInfo, NormalPrior, Parameter, Recipe, Result, Spec};
+use crate::{
+    DataDocument, DataValue, DesignComponent, Error, ModelInfo, NormalPrior, Parameter, Recipe,
+    Result, Spec,
+};
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs};
 
@@ -11,7 +14,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let mut module = Module::new();
     let mut b = Builder::new(&mut module);
     b.stamp_compat();
-    let improper = !recipe.formula.fixed.is_empty() && recipe.priors.b.is_none();
+    let improper = !recipe.design.columns.is_empty() && recipe.priors.b.is_none();
     if improper {
         let name = b.str_lit("regression");
         let version = b.str_lit("0.1");
@@ -22,8 +25,13 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let size = b.call("external", &[positive]);
     b.bind("N", size);
     external_vector(&mut b, "y_data", "reals");
-    for i in 0..recipe.formula.fixed.len() {
-        external_vector(&mut b, &format!("x_{}", i + 1), "reals");
+    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
+        let set = if predictor.factor.is_some() {
+            "posintegers"
+        } else {
+            "reals"
+        };
+        external_vector(&mut b, &format!("x_{}", i + 1), set);
     }
     for group in &mut recipe.groups {
         group.index = b.alloc_name(&format!("index_{}", group.column));
@@ -45,13 +53,13 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         };
         draw(&mut b, "temp_Intercept", prior, &mut parameters, docs);
     }
-    if !recipe.formula.fixed.is_empty() {
+    if !recipe.design.columns.is_empty() {
         let prior = if let Some(normal) = recipe.priors.b {
             prior(&mut b, Some(normal), 0.0, 1.0, false)
         } else {
             b.module_user_call("reg", "Flat", &[])
         };
-        let count = b.lit_int(recipe.formula.fixed.len() as i64);
+        let count = b.lit_int(recipe.design.columns.len() as i64);
         let iid = b.call("iid", &[prior, count]);
         draw(&mut b, "b", iid, &mut parameters, &[]);
     }
@@ -99,10 +107,20 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         .formula
         .intercept
         .then(|| b.self_ref("temp_Intercept"));
-    if !recipe.formula.fixed.is_empty() {
+    if !recipe.design.columns.is_empty() {
         let mut columns = Vec::new();
-        for (i, &mean) in recipe.means.iter().enumerate() {
-            let column = b.self_ref(&format!("x_{}", i + 1));
+        let mut components = std::collections::HashMap::new();
+        for (column, &mean) in recipe.design.columns.iter().zip(&recipe.means) {
+            let mut values = column.components.iter().map(|component| {
+                *components
+                    .entry(component.clone())
+                    .or_insert_with(|| design_component(&mut b, recipe, component))
+            });
+            let first = values.next().expect("a design column has a component");
+            let values: Vec<_> = values.collect();
+            let column = values.into_iter().fold(first, |left, right| {
+                broadcast(&mut b, "mul", &[left, right])
+            });
             columns.push(if recipe.center {
                 let mean = b.lit_real(mean);
                 broadcast(&mut b, "sub", &[column, mean])
@@ -200,6 +218,43 @@ fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
     b.bind(name, external);
 }
 
+fn design_component(b: &mut Builder<'_>, recipe: &Recipe, component: &DesignComponent) -> NodeId {
+    let (predictor, weights, name) = match *component {
+        DesignComponent::Numeric { predictor } => {
+            return b.self_ref(&format!("x_{}", predictor + 1));
+        }
+        DesignComponent::Contrast { predictor, column } => {
+            let factor = recipe.design.predictors[predictor].factor.as_ref().unwrap();
+            (
+                predictor,
+                factor
+                    .matrix
+                    .iter()
+                    .map(|row| row[column])
+                    .collect::<Vec<_>>(),
+                format!("contrast_{}_{}", predictor + 1, column + 1),
+            )
+        }
+        DesignComponent::Indicator { predictor, level } => {
+            let factor = recipe.design.predictors[predictor].factor.as_ref().unwrap();
+            (
+                predictor,
+                (0..factor.levels.len())
+                    .map(|i| if i == level { 1.0 } else { 0.0 })
+                    .collect(),
+                format!("indicator_{}_{}", predictor + 1, level + 1),
+            )
+        }
+    };
+    let weights: Vec<_> = weights.into_iter().map(|value| b.lit_real(value)).collect();
+    let weights = b.array(&weights);
+    let indices = b.self_ref(&format!("x_{}", predictor + 1));
+    let values = b.call("get", &[weights, indices]);
+    let name = b.alloc_name(&name);
+    b.bind(&name, values);
+    b.self_ref(&name)
+}
+
 fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> NodeId {
     let head = b.call_head(name);
     let args: Vec<_> = std::iter::once(head).chain(args.iter().copied()).collect();
@@ -284,7 +339,7 @@ pub(crate) fn inline(mut module: Module, data: &DataDocument) -> Result<Module> 
     Ok(module)
 }
 
-pub(crate) fn info(spec: &Spec, recipe: &Recipe, data: &DataDocument) -> ModelInfo {
+pub(crate) fn info(spec: &Spec, recipe: &Recipe, data: &DataDocument) -> Result<ModelInfo> {
     let mut parameters = Vec::new();
     let mut add = |name: String, binding: &str, index: Option<usize>, derived| {
         parameters.push(Parameter {
@@ -298,8 +353,18 @@ pub(crate) fn info(spec: &Spec, recipe: &Recipe, data: &DataDocument) -> ModelIn
         add("Intercept".into(), "temp_Intercept", None, false);
         add("b_Intercept".into(), "b_Intercept", None, true);
     }
-    for (i, column) in recipe.formula.fixed.iter().enumerate() {
-        add(format!("b_{column}"), "b", Some(i + 1), false);
+    let mut names = std::collections::HashSet::new();
+    if recipe.formula.intercept {
+        names.insert("Intercept".into());
+    }
+    for (i, column) in recipe.design.columns.iter().enumerate() {
+        let name = coefficient_name(&column.name);
+        if !names.insert(name.clone()) {
+            return Err(Error(format!(
+                "design columns have duplicate brms name `{name}`"
+            )));
+        }
+        add(format!("b_{name}"), "b", Some(i + 1), false);
     }
     for (group_index, group) in recipe.groups.iter().enumerate() {
         add(
@@ -329,15 +394,42 @@ pub(crate) fn info(spec: &Spec, recipe: &Recipe, data: &DataDocument) -> ModelIn
         }
     }
     add("sigma".into(), "sigma", None, false);
-    ModelInfo {
+    Ok(ModelInfo {
         formula: spec.formula.clone(),
         family: spec.family.clone(),
         group_collation: "C".into(),
         default_prior_rule: format!("{INTERCEPT_RULE} {SCALE_RULE}"),
-        design_columns: recipe.formula.fixed.clone(),
+        design_columns: recipe
+            .design
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
         parameters,
-        has_improper_prior: !recipe.formula.fixed.is_empty() && recipe.priors.b.is_none(),
+        has_improper_prior: !recipe.design.columns.is_empty() && recipe.priors.b.is_none(),
         training_rows: data.rows.clone(),
         score_offset: 0.0,
+    })
+}
+
+fn coefficient_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        let replacement = match ch {
+            ' ' | '(' | ')' | '[' | ']' | ',' | '"' | '\'' | '?' => "",
+            '+' => "P",
+            '-' => "M",
+            '*' => "MU",
+            '/' => "D",
+            '^' => "E",
+            '=' => "EQ",
+            '$' => "USD",
+            _ => {
+                out.push(ch);
+                continue;
+            }
+        };
+        out.push_str(replacement);
     }
+    out
 }

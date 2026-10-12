@@ -1,9 +1,11 @@
 //! Pure Rust conversion of a bounded brms formula subset into FlatPPL.
 //!
-//! The first slice supports Gaussian identity-link models, additive numeric
-//! predictors and random intercepts. It does not evaluate or fit a model.
+//! The supported subset uses Gaussian identity-link models, numeric and factor
+//! predictors, interactions and random intercepts. It does not fit a model.
 
+mod contrasts;
 mod data;
+mod design;
 mod emit;
 mod formula;
 mod priors;
@@ -13,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, prepare_data};
-pub use formula::{Formula, parse_formula};
+pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
+pub use formula::{Formula, Term, parse_formula};
 pub use priors::{NormalPrior, Prior, Priors};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -58,6 +61,7 @@ fn gaussian() -> String {
 pub struct Options {
     pub center: bool,
     pub data_placement: DataPlacement,
+    pub contrasts: std::collections::BTreeMap<String, Contrast>,
 }
 
 impl Default for Options {
@@ -65,6 +69,7 @@ impl Default for Options {
         Self {
             center: true,
             data_placement: DataPlacement::External,
+            contrasts: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -88,6 +93,7 @@ pub struct Conversion {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recipe {
     pub formula: Formula,
+    pub design: Design,
     pub center: bool,
     pub means: Vec<f64>,
     pub groups: Vec<Group>,
@@ -150,7 +156,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         )));
     }
     let formula = parse_formula(&spec.formula)?;
-    if formula.fixed.contains(&formula.response) {
+    if formula.variables.contains(&formula.response) {
         return Err(Error(
             "the response cannot also be a fixed predictor in this subset".into(),
         ));
@@ -159,11 +165,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
     }
     let rows = data::model_rows(&formula, table, DataMode::Training)?;
-    let means = formula
-        .fixed
-        .iter()
-        .map(|name| table.column(name)?.mean(&rows))
-        .collect::<Result<_>>()?;
+    let (design, means) = design::build(&formula, table, &rows, &spec.options.contrasts)?;
     let response = table.column(&formula.response)?.numeric(&rows)?;
     let priors = priors::resolve(spec, &formula, &response)?;
     let groups = formula
@@ -183,6 +185,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let mut recipe = Recipe {
         center: spec.options.center && formula.intercept,
         formula,
+        design,
         means,
         groups,
         priors,
@@ -197,7 +200,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let text = flatppl_syntax::print(&module);
     let module = flatppl_syntax::parse(&text)
         .map_err(|e| Error(format!("generated module failed to reparse: {e}")))?;
-    let info = emit::info(spec, &recipe, &data);
+    let info = emit::info(spec, &recipe, &data)?;
     Ok(Conversion {
         module,
         data,

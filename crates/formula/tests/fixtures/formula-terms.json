@@ -1,0 +1,246 @@
+{
+  "r_version": "R version 4.6.1 (2026-06-24)",
+  "stats_version": "4.6.1",
+  "locale": "C/C.UTF-8/C.UTF-8/C/C.UTF-8/C.UTF-8",
+  "brms_executed": false,
+  "reconstruction": "Base R execution of the fixed formula reconstructed as brms terms_fe: intercept + surviving ordinary term.labels. brms itself is not installed.",
+  "source": "https://github.com/paul-buerkner/brms/blob/c89c4c05ef52fefb4b78d5fb80df0cf6352f48b4/R/brmsterms.R#L351",
+  "cases": [
+    {
+      "formula": "y ~ 0*(x+1)",
+      "intercept": 1,
+      "variables": [],
+      "terms": []
+    },
+    {
+      "formula": "y ~ 1/(x+0)",
+      "intercept": 0,
+      "variables": [],
+      "terms": []
+    },
+    {
+      "formula": "y ~ x + z - z",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ x * f",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "f"
+      ],
+      "terms": [
+        "x",
+        "f",
+        "x:f"
+      ]
+    },
+    {
+      "formula": "y ~ (x + z):(f + g)",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "f",
+        "g",
+        "z"
+      ],
+      "terms": [
+        "x:f",
+        "x:g",
+        "f:z",
+        "g:z"
+      ]
+    },
+    {
+      "formula": "y ~ f:g + g:f + f:g",
+      "intercept": 1,
+      "variables": [
+        "f",
+        "g"
+      ],
+      "terms": [
+        "f:g"
+      ]
+    },
+    {
+      "formula": "y ~ f:g + g + f",
+      "intercept": 1,
+      "variables": [
+        "g",
+        "f"
+      ],
+      "terms": [
+        "g",
+        "f",
+        "g:f"
+      ]
+    },
+    {
+      "formula": "y ~ (x + z)^2.5",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "z"
+      ],
+      "terms": [
+        "x",
+        "z",
+        "x:z"
+      ]
+    },
+    {
+      "formula": "y ~ (x + z + f)^2 - x:f + x:z - z",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "f",
+        "z"
+      ],
+      "terms": [
+        "x",
+        "f",
+        "x:z",
+        "f:z"
+      ]
+    },
+    {
+      "formula": "y ~ x^2",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ (x + z) / f",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "z",
+        "f"
+      ],
+      "terms": [
+        "x",
+        "z",
+        "x:z:f"
+      ]
+    },
+    {
+      "formula": "y ~ (f + g) %in% (x + z)",
+      "intercept": 1,
+      "variables": [
+        "f",
+        "x",
+        "z",
+        "g"
+      ],
+      "terms": [
+        "f:x:z",
+        "x:z:g"
+      ]
+    },
+    {
+      "formula": "y ~ x + z:w * f",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "f",
+        "z",
+        "w"
+      ],
+      "terms": [
+        "x",
+        "f",
+        "z:w",
+        "f:z:w"
+      ]
+    },
+    {
+      "formula": "y ~ x * f %in% g",
+      "intercept": 1,
+      "variables": [
+        "x",
+        "f",
+        "g"
+      ],
+      "terms": [
+        "x",
+        "f:g",
+        "x:f:g"
+      ]
+    },
+    {
+      "formula": "y ~ x - -z",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ x - -1",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ x + -(z - 1)",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ 0 + x*1",
+      "intercept": 1,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    },
+    {
+      "formula": "y ~ -1 + f",
+      "intercept": 0,
+      "variables": [
+        "f"
+      ],
+      "terms": [
+        "f"
+      ]
+    },
+    {
+      "formula": "y ~ x - (1 - z)",
+      "intercept": 0,
+      "variables": [
+        "x"
+      ],
+      "terms": [
+        "x"
+      ]
+    }
+  ],
+  "errors": [
+    "y ~ (x+z)^1",
+    "y ~ (x+z)^(2)",
+    "y ~ (x+z)^2^2"
+  ]
+}
