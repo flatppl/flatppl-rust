@@ -126,3 +126,21 @@ fn scalar_only_broadcast_preserves_the_scored_draw() {
         emit(&source.replace("locscale.(", "locscale("))
     );
 }
+
+#[test]
+fn normalized_iid_prior_retains_bounds_from_record_input() {
+    let source = "sigma ~ Exponential(2)\n\
+                  b ~ iid(normalize(truncate(Normal(0, 1), interval(0, sigma))), 1)\n\
+                  prior = lawof(record(b = b, sigma = sigma))\n\
+                  p = external(cartprod(b = cartpow(reals, 1), sigma = posreals))\n\
+                  inputs = p\noutputs = logdensityof(prior, p)";
+    assert_eq!(
+        emit(source),
+        emit(&source.replace(
+            "p = external(cartprod(b = cartpow(reals, 1), sigma = posreals))",
+            "q_b = external(cartpow(reals, 1))\n\
+             q_sigma = external(posreals)\n\
+             p = record(b = q_b, sigma = q_sigma)",
+        )),
+    );
+}
