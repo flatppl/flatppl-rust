@@ -2,7 +2,7 @@
 //! FlatPPL.
 //!
 //! A thin `wasm-bindgen` wrapper over the pure library crates (the
-//! `flatppl-hs3` importers + the `flatppl-syntax` printer, and the
+//! `flatppl-hs3` and `flatppl-formula` importers + the `flatppl-syntax` printer, and the
 //! `flatppl-mathdoc` math renderer), built to wasm and consumed in-browser by
 //! the web gallery's "Convert to FlatPPL" command and by the viewer's Math
 //! pane. The logic lives in the libraries; this crate only adapts
@@ -19,10 +19,12 @@
 
 /// Convert a model document to FlatPPL source text.
 ///
-/// `from` selects the importer (`"pyhf"` or `"hs3"`); `to` must be
+/// `from` selects the importer (`"pyhf"`, `"hs3"` or `"formula"`); `to` must be
 /// `"flatppl"` (the only target for now). Returns the rendered FlatPPL text,
 /// or an error message (the importer/printer diagnostic). This is the
 /// plain-Rust core — host-testable, no wasm — that the wasm entry point wraps.
+/// Formula specifications contain typed data and produce an inline snapshot;
+/// use [`import_formula_str`] for external data and a reusable recipe.
 pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> {
     if to != "flatppl" {
         return Err(format!(
@@ -32,13 +34,69 @@ pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> 
     let module = match from {
         "pyhf" => flatppl_hs3::read_pyhf(input).map_err(|e| format!("pyhf import: {e}"))?,
         "hs3" => flatppl_hs3::read_hs3(input).map_err(|e| format!("hs3 import: {e}"))?,
+        "formula" => convert_formula(input, None, flatppl_formula::DataPlacement::Inline)?.module,
         other => {
             return Err(format!(
-                "unsupported source '{other}' (expected 'pyhf' or 'hs3')"
+                "unsupported source '{other}' (expected 'pyhf', 'hs3' or 'formula')"
             ));
         }
     };
     Ok(flatppl_syntax::print(&module))
+}
+
+/// Import a formula as an unbound source template, prepared training constants,
+/// reusable recipe and model metadata. IPC bytes override inline typed data.
+pub fn import_formula_str(input: &str, data_ipc: Option<&[u8]>) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Imported {
+        source: String,
+        data: flatppl_formula::DataDocument,
+        recipe: flatppl_formula::Recipe,
+        info: flatppl_formula::ModelInfo,
+    }
+    let converted = convert_formula(input, data_ipc, flatppl_formula::DataPlacement::External)?;
+    serde_json::to_string(&Imported {
+        source: flatppl_syntax::print(&converted.module),
+        data: converted.data,
+        recipe: converted.recipe,
+        info: converted.info,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Prepare new Arrow rows with a saved recipe. Prediction needs no response;
+/// returned row indices refer to the input table before missing-row omission.
+pub fn prepare_formula_str(recipe: &str, data_ipc: &[u8], mode: &str) -> Result<String, String> {
+    let recipe =
+        serde_json::from_str(recipe).map_err(|error| format!("formula recipe: {error}"))?;
+    let table =
+        flatppl_formula::Table::from_arrow_ipc(data_ipc).map_err(|error| error.to_string())?;
+    let mode = match mode {
+        "prediction" => flatppl_formula::DataMode::Prediction,
+        "training" => flatppl_formula::DataMode::Training,
+        _ => return Err("mode must be prediction or training".into()),
+    };
+    let data =
+        flatppl_formula::prepare_data(&recipe, &table, mode).map_err(|error| error.to_string())?;
+    serde_json::to_string(&data).map_err(|error| error.to_string())
+}
+
+fn convert_formula(
+    input: &str,
+    data_ipc: Option<&[u8]>,
+    placement: flatppl_formula::DataPlacement,
+) -> Result<flatppl_formula::Conversion, String> {
+    let mut spec = flatppl_formula::read(input).map_err(|error| error.to_string())?;
+    spec.options.data_placement = placement;
+    let table = data_ipc
+        .map(flatppl_formula::Table::from_arrow_ipc)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let table = table
+        .as_ref()
+        .or(spec.data.as_ref())
+        .ok_or("formula import needs data in the specification or Arrow IPC bytes")?;
+    flatppl_formula::build(&spec, table).map_err(|error| error.to_string())
 }
 
 /// Render a model as per-binding mathematics (the viewer's Math pane).
@@ -65,8 +123,8 @@ pub fn export_math_str(request: &str) -> Result<String, String> {
     flatppl_mathdoc::json::export_math(request)
 }
 
-/// The wasm/JS boundary. `convert(input, from, to) -> string`,
-/// `render_math(request) -> string` and `export_math(request) -> string`; a
+/// The wasm/JS boundary. Conversion, formula preparation and math functions
+/// return strings carrying the same source/JSON contracts as their Rust cores; a
 /// returned `Err` becomes a JavaScript `Error` object carrying the message.
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -75,6 +133,16 @@ mod wasm {
     #[wasm_bindgen]
     pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
         super::convert_str(input, from, to).map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
+    pub fn import_formula(input: &str, data_ipc: Option<Vec<u8>>) -> Result<String, JsError> {
+        super::import_formula_str(input, data_ipc.as_deref()).map_err(|error| JsError::new(&error))
+    }
+
+    #[wasm_bindgen]
+    pub fn prepare_formula(recipe: &str, data_ipc: &[u8], mode: &str) -> Result<String, JsError> {
+        super::prepare_formula_str(recipe, data_ipc, mode).map_err(|error| JsError::new(&error))
     }
 
     #[wasm_bindgen]

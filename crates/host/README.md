@@ -40,6 +40,16 @@ makes the constraint centres one `pyhf_auxdata` record input. Each measurement's
 settings and channel layout are a `pyhf_measurement_<name>` record. Conversion
 errors use the `pyhf` diagnostic stage.
 
+`Context::import_formula_json(spec, data_ipc, name, source_path)` imports a
+Gaussian formula specification. Optional Arrow IPC bytes supply the table;
+otherwise the specification contains typed data. The returned `FormulaModel`
+retains its bound training module, unbound template, recipe and metadata.
+`model.prepare_arrow(&mut context, bytes, DataMode::Prediction)` returns a new
+module and zero-based retained input row indices. Prediction needs no response
+column and reuses training levels, contrasts, means and priors. Preparing data
+does not change the training snapshot, and requires its original context.
+The typed `import_formula` and `prepare` methods remain available to Rust callers.
+
 ## Batch independent calls
 
 `LoadedModule::compile_batched` accepts a `BatchSpec` from the StableHLO crate.
