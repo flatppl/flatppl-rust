@@ -140,7 +140,7 @@ impl Family {
             Self::Poisson => broadcast(b, "Poisson", &[mu]),
             Self::Negbinomial | Self::Gamma => {
                 let shape = b.self_ref("shape");
-                let rate = broadcast(b, "div", &[shape, mu]);
+                let rate = broadcast(b, "divide", &[shape, mu]);
                 let law = if self == Self::Gamma {
                     "Gamma"
                 } else {
@@ -150,7 +150,7 @@ impl Family {
             }
             Self::Exponential => {
                 let one = b.lit_real(1.0);
-                let rate = broadcast(b, "div", &[one, mu]);
+                let rate = broadcast(b, "divide", &[one, mu]);
                 broadcast(b, "Exponential", &[rate])
             }
         }
@@ -190,7 +190,7 @@ impl Link {
             Self::Probit => broadcast(b, "invprobit", &[eta]),
             Self::Inverse => {
                 let one = b.lit_real(1.0);
-                broadcast(b, "div", &[one, eta])
+                broadcast(b, "divide", &[one, eta])
             }
             Self::Sqrt => broadcast(b, "mul", &[eta, eta]),
             Self::Softplus => softplus(b, eta),
@@ -201,7 +201,7 @@ impl Link {
                 let root = broadcast(b, "sqrt", &[sum]);
                 let sum = broadcast(b, "add", &[eta, root]);
                 let two = b.lit_real(2.0);
-                broadcast(b, "div", &[sum, two])
+                broadcast(b, "divide", &[sum, two])
             }
             Self::ProbitApprox => {
                 let square = broadcast(b, "mul", &[eta, eta]);
@@ -221,7 +221,7 @@ impl Link {
             Self::Cauchit => {
                 let atan = broadcast(b, "atan", &[eta]);
                 let pi = b.call_head("pi");
-                let ratio = broadcast(b, "div", &[atan, pi]);
+                let ratio = broadcast(b, "divide", &[atan, pi]);
                 let half = b.lit_real(0.5);
                 broadcast(b, "add", &[ratio, half])
             }
@@ -229,7 +229,7 @@ impl Link {
                 let value = softplus(b, eta);
                 let one = b.lit_real(1.0);
                 let denominator = broadcast(b, "add", &[one, value]);
-                broadcast(b, "div", &[value, denominator])
+                broadcast(b, "divide", &[value, denominator])
             }
         }
     }

@@ -155,7 +155,7 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
                         return b.lit_real((value - location) / scale);
                     }
                     let shifted = b.call("sub", &[value, location]);
-                    b.call("div", &[shifted, scale])
+                    b.call("divide", &[shifted, scale])
                 };
                 let lo = transform(b, lo);
                 let hi = transform(b, hi);
