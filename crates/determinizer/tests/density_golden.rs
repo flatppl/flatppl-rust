@@ -724,6 +724,27 @@ lp = logdensityof(hn, 1.0)";
     );
 }
 
+#[test]
+fn normalized_student_t_half_lines_use_their_exact_mass() {
+    for (lo, hi, mass, point) in [
+        ("0", "inf", "0.5", "0.5"),
+        ("-inf", "0", "0.5", "-0.5"),
+        ("-inf", "inf", "1.0", "0.5"),
+    ] {
+        let restriction = format!("truncate(StudentT(3), interval({lo}, {hi}))");
+        let actual = determinize_src(&format!(
+            "lp = logdensityof(normalize({restriction}), {point})"
+        ));
+        let expected = determinize_src(&format!(
+            "lp = logdensityof({restriction}, {point}) - log({mass})"
+        ));
+        assert_eq!(
+            pir_binding(&flatppl_flatpir::write(&actual), "lp"),
+            pir_binding(&flatppl_flatpir::write(&expected), "lp")
+        );
+    }
+}
+
 // pushfwd(bijection(exp, log, identity), M): logdensityof → density(M, log(v)) - identity(log(v))
 #[test]
 fn pushfwd_bijection_lowers_to_sub_density_logvol() {
