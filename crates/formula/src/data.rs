@@ -652,6 +652,9 @@ pub(crate) fn response(
             "Gamma, exponential, lognormal and Weibull responses must be strictly positive".into(),
         ));
     }
+    if family == Family::HurdleGamma && column.numeric(rows)?.iter().any(|&value| value < 0.0) {
+        return Err(Error("hurdle responses must be nonnegative".into()));
+    }
     if matches!(family, Family::Beta | Family::ZeroInflatedBeta)
         && column
             .numeric(rows)?

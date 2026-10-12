@@ -308,6 +308,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "negbinomial",
         "geometric",
         "Gamma",
+        "hurdle_gamma",
         "exponential",
         "weibull",
         "beta",
@@ -325,6 +326,8 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.1, 0.4, 0.8, 0.7]
         } else if family == "zero_inflated_beta" {
             vec![0.0, 0.2, 0.8, 0.0]
+        } else if family == "hurdle_gamma" {
+            vec![0.0, 0.8, 2.3, 0.0]
         } else if family == "von_mises" {
             vec![-2.0, -0.4, 0.8, 2.0]
         } else if family.starts_with("zero_inflated_") || family.starts_with("hurdle_") {
@@ -356,7 +359,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
             "zero_inflated_beta" => ", phi = posreals, zi = unitinterval",
             "hurdle_poisson" => ", hu = unitinterval",
-            "hurdle_negbinomial" => ", shape = posreals, hu = unitinterval",
+            "hurdle_negbinomial" | "hurdle_gamma" => ", shape = posreals, hu = unitinterval",
             _ => "",
         };
         let parameter = format!(
