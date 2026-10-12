@@ -3610,25 +3610,25 @@ fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, 
     Ok(build_call(m, "add", &[lw_scored, inner_density]))
 }
 
-/// The declared parameter count of a variate-dependent `weighted`/`logweighted`
+/// The declared parameter names of a variate-dependent `weighted`/`logweighted`
 /// weight, for the §06 "Weight arity" check in [`build_weight_call`]. Mirrors
 /// [`weight_is_variate_dependent`]'s two detection paths (a reified callable's
 /// inferred `Type::Function`/`Type::Kernel`, or an inline `functionof`/`kernelof`
 /// reification whose type inference left `%deferred`), reading the boundary's
 /// `%specinputs` list directly in the second case since the type carries no count.
-fn weight_declared_arity(m: &Module, w_node: NodeId) -> Option<usize> {
+fn weight_declared_inputs(m: &Module, w_node: NodeId) -> Option<Vec<Symbol>> {
     if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(w_node) {
-        return Some(inputs.len());
+        return Some(inputs.to_vec());
     }
     let (resolved, _) = resolve_ref_one(m, w_node);
     if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(resolved)
     {
-        return Some(inputs.len());
+        return Some(inputs.to_vec());
     }
     if let Node::Call(c) = m.node(resolved)
         && let Some(Inputs::Spec(entries)) = &c.inputs
     {
-        return Some(entries.len());
+        return Some(entries.iter().map(|(name, _)| *name).collect());
     }
     None
 }
@@ -3669,9 +3669,25 @@ fn array_len(m: &Module, node: NodeId) -> Option<usize> {
 /// misleading "not a fixed-length array" message, for a case §06 "Weight arity"
 /// was never written to describe.
 fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let Some(k) = weight_declared_arity(m, w_node) else {
+    let Some(inputs) = weight_declared_inputs(m, w_node) else {
         return Ok(build_user_call(m, w_node, v));
     };
+    // §06 passes a unary weight the whole variate. A positional record would
+    // instead auto-splat under §04's ordinary calling convention.
+    if let [name] = inputs.as_slice() {
+        return Ok(m.alloc(Node::Call(Call {
+            head: CallHead::User(w_node),
+            args: Box::new([]),
+            named: vec![NamedArg {
+                kind: NamedKind::Kwarg,
+                name: *name,
+                value: v,
+            }]
+            .into(),
+            inputs: None,
+        })));
+    }
+    let k = inputs.len();
     if k <= 1 {
         return Ok(build_user_call(m, w_node, v));
     }
