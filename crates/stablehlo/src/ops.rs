@@ -211,6 +211,7 @@ pub(crate) fn lower_builtin(
             Ok(e.matrix_determinant(&a, n, head == "logabsdet"))
         }
         "diag" => lower_diag(e, id, args),
+        "diagmat" => lower_diagmat(e, id, args),
         "trace" => lower_trace(e, id, args),
         "self_outer" => lower_self_outer(e, id, args),
         "row_gram" => lower_gram(e, id, args, Gram::Row),
@@ -840,6 +841,31 @@ fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
     square_dim(id, &a.ty, "diag")?;
     require_real_matrix(id, &a, "diag")?;
     Ok(e.diag(&a))
+}
+
+fn lower_diagmat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [arg] = args_exact(id, args)?;
+    let x = e.lower_node(arg)?;
+    let n = match e.cell_ty(&x) {
+        MlirTy::Ranked(dims) if matches!(dims.as_slice(), [Some(_)]) => dims[0].unwrap(),
+        _ => {
+            return Err(EmitError::at(
+                id,
+                "diagmat requires a statically sized vector",
+            ));
+        }
+    };
+    let column = e.reshape_cell(&x, MlirTy::Ranked(vec![Some(n), Some(1)]));
+    let zero = e.int_value_const(0);
+    let zero = e.convert(&zero, x.elem);
+    let zero = e.fill_cell(&zero, MlirTy::Ranked(vec![Some(n), Some(n)]));
+    let (entries, zero) = e.broadcast_pair(&column, &zero);
+    let batch = e.batch_rank(&entries);
+    let rows = e.axis_indices(&entries, batch);
+    let cols = e.axis_indices(&entries, batch + 1);
+    let diagonal = e.compare("EQ", &rows, &cols);
+    // Multiplication by an identity matrix would leak nonfinite entries off-diagonal.
+    Ok(e.select(&diagonal, &entries, &zero))
 }
 
 /// §07 `trace(A)` — $\mathrm{tr}(\mathbf{A})$ over "square matrices", the sum
