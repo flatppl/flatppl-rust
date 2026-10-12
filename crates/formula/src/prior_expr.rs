@@ -355,23 +355,18 @@ fn alias(
             "brms prior alias `{name}` requires {arity} positional arguments"
         )));
     }
-    if matches!(name, "student_t" | "cauchy")
-        && scalar(b.m, args[arity - 1]).is_some_and(|scale| !scale.is_finite() || scale <= 0.0)
-    {
-        return Err(Error(format!(
-            "brms prior `{name}` requires a positive finite scale"
-        )));
-    }
     Ok(Some(match name {
         "student_t" => {
+            let scale = positive_scale(b, args[2], name)?;
             let standard = b.call(target, &args[..1]);
-            b.call("locscale", &[standard, args[1], args[2]])
+            b.call("locscale", &[standard, args[1], scale])
         }
         "cauchy" => {
+            let scale = positive_scale(b, args[1], name)?;
             let zero = b.lit_real(0.0);
             let one = b.lit_real(1.0);
             let standard = b.call(target, &[zero, one]);
-            b.call("locscale", &[standard, args[0], args[1]])
+            b.call("locscale", &[standard, args[0], scale])
         }
         "uniform" => {
             let interval = b.call("interval", args);
@@ -385,6 +380,27 @@ fn alias(
         }
         _ => b.call(target, args),
     }))
+}
+
+fn positive_scale(b: &mut Builder<'_>, scale: NodeId, name: &str) -> Result<NodeId> {
+    if let Some(value) = scalar(b.m, scale) {
+        return if value.is_finite() && value > 0.0 {
+            Ok(scale)
+        } else {
+            Err(Error(format!(
+                "brms prior `{name}` requires a positive finite scale"
+            )))
+        };
+    }
+    // General locscale allows reflections; Stan's scale parameter does not.
+    // Invalid live parameters are undefined, never a reflected proper law.
+    let zero = b.lit_real(0.0);
+    let positive = b.call("gt", &[scale, zero]);
+    let finite = b.call("isfinite", &[scale]);
+    let valid = b.call("land", &[positive, finite]);
+    let negative = b.lit_real(-1.0);
+    let undefined = b.call("log", &[negative]);
+    Ok(b.call("ifelse", &[valid, scale, undefined]))
 }
 
 fn limits(b: &mut Builder<'_>, support: NodeId) -> Result<(NodeId, NodeId, bool)> {
