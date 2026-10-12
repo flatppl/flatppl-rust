@@ -195,7 +195,8 @@ pub(crate) fn resolve(
         group: None,
         dpar: None,
     }));
-    targets.extend(formula.groups.iter().map(|name| PriorTarget {
+    let group_names: Vec<_> = formula.groups.iter().map(|g| g.name()).collect();
+    targets.extend(group_names.iter().map(|name| PriorTarget {
         class: "sd",
         coef: Some("Intercept"),
         group: Some(name),

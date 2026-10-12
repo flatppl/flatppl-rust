@@ -276,7 +276,12 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
     let names = formula
         .predictor_columns()
         .into_iter()
-        .chain(formula.groups.iter().map(String::as_str))
+        .chain(
+            formula
+                .groups
+                .iter()
+                .flat_map(|group| group.columns.iter().map(String::as_str)),
+        )
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
@@ -284,7 +289,12 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
-    for expression in formula.expressions.values().chain(&formula.offsets) {
+    for expression in formula.expressions.values().chain(&formula.offsets).chain(
+        formula
+            .groups
+            .iter()
+            .flat_map(|group| group.expressions.values()),
+    ) {
         let values = expression.values(table, &rows)?;
         rows = rows
             .into_iter()
@@ -325,8 +335,24 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             table.column(&recipe.formula.response)?.data(&rows)?,
         );
     }
-    for group in &recipe.groups {
-        let column = table.column(&group.column)?;
+    for (group, term) in recipe.groups.iter().zip(&recipe.formula.groups) {
+        for (predictor, name) in group.design.predictors.iter().zip(&group.inputs) {
+            if constants.contains_key(name) {
+                continue;
+            }
+            let values = if let Some(expression) = term.expressions.get(&predictor.column) {
+                expression.data(table, &rows)?
+            } else {
+                let column = table.column(&predictor.column)?;
+                match &predictor.factor {
+                    Some(factor) => {
+                        DataValue::Integers(column.factor_codes(&factor.levels, &rows)?)
+                    }
+                    None => column.data(&rows)?,
+                }
+            };
+            constants.insert(name.clone(), values);
+        }
         let levels: HashMap<_, _> = group
             .levels
             .iter()
@@ -336,7 +362,7 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
         let indices = rows
             .iter()
             .map(|&row| {
-                let level = column.level(row)?;
+                let level = group_level(&term.columns, table, row)?;
                 levels.get(&level_key(&level)).copied().ok_or_else(|| {
                     Error(format!(
                         "unseen level {level:?} in group `{}`",
@@ -355,6 +381,7 @@ enum LevelKey<'a> {
     Integer(i64),
     Real(u64),
     Text(&'a str),
+    Interaction(Vec<LevelKey<'a>>),
 }
 
 fn level_key(level: &GroupLevel) -> LevelKey<'_> {
@@ -367,5 +394,48 @@ fn level_key(level: &GroupLevel) -> LevelKey<'_> {
         }
         GroupLevel::Real(value) => LevelKey::Real(value.to_bits()),
         GroupLevel::Text(value) => LevelKey::Text(value),
+        GroupLevel::Interaction(values) => {
+            LevelKey::Interaction(values.iter().map(level_key).collect())
+        }
     }
+}
+
+fn group_level(columns: &[String], table: &Table, row: usize) -> Result<GroupLevel> {
+    if columns.len() == 1 {
+        table.column(&columns[0])?.level(row)
+    } else {
+        columns
+            .iter()
+            .map(|name| table.column(name)?.level(row))
+            .collect::<Result<Vec<_>>>()
+            .map(GroupLevel::Interaction)
+    }
+}
+
+pub(crate) fn group_levels(
+    columns: &[String],
+    table: &Table,
+    rows: &[usize],
+) -> Result<Vec<GroupLevel>> {
+    if columns.len() == 1 {
+        return table.column(&columns[0])?.levels(rows);
+    }
+    let mut levels = rows
+        .iter()
+        .map(|&row| group_level(columns, table, row))
+        .collect::<Result<Vec<_>>>()?;
+    // brms combines observed grouping values into labels before factorizing;
+    // compound labels use C collation, not the input factors' level order.
+    levels.sort_by_key(ToString::to_string);
+    levels.dedup();
+    if levels
+        .windows(2)
+        .any(|pair| pair[0].to_string() == pair[1].to_string())
+    {
+        return Err(Error(format!(
+            "group `{}` has ambiguous combined labels",
+            columns.join(":")
+        )));
+    }
+    Ok(levels)
 }

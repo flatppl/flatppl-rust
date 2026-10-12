@@ -8,7 +8,7 @@ pub struct Formula {
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
-    pub groups: Vec<String>,
+    pub groups: Vec<GroupTerm>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
 }
@@ -18,14 +18,30 @@ pub struct Term {
     pub factors: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GroupTerm {
+    pub columns: Vec<String>,
+    pub intercept: bool,
+    pub variables: Vec<String>,
+    pub fixed: Vec<Term>,
+    pub expressions: BTreeMap<String, ColumnExpression>,
+    pub correlated: bool,
+}
+
+impl GroupTerm {
+    pub fn name(&self) -> String {
+        self.columns.join(":")
+    }
+}
+
 const MAX_DEPTH: usize = 128;
 const MAX_TERMS: usize = 4096;
 
-/// Expand R formula operators over column names and `(1 | group)` intercepts.
+/// Expand R formula operators over column expressions and group effects.
 ///
 /// Fixed terms follow brms's `terms_fe` reconstruction and second `terms` pass:
 /// removed variables disappear, and interactions use the surviving variable order.
-/// Group terms use C collation. Random slopes are unsupported.
+/// Group terms use C collation and preserve separate group-effect blocks.
 pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
@@ -56,11 +72,39 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         .collect();
     for term in terms {
         match &parser.atoms[term[0]] {
-            Atom::Group(group, independent) => groups.push((group.clone(), *independent)),
+            Atom::Groups(terms) => groups.extend(terms.iter().cloned()),
             Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
             Atom::Offset(_) => {}
         }
     }
+    let (variables, fixed, expressions) = fixed_terms(fixed, &parser.atoms);
+    groups.sort_by_key(GroupTerm::name);
+    for (i, group) in groups.iter().enumerate() {
+        if group.intercept
+            && groups[..i]
+                .iter()
+                .any(|previous| previous.columns == group.columns && previous.intercept)
+        {
+            return Err(Error(format!(
+                "duplicated group effect `Intercept` for `{}`",
+                group.name()
+            )));
+        }
+    }
+    Ok(Formula {
+        response,
+        intercept,
+        variables,
+        fixed,
+        groups,
+        expressions,
+        offsets,
+    })
+}
+
+type FixedTerms = (Vec<String>, Vec<Term>, BTreeMap<String, ColumnExpression>);
+
+fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     fixed.sort_by_key(Vec::len);
     let mut order = Vec::new();
     for term in &fixed {
@@ -70,15 +114,15 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             }
         }
     }
-    let variable = |id| match &parser.atoms[id] {
+    let variable = |id| match &atoms[id] {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
-        Atom::Group(..) | Atom::Offset(_) => unreachable!(),
+        Atom::Groups(_) | Atom::Offset(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
         .iter()
-        .filter_map(|&id| match &parser.atoms[id] {
+        .filter_map(|&id| match &atoms[id] {
             Atom::Expression(expression) => Some((expression.to_string(), expression.clone())),
             _ => None,
         })
@@ -92,22 +136,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             }
         })
         .collect();
-    groups.sort();
-    if let Some(pair) = groups.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(Error(format!(
-            "duplicated group-level intercept for `{}`",
-            pair[0].0
-        )));
-    }
-    Ok(Formula {
-        response,
-        intercept,
-        variables,
-        fixed,
-        groups: groups.into_iter().map(|(group, _)| group).collect(),
-        expressions,
-        offsets,
-    })
+    (variables, fixed, expressions)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -213,7 +242,7 @@ enum Atom {
     Variable(String),
     Expression(ColumnExpression),
     Offset(ColumnExpression),
-    Group(String, bool),
+    Groups(Vec<GroupTerm>),
 }
 
 struct Expr {
@@ -307,18 +336,45 @@ impl<'a> Parser<'a> {
             Token::Left => {
                 let child = self.expression(0, depth + 1)?;
                 let inner = if let Token::Bar(independent) = self.peek() {
-                    if !matches!(child.kind, ExprKind::Number(1.0)) {
-                        return Err(Error(
-                            "only `(1 | group)` random intercepts are supported".into(),
-                        ));
+                    self.at += 1;
+                    let grouping = self.expression(0, depth + 1)?;
+                    let mut group_order = Vec::new();
+                    grouping_columns(&grouping, &self.atoms, &mut group_order)?;
+                    group_effect_terms(&child, &self.atoms)?;
+                    let mut intercept = true;
+                    let fixed = expand(&child, &self.atoms, &mut intercept, true)?;
+                    reject_group_interaction(&fixed, &self.atoms)?;
+                    let (variables, fixed, expressions) = fixed_terms(fixed, &self.atoms);
+                    let mut unused_intercept = false;
+                    let columns = expand(&grouping, &self.atoms, &mut unused_intercept, true)?;
+                    if columns.is_empty() {
+                        return Err(Error("group effects require a grouping column".into()));
                     }
-                    self.at += 1;
-                    let Token::Name(group) = self.peek() else {
-                        return Err(Error("expected a plain grouping column".into()));
-                    };
-                    let group = name(group)?;
-                    self.at += 1;
-                    self.atom(Atom::Group(group, independent))?
+                    let groups = columns
+                        .into_iter()
+                        .map(|mut term| {
+                            term.sort_by_key(|id| group_order.iter().position(|v| v == id));
+                            let columns = term
+                                .into_iter()
+                                .map(|id| match &self.atoms[id] {
+                                    Atom::Variable(name) => Ok(name.clone()),
+                                    _ => Err(Error(
+                                        "grouping factors must be columns or their interactions"
+                                            .into(),
+                                    )),
+                                })
+                                .collect::<Result<_>>()?;
+                            Ok(GroupTerm {
+                                columns,
+                                intercept,
+                                variables: variables.clone(),
+                                fixed: fixed.clone(),
+                                expressions: expressions.clone(),
+                                correlated: !independent,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    self.atom(Atom::Groups(groups))?
                 } else {
                     Expr::new(ExprKind::Parentheses(Box::new(child)))?
                 };
@@ -435,13 +491,48 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms
         .iter()
         .flatten()
-        .any(|&id| matches!(atoms[id], Atom::Group(..) | Atom::Offset(_)))
+        .any(|&id| matches!(atoms[id], Atom::Groups(_) | Atom::Offset(_)))
     {
         return Err(Error(
             "group terms and offsets may only be added or removed".into(),
         ));
     }
     Ok(())
+}
+
+fn grouping_columns(expr: &Expr, atoms: &[Atom], order: &mut Vec<usize>) -> Result<()> {
+    match &expr.kind {
+        ExprKind::Atom(id) if matches!(atoms[*id], Atom::Variable(_)) => {
+            if !order.contains(id) {
+                order.push(*id);
+            }
+            Ok(())
+        }
+        ExprKind::Parentheses(child) => grouping_columns(child, atoms, order),
+        ExprKind::Binary(Op::Interact | Op::Nest, left, right) => {
+            grouping_columns(left, atoms, order)?;
+            grouping_columns(right, atoms, order)
+        }
+        _ => Err(Error(
+            "grouping factors support columns, `:` and `/`".into(),
+        )),
+    }
+}
+
+fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
+    match &expr.kind {
+        ExprKind::Atom(id) if matches!(atoms[*id], Atom::Groups(_) | Atom::Offset(_)) => Err(
+            Error("group effects cannot contain nested group terms or offsets".into()),
+        ),
+        ExprKind::Parentheses(child) | ExprKind::Unary(_, child) => {
+            group_effect_terms(child, atoms)
+        }
+        ExprKind::Binary(_, left, right) => {
+            group_effect_terms(left, atoms)?;
+            group_effect_terms(right, atoms)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
@@ -489,11 +580,17 @@ fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
 impl Formula {
     pub(crate) fn predictor_columns(&self) -> Vec<&str> {
         let mut names = Vec::new();
-        for name in &self.variables {
-            if let Some(expression) = self.expressions.get(name) {
-                expression.columns(&mut names);
-            } else if !names.contains(&name.as_str()) {
-                names.push(name);
+        for (variables, expressions) in std::iter::once((&self.variables, &self.expressions)).chain(
+            self.groups
+                .iter()
+                .map(|group| (&group.variables, &group.expressions)),
+        ) {
+            for name in variables {
+                if let Some(expression) = expressions.get(name) {
+                    expression.columns(&mut names);
+                } else if !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
             }
         }
         for expression in &self.offsets {

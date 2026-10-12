@@ -132,7 +132,16 @@ fn factor_group_order_and_specific_priors_survive_name_collisions() {
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     // brms orders grouping terms by group name, not formula occurrence order.
     // Under the pinned C collation, g.a precedes g_a.
-    assert_eq!(converted.recipe.formula.groups, ["g.a", "g_a"]);
+    assert_eq!(
+        converted
+            .recipe
+            .formula
+            .groups
+            .iter()
+            .map(|g| g.name())
+            .collect::<Vec<_>>(),
+        ["g.a", "g_a"]
+    );
     let first_latent = converted
         .info
         .parameters
