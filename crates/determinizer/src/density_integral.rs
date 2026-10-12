@@ -397,8 +397,8 @@ fn even_student_t_cdf(m: &mut Module, nu: usize, x: NodeId) -> NodeId {
     let complement = build_call(m, "sub", &[one, tail]);
     let cdf = build_call(m, "ifelse", &[negative, tail, complement]);
     let positive = build_call(m, "gt", &[x, zero]);
-    let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
-    let nonfinite = build_call(m, "ifelse", &[positive, one, nan]);
+    // A nonfinite input with neither sign is already NaN; propagate it.
+    let nonfinite = build_call(m, "ifelse", &[positive, one, x]);
     let nonfinite = build_call(m, "ifelse", &[negative, zero, nonfinite]);
     build_call(m, "ifelse", &[finite, cdf, nonfinite])
 }
