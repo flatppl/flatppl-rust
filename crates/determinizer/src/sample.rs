@@ -1000,6 +1000,13 @@ fn lower_iid_sample(
     if let Some(body) = crate::kernel::reduce_kernel_application(m, kernel) {
         return lower_iid_sample(m, body, iid_node, rng, sample_name);
     }
+    if m.type_of(iid_node).is_none()
+        && let Some(ty) = flatppl_infer::infer_expression(m, iid_node, &[])
+            .0
+            .remove(&iid_node)
+    {
+        m.set_type(iid_node, ty);
+    }
     let shape = iid_static_shape(m, iid_node).ok_or_else(|| {
         refuse(
             iid_node,
