@@ -16,7 +16,7 @@ The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma` or `exponential`. `link` is optional:
+`negbinomial`, `geometric`, `Gamma`, `exponential` or `weibull`. `link` is optional:
 
 | Family | Default link | Other links |
 | --- | --- | --- |
@@ -24,17 +24,19 @@ Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `po
 | Lognormal | identity | inverse |
 | Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
 | Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
-| Gamma, exponential | log | identity, inverse, softplus, squareplus |
+| Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
 the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
 Geometric models count failures before the first success and use
 `NegativeBinomial(1, 1 / mu)`, so `mu` is the expected count.
+Weibull models use a direct `shape` and mean `mu`, with scale
+`mu / gamma(1 + 1 / shape)` and a Gamma(0.01, 0.01) shape prior.
 Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
 integer or a numeric column of counts. Trials remain required for prediction.
 Counts must be nonnegative integers, and binomial responses cannot exceed
-their trials. Gamma, exponential and lognormal responses must be strictly positive.
+their trials. Gamma, exponential, lognormal and Weibull responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
 

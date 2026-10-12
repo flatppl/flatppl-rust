@@ -18,6 +18,7 @@ pub enum Family {
     #[serde(rename = "Gamma")]
     Gamma,
     Exponential,
+    Weibull,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -51,6 +52,7 @@ impl Family {
             "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
             "exponential" => Self::Exponential,
+            "weibull" => Self::Weibull,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
@@ -78,7 +80,7 @@ impl Family {
             Self::Poisson | Self::Negbinomial | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
-            Self::Gamma | Self::Exponential => {
+            Self::Gamma | Self::Exponential | Self::Weibull => {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
         };
@@ -102,7 +104,7 @@ impl Family {
         match self {
             Self::Gaussian | Self::Lognormal => &["sigma"],
             Self::Student => &["sigma", "nu"],
-            Self::Gamma | Self::Negbinomial => &["shape"],
+            Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             _ => &[],
         }
     }
@@ -174,6 +176,15 @@ impl Family {
                 let one = b.lit_real(1.0);
                 let rate = broadcast(b, "divide", &[one, mu]);
                 broadcast(b, "Exponential", &[rate])
+            }
+            Self::Weibull => {
+                let shape = b.self_ref("shape");
+                let one = b.lit_real(1.0);
+                let inverse = b.call("divide", &[one, shape]);
+                let argument = b.call("add", &[one, inverse]);
+                let gamma = b.call("gamma", &[argument]);
+                let scale = broadcast(b, "divide", &[mu, gamma]);
+                broadcast(b, "Weibull", &[shape, scale])
             }
         }
     }

@@ -529,11 +529,11 @@ pub(crate) fn response(
     }
     if matches!(
         family,
-        Family::Gamma | Family::Exponential | Family::Lognormal
+        Family::Gamma | Family::Exponential | Family::Lognormal | Family::Weibull
     ) && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
     {
         return Err(Error(
-            "Gamma, exponential and lognormal responses must be strictly positive".into(),
+            "Gamma, exponential, lognormal and Weibull responses must be strictly positive".into(),
         ));
     }
     column.data(rows)

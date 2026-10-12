@@ -172,6 +172,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "geometric",
         "Gamma",
         "exponential",
+        "weibull",
     ] {
         let formula = if family == "binomial" {
             "y | trials(n) ~ x"
@@ -200,7 +201,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         let auxiliaries = match family {
             "gaussian" | "lognormal" => ", sigma = posreals",
             "student" => ", sigma = posreals, nu = interval(1, inf)",
-            "Gamma" | "negbinomial" => ", shape = posreals",
+            "Gamma" | "negbinomial" | "weibull" => ", shape = posreals",
             _ => "",
         };
         let parameter = format!(
