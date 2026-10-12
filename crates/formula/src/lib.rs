@@ -254,9 +254,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "`se(...)` is available for Gaussian and Student families".into(),
         ));
     }
-    if (family == Family::Binomial) != formula.trials.is_some() {
+    if family.uses_trials() != formula.trials.is_some() {
         return Err(Error(
-            "`trials(...)` is required for binomial and is unavailable for other families".into(),
+            "`trials(...)` is required for binomial families and is unavailable for other families"
+                .into(),
         ));
     }
     if formula

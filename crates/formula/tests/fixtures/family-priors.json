@@ -5,6 +5,11 @@
   "formula": "y ~ x + (1 | g)",
   "cases": [
     {
+      "family": "zero_inflated_binomial", "link": "logit", "formula": "y | trials(8) ~ x + (1 | g)",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": 0.0, "scale": 2.5
+    },
+    {
       "family": "zero_inflated_negbinomial", "link": "log",
       "response": {"kind": "int", "values": [0, 2, 4, 0]},
       "intercept_location": -0.8, "scale": 2.5

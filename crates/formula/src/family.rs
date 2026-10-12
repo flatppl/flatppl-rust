@@ -12,6 +12,8 @@ pub enum Family {
     Lognormal,
     Bernoulli,
     Binomial,
+    #[serde(rename = "zero_inflated_binomial")]
+    ZeroInflatedBinomial,
     Poisson,
     #[serde(rename = "zero_inflated_poisson")]
     ZeroInflatedPoisson,
@@ -56,6 +58,7 @@ impl Family {
             "lognormal" => Self::Lognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
+            "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
             "poisson" => Self::Poisson,
             "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
@@ -71,7 +74,11 @@ impl Family {
         };
         let default = match family {
             Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
-            Self::Bernoulli | Self::Binomial | Self::Beta | Self::Cumulative => Link::Logit,
+            Self::Bernoulli
+            | Self::Binomial
+            | Self::ZeroInflatedBinomial
+            | Self::Beta
+            | Self::Cumulative => Link::Logit,
             Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
@@ -86,7 +93,7 @@ impl Family {
         let supported = match family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf),
             Self::Lognormal => matches!(link, Identity | Inverse),
-            Self::Bernoulli | Self::Binomial | Self::Beta => {
+            Self::Bernoulli | Self::Binomial | Self::ZeroInflatedBinomial | Self::Beta => {
                 matches!(
                     link,
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
@@ -119,6 +126,7 @@ impl Family {
             self,
             Self::Bernoulli
                 | Self::Binomial
+                | Self::ZeroInflatedBinomial
                 | Self::Poisson
                 | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
@@ -128,6 +136,10 @@ impl Family {
         )
     }
 
+    pub(crate) fn uses_trials(self) -> bool {
+        matches!(self, Self::Binomial | Self::ZeroInflatedBinomial)
+    }
+
     pub(crate) fn auxiliaries(self) -> &'static [&'static str] {
         match self {
             Self::Gaussian | Self::Lognormal => &["sigma"],
@@ -135,7 +147,7 @@ impl Family {
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
             Self::VonMises => &["kappa"],
-            Self::ZeroInflatedPoisson => &["zi"],
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
             _ => &[],
         }
@@ -174,7 +186,7 @@ impl Family {
     ) -> NodeId {
         if matches!(
             self,
-            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial | Self::ZeroInflatedBinomial
         ) && !scalar
         {
             let local = Ref {
@@ -182,19 +194,30 @@ impl Family {
                 name: b.sym("_mu_"),
             };
             let mean = b.m.alloc(Node::Ref(local));
+            let mut inputs = vec![(b.sym("mu"), local)];
+            let mut args = vec![mu];
+            let trials = trials.map(|value| {
+                let local = Ref {
+                    ns: RefNs::Local,
+                    name: b.sym("_trials_"),
+                };
+                inputs.push((b.sym("trials"), local));
+                args.push(value);
+                b.m.alloc(Node::Ref(local))
+            });
             let law = self.observation(b, mean, trials, scale, thresholds, true);
-            let input = b.sym("mu");
             let head = b.sym("functionof");
             let kernel = b.m.alloc(Node::Call(Call {
                 head: CallHead::Builtin(head),
                 args: vec![law].into(),
                 named: Box::default(),
-                inputs: Some(Inputs::Spec(vec![(input, local)].into())),
+                inputs: Some(Inputs::Spec(inputs.into())),
             }));
             let name = b.alloc_name("response_law");
             b.bind(&name, kernel);
             let kernel = b.self_ref(&name);
-            return b.call("broadcast", &[kernel, mu]);
+            args.insert(0, kernel);
+            return b.call("broadcast", &args);
         }
         let apply = |b: &mut Builder<'_>, name, args: &[NodeId]| {
             if scalar {
@@ -225,11 +248,13 @@ impl Family {
                 apply(b, "Binomial", &[n, mu])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
-            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial => {
-                let base = if self == Self::ZeroInflatedPoisson {
-                    Self::Poisson
-                } else {
-                    Self::Negbinomial
+            Self::ZeroInflatedPoisson
+            | Self::ZeroInflatedNegbinomial
+            | Self::ZeroInflatedBinomial => {
+                let base = match self {
+                    Self::ZeroInflatedPoisson => Self::Poisson,
+                    Self::ZeroInflatedNegbinomial => Self::Negbinomial,
+                    _ => Self::Binomial,
                 };
                 let base = base.observation(b, mu, trials, scale, thresholds, true);
                 let zi = b.self_ref("zi");

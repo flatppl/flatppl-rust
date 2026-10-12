@@ -197,6 +197,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "lognormal",
         "bernoulli",
         "binomial",
+        "zero_inflated_binomial",
         "poisson",
         "zero_inflated_poisson",
         "zero_inflated_negbinomial",
@@ -208,7 +209,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "beta",
         "von_mises",
     ] {
-        let formula = if family == "binomial" {
+        let formula = if matches!(family, "binomial" | "zero_inflated_binomial") {
             "y | trials(n) ~ x"
         } else {
             "y ~ x"
@@ -244,7 +245,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "Gamma" | "negbinomial" | "weibull" => ", shape = posreals",
             "beta" => ", phi = posreals",
             "von_mises" => ", kappa = posreals",
-            "zero_inflated_poisson" => ", zi = unitinterval",
+            "zero_inflated_poisson" | "zero_inflated_binomial" => ", zi = unitinterval",
             "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
             _ => "",
         };

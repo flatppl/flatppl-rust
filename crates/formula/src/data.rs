@@ -575,7 +575,7 @@ pub(crate) fn response(
     }
     if family.discrete() {
         let values = column.counts(rows)?;
-        if family == Family::Binomial {
+        if family.uses_trials() {
             let trials = match formula
                 .trials
                 .as_ref()
