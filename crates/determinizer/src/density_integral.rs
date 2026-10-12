@@ -258,14 +258,34 @@ pub(crate) fn lower_interval_mass(
         ));
     };
     let (base, lo, hi) = (*base, *lo, *hi);
+    // lower_normalize admits only normalized scalar continuous bases here.
+    if let Some((support_lo, support_hi)) = bounds(m, base)
+        && let (Some(lo), Some(hi), Some(support_lo), Some(support_hi)) = (
+            static_real(m, lo),
+            static_real(m, hi),
+            static_real(m, support_lo),
+            static_real(m, support_hi),
+        )
+        && lo <= support_lo
+        && hi >= support_hi
+    {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
     let (kernel, input) = kernel_and_input(m, base)?;
     let Node::Const(ctor) = m.node(kernel) else {
         unreachable!("kernel_and_input returns a constructor tag");
     };
+    let ctor = *ctor;
+    if m.resolve(ctor) == "Gamma"
+        && static_real(m, hi) == Some(f64::INFINITY)
+        && let Some(log_mass) = erlang_log_survival(m, input, lo)
+    {
+        return Ok(log_mass);
+    }
     if options.numerical_integrals
         && options
             .supports_cdf
-            .is_some_and(|supports| !supports(m.resolve(*ctor)))
+            .is_some_and(|supports| !supports(m.resolve(ctor)))
     {
         let (base_lo, base_hi) = bounds(m, base).ok_or_else(|| {
             refuse(
@@ -292,6 +312,46 @@ pub(crate) fn lower_interval_mass(
     let cdf_lo = build_touniform(m, kernel, input, lo);
     let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
     Ok(build_call(m, "log", &[z]))
+}
+
+/// Integer-shape Gamma survival: exp(-z) * sum(z^j/j!), z = rate*x.
+/// DLMF 8.4.10–11. Keep the mass in log space, including far-tail truncation.
+fn erlang_log_survival(m: &mut Module, input: NodeId, x: NodeId) -> Option<NodeId> {
+    let shape = static_real(m, find_field(m, input, "shape")?)?;
+    // Bound source-driven graph expansion. Other shapes retain the CDF path.
+    if !(1.0..=128.0).contains(&shape) || shape.fract() != 0.0 {
+        return None;
+    }
+    let rate = find_field(m, input, "rate")?;
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let positive = build_call(m, "gt", &[x, zero]);
+    let finite = build_call(m, "isfinite", &[x]);
+    let interior = build_call(m, "land", &[positive, finite]);
+    let safe_x = build_call(m, "ifelse", &[interior, x, one]);
+    let z = build_call(m, "mul", &[rate, safe_x]);
+    let log_polynomial = if shape == 1.0 {
+        zero
+    } else if shape == 2.0 {
+        build_call(m, "log1p", &[z])
+    } else {
+        let log_z = build_call(m, "log", &[z]);
+        let mut terms = vec![zero];
+        let mut log_factorial = 0.0;
+        for j in 1..shape as usize {
+            log_factorial += (j as f64).ln();
+            let power = m.alloc(Node::Lit(Scalar::Real(j as f64)));
+            let constant = m.alloc(Node::Lit(Scalar::Real(log_factorial)));
+            let power = build_call(m, "mul", &[power, log_z]);
+            terms.push(build_call(m, "sub", &[power, constant]));
+        }
+        let terms = build_call(m, "vector", &terms);
+        build_call(m, "logsumexp", &[terms])
+    };
+    let log_mass = build_call(m, "sub", &[log_polynomial, z]);
+    let neg_inf = m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)));
+    let positive_mass = build_call(m, "ifelse", &[finite, log_mass, neg_inf]);
+    Some(build_call(m, "ifelse", &[positive, positive_mass, zero]))
 }
 
 /// A conservative scalar support interval. Preserve dynamic interval endpoints.
