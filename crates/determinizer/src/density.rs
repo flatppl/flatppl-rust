@@ -7156,6 +7156,12 @@ fn lower_broadcast_kernel(
         return lower_measure_density_at(m, call, obs, origin);
     }
 
+    if let Node::Const(op) = *m.node(head)
+        && m.resolve(op) == "locscale"
+    {
+        return broadcast::call_density(m, CallHead::Builtin(op), &pos_args, &kw_args, obs);
+    }
+
     // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
     // one: a bare built-in `Node::Const(sym)` (`broadcast(Poisson, …)`), or a
     // standard-module member `Node::Ref { ns: Module(_), name }`
