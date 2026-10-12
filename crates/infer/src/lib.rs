@@ -210,7 +210,26 @@ pub fn infer_expression(
 ) -> (HashMap<NodeId, Type>, Vec<Diagnostic>) {
     let bundle = ModuleBundle::new();
     let session = InferSession::new(&bundle);
-    trace::Inferencer::new(module, Level::Shape, &session).run_expression(root, inputs)
+    let (types, _, diagnostics) =
+        trace::Inferencer::new(module, Level::Shape, &session).run_expression(root, inputs);
+    (types, diagnostics)
+}
+
+/// Infer one expression's type and support without replacing module annotations.
+/// Used when callable substitution rebuilt a measure whose density needs a safe
+/// point inside its support. Failed inference does not provide such a proof.
+pub fn infer_expression_support(
+    module: &mut Module,
+    root: NodeId,
+) -> Option<(Type, flatppl_core::ValueSet)> {
+    let bundle = ModuleBundle::new();
+    let session = InferSession::new(&bundle);
+    let (mut types, support, diagnostics) =
+        trace::Inferencer::new(module, Level::Shape, &session).run_expression(root, &[]);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    Some((types.remove(&root)?, support))
 }
 
 /// Like [`infer_module`], retaining automatic callable inputs for later lowering.
