@@ -150,6 +150,18 @@ pub(super) fn kernel_density(
         };
         bound.push((name, value));
     }
+    call_density(m, CallHead::User(head), &[], &bound, values)
+}
+
+/// Composed measures use the same per-cell lowering as reified kernels. Measure
+/// operands stay invariant even when their variates are arrays.
+pub(super) fn call_density(
+    m: &mut Module,
+    head: CallHead,
+    positional: &[NodeId],
+    named: &[(Symbol, NodeId)],
+    values: NodeId,
+) -> Result<NodeId, RefuseError> {
     let mut inputs = Vec::new();
     let mut args = Vec::new();
     let mut bind = |m: &mut Module, value| {
@@ -161,7 +173,11 @@ pub(super) fn kernel_density(
             _ => Ok(value),
         }
     };
-    let named = bound
+    let positional = positional
+        .iter()
+        .map(|&value| bind(m, value))
+        .collect::<Result<Vec<_>, RefuseError>>()?;
+    let named = named
         .iter()
         .map(|&(name, value)| {
             Ok(NamedArg {
@@ -172,8 +188,8 @@ pub(super) fn kernel_density(
         })
         .collect::<Result<Vec<_>, RefuseError>>()?;
     let measure = m.alloc(Node::Call(Call {
-        head: CallHead::User(head),
-        args: vec![].into(),
+        head,
+        args: positional.into(),
         named: named.into(),
         inputs: None,
     }));
