@@ -16,6 +16,8 @@ use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
+mod bessel;
+
 /// Cap source-driven emit-time expansion before allocating or generating IR.
 const MAX_STATIC_UNROLL: u64 = 4096;
 
@@ -1790,7 +1792,7 @@ fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
 }
 
 /// §08 VonMises, verbatim: `log f = kappa * cos(x - mu) - log(2 * pi) -
-/// log(I_0(kappa))`. `log(I_0(kappa))` is [`log_bessel_i0`]'s inlined A&S
+/// log(I_0(kappa))`. `log(I_0(kappa))` is [`log_bessel_i0`]'s inlined
 /// approximation (no `chlo.bessel_i0e` op exists — see the batch doc
 /// comment). No `@sample` builder yet (`sample: None`) — needs rejection
 /// sampling (e.g. Best & Fisher's algorithm); a later task lands its sampler.
@@ -1818,26 +1820,27 @@ fn von_mises_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     })
 }
 
-/// `log I_0(kappa)` via the Abramowitz & Stegun 9.8.1 (small-`kappa`) /
-/// 9.8.2 (large-`kappa`) rational approximations, branching on `kappa <
-/// 3.75` with [`Emitter::select`] — `chlo.bessel_i0e` is not a real CHLO op
-/// (no pretty or generic form parses against the real StableHLO+CHLO
-/// parser), so this inlines the polynomial rather than emitting a
-/// nonexistent op. `select` unconditionally evaluates both operands (it is
-/// not a lazy `ifelse`), so both branches are always computed here — safe:
-/// `kappa` is `posreals` (spec §08), so `log(kappa)` in the large branch
-/// never sees a non-positive input. Accurate to ~1e-7 (A&S's own stated
-/// bound for both approximations), not machine epsilon — a deliberate,
-/// documented trade-off of inlining a closed-form rational approximation for
-/// a special function with no native op, verified against `scipy.stats.
-/// vonmises.logpdf` (Task 10 report).
+/// Double precision uses Cephes' scaled expansion; float32 retains the shorter
+/// Abramowitz & Stegun 9.8.1/9.8.2 polynomials (accuracy about 1e-7).
+/// CHLO has no `bessel_i0e` operation, so both paths emit ordinary arithmetic.
 fn log_bessel_i0(e: &mut Emitter, kappa: &Value) -> Value {
+    if matches!(e.dtype(), crate::Dtype::F64) {
+        return bessel::log_i0(e, kappa);
+    }
     let threshold = e.scalar(3.75);
     let is_small = e.compare("LT", kappa, &threshold);
+    // Inactive operands still execute and participate in AD. In particular,
+    // the large expansion must never divide by zero at the uniform limit.
+    // Distinct interior values prevent simplification to min/max, whose tie
+    // derivative would change the selected branch at the approximation split.
+    let small_safe = e.scalar(1.0);
+    let large_safe = e.scalar(8.0);
+    let small_kappa = e.select(&is_small, kappa, &small_safe);
+    let large_kappa = e.select(&is_small, &large_safe, kappa);
 
     // Small branch (A&S 9.8.1): t = (kappa / 3.75)^2, I_0 ~= a degree-6
     // polynomial in t (Horner form), then log.
-    let ratio = e.div(kappa, &threshold);
+    let ratio = e.div(&small_kappa, &threshold);
     let t_small = e.mul(&ratio, &ratio);
     let i0_small = horner(
         e,
@@ -1850,7 +1853,7 @@ fn log_bessel_i0(e: &mut Emitter, kappa: &Value) -> Value {
 
     // Large branch (A&S 9.8.2): t = 3.75 / kappa, log I_0 = kappa -
     // 1/2 * log(kappa) + log(a degree-8 polynomial in t, Horner form).
-    let t_large = e.div(&threshold, kappa);
+    let t_large = e.div(&threshold, &large_kappa);
     let poly_large = horner(
         e,
         &t_large,
@@ -1867,7 +1870,7 @@ fn log_bessel_i0(e: &mut Emitter, kappa: &Value) -> Value {
         ],
     );
     let log_poly_large = e.log(&poly_large);
-    let log_kappa = e.log(kappa);
+    let log_kappa = e.log(&large_kappa);
     let half = e.scalar(0.5);
     let half_log_kappa = e.mul(&half, &log_kappa);
     let neg_half_log_kappa = e.neg(&half_log_kappa);
