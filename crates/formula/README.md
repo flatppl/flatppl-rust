@@ -173,6 +173,11 @@ contrasts. Set `options.contrasts` per column, for example
 an optional `ordered` flag. Training drops unused factor levels and preserves
 the remaining order. Logical predictors use the levels `FALSE`, `TRUE`.
 No-intercept formulas use R's cell coding, including full columns for `0 + f`.
+Use `0 + Intercept + x` for an ordinary, uncentred intercept coefficient.
+Its prior has class `b`, optionally `coef = "Intercept"`, and defaults to
+`Flat()`. The reserved column is generated as ones for training and prediction;
+any supplied `Intercept` column must contain only ones. As in brms, this form
+keeps contrast coding for population-level factors (`0 + Intercept + f`).
 Polynomial contrasts support at most 16 observed levels. Higher-degree R
 contrasts become sensitive to QR rank decisions and rounding; use treatment,
 sum or Helmert contrasts for larger factors.

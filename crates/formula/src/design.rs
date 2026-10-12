@@ -53,7 +53,13 @@ pub(crate) struct TermView<'a> {
 impl<'a> From<&'a Formula> for TermView<'a> {
     fn from(formula: &'a Formula) -> Self {
         Self {
-            intercept: formula.intercept,
+            // brms keeps contrast coding for population effects with its
+            // reserved Intercept column, without centring that coefficient.
+            intercept: formula.intercept
+                || formula
+                    .expressions
+                    .values()
+                    .any(ColumnExpression::uses_intercept),
             variables: &formula.variables,
             fixed: &formula.fixed,
             expressions: &formula.expressions,

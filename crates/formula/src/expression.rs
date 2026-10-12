@@ -7,6 +7,7 @@ use std::fmt;
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ColumnExpression {
     Column(String),
+    Intercept,
     Number(f64),
     Identity(Box<Self>),
     Log(Box<Self>),
@@ -34,7 +35,7 @@ impl ColumnExpression {
                     out.push(name);
                 }
             }
-            Self::Number(_) => {}
+            Self::Number(_) | Self::Intercept => {}
             Self::Identity(x)
             | Self::Log(x)
             | Self::Positive(x)
@@ -49,9 +50,23 @@ impl ColumnExpression {
         }
     }
 
+    pub(crate) fn uses_intercept(&self) -> bool {
+        match self {
+            Self::Intercept => true,
+            Self::Column(_) | Self::Number(_) => false,
+            Self::Identity(x)
+            | Self::Log(x)
+            | Self::Positive(x)
+            | Self::Negate(x)
+            | Self::Parentheses(x) => x.uses_intercept(),
+            Self::Binary(_, x, y) => x.uses_intercept() || y.uses_intercept(),
+        }
+    }
+
     pub(crate) fn values(&self, table: &Table, rows: &[usize]) -> Result<Vec<f64>> {
         let values = match self {
             Self::Column(name) => table.column(name)?.numeric(rows)?,
+            Self::Intercept => vec![1.0; rows.len()],
             Self::Number(value) => vec![*value; rows.len()],
             Self::Identity(x) | Self::Positive(x) | Self::Parentheses(x) => {
                 x.values(table, rows)?
@@ -106,6 +121,7 @@ impl fmt::Display for ColumnExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Column(name) => f.write_str(name),
+            Self::Intercept => f.write_str("Intercept"),
             Self::Number(value) => write!(f, "{value}"),
             Self::Identity(x) => write!(f, "I({x})"),
             Self::Log(x) => write!(f, "log({x})"),
