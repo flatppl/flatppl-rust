@@ -45,7 +45,7 @@ fmtlint = ["dep:flatppl-lint"]
 # `infer` too: before lowering it assembles the cross-module bundle (resolve
 # `load_module` refs from the cache) and runs the type/shape trace so a
 # mistyped model refuses loudly instead of being lowered blind.
-determinize = ["dep:flatppl-determinizer", "infer"]
+determinize = ["dep:flatppl-determinizer", "dep:flatppl-host", "infer"]
 # `mathdoc` renders a model as mathematics: `convert model.flatppl model.html`.
 # It needs `infer` for the typed module (index ranges, kernel inputs) and the
 # cross-module bundle, like the other verbs that read a model's meaning.
@@ -53,7 +53,7 @@ mathdoc = ["dep:flatppl-mathdoc", "infer"]
 # `stablehlo` prints textual StableHLO from post-`determinize` FlatPDL; it
 # always determinizes first, so it pulls in the determiniser and (like
 # `determinize`) `infer` for cross-module bundle assembly too.
-stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "infer"]
+stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "dep:flatppl-host", "infer"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
@@ -65,6 +65,7 @@ flatppl-formula = { path = "../formula", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
 flatppl-determinizer = { path = "../determinizer", optional = true }
 flatppl-stablehlo = { path = "../stablehlo", optional = true }
+flatppl-host = { path = "../host", optional = true }
 flatppl-mathdoc = { path = "../mathdoc", optional = true, default-features = false, features = ["document"] }
 # Source resolution + remote cache. `net` (TLS) is enabled only via the `prepare`
 # feature, so `infer` (cache-only) and the lean `flatppl-fmt` stay TLS-free.

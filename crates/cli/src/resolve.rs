@@ -375,6 +375,41 @@ pub fn build_bundle(
     root_loc: &Location,
     resolver: &CliResolver,
 ) -> Result<(flatppl_infer::ModuleBundle, Vec<Location>), Failure> {
+    build_bundle_with(root, root_loc, resolver, |_, _| Ok(()))
+}
+
+/// Preserve each data source's declaring location when compilation grafts modules.
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+pub fn compilation_bundle(
+    root: &mut Module,
+    root_loc: &Location,
+    resolver: &CliResolver,
+) -> Result<flatppl_infer::ModuleBundle, Failure> {
+    fn resolve_data(module: &mut Module, base: &Location) -> Result<(), Failure> {
+        let base = match base {
+            Location::Local(path) if path.is_relative() => Location::Local(
+                std::env::current_dir()
+                    .map_err(|error| Failure::Plain(error.to_string()))?
+                    .join(path),
+            ),
+            _ => base.clone(),
+        };
+        flatppl_host::resolve_data_sources(module, |source| {
+            Ok(base.join(source).normalized().display())
+        })
+        .map_err(Failure::Plain)
+    }
+    resolve_data(root, root_loc)?;
+    build_bundle_with(root, root_loc, resolver, resolve_data).map(|(bundle, _)| bundle)
+}
+
+#[cfg(feature = "infer")]
+fn build_bundle_with(
+    root: &Module,
+    root_loc: &Location,
+    resolver: &CliResolver,
+    prepare: fn(&mut Module, &Location) -> Result<(), Failure>,
+) -> Result<(flatppl_infer::ModuleBundle, Vec<Location>), Failure> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -416,7 +451,7 @@ pub fn build_bundle(
                 None => {
                     let source = resolver.read_string(loc)?;
                     let format = crate::Format::from_location(loc).map_err(Failure::Plain)?;
-                    let module =
+                    let mut module =
                         crate::read_module(format, &source).map_err(|(message, line, span)| {
                             Failure::Diagnostic {
                                 path: diagnostic_path(loc),
@@ -426,6 +461,7 @@ pub fn build_bundle(
                                 span,
                             }
                         })?;
+                    prepare(&mut module, loc)?;
                     let module = Arc::new(module);
                     parsed.insert(ld.clone(), module.clone());
                     module

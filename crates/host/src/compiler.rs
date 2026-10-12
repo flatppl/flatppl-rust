@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
@@ -95,6 +95,12 @@ struct Definition {
     origin: Origin,
     parsed: Arc<Module>,
     imports: Vec<(String, Arc<Definition>)>,
+    data_roots: Vec<(String, PathBuf)>,
+}
+
+struct DataSource {
+    canonical: PathBuf,
+    bytes: Vec<u8>,
 }
 
 /// An immutable root instance and the parsed definitions required to compile it.
@@ -103,6 +109,7 @@ pub struct LoadedModule {
     definition: Arc<Definition>,
     typed: Module,
     bundle: ModuleBundle,
+    data: Arc<Mutex<HashMap<String, DataSource>>>,
 }
 
 /// One public binding as hosts see it. Positions refer to the right-hand side
@@ -255,7 +262,7 @@ impl LoadedModule {
                 "declare inputs and outputs before compiling a module",
             ));
         }
-        let lowered = flatppl_determinizer::determinize_with_options(
+        let mut lowered = flatppl_determinizer::determinize_with_options(
             &self.typed,
             &self.bundle,
             Some(&roots),
@@ -271,6 +278,8 @@ impl LoadedModule {
                 self.source(),
             )
         })?;
+        crate::load_fixed_data(&mut lowered, |source| self.read_data(source))
+            .map_err(|error| Diagnostic::new("load_data", self.source_name(), error))?;
         emit_query(lowered, &self.typed, options, batch).map_err(|e| {
             // Lowering appends nodes and never renumbers, so only nodes of the
             // typed root module index its source.
@@ -282,6 +291,53 @@ impl LoadedModule {
             )
         })
     }
+
+    fn read_data(&self, source: &str) -> Result<Vec<u8>, String> {
+        let mut data = self.data.lock().map_err(|error| error.to_string())?;
+        if let Some(loaded) = data.get(source) {
+            self.check_data_path(source, &loaded.canonical)?;
+            return Ok(loaded.bytes.clone());
+        }
+        let location = Location::parse(source);
+        if matches!(&location, Location::Local(path) if path.is_relative()) {
+            return Err("provide source_path for relative data sources in inline code".into());
+        }
+        let mut cache = Cache::from_env();
+        cache.set_offline(true);
+        let resolver = Resolver::new(cache, &OfflineFetcher, &DenyAll);
+        let path = resolver
+            .local_path(&location)
+            .map_err(|error| error.to_string())?;
+        let canonical = std::fs::canonicalize(&path).map_err(|error| error.to_string())?;
+        self.check_data_path(source, &canonical)?;
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        data.insert(
+            source.into(),
+            DataSource {
+                canonical,
+                bytes: bytes.clone(),
+            },
+        );
+        Ok(bytes)
+    }
+
+    fn check_data_path(&self, source: &str, canonical: &Path) -> Result<(), String> {
+        let mut pending = vec![&self.definition];
+        let mut seen = HashSet::new();
+        while let Some(definition) = pending.pop() {
+            if !seen.insert(&definition.identity) {
+                continue;
+            }
+            for (name, root) in &definition.data_roots {
+                if name == source {
+                    check_bundle_path(canonical, Some(root), source)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            pending.extend(definition.imports.iter().map(|(_, child)| child));
+        }
+        Ok(())
+    }
 }
 
 /// Append-only definitions and explicit names. Existing modules own their import closure.
@@ -292,6 +348,7 @@ pub struct Context {
     files: HashMap<(String, Option<PathBuf>), Arc<Definition>>,
     sources: HashMap<String, String>,
     next_inline: usize,
+    data: Arc<Mutex<HashMap<String, DataSource>>>,
 }
 
 impl Context {
@@ -398,6 +455,7 @@ impl Context {
             origin: module.definition.origin.clone(),
             parsed: Arc::new(parsed),
             imports: module.definition.imports.clone(),
+            data_roots: module.definition.data_roots.clone(),
         }))
     }
 
@@ -548,6 +606,7 @@ impl Context {
             definition,
             typed,
             bundle,
+            data: self.data.clone(),
         }))
     }
 
@@ -562,8 +621,34 @@ impl Context {
         if stack.contains(&identity) {
             return Err(Diagnostic::new("resolve", &label, "cyclic module imports"));
         }
-        let parsed = flatppl_syntax::parse(&source)
+        let mut parsed = flatppl_syntax::parse(&source)
             .map_err(|e| Diagnostic::new("parse", &label, e.message).spanned(e.span, &source))?;
+        let mut data_roots = Vec::new();
+        crate::resolve_data_sources(&mut parsed, |literal| {
+            let (base, root) = match &origin {
+                Origin::File {
+                    location,
+                    bundle_root,
+                } => (Some(location), bundle_root.as_deref()),
+                Origin::Inline { file, .. } => (file.as_ref(), None),
+            };
+            if root.is_some()
+                && (Path::new(literal).is_absolute()
+                    || flatppl_core::text::uri_scheme(literal).is_some())
+            {
+                return Err("data sources inside a bundle must be relative paths".into());
+            }
+            let location = base
+                .map_or_else(|| Location::parse(literal), |base| base.join(literal))
+                .normalized();
+            let name = location.display();
+            if let (Some(root), Location::Local(path)) = (root, &location) {
+                check_bundle_path(path, Some(root), &name).map_err(|error| error.to_string())?;
+                data_roots.push((name.clone(), root.to_path_buf()));
+            }
+            Ok(name)
+        })
+        .map_err(|error| Diagnostic::new("load_data", &label, error))?;
         let mut literals = Vec::new();
         for i in 0..parsed.node_count() {
             if let Node::Call(c) = parsed.node(NodeId::from_usize(i))
@@ -598,6 +683,7 @@ impl Context {
             origin,
             parsed: Arc::new(parsed),
             imports: imports?,
+            data_roots,
         }))
     }
 
