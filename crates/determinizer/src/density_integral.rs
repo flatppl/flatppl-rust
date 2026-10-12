@@ -282,6 +282,11 @@ pub(crate) fn lower_interval_mass(
     {
         return Ok(log_mass);
     }
+    if m.resolve(ctor) == "StudentT"
+        && let Some(log_mass) = student_t_log_mass(m, input, lo, hi)
+    {
+        return Ok(log_mass);
+    }
     if options.numerical_integrals
         && options
             .supports_cdf
@@ -312,6 +317,90 @@ pub(crate) fn lower_interval_mass(
     let cdf_lo = build_touniform(m, kernel, input, lo);
     let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
     Ok(build_call(m, "log", &[z]))
+}
+
+/// For nu=2m, the smaller Student-t tail is I_p(m,m), where
+/// p=(1-|x|/sqrt(nu+x*x))/2. Integer beta tails are finite binomial sums.
+fn student_t_log_mass(m: &mut Module, input: NodeId, lo: NodeId, hi: NodeId) -> Option<NodeId> {
+    let nu = static_real(m, find_field(m, input, "nu")?)?;
+    // Bound source-driven expansion, as for the integer Gamma rule below.
+    if !(2.0..=128.0).contains(&nu) || nu % 2.0 != 0.0 {
+        return None;
+    }
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    // Reflect positive intervals so small masses do not subtract CDFs near one.
+    let positive = build_call(m, "ge", &[lo, zero]);
+    let neg_hi = build_call(m, "neg", &[hi]);
+    let neg_lo = build_call(m, "neg", &[lo]);
+    let left = build_call(m, "ifelse", &[positive, neg_hi, lo]);
+    let right = build_call(m, "ifelse", &[positive, neg_lo, hi]);
+    let left = even_student_t_cdf(m, nu as usize, left);
+    let right = even_student_t_cdf(m, nu as usize, right);
+    let mass = build_call(m, "sub", &[right, left]);
+    Some(build_call(m, "log", &[mass]))
+}
+
+fn even_student_t_cdf(m: &mut Module, nu: usize, x: NodeId) -> NodeId {
+    if let Some(x) = static_real(m, x)
+        && (x == 0.0 || x.is_infinite())
+    {
+        let cdf = if x < 0.0 {
+            0.0
+        } else if x > 0.0 {
+            1.0
+        } else {
+            0.5
+        };
+        return m.alloc(Node::Lit(Scalar::Real(cdf)));
+    }
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+    let root_nu = m.alloc(Node::Lit(Scalar::Real((nu as f64).sqrt())));
+    let negative = build_call(m, "lt", &[x, zero]);
+    let neg_x = build_call(m, "neg", &[x]);
+    // Select a side at zero: abs'(0)=0 would erase the CDF's nonzero derivative.
+    let magnitude = build_call(m, "ifelse", &[negative, neg_x, x]);
+    let finite = build_call(m, "isfinite", &[x]);
+    let magnitude = build_call(m, "ifelse", &[finite, magnitude, zero]);
+    let scaled = build_call(m, "divide", &[magnitude, root_nu]);
+    let squared = build_call(m, "mul", &[scaled, scaled]);
+    let denominator = build_call(m, "add", &[one, squared]);
+    let cosine_squared = build_call(m, "divide", &[one, denominator]);
+    let cosine = build_call(m, "sqrt", &[cosine_squared]);
+    let sine = build_call(m, "mul", &[scaled, cosine]);
+    let denominator = build_call(m, "add", &[one, sine]);
+    let numerator = build_call(m, "mul", &[half, cosine_squared]);
+    // Equivalent to (1-sine)/2 without cancellation in the tail.
+    let p = build_call(m, "divide", &[numerator, denominator]);
+    let q = build_call(m, "sub", &[one, p]);
+    let order = nu / 2;
+    let mut term = one;
+    for j in 1..=order {
+        let coefficient = m.alloc(Node::Lit(Scalar::Real((order - 1 + j) as f64 / j as f64)));
+        let factor = build_call(m, "mul", &[coefficient, p]);
+        term = build_call(m, "mul", &[term, factor]);
+    }
+    for _ in 1..order {
+        term = build_call(m, "mul", &[term, q]);
+    }
+    let mut tail = term;
+    let ratio = build_call(m, "divide", &[p, q]);
+    for j in order..nu - 1 {
+        let coefficient = m.alloc(Node::Lit(Scalar::Real(
+            (nu - 1 - j) as f64 / (j + 1) as f64,
+        )));
+        let factor = build_call(m, "mul", &[coefficient, ratio]);
+        term = build_call(m, "mul", &[term, factor]);
+        tail = build_call(m, "add", &[tail, term]);
+    }
+    let complement = build_call(m, "sub", &[one, tail]);
+    let cdf = build_call(m, "ifelse", &[negative, tail, complement]);
+    let positive = build_call(m, "gt", &[x, zero]);
+    let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
+    let nonfinite = build_call(m, "ifelse", &[positive, one, nan]);
+    let nonfinite = build_call(m, "ifelse", &[negative, zero, nonfinite]);
+    build_call(m, "ifelse", &[finite, cdf, nonfinite])
 }
 
 /// Integer-shape Gamma survival: exp(-z) * sum(z^j/j!), z = rate*x.
