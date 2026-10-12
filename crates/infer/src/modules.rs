@@ -4,7 +4,7 @@
 //! `trace.rs`; everything that crosses a module boundary lives here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use flatppl_core::{
@@ -308,10 +308,11 @@ fn subst_signature(importer: &Module, annos: &[(String, Resolved)]) -> String {
             map_type_symbols(&r.ty, &mut record);
             map_valueset_symbols(&r.vset, &mut record);
             format!(
-                "{name}={:?}/{:?}/{:?}[{}]",
+                "{name}={:?}/{:?}/{:?}/{:?}[{}]",
                 r.ty,
                 r.phase,
                 r.vset,
+                r.admitted_source,
                 names.join("+")
             )
         })
@@ -327,6 +328,7 @@ fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolve
         result: res.result.map(|t| reintern_type(into, from, &t)),
         phase: res.phase,
         catalogue: res.catalogue,
+        admitted_source: res.admitted_source,
     }
 }
 
@@ -336,6 +338,8 @@ pub(crate) struct Resolved {
     pub(crate) ty: Type,
     pub(crate) phase: Phase,
     pub(crate) vset: ValueSet,
+    /// Construction-based eligibility for draw/lawof, independent of mass class.
+    pub(crate) admitted_source: bool,
     /// For a reified-callable binding (`%function` / `%kernel`), the inferred
     /// type of the callable's reified BODY in the dependency. Applying the
     /// callable (via `likelihoodof` or a user call) reads this body-result
@@ -407,7 +411,7 @@ pub(crate) struct InferSession<'b> {
     pub(crate) catalogues: CatalogueSet<'b>,
     /// (resolved identity, substitution-signature) -> the dependency's inferred
     /// (annotated) Module.
-    memo: RefCell<HashMap<(String, String), Module>>,
+    memo: RefCell<HashMap<(String, String), InferredDependency>>,
     /// Resolved identities of the modules on the current resolution chain
     /// (cycle detection). The top is the module being inferred right now, so it
     /// is also the importer whose directives resolve next.
@@ -416,6 +420,11 @@ pub(crate) struct InferSession<'b> {
     /// `Inferencer::run` drains this into its own diagnostic list so that
     /// cycle errors and other dep-level errors reach the caller.
     dep_diags: RefCell<Vec<Diagnostic>>,
+}
+
+struct InferredDependency {
+    module: Module,
+    admitted_sources: HashSet<NodeId>,
 }
 
 impl<'b> InferSession<'b> {
@@ -518,9 +527,20 @@ impl<'b> InferSession<'b> {
         })
     }
 
-    pub(crate) fn finish_dependency(&self, key: (String, String), module: Module) {
+    pub(crate) fn finish_dependency(
+        &self,
+        key: (String, String),
+        module: Module,
+        admitted_sources: HashSet<NodeId>,
+    ) {
         self.stack.borrow_mut().pop();
-        self.memo.borrow_mut().insert(key, module);
+        self.memo.borrow_mut().insert(
+            key,
+            InferredDependency {
+                module,
+                admitted_sources,
+            },
+        );
     }
 
     pub(crate) fn input_metadata(&self) -> InputMetadata {
@@ -530,7 +550,8 @@ impl<'b> InferSession<'b> {
             // Substituted instances may carry narrower annotations. Leave
             // those sources on the existing unsubstituted inference fallback.
             .filter(|((_, substitutions), _)| substitutions.is_empty())
-            .map(|((identity, _), module)| {
+            .map(|((identity, _), dependency)| {
+                let module = &dependency.module;
                 let inputs = (0..module.node_count())
                     .map(NodeId::from_usize)
                     .filter_map(|node| {
@@ -651,7 +672,8 @@ impl<'b> InferSession<'b> {
         binding_name: &str,
     ) -> Result<Resolved, String> {
         let memo = self.memo.borrow();
-        let dep_annotated = memo.get(key).expect("dependency inference completed");
+        let dependency = memo.get(key).expect("dependency inference completed");
+        let dep_annotated = &dependency.module;
         // CROSS-INTERNER: resolve by string, not Symbol — the importer and
         // dependency have separate interners.
         let (_, b) = dep_annotated
@@ -687,6 +709,7 @@ impl<'b> InferSession<'b> {
                 .unwrap_or(ValueSet::Unknown),
             result: callable_body_result(dep_annotated, rhs),
             catalogue: None,
+            admitted_source: dependency.admitted_sources.contains(&rhs),
         };
         Ok(reintern_resolved(importer, dep_annotated, raw))
     }
@@ -730,6 +753,7 @@ fn resolve_standard(
         phase: Phase::Fixed,
         vset: ValueSet::Unknown,
         result: None,
+        admitted_source: false,
         catalogue: Some(CatalogueRef {
             module: path.clone(),
             member: binding_name.to_string(),

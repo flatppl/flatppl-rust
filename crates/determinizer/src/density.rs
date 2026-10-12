@@ -1788,7 +1788,11 @@ fn lower_applied_kernel_joint_inner(
                 );
                 bound.extend(component_bound);
                 let coordinate = build_call(m, "lawof", &[body]);
-                annotate_synthesized_lawof(m, coordinate, body);
+                let mass = match m.type_of(component) {
+                    Some(Type::Kernel { mass, .. } | Type::Measure { mass, .. }) => *mass,
+                    _ => Mass::Unknown,
+                };
+                annotate_synthesized_lawof(m, coordinate, body, mass);
                 rewritten.push(coordinate);
             }
             None => {
@@ -1878,12 +1882,9 @@ fn component_reaches_draw(m: &Module, component: NodeId) -> bool {
 /// without this the positional fan-out refuses on its own synthesized node rather than on
 /// anything about the model.
 ///
-/// The type is `infer`'s own rule for a VALUE argument, not a new one: `lawof_type`
-/// (`infer/src/ops.rs`) gives `Type::Measure { domain: <the value's type>, mass:
-/// Normalized }`, the `%normalized` coming from §04's `lawof` identity law. A body whose
-/// own type did not resolve is left unannotated, so the fail-closed guard still fires
-/// there instead of being handed a guess.
-fn annotate_synthesized_lawof(m: &mut Module, lawof_node: NodeId, body: NodeId) {
+/// Preserve the source kernel's inferred mass. A reified improper law must not
+/// become normalized merely because its boundary has been supplied.
+fn annotate_synthesized_lawof(m: &mut Module, lawof_node: NodeId, body: NodeId, mass: Mass) {
     let (resolved, _) = resolve_ref_one(m, body);
     let Some(domain) = m.type_of(body).or_else(|| m.type_of(resolved)).cloned() else {
         return;
@@ -1895,7 +1896,7 @@ fn annotate_synthesized_lawof(m: &mut Module, lawof_node: NodeId, body: NodeId) 
         lawof_node,
         Type::Measure {
             domain: Box::new(domain),
-            mass: Mass::Normalized,
+            mass,
         },
     );
 }
@@ -4196,14 +4197,8 @@ fn normalized_logdensity(m: &mut Module, density: NodeId, log_z: NodeId) -> Node
 /// closed-form normalizer Z = Σᵢ wᵢ (see [`lower_normalize`]); `None` keeps
 /// `normalize`'s refuse.
 ///
-/// `K`'s unit mass is read from its CONSTRUCTOR NAME rather than from an inferred
-/// `Mass::Normalized`, because a bare constructor in the component slot
-/// (`ksuperpose(Normal, w)`) is a `Node::Const` and carries no measure type at
-/// all — the mass only appears once the constructor is CALLED. Every §08/§09
-/// distribution is a probability measure and `Dirac` is a point mass, which is
-/// `fill_mass`'s own reading of a constructor head; a reference measure
-/// (`Lebesgue`/`Counting`) is neither and yields `None`. Structural, immutable
-/// read of `m`.
+/// A bare constructor has no inferred measure type. Read its declared mass
+/// from the catalogue rather than assuming every constructor is normalized.
 fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
     let Node::Call(c) = m.node(node) else {
         return None;
@@ -4226,7 +4221,9 @@ fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
         _ => return None,
     };
     let name = m.resolve(ctor_sym);
-    let is_probability = flatppl_infer::distribution_param_names(name).is_some() || name == "Dirac";
+    let is_probability = flatppl_infer::builtin_catalogue().distribution_mass(name)
+        == Some(Mass::Normalized)
+        || name == "Dirac";
     is_probability.then_some(lift.args[1])
 }
 
@@ -7249,6 +7246,9 @@ fn emit_kernel_broadcast_density(
     kernel_input: NodeId,
     obs: NodeId,
 ) -> NodeId {
+    if m.resolve(ctor_sym) == "Flat" {
+        return m.alloc(Node::Lit(Scalar::Real(0.0)));
+    }
     let per_cell = emit_kernel_broadcast_per_cell(m, ctor_sym, kernel_input, obs);
     build_call(m, "sum", &[per_cell])
 }
@@ -8056,6 +8056,11 @@ pub(crate) fn build_density_term(
             "primitive measure must be a built-in constructor call with well-formed positional or keyword arguments",
         )
     })?;
+
+    // The improper flat prior has no density contribution or constructor parameters.
+    if m.resolve(ctor_sym) == "Flat" {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
 
     let kernel = m.alloc(Node::Const(ctor_sym));
     let kernel_input = build_record(m, &kwargs);

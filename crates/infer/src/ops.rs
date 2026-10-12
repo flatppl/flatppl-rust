@@ -19,6 +19,7 @@ use crate::rule::RuleStep::Ready;
 use crate::rule::{LocalTargets, RuleStep};
 use crate::trace::{Inferencer, join_phase};
 
+pub(crate) mod improper;
 mod pyhf;
 mod tilt;
 
@@ -129,7 +130,8 @@ pub(crate) fn call_rule(
     // + body. The phase follows the CAPTURED ancestors, so the rule returns it
     // rather than assuming `%fixed`; see [`reification_type`].
     if call.inputs.is_some() {
-        return Ready(reification_type(inf, id, call, &name, args));
+        let result = reification_type(inf, id, call, &name, args);
+        return improper::conditional_reification(inf, id, result);
     }
 
     // Keyword arguments moved into their DECLARED POSITIONS, once, before any rule reads
@@ -546,7 +548,12 @@ pub(crate) fn call_rule(
         // ---- measure algebra (spec §06) ----
         "lawof" => match lawof_mass_gate(inf, args) {
             Some(failed) => failed,
-            None => lawof_type(args.first().map(|(_, t, _)| t)),
+            None => {
+                let mass = args.first().map_or(Mass::Deferred, |(node, _, _)| {
+                    improper::law_mass(inf, *node, &[])
+                });
+                lawof_type(args.first().map(|(_, t, _)| t), mass)
+            }
         },
         "draw" => match draw_mass_gate(inf, args) {
             Some(failed) => failed,
@@ -2830,124 +2837,32 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
     }
 }
 
-/// `lawof(x)`'s result type, for each of the three argument shapes §04 admits.
-///
-/// The measure case is DERIVED, not asserted. §04 as amended by flatppl-design#73
-/// (@ `9d9a91c`, pending owner review) gives one equation — "`lawof(m)` is
-/// `lawof(draw(m))`, the law of a draw from `m`" — and composing the two rules
-/// this module already has for its halves types it mechanically:
-///
-/// - `draw(m)` is m's DOMAIN (`measure_domain`, the `"draw"` arm), and
-/// - `lawof(<value : T>)` is a measure over `T`,
-///
-/// so `lawof(m)` is a measure over m's domain — which, for the `%normalized`
-/// measure the gate admits, IS m's own type. §04 states that consequence
-/// separately ("A probability measure of fixed or parameterized phase is its own
-/// law, so `lawof(m)` is equivalent to `m` and `lawof` is idempotent"), so the
-/// derivation and the prose agree.
-///
-/// **Both phases give the same TYPE, which is why no phase split appears here.**
-/// §04 distinguishes them semantically — a fixed/parameterized measure is its own
-/// law, while a stochastic one yields "the marginal law of a draw from it: the
-/// mixture ν(B) = ∫ κ(z, B) dP(z)". A mixture of measures over `D` is still a
-/// measure over `D`, and still a probability measure, so the two cases differ in
-/// what the determiniser must BUILD, not in what infer records.
-///
-/// The result's `%mass` is the ARGUMENT's mass, not `%normalized`
-/// unconditionally: [`lawof_mass_gate`] only admits a measure whose mass is
-/// `%normalized` (a theorem) or `%deferred` (not yet inferred, §11) — never a
-/// settled non-normalized class. Propagating the admitted mass gives
-/// `%normalized` on the proven path and `%deferred` on the unproven one; this
-/// is the ONLY place that mass is decided — the mass-level rule table has no
-/// `"lawof"` arm, deliberately (see the pointer there).
-///
-/// Design-PR #73's option C (owner ruling, decisions-log 2026-08-18) is the
-/// no-laundering rider: an engine that admits a `%deferred`-mass argument is
-/// ASSUMING normalization, not proving it, and "must leave the result's `%mass`
-/// `%deferred` rather than record it as `%normalized`" — stamping `%normalized`
-/// here would record an assumption as knowledge, which §11's "strongest
-/// statically KNOWN class" slot definition forbids. Before this fix the result
-/// was always stamped `%normalized`, laundering the assumption; `lawof(joint())`
-/// (the zero-component `joint` — the one source of a genuinely `%deferred`-mass
-/// measure reachable from source, per `product_mass`'s empty-list arm) is the
-/// executed red case.
-///
-/// A KERNEL argument lifts pointwise — §04: "On a non-nullary kernel, `lawof`
-/// lifts pointwise, as the uniform kernel extension does for measure-algebra
-/// operations" — so the result is a kernel over the same inputs whose output
-/// measure is a law, carrying that output measure's mass onward the same way.
-/// Before this it wrapped, producing a measure whose DOMAIN was a kernel.
-/// [`lawof_mass_gate`] gates the kernel case by the identical three rules
-/// (2026-08-19, `lawof-kernel-mass-maths.md`: the pointwise lift composes the
-/// whole measure clause, settled-class error included, onto each output
-/// measure the kernel generates), so this branch only ever sees a kernel whose
-/// mass is `%normalized` or `%deferred` — the same two values the measure
-/// branch above sees.
-///
-/// Every other argument is a VALUE, and keeps the original behaviour: a measure
-/// over that value's type, `%normalized` unconditionally — there is no mass
-/// slot on a value to propagate, and the law of a value is a probability
-/// measure by definition. That is the overwhelmingly common spelling
-/// (`lawof(y)`, `lawof(record(y = y))`) and the corpus's only one.
-///
-/// A `Likelihood` argument falls in that last bucket and so still types as a
-/// measure OVER a likelihood. #73 is silent on likelihoods — it defines `lawof`
-/// for a measure and for a kernel — so nothing here invents semantics for it; the
-/// open question is recorded in the wave report rather than guessed at.
-fn lawof_type(arg: Option<&Type>) -> Type {
+/// Reification keeps the value domain and uses the mass of its traced sources.
+fn lawof_type(arg: Option<&Type>, mass: Mass) -> Type {
     match arg {
         // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain, carrying
         // m's own (gate-admitted) mass onward rather than reasserting it.
-        Some(Type::Measure { domain, mass }) => Type::Measure {
+        Some(Type::Measure { domain, .. }) => Type::Measure {
             domain: domain.clone(),
-            mass: *mass,
+            mass,
         },
         // Pointwise lift over a kernel's output measure — same propagation.
-        Some(Type::Kernel { inputs, mass }) => Type::Kernel {
+        Some(Type::Kernel { inputs, .. }) => Type::Kernel {
             inputs: inputs.clone(),
-            mass: *mass,
+            mass,
         },
         // A value: the law of that value.
         other => Type::Measure {
             domain: Box::new(other.cloned().unwrap_or(Type::Any)),
-            mass: Mass::Normalized,
+            mass,
         },
     }
 }
 
-/// The mass class of the slice's first argument, when that argument is a MEASURE
-/// whose normalization cannot be established, as the `%name` to quote in a
-/// diagnostic — `None` when the argument is not a measure, or is one whose mass
-/// the caller must accept. All callers take the measure as their first argument.
-///
-/// Shared by [`lawof_mass_gate`], [`draw_mass_gate`], and [`rand_mass_gate`] so
-/// the three cannot drift: all three implement "reject unless proven
-/// `%normalized`, or not yet inferred", and the three narrowings that phrase
-/// encodes are argued once here.
-///
-/// - `%finite` IS rejected. The rule quantifies over the mass CLASS: this reads
-///   the class the mass rules produced and does no arithmetic of its own, so a
-///   `%finite` measure is refused however normalized it looks here. Proving
-///   normalization is the MASS RULE's job, and where a proof exists the class it
-///   yields is `%normalized` before this is ever consulted — see
-///   [`superpose_is_provably_normalized`], which is why a mixture with
-///   sum-to-one weights reaches this function as `%normalized` rather than
-///   arguing its way past a `%finite` verdict.
-/// - `%deferred` PASSES. §11 defines it as "not yet inferred" rather than a mass
-///   verdict, so rejecting it would turn every gap in mass inference into a
-///   user-facing error on a possibly well-formed model. Note what this makes the
-///   rule: **reject unless proven `%normalized`, or not yet inferred** — NOT
-///   "reject what is proven unnormalized". The difference is `%unknown`, which §11
-///   defines as "unknown total mass" and which IS rejected, without anything having
-///   been proven about it, because the question is whether normalization was
-///   established, not whether non-normalization was.
-/// - Only `Type::Measure` is inspected here. A `Type::Kernel` argument is each
-///   caller's own question, deliberately NOT folded into this shared function:
-///   [`lawof_mass_gate`] decides it (2026-08-19, `lawof-kernel-mass-maths.md`)
-///   with its own kernel arm, by the identical three rules — but `draw`/`rand`
-///   over a kernel remain a separate, undecided question; see
-///   [`draw_mass_gate`] for why `draw` does not extend to one. Folding the
-///   kernel case in here would silently extend it to `draw`/`rand` too.
+/// A measure's non-probability mass class, for the gate diagnostic. Deferred
+/// means not yet inferred, so it passes. Draw and lawof separately admit the
+/// explicit improper sources; rand has no such exception. Kernel admission
+/// belongs to lawof's pointwise rule, not this shared measure gate.
 fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
     let (_, arg_ty, _) = args.first()?;
     let Type::Measure { mass, .. } = arg_ty else {
@@ -2963,55 +2878,19 @@ fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
     }
 }
 
-/// `draw(m)`'s total-mass gate: you cannot draw from a measure that is not a
-/// probability measure, and this engine will not quietly normalize one for you.
-///
-/// **§04 states the rule normatively** (`docs/04-design.md`, reification): "`x ~ m`
-/// (equivalent to `x = draw(m)`) introduces a stochastic node `x` by drawing a
-/// variate from a normalized measure (i.e. a probability measure) `m`." A `draw`
-/// from anything else is therefore already ill-formed; the owner ruling is only
-/// that the engine says so instead of normalizing quietly, because implicit
-/// normalization makes a model's meaning depend on a step the user never wrote.
-///
-/// flatppl-design#73 corroborates §04 when its equation is read right-to-left:
-/// #73 gives `lawof(m)` = `lawof(draw(m))` and requires `lawof`'s argument to be
-/// `%normalized`, so a draw from an unnormalized measure has no law.
-///
-/// What §04 does NOT settle is how much proving a checker attempts. It says
-/// "normalized measure", not how hard to work at showing a measure is one. That
-/// question is answered in two places, and the split matters: the MASS RULES
-/// prove what they can (see [`superpose_is_provably_normalized`] for the
-/// sum-to-one mixture) and this gate then quantifies over the resulting class
-/// (see [`unprovable_normalization`]). The classification a checker is expected
-/// to reach is the part that may still owe spec text.
-///
-/// The gap this closes was surfaced measurably: `draw(truncate(lawof(…), S))` used
-/// to lower to the marginal density gated on `S` with **no normalizer** — the
-/// correct density of an unnormalized restriction, silently presented as a law.
-/// `normalize(...)` is the escape, and the diagnostic says so.
-///
-/// **A KERNEL argument is deliberately NOT gated, and not because it is safe.**
-/// §06's "Uniform kernel extension" is what would license reading `draw(K)`
-/// pointwise — "On a kernel, the operation applies to the output measure at each
-/// input point" — but that paragraph scopes itself to measure-algebra operations
-/// and closes with "This applies to all measure-to-measure operations except
-/// `jointchain` and `kchain`". `draw` is measure-to-VALUE, so the sentence does not
-/// reach it. §06 arguably FORBIDS the case outright: "Operations that map measures
-/// to values, like `totalmass`, `densityof`, and `logdensityof`, require closed
-/// measures (i.e. nullary kernels) as inputs" — an exemplary list, and `draw` maps
-/// a measure to a value. A NULLARY kernel is a measure by that same paragraph's
-/// identity ("identify measures with nullary kernels") and so is covered by the
-/// measure arm. So the open question is whether `draw(<non-nullary kernel>)`
-/// deserves a static error of its own, which is a rule about shapes rather than
-/// about mass; today it types `%deferred` via `measure_domain` and is left alone.
+/// §04 admits probability measures and explicit Flat-derived prior sources.
+/// Other non-normalized measures still require explicit normalization.
 fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let offending = unprovable_normalization(args)?;
     let (arg_node, _, _) = args.first()?;
+    if improper::admitted(inf, *arg_node) {
+        return None;
+    }
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
         format!(
-            "`draw` requires a probability measure, but this argument's total mass is \
-             `{offending}`: there is no draw from an unnormalized measure. Wrap it in \
+            "`draw` requires a probability measure or an admitted improper prior, but \
+             this argument's total mass is `{offending}` and its source is not admitted. Wrap it in \
              `normalize(...)` to state that intent — `draw` never normalizes its \
              argument"
         ),
@@ -3019,10 +2898,7 @@ fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
     Some(Type::Failed("draw from an unnormalized measure".into()))
 }
 
-/// `rand(m, rstate)`'s total-mass gate: the same rule as [`draw_mass_gate`]
-/// (§07's `rand` draws from a normalized measure exactly as `draw` does — #73's
-/// equation is agnostic to which spelling produced the draw), reused via
-/// [`unprovable_normalization`]. Both take their measure as argument 0.
+/// Concrete random sampling still requires a probability measure.
 fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let offending = unprovable_normalization(args)?;
     let (arg_node, _, _) = args.first()?;
@@ -3038,53 +2914,21 @@ fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
     Some(Type::Failed("rand from an unnormalized measure".into()))
 }
 
-/// `lawof(m)`'s total-mass gate: a MEASURE argument must be `%normalized`.
-///
-/// Spec §04 as amended by flatppl-design#73 (@ `9d9a91c`, pending owner review):
-/// "`lawof(m)` requires `m`'s `%mass` to be `%normalized` (see total-mass
-/// classes); anything else is a static error, since an unnormalized measure is
-/// not its own law and admits no such mixture. `lawof` never normalizes its
-/// argument; `normalize(m)` states that intent." So the diagnostic names
-/// `normalize` as the escape.
-///
-/// Returns `Some(Type::Failed(_))` when it rejects, `None` to let the ordinary
-/// rule run. Deliberately conservative, and deliberately narrow in three ways:
-///
-/// - It rejects on the mass class the checker can PROVE is not `%normalized`,
-///   which includes `%finite`. A `%finite` `superpose` whose weights happen to sum
-///   to one is rejected: the class is what the rule quantifies over, not the
-///   arithmetic, and a checker that tried to discharge the arithmetic would accept
-///   some models and reject equivalent ones depending on how much constant folding
-///   had run.
-/// - `%deferred` PASSES. §04's "anything else" reads literally as including it,
-///   but `%deferred` means "not yet inferred" rather than "not normalized" (§11),
-///   so rejecting it would convert every gap in mass inference into a user-facing
-///   error on a model that may be perfectly well-formed. So the rule this
-///   implements is **reject unless proven `%normalized`, or not yet inferred** —
-///   NOT "reject what is proven unnormalized". The difference is `%unknown`, which
-///   §11 defines as "unknown total mass": it is rejected without anything having
-///   been proven about it, because the gate's question is whether normalization was
-///   established, not whether non-normalization was.
-/// - A `Type::Kernel` argument is gated too, by the SAME three rules, pointwise
-///   (`lawof-kernel-mass-maths.md`, ruled 2026-08-19): §04's "On a non-nullary
-///   kernel, `lawof` lifts pointwise" composes the whole measure clause above —
-///   requirement, settled-class error, and no-laundering rider alike — onto each
-///   output measure the kernel generates, and §11 puts the kernel `%mass` slot
-///   under the same "statically known" definition ("respectively all measures
-///   generated by the kernel"). The maths is exhaustive: wherever `lawof(K)` is
-///   defined at all, every output measure has mass 1 (the identity law at a
-///   fixed/parameterized point, the marginal-mixture integral at a stochastic
-///   one), so a settled non-`%normalized` kernel result never describes a value
-///   — it types an expression that has none, the same defect the measure arm
-///   exists to catch.
+/// `lawof(m)` admits the same measure sources as `draw`, pointwise for kernels.
 fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    if let Some((node, _, _)) = args.first()
+        && improper::admitted(inf, *node)
+    {
+        return None;
+    }
     if let Some(offending) = unprovable_normalization(args) {
         let (arg_node, _, _) = args.first()?;
         inf.diags.push(crate::Diagnostic::error_at(
             *arg_node,
             format!(
-                "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
-                 total mass is `{offending}`: an unnormalized measure is not its own law. \
+                "`lawof` requires a `%normalized` measure or an admitted improper prior \
+                 (spec §04), but this argument's total mass is `{offending}` and its source \
+                 is not admitted. \
                  Wrap it in `normalize(...)` to state that intent — `lawof` never \
                  normalizes its argument"
             ),
@@ -3108,8 +2952,8 @@ fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Typ
         *arg_node,
         format!(
             "`lawof` lifts pointwise over a kernel (spec §04), but this kernel's output \
-             measures' total mass is `{offending}`: an unnormalized measure is not its \
-             own law. Wrap it in `normalize(...)` to state that intent — `lawof` never \
+             measures' total mass is `{offending}` and their source is not admitted. \
+             Wrap it in `normalize(...)` to state that intent — `lawof` never \
              normalizes its argument"
         ),
     ));
@@ -4928,13 +4772,8 @@ fn reification_type(
     };
     let body_ty = args.first().map(|(_, t, _)| t);
     let ty = match (name, body_ty) {
-        // `kernelof` reifies the LAW of a value-typed body — a probability
-        // measure per input, i.e. a Markov kernel. Its body must BE a value:
-        // §04 "Kernels and `kernelof`" says it "reifies (typically stochastic)
-        // value nodes to Markov kernels. `x` must not be a measure", and
-        // flatppl-design#73 adds the reason — "since `functionof` already reifies
-        // a measure node to a kernel directly". A measure-layer body is therefore
-        // a static error, not something to wrap.
+        // `kernelof` reifies a value's law after cutting the input boundary.
+        // A measure body belongs to functionof; it is not wrapped again.
         ("kernelof", Some(body @ (Type::Measure { .. } | Type::Kernel { .. }))) => {
             let anchor = args.first().map_or(id, |(n, _, _)| *n);
             // §04's sentence names the measure case; a KERNEL body fails the same
@@ -4964,7 +4803,9 @@ fn reification_type(
         }
         ("kernelof", _) => Type::Kernel {
             inputs,
-            mass: Mass::Normalized,
+            mass: args.first().map_or(Mass::Deferred, |(body, _, _)| {
+                improper::law_mass(inf, *body, &boundary_targets)
+            }),
         },
         ("functionof", Some(Type::Measure { mass, .. })) => Type::Kernel {
             inputs,
@@ -5755,6 +5596,26 @@ fn module_member_arity_check(
     ))
 }
 
+/// Include record auto-splats and measures nested in argument collections.
+fn contains_measure(ty: &Type) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            Type::Measure { .. } | Type::Kernel { .. } => return true,
+            Type::Array { elem, .. } | Type::TVector { elem, .. } => pending.push(elem),
+            Type::Record(fields)
+            | Type::Table {
+                columns: fields, ..
+            } => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+            }
+            Type::Tuple(parts) => pending.extend(parts.iter()),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Calling a user-defined callable: a function returns its body's type, a
 /// kernel returns the *measure* its body denotes (`kernelof` reifies the law
 /// of a value-typed body).
@@ -5765,6 +5626,24 @@ fn user_call_type(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> RuleStep<Type> {
+    let resolved = resolve_binding_refs(inf, callee);
+    if matches!(inf.module.node(resolved), Node::Ref(r) if matches!(r.ns, RefNs::Module(_)))
+        && inf.module_catalogue_ref(resolved).is_none()
+        && args
+            .iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+            .any(contains_measure)
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            callee,
+            "imported callables with measure-valued arguments are not supported: \
+             actual measure substitution across this boundary is not implemented. \
+             Apply the helper in its defining module and export the resulting measure, \
+             or define the helper in this module",
+        ));
+        return Ready(Type::Failed("imported measure argument".into()));
+    }
     // §09 standard-module application (`hepphys.CrystalBall(args)` /
     // `specfns.erf(x)`): the callee is a `RefNs::Module` ref whose catalogue
     // signature was stashed at resolution time. Lower it with the concrete
@@ -6092,6 +5971,7 @@ fn substituted_result(
             vset: inf.lookup_valueset(arg_node),
             result: None,
             catalogue: None,
+            admitted_source: improper::admitted(inf, arg_node),
         };
         match decl.ns {
             RefNs::Local => {
@@ -9640,6 +9520,19 @@ pub(crate) fn fill_mass(
 /// the split is mirrored here so both spellings of the same joint fold
 /// identically.
 fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Mass {
+    if args
+        .iter()
+        .map(|(node, _, _)| *node)
+        .chain(named.iter().map(|(_, node, _, _)| *node))
+        .any(|node| {
+            !matches!(
+                improper::ancestor_mass(inf, node),
+                Mass::Normalized | Mass::Deferred
+            )
+        })
+    {
+        return Mass::Unknown;
+    }
     let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
         named
             .iter()
@@ -10171,7 +10064,7 @@ mod no_laundering_tests {
             domain: Box::new(Type::Scalar(ScalarType::Real)),
             mass: Mass::Deferred,
         };
-        let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
+        let Type::Measure { mass, .. } = lawof_type(Some(&arg), Mass::Deferred) else {
             panic!("lawof of a measure is a measure");
         };
         assert_eq!(
@@ -10189,22 +10082,10 @@ mod no_laundering_tests {
             inputs: Box::new([]),
             mass: Mass::Deferred,
         };
-        let Type::Kernel { mass, .. } = lawof_type(Some(&arg)) else {
+        let Type::Kernel { mass, .. } = lawof_type(Some(&arg), Mass::Deferred) else {
             panic!("lawof of a kernel is a kernel");
         };
         assert_eq!(mass, Mass::Deferred, "same rider, kernel side");
-    }
-
-    /// `lawof` of a VALUE is `%normalized`, and must stay so: the rider is about
-    /// not inventing a class for a measure whose mass is unknown, not about
-    /// refusing to state one where the maths gives it. §06: `lawof(x)` is the law
-    /// of `x`, a probability measure.
-    #[test]
-    fn lawof_of_a_value_is_normalized() {
-        let Type::Measure { mass, .. } = lawof_type(Some(&Type::Scalar(ScalarType::Real))) else {
-            panic!("lawof of a value is a measure");
-        };
-        assert_eq!(mass, Mass::Normalized);
     }
 
     /// Every other mass class passes through `lawof_type` unchanged too, so the
@@ -10222,7 +10103,7 @@ mod no_laundering_tests {
                 domain: Box::new(Type::Scalar(ScalarType::Real)),
                 mass: m,
             };
-            let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
+            let Type::Measure { mass, .. } = lawof_type(Some(&arg), m) else {
                 unreachable!()
             };
             assert_eq!(mass, m, "lawof must not restate a measure's own mass");

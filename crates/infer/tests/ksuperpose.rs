@@ -121,7 +121,7 @@ fn applying_the_lift_contracts_the_family_axis_into_one_measure() {
 /// unnormalized, of total mass $\sum_i w_i\,\mathrm{totalmass}(\kappa(\theta_i))$,
 /// which is $\sum_i w_i$ for a Markov `kernel`". So a Markov component gives
 /// `%finite`, never `%normalized` — and `draw` must therefore reject the bare
-/// mixture, exactly as it rejects any unnormalized measure.
+/// mixture: it is not an admitted improper prior source either.
 #[test]
 fn a_markov_component_makes_the_mixture_finite_not_normalized() {
     let out = pir(TWO_NORMALS);
@@ -131,7 +131,7 @@ fn a_markov_component_makes_the_mixture_finite_not_normalized() {
     );
     rejects(
         &format!("{TWO_NORMALS}y = draw(mix)\n"),
-        "there is no draw from an unnormalized measure",
+        "source is not admitted",
     );
 }
 
