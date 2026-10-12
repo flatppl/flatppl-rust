@@ -2187,7 +2187,9 @@ fn lower_measure_density_in_reference(
         // still substitutes their boundaries after scoring, as before.
         let application_atoms = if atoms.is_empty() {
             match superposition_reference(m, measure_node, &mut Vec::new()) {
-                Some(SuperpositionReference::Mixed(atoms)) => atoms,
+                Some(
+                    SuperpositionReference::Mixed(atoms) | SuperpositionReference::Atoms(atoms),
+                ) => atoms,
                 _ => Vec::new(),
             }
         } else {
@@ -3658,11 +3660,12 @@ fn lower_weighted(
     } else {
         w_node
     };
-    // Outside the base measure's support the product is zero for every weight.
-    // Do not differentiate an inactive log(0) at a zero mixture weight.
+    // In a fixed-atom mixture, an absent component contributes zero for every
+    // weight. Keep this guard within that proven reference: a density comparison
+    // would introduce an implicit breakpoint in ordinary numerical normalizers.
     let positive = static_real(m, w_scored).is_some_and(|w| w > 0.0 && w.is_finite())
         || matches!(m.valueset_of(w_scored), Some(ValueSet::PosReals));
-    let safe_weight = if positive {
+    let safe_weight = if atoms.is_empty() || positive {
         w_scored
     } else {
         let inf = m.intern("inf");
@@ -3836,7 +3839,7 @@ fn lower_superpose(
             .ok_or_else(|| refuse(node, m,
                 "superpose densities need a fixed common reference; continuous components may mix only with proven finite fixed scalar atoms"))?;
         match common {
-            SuperpositionReference::Mixed(atoms) => atoms,
+            SuperpositionReference::Mixed(atoms) | SuperpositionReference::Atoms(atoms) => atoms,
             _ => Vec::new(),
         }
     } else {
