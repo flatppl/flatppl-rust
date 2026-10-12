@@ -34,8 +34,8 @@ fn numeric_expression_matrix_and_prediction_match_r() {
         DataValue::Real64(logs.to_vec())
     );
     let mean_log = logs.iter().sum::<f64>() / 4.0;
-    assert_eq!(result.recipe.means, [7.5, mean_log]);
-    assert_eq!(result.recipe.priors.intercept_location, 5.5 - mean_log);
+    assert_eq!(result.recipe.mu.means, [7.5, mean_log]);
+    assert_eq!(result.recipe.mu.priors.intercept_location, 5.5 - mean_log);
     assert_eq!(result.info.parameters[2].name, "b_IxE2");
     assert_eq!(result.info.parameters[3].name, "b_logz");
 
@@ -53,7 +53,7 @@ fn numeric_expression_matrix_and_prediction_match_r() {
         prediction.constants["offset"],
         result.data.constants["offset"]
     );
-    assert_eq!(recipe.means, result.recipe.means);
+    assert_eq!(recipe.mu.means, result.recipe.mu.means);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn offset_subtraction_and_expression_missing_rows_follow_r() {
         result.data.constants["offset"],
         DataValue::Real32(vec![1.0, 3.0, 4.0])
     );
-    assert_eq!(result.recipe.priors.intercept_location, 7.0 - 8.0 / 3.0);
+    assert_eq!(result.recipe.mu.priors.intercept_location, 7.0 - 8.0 / 3.0);
 }
 
 #[test]

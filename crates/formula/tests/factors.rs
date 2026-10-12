@@ -60,17 +60,19 @@ fn matrix(recipe: &Recipe, data: &DataDocument) -> Vec<Vec<f64>> {
     (0..data.rows.len())
         .map(|row| {
             let mut values = Vec::new();
-            if recipe.formula.intercept {
+            if recipe.mu.formula.intercept {
                 values.push(1.0);
             }
-            for column in &recipe.design.columns {
+            for column in &recipe.mu.design.columns {
                 let mut value = 1.0;
                 for component in &column.components {
                     value *= match *component {
                         DesignComponent::Numeric { predictor } => input(predictor, row),
                         DesignComponent::Contrast { predictor, column } => {
-                            let factor =
-                                recipe.design.predictors[predictor].factor.as_ref().unwrap();
+                            let factor = recipe.mu.design.predictors[predictor]
+                                .factor
+                                .as_ref()
+                                .unwrap();
                             factor.matrix[input(predictor, row) as usize - 1][column]
                         }
                         DesignComponent::Indicator { predictor, level } => {
@@ -115,9 +117,10 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             "{} rows",
             case.name
         );
-        let offset = usize::from(recipe.formula.intercept);
+        let offset = usize::from(recipe.mu.formula.intercept);
         assert_eq!(
             recipe
+                .mu
                 .design
                 .columns
                 .iter()
@@ -148,6 +151,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
         );
         assert_eq!(
             recipe
+                .mu
                 .design
                 .columns
                 .iter()
@@ -157,7 +161,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             "{} term assignments",
             case.name
         );
-        for predictor in &recipe.design.predictors {
+        for predictor in &recipe.mu.design.predictors {
             if let Some(expected) = case.expected.factor_levels.get(&predictor.column) {
                 let actual = predictor.factor.as_ref().unwrap();
                 assert_eq!(actual.levels, expected.levels, "{} levels", case.name);
@@ -169,7 +173,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             &case.expected.x.values,
             &case.name,
         );
-        for (column, &mean) in recipe.design.columns.iter().zip(&recipe.means) {
+        for (column, &mean) in recipe.mu.design.columns.iter().zip(&recipe.mu.means) {
             assert!(
                 (mean - case.expected.means[&column.name]).abs() < 2e-12,
                 "{} mean of {}",
@@ -191,7 +195,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
                 &prediction.values,
                 &format!("{} prediction", case.name),
             );
-            for (actual, expected) in restored.means.iter().zip(&recipe.means) {
+            for (actual, expected) in restored.mu.means.iter().zip(&recipe.mu.means) {
                 assert!((actual - expected).abs() < 2e-12);
             }
         }
@@ -319,9 +323,9 @@ fn larger_ordered_factors_use_indicators_or_other_contrasts() {
         .contrasts
         .insert("o".into(), Contrast::Treatment);
     let converted = build(&spec, &table).unwrap();
-    assert_eq!(converted.recipe.design.columns.len(), 16);
-    assert_eq!(converted.recipe.design.columns[0].name, "o2");
-    assert_eq!(converted.recipe.design.columns[15].name, "o17");
+    assert_eq!(converted.recipe.mu.design.columns.len(), 16);
+    assert_eq!(converted.recipe.mu.design.columns[0].name, "o2");
+    assert_eq!(converted.recipe.mu.design.columns[15].name, "o17");
 
     spec.options.contrasts.clear();
     spec.formula = "y ~ 0 + o".into();

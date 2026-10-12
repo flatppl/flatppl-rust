@@ -44,6 +44,61 @@ fn formula_training_and_prediction_compile_from_distinct_snapshots()
     compile_from_distinct_snapshots(&spec)
 }
 
+#[test]
+fn distributional_prediction_reuses_both_predictors_without_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "../../formula/tests/fixtures/distributional-prediction.json"
+    ))?;
+    let spec = flatppl_formula::read(include_str!(
+        "../../formula/tests/fixtures/distributional.formula.json"
+    ))?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    context.register("training.flatppl", &model.module)?;
+    let parameters = "p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 1), temp_Intercept_sigma = reals, b_sigma = cartpow(reals, 1)))";
+    let score = context.parse(
+        &format!(
+            r#"
+        m = load_module("training.flatppl")
+        {parameters}
+        inputs = p
+        outputs = record(
+            posterior = logdensityof(m.Pi_post, p),
+            pointwise = m.log_lik(temp_Intercept = p.temp_Intercept, b = p.b,
+                temp_Intercept_sigma = p.temp_Intercept_sigma, b_sigma = p.b_sigma))
+    "#
+        ),
+        None,
+        None,
+    )?;
+    let training = score.compile(&EmitOptions::default())?;
+    let data = serde_json::from_value(serde_json::json!({"nrows": 2, "columns": [
+        {"name": "x", "values": {"kind": "real32", "values": oracle["data"]["x"]}},
+        {"name": "g", "values": {"kind": "real64", "values": oracle["data"]["g"]}}
+    ]}))?;
+    let prediction = model.prepare(&mut context, &data, DataMode::Prediction)?;
+    context.register("prediction.flatppl", &prediction)?;
+    let forward = context.parse(
+        &format!(
+            r#"
+        m = load_module("prediction.flatppl")
+        {parameters}
+        inputs = p
+        outputs = logdensityof(m.K_model(p), record(y = [1.0, 2.0]))
+    "#
+        ),
+        None,
+        None,
+    )?;
+    forward.compile(&EmitOptions::default())?;
+    assert_eq!(
+        score.compile(&EmitOptions::default())?.stablehlo,
+        training.stablehlo
+    );
+    Ok(())
+}
+
 fn compile_from_distinct_snapshots(
     spec: &flatppl_formula::Spec,
 ) -> Result<(), Box<dyn std::error::Error>> {

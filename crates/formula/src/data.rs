@@ -336,21 +336,30 @@ impl Column {
     }
 }
 
-pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Result<Vec<usize>> {
+pub(crate) fn model_rows(
+    formula: &Formula,
+    extra: &[&Formula],
+    table: &Table,
+    mode: DataMode,
+) -> Result<Vec<usize>> {
     table.validate()?;
     let mut se_columns = Vec::new();
     if let Some(se) = &formula.se {
         se.value.columns(&mut se_columns);
     }
-    let names = formula
-        .predictor_columns()
-        .into_iter()
-        .chain(
-            formula
-                .groups
-                .iter()
-                .flat_map(|group| group.columns.iter().map(String::as_str)),
-        )
+    let formulas: Vec<_> = std::iter::once(formula)
+        .chain(extra.iter().copied())
+        .collect();
+    let names = formulas
+        .iter()
+        .flat_map(|formula| {
+            formula.predictor_columns().into_iter().chain(
+                formula
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.columns.iter().map(String::as_str)),
+            )
+        })
         .chain(match &formula.trials {
             Some(Trials::Column(name)) => Some(name.as_str()),
             _ => None,
@@ -368,16 +377,16 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
-    for expression in formula
-        .expressions
-        .values()
-        .chain(&formula.offsets)
-        .chain(
-            formula
-                .groups
-                .iter()
-                .flat_map(|group| group.expressions.values()),
-        )
+    for expression in formulas
+        .iter()
+        .flat_map(|formula| {
+            formula.expressions.values().chain(&formula.offsets).chain(
+                formula
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.expressions.values()),
+            )
+        })
         .chain(formula.se.as_ref().map(|se| &se.value))
     {
         let values = expression.values(table, &rows)?;
@@ -396,23 +405,12 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
 /// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
-    let rows = model_rows(&recipe.formula, table, mode)?;
+    let extra: Vec<_> = recipe.dpars.values().map(|p| &p.formula).collect();
+    let rows = model_rows(&recipe.mu.formula, &extra, table, mode)?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
-    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
-        if let Some(expression) = recipe.formula.expressions.get(&predictor.column) {
-            constants.insert(format!("x_{}", i + 1), expression.data(table, &rows)?);
-            continue;
-        }
-        let column = table.column(&predictor.column)?;
-        let values = match &predictor.factor {
-            Some(factor) => DataValue::Integers(column.factor_codes(&factor.levels, &rows)?),
-            None => column.data(&rows)?,
-        };
-        constants.insert(format!("x_{}", i + 1), values);
-    }
-    if let Some(offset) = recipe.formula.offset() {
-        constants.insert("offset".into(), offset.data(table, &rows)?);
+    for (dpar, predictor) in recipe.predictors() {
+        prepare_predictor(predictor, dpar, table, &rows, &mut constants)?;
     }
     if mode == DataMode::Training {
         constants.insert(
@@ -420,12 +418,12 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             response(
                 recipe.family,
                 recipe.response_levels.as_deref(),
-                &recipe.formula,
+                &recipe.mu.formula,
                 table,
                 &rows,
             )?,
         );
-        if let Some(name) = &recipe.formula.weights {
+        if let Some(name) = &recipe.mu.formula.weights {
             let weights = table.column(name)?;
             if weights.numeric(&rows)?.iter().any(|&value| value < 0.0) {
                 return Err(Error("response weights must be nonnegative".into()));
@@ -433,13 +431,13 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             constants.insert("weights_data".into(), weights.data(&rows)?);
         }
     }
-    if let Some(Trials::Column(name)) = &recipe.formula.trials {
+    if let Some(Trials::Column(name)) = &recipe.mu.formula.trials {
         constants.insert(
             "trials_data".into(),
             DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
     }
-    if let Some(se) = &recipe.formula.se {
+    if let Some(se) = &recipe.mu.formula.se {
         let values = se.value.data(table, &rows)?;
         let valid = |value: f64| value >= 0.0 && (se.sigma || value > 0.0);
         let valid = match &values {
@@ -454,20 +452,52 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
         }
         constants.insert("se_data".into(), values);
     }
+    Ok(DataDocument { constants, rows })
+}
+
+fn prepare_predictor(
+    recipe: &crate::PredictorRecipe,
+    dpar: &str,
+    table: &Table,
+    rows: &[usize],
+    constants: &mut BTreeMap<String, DataValue>,
+) -> Result<()> {
+    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
+        if let Some(expression) = recipe.formula.expressions.get(&predictor.column) {
+            constants.insert(
+                crate::emit::predictor_name(dpar, &format!("x_{}", i + 1)),
+                expression.data(table, rows)?,
+            );
+            continue;
+        }
+        let column = table.column(&predictor.column)?;
+        let values = match &predictor.factor {
+            Some(factor) => DataValue::Integers(column.factor_codes(&factor.levels, rows)?),
+            None => column.data(rows)?,
+        };
+        constants.insert(
+            crate::emit::predictor_name(dpar, &format!("x_{}", i + 1)),
+            values,
+        );
+    }
+    if let Some(offset) = recipe.formula.offset() {
+        constants.insert(
+            crate::emit::predictor_name(dpar, "offset"),
+            offset.data(table, rows)?,
+        );
+    }
     for (group, term) in recipe.groups.iter().zip(&recipe.formula.groups) {
         for (predictor, name) in group.design.predictors.iter().zip(&group.inputs) {
             if constants.contains_key(name) {
                 continue;
             }
             let values = if let Some(expression) = term.expressions.get(&predictor.column) {
-                expression.data(table, &rows)?
+                expression.data(table, rows)?
             } else {
                 let column = table.column(&predictor.column)?;
                 match &predictor.factor {
-                    Some(factor) => {
-                        DataValue::Integers(column.factor_codes(&factor.levels, &rows)?)
-                    }
-                    None => column.data(&rows)?,
+                    Some(factor) => DataValue::Integers(column.factor_codes(&factor.levels, rows)?),
+                    None => column.data(rows)?,
                 }
             };
             constants.insert(name.clone(), values);
@@ -492,7 +522,7 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             .collect::<Result<Vec<_>>>()?;
         constants.insert(group.index.clone(), DataValue::Integers(indices));
     }
-    Ok(DataDocument { constants, rows })
+    Ok(())
 }
 
 pub(crate) fn response_levels(

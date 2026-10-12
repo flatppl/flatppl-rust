@@ -35,11 +35,11 @@ fn gaussian_model_frame_preserves_brms_coordinates() {
     // labels sort to 10,20. X=[1,2,3], Xc=[-1,0,1], median(y)=4,
     // mad(y)=1.4826*2=2.9652, hence brms's rounded prior scale is 3.
     assert_eq!(converted.data.rows, [0, 1, 2]);
-    assert_eq!(converted.recipe.means, [2.0]);
-    assert_eq!(converted.recipe.priors.intercept_location, 4.0);
-    assert_eq!(converted.recipe.priors.scale, 3.0);
+    assert_eq!(converted.recipe.mu.means, [2.0]);
+    assert_eq!(converted.recipe.mu.priors.intercept_location, 4.0);
+    assert_eq!(converted.recipe.mu.priors.scale, 3.0);
     assert_eq!(
-        converted.recipe.groups[0].levels,
+        converted.recipe.mu.groups[0].levels,
         [GroupLevel::Integer(10), GroupLevel::Integer(20)]
     );
     assert_eq!(
@@ -52,7 +52,7 @@ fn gaussian_model_frame_preserves_brms_coordinates() {
     );
     assert!(converted.info.has_improper_prior);
     let formula = parse_formula("y ~ x + x + discarded - discarded + (1 | g)").unwrap();
-    assert_eq!(formula, converted.recipe.formula);
+    assert_eq!(formula, converted.recipe.mu.formula);
     let no_intercept = parse_formula("y ~ x - 1").unwrap();
     assert_eq!(no_intercept, parse_formula("y ~ 0 + x").unwrap());
     assert!(!no_intercept.intercept);
@@ -84,7 +84,7 @@ fn prediction_reuses_training_recipe_without_response() {
         DataValue::Integers(vec![2, 1, 2, 1])
     );
     assert!(!prepared.constants.contains_key("y_data"));
-    assert_eq!(converted.recipe.means, [2.0]);
+    assert_eq!(converted.recipe.mu.means, [2.0]);
     let saved = serde_json::to_string(&converted.recipe).unwrap();
     assert_eq!(
         prepare_data(
@@ -108,7 +108,7 @@ fn explicit_normal_priors_in_a_no_intercept_model() {
     .unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert!(!converted.info.has_improper_prior);
-    assert!(!converted.recipe.center);
+    assert!(!converted.recipe.mu.center);
     assert_eq!(
         converted
             .info
@@ -146,6 +146,7 @@ fn factor_group_order_and_specific_priors_survive_name_collisions() {
     assert_eq!(
         converted
             .recipe
+            .mu
             .formula
             .groups
             .iter()
@@ -159,18 +160,21 @@ fn factor_group_order_and_specific_priors_survive_name_collisions() {
         .iter()
         .find(|p| p.name == "z_1[1,1]")
         .unwrap();
-    assert_eq!(first_latent.binding, converted.recipe.groups[0].z);
+    assert_eq!(first_latent.binding, converted.recipe.mu.groups[0].z);
     assert_eq!(
-        converted.recipe.groups[0].levels,
+        converted.recipe.mu.groups[0].levels,
         [GroupLevel::Text("B".into()), GroupLevel::Text("A".into())]
     );
     assert_eq!(
-        converted.data.constants[&converted.recipe.groups[0].index],
+        converted.data.constants[&converted.recipe.mu.groups[0].index],
         DataValue::Integers(vec![2, 1, 2])
     );
-    assert_ne!(converted.recipe.groups[0].sd, converted.recipe.groups[1].sd);
     assert_ne!(
-        converted.recipe.groups[0].index,
-        converted.recipe.groups[1].index
+        converted.recipe.mu.groups[0].sd,
+        converted.recipe.mu.groups[1].sd
+    );
+    assert_ne!(
+        converted.recipe.mu.groups[0].index,
+        converted.recipe.mu.groups[1].index
     );
 }

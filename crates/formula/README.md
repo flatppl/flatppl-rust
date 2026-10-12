@@ -15,6 +15,35 @@ Group terms support random slopes, nested groups and independent `||` effects.
 The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
+Distributional formulas use the same terms for a family parameter:
+
+```json
+{
+  "formula": "y ~ x",
+  "family": "gaussian",
+  "dpars": {"sigma": {"formula": "sigma ~ g", "link": "log"}},
+  "priors": [{"class": "b", "dpar": "sigma", "prior": "normal(0, 1)"}]
+}
+```
+
+This is the typed equivalent of `bf(y ~ x, sigma ~ g)`; `bf(...)` strings are
+not yet accepted. Each predictor saves its own contrasts, centring, offsets
+and group effects. Training omits incomplete rows jointly across the response
+and every predictor. Prediction reuses all fitted recipes without a response.
+Priors without `dpar` apply to the mean predictor. Set `dpar` for auxiliary
+coefficients, intercepts, group scales or correlations. A direct `sigma` prior
+is unavailable when `sigma` has a predictor; its priors belong to the linear
+predictor before the inverse link.
+
+The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa` and `zi`
+where present in the family. Positive parameters default to the log link;
+Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi` uses logit.
+Identity is also available; positive parameters other than `nu` additionally
+accept softplus and squareplus. Auxiliary priors follow brms's link-dependent
+defaults. `ModelInfo.dpars` records each formula, link and design columns.
+For example, `temp_Intercept_sigma` is the centred scale intercept and
+`b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
+
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises` or `cumulative`.
 `link` is optional:
@@ -254,3 +283,9 @@ the category coding, generated Stan, and independent density values.
 normalized brms-generated Stan scores and gradients for Gaussian and Student
 models with both `se()` residual-scale settings; its adjacent R script regenerates
 the models.
+
+[The distributional reproducer](tests/fixtures/distributional-oracle.R) generates
+normalized brms models and independent density/gradient oracles for Gaussian
+mean/scale predictors, Student mean/scale/degrees-of-freedom predictors, and
+group effects on both mean and scale. The adjacent JSON fixtures retain the
+executed Stan comparisons and parameter ordering.

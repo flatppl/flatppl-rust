@@ -84,7 +84,7 @@ fn group_prior_selectors_follow_brms_coefficient_and_alias_precedence() {
     // Actual brms 2.23.2 make_stancode(normalize=TRUE): g has a half-Cauchy
     // intercept sd, a Student-t slope sd restricted above zero, and LKJ(3).
     // h inherits both half-Normal sd laws and LKJ(2) from the class priors.
-    let priors = serde_json::to_value(&converted.recipe.priors).unwrap();
+    let priors = serde_json::to_value(&converted.recipe.mu.priors).unwrap();
     assert_eq!(
         priors["sd"],
         json!([

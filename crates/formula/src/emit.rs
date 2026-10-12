@@ -26,201 +26,41 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             "reals"
         },
     );
-    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
+    if matches!(recipe.mu.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
     }
-    if recipe.formula.weights.is_some() {
+    if recipe.mu.formula.weights.is_some() {
         external_vector(&mut b, "weights_data", "nonnegreals");
     }
-    if recipe.formula.se.is_some() {
+    if recipe.mu.formula.se.is_some() {
         external_vector(&mut b, "se_data", "nonnegreals");
     }
-    if !recipe.formula.offsets.is_empty() {
-        external_vector(&mut b, "offset", "reals");
-    }
-    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
-        let set = if predictor.factor.is_some() {
-            "posintegers"
-        } else {
-            "reals"
-        };
-        external_vector(&mut b, &format!("x_{}", i + 1), set);
-    }
-    let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
-        .map(|i| format!("x_{}", i + 1))
-        .collect();
-    let mut input_names: std::collections::HashMap<_, _> = recipe
-        .design
-        .predictors
-        .iter()
-        .zip(&fixed_inputs)
-        .map(|(predictor, name)| (predictor.column.clone(), name.clone()))
-        .collect();
-    for (group_index, group) in recipe.groups.iter_mut().enumerate() {
-        group.index = b.alloc_name(&format!("index_{}", group.column));
-        external_vector(&mut b, &group.index, "posintegers");
-        group.inputs = group
-            .design
-            .predictors
-            .iter()
-            .enumerate()
-            .map(|(i, predictor)| {
-                if let Some(name) = input_names.get(&predictor.column) {
-                    return name.clone();
-                }
-                let name = b.alloc_name(&format!("group_{}_x_{}", group_index + 1, i + 1));
-                let set = if predictor.factor.is_some() {
-                    "posintegers"
-                } else {
-                    "reals"
-                };
-                external_vector(&mut b, &name, set);
-                input_names.insert(predictor.column.clone(), name.clone());
-                name
-            })
-            .collect();
+    predictor_data(&mut b, "mu", &mut recipe.mu);
+    for &name in recipe.family.auxiliaries() {
+        if let Some(predictor) = recipe.dpars.get_mut(name) {
+            predictor_data(&mut b, name, predictor);
+        }
     }
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
-    if thresholds > 0 {
-        let names = scope(&b, recipe.family);
-        let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-        let PriorNode::Measure(prior) =
-            priors::emit(&mut b, &recipe.priors.intercept, None, None, &bindings)?
-        else {
-            return Err(Error(
-                "cumulative thresholds require a shared continuous prior".into(),
-            ));
-        };
-        let count = b.lit_int(thresholds as i64);
-        let prior = b.call("iid", &[prior, count]);
-        let domain = b.call("ordered", &[count]);
-        let reference = b.call("Lebesgue", &[domain]);
-        let prior = b.call("tilt", &[prior, reference]);
-        draw(&mut b, "cuts", prior, &mut parameters);
-    } else if recipe.formula.intercept {
-        parameter(
-            &mut b,
-            "temp_Intercept",
-            &recipe.priors.intercept,
-            None,
-            &mut parameters,
-            recipe.family,
-        )?;
-    }
-    if !recipe.design.columns.is_empty() {
-        if recipe.priors.b.iter().all(|p| *p == recipe.priors.b[0]) {
-            let scope = scope(&b, recipe.family);
-            let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
-            let prior = priors::emit(&mut b, &recipe.priors.b[0], None, None, &bindings)?;
-            let count = b.lit_int(recipe.design.columns.len() as i64);
-            match prior {
-                PriorNode::Measure(prior) => {
-                    let iid = b.call("iid", &[prior, count]);
-                    draw(&mut b, "b", iid, &mut parameters);
-                }
-                PriorNode::Constant(value) => {
-                    let values = b.call("fill", &[value, count]);
-                    b.bind("b", values);
-                }
-            }
-        } else {
-            let mut values = Vec::new();
-            for (i, prior) in recipe.priors.b.iter().enumerate() {
-                let name = format!("b_{}", i + 1);
-                parameter(&mut b, &name, prior, None, &mut parameters, recipe.family)?;
-                values.push(b.self_ref(&name));
-            }
-            let coefficients = b.array(&values);
-            b.bind("b", coefficients);
+    predictor_parameters(
+        &mut b,
+        "mu",
+        &mut recipe.mu,
+        recipe.family,
+        thresholds,
+        &mut parameters,
+    )?;
+    for &name in recipe.family.auxiliaries() {
+        if let Some(predictor) = recipe.dpars.get_mut(name) {
+            predictor_parameters(&mut b, name, predictor, recipe.family, 0, &mut parameters)?;
         }
-    }
-    for (i, group) in recipe.groups.iter_mut().enumerate() {
-        group.sd = b.alloc_name(&format!("sd_{}", group.column));
-        let dimensions = group.coefficients.len();
-        let dimension = b.lit_int(dimensions as i64);
-        let support = lower_bound(&mut b, 0.0);
-        let sd_priors = &recipe.priors.sd[i];
-        if dimensions == 1 {
-            parameter(
-                &mut b,
-                &group.sd,
-                &sd_priors[0],
-                Some(support),
-                &mut parameters,
-                recipe.family,
-            )?;
-        } else if sd_priors.iter().all(|prior| *prior == sd_priors[0]) {
-            let names = scope(&b, recipe.family);
-            let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-            match priors::emit(&mut b, &sd_priors[0], Some(support), None, &bindings)? {
-                PriorNode::Measure(law) => {
-                    let law = b.call("iid", &[law, dimension]);
-                    draw(&mut b, &group.sd, law, &mut parameters);
-                }
-                PriorNode::Constant(value) => {
-                    let value = b.call("fill", &[value, dimension]);
-                    b.bind(&group.sd, value);
-                }
-            }
-        } else {
-            let mut values = Vec::new();
-            for (j, prior) in sd_priors.iter().enumerate() {
-                let name = b.alloc_name(&format!("{}_{}", group.sd, j + 1));
-                parameter(
-                    &mut b,
-                    &name,
-                    prior,
-                    Some(support),
-                    &mut parameters,
-                    recipe.family,
-                )?;
-                values.push(b.self_ref(&name));
-            }
-            let value = b.array(&values);
-            b.bind(&group.sd, value);
-        }
-        group.z = b.alloc_name(&format!("z_{}", group.column));
-        let zero = b.lit_real(0.0);
-        let one = b.lit_real(1.0);
-        let standard = b.call("Normal", &[zero, one]);
-        let count = b.lit_int(group.levels.len() as i64);
-        let size = if dimensions == 1 {
-            count
-        } else {
-            b.array(&[dimension, count])
-        };
-        let iid = b.call("iid", &[standard, size]);
-        draw(&mut b, &group.z, iid, &mut parameters);
-        group.r = b.alloc_name(&format!("r_{}", group.column));
-        let sd = b.self_ref(&group.sd);
-        let z = b.self_ref(&group.z);
-        let effect = if dimensions == 1 {
-            broadcast(&mut b, "mul", &[sd, z])
-        } else {
-            let mut scale = b.call("diagmat", &[sd]);
-            if let Some(prior) = &recipe.priors.cor[i] {
-                let name = b.alloc_name(&format!("L_{}", group.column));
-                let names = scope(&b, recipe.family);
-                let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-                let law = priors::emit_correlation(&mut b, prior, dimensions, &bindings)?;
-                draw(&mut b, &name, law, &mut parameters);
-                let cholesky = b.self_ref(&name);
-                scale = b.call("mul", &[scale, cholesky]);
-                group.correlation = Some(name);
-                let name = b.alloc_name(&format!("Cor_{}", group.column));
-                let transposed = b.call("transpose", &[cholesky]);
-                let correlation = b.call("mul", &[cholesky, transposed]);
-                b.bind(&name, correlation);
-                group.correlation_matrix = Some(name);
-            }
-            let effect = b.call("mul", &[scale, z]);
-            b.call("transpose", &[effect])
-        };
-        b.bind(&group.r, effect);
     }
     for &name in recipe.family.auxiliaries() {
-        if name == "sigma" && !recipe.priors.aux.contains_key(name) {
+        if recipe.dpars.contains_key(name) {
+            continue;
+        }
+        if name == "sigma" && !recipe.auxiliary_priors.contains_key(name) {
             let zero = b.lit_real(0.0);
             b.bind(name, zero);
             continue;
@@ -235,7 +75,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         parameter(
             &mut b,
             name,
-            &recipe.priors.aux[name],
+            &recipe.auxiliary_priors[name],
             Some(support),
             &mut parameters,
             recipe.family,
@@ -254,104 +94,49 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let prior = b.call("lawof", &[record]);
     b.bind("Pi_prior", prior);
 
-    let n = b.self_ref("N");
-    let zero = b.lit_real(0.0);
-    let mut eta = b.call("fill", &[zero, n]);
-    let mut intercept = recipe.formula.intercept.then(|| {
-        b.self_ref(if thresholds > 0 {
-            "cuts"
-        } else {
-            "temp_Intercept"
-        })
-    });
-    if !recipe.design.columns.is_empty() {
-        let mut columns = design_columns(&mut b, &recipe.design, &fixed_inputs);
-        if recipe.center {
-            for (column, &mean) in columns.iter_mut().zip(&recipe.means) {
-                let mean = b.lit_real(mean);
-                *column = broadcast(&mut b, "sub", &[*column, mean]);
-            }
+    predictor_values(&mut b, "mu", &recipe.mu, thresholds);
+    for &name in recipe.family.auxiliaries() {
+        if let Some(predictor) = recipe.dpars.get(name) {
+            predictor_values(&mut b, name, predictor, 0);
         }
-        let columns = b.array(&columns);
-        let design = b.call("colstack", &[columns]);
-        b.bind("X", design);
-        let x = b.self_ref("X");
-        let coefficients = b.self_ref("b");
-        eta = b.call("mul", &[x, coefficients]);
-        if recipe.center {
-            let means: Vec<_> = recipe.means.iter().map(|&v| b.lit_real(v)).collect();
-            let means = b.array(&means);
-            let products = broadcast(&mut b, "mul", &[means, coefficients]);
-            let dot = b.call("sum", &[products]);
-            intercept = intercept.map(|value| {
-                if thresholds > 0 {
-                    broadcast(&mut b, "add", &[value, dot])
-                } else {
-                    b.call("sub", &[value, dot])
-                }
-            });
-        }
-    }
-    if recipe.formula.intercept && thresholds == 0 {
-        let value = b.self_ref("temp_Intercept");
-        eta = broadcast(&mut b, "add", &[eta, value]);
-    }
-    for (i, group) in recipe.groups.iter().enumerate() {
-        let mut columns = design_columns(&mut b, &group.design, &group.inputs);
-        if recipe.formula.groups[i].intercept {
-            let one = b.lit_real(1.0);
-            columns.insert(0, b.call("fill", &[one, n]));
-        }
-        for (j, column) in columns.into_iter().enumerate() {
-            let name = b.alloc_name(&format!("Z_{}_{}", i + 1, j + 1));
-            b.bind(&name, column);
-            let values = b.self_ref(&name);
-            let effect = b.self_ref(&group.r);
-            let index = b.self_ref(&group.index);
-            let selected = if group.coefficients.len() == 1 {
-                b.call("get", &[effect, index])
-            } else {
-                let column = b.lit_int(j as i64 + 1);
-                b.call("get", &[effect, index, column])
-            };
-            let contribution = broadcast(&mut b, "mul", &[selected, values]);
-            eta = broadcast(&mut b, "add", &[eta, contribution]);
-        }
-    }
-    if !recipe.formula.offsets.is_empty() {
-        let offset = b.self_ref("offset");
-        eta = broadcast(&mut b, "add", &[eta, offset]);
-    }
-    b.bind("eta_mu", eta);
-    let eta = b.self_ref("eta_mu");
-    let mu = if recipe.family == Family::Cumulative {
-        eta
-    } else {
-        recipe.link.inverse(&mut b, eta)
-    };
-    b.bind("mu", mu);
-    if let Some(intercept) = intercept {
-        b.bind("b_Intercept", intercept);
     }
     let mu = b.self_ref("mu");
-    let trials = recipe.formula.trials.as_ref().map(|trials| match trials {
-        Trials::Constant(n) => b.lit_int(*n),
-        Trials::Column(_) => b.self_ref("trials_data"),
-    });
-    let scale = recipe.formula.se.as_ref().map(|se| {
+    let trials = recipe
+        .mu
+        .formula
+        .trials
+        .as_ref()
+        .map(|trials| match trials {
+            Trials::Constant(n) => b.lit_int(*n),
+            Trials::Column(_) => b.self_ref("trials_data"),
+        });
+    let scale = recipe.mu.formula.se.as_ref().map(|se| {
         let known = b.self_ref("se_data");
         if !se.sigma {
             return known;
         }
         let sigma = b.self_ref("sigma");
-        let residual = b.call("mul", &[sigma, sigma]);
+        let residual = broadcast(&mut b, "mul", &[sigma, sigma]);
         let known = broadcast(&mut b, "mul", &[known, known]);
         let variance = broadcast(&mut b, "add", &[known, residual]);
         broadcast(&mut b, "sqrt", &[variance])
     });
-    let law = recipe
-        .family
-        .observation(&mut b, mu, trials, scale, thresholds, false);
+    let auxiliary: Vec<_> = recipe
+        .dpars
+        .keys()
+        .map(|name| (name.as_str(), b.self_ref(name)))
+        .collect();
+    let law = recipe.family.observation(
+        &mut b,
+        crate::family::Observation {
+            mu,
+            trials,
+            scale,
+            auxiliary: &auxiliary,
+        },
+        thresholds,
+        false,
+    );
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");
@@ -371,7 +156,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         &["Unweighted log likelihood for each observed row."],
     );
     let prior = b.self_ref("Pi_prior");
-    let posterior = if recipe.formula.weights.is_some() {
+    let posterior = if recipe.mu.formula.weights.is_some() {
         let point = Ref {
             ns: RefNs::Local,
             name: b.sym("_point_"),
@@ -415,21 +200,321 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     b.bind("Pi_post", posterior);
     let formula = b.str_lit(&spec.formula);
     let family = b.str_lit(&spec.family);
-    let link = b.str_lit(recipe.link.name());
+    let link = b.str_lit(recipe.mu.link.name());
     let improper = b.lit_bool(false);
     let score_offset = b.lit_real((1..=thresholds).map(|i| (i as f64).ln()).sum());
-    let metadata = b.call_fields(
-        "record",
-        &[
-            ("formula", formula),
-            ("family", family),
-            ("link", link),
-            ("has_improper_prior", improper),
-            ("score_offset", score_offset),
-        ],
-    );
+    let mut fields = vec![
+        ("formula", formula),
+        ("family", family),
+        ("link", link),
+        ("has_improper_prior", improper),
+        ("score_offset", score_offset),
+    ];
+    if !recipe.dpars.is_empty() {
+        let dpars: Vec<_> = recipe
+            .dpars
+            .iter()
+            .map(|(name, predictor)| {
+                let formula = b.str_lit(&spec.dpars[name].formula);
+                let link = b.str_lit(predictor.link.name());
+                (
+                    name.as_str(),
+                    b.call_fields("record", &[("formula", formula), ("link", link)]),
+                )
+            })
+            .collect();
+        fields.push(("dpars", b.call_fields("record", &dpars)));
+    }
+    let metadata = b.call_fields("record", &fields);
     b.bind("formula_model", metadata);
     Ok(module)
+}
+
+pub(crate) fn predictor_name(dpar: &str, name: &str) -> String {
+    if dpar == "mu" {
+        name.into()
+    } else {
+        format!("{name}_{dpar}")
+    }
+}
+
+fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::PredictorRecipe) {
+    if !recipe.formula.offsets.is_empty() {
+        external_vector(b, &predictor_name(dpar, "offset"), "reals");
+    }
+    for (i, predictor) in recipe.design.predictors.iter().enumerate() {
+        let set = if predictor.factor.is_some() {
+            "posintegers"
+        } else {
+            "reals"
+        };
+        external_vector(b, &predictor_name(dpar, &format!("x_{}", i + 1)), set);
+    }
+    let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
+        .map(|i| predictor_name(dpar, &format!("x_{}", i + 1)))
+        .collect();
+    let mut input_names: std::collections::HashMap<_, _> = recipe
+        .design
+        .predictors
+        .iter()
+        .zip(&fixed_inputs)
+        .map(|(predictor, name)| (predictor.column.clone(), name.clone()))
+        .collect();
+    for (group_index, group) in recipe.groups.iter_mut().enumerate() {
+        group.index = b.alloc_name(&predictor_name(dpar, &format!("index_{}", group.column)));
+        external_vector(b, &group.index, "posintegers");
+        group.inputs = group
+            .design
+            .predictors
+            .iter()
+            .enumerate()
+            .map(|(i, predictor)| {
+                if let Some(name) = input_names.get(&predictor.column) {
+                    return name.clone();
+                }
+                let name = b.alloc_name(&format!("group_{}_x_{}", group_index + 1, i + 1));
+                let set = if predictor.factor.is_some() {
+                    "posintegers"
+                } else {
+                    "reals"
+                };
+                external_vector(b, &name, set);
+                input_names.insert(predictor.column.clone(), name.clone());
+                name
+            })
+            .collect();
+    }
+}
+
+fn predictor_parameters(
+    b: &mut Builder<'_>,
+    dpar: &str,
+    recipe: &mut crate::PredictorRecipe,
+    family: Family,
+    thresholds: usize,
+    parameters: &mut Vec<String>,
+) -> Result<()> {
+    if thresholds > 0 {
+        let names = scope(b, family);
+        let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+        let PriorNode::Measure(prior) =
+            priors::emit(b, &recipe.priors.intercept, None, None, &bindings)?
+        else {
+            return Err(Error(
+                "cumulative thresholds require a shared continuous prior".into(),
+            ));
+        };
+        let count = b.lit_int(thresholds as i64);
+        let prior = b.call("iid", &[prior, count]);
+        let domain = b.call("ordered", &[count]);
+        let reference = b.call("Lebesgue", &[domain]);
+        let prior = b.call("tilt", &[prior, reference]);
+        draw(b, "cuts", prior, parameters);
+    } else if recipe.formula.intercept {
+        parameter(
+            b,
+            &predictor_name(dpar, "temp_Intercept"),
+            &recipe.priors.intercept,
+            None,
+            parameters,
+            family,
+        )?;
+    }
+    if !recipe.design.columns.is_empty() {
+        if recipe.priors.b.iter().all(|p| *p == recipe.priors.b[0]) {
+            let scope = scope(b, family);
+            let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
+            let prior = priors::emit(b, &recipe.priors.b[0], None, None, &bindings)?;
+            let count = b.lit_int(recipe.design.columns.len() as i64);
+            match prior {
+                PriorNode::Measure(prior) => {
+                    let iid = b.call("iid", &[prior, count]);
+                    draw(b, &predictor_name(dpar, "b"), iid, parameters);
+                }
+                PriorNode::Constant(value) => {
+                    let values = b.call("fill", &[value, count]);
+                    b.bind(&predictor_name(dpar, "b"), values);
+                }
+            }
+        } else {
+            let mut values = Vec::new();
+            for (i, prior) in recipe.priors.b.iter().enumerate() {
+                let name = predictor_name(dpar, &format!("b_{}", i + 1));
+                parameter(b, &name, prior, None, parameters, family)?;
+                values.push(b.self_ref(&name));
+            }
+            let coefficients = b.array(&values);
+            b.bind(&predictor_name(dpar, "b"), coefficients);
+        }
+    }
+    for (i, group) in recipe.groups.iter_mut().enumerate() {
+        group.sd = b.alloc_name(&predictor_name(dpar, &format!("sd_{}", group.column)));
+        let dimensions = group.coefficients.len();
+        let dimension = b.lit_int(dimensions as i64);
+        let support = lower_bound(b, 0.0);
+        let sd_priors = &recipe.priors.sd[i];
+        if dimensions == 1 {
+            parameter(
+                b,
+                &group.sd,
+                &sd_priors[0],
+                Some(support),
+                parameters,
+                family,
+            )?;
+        } else if sd_priors.iter().all(|prior| *prior == sd_priors[0]) {
+            let names = scope(b, family);
+            let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+            match priors::emit(b, &sd_priors[0], Some(support), None, &bindings)? {
+                PriorNode::Measure(law) => {
+                    let law = b.call("iid", &[law, dimension]);
+                    draw(b, &group.sd, law, parameters);
+                }
+                PriorNode::Constant(value) => {
+                    let value = b.call("fill", &[value, dimension]);
+                    b.bind(&group.sd, value);
+                }
+            }
+        } else {
+            let mut values = Vec::new();
+            for (j, prior) in sd_priors.iter().enumerate() {
+                let name = b.alloc_name(&format!("{}_{}", group.sd, j + 1));
+                parameter(b, &name, prior, Some(support), parameters, family)?;
+                values.push(b.self_ref(&name));
+            }
+            let value = b.array(&values);
+            b.bind(&group.sd, value);
+        }
+        group.z = b.alloc_name(&predictor_name(dpar, &format!("z_{}", group.column)));
+        let zero = b.lit_real(0.0);
+        let one = b.lit_real(1.0);
+        let standard = b.call("Normal", &[zero, one]);
+        let count = b.lit_int(group.levels.len() as i64);
+        let size = if dimensions == 1 {
+            count
+        } else {
+            b.array(&[dimension, count])
+        };
+        let iid = b.call("iid", &[standard, size]);
+        draw(b, &group.z, iid, parameters);
+        group.r = b.alloc_name(&predictor_name(dpar, &format!("r_{}", group.column)));
+        let sd = b.self_ref(&group.sd);
+        let z = b.self_ref(&group.z);
+        let effect = if dimensions == 1 {
+            broadcast(b, "mul", &[sd, z])
+        } else {
+            let mut scale = b.call("diagmat", &[sd]);
+            if let Some(prior) = &recipe.priors.cor[i] {
+                let name = b.alloc_name(&predictor_name(dpar, &format!("L_{}", group.column)));
+                let names = scope(b, family);
+                let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+                let law = priors::emit_correlation(b, prior, dimensions, &bindings)?;
+                draw(b, &name, law, parameters);
+                let cholesky = b.self_ref(&name);
+                scale = b.call("mul", &[scale, cholesky]);
+                group.correlation = Some(name);
+                let name = b.alloc_name(&predictor_name(dpar, &format!("Cor_{}", group.column)));
+                let transposed = b.call("transpose", &[cholesky]);
+                let correlation = b.call("mul", &[cholesky, transposed]);
+                b.bind(&name, correlation);
+                group.correlation_matrix = Some(name);
+            }
+            let effect = b.call("mul", &[scale, z]);
+            b.call("transpose", &[effect])
+        };
+        b.bind(&group.r, effect);
+    }
+    Ok(())
+}
+
+fn predictor_values(
+    b: &mut Builder<'_>,
+    dpar: &str,
+    recipe: &crate::PredictorRecipe,
+    thresholds: usize,
+) {
+    let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
+        .map(|i| predictor_name(dpar, &format!("x_{}", i + 1)))
+        .collect();
+    let n = b.self_ref("N");
+    let zero = b.lit_real(0.0);
+    let mut eta = b.call("fill", &[zero, n]);
+    let mut intercept = recipe.formula.intercept.then(|| {
+        b.self_ref(&if thresholds > 0 {
+            "cuts".into()
+        } else {
+            predictor_name(dpar, "temp_Intercept")
+        })
+    });
+    if !recipe.design.columns.is_empty() {
+        let mut columns = design_columns(b, &recipe.design, &fixed_inputs);
+        if recipe.center {
+            for (column, &mean) in columns.iter_mut().zip(&recipe.means) {
+                let mean = b.lit_real(mean);
+                *column = broadcast(b, "sub", &[*column, mean]);
+            }
+        }
+        let columns = b.array(&columns);
+        let design = b.call("colstack", &[columns]);
+        b.bind(&predictor_name(dpar, "X"), design);
+        let x = b.self_ref(&predictor_name(dpar, "X"));
+        let coefficients = b.self_ref(&predictor_name(dpar, "b"));
+        eta = b.call("mul", &[x, coefficients]);
+        if recipe.center {
+            let means: Vec<_> = recipe.means.iter().map(|&v| b.lit_real(v)).collect();
+            let means = b.array(&means);
+            let products = broadcast(b, "mul", &[means, coefficients]);
+            let dot = b.call("sum", &[products]);
+            intercept = intercept.map(|value| {
+                if thresholds > 0 {
+                    broadcast(b, "add", &[value, dot])
+                } else {
+                    b.call("sub", &[value, dot])
+                }
+            });
+        }
+    }
+    if recipe.formula.intercept && thresholds == 0 {
+        let value = b.self_ref(&predictor_name(dpar, "temp_Intercept"));
+        eta = broadcast(b, "add", &[eta, value]);
+    }
+    for (i, group) in recipe.groups.iter().enumerate() {
+        let mut columns = design_columns(b, &group.design, &group.inputs);
+        if recipe.formula.groups[i].intercept {
+            let one = b.lit_real(1.0);
+            columns.insert(0, b.call("fill", &[one, n]));
+        }
+        for (j, column) in columns.into_iter().enumerate() {
+            let name = b.alloc_name(&format!("Z_{}_{}", i + 1, j + 1));
+            b.bind(&name, column);
+            let values = b.self_ref(&name);
+            let effect = b.self_ref(&group.r);
+            let index = b.self_ref(&group.index);
+            let selected = if group.coefficients.len() == 1 {
+                b.call("get", &[effect, index])
+            } else {
+                let column = b.lit_int(j as i64 + 1);
+                b.call("get", &[effect, index, column])
+            };
+            let contribution = broadcast(b, "mul", &[selected, values]);
+            eta = broadcast(b, "add", &[eta, contribution]);
+        }
+    }
+    if !recipe.formula.offsets.is_empty() {
+        let offset = b.self_ref(&predictor_name(dpar, "offset"));
+        eta = broadcast(b, "add", &[eta, offset]);
+    }
+    b.bind(&format!("eta_{dpar}"), eta);
+    let eta = b.self_ref(&format!("eta_{dpar}"));
+    let value = if thresholds > 0 {
+        eta
+    } else {
+        recipe.link.inverse(b, eta)
+    };
+    b.bind(dpar, value);
+    if let Some(intercept) = intercept {
+        b.bind(&predictor_name(dpar, "b_Intercept"), intercept);
+    }
 }
 
 fn parameter_function(
@@ -472,15 +557,28 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     };
     let mu = argument(b, "mu");
     let value = argument(b, "value");
-    let trials = match recipe.formula.trials {
+    let trials = match recipe.mu.formula.trials {
         Some(Trials::Constant(n)) => Some(b.lit_int(n)),
         Some(Trials::Column(_)) => Some(argument(b, "trials")),
         None => None,
     };
     let row_scale = scale.map(|_| argument(b, "scale"));
-    let law = recipe
-        .family
-        .observation(b, mu, trials, row_scale, recipe.thresholds(), true);
+    let auxiliary: Vec<_> = recipe
+        .dpars
+        .keys()
+        .map(|name| (name.as_str(), argument(b, name)))
+        .collect();
+    let law = recipe.family.observation(
+        b,
+        crate::family::Observation {
+            mu,
+            trials,
+            scale: row_scale,
+            auxiliary: &auxiliary,
+        },
+        recipe.thresholds(),
+        true,
+    );
     let score = b.call("logdensityof", &[law, value]);
     let head = b.sym("functionof");
     let row_score = b.m.alloc(Node::Call(Call {
@@ -490,12 +588,13 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
     let mut args = vec![row_score, b.self_ref("mu"), b.self_ref("y_data")];
-    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
+    if matches!(recipe.mu.formula.trials, Some(Trials::Column(_))) {
         args.push(b.self_ref("trials_data"));
     }
     if let Some(scale) = scale {
         args.push(scale);
     }
+    args.extend(recipe.dpars.keys().map(|name| b.self_ref(name)));
     b.call("broadcast", &args)
 }
 
@@ -579,7 +678,13 @@ fn scope(b: &Builder<'_>, family: Family) -> Vec<String> {
     b.m.public_bindings()
         .map(|(_, binding)| b.m.resolve(binding.name).to_owned())
         .chain(["temp_Intercept", "cuts", "b"].map(str::to_owned))
-        .chain(family.auxiliaries().iter().map(|name| (*name).to_owned()))
+        .chain(family.auxiliaries().iter().flat_map(|name| {
+            [
+                (*name).to_owned(),
+                predictor_name(name, "temp_Intercept"),
+                predictor_name(name, "b"),
+            ]
+        }))
         .collect()
 }
 
@@ -690,6 +795,94 @@ pub(crate) fn info(
     module: &Module,
 ) -> Result<ModelInfo> {
     let mut parameters = Vec::new();
+    let mut group_offset = 0;
+    for (dpar, predictor) in recipe.predictors() {
+        let thresholds = if dpar == "mu" { recipe.thresholds() } else { 0 };
+        parameters.extend(predictor_info(
+            dpar,
+            predictor,
+            module,
+            thresholds,
+            group_offset,
+        )?);
+        group_offset += predictor.groups.len();
+    }
+    for &name in recipe.family.auxiliaries() {
+        if !recipe.dpars.contains_key(name) {
+            parameters.push(Parameter {
+                name: name.into(),
+                binding: name.into(),
+                index: None,
+                indices: None,
+                derived: !sampled(module, name),
+            });
+        }
+    }
+    Ok(ModelInfo {
+        formula: spec.formula.clone(),
+        family: spec.family.clone(),
+        link: recipe.mu.link.name().into(),
+        group_collation: "C".into(),
+        default_prior_rule: format!(
+            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; direct sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept. Predicted auxiliaries use brms's link-specific intercept defaults and the mean predictor's response scale for group priors.",
+            spec.family,
+            recipe.mu.link.name()
+        ),
+        design_columns: recipe
+            .mu
+            .design
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        dpars: recipe
+            .dpars
+            .iter()
+            .map(|(name, predictor)| {
+                (
+                    name.clone(),
+                    crate::PredictorInfo {
+                        formula: spec.dpars[name].formula.clone(),
+                        link: predictor.link.name().into(),
+                        design_columns: predictor
+                            .design
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+        parameters,
+        has_improper_prior: module.public_bindings().any(|(_, binding)| {
+            module.resolve(binding.name) == "Pi_prior"
+                && !matches!(
+                    module.type_of(binding.rhs),
+                    Some(flatppl_core::Type::Measure {
+                        mass: flatppl_core::Mass::Normalized,
+                        ..
+                    })
+                )
+        }),
+        training_rows: data.rows.clone(),
+        score_offset: (1..=recipe.thresholds()).map(|i| (i as f64).ln()).sum(),
+    })
+}
+
+fn predictor_info(
+    dpar: &str,
+    recipe: &crate::PredictorRecipe,
+    module: &Module,
+    thresholds: usize,
+    group_offset: usize,
+) -> Result<Vec<Parameter>> {
+    let prefix = if dpar == "mu" {
+        String::new()
+    } else {
+        format!("{dpar}_")
+    };
+    let mut parameters = Vec::new();
     let mut add = |name: String, binding: &str, indices: &[usize], derived| {
         parameters.push(Parameter {
             name,
@@ -699,19 +892,29 @@ pub(crate) fn info(
             derived,
         })
     };
-    if recipe.thresholds() > 0 {
-        for i in 1..=recipe.thresholds() {
+    if thresholds > 0 {
+        for i in 1..=thresholds {
             add(format!("Intercept[{i}]"), "cuts", &[i], false);
-            add(format!("b_Intercept[{i}]"), "b_Intercept", &[i], true);
+            add(
+                format!("b_Intercept[{i}]"),
+                &predictor_name(dpar, "b_Intercept"),
+                &[i],
+                true,
+            );
         }
     } else if recipe.formula.intercept {
         add(
-            "Intercept".into(),
-            "temp_Intercept",
+            predictor_name(dpar, "Intercept"),
+            &predictor_name(dpar, "temp_Intercept"),
             &[],
-            !sampled(module, "temp_Intercept"),
+            !sampled(module, &predictor_name(dpar, "temp_Intercept")),
         );
-        add("b_Intercept".into(), "b_Intercept", &[], true);
+        add(
+            format!("b_{prefix}Intercept"),
+            &predictor_name(dpar, "b_Intercept"),
+            &[],
+            true,
+        );
     }
     let mut names = std::collections::HashSet::new();
     if recipe.formula.intercept {
@@ -724,17 +927,22 @@ pub(crate) fn info(
                 "design columns have duplicate brms name `{name}`"
             )));
         }
-        let component = format!("b_{}", i + 1);
+        let component = predictor_name(dpar, &format!("b_{}", i + 1));
         if sampled(module, &component) {
-            add(format!("b_{name}"), &component, &[], false);
+            add(format!("b_{prefix}{name}"), &component, &[], false);
         } else {
-            add(format!("b_{name}"), "b", &[i + 1], !sampled(module, "b"));
+            add(
+                format!("b_{prefix}{name}"),
+                &predictor_name(dpar, "b"),
+                &[i + 1],
+                !sampled(module, &predictor_name(dpar, "b")),
+            );
         }
     }
     for (group_index, group) in recipe.groups.iter().enumerate() {
         let k = group.coefficients.len();
         for (j, coefficient) in group.coefficients.iter().enumerate() {
-            let name = format!("sd_{}__{coefficient}", group.column);
+            let name = format!("sd_{}__{prefix}{coefficient}", group.column);
             if let Some(component) = sampled_component(module, &group.sd, j) {
                 add(name, component, &[], false);
             } else {
@@ -753,13 +961,13 @@ pub(crate) fn info(
                 let z_index = [j + 1, i + 1];
                 let r_index = [i + 1, j + 1];
                 add(
-                    format!("z_{}[{},{}]", group_index + 1, j + 1, i + 1),
+                    format!("z_{}[{},{}]", group_offset + group_index + 1, j + 1, i + 1),
                     &group.z,
                     if k == 1 { &vector_index } else { &z_index },
                     false,
                 );
                 add(
-                    format!("r_{}[{level},{coefficient}]", group.column),
+                    format!("r_{}[{level},{prefix}{coefficient}]", group.column),
                     &group.r,
                     if k == 1 { &vector_index } else { &r_index },
                     true,
@@ -770,7 +978,7 @@ pub(crate) fn info(
             for i in 0..k {
                 for j in 0..=i {
                     add(
-                        format!("L_{}[{},{}]", group_index + 1, i + 1, j + 1),
+                        format!("L_{}[{},{}]", group_offset + group_index + 1, i + 1, j + 1),
                         cholesky,
                         &[i + 1, j + 1],
                         false,
@@ -783,7 +991,7 @@ pub(crate) fn info(
                 for j in i + 1..k {
                     add(
                         format!(
-                            "cor_{}__{}__{}",
+                            "cor_{}__{prefix}{}__{prefix}{}",
                             group.column, group.coefficients[i], group.coefficients[j]
                         ),
                         correlation,
@@ -794,39 +1002,7 @@ pub(crate) fn info(
             }
         }
     }
-    for &name in recipe.family.auxiliaries() {
-        add(name.into(), name, &[], !sampled(module, name));
-    }
-    Ok(ModelInfo {
-        formula: spec.formula.clone(),
-        family: spec.family.clone(),
-        link: recipe.link.name().into(),
-        group_collation: "C".into(),
-        default_prior_rule: format!(
-            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept.",
-            spec.family,
-            recipe.link.name()
-        ),
-        design_columns: recipe
-            .design
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
-        parameters,
-        has_improper_prior: module.public_bindings().any(|(_, binding)| {
-            module.resolve(binding.name) == "Pi_prior"
-                && !matches!(
-                    module.type_of(binding.rhs),
-                    Some(flatppl_core::Type::Measure {
-                        mass: flatppl_core::Mass::Normalized,
-                        ..
-                    })
-                )
-        }),
-        training_rows: data.rows.clone(),
-        score_offset: (1..=recipe.thresholds()).map(|i| (i as f64).ln()).sum(),
-    })
+    Ok(parameters)
 }
 
 fn sampled(module: &Module, name: &str) -> bool {
