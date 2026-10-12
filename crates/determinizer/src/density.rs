@@ -581,6 +581,14 @@ pub(crate) fn graft_query_target(
     if let Some(grafted) = graft_cross_module_target(m, arg2, bundle, imports)? {
         return Ok(Some(build_call(m, op, &[arg1, grafted])));
     }
+    // Record observations can contain imported arrays below their fields.
+    // Graft those values before density broadcasting reads their cell types.
+    let (observation, _) = resolve_ref_chain(m, arg2);
+    let grafted = crate::crossmodule::graft_host_value(m, observation, bundle, imports)
+        .map_err(|reason| refuse(observation, m, &reason))?;
+    if grafted != observation {
+        return Ok(Some(build_call(m, op, &[arg1, grafted])));
+    }
     Ok(None) // same-module target — driver lowers normally
 }
 

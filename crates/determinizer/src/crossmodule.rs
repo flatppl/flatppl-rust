@@ -255,7 +255,7 @@ pub(crate) fn graft_subtree(
 
 /// Load assignments belong to the loading module. Resolve file-module values
 /// there before entering the loaded member's source expansion stack.
-fn graft_host_value(
+pub(crate) fn graft_host_value(
     host: &mut Module,
     root: NodeId,
     bundle: &ModuleBundle,
