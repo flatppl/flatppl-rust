@@ -81,3 +81,22 @@ fn local_kernel_wrapper_preserves_shared_draws() {
     );
     assert_eq!(emit(&source), emit(&explicit));
 }
+
+#[test]
+fn derived_fields_read_the_applied_kernels_sampled_ancestors() {
+    let prefix = "p = external(cartpow(reals, 2))\ninputs = p\n";
+    for fields in ["a = x, b = x, d = x - y", "d = x - y"] {
+        let source = format!(
+            "{prefix}mu ~ Normal(0, 1)\nsigma ~ Normal(0, 1)\n\
+             x ~ Normal(mu, sigma)\ny ~ Normal(x, 1)\n\
+             K = kernelof(record({fields}), mu = mu, sigma = sigma)\n\
+             outputs = rand(K(p[1], p[2]), rnginit(19))"
+        );
+        let explicit = format!(
+            "{prefix}x, state1 = rand(Normal(p[1], p[2]), rnginit(19))\n\
+             y, state = rand(Normal(x, 1), state1)\n\
+             outputs = (record({fields}), state)"
+        );
+        assert_eq!(emit(&source), emit(&explicit));
+    }
+}

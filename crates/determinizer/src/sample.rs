@@ -1255,14 +1255,25 @@ fn lower_record_of_draws_sample(
 /// passes through, reading its sampled latents by name.
 ///
 /// Fail-closed on the type: an unresolved/`%deferred` type is NOT confirmed, so a
-/// field inference never typed keeps its current refusal instead of being passed
+/// field inference cannot type keeps its current refusal instead of being passed
 /// through as if deterministic. In particular an un-drawn measure in a field
 /// (`record(a = Normal(…))`) is `Type::Measure` and so still refuses — admitting
 /// the constructor leaf in measure position must not fabricate a draw here.
-fn is_derived_value_field(m: &Module, value: NodeId) -> bool {
+fn is_derived_value_field(m: &mut Module, value: NodeId) -> bool {
     let (resolved, _) = resolve_ref_one(m, value);
     if matches!(builtin_name(m, resolved), Some("draw") | Some("record")) {
         return false;
+    }
+    if m.type_of(resolved).is_none() {
+        // Boundary substitution can rebuild a value without its annotations.
+        let (mut types, diagnostics) = flatppl_infer::infer_expression(m, resolved, &[]);
+        if !diagnostics
+            .iter()
+            .any(|d| d.severity == flatppl_infer::Severity::Error)
+            && let Some(ty) = types.remove(&resolved)
+        {
+            m.set_type(resolved, ty);
+        }
     }
     m.type_of(resolved).is_some_and(is_confirmed_value_type)
 }
@@ -1292,7 +1303,7 @@ fn is_confirmed_value_type(ty: &Type) -> bool {
 /// them by name. They join the field seeds in [`lower_shared_record_sample`];
 /// [`topo_draw_cone`]'s visited set dedupes the overlap.
 fn derived_field_latents(
-    m: &Module,
+    m: &mut Module,
     fields: &[(Symbol, NodeId)],
     field_bids: &[Option<BindingId>],
 ) -> Vec<BindingId> {
