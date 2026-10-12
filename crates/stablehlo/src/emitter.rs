@@ -2329,12 +2329,12 @@ impl<'m> Emitter<'m> {
     /// times `[n]` product has shape `[m]`, which only coincides with `b`'s
     /// `[n]` shape in the square (`m == n`) case.
     pub fn matvec(&mut self, a: &Value, b: &Value) -> Value {
-        let a_dims = match &a.ty {
-            MlirTy::Ranked(dims) if dims.len() == 2 => dims.clone(),
+        let a_dims = match self.cell_ty(a) {
+            MlirTy::Ranked(dims) if dims.len() == 2 => dims,
             other => panic!("matvec expects a rank-2 (matrix) lhs operand, got {other:?}"),
         };
-        let b_dims = match &b.ty {
-            MlirTy::Ranked(dims) if dims.len() == 1 => dims.clone(),
+        let b_dims = match self.cell_ty(b) {
+            MlirTy::Ranked(dims) if dims.len() == 1 => dims,
             other => panic!("matvec expects a rank-1 (vector) rhs operand, got {other:?}"),
         };
         if a_dims[1] != b_dims[0] {
@@ -2357,8 +2357,8 @@ impl<'m> Emitter<'m> {
     /// checks both before calling, so a caller-facing shape error refuses
     /// there rather than reaching here.
     pub fn matmat(&mut self, a: &Value, b: &Value) -> Value {
-        let dims = |v: &Value, side: &str| match &v.ty {
-            MlirTy::Ranked(d) if d.len() == 2 => d.clone(),
+        let dims = |v: &Value, side: &str| match self.cell_ty(v) {
+            MlirTy::Ranked(d) if d.len() == 2 => d,
             other => panic!("matmat expects a rank-2 (matrix) {side} operand, got {other:?}"),
         };
         let a_dims = dims(a, "lhs");
@@ -2381,8 +2381,8 @@ impl<'m> Emitter<'m> {
     /// Panics on a non-rank-1 operand or disagreeing lengths; `crate::ops`'s `mul`
     /// dispatch checks both first.
     pub fn inner_product(&mut self, a: &Value, b: &Value) -> Value {
-        let dims = |v: &Value, side: &str| match &v.ty {
-            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+        let dims = |v: &Value, side: &str| match self.cell_ty(v) {
+            MlirTy::Ranked(d) if d.len() == 1 => d,
             other => panic!("inner_product expects a rank-1 {side} operand, got {other:?}"),
         };
         let a_dims = dims(a, "lhs");
@@ -2409,12 +2409,12 @@ impl<'m> Emitter<'m> {
     /// Panics on a non-rank-1 lhs, a non-rank-2 rhs, or a disagreeing inner
     /// dimension; `crate::ops`'s `mul` dispatch checks all three first.
     pub fn row_matrix_product(&mut self, a: &Value, b: &Value) -> Value {
-        let a_dims = match &a.ty {
-            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+        let a_dims = match self.cell_ty(a) {
+            MlirTy::Ranked(d) if d.len() == 1 => d,
             other => panic!("row_matrix_product expects a rank-1 lhs, got {other:?}"),
         };
-        let b_dims = match &b.ty {
-            MlirTy::Ranked(d) if d.len() == 2 => d.clone(),
+        let b_dims = match self.cell_ty(b) {
+            MlirTy::Ranked(d) if d.len() == 2 => d,
             other => panic!("row_matrix_product expects a rank-2 rhs, got {other:?}"),
         };
         if matches!((a_dims[0], b_dims[0]), (Some(k1), Some(k2)) if k1 != k2) {
@@ -2438,15 +2438,27 @@ impl<'m> Emitter<'m> {
     /// along axis 0 and `b` along axis 1, so the multiply is the outer product.
     /// Panics on a non-rank-1 operand; `crate::ops`'s `mul` dispatch checks first.
     pub fn outer_product(&mut self, a: &Value, b: &Value) -> Value {
-        let dims = |v: &Value, side: &str| match &v.ty {
-            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+        let dims = |v: &Value, side: &str| match self.cell_ty(v) {
+            MlirTy::Ranked(d) if d.len() == 1 => d,
             other => panic!("outer_product expects a rank-1 {side} operand, got {other:?}"),
         };
         let n = dims(a, "lhs")[0];
         let m = dims(b, "rhs")[0];
-        let out = MlirTy::Ranked(vec![n, m]);
-        let a_full = self.broadcast_in_dim(a, &[0], out.clone());
-        let b_full = self.broadcast_in_dim(b, &[1], out);
+        let (a, b) = self.broadcast_batches(a, b);
+        let batch = self.batch_rank(&a);
+        let mut out = shape(&a.ty)[..batch].to_vec();
+        out.extend([n, m]);
+        let out = batching::tensor(out);
+        let axes = Axes {
+            batch,
+            layers: vec![2],
+        };
+        let left = (0..=batch as u64).collect::<Vec<_>>();
+        let right = (0..batch as u64)
+            .chain([batch as u64 + 1])
+            .collect::<Vec<_>>();
+        let a_full = self.expand_axes(&a, &left, out.clone(), axes.clone());
+        let b_full = self.expand_axes(&b, &right, out, axes);
         self.mul(&a_full, &b_full)
     }
 
@@ -2493,12 +2505,37 @@ impl<'m> Emitter<'m> {
         };
         let a = self.convert(a, kind);
         let b = self.convert(b, kind);
+        let (a, b) = self.broadcast_batches(&a, &b);
+        let batch = self.batch_rank(&a);
+        let layers = if shape(&result_ty).is_empty() {
+            vec![]
+        } else {
+            vec![shape(&result_ty).len()]
+        };
+        let result_ty = batching::tensor(
+            shape(&a.ty)[..batch]
+                .iter()
+                .chain(shape(&result_ty))
+                .copied()
+                .collect(),
+        );
+        let la = la + batch;
+        let lb = lb + batch;
+        let dimensions = (0..batch)
+            .map(|axis| axis.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let batching = if batch == 0 {
+            String::new()
+        } else {
+            format!("batching_dims = [{dimensions}] x [{dimensions}], ")
+        };
         let ssa = self.fresh();
         let a_ty = a.ty.render(self.dtype, kind);
         let b_ty = b.ty.render(self.dtype, kind);
         let result_ty_text = result_ty.render(self.dtype, kind);
         self.push(&format!(
-            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, {batching}contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
         let result = Value {
@@ -2506,7 +2543,8 @@ impl<'m> Emitter<'m> {
             ty: result_ty,
             elem: kind,
         };
-        self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb));
+        self.remember_axes(&result.ssa, Axes { batch, layers });
+        self.remember_pointwise(&result.ssa, &result, Pointwise::Dot(a, b, la, lb, batch));
         result
     }
 

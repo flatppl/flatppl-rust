@@ -30,7 +30,8 @@ pub(super) enum Pointwise {
     // In-bounds, zero-based selections, including equivalent vector concatenations.
     Gather(Value, usize, Vec<u64>),
     DynamicGather(Value, Value, GatherDimensions),
-    Dot(Value, Value, usize, usize),
+    // Physical contraction axes and the existing shared batch prefix.
+    Dot(Value, Value, usize, usize, usize),
     Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
 }

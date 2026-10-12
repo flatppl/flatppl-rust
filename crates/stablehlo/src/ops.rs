@@ -697,10 +697,22 @@ fn lower_transpose(
 ) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
     let v = e.lower_node(a)?;
-    match &v.ty {
+    match e.cell_ty(&v) {
         // A vector or a transposed vector: the distinction is type-level only.
         MlirTy::Ranked(d) if d.len() == 1 => Ok(v),
-        MlirTy::Ranked(d) if d.len() == 2 => Ok(e.transpose(&v, &[1, 0])),
+        MlirTy::Ranked(d) if d.len() == 2 => {
+            let batch = e.batch_rank(&v);
+            let perm = (0..batch as u64)
+                .chain([batch as u64 + 1, batch as u64])
+                .collect::<Vec<_>>();
+            let result = e.transpose(&v, &perm);
+            if batch == 0 {
+                Ok(result)
+            } else {
+                let identity = (0..(batch + 2) as u64).collect::<Vec<_>>();
+                Ok(e.expand_axes(&result, &identity, result.ty.clone(), e.axes_of(&v)))
+            }
+        }
         other => Err(EmitError::at(
             id,
             format!(
@@ -1367,12 +1379,14 @@ fn lower_vector_product(
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
-    let rank1 = |v: &Value| matches!(&v.ty, MlirTy::Ranked(d) if d.len() == 1);
+    let a_ty = e.cell_ty(&a);
+    let b_ty = e.cell_ty(&b);
+    let rank1 = |ty: &MlirTy| matches!(ty, MlirTy::Ranked(d) if d.len() == 1);
     // The row–matrix case takes a rank-2 rhs; the two vector products take rank 1
     // on both sides.
     let want_rank2_rhs = matches!(kind, VectorProduct::RowMatrix);
-    let rhs_ok = |v: &Value| matches!(&v.ty, MlirTy::Ranked(d) if d.len() == if want_rank2_rhs { 2 } else { 1 });
-    if !rank1(&a) || !rhs_ok(&b) {
+    let rhs_ok = |ty: &MlirTy| matches!(ty, MlirTy::Ranked(d) if d.len() == if want_rank2_rhs { 2 } else { 1 });
+    if !rank1(&a_ty) || !rhs_ok(&b_ty) {
         return Err(EmitError::at(
             id,
             format!(
@@ -1386,7 +1400,7 @@ fn lower_vector_product(
     }
     match kind {
         VectorProduct::Inner => {
-            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a_ty, &b_ty) else {
                 unreachable!("rank-1 checked above");
             };
             if matches!((da[0], db[0]), (Some(m), Some(n)) if m != n) {
@@ -1404,7 +1418,7 @@ fn lower_vector_product(
         }
         VectorProduct::Outer => Ok(e.outer_product(&a, &b)),
         VectorProduct::RowMatrix => {
-            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a_ty, &b_ty) else {
                 unreachable!("ranks checked above");
             };
             // The row's length pairs with the matrix's LEADING axis.
@@ -1609,7 +1623,7 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
-    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (e.cell_ty(&a), e.cell_ty(&b)) else {
         return Err(EmitError::at(
             id,
             "matrix product needs ranked tensor operands",
