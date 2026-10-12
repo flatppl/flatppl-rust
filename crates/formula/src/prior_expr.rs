@@ -147,6 +147,19 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
             if !open {
                 let (location, scale) = (call.args[1], call.args[2]);
                 let transform = |b: &mut Builder<'_>, value| {
+                    // Infinite endpoints only change sign. Dividing infinity
+                    // by a live scale poisons its reverse derivative with 0*inf.
+                    if let Some(endpoint) = scalar(b.m, value)
+                        && endpoint.is_infinite()
+                    {
+                        if let Some(scale) = scalar(b.m, scale) {
+                            return b.lit_real(endpoint / scale);
+                        }
+                        let zero = b.lit_real(0.0);
+                        let positive = b.call("gt", &[scale, zero]);
+                        let reflected = b.call("neg", &[value]);
+                        return b.call("ifelse", &[positive, value, reflected]);
+                    }
                     if let (Some(value), Some(location), Some(scale)) = (
                         scalar(b.m, value),
                         scalar(b.m, location),
