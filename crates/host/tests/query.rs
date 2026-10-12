@@ -2,6 +2,39 @@ use flatppl_host::{BatchSpec, Context, EmitOptions};
 use serde_json::json;
 
 #[test]
+fn imported_observations_score_a_composed_broadcast_kernel()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let model = context.parse(
+        r#"
+        y_data = [1.0, 2.0, 4.0]
+        mu ~ Normal(0.0, 2.0)
+        y ~ locscale.(StudentT(5.0), fill(mu, 3), [0.3, 0.6, 0.9])
+        K_model = kernelof(record(y = y), mu = mu)
+        "#,
+        None,
+        None,
+    )?;
+    context.register("model.flatppl", &model)?;
+    for observations in [
+        "m.y_data",
+        "record(data = record(y = m.y_data)).data.y",
+        "[1.0, 2.0, 4.0]",
+    ] {
+        let query = context.parse(
+            &format!(
+                "m = load_module(\"model.flatppl\")\np = elementof(reals)\ninputs = p\n\
+                 outputs = logdensityof(m.K_model(mu = p), record(y = {observations}))"
+            ),
+            None,
+            None,
+        )?;
+        query.compile(&EmitOptions::default())?;
+    }
+    Ok(())
+}
+
+#[test]
 fn bound_columns_export_their_matrix_shape() -> Result<(), Box<dyn std::error::Error>> {
     use flatppl_host::Constant;
     let mut context = Context::default();
