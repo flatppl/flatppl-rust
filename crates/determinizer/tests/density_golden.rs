@@ -2831,6 +2831,17 @@ lp = logdensityof(superpose(lawof(y), Normal(mu = 1.0, sigma = 1.0)), 0.3)";
     );
 }
 
+#[test]
+fn applied_count_mixture_retains_its_reference_measure() {
+    let direct = "lp = logdensityof(superpose(weighted(0.3, Dirac(0)), \
+                  weighted(0.7, Poisson(2))), 0)";
+    let applied = "K(mu) = superpose(weighted(0.3, Dirac(0)), \
+                   weighted(0.7, Poisson(mu)))\nlp = logdensityof(K(2), 0)";
+    let direct = flatppl_flatpir::write(&determinize_src(direct));
+    let applied = flatppl_flatpir::write(&determinize_src(applied));
+    assert_eq!(pir_binding(&direct, "lp"), pir_binding(&applied, "lp"));
+}
+
 // The second net for the same §04 rule, at the pre-existing reified-measure path.
 // `density::lower_reified_measure` screened a `%specinputs` boundary for placeholder
 // ENTRIES, which cannot see this shape: an `%autoinputs` boundary lists `elementof`

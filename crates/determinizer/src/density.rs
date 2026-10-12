@@ -3811,10 +3811,17 @@ fn superposition_reference(
                     .then_some(reference)
             }
             _ if flatppl_infer::distribution_param_names(name).is_some() => {
-                let Type::Measure { domain, .. } = m.type_of(node)? else {
+                // Applying a row kernel rebuilds its constructor without the
+                // original annotations. Infer that expression, not the module.
+                let ty = m.type_of(node).cloned().or_else(|| {
+                    flatppl_infer::infer_expression(m, node, &[])
+                        .0
+                        .remove(&node)
+                })?;
+                let Type::Measure { domain, .. } = ty else {
                     return None;
                 };
-                reference_measure(domain)
+                reference_measure(&domain)
             }
             _ => None,
         }
