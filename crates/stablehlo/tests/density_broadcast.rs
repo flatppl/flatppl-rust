@@ -116,6 +116,19 @@ fn collection_locscale_matches_its_reified_kernel() {
 }
 
 #[test]
+fn location_scale_application_keeps_the_dependent_base_domain() {
+    let source = "nu = external(posreals)\n\
+                  mu = external(reals)\n\
+                  sigma = external(posreals)\n\
+                  x = external(reals)\n\
+                  row = (d, l, s) -> locscale(StudentT(d), l, s)\n\
+                  inputs = (nu, mu, sigma, x)\n\
+                  outputs = logdensityof(row(nu, mu, sigma), x)";
+    let reference = source.replace("row(nu, mu, sigma)", "locscale(StudentT(nu), mu, sigma)");
+    assert_eq!(emit(source), emit(&reference));
+}
+
+#[test]
 fn scalar_only_broadcast_preserves_the_scored_draw() {
     let source = "z ~ Normal(0, 1)\n\
                   y = external(reals)\n\

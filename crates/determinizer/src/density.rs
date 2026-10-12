@@ -5245,11 +5245,15 @@ fn lower_locscale(
         }
         (c.args[0], c.args[1], c.args[2])
     };
-    // The affine form is keyed on `m`'s variate domain (scalar vs vector); read it
-    // from the inner measure's inferred type (an unknown domain → `%any`, which
-    // `derive_locscale` refuses).
-    let domain = match m.type_of(m_inner) {
-        Some(Type::Measure { domain, .. }) => (**domain).clone(),
+    // Callable substitution rebuilds dependent constructors without annotations.
+    // Infer the scalar/vector domain locally; unknown domains still refuse.
+    let inner_type = m.type_of(m_inner).cloned().or_else(|| {
+        flatppl_infer::infer_expression(m, m_inner, &[])
+            .0
+            .remove(&m_inner)
+    });
+    let domain = match inner_type {
+        Some(Type::Measure { domain, .. }) => *domain,
         _ => Type::Any,
     };
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
