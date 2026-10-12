@@ -162,7 +162,7 @@ fn support_dyn(tag: SupportTag) -> ValueSet {
     }
 }
 
-fn mass(tag: MassTag) -> Mass {
+pub(super) fn mass(tag: MassTag) -> Mass {
     match tag {
         MassTag::Normalized => Mass::Normalized,
         MassTag::Finite => Mass::Finite,
@@ -372,6 +372,7 @@ mod tests {
             support: SupportTag::Reals,
             mass: MassTag::Normalized,
             params: vec!["mu".to_string(), "sigma".to_string()],
+            nullary: false,
             param_ranks: vec![],
             param_sets: Vec::new(),
         };
