@@ -297,18 +297,23 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "gaussian",
         "student",
         "lognormal",
+        "hurdle_lognormal",
         "bernoulli",
         "binomial",
         "zero_inflated_binomial",
         "poisson",
+        "hurdle_poisson",
+        "hurdle_negbinomial",
         "zero_inflated_poisson",
         "zero_inflated_negbinomial",
         "negbinomial",
         "geometric",
         "Gamma",
+        "hurdle_gamma",
         "exponential",
         "weibull",
         "beta",
+        "zero_inflated_beta",
         "von_mises",
     ] {
         let formula = if matches!(family, "binomial" | "zero_inflated_binomial") {
@@ -320,9 +325,15 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.0, 1.0, 1.0, 0.0]
         } else if family == "beta" {
             vec![0.1, 0.4, 0.8, 0.7]
+        } else if family == "zero_inflated_beta" {
+            vec![0.0, 0.2, 0.8, 0.0]
+        } else if family == "hurdle_gamma" {
+            vec![0.0, 0.8, 2.3, 0.0]
+        } else if family == "hurdle_lognormal" {
+            vec![0.0, (-1.0_f64).exp(), 2.0_f64.exp(), 0.0]
         } else if family == "von_mises" {
             vec![-2.0, -0.4, 0.8, 2.0]
-        } else if family.starts_with("zero_inflated_") {
+        } else if family.starts_with("zero_inflated_") || family.starts_with("hurdle_") {
             vec![0.0, 2.0, 4.0, 0.0]
         } else {
             vec![2.0, 4.0, 8.0, 7.0]
@@ -349,6 +360,10 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "von_mises" => ", kappa = posreals",
             "zero_inflated_poisson" | "zero_inflated_binomial" => ", zi = unitinterval",
             "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
+            "zero_inflated_beta" => ", phi = posreals, zi = unitinterval",
+            "hurdle_poisson" => ", hu = unitinterval",
+            "hurdle_negbinomial" | "hurdle_gamma" => ", shape = posreals, hu = unitinterval",
+            "hurdle_lognormal" => ", sigma = posreals, hu = unitinterval",
             _ => "",
         };
         let parameter = format!(
@@ -375,7 +390,9 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         context.register("prediction.flatppl", &prediction)?;
         let observation = if family == "beta" {
             "[0.2, 0.8]"
-        } else if family.starts_with("zero_inflated_") {
+        } else if family == "zero_inflated_beta" {
+            "[0.0, 0.8]"
+        } else if family.starts_with("zero_inflated_") || family.starts_with("hurdle_") {
             "[0, 2]"
         } else {
             "[1, 1]"

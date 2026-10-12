@@ -5,6 +5,31 @@
   "formula": "y ~ x + (1 | g)",
   "cases": [
     {
+      "family": "hurdle_lognormal", "link": "inverse",
+      "response": {"kind": "real64", "values": [0, 0.01831563888873418, 7.38905609893065, 20.085536923187668]},
+      "intercept_location": -0.2, "scale": 3.9, "sigma_scale": 3.9
+    },
+    {
+      "family": "hurdle_gamma", "link": "log",
+      "response": {"kind": "real64", "values": [0, 0.8, 2.3, 0]},
+      "intercept_location": -1.3, "scale": 2.5
+    },
+    {
+      "family": "hurdle_negbinomial", "link": "log",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": -0.8, "scale": 2.5
+    },
+    {
+      "family": "hurdle_poisson", "link": "log",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": -0.8, "scale": 2.5
+    },
+    {
+      "family": "zero_inflated_beta", "link": "logit",
+      "response": {"kind": "real64", "values": [0, 0.2, 0.8, 0]},
+      "intercept_location": 0.0, "scale": 2.5
+    },
+    {
       "family": "zero_inflated_binomial", "link": "logit", "formula": "y | trials(8) ~ x + (1 | g)",
       "response": {"kind": "int", "values": [0, 2, 4, 0]},
       "intercept_location": 0.0, "scale": 2.5

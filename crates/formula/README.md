@@ -52,9 +52,9 @@ coefficients, intercepts, group scales or correlations. A direct `sigma` prior
 is unavailable when `sigma` has a predictor; its priors belong to the linear
 predictor before the inverse link.
 
-The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa` and `zi`
+The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa`, `zi` and `hu`
 where present in the family. Positive parameters default to the log link;
-Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi` uses logit.
+Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi`/`hu` use logit.
 Identity is also available; positive parameters other than `nu` additionally
 accept softplus and squareplus. Auxiliary priors follow brms's link-dependent
 defaults. `ModelInfo.dpars` records each formula, link and design columns.
@@ -63,7 +63,9 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
-`cumulative` or `categorical`.
+`cumulative`, `categorical`, `zero_inflated_poisson`, `zero_inflated_binomial`,
+`zero_inflated_negbinomial`, `zero_inflated_beta`, `hurdle_poisson`,
+`hurdle_negbinomial`, `hurdle_gamma` or `hurdle_lognormal`.
 `link` is optional:
 
 | Family | Default link | Other links |
@@ -86,6 +88,27 @@ Weibull models use a direct `shape` and mean `mu`, with scale
 `mu / gamma(1 + 1 / shape)` and a Gamma(0.01, 0.01) shape prior.
 Beta models use mean `mu` and direct precision `phi`, with a Gamma(0.01, 0.01)
 prior and response values strictly between zero and one.
+`zero_inflated_beta` adds a probability `zi` of an exact zero; positive values
+follow the same beta law. Its `phi` prior is unchanged and `zi` defaults to
+Beta(1, 1). Responses lie in `[0, 1)`. The observation is an ordinary
+superposition of a fixed atom and a continuous law, with their common reference.
+`hurdle_poisson` assigns probability `hu` to zero and otherwise uses Poisson
+conditioned on a positive count. It uses the Poisson links and a Beta(1, 1)
+prior for direct `hu`; a predictor for `hu` defaults to logit with a
+Logistic(0, 1) intercept prior.
+`hurdle_negbinomial` uses the same zero probability and the negative-binomial
+law conditioned on a positive count, retaining its InverseGamma(0.4, 0.3)
+prior on `shape` and its mean/rate parameterization.
+Sampling the zero-truncated count component is not yet supported by the Rust
+sampler lowering; its density and derivatives are available.
+`hurdle_gamma` combines an exact zero with the ordinary Gamma mean/shape law,
+with `hu` defined as above and the same Gamma(0.01, 0.01) shape prior.
+Its responses are nonnegative; the continuous component contributes no mass
+at zero.
+`hurdle_lognormal` instead uses the ordinary lognormal law for positive values,
+with `mu` on the log-response scale and a direct `sigma`. The mean-link options
+are identity and inverse. Its response-based priors use log responses, replacing
+zeros by 0.1 before taking logs, just as brms does.
 von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
 Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
 The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the

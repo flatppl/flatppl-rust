@@ -10,22 +10,32 @@ pub enum Family {
     Gaussian,
     Student,
     Lognormal,
+    #[serde(rename = "hurdle_lognormal")]
+    HurdleLognormal,
     Bernoulli,
     Binomial,
     #[serde(rename = "zero_inflated_binomial")]
     ZeroInflatedBinomial,
     Poisson,
+    #[serde(rename = "hurdle_poisson")]
+    HurdlePoisson,
     #[serde(rename = "zero_inflated_poisson")]
     ZeroInflatedPoisson,
     Negbinomial,
+    #[serde(rename = "hurdle_negbinomial")]
+    HurdleNegbinomial,
     #[serde(rename = "zero_inflated_negbinomial")]
     ZeroInflatedNegbinomial,
     Geometric,
     #[serde(rename = "Gamma")]
     Gamma,
+    #[serde(rename = "hurdle_gamma")]
+    HurdleGamma,
     Exponential,
     Weibull,
     Beta,
+    #[serde(rename = "zero_inflated_beta")]
+    ZeroInflatedBeta,
     #[serde(rename = "von_mises")]
     VonMises,
     Cumulative,
@@ -66,29 +76,37 @@ impl Family {
             "gaussian" => Self::Gaussian,
             "student" => Self::Student,
             "lognormal" => Self::Lognormal,
+            "hurdle_lognormal" => Self::HurdleLognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
             "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
             "poisson" => Self::Poisson,
+            "hurdle_poisson" => Self::HurdlePoisson,
             "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
+            "hurdle_negbinomial" => Self::HurdleNegbinomial,
             "zero_inflated_negbinomial" => Self::ZeroInflatedNegbinomial,
             "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
+            "hurdle_gamma" => Self::HurdleGamma,
             "exponential" => Self::Exponential,
             "weibull" => Self::Weibull,
             "beta" => Self::Beta,
+            "zero_inflated_beta" => Self::ZeroInflatedBeta,
             "von_mises" => Self::VonMises,
             "cumulative" => Self::Cumulative,
             "categorical" => Self::Categorical,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
-            Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
+            Self::Gaussian | Self::Student | Self::Lognormal | Self::HurdleLognormal => {
+                Link::Identity
+            }
             Self::Bernoulli
             | Self::Binomial
             | Self::ZeroInflatedBinomial
             | Self::Beta
+            | Self::ZeroInflatedBeta
             | Self::Cumulative
             | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
@@ -104,21 +122,27 @@ impl Family {
         use Link::*;
         let supported = match family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
-            Self::Lognormal => matches!(link, Identity | Inverse),
-            Self::Bernoulli | Self::Binomial | Self::ZeroInflatedBinomial | Self::Beta => {
+            Self::Lognormal | Self::HurdleLognormal => matches!(link, Identity | Inverse),
+            Self::Bernoulli
+            | Self::Binomial
+            | Self::ZeroInflatedBinomial
+            | Self::Beta
+            | Self::ZeroInflatedBeta => {
                 matches!(
                     link,
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
                 )
             }
             Self::Poisson
+            | Self::HurdlePoisson
             | Self::ZeroInflatedPoisson
             | Self::Negbinomial
+            | Self::HurdleNegbinomial
             | Self::ZeroInflatedNegbinomial
             | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
-            Self::Gamma | Self::Exponential | Self::Weibull => {
+            Self::Gamma | Self::HurdleGamma | Self::Exponential | Self::Weibull => {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
@@ -140,8 +164,10 @@ impl Family {
                 | Self::Binomial
                 | Self::ZeroInflatedBinomial
                 | Self::Poisson
+                | Self::HurdlePoisson
                 | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
+                | Self::HurdleNegbinomial
                 | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
@@ -159,6 +185,10 @@ impl Family {
             Self::Student => &["sigma", "nu"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
+            Self::ZeroInflatedBeta => &["phi", "zi"],
+            Self::HurdlePoisson => &["hu"],
+            Self::HurdleNegbinomial | Self::HurdleGamma => &["shape", "hu"],
+            Self::HurdleLognormal => &["sigma", "hu"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
@@ -174,7 +204,7 @@ impl Family {
         }
         let default = match name {
             "nu" => Link::Logm1,
-            "zi" => Link::Logit,
+            "zi" | "hu" => Link::Logit,
             _ => Link::Log,
         };
         let link = link
@@ -203,13 +233,13 @@ impl Family {
         match name {
             "nu" => "normal(2.7, 0.8)".into(),
             "kappa" => "normal(5.0, 0.8)".into(),
-            "zi" => "logistic(0, 1)".into(),
+            "zi" | "hu" => "logistic(0, 1)".into(),
             _ => "student_t(3, 0, 2.5)".into(),
         }
     }
 
     pub(crate) fn prior_scale_link(self, link: Link) -> Link {
-        if self == Self::Lognormal {
+        if matches!(self, Self::Lognormal | Self::HurdleLognormal) {
             Link::Log
         } else {
             link
@@ -220,12 +250,17 @@ impl Family {
         match name {
             "sigma" => format!("student_t(3, 0, {sigma_scale})"),
             "nu" => "gamma(2, 0.1)".into(),
-            "shape" if matches!(self, Self::Negbinomial | Self::ZeroInflatedNegbinomial) => {
+            "shape"
+                if matches!(
+                    self,
+                    Self::Negbinomial | Self::ZeroInflatedNegbinomial | Self::HurdleNegbinomial
+                ) =>
+            {
                 "InverseGamma(0.4, 0.3)".into()
             }
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             "kappa" => "Gamma(2, 0.01)".into(),
-            "zi" => "Beta(1, 1)".into(),
+            "zi" | "hu" => "Beta(1, 1)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -247,9 +282,14 @@ impl Family {
             || matches!(
                 self,
                 Self::Student
+                    | Self::HurdlePoisson
+                    | Self::HurdleNegbinomial
+                    | Self::HurdleGamma
+                    | Self::HurdleLognormal
                     | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
+                    | Self::ZeroInflatedBeta
             ))
             && !scalar
         {
@@ -350,23 +390,44 @@ impl Family {
                 apply(b, "Binomial", &[n, mu])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
-            Self::ZeroInflatedPoisson
+            Self::HurdlePoisson
+            | Self::HurdleNegbinomial
+            | Self::HurdleGamma
+            | Self::HurdleLognormal
+            | Self::ZeroInflatedPoisson
             | Self::ZeroInflatedNegbinomial
-            | Self::ZeroInflatedBinomial => {
-                let base = match self {
-                    Self::ZeroInflatedPoisson => Self::Poisson,
-                    Self::ZeroInflatedNegbinomial => Self::Negbinomial,
-                    _ => Self::Binomial,
+            | Self::ZeroInflatedBinomial
+            | Self::ZeroInflatedBeta => {
+                let (base, probability) = match self {
+                    Self::HurdlePoisson => (Self::Poisson, "hu"),
+                    Self::HurdleNegbinomial => (Self::Negbinomial, "hu"),
+                    Self::HurdleGamma => (Self::Gamma, "hu"),
+                    Self::HurdleLognormal => (Self::Lognormal, "hu"),
+                    Self::ZeroInflatedPoisson => (Self::Poisson, "zi"),
+                    Self::ZeroInflatedNegbinomial => (Self::Negbinomial, "zi"),
+                    Self::ZeroInflatedBeta => (Self::Beta, "zi"),
+                    _ => (Self::Binomial, "zi"),
                 };
-                let base = base.observation(b, observation, thresholds, true);
-                let zi = auxiliary(b, "zi");
-                let zero = b.lit_int(0);
+                let mut base = base.observation(b, observation, thresholds, true);
+                if matches!(self, Self::HurdlePoisson | Self::HurdleNegbinomial) {
+                    let one = b.lit_real(1.0);
+                    let infinity = b.call_head("inf");
+                    let support = b.call("interval", &[one, infinity]);
+                    let truncated = b.call("truncate", &[base, support]);
+                    base = b.call("normalize", &[truncated]);
+                }
+                let probability = auxiliary(b, probability);
+                let zero = if self.discrete() {
+                    b.lit_int(0)
+                } else {
+                    b.lit_real(0.0)
+                };
                 let atom = b.call("Dirac", &[zero]);
-                let atom = b.call("weighted", &[zi, atom]);
+                let atom = b.call("weighted", &[probability, atom]);
                 let one = b.lit_real(1.0);
-                let complement = b.call("sub", &[one, zi]);
-                let count = b.call("weighted", &[complement, base]);
-                let law = b.call("superpose", &[atom, count]);
+                let complement = b.call("sub", &[one, probability]);
+                let component = b.call("weighted", &[complement, base]);
+                let law = b.call("superpose", &[atom, component]);
                 b.call("normalize", &[law])
             }
             Self::Negbinomial | Self::Geometric | Self::Gamma => {
