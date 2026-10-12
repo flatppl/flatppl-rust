@@ -178,3 +178,55 @@ fn gpu_target_interpolates_every_histosys_call_in_one_lane_tensor() {
     );
     assert_eq!(emit(source).matches("stablehlo.maximum").count(), 2);
 }
+
+#[test]
+fn pyhf_yields_preserve_the_last_sampled_output_state() {
+    use flatppl_stablehlo::{Dtype, EmitOptions, Mode, Target};
+    let module = determinized(
+        "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
+         s = rnginit(0)\n\
+         a = rand(iid(Uniform(support = interval(0.0, 1.0)), 4), s)\n\
+         b = rand(iid(Uniform(support = interval(0.0, 1.0)), 8), s)\n\
+         c = rand(iid(Uniform(support = interval(0.0, 1.0)), 12), s)\n\
+         ya = pyhf.sample_yields(rowstack([a[[1, 2]], a[[3, 4]]]), \
+         fill(0.0, [2, 1, 2]), fill(1.0, [2, 1, 2]))\n\
+         yb = pyhf.sample_yields(rowstack([b[[1, 2]], b[[3, 4]]]), \
+         fill(0.0, [2, 1, 2]), fill(1.0, [2, 1, 2]))\n\
+         yc = pyhf.sample_yields(rowstack([c[[1, 2]], c[[3, 4]]]), \
+         fill(0.0, [2, 1, 2]), fill(1.0, [2, 1, 2]))\n\
+         ea = pyhf.expected_counts(ya)\neb = pyhf.expected_counts(yb)\n\
+         ec = pyhf.expected_counts(yc)\n\
+         outputs = (ea, eb, ec)",
+    );
+    let final_state_draw = [Target::Cpu, Target::Gpu].map(|target| {
+        let ir = flatppl_stablehlo::emit(
+            &module,
+            Mode::Sample,
+            &EmitOptions {
+                dtype: Dtype::F64,
+                restrict_enzyme_compatible: false,
+                target,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let returned = ir
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("return "))
+            .unwrap()
+            .split_once(" : ")
+            .unwrap()
+            .0;
+        let state = returned.rsplit(", ").next().unwrap();
+        ir.lines()
+            .find_map(|line| {
+                let (results, operation) = line.trim().split_once(" = ")?;
+                (results.split(", ").next() == Some(state)).then(|| operation.to_owned())
+            })
+            .unwrap()
+    });
+    // Independent draws share the input key. The final state belongs to c's
+    // twelve-word draw, even if sibling yield discovery reverses output order.
+    assert!(final_state_draw[0].contains("tensor<12xui64>"));
+    assert_eq!(final_state_draw[0], final_state_draw[1]);
+}

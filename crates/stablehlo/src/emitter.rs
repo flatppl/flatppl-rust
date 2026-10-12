@@ -138,6 +138,8 @@ pub struct Emitter<'m> {
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
+    /// Prevent sibling yield discovery while lowering a shared lane buffer.
+    pooling_yields: bool,
     integrating: bool,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
@@ -200,6 +202,7 @@ impl<'m> Emitter<'m> {
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,
+            pooling_yields: false,
             integrating: false,
             next: 0,
             memo: HashMap::new(),
