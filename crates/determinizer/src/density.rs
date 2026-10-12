@@ -147,7 +147,7 @@ use flatppl_core::{
 use flatppl_infer::ModuleBundle;
 
 #[path = "density_broadcast.rs"]
-mod broadcast;
+pub(crate) mod broadcast;
 pub(crate) use broadcast::{
     lower_query as lower_broadcast_query, query_head as broadcast_query_head,
 };

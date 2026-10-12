@@ -10,7 +10,7 @@
 //! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
 //! refusal — see that module's doc comment.
 
-use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, ValueSet};
+use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, Type, ValueSet};
 
 use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -361,6 +361,8 @@ pub struct Params {
     kernel_input: NodeId,
     /// Scored node for shape checks and diagnostics. Sampling has no variate.
     variate: Option<NodeId>,
+    /// Outer axes of a broadcasted scalar kernel; primitive samplers use flat lanes.
+    sample_shape: Option<Vec<u64>>,
 }
 
 impl Params {
@@ -374,7 +376,32 @@ impl Params {
     /// this crate's own determinizer built.
     pub fn get(&self, e: &mut Emitter, name: &str) -> Result<Value, EmitError> {
         let field = self.field_id(e, name)?;
-        e.lower_node(field)
+        let mut value = e.lower_node(field)?;
+        if let Some(shape) = &self.sample_shape
+            && let MlirTy::Ranked(dims) = &value.ty
+        {
+            if dims.len() != shape.len()
+                || dims
+                    .iter()
+                    .zip(shape)
+                    .any(|(d, n)| *d != Some(1) && *d != Some(*n))
+            {
+                return Err(EmitError::at(
+                    field,
+                    "broadcast sample parameter shape mismatch",
+                ));
+            }
+            let ty = MlirTy::Ranked(shape.iter().copied().map(Some).collect());
+            if value.ty != ty {
+                value = e.broadcast_in_dim(&value, &(0..dims.len() as u64).collect::<Vec<_>>(), ty);
+            }
+            let n = shape.iter().product();
+            let flat = MlirTy::Ranked(vec![Some(n)]);
+            if value.ty != flat {
+                value = e.reshape(&value, flat);
+            }
+        }
+        Ok(value)
     }
 
     /// The raw (pre-[`Emitter::lower_node`]) [`NodeId`] of the kernel-input
@@ -569,6 +596,7 @@ pub(crate) fn lower_logdensityof_batched(
         let params = Params {
             kernel_input,
             variate: Some(v),
+            sample_shape: None,
         };
         let atom = params.field_id(e, "value")?;
         return e.lower_broadcast_cells(id, &[atom, v], |e, values| {
@@ -601,6 +629,7 @@ pub(crate) fn lower_logdensityof_batched(
     let params = Params {
         kernel_input,
         variate: Some(v),
+        sample_shape: None,
     };
     let value = e.lower_node(v)?;
     builder(e, &params, &value)
@@ -636,6 +665,7 @@ pub(crate) fn lower_logdensityof(
     let params = Params {
         kernel_input,
         variate: Some(v),
+        sample_shape: None,
     };
     if ctor == "Dirac" {
         let atom = params.field_id(e, "value")?;
@@ -695,6 +725,7 @@ pub(crate) fn lower_touniform(
     let params = Params {
         kernel_input,
         variate: Some(x),
+        sample_shape: None,
     };
     let value = e.lower_node(x)?;
     cdf(e, &params, &value)
@@ -709,11 +740,9 @@ pub(crate) fn lower_touniform(
 /// ([`Emitter::record_sample_key`]) so a `get0(sample, 1)`/`get(sample, 2)`
 /// projection can thread it onward (the `(value, new_rngstate)` pair's second
 /// slot — see the `get0/get` arm in `emitter.rs`). `ctor` is a bare
-/// `Const(ctor)` distribution constructor symbol, `kernel_input` its kwargs
-/// record — otherwise the same shape as [`lower_logdensityof`]'s `kernel`/
-/// `kernel_input`. Dispatches to `lookup(ctor).sample`, refusing precisely
-/// for a malformed call shape, an unregistered ctor, or a registered ctor
-/// with no `@sample` builder yet — never guessed.
+/// distribution constructor or `broadcasted(ctor)` for one product of scalar
+/// row laws; `kernel_input` is its kwargs record. Both reuse the registered
+/// primitive sampler, retaining the row axes separately from the variate.
 pub(crate) fn lower_sample(
     e: &mut Emitter,
     id: NodeId,
@@ -732,7 +761,16 @@ pub(crate) fn lower_sample(
         ));
     };
     let (rng, ctor, kernel_input) = (*rng, *ctor, *kernel_input);
-    let batch_shape = size_args
+    let (ctor, broadcasted) = match e.node(ctor) {
+        Node::Call(call)
+            if matches!(call.head, CallHead::Builtin(op) if e.resolve(op) == "broadcasted")
+                && call.args.len() == 1 =>
+        {
+            (call.args[0], true)
+        }
+        _ => (ctor, false),
+    };
+    let mut batch_shape = size_args
         .iter()
         .map(|&dim| match e.node(dim) {
             Node::Lit(Scalar::Int(n)) if *n > 0 => Ok(*n as u64),
@@ -742,6 +780,41 @@ pub(crate) fn lower_sample(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if broadcasted {
+        if !size_args.is_empty() {
+            return Err(EmitError::at(
+                id,
+                "IID copies of broadcasted kernels are not yet supported",
+            ));
+        }
+        let Some(Type::Tuple(parts)) = e.type_of(id) else {
+            return Err(EmitError::at(
+                id,
+                "broadcast sample requires known scalar cell and outer axes",
+            ));
+        };
+        match parts.first() {
+            Some(Type::Scalar(_)) => {}
+            Some(Type::Array { shape, elem }) if matches!(elem.as_ref(), Type::Scalar(_)) => {
+                batch_shape = shape
+                    .iter()
+                    .map(|dim| match dim {
+                        flatppl_core::Dim::Static(n) => Ok(*n as u64),
+                        _ => Err(EmitError::at(
+                            id,
+                            "broadcast sample requires static outer axes",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            _ => {
+                return Err(EmitError::at(
+                    id,
+                    "broadcast sample requires scalar outcome kernels",
+                ));
+            }
+        }
+    }
     let batch_n = if batch_shape.is_empty() {
         None
     } else {
@@ -762,6 +835,18 @@ pub(crate) fn lower_sample(
             ));
         }
     };
+    if broadcasted
+        && (ctor_name == "Binomial"
+            || !flatppl_infer::distribution_param_ranks(&ctor_name)
+                .is_some_and(|ranks| ranks.iter().all(|&rank| rank == 0)))
+    {
+        // Vector parameters own event axes; Binomial owns an inner trial axis.
+        // Neither is an elementwise scalar-parameter sampler.
+        return Err(EmitError::at(
+            id,
+            format!("broadcast sampling for '{ctor_name}' is not yet supported"),
+        ));
+    }
     let dist = lookup(&ctor_name)
         .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor_name}'")))?;
     let sample = dist
@@ -792,6 +877,7 @@ pub(crate) fn lower_sample(
     let params = Params {
         kernel_input,
         variate: None,
+        sample_shape: broadcasted.then(|| batch_shape.clone()),
     };
     // Existing samplers consume a flat product batch. Restore its outer axes
     // after sampling, keeping the inner event axes and RNG advances unchanged.
@@ -3351,8 +3437,8 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
 /// candidate)`, `accepted := accepted || accept_this`) — so a lane latches on
 /// its FIRST accepted candidate, and an all-reject lane ends on the last
 /// candidate exactly as [`draw_gamma_scalar`] does. The loop runs until
-/// `all(accepted)` (or `MAXITER`). `shape`/`rate` are scalar (identical across
-/// the iid batch) and broadcast over the `[n]` lanes.
+/// `all(accepted)` (or `MAXITER`). `shape`/`rate` may be scalar for an iid batch
+/// or `[n]` parameters for distinct row laws.
 ///
 /// The candidate batches are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (via
 /// a temporary `[MAXITER, n]` [`Emitter::batch_shape`], restored to `[n]` for
@@ -3363,12 +3449,12 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
 
-    // boost setup (scalar: shape/rate are identical across the iid batch).
+    // Boost each shape below one, including row-varying parameters.
     let shape_lt_one = e.compare("LT", shape, &one);
     let shape_plus_one = e.add(shape, &one);
     let alpha_boosted = e.select(&shape_lt_one, &shape_plus_one, shape);
 
-    // d = alpha_boosted - 1/3 ; c = 1 / sqrt(9 d)  (all scalar).
+    // d = alpha_boosted - 1/3 ; c = 1 / sqrt(9 d).
     let third = e.scalar(1.0 / 3.0);
     let d = e.sub(&alpha_boosted, &third);
     let nine = e.scalar(9.0);

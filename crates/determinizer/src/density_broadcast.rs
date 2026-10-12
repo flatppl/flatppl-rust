@@ -121,7 +121,7 @@ fn captures(m: &Module, root: NodeId, inputs: &[(Symbol, Ref)]) -> Vec<(Capture,
     result
 }
 
-pub(super) fn placeholder(m: &mut Module, cell: Type) -> (Symbol, Ref, NodeId) {
+pub(crate) fn placeholder(m: &mut Module, cell: Type) -> (Symbol, Ref, NodeId) {
     let used: std::collections::HashSet<_> = (0..m.node_count())
         .filter_map(|i| match m.node(NodeId::from_usize(i)) {
             Node::Ref(Ref {
@@ -244,7 +244,7 @@ pub(super) fn call_density(
     sum_density_with(m, measure, values, inputs, args)
 }
 
-fn cell_input(
+pub(crate) fn cell_input(
     m: &mut Module,
     values: NodeId,
     inputs: &mut Vec<(Symbol, Ref)>,
@@ -317,6 +317,18 @@ fn sum_density_with(
     };
     let point = cell_input(m, values, &mut inputs, &mut args)?;
     let body = lower_measure_density(m, measure, point)?;
+    let mapped = map_body(m, body, inputs, args, rank);
+    Ok(build_call(m, "sum", &[mapped]))
+}
+
+/// Map a scalar body, keeping captured arrays outside its cell axes.
+pub(crate) fn map_body(
+    m: &mut Module,
+    body: NodeId,
+    mut inputs: Vec<(Symbol, Ref)>,
+    mut args: Vec<NodeId>,
+    rank: usize,
+) -> NodeId {
     let mut replacements = Vec::new();
     for (capture, value) in captures(m, body, &inputs) {
         let (resolved, _) = resolve_ref_chain(m, value);
@@ -376,6 +388,5 @@ fn sum_density_with(
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
     args.insert(0, function);
-    let mapped = build_call(m, "broadcast", &args);
-    Ok(build_call(m, "sum", &[mapped]))
+    build_call(m, "broadcast", &args)
 }

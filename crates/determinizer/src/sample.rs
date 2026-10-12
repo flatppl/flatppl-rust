@@ -37,6 +37,9 @@ use flatppl_core::{
     ScalarType, Symbol, Type,
 };
 
+#[path = "sample_broadcast.rs"]
+mod broadcast;
+
 /// `rand(m, rng)` → a deterministic sample of the closed measure `m`.
 ///
 /// The measure is handed straight to [`lower_closed_measure_sample`], which
@@ -308,6 +311,7 @@ fn lower_closed_measure_sample(
             Ok((build_call(m, "add", &[scaled, shift]), next))
         }
         Some("normalize") => lower_normalized_weight_sample(m, resolved, rng, None),
+        Some("broadcast") => broadcast::lower(m, resolved, rng, None),
         Some("tilt") => lower_tilt_sample(m, resolved, rng, None),
         // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
@@ -848,6 +852,9 @@ fn lower_draw(
     }
     if builtin_name(m, inner_resolved) == Some("normalize") {
         return lower_normalized_weight_sample(m, inner_resolved, rng, sample_name);
+    }
+    if builtin_name(m, inner_resolved) == Some("broadcast") {
+        return broadcast::lower(m, inner_resolved, rng, sample_name);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
