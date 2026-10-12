@@ -6,7 +6,7 @@ use super::*;
 struct TensorBatch<'a, 'm> {
     source: &'a Emitter<'m>,
     out: Emitter<'m>,
-    literals: HashMap<&'a str, &'a str>,
+    invariants: HashMap<&'a str, &'a str>,
     values: HashMap<String, Value>,
     visiting: HashSet<String>,
 }
@@ -31,12 +31,14 @@ impl Emitter<'_> {
         let mut replay = TensorBatch {
             source: self,
             out: self.scratch_emitter(),
-            // Exact constant RHS text also preserves infinities and NaNs,
-            // which the finite-only constant-folding metadata omits.
-            literals: self
+            // Constants and static coordinate iotas are independent of host inputs.
+            // Exact RHS text also preserves nonfinite constant values.
+            invariants: self
                 .pure_ops
                 .iter()
-                .filter(|((rhs, _), _)| rhs.starts_with("stablehlo.constant "))
+                .filter(|((rhs, _), _)| {
+                    rhs.starts_with("stablehlo.constant ") || rhs.starts_with("stablehlo.iota ")
+                })
                 .map(|((rhs, _), ssa)| (ssa.as_str(), rhs.as_str()))
                 .collect(),
             values: HashMap::new(),
@@ -76,7 +78,7 @@ impl TensorBatch<'_, '_> {
         if !self.visiting.insert(value.ssa.clone()) {
             return None;
         }
-        let result = if let Some(rhs) = self.literals.get(value.ssa.as_str()) {
+        let result = if let Some(rhs) = self.invariants.get(value.ssa.as_str()) {
             if !rhs.ends_with(&format!(
                 " : {}",
                 value.ty.render(self.out.dtype, value.elem)
