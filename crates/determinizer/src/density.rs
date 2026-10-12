@@ -3658,7 +3658,21 @@ fn lower_weighted(
     } else {
         w_node
     };
-    let log_w = build_call(m, "log", &[w_scored]);
+    // Outside the base measure's support the product is zero for every weight.
+    // Do not differentiate an inactive log(0) at a zero mixture weight.
+    let positive = static_real(m, w_scored).is_some_and(|w| w > 0.0 && w.is_finite())
+        || matches!(m.valueset_of(w_scored), Some(ValueSet::PosReals));
+    let safe_weight = if positive {
+        w_scored
+    } else {
+        let inf = m.intern("inf");
+        let inf = m.alloc(Node::Const(inf));
+        let neg_inf = build_call(m, "neg", &[inf]);
+        let absent = build_call(m, "le", &[inner_density, neg_inf]);
+        let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        build_call(m, "ifelse", &[absent, one, w_scored])
+    };
+    let log_w = build_call(m, "log", &[safe_weight]);
     Ok(build_call(m, "add", &[log_w, inner_density]))
 }
 
