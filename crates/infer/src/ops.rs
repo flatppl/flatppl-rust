@@ -211,41 +211,7 @@ pub(crate) fn call_rule(
         // the complex case must promote. See `divide_type`.
         "divide" => divide_type(arg_ty(args, 0), arg_ty(args, 1)),
 
-        // `div(a, b) = ⌊a/b⌋` and `mod(a, b) = a − b·⌊a/b⌋` are integer-domain
-        // (spec §07: operands and result `integers`, `b ≠ 0`). The result is
-        // always `integer` (per the catalogue); additionally reject a real or
-        // complex operand as a static error rather than letting it through to a
-        // silently-fractional value — real division is the separate `divide`
-        // op. Booleans embed into integers (spec §03 `booleans ⊂ integers ⊂
-        // reals`) and pass; deferred/any operands defer to runtime.
-        "div" | "mod" => {
-            let mut ok = true;
-            for i in 0..2 {
-                let Some(t) = arg_ty(args, i) else { continue };
-                if let Some(kind @ (ScalarType::Real | ScalarType::Complex)) = scalar_kind(t) {
-                    let anchor = args.get(i).map_or(id, |(n, _, _)| *n);
-                    let hint = if name == "div" {
-                        " — use `divide` for real division"
-                    } else {
-                        ""
-                    };
-                    inf.diags.push(crate::Diagnostic::error_at(
-                        anchor,
-                        format!(
-                            "`{name}` is integer-domain (spec §07): argument {} \
-                             is {kind}, but `{name}` requires integers{hint}",
-                            i + 1,
-                        ),
-                    ));
-                    ok = false;
-                }
-            }
-            if ok {
-                Type::Scalar(ScalarType::Integer)
-            } else {
-                Type::Failed(format!("{name} non-integer operand").into())
-            }
-        }
+        "div" | "mod" => integer_arithmetic_type(inf, &name, args),
 
         // ---- containers (spec §03) — structural: result type threads arg types ----
         "vector" => vector_type(inf, args),
@@ -1123,6 +1089,37 @@ fn scalar_kind(t: &Type) -> Option<ScalarType> {
         Type::Scalar(s) => Some(*s),
         Type::Array { elem, .. } => scalar_kind(elem),
         _ => None,
+    }
+}
+
+/// §07 `div` and `mod` take integers, including §03's Boolean embedding.
+/// Share the ordinary-call check with broadcasting so real/complex array
+/// cells and held scalars cannot bypass the integer domain. Unknown kinds
+/// stay undecided; real division is the separate `divide` operation.
+fn integer_arithmetic_type(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Type {
+    let mut ok = true;
+    for (i, (node, t, _)) in args.iter().take(2).enumerate() {
+        if let Some(kind @ (ScalarType::Real | ScalarType::Complex)) = scalar_kind(t) {
+            let hint = if name == "div" {
+                " — use `divide` for real division"
+            } else {
+                ""
+            };
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`{name}` is integer-domain (spec §07): argument {} \
+                     is {kind}, but `{name}` requires integers{hint}",
+                    i + 1,
+                ),
+            ));
+            ok = false;
+        }
+    }
+    if ok {
+        Type::Scalar(ScalarType::Integer)
+    } else {
+        Type::Failed(format!("{name} non-integer operand").into())
     }
 }
 
@@ -6188,6 +6185,23 @@ fn broadcast_type(
             }
             other => elems.push(other.clone()),
         }
+    }
+    if let Node::Const(op) = inf.module.node(head_node)
+        && matches!(inf.module.resolve(*op), "div" | "mod")
+    {
+        let name = inf.module.resolve(*op).to_string();
+        if let Some(ty) = arity_check(inf, id, &name, &args[1..], named) {
+            return Ready(ty);
+        }
+        let normalized = normalize_keyword_args(inf.module, &name, &args[1..], named);
+        let cell = integer_arithmetic_type(inf, &name, normalized.as_deref().unwrap_or(&args[1..]));
+        return Ready(match shape {
+            Some(shape) if !matches!(cell, Type::Failed(_)) => Type::Array {
+                shape,
+                elem: Box::new(cell),
+            },
+            _ => cell,
+        });
     }
     let Some(shape) = shape else {
         if is_flat_constructor(inf, head_node) {
