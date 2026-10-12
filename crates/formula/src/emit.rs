@@ -628,7 +628,7 @@ pub(crate) fn info(
         link: recipe.link.name().into(),
         group_collation: "C".into(),
         default_prior_rule: format!(
-            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics.",
+            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept.",
             spec.family,
             recipe.link.name()
         ),

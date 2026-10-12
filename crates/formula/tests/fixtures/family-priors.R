@@ -2,6 +2,7 @@
 stopifnot(as.character(packageVersion("brms")) == "2.23.2")
 library(brms)
 cases <- list(
+  list(von_mises(), c(-2, -.4, .8, 2)),
   list(lognormal("inverse"), exp(c(-4, -1, 2, 3))),
   list(gaussian("log"), c(-2, 4, 8, 7)),
   list(student("inverse"), c(0, 4, 8, 7)),

@@ -208,13 +208,17 @@ pub(crate) fn resolve(
     }));
     let mut selected = select(&spec.priors, &targets)?.into_iter();
     let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
+    let default_intercept = || {
+        if family == Family::VonMises && link == Link::TanHalf {
+            ResolvedPrior::new("student_t(1, 0, 1)")
+        } else {
+            student(location)
+        }
+    };
     let intercept = if formula.intercept {
-        selected
-            .next()
-            .unwrap()
-            .unwrap_or_else(|| student(location))
+        selected.next().unwrap().unwrap_or_else(default_intercept)
     } else {
-        student(location)
+        default_intercept()
     };
     let b = names
         .iter()

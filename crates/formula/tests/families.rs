@@ -10,6 +10,11 @@ fn response_support_matches_brms() {
         ("geometric", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         ("weibull", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
         ("beta", vec![0.1, 0.5, 0.9], vec![0.0, 1.0]),
+        (
+            "von_mises",
+            vec![-std::f64::consts::PI, 0.0, std::f64::consts::PI],
+            vec![-3.2, 3.2],
+        ),
     ] {
         let mut spec = read(
             &json!({
@@ -58,6 +63,9 @@ fn link_scaled_default_priors_match_brms() {
         assert_eq!(priors.scale, case["scale"].as_f64().unwrap());
         if let Some(scale) = case["sigma_scale"].as_f64() {
             assert_eq!(priors.sigma_scale, scale);
+        }
+        if let Some(prior) = case["intercept_prior"].as_str() {
+            assert_eq!(priors.intercept.prior, prior);
         }
     }
 }

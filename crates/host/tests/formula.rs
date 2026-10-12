@@ -174,6 +174,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "exponential",
         "weibull",
         "beta",
+        "von_mises",
     ] {
         let formula = if family == "binomial" {
             "y | trials(n) ~ x"
@@ -184,6 +185,8 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.0, 1.0, 1.0, 0.0]
         } else if family == "beta" {
             vec![0.1, 0.4, 0.8, 0.7]
+        } else if family == "von_mises" {
+            vec![-2.0, -0.4, 0.8, 2.0]
         } else {
             vec![2.0, 4.0, 8.0, 7.0]
         };
@@ -206,6 +209,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "student" => ", sigma = posreals, nu = interval(1, inf)",
             "Gamma" | "negbinomial" | "weibull" => ", shape = posreals",
             "beta" => ", phi = posreals",
+            "von_mises" => ", kappa = posreals",
             _ => "",
         };
         let parameter = format!(
@@ -272,9 +276,12 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         "cloglog",
         "cauchit",
         "softit",
+        "tan_half",
     ] {
         let family = if link == "sqrt" {
             "poisson"
+        } else if link == "tan_half" {
+            "von_mises"
         } else {
             "gaussian"
         };
@@ -287,6 +294,8 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         context.register("model.flatppl", &model.module)?;
         let parameters = if family == "gaussian" {
             "record(temp_Intercept = eta, sigma = 1)"
+        } else if family == "von_mises" {
+            "record(temp_Intercept = eta, kappa = 1)"
         } else {
             "record(temp_Intercept = eta)"
         };

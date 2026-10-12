@@ -546,6 +546,16 @@ pub(crate) fn response(
             "beta responses must lie strictly between 0 and 1".into(),
         ));
     }
+    if family == Family::VonMises
+        && column
+            .numeric(rows)?
+            .iter()
+            .any(|value| !(-std::f64::consts::PI..=std::f64::consts::PI).contains(value))
+    {
+        return Err(Error(
+            "von Mises responses must lie between -pi and pi".into(),
+        ));
+    }
     column.data(rows)
 }
 

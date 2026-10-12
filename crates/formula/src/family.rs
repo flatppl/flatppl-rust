@@ -20,6 +20,8 @@ pub enum Family {
     Exponential,
     Weibull,
     Beta,
+    #[serde(rename = "von_mises")]
+    VonMises,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub enum Link {
     Cloglog,
     Cauchit,
     Softit,
+    TanHalf,
 }
 
 impl Family {
@@ -55,11 +58,13 @@ impl Family {
             "exponential" => Self::Exponential,
             "weibull" => Self::Weibull,
             "beta" => Self::Beta,
+            "von_mises" => Self::VonMises,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
             Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
             Self::Bernoulli | Self::Binomial | Self::Beta => Link::Logit,
+            Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
         let link = link
@@ -71,7 +76,7 @@ impl Family {
             .unwrap_or(default);
         use Link::*;
         let supported = match family {
-            Self::Gaussian | Self::Student => link != Sqrt,
+            Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf),
             Self::Lognormal => matches!(link, Identity | Inverse),
             Self::Bernoulli | Self::Binomial | Self::Beta => {
                 matches!(
@@ -85,6 +90,7 @@ impl Family {
             Self::Gamma | Self::Exponential | Self::Weibull => {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
+            Self::VonMises => matches!(link, TanHalf | Identity),
         };
         if !supported {
             return Err(Error(format!(
@@ -108,6 +114,7 @@ impl Family {
             Self::Student => &["sigma", "nu"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
+            Self::VonMises => &["kappa"],
             _ => &[],
         }
     }
@@ -126,6 +133,7 @@ impl Family {
             "nu" => "gamma(2, 0.1)".into(),
             "shape" if self == Self::Negbinomial => "InverseGamma(0.4, 0.3)".into(),
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
+            "kappa" => "Gamma(2, 0.01)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -197,6 +205,10 @@ impl Family {
                 let beta = broadcast(b, "mul", &[complement, phi]);
                 broadcast(b, "Beta", &[alpha, beta])
             }
+            Self::VonMises => {
+                let kappa = b.self_ref("kappa");
+                broadcast(b, "VonMises", &[mu, kappa])
+            }
         }
     }
 }
@@ -216,6 +228,7 @@ impl Link {
             Self::Cloglog => "cloglog",
             Self::Cauchit => "cauchit",
             Self::Softit => "softit",
+            Self::TanHalf => "tan_half",
         }
     }
 
@@ -274,6 +287,11 @@ impl Link {
                 let one = b.lit_real(1.0);
                 let denominator = broadcast(b, "add", &[one, value]);
                 broadcast(b, "divide", &[value, denominator])
+            }
+            Self::TanHalf => {
+                let atan = broadcast(b, "atan", &[eta]);
+                let two = b.lit_real(2.0);
+                broadcast(b, "mul", &[two, atan])
             }
         }
     }
