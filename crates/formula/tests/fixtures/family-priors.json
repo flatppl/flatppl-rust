@@ -5,6 +5,11 @@
   "formula": "y ~ x + (1 | g)",
   "cases": [
     {
+      "family": "lognormal", "link": "inverse",
+      "response": {"kind": "real64", "values": [0.01831563888873418, 0.36787944117144233, 7.38905609893065, 20.085536923187668]},
+      "intercept_location": 0.5, "scale": 3.0, "sigma_scale": 3.0
+    },
+    {
       "family": "gaussian", "link": "log",
       "response": {"kind": "real64", "values": [-2, 4, 8, 7]},
       "intercept_location": 0.0, "scale": 2.5, "sigma_scale": 3.0

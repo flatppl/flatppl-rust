@@ -527,11 +527,13 @@ pub(crate) fn response(
         }
         return Ok(DataValue::Integers(values));
     }
-    if matches!(family, Family::Gamma | Family::Exponential)
-        && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
+    if matches!(
+        family,
+        Family::Gamma | Family::Exponential | Family::Lognormal
+    ) && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
     {
         return Err(Error(
-            "Gamma and exponential responses must be strictly positive".into(),
+            "Gamma, exponential and lognormal responses must be strictly positive".into(),
         ));
     }
     column.data(rows)

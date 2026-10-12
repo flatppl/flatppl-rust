@@ -15,12 +15,13 @@ Group terms support random slopes, nested groups and independent `||` effects.
 The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
-Set `family` to `gaussian`, `student`, `bernoulli`, `binomial`, `poisson`,
+Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `Gamma` or `exponential`. `link` is optional:
 
 | Family | Default link | Other links |
 | --- | --- | --- |
 | Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
+| Lognormal | identity | inverse |
 | Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
 | Poisson, negative binomial | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential | log | identity, inverse, softplus, squareplus |
@@ -31,7 +32,7 @@ the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
 Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
 integer or a numeric column of counts. Trials remain required for prediction.
 Counts must be nonnegative integers, and binomial responses cannot exceed
-their trials. Gamma and exponential responses must be strictly positive.
+their trials. Gamma, exponential and lognormal responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
 
@@ -51,7 +52,9 @@ no such level limit.
 Defaults follow brms: a centred Student-t intercept, half-Student-t scales,
 and improper `regression.Flat()` coefficients. Numeric response statistics use
 the selected link for the intercept and group scales; direct `sigma` uses the
-identity-link response scale. The default Student degrees of freedom has a
+identity-link response scale. Lognormal uses log-response statistics for the
+intercept, group scales and direct `sigma`, including with its inverse link.
+The default Student degrees of freedom has a
 Gamma(2, 0.1) prior normalized above 1. Gamma shape has Gamma(0.01, 0.01),
 and negative-binomial shape has inverse-Gamma(0.4, 0.3).
 Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_t`,

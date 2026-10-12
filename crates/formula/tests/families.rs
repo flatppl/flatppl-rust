@@ -4,6 +4,30 @@ use flatppl_formula::{
 use serde_json::json;
 
 #[test]
+fn response_support_matches_brms() {
+    for (family, valid, invalid) in [("lognormal", vec![0.1, 1.0, 2.0], vec![0.0, -0.1])] {
+        let mut spec = read(
+            &json!({
+                "formula": "y ~ 1", "family": family,
+                "data": {"nrows": 3, "columns": [
+                    {"name": "y", "values": {"kind": "real64", "values": valid}}
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        build(&spec, spec.data.as_ref().unwrap()).unwrap();
+        for value in invalid {
+            spec.data.as_mut().unwrap().columns[0].values = ColumnValues::Real64(vec![value; 3]);
+            assert!(
+                build(&spec, spec.data.as_ref().unwrap()).is_err(),
+                "{family}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
 fn link_scaled_default_priors_match_brms() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/family-priors.json")).unwrap();

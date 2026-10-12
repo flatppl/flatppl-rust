@@ -164,6 +164,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
     for family in [
         "gaussian",
         "student",
+        "lognormal",
         "bernoulli",
         "binomial",
         "poisson",
@@ -196,7 +197,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
         context.register("training.flatppl", &model.module)?;
         let auxiliaries = match family {
-            "gaussian" => ", sigma = posreals",
+            "gaussian" | "lognormal" => ", sigma = posreals",
             "student" => ", sigma = posreals, nu = interval(1, inf)",
             "Gamma" | "negbinomial" => ", shape = posreals",
             _ => "",

@@ -173,11 +173,12 @@ pub(crate) fn resolve(
     response: Option<&[f64]>,
     offset_mean: f64,
 ) -> Result<Priors> {
-    let (mut location, scale) = default_scale(link, response);
-    if response.is_some() && link.uses_response_scale() {
+    let scale_link = family.prior_scale_link(link);
+    let (mut location, scale) = default_scale(scale_link, response);
+    if response.is_some() && scale_link.uses_response_scale() {
         location -= offset_mean;
     }
-    let (_, sigma_scale) = default_scale(Link::Identity, response);
+    let (_, sigma_scale) = default_scale(family.prior_scale_link(Link::Identity), response);
     let names: Vec<_> = design
         .columns
         .iter()

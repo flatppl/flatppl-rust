@@ -9,6 +9,7 @@ pub enum Family {
     #[default]
     Gaussian,
     Student,
+    Lognormal,
     Bernoulli,
     Binomial,
     Poisson,
@@ -41,6 +42,7 @@ impl Family {
         let family = match name {
             "gaussian" => Self::Gaussian,
             "student" => Self::Student,
+            "lognormal" => Self::Lognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
             "poisson" => Self::Poisson,
@@ -50,7 +52,7 @@ impl Family {
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
-            Self::Gaussian | Self::Student => Link::Identity,
+            Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
             Self::Bernoulli | Self::Binomial => Link::Logit,
             _ => Link::Log,
         };
@@ -64,6 +66,7 @@ impl Family {
         use Link::*;
         let supported = match family {
             Self::Gaussian | Self::Student => link != Sqrt,
+            Self::Lognormal => matches!(link, Identity | Inverse),
             Self::Bernoulli | Self::Binomial => {
                 matches!(
                     link,
@@ -95,10 +98,18 @@ impl Family {
 
     pub(crate) fn auxiliaries(self) -> &'static [&'static str] {
         match self {
-            Self::Gaussian => &["sigma"],
+            Self::Gaussian | Self::Lognormal => &["sigma"],
             Self::Student => &["sigma", "nu"],
             Self::Gamma | Self::Negbinomial => &["shape"],
             _ => &[],
+        }
+    }
+
+    pub(crate) fn prior_scale_link(self, link: Link) -> Link {
+        if self == Self::Lognormal {
+            Link::Log
+        } else {
+            link
         }
     }
 
@@ -119,9 +130,14 @@ impl Family {
         trials: Option<&Trials>,
     ) -> NodeId {
         match self {
-            Self::Gaussian => {
+            Self::Gaussian | Self::Lognormal => {
                 let sigma = b.self_ref("sigma");
-                broadcast(b, "Normal", &[mu, sigma])
+                let law = if self == Self::Lognormal {
+                    "LogNormal"
+                } else {
+                    "Normal"
+                };
+                broadcast(b, law, &[mu, sigma])
             }
             Self::Student => {
                 let nu = b.self_ref("nu");
