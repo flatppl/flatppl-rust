@@ -378,6 +378,29 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+#[test]
+fn unary_record_weights_receive_the_whole_variate() {
+    let prefix = "x = elementof(reals)\ny = elementof(reals)\n\
+                  prior = joint(a = Normal(0, 1), b = Normal(1, 2))\n\
+                  point = record(a = x, b = y)\n";
+    for (measure, weight) in [
+        ("logweighted(p -> p.a - 2 * p.b, prior)", "x - 2 * y"),
+        (
+            "weighted(p -> exp(p.a - 2 * p.b), prior)",
+            "log(exp(x - 2 * y))",
+        ),
+    ] {
+        let actual = determinize_src(&format!("{prefix}lp = logdensityof({measure}, point)"));
+        let expected = determinize_src(&format!(
+            "{prefix}lp = ({weight}) + logdensityof(prior, point)"
+        ));
+        assert_eq!(
+            pir_binding(&flatppl_flatpir::write(&actual), "lp"),
+            pir_binding(&flatppl_flatpir::write(&expected), "lp"),
+        );
+    }
+}
+
 // logweighted(lw, M): logdensityof → lw + logdensityof(M, v)
 #[test]
 fn logweighted_lowers_to_lw_plus_density() {
