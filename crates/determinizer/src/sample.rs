@@ -272,6 +272,9 @@ fn lower_closed_measure_sample(
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let (resolved, _) = resolve_ref_one(m, measure);
+    if let Some(body) = crate::kernel::reduce_kernel_application(m, resolved) {
+        return lower_closed_measure_sample(m, body, rng);
+    }
     if let Some(law) = crate::density::exponential_tilt::recognize(m, resolved) {
         return sample_exponential_tilt(m, law, rng, None);
     }
@@ -298,6 +301,12 @@ fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
+        Some("locscale") => {
+            let (base, shift, scale) = scalar_locscale(m, resolved)?;
+            let (value, next) = lower_closed_measure_sample(m, base, rng)?;
+            let scaled = build_call(m, "mul", &[scale, value]);
+            Ok((build_call(m, "add", &[scaled, shift]), next))
+        }
         Some("tilt") => lower_tilt_sample(m, resolved, rng, None),
         // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
@@ -332,6 +341,35 @@ fn lower_closed_measure_sample(
             ))
         }
     }
+}
+
+/// Sampling uses the affine map, not its inverse: signed scales keep their sign
+/// and the base sample supplies the successor RNG without another draw.
+fn scalar_locscale(m: &mut Module, node: NodeId) -> Result<(NodeId, NodeId, NodeId), RefuseError> {
+    let call = expect_builtin_call(m, node, "locscale").unwrap();
+    let [base, shift, scale] = &*call.args else {
+        return Err(refuse(node, m, "locscale expects 3 args (m, shift, scale)"));
+    };
+    let (base, shift, scale) = (*base, *shift, *scale);
+    let base_type = m.type_of(base).cloned().or_else(|| {
+        flatppl_infer::infer_expression(m, base, &[])
+            .0
+            .remove(&base)
+    });
+    if !matches!(base_type, Some(Type::Measure { domain, .. }) if matches!(*domain, Type::Scalar(_)))
+    {
+        return Err(refuse(node, m, "locscale sampling requires a scalar base"));
+    }
+    for arg in [shift, scale] {
+        if crate::density::confirmed_non_scalar(m, arg).is_some() {
+            return Err(refuse(
+                node,
+                m,
+                "scalar locscale sampling requires scalar shift and scale",
+            ));
+        }
+    }
+    Ok((base, shift, scale))
 }
 
 /// `pushfwd(f, M)` in measure position → sample `M`, then apply `f` FORWARD to the
@@ -723,11 +761,22 @@ fn lower_draw(
         c.args[0]
     };
     let (inner_resolved, _) = resolve_ref_one(m, inner_measure);
+    if let Some(body) = crate::kernel::reduce_kernel_application(m, inner_resolved) {
+        let draw = build_call(m, "draw", &[body]);
+        return lower_draw(m, draw, rng, sample_name);
+    }
     if let Some(law) = crate::density::exponential_tilt::recognize(m, inner_resolved) {
         return sample_exponential_tilt(m, law, rng, sample_name);
     }
     if let Some(err) = classify_drawn_measure(m, inner_resolved) {
         return Err(err);
+    }
+    if builtin_name(m, inner_resolved) == Some("locscale") {
+        let (base, shift, scale) = scalar_locscale(m, inner_resolved)?;
+        let draw = build_call(m, "draw", &[base]);
+        let (value, next) = lower_draw(m, draw, rng, sample_name)?;
+        let scaled = build_call(m, "mul", &[scale, value]);
+        return Ok((build_call(m, "add", &[scaled, shift]), next));
     }
     // Fan-out: `draw(iid(K, n))` → ONE batched `builtin_sample`, via the same
     // [`lower_iid_sample`] the measure-position `rand(iid(K, n), s)` spelling uses.
