@@ -11,6 +11,33 @@ pub struct FormulaModel {
 }
 
 impl Context {
+    /// Import a JSON specification with an optional Arrow IPC table override.
+    /// With no IPC bytes, the specification must contain its typed data table.
+    pub fn import_formula_json(
+        &mut self,
+        source: &str,
+        data_ipc: Option<&[u8]>,
+        name: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<FormulaModel, Diagnostic> {
+        let fail = |error: String| {
+            Diagnostic::new(
+                "formula",
+                source_path.or(name).unwrap_or("<formula>"),
+                error,
+            )
+        };
+        let spec = flatppl_formula::read(source).map_err(|e| fail(e.to_string()))?;
+        let data = data_ipc
+            .map(Table::from_arrow_ipc)
+            .transpose()
+            .map_err(|e| fail(e.to_string()))?;
+        let table = data.as_ref().or(spec.data.as_ref()).ok_or_else(|| {
+            fail("formula import needs data in the specification or Arrow IPC bytes".into())
+        })?;
+        self.import_formula(&spec, table, name, source_path)
+    }
+
     /// Import a Gaussian formula model, retaining its Rust preprocessing recipe.
     /// Data placement in the specification controls printed exports only.
     pub fn import_formula(
@@ -49,9 +76,34 @@ impl FormulaModel {
         data: &Table,
         mode: DataMode,
     ) -> Result<Arc<LoadedModule>, Diagnostic> {
-        let prepared = flatppl_formula::prepare_data(&self.recipe, data, mode)
+        self.prepare_with_rows(context, data, mode)
+            .map(|(module, _)| module)
+    }
+
+    /// Prepare Arrow IPC data and return the retained input row indices.
+    pub fn prepare_arrow(
+        &self,
+        context: &mut Context,
+        data_ipc: &[u8],
+        mode: DataMode,
+    ) -> Result<(Arc<LoadedModule>, Vec<usize>), Diagnostic> {
+        let data = Table::from_arrow_ipc(data_ipc)
             .map_err(|error| Diagnostic::new("formula", self.template.source_name(), error))?;
-        context.set(&self.template, &constants(prepared))
+        self.prepare_with_rows(context, &data, mode)
+    }
+
+    /// Bind a fresh snapshot and retain the model-frame row mapping.
+    pub fn prepare_with_rows(
+        &self,
+        context: &mut Context,
+        data: &Table,
+        mode: DataMode,
+    ) -> Result<(Arc<LoadedModule>, Vec<usize>), Diagnostic> {
+        let mut prepared = flatppl_formula::prepare_data(&self.recipe, data, mode)
+            .map_err(|error| Diagnostic::new("formula", self.template.source_name(), error))?;
+        let rows = std::mem::take(&mut prepared.rows);
+        let module = context.set(&self.template, &constants(prepared))?;
+        Ok((module, rows))
     }
 }
 

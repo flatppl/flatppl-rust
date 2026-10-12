@@ -53,9 +53,19 @@ and remaps factor labels even when new data uses a different level order.
 It rejects unseen factor and group levels.
 Build a new recipe for a new fit or cross-validation fold.
 
+The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` for uncompressed
+IPC files and streams. It preserves float32, float64, integers, logical values,
+dictionary levels and orderedness, and null validity. Plain string columns use
+sorted levels. Dictionary indices are remapped across batches; ordered
+dictionaries must retain a consistent level order. Missing values remain in the
+table until model-frame construction, so nulls in unused columns do not drop rows.
+
 `flatppl_host::Context::import_formula` returns a `FormulaModel` with a bound
 training module and an unbound template. Its `prepare` method binds a fresh
 snapshot in the same context. It never rebinds the training module.
+`Context::import_formula_json` accepts specification text and optional Arrow
+bytes; `FormulaModel::prepare_arrow` returns a fresh snapshot and retained input
+row indices. Python and wasm use this same Rust preprocessing.
 
 With the CLI `formula` feature:
 

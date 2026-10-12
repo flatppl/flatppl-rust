@@ -3,6 +3,8 @@
 //! The supported subset uses Gaussian identity-link models, numeric and factor
 //! predictors, interactions and random intercepts. It does not fit a model.
 
+#[cfg(feature = "arrow")]
+mod arrow;
 mod contrasts;
 mod data;
 mod design;

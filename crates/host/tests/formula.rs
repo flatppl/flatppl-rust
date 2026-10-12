@@ -105,3 +105,55 @@ fn factor_prediction_reuses_training_contrasts_across_level_orders()
     assert_eq!(first.stablehlo, second.stablehlo);
     Ok(())
 }
+
+#[test]
+fn arrow_import_and_prediction_keep_context_and_training_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let model = context.import_formula_json(
+        r#"{"formula":"y ~ x + f"}"#,
+        Some(include_bytes!(
+            "../../formula/tests/fixtures/arrow/training.arrow"
+        )),
+        Some("training"),
+        None,
+    )?;
+    assert_eq!(model.info.training_rows, vec![0, 1, 3]);
+    context.register("training.flatppl", &model.module)?;
+    let score = context.parse(
+        r#"
+        m = load_module("training.flatppl")
+        p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 2), sigma = posreals))
+        inputs = p
+        outputs = logdensityof(m.Pi_post, p)
+    "#,
+        None,
+        None,
+    )?;
+    let training = score.compile(&EmitOptions::default())?;
+    let bytes = include_bytes!("../../formula/tests/fixtures/arrow/prediction.arrows");
+    let (prediction, rows) = model.prepare_arrow(&mut context, bytes, DataMode::Prediction)?;
+    assert_eq!(rows, vec![0, 2]);
+    context.register("prediction.flatppl", &prediction)?;
+    let forward = context.parse(
+        r#"
+        m = load_module("prediction.flatppl")
+        p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 2), sigma = posreals))
+        inputs = p
+        outputs = logdensityof(m.K_model(p), record(y = [2.0, 6.0]))
+    "#,
+        None,
+        None,
+    )?;
+    forward.compile(&EmitOptions::default())?;
+    assert_eq!(
+        score.compile(&EmitOptions::default())?.stablehlo,
+        training.stablehlo
+    );
+    assert!(
+        model
+            .prepare_arrow(&mut Context::default(), bytes, DataMode::Prediction)
+            .is_err()
+    );
+    Ok(())
+}
