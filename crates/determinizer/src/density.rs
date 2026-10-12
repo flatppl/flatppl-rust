@@ -4236,13 +4236,24 @@ pub(crate) fn normalized_scalar_weight(m: &mut Module, node: NodeId) -> Option<(
     let [weight, base] = *call.args else {
         return None;
     };
+    let resolved_base = resolve_ref_chain(m, base).0;
+    if m.type_of(weight).is_none() || m.type_of(resolved_base).is_none() {
+        // Callback substitution rebuilds these nodes without their annotations.
+        let mut inferred = flatppl_infer::infer_expression(m, inner, &[]).0;
+        for node in [weight, resolved_base] {
+            if m.type_of(node).is_none()
+                && let Some(ty) = inferred.remove(&node)
+            {
+                m.set_type(node, ty);
+            }
+        }
+    }
     if !matches!(
         m.type_of(weight),
         Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
     ) {
         return None;
     }
-    let resolved_base = resolve_ref_chain(m, base).0;
     if !matches!(
         m.type_of(resolved_base),
         Some(Type::Measure {
