@@ -236,15 +236,6 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         .map(|offset| offset.values(table, &rows))
         .transpose()?
         .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
-    let priors = priors::resolve(
-        spec,
-        &formula,
-        &design,
-        family,
-        link,
-        response.as_deref(),
-        offset_mean,
-    )?;
     let groups = formula
         .groups
         .iter()
@@ -293,6 +284,15 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             }
         }
     }
+    let priors = priors::resolve(
+        spec,
+        &formula,
+        &design,
+        &groups,
+        (family, link),
+        response.as_deref(),
+        offset_mean,
+    )?;
     let mut recipe = Recipe {
         center: spec.options.center && formula.intercept,
         formula,

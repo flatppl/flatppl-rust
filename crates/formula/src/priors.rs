@@ -1,8 +1,8 @@
-use crate::{Design, Error, Family, Formula, Link, Result, Spec, family::default_scale};
+use crate::{Design, Error, Family, Formula, Group, Link, Result, Spec, family::default_scale};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-pub(crate) use crate::prior_expr::{PriorNode, emit};
+pub(crate) use crate::prior_expr::{PriorNode, emit, emit_correlation};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -55,7 +55,8 @@ pub struct Priors {
     pub sigma_scale: f64,
     pub intercept: ResolvedPrior,
     pub b: Vec<ResolvedPrior>,
-    pub sd: Vec<ResolvedPrior>,
+    pub sd: Vec<Vec<ResolvedPrior>>,
+    pub cor: Vec<Option<ResolvedPrior>>,
     pub aux: BTreeMap<String, ResolvedPrior>,
 }
 
@@ -70,9 +71,13 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
 
+fn canonical_class(class: &str) -> &str {
+    if class == "L" { "cor" } else { class }
+}
+
 impl Prior {
     fn matches(&self, target: &PriorTarget<'_>) -> bool {
-        self.class == target.class
+        canonical_class(&self.class) == target.class
             && [
                 (self.coef.as_deref(), target.coef),
                 (self.group.as_deref(), target.group),
@@ -98,7 +103,7 @@ pub(crate) fn select(
     let mut seen = HashSet::new();
     for prior in priors {
         let selector = (
-            &prior.class,
+            canonical_class(&prior.class),
             nonempty(prior.coef.as_deref()),
             nonempty(prior.group.as_deref()),
             nonempty(prior.dpar.as_deref()),
@@ -163,8 +168,8 @@ pub(crate) fn resolve(
     spec: &Spec,
     formula: &Formula,
     design: &Design,
-    family: Family,
-    link: Link,
+    groups: &[Group],
+    (family, link): (Family, Link),
     response: Option<&[f64]>,
     offset_mean: f64,
 ) -> Result<Priors> {
@@ -193,13 +198,7 @@ pub(crate) fn resolve(
         group: None,
         dpar: None,
     }));
-    let group_names: Vec<_> = formula.groups.iter().map(|g| g.name()).collect();
-    targets.extend(group_names.iter().map(|name| PriorTarget {
-        class: "sd",
-        coef: Some("Intercept"),
-        group: Some(name),
-        dpar: None,
-    }));
+    targets.extend(group_targets(groups, formula));
     targets.extend(family.auxiliaries().iter().map(|name| PriorTarget {
         class: name,
         coef: None,
@@ -225,11 +224,23 @@ pub(crate) fn resolve(
                 .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
         })
         .collect();
-    let sd = formula
-        .groups
-        .iter()
-        .map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)))
-        .collect();
+    let mut sd = Vec::new();
+    let mut cor = Vec::new();
+    for (group, term) in groups.iter().zip(&formula.groups) {
+        sd.push(
+            group
+                .coefficients
+                .iter()
+                .map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)))
+                .collect(),
+        );
+        cor.push((term.correlated && group.coefficients.len() > 1).then(|| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("lkj(1)"))
+        }));
+    }
     let aux = family
         .auxiliaries()
         .iter()
@@ -248,6 +259,28 @@ pub(crate) fn resolve(
         intercept,
         b,
         sd,
+        cor,
         aux,
     })
+}
+
+fn group_targets<'a>(groups: &'a [Group], formula: &Formula) -> Vec<PriorTarget<'a>> {
+    let mut targets = Vec::new();
+    for (group, term) in groups.iter().zip(&formula.groups) {
+        targets.extend(group.coefficients.iter().map(|coefficient| PriorTarget {
+            class: "sd",
+            coef: Some(coefficient),
+            group: Some(&group.column),
+            dpar: None,
+        }));
+        if term.correlated && group.coefficients.len() > 1 {
+            targets.push(PriorTarget {
+                class: "cor",
+                coef: None,
+                group: Some(&group.column),
+                dpar: None,
+            });
+        }
+    }
+    targets
 }

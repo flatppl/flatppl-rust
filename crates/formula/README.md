@@ -60,10 +60,17 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `sigma`, `nu`, `shape`) with
+Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.
+
+Group scales resolve each coefficient's prior separately, including scalar
+constants. `cor` and `L` are equivalent selectors for a correlated group's
+Cholesky factor: `lkj(2)`, `lkj_corr(2)` and `lkj_corr_cholesky(2)` all select
+`LKJCholesky(n, 2)` with the group's dimension. A group-specific correlation
+prior overrides the class prior. Scalar bounds and matrix constants are not
+supported for correlation priors.
 
 ```json
 [

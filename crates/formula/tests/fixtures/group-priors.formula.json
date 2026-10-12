@@ -1,0 +1,22 @@
+{
+  "formula": "y ~ x + (1 + x | g) + (1 + x | h)",
+  "priors": [
+    {"class": "b", "prior": "normal(0, 2)"},
+    {"class": "Intercept", "prior": "normal(1, 3)"},
+    {"class": "sigma", "prior": "normal(0, 1)"},
+    {"class": "sd", "prior": "normal(0, 2)"},
+    {"class": "sd", "group": "g", "prior": "cauchy(0, 1)"},
+    {"class": "sd", "group": "g", "coef": "x", "prior": "student_t(4, 1, 3)"},
+    {"class": "cor", "prior": "lkj(2)"},
+    {"class": "L", "group": "g", "prior": "lkj_corr_cholesky(3)"}
+  ],
+  "data": {
+    "nrows": 4,
+    "columns": [
+      {"name": "y", "values": {"kind": "real64", "values": [2, 4, 8, 7]}},
+      {"name": "x", "values": {"kind": "real64", "values": [1, 2, 3, 4]}},
+      {"name": "g", "values": {"kind": "factor", "values": {"levels": ["B", "A"], "codes": [1, 0, 1, 0]}}},
+      {"name": "h", "values": {"kind": "factor", "values": {"levels": ["1", "2"], "codes": [0, 1, 1, 0]}}}
+    ]
+  }
+}

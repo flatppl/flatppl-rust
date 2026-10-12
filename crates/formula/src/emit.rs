@@ -116,25 +116,37 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         let dimensions = group.coefficients.len();
         let dimension = b.lit_int(dimensions as i64);
         let support = lower_bound(&mut b, 0.0);
-        let names = scope(&b);
-        let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-        match priors::emit(&mut b, &recipe.priors.sd[i], Some(support), None, &bindings)? {
-            PriorNode::Measure(law) => {
-                let law = if dimensions == 1 {
-                    law
-                } else {
-                    b.call("iid", &[law, dimension])
-                };
-                draw(&mut b, &group.sd, law, &mut parameters);
+        let sd_priors = &recipe.priors.sd[i];
+        if dimensions == 1 {
+            parameter(
+                &mut b,
+                &group.sd,
+                &sd_priors[0],
+                Some(support),
+                &mut parameters,
+            )?;
+        } else if sd_priors.iter().all(|prior| *prior == sd_priors[0]) {
+            let names = scope(&b);
+            let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+            match priors::emit(&mut b, &sd_priors[0], Some(support), None, &bindings)? {
+                PriorNode::Measure(law) => {
+                    let law = b.call("iid", &[law, dimension]);
+                    draw(&mut b, &group.sd, law, &mut parameters);
+                }
+                PriorNode::Constant(value) => {
+                    let value = b.call("fill", &[value, dimension]);
+                    b.bind(&group.sd, value);
+                }
             }
-            PriorNode::Constant(value) => {
-                let value = if dimensions == 1 {
-                    value
-                } else {
-                    b.call("fill", &[value, dimension])
-                };
-                b.bind(&group.sd, value);
+        } else {
+            let mut values = Vec::new();
+            for (j, prior) in sd_priors.iter().enumerate() {
+                let name = b.alloc_name(&format!("{}_{}", group.sd, j + 1));
+                parameter(&mut b, &name, prior, Some(support), &mut parameters)?;
+                values.push(b.self_ref(&name));
             }
+            let value = b.array(&values);
+            b.bind(&group.sd, value);
         }
         group.z = b.alloc_name(&format!("z_{}", group.column));
         let zero = b.lit_real(0.0);
@@ -155,10 +167,11 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             broadcast(&mut b, "mul", &[sd, z])
         } else {
             let mut scale = b.call("diagmat", &[sd]);
-            if recipe.formula.groups[i].correlated {
+            if let Some(prior) = &recipe.priors.cor[i] {
                 let name = b.alloc_name(&format!("L_{}", group.column));
-                let eta = b.lit_real(1.0);
-                let law = b.call("LKJCholesky", &[dimension, eta]);
+                let names = scope(&b);
+                let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+                let law = priors::emit_correlation(&mut b, prior, dimensions, &bindings)?;
                 draw(&mut b, &name, law, &mut parameters);
                 let cholesky = b.self_ref(&name);
                 scale = b.call("mul", &[scale, cholesky]);
@@ -503,13 +516,18 @@ pub(crate) fn info(
     for (group_index, group) in recipe.groups.iter().enumerate() {
         let k = group.coefficients.len();
         for (j, coefficient) in group.coefficients.iter().enumerate() {
-            let indices = [j + 1];
-            add(
-                format!("sd_{}__{coefficient}", group.column),
-                &group.sd,
-                if k == 1 { &[] } else { &indices },
-                !sampled(module, &group.sd),
-            );
+            let name = format!("sd_{}__{coefficient}", group.column);
+            if let Some(component) = sampled_component(module, &group.sd, j) {
+                add(name, component, &[], false);
+            } else {
+                let indices = [j + 1];
+                add(
+                    name,
+                    &group.sd,
+                    if k == 1 { &[] } else { &indices },
+                    !sampled(module, &group.sd),
+                );
+            }
         }
         for (i, level) in group.levels.iter().enumerate() {
             for (j, coefficient) in group.coefficients.iter().enumerate() {
@@ -595,6 +613,27 @@ pub(crate) fn info(
 
 fn sampled(module: &Module, name: &str) -> bool {
     module.public_bindings().find(|(_, binding)| module.resolve(binding.name) == name).is_some_and(|(_, binding)| matches!(module.node(binding.rhs), Node::Call(call) if matches!(call.head, CallHead::Builtin(s) if module.resolve(s) == "draw")))
+}
+
+fn sampled_component<'a>(module: &'a Module, name: &str, index: usize) -> Option<&'a str> {
+    let (_, binding) = module
+        .public_bindings()
+        .find(|(_, binding)| module.resolve(binding.name) == name)?;
+    let Node::Call(call) = module.node(binding.rhs) else {
+        return None;
+    };
+    if !matches!(call.head, CallHead::Builtin(head) if module.resolve(head) == "vector") {
+        return None;
+    }
+    let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = module.node(*call.args.get(index)?)
+    else {
+        return None;
+    };
+    let name = module.resolve(*name);
+    sampled(module, name).then_some(name)
 }
 
 pub(crate) fn mark_improper(module: &mut Module, improper: bool) {

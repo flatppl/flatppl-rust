@@ -8,6 +8,35 @@ pub(crate) enum PriorNode {
     Constant(NodeId),
 }
 
+pub(crate) fn emit_correlation(
+    b: &mut Builder<'_>,
+    prior: &ResolvedPrior,
+    dimension: usize,
+    bindings: &[&str],
+) -> Result<NodeId> {
+    if prior.lb.is_some() || prior.ub.is_some() {
+        return Err(Error(
+            "correlation priors do not support scalar bounds".into(),
+        ));
+    }
+    let PriorNode::Measure(node) = emit(b, prior, None, Some(dimension), bindings)? else {
+        return Err(Error(
+            "correlation priors require an LKJ law; matrix constants are unsupported".into(),
+        ));
+    };
+    if let Node::Call(call) = b.m.node(node)
+        && matches!(call.head, CallHead::Builtin(name) if b.m.resolve(name) == "LKJCholesky")
+        && call.args.len() == 2
+        && call.named.is_empty()
+        && scalar(b.m, call.args[0]) == Some(dimension as f64)
+    {
+        return Ok(node);
+    }
+    Err(Error(format!(
+        "correlation prior requires an LKJCholesky law of dimension {dimension}"
+    )))
+}
+
 pub(crate) fn emit(
     b: &mut Builder<'_>,
     prior: &ResolvedPrior,
