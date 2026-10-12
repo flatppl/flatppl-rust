@@ -16,6 +16,7 @@ mod formula;
 mod ordinal;
 mod prior_expr;
 mod priors;
+mod splines;
 mod text;
 
 use flatppl_core::Module;
@@ -28,6 +29,7 @@ pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
 pub use formula::{Formula, GroupTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
+pub use splines::ThinPlate;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
