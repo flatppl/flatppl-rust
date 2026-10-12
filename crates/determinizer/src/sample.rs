@@ -381,6 +381,25 @@ fn lower_normalized_weight_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
+    let (base, valid) = normalized_sample_base(m, measure)?;
+    let (value, next) = if sample_name.is_some() {
+        let draw = build_call(m, "draw", &[base]);
+        lower_draw(m, draw, rng, sample_name)?
+    } else {
+        lower_closed_measure_sample(m, base, rng)?
+    };
+    let value = if matches!(m.node(valid), Node::Lit(Scalar::Bool(true))) {
+        value
+    } else {
+        crate::density::exponential_tilt::guard(m, value, valid)
+    };
+    Ok((value, next))
+}
+
+fn normalized_sample_base(
+    m: &mut Module,
+    measure: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
     let (base, valid) = crate::density::normalized_scalar_weight(m, measure).ok_or_else(|| {
         refuse(
             measure,
@@ -410,18 +429,7 @@ fn lower_normalized_weight_sample(
             }
         }
     }
-    let (value, next) = if sample_name.is_some() {
-        let draw = build_call(m, "draw", &[base]);
-        lower_draw(m, draw, rng, sample_name)?
-    } else {
-        lower_closed_measure_sample(m, base, rng)?
-    };
-    let value = if matches!(m.node(valid), Node::Lit(Scalar::Bool(true))) {
-        value
-    } else {
-        crate::density::exponential_tilt::guard(m, value, valid)
-    };
-    Ok((value, next))
+    Ok((base, valid))
 }
 
 /// `pushfwd(f, M)` in measure position → sample `M`, then apply `f` FORWARD to the
@@ -975,8 +983,9 @@ fn lower_iid_normal_on_set(
 /// (`random_data, rstate2 = rand(iid(Normal(0, 1), 10), rstate)`), admissible
 /// because a fixed-kernel `iid` is itself a nullary kernel, i.e. a closed measure.
 ///
-/// [`split_constructor`] is what rejects a kernel that is not a bare built-in
-/// constructor call — in particular a `broadcast(K, arr0, arr1, …)` kernel (an
+/// Scalar affine maps and normalized weights are lifted over that one batch.
+/// [`split_constructor`] rejects unsupported leaves, in particular a
+/// `broadcast(K, arr0, arr1, …)` kernel (an
 /// array-of-kernels measure with DIFFERING per-element params, §04 broadcasting)
 /// has positional args, so it is refused rather than mislowered as a fixed-kernel
 /// fan-out.
@@ -987,6 +996,10 @@ fn lower_iid_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
+    let (kernel, _) = resolve_ref_one(m, kernel);
+    if let Some(body) = crate::kernel::reduce_kernel_application(m, kernel) {
+        return lower_iid_sample(m, body, iid_node, rng, sample_name);
+    }
     let shape = iid_static_shape(m, iid_node).ok_or_else(|| {
         refuse(
             iid_node,
@@ -1002,6 +1015,25 @@ fn lower_iid_sample(
             crate::density::exponential_tilt::guard_sample(m, value, law.valid, law.integer),
             next,
         ));
+    }
+    if builtin_name(m, kernel) == Some("locscale") {
+        let (base, shift, scale) = scalar_locscale(m, kernel)?;
+        let (value, next) = lower_iid_sample(m, base, iid_node, rng, sample_name)?;
+        let scaled = crate::density::tilt::elementwise(m, "mul", &[scale, value]);
+        return Ok((
+            crate::density::tilt::elementwise(m, "add", &[scaled, shift]),
+            next,
+        ));
+    }
+    if builtin_name(m, kernel) == Some("normalize") {
+        let (base, valid) = normalized_sample_base(m, kernel)?;
+        let (value, next) = lower_iid_sample(m, base, iid_node, rng, sample_name)?;
+        let value = if matches!(m.node(valid), Node::Lit(Scalar::Bool(true))) {
+            value
+        } else {
+            crate::density::exponential_tilt::guard(m, value, valid)
+        };
+        return Ok((value, next));
     }
     let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
         refuse(
