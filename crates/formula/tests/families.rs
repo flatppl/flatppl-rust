@@ -8,6 +8,7 @@ fn response_support_matches_brms() {
     for (family, valid, invalid) in [
         ("lognormal", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
         ("geometric", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
+        ("hurdle_poisson", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         (
             "zero_inflated_poisson",
             vec![0.0, 1.0, 2.0],
@@ -50,27 +51,29 @@ fn response_support_matches_brms() {
 
 #[test]
 fn mixture_probability_constraints_apply_to_constant_overrides() {
-    for (value, valid) in [
-        (0.0, true),
-        (0.4, true),
-        (1.0, true),
-        (-0.1, false),
-        (1.1, false),
-    ] {
-        let spec = read(
-            &json!({
-                "formula": "y ~ x", "family": "zero_inflated_poisson",
-                "priors": [{"class": "zi", "prior": format!("constant({value})")}],
-                "data": {"nrows": 4, "columns": [
-                    {"name": "x", "values": {"kind": "int", "values": [1, 2, 3, 4]}},
-                    {"name": "y", "values": {"kind": "int", "values": [0, 2, 4, 0]}}
-                ]}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let result = build(&spec, spec.data.as_ref().unwrap());
-        assert_eq!(result.is_ok(), valid, "{value}: {:?}", result.err());
+    for (family, probability) in [("zero_inflated_poisson", "zi"), ("hurdle_poisson", "hu")] {
+        for (value, valid) in [
+            (0.0, true),
+            (0.4, true),
+            (1.0, true),
+            (-0.1, false),
+            (1.1, false),
+        ] {
+            let spec = read(
+                &json!({
+                    "formula": "y ~ x", "family": family,
+                    "priors": [{"class": probability, "prior": format!("constant({value})")}],
+                    "data": {"nrows": 4, "columns": [
+                        {"name": "x", "values": {"kind": "int", "values": [1, 2, 3, 4]}},
+                        {"name": "y", "values": {"kind": "int", "values": [0, 2, 4, 0]}}
+                    ]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let result = build(&spec, spec.data.as_ref().unwrap());
+            assert_eq!(result.is_ok(), valid, "{value}: {:?}", result.err());
+        }
     }
 }
 

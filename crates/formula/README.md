@@ -52,9 +52,9 @@ coefficients, intercepts, group scales or correlations. A direct `sigma` prior
 is unavailable when `sigma` has a predictor; its priors belong to the linear
 predictor before the inverse link.
 
-The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa` and `zi`
+The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa`, `zi` and `hu`
 where present in the family. Positive parameters default to the log link;
-Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi` uses logit.
+Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi`/`hu` use logit.
 Identity is also available; positive parameters other than `nu` additionally
 accept softplus and squareplus. Auxiliary priors follow brms's link-dependent
 defaults. `ModelInfo.dpars` records each formula, link and design columns.
@@ -90,6 +90,12 @@ prior and response values strictly between zero and one.
 follow the same beta law. Its `phi` prior is unchanged and `zi` defaults to
 Beta(1, 1). Responses lie in `[0, 1)`. The observation is an ordinary
 superposition of a fixed atom and a continuous law, with their common reference.
+`hurdle_poisson` assigns probability `hu` to zero and otherwise uses Poisson
+conditioned on a positive count. It uses the Poisson links and a Beta(1, 1)
+prior for direct `hu`; a predictor for `hu` defaults to logit with a
+Logistic(0, 1) intercept prior.
+Sampling the zero-truncated count component is not yet supported by the Rust
+sampler lowering; its density and derivatives are available.
 von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
 Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
 The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the

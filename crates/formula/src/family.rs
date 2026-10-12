@@ -15,6 +15,8 @@ pub enum Family {
     #[serde(rename = "zero_inflated_binomial")]
     ZeroInflatedBinomial,
     Poisson,
+    #[serde(rename = "hurdle_poisson")]
+    HurdlePoisson,
     #[serde(rename = "zero_inflated_poisson")]
     ZeroInflatedPoisson,
     Negbinomial,
@@ -72,6 +74,7 @@ impl Family {
             "binomial" => Self::Binomial,
             "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
             "poisson" => Self::Poisson,
+            "hurdle_poisson" => Self::HurdlePoisson,
             "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
             "zero_inflated_negbinomial" => Self::ZeroInflatedNegbinomial,
@@ -120,6 +123,7 @@ impl Family {
                 )
             }
             Self::Poisson
+            | Self::HurdlePoisson
             | Self::ZeroInflatedPoisson
             | Self::Negbinomial
             | Self::ZeroInflatedNegbinomial
@@ -148,6 +152,7 @@ impl Family {
                 | Self::Binomial
                 | Self::ZeroInflatedBinomial
                 | Self::Poisson
+                | Self::HurdlePoisson
                 | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
                 | Self::ZeroInflatedNegbinomial
@@ -168,6 +173,7 @@ impl Family {
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
             Self::ZeroInflatedBeta => &["phi", "zi"],
+            Self::HurdlePoisson => &["hu"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
@@ -183,7 +189,7 @@ impl Family {
         }
         let default = match name {
             "nu" => Link::Logm1,
-            "zi" => Link::Logit,
+            "zi" | "hu" => Link::Logit,
             _ => Link::Log,
         };
         let link = link
@@ -212,7 +218,7 @@ impl Family {
         match name {
             "nu" => "normal(2.7, 0.8)".into(),
             "kappa" => "normal(5.0, 0.8)".into(),
-            "zi" => "logistic(0, 1)".into(),
+            "zi" | "hu" => "logistic(0, 1)".into(),
             _ => "student_t(3, 0, 2.5)".into(),
         }
     }
@@ -234,7 +240,7 @@ impl Family {
             }
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             "kappa" => "Gamma(2, 0.01)".into(),
-            "zi" => "Beta(1, 1)".into(),
+            "zi" | "hu" => "Beta(1, 1)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -256,6 +262,7 @@ impl Family {
             || matches!(
                 self,
                 Self::Student
+                    | Self::HurdlePoisson
                     | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
@@ -360,27 +367,36 @@ impl Family {
                 apply(b, "Binomial", &[n, mu])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
-            Self::ZeroInflatedPoisson
+            Self::HurdlePoisson
+            | Self::ZeroInflatedPoisson
             | Self::ZeroInflatedNegbinomial
             | Self::ZeroInflatedBinomial
             | Self::ZeroInflatedBeta => {
-                let base = match self {
-                    Self::ZeroInflatedPoisson => Self::Poisson,
-                    Self::ZeroInflatedNegbinomial => Self::Negbinomial,
-                    Self::ZeroInflatedBeta => Self::Beta,
-                    _ => Self::Binomial,
+                let (base, probability) = match self {
+                    Self::HurdlePoisson => (Self::Poisson, "hu"),
+                    Self::ZeroInflatedPoisson => (Self::Poisson, "zi"),
+                    Self::ZeroInflatedNegbinomial => (Self::Negbinomial, "zi"),
+                    Self::ZeroInflatedBeta => (Self::Beta, "zi"),
+                    _ => (Self::Binomial, "zi"),
                 };
-                let base = base.observation(b, observation, thresholds, true);
-                let zi = auxiliary(b, "zi");
+                let mut base = base.observation(b, observation, thresholds, true);
+                if self == Self::HurdlePoisson {
+                    let one = b.lit_real(1.0);
+                    let infinity = b.call_head("inf");
+                    let support = b.call("interval", &[one, infinity]);
+                    let truncated = b.call("truncate", &[base, support]);
+                    base = b.call("normalize", &[truncated]);
+                }
+                let probability = auxiliary(b, probability);
                 let zero = if self.discrete() {
                     b.lit_int(0)
                 } else {
                     b.lit_real(0.0)
                 };
                 let atom = b.call("Dirac", &[zero]);
-                let atom = b.call("weighted", &[zi, atom]);
+                let atom = b.call("weighted", &[probability, atom]);
                 let one = b.lit_real(1.0);
-                let complement = b.call("sub", &[one, zi]);
+                let complement = b.call("sub", &[one, probability]);
                 let component = b.call("weighted", &[complement, base]);
                 let law = b.call("superpose", &[atom, component]);
                 b.call("normalize", &[law])

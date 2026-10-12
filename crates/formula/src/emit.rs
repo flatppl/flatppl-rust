@@ -63,7 +63,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             b.bind(name, zero);
             continue;
         }
-        let support = if name == "zi" {
+        let support = if matches!(name, "zi" | "hu") {
             let zero = b.lit_real(0.0);
             let one = b.lit_real(1.0);
             b.call("interval", &[zero, one])

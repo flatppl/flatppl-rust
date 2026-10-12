@@ -5,6 +5,11 @@
   "formula": "y ~ x + (1 | g)",
   "cases": [
     {
+      "family": "hurdle_poisson", "link": "log",
+      "response": {"kind": "int", "values": [0, 2, 4, 0]},
+      "intercept_location": -0.8, "scale": 2.5
+    },
+    {
       "family": "zero_inflated_beta", "link": "logit",
       "response": {"kind": "real64", "values": [0, 0.2, 0.8, 0]},
       "intercept_location": 0.0, "scale": 2.5
