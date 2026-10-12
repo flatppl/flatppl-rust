@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::density::{draw_argument, resolve_ref_chain, resolve_ref_one};
 use flatppl_core::{
-    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
-    Type,
+    Binding, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
+    Symbol, Type,
 };
 
 /// A resolved kernel: its reified body and its boundary inputs as
@@ -463,7 +463,37 @@ fn substitute_dependencies(
         if changed == children {
             root
         } else {
-            crate::driver::rebuild_with_children(m, root, &changed)
+            let changed = crate::driver::rebuild_with_children(m, root, &changed);
+            if mode == Substitute::All
+                && absorbed
+                && draw_argument(m, root).is_some()
+                && !has_free_local(m, changed)
+            {
+                // A shared ancestor must remain a named draw after application.
+                // Memoization then gives every consumer this same binding, while
+                // separate applications instantiate distinct draw identities.
+                let mut index = m.binding_count();
+                let name = loop {
+                    let name = m.intern(&format!("__kernel_draw_{index}"));
+                    if m.binding_by_name(name).is_none() {
+                        break name;
+                    }
+                    index += 1;
+                };
+                m.add_binding(Binding {
+                    name,
+                    rhs: changed,
+                    doc: None,
+                    public: false,
+                    synthetic: true,
+                });
+                m.alloc(Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }))
+            } else {
+                changed
+            }
         }
     };
     memo.insert(key, result);
