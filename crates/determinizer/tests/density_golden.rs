@@ -2842,6 +2842,17 @@ fn applied_count_mixture_retains_its_reference_measure() {
     assert_eq!(pir_binding(&direct, "lp"), pir_binding(&applied, "lp"));
 }
 
+#[test]
+fn applied_normalized_count_mixture_retains_component_masses() {
+    let direct = "lp = logdensityof(normalize(superpose(weighted(2, Dirac(0)), \
+                  weighted(3, Poisson(2)))), 0)";
+    let applied = "K(mu) = normalize(superpose(weighted(2, Dirac(0)), \
+                   weighted(3, Poisson(mu))))\nlp = logdensityof(K(2), 0)";
+    let direct = flatppl_flatpir::write(&determinize_src(direct));
+    let applied = flatppl_flatpir::write(&determinize_src(applied));
+    assert_eq!(pir_binding(&direct, "lp"), pir_binding(&applied, "lp"));
+}
+
 // The second net for the same §04 rule, at the pre-existing reified-measure path.
 // `density::lower_reified_measure` screened a `%specinputs` boundary for placeholder
 // ENTRIES, which cannot see this shape: an `%autoinputs` boundary lists `elementof`
