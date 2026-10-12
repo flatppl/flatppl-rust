@@ -39,3 +39,18 @@ fn exact_gamma_tail_and_full_support_masses_need_no_cdf() {
         assert!(!source.contains("builtin_touniform"), "{base}: {source}");
     }
 }
+
+#[test]
+fn positive_count_normalization_survives_callback_and_text_round_trip() {
+    let source = "p = external(cartpow(posreals, 2))\ninputs = p\n\
+        K(a, b) = normalize(truncate(NegativeBinomial(a, b), interval(1, inf)))\n\
+        outputs = (logdensityof(K(p[1], p[2]), 2),\n\
+          logdensityof(normalize(truncate(Poisson(p[1]), interval(1, inf))), 0))";
+    let mut model = flatppl_syntax::parse(source).unwrap();
+    assert!(flatppl_infer::infer(&mut model).is_empty());
+    let lowered = determinize(&model).unwrap();
+    is_flatpdl(&lowered).unwrap();
+    let source = flatppl_syntax::print(&lowered);
+    let mut reparsed = flatppl_syntax::parse(&source).unwrap();
+    assert!(flatppl_infer::infer(&mut reparsed).is_empty());
+}

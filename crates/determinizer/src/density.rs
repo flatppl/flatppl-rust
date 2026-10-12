@@ -3985,6 +3985,10 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     }
 
     if let Some((base, lo, hi)) = truncate_shape {
+        if let Some(log_z) = integral::positive_count_log_mass(m, base, lo, hi) {
+            let density = lower_measure_density(m, m_inner, v)?;
+            return Ok(normalized_logdensity(m, density, log_z));
+        }
         // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
         // totalmass(truncate(base, S))` (§06 "Density of composed measures", the
         // `normalize` rule `Z = totalmass(M)`) holds ONLY when `base` is a

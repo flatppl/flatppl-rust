@@ -242,6 +242,49 @@ pub(super) fn mass(m: &mut Module, measure: NodeId) -> Option<Result<NodeId, Ref
     })
 }
 
+/// Restricting a nonnegative count law to [1, inf] retains mass 1 - P(0).
+pub(super) fn positive_count_log_mass(
+    m: &mut Module,
+    base: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+) -> Option<NodeId> {
+    if static_real(m, lo) != Some(1.0) || static_real(m, hi) != Some(f64::INFINITY) {
+        return None;
+    }
+    let (base, _) = resolve_ref_chain(m, base);
+    let (constructor, parameters) = split_kernel_constructor(m, base)?;
+    let log_p0 = match m.resolve(constructor) {
+        "Poisson" => {
+            let rate = find_kwarg(m, &parameters, "rate")?;
+            build_call(m, "neg", &[rate])
+        }
+        "NegativeBinomial" => {
+            let alpha = find_kwarg(m, &parameters, "alpha")?;
+            let beta = find_kwarg(m, &parameters, "beta")?;
+            let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+            let reciprocal = build_call(m, "divide", &[one, beta]);
+            let log_ratio = build_call(m, "log1p", &[reciprocal]);
+            let magnitude = build_call(m, "mul", &[alpha, log_ratio]);
+            build_call(m, "neg", &[magnitude])
+        }
+        _ => return None,
+    };
+    // expm1 avoids cancellation when almost all probability is at zero.
+    let difference = build_call(m, "expm1", &[log_p0]);
+    let mass = build_call(m, "neg", &[difference]);
+    let log_mass = build_call(m, "log", &[mass]);
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let mut valid = m.alloc(Node::Lit(Scalar::Bool(true)));
+    for (_, parameter) in parameters {
+        let positive = build_call(m, "gt", &[parameter, zero]);
+        let finite = build_call(m, "isfinite", &[parameter]);
+        let admissible = build_call(m, "land", &[positive, finite]);
+        valid = build_call(m, "land", &[valid, admissible]);
+    }
+    Some(exponential_tilt::guard(m, log_mass, valid))
+}
+
 /// Keep one interval error budget when the target cannot emit the exact CDF.
 pub(crate) fn lower_interval_mass(
     m: &mut Module,
