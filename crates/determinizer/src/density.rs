@@ -6916,19 +6916,38 @@ fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<Polyno
 /// admitting the built-in `inf`, so an unbounded endpoint is RECOGNIZED as
 /// infinite rather than merely unreadable. `None` for anything not static.
 fn static_real(m: &Module, id: NodeId) -> Option<f64> {
-    let (node, _) = resolve_ref_chain(m, id);
-    match m.node(node) {
-        Node::Lit(Scalar::Real(x)) => Some(*x),
-        Node::Lit(Scalar::Int(i)) => Some(*i as f64),
-        Node::Const(sym) if m.resolve(*sym) == "inf" => Some(f64::INFINITY),
-        _ => {
-            let c = expect_builtin_call(m, node, "neg")?;
-            if c.args.len() != 1 {
-                return None;
+    let mut promoted = None;
+    let mut node = id;
+    let mut sign = 1.0;
+    for _ in 0..=m.node_count() {
+        match m.node(node) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                // Query inputs replace their initial value, including through aliases.
+                if promoted
+                    .get_or_insert_with(|| crate::canon::promoted_input_names(m))
+                    .contains(name)
+                {
+                    return None;
+                }
+                node = m.binding(m.binding_by_name(*name)?).rhs;
             }
-            Some(-static_real(m, c.args[0])?)
+            Node::Lit(Scalar::Real(x)) => return Some(sign * x),
+            Node::Lit(Scalar::Int(i)) => return Some(sign * *i as f64),
+            Node::Const(sym) if m.resolve(*sym) == "inf" => return Some(sign * f64::INFINITY),
+            Node::Call(c)
+                if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "neg")
+                    && c.args.len() == 1 =>
+            {
+                sign = -sign;
+                node = c.args[0];
+            }
+            _ => return None,
         }
     }
+    None
 }
 
 /// Both FINITE endpoints of a [`recognize_polynomial_over_interval`] shape.

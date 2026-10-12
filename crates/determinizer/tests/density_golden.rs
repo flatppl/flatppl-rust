@@ -768,6 +768,30 @@ fn normalized_student_t_half_lines_use_their_exact_mass() {
     }
 }
 
+#[test]
+fn normalized_intervals_respect_promoted_input_bounds() {
+    for (base, lo, hi, lower) in [
+        ("Beta(2, 3)", "0.3", "1.5", "-lo"),
+        ("Gamma(2, 1.3)", "0", "inf", "lo"),
+        ("StudentT(3)", "0", "inf", "lo"),
+    ] {
+        let source = |lo: &str, hi: &str| {
+            format!(
+                "lo = {lo}\nhi = {hi}\nlower = {lower}\nupper = hi\n\
+                 inputs = (lo, hi)\n\
+                 lp = logdensityof(normalize(truncate({base}, interval(lower, upper))), 0.5)"
+            )
+        };
+        let promoted = determinize_src(&source(lo, hi));
+        let declared = determinize_src(&source("external(reals)", "external(reals)"));
+        assert_eq!(
+            pir_binding(&flatppl_flatpir::write(&promoted), "lp"),
+            pir_binding(&flatppl_flatpir::write(&declared), "lp"),
+            "{base}: query arguments replace the initial interval bounds"
+        );
+    }
+}
+
 // pushfwd(bijection(exp, log, identity), M): logdensityof → density(M, log(v)) - identity(log(v))
 #[test]
 fn pushfwd_bijection_lowers_to_sub_density_logvol() {
