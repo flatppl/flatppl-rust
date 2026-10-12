@@ -157,3 +157,140 @@ fn arrow_import_and_prediction_keep_context_and_training_snapshot()
     );
     Ok(())
 }
+
+#[test]
+fn scalar_families_compile_default_posteriors_and_fresh_predictions()
+-> Result<(), Box<dyn std::error::Error>> {
+    for family in [
+        "gaussian",
+        "student",
+        "bernoulli",
+        "binomial",
+        "poisson",
+        "negbinomial",
+        "Gamma",
+        "exponential",
+    ] {
+        let formula = if family == "binomial" {
+            "y | trials(n) ~ x"
+        } else {
+            "y ~ x"
+        };
+        let y = if family == "bernoulli" {
+            vec![0, 1, 1, 0]
+        } else {
+            vec![2, 4, 8, 7]
+        };
+        let spec = flatppl_formula::read(
+            &serde_json::json!({
+                "formula": formula, "family": family,
+                "data": {"nrows": 4, "columns": [
+                    {"name": "y", "values": {"kind": "int", "values": y}},
+                    {"name": "x", "values": {"kind": "real32", "values": [1, 2, 3, 4]}},
+                    {"name": "n", "values": {"kind": "int", "values": [3, 5, 8, 9]}}
+                ]}
+            })
+            .to_string(),
+        )?;
+        let mut context = Context::default();
+        let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+        context.register("training.flatppl", &model.module)?;
+        let auxiliaries = match family {
+            "gaussian" => ", sigma = posreals",
+            "student" => ", sigma = posreals, nu = interval(1, inf)",
+            "Gamma" | "negbinomial" => ", shape = posreals",
+            _ => "",
+        };
+        let parameter = format!(
+            "p = elementof(cartprod(temp_Intercept = reals, b = cartpow(reals, 1){auxiliaries}))"
+        );
+        let score = context.parse(
+            &format!(
+                r#"
+            m = load_module("training.flatppl")
+            {parameter}
+            inputs = p
+            outputs = logdensityof(m.Pi_post, p)
+        "#
+            ),
+            None,
+            None,
+        )?;
+        let training = score.compile(&EmitOptions::default())?;
+        let data = serde_json::from_value(serde_json::json!({"nrows": 2, "columns": [
+            {"name": "x", "values": {"kind": "real32", "values": [2, 5]}},
+            {"name": "n", "values": {"kind": "int", "values": [3, 2]}}
+        ]}))?;
+        let prediction = model.prepare(&mut context, &data, DataMode::Prediction)?;
+        context.register("prediction.flatppl", &prediction)?;
+        let forward = context.parse(
+            &format!(
+                r#"
+            m = load_module("prediction.flatppl")
+            {parameter}
+            inputs = p
+            outputs = logdensityof(m.K_model(p), record(y = [1, 1]))
+        "#
+            ),
+            None,
+            None,
+        )?;
+        forward.compile(&EmitOptions::default())?;
+        assert_eq!(
+            training.stablehlo,
+            score.compile(&EmitOptions::default())?.stablehlo,
+            "{family}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn std::error::Error>> {
+    for link in [
+        "identity",
+        "log",
+        "inverse",
+        "sqrt",
+        "softplus",
+        "squareplus",
+        "logit",
+        "probit",
+        "probit_approx",
+        "cloglog",
+        "cauchit",
+        "softit",
+    ] {
+        let family = if link == "sqrt" {
+            "poisson"
+        } else {
+            "gaussian"
+        };
+        let spec = flatppl_formula::read(&serde_json::json!({
+            "formula": "y ~ 1", "family": family, "link": link,
+            "data": {"nrows": 1, "columns": [{"name": "y", "values": {"kind": "int", "values": [1]}}]}
+        }).to_string())?;
+        let mut context = Context::default();
+        let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+        context.register("model.flatppl", &model.module)?;
+        let parameters = if family == "gaussian" {
+            "record(temp_Intercept = eta, sigma = 1)"
+        } else {
+            "record(temp_Intercept = eta)"
+        };
+        let query = context.parse(
+            &format!(
+                r#"
+            m = load_module("model.flatppl")
+            eta = elementof(reals)
+            inputs = eta
+            outputs = logdensityof(m.K_model({parameters}), record(y = [0]))
+        "#
+            ),
+            None,
+            None,
+        )?;
+        query.compile(&EmitOptions::default())?;
+    }
+    Ok(())
+}

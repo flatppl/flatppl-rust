@@ -1,14 +1,25 @@
-use crate::{Error, Result};
+use crate::{Arithmetic, ColumnExpression, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Formula {
     pub response: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trials: Option<Trials>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
-    pub groups: Vec<String>,
+    pub groups: Vec<GroupTerm>,
+    pub expressions: BTreeMap<String, ColumnExpression>,
+    pub offsets: Vec<ColumnExpression>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Trials {
+    Constant(i64),
+    Column(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -16,19 +27,35 @@ pub struct Term {
     pub factors: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GroupTerm {
+    pub columns: Vec<String>,
+    pub intercept: bool,
+    pub variables: Vec<String>,
+    pub fixed: Vec<Term>,
+    pub expressions: BTreeMap<String, ColumnExpression>,
+    pub correlated: bool,
+}
+
+impl GroupTerm {
+    pub fn name(&self) -> String {
+        self.columns.join(":")
+    }
+}
+
 const MAX_DEPTH: usize = 128;
 const MAX_TERMS: usize = 4096;
 
-/// Expand R formula operators over column names and `(1 | group)` intercepts.
+/// Expand R formula operators over column expressions and group effects.
 ///
 /// Fixed terms follow brms's `terms_fe` reconstruction and second `terms` pass:
 /// removed variables disappear, and interactions use the surviving variable order.
-/// Group terms use C collation. Expression calls and random slopes are unsupported.
+/// Group terms use C collation and preserve separate group-effect blocks.
 pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
         .ok_or_else(|| Error("formula must contain `response ~ terms`".into()))?;
-    let response = name(response.trim())?;
+    let (response, trials) = response_addition(response)?;
     let mut parser = Parser {
         tokens: tokenize(rhs)?,
         at: 0,
@@ -42,12 +69,52 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let terms = expand(&expr, &parser.atoms, &mut intercept, true)?;
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
+    // R records offset calls separately from coefficient terms, including
+    // calls appearing after subtraction. Negation belongs inside offset().
+    let offsets = parser
+        .atoms
+        .iter()
+        .filter_map(|atom| match atom {
+            Atom::Offset(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
     for term in terms {
         match &parser.atoms[term[0]] {
-            Atom::Group(group, independent) => groups.push((group.clone(), *independent)),
-            Atom::Variable(_) => fixed.push(term),
+            Atom::Groups(terms) => groups.extend(terms.iter().cloned()),
+            Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
+            Atom::Offset(_) => {}
         }
     }
+    let (variables, fixed, expressions) = fixed_terms(fixed, &parser.atoms);
+    groups.sort_by_key(GroupTerm::name);
+    for (i, group) in groups.iter().enumerate() {
+        if group.intercept
+            && groups[..i]
+                .iter()
+                .any(|previous| previous.columns == group.columns && previous.intercept)
+        {
+            return Err(Error(format!(
+                "duplicated group effect `Intercept` for `{}`",
+                group.name()
+            )));
+        }
+    }
+    Ok(Formula {
+        response,
+        trials,
+        intercept,
+        variables,
+        fixed,
+        groups,
+        expressions,
+        offsets,
+    })
+}
+
+type FixedTerms = (Vec<String>, Vec<Term>, BTreeMap<String, ColumnExpression>);
+
+fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     fixed.sort_by_key(Vec::len);
     let mut order = Vec::new();
     for term in &fixed {
@@ -57,11 +124,19 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             }
         }
     }
-    let variable = |id| match &parser.atoms[id] {
+    let variable = |id| match &atoms[id] {
         Atom::Variable(name) => name.clone(),
-        Atom::Group(..) => unreachable!(),
+        Atom::Expression(expression) => expression.to_string(),
+        Atom::Groups(_) | Atom::Offset(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
+    let expressions = order
+        .iter()
+        .filter_map(|&id| match &atoms[id] {
+            Atom::Expression(expression) => Some((expression.to_string(), expression.clone())),
+            _ => None,
+        })
+        .collect();
     let fixed = fixed
         .into_iter()
         .map(|mut term| {
@@ -71,20 +146,30 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             }
         })
         .collect();
-    groups.sort();
-    if let Some(pair) = groups.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(Error(format!(
-            "duplicated group-level intercept for `{}`",
-            pair[0].0
-        )));
-    }
-    Ok(Formula {
-        response,
-        intercept,
-        variables,
-        fixed,
-        groups: groups.into_iter().map(|(group, _)| group).collect(),
-    })
+    (variables, fixed, expressions)
+}
+
+fn response_addition(text: &str) -> Result<(String, Option<Trials>)> {
+    let Some((response, addition)) = text.split_once('|') else {
+        return Ok((name(text.trim())?, None));
+    };
+    let fail = || Error("response additions support only `y | trials(column_or_integer)`".into());
+    let argument = addition
+        .trim()
+        .strip_prefix("trials")
+        .and_then(|value| value.trim().strip_prefix('('))
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(fail)?
+        .trim();
+    let trials = if let Ok(value) = argument.parse::<i64>() {
+        if value < 0 {
+            return Err(Error("binomial trials must be nonnegative".into()));
+        }
+        Trials::Constant(value)
+    } else {
+        Trials::Column(name(argument).map_err(|_| fail())?)
+    };
+    Ok((name(response.trim())?, Some(trials)))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -188,7 +273,9 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>> {
 #[derive(PartialEq)]
 enum Atom {
     Variable(String),
-    Group(String, bool),
+    Expression(ColumnExpression),
+    Offset(ColumnExpression),
+    Groups(Vec<GroupTerm>),
 }
 
 struct Expr {
@@ -250,11 +337,29 @@ impl<'a> Parser<'a> {
         let mut left = match token {
             Token::Name(text) => {
                 if self.peek() == Token::Left {
-                    return Err(Error(format!(
-                        "formula call `{text}(...)` is not supported"
-                    )));
+                    if !matches!(text, "I" | "log" | "offset") {
+                        return Err(Error(format!(
+                            "formula call `{text}(...)` is not supported"
+                        )));
+                    }
+                    self.at += 1;
+                    let argument = self.expression(0, depth + 1)?;
+                    if self.peek() != Token::Right {
+                        return Err(Error(format!(
+                            "expected one numeric expression in `{text}`"
+                        )));
+                    }
+                    self.at += 1;
+                    let expression = column_expression(&argument, &self.atoms)?;
+                    self.atom(match text {
+                        "I" => Atom::Expression(ColumnExpression::Identity(Box::new(expression))),
+                        "log" => Atom::Expression(ColumnExpression::Log(Box::new(expression))),
+                        "offset" => Atom::Offset(expression),
+                        _ => unreachable!(),
+                    })?
+                } else {
+                    self.atom(Atom::Variable(name(text)?))?
                 }
-                self.atom(Atom::Variable(name(text)?))?
             }
             Token::Number(value) => Expr::new(ExprKind::Number(value))?,
             Token::Operator(op @ (Op::Add | Op::Subtract)) => {
@@ -264,18 +369,45 @@ impl<'a> Parser<'a> {
             Token::Left => {
                 let child = self.expression(0, depth + 1)?;
                 let inner = if let Token::Bar(independent) = self.peek() {
-                    if !matches!(child.kind, ExprKind::Number(1.0)) {
-                        return Err(Error(
-                            "only `(1 | group)` random intercepts are supported".into(),
-                        ));
+                    self.at += 1;
+                    let grouping = self.expression(0, depth + 1)?;
+                    let mut group_order = Vec::new();
+                    grouping_columns(&grouping, &self.atoms, &mut group_order)?;
+                    group_effect_terms(&child, &self.atoms)?;
+                    let mut intercept = true;
+                    let fixed = expand(&child, &self.atoms, &mut intercept, true)?;
+                    reject_group_interaction(&fixed, &self.atoms)?;
+                    let (variables, fixed, expressions) = fixed_terms(fixed, &self.atoms);
+                    let mut unused_intercept = false;
+                    let columns = expand(&grouping, &self.atoms, &mut unused_intercept, true)?;
+                    if columns.is_empty() {
+                        return Err(Error("group effects require a grouping column".into()));
                     }
-                    self.at += 1;
-                    let Token::Name(group) = self.peek() else {
-                        return Err(Error("expected a plain grouping column".into()));
-                    };
-                    let group = name(group)?;
-                    self.at += 1;
-                    self.atom(Atom::Group(group, independent))?
+                    let groups = columns
+                        .into_iter()
+                        .map(|mut term| {
+                            term.sort_by_key(|id| group_order.iter().position(|v| v == id));
+                            let columns = term
+                                .into_iter()
+                                .map(|id| match &self.atoms[id] {
+                                    Atom::Variable(name) => Ok(name.clone()),
+                                    _ => Err(Error(
+                                        "grouping factors must be columns or their interactions"
+                                            .into(),
+                                    )),
+                                })
+                                .collect::<Result<_>>()?;
+                            Ok(GroupTerm {
+                                columns,
+                                intercept,
+                                variables: variables.clone(),
+                                fixed: fixed.clone(),
+                                expressions: expressions.clone(),
+                                correlated: !independent,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    self.atom(Atom::Groups(groups))?
                 } else {
                     Expr::new(ExprKind::Parentheses(Box::new(child)))?
                 };
@@ -392,13 +524,122 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms
         .iter()
         .flatten()
-        .any(|&id| matches!(atoms[id], Atom::Group(..)))
+        .any(|&id| matches!(atoms[id], Atom::Groups(_) | Atom::Offset(_)))
     {
         return Err(Error(
-            "random intercepts may only be added or removed".into(),
+            "group terms and offsets may only be added or removed".into(),
         ));
     }
     Ok(())
+}
+
+fn grouping_columns(expr: &Expr, atoms: &[Atom], order: &mut Vec<usize>) -> Result<()> {
+    match &expr.kind {
+        ExprKind::Atom(id) if matches!(atoms[*id], Atom::Variable(_)) => {
+            if !order.contains(id) {
+                order.push(*id);
+            }
+            Ok(())
+        }
+        ExprKind::Parentheses(child) => grouping_columns(child, atoms, order),
+        ExprKind::Binary(Op::Interact | Op::Nest, left, right) => {
+            grouping_columns(left, atoms, order)?;
+            grouping_columns(right, atoms, order)
+        }
+        _ => Err(Error(
+            "grouping factors support columns, `:` and `/`".into(),
+        )),
+    }
+}
+
+fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
+    match &expr.kind {
+        ExprKind::Atom(id) if matches!(atoms[*id], Atom::Groups(_) | Atom::Offset(_)) => Err(
+            Error("group effects cannot contain nested group terms or offsets".into()),
+        ),
+        ExprKind::Parentheses(child) | ExprKind::Unary(_, child) => {
+            group_effect_terms(child, atoms)
+        }
+        ExprKind::Binary(_, left, right) => {
+            group_effect_terms(left, atoms)?;
+            group_effect_terms(right, atoms)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
+    Ok(match &expr.kind {
+        ExprKind::Number(value) if value.is_finite() => ColumnExpression::Number(*value),
+        ExprKind::Atom(id) => match &atoms[*id] {
+            Atom::Variable(name) => ColumnExpression::Column(name.clone()),
+            Atom::Expression(expression) => expression.clone(),
+            _ => {
+                return Err(Error(
+                    "group effects and offsets cannot be nested in column expressions".into(),
+                ));
+            }
+        },
+        ExprKind::Parentheses(x) => {
+            ColumnExpression::Parentheses(Box::new(column_expression(x, atoms)?))
+        }
+        ExprKind::Unary(Op::Add, x) => {
+            ColumnExpression::Positive(Box::new(column_expression(x, atoms)?))
+        }
+        ExprKind::Unary(Op::Subtract, x) => {
+            ColumnExpression::Negate(Box::new(column_expression(x, atoms)?))
+        }
+        ExprKind::Binary(op, x, y) => {
+            let op = match op {
+                Op::Add => Arithmetic::Add,
+                Op::Subtract => Arithmetic::Subtract,
+                Op::Cross => Arithmetic::Multiply,
+                Op::Nest => Arithmetic::Divide,
+                Op::Power => Arithmetic::Power,
+                _ => {
+                    return Err(Error(
+                        "unsupported operator in numeric column expression".into(),
+                    ));
+                }
+            };
+            ColumnExpression::Binary(
+                op,
+                Box::new(column_expression(x, atoms)?),
+                Box::new(column_expression(y, atoms)?),
+            )
+        }
+        _ => return Err(Error("unsupported numeric column expression".into())),
+    })
+}
+
+impl Formula {
+    pub(crate) fn predictor_columns(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        for (variables, expressions) in std::iter::once((&self.variables, &self.expressions)).chain(
+            self.groups
+                .iter()
+                .map(|group| (&group.variables, &group.expressions)),
+        ) {
+            for name in variables {
+                if let Some(expression) = expressions.get(name) {
+                    expression.columns(&mut names);
+                } else if !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
+            }
+        }
+        for expression in &self.offsets {
+            expression.columns(&mut names);
+        }
+        names
+    }
+
+    pub(crate) fn offset(&self) -> Option<ColumnExpression> {
+        self.offsets
+            .iter()
+            .cloned()
+            .reduce(|a, b| ColumnExpression::Binary(Arithmetic::Add, Box::new(a), Box::new(b)))
+    }
 }
 
 fn unique(terms: impl IntoIterator<Item = Vec<usize>>) -> Result<Terms> {

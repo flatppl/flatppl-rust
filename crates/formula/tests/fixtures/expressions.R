@@ -1,0 +1,16 @@
+# Independent R design/offset oracle; not a runtime dependency.
+d <- data.frame(y=c(2,4,8,7), x=c(1,2,3,4), z=c(2,3,5,7))
+f <- y ~ I(x^2) + log(z) + offset(log(z))
+frame <- model.frame(f, d)
+stopifnot(identical(colnames(model.matrix(f, frame)), c("(Intercept)", "I(x^2)", "log(z)")))
+stopifnot(identical(unname(model.matrix(f, frame)[,2]), d$x^2))
+stopifnot(identical(unname(model.matrix(f, frame)[,3]), log(d$z)))
+stopifnot(identical(model.offset(frame), log(d$z)))
+d$z[2] <- -1
+frame <- suppressWarnings(model.frame(y ~ log(z) + offset(x) - offset(x), d))
+stopifnot(identical(as.integer(rownames(frame)), c(1L,3L,4L)))
+stopifnot(identical(model.offset(frame), c(1,3,4)))
+matrix <- model.matrix(y ~ I(+x) + I(-x), d)
+stopifnot(identical(colnames(matrix), c("(Intercept)", "I(+x)", "I(-x)")))
+stopifnot(identical(unname(matrix[,2]), d$x), identical(unname(matrix[,3]), -d$x))
+print(R.version.string)

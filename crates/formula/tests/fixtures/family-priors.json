@@ -1,0 +1,33 @@
+{
+  "brms_version": "2.23.2",
+  "brms_sha": "c89c4c05ef52fefb4b78d5fb80df0cf6352f48b4",
+  "r_version": "4.5.3",
+  "formula": "y ~ x + (1 | g)",
+  "cases": [
+    {
+      "family": "gaussian", "link": "log",
+      "response": {"kind": "real64", "values": [-2, 4, 8, 7]},
+      "intercept_location": 0.0, "scale": 2.5, "sigma_scale": 3.0
+    },
+    {
+      "family": "student", "link": "inverse",
+      "response": {"kind": "real64", "values": [0, 4, 8, 7]},
+      "intercept_location": 0.2, "scale": 2.5, "sigma_scale": 3.0
+    },
+    {
+      "family": "poisson", "link": "sqrt",
+      "response": {"kind": "int", "values": [0, 4, 8, 7]},
+      "intercept_location": 2.3, "scale": 2.5
+    },
+    {
+      "family": "bernoulli", "link": "identity",
+      "response": {"kind": "int", "values": [-2, 7, -2, 7]},
+      "intercept_location": 2.5, "scale": 6.7
+    },
+    {
+      "family": "bernoulli", "link": "identity",
+      "response": {"kind": "bool", "values": [false, true, true, false]},
+      "intercept_location": 0.0, "scale": 2.5
+    }
+  ]
+}

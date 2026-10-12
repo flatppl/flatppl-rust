@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-formula"
-description = "A brms-compatible Gaussian formula frontend for FlatPPL."
+description = "A brms-compatible formula frontend for FlatPPL."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema"]
 flatppl-core = { path = "../core" }
 flatppl-convert = { path = "../convert" }
 flatppl-syntax = { path = "../syntax" }
+flatppl-infer = { path = "../infer" }
 serde.workspace = true
 serde_json.workspace = true
 arrow-array = { version = "60.0.0", optional = true }

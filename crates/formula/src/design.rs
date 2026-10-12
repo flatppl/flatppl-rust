@@ -1,5 +1,5 @@
 pub use crate::contrasts::Contrast;
-use crate::{Error, Formula, Result, Table};
+use crate::{ColumnExpression, Error, Formula, GroupTerm, Result, Table, Term};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -43,23 +43,56 @@ pub enum DesignComponent {
     Indicator { predictor: usize, level: usize },
 }
 
+pub(crate) struct TermView<'a> {
+    pub intercept: bool,
+    pub variables: &'a [String],
+    pub fixed: &'a [Term],
+    pub expressions: &'a BTreeMap<String, ColumnExpression>,
+}
+
+impl<'a> From<&'a Formula> for TermView<'a> {
+    fn from(formula: &'a Formula) -> Self {
+        Self {
+            intercept: formula.intercept,
+            variables: &formula.variables,
+            fixed: &formula.fixed,
+            expressions: &formula.expressions,
+        }
+    }
+}
+
+impl<'a> From<&'a GroupTerm> for TermView<'a> {
+    fn from(group: &'a GroupTerm) -> Self {
+        Self {
+            intercept: group.intercept,
+            variables: &group.variables,
+            fixed: &group.fixed,
+            expressions: &group.expressions,
+        }
+    }
+}
+
 pub(crate) fn build(
-    formula: &Formula,
+    formula: TermView<'_>,
     table: &Table,
     rows: &[usize],
     contrasts: &BTreeMap<String, Contrast>,
 ) -> Result<(Design, Vec<f64>)> {
-    for name in contrasts.keys() {
-        if !formula.variables.contains(name) {
-            return Err(Error(format!(
-                "contrast supplied for unused predictor `{name}`"
-            )));
-        }
-    }
     let mut predictors = formula
         .variables
         .iter()
         .map(|name| {
+            if formula.expressions.contains_key(name) {
+                if contrasts.contains_key(name) {
+                    return Err(Error(format!(
+                        "contrast supplied for numeric predictor `{name}`"
+                    )));
+                }
+                return Ok(Predictor {
+                    column: name.clone(),
+                    factor: None,
+                });
+            }
             let column = table.column(name)?;
             let factor = column
                 .factor_levels(rows)
@@ -175,15 +208,23 @@ pub(crate) fn build(
         predictors,
         columns,
     };
-    let means = means(&design, table, rows)?;
+    let means = means(&design, &formula, table, rows)?;
     Ok((design, means))
 }
 
-fn means(design: &Design, table: &Table, rows: &[usize]) -> Result<Vec<f64>> {
+fn means(
+    design: &Design,
+    formula: &TermView<'_>,
+    table: &Table,
+    rows: &[usize],
+) -> Result<Vec<f64>> {
     let inputs = design
         .predictors
         .iter()
         .map(|predictor| {
+            if let Some(expression) = formula.expressions.get(&predictor.column) {
+                return expression.values(table, rows);
+            }
             let column = table.column(&predictor.column)?;
             if let Some(factor) = &predictor.factor {
                 column
