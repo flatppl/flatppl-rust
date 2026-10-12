@@ -245,7 +245,7 @@ fn packed_f32_constants_use_their_source_precision() -> Result<(), Box<dyn std::
     let packed = serde_json::json!({"kind": "array", "value": {
         "shape": [3], "dtype": "real32", "data": values
     }});
-    let single: Constant = serde_json::from_value(packed.clone())?;
+    let single: Constant = serde_json::from_str(&packed.to_string())?;
     assert_eq!(serde_json::to_value(&single)?, packed);
     let bound = context.set(&module, &[("x".into(), single)])?;
     let double = Constant::Array {

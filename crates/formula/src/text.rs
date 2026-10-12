@@ -1,42 +1,46 @@
 use crate::{Column, ColumnValues, Error, Result, Table};
-use serde_json::{Number, Value};
-use std::{collections::BTreeSet, io::Read};
+use serde_json::{Number, Value, value::RawValue};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+};
+
+type JsonRow<'a> = BTreeMap<String, &'a RawValue>;
 
 impl Table {
     /// Read a typed table, an array of row objects, or an object of column arrays.
     /// Missing record fields and JSON nulls remain missing until model-frame
     /// construction. Strings become unordered factors with sorted levels.
     pub fn from_json(source: &str) -> Result<Self> {
-        let value: Value =
-            serde_json::from_str(source).map_err(|e| Error(format!("invalid table JSON: {e}")))?;
-        let table = match value {
-            Value::Object(ref object) if object.get("nrows").is_some_and(|v| !v.is_array()) => {
-                serde_json::from_value(value)
-                    .map_err(|e| Error(format!("invalid typed table JSON: {e}")))?
-            }
-            Value::Object(object) => {
-                let nrows = object
-                    .values()
-                    .next()
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
+        let table = match source.trim_start().as_bytes().first() {
+            Some(b'{') => {
+                let object: JsonRow<'_> = read_json(source)?;
+                if object
+                    .get("nrows")
+                    .is_some_and(|v| !v.get().starts_with('['))
+                {
+                    let table: Self = read_json(source)?;
+                    table.validate()?;
+                    return Ok(table);
+                }
+                let mut nrows = 0;
                 let mut columns = Vec::with_capacity(object.len());
                 for (name, values) in object {
-                    let Value::Array(values) = values else {
-                        return Err(Error(format!("JSON column `{name}` must be an array")));
-                    };
+                    let values: Vec<&RawValue> = read_json(values.get())
+                        .map_err(|_| Error(format!("JSON column `{name}` must be an array")))?;
+                    if columns.is_empty() {
+                        nrows = values.len();
+                    }
+                    let values = values
+                        .into_iter()
+                        .map(|value| json_cell(value, &name))
+                        .collect::<Result<_>>()?;
                     columns.push(column(name, values)?);
                 }
                 Self { columns, nrows }
             }
-            Value::Array(rows) => {
-                let rows = rows
-                    .into_iter()
-                    .map(|row| match row {
-                        Value::Object(row) => Ok(row),
-                        _ => Err(Error("JSON table rows must be objects".into())),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+            Some(b'[') => {
+                let rows: Vec<JsonRow<'_>> = read_json(source)?;
                 let names: BTreeSet<_> = rows.iter().flat_map(|r| r.keys()).collect();
                 let columns = names
                     .into_iter()
@@ -44,8 +48,11 @@ impl Table {
                         column(
                             name.clone(),
                             rows.iter()
-                                .map(|row| row.get(name).cloned().unwrap_or(Value::Null))
-                                .collect(),
+                                .map(|row| {
+                                    row.get(name)
+                                        .map_or(Ok(Value::Null), |value| json_cell(value, name))
+                                })
+                                .collect::<Result<_>>()?,
                         )
                     })
                     .collect::<Result<_>>()?;
@@ -88,6 +95,22 @@ impl Table {
         let table = Self { columns, nrows };
         table.validate()?;
         Ok(table)
+    }
+}
+
+fn read_json<'a, T: serde::Deserialize<'a>>(source: &'a str) -> Result<T> {
+    serde_json::from_str(source).map_err(|e| Error(format!("invalid table JSON: {e}")))
+}
+
+fn json_cell(value: &RawValue, name: &str) -> Result<Value> {
+    let source = value.get();
+    if integer_literal(source) {
+        source
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| Error(format!("integer in column `{name}` exceeds int64")))
+    } else {
+        read_json(source)
     }
 }
 

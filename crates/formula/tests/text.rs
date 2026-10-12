@@ -46,14 +46,14 @@ fn text_tables_share_model_frames_and_prediction_levels() -> Result<(), Box<dyn 
 #[test]
 fn typed_precision_and_json_numeric_boundaries_are_preserved()
 -> Result<(), Box<dyn std::error::Error>> {
-    let spec = read(r#"{"formula":"y ~ x"}"#)?;
-    let table = Table::from_json(
-        r#"{"nrows":2,"columns":[
+    let source = r#"{"nrows":2,"columns":[
           {"name":"y","values":{"kind":"int","values":[1,2]}},
-          {"name":"x","values":{"kind":"real32","values":[0.1,0.2]}}
-        ]}"#,
-    )?;
+          {"name":"x","values":{"values":[0.1,0.2],"kind":"real32"}}
+        ]}"#;
+    let table = Table::from_json(source)?;
+    let spec = read(&format!(r#"{{"formula":"y ~ x","data":{source}}}"#))?;
     let model = build(&spec, &table)?;
+    assert_eq!(model.data, build(&spec, spec.data.as_ref().unwrap())?.data);
     assert_eq!(
         model.data.constants["x_1"],
         DataValue::Real32(vec![0.1, 0.2])
