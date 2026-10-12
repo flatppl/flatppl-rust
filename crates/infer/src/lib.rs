@@ -1145,4 +1145,52 @@ mod int_domain_div_mod_tests {
         assert!(errs(&diags).is_empty(), "no errors expected; got {diags:?}");
         assert_eq!(ty(&m, "q"), Some(&Type::Scalar(ScalarType::Real)));
     }
+
+    #[test]
+    fn broadcast_div_mod_keep_the_integer_operand_domain() {
+        // Collection cells and held scalars have the same domain as an
+        // ordinary call; positional and named broadcasts must agree.
+        for call in [
+            "div.([7.0, 8.0], 2)",
+            "broadcast(mod, a = [7, 8], b = 2.0)",
+            "broadcast(div, b = [complex(2, 1)], a = 7)",
+            "mod.([7, 8], complex(2, 1))",
+            "div(complex(7, 1), 2)",
+            "mod(7, complex(2, 1))",
+            "div.(7.0, 2)",
+        ] {
+            let (_, diags) = infer_src(&format!("q = {call}\n"));
+            assert!(
+                errs(&diags)
+                    .iter()
+                    .any(|d| d.node.is_some() && d.message.contains("integer-domain")),
+                "{call} must report its non-integer operand: {diags:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn integer_broadcasts_type_the_cells_and_preserve_real_division() {
+        let (m, diags) = infer_src(
+            "q = div.([7, -7], 2)\n\
+             r = broadcast(mod, b = [2, 3], a = true)\n\
+             scalar = mod.(7, 2)\n\
+             ratio = divide.([7.0, 8.0], 2)\n",
+        );
+        assert!(errs(&diags).is_empty(), "{diags:?}");
+        assert_eq!(ty(&m, "scalar"), Some(&Type::Scalar(ScalarType::Integer)));
+        for (name, scalar) in [
+            ("q", ScalarType::Integer),
+            ("r", ScalarType::Integer),
+            ("ratio", ScalarType::Real),
+        ] {
+            assert_eq!(
+                ty(&m, name),
+                Some(&Type::Array {
+                    shape: Box::new([flatppl_core::Dim::Static(2)]),
+                    elem: Box::new(Type::Scalar(scalar)),
+                }),
+            );
+        }
+    }
 }
