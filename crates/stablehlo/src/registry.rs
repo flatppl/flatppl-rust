@@ -299,7 +299,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "LKJCholesky",
         DistLowering {
             logpdf: lkj_cholesky_logpdf,
-            sample: None,
+            sample: Some(lkj_cholesky_sample),
             touniform: None,
         },
     ),
@@ -904,9 +904,10 @@ const FANOUT_SAFE: &[&str] = &[
     "InverseGamma",
     "Beta",
     "GeneralizedNormal",
-    // Tier 2 (batched multivariate — mvnormal_sample / dirichlet_sample)
+    // Batched vector/matrix draws share parameters and retain independent lanes.
     "MvNormal",
     "Dirichlet",
+    "LKJCholesky",
     // Tier 3 (batched discrete NON-elementwise — inner-axis reduce / broadcast):
     // each already owns (or lacks) an inner axis a plain `[m]` fan-out cannot
     // express, so neither is Tier 1. Binomial draws a rank-2 `[m, n]` uniform
@@ -3468,6 +3469,72 @@ fn beta_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let y = draw_gamma(e, &beta, &one);
     let sum = e.add(&x, &y);
     Ok(e.div(&x, &sum))
+}
+
+/// Onion sampling: row i has squared radius Beta(i/2, eta+(n-i-1)/2)
+/// and an independent uniform direction on the (i-1)-sphere.
+fn lkj_cholesky_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "sample")?;
+    if n > MAX_STATIC_UNROLL / n {
+        return Err(EmitError::at(
+            p.field_id(e, "n")?,
+            "LKJCholesky sample matrix exceeds the static-unroll resource guard",
+        ));
+    }
+    let eta = p.get(e, "eta")?;
+    let batch = e.batch_shape().map(|shape| shape[0]);
+    let scalar_one = e.scalar(1.0);
+    let scalar_zero = e.scalar(0.0);
+    let (one, zero) = match batch {
+        Some(size) => {
+            let ty = MlirTy::Ranked(vec![Some(size)]);
+            (
+                e.broadcast_in_dim(&scalar_one, &[], ty.clone()),
+                e.broadcast_in_dim(&scalar_zero, &[], ty),
+            )
+        }
+        None => (scalar_one.clone(), scalar_zero),
+    };
+    let mut first = vec![zero.clone(); n as usize];
+    first[0] = one.clone();
+    let mut rows = vec![e.vector(&first)];
+    for i in 1..n {
+        let alpha = e.scalar(i as f64 / 2.0);
+        let offset = e.scalar((n - i - 1) as f64 / 2.0);
+        let beta = e.add(&eta, &offset);
+        let x = draw_gamma(e, &alpha, &scalar_one);
+        let y = draw_gamma(e, &beta, &scalar_one);
+        let total = e.add(&x, &y);
+        let radius_squared = e.div(&x, &total);
+        let diagonal_squared = e.div(&y, &total);
+        let radius = e.sqrt(&radius_squared);
+        let diagonal = e.sqrt(&diagonal_squared);
+        let normals: Vec<_> = (0..i).map(|_| e.rng("NORMAL", &MlirTy::Scalar)).collect();
+        let mut norm_squared = zero.clone();
+        for value in &normals {
+            let square = e.mul(value, value);
+            norm_squared = e.add(&norm_squared, &square);
+        }
+        // A zero vector has probability zero under the continuous law. Give
+        // that finite-precision case a valid direction without dividing by zero.
+        let nonzero = e.compare("GT", &norm_squared, &zero);
+        let safe_norm_squared = e.select(&nonzero, &norm_squared, &one);
+        let norm = e.sqrt(&safe_norm_squared);
+        let mut row = vec![zero.clone(); n as usize];
+        for (j, value) in normals.iter().enumerate() {
+            let direction = e.div(value, &norm);
+            let fallback = if j == 0 { &one } else { &zero };
+            let direction = e.select(&nonzero, &direction, fallback);
+            row[j] = e.mul(&radius, &direction);
+        }
+        row[i as usize] = diagonal;
+        rows.push(e.vector(&row));
+    }
+    let matrix = e.vector(&rows);
+    Ok(match batch {
+        Some(_) => e.transpose(&matrix, &[2, 0, 1]),
+        None => matrix,
+    })
 }
 
 /// §08 ChiSquared's sampler, verbatim: `Gamma(k/2, 1/2)` (the §08
