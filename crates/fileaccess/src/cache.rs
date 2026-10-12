@@ -142,6 +142,21 @@ impl Cache {
         &self.root
     }
 
+    /// Retain prepared JSON by content, independently of URL trust and offline mode.
+    /// The absolute path remains usable after the publishing host is dropped.
+    pub fn store_prepared_json(&self, bytes: &[u8]) -> Result<PathBuf, Error> {
+        let key = hex(&Sha256::digest(bytes));
+        let path = self
+            .v1()
+            .join("prepared")
+            .join(&key[..2])
+            .join(format!("{key}.json"));
+        if !is_regular_file(&path) || fs::read(&path)? != bytes {
+            self.write_atomic(&path, bytes)?;
+        }
+        Ok(fs::canonicalize(path)?)
+    }
+
     /// Force the offline flag (e.g. a tool that is cache-only regardless of
     /// `FLATPPL_CACHE_OFFLINE`). When offline, a cache miss is an error and no
     /// fetch is attempted.
@@ -413,6 +428,28 @@ fn iso8601_utc(unix_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_content_is_reusable_durable_and_checked() {
+        let root =
+            std::env::temp_dir().join(format!("flatppl-prepared-content-{}", std::process::id()));
+        let cache = Cache::new(root.clone(), true, false);
+        let original = br#"{"x":[1.5,2.5]}"#;
+        let first = cache.store_prepared_json(original).unwrap();
+        let repeated = cache.store_prepared_json(original).unwrap();
+        let changed = cache.store_prepared_json(br#"{"x":[3.5]}"#).unwrap();
+        assert!(first.is_absolute());
+        assert_eq!(first, repeated);
+        assert_ne!(first, changed);
+        drop(cache);
+        assert_eq!(fs::read(&first).unwrap(), original);
+        fs::write(&first, b"corrupted").unwrap();
+        let fresh = Cache::new(root.clone(), true, false);
+        assert_eq!(fresh.store_prepared_json(original).unwrap(), first);
+        assert_eq!(fs::read(&first).unwrap(), original);
+        assert_eq!(fs::read(&changed).unwrap(), br#"{"x":[3.5]}"#);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn key_is_sha256_of_url_without_fragment() {

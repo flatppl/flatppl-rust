@@ -56,6 +56,38 @@ pub enum DataValue {
     Integers(Vec<i64>),
 }
 
+impl DataDocument {
+    /// Prepared numeric columns for a JSON sidecar; the row count stays structural.
+    pub fn columns_json(&self) -> Result<serde_json::Value> {
+        let mut columns = serde_json::Map::new();
+        for (name, value) in &self.constants {
+            let value = match value {
+                DataValue::Integer(_) if name == "N" => continue,
+                DataValue::Integer(_) => {
+                    return Err(Error(format!("unexpected scalar data binding `{name}`")));
+                }
+                DataValue::Real32(values) => {
+                    // JSON has no dtype; preserve the exact stored f32 values.
+                    serde_json::to_value(values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>())?
+                }
+                DataValue::Real64(values) => serde_json::to_value(values)?,
+                DataValue::Integers(values) => serde_json::to_value(values)?,
+            };
+            columns.insert(name.clone(), value);
+        }
+        Ok(serde_json::Value::Object(columns))
+    }
+
+    /// Bind prepared columns through a file source in a copy of an external template.
+    pub fn with_data_source(
+        &self,
+        template: flatppl_core::Module,
+        source: &str,
+    ) -> Result<flatppl_core::Module> {
+        crate::emit::with_data_source(template, self, source)
+    }
+}
+
 impl Table {
     pub(crate) fn column(&self, name: &str) -> Result<&Column> {
         self.columns

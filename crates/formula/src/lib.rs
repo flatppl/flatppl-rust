@@ -129,7 +129,10 @@ impl Conversion {
     /// The caller writes both files. The original module remains external for
     /// in-memory data binding; only the structural row count is literal here.
     pub fn with_data_source(&self, source: &str) -> Result<(Module, serde_json::Value)> {
-        emit::with_data_source(self.module.clone(), &self.data, source)
+        Ok((
+            self.data.with_data_source(self.module.clone(), source)?,
+            self.data.columns_json()?,
+        ))
     }
 }
 
