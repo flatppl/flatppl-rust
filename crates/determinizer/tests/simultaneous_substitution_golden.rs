@@ -35,6 +35,21 @@ fn lower(src: &str, root: &str) -> String {
     flatppl_syntax::print(&out)
 }
 
+#[test]
+fn applied_stochastic_boundary_replaces_derived_ancestors() {
+    let applied = lower(
+        "mu ~ Normal(0, 1)\nderived = mu + 1\n\
+         report = functionof(derived, mu = mu)\nq = elementof(reals)\n\
+         outputs = (report(q), report(2 * q))",
+        "outputs",
+    );
+    let direct = lower(
+        "q = elementof(reals)\noutputs = (q + 1, 2 * q + 1)",
+        "outputs",
+    );
+    assert_eq!(applied, direct);
+}
+
 /// `canon::inline` beta-reduces a residual user call through `Substitute::All`, and a
 /// cross-named application is the plain deterministic shape of the defect.
 ///
