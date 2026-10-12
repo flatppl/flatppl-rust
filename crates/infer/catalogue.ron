@@ -132,6 +132,7 @@ Catalogue(
         // So the notation does not mean "at least two" for either row.
         Builtin(name: "cat",         sig: Structural(params: [Any, Variadic(Any)])),
         Builtin(name: "rowstack",    sig: Structural(params: [Any], names: ["vs"])),
+        Builtin(name: "colstack",    sig: Structural(params: [Any], names: ["vs"])),
         Builtin(name: "tile",        sig: Structural(params: [Any, Any], names: ["A", "size"])),
         Builtin(name: "splitblocks", sig: Structural(params: [Any, Any], names: ["A", "blocksize"])),
         // `partition`'s §07 Domains are "vector, positive integer or integer
@@ -325,7 +326,6 @@ Catalogue(
         Builtin(name: "blockdiagmat",   sig: Function(params: [Any], names: ["mats"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         Builtin(name: "bandedmat",      sig: Function(params: [Vector(Real), Scalar(Integer)], names: ["v", "rows"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         Builtin(name: "joinblocks",     sig: Function(params: [Any], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
-        Builtin(name: "colstack",       sig: Function(params: [Any], names: ["vs"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // onehot(i, n): real basis vector.
         Builtin(name: "onehot",         sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["i", "n"], result: Vector(len: Dyn, elem: Real))),
         // conv / crosscorr: 1-D vector result, element kind from the signal.
