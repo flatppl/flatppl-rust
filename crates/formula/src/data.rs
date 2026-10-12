@@ -64,7 +64,7 @@ impl Table {
             .ok_or_else(|| Error(format!("missing data column `{name}`")))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let mut names = HashSet::new();
         for column in &self.columns {
             if !names.insert(&column.name) {

@@ -83,7 +83,7 @@ enum Command {
     /// an alternate representation of FlatPIR (same content, including `%meta`
     /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
     /// JSON file (and override the extension); both need the optional `hs3` feature.
-    /// Formula input needs the `formula` feature and includes its table in JSON.
+    /// Formula input needs the `formula` feature and accepts a table in JSON or `--data`.
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
@@ -117,6 +117,14 @@ enum Command {
         /// centre a field of one record external, `pyhf_auxdata`.
         #[arg(long, value_enum, default_value_t = ObservationsArg::Bound)]
         auxiliary: ObservationsArg,
+        /// Formula input only: CSV, JSON, or Arrow IPC data file. Cannot be
+        /// combined with data embedded in the specification. Arrow needs `formula-arrow`.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Formula input only: override options.data_placement. Inline embeds
+        /// training constants; external leaves named inputs for the data sidecar.
+        #[arg(long, value_enum)]
+        data_placement: Option<DataPlacementArg>,
         /// Omit the leading "do not edit" banner comment (a single line, no
         /// timestamp/user/host/platform/command — included by default). The
         /// targeted FlatPPL version is recorded in-model as `flatppl_compat`,
@@ -301,7 +309,7 @@ enum FromFormat {
     /// Read a pyhf model or workspace JSON document (top-level `channels` array).
     /// Requires the optional `hs3` build feature.
     Pyhf,
-    /// Read a formula specification with an inline table. Requires `formula`.
+    /// Read a formula specification. Requires `formula`.
     Formula,
 }
 
@@ -321,6 +329,19 @@ struct PyhfArgs {
     measurement: Option<String>,
     observations: ObservationsArg,
     auxiliary: ObservationsArg,
+}
+
+#[cfg(feature = "convert")]
+#[derive(Clone, Copy, ValueEnum)]
+enum DataPlacementArg {
+    Inline,
+    External,
+}
+
+#[cfg(feature = "convert")]
+struct FormulaArgs {
+    data: Option<PathBuf>,
+    data_placement: Option<DataPlacementArg>,
 }
 
 /// Resolve `--from auto` against the input filename: `*.hs3.json` / `*.pyhf.json`
@@ -356,6 +377,8 @@ fn main() -> ExitCode {
             measurement,
             observations,
             auxiliary,
+            data,
+            data_placement,
             no_header,
         } => convert(
             &input,
@@ -366,6 +389,10 @@ fn main() -> ExitCode {
                 measurement,
                 observations,
                 auxiliary,
+            },
+            &FormulaArgs {
+                data,
+                data_placement,
             },
             no_header,
         ),
@@ -461,6 +488,7 @@ fn convert(
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
     pyhf: &PyhfArgs,
+    formula: &FormulaArgs,
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
@@ -474,6 +502,13 @@ fn convert(
     {
         return Err(Failure::Plain(
             "`--measurement`, `--observations` and `--auxiliary` apply to pyhf input only".into(),
+        ));
+    }
+    if from_format != FromFormat::Formula
+        && (formula.data.is_some() || formula.data_placement.is_some())
+    {
+        return Err(Failure::Plain(
+            "`--data` and `--data-placement` apply to formula input only".into(),
         ));
     }
 
@@ -494,10 +529,24 @@ fn convert(
             }
             let source = flatppl_cli::read_regular_utf8(input)
                 .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
-            let spec = flatppl_formula::read(&source)
+            let mut spec = flatppl_formula::read(&source)
                 .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
+            if let Some(path) = &formula.data {
+                if spec.data.is_some() {
+                    return Err(Failure::Plain(
+                        "formula input cannot combine embedded `data` with `--data`".into(),
+                    ));
+                }
+                spec.data = Some(read_formula_table(path)?);
+            }
+            if let Some(placement) = formula.data_placement {
+                spec.options.data_placement = match placement {
+                    DataPlacementArg::Inline => flatppl_formula::DataPlacement::Inline,
+                    DataPlacementArg::External => flatppl_formula::DataPlacement::External,
+                };
+            }
             let data = spec.data.as_ref().ok_or_else(|| {
-                Failure::Plain("formula input requires a `data` table in the specification".into())
+                Failure::Plain("formula input requires embedded `data` or `--data`".into())
             })?;
             let converted = flatppl_formula::build(&spec, data)
                 .map_err(|e| Failure::Plain(format!("formula: {e}")))?;
@@ -636,6 +685,41 @@ fn convert(
         Failure::Plain(format!(
             "writing `{}`: {e}",
             flatppl_cli::terminal_path(output)
+        ))
+    })
+}
+
+#[cfg(feature = "formula")]
+fn read_formula_table(path: &Path) -> Result<flatppl_formula::Table, Failure> {
+    let reading = |e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(path));
+    flatppl_cli::require_regular_file(path).map_err(reading)?;
+    let bytes = fs::read(path).map_err(reading)?;
+    let table = match path.extension().and_then(|s| s.to_str()) {
+        Some("csv") => flatppl_formula::Table::from_csv(bytes.as_slice()),
+        Some("json") => flatppl_formula::Table::from_json(
+            std::str::from_utf8(&bytes).map_err(|e| format!("table JSON must be UTF-8: {e}"))?,
+        ),
+        #[cfg(feature = "formula-arrow")]
+        Some("arrow" | "arrows" | "ipc" | "feather") => {
+            flatppl_formula::Table::from_arrow_ipc(&bytes)
+        }
+        #[cfg(not(feature = "formula-arrow"))]
+        Some("arrow" | "arrows" | "ipc" | "feather") => {
+            return Err(Failure::Plain(
+                "Arrow data needs the `formula-arrow` build feature".into(),
+            ));
+        }
+        _ => {
+            return Err(Failure::Plain(
+                "formula data must be .csv, .json, or Arrow IPC (.arrow, .arrows, .ipc, .feather)"
+                    .into(),
+            ));
+        }
+    };
+    table.map_err(|e| {
+        Failure::Plain(format!(
+            "formula data `{}`: {e}",
+            flatppl_cli::terminal_path(path)
         ))
     })
 }

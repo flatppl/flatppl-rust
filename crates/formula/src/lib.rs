@@ -15,6 +15,7 @@ mod family;
 mod formula;
 mod prior_expr;
 mod priors;
+mod text;
 
 use flatppl_core::Module;
 use serde::{Deserialize, Serialize};
