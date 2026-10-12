@@ -726,17 +726,17 @@ lp = logdensityof(hn, 1.0)";
 
 #[test]
 fn normalized_student_t_half_lines_use_their_exact_mass() {
-    for (lo, hi, mass, point) in [
-        ("0", "inf", "0.5", "0.5"),
-        ("-inf", "0", "0.5", "-0.5"),
-        ("-inf", "inf", "1.0", "0.5"),
+    for (lo, hi, log_mass, point) in [
+        ("0", "inf", "log(0.5)", "0.5"),
+        ("-inf", "0", "log(0.5)", "-0.5"),
+        ("-inf", "inf", "0.0", "0.5"),
     ] {
         let restriction = format!("truncate(StudentT(3), interval({lo}, {hi}))");
         let actual = determinize_src(&format!(
             "lp = logdensityof(normalize({restriction}), {point})"
         ));
         let expected = determinize_src(&format!(
-            "lp = logdensityof({restriction}, {point}) - log({mass})"
+            "lp = logdensityof({restriction}, {point}) - {log_mass}"
         ));
         assert_eq!(
             pir_binding(&flatppl_flatpir::write(&actual), "lp"),
