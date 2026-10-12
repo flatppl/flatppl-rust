@@ -15,7 +15,7 @@ flatppl-determinizer = { path = "../determinizer" }
 flatppl-stablehlo = { path = "../stablehlo" }
 flatppl-fileaccess = { path = "../fileaccess" }
 flatppl-hs3 = { path = "../hs3" }
-flatppl-formula = { path = "../formula" }
+flatppl-formula = { path = "../formula", features = ["arrow"] }
 flatppl-mathdoc = { path = "../mathdoc", default-features = false }
 serde.workspace = true
 

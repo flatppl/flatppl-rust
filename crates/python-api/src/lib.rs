@@ -10,9 +10,10 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 
+use flatppl_host::flatppl_formula::DataMode;
 use flatppl_host::{
-    Auxiliary, BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, IntegrationOptions,
-    LoadedModule, MathFormat, Observations, PyhfOptions, Target,
+    Auxiliary, BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, FormulaModel,
+    IntegrationOptions, LoadedModule, MathFormat, Observations, PyhfOptions, Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -90,6 +91,42 @@ impl NativeContext {
             .map_err(error)
     }
 
+    #[pyo3(signature = (spec, data_ipc=None, name=None, source_path=None))]
+    fn import_formula(
+        &mut self,
+        spec: &str,
+        data_ipc: Option<&[u8]>,
+        name: Option<&str>,
+        source_path: Option<&str>,
+    ) -> PyResult<NativeFormulaModel> {
+        self.inner
+            .import_formula_json(spec, data_ipc, name, source_path)
+            .map(|inner| NativeFormulaModel { inner })
+            .map_err(error)
+    }
+
+    #[pyo3(signature = (model, data_ipc, mode="prediction"))]
+    fn prepare_formula(
+        &mut self,
+        model: &NativeFormulaModel,
+        data_ipc: &[u8],
+        mode: &str,
+    ) -> PyResult<(NativeModule, String)> {
+        let mode = match mode {
+            "prediction" => DataMode::Prediction,
+            "training" => DataMode::Training,
+            _ => return Err(PyValueError::new_err("mode must be prediction or training")),
+        };
+        let (inner, rows) = model
+            .inner
+            .prepare_arrow(&mut self.inner, data_ipc, mode)
+            .map_err(error)?;
+        Ok((
+            NativeModule { inner },
+            serde_json::to_string(&rows).expect("row indices are JSON integers"),
+        ))
+    }
+
     fn load(&mut self, path: &str) -> PyResult<NativeModule> {
         self.inner
             .load(path)
@@ -116,6 +153,29 @@ impl NativeContext {
             .slice(&module.inner, &outputs)
             .map(|inner| NativeModule { inner })
             .map_err(error)
+    }
+}
+
+#[pyclass(name = "FormulaModel", module = "flatppl._native", frozen)]
+struct NativeFormulaModel {
+    inner: FormulaModel,
+}
+
+#[pymethods]
+impl NativeFormulaModel {
+    #[getter]
+    fn module(&self) -> NativeModule {
+        NativeModule {
+            inner: self.inner.module.clone(),
+        }
+    }
+
+    fn recipe(&self) -> String {
+        serde_json::to_string(&self.inner.recipe).expect("formula recipes contain only JSON values")
+    }
+
+    fn info(&self) -> String {
+        serde_json::to_string(&self.inner.info).expect("formula metadata contains only JSON values")
     }
 }
 
@@ -202,6 +262,7 @@ impl NativeModule {
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeContext>()?;
     m.add_class::<NativeModule>()?;
+    m.add_class::<NativeFormulaModel>()?;
     m.add("Error", m.py().get_type::<Error>())?;
     Ok(())
 }
