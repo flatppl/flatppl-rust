@@ -2,8 +2,8 @@ Module(
     name: "regression", version: "0.1",
     bindings: [
         Binding(name: "Flat", sig: Distribution(
-            domain: Scalar(Real), support: Reals, mass: LocallyFinite,
-            params: [], nullary: true,
+            domain: Scalar(Real), support: Structural, mass: LocallyFinite,
+            params: ["support"], nullary: true,
         )),
     ],
 )

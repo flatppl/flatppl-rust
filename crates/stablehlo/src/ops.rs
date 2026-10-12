@@ -2721,6 +2721,7 @@ enum ElemSet {
     /// §03 `nonnegreals` — "$[0, +\infty]$, the non-negative reals including
     /// $+\infty$". CLOSED at zero.
     NonNegReals,
+    UnitInterval,
 }
 
 /// `in(v, S)` (spec §06 membership predicate `_ in R`) over a §03 element set,
@@ -2829,14 +2830,10 @@ fn vector_set_parts(e: &Emitter, set_id: NodeId) -> Option<(VectorSet, NodeId)> 
 
 /// Membership of a rank-1 point in a [`VectorSet`], all-reduced to one `i1`.
 ///
-/// Only the inequalities are checked: `stdsimplex` entries `>= 0`, `ordered`
-/// consecutive differences `> 0`. The linear equality (`stdsimplex` sum 1,
-/// `zerosum` sum 0) is not. §03 "Standard simplex" and "Zero-sum vectors" make
-/// `Lebesgue(support = S)` the coordinate measure of the n-1 free coordinates,
-/// with the last coordinate determined by them. The density is a function of
-/// the free coordinates, and a float sum is rarely exact, so an exact equality
-/// test would reject the points a chart produces. Every entry must still be a
-/// real number: `NaN` is outside every set.
+/// Affine sums tolerate reduction and chart roundoff: `8*n*epsilon` times
+/// `max(sum(abs(x)), abs(target))`. There is no absolute unit floor for zero-sum
+/// vectors, so membership remains invariant under rescaling. Non-finite sums
+/// refuse instead of passing the indeterminate `inf <= inf` comparison.
 fn vector_set_membership(
     e: &mut Emitter,
     id: NodeId,
@@ -2886,7 +2883,32 @@ fn vector_set_membership(
             e.compare("GT", &gap, &zero)
         }
     };
-    let membership = e.reduce_boolean("stablehlo.and", "true", &per_cell);
+    let mut membership = e.reduce_boolean("stablehlo.and", "true", &per_cell);
+    if matches!(set, VectorSet::StdSimplex | VectorSet::ZeroSum) {
+        let coordinates = e.convert(v, ElemKind::Real);
+        let sum = e.reduce_sum(&coordinates);
+        let absolute = e.abs(&coordinates);
+        let magnitude = e.reduce_sum(&absolute);
+        let target = e.scalar(if matches!(set, VectorSet::StdSimplex) {
+            1.0
+        } else {
+            0.0
+        });
+        let difference = e.sub(&sum, &target);
+        let residual = e.abs(&difference);
+        let scale = e.max(&magnitude, &target);
+        let epsilon = match e.dtype() {
+            crate::Dtype::F32 => f64::from(f32::EPSILON),
+            crate::Dtype::F64 => f64::EPSILON,
+        };
+        let rounding = e.scalar(8.0 * len as f64 * epsilon);
+        let tolerance = e.mul(&rounding, &scale);
+        let on_plane = e.compare("LE", &residual, &tolerance);
+        let infinity = e.scalar(f64::INFINITY);
+        let finite = e.compare("LT", &scale, &infinity);
+        let valid = e.and(&on_plane, &finite);
+        membership = e.and(&membership, &valid);
+    }
     if matches!(e.node(n_id), Node::Lit(Scalar::Int(_))) {
         return Ok(membership);
     }
@@ -2927,6 +2949,13 @@ fn elem_membership(
             let zero = e.constant_like(0.0, v);
             Ok(e.compare("GE", v, &zero))
         }
+        ElemSet::UnitInterval => {
+            let zero = e.constant_like(0.0, v);
+            let one = e.constant_like(1.0, v);
+            let above = e.compare("GE", v, &zero);
+            let below = e.compare("LE", v, &one);
+            Ok(e.and(&above, &below))
+        }
         ElemSet::Interval(lo_id, hi_id) => {
             let lo = e.lower_node(lo_id)?;
             let hi = e.lower_node(hi_id)?;
@@ -2958,6 +2987,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
             "reals" => Ok(ElemSet::Reals),
             "posreals" => Ok(ElemSet::PosReals),
             "nonnegreals" => Ok(ElemSet::NonNegReals),
+            "unitinterval" => Ok(ElemSet::UnitInterval),
             _ => Err(refuse()),
         },
         Node::Call(c) => match c.head {

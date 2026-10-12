@@ -104,6 +104,22 @@ fn source(
                 }
             }
             CallHead::Builtin(head) => match inf.module.resolve(head) {
+                "broadcast" => {
+                    call.args.first().is_some_and(|&head| {
+                        super::is_flat_constructor(inf, super::resolve_binding_refs(inf, head))
+                    }) && call
+                        .args
+                        .iter()
+                        .skip(1)
+                        .copied()
+                        .chain(call.named.iter().map(|arg| arg.value))
+                        .all(|arg| {
+                            !matches!(
+                                inf.lookup_type(arg),
+                                Some(Type::Array { .. } | Type::Table { .. })
+                            )
+                        })
+                }
                 "iid" => call
                     .args
                     .first()
