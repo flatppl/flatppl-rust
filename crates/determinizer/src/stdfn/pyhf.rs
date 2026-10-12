@@ -1,4 +1,4 @@
-//! Portable definitions of the `pyhf_helpers` standard module.
+//! Portable definitions of the `pyhf-helpers` standard module.
 //! Each expansion uses ordinary FlatPDL operations. Backends that retain a
 //! helper call never construct this fallback body.
 
@@ -19,7 +19,7 @@ pub(super) fn lower_call(
     // one array-valued cell per application and retains its outer axes.
     if !matches!(member, "normsys_factor" | "histosys_shift") {
         return if broadcast {
-            lower_member_broadcast(m, args, "pyhf_helpers", member)
+            lower_member_broadcast(m, args, "pyhf-helpers", member)
         } else {
             lower_function(m, args, member)
         };
@@ -29,7 +29,7 @@ pub(super) fn lower_call(
     } else {
         let scope = m.node_count();
         let names =
-            flatppl_infer::builtin_catalogue().module_param_names("pyhf_helpers", member)?;
+            flatppl_infer::builtin_catalogue().module_param_names("pyhf-helpers", member)?;
         let mut inputs = Vec::with_capacity(names.len());
         let mut cells = Vec::with_capacity(names.len());
         for (index, label) in names.iter().enumerate() {
@@ -62,7 +62,7 @@ pub(super) fn lower_call(
 
 /// Resolve the ordinary call forms before creating the closed reference body.
 pub(super) fn ordered_args(m: &mut Module, call: &Call, member: &str) -> Option<Vec<NodeId>> {
-    let names = flatppl_infer::builtin_catalogue().module_param_names("pyhf_helpers", member)?;
+    let names = flatppl_infer::builtin_catalogue().module_param_names("pyhf-helpers", member)?;
     let offset =
         usize::from(matches!(call.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast"));
     let names: Vec<_> = names.iter().map(|name| m.intern(name)).collect();

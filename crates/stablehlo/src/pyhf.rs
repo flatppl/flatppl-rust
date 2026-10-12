@@ -1,4 +1,4 @@
-//! StableHLO fast paths for retained `pyhf_helpers` standard-module calls.
+//! StableHLO fast paths for retained `pyhf-helpers` standard-module calls.
 //! Other targets expand the portable reference during determinization.
 
 use super::*;
@@ -12,7 +12,7 @@ impl Emitter<'_> {
         broadcast: bool,
     ) -> Option<Result<Value, EmitError>> {
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
-        if module != "pyhf_helpers" {
+        if module != "pyhf-helpers" {
             return None;
         }
         if matches!(self.m.node(id), Node::Call(call) if !call.named.is_empty()) {
@@ -221,7 +221,7 @@ impl Emitter<'_> {
         };
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
         match (module.as_str(), member.as_str(), &call.args[..]) {
-            ("pyhf_helpers", "sample_yields", &[nominal, shifts, factors])
+            ("pyhf-helpers", "sample_yields", &[nominal, shifts, factors])
                 if call.named.is_empty() =>
             {
                 self.yield_block(nominal, shifts, factors)
@@ -522,7 +522,7 @@ impl Emitter<'_> {
         if self.resolve(head) != "broadcast"
             || !call.named.is_empty()
             || flatppl_determinizer::standard_function(self.m, callee)
-                != Some(("pyhf_helpers".into(), "histosys_shift".into()))
+                != Some(("pyhf-helpers".into(), "histosys_shift".into()))
         {
             return None;
         }

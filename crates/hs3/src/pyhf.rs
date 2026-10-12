@@ -443,7 +443,7 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument, options: &PyhfOptions) -> Resu
         helpers = format!("pyhf_helpers_{suffix}");
         suffix += 1;
     }
-    bind_standard_module(b, &helpers, "pyhf_helpers", "0.1");
+    bind_standard_module(b, &helpers, "pyhf-helpers", "0.1");
     // The centres' record is bound after the constraints that read it, so its
     // name must already avoid every parameter.
     let auxdata = (options.auxiliary == Auxiliary::External).then(|| {

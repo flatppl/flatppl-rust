@@ -13,7 +13,7 @@ pub(super) fn call_type(
 ) -> Option<Type> {
     let callee = resolve_binding_refs(inf, callee);
     let origin = inf.module_catalogue_ref(callee)?;
-    if origin.module != "pyhf_helpers" {
+    if origin.module != "pyhf-helpers" {
         return None;
     }
     let member = origin.member.clone();
@@ -179,7 +179,7 @@ fn known_mismatch(a: &Option<&[Dim]>, ai: usize, b: &Option<&[Dim]>, bi: usize) 
 }
 
 fn fail(inf: &mut Inferencer<'_, '_>, id: NodeId, member: &str, reason: &str) -> Type {
-    let message = format!("pyhf_helpers.{member}: {reason}");
+    let message = format!("pyhf-helpers.{member}: {reason}");
     inf.diags
         .push(crate::Diagnostic::error_at(id, message.clone()));
     Type::Failed(message.into())

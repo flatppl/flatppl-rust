@@ -1,4 +1,4 @@
-//! Converter-form `pyhf_helpers` yields lower as each sample's multiply chain.
+//! Converter-form `pyhf-helpers` yields lower as each sample's multiply chain.
 
 use flatppl_infer::ModuleBundle;
 
@@ -35,7 +35,7 @@ fn determinized(source: &str) -> flatppl_core::Module {
     .unwrap()
 }
 
-const PREFIX: &str = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+const PREFIX: &str = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
     theta = elementof(cartpow(reals, 4))\ninputs = theta\n\
     a = theta[1]\ng = theta[[2, 3]]\ns = theta[4]\n\
     n1 = [1.0, 2.0]\nn2 = [3.0, 4.0]\ndelta = [0.5, 0.25] .* s\n";
@@ -104,7 +104,7 @@ fn gpu_target_keeps_per_sample_rows_below_two_scalars_per_sample() {
 
 #[test]
 fn gpu_target_keeps_per_sample_rows_for_one_bin() {
-    let source = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+    let source = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
         theta = elementof(cartpow(reals, 2))\ninputs = theta\n\
         a = theta[1]\ns = theta[2]\n\
         factors = array(cat(fill(a, 1), fill(s, 1), fill(s, 1), fill(a, 1)), [2, 2, 1], [1, 2, 3])\n\
@@ -156,7 +156,7 @@ fn gpu_target_scales_the_rows_of_several_classes_once() {
 
 #[test]
 fn gpu_target_interpolates_every_histosys_call_in_one_lane_tensor() {
-    let source = "pyhf = standard_module(\"pyhf_helpers\", \"0.1\")\n\
+    let source = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
         theta = elementof(cartpow(reals, 3))\ninputs = theta\n\
         wide = pyhf.histosys_shift.(rowstack([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]]), \
         rowstack([[2.0, 3.0, 4.0], [2.0, 3.0, 4.0]]), \

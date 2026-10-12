@@ -201,7 +201,7 @@ fn lower_member_call(
         Node::Call(c) => c.clone(),
         _ => return None,
     };
-    if module == "pyhf_helpers" {
+    if module == "pyhf-helpers" {
         let args = pyhf::ordered_args(m, &c, member)?;
         let broadcast = matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast");
         return pyhf::lower_call(m, &args, member, broadcast, pyhf_functions);
@@ -274,7 +274,7 @@ fn lower_member_function(
     member: &str,
 ) -> Option<NodeId> {
     match (module, member) {
-        ("pyhf_helpers", member) => pyhf::lower_function(m, args, member),
+        ("pyhf-helpers", member) => pyhf::lower_function(m, args, member),
         ("particle-physics", "interp_pwlin") => arity::<4>(args).map(|a| interp_pwlin(m, a)),
         ("particle-physics", "interp_pwexp") => arity::<4>(args).map(|a| interp_pwexp(m, a)),
         ("particle-physics", "interp_poly2_lin") => {
