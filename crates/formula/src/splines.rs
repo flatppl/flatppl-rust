@@ -2,6 +2,14 @@ use crate::{Error, Result};
 use nalgebra::{DMatrix, DVector, linalg::SymmetricEigen};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Smooth {
+    pub basis: ThinPlate,
+    pub inputs: Vec<String>,
+    pub sds: String,
+    pub z: String,
+}
+
 /// Fitted one-dimensional thin-plate basis, with second-derivative penalty.
 /// The first output column is unpenalized; the remaining columns have unit
 /// penalty after dividing integrated squared curvature by `penalty_scale`.
@@ -92,6 +100,11 @@ impl ThinPlate {
             .fold(0.0, f64::max);
         let design_norm = design.row_iter().map(|r| r.abs().sum()).fold(0.0, f64::max);
         let penalty_scale = penalty_norm / design_norm.powi(2);
+        if !penalty_scale.is_finite() || penalty_scale <= 0.0 {
+            return Err(Error(
+                "thin-plate penalty scale is not positive and finite".into(),
+            ));
+        }
         penalty /= penalty_scale;
 
         let constraint = DMatrix::from_fn(rank, 1, |j, _| design.column(j).sum());
@@ -116,6 +129,11 @@ impl ThinPlate {
         }
         average_norm /= (rank - 2) as f64;
         let fixed_scale = (average_norm / design.column(rank - 2).norm_squared()).sqrt();
+        if !fixed_scale.is_finite() || fixed_scale <= 0.0 {
+            return Err(Error(
+                "thin-plate nullspace scale is not positive and finite".into(),
+            ));
+        }
         transform.column_mut(rank - 2).scale_mut(fixed_scale);
         // Give the one-dimensional affine nullspace its natural positive slope.
         if transform[(n + 1, rank - 2)] < 0.0 {
@@ -140,8 +158,17 @@ impl ThinPlate {
         let n = self.centers.len() + 2;
         let rank = self.transform.first().map_or(0, Vec::len);
         if rank < 2
+            || rank >= self.centers.len()
             || self.transform.len() != n
             || self.transform.iter().any(|row| row.len() != rank)
+            || !self.shift.is_finite()
+            || !self.penalty_scale.is_finite()
+            || self.penalty_scale <= 0.0
+            || self
+                .centers
+                .iter()
+                .chain(self.transform.iter().flatten())
+                .any(|x| !x.is_finite())
         {
             return Err(Error("invalid retained thin-plate transform".into()));
         }

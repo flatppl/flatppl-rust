@@ -459,6 +459,18 @@ fn prepare_predictor(
     rows: &[usize],
     constants: &mut BTreeMap<String, DataValue>,
 ) -> Result<()> {
+    for (smooth, term) in recipe.smooths.iter().zip(&recipe.formula.smooths) {
+        let column = table.column(&term.column)?;
+        let values = smooth.basis.evaluate(&column.numeric(rows)?)?;
+        for (j, name) in smooth.inputs.iter().enumerate() {
+            let values = if matches!(&column.values, ColumnValues::Real32(_)) {
+                DataValue::Real32(values.iter().map(|row| row[j] as f32).collect())
+            } else {
+                DataValue::Real64(values.iter().map(|row| row[j]).collect())
+            };
+            constants.insert(name.clone(), values);
+        }
+    }
     for (i, predictor) in recipe.design.predictors.iter().enumerate() {
         if let Some(expression) = recipe.formula.expressions.get(&predictor.column) {
             constants.insert(

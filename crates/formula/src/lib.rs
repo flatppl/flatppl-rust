@@ -1,7 +1,7 @@
 //! Pure Rust conversion of a bounded brms formula subset into FlatPPL.
 //!
 //! Scalar response families, numeric and factor predictors, interactions,
-//! numeric expressions, offsets and group effects are supported.
+//! numeric expressions, offsets, group effects and thin-plate smooths are supported.
 //! It does not fit a model.
 
 #[cfg(feature = "arrow")]
@@ -27,9 +27,9 @@ pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, p
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
-pub use formula::{Formula, GroupTerm, StandardError, Term, Trials, parse_formula};
+pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
-pub use splines::ThinPlate;
+pub use splines::{Smooth, ThinPlate};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -172,6 +172,8 @@ pub struct PredictorRecipe {
     pub center: bool,
     pub means: Vec<f64>,
     pub groups: Vec<Group>,
+    #[serde(default)]
+    pub smooths: Vec<Smooth>,
     pub priors: Priors,
 }
 
@@ -372,6 +374,18 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     for (name, formula, link) in formulas {
         let (design, means) =
             design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
+        let smooths = formula
+            .smooths
+            .iter()
+            .map(|term| {
+                Ok(Smooth {
+                    basis: ThinPlate::fit(&table.column(&term.column)?.numeric(&rows)?, term.rank)?,
+                    inputs: Vec::new(),
+                    sds: String::new(),
+                    z: String::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let offset_mean = formula
             .offset()
             .map(|offset| offset.values(table, &rows))
@@ -451,6 +465,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 design,
                 means,
                 groups,
+                smooths,
                 priors,
             },
         );

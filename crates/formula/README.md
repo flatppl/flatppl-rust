@@ -15,6 +15,23 @@ Group terms support random slopes, nested groups and independent `||` effects.
 The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
+Additive `s(x)` and `s(x, k=6)` terms use the one-dimensional mgcv/brms
+thin-plate basis. `x` must name a numeric column. The default rank is 10;
+the requested rank must be at least 3 and no greater than the number of
+distinct retained training values. This first implementation supports at most
+2,000 distinct values; mgcv's larger-data knot subsampling is not implemented.
+`by` smooths, tensor products, other bases, custom knots and smooth interactions
+are not yet supported.
+
+Each smooth is centred over the retained training rows. Its unpenalized slope
+uses class `b` (coefficient `sx_1` for `s(x)`); its scale uses class `sds`,
+optionally selected by the canonical term, such as `"s(x, k = 6)"`.
+The defaults are a Flat slope and half-Student-t scale. Penalized coefficients
+are independent standard Normals. The fitted recipe stores the basis and
+penalty transform, so prediction needs only predictor columns and never refits
+or recentres the smooth. This also applies within distributional formulas.
+Numerical setup runs in Rust; emitted models use ordinary matrix operations.
+
 Distributional formulas use the same terms for a family parameter:
 
 ```json
@@ -144,7 +161,7 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
+Select priors by `class` (`b`, `Intercept`, `sd`, `sds`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.
@@ -290,3 +307,9 @@ normalized brms models and independent density/gradient oracles for Gaussian
 mean/scale predictors, Student mean/scale/degrees-of-freedom predictors, and
 group effects on both mean and scale. The adjacent JSON fixtures retain the
 executed Stan comparisons and parameter ordering.
+
+[The spline fixture](tests/fixtures/splines.json) records mgcv 1.9.4 and
+brms 2.23.2 training and prediction bases. Its adjacent R script regenerates
+the values. The native basis preserves the fixed slope's scale and the full
+penalized covariance; independent eigensolvers may rotate the standard Normal
+coefficients without changing the induced smooth or prior.

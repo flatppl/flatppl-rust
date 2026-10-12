@@ -236,6 +236,18 @@ pub(crate) fn predictor_name(dpar: &str, name: &str) -> String {
 }
 
 fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::PredictorRecipe) {
+    for (i, smooth) in recipe.smooths.iter_mut().enumerate() {
+        smooth.inputs = (0..smooth.basis.transform[0].len())
+            .map(|j| {
+                let name = b.alloc_name(&predictor_name(
+                    dpar,
+                    &format!("smooth_{}_{}", i + 1, j + 1),
+                ));
+                external_vector(b, &name, "reals");
+                name
+            })
+            .collect();
+    }
     if !recipe.formula.offsets.is_empty() {
         external_vector(b, &predictor_name(dpar, "offset"), "reals");
     }
@@ -317,32 +329,62 @@ fn predictor_parameters(
             family,
         )?;
     }
-    if !recipe.design.columns.is_empty() {
-        if recipe.priors.b.iter().all(|p| *p == recipe.priors.b[0]) {
+    for (name, priors) in [("b", &recipe.priors.b), ("bs", &recipe.priors.bs)] {
+        if priors.is_empty() {
+            continue;
+        }
+        if priors.iter().all(|p| *p == priors[0]) {
             let scope = scope(b, family);
             let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
-            let prior = priors::emit(b, &recipe.priors.b[0], None, None, &bindings)?;
-            let count = b.lit_int(recipe.design.columns.len() as i64);
+            let prior = priors::emit(b, &priors[0], None, None, &bindings)?;
+            let count = b.lit_int(priors.len() as i64);
             match prior {
                 PriorNode::Measure(prior) => {
                     let iid = b.call("iid", &[prior, count]);
-                    draw(b, &predictor_name(dpar, "b"), iid, parameters);
+                    draw(b, &predictor_name(dpar, name), iid, parameters);
                 }
                 PriorNode::Constant(value) => {
                     let values = b.call("fill", &[value, count]);
-                    b.bind(&predictor_name(dpar, "b"), values);
+                    b.bind(&predictor_name(dpar, name), values);
                 }
             }
         } else {
             let mut values = Vec::new();
-            for (i, prior) in recipe.priors.b.iter().enumerate() {
-                let name = predictor_name(dpar, &format!("b_{}", i + 1));
+            for (i, prior) in priors.iter().enumerate() {
+                let name = predictor_name(dpar, &format!("{name}_{}", i + 1));
                 parameter(b, &name, prior, None, parameters, family)?;
                 values.push(b.self_ref(&name));
             }
             let coefficients = b.array(&values);
-            b.bind(&predictor_name(dpar, "b"), coefficients);
+            b.bind(&predictor_name(dpar, name), coefficients);
         }
+    }
+    for (i, (smooth, term)) in recipe
+        .smooths
+        .iter_mut()
+        .zip(&recipe.formula.smooths)
+        .enumerate()
+    {
+        smooth.sds = b.alloc_name(&predictor_name(
+            dpar,
+            &format!("sds_{}", term.coefficient()),
+        ));
+        smooth.z = b.alloc_name(&predictor_name(dpar, &format!("zs_{}", term.coefficient())));
+        let support = lower_bound(b, 0.0);
+        parameter(
+            b,
+            &smooth.sds,
+            &recipe.priors.sds[i],
+            Some(support),
+            parameters,
+            family,
+        )?;
+        let zero = b.lit_real(0.0);
+        let one = b.lit_real(1.0);
+        let normal = b.call("Normal", &[zero, one]);
+        let rank = b.lit_int(smooth.inputs.len() as i64 - 1);
+        let law = b.call("iid", &[normal, rank]);
+        draw(b, &smooth.z, law, parameters);
     }
     for (i, group) in recipe.groups.iter_mut().enumerate() {
         group.sd = b.alloc_name(&predictor_name(dpar, &format!("sd_{}", group.column)));
@@ -474,6 +516,25 @@ fn predictor_values(
     if recipe.formula.intercept && thresholds == 0 {
         let value = b.self_ref(&predictor_name(dpar, "temp_Intercept"));
         eta = broadcast(b, "add", &[eta, value]);
+    }
+    for (i, smooth) in recipe.smooths.iter().enumerate() {
+        let coefficients = b.self_ref(&predictor_name(dpar, "bs"));
+        let index = b.lit_int(i as i64 + 1);
+        let coefficient = b.call("get", &[coefficients, index]);
+        let fixed = b.self_ref(&smooth.inputs[0]);
+        let fixed = broadcast(b, "mul", &[fixed, coefficient]);
+        let columns: Vec<_> = smooth.inputs[1..]
+            .iter()
+            .map(|name| b.self_ref(name))
+            .collect();
+        let columns = b.array(&columns);
+        let random = b.call("colstack", &[columns]);
+        let scale = b.self_ref(&smooth.sds);
+        let z = b.self_ref(&smooth.z);
+        let coefficients = broadcast(b, "mul", &[scale, z]);
+        let random = b.call("mul", &[random, coefficients]);
+        let smooth = broadcast(b, "add", &[fixed, random]);
+        eta = broadcast(b, "add", &[eta, smooth]);
     }
     for (i, group) in recipe.groups.iter().enumerate() {
         let mut columns = design_columns(b, &group.design, &group.inputs);
@@ -681,12 +742,13 @@ pub(crate) fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> Nod
 fn scope(b: &Builder<'_>, family: Family) -> Vec<String> {
     b.m.public_bindings()
         .map(|(_, binding)| b.m.resolve(binding.name).to_owned())
-        .chain(["temp_Intercept", "cuts", "b"].map(str::to_owned))
+        .chain(["temp_Intercept", "cuts", "b", "bs"].map(str::to_owned))
         .chain(family.auxiliaries().iter().flat_map(|name| {
             [
                 (*name).to_owned(),
                 predictor_name(name, "temp_Intercept"),
                 predictor_name(name, "b"),
+                predictor_name(name, "bs"),
             ]
         }))
         .collect()
@@ -941,6 +1003,40 @@ fn predictor_info(
                 &[i + 1],
                 !sampled(module, &predictor_name(dpar, "b")),
             );
+        }
+    }
+    for (i, (smooth, term)) in recipe
+        .smooths
+        .iter()
+        .zip(&recipe.formula.smooths)
+        .enumerate()
+    {
+        let name = term.coefficient();
+        if !names.insert(name.clone()) {
+            return Err(Error(format!(
+                "design columns have duplicate brms name `{name}`"
+            )));
+        }
+        let component = predictor_name(dpar, &format!("bs_{}", i + 1));
+        let binding = predictor_name(dpar, "bs");
+        if sampled(module, &component) {
+            add(format!("b_{prefix}{name}"), &component, &[], false);
+        } else {
+            add(
+                format!("b_{prefix}{name}"),
+                &binding,
+                &[i + 1],
+                !sampled(module, &binding),
+            );
+        }
+        add(
+            format!("sds_{prefix}{name}"),
+            &smooth.sds,
+            &[],
+            !sampled(module, &smooth.sds),
+        );
+        for j in 1..smooth.inputs.len() {
+            add(format!("zs_{prefix}{name}[{j}]"), &smooth.z, &[j], false);
         }
     }
     for (group_index, group) in recipe.groups.iter().enumerate() {

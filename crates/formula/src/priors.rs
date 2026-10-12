@@ -55,6 +55,10 @@ pub struct Priors {
     pub sigma_scale: f64,
     pub intercept: ResolvedPrior,
     pub b: Vec<ResolvedPrior>,
+    #[serde(default)]
+    pub bs: Vec<ResolvedPrior>,
+    #[serde(default)]
+    pub sds: Vec<ResolvedPrior>,
     pub sd: Vec<Vec<ResolvedPrior>>,
     pub cor: Vec<Option<ResolvedPrior>>,
 }
@@ -236,6 +240,20 @@ pub(crate) fn resolve(
         group: None,
         dpar,
     }));
+    let smooth_names: Vec<_> = formula.smooths.iter().map(|s| s.coefficient()).collect();
+    let smooth_labels: Vec<_> = formula.smooths.iter().map(|s| s.label()).collect();
+    targets.extend(smooth_names.iter().map(|name| PriorTarget {
+        class: "b",
+        coef: Some(name),
+        group: None,
+        dpar,
+    }));
+    targets.extend(smooth_labels.iter().map(|label| PriorTarget {
+        class: "sds",
+        coef: Some(label),
+        group: None,
+        dpar,
+    }));
     targets.extend(group_targets(groups, formula, dpar));
     targets.extend(auxiliaries.iter().map(|name| PriorTarget {
         class: name,
@@ -285,6 +303,24 @@ pub(crate) fn resolve(
         })
         .collect();
     let mut sd = Vec::new();
+    let bs = smooth_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
+        })
+        .collect();
+    let sds = smooth_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new(format!("student_t(3, 0, {group_scale})")))
+        })
+        .collect();
     let mut cor = Vec::new();
     for (group, term) in groups.iter().zip(&formula.groups) {
         sd.push(
@@ -322,6 +358,8 @@ pub(crate) fn resolve(
             sigma_scale,
             intercept,
             b,
+            bs,
+            sds,
             sd,
             cor,
         },
