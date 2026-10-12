@@ -31,6 +31,14 @@ impl Emitter<'_> {
         args: &[NodeId],
         broadcast: bool,
     ) -> Result<Value, EmitError> {
+        if !broadcast
+            && member == "expected_counts"
+            && self.target == crate::Target::Gpu
+            && matches!(self.dtype, Dtype::F64)
+            && let Some(view) = self.yield_lane_view(id)
+        {
+            return view;
+        }
         if !broadcast && let Some(YieldRows { blocks, rows }) = self.yield_rows(member, args) {
             return self.lower_yield_rows(member, args, &blocks, &rows);
         }
@@ -243,23 +251,14 @@ impl Emitter<'_> {
         blocks: &[YieldBlock],
         rows: &[(usize, usize)],
     ) -> Result<Value, EmitError> {
-        let gpu = self.target == crate::Target::Gpu;
-        let merged = gpu.then(|| YieldBlock::merge(blocks, rows));
-        let samples = match merged {
-            Some(block) if block.takes_column() && !self.host_batch => self.scaled_stack(&block)?,
-            _ => {
-                let mut values = Vec::with_capacity(rows.len());
-                for &(block, row) in rows {
-                    values.push(self.chained_row(&blocks[block], row)?);
-                }
-                // A one-sample sum is that sample's row, as in the chain.
-                if member == "expected_counts" && values.len() == 1 {
-                    return Ok(values.remove(0));
-                }
-                self.stack_rows(&values)
-            }
-        };
-        Ok(if member == "expected_counts" {
+        let expected = member == "expected_counts";
+        // A one-sample sum is that sample's row, as in the chain.
+        if expected && rows.len() == 1 {
+            let (block, row) = rows[0];
+            return self.chained_row(&blocks[block], row, None);
+        }
+        let samples = self.yield_stack(expected, blocks, rows)?;
+        Ok(if expected {
             let samples = self.typed_axes(args[0], samples);
             self.pyhf_reduce(&samples, 0, false)
         } else {
@@ -267,9 +266,219 @@ impl Emitter<'_> {
         })
     }
 
+    fn yield_stack(
+        &mut self,
+        expected: bool,
+        blocks: &[YieldBlock],
+        rows: &[(usize, usize)],
+    ) -> Result<Value, EmitError> {
+        let gpu = self.target == crate::Target::Gpu;
+        let merged = gpu.then(|| YieldBlock::merge(blocks, rows));
+        Ok(match merged {
+            Some(block) if block.takes_column() && !self.host_batch => self.scaled_stack(&block)?,
+            _ => {
+                // Keep fixed nominal rows in one channel buffer through XLA
+                // fusion. Otherwise constant folding creates one kernel
+                // argument per row. Leave the original nominal nodes cached
+                // as constants for histosys coefficient folding.
+                let nominals = if gpu
+                    && self.host_batch
+                    && expected
+                    && rows.len() > 1
+                    && blocks[rows[0].0].bins > 1
+                    && rows
+                        .iter()
+                        .all(|&(block, row)| self.literals(blocks[block].nominals[row]).is_some())
+                {
+                    let values = rows
+                        .iter()
+                        .map(|&(block, row)| self.lower_node(blocks[block].nominals[row]))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let bins = blocks[rows[0].0].bins;
+                    // A literal binding can be overridden by a runtime input.
+                    // Mixed kinds must retain each row's original promotion.
+                    values
+                        .iter()
+                        .all(|value| {
+                            value.elem == values[0].elem
+                                && self.batch_rank(value) == 0
+                                && shape(&value.ty) == [Some(bins)]
+                                && self.constants.contains_key(&value.ssa)
+                        })
+                        .then(|| {
+                            let stack = self.stack_rows(&values);
+                            // The typed unary recipe also preserves tensor batching.
+                            let packed = self.unary("stablehlo.optimization_barrier", &stack);
+                            (0..rows.len() as u64)
+                                .map(|row| {
+                                    let view =
+                                        self.slice(&packed, &[row, 0], &[row + 1, bins], &[1, 1]);
+                                    self.reshape(&view, MlirTy::Ranked(vec![Some(bins)]))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                } else {
+                    None
+                };
+                let mut values = Vec::with_capacity(rows.len());
+                for (index, &(block, row)) in rows.iter().enumerate() {
+                    let nominal = nominals.as_ref().map(|values| &values[index]);
+                    values.push(self.chained_row(&blocks[block], row, nominal)?);
+                }
+                self.stack_rows(&values)
+            }
+        })
+    }
+
+    /// Share chained samples across channels before summing each channel.
+    /// Scalar columns already expose parallel templates; another buffer adds
+    /// primal and adjoint launches. F32 emission keeps its existing fused rows.
+    fn yield_lane_view(&mut self, id: NodeId) -> Option<Result<Value, EmitError>> {
+        if self.pooling_yields
+            || self.integrating
+            || !self.broadcast_frame.is_empty()
+            || !self.call_frame.is_empty()
+            || !self.scoped_inputs.is_empty()
+            || !self.scoped_types.is_empty()
+        {
+            return None;
+        }
+        let output = self
+            .m
+            .bindings()
+            .find(|(_, b)| self.resolve(b.name) == "outputs")?
+            .1
+            .rhs;
+        let mut pending = vec![output];
+        let mut seen = HashSet::new();
+        let mut calls = Vec::new();
+        while let Some(node) = pending.pop() {
+            if self.memo.contains_key(&node) || !seen.insert(node) {
+                continue;
+            }
+            // Axis substitutions belong to the aggregate's application.
+            // Its body cannot join a pool in the surrounding module.
+            if matches!(self.node(node), Node::Call(call)
+                if matches!(call.head, CallHead::Builtin(head)
+                    if matches!(self.resolve(head), "functionof" | "aggregate" | "metricsum")))
+            {
+                continue;
+            }
+            if let Some(call) = self.expected_yields(node) {
+                let yields = &call.yields;
+                if yields.rows.len() > 1
+                    && yields.blocks[0].bins > 1
+                    && !YieldBlock::merge(&yields.blocks, &yields.rows).takes_column()
+                    && !self.yield_dependencies(call.samples)
+                {
+                    calls.push(call);
+                }
+                continue;
+            }
+            self.yield_children(node, &mut pending);
+        }
+        // Two channels do not amortize the shared barrier and its adjoint.
+        if calls.len() < 3 || !calls.iter().any(|call| call.id == id) {
+            return None;
+        }
+        self.pooling_yields = true;
+        let result = self.lower_yield_lanes(id, &calls);
+        self.pooling_yields = false;
+        Some(result)
+    }
+
+    fn expected_yields(&self, id: NodeId) -> Option<YieldCall> {
+        let Node::Call(call) = self.node(id) else {
+            return None;
+        };
+        let CallHead::User(callee) = call.head else {
+            return None;
+        };
+        if !call.named.is_empty()
+            || flatppl_determinizer::standard_function(self.m, callee)
+                != Some(("pyhf-helpers".into(), "expected_counts".into()))
+        {
+            return None;
+        }
+        let &[samples] = &call.args[..] else {
+            return None;
+        };
+        Some(YieldCall {
+            id,
+            samples,
+            yields: self.yield_rows("expected_counts", &call.args)?,
+        })
+    }
+
+    fn yield_children(&self, id: NodeId, pending: &mut Vec<NodeId>) {
+        match self.node(id) {
+            Node::Ref(reference) if reference.ns == RefNs::SelfMod => {
+                if let Some(binding) = self.m.binding_by_name(reference.name) {
+                    pending.push(self.m.binding(binding).rhs);
+                }
+            }
+            _ => self.m.for_each_child(id, |child| pending.push(child)),
+        }
+    }
+
+    fn yield_dependencies(&self, samples: NodeId) -> bool {
+        let mut pending = vec![samples];
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if self.memo.contains_key(&id) || !seen.insert(id) {
+                continue;
+            }
+            // Pooling must not change which draw publishes the final RNG state.
+            if self.expected_yields(id).is_some()
+                || matches!(self.node(id), Node::Call(call)
+                    if matches!(call.head, CallHead::Builtin(head)
+                        if self.resolve(head) == "builtin_sample"))
+            {
+                return true;
+            }
+            self.yield_children(id, &mut pending);
+        }
+        false
+    }
+
+    fn lower_yield_lanes(&mut self, id: NodeId, calls: &[YieldCall]) -> Result<Value, EmitError> {
+        let mut pieces = Vec::new();
+        for call in calls {
+            let yields = &call.yields;
+            let samples = self.yield_stack(true, &yields.blocks, &yields.rows)?;
+            let width = yields.rows.len() as u64 * yields.blocks[0].bins;
+            pieces.push(self.reshape(&samples, MlirTy::Ranked(vec![Some(width)])));
+        }
+        let lanes = self.concatenate(id, &pieces)?;
+        let lanes = self.unary("stablehlo.optimization_barrier", &lanes);
+        let mut offset = 0;
+        let mut results = Vec::new();
+        for call in calls {
+            let yields = &call.yields;
+            let samples = yields.rows.len() as u64;
+            let bins = yields.blocks[0].bins;
+            let end = offset + samples * bins;
+            let piece = self.slice(&lanes, &[offset], &[end], &[1]);
+            let samples = self.reshape(&piece, MlirTy::Ranked(vec![Some(samples), Some(bins)]));
+            let samples = self.typed_axes(call.samples, samples);
+            results.push((call.id, self.pyhf_reduce(&samples, 0, false)));
+            offset = end;
+        }
+        self.memo.extend(results);
+        Ok(self.memo[&id].clone())
+    }
+
     /// A sample's nominal plus its shift rows.
-    fn shifted_template(&mut self, block: &YieldBlock, sample: usize) -> Result<Value, EmitError> {
-        let mut template = self.lower_node(block.nominals[sample])?;
+    fn shifted_template(
+        &mut self,
+        block: &YieldBlock,
+        sample: usize,
+        nominal: Option<&Value>,
+    ) -> Result<Value, EmitError> {
+        let mut template = match nominal {
+            Some(value) => value.clone(),
+            None => self.lower_node(block.nominals[sample])?,
+        };
         for &row in &block.shifts[sample] {
             let row = self.lower_node(row)?;
             template = self.add(&template, &row);
@@ -281,8 +490,13 @@ impl Emitter<'_> {
     /// chain's order, factor by factor. The GPU target applies the per-bin
     /// factors, then the product of all scalar factors once, so the reverse
     /// pass contracts the bins once per sample.
-    fn chained_row(&mut self, block: &YieldBlock, sample: usize) -> Result<Value, EmitError> {
-        let mut row = self.shifted_template(block, sample)?;
+    fn chained_row(
+        &mut self,
+        block: &YieldBlock,
+        sample: usize,
+        nominal: Option<&Value>,
+    ) -> Result<Value, EmitError> {
+        let mut row = self.shifted_template(block, sample, nominal)?;
         let fold = self.target == crate::Target::Gpu;
         let mut scale: Option<Value> = None;
         for factor in &block.factors[sample] {
@@ -320,7 +534,7 @@ impl Emitter<'_> {
         let mut templates = Vec::with_capacity(block.nominals.len());
         let mut scales = Vec::with_capacity(block.nominals.len());
         for (sample, factors) in block.factors.iter().enumerate() {
-            let mut template = self.shifted_template(block, sample)?;
+            let mut template = self.shifted_template(block, sample, None)?;
             let mut scale: Option<Value> = None;
             for factor in factors {
                 match *factor {
@@ -762,6 +976,13 @@ impl Emitter<'_> {
         let scale = self.scalar(scale);
         self.mul(&result, &scale)
     }
+}
+
+/// One live expected-count call whose rows can share a lane buffer.
+struct YieldCall {
+    id: NodeId,
+    samples: NodeId,
+    yields: YieldRows,
 }
 
 /// Converter-form blocks and the (block, row) of each summed sample in order.

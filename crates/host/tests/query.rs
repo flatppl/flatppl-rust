@@ -383,3 +383,241 @@ fn gpu_scalar_column_stays_out_of_batched_exports() -> Result<(), Box<dyn std::e
     assert!(!batched.contains(column), "{batched}");
     Ok(())
 }
+
+#[test]
+fn batched_fixed_pyhf_yields_keep_tensor_batching() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\na = elementof(reals)\ninputs = a\n\
+         outputs = pyhf.expected_counts(pyhf.sample_yields(rowstack([[1.0, 2.0], [3.0, 4.0]]), \
+         fill(0.0, [2, 1, 2]), array(cat(fill(a, 2), fill(a, 2)), [2, 1, 2], [1, 2, 3])))",
+        None,
+        None,
+    )?;
+    let exported = query.compile_batched(
+        &EmitOptions {
+            target: flatppl_host::Target::Gpu,
+            ..EmitOptions::default()
+        },
+        &BatchSpec {
+            shape: vec![4],
+            input_axes: vec![vec![Some(0)]],
+        },
+    )?;
+    // An untyped barrier recipe previously serialized this batch.
+    assert!(!exported.stablehlo.contains("stablehlo.while"));
+    Ok(())
+}
+
+#[test]
+fn batched_pyhf_nominals_keep_runtime_overrides() -> Result<(), Box<dyn std::error::Error>> {
+    for (binding, rows) in [
+        ("x = 1.0", "[[x, 2.0], [3.0, 4.0]]"),
+        ("x = [1.0, 2.0]", "[x, [3.0, 4.0]]"),
+    ] {
+        let query = Context::default().parse(
+            &format!(
+                "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n{binding}\ninputs = x\n\
+                 outputs = pyhf.expected_counts(pyhf.sample_yields(rowstack({rows}), \
+                 fill(0.0, [2, 1, 2]), fill(1.0, [2, 1, 2])))"
+            ),
+            None,
+            None,
+        )?;
+        query.compile_batched(
+            &EmitOptions {
+                target: flatppl_host::Target::Gpu,
+                ..EmitOptions::default()
+            },
+            &BatchSpec {
+                shape: vec![4],
+                input_axes: vec![vec![Some(0)]],
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn batched_pyhf_classes_keep_mixed_nominal_kinds() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\na = elementof(reals)\ninputs = a\n\
+         shifts = fill(0.0, [1, 1, 2])\n\
+         factors = array(cat(fill(a, 2)), [1, 1, 2], [1, 2, 3])\n\
+         y1 = pyhf.sample_yields(rowstack([[1, 2]]), shifts, factors)\n\
+         y2 = pyhf.sample_yields(rowstack([[3.0, 4.0]]), shifts, factors)\n\
+         outputs = pyhf.expected_counts(rowstack([get(y1, 1, all), get(y2, 1, all)]))",
+        None,
+        None,
+    )?;
+    query.compile_batched(
+        &EmitOptions {
+            target: flatppl_host::Target::Gpu,
+            ..EmitOptions::default()
+        },
+        &BatchSpec {
+            shape: vec![4],
+            input_axes: vec![vec![Some(0)]],
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
+fn gpu_pyhf_channels_share_lanes_without_serializing_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        r#"
+        pyhf = standard_module("pyhf-helpers", "0.1")
+        x = elementof(reals)
+        inputs = x
+        a = pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[1.0, 2.0], [3.0, 4.0]]), fill(0.0, [2, 1, 2]),
+            array(cat(fill(x, 2), fill(x, 2)), [2, 1, 2], [1, 2, 3])))
+        b = pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]]), fill(0.0, [2, 1, 3]),
+            array(cat(fill(x, 3), fill(x, 3)), [2, 1, 3], [1, 2, 3])))
+        c = pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[2.0, 1.0], [4.0, 3.0]]), fill(0.0, [2, 1, 2]),
+            array(cat(fill(2.0 * x, 2), fill(x, 2)), [2, 1, 2], [1, 2, 3])))
+        outputs = cat(a, b, c, a)
+        "#,
+        None,
+        None,
+    )?;
+    use flatppl_host::{Dtype, Target};
+    for (target, dtype) in [
+        (Target::Gpu, Dtype::F64),
+        (Target::Gpu, Dtype::F32),
+        (Target::Cpu, Dtype::F64),
+    ] {
+        let options = EmitOptions {
+            target,
+            dtype,
+            ..EmitOptions::default()
+        };
+        for batch in [None, Some(4)] {
+            let exported = match batch {
+                None => query.compile(&options)?,
+                Some(size) => query.compile_batched(
+                    &options,
+                    &BatchSpec {
+                        shape: vec![size],
+                        input_axes: vec![vec![Some(0)]],
+                    },
+                )?,
+            };
+            // Unequal channel widths share fourteen sample lanes. Reusing a channel
+            // still returns its bins twice, and the host batch stays tensorized.
+            let elem = if matches!(dtype, Dtype::F64) {
+                "f64"
+            } else {
+                "f32"
+            };
+            let lanes = if batch.is_some() {
+                format!("tensor<4x14x{elem}>")
+            } else {
+                format!("tensor<14x{elem}>")
+            };
+            assert_eq!(
+                exported
+                    .stablehlo
+                    .lines()
+                    .any(|line| line.contains("stablehlo.optimization_barrier")
+                        && line.contains(&lanes)),
+                target == Target::Gpu && matches!(dtype, Dtype::F64)
+            );
+            assert!(!exported.stablehlo.contains("stablehlo.while"));
+            let schema = serde_json::to_value(&exported)?;
+            assert_eq!(
+                schema["output"]["shape"],
+                if batch.is_some() {
+                    json!([4, 9])
+                } else {
+                    json!([9])
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gpu_pyhf_pool_stays_out_of_callable_scopes() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        r#"
+        pyhf = standard_module("pyhf-helpers", "0.1")
+        theta = elementof(reals)
+        f(x) = cat(
+            pyhf.expected_counts(pyhf.sample_yields(
+                rowstack([[1.0, 2.0], [3.0, 4.0]]), fill(0.0, [2, 1, 2]),
+                array(cat(fill(x, 2), fill(x, 2)), [2, 1, 2], [1, 2, 3]))),
+            pyhf.expected_counts(pyhf.sample_yields(
+                rowstack([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]]), fill(0.0, [2, 1, 3]),
+                array(cat(fill(x, 3), fill(x, 3)), [2, 1, 3], [1, 2, 3]))),
+            pyhf.expected_counts(pyhf.sample_yields(
+                rowstack([[2.0, 1.0], [4.0, 3.0]]), fill(0.0, [2, 1, 2]),
+                array(cat(fill(2.0 * x, 2), fill(x, 2)), [2, 1, 2], [1, 2, 3]))))
+        inputs = theta
+        outputs = f.([theta, 2.0 * theta])
+        "#,
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions {
+        target: flatppl_host::Target::Gpu,
+        dtype: flatppl_host::Dtype::F64,
+        ..EmitOptions::default()
+    })?;
+    // A broadcast binds x within its own frame. A module-level pool cannot
+    // capture that temporary binding.
+    assert!(
+        !exported
+            .stablehlo
+            .contains("stablehlo.optimization_barrier")
+    );
+    assert_eq!(
+        serde_json::to_value(&exported)?["output"]["shape"],
+        json!([2, 7])
+    );
+    Ok(())
+}
+
+#[test]
+fn gpu_pyhf_pool_respects_aggregate_axes() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        r#"
+        pyhf = standard_module("pyhf-helpers", "0.1")
+        theta = elementof(cartpow(reals, 2))
+        a = pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[1.0, 2.0], [3.0, 4.0]]), fill(0.0, [2, 1, 2]),
+            array(cat(fill(theta[1], 2), fill(theta[1], 2)), [2, 1, 2], [1, 2, 3])))
+        b = aggregate(sum, [], sum(pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]]), fill(0.0, [2, 1, 3]),
+            array(cat(fill(theta[1], 3), fill(theta[1], 3)), [2, 1, 3], [1, 2, 3])))) * theta[.i])
+        c = pyhf.expected_counts(pyhf.sample_yields(
+            rowstack([[2.0, 1.0], [4.0, 3.0]]), fill(0.0, [2, 1, 2]),
+            array(cat(fill(2.0 * theta[1], 2), fill(theta[1], 2)), [2, 1, 2], [1, 2, 3])))
+        inputs = theta
+        outputs = cat(a, c, [b])
+        "#,
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions {
+        target: flatppl_host::Target::Gpu,
+        dtype: flatppl_host::Dtype::F64,
+        ..EmitOptions::default()
+    })?;
+    // Aggregate bodies stay in their axis scope, even when one retained
+    // helper only captures a module input.
+    assert!(
+        !exported
+            .stablehlo
+            .contains("stablehlo.optimization_barrier")
+    );
+    assert_eq!(
+        serde_json::to_value(&exported)?["output"]["shape"],
+        json!([5])
+    );
+    Ok(())
+}
