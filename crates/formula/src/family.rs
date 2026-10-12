@@ -242,7 +242,8 @@ impl Family {
         if (!auxiliary.is_empty()
             || matches!(
                 self,
-                Self::ZeroInflatedPoisson
+                Self::Student
+                    | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
             ))
@@ -329,7 +330,7 @@ impl Family {
                 let nu = auxiliary(b, "nu");
                 let standard = b.call("StudentT", &[nu]);
                 let sigma = scale.unwrap_or_else(|| auxiliary(b, "sigma"));
-                apply(b, "locscale", &[standard, mu, sigma])
+                crate::prior_expr::positive_locscale(b, standard, mu, sigma)
             }
             Self::Bernoulli => apply(b, "Bernoulli", &[mu]),
             Self::Binomial => {
