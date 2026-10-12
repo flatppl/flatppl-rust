@@ -11,8 +11,8 @@ fn distributional_coordinates_and_priors_follow_brms() {
     ]))
     .unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-    let mu = &converted.recipe.mu;
-    let sigma = &converted.recipe.dpars["sigma"];
+    let mu = &converted.recipe.predictors["mu"];
+    let sigma = &converted.recipe.predictors["sigma"];
     assert_eq!(mu.means, [2.5]);
     assert_eq!(sigma.means, [0.75]);
     let oracle: Value =
@@ -52,7 +52,10 @@ fn distributional_coordinates_and_priors_follow_brms() {
     // A class-wide prior with no dpar affects only the mean, exactly as brms.
     spec.priors.retain(|p| p.dpar.is_none());
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-    assert_eq!(converted.recipe.dpars["sigma"].priors.b[0].prior, "Flat()");
+    assert_eq!(
+        converted.recipe.predictors["sigma"].priors.b[0].prior,
+        "Flat()"
+    );
     assert!(converted.info.has_improper_prior);
     spec.priors
         .push(serde_json::from_value(json!({"class":"sigma","prior":"normal(0,1)"})).unwrap());
@@ -77,8 +80,8 @@ fn missing_rows_and_prediction_share_each_fitted_recipe() {
         converted.data.constants["y_data"],
         DataValue::Real64(serde_json::from_value(oracle["Y"].clone()).unwrap())
     );
-    assert_eq!(converted.recipe.mu.means, [8.0 / 3.0]);
-    assert_eq!(converted.recipe.dpars["sigma"].means, [1.0 / 3.0]);
+    assert_eq!(converted.recipe.predictors["mu"].means, [8.0 / 3.0]);
+    assert_eq!(converted.recipe.predictors["sigma"].means, [1.0 / 3.0]);
     let saved = serde_json::to_string(&converted.recipe).unwrap();
     let restored: Recipe = serde_json::from_str(&saved).unwrap();
     let mut new_data = spec.data.unwrap();
@@ -127,7 +130,7 @@ fn auxiliary_predictor_defaults_match_pinned_brms() {
         )
         .unwrap();
         let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-        let predictor = &converted.recipe.dpars[dpar];
+        let predictor = &converted.recipe.predictors[dpar];
         assert_eq!(
             predictor.priors.intercept.prior,
             case["prior"].as_str().unwrap(),
@@ -162,8 +165,8 @@ fn group_predictors_keep_dpar_selectors_and_brms_coordinate_names() {
     ]))
     .unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-    let mu = &converted.recipe.mu;
-    let sigma = &converted.recipe.dpars["sigma"];
+    let mu = &converted.recipe.predictors["mu"];
+    let sigma = &converted.recipe.predictors["sigma"];
     assert_eq!(mu.priors.sd[0][0].prior, "normal(0, 2)");
     assert_eq!(sigma.priors.sd[0][0].prior, "normal(0, 1)");
     assert_eq!(sigma.priors.sd[0][1].prior, "normal(0, 0.5)");
@@ -193,7 +196,7 @@ fn group_predictors_keep_dpar_selectors_and_brms_coordinate_names() {
 
     spec.priors.clear();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-    let sigma = &converted.recipe.dpars["sigma"];
+    let sigma = &converted.recipe.predictors["sigma"];
     assert_eq!(sigma.priors.intercept.prior, "student_t(3, 0, 2.5)");
     // brms uses the response-family scale for all group sds, including sigma's.
     assert_eq!(sigma.priors.sd[0][0].prior, "student_t(3, 0, 3)");

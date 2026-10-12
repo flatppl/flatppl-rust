@@ -151,13 +151,12 @@ impl Conversion {
 /// Training preprocessing state. A new fit builds a new recipe.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recipe {
-    #[serde(flatten)]
-    pub mu: PredictorRecipe,
+    pub formula: Formula,
     pub family: Family,
+    pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_levels: Option<Vec<GroupLevel>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub dpars: BTreeMap<String, PredictorRecipe>,
+    pub predictors: BTreeMap<String, PredictorRecipe>,
     pub auxiliary_priors: BTreeMap<String, ResolvedPrior>,
 }
 
@@ -176,12 +175,9 @@ pub struct PredictorRecipe {
 
 impl Recipe {
     pub(crate) fn predictors(&self) -> impl Iterator<Item = (&str, &PredictorRecipe)> {
-        std::iter::once(("mu", &self.mu)).chain(
-            self.family
-                .auxiliaries()
-                .iter()
-                .filter_map(|&name| self.dpars.get(name).map(|predictor| (name, predictor))),
-        )
+        std::iter::once("mu")
+            .chain(self.family.auxiliaries().iter().copied())
+            .filter_map(|name| self.predictors.get(name).map(|predictor| (name, predictor)))
     }
 
     pub(crate) fn thresholds(&self) -> usize {
@@ -341,12 +337,8 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
         }
     }
-    let extra: Vec<_> = formulas
-        .iter()
-        .skip(1)
-        .map(|(_, formula, _)| formula)
-        .collect();
-    let rows = data::model_rows(formula, &extra, table, DataMode::Training)?;
+    let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
+    let rows = data::model_rows(formula, &predictor_formulas, table, DataMode::Training)?;
     for name in spec.options.contrasts.keys() {
         if !formulas.iter().any(|(_, formula, _)| {
             formula.variables.contains(name)
@@ -372,6 +364,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     let (_, group_scale) =
         family::default_scale(family.prior_scale_link(link), response.as_deref());
+    let response_formula = formula.clone();
     let mut predictors = BTreeMap::new();
     let mut auxiliary_priors = BTreeMap::new();
     for (name, formula, link) in formulas {
@@ -461,10 +454,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         );
     }
     let mut recipe = Recipe {
-        mu: predictors.remove("mu").unwrap(),
+        formula: response_formula,
         family,
+        link,
         response_levels,
-        dpars: predictors,
+        predictors,
         auxiliary_priors,
     };
     let module = emit::model(spec, &mut recipe)?;

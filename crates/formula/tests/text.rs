@@ -14,7 +14,7 @@ fn text_tables_share_model_frames_and_prediction_levels() -> Result<(), Box<dyn 
         DataValue::Real64(vec![1., 3., 4.])
     );
     assert_eq!(
-        expected.recipe.groups[0].levels,
+        expected.recipe.predictors["mu"].groups[0].levels,
         vec![GroupLevel::Integer(i64::MIN), GroupLevel::Integer(i64::MAX)]
     );
     let prediction =

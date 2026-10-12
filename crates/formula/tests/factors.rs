@@ -60,16 +60,16 @@ fn matrix(recipe: &Recipe, data: &DataDocument) -> Vec<Vec<f64>> {
     (0..data.rows.len())
         .map(|row| {
             let mut values = Vec::new();
-            if recipe.mu.formula.intercept {
+            if recipe.predictors["mu"].formula.intercept {
                 values.push(1.0);
             }
-            for column in &recipe.mu.design.columns {
+            for column in &recipe.predictors["mu"].design.columns {
                 let mut value = 1.0;
                 for component in &column.components {
                     value *= match *component {
                         DesignComponent::Numeric { predictor } => input(predictor, row),
                         DesignComponent::Contrast { predictor, column } => {
-                            let factor = recipe.mu.design.predictors[predictor]
+                            let factor = recipe.predictors["mu"].design.predictors[predictor]
                                 .factor
                                 .as_ref()
                                 .unwrap();
@@ -117,10 +117,9 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             "{} rows",
             case.name
         );
-        let offset = usize::from(recipe.mu.formula.intercept);
+        let offset = usize::from(recipe.predictors["mu"].formula.intercept);
         assert_eq!(
-            recipe
-                .mu
+            recipe.predictors["mu"]
                 .design
                 .columns
                 .iter()
@@ -150,8 +149,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             case.name
         );
         assert_eq!(
-            recipe
-                .mu
+            recipe.predictors["mu"]
                 .design
                 .columns
                 .iter()
@@ -161,7 +159,7 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             "{} term assignments",
             case.name
         );
-        for predictor in &recipe.mu.design.predictors {
+        for predictor in &recipe.predictors["mu"].design.predictors {
             if let Some(expected) = case.expected.factor_levels.get(&predictor.column) {
                 let actual = predictor.factor.as_ref().unwrap();
                 assert_eq!(actual.levels, expected.levels, "{} levels", case.name);
@@ -173,7 +171,12 @@ fn factor_design_and_prediction_match_r_model_matrices() {
             &case.expected.x.values,
             &case.name,
         );
-        for (column, &mean) in recipe.mu.design.columns.iter().zip(&recipe.mu.means) {
+        for (column, &mean) in recipe.predictors["mu"]
+            .design
+            .columns
+            .iter()
+            .zip(&recipe.predictors["mu"].means)
+        {
             assert!(
                 (mean - case.expected.means[&column.name]).abs() < 2e-12,
                 "{} mean of {}",
@@ -195,7 +198,11 @@ fn factor_design_and_prediction_match_r_model_matrices() {
                 &prediction.values,
                 &format!("{} prediction", case.name),
             );
-            for (actual, expected) in restored.mu.means.iter().zip(&recipe.mu.means) {
+            for (actual, expected) in restored.predictors["mu"]
+                .means
+                .iter()
+                .zip(&recipe.predictors["mu"].means)
+            {
                 assert!((actual - expected).abs() < 2e-12);
             }
         }
@@ -323,9 +330,15 @@ fn larger_ordered_factors_use_indicators_or_other_contrasts() {
         .contrasts
         .insert("o".into(), Contrast::Treatment);
     let converted = build(&spec, &table).unwrap();
-    assert_eq!(converted.recipe.mu.design.columns.len(), 16);
-    assert_eq!(converted.recipe.mu.design.columns[0].name, "o2");
-    assert_eq!(converted.recipe.mu.design.columns[15].name, "o17");
+    assert_eq!(converted.recipe.predictors["mu"].design.columns.len(), 16);
+    assert_eq!(
+        converted.recipe.predictors["mu"].design.columns[0].name,
+        "o2"
+    );
+    assert_eq!(
+        converted.recipe.predictors["mu"].design.columns[15].name,
+        "o17"
+    );
 
     spec.options.contrasts.clear();
     spec.formula = "y ~ 0 + o".into();

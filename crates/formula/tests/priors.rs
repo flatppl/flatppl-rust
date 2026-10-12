@@ -53,7 +53,7 @@ fn scoped_prior_expressions_use_the_parameter_graph() {
     ]));
     let conversion = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert_eq!(
-        conversion.recipe.priors.b[0].lb,
+        conversion.recipe.predictors["mu"].priors.b[0].lb,
         Some(flatppl_formula::PriorBound::Number(0.25))
     );
     assert_eq!(
@@ -84,7 +84,7 @@ fn group_prior_selectors_follow_brms_coefficient_and_alias_precedence() {
     // Actual brms 2.23.2 make_stancode(normalize=TRUE): g has a half-Cauchy
     // intercept sd, a Student-t slope sd restricted above zero, and LKJ(3).
     // h inherits both half-Normal sd laws and LKJ(2) from the class priors.
-    let priors = serde_json::to_value(&converted.recipe.mu.priors).unwrap();
+    let priors = serde_json::to_value(&converted.recipe.predictors["mu"].priors).unwrap();
     assert_eq!(
         priors["sd"],
         json!([

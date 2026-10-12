@@ -42,7 +42,7 @@ fn weights_follow_model_rows_and_are_not_prediction_inputs() {
     .unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert_eq!(converted.data.rows, [0, 1, 2]);
-    assert_eq!(converted.recipe.mu.means, [2.0]);
+    assert_eq!(converted.recipe.predictors["mu"].means, [2.0]);
     assert_eq!(
         converted.data.constants["weights_data"],
         DataValue::Real32(vec![0.0, 0.5, 2.0])

@@ -26,38 +26,36 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             "reals"
         },
     );
-    if matches!(recipe.mu.formula.trials, Some(Trials::Column(_))) {
+    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
     }
-    if recipe.mu.formula.weights.is_some() {
+    if recipe.formula.weights.is_some() {
         external_vector(&mut b, "weights_data", "nonnegreals");
     }
-    if recipe.mu.formula.se.is_some() {
+    if recipe.formula.se.is_some() {
         external_vector(&mut b, "se_data", "nonnegreals");
     }
-    predictor_data(&mut b, "mu", &mut recipe.mu);
-    for &name in recipe.family.auxiliaries() {
-        if let Some(predictor) = recipe.dpars.get_mut(name) {
-            predictor_data(&mut b, name, predictor);
-        }
+    let predictor_names: Vec<_> = recipe
+        .predictors()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    for name in &predictor_names {
+        predictor_data(&mut b, name, recipe.predictors.get_mut(name).unwrap());
     }
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
-    predictor_parameters(
-        &mut b,
-        "mu",
-        &mut recipe.mu,
-        recipe.family,
-        thresholds,
-        &mut parameters,
-    )?;
-    for &name in recipe.family.auxiliaries() {
-        if let Some(predictor) = recipe.dpars.get_mut(name) {
-            predictor_parameters(&mut b, name, predictor, recipe.family, 0, &mut parameters)?;
-        }
+    for name in &predictor_names {
+        predictor_parameters(
+            &mut b,
+            name,
+            recipe.predictors.get_mut(name).unwrap(),
+            recipe.family,
+            if name == "mu" { thresholds } else { 0 },
+            &mut parameters,
+        )?;
     }
     for &name in recipe.family.auxiliaries() {
-        if recipe.dpars.contains_key(name) {
+        if recipe.predictors.contains_key(name) {
             continue;
         }
         if name == "sigma" && !recipe.auxiliary_priors.contains_key(name) {
@@ -94,23 +92,20 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let prior = b.call("lawof", &[record]);
     b.bind("Pi_prior", prior);
 
-    predictor_values(&mut b, "mu", &recipe.mu, thresholds);
-    for &name in recipe.family.auxiliaries() {
-        if let Some(predictor) = recipe.dpars.get(name) {
-            predictor_values(&mut b, name, predictor, 0);
-        }
+    for (name, predictor) in recipe.predictors() {
+        predictor_values(
+            &mut b,
+            name,
+            predictor,
+            if name == "mu" { thresholds } else { 0 },
+        );
     }
     let mu = b.self_ref("mu");
-    let trials = recipe
-        .mu
-        .formula
-        .trials
-        .as_ref()
-        .map(|trials| match trials {
-            Trials::Constant(n) => b.lit_int(*n),
-            Trials::Column(_) => b.self_ref("trials_data"),
-        });
-    let scale = recipe.mu.formula.se.as_ref().map(|se| {
+    let trials = recipe.formula.trials.as_ref().map(|trials| match trials {
+        Trials::Constant(n) => b.lit_int(*n),
+        Trials::Column(_) => b.self_ref("trials_data"),
+    });
+    let scale = recipe.formula.se.as_ref().map(|se| {
         let known = b.self_ref("se_data");
         if !se.sigma {
             return known;
@@ -122,8 +117,9 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         broadcast(&mut b, "sqrt", &[variance])
     });
     let auxiliary: Vec<_> = recipe
-        .dpars
+        .predictors
         .keys()
+        .filter(|&name| name != "mu")
         .map(|name| (name.as_str(), b.self_ref(name)))
         .collect();
     let law = recipe.family.observation(
@@ -156,7 +152,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         &["Unweighted log likelihood for each observed row."],
     );
     let prior = b.self_ref("Pi_prior");
-    let posterior = if recipe.mu.formula.weights.is_some() {
+    let posterior = if recipe.formula.weights.is_some() {
         let point = Ref {
             ns: RefNs::Local,
             name: b.sym("_point_"),
@@ -200,7 +196,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     b.bind("Pi_post", posterior);
     let formula = b.str_lit(&spec.formula);
     let family = b.str_lit(&spec.family);
-    let link = b.str_lit(recipe.mu.link.name());
+    let link = b.str_lit(recipe.link.name());
     let improper = b.lit_bool(false);
     let score_offset = b.lit_real((1..=thresholds).map(|i| (i as f64).ln()).sum());
     let mut fields = vec![
@@ -210,10 +206,11 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         ("has_improper_prior", improper),
         ("score_offset", score_offset),
     ];
-    if !recipe.dpars.is_empty() {
+    if !spec.dpars.is_empty() {
         let dpars: Vec<_> = recipe
-            .dpars
+            .predictors
             .iter()
+            .filter(|(name, _)| name.as_str() != "mu")
             .map(|(name, predictor)| {
                 let formula = b.str_lit(&spec.dpars[name].formula);
                 let link = b.str_lit(predictor.link.name());
@@ -557,15 +554,16 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     };
     let mu = argument(b, "mu");
     let value = argument(b, "value");
-    let trials = match recipe.mu.formula.trials {
+    let trials = match recipe.formula.trials {
         Some(Trials::Constant(n)) => Some(b.lit_int(n)),
         Some(Trials::Column(_)) => Some(argument(b, "trials")),
         None => None,
     };
     let row_scale = scale.map(|_| argument(b, "scale"));
     let auxiliary: Vec<_> = recipe
-        .dpars
+        .predictors
         .keys()
+        .filter(|&name| name != "mu")
         .map(|name| (name.as_str(), argument(b, name)))
         .collect();
     let law = recipe.family.observation(
@@ -588,13 +586,19 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
     let mut args = vec![row_score, b.self_ref("mu"), b.self_ref("y_data")];
-    if matches!(recipe.mu.formula.trials, Some(Trials::Column(_))) {
+    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         args.push(b.self_ref("trials_data"));
     }
     if let Some(scale) = scale {
         args.push(scale);
     }
-    args.extend(recipe.dpars.keys().map(|name| b.self_ref(name)));
+    args.extend(
+        recipe
+            .predictors
+            .keys()
+            .filter(|&name| name != "mu")
+            .map(|name| b.self_ref(name)),
+    );
     b.call("broadcast", &args)
 }
 
@@ -808,7 +812,7 @@ pub(crate) fn info(
         group_offset += predictor.groups.len();
     }
     for &name in recipe.family.auxiliaries() {
-        if !recipe.dpars.contains_key(name) {
+        if !recipe.predictors.contains_key(name) {
             parameters.push(Parameter {
                 name: name.into(),
                 binding: name.into(),
@@ -821,23 +825,23 @@ pub(crate) fn info(
     Ok(ModelInfo {
         formula: spec.formula.clone(),
         family: spec.family.clone(),
-        link: recipe.mu.link.name().into(),
+        link: recipe.link.name().into(),
         group_collation: "C".into(),
         default_prior_rule: format!(
             "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; direct sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept. Predicted auxiliaries use brms's link-specific intercept defaults and the mean predictor's response scale for group priors.",
             spec.family,
-            recipe.mu.link.name()
+            recipe.link.name()
         ),
-        design_columns: recipe
-            .mu
+        design_columns: recipe.predictors["mu"]
             .design
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect(),
         dpars: recipe
-            .dpars
+            .predictors
             .iter()
+            .filter(|(name, _)| name.as_str() != "mu")
             .map(|(name, predictor)| {
                 (
                     name.clone(),

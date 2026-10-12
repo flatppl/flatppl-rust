@@ -338,7 +338,7 @@ impl Column {
 
 pub(crate) fn model_rows(
     formula: &Formula,
-    extra: &[&Formula],
+    predictors: &[&Formula],
     table: &Table,
     mode: DataMode,
 ) -> Result<Vec<usize>> {
@@ -347,10 +347,7 @@ pub(crate) fn model_rows(
     if let Some(se) = &formula.se {
         se.value.columns(&mut se_columns);
     }
-    let formulas: Vec<_> = std::iter::once(formula)
-        .chain(extra.iter().copied())
-        .collect();
-    let names = formulas
+    let names = predictors
         .iter()
         .flat_map(|formula| {
             formula.predictor_columns().into_iter().chain(
@@ -377,7 +374,7 @@ pub(crate) fn model_rows(
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
-    for expression in formulas
+    for expression in predictors
         .iter()
         .flat_map(|formula| {
             formula.expressions.values().chain(&formula.offsets).chain(
@@ -405,8 +402,8 @@ pub(crate) fn model_rows(
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
 /// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
-    let extra: Vec<_> = recipe.dpars.values().map(|p| &p.formula).collect();
-    let rows = model_rows(&recipe.mu.formula, &extra, table, mode)?;
+    let predictors: Vec<_> = recipe.predictors.values().map(|p| &p.formula).collect();
+    let rows = model_rows(&recipe.formula, &predictors, table, mode)?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
     for (dpar, predictor) in recipe.predictors() {
@@ -418,12 +415,12 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             response(
                 recipe.family,
                 recipe.response_levels.as_deref(),
-                &recipe.mu.formula,
+                &recipe.formula,
                 table,
                 &rows,
             )?,
         );
-        if let Some(name) = &recipe.mu.formula.weights {
+        if let Some(name) = &recipe.formula.weights {
             let weights = table.column(name)?;
             if weights.numeric(&rows)?.iter().any(|&value| value < 0.0) {
                 return Err(Error("response weights must be nonnegative".into()));
@@ -431,13 +428,13 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             constants.insert("weights_data".into(), weights.data(&rows)?);
         }
     }
-    if let Some(Trials::Column(name)) = &recipe.mu.formula.trials {
+    if let Some(Trials::Column(name)) = &recipe.formula.trials {
         constants.insert(
             "trials_data".into(),
             DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
     }
-    if let Some(se) = &recipe.mu.formula.se {
+    if let Some(se) = &recipe.formula.se {
         let values = se.value.data(table, &rows)?;
         let valid = |value: f64| value >= 0.0 && (se.sigma || value > 0.0);
         let valid = match &values {

@@ -199,9 +199,10 @@ separate; shape and fitted model constants remain in source. The original
 conversion remains external for dataframe binding and prediction. JSON has no
 dtype; float32 columns retain their exact
 stored values when written as JSON numbers.
-The recipe retains family and link, response
-coding, training means, factor contrasts and levels, design terms, and group
-levels. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
+The recipe stores the response formula, family, link and response coding separately
+from its `predictors` map. Each entry (`mu`, `sigma`, and so on) retains its own
+formula, link, training means, factor contrasts and levels, design terms, group
+levels and priors. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
 products. Metadata records the default-prior rule and group collation.
 Prediction requires no response column. It reuses the training contrast matrices
 and remaps factor labels even when new data uses a different level order.
