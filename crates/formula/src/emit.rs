@@ -474,11 +474,10 @@ pub(crate) fn with_data_source(
     mut module: Module,
     data: &DataDocument,
     source: &str,
-) -> Result<(Module, serde_json::Value)> {
+) -> Result<Module> {
     let mut b = Builder::new(&mut module);
     let name = b.alloc_name("formula_data");
     let mut fields = Vec::new();
-    let mut columns = serde_json::Map::new();
     for (column, value) in &data.constants {
         let (id, rhs) =
             b.m.public_bindings()
@@ -502,16 +501,6 @@ pub(crate) fn with_data_source(
             return Err(Error(format!("data binding `{column}` is not external")));
         }
         fields.push((column.as_str(), call.args[0]));
-        let value = match value {
-            DataValue::Real32(values) => {
-                // JSON has no dtype; preserve the exact stored f32 values.
-                serde_json::to_value(values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>())?
-            }
-            DataValue::Real64(values) => serde_json::to_value(values)?,
-            DataValue::Integers(values) => serde_json::to_value(values)?,
-            DataValue::Integer(_) => unreachable!("scalar count handled above"),
-        };
-        columns.insert(column.clone(), value);
         let data = b.self_ref(&name);
         let field = b.str_lit(column);
         let value = b.call("get", &[data, field]);
@@ -521,7 +510,7 @@ pub(crate) fn with_data_source(
     let source = b.str_lit(source);
     let data = b.call("load_data", &[source, domain]);
     b.bind(&name, data);
-    Ok((module, serde_json::Value::Object(columns)))
+    Ok(module)
 }
 
 pub(crate) fn info(

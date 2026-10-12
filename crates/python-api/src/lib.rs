@@ -5,7 +5,7 @@
 
 #![cfg(feature = "extension")]
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -24,6 +24,14 @@ fn error(diagnostic: Diagnostic) -> PyErr {
     Error::new_err(
         serde_json::to_string(&diagnostic).expect("diagnostics contain only JSON values"),
     )
+}
+
+fn formula_mode(mode: &str) -> PyResult<DataMode> {
+    match mode {
+        "prediction" => Ok(DataMode::Prediction),
+        "training" => Ok(DataMode::Training),
+        _ => Err(PyValueError::new_err("mode must be prediction or training")),
+    }
 }
 
 #[pyclass(name = "Context", module = "flatppl._native")]
@@ -105,6 +113,20 @@ impl NativeContext {
             .map_err(error)
     }
 
+    #[pyo3(signature = (spec, path, name=None, source_path=None))]
+    fn import_formula_path(
+        &mut self,
+        spec: &str,
+        path: &str,
+        name: Option<&str>,
+        source_path: Option<&str>,
+    ) -> PyResult<NativeFormulaModel> {
+        self.inner
+            .import_formula_path_json(spec, Path::new(path), name, source_path)
+            .map(|inner| NativeFormulaModel { inner })
+            .map_err(error)
+    }
+
     #[pyo3(signature = (model, data_ipc, mode="prediction"))]
     fn prepare_formula(
         &mut self,
@@ -112,14 +134,27 @@ impl NativeContext {
         data_ipc: &[u8],
         mode: &str,
     ) -> PyResult<(NativeModule, String)> {
-        let mode = match mode {
-            "prediction" => DataMode::Prediction,
-            "training" => DataMode::Training,
-            _ => return Err(PyValueError::new_err("mode must be prediction or training")),
-        };
+        let mode = formula_mode(mode)?;
         let (inner, rows) = model
             .inner
             .prepare_arrow(&mut self.inner, data_ipc, mode)
+            .map_err(error)?;
+        Ok((
+            NativeModule { inner },
+            serde_json::to_string(&rows).expect("row indices are JSON integers"),
+        ))
+    }
+
+    #[pyo3(signature = (model, path, mode="prediction"))]
+    fn prepare_formula_path(
+        &mut self,
+        model: &NativeFormulaModel,
+        path: &str,
+        mode: &str,
+    ) -> PyResult<(NativeModule, String)> {
+        let (inner, rows) = model
+            .inner
+            .prepare_path(&mut self.inner, Path::new(path), formula_mode(mode)?)
             .map_err(error)?;
         Ok((
             NativeModule { inner },

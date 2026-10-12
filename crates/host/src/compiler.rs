@@ -154,6 +154,10 @@ pub enum MathFormat {
 }
 
 impl LoadedModule {
+    pub(crate) fn parsed(&self) -> &Module {
+        &self.definition.parsed
+    }
+
     pub fn source(&self) -> &str {
         &self.definition.source
     }
@@ -352,6 +356,10 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) fn owns(&self, module: &LoadedModule) -> bool {
+        Arc::ptr_eq(&self.owner, &module.owner)
+    }
+
     /// Bind fixed values to declared externals in a new immutable module.
     pub fn set(
         &mut self,
