@@ -790,6 +790,9 @@ pub(crate) fn call_rule(
         "broadcast" => {
             return broadcast_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
         }
+        // Like a bare builtin callable, the lifted callable's result depends
+        // on application arguments. Kernel primitives inspect it structurally.
+        "broadcasted" => arg_ty(args, 0).cloned().unwrap_or(Type::Deferred),
 
         // ---- catalogue dispatch (spec §07 functions + spec §08 distributions) ----
         // Per-name functions whose result is a pure scalar (constant, RealOrComplexOfArg,
@@ -8454,6 +8457,42 @@ fn kernel_variate(
     kernel_input_node: Option<NodeId>,
 ) -> Option<Type> {
     use crate::catalogue::{LowerCtx, Sig, lower, no_intern};
+
+    let kernel_node = resolve_binding_refs(inf, kernel_node);
+    if let Node::Call(call) = inf.module.node(kernel_node)
+        && matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "broadcasted")
+        && let [inner] = call.args.as_ref()
+    {
+        let inner = *inner;
+        let cell = kernel_variate(inf, inner, None)?;
+        if !matches!(cell, Type::Scalar(_)) {
+            return None;
+        }
+        let input = resolve_binding_refs(inf, kernel_input_node?);
+        let Type::Record(fields) = inf.lookup_type(input)? else {
+            return None;
+        };
+        let mut shape: Option<Box<[Dim]>> = None;
+        for (_, ty) in fields {
+            match ty {
+                Type::Scalar(_) => {}
+                Type::Array { shape: s, elem } if matches!(elem.as_ref(), Type::Scalar(_)) => {
+                    shape = Some(match shape {
+                        None => s.clone(),
+                        Some(previous) => broadcast_shape_join(&previous, s)?,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        return Some(match shape {
+            Some(shape) => Type::Array {
+                shape,
+                elem: Box::new(cell),
+            },
+            None => cell,
+        });
+    }
 
     // Lower a distribution `Sig` to its variate domain. `param_dim` reads the
     // kernel_input RECORD's field `kwarg` (vs `distribution_domain`'s call args);
