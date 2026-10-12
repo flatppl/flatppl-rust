@@ -7,6 +7,8 @@ pub struct Formula {
     pub response: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trials: Option<Trials>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<String>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
@@ -55,7 +57,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
         .ok_or_else(|| Error("formula must contain `response ~ terms`".into()))?;
-    let (response, trials) = response_addition(response)?;
+    let (response, trials, weights) = response_additions(response)?;
     let mut parser = Parser {
         tokens: tokenize(rhs)?,
         at: 0,
@@ -103,6 +105,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     Ok(Formula {
         response,
         trials,
+        weights,
         intercept,
         variables,
         fixed,
@@ -149,27 +152,52 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     (variables, fixed, expressions)
 }
 
-fn response_addition(text: &str) -> Result<(String, Option<Trials>)> {
+fn response_additions(text: &str) -> Result<(String, Option<Trials>, Option<String>)> {
     let Some((response, addition)) = text.split_once('|') else {
-        return Ok((name(text.trim())?, None));
+        return Ok((name(text.trim())?, None, None));
     };
-    let fail = || Error("response additions support only `y | trials(column_or_integer)`".into());
-    let argument = addition
-        .trim()
-        .strip_prefix("trials")
-        .and_then(|value| value.trim().strip_prefix('('))
-        .and_then(|value| value.strip_suffix(')'))
-        .ok_or_else(fail)?
-        .trim();
-    let trials = if let Ok(value) = argument.parse::<i64>() {
-        if value < 0 {
-            return Err(Error("binomial trials must be nonnegative".into()));
+    let fail = || {
+        Error("response additions support `trials(column_or_integer)` and `weights(column)`".into())
+    };
+    let mut trials = None;
+    let mut weights = None;
+    let mut depth = 0i32;
+    for addition in addition.split(|c| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
         }
-        Trials::Constant(value)
-    } else {
-        Trials::Column(name(argument).map_err(|_| fail())?)
-    };
-    Ok((name(response.trim())?, Some(trials)))
+        c == '+' && depth == 0
+    }) {
+        let (head, argument) = addition.trim().split_once('(').ok_or_else(fail)?;
+        let argument = argument.strip_suffix(')').ok_or_else(fail)?.trim();
+        match head.trim() {
+            "trials" => {
+                let value = if let Ok(value) = argument.parse::<i64>() {
+                    if value < 0 {
+                        return Err(Error("binomial trials must be nonnegative".into()));
+                    }
+                    Trials::Constant(value)
+                } else {
+                    Trials::Column(name(argument).map_err(|_| fail())?)
+                };
+                if trials.as_ref().is_some_and(|previous| previous != &value) {
+                    return Err(Error("conflicting trials additions".into()));
+                }
+                trials = Some(value);
+            }
+            "weights" => {
+                let value = name(argument).map_err(|_| fail())?;
+                if weights.as_ref().is_some_and(|previous| previous != &value) {
+                    return Err(Error("conflicting weights additions".into()));
+                }
+                weights = Some(value);
+            }
+            _ => return Err(fail()),
+        }
+    }
+    Ok((name(response.trim())?, trials, weights))
 }
 
 #[derive(Clone, Copy, PartialEq)]

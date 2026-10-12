@@ -351,6 +351,11 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
             Some(Trials::Column(name)) => Some(name.as_str()),
             _ => None,
         })
+        .chain(
+            (mode == DataMode::Training)
+                .then_some(formula.weights.as_deref())
+                .flatten(),
+        )
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
@@ -378,7 +383,7 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
 }
 
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
-/// Prediction does not require a response column and never refits the recipe.
+/// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
     let rows = model_rows(&recipe.formula, table, mode)?;
     let mut constants = BTreeMap::new();
@@ -409,6 +414,13 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
                 &rows,
             )?,
         );
+        if let Some(name) = &recipe.formula.weights {
+            let weights = table.column(name)?;
+            if weights.numeric(&rows)?.iter().any(|&value| value < 0.0) {
+                return Err(Error("response weights must be nonnegative".into()));
+            }
+            constants.insert("weights_data".into(), weights.data(&rows)?);
+        }
     }
     if let Some(Trials::Column(name)) = &recipe.formula.trials {
         constants.insert(

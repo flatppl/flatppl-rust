@@ -64,6 +64,21 @@ Different parameterizations of the same law may still be refused, such as
 `cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
 priors and other ordinal links or threshold parameterizations are not supported.
 
+Response weights use `y | weights(w) ~ ...`, or
+`y | trials(n) + weights(w) ~ ...` for binomial data. `w` names a numeric
+column. After omitting incomplete model rows, retained weights must be finite
+and nonnegative. Zero weights, including an all-zero vector, are allowed.
+Weights are not rescaled. Weight expressions, constants and `scale = TRUE`
+are outside this subset; unlike brms, infinite weights are refused under the
+converter's finite numeric input policy.
+
+The generated `K_model` and `L` keep the ordinary unweighted observation law.
+`log_lik` returns unweighted pointwise log likelihoods for the retained training
+rows, with the same parameter arguments as `K_model`. `weights_data` stores
+the aligned weights. `Pi_post` adds `sum(weights_data .* log_lik(...))` once
+to the prior log density. Prediction requires neither responses nor weights;
+it uses the existing predictor-row filtering and saved training recipe.
+
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
 `{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and

@@ -4,7 +4,7 @@ use crate::{
     priors::{self, PriorNode},
 };
 use flatppl_convert::Builder;
-use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs};
+use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs};
 
 pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let mut module = Module::new();
@@ -28,6 +28,9 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     );
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
+    }
+    if recipe.formula.weights.is_some() {
+        external_vector(&mut b, "weights_data", "nonnegreals");
     }
     if !recipe.formula.offsets.is_empty() {
         external_vector(&mut b, "offset", "reals");
@@ -318,35 +321,62 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     b.bind("y", y);
     let y = b.self_ref("y");
     let response = b.call_fields("record", &[("y", y)]);
-    let inputs = parameters
-        .iter()
-        .map(|name| {
-            let name = b.sym(name);
-            (
-                name,
-                Ref {
-                    ns: RefNs::SelfMod,
-                    name,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let head = b.sym("kernelof");
-    let kernel = b.m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(head),
-        args: vec![response].into(),
-        named: Box::default(),
-        inputs: Some(Inputs::Spec(inputs.into())),
-    }));
+    let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
     let y = b.self_ref("y_data");
     let observation = b.call_fields("record", &[("y", y)]);
     let kernel = b.self_ref("K_model");
     let likelihood = b.call("likelihoodof", &[kernel, observation]);
     b.bind("L", likelihood);
-    let likelihood = b.self_ref("L");
+    let pointwise = pointwise_log_likelihood(&mut b, recipe);
+    let log_lik = parameter_function(&mut b, "functionof", pointwise, &parameters);
+    b.bind_doc(
+        "log_lik",
+        log_lik,
+        &["Unweighted log likelihood for each observed row."],
+    );
     let prior = b.self_ref("Pi_prior");
-    let posterior = b.call("bayesupdate", &[likelihood, prior]);
+    let posterior = if recipe.formula.weights.is_some() {
+        let point = Ref {
+            ns: RefNs::Local,
+            name: b.sym("_point_"),
+        };
+        let value = b.m.alloc(Node::Ref(point));
+        let named = parameters
+            .iter()
+            .map(|name| {
+                let field = b.str_lit(name);
+                let value = b.call("get", &[value, field]);
+                NamedArg {
+                    kind: NamedKind::Kwarg,
+                    name: b.sym(name),
+                    value,
+                }
+            })
+            .collect::<Vec<_>>();
+        let log_lik = b.self_ref("log_lik");
+        let pointwise = b.m.alloc(Node::Call(Call {
+            head: CallHead::User(log_lik),
+            args: Box::default(),
+            named: named.into(),
+            inputs: None,
+        }));
+        let weights = b.self_ref("weights_data");
+        let weighted = broadcast(&mut b, "mul", &[weights, pointwise]);
+        let score = b.call("sum", &[weighted]);
+        let head = b.sym("functionof");
+        let name = b.sym("point");
+        let weight = b.m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: Box::new([score]),
+            named: Box::default(),
+            inputs: Some(Inputs::Spec(Box::new([(name, point)]))),
+        }));
+        b.call("logweighted", &[weight, prior])
+    } else {
+        let likelihood = b.self_ref("L");
+        b.call("bayesupdate", &[likelihood, prior])
+    };
     b.bind("Pi_post", posterior);
     let formula = b.str_lit(&spec.formula);
     let family = b.str_lit(&spec.family);
@@ -365,6 +395,69 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     );
     b.bind("formula_model", metadata);
     Ok(module)
+}
+
+fn parameter_function(
+    b: &mut Builder<'_>,
+    head: &str,
+    body: NodeId,
+    parameters: &[String],
+) -> NodeId {
+    let inputs = parameters
+        .iter()
+        .map(|name| {
+            let name = b.sym(name);
+            (
+                name,
+                Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let head = b.sym(head);
+    b.m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: vec![body].into(),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(inputs.into())),
+    }))
+}
+
+fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe) -> NodeId {
+    let mut inputs = Vec::new();
+    let mut argument = |b: &mut Builder<'_>, name: &str| {
+        let value = Ref {
+            ns: RefNs::Local,
+            name: b.sym(&format!("_{name}_")),
+        };
+        inputs.push((b.sym(name), value));
+        b.m.alloc(Node::Ref(value))
+    };
+    let mu = argument(b, "mu");
+    let value = argument(b, "value");
+    let trials = match recipe.formula.trials {
+        Some(Trials::Constant(n)) => Some(b.lit_int(n)),
+        Some(Trials::Column(_)) => Some(argument(b, "trials")),
+        None => None,
+    };
+    let law = recipe
+        .family
+        .observation(b, mu, trials, recipe.thresholds(), true);
+    let score = b.call("logdensityof", &[law, value]);
+    let head = b.sym("functionof");
+    let row_score = b.m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Box::new([score]),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(inputs.into())),
+    }));
+    let mut args = vec![row_score, b.self_ref("mu"), b.self_ref("y_data")];
+    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
+        args.push(b.self_ref("trials_data"));
+    }
+    b.call("broadcast", &args)
 }
 
 fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
