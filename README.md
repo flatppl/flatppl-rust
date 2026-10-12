@@ -16,6 +16,8 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
+* [`flatppl-formula`](crates/formula) — Gaussian regression formulas → FlatPPL, with reusable data recipes
+* [`flatppl-convert`](crates/convert) — shared IR construction helpers for converters
 * [`flatppl-fileaccess`](crates/fileaccess) — resolve a `source` (local path or `http`/`https` URL) to a local file, with the shared remote-content cache (native host layer)
 * [`flatppl-host`](crates/host) — immutable source contexts and typed StableHLO query exports for native hosts
 * [`flatppl-python-api`](crates/python-api) — PyO3 bindings for the [Python package](https://github.com/flatppl/flatppl-python)

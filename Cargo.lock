@@ -358,6 +358,7 @@ dependencies = [
  "flatppl-determinizer",
  "flatppl-fileaccess",
  "flatppl-flatpir",
+ "flatppl-formula",
  "flatppl-hs3",
  "flatppl-infer",
  "flatppl-lint",
@@ -365,6 +366,14 @@ dependencies = [
  "flatppl-stablehlo",
  "flatppl-syntax",
  "serde_json",
+]
+
+[[package]]
+name = "flatppl-convert"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-syntax",
 ]
 
 [[package]]
@@ -402,12 +411,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatppl-formula"
+version = "0.1.0"
+dependencies = [
+ "flatppl-convert",
+ "flatppl-core",
+ "flatppl-syntax",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flatppl-host"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
  "flatppl-determinizer",
  "flatppl-fileaccess",
+ "flatppl-formula",
  "flatppl-hs3",
  "flatppl-infer",
  "flatppl-mathdoc",
@@ -421,6 +442,7 @@ dependencies = [
 name = "flatppl-hs3"
 version = "0.1.0"
 dependencies = [
+ "flatppl-convert",
  "flatppl-core",
  "flatppl-syntax",
  "serde",

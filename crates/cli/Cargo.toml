@@ -38,6 +38,7 @@ infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
 # `flatppl-fileaccess/net` (ureq + rustls).
 prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/net"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
+formula = ["dep:flatppl-formula", "convert"]
 fmtlint = ["dep:flatppl-lint"]
 # `determinize` legalizes a FlatPPL model to the deterministic FlatPDL profile
 # (eliminate the measure layer), refusing constructs it cannot lower. It needs
@@ -60,6 +61,7 @@ flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
+flatppl-formula = { path = "../formula", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
 flatppl-determinizer = { path = "../determinizer", optional = true }
 flatppl-stablehlo = { path = "../stablehlo", optional = true }

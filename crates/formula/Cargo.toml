@@ -1,0 +1,15 @@
+[package]
+name = "flatppl-formula"
+description = "A brms-compatible Gaussian formula frontend for FlatPPL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-convert = { path = "../convert" }
+flatppl-syntax = { path = "../syntax" }
+serde.workspace = true
+serde_json.workspace = true

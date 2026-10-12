@@ -1,0 +1,14 @@
+[package]
+name = "flatppl-convert"
+description = "Shared IR construction helpers for FlatPPL converters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }
