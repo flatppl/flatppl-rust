@@ -9428,6 +9428,8 @@ pub(crate) fn fill_mass(
         // would re-launder it to `%normalized` right where the no-laundering
         // rider forbids it.
         "lawof" => mass,
+        // The broadcast rule already classified the product, even if deferred.
+        "broadcast" => mass,
         // Every §08 distribution is a probability measure.
         // `Dirac(value)` is a point-mass probability measure (total mass 1).
         "Dirac" => Mass::Normalized,
@@ -9871,6 +9873,7 @@ fn joint_component_is_trace_clean(inf: &Inferencer<'_, '_>, node: NodeId, depth:
 /// Broadcasting a kernel over data cells: an independent product per cell.
 fn broadcast_mass(cell: Mass) -> Mass {
     match cell {
+        Mass::Deferred => Mass::Deferred,
         Mass::Normalized => Mass::Normalized,
         Mass::Null => Mass::Null,
         Mass::Finite => Mass::Finite,

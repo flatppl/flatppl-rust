@@ -37,6 +37,47 @@ fn input_names<'m>(
     inputs.iter().map(|s| module.resolve(*s)).collect()
 }
 
+#[test]
+fn broadcast_kernel_draw_defers_mass_until_normalization() {
+    let source = "k = m -> Normal(m, 1.0)\nlaw = k.([0.0, 1.0])\ny ~ law";
+    for level in [
+        Level::Type,
+        Level::Valueset,
+        Level::Normalization,
+        Level::Shape,
+    ] {
+        let module = infer_src(source, level);
+        let expected = if level < Level::Normalization {
+            Mass::Deferred
+        } else {
+            Mass::Normalized
+        };
+        assert!(
+            matches!(binding_ty(&module, "law"), Some(Type::Measure { mass, .. }) if *mass == expected),
+            "{level:?}: {:?}",
+            binding_ty(&module, "law")
+        );
+    }
+}
+
+#[test]
+fn broadcast_kernel_draw_keeps_nonprobability_mass() {
+    for (weight, expected) in [("2.0", Mass::Finite), ("m", Mass::Unknown)] {
+        for level in [Level::Normalization, Level::Shape] {
+            let source = format!(
+                "k = m -> weighted({weight}, Normal(m, 1.0))\n\
+                 law = k.([0.5, 2.0])\ny ~ law"
+            );
+            let mut module = flatppl_syntax::parse(&source).unwrap();
+            let diagnostics = infer_module(&mut module, &ModuleBundle::new(), level);
+            assert!(
+                matches!(binding_ty(&module, "law"), Some(Type::Measure { mass, .. }) if *mass == expected)
+            );
+            assert!(diagnostics.iter().any(|d| d.severity == Severity::Error));
+        }
+    }
+}
+
 /// A boundary-less `functionof` over a measure body is a KERNEL whose inputs are
 /// the body's `elementof` leaves, **sorted by name** — not the build order.
 #[test]
