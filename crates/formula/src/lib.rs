@@ -14,6 +14,7 @@ mod emit;
 mod expression;
 mod family;
 mod formula;
+mod metadata;
 mod ordinal;
 mod prior_expr;
 mod priors;
@@ -250,9 +251,17 @@ pub struct ModelInfo {
     pub default_prior_rule: String,
     pub design_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub factor_levels: BTreeMap<String, FactorInfo>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_levels: BTreeMap<String, GroupInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_levels: Option<Vec<GroupLevel>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dpars: BTreeMap<String, PredictorInfo>,
     pub parameters: Vec<Parameter>,
     pub has_improper_prior: bool,
+    pub prior_factors: BTreeMap<String, PriorFactor>,
+    pub prior_sampling: PriorSampling,
     pub training_rows: Vec<usize>,
     /// Additive difference from the target using normalized Stan density functions.
     pub score_offset: f64,
@@ -263,6 +272,47 @@ pub struct PredictorInfo {
     pub formula: String,
     pub link: String,
     pub design_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub factor_levels: BTreeMap<String, FactorInfo>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_levels: BTreeMap<String, GroupInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FactorInfo {
+    pub name: String,
+    pub levels: Vec<String>,
+    pub ordered: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GroupInfo {
+    pub name: String,
+    pub levels: Vec<GroupLevel>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterRole {
+    Sampled,
+    Fixed,
+    Derived,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorSampling {
+    /// A Flat source is deliberately unavailable for prior sampling.
+    Unavailable,
+    /// Conversion does not test an engine's sampler implementation.
+    NotChecked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PriorFactor {
+    /// The inferred FlatPIR total-mass class, not a sampler capability.
+    pub mass: String,
+    pub contains_flat: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -275,6 +325,8 @@ pub struct Parameter {
     /// One-based matrix coordinates, when the binding is matrix-valued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indices: Option<Vec<usize>>,
+    pub role: ParameterRole,
+    /// Legacy flag: true for both fixed and derived values.
     pub derived: bool,
 }
 
@@ -535,7 +587,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         predictors,
         auxiliary_priors,
     };
-    let module = emit::model(spec, &mut recipe)?;
+    let module = emit::model(&mut recipe)?;
     let data = prepare_data(&recipe, table, DataMode::Training)?;
     let text = flatppl_syntax::print(&module);
     let mut module = flatppl_syntax::parse(&text)
@@ -549,7 +601,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         )));
     }
     let info = emit::info(spec, &recipe, &data, &validation)?;
-    emit::mark_improper(&mut module, info.has_improper_prior);
+    metadata::emit(&mut module, &info)?;
+    let text = flatppl_syntax::print(&module);
+    let module = flatppl_syntax::parse(&text)
+        .map_err(|e| Error(format!("generated formula metadata failed to reparse: {e}")))?;
     Ok(Conversion {
         module,
         data,
