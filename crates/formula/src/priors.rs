@@ -55,9 +55,12 @@ pub struct Priors {
     pub sigma_scale: f64,
     pub intercept: ResolvedPrior,
     pub b: Vec<ResolvedPrior>,
+    #[serde(default)]
+    pub bs: Vec<ResolvedPrior>,
+    #[serde(default)]
+    pub sds: Vec<ResolvedPrior>,
     pub sd: Vec<Vec<ResolvedPrior>>,
     pub cor: Vec<Option<ResolvedPrior>>,
-    pub aux: BTreeMap<String, ResolvedPrior>,
 }
 
 pub(crate) struct PriorTarget<'a> {
@@ -75,13 +78,17 @@ fn canonical_class(class: &str) -> &str {
     if class == "L" { "cor" } else { class }
 }
 
+pub(crate) fn dpar(value: Option<&str>) -> Option<&str> {
+    nonempty(value).filter(|&name| name != "mu")
+}
+
 impl Prior {
     fn matches(&self, target: &PriorTarget<'_>) -> bool {
         canonical_class(&self.class) == target.class
+            && dpar(self.dpar.as_deref()) == target.dpar
             && [
                 (self.coef.as_deref(), target.coef),
                 (self.group.as_deref(), target.group),
-                (self.dpar.as_deref(), target.dpar),
             ]
             .iter()
             .all(|&(selector, value)| nonempty(selector).is_none_or(|s| Some(s) == value))
@@ -106,7 +113,7 @@ pub(crate) fn select(
             canonical_class(&prior.class),
             nonempty(prior.coef.as_deref()),
             nonempty(prior.group.as_deref()),
-            nonempty(prior.dpar.as_deref()),
+            dpar(prior.dpar.as_deref()),
         );
         if !seen.insert(selector) {
             return Err(Error(format!(
@@ -164,18 +171,37 @@ pub(crate) fn select(
         .collect())
 }
 
+pub(crate) struct PriorContext<'a> {
+    pub family: Family,
+    pub link: Link,
+    pub thresholds: usize,
+    pub dpar: Option<&'a str>,
+    pub response: Option<&'a [f64]>,
+    pub offset_mean: f64,
+    pub group_scale: f64,
+}
+
 pub(crate) fn resolve(
     spec: &Spec,
     formula: &Formula,
     design: &Design,
     groups: &[Group],
-    (family, link, thresholds): (Family, Link, usize),
-    response: Option<&[f64]>,
-    offset_mean: f64,
-) -> Result<Priors> {
+    context: PriorContext<'_>,
+) -> Result<(Priors, BTreeMap<String, ResolvedPrior>)> {
+    let PriorContext {
+        family,
+        link,
+        thresholds,
+        dpar,
+        response,
+        offset_mean,
+        group_scale,
+    } = context;
     let scale_link = family.prior_scale_link(link);
     let (mut location, scale) = default_scale(scale_link, response);
-    if response.is_some() && scale_link.uses_response_scale() {
+    if dpar.is_some() {
+        location = 0.0;
+    } else if response.is_some() && scale_link.uses_response_scale() {
         location -= offset_mean;
     }
     let (_, sigma_scale) = default_scale(family.prior_scale_link(Link::Identity), response);
@@ -189,6 +215,7 @@ pub(crate) fn resolve(
         .auxiliaries()
         .iter()
         .copied()
+        .filter(|name| dpar.is_none() && !spec.dpars.contains_key(*name))
         .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
         .collect();
     let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
@@ -197,33 +224,55 @@ pub(crate) fn resolve(
             class: "Intercept",
             coef: Some(name),
             group: None,
-            dpar: None,
+            dpar,
         }));
     } else if formula.intercept {
         targets.push(PriorTarget {
             class: "Intercept",
             coef: None,
             group: None,
-            dpar: None,
+            dpar,
         });
     }
     targets.extend(names.iter().map(|name| PriorTarget {
         class: "b",
         coef: Some(name),
         group: None,
-        dpar: None,
+        dpar,
     }));
-    targets.extend(group_targets(groups, formula));
+    let smooth_names: Vec<_> = formula.smooths.iter().map(|s| s.coefficient()).collect();
+    let smooth_labels: Vec<_> = formula.smooths.iter().map(|s| s.label()).collect();
+    targets.extend(smooth_names.iter().map(|name| PriorTarget {
+        class: "b",
+        coef: Some(name),
+        group: None,
+        dpar,
+    }));
+    targets.extend(smooth_labels.iter().map(|label| PriorTarget {
+        class: "sds",
+        coef: Some(label),
+        group: None,
+        dpar,
+    }));
+    targets.extend(group_targets(groups, formula, dpar));
     targets.extend(auxiliaries.iter().map(|name| PriorTarget {
         class: name,
         coef: None,
         group: None,
         dpar: None,
     }));
-    let mut selected = select(&spec.priors, &targets)?.into_iter();
+    let priors: Vec<_> = spec
+        .priors
+        .iter()
+        .filter(|prior| self::dpar(prior.dpar.as_deref()) == dpar)
+        .cloned()
+        .collect();
+    let mut selected = select(&priors, &targets)?.into_iter();
     let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
     let default_intercept = || {
-        if family == Family::VonMises && link == Link::TanHalf {
+        if let Some(name) = dpar {
+            ResolvedPrior::new(family.default_predictor_prior(name, link, scale))
+        } else if family == Family::VonMises && link == Link::TanHalf {
             ResolvedPrior::new("student_t(1, 0, 1)")
         } else {
             student(location)
@@ -254,13 +303,35 @@ pub(crate) fn resolve(
         })
         .collect();
     let mut sd = Vec::new();
+    let bs = smooth_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
+        })
+        .collect();
+    let sds = smooth_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new(format!("student_t(3, 0, {group_scale})")))
+        })
+        .collect();
     let mut cor = Vec::new();
     for (group, term) in groups.iter().zip(&formula.groups) {
         sd.push(
             group
                 .coefficients
                 .iter()
-                .map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)))
+                .map(|_| {
+                    selected.next().unwrap().unwrap_or_else(|| {
+                        ResolvedPrior::new(format!("student_t(3, 0, {group_scale})"))
+                    })
+                })
                 .collect(),
         );
         cor.push((term.correlated && group.coefficients.len() > 1).then(|| {
@@ -280,35 +351,76 @@ pub(crate) fn resolve(
             (name.into(), prior)
         })
         .collect();
-    Ok(Priors {
-        intercept_location: location,
-        scale,
-        sigma_scale,
-        intercept,
-        b,
-        sd,
-        cor,
+    Ok((
+        Priors {
+            intercept_location: location,
+            scale,
+            sigma_scale,
+            intercept,
+            b,
+            bs,
+            sds,
+            sd,
+            cor,
+        },
         aux,
-    })
+    ))
 }
 
-fn group_targets<'a>(groups: &'a [Group], formula: &Formula) -> Vec<PriorTarget<'a>> {
+fn group_targets<'a>(
+    groups: &'a [Group],
+    formula: &Formula,
+    dpar: Option<&'a str>,
+) -> Vec<PriorTarget<'a>> {
     let mut targets = Vec::new();
     for (group, term) in groups.iter().zip(&formula.groups) {
         targets.extend(group.coefficients.iter().map(|coefficient| PriorTarget {
             class: "sd",
             coef: Some(coefficient),
             group: Some(&group.column),
-            dpar: None,
+            dpar,
         }));
         if term.correlated && group.coefficients.len() > 1 {
             targets.push(PriorTarget {
                 class: "cor",
                 coef: None,
                 group: Some(&group.column),
-                dpar: None,
+                dpar,
             });
         }
     }
     targets
+}
+
+pub(crate) fn categorical_correlations(
+    priors: &[Prior],
+    predictors: &mut BTreeMap<String, crate::PredictorRecipe>,
+) -> Result<()> {
+    let priors: Vec<_> = priors
+        .iter()
+        .filter(|prior| canonical_class(&prior.class) == "cor")
+        .cloned()
+        .collect();
+    let targets: Vec<_> = predictors
+        .values()
+        .flat_map(|predictor| predictor.groups.iter().zip(&predictor.priors.cor))
+        .filter(|(_, prior)| prior.is_some())
+        .map(|(group, _)| PriorTarget {
+            class: "cor",
+            coef: None,
+            group: Some(&group.column),
+            dpar: None,
+        })
+        .collect();
+    let selected = select(&priors, &targets)?;
+    for (prior, selected) in predictors
+        .values_mut()
+        .flat_map(|predictor| predictor.priors.cor.iter_mut().flatten())
+        .zip(selected)
+    {
+        if let Some(selected) = selected {
+            *prior = selected;
+        }
+    }
+    Ok(())
 }

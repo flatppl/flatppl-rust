@@ -39,10 +39,13 @@ fn pyarrow_file_and_stream_preserve_precision_and_prediction_recipe()
             model.data.constants["x_2"],
             DataValue::Integers(vec![1, 2, 2])
         );
-        let factor = model.recipe.design.predictors[1].factor.as_ref().unwrap();
+        let factor = model.recipe.predictors["mu"].design.predictors[1]
+            .factor
+            .as_ref()
+            .unwrap();
         assert_eq!(factor.levels, vec!["b", "a"]);
         assert!(factor.ordered);
-        assert_eq!(model.recipe.means[0], 4. / 3.);
+        assert_eq!(model.recipe.predictors["mu"].means[0], 4. / 3.);
         let recipe: Recipe = serde_json::from_str(&serde_json::to_string(&model.recipe)?)?;
         let data = prepare_data(&recipe, &prediction, DataMode::Prediction)?;
         assert_eq!(data.rows, vec![0, 2]);
@@ -95,7 +98,7 @@ fn ordered_dictionaries_merge_constraints_and_recode_prior_batches()
         let table = Table::from_arrow_ipc(&stream(&batches)?)?;
         let model = build(&read(r#"{"formula":"y ~ f"}"#)?, &table)?;
         assert_eq!(
-            model.recipe.design.predictors[0]
+            model.recipe.predictors["mu"].design.predictors[0]
                 .factor
                 .as_ref()
                 .unwrap()
@@ -165,7 +168,7 @@ fn dictionary_replacements_and_missing_values_preserve_model_rows()
         DataValue::Integers(vec![1, 2, 1, 2])
     );
     assert_eq!(
-        model.recipe.design.predictors[0]
+        model.recipe.predictors["mu"].design.predictors[0]
             .factor
             .as_ref()
             .unwrap()
@@ -173,7 +176,7 @@ fn dictionary_replacements_and_missing_values_preserve_model_rows()
         vec!["b", "a"]
     );
     assert_eq!(
-        model.recipe.design.predictors[1]
+        model.recipe.predictors["mu"].design.predictors[1]
             .factor
             .as_ref()
             .unwrap()

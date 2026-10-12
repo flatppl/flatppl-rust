@@ -15,6 +15,8 @@ pub struct Formula {
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
     pub groups: Vec<GroupTerm>,
+    #[serde(default)]
+    pub smooths: Vec<SmoothTerm>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
 }
@@ -30,6 +32,25 @@ pub enum Trials {
 pub struct StandardError {
     pub value: ColumnExpression,
     pub sigma: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SmoothTerm {
+    pub column: String,
+    pub rank: Option<usize>,
+}
+
+impl SmoothTerm {
+    pub fn label(&self) -> String {
+        match self.rank {
+            Some(rank) => format!("s({}, k = {rank})", self.column),
+            None => format!("s({})", self.column),
+        }
+    }
+
+    pub(crate) fn coefficient(&self) -> String {
+        format!("s{}_1", crate::emit::coefficient_name(&self.column))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -79,6 +100,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let terms = expand(&expr, &parser.atoms, &mut intercept, true)?;
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
+    let mut smooths = Vec::new();
     // R records offset calls separately from coefficient terms, including
     // calls appearing after subtraction. Negation belongs inside offset().
     let offsets = parser
@@ -94,6 +116,18 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             Atom::Groups(terms) => groups.extend(terms.iter().cloned()),
             Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
             Atom::Offset(_) => {}
+            Atom::Smooth(smooth) => {
+                if smooths
+                    .iter()
+                    .any(|s: &SmoothTerm| s.column == smooth.column)
+                {
+                    return Err(Error(format!(
+                        "repeated smooths of `{}` are not supported",
+                        smooth.column
+                    )));
+                }
+                smooths.push(smooth.clone());
+            }
         }
     }
     let (variables, fixed, expressions) = fixed_terms(fixed, &parser.atoms);
@@ -119,6 +153,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         variables,
         fixed,
         groups,
+        smooths,
         expressions,
         offsets,
     })
@@ -139,7 +174,7 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     let variable = |id| match &atoms[id] {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
-        Atom::Groups(_) | Atom::Offset(_) => unreachable!(),
+        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
@@ -282,6 +317,8 @@ enum Token<'a> {
     Operator(Op),
     Left,
     Right,
+    Comma,
+    Equals,
     Bar(bool),
     End,
 }
@@ -304,6 +341,8 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>> {
             b'^' => Token::Operator(Op::Power),
             b'(' => Token::Left,
             b')' => Token::Right,
+            b',' => Token::Comma,
+            b'=' => Token::Equals,
             b'|' => {
                 let independent = bytes.get(at) == Some(&b'|');
                 at += usize::from(independent);
@@ -356,6 +395,7 @@ enum Atom {
     Expression(ColumnExpression),
     Offset(ColumnExpression),
     Groups(Vec<GroupTerm>),
+    Smooth(SmoothTerm),
 }
 
 struct Expr {
@@ -408,6 +448,44 @@ impl<'a> Parser<'a> {
         Expr::new(ExprKind::Atom(id))
     }
 
+    fn smooth(&mut self) -> Result<Expr> {
+        let fail = || {
+            Error("smooths support `s(column)` and `s(column, k=integer)` with the default thin-plate basis".into())
+        };
+        self.at += 1;
+        let Token::Name(column) = self.peek() else {
+            return Err(fail());
+        };
+        let column = name(column)?;
+        self.at += 1;
+        let rank = if self.peek() == Token::Comma {
+            self.at += 1;
+            if self.peek() != Token::Name("k") {
+                return Err(fail());
+            }
+            self.at += 1;
+            if self.peek() != Token::Equals {
+                return Err(fail());
+            }
+            self.at += 1;
+            let Token::Number(rank) = self.peek() else {
+                return Err(fail());
+            };
+            if !(3.0..=2000.0).contains(&rank) || rank.fract() != 0.0 {
+                return Err(fail());
+            }
+            self.at += 1;
+            Some(rank as usize)
+        } else {
+            None
+        };
+        if self.peek() != Token::Right {
+            return Err(fail());
+        }
+        self.at += 1;
+        self.atom(Atom::Smooth(SmoothTerm { column, rank }))
+    }
+
     fn expression(&mut self, min_precedence: u8, depth: usize) -> Result<Expr> {
         if depth >= MAX_DEPTH {
             return Err(Error(format!("formula exceeds nesting limit {MAX_DEPTH}")));
@@ -416,7 +494,9 @@ impl<'a> Parser<'a> {
         self.at += 1;
         let mut left = match token {
             Token::Name(text) => {
-                if self.peek() == Token::Left {
+                if self.peek() == Token::Left && text == "s" {
+                    self.smooth()?
+                } else if self.peek() == Token::Left {
                     if !matches!(text, "I" | "log" | "offset") {
                         return Err(Error(format!(
                             "formula call `{text}(...)` is not supported"
@@ -601,13 +681,14 @@ fn expand(expr: &Expr, atoms: &[Atom], intercept: &mut bool, positive: bool) -> 
 }
 
 fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
-    if terms
-        .iter()
-        .flatten()
-        .any(|&id| matches!(atoms[id], Atom::Groups(_) | Atom::Offset(_)))
-    {
+    if terms.iter().flatten().any(|&id| {
+        matches!(
+            atoms[id],
+            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
+        )
+    }) {
         return Err(Error(
-            "group terms and offsets may only be added or removed".into(),
+            "group terms, offsets and smooths may only be added or removed".into(),
         ));
     }
     Ok(())
@@ -634,9 +715,16 @@ fn grouping_columns(expr: &Expr, atoms: &[Atom], order: &mut Vec<usize>) -> Resu
 
 fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
     match &expr.kind {
-        ExprKind::Atom(id) if matches!(atoms[*id], Atom::Groups(_) | Atom::Offset(_)) => Err(
-            Error("group effects cannot contain nested group terms or offsets".into()),
-        ),
+        ExprKind::Atom(id)
+            if matches!(
+                atoms[*id],
+                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
+            ) =>
+        {
+            Err(Error(
+                "group effects cannot contain nested group terms, offsets or smooths".into(),
+            ))
+        }
         ExprKind::Parentheses(child) | ExprKind::Unary(_, child) => {
             group_effect_terms(child, atoms)
         }
@@ -710,6 +798,11 @@ impl Formula {
         }
         for expression in &self.offsets {
             expression.columns(&mut names);
+        }
+        for smooth in &self.smooths {
+            if !names.contains(&smooth.column.as_str()) {
+                names.push(&smooth.column);
+            }
         }
         names
     }

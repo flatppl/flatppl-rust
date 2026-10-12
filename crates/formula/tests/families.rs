@@ -91,7 +91,7 @@ fn link_scaled_default_priors_match_brms() {
         )
         .unwrap();
         let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-        let priors = &converted.recipe.priors;
+        let priors = &converted.recipe.predictors["mu"].priors;
         assert_eq!(
             priors.intercept_location,
             case["intercept_location"].as_f64().unwrap()
@@ -119,14 +119,17 @@ fn bernoulli_response_levels_survive_new_data_and_recipe_roundtrip() {
     }).to_string()).unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert_eq!(converted.recipe.family, Family::Bernoulli);
-    assert_eq!(converted.recipe.link, Link::Logit);
+    assert_eq!(converted.recipe.predictors["mu"].link, Link::Logit);
     assert_eq!(converted.data.rows, [0, 1, 2]);
     assert_eq!(
         converted.data.constants["y_data"],
         DataValue::Integers(vec![1, 0, 1])
     );
-    assert_eq!(converted.recipe.priors.intercept_location, 0.0);
-    assert_eq!(converted.recipe.priors.scale, 2.5);
+    assert_eq!(
+        converted.recipe.predictors["mu"].priors.intercept_location,
+        0.0
+    );
+    assert_eq!(converted.recipe.predictors["mu"].priors.scale, 2.5);
     let saved = serde_json::to_string(&converted.recipe).unwrap();
     let recipe = serde_json::from_str(&saved).unwrap();
     let mut table = spec.data.unwrap();
@@ -201,7 +204,7 @@ fn binomial_trials_follow_selected_rows_and_remain_prediction_inputs() {
         invalid.columns[1].values = ColumnValues::Real64(vec![5.0, 1.0, 0.0, 9.0]);
         assert!(build(&spec, &invalid).is_err());
         assert_eq!(
-            converted.recipe.formula.trials,
+            converted.recipe.predictors["mu"].formula.trials,
             Some(Trials::Column("n".into()))
         );
         assert_eq!(converted.data.rows, [0, 1, 2]);
@@ -229,7 +232,10 @@ fn binomial_trials_follow_selected_rows_and_remain_prediction_inputs() {
         ]}))
         .unwrap();
         let converted = build(&spec, &table).unwrap();
-        assert_eq!(converted.recipe.formula.trials, Some(Trials::Constant(10)));
+        assert_eq!(
+            converted.recipe.predictors["mu"].formula.trials,
+            Some(Trials::Constant(10))
+        );
         assert_eq!(
             converted.data.constants["y_data"],
             DataValue::Integers(vec![0, 3, 10])

@@ -2,7 +2,8 @@
 use crate::{Error, PriorBound, ResolvedPrior, Result};
 use flatppl_convert::Builder;
 use flatppl_core::{
-    Call, CallHead, Idx, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
+    Call, CallHead, Idx, Inputs, Mass, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
+    ScalarType, Type,
 };
 
 pub(crate) enum PriorNode {
@@ -274,11 +275,31 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
         if matches!(call.head, CallHead::Builtin(s) if b.m.resolve(s) == "normalize")
             && call.args.len() == 1
             && let Node::Call(inner) = b.m.node(call.args[0]).clone()
-            && matches!(inner.head, CallHead::Builtin(s) if b.m.resolve(s) == "truncate")
             && inner.args.len() == 2
         {
-            let support = intersect(b, inner.args[1], support)?;
-            return restrict(b, inner.args[0], support);
+            if matches!(inner.head, CallHead::Builtin(s) if b.m.resolve(s) == "truncate") {
+                let support = intersect(b, inner.args[1], support)?;
+                return restrict(b, inner.args[0], support);
+            }
+            if matches!(inner.head, CallHead::Builtin(s) if b.m.resolve(s) == "weighted") {
+                let (types, _) = flatppl_infer::infer_expression(b.m, call.args[0], &[]);
+                if matches!(
+                    types.get(&inner.args[0]),
+                    Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
+                ) && matches!(
+                    types.get(&inner.args[1]),
+                    Some(Type::Measure {
+                        mass: Mass::Normalized,
+                        ..
+                    })
+                ) {
+                    // Keep the scalar validity guard outside the restricted
+                    // probability law; otherwise its primitive CDF is hidden.
+                    let base = restrict(b, inner.args[1], support)?;
+                    let weighted = b.call("weighted", &[inner.args[0], base]);
+                    return Ok(b.call("normalize", &[weighted]));
+                }
+            }
         }
     }
     let restricted = b.call("truncate", &[measure, support]);
@@ -449,16 +470,16 @@ fn alias(
     }
     Ok(Some(match name {
         "student_t" => {
-            let scale = positive_scale(b, args[2], name)?;
+            validate_scale(b.m, args[2], name)?;
             let standard = b.call(target, &args[..1]);
-            b.call("locscale", &[standard, args[1], scale])
+            positive_locscale(b, standard, args[1], args[2])
         }
         "cauchy" => {
-            let scale = positive_scale(b, args[1], name)?;
+            validate_scale(b.m, args[1], name)?;
             let zero = b.lit_real(0.0);
             let one = b.lit_real(1.0);
             let standard = b.call(target, &[zero, one]);
-            b.call("locscale", &[standard, args[0], scale])
+            positive_locscale(b, standard, args[0], args[1])
         }
         "uniform" => {
             let interval = b.call("interval", args);
@@ -474,25 +495,38 @@ fn alias(
     }))
 }
 
-fn positive_scale(b: &mut Builder<'_>, scale: NodeId, name: &str) -> Result<NodeId> {
-    if let Some(value) = scalar(b.m, scale) {
-        return if value.is_finite() && value > 0.0 {
-            Ok(scale)
-        } else {
-            Err(Error(format!(
-                "brms prior `{name}` requires a positive finite scale"
-            )))
-        };
+fn validate_scale(module: &Module, scale: NodeId, name: &str) -> Result<()> {
+    if let Some(value) = scalar(module, scale)
+        && (!value.is_finite() || value <= 0.0)
+    {
+        return Err(Error(format!(
+            "brms prior `{name}` requires a positive finite scale"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn positive_locscale(
+    b: &mut Builder<'_>,
+    base: NodeId,
+    location: NodeId,
+    scale: NodeId,
+) -> NodeId {
+    if scalar(b.m, scale).is_some_and(|value| value.is_finite() && value > 0.0) {
+        return b.call("locscale", &[base, location, scale]);
     }
     // General locscale allows reflections; Stan's scale parameter does not.
-    // Invalid live parameters are undefined, never a reflected proper law.
+    // An invalid scale produces zero mass, whose normalization is undefined.
     let zero = b.lit_real(0.0);
+    let one = b.lit_real(1.0);
     let positive = b.call("gt", &[scale, zero]);
     let finite = b.call("isfinite", &[scale]);
     let valid = b.call("land", &[positive, finite]);
-    let negative = b.lit_real(-1.0);
-    let undefined = b.call("log", &[negative]);
-    Ok(b.call("ifelse", &[valid, scale, undefined]))
+    let safe_scale = b.call("ifelse", &[valid, scale, one]);
+    let law = b.call("locscale", &[base, location, safe_scale]);
+    let weight = b.call("ifelse", &[valid, one, zero]);
+    let weighted = b.call("weighted", &[weight, law]);
+    b.call("normalize", &[weighted])
 }
 
 fn limits(b: &mut Builder<'_>, support: NodeId) -> Result<(NodeId, NodeId, bool)> {

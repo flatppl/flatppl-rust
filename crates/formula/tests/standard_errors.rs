@@ -14,7 +14,7 @@ fn known_scale_expressions_survive_recipe_and_response_free_prediction() {
     spec.data.as_mut().unwrap().columns[2].values = ColumnValues::Real32(vec![2.0, -1.0, 4.0]);
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert_eq!(converted.data.rows, [0, 2]);
-    assert_eq!(converted.recipe.means, [1.5]);
+    assert_eq!(converted.recipe.predictors["mu"].means, [1.5]);
     assert_eq!(
         converted.data.constants["se_data"],
         DataValue::Real32(vec![2.0f32.ln(), 4.0f32.ln()])
@@ -76,7 +76,10 @@ fn residual_scale_flag_controls_coordinates_priors_and_zero_known_scale() {
     assert_eq!(coordinates(&converted), ["Intercept", "b_x", "sigma"]);
     spec.formula = "y | se(s, TRUE) ~ x".into();
     let positional = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-    assert_eq!(positional.recipe.formula, converted.recipe.formula);
+    assert_eq!(
+        positional.recipe.predictors["mu"].formula,
+        converted.recipe.predictors["mu"].formula
+    );
     spec.priors.retain(|prior| prior.class != "sigma");
     spec.formula = "y | se(s, FALSE) ~ x".into();
     assert!(build(&spec, spec.data.as_ref().unwrap()).is_err());

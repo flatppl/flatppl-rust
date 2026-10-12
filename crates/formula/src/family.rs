@@ -29,6 +29,7 @@ pub enum Family {
     #[serde(rename = "von_mises")]
     VonMises,
     Cumulative,
+    Categorical,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -48,6 +49,15 @@ pub enum Link {
     Cauchit,
     Softit,
     TanHalf,
+    Logm1,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Observation<'a> {
+    pub mu: NodeId,
+    pub trials: Option<NodeId>,
+    pub scale: Option<NodeId>,
+    pub auxiliary: &'a [(&'a str, NodeId)],
 }
 
 impl Family {
@@ -70,6 +80,7 @@ impl Family {
             "beta" => Self::Beta,
             "von_mises" => Self::VonMises,
             "cumulative" => Self::Cumulative,
+            "categorical" => Self::Categorical,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
@@ -78,7 +89,8 @@ impl Family {
             | Self::Binomial
             | Self::ZeroInflatedBinomial
             | Self::Beta
-            | Self::Cumulative => Link::Logit,
+            | Self::Cumulative
+            | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
@@ -91,7 +103,7 @@ impl Family {
             .unwrap_or(default);
         use Link::*;
         let supported = match family {
-            Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf),
+            Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
             Self::Lognormal => matches!(link, Identity | Inverse),
             Self::Bernoulli | Self::Binomial | Self::ZeroInflatedBinomial | Self::Beta => {
                 matches!(
@@ -110,7 +122,7 @@ impl Family {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
-            Self::Cumulative => link == Logit,
+            Self::Cumulative | Self::Categorical => link == Logit,
         };
         if !supported {
             return Err(Error(format!(
@@ -133,6 +145,7 @@ impl Family {
                 | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
+                | Self::Categorical
         )
     }
 
@@ -150,6 +163,48 @@ impl Family {
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
             _ => &[],
+        }
+    }
+
+    pub(crate) fn auxiliary_link(self, name: &str, link: Option<&str>) -> Result<Link> {
+        if !self.auxiliaries().contains(&name) {
+            return Err(Error(format!(
+                "family has no distributional parameter `{name}`"
+            )));
+        }
+        let default = match name {
+            "nu" => Link::Logm1,
+            "zi" => Link::Logit,
+            _ => Link::Log,
+        };
+        let link = link
+            .map(|name| {
+                serde_json::from_value(serde_json::Value::String(name.into()))
+                    .map_err(|_| Error(format!("unsupported link `{name}`")))
+            })
+            .transpose()?
+            .unwrap_or(default);
+        let supported = link == Link::Identity
+            || link == default
+            || (default == Link::Log && matches!(link, Link::Softplus | Link::Squareplus));
+        if !supported {
+            return Err(Error(format!(
+                "link `{}` is not supported by parameter `{name}`",
+                link.name()
+            )));
+        }
+        Ok(link)
+    }
+
+    pub(crate) fn default_predictor_prior(self, name: &str, link: Link, scale: f64) -> String {
+        if name == "sigma" || link == Link::Identity {
+            return self.default_auxiliary(name, scale);
+        }
+        match name {
+            "nu" => "normal(2.7, 0.8)".into(),
+            "kappa" => "normal(5.0, 0.8)".into(),
+            "zi" => "logistic(0, 1)".into(),
+            _ => "student_t(3, 0, 2.5)".into(),
         }
     }
 
@@ -178,24 +233,41 @@ impl Family {
     pub(crate) fn observation(
         self,
         b: &mut Builder<'_>,
-        mu: NodeId,
-        trials: Option<NodeId>,
-        scale: Option<NodeId>,
+        observation: Observation<'_>,
         thresholds: usize,
         scalar: bool,
     ) -> NodeId {
-        if matches!(
-            self,
-            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial | Self::ZeroInflatedBinomial
-        ) && !scalar
+        let Observation {
+            mu,
+            trials,
+            scale,
+            auxiliary,
+        } = observation;
+        if (!auxiliary.is_empty()
+            || matches!(
+                self,
+                Self::Student
+                    | Self::ZeroInflatedPoisson
+                    | Self::ZeroInflatedNegbinomial
+                    | Self::ZeroInflatedBinomial
+            ))
+            && !scalar
         {
             let local = Ref {
                 ns: RefNs::Local,
                 name: b.sym("_mu_"),
             };
-            let mean = b.m.alloc(Node::Ref(local));
-            let mut inputs = vec![(b.sym("mu"), local)];
-            let mut args = vec![mu];
+            let mean = if self == Self::Categorical {
+                mu
+            } else {
+                b.m.alloc(Node::Ref(local))
+            };
+            let mut inputs = Vec::new();
+            let mut args = Vec::new();
+            if self != Self::Categorical {
+                inputs.push((b.sym("mu"), local));
+                args.push(mu);
+            }
             let trials = trials.map(|value| {
                 let local = Ref {
                     ns: RefNs::Local,
@@ -205,7 +277,31 @@ impl Family {
                 args.push(value);
                 b.m.alloc(Node::Ref(local))
             });
-            let law = self.observation(b, mean, trials, scale, thresholds, true);
+            let mut argument = |b: &mut Builder<'_>, name: &str, value| {
+                let local = Ref {
+                    ns: RefNs::Local,
+                    name: b.sym(&format!("_{name}_")),
+                };
+                inputs.push((b.sym(name), local));
+                args.push(value);
+                b.m.alloc(Node::Ref(local))
+            };
+            let scale = scale.map(|value| argument(b, "scale", value));
+            let auxiliary: Vec<_> = auxiliary
+                .iter()
+                .map(|&(name, value)| (name, argument(b, name, value)))
+                .collect();
+            let law = self.observation(
+                b,
+                Observation {
+                    mu: mean,
+                    trials,
+                    scale,
+                    auxiliary: &auxiliary,
+                },
+                thresholds,
+                true,
+            );
             let head = b.sym("functionof");
             let kernel = b.m.alloc(Node::Call(Call {
                 head: CallHead::Builtin(head),
@@ -226,9 +322,15 @@ impl Family {
                 broadcast(b, name, args)
             }
         };
+        let auxiliary = |b: &mut Builder<'_>, name: &str| {
+            auxiliary
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map_or_else(|| b.self_ref(name), |(_, value)| *value)
+        };
         match self {
             Self::Gaussian | Self::Lognormal => {
-                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+                let sigma = scale.unwrap_or_else(|| auxiliary(b, "sigma"));
                 let law = if self == Self::Lognormal {
                     "LogNormal"
                 } else {
@@ -237,10 +339,10 @@ impl Family {
                 apply(b, law, &[mu, sigma])
             }
             Self::Student => {
-                let nu = b.self_ref("nu");
+                let nu = auxiliary(b, "nu");
                 let standard = b.call("StudentT", &[nu]);
-                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
-                apply(b, "locscale", &[standard, mu, sigma])
+                let sigma = scale.unwrap_or_else(|| auxiliary(b, "sigma"));
+                crate::prior_expr::positive_locscale(b, standard, mu, sigma)
             }
             Self::Bernoulli => apply(b, "Bernoulli", &[mu]),
             Self::Binomial => {
@@ -256,8 +358,8 @@ impl Family {
                     Self::ZeroInflatedNegbinomial => Self::Negbinomial,
                     _ => Self::Binomial,
                 };
-                let base = base.observation(b, mu, trials, scale, thresholds, true);
-                let zi = b.self_ref("zi");
+                let base = base.observation(b, observation, thresholds, true);
+                let zi = auxiliary(b, "zi");
                 let zero = b.lit_int(0);
                 let atom = b.call("Dirac", &[zero]);
                 let atom = b.call("weighted", &[zi, atom]);
@@ -271,7 +373,7 @@ impl Family {
                 let shape = if self == Self::Geometric {
                     b.lit_real(1.0)
                 } else {
-                    b.self_ref("shape")
+                    auxiliary(b, "shape")
                 };
                 let rate = apply(b, "divide", &[shape, mu]);
                 let law = if self == Self::Gamma {
@@ -287,7 +389,7 @@ impl Family {
                 apply(b, "Exponential", &[rate])
             }
             Self::Weibull => {
-                let shape = b.self_ref("shape");
+                let shape = auxiliary(b, "shape");
                 let one = b.lit_real(1.0);
                 let inverse = b.call("divide", &[one, shape]);
                 let argument = b.call("add", &[one, inverse]);
@@ -296,7 +398,7 @@ impl Family {
                 apply(b, "Weibull", &[shape, scale])
             }
             Self::Beta => {
-                let phi = b.self_ref("phi");
+                let phi = auxiliary(b, "phi");
                 let alpha = apply(b, "mul", &[mu, phi]);
                 let one = b.lit_real(1.0);
                 let complement = apply(b, "sub", &[one, mu]);
@@ -304,10 +406,17 @@ impl Family {
                 apply(b, "Beta", &[alpha, beta])
             }
             Self::VonMises => {
-                let kappa = b.self_ref("kappa");
+                let kappa = auxiliary(b, "kappa");
                 apply(b, "VonMises", &[mu, kappa])
             }
             Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
+            Self::Categorical => {
+                let mut logits = vec![b.lit_real(0.0)];
+                logits.extend(observation.auxiliary.iter().map(|(_, value)| *value));
+                let logits = b.array(&logits);
+                let probabilities = b.call("softmax", &[logits]);
+                b.call("Categorical", &[probabilities])
+            }
         }
     }
 }
@@ -328,6 +437,7 @@ impl Link {
             Self::Cauchit => "cauchit",
             Self::Softit => "softit",
             Self::TanHalf => "tan_half",
+            Self::Logm1 => "logm1",
         }
     }
 
@@ -342,6 +452,11 @@ impl Link {
         match self {
             Self::Identity => eta,
             Self::Log => broadcast(b, "exp", &[eta]),
+            Self::Logm1 => {
+                let exponential = broadcast(b, "exp", &[eta]);
+                let one = b.lit_real(1.0);
+                broadcast(b, "add", &[one, exponential])
+            }
             Self::Logit => broadcast(b, "invlogit", &[eta]),
             Self::Probit => broadcast(b, "invprobit", &[eta]),
             Self::Inverse => {

@@ -9,7 +9,7 @@ fn ordinal_training_and_prediction_preserve_order_and_centering() {
         converted.data.constants["y_data"],
         DataValue::Integers(vec![2, 1, 3, 2])
     );
-    assert_eq!(converted.recipe.means, [3.0]);
+    assert_eq!(converted.recipe.predictors["mu"].means, [3.0]);
     assert_eq!(converted.info.score_offset, 2.0_f64.ln());
     let threshold = converted
         .info
@@ -38,7 +38,7 @@ fn ordinal_training_and_prediction_preserve_order_and_centering() {
             .constants["x_1"],
         DataValue::Real64(vec![7.0, 8.0, 9.0, 10.0])
     );
-    assert_eq!(converted.recipe.means, [3.0]);
+    assert_eq!(converted.recipe.predictors["mu"].means, [3.0]);
 }
 
 #[test]

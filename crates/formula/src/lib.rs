@@ -1,11 +1,12 @@
 //! Pure Rust conversion of a bounded brms formula subset into FlatPPL.
 //!
 //! Scalar response families, numeric and factor predictors, interactions,
-//! numeric expressions, offsets and group effects are supported.
+//! numeric expressions, offsets, group effects and thin-plate smooths are supported.
 //! It does not fit a model.
 
 #[cfg(feature = "arrow")]
 mod arrow;
+mod categorical;
 mod contrasts;
 mod data;
 mod design;
@@ -16,18 +17,20 @@ mod formula;
 mod ordinal;
 mod prior_expr;
 mod priors;
+mod splines;
 mod text;
 
 use flatppl_core::Module;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, prepare_data};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
-pub use formula::{Formula, GroupTerm, StandardError, Term, Trials, parse_formula};
+pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
+pub use splines::{Smooth, ThinPlate};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -56,12 +59,23 @@ pub struct Spec {
     pub family: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dpars: BTreeMap<String, DistributionalFormula>,
     #[serde(default)]
     pub priors: Vec<Prior>,
     #[serde(default)]
     pub options: Options,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Table>,
+}
+
+/// A predictor for a family parameter, for example `sigma ~ g`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistributionalFormula {
+    pub formula: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 fn gaussian() -> String {
@@ -141,20 +155,40 @@ impl Conversion {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recipe {
     pub formula: Formula,
-    #[serde(default)]
     pub family: Family,
-    #[serde(default)]
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_levels: Option<Vec<GroupLevel>>,
+    /// Predictor names in nonreference response-category order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_predictors: Vec<String>,
+    pub predictors: BTreeMap<String, PredictorRecipe>,
+    pub auxiliary_priors: BTreeMap<String, ResolvedPrior>,
+}
+
+/// Fitted coding, centring and priors for one distributional predictor.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictorRecipe {
+    pub formula: Formula,
+    #[serde(default)]
+    pub link: Link,
     pub design: Design,
     pub center: bool,
     pub means: Vec<f64>,
     pub groups: Vec<Group>,
+    #[serde(default)]
+    pub smooths: Vec<Smooth>,
     pub priors: Priors,
 }
 
 impl Recipe {
+    pub(crate) fn predictors(&self) -> impl Iterator<Item = (&str, &PredictorRecipe)> {
+        std::iter::once("mu")
+            .chain(self.family.auxiliaries().iter().copied())
+            .chain(self.category_predictors.iter().map(String::as_str))
+            .filter_map(|name| self.predictors.get(name).map(|predictor| (name, predictor)))
+    }
+
     pub(crate) fn thresholds(&self) -> usize {
         if self.family == Family::Cumulative {
             self.response_levels.as_ref().unwrap().len() - 1
@@ -215,11 +249,20 @@ pub struct ModelInfo {
     pub group_collation: String,
     pub default_prior_rule: String,
     pub design_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dpars: BTreeMap<String, PredictorInfo>,
     pub parameters: Vec<Parameter>,
     pub has_improper_prior: bool,
     pub training_rows: Vec<usize>,
     /// Additive difference from the target using normalized Stan density functions.
     pub score_offset: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PredictorInfo {
+    pub formula: String,
+    pub link: String,
+    pub design_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -260,30 +303,111 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 .into(),
         ));
     }
-    if formula
-        .predictor_columns()
-        .contains(&formula.response.as_str())
-    {
+    let initial_levels = if family == Family::Categorical {
+        let mut response_only = formula.clone();
+        response_only.weights = None;
+        let rows = data::model_rows(&response_only, &[], table, DataMode::Training)?;
+        data::response_levels(family, table.column(&formula.response)?, &rows)?
+    } else {
+        None
+    };
+    let category_predictors = initial_levels
+        .as_deref()
+        .map(categorical::predictor_names)
+        .transpose()?
+        .unwrap_or_default();
+    let mut formulas = if family == Family::Categorical {
+        category_predictors
+            .iter()
+            .map(|name| (name.as_str(), formula.clone(), link))
+            .collect()
+    } else {
+        vec![("mu", formula.clone(), link)]
+    };
+    for (name, spec) in &spec.dpars {
+        let formula = parse_formula(&spec.formula)?;
+        if formula.response != *name
+            || formula.trials.is_some()
+            || formula.weights.is_some()
+            || formula.se.is_some()
+        {
+            return Err(Error(format!(
+                "distributional formula must be `{name} ~ terms` without response additions"
+            )));
+        }
+        if family == Family::Categorical {
+            let predictor = formulas
+                .iter_mut()
+                .find(|(dpar, _, _)| *dpar == name)
+                .ok_or_else(|| {
+                    Error(format!(
+                        "categorical predictor `{name}` is not one of {}",
+                        category_predictors.join(", ")
+                    ))
+                })?;
+            let (_, link) = Family::resolve("categorical", spec.link.as_deref())?;
+            *predictor = (name, formula, link);
+        } else {
+            let link = family.auxiliary_link(name, spec.link.as_deref())?;
+            formulas.push((name, formula, link));
+        }
+    }
+    if spec.dpars.contains_key("sigma") && formula.se.as_ref().is_some_and(|se| !se.sigma) {
         return Err(Error(
-            "the response cannot also be a predictor in this subset".into(),
+            "sigma cannot be predicted with se(sigma=FALSE)".into(),
         ));
     }
-    if formula.intercept && !spec.options.center {
-        return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
-    }
-    let rows = data::model_rows(&formula, table, DataMode::Training)?;
-    for name in spec.options.contrasts.keys() {
-        if !formula.variables.contains(name)
-            && !formula.groups.iter().any(|g| g.variables.contains(name))
+    for prior in &spec.priors {
+        let dpar = priors::dpar(prior.dpar.as_deref());
+        let correlation = matches!(prior.class.as_str(), "cor" | "L");
+        if family == Family::Categorical && dpar.is_none() && !correlation {
+            return Err(Error(
+                "categorical priors must select a category predictor with `dpar`".into(),
+            ));
+        }
+        if family == Family::Categorical && dpar.is_some() && correlation {
+            return Err(Error(
+                "categorical correlation priors select `group`, without `dpar`".into(),
+            ));
+        }
+        if let Some(name) = dpar
+            && !formulas.iter().any(|(dpar, _, _)| *dpar == name)
         {
+            return Err(Error(format!(
+                "prior selects unpredicted distributional parameter `{name}`"
+            )));
+        }
+    }
+    for (_, predictor, _) in &formulas {
+        if predictor
+            .predictor_columns()
+            .contains(&formula.response.as_str())
+        {
+            return Err(Error(
+                "the response cannot also be a predictor in this subset".into(),
+            ));
+        }
+        if predictor.intercept && !spec.options.center {
+            return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
+        }
+    }
+    let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
+    let rows = data::model_rows(&formula, &predictor_formulas, table, DataMode::Training)?;
+    for name in spec.options.contrasts.keys() {
+        if !formulas.iter().any(|(_, formula, _)| {
+            formula.variables.contains(name)
+                || formula.groups.iter().any(|g| g.variables.contains(name))
+        }) {
             return Err(Error(format!(
                 "contrast supplied for unused predictor `{name}`"
             )));
         }
     }
-    let (design, means) = design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
     let response_column = table.column(&formula.response)?;
     let response_levels = data::response_levels(family, response_column, &rows)?;
+    if family == Family::Categorical && initial_levels != response_levels {
+        return Err(Error("missing-row omission removed an entire categorical response level; filter rows and refit the formula explicitly".into()));
+    }
     let thresholds = if family == Family::Cumulative {
         response_levels.as_ref().unwrap().len() - 1
     } else {
@@ -295,78 +419,121 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     } else {
         Some(response_column.numeric(&rows)?)
     };
-    let offset_mean = formula
-        .offset()
-        .map(|offset| offset.values(table, &rows))
-        .transpose()?
-        .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
-    let groups = formula
-        .groups
-        .iter()
-        .map(|term| {
-            let (design, _) = design::build(term.into(), table, &rows, &spec.options.contrasts)?;
-            let coefficients: Vec<_> = term
-                .intercept
-                .then_some("Intercept".into())
-                .into_iter()
-                .chain(
-                    design
-                        .columns
-                        .iter()
-                        .map(|column| emit::coefficient_name(&column.name)),
-                )
-                .collect();
-            if coefficients.is_empty() {
-                return Err(Error(format!(
-                    "group `{}` has no group effects",
-                    term.name()
-                )));
-            }
-            Ok(Group {
-                column: term.name(),
-                levels: data::group_levels(&term.columns, table, &rows)?,
-                design,
-                coefficients,
-                inputs: Vec::new(),
-                correlation: None,
-                correlation_matrix: None,
-                sd: String::new(),
-                z: String::new(),
-                r: String::new(),
-                index: String::new(),
+    let (_, group_scale) =
+        family::default_scale(family.prior_scale_link(link), response.as_deref());
+    let response_formula = formula;
+    let mut predictors = BTreeMap::new();
+    let mut auxiliary_priors = BTreeMap::new();
+    for (name, formula, link) in formulas {
+        let (design, means) =
+            design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
+        let smooths = formula
+            .smooths
+            .iter()
+            .map(|term| {
+                Ok(Smooth {
+                    basis: ThinPlate::fit(&table.column(&term.column)?.numeric(&rows)?, term.rank)?,
+                    inputs: Vec::new(),
+                    sds: String::new(),
+                    z: String::new(),
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut group_coefficients = std::collections::HashSet::new();
-    for group in &groups {
-        for coefficient in &group.coefficients {
-            if !group_coefficients.insert((&group.column, coefficient)) {
-                return Err(Error(format!(
-                    "duplicated group effect `{coefficient}` for `{}`",
-                    group.column
-                )));
+            .collect::<Result<Vec<_>>>()?;
+        let offset_mean = formula
+            .offset()
+            .map(|offset| offset.values(table, &rows))
+            .transpose()?
+            .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
+        let groups = formula
+            .groups
+            .iter()
+            .map(|term| {
+                let (design, _) =
+                    design::build(term.into(), table, &rows, &spec.options.contrasts)?;
+                let coefficients: Vec<_> = term
+                    .intercept
+                    .then_some("Intercept".into())
+                    .into_iter()
+                    .chain(
+                        design
+                            .columns
+                            .iter()
+                            .map(|column| emit::coefficient_name(&column.name)),
+                    )
+                    .collect();
+                if coefficients.is_empty() {
+                    return Err(Error(format!(
+                        "group `{}` has no group effects",
+                        term.name()
+                    )));
+                }
+                Ok(Group {
+                    column: term.name(),
+                    levels: data::group_levels(&term.columns, table, &rows)?,
+                    design,
+                    coefficients,
+                    inputs: Vec::new(),
+                    correlation: None,
+                    correlation_matrix: None,
+                    sd: String::new(),
+                    z: String::new(),
+                    r: String::new(),
+                    index: String::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut group_coefficients = std::collections::HashSet::new();
+        for group in &groups {
+            for coefficient in &group.coefficients {
+                if !group_coefficients.insert((&group.column, coefficient)) {
+                    return Err(Error(format!(
+                        "duplicated group effect `{coefficient}` for `{}`",
+                        group.column
+                    )));
+                }
             }
         }
+        let (priors, aux) = priors::resolve(
+            spec,
+            &formula,
+            &design,
+            &groups,
+            priors::PriorContext {
+                family,
+                link,
+                thresholds: if name == "mu" { thresholds } else { 0 },
+                dpar: (name != "mu").then_some(name),
+                response: response.as_deref(),
+                offset_mean,
+                group_scale,
+            },
+        )?;
+        auxiliary_priors.extend(aux);
+        predictors.insert(
+            name.to_owned(),
+            PredictorRecipe {
+                center: spec.options.center && formula.intercept,
+                formula,
+                link,
+                design,
+                means,
+                groups,
+                smooths,
+                priors,
+            },
+        );
     }
-    let priors = priors::resolve(
-        spec,
-        &formula,
-        &design,
-        &groups,
-        (family, link, thresholds),
-        response.as_deref(),
-        offset_mean,
-    )?;
+    if family == Family::Categorical {
+        priors::categorical_correlations(&spec.priors, &mut predictors)?;
+    }
     let mut recipe = Recipe {
-        center: spec.options.center && formula.intercept,
-        formula,
+        formula: response_formula,
         family,
         link,
         response_levels,
-        design,
-        means,
-        groups,
-        priors,
+        category_predictors,
+        predictors,
+        auxiliary_priors,
     };
     let module = emit::model(spec, &mut recipe)?;
     let data = prepare_data(&recipe, table, DataMode::Training)?;

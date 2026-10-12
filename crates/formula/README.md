@@ -15,8 +15,55 @@ Group terms support random slopes, nested groups and independent `||` effects.
 The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
 
+Additive `s(x)` and `s(x, k=6)` terms use the one-dimensional mgcv/brms
+thin-plate basis. `x` must name a numeric column. The default rank is 10;
+the requested rank must be at least 3 and no greater than the number of
+distinct retained training values. This first implementation supports at most
+2,000 distinct values; mgcv's larger-data knot subsampling is not implemented.
+`by` smooths, tensor products, other bases, custom knots and smooth interactions
+are not yet supported.
+
+Each smooth is centred over the retained training rows. Its unpenalized slope
+uses class `b` (coefficient `sx_1` for `s(x)`); its scale uses class `sds`,
+optionally selected by the canonical term, such as `"s(x, k = 6)"`.
+The defaults are a Flat slope and half-Student-t scale. Penalized coefficients
+are independent standard Normals. The fitted recipe stores the basis and
+penalty transform, so prediction needs only predictor columns and never refits
+or recentres the smooth. This also applies within distributional formulas.
+Numerical setup runs in Rust; emitted models use ordinary matrix operations.
+
+Distributional formulas use the same terms for a family parameter:
+
+```json
+{
+  "formula": "y ~ x",
+  "family": "gaussian",
+  "dpars": {"sigma": {"formula": "sigma ~ g", "link": "log"}},
+  "priors": [{"class": "b", "dpar": "sigma", "prior": "normal(0, 1)"}]
+}
+```
+
+This is the typed equivalent of `bf(y ~ x, sigma ~ g)`; `bf(...)` strings are
+not yet accepted. Each predictor saves its own contrasts, centring, offsets
+and group effects. Training omits incomplete rows jointly across the response
+and every predictor. Prediction reuses all fitted recipes without a response.
+For scalar families, priors without `dpar` apply to the mean predictor. Set `dpar` for auxiliary
+coefficients, intercepts, group scales or correlations. A direct `sigma` prior
+is unavailable when `sigma` has a predictor; its priors belong to the linear
+predictor before the inverse link.
+
+The same interface supports `sigma`, `nu`, `shape`, `phi`, `kappa` and `zi`
+where present in the family. Positive parameters default to the log link;
+Student `nu` uses `logm1`, whose inverse is `1 + exp(eta)`, and `zi` uses logit.
+Identity is also available; positive parameters other than `nu` additionally
+accept softplus and squareplus. Auxiliary priors follow brms's link-dependent
+defaults. `ModelInfo.dpars` records each formula, link and design columns.
+For example, `temp_Intercept_sigma` is the centred scale intercept and
+`b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
+
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises` or `cumulative`.
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
+`cumulative` or `categorical`.
 `link` is optional:
 
 | Family | Default link | Other links |
@@ -28,6 +75,7 @@ Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `po
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 | von Mises | tan_half | identity |
 | Cumulative ordinal | logit | — |
+| Categorical | logit | — |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
@@ -63,6 +111,36 @@ when they match after alias expansion and exact numeric-literal comparison.
 Different parameterizations of the same law may still be refused, such as
 `cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
 priors and other ordinal links or threshold parameterizations are not supported.
+
+Categorical responses accept factors, logical values or numeric labels. The first
+retained level is the reference category, with logit zero. Every other category
+gets a predictor from the main formula, named `mu` followed by its brms category
+name. For levels `red`, `blue`, `green`, the predictors are `mublue` and `mugreen`:
+
+```json
+{
+  "formula": "y ~ x",
+  "family": "categorical",
+  "dpars": {"mublue": {"formula": "mublue ~ 0 + z"}},
+  "priors": [
+    {"class": "b", "dpar": "mublue", "prior": "normal(0, 1)"},
+    {"class": "b", "dpar": "mugreen", "prior": "normal(0, 1)"}
+  ]
+}
+```
+
+Each category retains its own design, centring, offsets, groups and priors.
+The observation law is `Categorical(softmax([0, eta_blue, eta_green]))` for each
+row. Coefficients default to Flat and category intercepts to Student-t(3, 0, 2.5).
+As in brms, `b`, `Intercept` and `sd` priors require `dpar`. Correlation priors
+use global or group selectors across all categories, without `dpar`.
+The recipe preserves training response levels and their predictor order;
+`ModelInfo.dpars` lists the generated names. Names follow brms with C collation
+and default numeric formatting; nonreference labels must be ASCII and ambiguous
+names are refused.
+An alternative reference category and a missing-row omission that removes an
+entire response level are currently refused. Filter those rows and refit with an
+explicit factor level order. Prediction needs no response or weights.
 
 Response weights use `y | weights(w) ~ ...`, or
 `y | trials(n) + weights(w) ~ ...` for binomial data. `w` names a numeric
@@ -115,7 +193,7 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
+Select priors by `class` (`b`, `Intercept`, `sd`, `sds`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.
@@ -170,9 +248,10 @@ separate; shape and fitted model constants remain in source. The original
 conversion remains external for dataframe binding and prediction. JSON has no
 dtype; float32 columns retain their exact
 stored values when written as JSON numbers.
-The recipe retains family and link, response
-coding, training means, factor contrasts and levels, design terms, and group
-levels. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
+The recipe stores the response formula, family, link and response coding separately
+from its `predictors` map. Each entry (`mu`, `sigma`, and so on) retains its own
+formula, link, training means, factor contrasts and levels, design terms, group
+levels and priors. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
 products. Metadata records the default-prior rule and group collation.
 Prediction requires no response column. It reuses the training contrast matrices
 and remaps factor labels even when new data uses a different level order.
@@ -254,3 +333,21 @@ the category coding, generated Stan, and independent density values.
 normalized brms-generated Stan scores and gradients for Gaussian and Student
 models with both `se()` residual-scale settings; its adjacent R script regenerates
 the models.
+
+[The distributional reproducer](tests/fixtures/distributional-oracle.R) generates
+normalized brms models and independent density/gradient oracles for Gaussian
+mean/scale predictors, Student mean/scale/degrees-of-freedom predictors, and
+group effects on both mean and scale. The adjacent JSON fixtures retain the
+executed Stan comparisons and parameter ordering.
+
+[The spline fixture](tests/fixtures/splines.json) records mgcv 1.9.4 and
+brms 2.23.2 training and prediction bases. Its adjacent R script regenerates
+the values. The native basis preserves the fixed slope's scale and the full
+penalized covariance; independent eigensolvers may rotate the standard Normal
+coefficients without changing the induced smooth or prior.
+
+[The categorical reproducer](tests/fixtures/categorical-oracle.R) checks saved
+response coding, selector rules and numeric category names against brms, and
+generates default and weighted category-specific Stan models. The adjacent JSON
+retains their normalized scores, coefficient gradients and source hashes beside
+independent softmax calculations.

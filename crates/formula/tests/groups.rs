@@ -29,7 +29,7 @@ fn spec(formula: &str) -> Spec {
 // Interpret the public prediction recipe to check its group columns against
 // independently generated brms make_standata fixtures.
 fn columns(recipe: &Recipe, data: &DataDocument, index: usize) -> Vec<Vec<f64>> {
-    let group = &recipe.groups[index];
+    let group = &recipe.predictors["mu"].groups[index];
     let input = |predictor: usize, row: usize| match &data.constants[&group.inputs[predictor]] {
         DataValue::Real32(v) => f64::from(v[row]),
         DataValue::Real64(v) => v[row],
@@ -37,7 +37,7 @@ fn columns(recipe: &Recipe, data: &DataDocument, index: usize) -> Vec<Vec<f64>> 
         DataValue::Integer(_) => panic!("group design inputs are vectors"),
     };
     let mut out = Vec::new();
-    if recipe.formula.groups[index].intercept {
+    if recipe.predictors["mu"].formula.groups[index].intercept {
         out.push(vec![1.0; data.rows.len()]);
     }
     for column in &group.design.columns {
@@ -97,12 +97,12 @@ fn group_designs_and_indices_match_brms() {
             .filter(|key| key.starts_with("J_"))
             .count();
         assert_eq!(
-            converted.recipe.groups.len(),
+            converted.recipe.predictors["mu"].groups.len(),
             expected_groups,
             "{} group blocks",
             case.name
         );
-        for (i, group) in converted.recipe.groups.iter().enumerate() {
+        for (i, group) in converted.recipe.predictors["mu"].groups.iter().enumerate() {
             let id = i + 1;
             assert_eq!(
                 group.levels.len() as u64,
@@ -145,8 +145,7 @@ fn group_designs_and_indices_match_brms() {
 fn group_recipe_preserves_names_coordinates_and_prediction_coding() {
     let converted = build(&spec("y ~ h + (1+x|g/h)"), &table()).unwrap();
     assert_eq!(
-        converted
-            .recipe
+        converted.recipe.predictors["mu"]
             .groups
             .iter()
             .map(|group| group.column.as_str())
@@ -154,7 +153,7 @@ fn group_recipe_preserves_names_coordinates_and_prediction_coding() {
         ["g", "g:h"]
     );
     assert_eq!(
-        converted.recipe.groups[1]
+        converted.recipe.predictors["mu"].groups[1]
             .levels
             .iter()
             .map(ToString::to_string)
@@ -210,8 +209,11 @@ fn group_recipe_preserves_names_coordinates_and_prediction_coding() {
 #[test]
 fn group_expressions_and_overlapping_blocks_follow_brms() {
     let converted = build(&spec("y ~ (1|g) + (0+I(x^2)|g)"), &table()).unwrap();
-    assert_eq!(converted.recipe.groups.len(), 2);
-    assert_eq!(converted.recipe.groups[1].coefficients, ["IxE2"]);
+    assert_eq!(converted.recipe.predictors["mu"].groups.len(), 2);
+    assert_eq!(
+        converted.recipe.predictors["mu"].groups[1].coefficients,
+        ["IxE2"]
+    );
     assert_eq!(
         columns(&converted.recipe, &converted.data, 1),
         [vec![1.0, 4.0, 9.0, 16.0]]

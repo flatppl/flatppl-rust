@@ -1,0 +1,10 @@
+{
+  "formula": "y ~ x",
+  "family": "gaussian",
+  "dpars": {"sigma": {"formula": "sigma ~ g"}},
+  "data": {"nrows": 4, "columns": [
+    {"name": "y", "values": {"kind": "real64", "values": [2, 4, 8, 7]}},
+    {"name": "x", "values": {"kind": "int", "values": [1, 2, 3, 4]}},
+    {"name": "g", "values": {"kind": "real64", "values": [0, 1, 0, 2]}}
+  ]}
+}
