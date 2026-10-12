@@ -16,6 +16,8 @@ pub enum Family {
     #[serde(rename = "zero_inflated_poisson")]
     ZeroInflatedPoisson,
     Negbinomial,
+    #[serde(rename = "zero_inflated_negbinomial")]
+    ZeroInflatedNegbinomial,
     Geometric,
     #[serde(rename = "Gamma")]
     Gamma,
@@ -57,6 +59,7 @@ impl Family {
             "poisson" => Self::Poisson,
             "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
+            "zero_inflated_negbinomial" => Self::ZeroInflatedNegbinomial,
             "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
             "exponential" => Self::Exponential,
@@ -89,7 +92,11 @@ impl Family {
                     Logit | Probit | ProbitApprox | Cloglog | Cauchit | Softit | Identity | Log
                 )
             }
-            Self::Poisson | Self::ZeroInflatedPoisson | Self::Negbinomial | Self::Geometric => {
+            Self::Poisson
+            | Self::ZeroInflatedPoisson
+            | Self::Negbinomial
+            | Self::ZeroInflatedNegbinomial
+            | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
             }
             Self::Gamma | Self::Exponential | Self::Weibull => {
@@ -115,6 +122,7 @@ impl Family {
                 | Self::Poisson
                 | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
+                | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
         )
@@ -128,6 +136,7 @@ impl Family {
             Self::Beta => &["phi"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson => &["zi"],
+            Self::ZeroInflatedNegbinomial => &["shape", "zi"],
             _ => &[],
         }
     }
@@ -144,7 +153,9 @@ impl Family {
         match name {
             "sigma" => format!("student_t(3, 0, {sigma_scale})"),
             "nu" => "gamma(2, 0.1)".into(),
-            "shape" if self == Self::Negbinomial => "InverseGamma(0.4, 0.3)".into(),
+            "shape" if matches!(self, Self::Negbinomial | Self::ZeroInflatedNegbinomial) => {
+                "InverseGamma(0.4, 0.3)".into()
+            }
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             "kappa" => "Gamma(2, 0.01)".into(),
             "zi" => "Beta(1, 1)".into(),
@@ -161,7 +172,11 @@ impl Family {
         thresholds: usize,
         scalar: bool,
     ) -> NodeId {
-        if self == Self::ZeroInflatedPoisson && !scalar {
+        if matches!(
+            self,
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial
+        ) && !scalar
+        {
             let local = Ref {
                 ns: RefNs::Local,
                 name: b.sym("_mu_"),
@@ -210,15 +225,20 @@ impl Family {
                 apply(b, "Binomial", &[n, mu])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
-            Self::ZeroInflatedPoisson => {
-                let poisson = b.call("Poisson", &[mu]);
+            Self::ZeroInflatedPoisson | Self::ZeroInflatedNegbinomial => {
+                let base = if self == Self::ZeroInflatedPoisson {
+                    Self::Poisson
+                } else {
+                    Self::Negbinomial
+                };
+                let base = base.observation(b, mu, trials, scale, thresholds, true);
                 let zi = b.self_ref("zi");
                 let zero = b.lit_int(0);
                 let atom = b.call("Dirac", &[zero]);
                 let atom = b.call("weighted", &[zi, atom]);
                 let one = b.lit_real(1.0);
                 let complement = b.call("sub", &[one, zi]);
-                let count = b.call("weighted", &[complement, poisson]);
+                let count = b.call("weighted", &[complement, base]);
                 let law = b.call("superpose", &[atom, count]);
                 b.call("normalize", &[law])
             }

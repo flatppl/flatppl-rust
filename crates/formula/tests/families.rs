@@ -13,6 +13,11 @@ fn response_support_matches_brms() {
             vec![0.0, 1.0, 2.0],
             vec![-1.0, 0.5],
         ),
+        (
+            "zero_inflated_negbinomial",
+            vec![0.0, 1.0, 2.0],
+            vec![-1.0, 0.5],
+        ),
         ("weibull", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
         ("beta", vec![0.1, 0.5, 0.9], vec![0.0, 1.0]),
         (

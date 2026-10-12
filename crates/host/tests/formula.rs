@@ -199,6 +199,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "binomial",
         "poisson",
         "zero_inflated_poisson",
+        "zero_inflated_negbinomial",
         "negbinomial",
         "geometric",
         "Gamma",
@@ -218,7 +219,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.1, 0.4, 0.8, 0.7]
         } else if family == "von_mises" {
             vec![-2.0, -0.4, 0.8, 2.0]
-        } else if family == "zero_inflated_poisson" {
+        } else if family.starts_with("zero_inflated_") {
             vec![0.0, 2.0, 4.0, 0.0]
         } else {
             vec![2.0, 4.0, 8.0, 7.0]
@@ -244,6 +245,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "beta" => ", phi = posreals",
             "von_mises" => ", kappa = posreals",
             "zero_inflated_poisson" => ", zi = unitinterval",
+            "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
             _ => "",
         };
         let parameter = format!(
@@ -270,7 +272,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         context.register("prediction.flatppl", &prediction)?;
         let observation = if family == "beta" {
             "[0.2, 0.8]"
-        } else if family == "zero_inflated_poisson" {
+        } else if family.starts_with("zero_inflated_") {
             "[0, 2]"
         } else {
             "[1, 1]"
