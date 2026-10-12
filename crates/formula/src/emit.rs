@@ -1,12 +1,12 @@
 use crate::{
-    DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter, Recipe,
-    ResolvedPrior, Result, Spec, Trials,
+    DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter,
+    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, metadata,
     priors::{self, PriorNode},
 };
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs};
 
-pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
+pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let mut module = Module::new();
     let mut b = Builder::new(&mut module);
     b.stamp_compat();
@@ -198,40 +198,6 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         b.call("bayesupdate", &[likelihood, prior])
     };
     b.bind("Pi_post", posterior);
-    let formula = b.str_lit(&spec.formula);
-    let family = b.str_lit(&spec.family);
-    let link = b.str_lit(recipe.link.name());
-    let improper = b.lit_bool(false);
-    let score_offset = b.lit_real((1..=thresholds).map(|i| (i as f64).ln()).sum());
-    let mut fields = vec![
-        ("formula", formula),
-        ("family", family),
-        ("link", link),
-        ("has_improper_prior", improper),
-        ("score_offset", score_offset),
-    ];
-    if recipe.predictors.keys().any(|name| name != "mu") {
-        let dpars: Vec<_> = recipe
-            .predictors
-            .iter()
-            .filter(|(name, _)| name.as_str() != "mu")
-            .map(|(name, predictor)| {
-                let formula = b.str_lit(
-                    spec.dpars
-                        .get(name)
-                        .map_or(&spec.formula, |dpar| &dpar.formula),
-                );
-                let link = b.str_lit(predictor.link.name());
-                (
-                    name.as_str(),
-                    b.call_fields("record", &[("formula", formula), ("link", link)]),
-                )
-            })
-            .collect();
-        fields.push(("dpars", b.call_fields("record", &dpars)));
-    }
-    let metadata = b.call_fields("record", &fields);
-    b.bind("formula_model", metadata);
     Ok(module)
 }
 
@@ -895,10 +861,21 @@ pub(crate) fn info(
                 binding: name.into(),
                 index: None,
                 indices: None,
+                role: parameter_role(module, name),
                 derived: !sampled(module, name),
             });
         }
     }
+    let prior_factors = metadata::prior_factors(module, &parameters);
+    let prior_sampling = if prior_factors.values().any(|prior| prior.contains_flat) {
+        crate::PriorSampling::Unavailable
+    } else {
+        crate::PriorSampling::NotChecked
+    };
+    let (factor_levels, group_levels) = recipe
+        .predictors
+        .get("mu")
+        .map_or_else(Default::default, metadata::levels);
     Ok(ModelInfo {
         formula: spec.formula.clone(),
         family: spec.family.clone(),
@@ -920,11 +897,15 @@ pub(crate) fn info(
                     .map(|column| column.name.clone())
                     .collect()
             }),
+        factor_levels,
+        group_levels,
+        response_levels: recipe.response_levels.clone(),
         dpars: recipe
             .predictors
             .iter()
             .filter(|(name, _)| name.as_str() != "mu")
             .map(|(name, predictor)| {
+                let (factor_levels, group_levels) = metadata::levels(predictor);
                 (
                     name.clone(),
                     crate::PredictorInfo {
@@ -940,11 +921,15 @@ pub(crate) fn info(
                             .iter()
                             .map(|column| column.name.clone())
                             .collect(),
+                        factor_levels,
+                        group_levels,
                     },
                 )
             })
             .collect(),
         parameters,
+        prior_factors,
+        prior_sampling,
         has_improper_prior: module.public_bindings().any(|(_, binding)| {
             module.resolve(binding.name) == "Pi_prior"
                 && !matches!(
@@ -973,23 +958,29 @@ fn predictor_info(
         format!("{dpar}_")
     };
     let mut parameters = Vec::new();
-    let mut add = |name: String, binding: &str, indices: &[usize], derived| {
+    let mut add = |name: String, binding: &str, indices: &[usize], role| {
         parameters.push(Parameter {
             name,
             binding: binding.into(),
             index: (indices.len() == 1).then(|| indices[0]),
             indices: (indices.len() > 1).then(|| indices.to_vec()),
-            derived,
+            role,
+            derived: role != ParameterRole::Sampled,
         })
     };
     if thresholds > 0 {
         for i in 1..=thresholds {
-            add(format!("Intercept[{i}]"), "cuts", &[i], false);
+            add(
+                format!("Intercept[{i}]"),
+                "cuts",
+                &[i],
+                ParameterRole::Sampled,
+            );
             add(
                 format!("b_Intercept[{i}]"),
                 &predictor_name(dpar, "b_Intercept"),
                 &[i],
-                true,
+                ParameterRole::Derived,
             );
         }
     } else if recipe.formula.intercept {
@@ -997,13 +988,13 @@ fn predictor_info(
             predictor_name(dpar, "Intercept"),
             &predictor_name(dpar, "temp_Intercept"),
             &[],
-            !sampled(module, &predictor_name(dpar, "temp_Intercept")),
+            parameter_role(module, &predictor_name(dpar, "temp_Intercept")),
         );
         add(
             format!("b_{prefix}Intercept"),
             &predictor_name(dpar, "b_Intercept"),
             &[],
-            true,
+            ParameterRole::Derived,
         );
     }
     let mut names = std::collections::HashSet::new();
@@ -1019,13 +1010,18 @@ fn predictor_info(
         }
         let component = predictor_name(dpar, &format!("b_{}", i + 1));
         if sampled(module, &component) {
-            add(format!("b_{prefix}{name}"), &component, &[], false);
+            add(
+                format!("b_{prefix}{name}"),
+                &component,
+                &[],
+                ParameterRole::Sampled,
+            );
         } else {
             add(
                 format!("b_{prefix}{name}"),
                 &predictor_name(dpar, "b"),
                 &[i + 1],
-                !sampled(module, &predictor_name(dpar, "b")),
+                parameter_role(module, &predictor_name(dpar, "b")),
             );
         }
     }
@@ -1044,23 +1040,33 @@ fn predictor_info(
         let component = predictor_name(dpar, &format!("bs_{}", i + 1));
         let binding = predictor_name(dpar, "bs");
         if sampled(module, &component) {
-            add(format!("b_{prefix}{name}"), &component, &[], false);
+            add(
+                format!("b_{prefix}{name}"),
+                &component,
+                &[],
+                ParameterRole::Sampled,
+            );
         } else {
             add(
                 format!("b_{prefix}{name}"),
                 &binding,
                 &[i + 1],
-                !sampled(module, &binding),
+                parameter_role(module, &binding),
             );
         }
         add(
             format!("sds_{prefix}{name}"),
             &smooth.sds,
             &[],
-            !sampled(module, &smooth.sds),
+            parameter_role(module, &smooth.sds),
         );
         for j in 1..smooth.inputs.len() {
-            add(format!("zs_{prefix}{name}[{j}]"), &smooth.z, &[j], false);
+            add(
+                format!("zs_{prefix}{name}[{j}]"),
+                &smooth.z,
+                &[j],
+                ParameterRole::Sampled,
+            );
         }
     }
     for (group_index, group) in recipe.groups.iter().enumerate() {
@@ -1068,14 +1074,14 @@ fn predictor_info(
         for (j, coefficient) in group.coefficients.iter().enumerate() {
             let name = format!("sd_{}__{prefix}{coefficient}", group.column);
             if let Some(component) = sampled_component(module, &group.sd, j) {
-                add(name, component, &[], false);
+                add(name, component, &[], ParameterRole::Sampled);
             } else {
                 let indices = [j + 1];
                 add(
                     name,
                     &group.sd,
                     if k == 1 { &[] } else { &indices },
-                    !sampled(module, &group.sd),
+                    parameter_role(module, &group.sd),
                 );
             }
         }
@@ -1088,13 +1094,13 @@ fn predictor_info(
                     format!("z_{}[{},{}]", group_offset + group_index + 1, j + 1, i + 1),
                     &group.z,
                     if k == 1 { &vector_index } else { &z_index },
-                    false,
+                    ParameterRole::Sampled,
                 );
                 add(
                     format!("r_{}[{level},{prefix}{coefficient}]", group.column),
                     &group.r,
                     if k == 1 { &vector_index } else { &r_index },
-                    true,
+                    ParameterRole::Derived,
                 );
             }
         }
@@ -1105,7 +1111,7 @@ fn predictor_info(
                         format!("L_{}[{},{}]", group_offset + group_index + 1, i + 1, j + 1),
                         cholesky,
                         &[i + 1, j + 1],
-                        false,
+                        ParameterRole::Sampled,
                     );
                 }
             }
@@ -1120,7 +1126,7 @@ fn predictor_info(
                         ),
                         correlation,
                         &[i + 1, j + 1],
-                        true,
+                        ParameterRole::Derived,
                     );
                 }
             }
@@ -1131,6 +1137,14 @@ fn predictor_info(
 
 fn sampled(module: &Module, name: &str) -> bool {
     module.public_bindings().find(|(_, binding)| module.resolve(binding.name) == name).is_some_and(|(_, binding)| matches!(module.node(binding.rhs), Node::Call(call) if matches!(call.head, CallHead::Builtin(s) if module.resolve(s) == "draw")))
+}
+
+fn parameter_role(module: &Module, name: &str) -> ParameterRole {
+    if sampled(module, name) {
+        ParameterRole::Sampled
+    } else {
+        ParameterRole::Fixed
+    }
 }
 
 fn sampled_component<'a>(module: &'a Module, name: &str, index: usize) -> Option<&'a str> {
@@ -1152,24 +1166,6 @@ fn sampled_component<'a>(module: &'a Module, name: &str, index: usize) -> Option
     };
     let name = module.resolve(*name);
     sampled(module, name).then_some(name)
-}
-
-pub(crate) fn mark_improper(module: &mut Module, improper: bool) {
-    let (id, binding) = module
-        .public_bindings()
-        .find(|(_, binding)| module.resolve(binding.name) == "formula_model")
-        .unwrap();
-    let Node::Call(mut call) = module.node(binding.rhs).clone() else {
-        unreachable!()
-    };
-    let value = module.alloc(Node::Lit(flatppl_core::Scalar::Bool(improper)));
-    for field in &mut call.named {
-        if module.resolve(field.name) == "has_improper_prior" {
-            field.value = value;
-        }
-    }
-    let metadata = module.alloc(Node::Call(call));
-    module.set_binding_rhs(id, metadata);
 }
 
 pub(crate) fn coefficient_name(name: &str) -> String {

@@ -257,6 +257,19 @@ priors use `iid`; differing priors use scalar declarations and a combined vector
 A Flat prior cannot be sampled. An improper prior does not imply an improper
 posterior.
 
+`ModelInfo.parameters` labels each coordinate as `sampled`, `fixed` or `derived`;
+the legacy `derived` flag remains true for both fixed and derived values.
+`prior_factors` records each sampled binding's inferred mass and `contains_flat`.
+`prior_sampling` is `unavailable` for Flat sources and otherwise `not_checked`:
+normalized mass does not establish an engine's sampler support.
+
+The generated `formula_parameter_names` maps bindings and one-based coordinates
+to the same parameter metadata. `formula_model` includes that map, design names
+and retained factor, group and response levels. These module constants project
+JSON sequences to `record(length = n, _1 = ..., _2 = ...)`, including empty
+sequences. Integer level values use exact decimal strings and retain their
+`kind = "integer"` tag. Host JSON keeps ordinary arrays and integer values.
+
 ```rust
 let spec = flatppl_formula::read(spec_json)?;
 let converted = flatppl_formula::build(&spec, &table)?;
