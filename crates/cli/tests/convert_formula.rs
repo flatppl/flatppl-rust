@@ -145,10 +145,12 @@ fn external_text_data_match_direct_conversion_without_embedding() {
         .arg(&inline)
         .output()
         .unwrap();
-    assert!(!result.status.success());
-    for extension in ["flatppl", "data.json", "recipe.json", "model.json"] {
-        assert!(!inline.with_extension(extension).exists());
-    }
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_conversion(&inline, &spec, spec.data.as_ref().unwrap());
     fs::remove_dir_all(directory).unwrap();
 }
 

@@ -173,9 +173,10 @@ with `.arrow`, `.arrows`, `.ipc` or `.feather` extensions through `--data`.
 The command writes `model.data.json`, `model.recipe.json` and `model.model.json`
 alongside the source. Its `load_data` declaration reads the prepared numeric
 sidecar relative to `model.flatppl`; keep these files together. Row selection is
-recorded in model metadata. Training data is never embedded in generated source;
-the old `data_placement` option is no longer accepted. StableHLO precision remains
-a compiler option.
+recorded in model metadata. Training data is never embedded in generated source.
+For migration, the old JSON `data_placement` option is temporarily accepted and
+ignored; the CLI flag has been removed. StableHLO precision remains a compiler
+option.
 
 The factor and term fixtures come from base R, with the fixed formula
 reconstruction used by brms 2.23.2. The Gaussian default-prior test values are

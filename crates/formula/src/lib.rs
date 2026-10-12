@@ -68,7 +68,7 @@ fn gaussian() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(from = "OptionsInput")]
 pub struct Options {
     pub center: bool,
     pub contrasts: std::collections::BTreeMap<String, Contrast>,
@@ -77,8 +77,41 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            center: true,
+            center: default_center(),
             contrasts: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+fn default_center() -> bool {
+    true
+}
+
+// Read older specifications without restoring their data-embedding behavior.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptionsInput {
+    #[serde(default = "default_center")]
+    center: bool,
+    #[serde(default)]
+    contrasts: std::collections::BTreeMap<String, Contrast>,
+    #[serde(default, rename = "data_placement")]
+    _legacy_placement: LegacyDataPlacement,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyDataPlacement {
+    #[default]
+    External,
+    Inline,
+}
+
+impl From<OptionsInput> for Options {
+    fn from(input: OptionsInput) -> Self {
+        Self {
+            center: input.center,
+            contrasts: input.contrasts,
         }
     }
 }
