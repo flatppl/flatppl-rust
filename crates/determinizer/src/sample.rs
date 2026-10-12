@@ -34,7 +34,7 @@ use crate::density::{
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Binding, BindingId, CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar,
-    Symbol, Type,
+    ScalarType, Symbol, Type,
 };
 
 /// `rand(m, rng)` → a deterministic sample of the closed measure `m`.
@@ -307,6 +307,7 @@ fn lower_closed_measure_sample(
             let scaled = build_call(m, "mul", &[scale, value]);
             Ok((build_call(m, "add", &[scaled, shift]), next))
         }
+        Some("normalize") => lower_normalized_weight_sample(m, resolved, rng, None),
         Some("tilt") => lower_tilt_sample(m, resolved, rng, None),
         // §07's own worked `rand` example is `rand(iid(Normal(0, 1), 10), rstate)`:
         // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
@@ -370,6 +371,57 @@ fn scalar_locscale(m: &mut Module, node: NodeId) -> Result<(NodeId, NodeId, Node
         }
     }
     Ok((base, shift, scale))
+}
+
+/// Constant weighting does not change a normalized law's samples or RNG use.
+/// Dynamic invalid mass must still produce an undefined value, never a base draw.
+fn lower_normalized_weight_sample(
+    m: &mut Module,
+    measure: NodeId,
+    rng: NodeId,
+    sample_name: Option<Symbol>,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (base, valid) = crate::density::normalized_scalar_weight(m, measure).ok_or_else(|| {
+        refuse(
+            measure,
+            m,
+            "normalized sampling requires a scalar constant weight and a probability base",
+        )
+    })?;
+    match m.node(valid) {
+        Node::Lit(Scalar::Bool(true)) => {}
+        Node::Lit(Scalar::Bool(false)) => {
+            return Err(refuse(
+                measure,
+                m,
+                "normalization requires finite positive mass",
+            ));
+        }
+        _ => {
+            let base = crate::density::resolve_ref_chain(m, base).0;
+            if !matches!(m.type_of(base), Some(Type::Measure { domain, .. })
+                if matches!(domain.as_ref(), Type::Scalar(ScalarType::Real)))
+            {
+                return Err(refuse(
+                    measure,
+                    m,
+                    "dynamic normalized weights currently require a real scalar variate",
+                ));
+            }
+        }
+    }
+    let (value, next) = if sample_name.is_some() {
+        let draw = build_call(m, "draw", &[base]);
+        lower_draw(m, draw, rng, sample_name)?
+    } else {
+        lower_closed_measure_sample(m, base, rng)?
+    };
+    let value = if matches!(m.node(valid), Node::Lit(Scalar::Bool(true))) {
+        value
+    } else {
+        crate::density::exponential_tilt::guard(m, value, valid)
+    };
+    Ok((value, next))
 }
 
 /// `pushfwd(f, M)` in measure position → sample `M`, then apply `f` FORWARD to the
@@ -785,6 +837,9 @@ fn lower_draw(
     }
     if builtin_name(m, inner_resolved) == Some("tilt") {
         return lower_tilt_sample(m, inner_resolved, rng, sample_name);
+    }
+    if builtin_name(m, inner_resolved) == Some("normalize") {
+        return lower_normalized_weight_sample(m, inner_resolved, rng, sample_name);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(

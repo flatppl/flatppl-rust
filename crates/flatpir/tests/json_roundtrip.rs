@@ -12,6 +12,27 @@ use std::path::PathBuf;
 use flatppl_flatpir::{from_json, read, to_json, write};
 use serde_json::json;
 
+#[test]
+fn nonfinite_ir_values_roundtrip_as_expressions() {
+    use flatppl_core::{Node, Scalar};
+
+    for (value, expected) in [
+        (f64::NAN, json!(["divide", {"real": 0.0}, {"real": 0.0}])),
+        (f64::INFINITY, json!({"const": "inf"})),
+        (f64::NEG_INFINITY, json!(["neg", {"const": "inf"}])),
+    ] {
+        let mut module = read("(%module (%public x) (%bind x 0.0))").unwrap();
+        let binding = module.bindings().next().unwrap().0;
+        let value = module.alloc(Node::Lit(Scalar::Real(value)));
+        module.set_binding_rhs(binding, value);
+        let text = write(&module);
+        let encoded = to_json(&module);
+        assert_eq!(encoded["%module"]["binds"][0]["expr"], expected);
+        assert_eq!(write(&read(&text).unwrap()), text);
+        assert_eq!(write(&from_json(&encoded).unwrap()), text);
+    }
+}
+
 fn fixture(name: &str) -> String {
     let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "../../fixtures/flatpir", name]
         .iter()

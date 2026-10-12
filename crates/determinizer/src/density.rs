@@ -3907,6 +3907,10 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     if let Some(law) = exponential_tilt::recognize(m, node) {
         return exponential_tilt::density(m, law, v);
     }
+    if let Some((base, valid)) = normalized_scalar_weight(m, node) {
+        let score = lower_measure_density(m, base, v)?;
+        return Ok(exponential_tilt::guard(m, score, valid));
+    }
     let m_inner = {
         let c = expect_builtin_call(m, node, "normalize")
             .ok_or_else(|| refuse(node, m, "expected normalize"))?;
@@ -4210,11 +4214,64 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 fn normalized_logdensity(m: &mut Module, density: NodeId, log_z: NodeId) -> NodeId {
     let score = build_call(m, "sub", &[density, log_z]);
     let finite = build_call(m, "isfinite", &[log_z]);
-    // FlatPIR has no NaN literal. Keep the undefined result as arithmetic.
-    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-    let negative = build_call(m, "neg", &[one]);
-    let nan = build_call(m, "log", &[negative]);
-    build_call(m, "ifelse", &[finite, score, nan])
+    exponential_tilt::guard(m, score, finite)
+}
+
+/// A scalar weighting of a probability law has mass w (or exp(logw)).
+/// Normalization removes that weight only where the mass is finite and positive.
+/// Keep the validity predicate separate from the cancelled density arithmetic.
+pub(crate) fn normalized_scalar_weight(m: &mut Module, node: NodeId) -> Option<(NodeId, NodeId)> {
+    let node = resolve_ref_chain(m, node).0;
+    let call = expect_builtin_call(m, node, "normalize")?;
+    let [inner] = *call.args else { return None };
+    let inner = resolve_ref_chain(m, inner).0;
+    let logarithmic = match builtin_name(m, inner)? {
+        "weighted" => false,
+        "logweighted" => true,
+        _ => return None,
+    };
+    let Node::Call(call) = m.node(inner) else {
+        return None;
+    };
+    let [weight, base] = *call.args else {
+        return None;
+    };
+    if !matches!(
+        m.type_of(weight),
+        Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
+    ) {
+        return None;
+    }
+    let resolved_base = resolve_ref_chain(m, base).0;
+    if !matches!(
+        m.type_of(resolved_base),
+        Some(Type::Measure {
+            mass: Mass::Normalized,
+            ..
+        })
+    ) {
+        return None;
+    }
+    let literal = match m.node(weight) {
+        Node::Lit(Scalar::Real(value)) => Some(*value),
+        Node::Lit(Scalar::Int(value)) => Some(*value as f64),
+        _ => None,
+    };
+    let valid = if let Some(value) = literal {
+        m.alloc(Node::Lit(Scalar::Bool(
+            value.is_finite() && (logarithmic || value > 0.0),
+        )))
+    } else {
+        let finite = build_call(m, "isfinite", &[weight]);
+        if logarithmic {
+            finite
+        } else {
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let positive = build_call(m, "gt", &[weight, zero]);
+            build_call(m, "land", &[finite, positive])
+        }
+    };
+    Some((base, valid))
 }
 
 /// Recognize an APPLIED `ksuperpose(K, w)(θ)` whose component `K` is a
