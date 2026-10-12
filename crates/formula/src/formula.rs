@@ -1,14 +1,16 @@
-use crate::{Error, Result};
+use crate::{Arithmetic, ColumnExpression, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Formula {
     pub response: String,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
     pub groups: Vec<String>,
+    pub expressions: BTreeMap<String, ColumnExpression>,
+    pub offsets: Vec<ColumnExpression>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -23,7 +25,7 @@ const MAX_TERMS: usize = 4096;
 ///
 /// Fixed terms follow brms's `terms_fe` reconstruction and second `terms` pass:
 /// removed variables disappear, and interactions use the surviving variable order.
-/// Group terms use C collation. Expression calls and random slopes are unsupported.
+/// Group terms use C collation. Random slopes are unsupported.
 pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
@@ -42,10 +44,21 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let terms = expand(&expr, &parser.atoms, &mut intercept, true)?;
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
+    // R records offset calls separately from coefficient terms, including
+    // calls appearing after subtraction. Negation belongs inside offset().
+    let offsets = parser
+        .atoms
+        .iter()
+        .filter_map(|atom| match atom {
+            Atom::Offset(expression) => Some(expression.clone()),
+            _ => None,
+        })
+        .collect();
     for term in terms {
         match &parser.atoms[term[0]] {
             Atom::Group(group, independent) => groups.push((group.clone(), *independent)),
-            Atom::Variable(_) => fixed.push(term),
+            Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
+            Atom::Offset(_) => {}
         }
     }
     fixed.sort_by_key(Vec::len);
@@ -59,9 +72,17 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     }
     let variable = |id| match &parser.atoms[id] {
         Atom::Variable(name) => name.clone(),
-        Atom::Group(..) => unreachable!(),
+        Atom::Expression(expression) => expression.to_string(),
+        Atom::Group(..) | Atom::Offset(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
+    let expressions = order
+        .iter()
+        .filter_map(|&id| match &parser.atoms[id] {
+            Atom::Expression(expression) => Some((expression.to_string(), expression.clone())),
+            _ => None,
+        })
+        .collect();
     let fixed = fixed
         .into_iter()
         .map(|mut term| {
@@ -84,6 +105,8 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         variables,
         fixed,
         groups: groups.into_iter().map(|(group, _)| group).collect(),
+        expressions,
+        offsets,
     })
 }
 
@@ -188,6 +211,8 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>> {
 #[derive(PartialEq)]
 enum Atom {
     Variable(String),
+    Expression(ColumnExpression),
+    Offset(ColumnExpression),
     Group(String, bool),
 }
 
@@ -250,11 +275,29 @@ impl<'a> Parser<'a> {
         let mut left = match token {
             Token::Name(text) => {
                 if self.peek() == Token::Left {
-                    return Err(Error(format!(
-                        "formula call `{text}(...)` is not supported"
-                    )));
+                    if !matches!(text, "I" | "log" | "offset") {
+                        return Err(Error(format!(
+                            "formula call `{text}(...)` is not supported"
+                        )));
+                    }
+                    self.at += 1;
+                    let argument = self.expression(0, depth + 1)?;
+                    if self.peek() != Token::Right {
+                        return Err(Error(format!(
+                            "expected one numeric expression in `{text}`"
+                        )));
+                    }
+                    self.at += 1;
+                    let expression = column_expression(&argument, &self.atoms)?;
+                    self.atom(match text {
+                        "I" => Atom::Expression(ColumnExpression::Identity(Box::new(expression))),
+                        "log" => Atom::Expression(ColumnExpression::Log(Box::new(expression))),
+                        "offset" => Atom::Offset(expression),
+                        _ => unreachable!(),
+                    })?
+                } else {
+                    self.atom(Atom::Variable(name(text)?))?
                 }
-                self.atom(Atom::Variable(name(text)?))?
             }
             Token::Number(value) => Expr::new(ExprKind::Number(value))?,
             Token::Operator(op @ (Op::Add | Op::Subtract)) => {
@@ -392,13 +435,79 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms
         .iter()
         .flatten()
-        .any(|&id| matches!(atoms[id], Atom::Group(..)))
+        .any(|&id| matches!(atoms[id], Atom::Group(..) | Atom::Offset(_)))
     {
         return Err(Error(
-            "random intercepts may only be added or removed".into(),
+            "group terms and offsets may only be added or removed".into(),
         ));
     }
     Ok(())
+}
+
+fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
+    Ok(match &expr.kind {
+        ExprKind::Number(value) if value.is_finite() => ColumnExpression::Number(*value),
+        ExprKind::Atom(id) => match &atoms[*id] {
+            Atom::Variable(name) => ColumnExpression::Column(name.clone()),
+            Atom::Expression(expression) => expression.clone(),
+            _ => {
+                return Err(Error(
+                    "group effects and offsets cannot be nested in column expressions".into(),
+                ));
+            }
+        },
+        ExprKind::Parentheses(x) => {
+            ColumnExpression::Parentheses(Box::new(column_expression(x, atoms)?))
+        }
+        ExprKind::Unary(Op::Add, x) => column_expression(x, atoms)?,
+        ExprKind::Unary(Op::Subtract, x) => {
+            ColumnExpression::Negate(Box::new(column_expression(x, atoms)?))
+        }
+        ExprKind::Binary(op, x, y) => {
+            let op = match op {
+                Op::Add => Arithmetic::Add,
+                Op::Subtract => Arithmetic::Subtract,
+                Op::Cross => Arithmetic::Multiply,
+                Op::Nest => Arithmetic::Divide,
+                Op::Power => Arithmetic::Power,
+                _ => {
+                    return Err(Error(
+                        "unsupported operator in numeric column expression".into(),
+                    ));
+                }
+            };
+            ColumnExpression::Binary(
+                op,
+                Box::new(column_expression(x, atoms)?),
+                Box::new(column_expression(y, atoms)?),
+            )
+        }
+        _ => return Err(Error("unsupported numeric column expression".into())),
+    })
+}
+
+impl Formula {
+    pub(crate) fn predictor_columns(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        for name in &self.variables {
+            if let Some(expression) = self.expressions.get(name) {
+                expression.columns(&mut names);
+            } else if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        for expression in &self.offsets {
+            expression.columns(&mut names);
+        }
+        names
+    }
+
+    pub(crate) fn offset(&self) -> Option<ColumnExpression> {
+        self.offsets
+            .iter()
+            .cloned()
+            .reduce(|a, b| ColumnExpression::Binary(Arithmetic::Add, Box::new(a), Box::new(b)))
+    }
 }
 
 fn unique(terms: impl IntoIterator<Item = Vec<usize>>) -> Result<Terms> {

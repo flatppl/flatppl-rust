@@ -60,6 +60,17 @@ pub(crate) fn build(
         .variables
         .iter()
         .map(|name| {
+            if formula.expressions.contains_key(name) {
+                if contrasts.contains_key(name) {
+                    return Err(Error(format!(
+                        "contrast supplied for numeric predictor `{name}`"
+                    )));
+                }
+                return Ok(Predictor {
+                    column: name.clone(),
+                    factor: None,
+                });
+            }
             let column = table.column(name)?;
             let factor = column
                 .factor_levels(rows)
@@ -175,15 +186,18 @@ pub(crate) fn build(
         predictors,
         columns,
     };
-    let means = means(&design, table, rows)?;
+    let means = means(&design, formula, table, rows)?;
     Ok((design, means))
 }
 
-fn means(design: &Design, table: &Table, rows: &[usize]) -> Result<Vec<f64>> {
+fn means(design: &Design, formula: &Formula, table: &Table, rows: &[usize]) -> Result<Vec<f64>> {
     let inputs = design
         .predictors
         .iter()
         .map(|predictor| {
+            if let Some(expression) = formula.expressions.get(&predictor.column) {
+                return expression.values(table, rows);
+            }
             let column = table.column(&predictor.column)?;
             if let Some(factor) = &predictor.factor {
                 column

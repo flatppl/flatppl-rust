@@ -1,7 +1,8 @@
 //! Pure Rust conversion of a bounded brms formula subset into FlatPPL.
 //!
 //! The supported subset uses Gaussian identity-link models, numeric and factor
-//! predictors, interactions and random intercepts. It does not fit a model.
+//! predictors, interactions, numeric expressions, offsets and random intercepts.
+//! It does not fit a model.
 
 #[cfg(feature = "arrow")]
 mod arrow;
@@ -9,6 +10,7 @@ mod contrasts;
 mod data;
 mod design;
 mod emit;
+mod expression;
 mod formula;
 mod priors;
 
@@ -18,6 +20,7 @@ use std::fmt;
 
 pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, prepare_data};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
+pub use expression::{Arithmetic, ColumnExpression};
 pub use formula::{Formula, Term, parse_formula};
 pub use priors::{NormalPrior, Prior, Priors};
 
@@ -158,7 +161,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         )));
     }
     let formula = parse_formula(&spec.formula)?;
-    if formula.variables.contains(&formula.response) {
+    if formula
+        .predictor_columns()
+        .contains(&formula.response.as_str())
+    {
         return Err(Error(
             "the response cannot also be a fixed predictor in this subset".into(),
         ));
@@ -169,7 +175,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let rows = data::model_rows(&formula, table, DataMode::Training)?;
     let (design, means) = design::build(&formula, table, &rows, &spec.options.contrasts)?;
     let response = table.column(&formula.response)?.numeric(&rows)?;
-    let priors = priors::resolve(spec, &formula, &response)?;
+    let mut priors = priors::resolve(spec, &formula, &response)?;
+    if let Some(offset) = formula.offset() {
+        priors.intercept_location -=
+            offset.values(table, &rows)?.iter().sum::<f64>() / rows.len() as f64;
+    }
     let groups = formula
         .groups
         .iter()

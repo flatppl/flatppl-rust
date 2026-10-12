@@ -6,7 +6,7 @@ use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs};
 
 const INTERCEPT_RULE: &str =
-    "brms gaussian(identity): centred intercept location = round(median(y), 1).";
+    "brms gaussian(identity): centred intercept location = round(median(y), 1) - mean(offset).";
 const SCALE_RULE: &str =
     "brms gaussian(identity): scale = max(2.5, round(mad(y), 1)). R MAD constant = 1.4826.";
 
@@ -25,6 +25,9 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let size = b.call("external", &[positive]);
     b.bind("N", size);
     external_vector(&mut b, "y_data", "reals");
+    if !recipe.formula.offsets.is_empty() {
+        external_vector(&mut b, "offset", "reals");
+    }
     for (i, predictor) in recipe.design.predictors.iter().enumerate() {
         let set = if predictor.factor.is_some() {
             "posintegers"
@@ -151,6 +154,10 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         let index = b.self_ref(&group.index);
         let selected = b.call("get", &[effect, index]);
         eta = broadcast(&mut b, "add", &[eta, selected]);
+    }
+    if !recipe.formula.offsets.is_empty() {
+        let offset = b.self_ref("offset");
+        eta = broadcast(&mut b, "add", &[eta, offset]);
     }
     b.bind("eta_mu", eta);
     let eta = b.self_ref("eta_mu");

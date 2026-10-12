@@ -274,16 +274,24 @@ impl Column {
 pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Result<Vec<usize>> {
     table.validate()?;
     let names = formula
-        .variables
-        .iter()
-        .chain(&formula.groups)
-        .chain((mode == DataMode::Training).then_some(&formula.response));
+        .predictor_columns()
+        .into_iter()
+        .chain(formula.groups.iter().map(String::as_str))
+        .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
         .collect::<Result<Vec<_>>>()?;
-    let rows: Vec<_> = (0..table.nrows)
+    let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))
         .collect();
+    for expression in formula.expressions.values().chain(&formula.offsets) {
+        let values = expression.values(table, &rows)?;
+        rows = rows
+            .into_iter()
+            .zip(values)
+            .filter_map(|(row, value)| (!value.is_nan()).then_some(row))
+            .collect();
+    }
     if rows.is_empty() {
         return Err(Error("no complete model rows remain".into()));
     }
@@ -297,12 +305,19 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
     for (i, predictor) in recipe.design.predictors.iter().enumerate() {
+        if let Some(expression) = recipe.formula.expressions.get(&predictor.column) {
+            constants.insert(format!("x_{}", i + 1), expression.data(table, &rows)?);
+            continue;
+        }
         let column = table.column(&predictor.column)?;
         let values = match &predictor.factor {
             Some(factor) => DataValue::Integers(column.factor_codes(&factor.levels, &rows)?),
             None => column.data(&rows)?,
         };
         constants.insert(format!("x_{}", i + 1), values);
+    }
+    if let Some(offset) = recipe.formula.offset() {
+        constants.insert("offset".into(), offset.data(table, &rows)?);
     }
     if mode == DataMode::Training {
         constants.insert(
