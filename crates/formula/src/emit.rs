@@ -1,15 +1,10 @@
 use crate::{
     DataDocument, DataValue, Design, DesignComponent, Error, ModelInfo, Parameter, Recipe,
-    ResolvedPrior, Result, Spec,
+    ResolvedPrior, Result, Spec, Trials,
     priors::{self, PriorNode},
 };
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs};
-
-const INTERCEPT_RULE: &str =
-    "brms gaussian(identity): centred intercept location = round(median(y), 1) - mean(offset).";
-const SCALE_RULE: &str =
-    "brms gaussian(identity): scale = max(2.5, round(mad(y), 1)). R MAD constant = 1.4826.";
 
 pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let mut module = Module::new();
@@ -22,7 +17,18 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     let count_set = b.call_head("posintegers");
     let size = b.call("external", &[count_set]);
     b.bind("N", size);
-    external_vector(&mut b, "y_data", "reals");
+    external_vector(
+        &mut b,
+        "y_data",
+        if recipe.family.discrete() {
+            "nonnegintegers"
+        } else {
+            "reals"
+        },
+    );
+    if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
+        external_vector(&mut b, "trials_data", "nonnegintegers");
+    }
     if !recipe.formula.offsets.is_empty() {
         external_vector(&mut b, "offset", "reals");
     }
@@ -109,7 +115,7 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         group.sd = b.alloc_name(&format!("sd_{}", group.column));
         let dimensions = group.coefficients.len();
         let dimension = b.lit_int(dimensions as i64);
-        let support = positive(&mut b);
+        let support = lower_bound(&mut b, 0.0);
         let names = scope(&b);
         let bindings: Vec<_> = names.iter().map(String::as_str).collect();
         match priors::emit(&mut b, &recipe.priors.sd[i], Some(support), None, &bindings)? {
@@ -168,14 +174,16 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         };
         b.bind(&group.r, effect);
     }
-    let support = positive(&mut b);
-    parameter(
-        &mut b,
-        "sigma",
-        &recipe.priors.aux["sigma"],
-        Some(support),
-        &mut parameters,
-    )?;
+    for &name in recipe.family.auxiliaries() {
+        let support = lower_bound(&mut b, if name == "nu" { 1.0 } else { 0.0 });
+        parameter(
+            &mut b,
+            name,
+            &recipe.priors.aux[name],
+            Some(support),
+            &mut parameters,
+        )?;
+    }
     if parameters.is_empty() {
         return Err(Error(
             "a formula model needs at least one sampled parameter".into(),
@@ -250,13 +258,15 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     }
     b.bind("eta_mu", eta);
     let eta = b.self_ref("eta_mu");
-    b.bind("mu", eta);
+    let mu = recipe.link.inverse(&mut b, eta);
+    b.bind("mu", mu);
     if let Some(intercept) = intercept {
         b.bind("b_Intercept", intercept);
     }
     let mu = b.self_ref("mu");
-    let sigma = b.self_ref("sigma");
-    let law = broadcast(&mut b, "Normal", &[mu, sigma]);
+    let law = recipe
+        .family
+        .observation(&mut b, mu, recipe.formula.trials.as_ref());
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");
@@ -293,12 +303,14 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
     b.bind("Pi_post", posterior);
     let formula = b.str_lit(&spec.formula);
     let family = b.str_lit(&spec.family);
+    let link = b.str_lit(recipe.link.name());
     let improper = b.lit_bool(false);
     let metadata = b.call_fields(
         "record",
         &[
             ("formula", formula),
             ("family", family),
+            ("link", link),
             ("has_improper_prior", improper),
         ],
     );
@@ -376,7 +388,7 @@ fn design_component(
     b.self_ref(&name)
 }
 
-fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> NodeId {
+pub(crate) fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> NodeId {
     let head = b.call_head(name);
     let args: Vec<_> = std::iter::once(head).chain(args.iter().copied()).collect();
     b.call("broadcast", &args)
@@ -385,7 +397,7 @@ fn broadcast(b: &mut Builder<'_>, name: &str, args: &[NodeId]) -> NodeId {
 fn scope(b: &Builder<'_>) -> Vec<String> {
     b.m.public_bindings()
         .map(|(_, binding)| b.m.resolve(binding.name).to_owned())
-        .chain(["temp_Intercept", "b", "sigma"].map(str::to_owned))
+        .chain(["temp_Intercept", "b", "sigma", "nu", "shape"].map(str::to_owned))
         .collect()
 }
 
@@ -405,10 +417,10 @@ fn parameter(
     Ok(())
 }
 
-fn positive(b: &mut Builder<'_>) -> NodeId {
-    let zero = b.lit_real(0.0);
+fn lower_bound(b: &mut Builder<'_>, value: f64) -> NodeId {
+    let lower = b.lit_real(value);
     let inf = b.call_head("inf");
-    b.call("interval", &[zero, inf])
+    b.call("interval", &[lower, inf])
 }
 
 fn draw(b: &mut Builder<'_>, name: &str, law: NodeId, parameters: &mut Vec<String>) {
@@ -546,12 +558,19 @@ pub(crate) fn info(
             }
         }
     }
-    add("sigma".into(), "sigma", &[], !sampled(module, "sigma"));
+    for &name in recipe.family.auxiliaries() {
+        add(name.into(), name, &[], !sampled(module, name));
+    }
     Ok(ModelInfo {
         formula: spec.formula.clone(),
         family: spec.family.clone(),
+        link: recipe.link.name().into(),
         group_collation: "C".into(),
-        default_prior_rule: format!("{INTERCEPT_RULE} {SCALE_RULE}"),
+        default_prior_rule: format!(
+            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; sigma uses the identity-link response scale.",
+            spec.family,
+            recipe.link.name()
+        ),
         design_columns: recipe
             .design
             .columns

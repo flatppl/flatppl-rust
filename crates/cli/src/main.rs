@@ -102,7 +102,7 @@ enum Command {
         /// `.flatpir`, and `.hs3.json` / `.pyhf.json`); `hs3` reads a native HS3
         /// JSON document (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf
         /// model or workspace JSON document (top-level `channels` array). `formula`
-        /// reads a Gaussian formula specification. Explicit formats override the extension.
+        /// reads a formula specification. Explicit formats override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
         /// pyhf input only: the workspace measurement whose configuration the

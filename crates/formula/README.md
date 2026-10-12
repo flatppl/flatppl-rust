@@ -3,16 +3,37 @@
 This crate converts a small brms formula subset into ordinary FlatPPL.
 It performs no inference and has no R or Python dependency.
 
-The supported subset uses Gaussian identity-link models, numeric, logical and
-factor predictors, and random intercepts such as `y ~ x * treatment + (1 | g)`.
+The supported subset uses scalar response families, numeric, logical and factor
+predictors, and group effects such as `y ~ x * treatment + (1 + x | g)`.
 Formula terms support `+`, `-`, `:`, `*`, `/`, `%in%`, powers and parentheses.
 R term expansion and brms fixed-term ordering determine the design columns.
 Numeric and explicit factor grouping columns retain their training levels.
 Grouping terms are ordered with C collation for stable brms parameter names.
 Missing model rows are omitted. Unused columns do not affect row selection.
-Offsets, formula expression calls, random slopes and other families are not yet
-supported. The response cannot also be a fixed predictor.
+Numeric expressions and offsets are prepared in Rust and saved in the recipe.
+Group terms support random slopes, nested groups and independent `||` effects.
+The response cannot also be a fixed predictor.
 Unsupported terms and options fail explicitly.
+
+Set `family` to `gaussian`, `student`, `bernoulli`, `binomial`, `poisson`,
+`negbinomial`, `Gamma` or `exponential`. `link` is optional:
+
+| Family | Default link | Other links |
+| --- | --- | --- |
+| Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
+| Bernoulli, binomial | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
+| Poisson, negative binomial | log | identity, sqrt, softplus, squareplus |
+| Gamma, exponential | log | identity, inverse, softplus, squareplus |
+
+Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
+Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
+the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
+Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
+integer or a numeric column of counts. Trials remain required for prediction.
+Counts must be nonnegative integers, and binomial responses cannot exceed
+their trials. Gamma and exponential responses must be strictly positive.
+Bernoulli responses may be numeric, logical or factors; the recipe retains
+the training event coding when preparing new data.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
@@ -27,16 +48,20 @@ sum or Helmert contrasts for larger factors.
 Indicator-only terms such as `0 + o` do not need polynomial contrasts and have
 no such level limit.
 
-Defaults match the Gaussian brms rules: a centred Student-t intercept,
-half-Student-t scales, and improper `regression.Flat()` coefficients.
+Defaults follow brms: a centred Student-t intercept, half-Student-t scales,
+and improper `regression.Flat()` coefficients. Numeric response statistics use
+the selected link for the intercept and group scales; direct `sigma` uses the
+identity-link response scale. The default Student degrees of freedom has a
+Gamma(2, 0.1) prior normalized above 1. Gamma shape has Gamma(0.01, 0.01),
+and negative-binomial shape has inverse-Gamma(0.4, 0.3).
 Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_t`,
 `cauchy`, `exponential`, `gamma`, `inv_gamma`, `beta`, `lognormal`, `logistic`,
 `weibull`, `double_exponential`, `chi_square` and `uniform` accept their usual
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
 
-Select priors by `class` (`b`, `Intercept`, `sd`, `sigma`) with optional `coef`,
-`group` and `dpar`. Selectors must identify existing parameters. A coefficient
+Select priors by `class` (`b`, `Intercept`, `sd`, `sigma`, `nu`, `shape`) with
+optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
 prior overrides its class prior; a group prior overrides the global group-scale
 prior. A coefficient-specific `sd` prior also needs `group`.
 
@@ -73,9 +98,9 @@ let prediction = flatppl_formula::prepare_data(
 ```
 
 `Conversion` contains a module, named data constants, a serializable training
-recipe, and parameter metadata. The recipe retains training means, factor
-contrasts and levels, design terms, and group levels. Numeric source columns
-remain raw. The emitted FlatPPL selects contrast values and computes interaction
+recipe, and parameter metadata. The recipe retains family and link, response
+coding, training means, factor contrasts and levels, design terms, and group
+levels. Numeric source columns remain raw. The emitted FlatPPL selects contrast values and computes interaction
 products. Metadata records the default-prior rule and group collation.
 Prediction requires no response column. It reuses the training contrast matrices
 and remaps factor labels even when new data uses a different level order.
@@ -114,6 +139,9 @@ The factor and term fixtures come from base R, with the fixed formula
 reconstruction used by brms 2.23.2. The Gaussian default-prior test values are
 hand-derived from brms rules. [The R script](tests/fixtures/brms-oracle.R) checks
 those defaults with brms 2.23.2.
+[The family prior fixture](tests/fixtures/family-priors.json) records executed
+brms defaults for different links and response types; its adjacent R script
+regenerates the source values.
 [The factor oracle script](tests/fixtures/factor-matrix.R) regenerates the
 design matrices, prediction matrices and brms coefficient names using base R.
 [The Gaussian oracle](tests/fixtures/gaussian-oracle.stan) independently defines

@@ -38,7 +38,7 @@ impl Context {
         self.import_formula(&spec, table, name, source_path)
     }
 
-    /// Import a Gaussian formula model, retaining its Rust preprocessing recipe.
+    /// Import a formula model, retaining its Rust preprocessing recipe.
     /// Data placement in the specification controls printed exports only.
     pub fn import_formula(
         &mut self,

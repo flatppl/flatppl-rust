@@ -1,4 +1,4 @@
-use crate::{Design, Error, Formula, Result, Spec};
+use crate::{Design, Error, Family, Formula, Link, Result, Spec, family::default_scale};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -163,18 +163,16 @@ pub(crate) fn resolve(
     spec: &Spec,
     formula: &Formula,
     design: &Design,
-    response: &[f64],
+    family: Family,
+    link: Link,
+    response: Option<&[f64]>,
     offset_mean: f64,
 ) -> Result<Priors> {
-    let location = median(response.to_vec());
-    let mad = 1.4826 * median(response.iter().map(|y| (y - location).abs()).collect());
-    let location = round_decimal(location) - offset_mean;
-    let scale = round_decimal(mad).max(2.5);
-    if !scale.is_finite() || !location.is_finite() {
-        return Err(Error(
-            "response statistics exceed the finite Gaussian prior range".into(),
-        ));
+    let (mut location, scale) = default_scale(link, response);
+    if response.is_some() && link.uses_response_scale() {
+        location -= offset_mean;
     }
+    let (_, sigma_scale) = default_scale(Link::Identity, response);
     let names: Vec<_> = design
         .columns
         .iter()
@@ -202,12 +200,12 @@ pub(crate) fn resolve(
         group: Some(name),
         dpar: None,
     }));
-    targets.push(PriorTarget {
-        class: "sigma",
+    targets.extend(family.auxiliaries().iter().map(|name| PriorTarget {
+        class: name,
         coef: None,
         group: None,
         dpar: None,
-    });
+    }));
     let mut selected = select(&spec.priors, &targets)?.into_iter();
     let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
     let intercept = if formula.intercept {
@@ -232,39 +230,24 @@ pub(crate) fn resolve(
         .iter()
         .map(|_| selected.next().unwrap().unwrap_or_else(|| student(0.0)))
         .collect();
-    let sigma = selected.next().unwrap().unwrap_or_else(|| student(0.0));
+    let aux = family
+        .auxiliaries()
+        .iter()
+        .map(|&name| {
+            let prior = selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new(family.default_auxiliary(name, sigma_scale)));
+            (name.into(), prior)
+        })
+        .collect();
     Ok(Priors {
         intercept_location: location,
         scale,
-        sigma_scale: scale,
+        sigma_scale,
         intercept,
         b,
         sd,
-        aux: BTreeMap::from([("sigma".into(), sigma)]),
+        aux,
     })
-}
-
-fn median(mut values: Vec<f64>) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        values[middle - 1] / 2.0 + values[middle] / 2.0
-    } else {
-        values[middle]
-    }
-}
-
-// R rounds at the input scale: multiplying first can erase a rounding tie.
-fn round_decimal(value: f64) -> f64 {
-    let x = value.abs();
-    let index = (x * 10.0).floor();
-    let lower = index / 10.0;
-    let upper = (index + 1.0) / 10.0;
-    let distance = x - lower;
-    let rounded = if distance > upper - x || (distance == upper - x && index % 2.0 == 1.0) {
-        upper
-    } else {
-        lower
-    };
-    rounded.copysign(value)
 }

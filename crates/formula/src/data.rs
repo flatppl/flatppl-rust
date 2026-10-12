@@ -1,4 +1,4 @@
-use crate::{Error, Formula, GroupLevel, Recipe, Result};
+use crate::{Error, Family, Formula, GroupLevel, Recipe, Result, Trials};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -103,6 +103,13 @@ impl Table {
 }
 
 impl Column {
+    pub(crate) fn like_factor(&self) -> bool {
+        matches!(
+            self.values,
+            ColumnValues::Factor { .. } | ColumnValues::Bool(_)
+        )
+    }
+
     fn present(&self, row: usize) -> bool {
         self.valid.as_ref().is_none_or(|v| v[row])
             && match &self.values {
@@ -124,6 +131,32 @@ impl Column {
         if values.iter().any(|v| !v.is_finite()) {
             return Err(Error(format!(
                 "column `{}` contains infinite values",
+                self.name
+            )));
+        }
+        Ok(values)
+    }
+
+    fn counts(&self, rows: &[usize]) -> Result<Vec<i64>> {
+        let values = if let ColumnValues::Int(values) = &self.values {
+            rows.iter().map(|&i| values[i]).collect()
+        } else {
+            self.numeric(rows)?
+                .into_iter()
+                .map(|value| {
+                    if value < 0.0 || value.fract() != 0.0 || value >= -(i64::MIN as f64) {
+                        return Err(Error(format!(
+                            "column `{}` must contain nonnegative integers",
+                            self.name
+                        )));
+                    }
+                    Ok(value as i64)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        if values.iter().any(|&value| value < 0) {
+            return Err(Error(format!(
+                "column `{}` must contain nonnegative integers",
                 self.name
             )));
         }
@@ -282,6 +315,10 @@ pub(crate) fn model_rows(formula: &Formula, table: &Table, mode: DataMode) -> Re
                 .iter()
                 .flat_map(|group| group.columns.iter().map(String::as_str)),
         )
+        .chain(match &formula.trials {
+            Some(Trials::Column(name)) => Some(name.as_str()),
+            _ => None,
+        })
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name))
@@ -332,7 +369,19 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
     if mode == DataMode::Training {
         constants.insert(
             "y_data".into(),
-            table.column(&recipe.formula.response)?.data(&rows)?,
+            response(
+                recipe.family,
+                recipe.response_levels.as_deref(),
+                &recipe.formula,
+                table,
+                &rows,
+            )?,
+        );
+    }
+    if let Some(Trials::Column(name)) = &recipe.formula.trials {
+        constants.insert(
+            "trials_data".into(),
+            DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
     }
     for (group, term) in recipe.groups.iter().zip(&recipe.formula.groups) {
@@ -374,6 +423,86 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
         constants.insert(group.index.clone(), DataValue::Integers(indices));
     }
     Ok(DataDocument { constants, rows })
+}
+
+pub(crate) fn response_levels(
+    family: Family,
+    column: &Column,
+    rows: &[usize],
+) -> Result<Option<Vec<GroupLevel>>> {
+    if family != Family::Bernoulli {
+        return Ok(None);
+    }
+    let mut levels = column.levels(rows)?;
+    if !column.like_factor() && levels.len() == 1 {
+        if level_key(&levels[0]) == LevelKey::Integer(0) {
+            levels.push(GroupLevel::Integer(1));
+        } else {
+            levels.insert(0, GroupLevel::Integer(0));
+        }
+    }
+    if levels.len() > 2 {
+        return Err(Error(
+            "Bernoulli responses must contain at most two distinct levels".into(),
+        ));
+    }
+    Ok(Some(levels))
+}
+
+pub(crate) fn response(
+    family: Family,
+    levels: Option<&[GroupLevel]>,
+    formula: &Formula,
+    table: &Table,
+    rows: &[usize],
+) -> Result<DataValue> {
+    let column = table.column(&formula.response)?;
+    if family == Family::Bernoulli {
+        let indices: HashMap<_, _> = levels
+            .expect("binary response levels were saved")
+            .iter()
+            .enumerate()
+            .map(|(i, level)| (level_key(level), i as i64))
+            .collect();
+        return Ok(DataValue::Integers(
+            rows.iter()
+                .map(|&row| {
+                    let value = column.level(row)?;
+                    indices
+                        .get(&level_key(&value))
+                        .copied()
+                        .ok_or_else(|| Error(format!("unseen response level {value:?}")))
+                })
+                .collect::<Result<_>>()?,
+        ));
+    }
+    if family.discrete() {
+        let values = column.counts(rows)?;
+        if family == Family::Binomial {
+            let trials = match formula
+                .trials
+                .as_ref()
+                .expect("binomial trials were validated")
+            {
+                Trials::Constant(n) => vec![*n; rows.len()],
+                Trials::Column(name) => table.column(name)?.counts(rows)?,
+            };
+            if values.iter().zip(trials).any(|(&y, n)| y > n) {
+                return Err(Error(
+                    "binomial responses must not exceed the number of trials".into(),
+                ));
+            }
+        }
+        return Ok(DataValue::Integers(values));
+    }
+    if matches!(family, Family::Gamma | Family::Exponential)
+        && column.numeric(rows)?.iter().any(|&value| value <= 0.0)
+    {
+        return Err(Error(
+            "Gamma and exponential responses must be strictly positive".into(),
+        ));
+    }
+    column.data(rows)
 }
 
 #[derive(PartialEq, Eq, Hash)]

@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-formula"
-description = "A brms-compatible Gaussian formula frontend for FlatPPL."
+description = "A brms-compatible formula frontend for FlatPPL."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

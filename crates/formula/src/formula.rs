@@ -5,12 +5,21 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Formula {
     pub response: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trials: Option<Trials>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
     pub groups: Vec<GroupTerm>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Trials {
+    Constant(i64),
+    Column(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -46,7 +55,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
         .ok_or_else(|| Error("formula must contain `response ~ terms`".into()))?;
-    let response = name(response.trim())?;
+    let (response, trials) = response_addition(response)?;
     let mut parser = Parser {
         tokens: tokenize(rhs)?,
         at: 0,
@@ -93,6 +102,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     }
     Ok(Formula {
         response,
+        trials,
         intercept,
         variables,
         fixed,
@@ -137,6 +147,29 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
         })
         .collect();
     (variables, fixed, expressions)
+}
+
+fn response_addition(text: &str) -> Result<(String, Option<Trials>)> {
+    let Some((response, addition)) = text.split_once('|') else {
+        return Ok((name(text.trim())?, None));
+    };
+    let fail = || Error("response additions support only `y | trials(column_or_integer)`".into());
+    let argument = addition
+        .trim()
+        .strip_prefix("trials")
+        .and_then(|value| value.trim().strip_prefix('('))
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(fail)?
+        .trim();
+    let trials = if let Ok(value) = argument.parse::<i64>() {
+        if value < 0 {
+            return Err(Error("binomial trials must be nonnegative".into()));
+        }
+        Trials::Constant(value)
+    } else {
+        Trials::Column(name(argument).map_err(|_| fail())?)
+    };
+    Ok((name(response.trim())?, Some(trials)))
 }
 
 #[derive(Clone, Copy, PartialEq)]

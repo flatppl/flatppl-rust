@@ -1,7 +1,7 @@
 //! Pure Rust conversion of a bounded brms formula subset into FlatPPL.
 //!
-//! The supported subset uses Gaussian identity-link models, numeric and factor
-//! predictors, interactions, numeric expressions, offsets and group effects.
+//! Scalar response families, numeric and factor predictors, interactions,
+//! numeric expressions, offsets and group effects are supported.
 //! It does not fit a model.
 
 #[cfg(feature = "arrow")]
@@ -11,6 +11,7 @@ mod data;
 mod design;
 mod emit;
 mod expression;
+mod family;
 mod formula;
 mod prior_expr;
 mod priors;
@@ -22,7 +23,8 @@ use std::fmt;
 pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, prepare_data};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
-pub use formula::{Formula, GroupTerm, Term, parse_formula};
+pub use family::{Family, Link};
+pub use formula::{Formula, GroupTerm, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -50,6 +52,8 @@ pub struct Spec {
     pub formula: String,
     #[serde(default = "gaussian")]
     pub family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     #[serde(default)]
     pub priors: Vec<Prior>,
     #[serde(default)]
@@ -99,6 +103,12 @@ pub struct Conversion {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recipe {
     pub formula: Formula,
+    #[serde(default)]
+    pub family: Family,
+    #[serde(default)]
+    pub link: Link,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_levels: Option<Vec<GroupLevel>>,
     pub design: Design,
     pub center: bool,
     pub means: Vec<f64>,
@@ -153,6 +163,7 @@ impl fmt::Display for GroupLevel {
 pub struct ModelInfo {
     pub formula: String,
     pub family: String,
+    pub link: String,
     pub group_collation: String,
     pub default_prior_rule: String,
     pub design_columns: Vec<String>,
@@ -183,13 +194,13 @@ pub fn read(json: &str) -> Result<Spec> {
 
 /// Build a model and an immutable training recipe without I/O.
 pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
-    if spec.family != "gaussian" {
-        return Err(Error(format!(
-            "family `{}` is unsupported; this converter supports gaussian with identity link",
-            spec.family
-        )));
-    }
+    let (family, link) = Family::resolve(&spec.family, spec.link.as_deref())?;
     let formula = parse_formula(&spec.formula)?;
+    if (family == Family::Binomial) != formula.trials.is_some() {
+        return Err(Error(
+            "`trials(...)` is required for binomial and is unavailable for other families".into(),
+        ));
+    }
     if formula
         .predictor_columns()
         .contains(&formula.response.as_str())
@@ -212,13 +223,28 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let (design, means) = design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
-    let response = table.column(&formula.response)?.numeric(&rows)?;
+    let response_column = table.column(&formula.response)?;
+    let response_levels = data::response_levels(family, response_column, &rows)?;
+    data::response(family, response_levels.as_deref(), &formula, table, &rows)?;
+    let response = if response_column.like_factor() {
+        None
+    } else {
+        Some(response_column.numeric(&rows)?)
+    };
     let offset_mean = formula
         .offset()
         .map(|offset| offset.values(table, &rows))
         .transpose()?
         .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
-    let priors = priors::resolve(spec, &formula, &design, &response, offset_mean)?;
+    let priors = priors::resolve(
+        spec,
+        &formula,
+        &design,
+        family,
+        link,
+        response.as_deref(),
+        offset_mean,
+    )?;
     let groups = formula
         .groups
         .iter()
@@ -270,6 +296,9 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let mut recipe = Recipe {
         center: spec.options.center && formula.intercept,
         formula,
+        family,
+        link,
+        response_levels,
         design,
         means,
         groups,
