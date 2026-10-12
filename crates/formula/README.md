@@ -63,7 +63,9 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
-`cumulative` or `categorical`.
+`cumulative`, `categorical`, `zero_inflated_poisson`, `zero_inflated_binomial`,
+`zero_inflated_negbinomial`, `zero_inflated_beta`, `hurdle_poisson`,
+`hurdle_negbinomial`, `hurdle_gamma` or `hurdle_lognormal`.
 `link` is optional:
 
 | Family | Default link | Other links |
@@ -103,6 +105,10 @@ sampler lowering; its density and derivatives are available.
 with `hu` defined as above and the same Gamma(0.01, 0.01) shape prior.
 Its responses are nonnegative; the continuous component contributes no mass
 at zero.
+`hurdle_lognormal` instead uses the ordinary lognormal law for positive values,
+with `mu` on the log-response scale and a direct `sigma`. The mean-link options
+are identity and inverse. Its response-based priors use log responses, replacing
+zeros by 0.1 before taking logs, just as brms does.
 von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
 Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
 The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the

@@ -11,6 +11,7 @@ fn response_support_matches_brms() {
         ("hurdle_poisson", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         ("hurdle_negbinomial", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         ("hurdle_gamma", vec![0.0, 0.8, 2.3], vec![-0.1]),
+        ("hurdle_lognormal", vec![0.0, 0.8, 2.3], vec![-0.1]),
         (
             "zero_inflated_poisson",
             vec![0.0, 1.0, 2.0],

@@ -10,6 +10,8 @@ pub enum Family {
     Gaussian,
     Student,
     Lognormal,
+    #[serde(rename = "hurdle_lognormal")]
+    HurdleLognormal,
     Bernoulli,
     Binomial,
     #[serde(rename = "zero_inflated_binomial")]
@@ -74,6 +76,7 @@ impl Family {
             "gaussian" => Self::Gaussian,
             "student" => Self::Student,
             "lognormal" => Self::Lognormal,
+            "hurdle_lognormal" => Self::HurdleLognormal,
             "bernoulli" => Self::Bernoulli,
             "binomial" => Self::Binomial,
             "zero_inflated_binomial" => Self::ZeroInflatedBinomial,
@@ -96,7 +99,9 @@ impl Family {
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
-            Self::Gaussian | Self::Student | Self::Lognormal => Link::Identity,
+            Self::Gaussian | Self::Student | Self::Lognormal | Self::HurdleLognormal => {
+                Link::Identity
+            }
             Self::Bernoulli
             | Self::Binomial
             | Self::ZeroInflatedBinomial
@@ -117,7 +122,7 @@ impl Family {
         use Link::*;
         let supported = match family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
-            Self::Lognormal => matches!(link, Identity | Inverse),
+            Self::Lognormal | Self::HurdleLognormal => matches!(link, Identity | Inverse),
             Self::Bernoulli
             | Self::Binomial
             | Self::ZeroInflatedBinomial
@@ -183,6 +188,7 @@ impl Family {
             Self::ZeroInflatedBeta => &["phi", "zi"],
             Self::HurdlePoisson => &["hu"],
             Self::HurdleNegbinomial | Self::HurdleGamma => &["shape", "hu"],
+            Self::HurdleLognormal => &["sigma", "hu"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
@@ -233,7 +239,7 @@ impl Family {
     }
 
     pub(crate) fn prior_scale_link(self, link: Link) -> Link {
-        if self == Self::Lognormal {
+        if matches!(self, Self::Lognormal | Self::HurdleLognormal) {
             Link::Log
         } else {
             link
@@ -279,6 +285,7 @@ impl Family {
                     | Self::HurdlePoisson
                     | Self::HurdleNegbinomial
                     | Self::HurdleGamma
+                    | Self::HurdleLognormal
                     | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
@@ -386,6 +393,7 @@ impl Family {
             Self::HurdlePoisson
             | Self::HurdleNegbinomial
             | Self::HurdleGamma
+            | Self::HurdleLognormal
             | Self::ZeroInflatedPoisson
             | Self::ZeroInflatedNegbinomial
             | Self::ZeroInflatedBinomial
@@ -394,6 +402,7 @@ impl Family {
                     Self::HurdlePoisson => (Self::Poisson, "hu"),
                     Self::HurdleNegbinomial => (Self::Negbinomial, "hu"),
                     Self::HurdleGamma => (Self::Gamma, "hu"),
+                    Self::HurdleLognormal => (Self::Lognormal, "hu"),
                     Self::ZeroInflatedPoisson => (Self::Poisson, "zi"),
                     Self::ZeroInflatedNegbinomial => (Self::Negbinomial, "zi"),
                     Self::ZeroInflatedBeta => (Self::Beta, "zi"),
