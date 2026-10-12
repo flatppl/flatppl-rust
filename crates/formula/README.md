@@ -47,7 +47,7 @@ This is the typed equivalent of `bf(y ~ x, sigma ~ g)`; `bf(...)` strings are
 not yet accepted. Each predictor saves its own contrasts, centring, offsets
 and group effects. Training omits incomplete rows jointly across the response
 and every predictor. Prediction reuses all fitted recipes without a response.
-Priors without `dpar` apply to the mean predictor. Set `dpar` for auxiliary
+For scalar families, priors without `dpar` apply to the mean predictor. Set `dpar` for auxiliary
 coefficients, intercepts, group scales or correlations. A direct `sigma` prior
 is unavailable when `sigma` has a predictor; its priors belong to the linear
 predictor before the inverse link.
@@ -62,7 +62,8 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 `b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
-`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises` or `cumulative`.
+`negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
+`cumulative` or `categorical`.
 `link` is optional:
 
 | Family | Default link | Other links |
@@ -74,6 +75,7 @@ Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `po
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 | von Mises | tan_half | identity |
 | Cumulative ordinal | logit | — |
+| Categorical | logit | — |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
@@ -109,6 +111,36 @@ when they match after alias expansion and exact numeric-literal comparison.
 Different parameterizations of the same law may still be refused, such as
 `cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
 priors and other ordinal links or threshold parameterizations are not supported.
+
+Categorical responses accept factors, logical values or numeric labels. The first
+retained level is the reference category, with logit zero. Every other category
+gets a predictor from the main formula, named `mu` followed by its brms category
+name. For levels `red`, `blue`, `green`, the predictors are `mublue` and `mugreen`:
+
+```json
+{
+  "formula": "y ~ x",
+  "family": "categorical",
+  "dpars": {"mublue": {"formula": "mublue ~ 0 + z"}},
+  "priors": [
+    {"class": "b", "dpar": "mublue", "prior": "normal(0, 1)"},
+    {"class": "b", "dpar": "mugreen", "prior": "normal(0, 1)"}
+  ]
+}
+```
+
+Each category retains its own design, centring, offsets, groups and priors.
+The observation law is `Categorical(softmax([0, eta_blue, eta_green]))` for each
+row. Coefficients default to Flat and category intercepts to Student-t(3, 0, 2.5).
+As in brms, `b`, `Intercept` and `sd` priors require `dpar`. Correlation priors
+use global or group selectors across all categories, without `dpar`.
+The recipe preserves training response levels and their predictor order;
+`ModelInfo.dpars` lists the generated names. Names follow brms with C collation
+and default numeric formatting; nonreference labels must be ASCII and ambiguous
+names are refused.
+An alternative reference category and a missing-row omission that removes an
+entire response level are currently refused. Filter those rows and refit with an
+explicit factor level order. Prediction needs no response or weights.
 
 Response weights use `y | weights(w) ~ ...`, or
 `y | trials(n) + weights(w) ~ ...` for binomial data. `w` names a numeric
@@ -313,3 +345,9 @@ brms 2.23.2 training and prediction bases. Its adjacent R script regenerates
 the values. The native basis preserves the fixed slope's scale and the full
 penalized covariance; independent eigensolvers may rotate the standard Normal
 coefficients without changing the induced smooth or prior.
+
+[The categorical reproducer](tests/fixtures/categorical-oracle.R) checks saved
+response coding, selector rules and numeric category names against brms, and
+generates default and weighted category-specific Stan models. The adjacent JSON
+retains their normalized scores, coefficient gradients and source hashes beside
+independent softmax calculations.

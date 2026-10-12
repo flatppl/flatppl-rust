@@ -539,6 +539,15 @@ pub(crate) fn response_levels(
     column: &Column,
     rows: &[usize],
 ) -> Result<Option<Vec<GroupLevel>>> {
+    if family == Family::Categorical {
+        let levels = column.levels(rows)?;
+        if levels.len() < 2 {
+            return Err(Error(
+                "categorical responses require at least two categories".into(),
+            ));
+        }
+        return Ok(Some(levels));
+    }
     if family == Family::Cumulative {
         let levels = match &column.values {
             ColumnValues::Factor { ordered: true, .. } => column.levels(rows)?,
@@ -592,8 +601,11 @@ pub(crate) fn response(
     rows: &[usize],
 ) -> Result<DataValue> {
     let column = table.column(&formula.response)?;
-    if matches!(family, Family::Bernoulli | Family::Cumulative) {
-        let first = i64::from(family == Family::Cumulative);
+    if matches!(
+        family,
+        Family::Bernoulli | Family::Cumulative | Family::Categorical
+    ) {
+        let first = i64::from(family != Family::Bernoulli);
         let indices: HashMap<_, _> = levels
             .expect("response levels were saved")
             .iter()

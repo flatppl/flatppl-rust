@@ -4,6 +4,53 @@ use flatppl_host::{
 };
 
 #[test]
+fn categorical_prediction_reuses_each_category_predictor() -> Result<(), Box<dyn std::error::Error>>
+{
+    let spec = flatppl_formula::read(include_str!(
+        "../../formula/tests/fixtures/categorical.formula.json"
+    ))?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    context.register("categorical.flatppl", &model.module)?;
+    let parameters = "temp_Intercept_mublue=p[1], b_mublue=[p[2]], temp_Intercept_mugreen=p[3], b_mugreen=[p[4]]";
+    let score = context.parse(
+        &format!(
+            r#"
+        m = load_module("categorical.flatppl")
+        p = elementof(cartpow(reals, 4))
+        inputs = p
+        outputs = record(posterior = logdensityof(m.Pi_post, record({parameters})),
+            pointwise = m.log_lik({parameters}))
+    "#
+        ),
+        None,
+        None,
+    )?;
+    let training = score.compile(&EmitOptions::default())?;
+    let prediction = flatppl_formula::Table::from_json(r#"{"x":[-1,2,8]}"#)?;
+    let prediction = model.prepare(&mut context, &prediction, DataMode::Prediction)?;
+    context.register("prediction.flatppl", &prediction)?;
+    let query = context.parse(
+        &format!(
+            r#"
+        m = load_module("prediction.flatppl")
+        p = elementof(cartpow(reals, 4))
+        inputs = p
+        outputs = logdensityof(m.K_model({parameters}), record(y=[3,2,1]))
+    "#
+        ),
+        None,
+        None,
+    )?;
+    query.compile(&EmitOptions::default())?;
+    assert_eq!(
+        score.compile(&EmitOptions::default())?.stablehlo,
+        training.stablehlo
+    );
+    Ok(())
+}
+
+#[test]
 fn coefficient_priors_can_reference_later_family_auxiliaries()
 -> Result<(), Box<dyn std::error::Error>> {
     let spec = flatppl_formula::read(

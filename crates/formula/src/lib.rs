@@ -6,6 +6,7 @@
 
 #[cfg(feature = "arrow")]
 mod arrow;
+mod categorical;
 mod contrasts;
 mod data;
 mod design;
@@ -158,6 +159,9 @@ pub struct Recipe {
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_levels: Option<Vec<GroupLevel>>,
+    /// Predictor names in nonreference response-category order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_predictors: Vec<String>,
     pub predictors: BTreeMap<String, PredictorRecipe>,
     pub auxiliary_priors: BTreeMap<String, ResolvedPrior>,
 }
@@ -181,6 +185,7 @@ impl Recipe {
     pub(crate) fn predictors(&self) -> impl Iterator<Item = (&str, &PredictorRecipe)> {
         std::iter::once("mu")
             .chain(self.family.auxiliaries().iter().copied())
+            .chain(self.category_predictors.iter().map(String::as_str))
             .filter_map(|name| self.predictors.get(name).map(|predictor| (name, predictor)))
     }
 
@@ -298,7 +303,27 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 .into(),
         ));
     }
-    let mut formulas = vec![("mu", formula, link)];
+    let initial_levels = if family == Family::Categorical {
+        let mut response_only = formula.clone();
+        response_only.weights = None;
+        let rows = data::model_rows(&response_only, &[], table, DataMode::Training)?;
+        data::response_levels(family, table.column(&formula.response)?, &rows)?
+    } else {
+        None
+    };
+    let category_predictors = initial_levels
+        .as_deref()
+        .map(categorical::predictor_names)
+        .transpose()?
+        .unwrap_or_default();
+    let mut formulas = if family == Family::Categorical {
+        category_predictors
+            .iter()
+            .map(|name| (name.as_str(), formula.clone(), link))
+            .collect()
+    } else {
+        vec![("mu", formula.clone(), link)]
+    };
     for (name, spec) in &spec.dpars {
         let formula = parse_formula(&spec.formula)?;
         if formula.response != *name
@@ -310,18 +335,43 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 "distributional formula must be `{name} ~ terms` without response additions"
             )));
         }
-        let link = family.auxiliary_link(name, spec.link.as_deref())?;
-        formulas.push((name, formula, link));
+        if family == Family::Categorical {
+            let predictor = formulas
+                .iter_mut()
+                .find(|(dpar, _, _)| *dpar == name)
+                .ok_or_else(|| {
+                    Error(format!(
+                        "categorical predictor `{name}` is not one of {}",
+                        category_predictors.join(", ")
+                    ))
+                })?;
+            let (_, link) = Family::resolve("categorical", spec.link.as_deref())?;
+            *predictor = (name, formula, link);
+        } else {
+            let link = family.auxiliary_link(name, spec.link.as_deref())?;
+            formulas.push((name, formula, link));
+        }
     }
-    let formula = &formulas[0].1;
     if spec.dpars.contains_key("sigma") && formula.se.as_ref().is_some_and(|se| !se.sigma) {
         return Err(Error(
             "sigma cannot be predicted with se(sigma=FALSE)".into(),
         ));
     }
     for prior in &spec.priors {
-        if let Some(name) = priors::dpar(prior.dpar.as_deref())
-            && !spec.dpars.contains_key(name)
+        let dpar = priors::dpar(prior.dpar.as_deref());
+        let correlation = matches!(prior.class.as_str(), "cor" | "L");
+        if family == Family::Categorical && dpar.is_none() && !correlation {
+            return Err(Error(
+                "categorical priors must select a category predictor with `dpar`".into(),
+            ));
+        }
+        if family == Family::Categorical && dpar.is_some() && correlation {
+            return Err(Error(
+                "categorical correlation priors select `group`, without `dpar`".into(),
+            ));
+        }
+        if let Some(name) = dpar
+            && !formulas.iter().any(|(dpar, _, _)| *dpar == name)
         {
             return Err(Error(format!(
                 "prior selects unpredicted distributional parameter `{name}`"
@@ -342,7 +392,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
-    let rows = data::model_rows(formula, &predictor_formulas, table, DataMode::Training)?;
+    let rows = data::model_rows(&formula, &predictor_formulas, table, DataMode::Training)?;
     for name in spec.options.contrasts.keys() {
         if !formulas.iter().any(|(_, formula, _)| {
             formula.variables.contains(name)
@@ -355,12 +405,15 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     }
     let response_column = table.column(&formula.response)?;
     let response_levels = data::response_levels(family, response_column, &rows)?;
+    if family == Family::Categorical && initial_levels != response_levels {
+        return Err(Error("missing-row omission removed an entire categorical response level; filter rows and refit the formula explicitly".into()));
+    }
     let thresholds = if family == Family::Cumulative {
         response_levels.as_ref().unwrap().len() - 1
     } else {
         0
     };
-    data::response(family, response_levels.as_deref(), formula, table, &rows)?;
+    data::response(family, response_levels.as_deref(), &formula, table, &rows)?;
     let response = if response_column.like_factor() {
         None
     } else {
@@ -368,7 +421,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     let (_, group_scale) =
         family::default_scale(family.prior_scale_link(link), response.as_deref());
-    let response_formula = formula.clone();
+    let response_formula = formula;
     let mut predictors = BTreeMap::new();
     let mut auxiliary_priors = BTreeMap::new();
     for (name, formula, link) in formulas {
@@ -470,11 +523,15 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             },
         );
     }
+    if family == Family::Categorical {
+        priors::categorical_correlations(&spec.priors, &mut predictors)?;
+    }
     let mut recipe = Recipe {
         formula: response_formula,
         family,
         link,
         response_levels,
+        category_predictors,
         predictors,
         auxiliary_priors,
     };

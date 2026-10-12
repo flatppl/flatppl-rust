@@ -98,9 +98,14 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
             name,
             predictor,
             if name == "mu" { thresholds } else { 0 },
+            recipe.family,
         );
     }
-    let mu = b.self_ref("mu");
+    let mu = if recipe.family == Family::Categorical {
+        b.lit_real(0.0)
+    } else {
+        b.self_ref("mu")
+    };
     let trials = recipe.formula.trials.as_ref().map(|trials| match trials {
         Trials::Constant(n) => b.lit_int(*n),
         Trials::Column(_) => b.self_ref("trials_data"),
@@ -117,10 +122,9 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         broadcast(&mut b, "sqrt", &[variance])
     });
     let auxiliary: Vec<_> = recipe
-        .predictors
-        .keys()
-        .filter(|&name| name != "mu")
-        .map(|name| (name.as_str(), b.self_ref(name)))
+        .predictors()
+        .filter(|(name, _)| *name != "mu")
+        .map(|(name, _)| (name, b.self_ref(name)))
         .collect();
     let law = recipe.family.observation(
         &mut b,
@@ -206,13 +210,17 @@ pub(crate) fn model(spec: &Spec, recipe: &mut Recipe) -> Result<Module> {
         ("has_improper_prior", improper),
         ("score_offset", score_offset),
     ];
-    if !spec.dpars.is_empty() {
+    if recipe.predictors.keys().any(|name| name != "mu") {
         let dpars: Vec<_> = recipe
             .predictors
             .iter()
             .filter(|(name, _)| name.as_str() != "mu")
             .map(|(name, predictor)| {
-                let formula = b.str_lit(&spec.dpars[name].formula);
+                let formula = b.str_lit(
+                    spec.dpars
+                        .get(name)
+                        .map_or(&spec.formula, |dpar| &dpar.formula),
+                );
                 let link = b.str_lit(predictor.link.name());
                 (
                     name.as_str(),
@@ -471,6 +479,7 @@ fn predictor_values(
     dpar: &str,
     recipe: &crate::PredictorRecipe,
     thresholds: usize,
+    family: Family,
 ) {
     let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
         .map(|i| predictor_name(dpar, &format!("x_{}", i + 1)))
@@ -564,7 +573,7 @@ fn predictor_values(
     }
     b.bind(&format!("eta_{dpar}"), eta);
     let eta = b.self_ref(&format!("eta_{dpar}"));
-    let value = if thresholds > 0 {
+    let value = if thresholds > 0 || family == Family::Categorical {
         eta
     } else {
         recipe.link.inverse(b, eta)
@@ -613,7 +622,11 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         inputs.push((b.sym(name), value));
         b.m.alloc(Node::Ref(value))
     };
-    let mu = argument(b, "mu");
+    let mu = if recipe.family == Family::Categorical {
+        b.lit_real(0.0)
+    } else {
+        argument(b, "mu")
+    };
     let value = argument(b, "value");
     let trials = match recipe.formula.trials {
         Some(Trials::Constant(n)) => Some(b.lit_int(n)),
@@ -622,10 +635,9 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     };
     let row_scale = scale.map(|_| argument(b, "scale"));
     let auxiliary: Vec<_> = recipe
-        .predictors
-        .keys()
-        .filter(|&name| name != "mu")
-        .map(|name| (name.as_str(), argument(b, name)))
+        .predictors()
+        .filter(|(name, _)| *name != "mu")
+        .map(|(name, _)| (name, argument(b, name)))
         .collect();
     let law = recipe.family.observation(
         b,
@@ -646,7 +658,11 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         named: Box::default(),
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
-    let mut args = vec![row_score, b.self_ref("mu"), b.self_ref("y_data")];
+    let mut args = vec![row_score];
+    if recipe.family != Family::Categorical {
+        args.push(b.self_ref("mu"));
+    }
+    args.push(b.self_ref("y_data"));
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         args.push(b.self_ref("trials_data"));
     }
@@ -655,10 +671,9 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     }
     args.extend(
         recipe
-            .predictors
-            .keys()
-            .filter(|&name| name != "mu")
-            .map(|name| b.self_ref(name)),
+            .predictors()
+            .filter(|(name, _)| *name != "mu")
+            .map(|(name, _)| b.self_ref(name)),
     );
     b.call("broadcast", &args)
 }
@@ -894,12 +909,17 @@ pub(crate) fn info(
             spec.family,
             recipe.link.name()
         ),
-        design_columns: recipe.predictors["mu"]
-            .design
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
+        design_columns: recipe
+            .predictors
+            .get("mu")
+            .map_or_else(Vec::new, |predictor| {
+                predictor
+                    .design
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect()
+            }),
         dpars: recipe
             .predictors
             .iter()
@@ -908,7 +928,11 @@ pub(crate) fn info(
                 (
                     name.clone(),
                     crate::PredictorInfo {
-                        formula: spec.dpars[name].formula.clone(),
+                        formula: spec
+                            .dpars
+                            .get(name)
+                            .map_or(&spec.formula, |dpar| &dpar.formula)
+                            .clone(),
                         link: predictor.link.name().into(),
                         design_columns: predictor
                             .design

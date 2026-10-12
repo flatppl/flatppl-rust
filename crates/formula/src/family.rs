@@ -29,6 +29,7 @@ pub enum Family {
     #[serde(rename = "von_mises")]
     VonMises,
     Cumulative,
+    Categorical,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -79,6 +80,7 @@ impl Family {
             "beta" => Self::Beta,
             "von_mises" => Self::VonMises,
             "cumulative" => Self::Cumulative,
+            "categorical" => Self::Categorical,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
@@ -87,7 +89,8 @@ impl Family {
             | Self::Binomial
             | Self::ZeroInflatedBinomial
             | Self::Beta
-            | Self::Cumulative => Link::Logit,
+            | Self::Cumulative
+            | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
             _ => Link::Log,
         };
@@ -119,7 +122,7 @@ impl Family {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
-            Self::Cumulative => link == Logit,
+            Self::Cumulative | Self::Categorical => link == Logit,
         };
         if !supported {
             return Err(Error(format!(
@@ -142,6 +145,7 @@ impl Family {
                 | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
+                | Self::Categorical
         )
     }
 
@@ -253,9 +257,17 @@ impl Family {
                 ns: RefNs::Local,
                 name: b.sym("_mu_"),
             };
-            let mean = b.m.alloc(Node::Ref(local));
-            let mut inputs = vec![(b.sym("mu"), local)];
-            let mut args = vec![mu];
+            let mean = if self == Self::Categorical {
+                mu
+            } else {
+                b.m.alloc(Node::Ref(local))
+            };
+            let mut inputs = Vec::new();
+            let mut args = Vec::new();
+            if self != Self::Categorical {
+                inputs.push((b.sym("mu"), local));
+                args.push(mu);
+            }
             let trials = trials.map(|value| {
                 let local = Ref {
                     ns: RefNs::Local,
@@ -398,6 +410,13 @@ impl Family {
                 apply(b, "VonMises", &[mu, kappa])
             }
             Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
+            Self::Categorical => {
+                let mut logits = vec![b.lit_real(0.0)];
+                logits.extend(observation.auxiliary.iter().map(|(_, value)| *value));
+                let logits = b.array(&logits);
+                let probabilities = b.call("softmax", &[logits]);
+                b.call("Categorical", &[probabilities])
+            }
         }
     }
 }

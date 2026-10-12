@@ -391,3 +391,36 @@ fn group_targets<'a>(
     }
     targets
 }
+
+pub(crate) fn categorical_correlations(
+    priors: &[Prior],
+    predictors: &mut BTreeMap<String, crate::PredictorRecipe>,
+) -> Result<()> {
+    let priors: Vec<_> = priors
+        .iter()
+        .filter(|prior| canonical_class(&prior.class) == "cor")
+        .cloned()
+        .collect();
+    let targets: Vec<_> = predictors
+        .values()
+        .flat_map(|predictor| predictor.groups.iter().zip(&predictor.priors.cor))
+        .filter(|(_, prior)| prior.is_some())
+        .map(|(group, _)| PriorTarget {
+            class: "cor",
+            coef: None,
+            group: Some(&group.column),
+            dpar: None,
+        })
+        .collect();
+    let selected = select(&priors, &targets)?;
+    for (prior, selected) in predictors
+        .values_mut()
+        .flat_map(|predictor| predictor.priors.cor.iter_mut().flatten())
+        .zip(selected)
+    {
+        if let Some(selected) = selected {
+            *prior = selected;
+        }
+    }
+    Ok(())
+}
