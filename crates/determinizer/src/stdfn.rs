@@ -27,7 +27,7 @@
 //! rather than refuse. `conformance::is_flatpdl` names the member in its refusal
 //! for the calls that do survive.
 //!
-//! A member this pass does implement, but whose call shape it cannot read (named
+//! A member this pass does implement, but whose call shape it cannot read (invalid
 //! arguments, wrong arity, a non-literal degree), is likewise left alone.
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,7 @@ use crate::density::{build_call, resolve_ref_one};
 use crate::refuse::RefuseError;
 
 mod pyhf;
+mod splines;
 
 /// Largest `polynomials` degree this pass will unroll. The lowering emits the
 /// three-term recursion node by node, so the emitted subtree grows linearly in
@@ -189,7 +190,7 @@ fn normalize_member_call(m: &mut Module, id: NodeId, module: &str, member: &str)
 
 /// Build the base-op replacement for the member call at `id`, or `None` to leave
 /// the call alone (no base-op form for this member, or a call shape this pass
-/// cannot read: named arguments, wrong arity, or a non-literal integer degree).
+/// cannot read: invalid arguments, wrong arity, or a non-literal integer degree).
 fn lower_member_call(
     m: &mut Module,
     id: NodeId,
@@ -197,6 +198,7 @@ fn lower_member_call(
     member: &str,
     pyhf_functions: &mut HashMap<String, NodeId>,
 ) -> Option<NodeId> {
+    let id = normalize_member_call(m, id, module, member).unwrap_or(id);
     let c = match m.node(id) {
         Node::Call(c) => c.clone(),
         _ => return None,
@@ -275,6 +277,7 @@ fn lower_member_function(
 ) -> Option<NodeId> {
     match (module, member) {
         ("pyhf-helpers", member) => pyhf::lower_function(m, args, member),
+        ("splines", member) => splines::lower_function(m, args, member),
         ("particle-physics", "interp_pwlin") => arity::<4>(args).map(|a| interp_pwlin(m, a)),
         ("particle-physics", "interp_pwexp") => arity::<4>(args).map(|a| interp_pwexp(m, a)),
         ("particle-physics", "interp_poly2_lin") => {

@@ -1,0 +1,13 @@
+// Standard module: splines (spec §09).
+Module(
+    name: "splines",
+    version: "0.1",
+    bindings: [
+        Binding(name: "thinplate_basis", sig: Function(
+            params: [Scalar(Real), Vector(Real)], names: ["x", "centers"],
+            result: Vector(len: Add(Axis(1, 0), 2), elem: Real))),
+        Binding(name: "thinplate_penalty", sig: Function(
+            params: [Vector(Real)], names: ["centers"],
+            result: Matrix(rows: Add(Axis(0, 0), 2), cols: Add(Axis(0, 0), 2)))),
+    ],
+)
