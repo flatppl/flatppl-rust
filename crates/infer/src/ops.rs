@@ -4540,8 +4540,8 @@ fn ksuperpose_cell_variate(
         }
         // A §09 member reference carries its catalogue sig; a bare builtin
         // constructor reaches its domain by name. Both mirror `broadcast_type`.
-        if let Some(sig) = inf.module_catalogue_ref(component).map(|c| c.sig.clone()) {
-            return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
+        if inf.module_catalogue_ref(component).is_some() {
+            return match catalogue_call_type(inf, component, &cell_args, &cell_named) {
                 Type::Measure { domain, .. } => Some(*domain),
                 _ => None,
             };
@@ -5660,7 +5660,7 @@ fn user_call_type(
         if let Some(note) = note {
             inf.note_once_str(&note);
         }
-        return Ready(catalogue_call_type(inf, callee, args));
+        return Ready(catalogue_call_type(inf, callee, args, named));
     }
     // Prefer the per-call substituted body type (arg types bound to the
     // callable's parameters); fall back to the un-substituted body type for
@@ -5727,7 +5727,29 @@ fn user_call_type(
 ///     or a dynamic-dim matrix).
 ///
 /// The support is carried separately by `catalogue_call_valueset`.
-fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[ArgInfo]) -> Type {
+fn catalogue_call_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    if is_flat_constructor(inf, callee) {
+        let support = lebesgue_counting_support_node(inf, args, named);
+        let valueset = flat_support(inf, args, named);
+        if !continuous_support(&valueset) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                support.unwrap_or(callee),
+                "Flat requires a continuous support set, as for Lebesgue",
+            ));
+            return Type::Failed("non-continuous Flat support".into());
+        }
+        return Type::Measure {
+            domain: Box::new(support.map_or(Type::Scalar(ScalarType::Real), |node| {
+                set_element_type(inf, Some(node))
+            })),
+            mass: reference_mass(&valueset),
+        };
+    }
     // Clone the sig out to drop the immutable borrow before `lower`'s closures
     // re-borrow `args` inside the `&mut inf` call frame.
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
@@ -5749,11 +5771,51 @@ fn catalogue_call_valueset(
     inf: &mut Inferencer<'_, '_>,
     callee: NodeId,
     args: &[ArgInfo],
+    named: &[NamedInfo],
 ) -> ValueSet {
+    if is_flat_constructor(inf, callee) {
+        return flat_support(inf, args, named);
+    }
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return ValueSet::Unknown;
     };
     catalogue_lower(&mut *inf.module, &sig, args).1
+}
+
+fn is_flat_constructor(inf: &Inferencer<'_, '_>, callee: NodeId) -> bool {
+    inf.module_catalogue_ref(callee)
+        .is_some_and(|c| c.module == "regression" && c.member == "Flat")
+}
+
+fn flat_support(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> ValueSet {
+    match lebesgue_counting_support_node(inf, args, named) {
+        Some(node) => set_expr_valueset(inf, Some(node)),
+        None => ValueSet::Reals,
+    }
+}
+
+fn continuous_support(support: &ValueSet) -> bool {
+    match support {
+        ValueSet::CartPow(element, _) => continuous_support(element),
+        ValueSet::CartProd(parts) => parts.iter().all(continuous_support),
+        ValueSet::RecordSet(fields) => fields.iter().all(|(_, set)| continuous_support(set)),
+        ValueSet::Integers
+        | ValueSet::PosIntegers
+        | ValueSet::NonNegIntegers
+        | ValueSet::Booleans
+        | ValueSet::Complexes
+        | ValueSet::RngStates
+        | ValueSet::Anything => false,
+        _ => true,
+    }
+}
+
+fn reference_mass(support: &ValueSet) -> Mass {
+    match support.is_bounded() {
+        Some(true) => Mass::Finite,
+        Some(false) => Mass::LocallyFinite,
+        None => Mass::Unknown,
+    }
 }
 
 /// Lower a §09 catalogue sig with a `LowerCtx` built from the concrete
@@ -6124,6 +6186,9 @@ fn broadcast_type(
         }
     }
     let Some(shape) = shape else {
+        if is_flat_constructor(inf, head_node) {
+            return Ready(catalogue_call_type(inf, head_node, &args[1..], named));
+        }
         // No concrete array argument. Broadcasting a DISTRIBUTION is still a
         // measure (an independent product over the eventual broadcast shape), so
         // a reified lambda body `dist.(params)` — whose params are still `%local`
@@ -6224,7 +6289,7 @@ fn broadcast_type(
     // type, a scalar rides along unchanged (every current §09 sig has a fixed
     // cell type, but lowering against the cell args keeps a future
     // `RealOrComplexOfArg` / `DomainMap` row correct).
-    if let Some(sig) = inf.module_catalogue_ref(head_node).map(|c| c.sig.clone()) {
+    if inf.module_catalogue_ref(head_node).is_some() {
         let cell_args: Vec<ArgInfo> = args[1..]
             .iter()
             .map(|(n, t, p)| {
@@ -6236,7 +6301,7 @@ fn broadcast_type(
             })
             .collect();
         return Ready(
-            match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
+            match catalogue_call_type(inf, head_node, &cell_args, named) {
                 // Distribution head: an independent product over the array. Its cell
                 // domain and mass come from the catalogue sig, so a non-probability
                 // measure like `ContinuedPoisson` stays `Finite`, not forced to
@@ -8566,7 +8631,7 @@ pub(crate) fn call_valueset(
     // is lowered from the catalogue sig with the call args.
     if let Some((callee_node, _)) = callee {
         if inf.module_catalogue_ref(*callee_node).is_some() {
-            return Ready(catalogue_call_valueset(inf, *callee_node, args));
+            return Ready(catalogue_call_valueset(inf, *callee_node, args, named));
         }
         // Per-call substituted body value-set (arg sets bound to the callable's
         // parameters): a callable whose body tightens its range — `f(x) =
@@ -8614,6 +8679,9 @@ pub(crate) fn call_valueset(
                 return Ready(ValueSet::Unknown);
             };
             let head_node = *head_node;
+            if is_flat_constructor(inf, head_node) {
+                return Ready(flat_support(inf, &args[1..], named));
+            }
             let cell = |t: &Type| match t {
                 Type::Array { elem, .. } => elem.as_ref().clone(),
                 other => other.clone(),
@@ -9349,11 +9417,7 @@ pub(crate) fn fill_mass(
         // boundedly finite) on an unbounded one.
         "Lebesgue" | "Counting" => {
             let support_node = lebesgue_counting_support_node(inf, args, named);
-            match set_expr_valueset(inf, support_node).is_bounded() {
-                Some(true) => Mass::Finite,
-                Some(false) => Mass::LocallyFinite,
-                None => Mass::Unknown,
-            }
+            reference_mass(&set_expr_valueset(inf, support_node))
         }
         "iid" => match arg_mass(0) {
             Mass::Normalized => Mass::Normalized,

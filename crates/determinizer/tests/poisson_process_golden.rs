@@ -92,7 +92,7 @@ lp = logdensityof(lawof(record(events = events)), record(events = obs))";
 // below — deliberately NOT a product that folds to 1, which would pass even if
 // the interval length were dropped for a unit-mass shortcut.
 #[test]
-fn bounded_lebesgue_mass_is_the_interval_length() {
+fn bounded_reference_mass_is_the_interval_length() {
     let src = "\
 window = interval(0.0, 4.0)
 obs = [2.0]
@@ -100,12 +100,18 @@ b = elementof(posreals)
 intensity = weighted(b, weighted(0.3, Lebesgue(support = window)))
 events ~ PoissonProcess(intensity = intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
-    let out = determinize_src(src);
-    let text = flatppl_syntax::print(&out);
-    assert!(
-        text.contains("b * 1.2"),
-        "Λ = b · (0.3 · 4.0) = 1.2·b:\n{text}"
-    );
+    for reference in ["Lebesgue", "reg.Flat"] {
+        let source = format!(
+            "reg = standard_module(\"regression\", \"0.1\")\n{}",
+            src.replace("Lebesgue", reference)
+        );
+        let out = determinize_src(&source);
+        let text = flatppl_syntax::print(&out);
+        assert!(
+            text.contains("b * 1.2"),
+            "Λ = b · (0.3 · 4.0) = 1.2·b:\n{text}"
+        );
+    }
 }
 
 // An UNBOUNDED intensity support has infinite mass, so §08's finite-mass

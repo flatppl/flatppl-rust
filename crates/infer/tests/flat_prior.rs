@@ -1,4 +1,4 @@
-use flatppl_core::{Mass, Module, Type};
+use flatppl_core::{Mass, Module, Type, ValueSet};
 use flatppl_infer::{Level, ModuleBundle, Severity};
 
 fn analyze(source: &str) -> (Module, Vec<flatppl_infer::Diagnostic>) {
@@ -45,13 +45,30 @@ fn flat_compositions_admit_coordinates_without_normalizing_the_prior() {
          raw ~ reg.Flat()\n\
          shifted = kernelof(raw + offset, offset = offset)\n\
          shifted_draw ~ shifted(0)\n\
-         shifted_law = lawof(shifted_draw)",
+         shifted_law = lawof(shifted_draw)\n\
+         bounded ~ reg.Flat(support = interval(-1, 2))\n\
+         bounded_law = lawof(bounded)\n\
+         bounded_copy ~ bounded_law\n\
+         dependent ~ reg.Flat(interval(0, sigma))\n\
+         dependent_law = kernelof(dependent, sigma = sigma)\n\
+         dotted ~ reg.Flat.(posreals)\n\
+         dotted_law = lawof(dotted)\n\
+         structured ~ reg.Flat(cartprod(a = unitinterval, b = ordered(3)))\n\
+         response ~ Normal(structured.a + sum(structured.b), 1)",
     );
     assert_eq!(mass(&module, "source"), Mass::LocallyFinite);
     assert_eq!(mass(&module, "direct"), Mass::LocallyFinite);
     assert_eq!(mass(&module, "prior"), Mass::Unknown);
     assert_ne!(mass(&module, "chain_law"), Mass::Normalized);
     assert_eq!(mass(&module, "shifted_law"), Mass::Unknown);
+    assert_eq!(mass(&module, "bounded_law"), Mass::Finite);
+    assert_eq!(mass(&module, "dependent_law"), Mass::Unknown);
+    assert_eq!(mass(&module, "dotted_law"), Mass::LocallyFinite);
+    let (_, dotted) = module
+        .bindings()
+        .find(|(_, binding)| module.resolve(binding.name) == "dotted")
+        .unwrap();
+    assert_eq!(module.valueset_of(dotted.rhs), Some(&ValueSet::PosReals));
 }
 
 #[test]
@@ -109,12 +126,14 @@ fn nested_kernel_calls_retain_enclosing_input_substitutions() {
 
 #[test]
 fn admitted_improper_prior_still_cannot_be_sampled() {
-    let (_, diagnostics) = analyze(
-        "b ~ reg.Flat()\n\
-         prior = lawof(record(b = b))\n\
-         sample = rand(prior, rnginit(7))",
-    );
-    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error));
+    for support in ["", "interval(0, 1)"] {
+        let (_, diagnostics) = analyze(&format!(
+            "b ~ reg.Flat({support})\n\
+             prior = lawof(record(b = b))\n\
+             sample = rand(prior, rnginit(7))"
+        ));
+        assert!(diagnostics.iter().any(|d| d.severity == Severity::Error));
+    }
 }
 
 #[test]

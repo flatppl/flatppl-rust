@@ -1854,25 +1854,35 @@ fn lower_in_ordered_compares_consecutive_differences() {
     assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
 }
 
-/// §03 "Standard simplex": entries `>= 0`. The unit sum is not checked.
+/// §03 "Standard simplex": nonnegative entries and a unit sum within roundoff.
 #[test]
-fn lower_in_stdsimplex_checks_signs_not_the_sum() {
+fn lower_in_stdsimplex_checks_signs_and_the_sum() {
     let out = lower_in_vector_set("stdsimplex");
     assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
-    assert!(!out.contains("applies stablehlo.add"), "in:\n{out}");
+    assert_eq!(
+        out.matches("applies stablehlo.add").count(),
+        2,
+        "in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.compare LE"), "in:\n{out}");
     assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
 }
 
-/// §03 "Zero-sum vectors": the zero sum is not checked, only that every
-/// entry is a real number.
+/// §03 "Zero-sum vectors": a finite zero sum with a scale-relative tolerance.
 #[test]
-fn lower_in_zerosum_checks_only_real_entries() {
+fn lower_in_zerosum_checks_real_entries_and_the_sum() {
     let out = lower_in_vector_set("zerosum");
     assert!(
         out.contains("stablehlo.compare EQ, %arg0, %arg0"),
         "in:\n{out}"
     );
-    assert!(!out.contains("applies stablehlo.add"), "in:\n{out}");
+    assert_eq!(
+        out.matches("applies stablehlo.add").count(),
+        2,
+        "in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.compare LE"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare LT"), "in:\n{out}");
     assert!(out.contains("applies stablehlo.and"), "in:\n{out}");
 }
 
@@ -1890,26 +1900,6 @@ fn lower_in_vector_set_refuses_length_mismatch() {
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("size 4") && err.msg.contains("length 3"),
-        "unexpected message: {}",
-        err.msg
-    );
-}
-
-/// The gate emits no `unitinterval` membership, so `in` still refuses it —
-/// this stays the gate's vocabulary, not a general-purpose §03 set-membership
-/// lowering.
-#[test]
-fn lower_in_still_refuses_unitinterval() {
-    let mut m = Module::new();
-    let v = local_ref(&mut m, "v");
-    let set = const_node(&mut m, "unitinterval");
-    let node = call(&mut m, "in", &[v, set]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("posreals") && err.msg.contains("nonnegreals"),
         "unexpected message: {}",
         err.msg
     );

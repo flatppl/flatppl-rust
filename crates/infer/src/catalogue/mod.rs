@@ -66,7 +66,7 @@ pub(crate) enum Sig {
         /// break mid-migration — every row is expected to fill it in.
         #[serde(default)]
         params: Vec<String>,
-        /// Distinguish a declared nullary constructor from an omitted parameter list.
+        /// Permit a zero-argument call using the constructor's defaults.
         #[serde(default)]
         nullary: bool,
         /// Declared RANK (number of axes) of each parameter, parallel to
@@ -519,9 +519,9 @@ const STD_MODULE_SRCS: &[&str] = &[
 /// A distribution row's arity is exact: §08 "Built-in distributions" states that
 /// "the names and order of the distribution parameters specified below define the
 /// names and positional order of the kernel arguments", and no §08 entry gives a
-/// parameter a default, so every one is required. §09 "Standard modules" carries
-/// the same Parameters column for a module's distributions. An empty list stays
-/// unspecified unless `nullary` explicitly declares a zero-argument constructor.
+/// parameter a default, so every one is required. A §09 distribution with
+/// `nullary` also permits omitting its defaulted parameters. An empty list stays
+/// unspecified unless `nullary` explicitly permits a zero-argument constructor.
 ///
 /// Keyed on the `Sig` rather than on a name so a §09 member can be checked from
 /// the resolution side-table, which holds the sig and not the catalogue index.
@@ -531,8 +531,10 @@ pub(crate) fn sig_arity(sig: &Sig) -> Option<Arity> {
         Sig::Distribution {
             params, nullary, ..
         } if params.is_empty() && !nullary => None,
-        Sig::Distribution { params, .. } => Some(Arity {
-            min: params.len(),
+        Sig::Distribution {
+            params, nullary, ..
+        } => Some(Arity {
+            min: if *nullary { 0 } else { params.len() },
             max: Some(params.len()),
         }),
     }
