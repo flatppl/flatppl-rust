@@ -50,12 +50,54 @@ pub(crate) fn lower_query(m: &mut Module, id: NodeId) -> Option<NodeId> {
     Some(build_call(m, "broadcast", &[function, values]))
 }
 
-fn captures(m: &Module, root: NodeId) -> Vec<(Ref, NodeId)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Reference(Ref),
+    Projection(NodeId),
+}
+
+/// Find the root reference of a field path through records.
+fn record_projection(m: &Module, id: NodeId) -> Option<Ref> {
+    let call = expect_builtin_call(m, id, "get")?;
+    let [source, field] = *call.args else {
+        return None;
+    };
+    let (resolved, _) = resolve_ref_chain(m, source);
+    if !matches!(m.node(field), Node::Lit(Scalar::Str(_)))
+        || !matches!(
+            m.type_of(source).or_else(|| m.type_of(resolved)),
+            Some(Type::Record(_))
+        )
+    {
+        return None;
+    }
+    match m.node(source) {
+        Node::Ref(
+            reference @ Ref {
+                ns: RefNs::Local | RefNs::SelfMod,
+                ..
+            },
+        ) => Some(*reference),
+        _ => record_projection(m, source),
+    }
+}
+
+fn captures(m: &Module, root: NodeId, inputs: &[(Symbol, Ref)]) -> Vec<(Capture, NodeId)> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
+            continue;
+        }
+        // Arrays cannot contain records. Pass the used scalar/array field,
+        // rather than lifting its entire parameter record into vector(record).
+        // Fields of this density's cell inputs must still vary by cell.
+        if let Some(reference) = record_projection(m, id)
+            && !inputs.iter().any(|(_, r)| *r == reference)
+            && !matches!(m.type_of(id), Some(Type::Record(_)))
+        {
+            result.push((Capture::Projection(id), id));
             continue;
         }
         match m.node(id) {
@@ -65,8 +107,11 @@ fn captures(m: &Module, root: NodeId) -> Vec<(Ref, NodeId)> {
                     ..
                 },
             ) => {
-                if !result.iter().any(|(r, _)| r == reference) {
-                    result.push((*reference, id));
+                let capture = Capture::Reference(*reference);
+                if !inputs.iter().any(|(_, r)| r == reference)
+                    && !result.iter().any(|(r, _)| *r == capture)
+                {
+                    result.push((capture, id));
                 }
             }
             Node::Call(c) if c.inputs.is_some() => {}
@@ -257,15 +302,17 @@ fn sum_density_with(
     let point = cell_input(m, values, &mut inputs, &mut args)?;
     let body = lower_measure_density(m, measure, point)?;
     let mut replacements = Vec::new();
-    for (reference, value) in captures(m, body) {
-        if inputs.iter().any(|(_, r)| *r == reference) {
-            continue;
-        }
+    for (capture, value) in captures(m, body, &inputs) {
         let (resolved, _) = resolve_ref_chain(m, value);
         // Closed support sets and other fixed module bindings remain global.
         // In particular, a set must not become a runtime tensor argument.
-        if reference.ns == RefNs::SelfMod
-            && m.phase_of(resolved) == Some(flatppl_core::Phase::Fixed)
+        if matches!(
+            capture,
+            Capture::Reference(Ref {
+                ns: RefNs::SelfMod,
+                ..
+            })
+        ) && m.phase_of(resolved) == Some(flatppl_core::Phase::Fixed)
         {
             continue;
         }
@@ -279,8 +326,11 @@ fn sum_density_with(
             .unwrap_or(Type::Any);
         let (label, local, replacement) = placeholder(m, ty.clone());
         inputs.push((label, local));
-        replacements.push((reference, replacement));
-        let actual = m.alloc(Node::Ref(reference));
+        replacements.push((capture, replacement));
+        let actual = match capture {
+            Capture::Reference(reference) => m.alloc(Node::Ref(reference)),
+            Capture::Projection(id) => id,
+        };
         m.set_type(actual, ty);
         let mut singleton = build_call(m, "vector", &[actual]);
         if rank > 1 {
@@ -290,12 +340,17 @@ fn sum_density_with(
         }
         args.push(singleton);
     }
-    let body = crate::driver::map_tree(m, body, &mut |m, id| match m.node(id) {
-        Node::Ref(reference) => replacements
+    let body = crate::driver::map_tree(m, body, &mut |m, id| {
+        replacements
             .iter()
-            .find_map(|(r, value)| (r == reference).then_some(*value)),
-        Node::Call(c) if c.inputs.is_some() => Some(id),
-        _ => None,
+            .find_map(|(capture, value)| {
+                let matches = match capture {
+                    Capture::Reference(reference) => m.node(id) == &Node::Ref(*reference),
+                    Capture::Projection(projection) => *projection == id,
+                };
+                matches.then_some(*value)
+            })
+            .or_else(|| matches!(m.node(id), Node::Call(c) if c.inputs.is_some()).then_some(id))
     });
     let head = CallHead::Builtin(m.intern("functionof"));
     let function = m.alloc(Node::Call(Call {

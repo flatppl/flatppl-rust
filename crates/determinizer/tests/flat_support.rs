@@ -26,9 +26,8 @@ fn dependent_flat_bounds_survive_prior_and_likelihood_reification() {
          prior = lawof(record(bound = bound, x = x))\n\
          observation = kernelof(y, bound = bound, x = x)\n\
          posterior = bayesupdate(likelihoodof(observation, 2), prior)\n\
-         b = elementof(posreals)\n\
-         point = elementof(cartpow(reals, 2))\n\
-         lp = logdensityof(posterior, record(bound = b, x = point))",
+         point = elementof(cartprod(bound = posreals, x = cartpow(reals, 2)))\n\
+         lp = logdensityof(posterior, point)",
     );
 }
 
