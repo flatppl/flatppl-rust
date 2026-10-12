@@ -182,7 +182,9 @@ impl TensorBatch<'_, '_> {
             Pointwise::DynamicGather(_, _, dimensions) => {
                 self.gather(value, a, &inputs[1], dimensions)?
             }
-            Pointwise::Dot(_, _, left, right) => self.dot(value, a, &inputs[1], *left, *right),
+            Pointwise::Dot(_, _, left, right, existing_batch) => {
+                self.dot(value, a, &inputs[1], *left, *right, *existing_batch)
+            }
             Pointwise::Reduce(_, axis, op, init) => {
                 self.out.reduce_axis_lit(op, init, a, batch + axis)
             }
@@ -190,7 +192,15 @@ impl TensorBatch<'_, '_> {
         })
     }
 
-    fn dot(&mut self, value: &Value, a: &Value, b: &Value, left: usize, right: usize) -> Value {
+    fn dot(
+        &mut self,
+        value: &Value,
+        a: &Value,
+        b: &Value,
+        left: usize,
+        right: usize,
+        existing_batch: usize,
+    ) -> Value {
         let (a, b) = self.out.broadcast_batches(a, b);
         let batch = self.out.batch_rank(&a);
         let ty = batching::tensor(
@@ -200,7 +210,7 @@ impl TensorBatch<'_, '_> {
                 .copied()
                 .collect(),
         );
-        let dimensions = (0..batch)
+        let dimensions = (0..batch + existing_batch)
             .map(|axis| axis.to_string())
             .collect::<Vec<_>>()
             .join(", ");
