@@ -18,6 +18,4 @@ flatppl-hs3 = { path = "../hs3" }
 flatppl-formula = { path = "../formula", features = ["arrow"] }
 flatppl-mathdoc = { path = "../mathdoc", default-features = false }
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

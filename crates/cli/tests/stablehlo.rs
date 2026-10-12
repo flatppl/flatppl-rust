@@ -23,6 +23,43 @@ fn write_model(name: &str, src: &str) -> std::path::PathBuf {
     input
 }
 
+#[test]
+fn fixed_json_in_an_import_matches_explicit_literals() {
+    let input = write_model(
+        "fixed-json",
+        "m = load_module(\"nested/model.flatppl\")\nx = elementof(reals)\ninputs = x\noutputs = m.data.x .* x",
+    );
+    let dir = input.parent().unwrap();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(
+        dir.join("nested/model.flatppl"),
+        "data = load_data(\"data.json\", cartprod(x = cartpow(reals, 2)))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("nested/data.json"),
+        r#"{"x":[1.5,3.5,99],"unused":"ignored"}"#,
+    )
+    .unwrap();
+    let expected = write_model(
+        "fixed-json-literal",
+        "x = elementof(reals)\ninputs = x\noutputs = [1.5, 3.5] .* x",
+    );
+    let actual = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert!(
+        actual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    let literal = flatppl().arg("stablehlo").arg(expected).output().unwrap();
+    assert!(
+        literal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&literal.stderr)
+    );
+    assert_eq!(actual.stdout, literal.stdout);
+}
+
 /// A model with no `inputs`/`outputs` bindings is refused (exit 3): the
 /// last-public-binding query heuristic has been removed, so the ABI must be
 /// declared explicitly — there is no fallback.

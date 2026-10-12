@@ -524,6 +524,7 @@ dependencies = [
  "flatppl-fileaccess",
  "flatppl-flatpir",
  "flatppl-formula",
+ "flatppl-host",
  "flatppl-hs3",
  "flatppl-infer",
  "flatppl-lint",

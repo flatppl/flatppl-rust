@@ -902,7 +902,7 @@ fn load_and_infer(
     // determiniser can graft in cross-module measure refs, same as `infer`.
     let resolver = CliResolver::cache_only();
     let in_loc = Location::Local(input.to_path_buf());
-    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
+    let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, &resolver)?;
     let (diags, bundle) =
         flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
     let mut errors = 0u32;
@@ -1013,6 +1013,7 @@ fn determinize_cmd(
     };
     let mut lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    load_fixed_data(&mut lowered)?;
     flatppl_determinizer::prepare_serialization(&mut lowered, roots);
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
@@ -1086,13 +1087,14 @@ fn stablehlo_cmd(
     }
     let roots = Some(abi_syms);
 
-    let lowered = flatppl_determinizer::determinize_with_options(
+    let mut lowered = flatppl_determinizer::determinize_with_options(
         &module,
         &bundle,
         roots.as_deref(),
         &opts.lowering_options(),
     )
     .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    load_fixed_data(&mut lowered)?;
     let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
@@ -1105,4 +1107,22 @@ fn stablehlo_cmd(
         None => print!("{rendered}"),
     }
     Ok(())
+}
+
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn load_fixed_data(module: &mut flatppl_core::Module) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    flatppl_host::load_fixed_data(module, |source| {
+        let path =
+            resolver
+                .resolve_path(&Location::parse(source))
+                .map_err(|error| match error {
+                    Failure::Plain(message)
+                    | Failure::Refuse(message)
+                    | Failure::Usage(message)
+                    | Failure::Diagnostic { message, .. } => message,
+                })?;
+        fs::read(path).map_err(|error| error.to_string())
+    })
+    .map_err(|error| Failure::Refuse(flatppl_cli::resolve::terminal_message(&error)))
 }
