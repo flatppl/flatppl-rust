@@ -2032,31 +2032,6 @@ fn lower_land_refuses_a_non_predicate_operand() {
     assert_eq!(err.node, Some(lit));
 }
 
-/// `land` operands must share a shape — `Emitter::and` renders ONE type for
-/// both operands and the result, so a scalar/rank-1 pair would emit ill-typed
-/// text rather than broadcasting.
-#[test]
-fn lower_land_refuses_shape_mismatched_operands() {
-    let mut m = Module::new();
-    let s = local_ref(&mut m, "s");
-    let vec = local_ref(&mut m, "vec");
-    let pos = const_node(&mut m, "posreals");
-    let nonneg = const_node(&mut m, "nonnegreals");
-    let a = call(&mut m, "in", &[s, pos]);
-    let b = call(&mut m, "in", &[vec, nonneg]);
-    let node = call(&mut m, "land", &[a, b]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    bind_arg(&mut e, s, "%arg0", MlirTy::Scalar);
-    bind_arg(&mut e, vec, "%arg1", MlirTy::Ranked(vec![Some(3)]));
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("land: operands must have the same shape"),
-        "unexpected message: {}",
-        err.msg
-    );
-}
-
 /// §07 `iszero` — `stablehlo.compare EQ` against zero. §07: "`iszero` checks
 /// that its argument is exactly zero, with no tolerance for numerical
 /// precision", and the lattice test relies on that exactness (an atom's image

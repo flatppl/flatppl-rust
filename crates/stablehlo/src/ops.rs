@@ -2058,9 +2058,8 @@ enum Connective {
 /// §07 `land`/`lor`/`lxor` (`a && b`, `a || b`, exclusive or, all over
 /// `booleans`) — one `stablehlo.and`/`or`/`xor` over two `i1` predicates.
 ///
-/// Both operands must lower to Boolean values and share a shape:
-/// [`Emitter::and`] and its siblings render ONE type for both operands and the
-/// result, so a mismatched pair would emit ill-typed text.
+/// Explicit broadcasts may expand singleton axes. The emitter aligns both
+/// Boolean operands before rendering the shared result type.
 fn lower_land(
     e: &mut Emitter,
     id: NodeId,
@@ -2073,17 +2072,10 @@ fn lower_land(
         Connective::Xor => "lxor",
     };
     let [a_id, b_id] = args_exact(id, args)?;
+    require_same_orientation(e, id, a_id, b_id)?;
     let a = lower_predicate(e, a_id, &format!("{name} operand"))?;
     let b = lower_predicate(e, b_id, &format!("{name} operand"))?;
-    if e.cell_ty(&a) != e.cell_ty(&b) {
-        return Err(EmitError::at(
-            id,
-            format!(
-                "{name}: operands must have the same shape, got {:?} and {:?}",
-                a.ty, b.ty
-            ),
-        ));
-    }
+    require_broadcastable(e, id, &a, &b)?;
     Ok(match which {
         Connective::And => e.and(&a, &b),
         Connective::Or => e.or(&a, &b),
