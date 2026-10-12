@@ -302,6 +302,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
         "zero_inflated_binomial",
         "poisson",
         "hurdle_poisson",
+        "hurdle_negbinomial",
         "zero_inflated_poisson",
         "zero_inflated_negbinomial",
         "negbinomial",
@@ -326,7 +327,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             vec![0.0, 0.2, 0.8, 0.0]
         } else if family == "von_mises" {
             vec![-2.0, -0.4, 0.8, 2.0]
-        } else if family.starts_with("zero_inflated_") || family == "hurdle_poisson" {
+        } else if family.starts_with("zero_inflated_") || family.starts_with("hurdle_") {
             vec![0.0, 2.0, 4.0, 0.0]
         } else {
             vec![2.0, 4.0, 8.0, 7.0]
@@ -355,6 +356,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "zero_inflated_negbinomial" => ", shape = posreals, zi = unitinterval",
             "zero_inflated_beta" => ", phi = posreals, zi = unitinterval",
             "hurdle_poisson" => ", hu = unitinterval",
+            "hurdle_negbinomial" => ", shape = posreals, hu = unitinterval",
             _ => "",
         };
         let parameter = format!(
@@ -383,7 +385,7 @@ fn scalar_families_compile_default_posteriors_and_fresh_predictions()
             "[0.2, 0.8]"
         } else if family == "zero_inflated_beta" {
             "[0.0, 0.8]"
-        } else if family.starts_with("zero_inflated_") || family == "hurdle_poisson" {
+        } else if family.starts_with("zero_inflated_") || family.starts_with("hurdle_") {
             "[0, 2]"
         } else {
             "[1, 1]"

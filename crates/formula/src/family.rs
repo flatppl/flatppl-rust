@@ -20,6 +20,8 @@ pub enum Family {
     #[serde(rename = "zero_inflated_poisson")]
     ZeroInflatedPoisson,
     Negbinomial,
+    #[serde(rename = "hurdle_negbinomial")]
+    HurdleNegbinomial,
     #[serde(rename = "zero_inflated_negbinomial")]
     ZeroInflatedNegbinomial,
     Geometric,
@@ -77,6 +79,7 @@ impl Family {
             "hurdle_poisson" => Self::HurdlePoisson,
             "zero_inflated_poisson" => Self::ZeroInflatedPoisson,
             "negbinomial" => Self::Negbinomial,
+            "hurdle_negbinomial" => Self::HurdleNegbinomial,
             "zero_inflated_negbinomial" => Self::ZeroInflatedNegbinomial,
             "geometric" => Self::Geometric,
             "Gamma" | "gamma" => Self::Gamma,
@@ -126,6 +129,7 @@ impl Family {
             | Self::HurdlePoisson
             | Self::ZeroInflatedPoisson
             | Self::Negbinomial
+            | Self::HurdleNegbinomial
             | Self::ZeroInflatedNegbinomial
             | Self::Geometric => {
                 matches!(link, Log | Identity | Sqrt | Softplus | Squareplus)
@@ -155,6 +159,7 @@ impl Family {
                 | Self::HurdlePoisson
                 | Self::ZeroInflatedPoisson
                 | Self::Negbinomial
+                | Self::HurdleNegbinomial
                 | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
@@ -174,6 +179,7 @@ impl Family {
             Self::Beta => &["phi"],
             Self::ZeroInflatedBeta => &["phi", "zi"],
             Self::HurdlePoisson => &["hu"],
+            Self::HurdleNegbinomial => &["shape", "hu"],
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
@@ -235,7 +241,12 @@ impl Family {
         match name {
             "sigma" => format!("student_t(3, 0, {sigma_scale})"),
             "nu" => "gamma(2, 0.1)".into(),
-            "shape" if matches!(self, Self::Negbinomial | Self::ZeroInflatedNegbinomial) => {
+            "shape"
+                if matches!(
+                    self,
+                    Self::Negbinomial | Self::ZeroInflatedNegbinomial | Self::HurdleNegbinomial
+                ) =>
+            {
                 "InverseGamma(0.4, 0.3)".into()
             }
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
@@ -263,6 +274,7 @@ impl Family {
                 self,
                 Self::Student
                     | Self::HurdlePoisson
+                    | Self::HurdleNegbinomial
                     | Self::ZeroInflatedPoisson
                     | Self::ZeroInflatedNegbinomial
                     | Self::ZeroInflatedBinomial
@@ -368,19 +380,21 @@ impl Family {
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
             Self::HurdlePoisson
+            | Self::HurdleNegbinomial
             | Self::ZeroInflatedPoisson
             | Self::ZeroInflatedNegbinomial
             | Self::ZeroInflatedBinomial
             | Self::ZeroInflatedBeta => {
                 let (base, probability) = match self {
                     Self::HurdlePoisson => (Self::Poisson, "hu"),
+                    Self::HurdleNegbinomial => (Self::Negbinomial, "hu"),
                     Self::ZeroInflatedPoisson => (Self::Poisson, "zi"),
                     Self::ZeroInflatedNegbinomial => (Self::Negbinomial, "zi"),
                     Self::ZeroInflatedBeta => (Self::Beta, "zi"),
                     _ => (Self::Binomial, "zi"),
                 };
                 let mut base = base.observation(b, observation, thresholds, true);
-                if self == Self::HurdlePoisson {
+                if matches!(self, Self::HurdlePoisson | Self::HurdleNegbinomial) {
                     let one = b.lit_real(1.0);
                     let infinity = b.call_head("inf");
                     let support = b.call("interval", &[one, infinity]);

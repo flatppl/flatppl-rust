@@ -9,6 +9,7 @@ fn response_support_matches_brms() {
         ("lognormal", vec![0.1, 1.0, 2.0], vec![0.0, -0.1]),
         ("geometric", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         ("hurdle_poisson", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
+        ("hurdle_negbinomial", vec![0.0, 1.0, 2.0], vec![-1.0, 0.5]),
         (
             "zero_inflated_poisson",
             vec![0.0, 1.0, 2.0],

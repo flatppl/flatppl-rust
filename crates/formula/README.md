@@ -94,6 +94,9 @@ superposition of a fixed atom and a continuous law, with their common reference.
 conditioned on a positive count. It uses the Poisson links and a Beta(1, 1)
 prior for direct `hu`; a predictor for `hu` defaults to logit with a
 Logistic(0, 1) intercept prior.
+`hurdle_negbinomial` uses the same zero probability and the negative-binomial
+law conditioned on a positive count, retaining its InverseGamma(0.4, 0.3)
+prior on `shape` and its mean/rate parameterization.
 Sampling the zero-truncated count component is not yet supported by the Rust
 sampler lowering; its density and derivatives are available.
 von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
