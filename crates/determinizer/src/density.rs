@@ -3851,8 +3851,38 @@ fn lower_superpose(
         atoms
     };
 
-    let mut density_terms: Vec<NodeId> = Vec::with_capacity(inner_measures.len());
-    for measure in inner_measures {
+    let mut components = Vec::new();
+    for &measure in &inner_measures {
+        collect_superposition_components(m, measure, &mut components);
+    }
+    let mut atom_groups: Vec<CoincidentAtoms> = Vec::new();
+    let mut other_measures = Vec::new();
+    for measure in components {
+        if let Some((atom, base, weight)) = fixed_atom_weight(m, measure) {
+            if let Some(group) = atom_groups
+                .iter_mut()
+                .find(|group| m.structural_eq(group.atom, atom))
+            {
+                group.components.push((measure, weight));
+            } else {
+                atom_groups.push(CoincidentAtoms {
+                    atom,
+                    base,
+                    components: vec![(measure, weight)],
+                });
+            }
+            continue;
+        }
+        other_measures.push(measure);
+    }
+    let coalesced = atom_groups.iter().any(|group| group.components.len() > 1);
+    if !coalesced {
+        // Preserve the original reduction tree when no atom masses combine.
+        other_measures = inner_measures;
+        atom_groups.clear();
+    }
+    let mut density_terms = Vec::new();
+    for measure in other_measures {
         density_terms.push(lower_measure_density_in_reference(
             m,
             measure,
@@ -3861,12 +3891,114 @@ fn lower_superpose(
             atoms,
         )?);
     }
+    for CoincidentAtoms {
+        base,
+        components: group,
+        ..
+    } in atom_groups
+    {
+        density_terms.push(if group.len() == 1 {
+            lower_measure_density_in_reference(m, group[0].0, v, VariateOrigin::Other, atoms)?
+        } else {
+            let weights: Vec<_> = group.iter().map(|(_, weight)| *weight).collect();
+            let density =
+                lower_measure_density_in_reference(m, base, v, VariateOrigin::Other, atoms)?;
+            coincident_atom_density(m, density, &weights)
+        });
+    }
+    if coalesced {
+        // Binary logsumexp preserves an all-absent sum as -inf. Flattening into
+        // a larger reduction would otherwise introduce inf - inf arithmetic.
+        let mut terms = density_terms.into_iter();
+        let first = terms.next().expect("superposition has components");
+        return Ok(terms.fold(first, |left, right| {
+            let pair = build_call(m, "vector", &[left, right]);
+            build_call(m, "logsumexp", &[pair])
+        }));
+    }
 
     // §07 "Reductions and norms": `logsumexp(v)` takes a single real VECTOR, not
     // a variadic positional argument list — wrap the per-component densities in a
     // `vector` literal (`[t₁, …, tₖ]`) so the emitted call is `logsumexp([…])`.
     let terms_vec = build_call(m, "vector", &density_terms);
     Ok(build_call(m, "logsumexp", &[terms_vec]))
+}
+
+struct CoincidentAtoms {
+    atom: NodeId,
+    base: NodeId,
+    components: Vec<(NodeId, NodeId)>,
+}
+
+fn collect_superposition_components(m: &mut Module, node: NodeId, components: &mut Vec<NodeId>) {
+    let resolved = resolve_ref_chain(m, node).0;
+    if let Some(parts) = expect_builtin_call(m, resolved, "superpose")
+        .filter(|c| c.args.len() >= 2)
+        .map(|c| c.args.to_vec())
+    {
+        for part in parts {
+            collect_superposition_components(m, part, components);
+        }
+    } else {
+        components.push(node);
+    }
+}
+
+/// Keep other wrappers opaque: distributing weights or exponentiating logweights
+/// can overflow even when the existing log-space density is finite.
+fn fixed_atom_weight(m: &mut Module, node: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+    let node = resolve_ref_chain(m, node).0;
+    let (base, weight) = match expect_builtin_call(m, node, "weighted") {
+        Some(c) if c.args.len() == 2 => (c.args[1], Some(c.args[0])),
+        _ => (node, None),
+    };
+    let base = resolve_ref_chain(m, base).0;
+    let atom = named_or_positional(m, expect_builtin_call(m, base, "Dirac")?, "value")?;
+    static_real(m, atom).filter(|a| a.is_finite())?;
+    // Compare typed expressions, not lossy f64 keys: distinct integer atoms may
+    // round to the same real, and the Dirac gate must retain integer equality.
+    let atom = resolve_ref_chain(m, atom).0;
+    let weight = match weight {
+        Some(w) if weight_is_variate_dependent(m, w) => return None,
+        Some(w) => w,
+        None => m.alloc(Node::Lit(Scalar::Real(1.0))),
+    };
+    Some((atom, base, weight))
+}
+
+/// Sum coincident atom masses before taking logs. Separate log(w) terms have
+/// singular derivatives at w=0 even when another component supplies positive mass.
+fn coincident_atom_density(m: &mut Module, base_density: NodeId, weights: &[NodeId]) -> NodeId {
+    let present = build_call(m, "iszero", &[base_density]);
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let mut valid = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let weights: Vec<_> = weights
+        .iter()
+        .map(|&weight| {
+            // An absent atom must not inject log(0) derivatives into another term.
+            let weight = build_call(m, "ifelse", &[present, weight, one]);
+            let nonnegative = build_call(m, "ge", &[weight, zero]);
+            valid = build_call(m, "land", &[valid, nonnegative]);
+            weight
+        })
+        .collect();
+    let vector = build_call(m, "vector", &weights);
+    let scale = build_call(m, "maximum", &[vector]);
+    let positive = build_call(m, "gt", &[scale, zero]);
+    let finite = build_call(m, "isfinite", &[scale]);
+    let scalable = build_call(m, "land", &[positive, finite]);
+    let scale = build_call(m, "ifelse", &[scalable, scale, one]);
+    let scaled: Vec<_> = weights
+        .iter()
+        .map(|&weight| build_call(m, "divide", &[weight, scale]))
+        .collect();
+    let mass = fold_add(m, &scaled);
+    let log_mass = build_call(m, "log", &[mass]);
+    let log_scale = build_call(m, "log", &[scale]);
+    let density = build_call(m, "add", &[log_scale, log_mass]);
+    let density = exponential_tilt::guard(m, density, valid);
+    gate_density(m, present, density)
 }
 
 #[derive(Clone, PartialEq)]
