@@ -8,7 +8,73 @@ use std::sync::Arc;
 
 pub(super) type Constant = Arc<[Scalar]>;
 
+// Bound fixed-count tables and remembered index vectors to 4096 elements.
+pub(super) const MAX_FIXED_COUNTS: usize = 4096;
+
 impl Emitter<'_> {
+    /// Read fixed integer counts through layout views without expanding them.
+    fn fixed_count_at(&self, value: &Value, index: usize) -> Option<i64> {
+        if let Some(data) = self.constants.get(&value.ssa) {
+            return match data.get(if data.len() == 1 { 0 } else { index })? {
+                Scalar::Int(n) => Some(*n),
+                _ => None,
+            };
+        }
+        match &self.pointwise.get(&value.ssa)?.op {
+            Pointwise::Reshape(input) => self.fixed_count_at(input, index),
+            Pointwise::Broadcast(input, dimensions) => {
+                let mut remaining = index;
+                let mut coordinates = vec![0; shape(&value.ty).len()];
+                for (coordinate, size) in coordinates.iter_mut().zip(shape(&value.ty)).rev() {
+                    let size = usize::try_from((*size)?).ok()?;
+                    *coordinate = remaining.checked_rem(size)?;
+                    remaining = remaining.checked_div(size)?;
+                }
+                let mut source_index = 0usize;
+                for (size, axis) in shape(&input.ty).iter().zip(dimensions) {
+                    let size = usize::try_from((*size)?).ok()?;
+                    let coordinate = if size == 1 {
+                        0
+                    } else {
+                        coordinates[*axis as usize]
+                    };
+                    source_index = source_index.checked_mul(size)?.checked_add(coordinate)?;
+                }
+                self.fixed_count_at(input, source_index)
+            }
+            _ => None,
+        }
+    }
+
+    /// Round the whole fixed log-binomial coefficient once. Rounding three
+    /// large lgamma values separately loses precision in mixture weights.
+    pub(crate) fn fold_log_choose(&mut self, n: &Value, k: &Value) -> Option<Value> {
+        let (n, k) = self.broadcast_pair(n, k);
+        let count = element_count(&n.ty)?;
+        if count > MAX_FIXED_COUNTS {
+            return None;
+        }
+        let values = (0..count)
+            .map(|i| {
+                let n = self.fixed_count_at(&n, i)?;
+                let k = self.fixed_count_at(&k, i)?;
+                if n < 0 {
+                    return None;
+                }
+                // The caller masks out-of-support observations separately.
+                let result = if k < 0 || k > n {
+                    0.0
+                } else {
+                    libm::lgamma(n as f64 + 1.0)
+                        - libm::lgamma(k as f64 + 1.0)
+                        - libm::lgamma((n - k) as f64 + 1.0)
+                };
+                Some(Scalar::Real(result))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.folded_constant(values, n.ty.clone(), self.axes_of(&n))
+    }
+
     /// A fixed diagonal metric can be inverted without a matrix factorization.
     /// Query arguments have no constant entry, even when their source is fixed.
     pub(crate) fn constant_diagonal(&self, value: &Value) -> Option<Vec<f64>> {
