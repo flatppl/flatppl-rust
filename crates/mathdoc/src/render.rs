@@ -178,29 +178,23 @@ pub fn attach_inference_diagnostics(
     }
 }
 
-/// Parse the bundle and record every `load_module` resolution reachable from
-/// the root, keyed by the bundle's own (resolved) paths.
+/// Parse modules reached through `load_module`, leaving bundled data opaque.
 fn resolve_bundle(
     root: &Module,
     root_path: &str,
     bundle: &HashMap<String, String>,
 ) -> Result<ModuleBundle, String> {
-    // Parsed once each; matched by lexically normalised location so `a/./b`,
-    // `a/b` and `x/../a/b` denote the same key.
-    let mut by_norm: HashMap<String, (String, Arc<Module>)> = HashMap::new();
+    // Hosts bundle both module sources and load_data payloads. The directive,
+    // not the file suffix, determines which entries contain FlatPPL source.
+    let mut by_norm = HashMap::new();
     for (key, text) in bundle {
-        let parsed = flatppl_syntax::parse(text).map_err(|e| format!("{key}: {e}"))?;
         by_norm.insert(
             Location::parse(key).normalized().display(),
-            (key.clone(), Arc::new(parsed)),
+            (key.as_str(), text.as_str()),
         );
     }
     let mut deps = ModuleBundle::new();
     deps.set_root(root_path.to_string());
-    // Every bundled module stays reachable under its own key.
-    for (key, arc) in by_norm.values() {
-        deps.insert(key.clone(), arc.clone());
-    }
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, Arc<Module>)> = VecDeque::new();
     for literal in load_module_literals(root) {
@@ -211,7 +205,7 @@ fn resolve_bundle(
             &mut deps,
             &mut visited,
             &mut queue,
-        );
+        )?;
     }
     while let Some((importer, importer_module)) = queue.pop_front() {
         for literal in load_module_literals(&importer_module) {
@@ -222,7 +216,7 @@ fn resolve_bundle(
                 &mut deps,
                 &mut visited,
                 &mut queue,
-            );
+            )?;
         }
     }
     Ok(deps)
@@ -234,11 +228,11 @@ fn resolve_bundle(
 fn link(
     importer: &str,
     literal: &str,
-    by_norm: &HashMap<String, (String, Arc<Module>)>,
+    by_norm: &HashMap<String, (&str, &str)>,
     deps: &mut ModuleBundle,
     visited: &mut HashSet<String>,
     queue: &mut VecDeque<(String, Arc<Module>)>,
-) {
+) -> Result<(), String> {
     let resolved = Location::parse(importer)
         .join(literal)
         .normalized()
@@ -246,18 +240,23 @@ fn link(
     let entry = by_norm
         .get(&resolved)
         .or_else(|| by_norm.get(&Location::parse(literal).normalized().display()));
-    let Some((key, arc)) = entry else {
-        return;
+    let Some(&(key, text)) = entry else {
+        return Ok(());
+    };
+    let arc = match deps.get_arc_by_id(key) {
+        Some(parsed) => parsed.clone(),
+        None => Arc::new(flatppl_syntax::parse(text).map_err(|e| format!("{key}: {e}"))?),
     };
     deps.insert_resolved(
         importer.to_string(),
         literal.to_string(),
-        key.clone(),
+        key.to_string(),
         arc.clone(),
     );
-    if visited.insert(key.clone()) {
-        queue.push_back((key.clone(), arc.clone()));
+    if visited.insert(key.to_string()) {
+        queue.push_back((key.to_string(), arc));
     }
+    Ok(())
 }
 
 /// The `load_module` source literals of `module` (positional or `source =`).
@@ -612,6 +611,38 @@ mod tests {
             r.bindings[1]
                 .mathml
                 .contains("<mi data-flatppl-ref=\"h\">h</mi><mo>.</mo><mi>f</mi>")
+        );
+    }
+
+    #[test]
+    fn module_imports_determine_which_bundle_entries_are_parsed() {
+        let bundle = HashMap::from([
+            (
+                "lib/helpers".to_string(),
+                "d = load_data(\"data.json\", cartprod(x = reals))\nf(x) = x + d.x".to_string(),
+            ),
+            ("lib/data.json".to_string(), "{\"x\":1}".to_string()),
+        ]);
+        let source = "h = load_module(\"../lib/helpers\")\ny = h.f(2)";
+        let rendered = render_source(source, "models/main.flatppl", &bundle).unwrap();
+        assert!(
+            rendered.diagnostics.is_empty(),
+            "{:?}",
+            rendered.diagnostics
+        );
+        assert_eq!(rendered.bindings[0].kind, Kind::Module);
+
+        // A real module import must still report malformed source, regardless
+        // of the suffix. The same text is data only when used as data.
+        let error = render_source(
+            "d = load_module(\"../lib/data.json\")",
+            "models/main.flatppl",
+            &bundle,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("lib/data.json: FlatPPL parse error"),
+            "{error}"
         );
     }
 }

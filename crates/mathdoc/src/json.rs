@@ -32,6 +32,8 @@
 //! joined to its importer's directory per spec §04 (`/` separator, `..`
 //! allowed, an `http`/`https` URL as is) — exactly what the host resolved to
 //! load the text; transitive directives resolve against their own importer.
+//! It may also contain `load_data` payloads. Only `load_module` targets are
+//! parsed as FlatPPL; data shapes come from their declared value sets.
 //! `order` is the rows in **source order** (`NOTATION.md`: no topological
 //! sort). `names` lists every binding a row binds: a decomposition `a, b ~ M`
 //! is one row named `a` with `names: ["a", "b"]`, and `order` lists row names
@@ -437,5 +439,24 @@ mod tests {
         assert!(out.contains("\"mathml\":\"<math"), "{out}");
         assert!(render_math("not json").is_err());
         assert!(render_math(r#"{"source": "x = ("}"#).is_err());
+    }
+
+    #[test]
+    fn math_and_exports_accept_bundled_data() {
+        let mut request = serde_json::json!({
+            "source": "d = load_data(\"data.json\", cartprod(x = reals))\nx = d.x",
+            "path": "models/main.flatppl",
+            "bundle": { "models/data.json": "{\"x\":1}" },
+            "document": true
+        });
+        let out: serde_json::Value =
+            serde_json::from_str(&render_math(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(out["order"], serde_json::json!(["d", "x"]));
+        assert_eq!(out["bindings"][1]["refs"], serde_json::json!(["d"]));
+        assert_eq!(out["diagnostics"], serde_json::json!([]));
+        for format in ["html", "md", "tex", "typ"] {
+            request["document"] = format.into();
+            assert!(!export_math(&request.to_string()).unwrap().is_empty());
+        }
     }
 }
