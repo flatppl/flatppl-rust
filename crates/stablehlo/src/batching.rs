@@ -162,6 +162,8 @@ impl Emitter<'_> {
                             | "get0"
                             | "lengthof"
                             | "sizeof"
+                            | "indicesof"
+                            | "indicesof0"
                             | "identity"
                             | "broadcast"
                             | "functionof"
@@ -619,7 +621,7 @@ impl Emitter<'_> {
     ) -> Result<Value, EmitError> {
         let [_] = crate::ops::args_exact(id, args)?;
         self.lower_broadcast_cells(id, args, |e, values| {
-            if name == "sizeof" {
+            if matches!(name, "sizeof" | "indicesof" | "indicesof0") {
                 let axes = e.axes_of(&values[0]);
                 let sizes = axes.layers.first().and_then(|&rank| {
                     shape(&values[0].ty)[axes.batch..axes.batch + rank]
@@ -628,13 +630,24 @@ impl Emitter<'_> {
                         .collect::<Option<Vec<_>>>()
                 });
                 sizes
-                    .ok_or_else(|| EmitError::at(id, "sizeof requires a statically-shaped array"))
-                    .map(|sizes| {
+                    .ok_or_else(|| {
+                        EmitError::at(id, format!("{name} requires a statically-shaped array"))
+                    })
+                    .and_then(|sizes| {
+                        if name != "sizeof" {
+                            return match sizes.as_slice() {
+                                &[length] => Ok(e.index_vector(length, name == "indicesof0")),
+                                _ => Err(EmitError::at(
+                                    id,
+                                    "broadcast indicesof requires vector cells",
+                                )),
+                            };
+                        }
                         let values = sizes
                             .iter()
                             .map(|&n| e.int_value_const(n as i64))
                             .collect::<Vec<_>>();
-                        e.vector(&values)
+                        Ok(e.vector(&values))
                     })
             } else {
                 crate::ops::lower_builtin(e, id, name, args)

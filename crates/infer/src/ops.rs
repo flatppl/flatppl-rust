@@ -254,10 +254,7 @@ pub(crate) fn call_rule(
         {
             refuse_nonscalar_operand(inf, id, &name, args, named)
         }
-        "indicesof" | "indicesof0" => Type::Array {
-            shape: Box::new([Dim::Dynamic]),
-            elem: Box::new(Type::Scalar(ScalarType::Integer)),
-        },
+        "indicesof" | "indicesof0" => indices_type(arg_ty(args, 0)),
         // §07 "Table reductions": applied to a TABLE these reduce column-wise to a
         // record. Guarded so every non-table argument keeps the arm it had —
         // `sum`/`mean`/`prod` the array rule just below, `var`/`std` their catalogue
@@ -1855,20 +1852,14 @@ fn scalar_word(s: ScalarType) -> &'static str {
 /// collection — the legal `sum.(vv)` over §03's vector of vectors, which reduces each
 /// inner vector. `None` leaves the broadcast `%deferred`.
 ///
-/// Only the heads §07 gives a SCALAR result are answered here. `sum`/`prod`/`mean`/
+/// Scalar reductions and the supported collection results are answered here. `sum`/`prod`/`mean`/
 /// `maximum`/`minimum` route through [`reduce_type`], so the dotted form and the bare
 /// form cannot drift on §03's promotions — `sum` over boolean cells is `Integer` on
 /// both. The rest read their §07 row directly: `var`/`std`/`median`/`quantile` and the
 /// three norms are real-valued, `lany`/`lall` are truth values per §07 "Boolean
 /// reductions", `lengthof` counts.
 ///
-/// The SHAPE-PRESERVING heads (the four cumulative ops, the four normalizations) and
-/// the index-reporting ones (`indicesof`, `indicesof0`) return `None` and
-/// stay `%deferred`. §07 does pin their results, but there is no tensor form for a
-/// nested array to lower into — `stablehlo` refuses the whole nested family — so
-/// pinning the type would buy a number nothing can produce. Recorded in
-/// `flatppl-dev/TODO-flatppl-rust.md`; the scalar-cell refusal above covers them today,
-/// which is the half that was emitting wrong numbers.
+/// Heads without a cell rule, including multi-axis index tuples, remain deferred.
 fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
     let elem = match cell {
         Type::Array { elem, .. } | Type::TVector { elem, .. } => elem.as_ref(),
@@ -1885,6 +1876,10 @@ fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
         "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
         "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
         "sizeof" => Some(sizeof_type(Some(cell))),
+        "indicesof" | "indicesof0" => match indices_type(Some(cell)) {
+            result @ Type::Array { .. } => Some(result),
+            _ => None,
+        },
         "det" | "logabsdet" => (flatten_dims(cell).len() == 2).then(|| {
             Type::Scalar(if name == "logabsdet" {
                 ScalarType::Real
@@ -2838,6 +2833,19 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
             shape,
             elem: Box::new(elem),
         },
+    }
+}
+
+fn indices_type(input: Option<&Type>) -> Type {
+    let vector = |dim| Type::Array {
+        shape: Box::new([dim]),
+        elem: Box::new(Type::Scalar(ScalarType::Integer)),
+    };
+    match input {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => vector(shape[0]),
+        Some(Type::Array { shape, .. }) => Type::Tuple(shape.iter().copied().map(vector).collect()),
+        Some(Type::TVector { len, .. } | Type::Table { nrows: len, .. }) => vector(*len),
+        _ => Type::Deferred,
     }
 }
 

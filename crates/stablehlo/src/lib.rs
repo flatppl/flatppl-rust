@@ -203,6 +203,7 @@ mod call_batch;
 mod complex;
 mod emitter;
 mod indexing;
+mod indices;
 mod mlir;
 mod modes;
 mod norms;

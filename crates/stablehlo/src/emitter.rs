@@ -367,6 +367,25 @@ impl<'m> Emitter<'m> {
         self.constant(x, MlirTy::Scalar)
     }
 
+    pub(crate) fn index_vector(&mut self, length: u64, zero_based: bool) -> Value {
+        let ty = MlirTy::Ranked(vec![Some(length)]);
+        let ssa = self.pure(format!(
+            "stablehlo.iota dim = 0 : {}",
+            ty.render(self.dtype, ElemKind::Int)
+        ));
+        let indices = Value {
+            ssa,
+            ty,
+            elem: ElemKind::Int,
+        };
+        if zero_based {
+            indices
+        } else {
+            let one = self.int_value_const(1);
+            self.add(&indices, &one)
+        }
+    }
+
     /// Pack literal data without emitting a scalar operation per element.
     /// Mixed kinds retain the normal path and its intermediate conversions.
     pub(crate) fn literal_vector(&mut self, args: &[NodeId], elem: ElemKind) -> Option<Value> {
@@ -3913,6 +3932,8 @@ impl<'m> Emitter<'m> {
                 | "lany"
                 | "lall"
                 | "sizeof"
+                | "indicesof"
+                | "indicesof0"
                 | "lower_cholesky"
                 | "inv"
                 | "det"
