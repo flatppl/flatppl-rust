@@ -14,7 +14,7 @@ module {
     %12 = chlo.erf_inv %11 : tensor<2xf32> -> tensor<2xf32>
     %13 = stablehlo.constant dense<1.4142135> : tensor<2xf32>
     %14 = stablehlo.multiply %12, %13 : tensor<2xf32>
-    %15 = stablehlo.dot_general %0, %14, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf32>, tensor<2xf32>) -> tensor<2xf32>
+    %15 = stablehlo.dot_general %0, %14, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<2x2xf32>, tensor<2xf32>) -> tensor<2xf32>
     %16 = stablehlo.add %arg0, %15 : tensor<2xf32>
     return %16, %1 : tensor<2xf32>, tensor<2xui64>
   }

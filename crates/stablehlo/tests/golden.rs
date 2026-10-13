@@ -738,7 +738,7 @@ fn emitter_matrix_helpers_emit_expected_ops() {
         out.contains("contracting_dims = [1] x [0]"),
         "missing dot_general pretty-form contracting_dims in:\n{out}"
     );
-    assert!(out.contains("precision = [DEFAULT, DEFAULT]"));
+    assert!(out.contains("precision = [HIGHEST, HIGHEST]"));
     assert!(
         out.contains("\"stablehlo.triangular_solve\"("),
         "missing triangular_solve generic-form head in:\n{out}"
@@ -9521,7 +9521,7 @@ outputs = lp
     assert!(
         out.contains(
             "stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
-             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+             precision = [HIGHEST, HIGHEST] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
         ),
         "matrix·vector must be one dot_general giving tensor<4xf32>, in:\n{out}"
     );
@@ -9801,7 +9801,7 @@ outputs = lp
     assert!(
         out.contains(
             "stablehlo.dot_general %arg0, %arg1, contracting_dims = [0] x [0], \
-             precision = [DEFAULT, DEFAULT] : (tensor<3xf32>, tensor<3xf32>) -> tensor<f32>"
+             precision = [HIGHEST, HIGHEST] : (tensor<3xf32>, tensor<3xf32>) -> tensor<f32>"
         ),
         "the inner product must contract [0] x [0] to a scalar, in:\n{out}"
     );
@@ -9986,7 +9986,7 @@ outputs = lp
     assert!(
         out.contains(
             "stablehlo.dot_general %arg0, %arg1, contracting_dims = [0] x [0], \
-             precision = [DEFAULT, DEFAULT] : (tensor<3xf32>, tensor<3x4xf32>) -> tensor<4xf32>"
+             precision = [HIGHEST, HIGHEST] : (tensor<3xf32>, tensor<3x4xf32>) -> tensor<4xf32>"
         ),
         "row·matrix must contract [0] x [0] to tensor<4xf32>, in:\n{out}"
     );
@@ -11047,7 +11047,7 @@ outputs = (lp)
     assert!(
         out.contains(
             "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
-             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+             precision = [HIGHEST, HIGHEST] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
         ),
         "the x column must reach beta through one dot_general, in:\n{out}"
     );
@@ -11095,7 +11095,7 @@ outputs = (lp)
     assert!(
         out.contains(
             "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
-             precision = [DEFAULT, DEFAULT] : (tensor<20x3xf32>, tensor<3xf32>) -> tensor<20xf32>"
+             precision = [HIGHEST, HIGHEST] : (tensor<20x3xf32>, tensor<3xf32>) -> tensor<20xf32>"
         ),
         "the mean must come through dot_general(%arg3, %arg1), in:\n{out}"
     );

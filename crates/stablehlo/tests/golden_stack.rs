@@ -196,7 +196,7 @@ fn integer_matrix_product_keeps_its_element_type() {
     assert!(
         out.lines().any(|line| {
             line.contains("stablehlo.dot_general ")
-                && line.contains("contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT]")
+                && line.contains("contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST]")
                 && line.contains(": (tensor<2x3xi32>, tensor<3x2xi32>) -> tensor<2x2xi32>")
         }),
         "integer operands must give an integer product:\n{out}"

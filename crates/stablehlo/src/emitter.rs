@@ -2324,7 +2324,7 @@ impl<'m> Emitter<'m> {
     /// Matrix-vector product `a @ b` via `stablehlo.dot_general`'s pretty
     /// form, contracting `a`'s (rank-2, `[m, n]`) last dimension against `b`'s
     /// (rank-1, `[n]`) only dimension: `a, b, contracting_dims = [1] x [0],
-    /// precision = [DEFAULT, DEFAULT] : (a_ty, b_ty) -> r_ty`. The result
+    /// precision = [HIGHEST, HIGHEST] : (a_ty, b_ty) -> r_ty`. The result
     /// takes `a`'s leading dimension (`[m]`), *not* `b`'s type — a `[m, n]`
     /// times `[n]` product has shape `[m]`, which only coincides with `b`'s
     /// `[n]` shape in the square (`m == n`) case.
@@ -2534,8 +2534,11 @@ impl<'m> Emitter<'m> {
         let a_ty = a.ty.render(self.dtype, kind);
         let b_ty = b.ty.render(self.dtype, kind);
         let result_ty_text = result_ty.render(self.dtype, kind);
+        // DEFAULT permits reduced mantissa precision on accelerators (TF32 on
+        // NVIDIA GPUs). Density residuals and their derivatives need the
+        // selected floating-point precision, as do the linalg contractions.
         self.push(&format!(
-            "{ssa} = stablehlo.dot_general {}, {}, {batching}contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, {batching}contracting_dims = [{la}] x [{lb}], precision = [HIGHEST, HIGHEST] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
         let result = Value {
@@ -2585,7 +2588,7 @@ impl<'m> Emitter<'m> {
         let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
-            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : ({z_ty}, {l_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : ({z_ty}, {l_ty}) -> {result_ty_text}",
             z.ssa, l.ssa
         ));
         Value {
