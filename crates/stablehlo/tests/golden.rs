@@ -4315,6 +4315,21 @@ fn emit_logdensity_uniform_has_expected_structure() {
     assert!(is_delimiter_balanced(&out));
 }
 
+#[test]
+fn uniform_unitinterval_density_matches_explicit_bounds() {
+    let source = "support = unitinterval\n\
+                  x = elementof(reals)\n\
+                  inputs = x\n\
+                  outputs = logdensityof(Uniform(SUPPORT), x)";
+    let expected = emit_logdensity(&determinize_src(
+        &source.replace("SUPPORT", "interval(0.0, 1.0)"),
+    ));
+    for support in ["unitinterval", "support"] {
+        let actual = emit_logdensity(&determinize_src(&source.replace("SUPPORT", support)));
+        assert_eq!(actual, expected, "{support}");
+    }
+}
+
 /// `Uniform(support = reals)` — an unbounded set, infinite Lebesgue
 /// measure — must refuse with the exact message `registry::uniform_bounds`
 /// promises, rather than lowering a nonsensical `-log(inf)`.
@@ -6613,6 +6628,19 @@ fn emit_sample_uniform_matches_frozen_golden() {
         out, golden,
         "emitted @sample drifted from the frozen golden (tests/goldens/uniform_sample.mlir)"
     );
+}
+
+#[test]
+fn uniform_unitinterval_sample_matches_explicit_bounds() {
+    let source = "support = unitinterval\n".to_owned() + UNIFORM_SAMPLE_SRC;
+    let source = source.replace("interval(-1.0, 3.0)", "SUPPORT");
+    let expected = emit_sample(&determinize_src(
+        &source.replace("SUPPORT", "interval(0.0, 1.0)"),
+    ));
+    for support in ["unitinterval", "support"] {
+        let actual = emit_sample(&determinize_src(&source.replace("SUPPORT", support)));
+        assert_eq!(actual, expected, "{support}");
+    }
 }
 
 const CAUCHY_SAMPLE_SRC: &str = "\
