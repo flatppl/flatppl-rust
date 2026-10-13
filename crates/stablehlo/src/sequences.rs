@@ -403,12 +403,21 @@ impl Emitter<'_> {
         id: NodeId,
         args: &[NodeId],
     ) -> Result<Components, EmitError> {
+        let frame = self.broadcast_frame.clone();
+        let previous = std::mem::replace(&mut self.call_frame, frame);
+        let result = self.lower_scan_in_frame(id, args);
+        self.call_frame = previous;
+        result
+    }
+
+    fn lower_scan_in_frame(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+    ) -> Result<Components, EmitError> {
         let [function, init, xs] = crate::ops::args_exact(id, args)?;
         let item_type = self.sequence_item_type(xs)?;
         let state_type = self.sequence_item_type(id)?;
-        if self.broadcast_frame != self.call_frame {
-            return Err(EmitError::at(id, "scan inside broadcast has no lowering"));
-        }
         let (body, entries) = self.callable_parts(function)?;
         if entries.len() != 2 {
             return Err(EmitError::at(id, "scan: step must take state and input"));
