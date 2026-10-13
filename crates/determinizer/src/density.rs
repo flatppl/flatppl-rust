@@ -7669,6 +7669,19 @@ fn lower_broadcast_kernel(
         return broadcast::call_density(m, CallHead::Builtin(op), &pos_args, &kw_args, obs);
     }
 
+    // Tables have one axis. A matrix-valued product must therefore broadcast
+    // the scalar density directly instead of building a matrix of records.
+    let (resolved_obs, _) = resolve_ref_chain(m, obs);
+    if matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
+        Some(Type::Array { shape, .. }) if shape.len() > 1)
+    {
+        let head = match *m.node(head) {
+            Node::Const(op) => CallHead::Builtin(op),
+            _ => CallHead::User(head),
+        };
+        return broadcast::call_density(m, head, &pos_args, &kw_args, obs);
+    }
+
     // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
     // one: a bare built-in `Node::Const(sym)` (`broadcast(Poisson, …)`), or a
     // standard-module member `Node::Ref { ns: Module(_), name }`
