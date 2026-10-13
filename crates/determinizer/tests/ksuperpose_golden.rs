@@ -218,19 +218,19 @@ fn an_unapplied_lift_refuses_with_a_located_message() {
     );
 }
 
-/// A REIFIED component needs a per-component body evaluation with no backend
-/// form (the gap `lower_iid` documents for its own `functionof`-broadcast
-/// candidate). Refuse-don't-mislower.
 #[test]
-fn a_reified_component_refuses_rather_than_mislowering() {
-    let msg = refusal(
-        "w = [0.3, 1.2]\n\
-         mus = [-1.0, 2.0]\n\
-         k = kernelof(draw(Normal(mu = _m_, sigma = 1.0)), m = _m_)\n\
-         mix = ksuperpose(k, w)(m = mus)\n\
-         lp = logdensityof(mix, 0.5)\n",
-    );
-    assert!(msg.contains("not a bare measure constructor"), "got: {msg}");
+fn reified_product_mixtures_share_one_density_body_at_any_component_count() {
+    for n in [2, 500] {
+        let pir = lower(&format!(
+            "p = external(unitinterval)\n\
+             counts(n) = iid(Binomial(n, p), 5)\n\
+             sizes = indicesof(zeros({n}))\nweights = ones({n})\n\
+             mix = normalize(ksuperpose(counts, weights)(sizes))\n\
+             lp = logdensityof(mix, [1, 1, 2, 2, 2])\n"
+        ));
+        assert_eq!(pir.matches("builtin_logdensityof").count(), 1, "{pir}");
+        assert_eq!(pir.matches("(logsumexp ").count(), 1, "{pir}");
+    }
 }
 
 /// A TABLE parameter family types (§06 counts its rows as the one axis) but the
