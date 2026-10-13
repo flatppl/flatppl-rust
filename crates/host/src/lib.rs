@@ -13,6 +13,7 @@ mod data;
 mod export;
 mod formula;
 mod inspect;
+mod transforms;
 
 pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position};
 pub use constants::Constant;
@@ -23,3 +24,4 @@ pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
 pub use formula::FormulaModel;
 pub use inspect::{BindingKind, Bound, Domain, DomainField};
+pub use transforms::TransformedQueries;

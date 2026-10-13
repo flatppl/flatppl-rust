@@ -360,6 +360,103 @@ impl Context {
         Arc::ptr_eq(&self.owner, &module.owner)
     }
 
+    /// Wrap a query with the canonical coordinates of its single continuous input.
+    ///
+    /// `logdensity` adds the forward log-Jacobian to a scalar log density with
+    /// respect to the domain's coordinate Lebesgue measure. Ordinary outputs
+    /// only receive transformed inputs. The original module remains unchanged.
+    pub fn transform(
+        &mut self,
+        module: &LoadedModule,
+        logdensity: bool,
+    ) -> Result<crate::TransformedQueries, Diagnostic> {
+        let fail = |message: String| Diagnostic::new("transform", module.source_name(), message);
+        if !self.owns(module) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let typed = &module.typed;
+        let binding = |name: &str| {
+            typed
+                .public_bindings()
+                .find(|(_, b)| typed.resolve(b.name) == name)
+                .map(|(_, b)| b.rhs)
+        };
+        let mut input = binding("inputs").ok_or_else(|| {
+            fail("declare one continuous input before transforming a query".into())
+        })?;
+        if let Node::Call(call) = typed.node(input)
+            && matches!(call.head, CallHead::Builtin(s) if typed.resolve(s) == "tuple")
+            && call.args.len() == 1
+        {
+            input = call.args[0];
+        }
+        let Node::Ref(reference) = typed.node(input) else {
+            return Err(fail("coordinate transforms require one input; group parameters in a record or vector and bind data before compiling".into()));
+        };
+        let name = typed.resolve(reference.name);
+        let rhs =
+            binding(name).ok_or_else(|| fail("the input must name a local binding".into()))?;
+        if inspect::kind(typed, rhs) != BindingKind::Parameter {
+            return Err(fail(
+                "the transformed input must be declared with elementof".into(),
+            ));
+        }
+        if !typed
+            .type_of(rhs)
+            .is_some_and(crate::transforms::supported_container)
+        {
+            return Err(fail(
+                "coordinate transforms currently support scalars, scalar arrays and records; arrays with structured cells and tables are not supported".into(),
+            ));
+        }
+        let output = binding("outputs")
+            .ok_or_else(|| fail("declare outputs before transforming a query".into()))?;
+        if logdensity
+            && typed.type_of(output)
+                != Some(&flatppl_core::Type::Scalar(flatppl_core::ScalarType::Real))
+        {
+            return Err(fail(
+                "a log-density transform requires one real scalar output".into(),
+            ));
+        }
+        let domain = typed
+            .valueset_of(rhs)
+            .ok_or_else(|| fail("the input has no known domain".into()))?;
+        let chart = Domain::of(typed, domain).chart("point").map_err(fail)?;
+        let registered = loop {
+            let name = format!("__flatppl_coordinates_{}.flatppl", self.next_inline);
+            self.next_inline += 1;
+            if !self.registry.contains_key(&name) {
+                break name;
+            }
+        };
+        self.register(&registered, module)?;
+        let correction = if logdensity {
+            format!(" + ({})", chart.log_det)
+        } else {
+            String::new()
+        };
+        let source = format!(
+            "flatppl_compat = \"0.1\"\npoint = elementof({})\n\
+             _model = load_module(\"{registered}\", {name} = {})\n\
+             inputs = point\noutputs = _model.outputs{correction}\n",
+            chart.free, chart.constrain,
+        );
+        let unconstrained = self.parse(&source, None, None)?;
+        let make = |domain: &str, expression: &str| {
+            format!(
+                "flatppl_compat = \"0.1\"\npoint = elementof({domain})\ninputs = point\noutputs = {expression}\n"
+            )
+        };
+        let constrain = self.parse(&make(&chart.free, &chart.constrain), None, None)?;
+        let unconstrain = self.parse(&make(&chart.domain, &chart.unconstrain), None, None)?;
+        Ok(crate::TransformedQueries {
+            unconstrained,
+            constrain,
+            unconstrain,
+        })
+    }
+
     /// Bind fixed values to declared externals in a new immutable module.
     pub fn set(
         &mut self,

@@ -189,6 +189,28 @@ impl NativeContext {
             .map(|inner| NativeModule { inner })
             .map_err(error)
     }
+
+    fn transform(
+        &mut self,
+        module: &NativeModule,
+        logdensity: bool,
+    ) -> PyResult<(NativeModule, NativeModule, NativeModule)> {
+        let queries = self
+            .inner
+            .transform(&module.inner, logdensity)
+            .map_err(error)?;
+        Ok((
+            NativeModule {
+                inner: queries.unconstrained,
+            },
+            NativeModule {
+                inner: queries.constrain,
+            },
+            NativeModule {
+                inner: queries.unconstrain,
+            },
+        ))
+    }
 }
 
 #[pyclass(name = "FormulaModel", module = "flatppl._native", frozen)]
