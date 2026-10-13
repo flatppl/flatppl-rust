@@ -35,6 +35,7 @@ pub(super) fn conditional_reification(
         seeds.push((
             target,
             Resolved {
+                set_element: None,
                 ty: ty.clone(),
                 phase: Phase::Parameterized,
                 vset: inf.lookup_valueset(target),

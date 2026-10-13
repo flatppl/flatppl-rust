@@ -233,6 +233,9 @@ pub(crate) fn lower_builtin(
         "array" => lower_array(e, id, args),
         "cat" => lower_cat(e, id, args),
         "sum" => lower_sum(e, id, args),
+        "indicesof" | "indicesof0" => {
+            crate::indices::lower(e, id, args, head == "indicesof0", None)
+        }
         "lengthof" => {
             let [value] = args_exact(id, args)?;
             let length = match e.type_of(value) {
@@ -2631,6 +2634,10 @@ fn lower_get_literal(
         return Err(EmitError::at(id, "get/get0: index out of range"));
     }
     let idx = idx as u64;
+
+    if let Some(result) = crate::indices::projection(e, id, container, idx as usize) {
+        return result;
+    }
 
     let v = e.lower_node(container)?;
     let v = e.with_typed_axes(container, v);

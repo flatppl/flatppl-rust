@@ -583,10 +583,16 @@ pub(crate) fn graft_query_target(
     }
     // Record observations can contain imported arrays below their fields.
     // Graft those values before density broadcasting reads their cell types.
-    let (observation, _) = resolve_ref_chain(m, arg2);
+    let (observation, binding) = resolve_ref_chain(m, arg2);
     let grafted = crate::crossmodule::graft_host_value(m, observation, bundle, imports)
         .map_err(|reason| refuse(observation, m, &reason))?;
     if grafted != observation {
+        if let Some(binding) = binding {
+            // Importing an input's domain must not replace its named runtime
+            // leaf with an anonymous elementof expression in the query.
+            m.set_binding_rhs(binding, grafted);
+            return Ok(Some(build_call(m, op, &[arg1, arg2])));
+        }
         return Ok(Some(build_call(m, op, &[arg1, grafted])));
     }
     Ok(None) // same-module target — driver lowers normally

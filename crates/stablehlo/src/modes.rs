@@ -282,7 +282,11 @@ pub(crate) fn emit_logdensity_abi(
 
     let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
     for &node in &abi.outputs {
-        rets_vals.push(e.lower_node(node)?);
+        if let Some(indices) = crate::indices::outputs(&mut e, node) {
+            rets_vals.extend(indices?);
+        } else {
+            rets_vals.push(e.lower_node(node)?);
+        }
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("logdensity", &args, &rets))

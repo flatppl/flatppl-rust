@@ -778,7 +778,7 @@ fn the_exempt_rows_type_their_table_argument() {
     for f in ["indicesof", "indicesof0"] {
         let out = pir(f);
         assert!(
-            out.contains("(%bind s (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+            out.contains("(%bind s (%meta ((%array 1 (4) (%scalar integer))"),
             "`{f}` over a table must type as an integer index array, in:\n{out}"
         );
     }
