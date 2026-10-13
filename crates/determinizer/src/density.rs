@@ -4135,10 +4135,8 @@ fn superposition_reference(
                 let value = named_or_positional(m, &call, "value")?;
                 if let Some(atom) = static_real(m, value).filter(|x| x.is_finite()) {
                     Some(SuperpositionReference::Atoms(vec![atom]))
-                } else if matches!(
-                    m.type_of(value),
-                    Some(Type::Scalar(ScalarType::Integer | ScalarType::Boolean))
-                ) {
+                } else if m.type_of(value).and_then(reference_measure) == Some(Reference::Counting)
+                {
                     Some(SuperpositionReference::Counting)
                 } else {
                     None
@@ -4146,6 +4144,18 @@ fn superposition_reference(
             }
             "Counting" => Some(SuperpositionReference::Counting),
             "Lebesgue" => Some(SuperpositionReference::Lebesgue),
+            "markovchain" | "kscan" => {
+                let ty = m.type_of(node).cloned().or_else(|| {
+                    flatppl_infer::infer_expression(m, node, &[])
+                        .0
+                        .remove(&node)
+                })?;
+                let Type::Measure { domain, .. } = ty else {
+                    return None;
+                };
+                (reference_measure(&domain) == Some(Reference::Counting))
+                    .then_some(SuperpositionReference::Counting)
+            }
             "weighted" | "logweighted" | "tilt" => {
                 superposition_reference(m, *call.args.get(1)?, path)
             }
