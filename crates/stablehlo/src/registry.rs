@@ -2040,6 +2040,7 @@ fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
 fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let prob = p.get(e, "p")?;
+    let fixed_log_choose = e.fold_log_choose(&n, v);
     let zero = e.scalar(0.0);
     let above = e.compare("GE", v, &zero);
     let below = e.compare("LE", v, &n);
@@ -2049,20 +2050,17 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let prob = e.select(&supported, &prob, &half);
     let one = e.scalar(1.0);
 
-    let n_plus_one = e.add(&n, &one);
-    let lgamma_n1 = e.lgamma(&n_plus_one);
-
-    let k_plus_one = e.add(&v, &one);
-    let lgamma_k1 = e.lgamma(&k_plus_one);
-    let neg_lgamma_k1 = e.neg(&lgamma_k1);
-
     let n_minus_k = e.sub(&n, &v);
-    let n_minus_k_plus_one = e.add(&n_minus_k, &one);
-    let lgamma_nmk1 = e.lgamma(&n_minus_k_plus_one);
-    let neg_lgamma_nmk1 = e.neg(&lgamma_nmk1);
-
-    let t1 = e.add(&lgamma_n1, &neg_lgamma_k1);
-    let log_choose_nk = e.add(&t1, &neg_lgamma_nmk1);
+    let log_choose_nk = fixed_log_choose.unwrap_or_else(|| {
+        let n_plus_one = e.add(&n, &one);
+        let lgamma_n1 = e.lgamma(&n_plus_one);
+        let k_plus_one = e.add(&v, &one);
+        let lgamma_k1 = e.lgamma(&k_plus_one);
+        let n_minus_k_plus_one = e.add(&n_minus_k, &one);
+        let lgamma_nmk1 = e.lgamma(&n_minus_k_plus_one);
+        let difference = e.sub(&lgamma_n1, &lgamma_k1);
+        e.sub(&difference, &lgamma_nmk1)
+    });
 
     // A zero exponent contributes log(1), even when its probability is zero.
     // Guard before log so its unused singular derivative cannot poison AD.

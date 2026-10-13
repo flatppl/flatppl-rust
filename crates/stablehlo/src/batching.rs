@@ -384,7 +384,7 @@ impl Emitter<'_> {
     }
 
     /// A no-copy semantic view; backend canonicalization removes the reshape.
-    pub(super) fn axes_view(&mut self, v: &Value, axes: Axes) -> Value {
+    pub(crate) fn axes_view(&mut self, v: &Value, axes: Axes) -> Value {
         if self.axes_of(v) == axes {
             return v.clone();
         }

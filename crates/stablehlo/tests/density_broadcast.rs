@@ -34,6 +34,17 @@ fn fixed_measure_broadcast_preserves_each_density_and_its_sum() {
 }
 
 #[test]
+fn matrix_distribution_broadcast_matches_a_scalar_kernel() {
+    let source = "p = external(cartpow(unitinterval, [2, 3]))\n\
+                  y = external(cartpow(nonnegintegers, [2, 3]))\n\
+                  inputs = (p, y)\noutputs = logdensityof(Bernoulli.(p), y)";
+    assert_eq!(
+        emit(source),
+        emit(&source.replace("Bernoulli.(p)", "(q -> Bernoulli(q)).(p)"))
+    );
+}
+
+#[test]
 fn density_broadcast_keeps_mixed_scalar_and_collection_operands() {
     let source = "x = external(cartpow(reals, 3))\n\
                   shift = external(reals)\n\

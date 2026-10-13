@@ -378,12 +378,20 @@ impl<'m> Emitter<'m> {
             ty,
             elem: ElemKind::Int,
         };
-        if zero_based {
+        let result = if zero_based {
             indices
         } else {
             let one = self.int_value_const(1);
             self.add(&indices, &one)
+        };
+        if length <= constants::MAX_FIXED_COUNTS as u64 {
+            let start = i64::from(!zero_based);
+            self.remember_constant(
+                &result.ssa,
+                (0..length).map(|i| Scalar::Int(i as i64 + start)),
+            );
         }
+        result
     }
 
     /// Pack literal data without emitting a scalar operation per element.

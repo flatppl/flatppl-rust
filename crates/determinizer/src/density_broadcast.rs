@@ -207,6 +207,79 @@ pub(super) fn call_density(
     named: &[(Symbol, NodeId)],
     values: NodeId,
 ) -> Result<NodeId, RefuseError> {
+    let BoundCall {
+        measure,
+        inputs,
+        args,
+    } = bind_call(m, head, positional, named)?;
+    if inputs.is_empty() {
+        return lower_measure_density(m, measure, values);
+    }
+    sum_density_with(m, measure, values, inputs, args)
+}
+
+/// A mixture shares the whole observation across components. Only the family
+/// and weight axes vary; independent coordinates inside a component stay inside.
+pub(super) fn mixture_density(
+    m: &mut Module,
+    head: NodeId,
+    positional: &[NodeId],
+    named: &[(Symbol, NodeId)],
+    weights: NodeId,
+    value: NodeId,
+) -> Result<NodeId, RefuseError> {
+    if positional
+        .iter()
+        .chain(named.iter().map(|(_, value)| value))
+        .any(|&value| {
+            let (resolved, _) = resolve_ref_chain(m, value);
+            m.type_of(value)
+                .or_else(|| m.type_of(resolved))
+                .map(array_axes)
+                .unwrap_or(0)
+                > 1
+        })
+    {
+        return Err(refuse(
+            head,
+            m,
+            "reified ksuperpose needs a one-axis parameter family",
+        ));
+    }
+    let BoundCall {
+        measure,
+        mut inputs,
+        mut args,
+    } = bind_call(m, CallHead::User(head), positional, named)?;
+    if !matches!(
+        superposition_reference(m, measure, &mut Vec::new()),
+        Some(SuperpositionReference::Counting | SuperpositionReference::Lebesgue)
+    ) {
+        return Err(refuse(
+            head,
+            m,
+            "ksuperpose kernel needs a common counting or Lebesgue reference",
+        ));
+    }
+    let weight = cell_input(m, weights, &mut inputs, &mut args)?;
+    let weighted = build_call(m, "weighted", &[weight, measure]);
+    let body = lower_measure_density(m, weighted, value)?;
+    let terms = map_body(m, body, inputs, args, 1);
+    Ok(build_call(m, "logsumexp", &[terms]))
+}
+
+struct BoundCall {
+    measure: NodeId,
+    inputs: Vec<(Symbol, Ref)>,
+    args: Vec<NodeId>,
+}
+
+fn bind_call(
+    m: &mut Module,
+    head: CallHead,
+    positional: &[NodeId],
+    named: &[(Symbol, NodeId)],
+) -> Result<BoundCall, RefuseError> {
     let mut inputs = Vec::new();
     let mut args = Vec::new();
     let mut bind = |m: &mut Module, value| {
@@ -238,10 +311,11 @@ pub(super) fn call_density(
         named: named.into(),
         inputs: None,
     }));
-    if inputs.is_empty() {
-        return lower_measure_density(m, measure, values);
-    }
-    sum_density_with(m, measure, values, inputs, args)
+    Ok(BoundCall {
+        measure,
+        inputs,
+        args,
+    })
 }
 
 pub(crate) fn cell_input(

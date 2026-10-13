@@ -1348,14 +1348,10 @@ fn lower_applied_kernel_joint(
 /// annotation onto an array value. `broadcast_type`'s elementwise arm types both
 /// over the array (§04 "Broadcasting").
 ///
-/// **Refuse-don't-mislower.** The component must be a bare measure constructor:
-/// a REIFIED component (`ksuperpose(kernelof(…), w)`) needs a per-component body
-/// evaluation that `Emitter::lower_broadcast_userfn` cannot express — the same
-/// architectural gap [`lower_iid`] documents at length for its own
-/// `functionof`-broadcast candidate — so it refuses rather than emit a form the
-/// backend mislowers. A table family argument refuses for the same reason
-/// [`lower_broadcast_kernel`] takes only positional and keyword data-args: the
-/// per-column extraction is not built.
+/// Reified components use one mapped density body and score the whole event
+/// before contracting the family axis. They must prove a shared counting or
+/// Lebesgue reference. Table family arguments still refuse: per-column
+/// extraction is not built.
 fn lower_applied_ksuperpose(
     m: &mut Module,
     node: NodeId,
@@ -1401,9 +1397,12 @@ fn lower_applied_ksuperpose_inner(
     kw_args: &[(Symbol, NodeId)],
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
+    if crate::kernel::resolve_reified(m, component).is_some() {
+        return broadcast::mixture_density(m, component, pos_args, kw_args, weights, v);
+    }
     // The component must resolve to a measure-CONSTRUCTOR name, the same two
     // shapes `lower_broadcast_kernel` accepts: a bare built-in `Const`, or a §09
-    // member ref. A reification, a value-broadcast head, or a `%local` is not
+    // member ref. Reifications were handled above. A value-broadcast head or `%local` is not
     // one — refuse.
     let (ctor_node, _) = resolve_ref_one(m, component);
     let ctor_sym = match *m.node(ctor_node) {
@@ -4135,10 +4134,8 @@ fn superposition_reference(
                 let value = named_or_positional(m, &call, "value")?;
                 if let Some(atom) = static_real(m, value).filter(|x| x.is_finite()) {
                     Some(SuperpositionReference::Atoms(vec![atom]))
-                } else if matches!(
-                    m.type_of(value),
-                    Some(Type::Scalar(ScalarType::Integer | ScalarType::Boolean))
-                ) {
+                } else if m.type_of(value).and_then(reference_measure) == Some(Reference::Counting)
+                {
                     Some(SuperpositionReference::Counting)
                 } else {
                     None
@@ -4146,6 +4143,18 @@ fn superposition_reference(
             }
             "Counting" => Some(SuperpositionReference::Counting),
             "Lebesgue" => Some(SuperpositionReference::Lebesgue),
+            "markovchain" | "kscan" => {
+                let ty = m.type_of(node).cloned().or_else(|| {
+                    flatppl_infer::infer_expression(m, node, &[])
+                        .0
+                        .remove(&node)
+                })?;
+                let Type::Measure { domain, .. } = ty else {
+                    return None;
+                };
+                (reference_measure(&domain) == Some(Reference::Counting))
+                    .then_some(SuperpositionReference::Counting)
+            }
             "weighted" | "logweighted" | "tilt" => {
                 superposition_reference(m, *call.args.get(1)?, path)
             }
@@ -4679,6 +4688,15 @@ fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
         return None;
     }
     let (ctor_node, _) = resolve_ref_one(m, lift.args[0]);
+    if matches!(
+        m.type_of(ctor_node),
+        Some(Type::Kernel {
+            mass: Mass::Normalized,
+            ..
+        })
+    ) {
+        return Some(lift.args[1]);
+    }
     let ctor_sym = match *m.node(ctor_node) {
         Node::Const(sym) => sym,
         Node::Ref(Ref {
@@ -6967,6 +6985,15 @@ fn iid_static_table_rows(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// reified density over the outer collection, preserving each observation cell.
 /// Static product axes are required; an empty product returns the empty sum.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    // Applying a reified component rebuilds its product node. Recover the
+    // concrete shape without borrowing the unapplied kernel's annotations.
+    if m.type_of(node).is_none()
+        && let Some(ty) = flatppl_infer::infer_expression(m, node, &[])
+            .0
+            .remove(&node)
+    {
+        m.set_type(node, ty);
+    }
     // Record-valued products with a scalar size are tables, whose row count
     // comes from a separate reader. Their row remains the whole inner event.
     let shape = iid_static_shape(m, node)
@@ -7667,6 +7694,19 @@ fn lower_broadcast_kernel(
         && m.resolve(op) == "locscale"
     {
         return broadcast::call_density(m, CallHead::Builtin(op), &pos_args, &kw_args, obs);
+    }
+
+    // Tables have one axis. A matrix-valued product must therefore broadcast
+    // the scalar density directly instead of building a matrix of records.
+    let (resolved_obs, _) = resolve_ref_chain(m, obs);
+    if matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
+        Some(Type::Array { shape, .. }) if shape.len() > 1)
+    {
+        let head = match *m.node(head) {
+            Node::Const(op) => CallHead::Builtin(op),
+            _ => CallHead::User(head),
+        };
+        return broadcast::call_density(m, head, &pos_args, &kw_args, obs);
     }
 
     // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
