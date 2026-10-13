@@ -1637,9 +1637,9 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // (e.g. Best & Fisher) but is not part of Task 15's batch — it stays
 // `sample: None` for a later task.
 
-/// The `(lo, hi)` bounds of a value-set `S`, when `S` is a closed-form
+/// The `(lo, hi)` bounds of a support `S`, when `S` is a closed-form
 /// measurable interval: a plain `ValueSet::Interval(lo, hi)` with finite,
-/// correctly-ordered bounds, or `ValueSet::UnitInterval` (`[0, 1]`). Its
+/// correctly-ordered bounds, or the named `unitinterval` (`[0, 1]`). Its
 /// Lebesgue measure `lambda(S)` is then `hi - lo`. `None` for anything else —
 /// `Unknown`/`Deferred` (the support's bounds are not static literals — spec
 /// §03's `ValueSet::Interval` only ever holds compile-time-constant bounds,
@@ -1654,8 +1654,13 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// here rather than lowering a `-log(box-volume)` nobody could reach is the
 /// refuse-don't-mislower call. [`uniform_logpdf`] and [`uniform_sample`] each
 /// turn `None` into a precise refusal.
-fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
-    match vs {
+fn uniform_bounds(e: &Emitter, support: NodeId) -> Option<(f64, f64)> {
+    let support = e.resolve_ref_one(support);
+    // Named set constants carry no interval metadata; read their denotation.
+    if matches!(e.node(support), Node::Const(s) if e.resolve(*s) == "unitinterval") {
+        return Some((0.0, 1.0));
+    }
+    match e.valueset_of(support)? {
         ValueSet::Interval(lo, hi) if lo.is_finite() && hi.is_finite() && hi > lo => {
             Some((*lo, *hi))
         }
@@ -1689,8 +1694,7 @@ fn uniform_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
             "Uniform logpdf needs a measurable interval/box support",
         )
     };
-    let (lo_c, hi_c, dens) = if let Some((lo, hi)) = e.valueset_of(support).and_then(uniform_bounds)
-    {
+    let (lo_c, hi_c, dens) = if let Some((lo, hi)) = uniform_bounds(e, support) {
         (e.scalar(lo), e.scalar(hi), e.scalar(-(hi - lo).ln()))
     } else {
         if !matches!(
@@ -1740,15 +1744,12 @@ fn uniform_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
 /// directly rather than through [`unbatch_field_id`].
 fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let support = p.field_id(e, "support")?;
-    let (lo, hi) = e
-        .valueset_of(support)
-        .and_then(uniform_bounds)
-        .ok_or_else(|| {
-            EmitError::at(
-                support,
-                "Uniform sample needs a measurable interval/box support",
-            )
-        })?;
+    let (lo, hi) = uniform_bounds(e, support).ok_or_else(|| {
+        EmitError::at(
+            support,
+            "Uniform sample needs a measurable interval/box support",
+        )
+    })?;
 
     let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
