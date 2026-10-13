@@ -14,6 +14,7 @@ use crate::refuse::EmitError;
 
 enum TensorSelector {
     Scalar(u64),
+    DynamicScalar(Value),
     All,
     Vector(Value),
 }
@@ -108,7 +109,7 @@ pub(crate) fn lower_multi_axis(
             .iter()
             .zip(&cell_dims)
             .filter_map(|(selector, &dim)| {
-                matches!(selector, TensorSelector::All | TensorSelector::Vector(_)).then_some(dim)
+                (!matches!(selector, TensorSelector::Scalar(_))).then_some(dim)
             }),
     );
     let kept_ty = if kept_dims.is_empty() {
@@ -116,25 +117,47 @@ pub(crate) fn lower_multi_axis(
     } else {
         MlirTy::Ranked(kept_dims)
     };
-    let selected = if sliced.ty == kept_ty {
+    let mut selected = if sliced.ty == kept_ty {
         sliced
     } else {
         e.reshape(&sliced, kept_ty)
     };
 
-    let Some((cell_axis, index)) = selectors
-        .iter()
-        .filter(|selector| !matches!(selector, TensorSelector::Scalar(_)))
-        .enumerate()
-        .find_map(|(axis, selector)| match selector {
-            TensorSelector::Vector(index) => Some((axis, index)),
-            TensorSelector::All => None,
-            TensorSelector::Scalar(_) => unreachable!(),
-        })
-    else {
-        return Ok(selected);
-    };
-    Ok(e.gather_axis(&selected, index, base, cell_axis))
+    let mut cell_axis = 0;
+    for selector in &selectors {
+        match selector {
+            TensorSelector::Scalar(_) => {}
+            TensorSelector::All => cell_axis += 1,
+            TensorSelector::Vector(index) => {
+                selected = e.gather_axis(&selected, index, base, cell_axis);
+                cell_axis += 1;
+            }
+            TensorSelector::DynamicScalar(index) => {
+                let batch = e.batch_rank(&selected);
+                let rank = match e.cell_ty(&selected) {
+                    MlirTy::Ranked(dims) => dims.len(),
+                    _ => unreachable!(),
+                };
+                let mut permutation: Vec<_> = (0..batch as u64).collect();
+                permutation.push((batch + cell_axis) as u64);
+                permutation.extend(
+                    (batch..batch + rank)
+                        .filter(|&i| i != batch + cell_axis)
+                        .map(|i| i as u64),
+                );
+                let moved = e.transpose(&selected, &permutation);
+                let mut axes = e.axes_of(&selected);
+                axes.layers = if rank == 1 {
+                    vec![1]
+                } else {
+                    vec![1, rank - 1]
+                };
+                let moved = e.axes_view(&moved, axes);
+                selected = e.gather_cells(&moved, index, base);
+            }
+        }
+    }
+    Ok(e.with_typed_axes(id, selected))
 }
 
 fn lower_selectors(
@@ -167,6 +190,10 @@ fn lower_selectors(
             }
             _ => {
                 let index = e.lower_node(node)?;
+                if index.elem == ElemKind::Int && e.cell_ty(&index) == MlirTy::Scalar {
+                    selectors.push(TensorSelector::DynamicScalar(index));
+                    continue;
+                }
                 if index.elem != ElemKind::Int
                     || e.batch_rank(&index) != 0
                     || !matches!(e.cell_ty(&index), MlirTy::Ranked(dims) if dims.len() == 1)
