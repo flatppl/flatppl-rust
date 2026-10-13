@@ -222,6 +222,13 @@ fn batched_matrix_products_do_not_loop_over_points() -> Result<(), Box<dyn std::
             "{}",
             exported.stablehlo
         );
+        for dot in exported
+            .stablehlo
+            .lines()
+            .filter(|line| line.contains("stablehlo.dot_general"))
+        {
+            assert!(dot.contains("precision = [HIGHEST, HIGHEST]"), "{dot}");
+        }
     }
     Ok(())
 }
