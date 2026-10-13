@@ -326,6 +326,7 @@ fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolve
         ty: reintern_type(into, from, &res.ty),
         vset: reintern_valueset(into, from, &res.vset),
         result: res.result.map(|t| reintern_type(into, from, &t)),
+        set_element: res.set_element.map(|t| reintern_type(into, from, &t)),
         phase: res.phase,
         catalogue: res.catalogue,
         admitted_source: res.admitted_source,
@@ -338,6 +339,9 @@ pub(crate) struct Resolved {
     pub(crate) ty: Type,
     pub(crate) phase: Phase,
     pub(crate) vset: ValueSet,
+    /// A set export's element type, read from its AST in the owning scope.
+    /// Its ordinary object type remains Any; support alone loses array nesting.
+    pub(crate) set_element: Option<Type>,
     /// Construction-based eligibility for draw/lawof, independent of mass class.
     pub(crate) admitted_source: bool,
     /// For a reified-callable binding (`%function` / `%kernel`), the inferred
@@ -425,6 +429,7 @@ pub(crate) struct InferSession<'b> {
 struct InferredDependency {
     module: Module,
     admitted_sources: HashSet<NodeId>,
+    sets: HashMap<NodeId, (Type, ValueSet)>,
 }
 
 impl<'b> InferSession<'b> {
@@ -532,6 +537,7 @@ impl<'b> InferSession<'b> {
         key: (String, String),
         module: Module,
         admitted_sources: HashSet<NodeId>,
+        sets: HashMap<NodeId, (Type, ValueSet)>,
     ) {
         self.stack.borrow_mut().pop();
         self.memo.borrow_mut().insert(
@@ -539,6 +545,7 @@ impl<'b> InferSession<'b> {
             InferredDependency {
                 module,
                 admitted_sources,
+                sets,
             },
         );
     }
@@ -703,10 +710,17 @@ impl<'b> InferSession<'b> {
                 .cloned()
                 .unwrap_or(Type::Deferred),
             phase: dep_annotated.phase_of(rhs).unwrap_or(Phase::Fixed),
-            vset: dep_annotated
-                .valueset_of(rhs)
-                .cloned()
-                .unwrap_or(ValueSet::Unknown),
+            vset: dependency
+                .sets
+                .get(&rhs)
+                .map(|(_, set)| set.clone())
+                .unwrap_or_else(|| {
+                    dep_annotated
+                        .valueset_of(rhs)
+                        .cloned()
+                        .unwrap_or(ValueSet::Unknown)
+                }),
+            set_element: dependency.sets.get(&rhs).map(|(ty, _)| ty.clone()),
             result: callable_body_result(dep_annotated, rhs),
             catalogue: None,
             admitted_source: dependency.admitted_sources.contains(&rhs),
@@ -752,6 +766,7 @@ fn resolve_standard(
         ty: Type::Any,
         phase: Phase::Fixed,
         vset: ValueSet::Unknown,
+        set_element: None,
         result: None,
         admitted_source: false,
         catalogue: Some(CatalogueRef {

@@ -3005,7 +3005,7 @@ const SET_EXPR_MAX_DEPTH: u32 = 256;
 
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
-fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
+pub(crate) fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
     let mut budget = SET_EXPR_NODE_BUDGET;
     set_element_type_at(inf, node, &mut budget, 0)
 }
@@ -3148,6 +3148,10 @@ fn set_element_type_at(
                 None => Type::Deferred,
             }
         }
+        Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => inf
+            .module_set_element(node)
+            .cloned()
+            .unwrap_or(Type::Deferred),
         _ => Type::Deferred,
     }
 }
@@ -6044,6 +6048,7 @@ fn substituted_result(
             phase,
             vset: inf.lookup_valueset(arg_node),
             result: None,
+            set_element: None,
             catalogue: None,
             admitted_source: improper::admitted(inf, arg_node),
         };
@@ -9020,7 +9025,7 @@ fn set_call_valueset_at(
 
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
-fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
+pub(crate) fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
     let mut budget = SET_EXPR_NODE_BUDGET;
     set_expr_valueset_at(inf, node, &mut budget, 0)
 }
@@ -9064,6 +9069,11 @@ fn set_expr_valueset_at(
             }
             None => ValueSet::Unknown,
         },
+        Node::Ref(r)
+            if matches!(r.ns, RefNs::Module(_)) && inf.module_set_element(node).is_some() =>
+        {
+            inf.lookup_valueset(node)
+        }
         _ => ValueSet::Unknown,
     }
 }

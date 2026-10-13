@@ -40,6 +40,7 @@ struct Scope {
     active_bindings: HashSet<BindingId>,
     noted_gaps: HashSet<Symbol>,
     module_callable_results: HashMap<NodeId, Type>,
+    module_set_elements: HashMap<NodeId, Type>,
     module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
 }
 
@@ -132,6 +133,8 @@ pub(crate) struct Inferencer<'m, 's> {
     /// reaches its body type — the body lives in the dependency's interner and
     /// cannot be looked up by node here. Populated in the `RefNs::Module` arm.
     module_callable_results: HashMap<NodeId, Type>,
+    /// Original element types for imported set objects, distinct from supports.
+    module_set_elements: HashMap<NodeId, Type>,
     /// For a §09 standard-module reference (`hepphys.CrystalBall`), the
     /// catalogue signature of the referenced binding, keyed by the importer ref
     /// node. The user-call path consults this so that applying the reference
@@ -216,6 +219,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             active_bindings: HashSet::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
+            module_set_elements: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
             kernel_tag_nodes,
             auto_inputs: vec![HashMap::new()],
@@ -244,6 +248,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             active_bindings: std::mem::take(&mut self.active_bindings),
             noted_gaps: std::mem::take(&mut self.noted_gaps),
             module_callable_results: std::mem::take(&mut self.module_callable_results),
+            module_set_elements: std::mem::take(&mut self.module_set_elements),
             module_catalogue_refs: std::mem::take(&mut self.module_catalogue_refs),
         }
     }
@@ -258,6 +263,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.active_bindings = scope.active_bindings;
         self.noted_gaps = scope.noted_gaps;
         self.module_callable_results = scope.module_callable_results;
+        self.module_set_elements = scope.module_set_elements;
         self.module_catalogue_refs = scope.module_catalogue_refs;
     }
 
@@ -381,6 +387,10 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// for local callables (their body is looked up by node instead).
     pub(crate) fn module_callable_result(&self, id: NodeId) -> Option<&Type> {
         self.module_callable_results.get(&id)
+    }
+
+    pub(crate) fn module_set_element(&self, id: NodeId) -> Option<&Type> {
+        self.module_set_elements.get(&id)
     }
 
     /// The catalogue signature recorded for `id`, if `id` is a `RefNs::Module`
@@ -611,14 +621,34 @@ impl<'m, 's> Inferencer<'m, 's> {
                         .map(|(_, binding)| binding.rhs)
                         .filter(|&node| ops::improper::admitted(self, node))
                         .collect();
+                    // Read set ASTs while the dependency's substitutions and
+                    // imported metadata still belong to this inference scope.
+                    let exported: Vec<_> =
+                        self.module.public_bindings().map(|(_, b)| b.rhs).collect();
+                    let sets = exported
+                        .into_iter()
+                        .filter_map(|node| {
+                            if self.lookup_type(node) != Some(&Type::Any) {
+                                return None;
+                            }
+                            let element = ops::set_element_type(self, Some(node));
+                            (!matches!(element, Type::Deferred | Type::Failed(_))).then(|| {
+                                (node, (element, ops::set_expr_valueset(self, Some(node))))
+                            })
+                        })
+                        .collect();
                     let diags = self.finish_module();
                     self.session.push_dep_diags(diags);
                     let dependency = std::mem::replace(self.module, frame.module);
                     self.kernel_tag_nodes = frame.kernel_tag_nodes;
                     self.auto_inputs = frame.auto_inputs;
                     self.restore_scope(frame.scope);
-                    self.session
-                        .finish_dependency(frame.key.clone(), dependency, admitted_sources);
+                    self.session.finish_dependency(
+                        frame.key.clone(),
+                        dependency,
+                        admitted_sources,
+                        sets,
+                    );
                     let result = self.session.resolved_binding(
                         self.module,
                         &frame.key,
@@ -731,6 +761,9 @@ impl<'m, 's> Inferencer<'m, 's> {
                 self.source_admission.insert(node, res.admitted_source);
                 if let Some(result) = res.result {
                     self.module_callable_results.insert(node, result);
+                }
+                if let Some(element) = res.set_element {
+                    self.module_set_elements.insert(node, element);
                 }
                 if let Some(catalogue) = res.catalogue {
                     self.module_catalogue_refs.insert(node, catalogue);
@@ -1144,6 +1177,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                         phase,
                         vset,
                         result: None,
+                        set_element: None,
                         catalogue: None,
                         admitted_source: ops::improper::admitted(self, value),
                     },
