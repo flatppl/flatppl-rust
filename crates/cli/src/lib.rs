@@ -245,7 +245,7 @@ pub(crate) fn render_diagnostic(
 ) {
     let located = span.or_else(|| line_span(source, line));
     let (Some((start, end)), false) = (located, source.is_empty()) else {
-        eprintln!("flatppl: {}: {message}", terminal_path(path));
+        eprintln!("flatppl: :3 {}: {message}", terminal_path(path));
         return;
     };
     // Clamp to the source: spans may legitimately point at EOF (zero-width
@@ -256,7 +256,7 @@ pub(crate) fn render_diagnostic(
     let name = terminal_path(path);
     let report = Report::build(ReportKind::Error, (name.clone(), start..end))
         .with_config(Config::default().with_color(std::io::stderr().is_terminal()))
-        .with_message(message)
+        .with_message(format!(":3 {message}"))
         .with_label(Label::new((name.clone(), start..end)).with_message("here"))
         .finish();
     let _ = report.eprint((name, Source::from(source)));
@@ -285,7 +285,7 @@ pub fn report(result: Result<(), Failure>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Plain(msg)) => {
-            eprintln!("flatppl: {msg}");
+            eprintln!("flatppl: :3 {msg}");
             ExitCode::FAILURE
         }
         Err(Failure::Diagnostic {
