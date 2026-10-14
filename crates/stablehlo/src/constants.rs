@@ -8,20 +8,20 @@ use std::sync::Arc;
 
 pub(super) type Constant = Arc<[Scalar]>;
 
-// Bound fixed-count tables and remembered index vectors to 4096 elements.
-pub(super) const MAX_FIXED_COUNTS: usize = 4096;
+// Bound newly materialized fixed tables and remembered index vectors.
+pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
 
 impl Emitter<'_> {
-    /// Read fixed integer counts through layout views without expanding them.
-    fn fixed_count_at(&self, value: &Value, index: usize) -> Option<i64> {
+    /// Read a fixed element through layout views without expanding them.
+    fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<&Scalar> {
+        if index >= element_count(&value.ty)? {
+            return None;
+        }
         if let Some(data) = self.constants.get(&value.ssa) {
-            return match data.get(if data.len() == 1 { 0 } else { index })? {
-                Scalar::Int(n) => Some(*n),
-                _ => None,
-            };
+            return data.get(if data.len() == 1 { 0 } else { index });
         }
         match &self.pointwise.get(&value.ssa)?.op {
-            Pointwise::Reshape(input) => self.fixed_count_at(input, index),
+            Pointwise::Reshape(input) => self.fixed_scalar_at(input, index),
             Pointwise::Broadcast(input, dimensions) => {
                 let mut remaining = index;
                 let mut coordinates = vec![0; shape(&value.ty).len()];
@@ -36,12 +36,19 @@ impl Emitter<'_> {
                     let coordinate = if size == 1 {
                         0
                     } else {
-                        coordinates[*axis as usize]
+                        *coordinates.get(usize::try_from(*axis).ok()?)?
                     };
                     source_index = source_index.checked_mul(size)?.checked_add(coordinate)?;
                 }
-                self.fixed_count_at(input, source_index)
+                self.fixed_scalar_at(input, source_index)
             }
+            _ => None,
+        }
+    }
+
+    fn fixed_count_at(&self, value: &Value, index: usize) -> Option<i64> {
+        match self.fixed_scalar_at(value, index)? {
+            Scalar::Int(n) => Some(*n),
             _ => None,
         }
     }
@@ -51,7 +58,7 @@ impl Emitter<'_> {
     pub(crate) fn fold_log_choose(&mut self, n: &Value, k: &Value) -> Option<Value> {
         let (n, k) = self.broadcast_pair(n, k);
         let count = element_count(&n.ty)?;
-        if count > MAX_FIXED_COUNTS {
+        if count > MAX_FOLDED_ELEMENTS {
             return None;
         }
         let values = (0..count)
@@ -261,8 +268,9 @@ impl Emitter<'_> {
     }
 
     pub(super) fn fold_binary(&mut self, op: &str, a: &Value, b: &Value) -> Option<Value> {
-        let aa = self.constants.get(&a.ssa)?;
-        let bb = self.constants.get(&b.ssa)?;
+        let (Some(aa), Some(bb)) = (self.constants.get(&a.ssa), self.constants.get(&b.ssa)) else {
+            return self.fold_fixed_indices(op, a, b);
+        };
         let n = aa.len().max(bb.len());
         if (aa.len() != 1 && aa.len() != n) || (bb.len() != 1 && bb.len() != n) {
             return None;
@@ -291,6 +299,69 @@ impl Emitter<'_> {
             })
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
+    }
+
+    /// Index arithmetic can use broadcast views without materializing operands.
+    /// Real arithmetic retains its existing target-precision folding path.
+    fn fold_fixed_indices(&mut self, op: &str, a: &Value, b: &Value) -> Option<Value> {
+        if a.elem != ElemKind::Int || b.elem != ElemKind::Int {
+            return None;
+        }
+        let count = element_count(&a.ty)?;
+        if count > MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let values = (0..count)
+            .map(|i| {
+                let x = self.fixed_count_at(a, i)?;
+                let y = self.fixed_count_at(b, i)?;
+                match op {
+                    "stablehlo.add" => x.checked_add(y),
+                    "stablehlo.subtract" => x.checked_sub(y),
+                    "stablehlo.multiply" => x.checked_mul(y),
+                    _ => None,
+                }
+                .map(Scalar::Int)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.folded_constant(values, a.ty.clone(), self.axes_of(a))
+    }
+
+    /// Gather outer cells from fixed data, reading broadcast sources lazily.
+    /// Both operands already share a batch prefix; indices are zero-based.
+    pub(super) fn fold_gather_cells(
+        &mut self,
+        operand: &Value,
+        indices: &Value,
+        ty: MlirTy,
+        axes: Axes,
+    ) -> Option<Value> {
+        let count = element_count(&ty)?;
+        if count > MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let batch = self.batch_rank(operand);
+        let dims = shape(&operand.ty);
+        let width = usize::try_from(*dims.get(batch)?.as_ref()?).ok()?;
+        let cell = element_count(&MlirTy::Ranked(dims.get(batch + 1..)?.to_vec()))?;
+        let selectors = element_count(&MlirTy::Ranked(shape(&indices.ty).get(batch..)?.to_vec()))?;
+        let values = (0..count)
+            .map(|i| {
+                let selector = i.checked_div(cell)?;
+                let index = usize::try_from(self.fixed_count_at(indices, selector)?).ok()?;
+                if index >= width {
+                    return None;
+                }
+                let source = selector
+                    .checked_div(selectors)?
+                    .checked_mul(width)?
+                    .checked_add(index)?
+                    .checked_mul(cell)?
+                    .checked_add(i.checked_rem(cell)?)?;
+                self.fixed_scalar_at(operand, source).cloned()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.folded_constant(values, ty, axes)
     }
 
     pub(super) fn fold_convert(&mut self, a: &Value, target: ElemKind) -> Option<Value> {

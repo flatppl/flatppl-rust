@@ -384,7 +384,7 @@ impl<'m> Emitter<'m> {
             let one = self.int_value_const(1);
             self.add(&indices, &one)
         };
-        if length <= constants::MAX_FIXED_COUNTS as u64 {
+        if length <= constants::MAX_FOLDED_ELEMENTS as u64 {
             let start = i64::from(!zero_based);
             self.remember_constant(
                 &result.ssa,
@@ -1300,6 +1300,9 @@ impl<'m> Emitter<'m> {
         let mut axes = self.axes_of(&operand);
         if scalar {
             axes.layers.remove(0);
+        }
+        if let Some(value) = self.fold_gather_cells(&operand, &idx, ty.clone(), axes.clone()) {
+            return value;
         }
         let ssa = self.pure_axes(format!(
             "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<offset_dims = [{offsets}], collapsed_slice_dims = [{batch}], operand_batching_dims = [{batches}], start_indices_batching_dims = [{batches}], start_index_map = [{batch}], index_vector_dim = {index_rank}>, indices_are_sorted = false, slice_sizes = array<i64: {sizes}>}}> : ({}, {}) -> {}",
