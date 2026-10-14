@@ -134,11 +134,11 @@ outputs = (score)\n";
 #[test]
 fn iid_density_broadcasts_size_one_params_to_batch_shape() {
     let src = "\
-y_obs = [0.5, -0.3, 1.2]
+y_obs = external(cartpow(reals, 3))
 a = elementof(reals)
 m = lawof(record(y = draw(iid(Normal(mu = a, sigma = 1.0), 3))))
 q = logdensityof(m, record(y = y_obs))
-inputs = (a)
+inputs = (a, y_obs)
 outputs = (q)
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);

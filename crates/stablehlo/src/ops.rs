@@ -1691,6 +1691,11 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 /// `sum`-only; `crate::norms` wires them, so each needs the same table check.
 fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     if let [arg] = args
+        && let Some(value) = e.reduce_fixed_likelihood(*arg)?
+    {
+        return Ok(value);
+    }
+    if let [arg] = args
         && matches!(e.type_of(*arg), Some(Type::Table { .. }))
     {
         return Err(crate::norms::table_reduction_refusal(id, "sum"));
