@@ -135,6 +135,16 @@ fn builtins_as_values_resolve() {
     );
 }
 
+#[test]
+fn grammar_builtins_resolve_before_execution_support() {
+    assert_clean(
+        "sort_fn = sort\nmap_fn = valuemap\ninverse_fn = inverseof\n\
+         xs = sort([3, 1, 2])\n\
+         mapping = valuemap([10, 20], [1, 2])\n\
+         inverse = base.inverseof(exp)\n",
+    );
+}
+
 /// `in` has a `catalogue.ron` row but is a deliberate keyword-list exclusion — the
 /// grammars handle the operator structurally — so the union in
 /// `builtins::is_base_name` is load-bearing. Removing either half of it reddens this
