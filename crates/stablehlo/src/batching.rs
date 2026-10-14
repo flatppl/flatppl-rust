@@ -107,6 +107,14 @@ impl Emitter<'_> {
                     if name == "mul" && !matches!(type_of(id), Some(Type::Scalar(_))) {
                         return false;
                     }
+                    if name == "in"
+                        && !call
+                            .args
+                            .first()
+                            .is_some_and(|&point| matches!(type_of(point), Some(Type::Scalar(_))))
+                    {
+                        return false;
+                    }
                     if matches!(name, "get" | "get0")
                         && !call
                             .args
@@ -114,6 +122,17 @@ impl Emitter<'_> {
                             .is_some_and(|&index| matches!(self.m.node(index), Node::Lit(_)))
                     {
                         return false;
+                    }
+                    // Cauchy's scalar transport is pointwise arithmetic plus
+                    // atan. Keep normalized/truncated scalar densities on the
+                    // same tensor path as their surrounding scan.
+                    if name == "builtin_touniform"
+                        && call.args.first().is_some_and(|&kernel| {
+                            matches!(self.m.node(kernel), Node::Const(s) if self.m.resolve(*s) == "Cauchy")
+                        })
+                    {
+                        pending.extend(self.m.node(id).children());
+                        continue;
                     }
                     if !matches!(
                         name,
@@ -139,6 +158,7 @@ impl Emitter<'_> {
                             | "min"
                             | "max"
                             | "ifelse"
+                            | "in"
                             | "eq"
                             | "ne"
                             | "lt"
@@ -168,6 +188,7 @@ impl Emitter<'_> {
                             | "broadcast"
                             | "functionof"
                             | "Normal"
+                            | "Cauchy"
                             | "Bernoulli"
                             | "Uniform"
                             | "Exponential"
@@ -204,9 +225,11 @@ impl Emitter<'_> {
                             | "record"
                             | "builtin_logdensityof"
                             | "Normal"
+                            | "Cauchy"
                             | "Bernoulli"
                             | "Uniform"
                             | "Exponential"
+                            | "inf"
                     ) =>
                 {
                     return false;

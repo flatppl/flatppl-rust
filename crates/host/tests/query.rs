@@ -323,10 +323,11 @@ fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
-fn batched_scan_density_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> {
+fn batched_scan_density_with_a_normalized_cauchy_prior_keeps_one_time_loop()
+-> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         r#"
-        alpha ~ Uniform(interval(-2.0, 2.0))
+        alpha ~ normalize(truncate(Cauchy(0, 2.5), interval(0, inf)))
         update(s, x) = record(mean = s.mean + alpha*x)
         states = scan(update, record(mean = 0.0), [1.0, 2.0])
         read_mean(s) = s.mean
