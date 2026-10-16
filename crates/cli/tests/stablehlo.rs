@@ -24,6 +24,32 @@ fn write_model(name: &str, src: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn syntax_sugar_exports_the_same_ordered_query() {
+    let sugar = write_model(
+        "syntax-sugar",
+        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2.0 * b, a, b)\ny ~ Normal(a + 2.0 * b, 2.0)\nk = kernelof((y = y), a, b)\nL = likelihoodof(k, (y = 15.0))\nlp = logdensityof(L, (a = a, b = b))\ninputs = (a, b)\noutputs = (f(a, b), lp)",
+    );
+    let explicit = write_model(
+        "syntax-explicit",
+        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2.0 * b, a = a, b = b)\ny ~ Normal(a + 2.0 * b, 2.0)\nk = kernelof(record(y = y), a = a, b = b)\nL = likelihoodof(k, record(y = 15.0))\nlp = logdensityof(L, record(a = a, b = b))\ninputs = (a, b)\noutputs = (f(a, b), lp)",
+    );
+    let emit = |input| {
+        let output = flatppl()
+            .args(["stablehlo", "--dtype", "f64"])
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    assert_eq!(emit(sugar), emit(explicit));
+}
+
+#[test]
 fn fixed_json_in_an_import_matches_explicit_literals() {
     let input = write_model(
         "fixed-json",

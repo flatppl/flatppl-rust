@@ -604,6 +604,7 @@ enum Primary {
 enum CallTarget {
     Name(String),
     Builtin(String),
+    Record,
     Ref(Ref),
     Applied(NodeId),
     Broadcast(NodeId),
@@ -834,8 +835,19 @@ impl<'a> ExprParser<'a> {
                         Precedence::Primary => match self.peek() {
                             Some(TokenKind::LParen) => {
                                 self.advance();
-                                work.push(ExprFrame::Group(start));
-                                work.push(ExprFrame::Expr);
+                                if matches!(self.peek(), Some(TokenKind::Name(_)))
+                                    && self.peek_at(1) == Some(&TokenKind::Assign)
+                                {
+                                    self.schedule_primary(
+                                        Primary::Call(CallTarget::Record),
+                                        start,
+                                        &mut work,
+                                        &mut value,
+                                    );
+                                } else {
+                                    work.push(ExprFrame::Group(start));
+                                    work.push(ExprFrame::Expr);
+                                }
                             }
                             Some(TokenKind::LBracket) => {
                                 self.advance();
@@ -1010,6 +1022,23 @@ impl<'a> ExprParser<'a> {
                             self.advance();
                             self.advance();
                             Some(key)
+                        } else if call.reify && !call.positional.is_empty() {
+                            match (self.peek(), self.peek_at(1)) {
+                                (
+                                    Some(TokenKind::Name(n)),
+                                    Some(TokenKind::Comma | TokenKind::RParen),
+                                ) => Some(n.clone()),
+                                _ => {
+                                    return Err(self.err_here(
+                                        "expected a bare name or keyword boundary binding",
+                                    ));
+                                }
+                            }
+                        } else if !call.named.is_empty() {
+                            return Err(self
+                                .err_here("positional arguments must precede keyword arguments"));
+                        } else if matches!(call.target, CallTarget::Record) {
+                            return Err(self.err_here("expected a named record field"));
                         } else {
                             None
                         };
@@ -1063,7 +1092,16 @@ impl<'a> ExprParser<'a> {
             Primary::Call(target) => {
                 // Both bare and base-qualified constructs scope their whole
                 // argument list, including the boundary keyword arguments.
-                let reify = matches!(&target, CallTarget::Name(name) | CallTarget::Builtin(name) if name == "functionof" || name == "kernelof");
+                let reify = match &target {
+                    CallTarget::Name(name) => {
+                        matches!(name.as_str(), "functionof" | "kernelof")
+                            && !self.names.bound.contains(name)
+                    }
+                    CallTarget::Builtin(name) => {
+                        matches!(name.as_str(), "functionof" | "kernelof")
+                    }
+                    _ => false,
+                };
                 if reify {
                     self.reify_frames.push(ReifyFrame::Explicit);
                 }
@@ -1098,6 +1136,7 @@ impl<'a> ExprParser<'a> {
         match target {
             CallTarget::Name(name) => self.make_call(&name, positional, named, start),
             CallTarget::Builtin(name) => self.make_builtin_call(&name, positional, named, start),
+            CallTarget::Record => self.make_builtin_call("record", positional, named, start),
             CallTarget::Ref(r) => Ok(self.make_user_call(r, positional, named, start)),
             CallTarget::Applied(callee) => {
                 Ok(self.make_applied_call(callee, positional, named, start))
@@ -1562,10 +1601,7 @@ impl<'a> ExprParser<'a> {
         named: Vec<NamedArg>,
         start: usize,
     ) -> Result<NodeId> {
-        // The reification constructs are special operations with their own
-        // syntax (spec §05), recognised before name resolution.
-        let special = name == "functionof" || name == "kernelof";
-        if !special && self.names.bound.contains(name) {
+        if self.names.bound.contains(name) {
             let sym = self.module.intern(name);
             let r = Ref {
                 ns: RefNs::SelfMod,

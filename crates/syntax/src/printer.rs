@@ -711,7 +711,7 @@ impl<'m> Printer<'m> {
             lambda: Rc::from([]),
         };
         let mut parts = match call.head {
-            CallHead::Builtin(op) => vec![PrintPiece::text(self.module.resolve(op))],
+            CallHead::Builtin(op) => vec![PrintPiece::text(self.builtin_name(op))],
             CallHead::User(callee) => vec![PrintPiece::child(&body, callee, EXPR)],
         };
         parts.push(PrintPiece::text("("));
