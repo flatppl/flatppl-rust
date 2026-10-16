@@ -61,49 +61,7 @@ fn ir(src: &str) -> String {
 
 // ---- §04: special-operation arity -------------------------------------------
 
-/// §04 "Calling conventions": "Nullary calls (`f()`) are not allowed", and for
-/// the special operations specifically "The total number of inputs is never
-/// zero." Seven nullary calls typed at exit 0 before this — `record()` as an
-/// empty record and both loaders as `%module`.
-#[test]
-fn nullary_special_operations_are_refused() {
-    for src in [
-        "a = aggregate()\n",
-        "a = metricsum()\n",
-        "a = load_module()\n",
-        "a = standard_module()\n",
-        "a = record()\n",
-        "a = table()\n",
-        "a = broadcast()\n",
-        "a = draw()\n",
-        "a = elementof()\n",
-    ] {
-        assert_refuses(src, "spec §04 \"Calling conventions\"");
-    }
-}
-
-/// §04's nullary rule reaches the four variadic PRODUCT and CHAIN heads too, with
-/// no exemption (owner ruling). An earlier revision exempted them because three
-/// `spec_coverage_measures.rs` tests reached design-PR #73's no-laundering rider
-/// through `joint()`, the only measure reachable from source whose mass is
-/// genuinely `%deferred`. That coverage moved to `ops.rs`
-/// `mod no_laundering_tests`, asserted against `product_mass` and `lawof_type`
-/// directly, so the rider no longer depends on `joint()` being spellable and §04
-/// applies to all four.
-#[test]
-fn the_nullary_product_and_chain_heads_are_refused() {
-    for src in [
-        "e = joint()\n",
-        "e = jointchain()\n",
-        "e = cartprod()\n",
-        "e = superpose()\n",
-    ] {
-        assert_refuses(src, "takes at least 1 input");
-    }
-}
-
-/// Each of the four still types with components, so the rule is about the nullary
-/// call and not about the head.
+/// Product heads still type with components; the parser refuses only empty calls.
 #[test]
 fn the_product_and_chain_heads_type_with_components() {
     assert_clean("m = joint(Normal(0.0, 1.0), Normal(2.0, 3.0))\n");
@@ -284,14 +242,12 @@ fn load_module_keeps_its_named_substitutions() {
 #[test]
 fn a_module_member_is_checked_against_its_catalogue_row() {
     let pp = "pp = standard_module(\"particle-physics\", \"0.1\")\n";
-    for (n, call) in [
-        (0, "pp.CrystalBall()"),
-        (1, "pp.CrystalBall(1.0)"),
-        (5, "pp.CrystalBall(1.0, 2.0, 3.0, 4.0, 5.0)"),
+    for call in [
+        "pp.CrystalBall(1.0)",
+        "pp.CrystalBall(1.0, 2.0, 3.0, 4.0, 5.0)",
     ] {
         let src = format!("{pp}c = {call}\n");
         assert_refuses(&src, "takes 4 arguments (spec §09)");
-        let _ = n;
     }
     assert_clean(&format!("{pp}c = pp.CrystalBall(1.0, 2.0, 3.0, 4.0)\n"));
     assert_clean(&format!(
@@ -361,7 +317,6 @@ fn load_data_is_an_ordinary_builtin_not_a_special_operation() {
         assert_clean(src);
     }
     // The count still binds, and it is the §07 row that reports it.
-    assert_refuses("d = load_data()\n", "takes 2 arguments (spec §07), got 0");
     assert_refuses(
         "d = load_data(\"x.csv\", reals, 3)\n",
         "takes 2 arguments (spec §07), got 3",

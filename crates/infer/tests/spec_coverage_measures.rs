@@ -1651,7 +1651,7 @@ fn an_ill_formed_application_of_a_fan_out_kernel_is_a_static_error() {
         )
     };
     assert!(
-        rejects(&model("KJ()"), "`KJ` declares 1 parameter, got 0 arguments"),
+        flatppl_syntax::parse(&model("KJ()")).is_err(),
         "an unbound declared input is not a closed measure"
     );
     assert!(

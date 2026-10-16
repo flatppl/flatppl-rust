@@ -100,18 +100,12 @@ b = elementof(posreals)
 intensity = weighted(b, weighted(0.3, Lebesgue(support = window)))
 events ~ PoissonProcess(intensity = intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
-    for reference in ["Lebesgue", "reg.Flat"] {
-        let source = format!(
-            "reg = standard_module(\"regression\", \"0.1\")\n{}",
-            src.replace("Lebesgue", reference)
-        );
-        let out = determinize_src(&source);
-        let text = flatppl_syntax::print(&out);
-        assert!(
-            text.contains("b * 1.2"),
-            "Λ = b · (0.3 · 4.0) = 1.2·b:\n{text}"
-        );
-    }
+    let out = determinize_src(src);
+    let text = flatppl_syntax::print(&out);
+    assert!(
+        text.contains("b * 1.2"),
+        "Λ = b · (0.3 · 4.0) = 1.2·b:\n{text}"
+    );
 }
 
 // An UNBOUNDED intensity support has infinite mass, so §08's finite-mass

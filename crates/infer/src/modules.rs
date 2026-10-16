@@ -4,7 +4,7 @@
 //! `trace.rs`; everything that crosses a module boundary lives here.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use flatppl_core::{
@@ -308,11 +308,10 @@ fn subst_signature(importer: &Module, annos: &[(String, Resolved)]) -> String {
             map_type_symbols(&r.ty, &mut record);
             map_valueset_symbols(&r.vset, &mut record);
             format!(
-                "{name}={:?}/{:?}/{:?}/{:?}[{}]",
+                "{name}={:?}/{:?}/{:?}[{}]",
                 r.ty,
                 r.phase,
                 r.vset,
-                r.admitted_source,
                 names.join("+")
             )
         })
@@ -329,7 +328,6 @@ fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolve
         set_element: res.set_element.map(|t| reintern_type(into, from, &t)),
         phase: res.phase,
         catalogue: res.catalogue,
-        admitted_source: res.admitted_source,
     }
 }
 
@@ -342,8 +340,6 @@ pub(crate) struct Resolved {
     /// A set export's element type, read from its AST in the owning scope.
     /// Its ordinary object type remains Any; support alone loses array nesting.
     pub(crate) set_element: Option<Type>,
-    /// Construction-based eligibility for draw/lawof, independent of mass class.
-    pub(crate) admitted_source: bool,
     /// For a reified-callable binding (`%function` / `%kernel`), the inferred
     /// type of the callable's reified BODY in the dependency. Applying the
     /// callable (via `likelihoodof` or a user call) reads this body-result
@@ -428,7 +424,6 @@ pub(crate) struct InferSession<'b> {
 
 struct InferredDependency {
     module: Module,
-    admitted_sources: HashSet<NodeId>,
     sets: HashMap<NodeId, (Type, ValueSet)>,
 }
 
@@ -536,18 +531,12 @@ impl<'b> InferSession<'b> {
         &self,
         key: (String, String),
         module: Module,
-        admitted_sources: HashSet<NodeId>,
         sets: HashMap<NodeId, (Type, ValueSet)>,
     ) {
         self.stack.borrow_mut().pop();
-        self.memo.borrow_mut().insert(
-            key,
-            InferredDependency {
-                module,
-                admitted_sources,
-                sets,
-            },
-        );
+        self.memo
+            .borrow_mut()
+            .insert(key, InferredDependency { module, sets });
     }
 
     pub(crate) fn input_metadata(&self) -> InputMetadata {
@@ -723,7 +712,6 @@ impl<'b> InferSession<'b> {
             set_element: dependency.sets.get(&rhs).map(|(ty, _)| ty.clone()),
             result: callable_body_result(dep_annotated, rhs),
             catalogue: None,
-            admitted_source: dependency.admitted_sources.contains(&rhs),
         };
         Ok(reintern_resolved(importer, dep_annotated, raw))
     }
@@ -768,7 +756,6 @@ fn resolve_standard(
         vset: ValueSet::Unknown,
         set_element: None,
         result: None,
-        admitted_source: false,
         catalogue: Some(CatalogueRef {
             module: path.clone(),
             member: binding_name.to_string(),

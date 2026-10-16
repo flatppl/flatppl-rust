@@ -11,18 +11,21 @@
 //! Each kernel's boundary inputs bind to the realized variates of the
 //! components to its left (spec: `b ~ K(a)`). This module recognizes two
 //! variate families and refuses everything else (refuse-don't-mislower):
-//!   * record-form — components are single-named-variate draws; output is a
-//!     merged record; kernel inputs bind by field name (auto-splat).
+//!   * record-form — component record fields merge; kernel inputs bind to prior
+//!     fields by name (auto-splat).
 //!   * scalar-cat — components are scalar draws; output is a vector; a kernel's
 //!     single input binds to the `cat` of all prior slices.
 
 use crate::density::{
-    MEASURE_COMBINATOR_OPS, build_call, build_density_term, builtin_name, draw_argument,
-    expect_builtin_call, fold_add, resolve_ref_one,
+    MEASURE_COMBINATOR_OPS, build_call, build_density_term, build_record, builtin_name,
+    draw_argument, expect_builtin_call, fold_add, lookup_field, lower_measure_density,
+    materialize_record_value, resolve_ref_chain, resolve_ref_one,
 };
-use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
+use crate::kernel::{Kernel, resolve_kernel, resolve_reified, substitute_ref};
 use crate::refuse::RefuseError;
-use flatppl_core::{Module, NamedKind, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{
+    Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Scalar, Symbol, Type,
+};
 
 /// A resolved single-draw component: its variate field name (record-form) or
 /// `None` (scalar-cat), and its distribution constructor. Kernel inputs are
@@ -56,13 +59,16 @@ pub(crate) fn lower_jointchain(
         c.args.to_vec()
     };
 
-    // Resolve the base (component 0); its record-field presence picks the family.
+    let (base_node, _) = resolve_ref_chain(m, args[0]);
+    if matches!(m.type_of(base_node), Some(Type::Measure { .. }))
+        && record_fields(m, args[0]).is_some()
+    {
+        return lower_record_family(m, node, &args, v);
+    }
+
     let base = resolve_base(m, args[0])
         .ok_or_else(|| refuse_jc(node, "jointchain base is not a single-draw measure"))?;
-    match base.field {
-        Some(_) => lower_record_family(m, node, &args, base, v),
-        None => lower_scalar_family(m, node, &args, base, v),
-    }
+    lower_scalar_family(m, node, &args, base, v)
 }
 
 /// The ordered variate field names of a RECORD-FAMILY `jointchain` `node` — the
@@ -129,69 +135,93 @@ pub(crate) fn kernel_body_is_normalized(m: &Module, k_arg: NodeId) -> bool {
     )
 }
 
-/// Record-form: components are single-field-record draws; the point is a record
-/// literal; kernel inputs bind to prior fields by name.
+/// Record fields from an inferred measure domain or a reified value body.
+fn record_fields(m: &Module, node: NodeId) -> Option<Vec<Symbol>> {
+    let (resolved, _) = resolve_ref_chain(m, node);
+    let ty = m.type_of(node).or_else(|| m.type_of(resolved))?;
+    let domain = match ty {
+        Type::Measure { domain, .. } => domain.as_ref(),
+        ty => ty,
+    };
+    match domain {
+        Type::Record(fields) => Some(fields.iter().map(|(name, _)| *name).collect()),
+        _ => None,
+    }
+}
+
+/// Score each record component through the ordinary measure dispatcher. Named
+/// applications retain kernel conditioning and simultaneous boundary substitution.
 fn lower_record_family(
     m: &mut Module,
     node: NodeId,
     args: &[NodeId],
-    base: Component,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    // The point must be a record literal `record(%field f val …)`.
-    let (v_resolved, _) = resolve_ref_one(m, v);
-    let point: Vec<(Symbol, NodeId)> = {
-        let rec = expect_builtin_call(m, v_resolved, "record")
-            .ok_or_else(|| refuse_jc(node, "record-form jointchain point must be a record"))?;
-        if !rec.args.is_empty() {
-            return Err(refuse_jc(node, "record point with positional args"));
-        }
-        rec.named.iter().map(|n| (n.name, n.value)).collect()
-    };
-    let field_value = |f: Symbol| -> Option<NodeId> {
-        point.iter().find(|(nm, _)| *nm == f).map(|(_, val)| *val)
-    };
-
-    // env: field name -> its realized value node, accumulated left to right.
-    let mut env: Vec<(Symbol, NodeId)> = Vec::with_capacity(args.len());
-    let mut terms: Vec<NodeId> = Vec::with_capacity(args.len());
-
-    // Component 0 (base): no inputs.
-    let f0 = base.field.expect("record family base has a field");
-    let s0 = field_value(f0)
-        .ok_or_else(|| refuse_jc(node, "point is missing the base variate field"))?;
-    terms.push(build_density_term(m, base.dist, s0)?);
-    env.push((f0, s0));
-
-    // Components 1..n (kernels).
-    for &k_arg in &args[1..] {
-        let kernel = resolve_kernel(m, k_arg)
-            .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a kernelof(...)"))?;
-        let comp = resolve_kernel_component(m, &kernel)
-            .ok_or_else(|| refuse_jc(node, "kernel body is not a single-field-record draw"))?;
-        let fi = comp.field.ok_or_else(|| {
+    let value = materialize_record_value(m, v);
+    let point = expect_builtin_call(m, value, "record")
+        .filter(|call| call.args.is_empty())
+        .ok_or_else(|| refuse_jc(node, "record-form jointchain point must be a record"))?
+        .named
+        .to_vec();
+    let mut env: Vec<(Symbol, NodeId)> = Vec::new();
+    let mut terms = Vec::with_capacity(args.len());
+    for (i, &component) in args.iter().enumerate() {
+        let (measure, fields) = if i == 0 {
+            (component, record_fields(m, component))
+        } else {
+            let (resolved, _) = resolve_ref_chain(m, component);
+            if !matches!(m.type_of(resolved), Some(Type::Kernel { .. })) {
+                return Err(refuse_jc(
+                    node,
+                    "jointchain component is not a transition kernel",
+                ));
+            }
+            let kernel = resolve_reified(m, component)
+                .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
+            let mut named = Vec::with_capacity(kernel.inputs.len());
+            for (name, _) in &kernel.inputs {
+                let value = env
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| *value)
+                    .ok_or_else(|| {
+                        refuse_jc(node, "kernel input names a non-prior variate field")
+                    })?;
+                named.push(NamedArg {
+                    kind: NamedKind::Kwarg,
+                    name: *name,
+                    value,
+                });
+            }
+            let applied = m.alloc(Node::Call(Call {
+                head: CallHead::User(component),
+                args: Box::new([]),
+                named: named.into(),
+                inputs: None,
+            }));
+            (applied, record_fields(m, kernel.body))
+        };
+        let fields = fields.ok_or_else(|| {
             refuse_jc(
                 node,
-                "record-form jointchain kernel body is not a single-field-record draw",
+                "record-form jointchain component domain is not a record",
             )
         })?;
-
-        // Bind each input: match its NAME to a prior field, substitute its REF
-        // SYMBOL in the constructor with that field's realized value.
-        let mut dist_i = comp.dist;
-        for (name, target) in &kernel.inputs {
-            let value = env
-                .iter()
-                .find(|(nm, _)| nm == name)
-                .map(|(_, val)| *val)
-                .ok_or_else(|| refuse_jc(node, "kernel input names a non-prior variate field"))?;
-            dist_i = substitute_ref(m, dist_i, target.name, value);
+        let mut values = Vec::with_capacity(fields.len());
+        for field in fields {
+            if env.iter().any(|(name, _)| *name == field) {
+                return Err(refuse_jc(
+                    node,
+                    "jointchain record components have duplicate fields",
+                ));
+            }
+            let value = lookup_field(m, &point, field)
+                .ok_or_else(|| refuse_jc(node, "point is missing a component variate field"))?;
+            values.push((field, value));
         }
-
-        let si = field_value(fi)
-            .ok_or_else(|| refuse_jc(node, "point is missing a kernel variate field"))?;
-        terms.push(build_density_term(m, dist_i, si)?);
-        env.push((fi, si));
+        let subrecord = build_record(m, &values);
+        terms.push(lower_measure_density(m, measure, subrecord)?);
+        env.extend(values);
     }
 
     Ok(fold_add(m, &terms))

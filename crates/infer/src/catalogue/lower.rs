@@ -376,7 +376,6 @@ mod tests {
             support: SupportTag::Reals,
             mass: MassTag::Normalized,
             params: vec!["mu".to_string(), "sigma".to_string()],
-            nullary: false,
             param_ranks: vec![],
             param_sets: Vec::new(),
         };

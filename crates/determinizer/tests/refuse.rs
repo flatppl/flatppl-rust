@@ -495,28 +495,6 @@ lp = logdensityof(L, record(mu = 0.0))";
     );
 }
 
-// `joint_likelihood()` with NO components is not a well-formed §06 combination
-// (there is nothing to sum). The determiniser must refuse rather than fold an
-// empty term list into a degenerate `0.0`-density.
-#[test]
-fn joint_likelihood_empty_refuses() {
-    let src = "\
-mu = elementof(reals)
-L = joint_likelihood()
-lp = logdensityof(L, record(mu = 0.0))";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("joint_likelihood with no components has nothing to sum — refuse");
-    assert!(
-        err.construct.contains("joint_likelihood"),
-        "refusal names joint_likelihood: {err:?}"
-    );
-    assert!(
-        err.reason.contains("at least one component"),
-        "refusal explains a component is required: {err:?}"
-    );
-}
-
 // Every `joint_likelihood` component must itself be a likelihood (typically
 // `likelihoodof(K, obs)`, a name bound to one, or a nested `joint_likelihood`).
 // A component that resolves to a BARE measure (`Normal(…)`, not wrapped in

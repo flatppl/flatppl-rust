@@ -17,6 +17,7 @@ mod formula;
 mod metadata;
 mod ordinal;
 mod prior_expr;
+mod prior_model;
 mod priors;
 mod splines;
 mod text;
@@ -302,7 +303,7 @@ pub enum ParameterRole {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorSampling {
-    /// A Flat source is deliberately unavailable for prior sampling.
+    /// A prior factor is not a probability measure.
     Unavailable,
     /// Conversion does not test an engine's sampler implementation.
     NotChecked,
@@ -312,7 +313,6 @@ pub enum PriorSampling {
 pub struct PriorFactor {
     /// The inferred FlatPIR total-mass class, not a sampler capability.
     pub mass: String,
-    pub contains_flat: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

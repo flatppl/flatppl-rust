@@ -1117,6 +1117,9 @@ impl<'a> ExprParser<'a> {
     }
 
     fn finish_call(&mut self, call: CallArgs) -> Result<NodeId> {
+        if call.positional.is_empty() && call.named.is_empty() {
+            return Err(self.err_here("nullary calls are not allowed"));
+        }
         if call.reify {
             self.reify_frames.pop();
         }

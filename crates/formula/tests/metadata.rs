@@ -91,24 +91,34 @@ fn exported_coordinates_distinguish_fixed_sampled_and_derived_values() {
     assert_eq!(
         model["prior_factors"],
         json!({
-            "b_1":{"mass":"normalized", "contains_flat":false},
-            "temp_Intercept":{"mass":"normalized", "contains_flat":false},
-            "z_g":{"mass":"normalized", "contains_flat":false}
+            "b_1":{"mass":"normalized"},
+            "temp_Intercept":{"mass":"normalized"},
+            "z_g":{"mass":"normalized"}
         })
     );
     assert_eq!(model["prior_sampling"], "not_checked");
 }
 
 #[test]
-fn flat_sampling_metadata_is_independent_of_support_volume_and_mass() {
+fn reference_prior_metadata_tracks_mass_and_inference_coordinates() {
     let mut spec = read(include_str!("fixtures/gaussian.formula.json")).unwrap();
     spec.formula = "y ~ 0 + x".into();
-    for (prior, mass, flat) in [
-        ("Flat()", "locallyfinite", true),
-        ("Flat(interval(0, 2))", "finite", true),
-        ("Flat(unitinterval)", "finite", true),
-        ("normalize(Flat(unitinterval))", "normalized", true),
-        ("normal(0, 1)", "normalized", false),
+    for (prior, mass, sampling) in [
+        (
+            "Lebesgue(reals)",
+            "locallyfinite",
+            PriorSampling::Unavailable,
+        ),
+        (
+            "Lebesgue(interval(0, 2))",
+            "finite",
+            PriorSampling::Unavailable,
+        ),
+        (
+            "normalize(Lebesgue(unitinterval))",
+            "normalized",
+            PriorSampling::NotChecked,
+        ),
     ] {
         spec.priors = serde_json::from_value(json!([
             {"class":"b", "prior":prior},
@@ -118,34 +128,11 @@ fn flat_sampling_metadata_is_independent_of_support_volume_and_mass() {
         let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
         let factor = &converted.info.prior_factors["b"];
         assert_eq!(factor.mass, mass, "{prior}");
-        assert_eq!(factor.contains_flat, flat, "{prior}");
-        assert_eq!(
-            converted.info.prior_sampling,
-            if flat {
-                PriorSampling::Unavailable
-            } else {
-                PriorSampling::NotChecked
-            }
-        );
+        assert_eq!(converted.info.prior_sampling, sampling, "{prior}");
+        assert_eq!(converted.info.parameters[0].role, ParameterRole::Sampled);
         let exported = metadata(&converted.module, "formula_model");
         assert_eq!(exported["prior_factors"]["b"], json!(factor));
-        assert_eq!(
-            exported["prior_sampling"],
-            json!(converted.info.prior_sampling)
-        );
-    }
-    for (prior, flat) in [("normal(0, sigma)", false), ("lawof(sigma)", true)] {
-        spec.priors = serde_json::from_value(json!([
-            {"class":"b", "prior":prior},
-            {"class":"sigma", "prior":"Flat(posreals)"}
-        ]))
-        .unwrap();
-        let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            converted.info.prior_factors["b"].contains_flat, flat,
-            "{prior}"
-        );
-        assert!(converted.info.prior_factors["sigma"].contains_flat);
+        assert_eq!(exported["prior_sampling"], json!(sampling));
     }
 }
 

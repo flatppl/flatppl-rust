@@ -184,37 +184,7 @@ pub(crate) fn emit(
         }
         return Ok(PriorNode::Constant(value));
     }
-    let flat = match b.m.node(node) {
-        Node::Call(call) => match call.head {
-            CallHead::User(head) if matches!(b.m.node(head), Node::Ref(Ref { ns: RefNs::Module(alias), name }) if b.m.resolve(*alias) == "reg" && b.m.resolve(*name) == "Flat") => {
-                Some(call.clone())
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    let measure = if let Some(call) = flat {
-        let existing = call.args.first().copied().or_else(|| {
-            call.named
-                .iter()
-                .find(|arg| b.m.resolve(arg.name) == "support")
-                .map(|arg| arg.value)
-        });
-        if call.args.len() > 1
-            || call
-                .named
-                .iter()
-                .any(|arg| b.m.resolve(arg.name) != "support")
-            || (!call.args.is_empty() && !call.named.is_empty())
-        {
-            return Err(Error("Flat accepts one support argument".into()));
-        }
-        let support = match (existing, restriction) {
-            (Some(a), Some(c)) => Some(intersect(b, a, c)?),
-            (a, c) => a.or(c),
-        };
-        b.module_user_call("reg", "Flat", &support.into_iter().collect::<Vec<_>>())
-    } else if let Some(support) = restriction {
+    let measure = if let Some(support) = restriction {
         restrict(b, node, support)?
     } else {
         node
@@ -223,6 +193,10 @@ pub(crate) fn emit(
 }
 
 fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<NodeId> {
+    if let Some(existing) = reference_support(b.m, measure) {
+        let support = intersect(b, existing, support)?;
+        return Ok(b.call("Lebesgue", &[support]));
+    }
     if let Node::Call(call) = b.m.node(measure).clone() {
         if matches!(call.head, CallHead::Builtin(s) if b.m.resolve(s) == "locscale")
             && call.args.len() == 3
@@ -279,7 +253,8 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
         {
             if matches!(inner.head, CallHead::Builtin(s) if b.m.resolve(s) == "truncate") {
                 let support = intersect(b, inner.args[1], support)?;
-                return restrict(b, inner.args[0], support);
+                let restricted = restrict(b, inner.args[0], support)?;
+                return Ok(b.call("normalize", &[restricted]));
             }
             if matches!(inner.head, CallHead::Builtin(s) if b.m.resolve(s) == "weighted") {
                 let (types, _) = flatppl_infer::infer_expression(b.m, call.args[0], &[]);
@@ -302,8 +277,48 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
             }
         }
     }
+    let (types, _) = flatppl_infer::infer_expression(b.m, measure, &[]);
+    let probability = matches!(
+        types.get(&measure),
+        Some(Type::Measure {
+            mass: Mass::Normalized | Mass::Deferred,
+            ..
+        })
+    );
     let restricted = b.call("truncate", &[measure, support]);
-    Ok(b.call("normalize", &[restricted]))
+    Ok(if probability {
+        b.call("normalize", &[restricted])
+    } else {
+        restricted
+    })
+}
+
+/// Resolve all ordinary call spellings without discarding extra arguments.
+pub(crate) fn reference_support(module: &Module, measure: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = module.node(measure) else {
+        return None;
+    };
+    if !matches!(call.head, CallHead::Builtin(name) if module.resolve(name) == "Lebesgue") {
+        return None;
+    }
+    let support_field = |fields: &[NamedArg]| match fields {
+        [field] if module.resolve(field.name) == "support" => Some(field.value),
+        _ => None,
+    };
+    match (&call.args[..], &call.named[..]) {
+        ([support], []) => {
+            if let Node::Call(record) = module.node(*support)
+                && matches!(record.head, CallHead::Builtin(name) if module.resolve(name) == "record")
+                && record.args.is_empty()
+            {
+                support_field(&record.named)
+            } else {
+                Some(*support)
+            }
+        }
+        ([], fields) => support_field(fields),
+        _ => None,
+    }
 }
 
 fn bound(b: &mut Builder<'_>, value: &PriorBound, bindings: &[&str]) -> Result<NodeId> {
@@ -327,18 +342,13 @@ fn expression(
 }
 
 fn parse_expression(text: &str) -> Result<(Module, NodeId)> {
-    let parsed = flatppl_syntax::parse(&format!(
-        "reg = standard_module(\"regression\", \"0.1\")\n__prior_expr = ({text})"
-    ))
-    .map_err(|e| Error(format!("invalid prior expression `{text}`: {e}")))?;
+    let parsed = flatppl_syntax::parse(&format!("__prior_expr = ({text})"))
+        .map_err(|e| Error(format!("invalid prior expression `{text}`: {e}")))?;
     let rows: Vec<_> = parsed.bindings().collect();
-    if rows.len() != 2
-        || parsed.resolve(rows[0].1.name) != "reg"
-        || parsed.resolve(rows[1].1.name) != "__prior_expr"
-    {
+    if rows.len() != 1 || parsed.resolve(rows[0].1.name) != "__prior_expr" {
         return Err(Error("a prior must contain exactly one expression".into()));
     }
-    let root = rows[1].1.rhs;
+    let root = rows[0].1.rhs;
     Ok((parsed, root))
 }
 
@@ -452,15 +462,6 @@ fn alias(
         "cauchy" => ("Cauchy", 2),
         "uniform" => ("Uniform", 2),
         "lkj" | "lkj_corr" | "lkj_corr_cholesky" => ("LKJCholesky", 1),
-        "Flat" => {
-            let head = b.module_call("reg", "Flat");
-            return Ok(Some(b.m.alloc(Node::Call(Call {
-                head: CallHead::User(head),
-                args: args.to_vec().into(),
-                named: named.to_vec().into(),
-                inputs: None,
-            }))));
-        }
         _ => return Ok(None),
     };
     if args.len() != arity || !named.is_empty() {
@@ -567,7 +568,7 @@ fn intersect(b: &mut Builder<'_>, a: NodeId, c: NodeId) -> Result<NodeId> {
     let (cl, cu, co) = limits(b, c)?;
     let (Some(alv), Some(clv)) = (scalar(b.m, al), scalar(b.m, cl)) else {
         if ao || co {
-            return Err(Error("open Flat supports with parameter-dependent bounds are not representable as an interval".into()));
+            return Err(Error("open supports with parameter-dependent bounds are not representable as an interval".into()));
         }
         let lo = b.array(&[al, cl]);
         let lo = b.call("maximum", &[lo]);
@@ -594,7 +595,7 @@ fn intersect(b: &mut Builder<'_>, a: NodeId, c: NodeId) -> Result<NodeId> {
         if scalar(b.m, lo) == Some(0.0) && scalar(b.m, hi) == Some(f64::INFINITY) {
             return Ok(b.call_head("posreals"));
         }
-        return Err(Error("a finite upper bound on an open Flat support is not representable as an interval; use Flat(interval(...))".into()));
+        return Err(Error("a finite upper bound on an open support is not representable as an interval; use Lebesgue(interval(...)) for a closed support".into()));
     }
     Ok(b.call("interval", &[lo, hi]))
 }

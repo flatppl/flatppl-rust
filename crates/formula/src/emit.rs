@@ -1,6 +1,7 @@
 use crate::{
     DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter,
     ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, metadata,
+    prior_model::ParameterPrior,
     priors::{self, PriorNode},
 };
 use flatppl_convert::Builder;
@@ -10,10 +11,6 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let mut module = Module::new();
     let mut b = Builder::new(&mut module);
     b.stamp_compat();
-    let name = b.str_lit("regression");
-    let version = b.str_lit("0.1");
-    let reg = b.call("standard_module", &[name, version]);
-    b.bind("reg", reg);
     let count_set = b.call_head("posintegers");
     let size = b.call("external", &[count_set]);
     b.bind("N", size);
@@ -84,12 +81,11 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             "a formula model needs at least one sampled parameter".into(),
         ));
     }
-    let fields: Vec<_> = parameters
-        .iter()
-        .map(|name| (name.as_str(), b.self_ref(name)))
+    let prior = crate::prior_model::build(&mut b, &parameters)?;
+    let parameters: Vec<_> = parameters
+        .into_iter()
+        .map(|parameter| parameter.name)
         .collect();
-    let record = b.call_fields("record", &fields);
-    let prior = b.call("lawof", &[record]);
     b.bind("Pi_prior", prior);
 
     for (name, predictor) in recipe.predictors() {
@@ -275,7 +271,7 @@ fn predictor_parameters(
     recipe: &mut crate::PredictorRecipe,
     family: Family,
     thresholds: usize,
-    parameters: &mut Vec<String>,
+    parameters: &mut Vec<ParameterPrior>,
 ) -> Result<()> {
     if thresholds > 0 {
         let names = scope(b, family);
@@ -292,7 +288,7 @@ fn predictor_parameters(
         let domain = b.call("ordered", &[count]);
         let reference = b.call("Lebesgue", &[domain]);
         let prior = b.call("tilt", &[prior, reference]);
-        draw(b, "cuts", prior, parameters);
+        declare_parameter(b, "cuts", prior, parameters);
     } else if recipe.formula.intercept {
         parameter(
             b,
@@ -315,7 +311,7 @@ fn predictor_parameters(
             match prior {
                 PriorNode::Measure(prior) => {
                     let iid = b.call("iid", &[prior, count]);
-                    draw(b, &predictor_name(dpar, name), iid, parameters);
+                    declare_parameter(b, &predictor_name(dpar, name), iid, parameters);
                 }
                 PriorNode::Constant(value) => {
                     let values = b.call("fill", &[value, count]);
@@ -358,7 +354,7 @@ fn predictor_parameters(
         let normal = b.call("Normal", &[zero, one]);
         let rank = b.lit_int(smooth.inputs.len() as i64 - 1);
         let law = b.call("iid", &[normal, rank]);
-        draw(b, &smooth.z, law, parameters);
+        declare_parameter(b, &smooth.z, law, parameters);
     }
     for (i, group) in recipe.groups.iter_mut().enumerate() {
         group.sd = b.alloc_name(&predictor_name(dpar, &format!("sd_{}", group.column)));
@@ -381,7 +377,7 @@ fn predictor_parameters(
             match priors::emit(b, &sd_priors[0], Some(support), None, &bindings)? {
                 PriorNode::Measure(law) => {
                     let law = b.call("iid", &[law, dimension]);
-                    draw(b, &group.sd, law, parameters);
+                    declare_parameter(b, &group.sd, law, parameters);
                 }
                 PriorNode::Constant(value) => {
                     let value = b.call("fill", &[value, dimension]);
@@ -409,7 +405,7 @@ fn predictor_parameters(
             b.array(&[dimension, count])
         };
         let iid = b.call("iid", &[standard, size]);
-        draw(b, &group.z, iid, parameters);
+        declare_parameter(b, &group.z, iid, parameters);
         group.r = b.alloc_name(&predictor_name(dpar, &format!("r_{}", group.column)));
         let sd = b.self_ref(&group.sd);
         let z = b.self_ref(&group.z);
@@ -422,7 +418,7 @@ fn predictor_parameters(
                 let names = scope(b, family);
                 let bindings: Vec<_> = names.iter().map(String::as_str).collect();
                 let law = priors::emit_correlation(b, prior, dimensions, &bindings)?;
-                draw(b, &name, law, parameters);
+                declare_parameter(b, &name, law, parameters);
                 let cholesky = b.self_ref(&name);
                 scale = b.call("mul", &[scale, cholesky]);
                 group.correlation = Some(name);
@@ -550,7 +546,7 @@ fn predictor_values(
     }
 }
 
-fn parameter_function(
+pub(crate) fn parameter_function(
     b: &mut Builder<'_>,
     head: &str,
     body: NodeId,
@@ -740,13 +736,13 @@ fn parameter(
     name: &str,
     prior: &ResolvedPrior,
     support: Option<NodeId>,
-    parameters: &mut Vec<String>,
+    parameters: &mut Vec<ParameterPrior>,
     family: Family,
 ) -> Result<()> {
     let names = scope(b, family);
     let bindings: Vec<_> = names.iter().map(String::as_str).collect();
     match priors::emit(b, prior, support, None, &bindings)? {
-        PriorNode::Measure(law) => draw(b, name, law, parameters),
+        PriorNode::Measure(law) => declare_parameter(b, name, law, parameters),
         PriorNode::Constant(value) => b.bind(name, value),
     }
     Ok(())
@@ -758,10 +754,21 @@ fn lower_bound(b: &mut Builder<'_>, value: f64) -> NodeId {
     b.call("interval", &[lower, inf])
 }
 
-fn draw(b: &mut Builder<'_>, name: &str, law: NodeId, parameters: &mut Vec<String>) {
-    let value = b.call("draw", &[law]);
+fn declare_parameter(
+    b: &mut Builder<'_>,
+    name: &str,
+    law: NodeId,
+    parameters: &mut Vec<ParameterPrior>,
+) {
+    // Classify all priors after their parameter references exist. Only proper
+    // measures become draws; the others retain an explicit measure factor.
+    let support = crate::prior_model::parameter_support(b, law);
+    let value = b.call("elementof", &[support]);
     b.bind(name, value);
-    parameters.push(name.into());
+    parameters.push(ParameterPrior {
+        name: name.into(),
+        measure: law,
+    });
 }
 
 pub(crate) fn inline(mut module: Module, data: &DataDocument) -> Result<Module> {
@@ -867,7 +874,10 @@ pub(crate) fn info(
         }
     }
     let prior_factors = metadata::prior_factors(module, &parameters);
-    let prior_sampling = if prior_factors.values().any(|prior| prior.contains_flat) {
+    let prior_sampling = if prior_factors
+        .values()
+        .any(|prior| !matches!(prior.mass.as_str(), "normalized" | "deferred"))
+    {
         crate::PriorSampling::Unavailable
     } else {
         crate::PriorSampling::NotChecked
@@ -1136,7 +1146,7 @@ fn predictor_info(
 }
 
 fn sampled(module: &Module, name: &str) -> bool {
-    module.public_bindings().find(|(_, binding)| module.resolve(binding.name) == name).is_some_and(|(_, binding)| matches!(module.node(binding.rhs), Node::Call(call) if matches!(call.head, CallHead::Builtin(s) if module.resolve(s) == "draw")))
+    module.public_bindings().find(|(_, binding)| module.resolve(binding.name) == name).is_some_and(|(_, binding)| matches!(module.node(binding.rhs), Node::Call(call) if matches!(call.head, CallHead::Builtin(s) if matches!(module.resolve(s), "draw" | "elementof"))))
 }
 
 fn parameter_role(module: &Module, name: &str) -> ParameterRole {

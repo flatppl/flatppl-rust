@@ -66,9 +66,6 @@ pub(crate) enum Sig {
         /// break mid-migration — every row is expected to fill it in.
         #[serde(default)]
         params: Vec<String>,
-        /// Permit a zero-argument call using the constructor's defaults.
-        #[serde(default)]
-        nullary: bool,
         /// Declared RANK (number of axes) of each parameter, parallel to
         /// `params` — `MvNormal` → `[1, 2]`, since §08 gives `mu` as a "mean
         /// vector" and `cov` as an "$n \times n$" matrix. Read by
@@ -513,7 +510,6 @@ const STD_MODULE_SRCS: &[&str] = &[
     include_str!("../../catalogues/polynomials.ron"),
     include_str!("../../catalogues/splines.ron"),
     include_str!("../../catalogues/distances.ron"),
-    include_str!("../../catalogues/regression.ron"),
 ];
 
 /// The declared call arity of any catalogue row, base or §09 module member, or
@@ -522,22 +518,16 @@ const STD_MODULE_SRCS: &[&str] = &[
 /// A distribution row's arity is exact: §08 "Built-in distributions" states that
 /// "the names and order of the distribution parameters specified below define the
 /// names and positional order of the kernel arguments", and no §08 entry gives a
-/// parameter a default, so every one is required. A §09 distribution with
-/// `nullary` also permits omitting its defaulted parameters. An empty list stays
-/// unspecified unless `nullary` explicitly permits a zero-argument constructor.
+/// parameter a default, so every one is required. An empty list stays unspecified.
 ///
 /// Keyed on the `Sig` rather than on a name so a §09 member can be checked from
 /// the resolution side-table, which holds the sig and not the catalogue index.
 pub(crate) fn sig_arity(sig: &Sig) -> Option<Arity> {
     match sig {
         Sig::Function { params, .. } | Sig::Structural { params, .. } => Some(Arity::of(params)),
-        Sig::Distribution {
-            params, nullary, ..
-        } if params.is_empty() && !nullary => None,
-        Sig::Distribution {
-            params, nullary, ..
-        } => Some(Arity {
-            min: if *nullary { 0 } else { params.len() },
+        Sig::Distribution { params, .. } if params.is_empty() => None,
+        Sig::Distribution { params, .. } => Some(Arity {
+            min: params.len(),
             max: Some(params.len()),
         }),
     }
@@ -559,9 +549,7 @@ pub(crate) fn sig_param_sets(sig: &Sig) -> &[ParamSet] {
 /// deliberately nameless and why an empty list means "accept".
 pub(crate) fn sig_param_names(sig: &Sig) -> Option<&[String]> {
     match sig {
-        Sig::Distribution {
-            params, nullary, ..
-        } if !params.is_empty() || *nullary => Some(params),
+        Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
         Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
             Some(names)
         }
@@ -983,9 +971,7 @@ impl Catalogue {
     /// carrying its own copy.
     pub fn module_param_names(&self, module: &str, binding: &str) -> Option<&[String]> {
         match self.module(module, binding)?.0 {
-            Sig::Distribution {
-                params, nullary, ..
-            } if !params.is_empty() || *nullary => Some(params),
+            Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
             Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
                 Some(names)
             }
@@ -1619,12 +1605,9 @@ mod tests {
 
         for m in &cat.modules {
             for binding in &m.bindings {
-                if let Sig::Distribution {
-                    params, nullary, ..
-                } = &binding.sig
-                {
+                if let Sig::Distribution { params, .. } = &binding.sig {
                     assert!(
-                        !params.is_empty() || *nullary,
+                        !params.is_empty(),
                         "module '{}' distribution '{}' has empty params",
                         m.name,
                         binding.name

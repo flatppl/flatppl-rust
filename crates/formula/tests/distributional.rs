@@ -54,7 +54,7 @@ fn distributional_coordinates_and_priors_follow_brms() {
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
     assert_eq!(
         converted.recipe.predictors["sigma"].priors.b[0].prior,
-        "Flat()"
+        "Lebesgue(reals)"
     );
     assert!(converted.info.has_improper_prior);
     spec.priors

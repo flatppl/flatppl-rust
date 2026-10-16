@@ -80,10 +80,8 @@ pub(crate) fn prior_factors(
             if !sampled.contains(name) {
                 return None;
             }
-            let Node::Call(call) = module.node(binding.rhs) else {
-                return None;
-            };
-            let &law = call.args.first()?;
+            let law =
+                parameter_measure(module, binding.rhs).or_else(|| explicit_factor(module, name))?;
             let mass = match module.type_of(law) {
                 Some(Type::Measure { mass, .. }) => *mass,
                 _ => Mass::Unknown,
@@ -96,63 +94,57 @@ pub(crate) fn prior_factors(
                 Mass::LocallyFinite => "locallyfinite",
                 Mass::Unknown => "unknown",
             };
-            Some((
-                name.to_owned(),
-                PriorFactor {
-                    mass: mass.into(),
-                    contains_flat: contains_flat(module, law),
-                },
-            ))
+            Some((name.to_owned(), PriorFactor { mass: mass.into() }))
         })
         .collect()
 }
 
-fn contains_flat(module: &Module, root: NodeId) -> bool {
-    let mut pending = vec![(root, false)];
-    let mut visited = HashSet::new();
-    while let Some((node, trace_values)) = pending.pop() {
-        if !visited.insert((node, trace_values)) {
+/// Proper parameters carry their source in the draw declaration.
+fn parameter_measure(module: &Module, node: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = module.node(node) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    match module.resolve(head) {
+        "draw" => call.args.first().copied(),
+        _ => None,
+    }
+}
+
+/// Explicit factors live in a named joint, possibly under conditional layers.
+fn explicit_factor(module: &Module, name: &str) -> Option<NodeId> {
+    let (_, prior) = module
+        .public_bindings()
+        .find(|(_, binding)| module.resolve(binding.name) == "Pi_prior")?;
+    let mut pending = vec![prior.rhs];
+    let mut seen = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
             continue;
         }
         match module.node(node) {
-            Node::Ref(reference) => match reference.ns {
-                RefNs::Module(alias)
-                    if module.resolve(alias) == "reg"
-                        && module.resolve(reference.name) == "Flat" =>
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if module.resolve(head) == "joint") =>
+            {
+                if let Some(field) = call
+                    .named
+                    .iter()
+                    .find(|field| module.resolve(field.name) == name)
                 {
-                    return true;
+                    return Some(field.value);
                 }
-                RefNs::SelfMod => {
-                    if let Some(binding) = module.binding_by_name(reference.name) {
-                        pending.push((module.binding(binding).rhs, trace_values));
-                    }
-                }
-                _ => {}
-            },
-            Node::Call(call) => {
-                if let CallHead::User(callee) = call.head {
-                    pending.push((callee, false));
-                }
-                // Only reified laws include the scalar value's draw ancestors.
-                // A Normal's scale parameter does not change its own prior source.
-                let trace_values = trace_values
-                    || matches!(call.head, CallHead::Builtin(head)
-                        if matches!(module.resolve(head), "lawof" | "kernelof"));
-                for child in module.node(node).children() {
-                    if trace_values
-                        || matches!(
-                            module.type_of(child),
-                            Some(Type::Measure { .. } | Type::Kernel { .. })
-                        )
-                    {
-                        pending.push((child, trace_values));
-                    }
+                pending.extend(module.node(node).children());
+            }
+            Node::Ref(reference) if reference.ns == RefNs::SelfMod => {
+                if let Some(binding) = module.binding_by_name(reference.name) {
+                    pending.push(module.binding(binding).rhs);
                 }
             }
-            _ => {}
+            _ => pending.extend(module.node(node).children()),
         }
     }
-    false
+    None
 }
 
 pub(crate) fn emit(module: &mut Module, info: &ModelInfo) -> Result<()> {

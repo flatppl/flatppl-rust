@@ -267,9 +267,8 @@ lp = logdensityof(j, [0.3, 0.7])";
     );
 }
 
-// A jointchain base that is a measure-combinator (here superpose), not a single
-// primitive draw, must refuse NAMING jointchain (design refuse-set: nullary-kernel
-// / non-single-draw base) — not with the inner combinator's name.
+// Record components reach their own density lowerer. Superposition over a
+// record still lacks common-reference support and must refuse there.
 #[test]
 fn jointchain_combinator_base_refuses() {
     let src = "\
@@ -280,9 +279,5 @@ k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
 j = jointchain(finite_m, k)
 lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     let m = parse_infer(src);
-    let err = determinize(&m).expect_err("combinator base must refuse");
-    assert!(
-        err.construct.contains("jointchain"),
-        "refusal names jointchain: {err:?}"
-    );
+    determinize(&m).expect_err("unsupported record superposition must refuse");
 }
