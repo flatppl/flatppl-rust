@@ -7924,9 +7924,11 @@ fn emit_kernel_broadcast_per_cell(
 /// shared-trace group handling below and [`lower_keyword_joint`], which builds the same
 /// rewrite for the named spelling.
 ///
-/// **Scope:** scalar-variate components only. `joint`'s variate is the positional `cat`
+/// **Scope:** scalar or record variates. Records route their fields through
+/// [`lower_keyword_joint`], retaining its shared-trace handling. For scalars,
+/// `joint`'s variate is the positional `cat`
 /// of the component variates; for scalar-variate components the destructuring is
-/// `get0(v, i)`, one slot per component. Component variates of higher rank need
+/// `get0(v, i)`, one slot per component. Vector component variates need
 /// `cat`-slice routing, which this does not build — a component whose measure domain is
 /// non-scalar (e.g. `iid(Normal, 2)`, domain array[2]) is refused HERE, up front, by
 /// inspecting each component's own measure domain kind. This is NOT left to the
@@ -7970,6 +7972,61 @@ fn lower_joint(
     let inner = positional;
     if inner.len() < 2 {
         return Err(refuse(node, m, "joint needs at least 2 components"));
+    }
+    let record_fields: Option<Vec<Vec<Symbol>>> = inner
+        .iter()
+        .map(|&component| {
+            let (resolved, _) = resolve_ref_chain(m, component);
+            match m.type_of(resolved) {
+                Some(Type::Measure { domain, .. }) => match domain.as_ref() {
+                    Type::Record(fields) => Some(fields.iter().map(|(name, _)| *name).collect()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .collect();
+    if let Some(record_fields) = record_fields {
+        // Positional records concatenate fields. Reassemble each component's
+        // subrecord, then reuse the named joint's dependence-aware scoring.
+        let value = materialize_record_value(m, v);
+        let value_fields = expect_builtin_call(m, value, "record")
+            .filter(|call| call.args.is_empty())
+            .ok_or_else(|| refuse(v, m, "joint value must be a record"))?
+            .named
+            .to_vec();
+        let mut components = Vec::with_capacity(inner.len());
+        let mut values = Vec::with_capacity(inner.len());
+        let mut seen = std::collections::HashSet::new();
+        for (i, (&component, fields)) in inner.iter().zip(record_fields).enumerate() {
+            let mut subrecord = Vec::with_capacity(fields.len());
+            for field in fields {
+                if !seen.insert(field) {
+                    return Err(refuse(
+                        node,
+                        m,
+                        "joint record components have duplicate fields",
+                    ));
+                }
+                let value = lookup_field(m, &value_fields, field).ok_or_else(|| {
+                    refuse(
+                        v,
+                        m,
+                        &format!("missing field {} in joint value record", m.resolve(field)),
+                    )
+                })?;
+                subrecord.push((field, value));
+            }
+            let name = m.intern(&format!("_j{i}"));
+            components.push(NamedArg {
+                kind: NamedKind::Field,
+                name,
+                value: component,
+            });
+            values.push((name, build_record(m, &subrecord)));
+        }
+        let value = build_record(m, &values);
+        return lower_keyword_joint(m, node, &components, value, origin);
     }
     // Guard the scalar-only restriction HERE, before the recursion. `get0(v, i)`
     // assigns each component ONE scalar slot of the positional `cat` variate; a

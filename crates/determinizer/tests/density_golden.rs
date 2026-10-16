@@ -3,6 +3,45 @@ use flatppl_determinizer::determinize;
 mod common;
 use common::pir_binding;
 
+#[test]
+fn positional_record_joint_retains_reference_and_dependent_proper_factors() {
+    let source = r#"
+beta = elementof(cartpow(reals, 2))
+s ~ Exponential(2)
+b ~ Normal(s, 1)
+proper = lawof((s = s, b = b))
+improper = Lebesgue(cartprod(beta = cartpow(interval(-1, 1), 2)))
+prior = joint(improper, proper)
+p = elementof(cartprod(b = reals, beta = cartpow(reals, 2), s = posreals))
+inputs = p
+outputs = logdensityof(prior, p)
+"#;
+    let out = determinize_src(source);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    assert_eq!(pir.matches("builtin_logdensityof").count(), 2, "{pir}");
+    assert!(
+        pir.contains("(in "),
+        "the reference support must survive: {pir}"
+    );
+}
+
+#[test]
+fn positional_record_joint_preserves_nested_observation_types() {
+    let out = determinize_src(
+        r#"
+r ~ joint(a = Normal(0, 1), b = Exponential(1))
+prior = joint(Lebesgue(cartprod(x = reals)), lawof((r = r)))
+p = elementof(cartprod(x = reals, r = cartprod(a = reals, b = posreals)))
+inputs = p
+outputs = logdensityof(prior, p)
+"#,
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    assert_eq!(pir.matches("builtin_logdensityof").count(), 2, "{pir}");
+}
+
 // A two-independent-Gaussian product scored at data: logdensityof(lawof(record(...)), v)
 // must lower to a SUM of two builtin_logdensityof terms, no `lawof`/`draw`/`joint` left.
 #[test]
