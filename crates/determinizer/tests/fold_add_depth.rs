@@ -6,8 +6,7 @@ fn lower(n: usize) -> String {
     let src = format!(
         "g = Normal(0.0, 1.0)\n\
          obs = elementof(cartpow(reals, {n}))\n\
-         lk = likelihoodof(iid(g, {n}), obs)\n\
-         lp = logdensityof(lk, record())"
+         lp = logdensityof(iid(g, {n}), obs)"
     );
     let mut m = flatppl_syntax::parse(&src).unwrap();
     let _ = flatppl_infer::infer(&mut m);

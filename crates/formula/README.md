@@ -26,7 +26,7 @@ are not yet supported.
 Each smooth is centred over the retained training rows. Its unpenalized slope
 uses class `b` (coefficient `sx_1` for `s(x)`); its scale uses class `sds`,
 optionally selected by the canonical term, such as `"s(x, k = 6)"`.
-The defaults are a Flat slope and half-Student-t scale. Penalized coefficients
+The defaults are an improper Lebesgue slope prior and half-Student-t scale. Penalized coefficients
 are independent standard Normals. The fitted recipe stores the basis and
 penalty transform, so prediction needs only predictor columns and never refits
 or recentres the smooth. This also applies within distributional formulas.
@@ -154,7 +154,7 @@ name. For levels `red`, `blue`, `green`, the predictors are `mublue` and `mugree
 
 Each category retains its own design, centring, offsets, groups and priors.
 The observation law is `Categorical(softmax([0, eta_blue, eta_green]))` for each
-row. Coefficients default to Flat and category intercepts to Student-t(3, 0, 2.5).
+row. Coefficients default to Lebesgue measure and category intercepts to Student-t(3, 0, 2.5).
 As in brms, `b`, `Intercept` and `sd` priors require `dpar`. Correlation priors
 use global or group selectors across all categories, without `dpar`.
 The recipe preserves training response levels and their predictor order;
@@ -198,7 +198,7 @@ the remaining order. Logical predictors use the levels `FALSE`, `TRUE`.
 No-intercept formulas use R's cell coding, including full columns for `0 + f`.
 Use `0 + Intercept + x` for an ordinary, uncentred intercept coefficient.
 Its prior has class `b`, optionally `coef = "Intercept"`, and defaults to
-`Flat()`. The reserved column is generated as ones for training and prediction;
+`Lebesgue(reals)`. The reserved column is generated as ones for training and prediction;
 any supplied `Intercept` column must contain only ones. As in brms, this form
 keeps contrast coding for population-level factors (`0 + Intercept + f`).
 Polynomial contrasts support at most 16 observed levels. Higher-degree R
@@ -208,7 +208,7 @@ Indicator-only terms such as `0 + o` do not need polynomial contrasts and have
 no such level limit.
 
 Defaults follow brms: a centred Student-t intercept, half-Student-t scales,
-and improper `regression.Flat()` coefficients. Numeric response statistics use
+and improper `Lebesgue(reals)` coefficients. Numeric response statistics use
 the selected link for the intercept and group scales; direct `sigma` uses the
 identity-link response scale. Lognormal uses log-response statistics for the
 intercept, group scales and direct `sigma`, including with its inverse link.
@@ -219,7 +219,7 @@ Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_
 `cauchy`, `exponential`, `gamma`, `inv_gamma`, `beta`, `lognormal`, `logistic`,
 `weibull`, `double_exponential`, `chi_square` and `uniform` accept their usual
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
-correlation target. `Flat()` abbreviates `reg.Flat()` from `regression`.
+correlation target.
 
 Select priors by `class` (`b`, `Intercept`, `sd`, `sds`, `cor`, `L`, `sigma`, `nu`, `shape`, `phi`, `kappa`) with
 optional `coef`, `group` and `dpar`. Selectors must identify existing parameters. A coefficient
@@ -244,23 +244,24 @@ supported for correlation priors.
 Coefficient overrides inherit the class row's bounds; bounds cannot be attached
 to coefficient rows. Bounds can be numbers or scalar FlatPPL expressions using
 the generated parameter names. Proper restrictions retain their normalization,
-including parameter-dependent normalizers. Flat restrictions retain unit density.
-An explicit open Flat support with a finite upper bound is currently refused:
-the required `truncate(Flat(...), ...)` draw is not yet admitted by the engines.
-Use `Flat(interval(...))` when a closed interval is intended.
+including parameter-dependent normalizers. Lebesgue restrictions retain unit density,
+even when an inferred parameter controls the interval width. Some intersections
+of open supports with additional bounds cannot be represented as an interval.
 
 `constant(c)` requires a finite numeric literal and creates a fixed coefficient
 without a sampled coordinate. It requires fixed bounds when bounds are supplied;
 the model must retain at least one sampled parameter.
 Expressions use the ordinary FlatPPL type and phase validation. Shared coefficient
 priors use `iid`; differing priors use scalar declarations and a combined vector.
-A Flat prior cannot be sampled. An improper prior does not imply an improper
-posterior.
+Improper parameters use `elementof` and explicit measure factors. Proper parameters
+remain draws with a combined `lawof`; `joint` combines independent groups, and
+`jointchain` binds conditional priors explicitly. An improper prior cannot be
+sampled, but its posterior can be proper.
 
 `ModelInfo.parameters` labels each coordinate as `sampled`, `fixed` or `derived`;
 the legacy `derived` flag remains true for both fixed and derived values.
-`prior_factors` records each sampled binding's inferred mass and `contains_flat`.
-`prior_sampling` is `unavailable` for Flat sources and otherwise `not_checked`:
+`prior_factors` records each inference coordinate's prior mass.
+`prior_sampling` is `unavailable` for nonnormalized factors and otherwise `not_checked`:
 normalized mass does not establish an engine's sampler support.
 
 The generated `formula_parameter_names` maps bindings and one-based coordinates

@@ -35,7 +35,6 @@ struct Scope {
     inferred: HashMap<NodeId, (Type, Phase)>,
     vsets: HashMap<NodeId, ValueSet>,
     seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
-    source_admission: HashMap<NodeId, bool>,
     in_progress: Vec<BindingId>,
     active_bindings: HashSet<BindingId>,
     noted_gaps: HashSet<Symbol>,
@@ -71,7 +70,6 @@ impl InferredBody {
                     && x.ty == y.ty
                     && x.phase == y.phase
                     && x.vset == y.vset
-                    && x.admitted_source == y.admitted_source
                     && x.result.is_none()
                     && y.result.is_none()
                     && x.catalogue.is_none()
@@ -120,8 +118,6 @@ pub(crate) struct Inferencer<'m, 's> {
     /// valueset). Applied when entering a node before any other logic,
     /// making the substituted input authoritative for everything downstream.
     seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
-    /// Source eligibility carried across substitutions and module boundaries.
-    source_admission: HashMap<NodeId, bool>,
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
     active_bindings: HashSet<BindingId>,
@@ -214,7 +210,6 @@ impl<'m, 's> Inferencer<'m, 's> {
             inferred: HashMap::new(),
             vsets: HashMap::new(),
             seeds: HashMap::new(),
-            source_admission: HashMap::new(),
             in_progress: Vec::new(),
             active_bindings: HashSet::new(),
             noted_gaps: HashSet::new(),
@@ -231,10 +226,6 @@ impl<'m, 's> Inferencer<'m, 's> {
             .iter()
             .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
             .collect();
-        self.source_admission = seeds
-            .iter()
-            .map(|(id, r)| (*id, r.admitted_source))
-            .collect();
     }
 
     fn suspend_scope(&mut self) -> Scope {
@@ -243,7 +234,6 @@ impl<'m, 's> Inferencer<'m, 's> {
             inferred: std::mem::take(&mut self.inferred),
             vsets: std::mem::take(&mut self.vsets),
             seeds: std::mem::take(&mut self.seeds),
-            source_admission: std::mem::take(&mut self.source_admission),
             in_progress: std::mem::take(&mut self.in_progress),
             active_bindings: std::mem::take(&mut self.active_bindings),
             noted_gaps: std::mem::take(&mut self.noted_gaps),
@@ -258,7 +248,6 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.inferred = scope.inferred;
         self.vsets = scope.vsets;
         self.seeds = scope.seeds;
-        self.source_admission = scope.source_admission;
         self.in_progress = scope.in_progress;
         self.active_bindings = scope.active_bindings;
         self.noted_gaps = scope.noted_gaps;
@@ -545,10 +534,6 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.seeds.contains_key(&id)
     }
 
-    pub(crate) fn source_admission(&self, id: NodeId) -> Option<bool> {
-        self.source_admission.get(&id).copied()
-    }
-
     fn drain_work(&mut self, work: &mut Vec<Work>) {
         while let Some(step) = work.pop() {
             match step {
@@ -571,32 +556,10 @@ impl<'m, 's> Inferencer<'m, 's> {
                 Work::ResumeBody(frame) => {
                     let ty = self.inferred[&frame.body].0.clone();
                     let vset = self.lookup_valueset(frame.body);
-                    let kernel_value = matches!(&frame.resume, CallResume::Type(call, _)
-                        if matches!(call.callee.as_ref(), Some((_, Type::Kernel { .. }))))
-                        && matches!(
-                            ty,
-                            Type::Scalar(_)
-                                | Type::Array { .. }
-                                | Type::TVector { .. }
-                                | Type::Record(_)
-                                | Type::Tuple(_)
-                                | Type::Table { .. }
-                        );
-                    let admitted = if kernel_value {
-                        ops::improper::admitted_value_law(self, frame.body)
-                    } else {
-                        ops::improper::admitted(self, frame.body)
-                    };
                     self.auto_inputs.pop();
                     self.restore_scope(frame.scope);
                     match frame.resume {
                         CallResume::Type(mut call, resume) => {
-                            // These requests infer the application's actual result;
-                            // other body requests only determine argument shapes.
-                            if matches!(call.call.head, CallHead::User(_)) || frame.body == call.id
-                            {
-                                self.source_admission.insert(call.id, admitted);
-                            }
                             if self.level >= Level::Valueset {
                                 call.body_result = Some(Box::new(InferredBody {
                                     body: frame.body,
@@ -615,12 +578,6 @@ impl<'m, 's> Inferencer<'m, 's> {
                     }
                 }
                 Work::ResumeModule(frame) => {
-                    let admitted_sources = self
-                        .module
-                        .bindings()
-                        .map(|(_, binding)| binding.rhs)
-                        .filter(|&node| ops::improper::admitted(self, node))
-                        .collect();
                     // Read set ASTs while the dependency's substitutions and
                     // imported metadata still belong to this inference scope.
                     let exported: Vec<_> =
@@ -643,12 +600,8 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.kernel_tag_nodes = frame.kernel_tag_nodes;
                     self.auto_inputs = frame.auto_inputs;
                     self.restore_scope(frame.scope);
-                    self.session.finish_dependency(
-                        frame.key.clone(),
-                        dependency,
-                        admitted_sources,
-                        sets,
-                    );
+                    self.session
+                        .finish_dependency(frame.key.clone(), dependency, sets);
                     let result = self.session.resolved_binding(
                         self.module,
                         &frame.key,
@@ -758,7 +711,6 @@ impl<'m, 's> Inferencer<'m, 's> {
     fn record_resolution(&mut self, node: NodeId, result: Result<Resolved, String>) {
         let result = match result {
             Ok(res) => {
-                self.source_admission.insert(node, res.admitted_source);
                 if let Some(result) = res.result {
                     self.module_callable_results.insert(node, result);
                 }
@@ -921,9 +873,6 @@ impl<'m, 's> Inferencer<'m, 's> {
         // New arguments override inherited substitutions at the same node.
         for (&node, annotation) in &scope.seeds {
             self.seeds.entry(node).or_insert_with(|| annotation.clone());
-            if let Some(&admitted) = scope.source_admission.get(&node) {
-                self.source_admission.entry(node).or_insert(admitted);
-            }
         }
         self.auto_inputs.push(HashMap::new());
         let seeds = if self.level >= Level::Valueset && matches!(&resume, CallResume::Type(..)) {
@@ -1179,7 +1128,6 @@ impl<'m, 's> Inferencer<'m, 's> {
                         result: None,
                         set_element: None,
                         catalogue: None,
-                        admitted_source: ops::improper::admitted(self, value),
                     },
                 )
             })

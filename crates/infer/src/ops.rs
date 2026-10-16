@@ -19,7 +19,6 @@ use crate::rule::RuleStep::Ready;
 use crate::rule::{LocalTargets, RuleStep};
 use crate::trace::{Inferencer, join_phase};
 
-pub(crate) mod improper;
 mod pyhf;
 mod tilt;
 
@@ -130,8 +129,7 @@ pub(crate) fn call_rule(
     // + body. The phase follows the CAPTURED ancestors, so the rule returns it
     // rather than assuming `%fixed`; see [`reification_type`].
     if call.inputs.is_some() {
-        let result = reification_type(inf, id, call, &name, args);
-        return improper::conditional_reification(inf, id, result);
+        return Ready(reification_type(inf, id, call, &name, args));
     }
 
     // Keyword arguments moved into their DECLARED POSITIONS, once, before any rule reads
@@ -511,12 +509,7 @@ pub(crate) fn call_rule(
         // ---- measure algebra (spec §06) ----
         "lawof" => match lawof_mass_gate(inf, args) {
             Some(failed) => failed,
-            None => {
-                let mass = args.first().map_or(Mass::Deferred, |(node, _, _)| {
-                    improper::law_mass(inf, *node, &[])
-                });
-                lawof_type(args.first().map(|(_, t, _)| t), mass)
-            }
+            None => lawof_type(args.first().map(|(_, t, _)| t)),
         },
         "draw" => match draw_mass_gate(inf, args) {
             Some(failed) => failed,
@@ -2849,32 +2842,31 @@ fn indices_type(input: Option<&Type>) -> Type {
     }
 }
 
-/// Reification keeps the value domain and uses the mass of its traced sources.
-fn lawof_type(arg: Option<&Type>, mass: Mass) -> Type {
+/// Value laws are normalized; measure and kernel arguments keep deferred proofs.
+fn lawof_type(arg: Option<&Type>) -> Type {
     match arg {
-        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain, carrying
-        // m's own (gate-admitted) mass onward rather than reasserting it.
-        Some(Type::Measure { domain, .. }) => Type::Measure {
+        // `lawof(m)` = `lawof(draw(m))`: retain m's domain and deferred proof.
+        // The mass gate validates settled classes.
+        Some(Type::Measure { domain, mass }) => Type::Measure {
             domain: domain.clone(),
-            mass,
+            mass: *mass,
         },
         // Pointwise lift over a kernel's output measure — same propagation.
-        Some(Type::Kernel { inputs, .. }) => Type::Kernel {
+        Some(Type::Kernel { inputs, mass }) => Type::Kernel {
             inputs: inputs.clone(),
-            mass,
+            mass: *mass,
         },
         // A value: the law of that value.
         other => Type::Measure {
             domain: Box::new(other.cloned().unwrap_or(Type::Any)),
-            mass,
+            mass: Mass::Normalized,
         },
     }
 }
 
 /// A measure's non-probability mass class, for the gate diagnostic. Deferred
-/// means not yet inferred, so it passes. Draw and lawof separately admit the
-/// explicit improper sources; rand has no such exception. Kernel admission
-/// belongs to lawof's pointwise rule, not this shared measure gate.
+/// means not yet inferred, so it passes. Kernel admission belongs to lawof's
+/// pointwise rule, not this shared measure gate.
 fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
     let (_, arg_ty, _) = args.first()?;
     let Type::Measure { mass, .. } = arg_ty else {
@@ -2890,19 +2882,15 @@ fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
     }
 }
 
-/// §04 admits probability measures and explicit Flat-derived prior sources.
-/// Other non-normalized measures still require explicit normalization.
+/// Drawing requires a probability measure; normalization must be explicit.
 fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let offending = unprovable_normalization(args)?;
     let (arg_node, _, _) = args.first()?;
-    if improper::admitted(inf, *arg_node) {
-        return None;
-    }
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
         format!(
-            "`draw` requires a probability measure or an admitted improper prior, but \
-             this argument's total mass is `{offending}` and its source is not admitted. Wrap it in \
+            "`draw` requires a probability measure, but this argument's total mass is \
+             `{offending}`: there is no draw from an unnormalized measure. Wrap it in \
              `normalize(...)` to state that intent — `draw` never normalizes its \
              argument"
         ),
@@ -2926,21 +2914,15 @@ fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
     Some(Type::Failed("rand from an unnormalized measure".into()))
 }
 
-/// `lawof(m)` admits the same measure sources as `draw`, pointwise for kernels.
+/// `lawof(m)` requires a normalized measure, pointwise for kernels.
 fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    if let Some((node, _, _)) = args.first()
-        && improper::admitted(inf, *node)
-    {
-        return None;
-    }
     if let Some(offending) = unprovable_normalization(args) {
         let (arg_node, _, _) = args.first()?;
         inf.diags.push(crate::Diagnostic::error_at(
             *arg_node,
             format!(
-                "`lawof` requires a `%normalized` measure or an admitted improper prior \
-                 (spec §04), but this argument's total mass is `{offending}` and its source \
-                 is not admitted. \
+                "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
+                 total mass is `{offending}`: an unnormalized measure is not its own law. \
                  Wrap it in `normalize(...)` to state that intent — `lawof` never \
                  normalizes its argument"
             ),
@@ -2964,8 +2946,8 @@ fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Typ
         *arg_node,
         format!(
             "`lawof` lifts pointwise over a kernel (spec §04), but this kernel's output \
-             measures' total mass is `{offending}` and their source is not admitted. \
-             Wrap it in `normalize(...)` to state that intent — `lawof` never \
+             measures' total mass is `{offending}`: an unnormalized measure is not its \
+             own law. Wrap it in `normalize(...)` to state that intent — `lawof` never \
              normalizes its argument"
         ),
     ));
@@ -4557,7 +4539,7 @@ fn ksuperpose_cell_variate(
         // A §09 member reference carries its catalogue sig; a bare builtin
         // constructor reaches its domain by name. Both mirror `broadcast_type`.
         if inf.module_catalogue_ref(component).is_some() {
-            return match catalogue_call_type(inf, component, &cell_args, &cell_named) {
+            return match catalogue_call_type(inf, component, &cell_args) {
                 Type::Measure { domain, .. } => Some(*domain),
                 _ => None,
             };
@@ -4819,9 +4801,7 @@ fn reification_type(
         }
         ("kernelof", _) => Type::Kernel {
             inputs,
-            mass: args.first().map_or(Mass::Deferred, |(body, _, _)| {
-                improper::law_mass(inf, *body, &boundary_targets)
-            }),
+            mass: Mass::Normalized,
         },
         ("functionof", Some(Type::Measure { mass, .. })) => Type::Kernel {
             inputs,
@@ -5676,7 +5656,7 @@ fn user_call_type(
         if let Some(note) = note {
             inf.note_once_str(&note);
         }
-        return Ready(catalogue_call_type(inf, callee, args, named));
+        return Ready(catalogue_call_type(inf, callee, args));
     }
     // Prefer the per-call substituted body type (arg types bound to the
     // callable's parameters); fall back to the un-substituted body type for
@@ -5743,29 +5723,7 @@ fn user_call_type(
 ///     or a dynamic-dim matrix).
 ///
 /// The support is carried separately by `catalogue_call_valueset`.
-fn catalogue_call_type(
-    inf: &mut Inferencer<'_, '_>,
-    callee: NodeId,
-    args: &[ArgInfo],
-    named: &[NamedInfo],
-) -> Type {
-    if is_flat_constructor(inf, callee) {
-        let support = lebesgue_counting_support_node(inf, args, named);
-        let valueset = flat_support(inf, args, named);
-        if !continuous_support(&valueset) {
-            inf.diags.push(crate::Diagnostic::error_at(
-                support.unwrap_or(callee),
-                "Flat requires a continuous support set, as for Lebesgue",
-            ));
-            return Type::Failed("non-continuous Flat support".into());
-        }
-        return Type::Measure {
-            domain: Box::new(support.map_or(Type::Scalar(ScalarType::Real), |node| {
-                set_element_type(inf, Some(node))
-            })),
-            mass: reference_mass(&valueset),
-        };
-    }
+fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[ArgInfo]) -> Type {
     // Clone the sig out to drop the immutable borrow before `lower`'s closures
     // re-borrow `args` inside the `&mut inf` call frame.
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
@@ -5787,43 +5745,11 @@ fn catalogue_call_valueset(
     inf: &mut Inferencer<'_, '_>,
     callee: NodeId,
     args: &[ArgInfo],
-    named: &[NamedInfo],
 ) -> ValueSet {
-    if is_flat_constructor(inf, callee) {
-        return flat_support(inf, args, named);
-    }
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return ValueSet::Unknown;
     };
     catalogue_lower(&mut *inf.module, &sig, args).1
-}
-
-fn is_flat_constructor(inf: &Inferencer<'_, '_>, callee: NodeId) -> bool {
-    inf.module_catalogue_ref(callee)
-        .is_some_and(|c| c.module == "regression" && c.member == "Flat")
-}
-
-fn flat_support(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> ValueSet {
-    match lebesgue_counting_support_node(inf, args, named) {
-        Some(node) => set_expr_valueset(inf, Some(node)),
-        None => ValueSet::Reals,
-    }
-}
-
-fn continuous_support(support: &ValueSet) -> bool {
-    match support {
-        ValueSet::CartPow(element, _) => continuous_support(element),
-        ValueSet::CartProd(parts) => parts.iter().all(continuous_support),
-        ValueSet::RecordSet(fields) => fields.iter().all(|(_, set)| continuous_support(set)),
-        ValueSet::Integers
-        | ValueSet::PosIntegers
-        | ValueSet::NonNegIntegers
-        | ValueSet::Booleans
-        | ValueSet::Complexes
-        | ValueSet::RngStates
-        | ValueSet::Anything => false,
-        _ => true,
-    }
 }
 
 fn reference_mass(support: &ValueSet) -> Mass {
@@ -6050,7 +5976,6 @@ fn substituted_result(
             result: None,
             set_element: None,
             catalogue: None,
-            admitted_source: improper::admitted(inf, arg_node),
         };
         match decl.ns {
             RefNs::Local => {
@@ -6220,9 +6145,6 @@ fn broadcast_type(
         });
     }
     let Some(shape) = shape else {
-        if is_flat_constructor(inf, head_node) {
-            return Ready(catalogue_call_type(inf, head_node, &args[1..], named));
-        }
         // No concrete array argument. Broadcasting a DISTRIBUTION is still a
         // measure (an independent product over the eventual broadcast shape), so
         // a reified lambda body `dist.(params)` — whose params are still `%local`
@@ -6334,28 +6256,26 @@ fn broadcast_type(
                 (*n, cell, *p)
             })
             .collect();
-        return Ready(
-            match catalogue_call_type(inf, head_node, &cell_args, named) {
-                // Distribution head: an independent product over the array. Its cell
-                // domain and mass come from the catalogue sig, so a non-probability
-                // measure like `ContinuedPoisson` stays `Finite`, not forced to
-                // `Normalized` (mirrors the built-in distribution path below).
-                Type::Measure { domain, mass } => Type::Measure {
-                    domain: Box::new(Type::Array {
-                        shape,
-                        elem: domain,
-                    }),
-                    mass: broadcast_mass(mass),
-                },
-                // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
-                // elementwise into an array of the per-cell result, exactly as the
-                // built-in deterministic-op path does.
-                cell => Type::Array {
+        return Ready(match catalogue_call_type(inf, head_node, &cell_args) {
+            // Distribution head: an independent product over the array. Its cell
+            // domain and mass come from the catalogue sig, so a non-probability
+            // measure like `ContinuedPoisson` stays `Finite`, not forced to
+            // `Normalized` (mirrors the built-in distribution path below).
+            Type::Measure { domain, mass } => Type::Measure {
+                domain: Box::new(Type::Array {
                     shape,
-                    elem: Box::new(cell),
-                },
+                    elem: domain,
+                }),
+                mass: broadcast_mass(mass),
             },
-        );
+            // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
+            // elementwise into an array of the per-cell result, exactly as the
+            // built-in deterministic-op path does.
+            cell => Type::Array {
+                shape,
+                elem: Box::new(cell),
+            },
+        });
     }
 
     // Built-in head: a distribution constructor broadcasts into a measure
@@ -8701,7 +8621,7 @@ pub(crate) fn call_valueset(
     // is lowered from the catalogue sig with the call args.
     if let Some((callee_node, _)) = callee {
         if inf.module_catalogue_ref(*callee_node).is_some() {
-            return Ready(catalogue_call_valueset(inf, *callee_node, args, named));
+            return Ready(catalogue_call_valueset(inf, *callee_node, args));
         }
         // Per-call substituted body value-set (arg sets bound to the callable's
         // parameters): a callable whose body tightens its range — `f(x) =
@@ -8749,9 +8669,6 @@ pub(crate) fn call_valueset(
                 return Ready(ValueSet::Unknown);
             };
             let head_node = *head_node;
-            if is_flat_constructor(inf, head_node) {
-                return Ready(flat_support(inf, &args[1..], named));
-            }
             let cell = |t: &Type| match t {
                 Type::Array { elem, .. } => elem.as_ref().clone(),
                 other => other.clone(),
@@ -9661,19 +9578,6 @@ pub(crate) fn fill_mass(
 /// the split is mirrored here so both spellings of the same joint fold
 /// identically.
 fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Mass {
-    if args
-        .iter()
-        .map(|(node, _, _)| *node)
-        .chain(named.iter().map(|(_, node, _, _)| *node))
-        .any(|node| {
-            !matches!(
-                improper::ancestor_mass(inf, node),
-                Mass::Normalized | Mass::Deferred
-            )
-        })
-    {
-        return Mass::Unknown;
-    }
     let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
         named
             .iter()
@@ -10206,7 +10110,7 @@ mod no_laundering_tests {
             domain: Box::new(Type::Scalar(ScalarType::Real)),
             mass: Mass::Deferred,
         };
-        let Type::Measure { mass, .. } = lawof_type(Some(&arg), Mass::Deferred) else {
+        let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
             panic!("lawof of a measure is a measure");
         };
         assert_eq!(
@@ -10224,7 +10128,7 @@ mod no_laundering_tests {
             inputs: Box::new([]),
             mass: Mass::Deferred,
         };
-        let Type::Kernel { mass, .. } = lawof_type(Some(&arg), Mass::Deferred) else {
+        let Type::Kernel { mass, .. } = lawof_type(Some(&arg)) else {
             panic!("lawof of a kernel is a kernel");
         };
         assert_eq!(mass, Mass::Deferred, "same rider, kernel side");
@@ -10245,7 +10149,7 @@ mod no_laundering_tests {
                 domain: Box::new(Type::Scalar(ScalarType::Real)),
                 mass: m,
             };
-            let Type::Measure { mass, .. } = lawof_type(Some(&arg), m) else {
+            let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
                 unreachable!()
             };
             assert_eq!(mass, m, "lawof must not restate a measure's own mass");

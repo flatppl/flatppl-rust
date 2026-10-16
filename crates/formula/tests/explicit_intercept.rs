@@ -23,7 +23,7 @@ fn explicit_intercept_is_an_uncentred_coefficient_in_training_and_prediction() {
     assert!(!mu.formula.intercept);
     assert!(!mu.center);
     assert_eq!(mu.means, [1.0, 2.5]);
-    assert!(mu.priors.b.iter().all(|p| p.prior == "Flat()"));
+    assert!(mu.priors.b.iter().all(|p| p.prior == "Lebesgue(reals)"));
     assert!(converted.info.has_improper_prior);
     assert_eq!(
         converted.data.constants["x_1"],
@@ -125,7 +125,7 @@ fn explicit_intercept_preserves_brms_factor_coding_and_expression_names() {
     assert!(!converted.recipe.predictors["sigma"].center);
     assert_eq!(
         converted.recipe.predictors["sigma"].priors.b[0].prior,
-        "Flat()"
+        "Lebesgue(reals)"
     );
 }
 

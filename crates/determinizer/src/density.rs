@@ -7052,7 +7052,7 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // `lower_broadcast_kernel` tail.
     if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner)
         && is_scalar_domain_kernel(m, m_inner)
-        && m.resolve(ctor_sym) != "Flat"
+        && m.resolve(ctor_sym) != "Lebesgue"
     {
         let kernel_input = singleton_kernel_input(m, &kwargs, 1);
         return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
@@ -7082,7 +7082,7 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
             break;
         }
         if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, next_inner) {
-            if !is_scalar_domain_kernel(m, next_inner) || m.resolve(ctor_sym) == "Flat" {
+            if !is_scalar_domain_kernel(m, next_inner) || m.resolve(ctor_sym) == "Lebesgue" {
                 break;
             }
             let kernel_input = singleton_kernel_input(m, &kwargs, depth + 1);
@@ -7210,47 +7210,6 @@ fn reference_membership(m: &mut Module, v: NodeId, support: NodeId) -> NodeId {
         return result;
     }
     build_call(m, "in", &[v, support])
-}
-
-fn finite_coordinates(m: &mut Module, value: NodeId, domain: &Type) -> NodeId {
-    match domain {
-        Type::Record(fields) => {
-            let mut result = m.alloc(Node::Lit(Scalar::Bool(true)));
-            for (name, ty) in fields {
-                let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(*name).into())));
-                let field = build_call(m, "get", &[value, key]);
-                let finite = finite_coordinates(m, field, ty);
-                result = build_call(m, "land", &[result, finite]);
-            }
-            result
-        }
-        Type::Array { .. } | Type::TVector { .. } => {
-            let entries = tilt::elementwise(m, "isfinite", &[value]);
-            build_call(m, "lall", &[entries])
-        }
-        _ => build_call(m, "isfinite", &[value]),
-    }
-}
-
-fn lower_flat(
-    m: &mut Module,
-    measure: NodeId,
-    kwargs: &[(Symbol, NodeId)],
-    value: NodeId,
-) -> NodeId {
-    let support = find_kwarg(m, kwargs, "support").unwrap_or_else(|| {
-        let reals = m.intern("reals");
-        m.alloc(Node::Const(reals))
-    });
-    let domain = match m.type_of(measure) {
-        Some(Type::Measure { domain, .. }) => *domain.clone(),
-        _ => Type::Scalar(ScalarType::Real),
-    };
-    let member = reference_membership(m, value, support);
-    let finite = finite_coordinates(m, value, &domain);
-    let valid = build_call(m, "land", &[member, finite]);
-    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
-    gate_density(m, valid, zero)
 }
 
 /// The argument named `name` of `c`: the keyword/field entry, the same name
@@ -7512,7 +7471,7 @@ fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<
 ///   from §06 `weighted`'s $\mathrm{d}\nu = \text{weight}\cdot\mathrm{d}M$. A
 ///   variate-dependent weight makes `Λ = ∫ w(x)\,\mathrm{d}M(x)` an integral with
 ///   no closed form, the same guard [`recognize_convex_superposition`] applies;
-/// * `Lebesgue` or `Flat` over `interval(lo, hi)` with mass proved FINITE —
+/// * `Lebesgue` over `interval(lo, hi)` with mass proved FINITE —
 ///   `Λ = hi − lo`, the support's length. The `Mass::Finite` check is what rules
 ///   out an unbounded interval, whose mass is infinite.
 /// * `truncate(weighted(x → polynomial(c, x), Lebesgue(reals)), interval(lo, hi))` —
@@ -7574,15 +7533,8 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
 
     if bounded_reference {
         let bounds = {
-            let support = if let Some(c) = expect_builtin_call(m, node, "Lebesgue") {
-                named_or_positional(m, c, "support")?
-            } else {
-                let (ctor, kwargs) = split_kernel_constructor(m, node)?;
-                if m.resolve(ctor) != "Flat" {
-                    return None;
-                }
-                find_kwarg(m, &kwargs, "support")?
-            };
+            let c = expect_builtin_call(m, node, "Lebesgue")?;
+            let support = named_or_positional(m, c, "support")?;
             let (set, _) = resolve_ref_one(m, support);
             let ic = expect_builtin_call(m, set, "interval")?;
             if ic.args.len() != 2 {
@@ -7734,28 +7686,6 @@ fn lower_broadcast_kernel(
             ));
         }
     };
-
-    // Support sets are structural operands, so broadcasting Flat is an ordinary
-    // constructor call. IID products take the shared density path above.
-    if m.resolve(ctor_sym) == "Flat" {
-        let call = m.alloc(Node::Call(Call {
-            head: CallHead::User(head),
-            args: pos_args.into(),
-            named: kw_args
-                .into_iter()
-                .map(|(name, value)| NamedArg {
-                    kind: NamedKind::Kwarg,
-                    name,
-                    value,
-                })
-                .collect(),
-            inputs: None,
-        }));
-        if let Some(ty) = m.type_of(measure).cloned() {
-            m.set_type(call, ty);
-        }
-        return lower_measure_density_at(m, call, obs, origin);
-    }
 
     // Ordered constructor parameter names (spec §08 distributions + §06
     // fundamental measures). `None` ⇒ the head is not a known measure
@@ -8752,10 +8682,6 @@ pub(crate) fn build_density_term(
         )
     })?;
 
-    if m.resolve(ctor_sym) == "Flat" {
-        return Ok(lower_flat(m, measure, &kwargs, pinned));
-    }
-
     let kernel = m.alloc(Node::Const(ctor_sym));
     let kernel_input = build_record(m, &kwargs);
     let builtin = m.intern("builtin_logdensityof");
@@ -8910,7 +8836,7 @@ pub(crate) fn draw_argument(m: &Module, id: NodeId) -> Option<NodeId> {
 }
 
 /// The value of the `%field`-named entry `name` in `named`, if present.
-fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Option<NodeId> {
+pub(crate) fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Option<NodeId> {
     named
         .iter()
         .find(|n| n.kind == NamedKind::Field && n.name == name)
@@ -8919,7 +8845,7 @@ fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Option<NodeId>
 
 /// Expose a typed record input through projections, as for a literal query point.
 /// Keep the field types: density rules use them before the next inference pass.
-fn materialize_record_value(m: &mut Module, v: NodeId) -> NodeId {
+pub(crate) fn materialize_record_value(m: &mut Module, v: NodeId) -> NodeId {
     let (resolved, _) = resolve_ref_one(m, v);
     let promoted = matches!(m.node(v), Node::Ref(r)
         if r.ns == RefNs::SelfMod && crate::canon::promoted_input_names(m).contains(&r.name));

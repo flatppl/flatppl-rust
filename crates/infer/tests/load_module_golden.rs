@@ -13,6 +13,41 @@ use flatppl_core::{Mass, ScalarType, Type};
 use flatppl_infer::{Level, ModuleBundle, Severity, infer_module};
 
 #[test]
+fn imported_measure_arguments_refuse_until_actual_substitution_is_supported() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "model.flatppl",
+        std::sync::Arc::new(
+            flatppl_syntax::parse(
+                "source = Normal(0, 1)\n\
+                 factory = functionof(source, M = source)",
+            )
+            .unwrap(),
+        ),
+    );
+    for call in [
+        "m.factory(m.source)",
+        "m.factory(Normal(2, 3))",
+        "m.factory(Lebesgue(reals))",
+        "m.factory(weighted(2, Normal(0, 1)))",
+        "m.factory(M = Normal(2, 3))",
+        "m.factory(record(M = Normal(2, 3)))",
+        "factory(Normal(2, 3))",
+    ] {
+        let mut module = flatppl_syntax::parse(&format!(
+            "m = load_module(\"model.flatppl\")\nfactory = m.factory\nx ~ {call}"
+        ))
+        .unwrap();
+        let diagnostics = flatppl_infer::infer_module(&mut module, &bundle, Level::Shape);
+        assert!(
+            diagnostics.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("actual measure substitution")),
+            "{call}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn source_scheme_allowlist_is_a_static_check() {
     for source in [
         "m = load_module(\"ftp://example.test/model.flatppl\")",

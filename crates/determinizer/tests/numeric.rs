@@ -907,14 +907,20 @@ lp = logdensityof(lawof(record(theta = theta)), record(theta = 0.5))";
 
 #[test]
 fn empty_record_is_zero() {
-    let src = "lp = logdensityof(lawof(record()), record())";
-    let m = parse_infer(src);
+    // Empty records remain valid IR values, but nullary source calls are forbidden.
+    let mut m =
+        flatppl_flatpir::read("(%module (%bind lp (logdensityof (lawof (record)) (record))))")
+            .unwrap();
+    let _ = flatppl_infer::infer(&mut m);
     let out = determinize(&m).expect("empty record must lower to 0");
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
-    let pir = flatppl_flatpir::write(&out);
-    assert!(
-        !pir.contains("builtin_logdensityof"),
-        "no density terms:\n{pir}"
+    let (_, lp) = out
+        .bindings()
+        .find(|(_, b)| out.resolve(b.name) == "lp")
+        .unwrap();
+    assert_eq!(
+        out.node(lp.rhs),
+        &flatppl_core::Node::Lit(flatppl_core::Scalar::Real(0.0))
     );
 }
 

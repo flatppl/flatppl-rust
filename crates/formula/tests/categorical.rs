@@ -24,7 +24,7 @@ fn categorical_predictors_and_saved_response_coding_follow_brms() {
             / 6.0;
         assert_eq!(predictor.means, [mean]);
         assert_eq!(predictor.priors.intercept.prior, "student_t(3, 0, 2.5)");
-        assert_eq!(predictor.priors.b[0].prior, "Flat()");
+        assert_eq!(predictor.priors.b[0].prior, "Lebesgue(reals)");
     }
     assert_eq!(
         converted

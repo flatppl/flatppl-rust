@@ -32,7 +32,7 @@ const SPLAT_HINT: &str = " — this sole positional record or table splatted int
                            argument names; to pass it as one ordinary argument use \
                            the keyword spelling, as in `f(pars = record(...))`";
 
-/// The six leaks that motivated the rule. Each typed a concrete scalar (or
+/// The nonempty calls that motivated the rule. Each typed a concrete scalar (or
 /// `%deferred`) before; each is `%failed` now, with the callee and its declared
 /// count named.
 #[test]
@@ -55,7 +55,6 @@ fn measured_leaks_are_now_static_errors() {
             "x = lengthof([1.0], 2.0)",
             "`lengthof` takes 1 argument (spec §07), got 2",
         ),
-        ("x = log()", "`log` takes 1 argument (spec §07), got 0"),
     ] {
         assert_eq!(errors(src), vec![want.to_string()], "for {src}");
         assert!(
@@ -206,10 +205,6 @@ fn rowstack_and_colstack_take_one_vector_of_vectors() {
             errors(&format!("{v}M = {head}(a, b, a)")),
             vec![format!("`{head}` takes 1 argument (spec §07), got 3")]
         );
-        assert_eq!(
-            errors(&format!("{v}M = {head}()")),
-            vec![format!("`{head}` takes 1 argument (spec §07), got 0")]
-        );
     }
 }
 
@@ -220,29 +215,20 @@ fn rowstack_and_colstack_take_one_vector_of_vectors() {
 /// two" for `cat` would reject `cat(1.0)` while accepting the equivalent
 /// `vector(1.0)`.
 ///
-/// The nullary spellings are an arity ACCEPT and a §05 position refusal: the
-/// `vector` row's minimum stays 0, and the empty `(vector)` node those two
-/// spellings share is an empty axis list out of position (see
-/// `axis_position.rs`), so no count message is what comes back.
+/// The empty `(vector)` IR node remains available for axis lists. A bare `[]`
+/// fails on its position; the parser separately rejects `vector()` and `cat()`.
 #[test]
 fn cat_and_vector_read_the_same_notation_the_same_way() {
     assert!(errors("v = cat(1.0)").is_empty());
     assert!(errors("v = cat(1.0, 2.0)").is_empty());
     assert!(errors("v = vector(1.0)").is_empty());
     assert!(errors("v = [1.0]").is_empty());
-    for src in ["v = vector()", "v = []"] {
-        let msgs = errors(src);
-        assert_eq!(msgs.len(), 1, "one error for `{src}`; got {msgs:?}");
-        assert!(
-            msgs[0].contains("an axis list is legal only as `output_axes`"),
-            "`{src}` must fail on position, not on count; got {}",
-            msgs[0]
-        );
-    }
-    // `cat` still needs something to concatenate.
-    assert_eq!(
-        errors("v = cat()"),
-        vec!["`cat` takes at least 1 argument (spec §07), got 0".to_string()]
+    let msgs = errors("v = []");
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        msgs[0].contains("an axis list is legal only as `output_axes`"),
+        "a bare empty axis list must fail on position: {}",
+        msgs[0]
     );
 }
 
@@ -335,10 +321,6 @@ fn user_call_arity_is_checked_against_the_declared_parameters() {
         errors(&format!("{f}s = scale(1.5, 3.0)")),
         vec!["`scale` declares 1 parameter, got 2 arguments".to_string()]
     );
-    assert_eq!(
-        errors(&format!("{f}s = scale()")),
-        vec!["`scale` declares 1 parameter, got 0 arguments".to_string()]
-    );
 
     let g = "lin(a, b, x) = add(a, mul(b, x))\n";
     assert!(errors(&format!("{g}y = lin(1.0, 2.0, 3.0)")).is_empty());
@@ -375,10 +357,6 @@ fn distribution_constructor_arity_is_the_declared_parameter_count() {
         (
             "m = GeneralizedNormal(0.0, 1.0)",
             "`GeneralizedNormal` takes 3 arguments (spec §08), got 2",
-        ),
-        (
-            "m = Poisson()",
-            "`Poisson` takes 1 argument (spec §08), got 0",
         ),
     ] {
         assert_eq!(errors(src), vec![want.to_string()], "for {src}");

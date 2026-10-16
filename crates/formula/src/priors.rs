@@ -299,7 +299,7 @@ pub(crate) fn resolve(
             selected
                 .next()
                 .unwrap()
-                .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
+                .unwrap_or_else(|| ResolvedPrior::new("Lebesgue(reals)"))
         })
         .collect();
     let mut sd = Vec::new();
@@ -309,7 +309,7 @@ pub(crate) fn resolve(
             selected
                 .next()
                 .unwrap()
-                .unwrap_or_else(|| ResolvedPrior::new("Flat()"))
+                .unwrap_or_else(|| ResolvedPrior::new("Lebesgue(reals)"))
         })
         .collect();
     let sds = smooth_names

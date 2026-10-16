@@ -654,7 +654,7 @@ f = functionof(add(a, b), a = a, b = b)";
 
 /// A reification over a REFERENCE to a capturing callable captures too. §04
 /// gives a reified callable the same ancestor rule as any other binding, so
-/// `z = inner()` outside a reification is stochastic exactly because `inner`
+/// `z = inner(c)` outside a reification is stochastic exactly because `inner`
 /// captures `a` — and a `functionof` over that same expression cannot be more
 /// deterministic than the expression is. `z` is asserted alongside to pin the
 /// two against each other.
@@ -687,7 +687,7 @@ fn a_reification_over_a_capturing_nested_literal_is_stochastic() {
     let src = "\
 a ~ Normal(mu = 0.0, sigma = 1.0)
 resolution = mul(2.5, exp(mul(0.12, a)))
-lit = functionof(functionof(resolution)())";
+lit = functionof(functionof(resolution))";
     assert_eq!(
         binding_phase(&infer_phases(src), "lit"),
         Some(flatppl_core::Phase::Stochastic),
@@ -704,7 +704,7 @@ fn a_functionof_over_the_law_of_a_capturing_callable_is_fixed() {
 a ~ Normal(mu = 0.0, sigma = 1.0)
 resolution = mul(2.5, exp(mul(0.12, a)))
 inner = functionof(Normal(mu = resolution, sigma = 1.0))
-ctrl = functionof(lawof(inner()))";
+ctrl = functionof(lawof(inner))";
     let module = infer_phases(src);
     assert_eq!(
         binding_phase(&module, "inner"),
@@ -830,7 +830,7 @@ fn the_captured_phase_propagates_to_a_consumer() {
     let src = "\
 s ~ Normal(mu = 0.0, sigma = 1.0)
 f = functionof(mul(2.0, s))
-y = f()
+y = f
 z = add(y, 1.0)";
     let module = infer_phases(src);
     for name in ["f", "y", "z"] {

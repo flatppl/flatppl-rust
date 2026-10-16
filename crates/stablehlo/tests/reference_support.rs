@@ -1,9 +1,8 @@
 fn emit(support: &str) -> String {
     let source = format!(
-        "reg = standard_module(\"regression\", \"0.1\")\n\
-         x = external(reals)\n\
+        "x = external(reals)\n\
          inputs = x\n\
-         outputs = logdensityof(reg.Flat({support}), x)"
+         outputs = logdensityof(Lebesgue({support}), x)"
     );
     let mut module = flatppl_syntax::parse(&source).unwrap();
     assert!(flatppl_infer::infer(&mut module).is_empty());
@@ -23,6 +22,6 @@ fn emit(support: &str) -> String {
 }
 
 #[test]
-fn flat_unitinterval_is_the_unnormalized_closed_unit_interval() {
+fn reference_unitinterval_is_the_unnormalized_closed_unit_interval() {
     assert_eq!(emit("unitinterval"), emit("interval(0.0, 1.0)"));
 }
