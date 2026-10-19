@@ -181,6 +181,20 @@ impl NativeContext {
         self.inner.register(name, &module.inner).map_err(error)
     }
 
+    fn contains(&self, name: &str) -> bool {
+        self.inner.contains(name)
+    }
+
+    fn pack<'py>(&self, py: Python<'py>, module: &NativeModule) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.pack(&module.inner).map_err(error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn fingerprint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.fingerprint().map_err(error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     fn set(&mut self, module: &NativeModule, constants: &str) -> PyResult<NativeModule> {
         let constants: Vec<(String, Constant)> =
             serde_json::from_str(constants).map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -251,6 +265,11 @@ struct NativeModule {
 
 #[pymethods]
 impl NativeModule {
+    fn fingerprint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.fingerprint().map_err(error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     fn pack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         self.inner
             .pack()

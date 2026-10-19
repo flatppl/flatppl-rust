@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use flatppl_core::{CallHead, Idx, Module, NamedKind, Node, NodeId, RefNs, Scalar};
+use sha2::{Digest, Sha256};
 
 use crate::{Compression, Error, Result};
 
@@ -16,7 +17,7 @@ pub struct Source {
     pub bytes: Arc<[u8]>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Module,
     Data,
@@ -26,12 +27,37 @@ pub enum SourceKind {
 /// spans change; all other source text and all data bytes are preserved.
 pub fn pack_sources(
     root: Source,
-    mut resolve: impl FnMut(&str, &str, SourceKind) -> std::result::Result<Source, String>,
+    resolve: impl FnMut(&str, &str, SourceKind) -> std::result::Result<Source, String>,
 ) -> Result<Vec<u8>> {
+    crate::pack(
+        source_files(root, [], resolve)?.files,
+        Compression::Deflated,
+    )
+}
+
+/// Portable files plus the archive member assigned to each module identity.
+pub struct SourceFiles {
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub modules: HashMap<String, String>,
+}
+
+/// Collect a root and optional extra modules using one dependency/data namespace.
+pub fn source_files(
+    root: Source,
+    additional: impl IntoIterator<Item = Source>,
+    mut resolve: impl FnMut(&str, &str, SourceKind) -> std::result::Result<Source, String>,
+) -> Result<SourceFiles> {
     let mut module_names = HashMap::from([(root.identity.clone(), "main.flatppl".to_string())]);
     let mut names = HashSet::from(["main.flatppl".to_string()]);
     let mut data_names: HashMap<String, String> = HashMap::new();
     let mut queue = VecDeque::from([root]);
+    for source in additional {
+        if !module_names.contains_key(&source.identity) {
+            let name = member_name("modules", &source.name, &mut names);
+            module_names.insert(source.identity.clone(), name);
+            queue.push_back(source);
+        }
+    }
     let mut files = BTreeMap::new();
     while let Some(snapshot) = queue.pop_front() {
         let fail = |error| Error::new(format!("{}: {error}", snapshot.identity));
@@ -91,7 +117,85 @@ pub fn pack_sources(
             source.into_bytes(),
         );
     }
-    crate::pack(files, Compression::Deflated)
+    Ok(SourceFiles {
+        files,
+        modules: module_names,
+    })
+}
+
+/// Hash source and recursive dependencies, replacing only dependency path arguments
+/// with their content digests. File locations and ZIP encoding do not affect identity.
+pub fn fingerprint_sources(
+    root: Source,
+    mut resolve: impl FnMut(&str, &str, SourceKind) -> std::result::Result<Source, String>,
+) -> Result<[u8; 32]> {
+    fn visit(
+        source: Source,
+        kind: SourceKind,
+        resolve: &mut impl FnMut(&str, &str, SourceKind) -> std::result::Result<Source, String>,
+        hashes: &mut HashMap<(String, SourceKind), [u8; 32]>,
+        active: &mut HashSet<(String, SourceKind)>,
+    ) -> Result<[u8; 32]> {
+        let key = (source.identity.clone(), kind);
+        if let Some(hash) = hashes.get(&key) {
+            return Ok(*hash);
+        }
+        if !active.insert(key.clone()) {
+            return Err(Error::new("cyclic module dependencies"));
+        }
+        let mut hash = Sha256::new();
+        if kind == SourceKind::Data {
+            hash.update(b"FlatPPL data\0");
+            hash.update(&source.bytes);
+        } else {
+            let mut text = std::str::from_utf8(&source.bytes)
+                .map_err(Error::new)?
+                .to_owned();
+            let module = flatppl_syntax::parse(&text).map_err(Error::new)?;
+            let mut replacements = Vec::new();
+            for (head, child_kind) in [
+                ("load_module", SourceKind::Module),
+                ("load_data", SourceKind::Data),
+            ] {
+                for argument in source_arguments(&module, head) {
+                    let path = fixed_source(&module, argument).ok_or_else(|| {
+                        Error::new(format!("{head} needs a fixed source to compare content"))
+                    })?;
+                    let child = resolve(&source.identity, path, child_kind).map_err(Error::new)?;
+                    let digest = visit(child, child_kind, resolve, hashes, active)?;
+                    let digest = digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    let span = module
+                        .span_of(argument)
+                        .ok_or_else(|| Error::new("source argument has no text span"))?;
+                    replacements.push((
+                        span.start as usize,
+                        span.end as usize,
+                        format!("\"{digest}\""),
+                    ));
+                }
+            }
+            replacements.sort_unstable_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+            for (start, end, replacement) in replacements {
+                text.replace_range(start..end, &replacement);
+            }
+            hash.update(b"FlatPPL module\0");
+            hash.update(text.as_bytes());
+        }
+        let hash = hash.finalize().into();
+        active.remove(&key);
+        hashes.insert(key, hash);
+        Ok(hash)
+    }
+    visit(
+        root,
+        SourceKind::Module,
+        &mut resolve,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
 }
 
 fn member_name(directory: &str, basename: &str, used: &mut HashSet<String>) -> String {
