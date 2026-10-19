@@ -10,11 +10,14 @@
 //! refuses untrusted URLs, per spec §sec:url-cache).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "prepare")]
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
+use flatppl_bundle::source::{fixed_source, source_arguments};
+use flatppl_core::Module;
 use flatppl_fileaccess::{Cache, Fetcher, Location, OfflineFetcher};
 
 use crate::Failure;
@@ -34,6 +37,16 @@ pub struct CliResolver {
     /// URLs approved this session (so a batch-prompted wave is not re-prompted
     /// when each member is then read).
     approved: RefCell<HashSet<String>>,
+    /// Mounted members remain in memory. Virtual identities never reach filesystem fallback.
+    members: RefCell<HashMap<String, (Arc<flatppl_bundle::Bundle>, String)>>,
+    entrypoints: RefCell<HashMap<String, Location>>,
+    directories: RefCell<HashMap<String, DirectoryMember>>,
+}
+
+#[derive(Clone)]
+struct DirectoryMember {
+    path: PathBuf,
+    root: PathBuf,
 }
 
 impl CliResolver {
@@ -50,6 +63,9 @@ impl CliResolver {
             interactive: false,
             update: false,
             approved: RefCell::new(HashSet::new()),
+            members: RefCell::new(HashMap::new()),
+            entrypoints: RefCell::new(HashMap::new()),
+            directories: RefCell::new(HashMap::new()),
         }
     }
 
@@ -65,6 +81,9 @@ impl CliResolver {
             interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             update,
             approved: RefCell::new(HashSet::new()),
+            members: RefCell::new(HashMap::new()),
+            entrypoints: RefCell::new(HashMap::new()),
+            directories: RefCell::new(HashMap::new()),
         }
     }
 
@@ -154,9 +173,192 @@ impl CliResolver {
 
     /// Resolve `loc` and read it as UTF-8 text (for FlatPPL/FlatPIR sources).
     pub fn read_string(&self, loc: &Location) -> Result<String, Failure> {
-        let path = self.resolve_path(loc)?;
-        std::fs::read_to_string(&path)
+        String::from_utf8(self.read_bytes(loc)?)
             .map_err(|e| Failure::Plain(format!("reading `{}`: {e}", terminal_location(loc))))
+    }
+
+    /// Read bytes from a mounted member or the existing file/cache policy.
+    pub fn read_bytes(&self, loc: &Location) -> Result<Vec<u8>, Failure> {
+        if let Some((bundle, member)) = self.members.borrow().get(&loc.display()) {
+            return bundle
+                .read(member)
+                .map(|bytes| bytes.to_vec())
+                .map_err(bundle_error);
+        }
+        if private_data_location(loc) {
+            return Err(Failure::Plain("unmapped archive data source".into()));
+        }
+        let directory = self.directories.borrow().get(&loc.display()).cloned();
+        let path = self.resolve_path(
+            &directory.map_or_else(|| loc.clone(), |member| Location::Local(member.path)),
+        )?;
+        std::fs::read(&path)
+            .map_err(|e| Failure::Plain(format!("reading `{}`: {e}", terminal_location(loc))))
+    }
+
+    /// Select `main.flatppl` when a source denotes a directory or ZIP bundle.
+    pub fn model_location(&self, loc: &Location) -> Result<Location, Failure> {
+        if let Some(entry) = self.entrypoints.borrow().get(&loc.display()) {
+            return Ok(entry.clone());
+        }
+        let mounted = self.members.borrow().get(&loc.display()).cloned();
+        let entry = if let Some((bundle, member)) = mounted {
+            if bundle.is_dir(&member).map_err(bundle_error)? {
+                self.mount(bundle.subdirectory(&member).map_err(bundle_error)?)?
+            } else if is_zip(&member) {
+                self.mount(bundle.nested(&member).map_err(bundle_error)?)?
+            } else {
+                loc.clone()
+            }
+        } else if let Some(path) = self.local_path(loc)
+            && path.is_dir()
+        {
+            let root = path
+                .canonicalize()
+                .map_err(|e| Failure::Plain(e.to_string()))?;
+            let entry = root.join("main.flatppl");
+            let entry = confined_file(&entry, &root)?;
+            self.directory_location(entry, root)
+        } else if is_zip(&self.file_name(loc)) {
+            let bytes = self.read_bytes(loc)?;
+            let bundle = flatppl_bundle::Bundle::open(
+                loc.normalized().display(),
+                bytes.into(),
+                flatppl_bundle::Limits::default(),
+            )
+            .map_err(bundle_error)?;
+            self.mount(bundle)?
+        } else {
+            loc.clone()
+        };
+        self.entrypoints
+            .borrow_mut()
+            .insert(loc.display(), entry.clone());
+        Ok(entry)
+    }
+
+    fn local_path(&self, location: &Location) -> Option<PathBuf> {
+        if let Some(member) = self.directories.borrow().get(&location.display()) {
+            Some(member.path.clone())
+        } else if let Location::Local(path) = location {
+            Some(path.clone())
+        } else {
+            None
+        }
+    }
+
+    fn directory_location(&self, path: PathBuf, root: PathBuf) -> Location {
+        let identity = format!("flatppl-directory:{root:?}:{path:?}");
+        self.directories
+            .borrow_mut()
+            .insert(identity.clone(), DirectoryMember { path, root });
+        Location::Invalid(identity)
+    }
+
+    fn mount(&self, bundle: flatppl_bundle::Bundle) -> Result<Location, Failure> {
+        let bundle = Arc::new(bundle);
+        let entry = bundle.identity_for(bundle.entrypoint());
+        let mut members = self.members.borrow_mut();
+        for member in bundle.members() {
+            members.insert(
+                bundle.identity_for(&member.path),
+                (bundle.clone(), member.path.clone()),
+            );
+        }
+        Ok(Location::Invalid(entry))
+    }
+
+    /// Resolve an import or data reference inside its declaring bundle boundary.
+    pub fn relative(&self, base: &Location, source: &str) -> Result<Location, Failure> {
+        if private_data_location(&Location::parse(source)) {
+            return Err(Failure::Plain(
+                "archive data keys are private to the loader".into(),
+            ));
+        }
+        let mounted = self.members.borrow().get(&base.display()).cloned();
+        if let Some((bundle, member)) = mounted {
+            let resolved = bundle.resolve(&member, source).map_err(bundle_error)?;
+            let id = bundle.identity_for(&resolved);
+            self.members
+                .borrow_mut()
+                .insert(id.clone(), (bundle, resolved));
+            return Ok(Location::Invalid(id));
+        }
+        let directory = self.directories.borrow().get(&base.display()).cloned();
+        if let Some(DirectoryMember {
+            path: importer,
+            root,
+        }) = directory
+        {
+            if source.contains('\\')
+                || !matches!(Location::parse(source), Location::Local(ref path) if path.is_relative())
+            {
+                return Err(Failure::Plain("bundle references must be relative".into()));
+            }
+            // Resolve links before parent segments. Missing data stays lazy.
+            let path = importer.parent().unwrap_or(Path::new("")).join(source);
+            let path = confined_reference(&path, &root)?;
+            return Ok(self.directory_location(path, root));
+        }
+        Ok(base.join(source))
+    }
+
+    /// The inferred source spelling stays within the language's closed file schemes.
+    #[cfg(any(feature = "determinize", feature = "stablehlo"))]
+    fn data_identity(&self, location: &Location) -> String {
+        let mounted = self.members.borrow().get(&location.display()).cloned();
+        if let Some((bundle, member)) = mounted {
+            let identity = bundle.data_identity_for(&member);
+            self.members
+                .borrow_mut()
+                .insert(Location::parse(&identity).display(), (bundle, member));
+            identity
+        } else if let Some(member) = self.directories.borrow().get(&location.display()) {
+            member.path.display().to_string()
+        } else {
+            location.normalized().display()
+        }
+    }
+
+    /// The format of a module after bundle entry selection.
+    pub fn model_format(&self, loc: &Location) -> Result<crate::Format, Failure> {
+        if let Some((_, member)) = self.members.borrow().get(&loc.display()) {
+            return crate::Format::from_path(Path::new(member)).map_err(Failure::Plain);
+        }
+        if let Some(member) = self.directories.borrow().get(&loc.display()) {
+            return crate::Format::from_path(&member.path).map_err(Failure::Plain);
+        }
+        crate::Format::from_location(loc).map_err(Failure::Plain)
+    }
+
+    pub(crate) fn file_name(&self, loc: &Location) -> String {
+        if let Some((_, member)) = self.members.borrow().get(&loc.display()) {
+            return member.rsplit('/').next().unwrap_or(member).to_string();
+        }
+        if let Some(member) = self.directories.borrow().get(&loc.display()) {
+            return member
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        loc.name()
+    }
+
+    fn sources(
+        &self,
+        module: &Module,
+        base: &Location,
+        head: &str,
+    ) -> Result<Vec<(String, Location)>, Failure> {
+        source_arguments(module, head)
+            .into_iter()
+            .filter_map(|arg| fixed_source(module, arg))
+            .map(|source| {
+                self.relative(base, source)
+                    .map(|loc| (source.to_string(), loc))
+            })
+            .collect()
     }
 
     /// Resolve a batch of locations to local files (fetching + caching URLs,
@@ -167,9 +369,61 @@ impl CliResolver {
         let refs: Vec<&Location> = locs.iter().collect();
         self.ensure_trusted(&refs)?;
         for loc in locs {
-            self.resolve_path(loc)?;
+            if self.members.borrow().contains_key(&loc.display())
+                || self.directories.borrow().contains_key(&loc.display())
+            {
+                self.read_bytes(loc)?;
+            } else {
+                self.resolve_path(loc)?;
+            }
         }
         Ok(())
+    }
+}
+
+fn is_zip(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".zip")
+}
+
+fn private_data_location(location: &Location) -> bool {
+    location
+        .display()
+        .starts_with(&Location::parse(flatppl_bundle::DATA_SOURCE_PREFIX).display())
+}
+
+fn bundle_error(error: impl std::fmt::Display) -> Failure {
+    Failure::Plain(format!("bundle: {}", terminal_message(&error.to_string())))
+}
+
+fn confined_file(path: &Path, root: &Path) -> Result<PathBuf, Failure> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| Failure::Plain(format!("{}: {e}", crate::terminal_path(path))))?;
+    if !canonical.starts_with(root) {
+        return Err(Failure::Plain("bundle reference escapes its root".into()));
+    }
+    Ok(canonical)
+}
+
+fn confined_reference(path: &Path, root: &Path) -> Result<PathBuf, Failure> {
+    match path.canonicalize() {
+        Ok(canonical) if canonical.starts_with(root) => Ok(canonical),
+        Ok(_) => Err(Failure::Plain("bundle reference escapes its root".into())),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            let parent = path
+                .parent()
+                .ok_or_else(|| Failure::Plain(error.to_string()))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| Failure::Plain(error.to_string()))?;
+            Ok(confined_reference(parent, root)?.join(name))
+        }
+        Err(error) => Err(Failure::Plain(format!(
+            "{}: {error}",
+            crate::terminal_path(path)
+        ))),
     }
 }
 
@@ -299,48 +553,16 @@ fn terminal_fileaccess_error(error: flatppl_fileaccess::Error) -> String {
     }
 }
 
-/// The string literal `source` of a `load_module`/`load_data` call: the first
-/// positional argument, or a `source =` keyword argument (the form `load_data`
-/// commonly uses). `None` for a non-literal source — it cannot be resolved
-/// statically by the host.
-fn source_of<'m>(module: &'m Module, call: &flatppl_core::Call) -> Option<&'m str> {
-    if let Some(&arg0) = call.args.first()
-        && let Node::Lit(Scalar::Str(s)) = module.node(arg0)
-    {
-        return Some(s);
-    }
-    for named in call.named.iter() {
-        if module.resolve(named.name) == "source"
-            && let Node::Lit(Scalar::Str(s)) = module.node(named.value)
-        {
-            return Some(s);
-        }
-    }
-    None
-}
-
 /// Every `source` of the builtin `head` in `module`, as `(source-string,
 /// resolved Location)` with the source resolved relative to `base`.
 /// `standard_module` is a catalogue reference (not a file) and never matched
 /// here; non-literal sources are skipped.
 fn sources_with_head(module: &Module, base: &Location, head: &str) -> Vec<(String, Location)> {
-    let mut out = Vec::new();
-    for i in 0..module.node_count() {
-        let id = NodeId::from_usize(i);
-        let Node::Call(call) = module.node(id) else {
-            continue;
-        };
-        let CallHead::Builtin(h) = call.head else {
-            continue;
-        };
-        if module.resolve(h) != head {
-            continue;
-        }
-        if let Some(source) = source_of(module, call) {
-            out.push((source.to_string(), base.join(source)));
-        }
-    }
-    out
+    source_arguments(module, head)
+        .into_iter()
+        .filter_map(|id| fixed_source(module, id))
+        .map(|source| (source.to_string(), base.join(source)))
+        .collect()
 }
 
 /// The `load_module` directives in `module`, each resolved relative to `base`.
@@ -385,7 +607,7 @@ pub fn compilation_bundle(
     root_loc: &Location,
     resolver: &CliResolver,
 ) -> Result<flatppl_infer::ModuleBundle, Failure> {
-    fn resolve_data(module: &mut Module, base: &Location) -> Result<(), Failure> {
+    let resolve_data = |module: &mut Module, base: &Location| -> Result<(), Failure> {
         let base = match base {
             Location::Local(path) if path.is_relative() => Location::Local(
                 std::env::current_dir()
@@ -395,12 +617,21 @@ pub fn compilation_bundle(
             _ => base.clone(),
         };
         flatppl_host::resolve_data_sources(module, |source| {
-            Ok(base.join(source).normalized().display())
+            resolver
+                .relative(&base, source)
+                .map(|location| resolver.data_identity(&location))
+                .map_err(|error| match error {
+                    Failure::Plain(message)
+                    | Failure::Usage(message)
+                    | Failure::Refuse(message)
+                    | Failure::Diagnostic { message, .. } => message,
+                })
         })
         .map_err(Failure::Plain)
-    }
+    };
+    let bundle = build_bundle_with(root, root_loc, resolver, resolve_data)?.0;
     resolve_data(root, root_loc)?;
-    build_bundle_with(root, root_loc, resolver, resolve_data).map(|(bundle, _)| bundle)
+    Ok(bundle)
 }
 
 #[cfg(feature = "infer")]
@@ -408,7 +639,7 @@ fn build_bundle_with(
     root: &Module,
     root_loc: &Location,
     resolver: &CliResolver,
-    prepare: fn(&mut Module, &Location) -> Result<(), Failure>,
+    mut prepare: impl FnMut(&mut Module, &Location) -> Result<(), Failure>,
 ) -> Result<(flatppl_infer::ModuleBundle, Vec<Location>), Failure> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -417,24 +648,23 @@ fn build_bundle_with(
     bundle.set_root(root_loc.display());
     // Parse each distinct file once, keyed by its resolved location.
     let mut parsed: HashMap<String, Arc<Module>> = HashMap::new();
-    // Locations whose own dependencies have already been queued (cycle guard).
-    let mut walked: HashSet<String> = HashSet::new();
     // `load_data` source locations across the graph, deduped by display.
     let mut data: Vec<Location> = Vec::new();
     let mut data_seen: HashSet<String> = HashSet::new();
-    let mut collect_data = |module: &Module, base: &Location| {
-        for loc in data_sources_of(module, base) {
+    let mut collect_data = |module: &Module, base: &Location| -> Result<(), Failure> {
+        for (_, loc) in resolver.sources(module, base, "load_data")? {
             if data_seen.insert(loc.display()) {
                 data.push(loc);
             }
         }
+        Ok(())
     };
 
-    collect_data(root, root_loc);
-    walked.insert(root_loc.display());
+    collect_data(root, root_loc)?;
     // Each entry carries the identity of the file that DECLARED the directive,
     // because that is what the directive resolves against.
-    let mut level: Vec<(String, String, Location)> = directives_of(root, root_loc)
+    let mut level: Vec<(String, String, Location)> = resolver
+        .sources(root, root_loc, "load_module")?
         .into_iter()
         .map(|(directive, loc)| (root_loc.display(), directive, loc))
         .collect();
@@ -445,23 +675,31 @@ fn build_bundle_with(
 
         let mut next: Vec<(String, String, Location)> = Vec::new();
         for (importer, directive, loc) in &level {
+            let loc = resolver.model_location(loc)?;
             let ld = loc.display();
             let module = match parsed.get(&ld) {
                 Some(m) => m.clone(),
                 None => {
-                    let source = resolver.read_string(loc)?;
-                    let format = crate::Format::from_location(loc).map_err(Failure::Plain)?;
+                    let source = resolver.read_string(&loc)?;
+                    let format = resolver.model_format(&loc)?;
                     let mut module =
                         crate::read_module(format, &source).map_err(|(message, line, span)| {
                             Failure::Diagnostic {
-                                path: diagnostic_path(loc),
+                                path: diagnostic_path(&loc),
                                 source: source.clone(),
                                 message,
                                 line,
                                 span,
                             }
                         })?;
-                    prepare(&mut module, loc)?;
+                    collect_data(&module, &loc)?;
+                    next.extend(
+                        resolver
+                            .sources(&module, &loc, "load_module")?
+                            .into_iter()
+                            .map(|(d, l)| (ld.clone(), d, l)),
+                    );
+                    prepare(&mut module, &loc)?;
                     let module = Arc::new(module);
                     parsed.insert(ld.clone(), module.clone());
                     module
@@ -473,17 +711,6 @@ fn build_bundle_with(
                 ld.clone(),
                 module.clone(),
             );
-
-            // Queue this file's own dependencies (and collect its data
-            // sources) exactly once.
-            if walked.insert(ld.clone()) {
-                collect_data(&module, loc);
-                next.extend(
-                    directives_of(&module, loc)
-                        .into_iter()
-                        .map(|(d, l)| (ld.clone(), d, l)),
-                );
-            }
         }
         level = next;
     }
@@ -508,26 +735,27 @@ pub fn fetch_graph(files: &[Location], resolver: &CliResolver) -> Result<(), Fai
         resolver.ensure_trusted(&refs)?;
         let mut next: Vec<Location> = Vec::new();
         for loc in &level {
+            let loc = resolver.model_location(loc)?;
             if !walked.insert(loc.display()) {
                 continue;
             }
-            let source = resolver.read_string(loc)?;
-            let format = crate::Format::from_location(loc).map_err(Failure::Plain)?;
+            let source = resolver.read_string(&loc)?;
+            let format = resolver.model_format(&loc)?;
             let module = crate::read_module(format, &source).map_err(|(message, line, span)| {
                 Failure::Diagnostic {
-                    path: diagnostic_path(loc),
+                    path: diagnostic_path(&loc),
                     source: source.clone(),
                     message,
                     line,
                     span,
                 }
             })?;
-            for d in data_sources_of(&module, loc) {
+            for (_, d) in resolver.sources(&module, &loc, "load_data")? {
                 if data_seen.insert(d.display()) {
                     data.push(d);
                 }
             }
-            for (_, dep) in directives_of(&module, loc) {
+            for (_, dep) in resolver.sources(&module, &loc, "load_module")? {
                 next.push(dep);
             }
         }
@@ -718,6 +946,9 @@ mod fetch_tests {
             interactive: false,
             update: false,
             approved: RefCell::new(HashSet::new()),
+            members: RefCell::new(HashMap::new()),
+            entrypoints: RefCell::new(HashMap::new()),
+            directories: RefCell::new(HashMap::new()),
         };
 
         let error = fetch_graph(&[Location::Local(model)], &resolver)

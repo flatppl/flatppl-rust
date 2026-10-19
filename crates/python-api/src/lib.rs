@@ -9,6 +9,7 @@ use std::{path::Path, sync::Arc};
 
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use flatppl_host::flatppl_formula::DataMode;
 use flatppl_host::{
@@ -169,6 +170,13 @@ impl NativeContext {
             .map_err(error)
     }
 
+    fn load_bundle(&mut self, name: &str, data: &[u8]) -> PyResult<NativeModule> {
+        self.inner
+            .load_bundle(name, data)
+            .map(|inner| NativeModule { inner })
+            .map_err(error)
+    }
+
     fn register(&mut self, name: &str, module: &NativeModule) -> PyResult<()> {
         self.inner.register(name, &module.inner).map_err(error)
     }
@@ -243,6 +251,13 @@ struct NativeModule {
 
 #[pymethods]
 impl NativeModule {
+    fn pack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.inner
+            .pack()
+            .map(|data| PyBytes::new(py, &data))
+            .map_err(error)
+    }
+
     #[getter]
     fn source(&self) -> &str {
         self.inner.source()

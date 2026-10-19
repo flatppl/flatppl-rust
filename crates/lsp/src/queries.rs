@@ -3,7 +3,7 @@
 use crate::capabilities::LspDiag;
 use crate::db::{Catalogues, FileSet, SourceFile};
 use crate::line_index::LineIndex;
-use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Idx, Module, Node, NodeId};
 use flatppl_fileaccess::Location;
 use std::sync::Arc;
 
@@ -537,10 +537,8 @@ pub fn parse<'db>(db: &'db dyn salsa::Database, file: SourceFile) -> Parsed<'db>
 
 // ── Cross-file load_module resolution ────────────────────────────────────────
 
-/// Extract the literal path string of every `load_module` / `standard_module`
-/// directive in `module`: iterate bindings, and for each binding whose RHS is a
-/// `Call` with a builtin head named `load_module` or `standard_module`, take
-/// `args[0]` when it is a `Scalar::Str`.
+/// Extract fixed path strings from `load_module` / `standard_module`
+/// directives, including local aliases of string literals.
 ///
 /// `standard_module` paths are module *names*, not workspace files; they will
 /// not resolve to a `SourceFile` (so `resolve_path` returns `None` and they are
@@ -559,8 +557,8 @@ pub(crate) fn load_module_paths(module: &Module) -> Vec<String> {
         if head_name != "load_module" && head_name != "standard_module" {
             continue;
         }
-        if let Some(Node::Lit(Scalar::Str(s))) = call.args.first().map(|&a| module.node(a)) {
-            paths.push(s.to_string());
+        if let Some(source) = flatppl_infer::module_source(module, call) {
+            paths.push(source.to_owned());
         }
     }
     paths
@@ -589,6 +587,16 @@ pub fn resolve_path(
     directive_path: &str,
     fs: FileSet,
 ) -> Option<SourceFile> {
+    if let Some(bundle) = importer.bundle(db)
+        && let Some(target) = bundle.modules.get(directive_path)
+    {
+        return fs.files(db).iter().copied().find(|f| f.path(db) == *target);
+    }
+    // A missing archive member must not fall through to a workspace file with
+    // the same name. The client supplies every permitted archive edge (§04).
+    if importer.path(db).starts_with("flatppl-zip:") {
+        return None;
+    }
     let joined = Location::parse(&importer.path(db)).join(directive_path);
     let direct = Location::parse(directive_path).normalized();
     let find = |target: &Location| {

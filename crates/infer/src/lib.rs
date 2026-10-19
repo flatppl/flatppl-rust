@@ -35,7 +35,7 @@ use flatppl_core::{Module, NodeId, Type};
 use std::collections::HashMap;
 
 pub use catalogue::{Catalogue, parse_catalogue};
-pub use modules::ModuleBundle;
+pub use modules::{ModuleBundle, module_source};
 
 /// Return the process-global built-in catalogue (parsed once from the bundled
 /// `catalogue.ron`).

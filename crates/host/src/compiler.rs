@@ -1,10 +1,13 @@
 //! Host-owned source snapshots. Imported definitions never cache inferred instances.
 
+mod pack;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs, Scalar};
+use flatppl_bundle::{Bundle, Limits};
+use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs};
 use flatppl_fileaccess::{Cache, DenyAll, Location, OfflineFetcher, Resolver};
 use flatppl_hs3::PyhfOptions;
 use flatppl_infer::{Level, ModuleBundle, Severity};
@@ -86,6 +89,10 @@ enum Origin {
         name: String,
         file: Option<Location>,
     },
+    Archive {
+        bundle: Bundle,
+        member: String,
+    },
 }
 
 struct Definition {
@@ -98,9 +105,9 @@ struct Definition {
     data_roots: Vec<(String, PathBuf)>,
 }
 
-struct DataSource {
-    canonical: PathBuf,
-    bytes: Vec<u8>,
+enum DataSource {
+    File { canonical: PathBuf, bytes: Vec<u8> },
+    Archive { bundle: Bundle, member: String },
 }
 
 /// An immutable root instance and the parsed definitions required to compile it.
@@ -299,10 +306,24 @@ impl LoadedModule {
     fn read_data(&self, source: &str) -> Result<Vec<u8>, String> {
         let mut data = self.data.lock().map_err(|error| error.to_string())?;
         if let Some(loaded) = data.get(source) {
-            self.check_data_path(source, &loaded.canonical)?;
-            return Ok(loaded.bytes.clone());
+            return match loaded {
+                DataSource::File { canonical, bytes } => {
+                    self.check_data_path(source, canonical)?;
+                    Ok(bytes.clone())
+                }
+                DataSource::Archive { bundle, member } => bundle
+                    .read(member)
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| error.to_string()),
+            };
+        }
+        if source.starts_with(flatppl_bundle::DATA_SOURCE_PREFIX) {
+            return Err("archive data has no mapped member".into());
         }
         let location = Location::parse(source);
+        if matches!(&location, Location::Local(path) if path.starts_with("/__flatppl_bundle__")) {
+            return Err("archive data has no mapped member".into());
+        }
         if matches!(&location, Location::Local(path) if path.is_relative()) {
             return Err("provide source_path for relative data sources in inline code".into());
         }
@@ -317,7 +338,7 @@ impl LoadedModule {
         let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
         data.insert(
             source.into(),
-            DataSource {
+            DataSource::File {
                 canonical,
                 bytes: bytes.clone(),
             },
@@ -594,14 +615,18 @@ impl Context {
         let source = flatppl_syntax::print(&parsed);
         let identity = format!("slice:{}", self.next_inline);
         self.next_inline += 1;
-        let definition = self.definition(
+        // Data paths already name this snapshot's resolved sources. Parsing
+        // refreshes spans but must not resolve those paths as new user imports.
+        let parsed = flatppl_syntax::parse(&source).map_err(|error| fail(error.message))?;
+        self.instantiate(Arc::new(Definition {
             identity,
-            module.definition.label.clone(),
+            label: module.definition.label.clone(),
             source,
-            module.definition.origin.clone(),
-            &mut Vec::new(),
-        )?;
-        self.instantiate(definition)
+            origin: module.definition.origin.clone(),
+            parsed: Arc::new(parsed),
+            imports: module.definition.imports.clone(),
+            data_roots: module.definition.data_roots.clone(),
+        }))
     }
 
     pub fn parse(
@@ -651,6 +676,20 @@ impl Context {
     pub fn load(&mut self, path: &str) -> Result<Arc<LoadedModule>, Diagnostic> {
         let location = absolute_location(path)?;
         let definition = self.file(location, None, &mut Vec::new())?;
+        self.instantiate(definition)
+    }
+
+    /// Load an immutable ZIP snapshot without extracting files or reading the host filesystem.
+    pub fn load_bundle(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        let identity = format!("memory:{}:{name}", self.next_inline);
+        self.next_inline += 1;
+        let bundle = Bundle::open(identity, bytes.into(), Limits::default())
+            .map_err(|error| Diagnostic::new("bundle", name, error))?;
+        let definition = self.archive_member(bundle, "main.flatppl", &mut Vec::new())?;
         self.instantiate(definition)
     }
 
@@ -730,22 +769,36 @@ impl Context {
             .map_err(|e| Diagnostic::new("parse", &label, e.message).spanned(e.span, &source))?;
         let mut data_roots = Vec::new();
         crate::resolve_data_sources(&mut parsed, |literal| {
+            if let Origin::Archive { bundle, member } = &origin {
+                let path = bundle
+                    .resolve(member, literal)
+                    .map_err(|error| error.to_string())?;
+                let name = bundle.data_identity_for(&path);
+                self.data
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .entry(name.clone())
+                    .or_insert_with(|| DataSource::Archive {
+                        bundle: bundle.clone(),
+                        member: path,
+                    });
+                return Ok(name);
+            }
             let (base, root) = match &origin {
                 Origin::File {
                     location,
                     bundle_root,
                 } => (Some(location), bundle_root.as_deref()),
                 Origin::Inline { file, .. } => (file.as_ref(), None),
+                Origin::Archive { .. } => unreachable!(),
             };
-            if root.is_some()
-                && (Path::new(literal).is_absolute()
-                    || flatppl_core::text::uri_scheme(literal).is_some())
-            {
-                return Err("data sources inside a bundle must be relative paths".into());
+            if root.is_some() {
+                check_bundle_source(literal).map_err(|error| error.to_string())?;
             }
-            let location = base
-                .map_or_else(|| Location::parse(literal), |base| base.join(literal))
-                .normalized();
+            let location = match base {
+                Some(base) => join_source(base, literal, root.is_some()),
+                None => Location::parse(literal).normalized(),
+            };
             let name = location.display();
             if let (Some(root), Location::Local(path)) = (root, &location) {
                 check_bundle_path(path, Some(root), &name).map_err(|error| error.to_string())?;
@@ -758,14 +811,10 @@ impl Context {
         for i in 0..parsed.node_count() {
             if let Node::Call(c) = parsed.node(NodeId::from_usize(i))
                 && matches!(c.head, CallHead::Builtin(s) if parsed.resolve(s) == "load_module")
-                && let Some(&arg) = c.args.first()
+                && let Some(literal) = flatppl_infer::module_source(&parsed, c)
+                && !literals.iter().any(|value| value == literal)
             {
-                let id = resolve_ref(&parsed, arg);
-                if let Node::Lit(Scalar::Str(s)) = parsed.node(id)
-                    && !literals.contains(&s.to_string())
-                {
-                    literals.push(s.to_string());
-                }
+                literals.push(literal.to_owned());
             }
         }
         stack.push(identity.clone());
@@ -798,6 +847,12 @@ impl Context {
         literal: &str,
         stack: &mut Vec<String>,
     ) -> Result<Arc<Definition>, Diagnostic> {
+        if let Origin::Archive { bundle, member } = origin {
+            let path = bundle
+                .resolve(member, literal)
+                .map_err(|error| Diagnostic::new("resolve", literal, error))?;
+            return self.archive_member(bundle.clone(), &path, stack);
+        }
         let Origin::Inline { name, file } = origin else {
             let Origin::File {
                 location,
@@ -806,14 +861,14 @@ impl Context {
             else {
                 unreachable!()
             };
-            let root = if Path::new(literal).is_absolute()
-                || flatppl_core::text::uri_scheme(literal).is_some()
-            {
-                None
-            } else {
-                bundle_root.clone()
-            };
-            return self.file(location.join(literal), root, stack);
+            if bundle_root.is_some() {
+                check_bundle_source(literal)?;
+            }
+            return self.file(
+                join_source(location, literal, bundle_root.is_some()),
+                bundle_root.clone(),
+                stack,
+            );
         };
         let explicit_location =
             flatppl_core::text::uri_scheme(literal).is_some() || Path::new(literal).is_absolute();
@@ -854,7 +909,11 @@ impl Context {
                 let canonical = std::fs::canonicalize(target)
                     .map_err(|e| Diagnostic::new("resolve", literal, e))?;
                 let key = (canonical.to_string_lossy().into_owned(), root);
-                if file_identity(&key) != definition.identity {
+                let file_id = self
+                    .files
+                    .get(&key)
+                    .map_or_else(|| file_identity(&key), |value| value.identity.clone());
+                if file_id != definition.identity {
                     return Err(Diagnostic::new(
                         "resolve",
                         literal,
@@ -880,7 +939,10 @@ impl Context {
         mut bundle_root: Option<PathBuf>,
         stack: &mut Vec<String>,
     ) -> Result<Arc<Definition>, Diagnostic> {
-        location = location.normalized();
+        if bundle_root.is_none() {
+            location = location.normalized();
+        }
+        let archive = location.name().to_ascii_lowercase().ends_with(".zip");
         let requested = location.display();
         let request_key = (requested.clone(), bundle_root.clone());
         if let Some(definition) = self.files.get(&request_key) {
@@ -911,6 +973,19 @@ impl Context {
             return Ok(definition);
         }
         let identity = file_identity(&key);
+        if archive {
+            let mut cache = Cache::from_env();
+            cache.set_offline(true);
+            let bytes = Resolver::new(cache, &OfflineFetcher, &DenyAll)
+                .read(&location)
+                .map_err(|error| Diagnostic::new("resolve", &label, error))?;
+            let bundle = Bundle::open(label.clone(), bytes.into(), Limits::default())
+                .map_err(|error| Diagnostic::new("bundle", &label, error))?;
+            let definition = self.archive_member(bundle, "main.flatppl", stack)?;
+            self.files.insert(key, definition.clone());
+            self.files.insert(request_key, definition.clone());
+            return Ok(definition);
+        }
         let source = if let Some(source) = self.sources.get(&label) {
             source.clone()
         } else {
@@ -939,10 +1014,71 @@ impl Context {
         self.files.insert(request_key, definition.clone());
         Ok(definition)
     }
+
+    fn archive_member(
+        &mut self,
+        mut bundle: Bundle,
+        path: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<Arc<Definition>, Diagnostic> {
+        let fail = |error| Diagnostic::new("bundle", &bundle.identity_for(path), error);
+        let mut member = bundle.resolve("", path).map_err(fail)?;
+        if bundle.is_dir(&member).map_err(fail)? {
+            bundle = bundle.subdirectory(&member).map_err(fail)?;
+            member = bundle.entrypoint().to_owned();
+        } else if member.to_ascii_lowercase().ends_with(".zip") {
+            bundle = bundle.nested(&member).map_err(fail)?;
+            member = bundle.entrypoint().to_owned();
+        }
+        let label = bundle.identity_for(&member);
+        let key = (label.clone(), None);
+        if let Some(definition) = self.files.get(&key) {
+            return Ok(definition.clone());
+        }
+        let bytes = bundle
+            .read(&member)
+            .map_err(|error| Diagnostic::new("bundle", &label, error))?;
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|error| Diagnostic::new("parse", &label, error))?
+            .to_owned();
+        let definition = self.definition(
+            label.clone(),
+            label,
+            source,
+            Origin::Archive { bundle, member },
+            stack,
+        )?;
+        self.files.insert(key, definition.clone());
+        Ok(definition)
+    }
 }
 
 fn file_identity(key: &(String, Option<PathBuf>)) -> String {
     format!("file:{key:?}")
+}
+
+fn check_bundle_source(source: &str) -> Result<(), Diagnostic> {
+    if Path::new(source).is_absolute()
+        || flatppl_core::text::uri_scheme(source).is_some()
+        || source.contains('\\')
+    {
+        Err(Diagnostic::new(
+            "resolve",
+            source,
+            "bundle sources must be relative paths using `/`",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn join_source(base: &Location, source: &str, contained: bool) -> Location {
+    if contained && let Location::Local(path) = base {
+        // Physical canonicalization must follow links before processing `..`.
+        Location::Local(path.parent().unwrap_or(Path::new("")).join(source))
+    } else {
+        base.join(source).normalized()
+    }
 }
 
 fn check_bundle_path(path: &Path, root: Option<&Path>, label: &str) -> Result<(), Diagnostic> {

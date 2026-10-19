@@ -8,6 +8,13 @@
 //! Houses the salsa database that backs incremental analysis. Tasks downstream
 //! add `#[salsa::tracked]` queries (parse, analyze) and tracked structs over
 //! the [`db::Database`] established here.
+//!
+//! Archive-aware clients send `flatppl/bundleSources` with `sources[id]` text,
+//! `resolutions[id].modules[source]` target identities, and `uris[id]` document
+//! URIs. The client validates archive paths and obtains remote trust approval.
+//! Data entries stay outside `sources`. The server performs no archive I/O.
+//! Members with `flatppl-zip:` identities remain read-only and mounted after
+//! document close. New graph notifications update their text and module edges.
 
 pub mod capabilities;
 pub mod db;

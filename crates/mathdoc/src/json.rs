@@ -34,6 +34,9 @@
 //! load the text; transitive directives resolve against their own importer.
 //! It may also contain `load_data` payloads. Only `load_module` targets are
 //! parsed as FlatPPL; data shapes come from their declared value sets.
+//! Optional `resolutions[importer].modules[source]` edges select explicit
+//! module identities, including archive entrypoints. The host may also send
+//! `files` byte payloads and `resolutions[importer].data`; Math leaves both opaque.
 //! `order` is the rows in **source order** (`NOTATION.md`: no topological
 //! sort). `names` lists every binding a row binds: a decomposition `a, b ~ M`
 //! is one row named `a` with `names: ["a", "b"]`, and `order` lists row names
@@ -64,10 +67,25 @@ struct Request {
     path: String,
     #[serde(default)]
     bundle: HashMap<String, String>,
+    #[serde(default)]
+    resolutions: HashMap<String, Resolutions>,
     #[serde(default = "default_formats")]
     formats: Vec<String>,
     #[serde(default)]
     document: bool,
+}
+
+#[derive(Deserialize)]
+struct Resolutions {
+    #[serde(default)]
+    modules: HashMap<String, String>,
+}
+
+fn module_edges(resolutions: HashMap<String, Resolutions>) -> render::ImportResolutions {
+    resolutions
+        .into_iter()
+        .map(|(path, edges)| (path, edges.modules))
+        .collect()
 }
 
 fn default_path() -> String {
@@ -84,6 +102,8 @@ struct ExportRequest {
     path: String,
     #[serde(default)]
     bundle: HashMap<String, String>,
+    #[serde(default)]
+    resolutions: HashMap<String, Resolutions>,
     document: String,
 }
 
@@ -176,8 +196,12 @@ struct DiagnosticJson {
 /// request or an unparsable primary module is an `Err` with the message.
 pub fn render_math(input: &str) -> Result<String, String> {
     let req: Request = serde_json::from_str(input).map_err(|e| format!("request: {e}"))?;
-    let (module, rendering) =
-        render::render_source_with_module(&req.source, &req.path, &req.bundle)?;
+    let (module, rendering) = render::render_source_with_module(
+        &req.source,
+        &req.path,
+        &req.bundle,
+        &module_edges(req.resolutions),
+    )?;
     let document = req.document.then(|| DocumentJson {
         html: document::fragment(&module, &rendering, title_of(&req.path)).html,
         css: document::CSS,
@@ -203,8 +227,12 @@ pub fn export_math(input: &str) -> Result<String, String> {
             req.document
         )
     })?;
-    let (module, rendering) =
-        render::render_source_with_module(&req.source, &req.path, &req.bundle)?;
+    let (module, rendering) = render::render_source_with_module(
+        &req.source,
+        &req.path,
+        &req.bundle,
+        &module_edges(req.resolutions),
+    )?;
     Ok(format.render(&module, &rendering, title_of(&req.path)))
 }
 
@@ -376,8 +404,13 @@ mod tests {
         let input = serde_json::json!({ "source": source, "document": true });
         let out: serde_json::Value =
             serde_json::from_str(&render_math(&input.to_string()).unwrap()).unwrap();
-        let (module, rendering) =
-            render::render_source_with_module(source, "model.flatppl", &HashMap::new()).unwrap();
+        let (module, rendering) = render::render_source_with_module(
+            source,
+            "model.flatppl",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         let page = document::html(&module, &rendering, "model");
         let article = out["document"]["html"].as_str().unwrap();
         assert!(page.contains(article));
@@ -404,8 +437,13 @@ mod tests {
     #[test]
     fn export_math_writes_the_document_the_cli_writes() {
         let source = "% $\\alpha$\nx ~ Normal(0, 2)\ndata = [1,2,3,4,5,6,7,8,9,10,11,12,13]";
-        let (module, rendering) =
-            render::render_source_with_module(source, "dir/m.flatppl", &HashMap::new()).unwrap();
+        let (module, rendering) = render::render_source_with_module(
+            source,
+            "dir/m.flatppl",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         for (ext, format) in [
             ("html", DocumentFormat::Html),
             ("md", DocumentFormat::Markdown),
@@ -458,5 +496,43 @@ mod tests {
             request["document"] = format.into();
             assert!(!export_math(&request.to_string()).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn archive_edges_keep_modules_distinct_and_data_opaque() {
+        let mut request = serde_json::json!({
+            "source": "a = load_module(\"a.zip\")\nb = load_module(\"b.zip\")\nx = a.values .+ b.values",
+            "path": "root.flatppl",
+            "bundle": {
+                "flatppl-zip:a.zip!/main.flatppl": "path = \"helper.flatppl\"\nh = load_module(path)\nvalues = h.values",
+                "flatppl-zip:a.zip!/helper.flatppl": "values = [1.0, 2.0]",
+                "flatppl-zip:b.zip!/main.flatppl": "values = [3.0, 4.0]"
+            },
+            "resolutions": {
+                "root.flatppl": {"modules": {
+                    "a.zip": "flatppl-zip:a.zip!/main.flatppl",
+                    "b.zip": "flatppl-zip:b.zip!/main.flatppl"
+                }},
+                "flatppl-zip:a.zip!/main.flatppl": {"modules": {
+                    "helper.flatppl": "flatppl-zip:a.zip!/helper.flatppl"
+                }}
+            },
+            "files": {"binary.dat": [0, 255, 123, 125]},
+            "formats": ["tex"]
+        });
+        let actual: serde_json::Value =
+            serde_json::from_str(&render_math(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(actual["diagnostics"], serde_json::json!([]));
+        assert_eq!(actual["order"], serde_json::json!(["a", "b", "x"]));
+        request["document"] = "html".into();
+        let html = export_math(&request.to_string()).unwrap();
+        assert!(html.contains("data-flatppl-binding=\"x\""));
+
+        // Type inference must reach the second archive rather than reuse the first main.
+        request["bundle"]["flatppl-zip:b.zip!/main.flatppl"] = "other = [3.0, 4.0]".into();
+        request["document"] = false.into();
+        let changed: serde_json::Value =
+            serde_json::from_str(&render_math(&request.to_string()).unwrap()).unwrap();
+        assert!(!changed["diagnostics"].as_array().unwrap().is_empty());
     }
 }

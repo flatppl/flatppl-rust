@@ -10,11 +10,22 @@
 //! field returns a borrow (`&String`) instead of a clone, and `#[salsa::input(debug)]`
 //! opts the generated id into `Debug` (no longer derived by default).
 
+/// Resolved module edges and document URI supplied by the archive-aware client.
+/// Archive identities stay opaque: the client owns ZIP containment and nesting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BundleSource {
+    pub uri: String,
+    pub modules: std::collections::HashMap<String, String>,
+}
+
 #[salsa::input(debug)]
 pub struct SourceFile {
     pub path: String,
     #[returns(ref)]
     pub text: String,
+    #[default]
+    #[returns(ref)]
+    pub bundle: Option<BundleSource>,
 }
 
 /// The set of workspace source files cross-file `load_module` resolution may

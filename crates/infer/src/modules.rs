@@ -15,6 +15,23 @@ use flatppl_core::{
 use crate::Diagnostic;
 use crate::catalogue::CatalogueSet;
 
+/// Read a fixed module source, following local aliases to a string literal.
+/// The distinguished source input is positional; named inputs are substitutions.
+pub fn module_source<'m>(module: &'m Module, call: &flatppl_core::Call) -> Option<&'m str> {
+    let mut node = *call.args.first()?;
+    // Each step follows one local binding. A longer chain repeats a binding.
+    for _ in 0..=module.binding_count() {
+        match module.node(node) {
+            Node::Lit(Scalar::Str(value)) => return Some(value),
+            Node::Ref(reference) if reference.ns == flatppl_core::RefNs::SelfMod => {
+                node = module.binding(module.binding_by_name(reference.name)?).rhs;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Does `source` name an `http`/`https` URL (case-insensitive)? Used only to
 /// phrase an unresolved-dependency diagnostic: a remote source absent from the
 /// bundle hasn't been *fetched*, which is different from a local file that isn't
@@ -503,10 +520,9 @@ impl<'b> InferSession<'b> {
             return Err(format!("`{alias_name}` is not a module"));
         }
         let standard = head_name == "standard_module";
-        let path = match call.args.first().map(|&a| importer.node(a)) {
-            Some(Node::Lit(Scalar::Str(s))) => s.to_string(),
-            _ => return Err(format!("`{alias_name}` load is missing a path string")),
-        };
+        let path = module_source(importer, call)
+            .ok_or_else(|| format!("`{alias_name}` load is missing a path string"))?
+            .to_owned();
         // `standard_module(name, version)` carries the requested version as the
         // second positional arg; `load_module(path)` has no version.
         let version = match call.args.get(1).map(|&a| importer.node(a)) {
