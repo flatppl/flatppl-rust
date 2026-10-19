@@ -166,3 +166,74 @@ fn directory_links_resolve_before_parent_traversal() -> Result<(), Box<dyn std::
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+#[test]
+fn context_export_preserves_aliases_and_only_its_own_registry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let model = context.load_bundle("original.zip", PORTABLE)?;
+    context.register("model.flatppl", &model)?;
+    context.register("alias.flatppl", &model)?;
+    let extra = context.parse("offset = external(reals)\noutputs = offset + 1", None, None)?;
+    let extra = context.set(
+        &extra,
+        &[("offset".into(), flatppl_host::Constant::Real(4.0))],
+    )?;
+    context.register("extra.flatppl", &extra)?;
+    let mut other = Context::default();
+    let unrelated = other.parse("outputs = 100", None, None)?;
+    other.register("other.flatppl", &unrelated)?;
+
+    let mut restored = Context::default();
+    let loaded = restored.load_bundle("moved.zip", &context.pack(&model)?)?;
+    assert_eq!(model.fingerprint()?, loaded.fingerprint()?);
+    assert_eq!(context.fingerprint()?, restored.fingerprint()?);
+    assert!(!restored.contains("other.flatppl"));
+    let via_alias = restored.parse(
+        "point = elementof(reals)\na = load_module(\"alias.flatppl\", theta = point)\ne = load_module(\"extra.flatppl\")\ninputs = point\noutputs = a.outputs + e.outputs",
+        None, None,
+    )?;
+    via_alias.compile(&EmitOptions::default())?;
+    let previous = restored.fingerprint()?;
+    restored.register("added.flatppl", &loaded)?;
+    assert_ne!(previous, restored.fingerprint()?);
+    Ok(())
+}
+
+#[test]
+fn context_restore_is_atomic_on_conflicts_including_cached_loads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = directory("context-conflict");
+    let bytes = archive(&[
+        ("main.flatppl", b"outputs = 1"),
+        ("fresh.flatppl", b"x = 2"),
+        ("taken.flatppl", b"x = 3"),
+        (
+            ".flatppl-context.json",
+            br#"{"fresh.flatppl":"fresh.flatppl","taken.flatppl":"taken.flatppl"}"#,
+        ),
+    ]);
+    let path = dir.join("model.zip");
+    std::fs::write(&path, bytes)?;
+    let mut context = Context::default();
+    let existing = context.parse("x = 4", None, None)?;
+    context.register("taken.flatppl", &existing)?;
+    let before = context.fingerprint()?;
+    for _ in 0..2 {
+        assert!(context.load(path.to_str().unwrap()).is_err());
+        assert!(!context.contains("fresh.flatppl"));
+        assert_eq!(before, context.fingerprint()?);
+    }
+    let outside = archive(&[
+        ("main.flatppl", b"outputs = 1"),
+        (
+            ".flatppl-context.json",
+            br#"{"escape.flatppl":"../outside.flatppl"}"#,
+        ),
+    ]);
+    std::fs::write(dir.join("outside.flatppl"), "x = 100")?;
+    std::fs::write(&path, outside)?;
+    assert!(Context::default().load(path.to_str().unwrap()).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}

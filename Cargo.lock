@@ -562,6 +562,7 @@ dependencies = [
  "flatppl-core",
  "flatppl-syntax",
  "serde_json",
+ "sha2",
  "zip",
 ]
 
@@ -663,6 +664,7 @@ dependencies = [
  "flatppl-syntax",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

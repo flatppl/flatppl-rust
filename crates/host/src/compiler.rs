@@ -4,7 +4,7 @@ mod pack;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use flatppl_bundle::{Bundle, Limits};
 use flatppl_core::{Binding, CallHead, Idx, Module, Node, NodeId, RefNs};
@@ -103,6 +103,7 @@ struct Definition {
     parsed: Arc<Module>,
     imports: Vec<(String, Arc<Definition>)>,
     data_roots: Vec<(String, PathBuf)>,
+    fingerprint: OnceLock<[u8; 32]>,
 }
 
 enum DataSource {
@@ -304,7 +305,17 @@ impl LoadedModule {
     }
 
     fn read_data(&self, source: &str) -> Result<Vec<u8>, String> {
-        let mut data = self.data.lock().map_err(|error| error.to_string())?;
+        self.definition.read_data(&self.data, source)
+    }
+}
+
+impl Definition {
+    fn read_data(
+        &self,
+        data: &Mutex<HashMap<String, DataSource>>,
+        source: &str,
+    ) -> Result<Vec<u8>, String> {
+        let mut data = data.lock().map_err(|error| error.to_string())?;
         if let Some(loaded) = data.get(source) {
             return match loaded {
                 DataSource::File { canonical, bytes } => {
@@ -347,7 +358,7 @@ impl LoadedModule {
     }
 
     fn check_data_path(&self, source: &str, canonical: &Path) -> Result<(), String> {
-        let mut pending = vec![&self.definition];
+        let mut pending = vec![self];
         let mut seen = HashSet::new();
         while let Some(definition) = pending.pop() {
             if !seen.insert(&definition.identity) {
@@ -359,7 +370,7 @@ impl LoadedModule {
                         .map_err(|error| error.to_string())?;
                 }
             }
-            pending.extend(definition.imports.iter().map(|(_, child)| child));
+            pending.extend(definition.imports.iter().map(|(_, child)| child.as_ref()));
         }
         Ok(())
     }
@@ -374,6 +385,7 @@ pub struct Context {
     sources: HashMap<String, String>,
     next_inline: usize,
     data: Arc<Mutex<HashMap<String, DataSource>>>,
+    fingerprint: OnceLock<[u8; 32]>,
 }
 
 impl Context {
@@ -582,6 +594,7 @@ impl Context {
             parsed: Arc::new(parsed),
             imports: module.definition.imports.clone(),
             data_roots: module.definition.data_roots.clone(),
+            fingerprint: OnceLock::new(),
         }))
     }
 
@@ -626,6 +639,7 @@ impl Context {
             parsed: Arc::new(parsed),
             imports: module.definition.imports.clone(),
             data_roots: module.definition.data_roots.clone(),
+            fingerprint: OnceLock::new(),
         }))
     }
 
@@ -676,7 +690,9 @@ impl Context {
     pub fn load(&mut self, path: &str) -> Result<Arc<LoadedModule>, Diagnostic> {
         let location = absolute_location(path)?;
         let definition = self.file(location, None, &mut Vec::new())?;
-        self.instantiate(definition)
+        let module = self.instantiate(definition.clone())?;
+        self.restore_registry(&definition)?;
+        Ok(module)
     }
 
     /// Load an immutable ZIP snapshot without extracting files or reading the host filesystem.
@@ -690,7 +706,9 @@ impl Context {
         let bundle = Bundle::open(identity, bytes.into(), Limits::default())
             .map_err(|error| Diagnostic::new("bundle", name, error))?;
         let definition = self.archive_member(bundle, "main.flatppl", &mut Vec::new())?;
-        self.instantiate(definition)
+        let module = self.instantiate(definition.clone())?;
+        self.restore_registry(&definition)?;
+        Ok(module)
     }
 
     pub fn register(&mut self, name: &str, module: &LoadedModule) -> Result<(), Diagnostic> {
@@ -710,7 +728,13 @@ impl Context {
             ));
         }
         self.registry.insert(name, module.definition.clone());
+        self.fingerprint.take();
         Ok(())
+    }
+
+    /// Whether a name is already registered in this context.
+    pub fn contains(&self, name: &str) -> bool {
+        self.registry.contains_key(name)
     }
 
     fn instantiate(&self, definition: Arc<Definition>) -> Result<Arc<LoadedModule>, Diagnostic> {
@@ -838,6 +862,7 @@ impl Context {
             parsed: Arc::new(parsed),
             imports: imports?,
             data_roots,
+            fingerprint: OnceLock::new(),
         }))
     }
 

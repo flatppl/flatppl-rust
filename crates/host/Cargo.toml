@@ -20,3 +20,4 @@ flatppl-formula = { path = "../formula", features = ["arrow"] }
 flatppl-mathdoc = { path = "../mathdoc", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
