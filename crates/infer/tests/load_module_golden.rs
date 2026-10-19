@@ -13,6 +13,69 @@ use flatppl_core::{Mass, ScalarType, Type};
 use flatppl_infer::{Level, ModuleBundle, Severity, infer_module};
 
 #[test]
+fn named_source_is_never_a_module_locator() {
+    for head in ["load_module", "standard_module"] {
+        let mut module =
+            flatppl_syntax::parse(&format!("m = {head}(source = \"dep.flatppl\")")).unwrap();
+        let binding = module.bindings().next().unwrap().1.rhs;
+        let flatppl_core::Node::Call(mut call) = module.node(binding).clone() else {
+            panic!("expected module call");
+        };
+        assert!(flatppl_infer::module_source(&module, &call).is_none());
+        // Hosts may also receive raw IR with a malformed keyword kind.
+        call.named[0].kind = flatppl_core::NamedKind::Kwarg;
+        assert!(flatppl_infer::module_source(&module, &call).is_none());
+        assert!(
+            flatppl_infer::infer(&mut module)
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+    }
+}
+
+#[test]
+fn fixed_source_aliases_keep_substitution_validation() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "dep.flatppl",
+        std::sync::Arc::new(
+            flatppl_syntax::parse("source = external(reals)\nout = source + 1.0").unwrap(),
+        ),
+    );
+    for value in ["2.0", "elementof(reals)"] {
+        let prelude = format!("file = \"dep.flatppl\"\npath = file\narg = {value}\n");
+        let mut direct = flatppl_syntax::parse(&format!(
+            "{prelude}m = load_module(\"dep.flatppl\", source = arg)\nvalue = m.out"
+        ))
+        .unwrap();
+        let mut aliased = flatppl_syntax::parse(&format!(
+            "{prelude}m = load_module(path, source = arg)\nvalue = m.out"
+        ))
+        .unwrap();
+        let errors = |module: &mut flatppl_core::Module| {
+            infer_module(module, &bundle, Level::Shape)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Error)
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+        let direct_errors = errors(&mut direct);
+        assert_eq!(errors(&mut aliased), direct_errors);
+        assert_eq!(direct_errors.is_empty(), value == "2.0");
+        let result = aliased
+            .bindings()
+            .find(|(_, b)| aliased.resolve(b.name) == "value")
+            .unwrap()
+            .1
+            .rhs;
+        assert_eq!(
+            aliased.type_of(result),
+            Some(&Type::Scalar(ScalarType::Real))
+        );
+    }
+}
+
+#[test]
 fn imported_measure_arguments_refuse_until_actual_substitution_is_supported() {
     let mut bundle = ModuleBundle::new();
     bundle.insert(

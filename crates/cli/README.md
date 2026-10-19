@@ -10,8 +10,17 @@ flatppl convert model.flatpir model.flatppl     # FlatPIR → FlatPPL (--syntax 
 flatppl convert --from hs3  model.json m.flatppl  # import native HS3
 flatppl convert --from pyhf ws.json    m.flatppl  # import a pyhf workspace
 flatppl infer model.flatppl typed.flatpir       # type/phase-annotated FlatPIR (--level phase|type|…|shape)
+flatppl pack model.flatppl model.flatppl.zip    # include imports and data
+flatppl unpack model.flatppl.zip working-copy  # extract into a new directory
 flatppl completions zsh > ~/.zfunc/_flatppl     # shell completions (bash|zsh|fish|powershell|elvish)
 ```
+
+Model inputs also accept directory and ZIP bundles containing `main.flatppl`.
+Imports and data remain inside the bundle, including nested archives.
+`pack` reads fixed source paths through the parser and includes binary data unchanged.
+Remote dependencies must already be cached with `flatppl prepare`.
+Both export and extraction require new destination paths.
+Extract a working copy before formatting or editing archive members.
 
 Formats are inferred from file extensions. Generated files carry a single minimal banner comment
 (`AUTOMATICALLY GENERATED - do not edit`) - deliberately no timestamp, user, host, platform, or

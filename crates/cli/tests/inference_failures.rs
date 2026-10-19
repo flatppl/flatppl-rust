@@ -132,7 +132,7 @@ fn remote_module_inference_errors_redact_url_userinfo() {
 }
 
 #[test]
-fn a_directory_is_refused_as_an_inference_input() {
+fn directory_inputs_require_a_bundle_entrypoint() {
     let dir = Scratch::new("infer-directory-input");
     let input = dir.path("source.flatppl");
     let output = dir.path("out.flatpir");
@@ -147,8 +147,20 @@ fn a_directory_is_refused_as_an_inference_input() {
     let stderr = String::from_utf8_lossy(&result.stderr);
 
     assert_eq!(result.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("not a regular file"), "{stderr}");
     assert!(!output.exists(), "invalid output was published");
+    fs::write(input.join("main.flatppl"), "x = 1\n").unwrap();
+    let valid = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("infer")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(fs::read_to_string(output).unwrap().contains("x"));
 }
 
 #[cfg(unix)]

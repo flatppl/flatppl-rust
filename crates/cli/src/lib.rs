@@ -56,6 +56,9 @@ pub use provenance::banner;
 #[cfg(any(feature = "infer", feature = "prepare"))]
 pub mod resolve;
 
+#[cfg(any(feature = "infer", feature = "prepare"))]
+pub mod bundle;
+
 // ── clap mirrors ───────────────────────────────────────────────────────────────
 
 /// CLI mirror of [`flatppl_syntax::Syntax`].
@@ -513,6 +516,68 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A local entrypoint for format and lint operations.
+#[cfg(feature = "fmtlint")]
+struct SourceInput {
+    path: std::path::PathBuf,
+    format: Format,
+    source: String,
+    archive: bool,
+}
+
+/// Read one local entrypoint without adding cache/network dependencies to flatppl-fmt.
+#[cfg(feature = "fmtlint")]
+fn read_source_input(file: &Path) -> Result<SourceInput, Failure> {
+    let mut path = file.to_path_buf();
+    if path.is_dir() {
+        let root = path
+            .canonicalize()
+            .map_err(|e| Failure::Plain(e.to_string()))?;
+        path = root
+            .join("main.flatppl")
+            .canonicalize()
+            .map_err(|e| Failure::Plain(e.to_string()))?;
+        if !path.starts_with(root) {
+            return Err(Failure::Plain("bundle entrypoint escapes its root".into()));
+        }
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        require_regular_file(&path).map_err(|e| Failure::Plain(e.to_string()))?;
+        let bytes = std::fs::read(&path).map_err(|e| Failure::Plain(e.to_string()))?;
+        let bundle = flatppl_bundle::Bundle::open(
+            path.display().to_string(),
+            bytes.into(),
+            Default::default(),
+        )
+        .map_err(|e| Failure::Plain(e.to_string()))?;
+        let source = String::from_utf8(
+            bundle
+                .read(bundle.entrypoint())
+                .map_err(|e| Failure::Plain(e.to_string()))?
+                .to_vec(),
+        )
+        .map_err(|e| Failure::Plain(e.to_string()))?;
+        return Ok(SourceInput {
+            path,
+            format: Format::FlatPpl,
+            source,
+            archive: true,
+        });
+    }
+    let format = Format::from_path(&path)?;
+    let source =
+        read_regular_utf8(&path).map_err(|e| format!("reading `{}`: {e}", terminal_path(&path)))?;
+    Ok(SourceInput {
+        path,
+        format,
+        source,
+        archive: false,
+    })
+}
+
 /// `flatppl fmt` logic — canonicalize FlatPPL in place / on stdin, or `--check`.
 #[cfg(feature = "fmtlint")]
 pub fn run_fmt(
@@ -550,7 +615,15 @@ pub fn run_fmt(
 
     let mut dirty: Vec<std::path::PathBuf> = Vec::new();
     for file in files {
-        match Format::from_path(file)? {
+        let input = read_source_input(file)?;
+        if input.archive && !check {
+            return Err(Failure::Plain(
+                "extract a working copy with `flatppl unpack` before formatting a ZIP bundle"
+                    .into(),
+            ));
+        }
+        let file = &input.path;
+        match input.format {
             Format::FlatPpl => {}
             Format::FlatPir | Format::FlatPirJson => {
                 return Err(Failure::Plain(format!(
@@ -565,8 +638,7 @@ pub fn run_fmt(
                 )));
             }
         }
-        let source = read_regular_utf8(file)
-            .map_err(|e| format!("reading `{}`: {e}", terminal_path(file)))?;
+        let source = input.source;
         let formatted =
             format_text(&source, syntax).map_err(|(message, line, span)| Failure::Diagnostic {
                 path: file.clone(),
@@ -630,9 +702,10 @@ pub fn run_lint(
 
     let mut any_deny = false;
     for file in files {
-        let from = Format::from_path(file)?;
-        let source = read_regular_utf8(file)
-            .map_err(|e| format!("reading `{}`: {e}", terminal_path(file)))?;
+        let input = read_source_input(file)?;
+        let file = &input.path;
+        let from = input.format;
+        let source = input.source;
 
         let mut cfg = base.clone();
         match inline_allows(&source) {

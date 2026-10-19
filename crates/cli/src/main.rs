@@ -73,6 +73,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write a portable ZIP containing a FlatPPL model, its imports, and its data.
+    /// Remote sources must already be cached with `flatppl prepare`.
+    #[cfg(any(feature = "infer", feature = "prepare"))]
+    Pack {
+        input: PathBuf,
+        /// New archive path. Existing files are never overwritten.
+        output: PathBuf,
+    },
+    /// Extract a bundle into a new directory. Existing directories are never reused.
+    #[cfg(any(feature = "infer", feature = "prepare"))]
+    Unpack {
+        input: PathBuf,
+        destination: PathBuf,
+    },
     /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding, or
     /// render a model as mathematics (`.html`, `.md`, `.tex`, `.typ`).
     ///
@@ -351,6 +365,10 @@ fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        #[cfg(any(feature = "infer", feature = "prepare"))]
+        Command::Pack { input, output } => flatppl_cli::bundle::pack(&input, &output),
+        #[cfg(any(feature = "infer", feature = "prepare"))]
+        Command::Unpack { input, destination } => flatppl_cli::bundle::unpack(&input, &destination),
         #[cfg(feature = "convert")]
         Command::Convert {
             input,
@@ -471,6 +489,8 @@ fn convert(
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
+    let resolver = CliResolver::cache_only();
+    let mut in_loc = Location::Local(input.to_path_buf());
     // `--from auto` keys off the input name: `*.hs3.json` / `*.pyhf.json` select
     // the importers; an explicit `--from` overrides.
     let from_format = resolve_from_format(from_format, input);
@@ -581,17 +601,21 @@ fn convert(
         // BEFORE reading the file so an unknown one is reported even if the file
         // is missing; for a bare `.json`, hint at the importers.
         FromFormat::Auto => {
-            let from = Format::from_path(input).map_err(|mut e| {
+            in_loc = resolver.model_location(&in_loc)?;
+            let from = resolver.model_format(&in_loc).map_err(|e| {
+                let mut e = match e {
+                    Failure::Plain(message) => message,
+                    other => return other,
+                };
                 if input.extension().and_then(|x| x.to_str()) == Some("json") {
                     e.push_str(
                         "; for an HS3 or pyhf JSON document pass `--from hs3` / `--from pyhf` \
                          (or name it `*.hs3.json` / `*.pyhf.json`)",
                     );
                 }
-                e
+                Failure::Plain(e)
             })?;
-            let source = flatppl_cli::read_regular_utf8(input)
-                .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
+            let source = resolver.read_string(&in_loc)?;
             match flatppl_cli::read_module(from, &source) {
                 Ok(module) => module,
                 Err((message, line, span)) => {
@@ -612,7 +636,7 @@ fn convert(
     // `infer` front end rather than the plain printer.
     #[cfg(feature = "mathdoc")]
     if to.is_document() {
-        return convert_document(input, output, to, &mut module, no_header);
+        return convert_document(&in_loc, output, to, &mut module, no_header, &resolver);
     }
     #[cfg(not(feature = "mathdoc"))]
     if to.is_document() {
@@ -710,15 +734,14 @@ fn read_formula_table(path: &Path) -> Result<flatppl_formula::Table, Failure> {
 /// still renders, with the typed features degraded where inference failed.
 #[cfg(all(feature = "convert", feature = "mathdoc"))]
 fn convert_document(
-    input: &Path,
+    in_loc: &Location,
     output: &Path,
     to: Format,
     module: &mut flatppl_core::Module,
     no_header: bool,
+    resolver: &CliResolver,
 ) -> Result<(), Failure> {
-    let resolver = CliResolver::cache_only();
-    let in_loc = Location::Local(input.to_path_buf());
-    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(module, &in_loc, &resolver)?;
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(module, in_loc, resolver)?;
     let diags = flatppl_infer::infer_module(module, &bundle, flatppl_infer::Level::Shape);
     for d in &diags {
         let level = match d.severity {
@@ -732,12 +755,13 @@ fn convert_document(
     }
     // FlatPPL input: the page quotes the source as written where a row falls
     // back to source text. Other inputs have no FlatPPL text to quote.
-    let source = matches!(Format::from_path(input), Ok(Format::FlatPpl))
-        .then(|| flatppl_cli::read_regular_utf8(input).ok())
+    let source = matches!(resolver.model_format(in_loc), Ok(Format::FlatPpl))
+        .then(|| resolver.read_string(in_loc).ok())
         .flatten();
     let mut rendering = flatppl_mathdoc::render_with_source(module, source.as_deref());
     flatppl_mathdoc::render::attach_inference_diagnostics(&mut rendering, module, &diags);
-    let title = input
+    let location = in_loc.display();
+    let title = Path::new(&location)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("model");
@@ -839,7 +863,9 @@ fn infer_cmd(
     level: flatppl_infer::Level,
     no_header: bool,
 ) -> Result<(), Failure> {
-    let from = Format::from_path(input)?;
+    let resolver = CliResolver::cache_only();
+    let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
+    let from = resolver.model_format(&in_loc)?;
     if !matches!(Format::from_path(output)?, Format::FlatPir) {
         return Err(Failure::Plain(format!(
             "`infer` writes annotated FlatPIR; `{}` must have a `.flatpir` extension \
@@ -849,8 +875,7 @@ fn infer_cmd(
     }
     // The input is a local file; cross-module deps resolve from the local cache
     // only (run `flatppl prepare` first for remote deps).
-    let source = flatppl_cli::read_regular_utf8(input)
-        .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
+    let source = resolver.read_string(&in_loc)?;
     let mut module = match flatppl_cli::read_module(from, &source) {
         Ok(module) => module,
         Err((message, line, span)) => {
@@ -870,8 +895,6 @@ fn infer_cmd(
     // cache-only resolver never touches the network; a remote dep that isn't
     // cached errors with a "run `flatppl prepare`" hint. `load_data` sources are
     // discovered but NOT resolved — inference never reads data.
-    let resolver = CliResolver::cache_only();
-    let in_loc = Location::Local(input.to_path_buf());
     let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
     let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
     let mut errors = 0u32;
@@ -946,9 +969,10 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
 #[cfg(any(feature = "determinize", feature = "stablehlo"))]
 fn load_and_infer(
     input: &Path,
+    resolver: &CliResolver,
 ) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
-    let source = flatppl_cli::read_regular_utf8(input)
-        .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
+    let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
+    let source = resolver.read_string(&in_loc)?;
     let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
         Ok(m) => m,
         Err((message, line, span)) => {
@@ -965,9 +989,7 @@ fn load_and_infer(
     // Assemble the cross-module bundle: resolve the model's transitive
     // `load_module` dependencies from the local cache (+ local files) so the
     // determiniser can graft in cross-module measure refs, same as `infer`.
-    let resolver = CliResolver::cache_only();
-    let in_loc = Location::Local(input.to_path_buf());
-    let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, &resolver)?;
+    let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, resolver)?;
     let (diags, bundle) =
         flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
     let mut errors = 0u32;
@@ -1069,7 +1091,8 @@ fn determinize_cmd(
     keep: &[String],
     emit: EmitForm,
 ) -> Result<(), Failure> {
-    let (mut module, bundle, source) = load_and_infer(input)?;
+    let resolver = CliResolver::cache_only();
+    let (mut module, bundle, source) = load_and_infer(input, &resolver)?;
     let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
     let roots = if syms.is_empty() {
         None
@@ -1078,7 +1101,7 @@ fn determinize_cmd(
     };
     let mut lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    load_fixed_data(&mut lowered)?;
+    load_fixed_data(&mut lowered, &resolver)?;
     flatppl_determinizer::prepare_serialization(&mut lowered, roots);
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
@@ -1110,7 +1133,8 @@ fn stablehlo_cmd(
     opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
-    let (module, bundle, source) = load_and_infer(input)?;
+    let resolver = CliResolver::cache_only();
+    let (module, bundle, source) = load_and_infer(input, &resolver)?;
 
     let mode = match mode {
         "logdensity" => flatppl_stablehlo::Mode::LogDensity,
@@ -1159,7 +1183,7 @@ fn stablehlo_cmd(
         &opts.lowering_options(),
     )
     .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    load_fixed_data(&mut lowered)?;
+    load_fixed_data(&mut lowered, &resolver)?;
     let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
@@ -1175,19 +1199,19 @@ fn stablehlo_cmd(
 }
 
 #[cfg(any(feature = "determinize", feature = "stablehlo"))]
-fn load_fixed_data(module: &mut flatppl_core::Module) -> Result<(), Failure> {
-    let resolver = CliResolver::cache_only();
+fn load_fixed_data(
+    module: &mut flatppl_core::Module,
+    resolver: &CliResolver,
+) -> Result<(), Failure> {
     flatppl_host::load_fixed_data(module, |source| {
-        let path =
-            resolver
-                .resolve_path(&Location::parse(source))
-                .map_err(|error| match error {
-                    Failure::Plain(message)
-                    | Failure::Refuse(message)
-                    | Failure::Usage(message)
-                    | Failure::Diagnostic { message, .. } => message,
-                })?;
-        fs::read(path).map_err(|error| error.to_string())
+        resolver
+            .read_bytes(&Location::parse(source))
+            .map_err(|error| match error {
+                Failure::Plain(message)
+                | Failure::Refuse(message)
+                | Failure::Usage(message)
+                | Failure::Diagnostic { message, .. } => message,
+            })
     })
     .map_err(|error| Failure::Refuse(flatppl_cli::resolve::terminal_message(&error)))
 }

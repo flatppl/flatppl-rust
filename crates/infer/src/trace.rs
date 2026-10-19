@@ -996,13 +996,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         let load_check: Option<(String, Vec<(Symbol, NodeId)>)> =
             if let CallHead::Builtin(head) = call.head {
                 if matches!(self.module.resolve(head), "load_module" | "standard_module") {
-                    let path = call.args.first().and_then(|&a| {
-                        if let Node::Lit(Scalar::Str(s)) = self.module.node(a) {
-                            Some(s.to_string())
-                        } else {
-                            None
-                        }
-                    });
+                    let path = crate::module_source(self.module, call).map(str::to_owned);
                     let assigns: Vec<(Symbol, NodeId)> = call
                         .named
                         .iter()

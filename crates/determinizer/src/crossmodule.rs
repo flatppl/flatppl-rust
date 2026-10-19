@@ -87,8 +87,8 @@ fn resolve_member<'a>(
             _ => return None,
         }
     };
-    let literal = string_literal(src, *call.args.first()?)?;
-    let path = bundle.identity_of(importer, &literal)?.to_string();
+    let literal = flatppl_infer::module_source(src, call)?;
+    let path = bundle.identity_of(importer, literal)?.to_string();
     let sub = bundle.get_by_id(&path)?;
     let member = sub
         .bindings()

@@ -358,10 +358,7 @@ fn loaded_dep_of(
         if module.resolve(head) != "load_module" {
             return None;
         }
-        match call.args.first().map(|&a| module.node(a)) {
-            Some(Node::Lit(flatppl_core::Scalar::Str(s))) => Some(s.to_string()),
-            _ => None,
-        }
+        flatppl_infer::module_source(module, call).map(str::to_owned)
     })?;
     crate::queries::resolve_path(db, file, &directive, fs)
 }

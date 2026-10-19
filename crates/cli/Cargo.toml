@@ -32,11 +32,11 @@ default = ["convert", "infer", "prepare", "fmtlint", "determinize", "stablehlo",
 convert = ["dep:flatppl-flatpir", "infer"]
 # `infer` resolves cross-module deps from the cache only (no network), so it
 # links `flatppl-fileaccess` WITHOUT its `net` feature — no TLS stack.
-infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
+infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess", "flatppl-bundle/source"]
 # `prepare` is the only network-touching verb: it readies a model for offline use
 # by fetching its remote deps into the cache, so it turns on
 # `flatppl-fileaccess/net` (ureq + rustls).
-prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/net"]
+prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/net", "flatppl-bundle/source"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
 formula = ["dep:flatppl-formula", "convert"]
 formula-arrow = ["formula", "flatppl-formula/arrow"]
@@ -58,6 +58,7 @@ stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "dep:flatppl-h
 
 [dependencies]
 flatppl-core = { path = "../core" }
+flatppl-bundle = { path = "../bundle" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }

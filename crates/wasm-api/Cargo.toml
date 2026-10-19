@@ -13,6 +13,7 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+flatppl-bundle = { path = "../bundle" }
 flatppl-hs3 = { path = "../hs3" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-formula = { path = "../formula", features = ["arrow"] }

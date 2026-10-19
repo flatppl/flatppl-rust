@@ -28,7 +28,7 @@ use lsp_types::{
     },
 };
 
-use crate::db::{Catalogues, Database, FileSet, SourceFile};
+use crate::db::{BundleSource, Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::Pos;
 use crate::outbound::{Outbound, Outgoing};
 use crate::queries::{import_bundle, line_index, node_span_index};
@@ -339,7 +339,12 @@ pub fn run_on(
                         // skip it (editor content takes precedence over on-disk).
                         editor_open_uris.insert(uri_str.clone());
                         doc_versions.insert(uri_str.clone(), p.text_document.version);
-                        upsert_file(&mut db, &mut uri_to_file, uri_str, text);
+                        if !uri_to_file
+                            .get(&uri_str)
+                            .is_some_and(|file| archive_member(&db, *file))
+                        {
+                            upsert_file(&mut db, &mut uri_to_file, uri_str, text);
+                        }
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
                         sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
@@ -365,6 +370,12 @@ pub fn run_on(
                                 }
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
+                        if uri_to_file
+                            .get(&uri_str)
+                            .is_some_and(|file| archive_member(&db, *file))
+                        {
+                            continue;
+                        }
                         // Drop stale / out-of-order edits: an editor may deliver a
                         // didChange whose version predates one we already applied
                         // (network reordering, replayed buffers). Applying it would
@@ -433,9 +444,15 @@ pub fn run_on(
                             // open, or a non-`file:` scheme). There is no truth to
                             // fall back to, so stop tracking it entirely rather
                             // than keep analysing text that exists nowhere.
-                            None => {
+                            None if !uri_to_file
+                                .get(&uri_str)
+                                .is_some_and(|file| archive_member(&db, *file)) =>
+                            {
                                 uri_to_file.remove(&uri_str);
                             }
+                            // Closing a virtual document does not unmount its
+                            // archive. Importers still need the supplied bytes.
+                            None => {}
                         }
                         sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
                         // Every open importer's inference can change, and the
@@ -523,6 +540,19 @@ pub fn run_on(
                         for doc_uri_str in uri_to_file.keys() {
                             dirty.insert(doc_uri_str.clone());
                         }
+                        diag_deadline = Some(Instant::now() + DEBOUNCE);
+                    }
+                    "flatppl/bundleSources" => {
+                        release_stale_requests(&connection, &pool, &mut pending)?;
+                        upsert_bundle_sources(
+                            &mut db,
+                            &mut uri_to_file,
+                            &mut url_to_file,
+                            &editor_open_uris,
+                            &note.params,
+                        );
+                        sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
+                        dirty.extend(uri_to_file.keys().cloned());
                         diag_deadline = Some(Instant::now() + DEBOUNCE);
                     }
                     "flatppl/urlSources" => {
@@ -1401,6 +1431,76 @@ fn upsert_url_source(
     }
 }
 
+/// Mount a client-resolved source graph without fetching or extracting files.
+/// `sources` contains FlatPPL text only. Data bytes stay with the client.
+/// `resolutions[id].modules` maps source arguments to opaque module identities.
+/// `uris` maps those identities to the client's virtual document provider.
+fn upsert_bundle_sources(
+    db: &mut Database,
+    uri_to_file: &mut HashMap<String, SourceFile>,
+    url_to_file: &mut HashMap<String, SourceFile>,
+    editor_open_uris: &HashSet<String>,
+    params: &serde_json::Value,
+) {
+    use salsa::Setter;
+    let Some(sources) = params.get("sources").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (identity, value) in sources {
+        let (Some(text), Some(uri)) = (
+            value.as_str(),
+            params
+                .get("uris")
+                .and_then(|v| v.get(identity))
+                .and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if Uri::from_str(uri).is_err() {
+            continue;
+        }
+        let url_source = url_to_file.remove(identity);
+        let file = uri_to_file
+            .get(uri)
+            .copied()
+            .or(url_source)
+            .unwrap_or_else(|| SourceFile::new(db, identity.clone(), text.to_owned()));
+        if file.path(db) != *identity {
+            file.set_path(db).to(identity.clone());
+        }
+        // A delayed dependency snapshot must not replace a newer editor buffer.
+        if (!editor_open_uris.contains(uri) || archive_member(db, file)) && file.text(db) != text {
+            file.set_text(db).to(text.to_owned());
+        }
+        let modules = params
+            .get("resolutions")
+            .and_then(|v| v.get(identity))
+            .and_then(|v| v.get("modules"))
+            .and_then(|v| v.as_object())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|(source, target)| {
+                        Some((source.clone(), target.as_str()?.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bundle = Some(BundleSource {
+            uri: uri.to_owned(),
+            modules,
+        });
+        if file.bundle(db) != &bundle {
+            file.set_bundle(db).to(bundle);
+        }
+        uri_to_file.insert(uri.to_owned(), file);
+    }
+}
+
+fn archive_member(db: &dyn salsa::Database, file: SourceFile) -> bool {
+    file.path(db).starts_with("flatppl-zip:")
+}
+
 /// Send a `textDocument/publishDiagnostics` notification for `file`.
 ///
 /// `uri_str` must be a valid URI string; the send is best-effort (a send
@@ -1573,13 +1673,7 @@ fn handle_goto_definition(
         let index = node_span_index(db, file, fs, cats);
         let def_loc =
             crate::capabilities::goto_definition(db, file, fs, cats, byte_offset, &index)?;
-        // Build the target URI from the DefLoc path.
-        let target_uri_str = if def_loc.path.starts_with("file://") {
-            def_loc.path.clone()
-        } else {
-            path_to_file_uri(&def_loc.path)
-        };
-        let target_uri = Uri::from_str(&target_uri_str).ok()?;
+        let target_uri = file_uri_for(db, fs, &def_loc.path)?;
         // Build the target range: find the dep SourceFile and use its cached
         // line index (avoids a per-request LineIndex::new rebuild).
         let dep_file = fs
@@ -1654,7 +1748,22 @@ fn handle_completion(
 ///
 /// A stored path that is already a URI (a client-fed URL source, or a `file://`
 /// path) is used as-is; a bare filesystem path is percent-encoded.
-fn file_uri_for(path: &str) -> Option<Uri> {
+pub(crate) fn file_uri_for(db: &dyn salsa::Database, fs: FileSet, path: &str) -> Option<Uri> {
+    if let Some(file) = fs.files(db).iter().find(|f| f.path(db) == path) {
+        return source_uri(db, *file);
+    }
+    path_uri(path)
+}
+
+pub(crate) fn source_uri(db: &dyn salsa::Database, file: SourceFile) -> Option<Uri> {
+    if let Some(bundle) = file.bundle(db) {
+        Uri::from_str(&bundle.uri).ok()
+    } else {
+        path_uri(&file.path(db))
+    }
+}
+
+fn path_uri(path: &str) -> Option<Uri> {
     let s = if path.contains("://") {
         path.to_string()
     } else {
@@ -1729,7 +1838,7 @@ fn handle_references(
             locs.into_iter()
                 .filter_map(|l| {
                     Some(lsp_types::Location {
-                        uri: file_uri_for(&l.path)?,
+                        uri: file_uri_for(db, fs, &l.path)?,
                         range: range_in(db, fs, &l.path, l.start, l.end),
                     })
                 })
@@ -1760,7 +1869,15 @@ fn handle_prepare_rename(
         };
     let result = (|| -> Option<lsp_types::Range> {
         let (file, byte) = position_target(db, uri_to_file, &params)?;
+        if archive_member(db, file) {
+            return None;
+        }
         let index = node_span_index(db, file, fs, cats);
+        if crate::capabilities::goto_definition(db, file, fs, cats, byte, &index)
+            .is_some_and(|definition| definition.path.starts_with("flatppl-zip:"))
+        {
+            return None;
+        }
         let (start, end) = crate::rename::prepare_rename(db, file, fs, cats, byte, &index).ok()?;
         Some(range_in(db, fs, &file.path(db).clone(), start, end))
     })();
@@ -1808,6 +1925,14 @@ fn handle_rename(
         }
     };
 
+    if archive_member(db, file) || locs.iter().any(|loc| loc.path.starts_with("flatppl-zip:")) {
+        return Response::new_err(
+            req.id.clone(),
+            lsp_server::ErrorCode::RequestFailed as i32,
+            "Archive members are read-only. Extract a working copy before renaming.".to_owned(),
+        );
+    }
+
     // Group the edits per file: a WorkspaceEdit is keyed by document URI, and a
     // rename through a `load_module` boundary touches at least two files.
     //
@@ -1829,7 +1954,7 @@ fn handle_rename(
     #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
     let changes = by_path
         .into_iter()
-        .filter_map(|(path, edits)| Some((file_uri_for(&path)?, edits)))
+        .filter_map(|(path, edits)| Some((file_uri_for(db, fs, &path)?, edits)))
         .collect();
     let edit = lsp_types::WorkspaceEdit {
         changes: Some(changes),

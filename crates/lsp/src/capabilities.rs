@@ -3,14 +3,12 @@
 //! `hover`, `document_symbols`, `workspace_symbols`, and `inlay_hints` functions
 //! that convert internal types to LSP protocol values.
 
-use std::str::FromStr;
-
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::queries::{
     SpanIndex, analyze, document_symbol_tree, line_index, node_at_offset_indexed, parse,
     parsed_catalogues, resolve_path,
 };
-use flatppl_core::{BindingId, CallHead, Doc, Node, Ref, RefNs, Scalar};
+use flatppl_core::{BindingId, CallHead, Doc, Node, Ref, RefNs};
 
 #[cfg(test)]
 thread_local! {
@@ -136,9 +134,8 @@ pub fn document_symbols(
 /// `query` matches every binding.  Bindings whose RHS node has no recorded span
 /// are silently skipped.  Files that fail to parse produce no symbols.
 ///
-/// The `location.uri` is derived from the [`SourceFile::path`] stored in the
-/// salsa database: paths that already look like `file://…` URIs are used as-is;
-/// bare filesystem paths are prefixed with `file://`.
+/// The `location.uri` uses the client's URI for archive members and the stored
+/// source location for ordinary files.
 #[allow(deprecated)] // SymbolInformation.deprecated field is deprecated in LSP 3.16
 pub fn workspace_symbols(
     db: &Database,
@@ -149,13 +146,7 @@ pub fn workspace_symbols(
     let mut syms = Vec::new();
 
     for &file in fs.files(db) {
-        let path = file.path(db);
-        let uri_str = if path.starts_with("file://") {
-            path.clone()
-        } else {
-            crate::server::path_to_file_uri(&path)
-        };
-        let Ok(uri) = lsp_types::Uri::from_str(&uri_str) else {
+        let Some(uri) = crate::server::source_uri(db, file) else {
             continue;
         };
 
@@ -406,11 +397,8 @@ pub(crate) fn resolve_ref_def(
             let CallHead::Builtin(_) = call.head else {
                 return None;
             };
-            let directive_path = match call.args.first().map(|&a| module.node(a)) {
-                Some(Node::Lit(Scalar::Str(s))) => s.to_string(),
-                _ => return None,
-            };
-            let dep_file = resolve_path(db, file, &directive_path, fs)?;
+            let directive_path = flatppl_infer::module_source(module, call)?;
+            let dep_file = resolve_path(db, file, directive_path, fs)?;
             let dep_analyzed = analyze(db, dep_file, fs, cats);
             let dep_mod = dep_analyzed.module(db)?;
             // Cross-interner name match: compare by string, not by Symbol.
@@ -758,11 +746,7 @@ fn extract_standard_module_name(module: &flatppl_core::Module, alias: &str) -> O
     if module.resolve(head_sym) != "standard_module" {
         return None;
     }
-    // First arg is the module name string.
-    match call.args.first().map(|&a| module.node(a)) {
-        Some(Node::Lit(Scalar::Str(s))) => Some(s.to_string()),
-        _ => None,
-    }
+    flatppl_infer::module_source(module, call).map(str::to_owned)
 }
 
 /// Strip the last non-empty line from `text` (newline-separated), returning

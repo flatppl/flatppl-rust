@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use flatppl_core::{CallHead, Doc, Idx, Module, Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Doc, Idx, Module, Node, NodeId};
 use flatppl_fileaccess::Location;
 use flatppl_infer::{Level, ModuleBundle};
 
@@ -137,7 +137,20 @@ pub fn render_source(
     path: &str,
     bundle: &HashMap<String, String>,
 ) -> Result<Rendering, String> {
-    render_source_with_module(source, path, bundle).map(|(_, rendering)| rendering)
+    render_source_resolved(source, path, bundle, &HashMap::new())
+}
+
+/// Host-resolved import edges, keyed first by importer identity, then source argument.
+pub type ImportResolutions = HashMap<String, HashMap<String, String>>;
+
+/// Render a bundle with explicit import identities, including archive entrypoints.
+pub fn render_source_resolved(
+    source: &str,
+    path: &str,
+    bundle: &HashMap<String, String>,
+    resolutions: &ImportResolutions,
+) -> Result<Rendering, String> {
+    render_source_with_module(source, path, bundle, resolutions).map(|(_, rendering)| rendering)
 }
 
 /// Retain the inferred module for document appendices without parsing twice.
@@ -145,9 +158,10 @@ pub(crate) fn render_source_with_module(
     source: &str,
     path: &str,
     bundle: &HashMap<String, String>,
+    resolutions: &ImportResolutions,
 ) -> Result<(Module, Rendering), String> {
     let mut module = flatppl_syntax::parse(source).map_err(|e| format!("{path}: {e}"))?;
-    let deps = resolve_bundle(&module, path, bundle)?;
+    let deps = resolve_bundle(&module, path, bundle, resolutions)?;
     let infer_diags = flatppl_infer::infer_module(&mut module, &deps, Level::Shape);
     let mut rendering = render_with_source(&module, Some(source));
     attach_inference_diagnostics(&mut rendering, &module, &infer_diags);
@@ -183,6 +197,7 @@ fn resolve_bundle(
     root: &Module,
     root_path: &str,
     bundle: &HashMap<String, String>,
+    resolutions: &ImportResolutions,
 ) -> Result<ModuleBundle, String> {
     // Hosts bundle both module sources and load_data payloads. The directive,
     // not the file suffix, determines which entries contain FlatPPL source.
@@ -193,6 +208,11 @@ fn resolve_bundle(
             (key.as_str(), text.as_str()),
         );
     }
+    let sources = BundleSources {
+        bundle,
+        resolutions,
+        by_norm,
+    };
     let mut deps = ModuleBundle::new();
     deps.set_root(root_path.to_string());
     let mut visited: HashSet<String> = HashSet::new();
@@ -201,7 +221,7 @@ fn resolve_bundle(
         link(
             root_path,
             &literal,
-            &by_norm,
+            &sources,
             &mut deps,
             &mut visited,
             &mut queue,
@@ -212,7 +232,7 @@ fn resolve_bundle(
             link(
                 &importer,
                 &literal,
-                &by_norm,
+                &sources,
                 &mut deps,
                 &mut visited,
                 &mut queue,
@@ -222,25 +242,58 @@ fn resolve_bundle(
     Ok(deps)
 }
 
+struct BundleSources<'a> {
+    bundle: &'a HashMap<String, String>,
+    resolutions: &'a ImportResolutions,
+    by_norm: HashMap<String, (&'a str, &'a str)>,
+}
+
 /// Record that `literal`, spelled in `importer`, denotes the bundle entry it
 /// resolves to (resolved path first, bare directive second), and queue that
 /// entry for its own directives.
 fn link(
     importer: &str,
     literal: &str,
-    by_norm: &HashMap<String, (&str, &str)>,
+    sources: &BundleSources<'_>,
     deps: &mut ModuleBundle,
     visited: &mut HashSet<String>,
     queue: &mut VecDeque<(String, Arc<Module>)>,
 ) -> Result<(), String> {
-    let resolved = Location::parse(importer)
-        .join(literal)
-        .normalized()
-        .display();
-    let entry = by_norm
-        .get(&resolved)
-        .or_else(|| by_norm.get(&Location::parse(literal).normalized().display()));
-    let Some(&(key, text)) = entry else {
+    let entry = if let Some(key) = sources
+        .resolutions
+        .get(importer)
+        .and_then(|edges| edges.get(literal))
+    {
+        // Archive identities are opaque. Joining `a.zip` cannot select its entrypoint.
+        Some((
+            key.as_str(),
+            sources
+                .bundle
+                .get(key)
+                .ok_or_else(|| {
+                    format!("{importer}: resolved module `{key}` is absent from the bundle")
+                })?
+                .as_str(),
+        ))
+    } else {
+        let importer_location = Location::parse(importer);
+        if matches!(importer_location, Location::Invalid(_)) {
+            return Err(format!(
+                "{importer}: missing resolved import edge for `{literal}`"
+            ));
+        }
+        let resolved = importer_location.join(literal).normalized().display();
+        sources
+            .by_norm
+            .get(&resolved)
+            .or_else(|| {
+                sources
+                    .by_norm
+                    .get(&Location::parse(literal).normalized().display())
+            })
+            .copied()
+    };
+    let Some((key, text)) = entry else {
         return Ok(());
     };
     let arc = match deps.get_arc_by_id(key) {
@@ -272,22 +325,9 @@ fn load_module_literals(module: &Module) -> Vec<String> {
         if module.resolve(head) != "load_module" {
             continue;
         }
-        let source = call
-            .args
-            .first()
-            .copied()
-            .or_else(|| {
-                call.named
-                    .iter()
-                    .find(|n| module.resolve(n.name) == "source")
-                    .map(|n| n.value)
-            })
-            .and_then(|id| match module.node(id) {
-                Node::Lit(Scalar::Str(s)) => Some(s.to_string()),
-                _ => None,
-            });
+        let source = flatppl_infer::module_source(module, call);
         if let Some(s) = source {
-            out.push(s);
+            out.push(s.to_string());
         }
     }
     out

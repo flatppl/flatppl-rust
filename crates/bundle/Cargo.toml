@@ -1,0 +1,17 @@
+[package]
+name = "flatppl-bundle"
+description = "Portable ZIP bundles and contained member resolution for FlatPPL hosts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+source = ["dep:flatppl-core", "dep:flatppl-syntax", "dep:serde_json"]
+
+[dependencies]
+flatppl-core = { path = "../core", optional = true }
+flatppl-syntax = { path = "../syntax", optional = true }
+serde_json = { workspace = true, optional = true }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }

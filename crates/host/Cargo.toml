@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flatppl-bundle = { path = "../bundle", features = ["source"] }
 flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-infer = { path = "../infer" }

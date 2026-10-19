@@ -17,6 +17,9 @@
 //! just [`convert_str`] (and its tests) build, so `wasm-bindgen` never enters
 //! a host build.
 
+pub mod bundle;
+pub use bundle::{ZipBundle, pack_bundle};
+
 /// Convert a model document to FlatPPL source text.
 ///
 /// `from` selects the importer (`"pyhf"`, `"hs3"` or `"formula"`); `to` must be
