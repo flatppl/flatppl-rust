@@ -8,11 +8,11 @@ resolver = "3"
 members = ["crates/*"]
 
 # Optimize shipped tools across crates without host-specific CPU flags.
-# Thin LTO trades longer release builds for faster tools and smaller binaries.
+# Full LTO reduces binary size at the cost of longer release builds.
 # Debug/`dev` builds keep symbols for backtraces.
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 
 # Size-optimized profile for the SHIPPED flatppl-lsp binary bundled into the
