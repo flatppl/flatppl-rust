@@ -286,7 +286,7 @@ fn is_flatpdl_accepts_bare_builtin_atoms() {
 #[test]
 fn determinize_refuses_a_model_with_an_unbound_component_name() {
     let m = infer_module(
-        "z = draw(Normal(mu = 0.4, sigma = 1.0))\n\
+        "z = 0.4\n\
          q = logdensityof(joint(f1 = Normal(mu = z, sigma = 0.5), \
          f2 = Normal(mu = f1, sigma = 1.5)), record(f1 = 0.3, f2 = 0.7))\n",
     );

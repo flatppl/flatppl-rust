@@ -1022,12 +1022,10 @@ fn rand_accepts_a_deferred_mass_measure() {
 }
 
 // ============================================================
-// `joint` mass class (kernel-joint-q4-maths.md §7)
+// §06 `joint` product mass
 // ============================================================
 
-/// All-normalized components stay `%normalized` regardless of arity spelling
-/// (kernel-joint-q4-maths.md §7: "the record law of probability components
-/// has mass 1") — the positional all-Normal control case.
+/// A product of probability measures has mass one in either arity spelling.
 #[test]
 fn joint_mass_positional_all_normalized_stays_normalized() {
     let src = "m = joint(Normal(0.0, 1.0), Normal(1.0, 2.0))";
@@ -1038,45 +1036,25 @@ fn joint_mass_positional_all_normalized_stays_normalized() {
     );
 }
 
-/// Two components sharing a stochastic ancestor (`z1`, `z2` both trace back
-/// to `mu`) and both non-normalized after `truncate`: the product rule is
-/// unsound here in general (kernel-joint-q4-maths.md §7, Student-t/`y^2`
-/// counterexample). Both components are `lawof`-reified, so neither is
-/// provably trace-clean (`joint_component_is_trace_clean` — reification is
-/// one of the two channels spec §06's `joint` entry names for sharing a
-/// stochastic node) and the composed class degrades to `%unknown`.
-///
-/// This does NOT prove the degrade fires because of the shared `mu` — a pair
-/// of `lawof`-reified components with no shared ancestor at all would hit the
-/// same branch and read the same `%unknown` (no ancestor-identity oracle
-/// exists to tell the two apart, by the wave brief's design). What the
-/// carve-out DOES discriminate is reified vs bare-constructor components: see
-/// `positional_joint_mass_matches_keyword_joint_mass` in `golden.rs`, whose
-/// two bare `Lebesgue(reals)` components are provably trace-clean and stay
-/// exact at `%locallyfinite` under the identical two-non-normalized shape.
+/// Each law absorbs its own copy of `mu`. Truncating both probability laws
+/// gives finite components, whose independent product is still finite.
 #[test]
-fn joint_mass_two_nonnormalized_components_degrade_to_unknown() {
+fn joint_mass_two_truncated_reified_laws_is_finite() {
     let src = "mu ~ Normal(0.0, 1.0)\n\
                z1 ~ Normal(mu, 1.0)\n\
                z2 ~ Normal(mu, 1.0)\n\
                lz1 = lawof(z1)\n\
                lz2 = lawof(z2)\n\
                j = joint(truncate(lz1, interval(0.0, 5.0)), truncate(lz2, interval(0.0, 5.0)))";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
     let out = ir(src);
-    let bind = out
-        .find("(%bind j ")
-        .unwrap_or_else(|| panic!("binding j not found in:\n{out}"));
     assert!(
-        out[bind..(bind + 120).min(out.len())].contains("%unknown"),
-        "shared-ancestor joint of two non-normalized components must be \
-         %unknown; got:\n{out}"
+        bind_line(&out, "j").contains("(%mass %finite)"),
+        "the product of two truncated laws must be finite; got:\n{out}"
     );
 }
 
-/// A single non-normalized component sharing ancestry with normalized peers
-/// stays exact (kernel-joint-q4-maths.md §7: "exactly one non-normalized
-/// component… its class carries over. Sound.") — no degrade when only one
-/// member deviates from `%normalized`.
+/// A finite component times a probability component remains finite.
 #[test]
 fn joint_mass_one_nonnormalized_component_stays_exact() {
     let src = "mu ~ Normal(0.0, 1.0)\n\
@@ -1095,12 +1073,8 @@ fn joint_mass_one_nonnormalized_component_stays_exact() {
     );
 }
 
-/// `draw`/`rand` gate integration: a positional `joint` of two non-normalized
-/// components must be refused, same as the keyword form always was — this is
-/// the draw/rand-gate consumer of the mass fix above, not a new gate rule.
-/// Refuses at `%locallyfinite` (the trace-clean carve-out keeps this shape
-/// exact; see `positional_joint_mass_matches_keyword_joint_mass`), same as it
-/// did once `#159` landed — the gate itself is untouched by this wave.
+/// A product of two Lebesgue measures is locally finite, so it cannot be drawn
+/// as a probability measure.
 #[test]
 fn draw_of_positional_joint_two_lebesgue_refuses() {
     assert!(rejects(
@@ -1120,16 +1094,8 @@ fn rand_of_positional_joint_two_lebesgue_refuses() {
     ));
 }
 
-/// Regression (review Critical 1): `normalize` is the one consumer that
-/// distinguishes `%locallyfinite` from `%unknown` — a `%locallyfinite`
-/// argument is a static error (spec §06, undefined normalization), while
-/// `%unknown` silently passes through as `%normalized`. Before the trace-clean
-/// carve-out, this exact shape's class widened from `%locallyfinite` to
-/// `%unknown` and this error disappeared, reopening (via `normalize`) the
-/// hole the wave exists to close: `draw(normalize(joint(Lebesgue(reals),
-/// Lebesgue(reals))))` would type `%normalized` and pass the draw gate. Both
-/// components are provably trace-clean bare constructors, so this must stay
-/// a static error.
+/// The exact locally finite product class must reach the normalization gate.
+/// Widening it to unknown would incorrectly permit normalization.
 #[test]
 fn normalize_of_two_lebesgue_joint_is_a_static_error() {
     assert!(rejects(
@@ -1142,17 +1108,8 @@ fn normalize_of_two_lebesgue_joint_is_a_static_error() {
     ));
 }
 
-/// Regression (re-review Important 3): the disqualifier catalogue must not
-/// disqualify a component just because it depends on an `elementof`
-/// parameter — §04 "Phases" classifies `elementof` inputs as *parameterized*,
-/// not stochastic, and kernel-joint-q4-maths.md §8 is explicit that "a shared
-/// input name is a shared value, not a shared stochastic node". Neither
-/// component below has a `draw` anywhere, so there is no stochastic node for
-/// them to share, and the joint must stay exact and trigger the same static
-/// error as the all-literal version — every HS3-converted model
-/// parameterizes exactly this way (`rf304_uncorrprod/model.flatppl`:
-/// `mean1 = elementof(reals)`, …), so a wrong answer here would be silent on
-/// every converted fixture.
+/// Shared free constructor parameters do not weaken the product mass class.
+/// The normalization gate still rejects this parameterized Lebesgue product.
 #[test]
 fn normalize_of_elementof_parameterized_joint_is_a_static_error() {
     assert!(rejects(
@@ -1205,13 +1162,10 @@ fn truncate_of_two_lebesgue_joint_is_finite() {
 // replacement fixture to build here.
 
 // ============================================================
-// `joint` over KERNEL components — the fan-out kernel
-// (spec §06 `joint` entry per flatppl-design#85; Q1–Q5 derived in
-// flatppl-dev/kernel-joint-q4-maths.md)
+// §06 `joint` over kernel components — the fan-out kernel
 // ============================================================
 
-/// The probe of `kernel-joint-q4-maths.md` §2: `u` is an internal latent shared
-/// by both components' traces, `z` is the boundary both reify against.
+/// Each kernel absorbs its own copy of `u`; `z` supplies a boundary input.
 const SHARED_LATENT_PROBE: &str = "z  = elementof(reals)\n\
      u  ~ Normal(mu = z, sigma = 1.0)\n\
      a1 ~ Normal(mu = u, sigma = 1.0)\n\
@@ -1230,10 +1184,7 @@ fn bind_line(out: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Q1: "The result's inputs are the union of the component kernels' inputs by
-/// name". Disjoint signatures coexist — this is grounding-report probe p4, which
-/// the union rule makes legal with inputs `{z, w}` rather than a signature
-/// mismatch.
+/// The result's inputs are the union of the component kernels' inputs by name.
 #[test]
 fn kernel_joint_inputs_are_the_union_of_the_component_inputs_by_name() {
     let out = ir("z  = elementof(reals)\n\
@@ -1249,9 +1200,8 @@ fn kernel_joint_inputs_are_the_union_of_the_component_inputs_by_name() {
     );
 }
 
-/// Q1, the fan half of the same rule: "a name declared by several components
-/// binds once in the result and every declaring component receives that one
-/// value". Both spellings, so the keyword and positional arms cannot drift.
+/// A name declared by several components binds once and is supplied to each
+/// component. Check both keyword and positional products.
 #[test]
 fn kernel_joint_shared_input_name_binds_once_and_fans() {
     for spelling in ["joint(p = K1, q = K2)", "joint(K1, K2)"] {
@@ -1268,8 +1218,7 @@ fn kernel_joint_shared_input_name_binds_once_and_fans() {
     }
 }
 
-/// Q2: "The keyword form applies unchanged, producing a kernel whose output
-/// variate is a record." §11's `(%kernel (%inputs …) (%mass …))` has no slot for
+/// The keyword product has a record variate. §11's kernel type has no slot for
 /// the variate, so the record surfaces on APPLICATION — the applied fan-out is a
 /// measure over `record{p, q}`.
 #[test]
@@ -1308,9 +1257,7 @@ fn applied_positional_kernel_joint_is_a_measure_over_the_cat_variate() {
     );
 }
 
-/// Q3: "Measure components are permitted and are the nullary case: they ignore
-/// the input." So a mixed `joint` is legal and the measure contributes nothing to
-/// the input union — grounding-report probe p3.
+/// A measure component contributes no declared inputs to a mixed product.
 #[test]
 fn mixed_measure_and_kernel_joint_is_a_kernel_over_the_kernel_inputs_alone() {
     let out = ir("z  = elementof(reals)\n\
@@ -1324,7 +1271,7 @@ fn mixed_measure_and_kernel_joint_is_a_kernel_over_the_kernel_inputs_alone() {
     );
 }
 
-/// Q5: the mass rule is the measure case applied pointwise, so a fan-out of
+/// The mass rule is the measure case applied pointwise, so a fan-out of
 /// Markov kernels is a Markov kernel (§06: "A fan-out of Markov kernels is a
 /// Markov kernel"). Covered by the tests above; pinned here against the mixed
 /// form too, where the fold has to read a measure and a kernel component with the
@@ -1350,29 +1297,24 @@ fn kernel_joint_of_normalized_components_is_markov_in_every_spelling() {
     }
 }
 
-/// Q5's qualification reaches through kernels, because the fold is the SAME one
-/// the measure case uses ([`joint_mass`]): two non-normalized components that may
-/// share a stochastic node degrade to `%unknown` rather than folding
-/// `%locallyfinite`×`%locallyfinite` (`kernel-joint-q4-maths.md` §7, the
-/// Student-t/`y^2` counterexample). One non-normalized member still folds
-/// exactly, which is the second half here.
-///
-/// Every KERNEL component is a reification, and `functionof`/`kernelof` are
-/// disqualifiers of `joint_component_is_trace_clean`, so no kernel component is
-/// ever provably trace-clean and 2+ non-normalized kernel components always
-/// degrade. Sound, and the same disclosed conservatism the measure case carries
-/// for two `lawof` components.
+/// Locally finite times finite, or times normalized, remains locally finite.
+/// Kernel reification does not change the independent-product mass rule.
 #[test]
-fn kernel_joint_mass_degrades_on_two_nonnormalized_components_and_not_on_one() {
+fn kernel_joint_mass_is_the_pointwise_product_class() {
     let two = ir(&format!(
         "{SHARED_LATENT_PROBE}\
          L1 = functionof(Lebesgue(reals), z = z)\n\
          L2 = functionof(Lebesgue(interval(0.0, 1.0)), z = z)\n\
-         KJ = joint(p = L1, q = L2)"
+         KJ = joint(p = L1, q = L2)\n\
+         M = KJ(z = 0.0)"
     ));
     assert!(
-        bind_line(&two, "KJ").contains("(%mass %unknown)"),
-        "two non-normalized components cannot fold to a definite class; got:\n{two}"
+        bind_line(&two, "KJ").contains("(%mass %locallyfinite)"),
+        "locally finite times finite must remain locally finite; got:\n{two}"
+    );
+    assert!(
+        bind_line(&two, "M").contains("(%mass %locallyfinite)"),
+        "applying the product kernel must preserve its mass class; got:\n{two}"
     );
     let one = ir(&format!(
         "{SHARED_LATENT_PROBE}\
@@ -1386,32 +1328,36 @@ fn kernel_joint_mass_degrades_on_two_nonnormalized_components_and_not_on_one() {
     );
 }
 
-/// The Q1 consistency clause: "Components that share a stochastic node must bind
-/// every boundary ancestor of that node under the same input name; a `joint`
-/// whose sharing components disagree on that name is a static error." `u` is
-/// shared and its boundary ancestor `z` is `s` in one component and `t` in the
-/// other, so `u`'s parent has no value where `s != t`.
+/// Each component owns its boundary substitution even when both source graphs
+/// reach `u`. The two public input names survive in the product interface.
 #[test]
-fn kernel_joint_sharing_components_must_agree_on_a_shared_nodes_input_name() {
-    assert!(rejects(
-        &format!(
-            "{SHARED_LATENT_PROBE}\
-             K1 = kernelof(a1, s = z)\n\
-             K2 = kernelof(a2, t = z)\n\
-             KJ = joint(p = K1, q = K2)"
+fn kernel_joint_components_keep_distinct_names_for_the_same_boundary_source() {
+    let src = format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, s = z)\n\
+         K2 = kernelof(a2, t = z)\n\
+         KJ = joint(p = K1, q = K2)\n\
+         M = KJ(s = 0.0, t = 2.0)"
+    );
+    assert!(diags_of(&src).is_empty(), "{:?}", diags_of(&src));
+    let out = ir(&src);
+    assert!(
+        bind_line(&out, "KJ").contains("(%kernel (%inputs s t) (%mass %normalized))"),
+        "both component inputs must survive; got:\n{out}"
+    );
+    assert!(
+        bind_line(&out, "M").contains(
+            "(%measure (%domain (%record (p (%scalar real)) (q (%scalar real)))) \
+             (%mass %normalized))"
         ),
-        "bound under different input names"
-    ));
+        "a fully applied product must be a normalized record measure; got:\n{out}"
+    );
 }
 
-/// The clause is restricted to boundary ANCESTORS of the shared node, so a
-/// disagreement off that ancestry is legal — widening it to any commonly-bound
-/// target would reject this well-formed program. Here the shared `u` descends
-/// from `w`, which both components bind as `c`; `z` is bound under `s` and `t`
-/// but is not an ancestor of `u`, so the retained node's parent stays
-/// single-valued and the inputs union to `{s, c, t}`.
+/// Unused declared inputs remain in the interface, and a common input name is
+/// included only once. Here `s` and `t` are unused while both kernels use `c`.
 #[test]
-fn kernel_joint_name_disagreement_off_the_shared_ancestry_is_legal() {
+fn kernel_joint_keeps_unused_inputs_and_deduplicates_common_names() {
     let src = "z  = elementof(reals)\n\
                w  = elementof(reals)\n\
                u  ~ Normal(mu = w, sigma = 1.0)\n\
@@ -1420,196 +1366,75 @@ fn kernel_joint_name_disagreement_off_the_shared_ancestry_is_legal() {
                K1 = kernelof(a1, s = z, c = w)\n\
                K2 = kernelof(a2, t = z, c = w)\n\
                KJ = joint(p = K1, q = K2)";
-    assert!(
-        !rejects(src, "bound under different input names"),
-        "a disagreement that is not a shared node's ancestor is legal"
-    );
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
     assert!(
         bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s c t)"),
         "and the inputs still union by name"
     );
 }
 
-/// Trace-DISJOINT components need no clause at all (`kernel-joint-q4-maths.md`
-/// §4: "Trace-disjoint components need no clause"), so differing input names for
-/// the same boundary node are legal when nothing is shared.
+/// Distinct components may expose the same source parameter under distinct names.
 #[test]
-fn trace_disjoint_kernel_joint_may_disagree_on_an_input_name() {
+fn kernel_joint_unions_distinct_names_for_a_common_source_parameter() {
     let src = "z  = elementof(reals)\n\
                b1 ~ Normal(mu = z, sigma = 1.0)\n\
                b2 ~ Normal(mu = z, sigma = 1.0)\n\
                K1 = kernelof(b1, s = z)\n\
                K2 = kernelof(b2, t = z)\n\
                KJ = joint(p = K1, q = K2)";
-    assert!(
-        !rejects(src, "bound under different input names"),
-        "disjoint traces share no node, so no name has to agree"
-    );
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
     assert!(
         bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s t)"),
         "and both names are inputs of the fan-out"
     );
 }
 
-/// The W1 shape: a MEASURE component sharing a stochastic node whose ancestor the
-/// kernel component binds as a boundary input.
-///
-/// `kernel-joint-w1-maths.md` §3 shows the shape denotes nothing: inside `K1(a)` the
-/// shared `u` carries `Normal(a, 1)` while inside `M` it carries `Normal(v, 1)` for the
-/// ambient `v`, and one node cannot carry two laws. #85's clause covers it under "does
-/// not bind it at all — in particular a measure component, which binds nothing".
-///
-/// The number the shape used to score, −2.0878770664093453, is reading A's — a
-/// different question (the `joint` of `K1` and the KERNELIZATION of `M`), which the
-/// next test spells explicitly and legally.
+/// Reifying outputs at different depths can still yield the same input signature.
 #[test]
-fn a_measure_component_sharing_a_boundary_bound_ancestor_is_a_static_error() {
-    let src = format!(
-        "{SHARED_LATENT_PROBE}\
-         K1 = kernelof(a1, z = z)\n\
-         M  = lawof(u)\n\
-         KJ = joint(p = K1, q = M)"
-    );
-    assert!(
-        rejects(&src, "binds it under no name"),
-        "a measure component sharing a boundary-descended node is a static error"
-    );
-    assert!(
-        rejects(
-            &src,
-            "a measure component binds it under no name (measure components are nullary"
-        ),
-        "and the diagnostic names the MEASURE component as the non-binder, with the reason \
-         AFTER the verb rather than interrupting it; got: {:?}",
-        diags_of(&src)
-    );
-}
-
-/// Reading E (`kernel-joint-w1-maths.md` §4): the same law is one explicit reification
-/// away, and THAT is legal — both components bind the shared node's ancestor `z` under
-/// the same input name.
-#[test]
-fn both_components_binding_the_shared_ancestor_is_legal() {
+fn kernel_components_with_different_outputs_share_one_declared_input() {
     let src = format!(
         "{SHARED_LATENT_PROBE}\
          K1 = kernelof(a1, z = z)\n\
          K2 = kernelof(u, z = z)\n\
          KJ = joint(p = K1, q = K2)"
     );
-    assert!(
-        !rejects(&src, "shared stochastic node"),
-        "both components bind the shared ancestor under one name; got: {:?}",
-        diags_of(&src)
-    );
+    assert!(diags_of(&src).is_empty(), "{:?}", diags_of(&src));
     assert!(
         bind_line(&ir(&src), "KJ").contains("(%kernel (%inputs z)"),
         "and the fan-out takes the one shared input"
     );
 }
 
-/// `kernel-joint-w1-maths.md` §5, first bullet — the CLOSED shared node. No ancestor of
-/// the shared `u` is anyone's boundary, so `M` is a closed measure, Q3's "they ignore
-/// the input" holds verbatim, and the shape is legal.
+/// A closed reified law contributes no inputs to a mixed kernel product.
 #[test]
-fn a_measure_component_sharing_a_closed_node_is_legal() {
+fn a_closed_reified_measure_adds_no_kernel_inputs() {
     let src = "z  = elementof(reals)\n\
                u  ~ Normal(mu = 0.0, sigma = 1.0)\n\
                a1 ~ Normal(mu = u + z, sigma = 1.0)\n\
                K1 = kernelof(a1, z = z)\n\
                M  = lawof(u)\n\
                KJ = joint(p = K1, q = M)";
-    assert!(
-        !rejects(src, "shared stochastic node"),
-        "a closed shared node has no boundary-bound ancestor; got: {:?}",
-        diags_of(src)
-    );
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
     assert!(
         bind_line(&ir(src), "KJ").contains("(%kernel (%inputs z)"),
-        "and the measure component contributes no input (Q3)"
+        "and the measure component contributes no input"
     );
 }
 
-/// `kernel-joint-w1-maths.md` §5, third bullet — no shared stochastic node at all. `M`
-/// is parameterized by the ambient `z` and `K1`'s reified graph holds a decoupled input,
-/// so no retained node forces two views onto one parent slot.
+/// Components can cut their source graphs at different depths. Both boundary
+/// names remain available to the product's caller.
 #[test]
-fn a_measure_component_sharing_no_stochastic_node_is_legal() {
-    let src = "z  = elementof(reals)\n\
-               u  ~ Normal(mu = z, sigma = 1.0)\n\
-               a1 ~ Normal(mu = u, sigma = 1.0)\n\
-               w  ~ Normal(mu = z, sigma = 2.0)\n\
-               K1 = kernelof(a1, z = z)\n\
-               M  = lawof(w)\n\
-               KJ = joint(p = K1, q = M)";
-    assert!(
-        !rejects(src, "shared stochastic node"),
-        "nothing is shared, so the clause does not apply; got: {:?}",
-        diags_of(src)
-    );
-}
-
-/// The component's OWN boundary severs its trace (§04: a boundary node "can be thought
-/// of as being substituted with a new node … in the reified graph"), so `K2`, which
-/// binds `u` itself, shares nothing with `K1` and must not be read as a non-binder of
-/// `u`'s ancestor `z`.
-///
-/// Without the cut in `component_draw_nodes` this well-formed program is rejected: the
-/// syntactic walk reaches `u`'s draw through `K2`'s body, `z` is an ancestor of it, and
-/// `K2` declares `u` but not `z`.
-#[test]
-fn a_component_binding_the_shared_node_itself_shares_nothing() {
+fn kernel_joint_keeps_boundaries_at_different_source_depths() {
     let src = format!(
         "{SHARED_LATENT_PROBE}\
          K1 = kernelof(a1, z = z)\n\
          K2 = kernelof(a2, u = u)\n\
          KJ = joint(p = K1, q = K2)"
     );
-    assert!(
-        !rejects(&src, "shared stochastic node"),
-        "a boundary-severed node is not shared; got: {:?}",
-        diags_of(&src)
-    );
+    assert!(diags_of(&src).is_empty(), "{:?}", diags_of(&src));
     assert!(
         bind_line(&ir(&src), "KJ").contains("(%kernel (%inputs z u)"),
         "and the inputs union by name"
-    );
-}
-
-/// The kernel-side analogue of W1 (`kernel-joint-w1-maths.md` §6, "sharing variant"):
-/// the non-binder is a KERNEL, not a measure. One clause covers both, so the error
-/// wording is the same "under no name" case.
-///
-/// `K2` reifies against `w`, which is not an ancestor of the shared `u`; `u`'s ancestor
-/// `z` is bound by `K1` alone.
-#[test]
-fn a_kernel_component_binding_a_shared_ancestor_under_no_name_is_a_static_error() {
-    let src = "z  = elementof(reals)\n\
-               w  = elementof(reals)\n\
-               u  ~ Normal(mu = z, sigma = 1.0)\n\
-               a1 ~ Normal(mu = u, sigma = 1.0)\n\
-               a2 ~ Normal(mu = u + w, sigma = 1.0)\n\
-               K1 = kernelof(a1, z = z)\n\
-               K2 = kernelof(a2, c = w)\n\
-               KJ = joint(p = K1, q = K2)";
-    assert!(
-        rejects(src, "binds it under no name"),
-        "a sharing KERNEL that binds the ancestor under no name is the same error; got: {:?}",
-        diags_of(src)
-    );
-    assert!(
-        rejects(
-            src,
-            "another kernel component binds it under no name (its own boundary omits that \
-             ancestor)"
-        ),
-        "and the diagnostic must name a KERNEL non-binder, not a measure component that is \
-         not there; got: {:?}",
-        diags_of(src)
-    );
-    assert!(
-        !rejects(src, "a measure component"),
-        "there is no measure component in this program; got: {:?}",
-        diags_of(src)
     );
 }
 
@@ -1685,7 +1510,7 @@ fn an_ill_formed_application_of_a_fan_out_kernel_is_a_static_error() {
 /// `truncate(kernelof(…), …)` keeps the base's `%normalized` where the measure
 /// version reads `%finite` (a separate, carded defect — asserted here as the
 /// premise, not as correct). Folding that unchanged published a wrong STRONGER
-/// class: the `joint` read `%normalized` instead of Q5's `%unknown`, and `kchain`
+/// class: the `joint` read `%normalized` instead of `%unknown`, and `kchain`
 /// carried it onto a MEASURE, past the gates an unnormalized measure must not
 /// pass.
 #[test]
@@ -1714,14 +1539,10 @@ fn a_fan_out_does_not_inherit_an_unlifted_component_mass() {
     );
 }
 
-/// The Q1 narrowing's load-bearing half. `component_draw_nodes` walks straight
-/// past the reification boundary, so both components here report `w`'s draw and
-/// the intersection is non-empty — yet boundary substitution SEVERS `w` and the
-/// components are genuinely trace-disjoint. Only the ancestor test stops the
-/// false fire: `w`'s own subtree is `Normal(0.0, 1.0)` and never reaches
-/// `(%ref self z)`. Without it, a well-formed program would be rejected.
+/// A derived stochastic value can be a component boundary. Substitution cuts
+/// its ancestors, and each component keeps its own public input name.
 #[test]
-fn a_shared_draw_upstream_of_the_boundary_does_not_fire_the_q1_error() {
+fn kernel_joint_accepts_distinct_inputs_for_a_derived_stochastic_boundary() {
     let src = "w  ~ Normal(mu = 0.0, sigma = 1.0)\n\
                z  = 2.0 * w\n\
                a1 ~ Normal(mu = z, sigma = 1.0)\n\
@@ -1729,47 +1550,43 @@ fn a_shared_draw_upstream_of_the_boundary_does_not_fire_the_q1_error() {
                K1 = kernelof(a1, s = z)\n\
                K2 = kernelof(a2, t = z)\n\
                KJ = joint(p = K1, q = K2)";
-    assert!(
-        !rejects(src, "bound under different input names"),
-        "a draw the boundary severs is not shared between the components"
-    );
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
     assert!(
         bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s t)"),
         "and both names are inputs of the fan-out"
     );
 }
 
-/// The `%autoinputs` boundary spelling reaches the Q1 check too: a bare
-/// `kernelof(a2)` auto-traces `z` as its input name, so pairing it with an
-/// explicit `s = z` is the same disagreement, and two bare `kernelof`s agree by
-/// construction. Every other test here uses an explicit boundary, so this pins
-/// the side-table path `input_entries` reads for `Inputs::Auto`.
+/// Auto-discovered and explicit input names participate in the same union.
+/// Distinct names remain distinct; matching auto-input names appear once.
 #[test]
-fn the_q1_error_reads_an_auto_inputs_boundary_too() {
-    assert!(
-        rejects(
-            &format!(
-                "{SHARED_LATENT_PROBE}\
-                 K1 = kernelof(a1, s = z)\n\
-                 K2 = kernelof(a2)\n\
-                 KJ = joint(p = K1, q = K2)"
+fn kernel_joint_unions_auto_and_explicit_inputs() {
+    for (first, inputs, application) in [
+        ("kernelof(a1, s = z)", "s z", "KJ(s = 0.0, z = 2.0)"),
+        ("kernelof(a1)", "z", "KJ(z = 2.0)"),
+    ] {
+        let src = format!(
+            "{SHARED_LATENT_PROBE}\
+             K1 = {first}\n\
+             K2 = kernelof(a2)\n\
+             KJ = joint(p = K1, q = K2)\n\
+             M = {application}"
+        );
+        assert!(diags_of(&src).is_empty(), "{:?}", diags_of(&src));
+        let out = ir(&src);
+        assert!(
+            bind_line(&out, "KJ")
+                .contains(&format!("(%kernel (%inputs {inputs}) (%mass %normalized))")),
+            "component input names must union; got:\n{out}"
+        );
+        assert!(
+            bind_line(&out, "M").contains(
+                "(%measure (%domain (%record (p (%scalar real)) (q (%scalar real)))) \
+                 (%mass %normalized))"
             ),
-            "bound under different input names"
-        ),
-        "an auto-traced input name disagrees with an explicit one"
-    );
-    assert!(
-        !rejects(
-            &format!(
-                "{SHARED_LATENT_PROBE}\
-                 K1 = kernelof(a1)\n\
-                 K2 = kernelof(a2)\n\
-                 KJ = joint(p = K1, q = K2)"
-            ),
-            "bound under different input names"
-        ),
-        "two auto-traced boundaries agree by construction"
-    );
+            "all declared inputs are bound in the applied record measure; got:\n{out}"
+        );
+    }
 }
 
 /// `disintegrate_type` uses an EMPTY kernel-inputs list as its documented
