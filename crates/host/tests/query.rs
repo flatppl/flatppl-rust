@@ -328,8 +328,8 @@ fn batched_scan_density_with_a_normalized_cauchy_prior_keeps_one_time_loop()
     let query = Context::default().parse(
         r#"
         alpha ~ normalize(truncate(Cauchy(0, 2.5), interval(0, inf)))
-        update(s, x) = record(mean = s.mean + alpha*x)
-        states = scan(update, record(mean = 0.0), [1.0, 2.0])
+        update(s, x) = record(mean = s.mean + x)
+        states = scan(update, record(mean = 0.0), alpha .* [1.0, 2.0])
         read_mean(s) = s.mean
         probabilities = invlogit.(read_mean.(states))
         choice ~ Bernoulli.(probabilities)

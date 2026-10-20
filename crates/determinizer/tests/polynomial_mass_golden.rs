@@ -76,26 +76,31 @@ lp = logdensityof(px, 0.5)",
 /// `1·5 + 0.5·2.5 − 0.25·(35/3) + 0.125·(65/4) = 515/96`.
 #[test]
 fn cubic_polynomial_over_asymmetric_interval() {
-    let pir = determinize_pir(
-        "\
-px = normalize(
-  truncate(
-    weighted(x -> polynomial([1.0, 0.5, -0.25, 0.125], x), Lebesgue(reals)),
-    interval(-2.0, 3.0),
-  ),
-)
-lp = logdensityof(px, 1.0)",
-    );
     let exact = 515.0_f64 / 96.0;
     let folded = 5.0 + 0.5 * 2.5 + -0.25 * (35.0 / 3.0) + 0.125 * (65.0 / 4.0);
     assert!(
         (folded - exact).abs() <= 4.0 * f64::EPSILON * exact,
         "the term-wise power rule must equal the exact integral 515/96: {folded} vs {exact}"
     );
-    assert!(
-        pir.contains(&folded.to_string()),
-        "Z = 515/96 = {folded}:\n{pir}"
-    );
+    for weight in [
+        "weighted(x -> polynomial([1.0, 0.5, -0.25, 0.125], x), Lebesgue(reals))",
+        "weighted((x,p) -> polynomial([1.0, p, -0.25, 0.125], x), Lebesgue(reals), 0.5)",
+    ] {
+        let pir = determinize_pir(&format!(
+            "\
+px = normalize(
+  truncate(
+    {weight},
+    interval(-2.0, 3.0),
+  ),
+)
+lp = logdensityof(px, 1.0)",
+        ));
+        assert!(
+            pir.contains(&folded.to_string()),
+            "Z = 515/96 = {folded}:\n{pir}"
+        );
+    }
 }
 
 /// A polynomial's mass over an unbounded interval is infinite, so §06's

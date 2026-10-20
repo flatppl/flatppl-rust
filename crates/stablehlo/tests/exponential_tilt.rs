@@ -64,6 +64,42 @@ fn scalar_closed_tilts_score_and_sample_without_integration() {
 }
 
 #[test]
+fn explicit_weight_parameters_keep_closed_tilts_and_rng_paths() {
+    for law in [
+        "normalize(logweighted((x, p) -> p*x, Normal(0, 1), theta))",
+        "tilt(logweighted((x, p) -> p*x, Lebesgue(reals), theta), Normal(0, 1))",
+    ] {
+        // Completing the square gives N(theta,1). At theta=.7,x=.25,
+        // log density is -1.0201885332046727 and d/dtheta is -.45.
+        let source = format!(
+            "theta = external(reals)\nx = external(reals)\nq = {law}\n\
+             inputs = (theta, x)\noutputs = logdensityof(q, x)"
+        );
+        compile(&source, Mode::LogDensity);
+        let sampled = compile(
+            &source.replace("logdensityof(q, x)", "rand(q, rnginit(1729))"),
+            Mode::Sample,
+        );
+        assert!(sampled.contains("stablehlo.rng_bit_generator"));
+    }
+}
+
+#[test]
+fn explicit_weights_keep_whole_records_and_exact_normalizers() {
+    for source in [
+        "p = external(cartprod(a=reals, b=reals))\n\
+         x = external(cartprod(a=reals, b=reals))\n\
+         M = logweighted((x,p) -> p.a*x.a+p.b*x.b, joint(a=Normal(0,1),b=Normal(0,1)), p)\n\
+         inputs = (p,x)\noutputs = logdensityof(M,x)",
+        "p = external(reals)\nx = external(reals)\n\
+         M = normalize(logweighted((x,p) -> logdensityof(Normal(p,1),x), Normal(0,1), p))\n\
+         inputs = (p,x)\noutputs = logdensityof(M,x)",
+    ] {
+        compile(source, Mode::LogDensity);
+    }
+}
+
+#[test]
 fn vector_linear_tilts_keep_covariance_and_live_coefficients() {
     for law in [
         "normalize(logweighted(weight, B))",

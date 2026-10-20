@@ -22,7 +22,8 @@ use flatppl_infer::ModuleBundle;
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(diags.is_empty(), "fixture must infer: {diags:?}");
     m
 }
 
@@ -152,19 +153,19 @@ draws = rand(pushfwd(f, lawof(record(p = d1, q = d2))), s)",
     );
 }
 
-/// A captured draw stays the enclosing graph's one realization even if its
-/// law depends on a boundary. Applications add offsets to that same sample.
+/// Passing one draw to two applications preserves its identity while the
+/// explicit offset input changes independently.
 #[test]
-fn calls_preserve_a_captured_draw_with_a_parameterized_law() {
+fn calls_share_an_explicit_draw_argument() {
     let m = parse_infer(
         "\
 s = rnginit(0)
 z = elementof(reals)
 a ~ Normal(z, 1)
-f = functionof(a + z, z=z)
-draws = rand(lawof(record(original=a, left=f(3), right=f(5))), s)",
+f = functionof(a + z, sample=a, offset=z)
+draws = rand(lawof(record(original=a, left=f(a,3), right=f(a,5))), s)",
     );
-    let out = determinize(&m).expect("captured shared sample must lower");
+    let out = determinize(&m).expect("explicit shared sample must lower");
     let printed = flatppl_syntax::print(&out);
     assert_eq!(printed.matches("builtin_sample").count(), 1, "{printed}");
     assert!(

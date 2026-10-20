@@ -3489,19 +3489,19 @@ fn lower_weighted(
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (w_node, m_inner) = {
+    let (w_node, m_inner, parameter) = {
         let c = expect_builtin_call(m, node, "weighted")
             .ok_or_else(|| refuse(node, m, "expected weighted"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(node, m, "weighted expects 2 args"));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(node, m, "weighted expects 2 or 3 args"));
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
-    let w_scored = if weight_is_variate_dependent(m, w_node) {
-        build_weight_call(m, w_node, v)?
+    let w_scored = if parameter.is_some() || weight_is_variate_dependent(m, w_node) {
+        build_weight_call(m, w_node, v, parameter)?
     } else {
         w_node
     };
@@ -3536,18 +3536,18 @@ fn lower_logweighted(
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (lw_node, m_inner) = {
+    let (lw_node, m_inner, parameter) = {
         let c = expect_builtin_call(m, node, "logweighted")
             .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(node, m, "logweighted expects 2 args"));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(node, m, "logweighted expects 2 or 3 args"));
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
-    let lw_scored = if weight_is_variate_dependent(m, lw_node) {
-        build_weight_call(m, lw_node, v)?
+    let lw_scored = if parameter.is_some() || weight_is_variate_dependent(m, lw_node) {
+        build_weight_call(m, lw_node, v, parameter)?
     } else {
         lw_node
     };
@@ -3590,8 +3590,9 @@ fn array_len(m: &Module, node: NodeId) -> Option<usize> {
     }
 }
 
-/// Apply a variate-dependent `weighted`/`logweighted` weight at the variate `v`,
-/// per §06 "Weight arity": a one-parameter weight receives the variate whole
+/// Apply a variate-dependent `weighted`/`logweighted` weight at the variate `v`.
+/// With an explicit parameter, call `w(v, p)` with the whole variate.
+/// Otherwise, per §06 "Weight arity", a one-parameter weight receives it whole
 /// (`w(v)`); when `v` is a k-element array (k ≥ 2), a weight of exactly k scalar
 /// parameters instead receives one component per parameter, in order
 /// (`w(v[1], …, v[k])`); any other arity over a k-array is a spec error, refused
@@ -3599,20 +3600,24 @@ fn array_len(m: &Module, node: NodeId) -> Option<usize> {
 /// reject with a generic (and, for this construct, misleading — it always
 /// tried one argument) arity-mismatch message.
 ///
-/// **Scope limit.** The array-length check only fires when `v` itself is a
-/// fixed-length array — a non-array variate falls back to the historical
-/// single-argument call unconditionally, even when the weight declares more
-/// than one input. That input list is not always a plain positional parameter
-/// roster: a `functionof`/`kernelof` reification's boundary can name a
-/// CAPTURED value alongside the variate parameter (e.g. `functionof(mul(coeff,
-/// _x_), x = _x_, coeff = coeff)`, closing over an outer θ), which is a
-/// different, already-guarded failure mode (θ captured inside a reification
-/// input — see `lower_likelihoodof_at_point`'s `subtree_capturing_reification_input`
-/// check) than the plain k-parameter split this function performs. Refusing
-/// here on arity alone would preempt that more specific diagnostic with a
-/// misleading "not a fixed-length array" message, for a case §06 "Weight arity"
-/// was never written to describe.
-fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+/// The array-length check applies only to fixed-length arrays. Other variates
+/// retain the ordinary call's boundary and arity diagnostics.
+fn build_weight_call(
+    m: &mut Module,
+    w_node: NodeId,
+    v: NodeId,
+    parameter: Option<NodeId>,
+) -> Result<NodeId, RefuseError> {
+    if let Some(parameter) = parameter {
+        if weight_declared_inputs(m, w_node).is_some_and(|inputs| inputs.len() != 2) {
+            return Err(refuse(
+                w_node,
+                m,
+                "explicit weight parameters require f(x, p)",
+            ));
+        }
+        return Ok(build_user_call_n(m, w_node, vec![v, parameter]));
+    }
     let Some(inputs) = weight_declared_inputs(m, w_node) else {
         return Ok(build_user_call(m, w_node, v));
     };
@@ -3656,6 +3661,30 @@ fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId
         })
         .collect();
     Ok(build_user_call_n(m, w_node, components))
+}
+
+/// A symbolic variate and the instantiated weight expression. This view feeds
+/// closed-form recognizers without creating a callable that captures `parameter`.
+fn weight_function_body(
+    m: &mut Module,
+    weight: NodeId,
+    parameter: Option<NodeId>,
+) -> Option<(NodeId, Ref)> {
+    let function = crate::kernel::resolve_reified(m, weight)?;
+    match (function.inputs.as_slice(), parameter) {
+        ([(_, variate)], None) => Some((function.body, *variate)),
+        ([(_, variate), (_, input)], Some(parameter)) if !function.auto => {
+            let body = crate::kernel::substitute_admitted(
+                m,
+                function.body,
+                &[(*input, parameter)],
+                crate::kernel::Substitute::All,
+                false,
+            );
+            Some((body, *variate))
+        }
+        _ => None,
+    }
 }
 
 /// Add component densities only after expressing them against a common reference.
@@ -4637,12 +4666,12 @@ struct GaussianProduct {
 /// refuse-don't-mislower). Structural matching; takes `&mut` only so the shared
 /// [`normal_ctor`]/[`split_kernel_constructor`] can intern positional-arg names.
 fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<GaussianProduct> {
-    let (lw_node, base) = {
+    let (lw_node, base, parameter) = {
         let c = expect_builtin_call(m, logweighted, "logweighted")?;
-        if c.args.len() != 2 {
+        if !matches!(c.args.len(), 2 | 3) {
             return None;
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
 
     // Factor 1 (g1): the logweighted base is a `Normal` constructor.
@@ -4654,21 +4683,7 @@ fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<Gau
     // `functionof` whose single positional body scores a `Normal` AT the reified
     // argument `x` (not at a constant, which would make ℓ a constant weight, not a
     // second Gaussian factor).
-    let (lw_resolved, _) = resolve_ref_one(m, lw_node);
-    // Read the reified callable's single body and input placeholder (`x`), then
-    // drop the `&Call` borrow before `gaussian_factor_scored_at` reborrows `&mut`.
-    let (g2_body, arg_ref) = {
-        let f = expect_builtin_call(m, lw_resolved, "functionof")?;
-        if f.args.len() != 1 {
-            return None;
-        }
-        // g2 must be scored at exactly this ref, so ℓ(x) = logdensityof(g2, x).
-        let arg_ref = match &f.inputs {
-            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
-            _ => return None,
-        };
-        (f.args[0], arg_ref)
-    };
+    let (g2_body, arg_ref) = weight_function_body(m, lw_node, parameter)?;
     let (mu2, sigma2) = gaussian_factor_scored_at(m, g2_body, arg_ref)?;
 
     Some(GaussianProduct {
@@ -7131,7 +7146,10 @@ struct PolynomialOverInterval {
 ///   the polynomial itself and not a polynomial of some other quantity;
 /// * the coefficient vector must be a literal `vector` call, so its length — the
 ///   degree — is static.
-fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<PolynomialOverInterval> {
+fn recognize_polynomial_over_interval(
+    m: &mut Module,
+    node: NodeId,
+) -> Option<PolynomialOverInterval> {
     let (base, set) = {
         let c = expect_builtin_call(m, node, "truncate")?;
         if c.args.len() != 2 {
@@ -7149,13 +7167,13 @@ fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<Polyno
         (ic.args[0], ic.args[1])
     };
 
-    let (weight, reference) = {
+    let (weight, reference, parameter) = {
         let (base, _) = resolve_ref_chain(m, base);
         let c = expect_builtin_call(m, base, "weighted")?;
-        if c.args.len() != 2 {
+        if !matches!(c.args.len(), 2 | 3) {
             return None;
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
 
     // The reference measure is Lebesgue over the whole line.
@@ -7172,18 +7190,7 @@ fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<Polyno
 
     // `x -> polynomial(c, x)`: a single-input reification whose body applies
     // `polynomial` to that input's own placeholder.
-    let (body, arg_ref) = {
-        let (weight, _) = resolve_ref_chain(m, weight);
-        let f = expect_builtin_call(m, weight, "functionof")?;
-        if f.args.len() != 1 {
-            return None;
-        }
-        let arg_ref = match &f.inputs {
-            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
-            _ => return None,
-        };
-        (f.args[0], arg_ref)
-    };
+    let (body, arg_ref) = weight_function_body(m, weight, parameter)?;
 
     let coefficients = {
         let p = expect_builtin_call(m, body, "polynomial")?;

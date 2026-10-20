@@ -192,6 +192,60 @@ pub(crate) fn call_rule(
         return Ready((ty, joined));
     }
 
+    if matches!(name.as_str(), "weighted" | "logweighted") && args.len() == 3 {
+        let result_type = fresh_measure(arg_ty(args, 1));
+        let Type::Measure { domain, .. } = &result_type else {
+            return Ready((result_type, joined));
+        };
+        let inputs = [
+            (args[1].0, *domain.clone(), Phase::Parameterized),
+            args[2].clone(),
+        ];
+        if let Some(ty) = user_arity_check(inf, id, args[0].0, &args[0].1, &inputs, &[]) {
+            return Ready((ty, joined));
+        }
+        let function = args[0].0;
+        let callable = matches!(
+            args[0].1,
+            Type::Function { .. } | Type::Any | Type::Deferred
+        );
+        let resolved = resolve_binding_refs(inf, function);
+        let result = if let Node::Const(op) = inf.module.node(resolved) {
+            // Builtin function values use the ordinary call checks too.
+            let application = Call {
+                head: CallHead::Builtin(*op),
+                args: inputs.iter().map(|arg| arg.0).collect(),
+                named: Box::new([]),
+                inputs: None,
+            };
+            call_rule(inf, id, &application, None, &inputs, &[], joined)
+                .map(inf, |_, (ty, _)| Some(ty))
+        } else {
+            substituted_result(inf, function, &inputs, &[], None, false)
+                .map(inf, |_, result| result.map(|(ty, _)| ty))
+        };
+        return result.map(inf, move |inf, result| {
+            let ty = result.or_else(|| reified_result_type(inf, function));
+            if ty.as_ref().is_some_and(|ty| {
+                !matches!(
+                    ty,
+                    Type::Scalar(ScalarType::Real | ScalarType::Integer)
+                        | Type::Any
+                        | Type::Deferred
+                        | Type::Failed(_)
+                )
+            }) || !callable
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "explicit weight parameters require a scalar real function f(x, p)",
+                ));
+                return (Type::Failed("invalid weight function".into()), joined);
+            }
+            (result_type, joined)
+        });
+    }
+
     let ty = match name.as_str() {
         flatppl_core::LOG_INTEGRAL
         | flatppl_core::LOG_INTERVAL_MASS
@@ -4440,34 +4494,28 @@ fn reification_type(
             return (Type::Failed("undeclared placeholder".into()), Phase::Fixed);
         }
     }
-    // §04 reification, the PHASE of a reified callable. A `functionof` may
-    // reference `draw` nodes of the enclosing graph: they stay shared ancestors
-    // with a single realization, so the callable is conditional on that
-    // realization — never resampled per call, never marginalized. What that
-    // costs is determinism, and the phase is where it is paid: a reification
-    // that captures a draw, or a node descending from one, is itself
-    // STOCHASTIC. §04's no-closures sentence then narrows to the deterministic
-    // ancestors it names, "a fixed ancestor is resolved to its value".
-    //
-    // A boundary-named ancestor is not captured — §04 substitutes it with a
-    // fresh `elementof(valueset(a))` input before the trace runs — so
-    // `functionof(m, raw_syst = raw_syst)` is the conditional kernel and stays
-    // `%fixed`. `functionof(lawof(m))` likewise: `lawof` absorbs, so nothing
-    // stochastic is captured.
-    //
-    // `kernelof` is never stochastic. §04 "Kernels and `kernelof`" makes
-    // `kernelof(x, kwargs…)` equivalent to `functionof(lawof(x), kwargs…)`, so
-    // its whole body sits under an implicit `lawof` and every draw it reaches is
-    // absorbed — the marginalization the eight-schools `forward_kernel` and the
-    // `prior_predictive` example rely on.
-    let phase = match (name, args.first()) {
-        ("functionof", Some((body, _, _)))
-            if !captured_draws(inf, *body, &boundary_targets).is_empty() =>
-        {
-            Phase::Stochastic
+    // Boundaries cut before tracing. kernelof absorbs the remaining draws,
+    // while functionof must have no free draw in its reified graph.
+    if name == "functionof"
+        && let Some((body, _, _)) = args.first()
+    {
+        let captures = captured_draws(inf, *body, &boundary_targets);
+        for (binding, at) in &captures {
+            let draw = binding
+                .map(|s| format!("draw `{}`", inf.module.resolve(s)))
+                .unwrap_or_else(|| "an inline draw".into());
+            inf.diags.push(crate::Diagnostic::error_at(
+                *at,
+                format!(
+                    "a reified callable cannot capture {draw}; expose it as a boundary \
+                     input, or reify its law with `lawof` or `kernelof`"
+                ),
+            ));
         }
-        _ => Phase::Fixed,
-    };
+        if !captures.is_empty() {
+            return (Type::Failed("captured draw".into()), Phase::Fixed);
+        }
+    }
     let body_ty = args.first().map(|(_, t, _)| t);
     let ty = match (name, body_ty) {
         // `kernelof` reifies a value's law after cutting the input boundary.
@@ -4510,14 +4558,7 @@ fn reification_type(
         ("functionof", _) => Type::Function { inputs },
         _ => Type::Deferred,
     };
-    // A `%failed` reification carries no meaningful phase; keep it `%fixed` so a
-    // downstream phase join is not reddened twice for one error.
-    let phase = if matches!(ty, Type::Failed(_)) {
-        Phase::Fixed
-    } else {
-        phase
-    };
-    (ty, phase)
+    (ty, Phase::Fixed)
 }
 
 /// Every `%local` placeholder the reified expression at `body` reaches that
@@ -4581,11 +4622,8 @@ fn undeclared_placeholders(
 /// `(binding name, node)` pairs in walk order. The name is `None` for a
 /// `draw(…)` written inline in the reified expression.
 ///
-/// A non-empty result makes the reification stochastic-phase. A captured draw
-/// is a shared ancestor with a single realization, so the callable is
-/// conditional on that realization rather than a function of its inputs alone.
-/// That is exactly what `%stochastic` records; the names are kept so a caller
-/// can say WHICH draws a callable is conditional on.
+/// A non-empty result makes the reification invalid. Names identify the free
+/// draws that must become boundary inputs or be absorbed by a law.
 ///
 /// `draw` is the only source of a stochastic node (§04 "Phases"; §07 *Random
 /// value generation* makes `rand`/`rnginit`/`rngstate` ordinary functions whose
@@ -4614,15 +4652,8 @@ fn undeclared_placeholders(
 ///   — the same "soundly does extra work, never skips" convention
 ///   `walk_auto` uses.
 ///
-/// A nested `functionof` is deliberately **not** a cut in itself. §04 gives a
-/// reified callable the same ancestor rule as any other binding, so
-/// `z = inner()` outside a reification is stochastic exactly when `inner`
-/// captures a draw — and a `functionof` over that same expression must capture
-/// it too. The phase cut above is what stops the walk at a nested reification
-/// that captures nothing, which is the useful half of the old blanket cut.
-/// (Without this, `inner = functionof(resolution)` over a drawn `raw_syst`
-/// followed by `outer = functionof(inner())` came out `%fixed` while the JS
-/// analyzer's `reificationCapturesDraw` called it stochastic.)
+/// Nested reifications are validated at their own construction, including
+/// those beneath a law that absorbs the outer graph's stochasticity.
 ///
 /// A cross-module reference is also a cut: a stochastic dependency binding is
 /// invisible across the load boundary (`modules.rs` refuses it there), so no
@@ -6039,8 +6070,8 @@ fn broadcast_type(
         }
         ("neg", [a]) => a.clone(),
         (
-            "exp" | "log" | "sqrt" | "invlogit" | "logit" | "log1p" | "expm1" | "abs" | "sin"
-            | "cos" | "tan" | "tanh",
+            "exp" | "log" | "sqrt" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1" | "abs"
+            | "sin" | "cos" | "tan" | "atan" | "tanh",
             [a],
         ) => real_or_complex(Some(a)),
         // The comparisons and the logical connectives, whose per-cell result is a
@@ -6770,6 +6801,8 @@ enum SpecialArity {
     /// that it "only accepts positional arguments, not keyword arguments", which
     /// is now what EVERY distinguished input does, so the carve-out folded in.
     Distinguished(usize),
+    /// A fixed positional prefix with one optional positional input.
+    DistinguishedOptional(usize),
     /// `n` distinguished inputs plus optional variadic NAMED inputs
     /// (`load_module`'s substitutions).
     DistinguishedPlusNamed(usize),
@@ -6834,9 +6867,17 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
             Distinguished(2),
             "§06 `tilt(M, B)` takes two positional arguments",
         ),
-        "aggregate" | "metricsum" | "markovchain" | "kscan" => (
+        "aggregate" | "metricsum" => (
             Distinguished(3),
-            "\"`aggregate`, `metricsum`, `markovchain`, `kscan`: Three distinguished inputs\"",
+            "\"`aggregate`, `metricsum`: Three distinguished inputs\"",
+        ),
+        "markovchain" | "kscan" => (
+            DistinguishedOptional(3),
+            "three distinguished inputs and an optional fourth positional parameter value",
+        ),
+        "weighted" | "logweighted" => (
+            DistinguishedOptional(2),
+            "two distinguished inputs and an optional third positional parameter value",
         ),
         "load_module" => (
             DistinguishedPlusNamed(1),
@@ -6944,7 +6985,7 @@ fn special_arity_check(
     let (pos, kw) = (args.len(), named.len());
     let total = pos + kw;
     match declared {
-        SpecialArity::Distinguished(n) => {
+        SpecialArity::Distinguished(n) | SpecialArity::DistinguishedOptional(n) => {
             // Spelling first: on a keyword call the COUNT may well be right, and
             // reporting "takes 3 inputs, got 3" would be both true and useless.
             if kw > 0 {
@@ -6959,8 +7000,14 @@ fn special_arity_check(
                     cite,
                 );
             }
-            if pos != n {
-                return refuse(inf, format!("takes {n} input(s), got {pos}"), cite);
+            let optional = matches!(declared, SpecialArity::DistinguishedOptional(_));
+            if pos != n && !(optional && pos == n + 1) {
+                let expected = if optional {
+                    format!("{n} or {}", n + 1)
+                } else {
+                    n.to_string()
+                };
+                return refuse(inf, format!("takes {expected} input(s), got {pos}"), cite);
             }
         }
         SpecialArity::DistinguishedPlusNamed(n) => {

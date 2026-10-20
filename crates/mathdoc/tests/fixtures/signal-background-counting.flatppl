@@ -63,8 +63,8 @@ is the same measure as $w p + (1 - w) q$ with $w = \nu_B / (\nu_B + \nu_S)$.
 Written with the yields, the model never forms $1 - w$, which loses every
 significant digit of the signal weight once $w$ rounds to one.
 ###
-energy = (b, s) -> normalize(superpose(weighted(b, bkg), weighted(s, sig)))
-E ~ energy.(nu_B[dataset_of_event], nu_S[dataset_of_event])
+energy = (b, s, scale) -> normalize(superpose(weighted(b, Exponential(1.0 / scale)), weighted(s, sig)))
+E ~ energy.(nu_B[dataset_of_event], nu_S[dataset_of_event], lam)
 
 forward_kernel = kernelof(
     record(event_counts = event_counts, E = E),

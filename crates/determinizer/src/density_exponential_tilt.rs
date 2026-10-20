@@ -41,7 +41,7 @@ enum Score {
 /// Match either normalized log weighting or its equivalent `tilt` spelling.
 pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
     let node = resolve_ref_chain(m, node).0;
-    let (weight, base, reference) = match builtin_name(m, node)? {
+    let (weight, base, reference, parameter) = match builtin_name(m, node)? {
         "normalize" => {
             let normalized = expect_builtin_call(m, node, "normalize")?;
             let [weighted] = *normalized.args else {
@@ -49,10 +49,15 @@ pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
             };
             let weighted = resolve_ref_chain(m, weighted).0;
             let weighted = expect_builtin_call(m, weighted, "logweighted")?;
-            let [weight, base] = *weighted.args else {
+            if !matches!(weighted.args.len(), 2 | 3) {
                 return None;
-            };
-            (weight, base, None)
+            }
+            (
+                weighted.args[0],
+                weighted.args[1],
+                None,
+                weighted.args.get(2).copied(),
+            )
         }
         "tilt" => {
             let call = expect_builtin_call(m, node, "tilt")?;
@@ -61,10 +66,15 @@ pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
             };
             let source = resolve_ref_chain(m, source).0;
             let source = expect_builtin_call(m, source, "logweighted")?;
-            let [weight, reference] = *source.args else {
+            if !matches!(source.args.len(), 2 | 3) {
                 return None;
-            };
-            (weight, base, Some(reference))
+            }
+            (
+                source.args[0],
+                base,
+                Some(source.args[1]),
+                source.args.get(2).copied(),
+            )
         }
         _ => return None,
     };
@@ -105,11 +115,8 @@ pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
     {
         return None;
     }
-    let function = crate::kernel::resolve_reified(m, weight)?;
-    let [(_, input)] = *function.inputs else {
-        return None;
-    };
-    let affine = affine(m, function.body, input, vector)?;
+    let (body, input) = weight_function_body(m, weight, parameter)?;
+    let affine = affine(m, body, input, vector)?;
     let mut valid = build_call(m, "isfinite", &[affine.offset]);
     if let Some(law) = &inherited {
         valid = build_call(m, "land", &[valid, law.valid]);

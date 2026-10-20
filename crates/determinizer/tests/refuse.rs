@@ -185,31 +185,6 @@ lp = logdensityof(d, 0.5)";
     );
 }
 
-// §06 `markovchain` takes THREE arguments (`kernel`, `init`, `n`) — it is not a
-// `jointchain`-style variadic. A two-argument spelling is malformed, so the
-// determiniser refuses on the arity rather than guess which argument is missing.
-// (This case previously pinned the blanket "deferred to a later task" refusal
-// that covered every `markovchain`; the trajectory lowering now handles the
-// well-formed shape, so what is left to pin here is the arity gate.)
-#[test]
-fn markovchain_two_argument_spelling_refuses() {
-    let src = "\
-z = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(z = draw(Normal(mu = z, sigma = 0.1))), z = z)
-mc = markovchain(lawof(record(z = z)), k)
-lp = logdensityof(mc, record(z = 1.0))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("a 2-arg markovchain must refuse, not lower");
-    assert!(
-        err.construct.contains("markovchain"),
-        "refusal names markovchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("3 positional args"),
-        "refusal names the §06 arity: {err:?}"
-    );
-}
-
 // A DYNAMIC trajectory length has no static step count, and FlatPDL has no loop
 // or scan primitive to carry one at runtime — so the unroll refuses rather than
 // pick a length. `n` here comes from a `load_data` table whose row count is

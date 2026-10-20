@@ -2,18 +2,38 @@ use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 
 /// Keep the category vector inside a scalar row kernel when broadcasting rows.
-pub(crate) fn observation(b: &mut Builder<'_>, eta: NodeId, thresholds: usize) -> NodeId {
+pub(crate) fn observation(
+    b: &mut Builder<'_>,
+    eta: NodeId,
+    cuts: &[NodeId],
+    scalar: bool,
+) -> NodeId {
     let name = b.sym("eta");
     let input = Ref {
         ns: RefNs::Local,
         name: b.sym("_eta_"),
     };
-    let value = b.m.alloc(Node::Ref(input));
-    let cuts = b.self_ref("cuts");
+    let value = if scalar {
+        eta
+    } else {
+        b.m.alloc(Node::Ref(input))
+    };
+    let mut inputs = vec![(name, input)];
+    let mut args = vec![eta];
     let mut differences = Vec::new();
-    for i in 1..=thresholds {
-        let index = b.lit_int(i as i64);
-        let cut = b.call("get", &[cuts, index]);
+    for (i, &cut) in cuts.iter().enumerate() {
+        let cut = if scalar {
+            cut
+        } else {
+            let name = b.sym(&format!("cut{}", i + 1));
+            let input = Ref {
+                ns: RefNs::Local,
+                name: b.sym(&format!("_cut{}_", i + 1)),
+            };
+            inputs.push((name, input));
+            args.push(cut);
+            b.m.alloc(Node::Ref(input))
+        };
         let difference = b.call("sub", &[cut, value]);
         differences.push(difference);
     }
@@ -30,19 +50,22 @@ pub(crate) fn observation(b: &mut Builder<'_>, eta: NodeId, thresholds: usize) -
         let mass = b.call("mul", &[lo, hi]);
         probabilities.push(b.call("mul", &[mass, gap]));
     }
-    let last = b.lit_int(thresholds as i64);
-    let last = b.call("get", &[cuts, last]);
-    let tail = b.call("sub", &[value, last]);
+    let last = *differences.last().expect("an ordinal model has thresholds");
+    let tail = b.call("neg", &[last]);
     // The complementary logistic form retains the upper tail near one.
     probabilities.push(b.call("invlogit", &[tail]));
     let probabilities = b.array(&probabilities);
     let law = b.call("Categorical", &[probabilities]);
+    if scalar {
+        return law;
+    }
     let head = CallHead::Builtin(b.sym("functionof"));
     let kernel = b.m.alloc(Node::Call(Call {
         head,
         args: Box::new([law]),
         named: Box::default(),
-        inputs: Some(Inputs::Spec(Box::new([(name, input)]))),
+        inputs: Some(Inputs::Spec(inputs.into())),
     }));
-    b.call("broadcast", &[kernel, eta])
+    args.insert(0, kernel);
+    b.call("broadcast", &args)
 }

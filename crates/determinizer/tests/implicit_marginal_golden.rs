@@ -569,16 +569,8 @@ y2 = draw(Normal(mu = z, sigma = 1.3))
     }
 }
 
-// The joint law must be reachable through a REIFIED spelling of the record too. §06's
-// *Uniform kernel extension* identifies a measure with a nullary kernel, so a CLOSED
-// `functionof` means its body, and the `lawof` routing unwraps it to a fixpoint. That unwrap
-// and this law are independent changes to the same dispatch area, so the composition is
-// pinned rather than assumed.
-//
-// The named spelling is compared on the `lp` binding, not the whole module: its
-// `M = functionof(record(…))` binding survives as a dead `Function`-typed one, which the
-// measure-binding sweep does not reach. That residual is byte-identical at `482d26f` with
-// this branch's changes stashed, so it is pre-existing and not this law's doing.
+// Absorbing the draws before function reification gives a closed kernel whose
+// law is the same correlated record law.
 #[test]
 fn a_reified_shared_latent_record_reaches_the_same_joint_law() {
     let model = "\
@@ -599,13 +591,10 @@ y2 = draw(Normal(mu = z, sigma = 1.0))
     );
     for query in [
         // Named closed reification.
-        "M = functionof(record(y1 = y1, y2 = y2))\n\
+        "M = functionof(lawof(record(y1 = y1, y2 = y2)))\n\
          lp = logdensityof(lawof(M), record(y1 = 0.5, y2 = 0.7))",
         // Inline.
-        "lp = logdensityof(lawof(functionof(record(y1 = y1, y2 = y2))), \
-         record(y1 = 0.5, y2 = 0.7))",
-        // Nested — §04's rationale applies at every level, so the unwrap is a fixpoint.
-        "lp = logdensityof(lawof(functionof(functionof(record(y1 = y1, y2 = y2)))), \
+        "lp = logdensityof(lawof(functionof(lawof(record(y1 = y1, y2 = y2)))), \
          record(y1 = 0.5, y2 = 0.7))",
     ] {
         let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");

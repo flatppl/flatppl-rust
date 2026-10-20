@@ -2541,8 +2541,8 @@ lp = logdensityof(lawof(K), 0.5)",
     let mut ok = flatppl_syntax::parse(
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = functionof(Normal(mu = a, sigma = 1.0))
-lp = logdensityof(lawof(F), 0.5)",
+F = functionof(Normal(mu = a, sigma = 1.0), a = a)
+lp = logdensityof(F(0.0), 0.5)",
     )
     .unwrap();
     let ok_diags = flatppl_infer::infer(&mut ok);

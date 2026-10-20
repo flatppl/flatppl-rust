@@ -66,24 +66,23 @@ pub(crate) fn lower_kscan(m: &mut Module, node: NodeId, v: NodeId) -> Result<Nod
 /// kernel input) or `"kscan"` (third arg `xs`, two kernel inputs).
 fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<NodeId, RefuseError> {
     let per_step_input = op == "kscan";
-    let expected_inputs = if per_step_input { 2 } else { 1 };
-
-    let (k_arg, init, third) = {
+    let (k_arg, init, third, parameter) = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected a chain call"));
         };
-        if !c.named.is_empty() || c.args.len() != 3 {
+        if !c.named.is_empty() || !(3..=4).contains(&c.args.len()) {
             return Err(refuse(
                 node,
                 m,
                 &format!(
-                    "{op} expects 3 positional args (kernel, init, {})",
+                    "{op} expects 3 or 4 positional args (kernel, init, {}, optional p)",
                     if per_step_input { "xs" } else { "n" }
                 ),
             ));
         }
-        (c.args[0], c.args[1], c.args[2])
+        (c.args[0], c.args[1], c.args[2], c.args.get(3).copied())
     };
+    let expected_inputs = (if per_step_input { 2 } else { 1 }) + usize::from(parameter.is_some());
 
     // The step count. `None` covers a dynamic length AND a record-state chain
     // (whose trajectory is a table, left with a deferred domain by inference) —
@@ -157,6 +156,9 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
         if per_step_input {
             let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
             app_args.push(build_call(m, "get0", &[third, idx]));
+        }
+        if let Some(parameter) = parameter {
+            app_args.push(parameter);
         }
         let step = m.alloc(Node::Call(Call {
             head: CallHead::User(k_arg),

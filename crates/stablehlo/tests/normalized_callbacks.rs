@@ -1,6 +1,15 @@
 use flatppl_stablehlo::{EmitOptions, Mode};
 
 fn emit(source: &str, mode: &Mode) -> String {
+    emit_with_integrals(source, mode, false)
+}
+
+fn emit_with_integrals(source: &str, mode: &Mode, numerical_integrals: bool) -> String {
+    let options = EmitOptions {
+        restrict_enzyme_compatible: false,
+        integration: numerical_integrals.then(Default::default),
+        ..Default::default()
+    };
     let mut model = flatppl_syntax::parse(source).unwrap();
     let diagnostics = flatppl_infer::infer(&mut model);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -9,7 +18,7 @@ fn emit(source: &str, mode: &Mode) -> String {
         &model,
         &flatppl_infer::ModuleBundle::new(),
         Some(&roots),
-        &flatppl_stablehlo::LOWERING_OPTIONS,
+        &options.lowering_options(),
     )
     .unwrap();
     flatppl_stablehlo::emit(
@@ -18,10 +27,7 @@ fn emit(source: &str, mode: &Mode) -> String {
             Mode::LogDensity => Mode::LogDensity,
             Mode::Sample => Mode::Sample,
         },
-        &EmitOptions {
-            restrict_enzyme_compatible: false,
-            ..Default::default()
-        },
+        &options,
     )
     .unwrap()
 }
@@ -43,6 +49,22 @@ fn callback_normalization_retains_scalar_weight_and_base_proofs() {
             emit(&source, &mode),
             emit(&source.replace("row(mu, sigma)", base), &mode),
         );
+    }
+}
+
+#[test]
+fn explicit_weights_retain_live_numerical_normalizers() {
+    for weight in [
+        "weighted((x,p) -> 1+p*x*x, Uniform(interval(0,1)), p)",
+        "logweighted((x,p) -> log1p(p*x*x), Uniform(interval(0,1)), p)",
+    ] {
+        // Z(p)=1+p/3. At p=2,x=.5, log density is -.10536051565782634
+        // and the derivative in p is -1/30.
+        let source = format!(
+            "p = external(posreals)\nx = external(reals)\n\
+             M = normalize({weight})\ninputs = (p,x)\noutputs = logdensityof(M,x)"
+        );
+        emit_with_integrals(&source, &Mode::LogDensity, true);
     }
 }
 
