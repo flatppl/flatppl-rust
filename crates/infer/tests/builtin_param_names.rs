@@ -294,7 +294,7 @@ fn spot_checked_names_match_the_spec_arguments_column() {
         ("checked", &["value", "condition"][..]),
         ("load_data", &["source", "valueset"][..]),
         ("rand", &["m", "rstate"][..]),
-        ("filter", &["pred", "data"][..]),
+        ("filter", &["pred", "data", "p"][..]),
         ("diag", &["A", "k"][..]),
         ("onehot", &["i", "n"][..]),
         ("sum", &["xs"][..]),

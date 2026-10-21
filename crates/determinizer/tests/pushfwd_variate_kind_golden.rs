@@ -110,7 +110,7 @@ fn an_explicit_bijection_between_kinds_still_lowers() {
     // asserts `f_inv` — "FlatPPL implementations are not required to verify this". Here
     // `f_inv` is a `functionof` that DOES bind the record's field, so the reducer
     // accepts it and the change of variables is the correct one.
-    let src = "finv = functionof(_a_, a = _a_)\n\
+    let src = "finv = r -> r.a\n\
                b = pushfwd(bijection(fn(record(a = _)), finv, fn(0.0 * _)), \
                  Normal(mu = 0.0, sigma = 1.0))\n\
                lp = logdensityof(b, record(a = 1.0))";
@@ -135,7 +135,7 @@ fn bare_operator_at_a_record_refuses_when_the_kind_check_cannot_fire() {
          lp = logdensityof(b, record(a = 1.0))",
     );
     assert!(
-        reason.contains("auto-splatting") && reason.contains("argument names"),
+        reason.contains("bare built-in") && reason.contains("whole record"),
         "expected the bare-operator record refusal, got: {reason}"
     );
 }

@@ -111,21 +111,9 @@ lp = logdensityof(Normal(mu = r, sigma = 1.0), 1.0)",
     );
 }
 
-/// The SAMPLER's `Substitute::All` site: `pushfwd`'s forward map, applied at the sampled
-/// record by §04 auto-splat.
-///
-/// The map is `functionof(p * q, p = p, q = q)` and the base is
-/// `lawof(record(p = d1, q = d2))` with `d1 ~ Normal(mu = q, sigma = 1.0)` — so the
-/// value bound to input `p` (the `d1` sample) READS the module binding input `q`
-/// targets. Sequentially, `p := <d1 sample>` inserts that read and `q := <d2 sample>`
-/// then rewrites it, so `d1` is sampled at a mean of `d2`'s realized value instead of
-/// the ambient `q`: a different measure, hence a wrong sample, at exit 0.
-///
-/// The discriminator is the sample COUNT. Two logical samples re-expand to three
-/// syntactic occurrences here (the writer has no CSE and `d1`'s advanced rng seeds
-/// `d2`), exactly as `pushfwd_over_independent_record_law_applies_map_to_both_draws`
-/// documents. Capture nests a whole extra `d2` sample inside `d1`'s own mean, giving
-/// five.
+/// A whole-record pushforward preserves the ambient parameter in the first
+/// sample, even when a record field has that parameter's name. The two draws
+/// appear three times in the printed tree because the first RNG feeds the second.
 #[test]
 fn a_pushfwd_sample_map_does_not_capture_a_cross_named_field() {
     let m = parse_infer(
@@ -135,10 +123,10 @@ p  = elementof(reals)
 q  = elementof(reals)
 d1 ~ Normal(mu = q, sigma = 1.0)
 d2 ~ Normal(mu = 0.0, sigma = 1.0)
-f  = functionof(p * q, p = p, q = q)
+f  = r -> r.p * r.q
 draws = rand(pushfwd(f, lawof(record(p = d1, q = d2))), s)",
     );
-    let out = determinize(&m).expect("a record-splatting pushfwd map must lower");
+    let out = determinize(&m).expect("a whole-record pushfwd map must lower");
     let printed = flatppl_syntax::print(&out);
     assert_eq!(
         printed.matches("builtin_sample").count(),

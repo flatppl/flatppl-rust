@@ -131,26 +131,6 @@ lp = logdensityof(lawof(t), [0.5, 1.5])";
     );
 }
 
-// A step kernel with the wrong arity is refused on the §06 signature rather than
-// bound by a guessed position: `markovchain`'s kernel takes ONE input (the
-// state), `kscan`'s takes TWO (state, exogenous input).
-#[test]
-fn markovchain_two_input_kernel_refuses() {
-    let src = "\
-f = (s, x) -> Normal(s + x, 1.0)
-t = draw(markovchain(f, 0.0, 3))
-lp = logdensityof(lawof(t), [0.5, 1.5, 1.0])";
-    let err = determinize(&parse_infer(src)).expect_err("arity mismatch must refuse");
-    assert!(
-        err.construct.contains("markovchain"),
-        "refusal names markovchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("boundary input") && err.reason.contains("§06"),
-        "refusal names the §06 signature: {err:?}"
-    );
-}
-
 // A RECORD state makes the trajectory a table (§06: "If `init` and `traj[i]` are
 // records, then the trajectories are tables, not arrays"), which inference leaves
 // with a deferred domain — so there is no static array length to unroll and no

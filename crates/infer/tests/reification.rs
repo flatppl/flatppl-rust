@@ -147,6 +147,33 @@ model = functionof(broadcast(Poisson, expected))
     }
 }
 
+#[test]
+fn explicit_boundaries_cover_parameters_after_descendant_substitution() {
+    for source in [
+        "p = elementof(reals)\nf(x) = x + p",
+        "p = elementof(reals)\ny ~ Normal(p, 1)\nf(x) = logdensityof(lawof(y), x)",
+        "p = elementof(reals)\nz = elementof(reals)\ny ~ Normal(p, 1)\nf = kernelof(y, unused = z)",
+    ] {
+        let mut module = flatppl_syntax::parse(source).unwrap();
+        let diagnostics = infer_module(&mut module, &ModuleBundle::new(), Level::Shape);
+        assert!(
+            diagnostics.iter().any(|d| d.severity == Severity::Error),
+            "{source}"
+        );
+    }
+    let module = infer_src(
+        "p = elementof(reals)\nz ~ Normal(p, 1)\ny = z + p\nfixed_offset = 2\n\
+         f = functionof(y + fixed_offset, y = y)\n\
+         g = kernelof(y, y = y, z = z)\n\
+         law = functionof(lawof(z), p = p)\nanswer = f(3.0)",
+        Level::Shape,
+    );
+    assert_eq!(
+        binding_ty(&module, "answer"),
+        Some(&Type::Scalar(flatppl_core::ScalarType::Real))
+    );
+}
+
 /// A leaf reached by two distinct paths (a shared sub-expression / diamond) is
 /// recorded once: the ancestor walk's visited-set both dedupes the input and
 /// stops the second traversal from re-descending the shared subgraph.

@@ -185,7 +185,8 @@ fn expectation(
         }
         return expectation(m, base, &mut |m, point| {
             let score = conditional(m, point)?;
-            let weight = build_weight_call(m, weight, point, parameter)?;
+            let weight = build_callback_call(m, weight, point, parameter)?;
+            let weight = crate::canon::inline_expression(m, weight);
             let weight = if logarithmic {
                 weight
             } else {

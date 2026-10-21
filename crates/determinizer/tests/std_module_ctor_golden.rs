@@ -32,7 +32,7 @@ fn std_module_member_call_lowers_to_bare_member_kernel() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 sig = hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0)
-lp = logdensityof(lawof(sig), 5.28)";
+lp = logdensityof(sig, 5.28)";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 
@@ -64,7 +64,7 @@ f = elementof(unitinterval)
 sig = hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0)
 bkg = hep.Argus(resonance = 5.29, slope = -20.0, power = 0.5)
 mix = normalize(superpose(weighted(f, sig), weighted(1.0 - f, bkg)))
-lp = logdensityof(lawof(mix), 5.28)";
+lp = logdensityof(mix, 5.28)";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 

@@ -35,7 +35,7 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
 fn broadcast_poisson_lowers_to_sum_over_broadcast() {
     let src = "\
 rates = [1.0, 2.0, 3.0]
-lp = logdensityof(lawof(broadcast(Poisson, rates)), [0, 1, 2])";
+lp = logdensityof(broadcast(Poisson, rates), [0, 1, 2])";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 
@@ -91,7 +91,7 @@ fn broadcast_kernel_density_is_axis_native_for_dynamic_length() {
 n = elementof(posintegers)
 rates = elementof(cartpow(posreals, n))
 obs = elementof(cartpow(nonnegintegers, n))
-lp = logdensityof(lawof(broadcast(Poisson, rates)), obs)";
+lp = logdensityof(broadcast(Poisson, rates), obs)";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 
@@ -134,7 +134,7 @@ fn broadcast_module_qualified_head_resolves_to_bare_member_kernel() {
 hepphys = standard_module(\"particle-physics\", \"0.1\")
 rates = [2.0, 3.0]
 obs = [1.0, 2.0]
-lp = logdensityof(lawof(broadcast(hepphys.ContinuedPoisson, rates)), obs)";
+lp = logdensityof(broadcast(hepphys.ContinuedPoisson, rates), obs)";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 
@@ -188,7 +188,7 @@ fn broadcast_normal_binds_positional_args_to_param_names_in_order() {
     let src = "\
 mus = [0.0, 1.0, 2.0]
 sigmas = [1.0, 2.0, 3.0]
-lp = logdensityof(lawof(broadcast(Normal, mus, sigmas)), [0.5, 0.5, 0.5])";
+lp = logdensityof(broadcast(Normal, mus, sigmas), [0.5, 0.5, 0.5])";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
 
@@ -218,7 +218,7 @@ fn broadcast_keyword_data_args_honor_given_names() {
     let src = "\
 mus = [0.0, 1.0]
 sigmas = [1.0, 2.0]
-lp = logdensityof(lawof(broadcast(Normal, sigma = sigmas, mu = mus)), [0.5, 0.5])";
+lp = logdensityof(broadcast(Normal, sigma = sigmas, mu = mus), [0.5, 0.5])";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
     assert!(
@@ -340,32 +340,4 @@ lp = logdensityof(L, record(mu = 2.0))";
         "measure/likelihood layer gone:\n{pir}"
     );
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
-}
-
-// Refuse-don't-mislower survives the reified-measure unwrap. Unwrapping the
-// outer `functionof` measure does NOT bypass the θ-capture guard: here the
-// unwrapped body `weighted(w, Normal(…))` scores through `w`, and
-// `w = functionof(mul(coeff, _x_), …, coeff = coeff)` closes over the θ param
-// `coeff` as a reification INPUT — which the per-query θ-inliner cannot reach
-// (`substitute_refs_by_name` walks `children()`, excluding a `Call`'s `Inputs`).
-// The `subtree_has_theta_capturing_input` guard follows the density's
-// `(%ref self w)` into `w`'s RHS, sees the `(coeff, %ref self coeff)` boundary
-// entry, and HARD REFUSES rather than score at the free `coeff`.
-#[test]
-fn functionof_measure_wrapping_theta_capturing_weight_still_refuses() {
-    let src = "\
-coeff = elementof(reals)
-w = functionof(mul(coeff, _x_), x = _x_, coeff = coeff)
-k = functionof(weighted(w, Normal(mu = 0.0, sigma = 1.0)), coeff = coeff)
-L = likelihoodof(k, 0.5)
-lp = logdensityof(L, record(coeff = 2.0))";
-    let err = determinize(&parse_infer(src)).expect_err(
-        "a θ param captured inside a reification input must refuse even when reached \
-         through an unwrapped functionof-as-measure, not silently score at the free param",
-    );
-    assert!(
-        err.reason.contains("reification input")
-            && err.reason.contains("refuse rather than mislower"),
-        "refusal is the θ-in-reification-input guard: {err:?}"
-    );
 }

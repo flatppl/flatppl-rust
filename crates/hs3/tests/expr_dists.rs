@@ -48,16 +48,18 @@ fn density_function_dist_converts() {
     eprintln!("=== density_function_dist ===\n{text}\n=== end ===");
 
     // Exact body: the generic_function lowers each operator to its FlatPPL call
-    // form over a fresh bound variable _x_; free names mu/sigma stay as refs.
+    // form over a fresh bound variable _x_; mu/sigma are explicit parameters.
     assert!(
         text.contains(
-            "my_gauss_fn = functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0))), x = _x_)"
+            "my_gauss_fn = functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, get(_parameters_, 1)), get(_parameters_, 2)), 2.0))), x = _x_, parameters = _parameters_)"
         ),
         "generic_function body mismatch, got:\n{text}"
     );
     // density (not log-density) → normalize(weighted(<fn>, Lebesgue(reals))).
     assert!(
-        text.contains("gauss_dist = normalize(weighted(my_gauss_fn, Lebesgue(reals)))"),
+        text.contains(
+            "gauss_dist = normalize(weighted(my_gauss_fn, Lebesgue(reals), (mu, sigma)))"
+        ),
         "density_function_dist body mismatch, got:\n{text}"
     );
     // density_function_dist must use weighted, never logweighted.
@@ -116,12 +118,14 @@ fn log_density_function_dist_converts() {
     // variant treats the function as a log-density, not a density.
     assert!(
         text.contains(
-            "log_gauss_fn = functionof(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0)), x = _x_)"
+            "log_gauss_fn = functionof(mul(neg(0.5), pow(divide(sub(_x_, get(_parameters_, 1)), get(_parameters_, 2)), 2.0)), x = _x_, parameters = _parameters_)"
         ),
         "log generic_function body mismatch, got:\n{text}"
     );
     assert!(
-        text.contains("log_gauss_dist = normalize(logweighted(log_gauss_fn, Lebesgue(reals)))"),
+        text.contains(
+            "log_gauss_dist = normalize(logweighted(log_gauss_fn, Lebesgue(reals), (mu, sigma)))"
+        ),
         "log_density_function_dist body mismatch, got:\n{text}"
     );
 
@@ -168,7 +172,7 @@ fn generic_dist_converts() {
     // (no separate functions-block binding — the expression is embedded).
     assert!(
         text.contains(
-            "inline_gauss = normalize(weighted(functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0))), x = _x_), Lebesgue(reals)))"
+            "inline_gauss = normalize(weighted(functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, get(_parameters_, 1)), get(_parameters_, 2)), 2.0))), x = _x_, parameters = _parameters_), Lebesgue(reals), (mu, sigma)))"
         ),
         "generic_dist body mismatch, got:\n{text}"
     );
@@ -634,12 +638,15 @@ fn a_fold_over_an_observable_is_a_lambda() {
     // Minimal syntax spells a lambda `functionof(<body>, <param> = <hole>)`;
     // canonical syntax prints the same node as `y -> <body>`.
     assert!(
-        text.contains("sum_over_obs = functionof(add(a0, _y_), y = _y_)")
-            && text.contains("prod_over_obs = functionof(mul(a1, _y_), y = _y_)"),
+        text.contains(
+            "sum_over_obs = functionof(add(_parameters_, _y_), y = _y_, parameters = _parameters_)"
+        ) && text.contains(
+            "prod_over_obs = functionof(mul(_parameters_, _y_), y = _y_, parameters = _parameters_)"
+        ),
         "a fold over an observable must be a lambda over it, got:\n{text}"
     );
     assert!(
-        text.contains("poly_fn = functionof(polynomial([a0, a1], _y_), y = _y_)"),
+        text.contains("poly_fn = functionof(polynomial([get(_parameters_, 1), get(_parameters_, 2)], _y_), y = _y_, parameters = _parameters_)"),
         "the polynomial sibling pins the shape being matched, got:\n{text}"
     );
     // A fold over parameters ONLY stays a bare scalar: wrapping it would make
@@ -720,11 +727,15 @@ fn every_function_kind_is_applied_at_its_observable() {
 
     // Every kind applies, not just generic_function. The bare name would be a
     // function inside a record, which §04 forbids.
-    // Minimal syntax names the lambda's bound observable `_y_`, so the
-    // application reads `fy_x(_y_)` inside the conditional's `functionof`.
-    for f in ["fy_gen", "fy_poly", "fy_sum", "fy_prod"] {
+    // Each helper receives its observable field and explicit parameter tuple.
+    for (f, parameters, sigma) in [
+        ("fy_gen", "(get(_parameters_, 1), get(_parameters_, 2))", 3),
+        ("fy_poly", "(get(_parameters_, 1), get(_parameters_, 2))", 3),
+        ("fy_sum", "get(_parameters_, 1)", 2),
+        ("fy_prod", "get(_parameters_, 1)", 2),
+    ] {
         assert!(
-            text.contains(&format!("Normal(mu = {f}(_y_), sigma = sig)")),
+            text.contains(&format!("Normal(mu = {f}(get(_point_, \"y\"), {parameters}), sigma = get(_parameters_, {sigma}))")),
             "`{f}` must be applied at its observable, got:\n{text}"
         );
         assert!(

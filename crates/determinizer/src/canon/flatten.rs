@@ -70,7 +70,7 @@ pub(crate) fn flatten_structural(m: &mut Module) -> bool {
 /// `get(record/table(%field k v ...), "k") -> v`; `get0(vector(e0, e1, ...), i) -> ei`
 /// for a literal `i`. Returns an EXISTING child NodeId (no alloc needed), so the
 /// `&Module` signature suffices. Dynamic index/field → None.
-fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Option<NodeId> {
+pub(crate) fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Option<NodeId> {
     let Node::Call(c) = m.node(id) else {
         return None;
     };
@@ -114,6 +114,46 @@ fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Option<NodeId>
         }
         _ => None,
     }
+}
+
+/// Resolve a compile-time object tuple without changing canonical RNG tuple
+/// projections, whose shared constructor carries sampling provenance.
+pub(crate) fn project_tuple(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Option<NodeId> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if !matches!(m.resolve(sym), "get" | "get0") || c.args.len() != 2 {
+        return None;
+    }
+    let Node::Lit(Scalar::Int(index)) = m.node(c.args[1]) else {
+        return None;
+    };
+    let mut container = c.args[0];
+    for _ in 0..m.binding_count() {
+        let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(container)
+        else {
+            break;
+        };
+        if promoted.contains(name) {
+            break;
+        }
+        let Some(binding) = m.binding_by_name(*name) else {
+            break;
+        };
+        container = m.binding(binding).rhs;
+    }
+    let tuple = expect_builtin(m, container, "tuple")?;
+    let base = i64::from(m.resolve(sym) == "get");
+    usize::try_from(index - base)
+        .ok()
+        .and_then(|i| tuple.args.get(i))
+        .copied()
 }
 
 fn expect_builtin<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a flatppl_core::Call> {

@@ -137,13 +137,15 @@ fn golden_density_function() {
     // The function body lowers each operator to its FlatPPL call form.
     assert!(
         text.contains(
-            "my_gauss_fn = functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0))), x = _x_)"
+            "my_gauss_fn = functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, get(_parameters_, 1)), get(_parameters_, 2)), 2.0))), x = _x_, parameters = _parameters_)"
         ),
         "generic_function body mismatch, got:\n{text}"
     );
     // The distribution normalizes the function against Lebesgue measure.
     assert!(
-        text.contains("gauss_dist = normalize(weighted(my_gauss_fn, Lebesgue(reals)))"),
+        text.contains(
+            "gauss_dist = normalize(weighted(my_gauss_fn, Lebesgue(reals), (mu, sigma)))"
+        ),
         "density_function_dist body mismatch, got:\n{text}"
     );
     // density (not log-density) → plain weighted, never logweighted.
@@ -225,8 +227,8 @@ fn golden_polynomial() {
         r#"{"distributions":[{"name":"poly","type":"polynomial_dist","coefficients":[1.0,"c1",0.5],"x":"po"}],
             "domains":[{"name":"default_domain","type":"product_domain","axes":[{"name":"po","min":-5.0,"max":5.0}]}],
             "parameter_points":[{"name":"n","entries":[{"name":"c1","value":0.3}]}]}"#,
-        "poly = normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _po_), \
-         po = _po_), Lebesgue(reals)), interval(-5.0, 5.0)))",
+        "poly = normalize(truncate(weighted(functionof(polynomial([1.0, _parameters_, 0.5], _po_), \
+         po = _po_, parameters = _parameters_), Lebesgue(reals), c1), interval(-5.0, 5.0)))",
     );
 }
 
@@ -371,7 +373,7 @@ fn golden_paper_product_density_product() {
     // Shared-variate product: reweight g1 by g2's log-density, then normalize.
     assert!(
         text.contains(
-            "prod = normalize(logweighted(functionof(logdensityof(g2, _x_), x = _x_), g1))"
+            "prod = normalize(logweighted(functionof(logdensityof(_parameters_, _x_), x = _x_, parameters = _parameters_), g1, g2))"
         ),
         "shared-variate product_dist lowering mismatch, got:\n{text}"
     );
@@ -446,7 +448,7 @@ fn golden_product_three_shared_variates() {
     let text = print_with(&m, Syntax::Minimal);
     assert!(
         text.contains(
-            "prod3 = normalize(logweighted(functionof(add(logdensityof(b, _x_), logdensityof(c, _x_)), x = _x_), a))"
+            "prod3 = normalize(logweighted(functionof(add(logdensityof(get(_parameters_, 1), _x_), logdensityof(get(_parameters_, 2), _x_)), x = _x_, parameters = _parameters_), a, (b, c)))"
         ),
         "3-factor shared-variate product lowering mismatch, got:\n{text}"
     );

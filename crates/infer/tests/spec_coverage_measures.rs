@@ -347,10 +347,7 @@ fn positional_joint_domain_is_cat_array() {
 // Measure-argument gates on `lawof` and `kernelof`
 // ============================================================
 //
-// Two §04 rules that nothing enforced before. `lawof(m)` requires `m`'s `%mass`
-// to be `%normalized` (flatppl-design#73 @ 9d9a91c, pending owner review);
-// `kernelof(x)` requires `x` to be a value node — "`x` must not be a measure",
-// already normative in §04.
+// Both reification operations take value nodes.
 
 /// Diagnostics from a full infer pass, as `Debug` strings.
 fn diags_of(src: &str) -> Vec<String> {
@@ -362,67 +359,22 @@ fn rejects(src: &str, needle: &str) -> bool {
     diags_of(src).iter().any(|d| d.contains(needle))
 }
 
-/// §04 (#73): "`lawof(m)` requires `m`'s `%mass` to be `%normalized` …; anything
-/// else is a static error, since an unnormalized measure is not its own law".
-/// One case per rejected mass class the checker can produce.
 #[test]
-fn lawof_rejects_a_measure_that_is_not_normalized() {
-    // %finite — a truncation is a restriction, mass ≤ 1 and not provably 1.
-    assert!(rejects(
-        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nz = lawof(t)",
-        "requires a `%normalized` measure"
-    ));
-    // %locallyfinite — infinite total mass.
-    assert!(rejects(
-        "z = lawof(Lebesgue(reals))",
-        "total mass is `%locallyfinite`"
-    ));
-    // The message names the escape hatch §04 names.
-    assert!(rejects(
-        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nz = lawof(t)",
-        "normalize(...)"
-    ));
-}
-
-/// The gate still quantifies over the mass CLASS — a measure it holds as
-/// `%finite` is rejected however normalized it looks — but a `superpose` whose
-/// weights provably sum to one is no longer `%finite` at all, so `lawof` of it is
-/// legal. Both halves are pinned here because the distinction is the whole design:
-/// the PROOF moved into the mass rule, the gate did not soften.
-#[test]
-fn lawof_takes_a_proven_mixture_and_still_refuses_a_finite_measure() {
-    let proven = "\
-n = Normal(mu = 0.0, sigma = 1.0)
-sp = superpose(weighted(0.5, n), weighted(0.5, n))
-z = lawof(sp)";
-    assert!(diags_of(proven).is_empty(), "{:?}", diags_of(proven));
-    let finite = "\
-n = Normal(mu = 0.0, sigma = 1.0)
-z = lawof(weighted(0.5, n))";
-    assert!(rejects(finite, "total mass is `%finite`"));
-    // `normalize` is the stated escape and must clear it.
-    let fixed = "\
-n = Normal(mu = 0.0, sigma = 1.0)
-z = lawof(normalize(weighted(0.5, n)))";
-    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
-}
-
-/// The gate must not fire where §04 says `lawof` is fine: a `%normalized`
-/// measure, a VALUE (the overwhelmingly common spelling), and a record of values.
-#[test]
-fn lawof_accepts_normalized_measures_and_values() {
-    for src in [
-        "z = lawof(Normal(mu = 0.0, sigma = 1.0))",
-        "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(y)",
-        "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(record(y = y))",
-        "n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(normalize(truncate(n, interval(0.0, 1.0))))",
+fn lawof_requires_a_value_node() {
+    for source in [
+        "M = Normal(0, 1)\nz = lawof(M)",
+        "K(x) = Normal(x, 1)\nz = lawof(K)",
+        "f(x) = x + 1\nz = lawof(f)",
+        "z = lawof((1, 2))",
     ] {
+        let mut module = flatppl_syntax::parse(source).unwrap();
         assert!(
-            diags_of(src).is_empty(),
-            "{src} must infer clean: {:?}",
-            diags_of(src)
+            infer(&mut module)
+                .iter()
+                .any(|d| d.severity == flatppl_infer::Severity::Error)
         );
     }
+    assert!(diags_of("z = lawof(draw(Normal(0, 1)))").is_empty());
 }
 
 /// §04: `kernelof` "reifies (typically stochastic) value nodes"; "`x` must not be
@@ -430,6 +382,9 @@ fn lawof_accepts_normalized_measures_and_values() {
 /// diagnostics differ so a user with a kernel is not told they have a measure.
 #[test]
 fn kernelof_rejects_a_measure_layer_argument() {
+    for source in ["f(x)=x*x\nbad=kernelof(f)", "bad=kernelof((1,2))"] {
+        assert!(rejects(source, "non-value object"));
+    }
     let measure = "mu = elementof(reals)\nz = kernelof(Normal(mu = mu, sigma = 1.0), mu = mu)";
     assert!(rejects(measure, "this argument is a measure"));
     assert!(
@@ -470,7 +425,7 @@ fn kernelof_of_a_value_and_functionof_of_a_measure_stay_legal() {
 fn both_gates_survive_alias_hops() {
     assert!(rejects(
         "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nt2 = t\nt3 = t2\nz = lawof(t3)",
-        "requires a `%normalized` measure"
+        "requires a value node"
     ));
     // Three hops on the kernelof side too — the same depth the lawof case pins, so
     // neither gate is left resting on a single-hop claim.
@@ -492,111 +447,6 @@ k2 = k
 k3 = k2
 z = kernelof(k3, mu = mu)",
         "this argument is a kernel"
-    ));
-}
-
-// ============================================================
-// `lawof` of a measure is the IDENTITY (#73's definition half)
-// ============================================================
-
-/// §04 as amended by flatppl-design#73 (@ `9d9a91c`, pending owner review):
-/// "`lawof(m)` is `lawof(draw(m))`, the law of a draw from `m`" and "A probability
-/// measure of fixed or parameterized phase is its own law, so `lawof(m)` is
-/// equivalent to `m` and `lawof` is idempotent."
-///
-/// So the result type is the ARGUMENT's type, not a measure wrapping it. Before
-/// this, `lawof(Normal(…))` typed as a measure whose DOMAIN was a measure.
-#[test]
-fn lawof_of_a_normalized_measure_is_the_identity() {
-    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(n)");
-    let n = out.lines().find(|l| l.contains("%bind n")).unwrap_or("");
-    let z = out.lines().find(|l| l.contains("%bind z")).unwrap_or("");
-    let ty = "((%measure (%domain (%scalar real)) (%mass %normalized))";
-    assert!(n.contains(ty), "the measure itself:\n{out}");
-    assert!(z.contains(ty), "lawof of it must type identically:\n{out}");
-    // No measure-over-measure anywhere.
-    assert!(
-        !z.contains("(%domain (%measure"),
-        "must not wrap the argument as the domain:\n{out}"
-    );
-}
-
-/// §04's idempotence, which falls out of the identity: `lawof(lawof(m))` types as
-/// `m`. Worth its own pin — it is the property that would break first if the arm
-/// ever went back to wrapping.
-#[test]
-fn lawof_is_idempotent_on_a_measure() {
-    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(lawof(lawof(n)))");
-    assert!(
-        out.lines()
-            .find(|l| l.contains("%bind z"))
-            .unwrap_or("")
-            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
-        "three lawof layers type as one:\n{out}"
-    );
-}
-
-/// A `normalize(...)`d restriction is the spelling §04 names as the escape, and
-/// `normalize` always stamps `%normalized` (never `%deferred`), so this case
-/// stays a theorem, not the gate's `%deferred` admission route — see
-/// `lawof_of_a_deferred_mass_measure_stays_deferred` for that one.
-#[test]
-fn lawof_of_a_normalized_restriction_types_over_the_element_domain() {
-    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\n\
-         z = lawof(normalize(truncate(n, interval(0.0, 1.0))))");
-    assert!(
-        out.lines()
-            .find(|l| l.contains("%bind z"))
-            .unwrap_or("")
-            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
-        "a measure over the ELEMENT domain, not over the measure:\n{out}"
-    );
-}
-
-/// §04: "On a non-nullary kernel, `lawof` lifts pointwise, as the uniform kernel
-/// extension does for measure-algebra operations." So the result is a KERNEL over
-/// the same inputs, not a measure whose domain is a kernel.
-#[test]
-fn lawof_of_a_kernel_lifts_pointwise() {
-    let out = ir("mu = elementof(reals)\n\
-         y ~ Normal(mu = mu, sigma = 1.0)\n\
-         k = kernelof(record(y = y), mu = mu)\n\
-         z = lawof(k)");
-    let z = out.lines().find(|l| l.contains("%bind z")).unwrap_or("");
-    assert!(
-        z.contains("((%kernel (%inputs mu) (%mass %normalized))"),
-        "a kernel over the same inputs:\n{out}"
-    );
-    assert!(
-        !z.contains("(%domain (%kernel"),
-        "must not wrap the kernel as a domain:\n{out}"
-    );
-}
-
-/// `lawof`'s gate extends to a KERNEL argument by the same three rules as the
-/// measure case, pointwise (owner ruling, `lawof-kernel-mass-maths.md`,
-/// 2026-08-19): §04's "On a non-nullary kernel, `lawof` lifts pointwise"
-/// composes the whole measure-argument mass clause — requirement, settled-class
-/// error, and no-laundering rider alike — onto each output measure the kernel
-/// generates. Wherever `lawof(K)` is defined at all, every output measure has
-/// mass 1, so a kernel with a SETTLED non-`%normalized` mass (here `%finite`,
-/// from `functionof` over a `weighted(...)` body) types an expression that has
-/// no value and must be a static error, exactly like `lawof` of a `%finite`
-/// measure. Before this fix the kernel branch was ungated and stamped the
-/// result `%normalized` regardless.
-#[test]
-fn lawof_rejects_a_kernel_that_is_not_normalized() {
-    assert!(rejects(
-        "k = functionof(weighted(0.5, Normal(mu = 0.0, sigma = 1.0)))\nq = lawof(k)",
-        "total mass is `%finite`"
-    ));
-    // The parameterized-input shape from the maths doc's probe 2, so a
-    // regression cannot narrow the fix to the nullary case alone.
-    assert!(rejects(
-        "z = elementof(reals)\n\
-         k = functionof(weighted(0.5, Normal(mu = z, sigma = 1.0)), z = z)\n\
-         q = lawof(k)",
-        "total mass is `%finite`"
     ));
 }
 
@@ -625,29 +475,13 @@ fn lawof_of_a_value_still_types_over_the_value() {
     }
 }
 
-/// Alias-transparent, like the gate: the identity is read off the inferred type, so
-/// hops cannot change it.
-#[test]
-fn the_lawof_identity_survives_alias_hops() {
-    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nn2 = n\nn3 = n2\nz = lawof(n3)");
-    assert!(
-        out.lines()
-            .find(|l| l.contains("%bind z"))
-            .unwrap_or("")
-            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
-        "three alias hops must not change the identity typing:\n{out}"
-    );
-}
-
 // ============================================================
 // `draw` requires a probability measure (owner ruling; spec PR to follow)
 // ============================================================
 //
 // No implicit normalization: drawing from a measure whose mass is not a
 // probability is a static error, and `normalize(m)` is the escape. Derived from
-// #73's equation read right-to-left — `lawof(m)` = `lawof(draw(m))` and `lawof`
-// requires `%normalized`, so a draw from an unnormalized measure has no law.
-// Mirrors `lawof`'s gate exactly; both route through `unprovable_normalization`.
+// Draw mass is checked by `unprovable_normalization`.
 
 /// Every mass class the checker can prove is not a probability is rejected, and the
 /// message names `normalize(...)`.
@@ -877,25 +711,6 @@ y = draw(normalize(weighted(0.5, n)))";
     assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
 }
 
-/// `lawof` shares the improvement, because the proof lives in the `superpose`
-/// MASS rule and not in either gate: the mixture is `%normalized`, so it is its
-/// own law.
-#[test]
-fn lawof_accepts_a_mixture_whose_weights_provably_sum_to_one() {
-    let src = "\
-psi ~ Beta(1.5, 1.5)
-sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
-m = lawof(sp)";
-    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
-    // Unproven weights still fail `lawof`'s gate, with its own message.
-    let unproven = "\
-psi ~ Beta(1.5, 1.5)
-phi ~ Beta(1.5, 1.5)
-sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - phi, Dirac(0)))
-m = lawof(sp)";
-    assert!(rejects(unproven, "`%unknown`"));
-}
-
 /// What the gate must NOT touch: the ordinary spellings every model uses, and the
 /// explicit `normalize` escape. `draw` of a KERNEL is also left alone — §06's
 /// uniform kernel extension scopes itself to "measure-to-measure operations", and
@@ -944,13 +759,13 @@ fn the_draw_gate_survives_alias_hops() {
 fn the_ldid_unnormalized_shape_is_now_rejected() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
+y = draw(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), interval(0.0, 3.0)))
 lp = logdensityof(lawof(y), 0.5)";
     assert!(rejects(src, "`draw` requires a probability measure"));
     // And the explicit escape clears it.
     let fixed = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
+y = draw(normalize(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), interval(0.0, 3.0))))
 lp = logdensityof(lawof(y), 0.5)";
     assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
 }
@@ -1134,32 +949,6 @@ fn truncate_of_two_lebesgue_joint_is_finite() {
         "truncated two-Lebesgue joint must be %finite; got:\n{out}"
     );
 }
-
-// The three tests that used to sit here are GONE, and their coverage moved
-// rather than being dropped.
-//
-// They pinned design-PR #73 option C's no-laundering rider — that `lawof` of a
-// `%deferred`-mass argument must leave the result `%deferred`, never
-// `%normalized` — and all three reached it through `joint()`, "the one measure
-// reachable from source whose mass is genuinely `%deferred`
-// (`product_mass`'s empty-list arm)". Spec §04 forbids that call: "Nullary calls
-// (`f()`) are not allowed", and of the special operations "The total number of
-// inputs is never zero". So `joint()` is now a static error
-// (`crates/infer/tests/special_arity.rs`) and the fixture no longer parses to a
-// measure.
-//
-// The rider is asserted instead in `crates/infer/src/ops.rs`
-// `mod no_laundering_tests`, directly against `product_mass` and `lawof_type`.
-// That is the stronger position, not a fallback: the old fixture could only reach
-// `Mass::Deferred` through one spellable expression, so `joint`'s arity and the
-// rider's coverage were coupled for no reason, and the unit tests hold whatever
-// the surface syntax admits. They also cover two cases the source-level fixture
-// could not — that a non-empty all-normalized product is still `%normalized`, and
-// that `lawof` passes EVERY mass class through unchanged rather than special-casing
-// `%deferred`.
-//
-// Nothing else in this file needs a `%deferred`-mass measure, so there is no
-// replacement fixture to build here.
 
 // ============================================================
 // §06 `joint` over kernel components — the fan-out kernel

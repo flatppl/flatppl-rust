@@ -6,7 +6,13 @@ const POLY_FN_JSON: &str = r#"{
   ],
   "functions": [
     {"name": "fy", "type": "polynomial", "coefficients": ["a0", "a1"], "x": "y"}
-  ]
+  ],
+  "domains": [{"name": "domain", "type": "product_domain", "axes": [
+    {"name": "x", "min": -5.0, "max": 5.0},
+    {"name": "y", "min": -5.0, "max": 5.0}
+  ]}],
+  "data": [{"name": "observations", "type": "unbinned",
+    "axes": [{"name": "x"}, {"name": "y"}], "entries": [[0.0, 0.0]]}]
 }"#;
 
 #[test]
@@ -22,10 +28,7 @@ fn polynomial_function_converts() {
         text.contains("functionof"),
         "missing functionof wrapper: {text}"
     );
-    assert!(
-        text.contains("a0") && text.contains("a1"),
-        "missing coeffs: {text}"
-    );
+    assert!(text.contains("(a0, a1, sx)"), "missing coeffs: {text}");
     // round-trips
     parse(&text).expect("emitted FlatPPL must re-parse");
 }

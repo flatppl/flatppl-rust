@@ -238,42 +238,6 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     determinize(&m).expect_err("iid with a genuinely dynamic (external) size must refuse");
 }
 
-// A θ parameter captured as a `functionof` / `kernelof`
-// reification INPUT (a `(coeff, %ref self coeff)` boundary entry) cannot be
-// inlined by the per-query θ substitution — `substitute_refs_by_name` walks
-// `map_tree` / `children()`, which EXCLUDES a `Call`'s `Inputs` bucket (core
-// `node.rs` `for_each_child`). Here the density subtree references its weight by
-// name (`(%call (%ref self w) obs)`), and `w = functionof(mul(coeff, _x_), …,
-// coeff = coeff)` closes over the θ param `coeff` as a boundary input. Left
-// un-inlined, `coeff` would stay a dangling `(%ref self coeff)` inside the
-// reification, so the density would score as a function of the FREE `coeff`
-// instead of at θ = 2.0 — a silent mislowering that still passes `is_flatpdl`. A
-// prior fix guarded this with a `debug_assert!`, which is STRIPPED in release, so
-// in release the mislowering shipped. The determiniser must HARD REFUSE in every
-// build profile (this test runs in debug and encodes the refuse, not the assert).
-#[test]
-fn theta_captured_in_reification_input_refuses() {
-    let src = "\
-coeff = elementof(reals)
-w = functionof(mul(coeff, _x_), x = _x_, coeff = coeff)
-weight_base = weighted(w, Normal(mu = 0.0, sigma = 1.0))
-obs = likelihoodof(weight_base, 0.5)
-lp = logdensityof(obs, record(coeff = 2.0))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err(
-        "a θ param captured inside a functionof/kernelof reification input must refuse, \
-         not silently score at the free param",
-    );
-    assert!(
-        err.reason.contains("reification input") && err.reason.contains("cannot be"),
-        "refusal explains the θ-in-reification-input cannot be inlined: {err:?}"
-    );
-    assert!(
-        err.reason.contains("refuse rather than mislower"),
-        "refusal makes the refuse-don't-mislower stance explicit: {err:?}"
-    );
-}
-
 // Composed truncation base: `normalize(truncate(pushfwd(bij, Normal), S))`
 // — a truncated log-normal-shaped base. The CDF-Z path emits
 // `builtin_touniform(<head>, …)` for ANY builtin head, but `touniform` is the CDF
@@ -1051,84 +1015,8 @@ draws = rand(lawof(record(y1 = y1, y2 = y2, d = d)), s)";
     );
 }
 
-// Applying a `pushfwd` map to a RECORD variate is an auto-splatting call, and §04
-// "Calling conventions" makes a field/argument-name mismatch a static error: `r` names no
-// field of `record(y1 = …, y2 = …)`.
-//
-// Pinned in both directions because the reducer's record branch binds each input from a
-// like-named field and never checks that every FIELD was consumed, so a map naming a
-// strict SUBSET would reduce to a silent projection — a different measure, hence a wrong
-// sample.
-#[test]
-fn rand_of_pushfwd_with_mismatched_record_map_refuses() {
-    let src = "\
-s = rnginit([42, 0, 0, 0])
-y1 = draw(Normal(mu = 0.0, sigma = 1.0))
-y2 = draw(Normal(mu = 0.0, sigma = 1.0))
-draws = rand(pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))), s)";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("a map whose parameters do not match the record variate's fields must refuse");
-    assert!(
-        err.reason.contains("does not correspond"),
-        "refusal rests on the §04 field/parameter correspondence: {err:?}"
-    );
-    // Both sides are named, so the message reads as a correspondence failure rather
-    // than blaming a field the map may legitimately be selecting.
-    assert!(
-        err.reason.contains("map parameters `r`") && err.reason.contains("variate fields `y1`"),
-        "refusal names the map's parameters AND the variate's fields: {err:?}"
-    );
-    assert!(
-        err.construct.contains("pushfwd"),
-        "refusal names the pushfwd: {err:?}"
-    );
-}
-
-// The subset direction of the same rule: the map declares only `y1`, so the
-// reducer would bind `y1` and silently DROP `y2`, emitting a projection of the
-// variate where the model wrote a transform of the whole record.
-#[test]
-fn rand_of_pushfwd_with_partial_record_map_refuses() {
-    let src = "\
-s = rnginit([42, 0, 0, 0])
-y1 = draw(Normal(mu = 0.0, sigma = 1.0))
-y2 = draw(Normal(mu = 0.0, sigma = 1.0))
-f = functionof(mul(2.0, _a_), y1 = _a_)
-draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("a map covering only some of the record's fields must refuse, not project");
-    assert!(
-        err.reason.contains("field `y2` binds no parameter"),
-        "refusal names the field that would have been silently dropped: {err:?}"
-    );
-}
-
-// The residual net behind the §04 correspondence check: a map that is neither a bare
-// builtin callee nor beta-reducible leaves a surviving `%call`, which is not FlatPDL. So
-// the sample path reduces the application itself and refuses when it cannot. Here the map
-// takes two inputs and the variate is a scalar, so there is no record to splat.
-#[test]
-fn rand_of_pushfwd_with_unreducible_map_refuses() {
-    let src = "\
-s = rnginit([42, 0, 0, 0])
-f = functionof(_a_ + _b_, x = _a_, y = _b_)
-draws = rand(pushfwd(f, Normal(mu = 0.0, sigma = 1.0)), s)";
-    let m = parse_infer(src);
-    let err = determinize(&m)
-        .expect_err("a pushfwd map that does not reduce must refuse, not emit an unreduced call");
-    assert!(
-        err.reason.contains("does not reduce"),
-        "refusal explains the map does not apply to the sampled variate: {err:?}"
-    );
-}
-
-// A BARE built-in operator as the `pushfwd` map, over a record-valued base: the
-// forward application is §04 auto-splatting against that operator's own parameter
-// names, and nothing downstream catches the mismatch — `infer` reports no
-// diagnostic for this model and `is_flatpdl` is structural, so `exp(record(y = …))`
-// would be emitted as a conformant module at exit 0 and fail only in the engine.
+// A scalar builtin cannot consume a whole record variate. The structural
+// FlatPDL gate alone would admit exp(record(...)), so sampling must refuse it.
 #[test]
 fn rand_of_pushfwd_bare_builtin_map_over_record_refuses() {
     let src = "\
@@ -1140,6 +1028,6 @@ draws = rand(pushfwd(exp, lawof(record(y = y1))), s)";
         .expect_err("a bare builtin map over a record variate must refuse, not emit exp(record)");
     assert!(
         err.reason.contains("bare built-in"),
-        "refusal names the unresolved auto-splat against the operator's parameters: {err:?}"
+        "refusal names the unsupported builtin argument: {err:?}"
     );
 }

@@ -61,13 +61,13 @@ impl Emitter<'_> {
                     };
                     let name = self.m.resolve(name);
                     if name == "scan" {
-                        let [function, init, xs] = call.args.as_ref() else {
+                        let [function, init, xs, parameters @ ..] = call.args.as_ref() else {
                             return false;
                         };
                         let Ok((body, entries)) = self.callable_parts(*function) else {
                             return false;
                         };
-                        if entries.len() != 2 {
+                        if parameters.len() > 1 || entries.len() != 2 + parameters.len() {
                             return false;
                         }
                         let item = |ty: &Type| match ty {
@@ -80,7 +80,13 @@ impl Emitter<'_> {
                         let (Some(state), Some(input)) = (type_of(id), type_of(*xs)) else {
                             return false;
                         };
-                        let arguments = [item(state), item(input)];
+                        let mut arguments = vec![item(state), item(input)];
+                        for parameter in parameters {
+                            let Some(ty) = type_of(*parameter) else {
+                                return false;
+                            };
+                            arguments.push(ty.clone());
+                        }
                         let mut seeds = types.clone();
                         for i in 0..self.m.node_count() {
                             let node = NodeId::from_usize(i);
@@ -102,6 +108,7 @@ impl Emitter<'_> {
                             return false;
                         }
                         pending.extend([*init, *xs]);
+                        pending.extend(parameters.iter().copied());
                         continue;
                     }
                     if name == "mul" && !matches!(type_of(id), Some(Type::Scalar(_))) {

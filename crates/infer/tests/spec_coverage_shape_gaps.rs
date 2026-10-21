@@ -732,7 +732,7 @@ fn cat_and_tile_preserve_kind_and_rank() {
 /// type); `filter(pred, data)` keeps data's type/rank with a dynamic length.
 #[test]
 fn reduce_and_filter_infer() {
-    let out = ir("xs = [1.0, 2.0, 3.0]\nx = reduce(fn(_ + 1.0), xs)");
+    let out = ir("xs = [1.0, 2.0, 3.0]\nx = reduce(add, xs)");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (reduce"),
         "reduce over a real vector should infer a real scalar, got:\n{out}"

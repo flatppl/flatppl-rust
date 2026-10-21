@@ -2072,7 +2072,7 @@ lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
 
 // C1: the marginalization guard's measure-expression half is NOT reachable from
 // `lower_value_law`. When `lawof`'s argument is a MEASURE the `lawof` is stripped and
-// `build_density_term` scores the constructor, so `lawof(Normal(mu = a, sigma = 1))`
+// `build_density_term` scores the constructor, so `lawof(draw(Normal(mu = a, sigma = 1)))`
 // with `a` latent emitted the conditional at whatever value a later query pinned `a`
 // to. Against Distributions.jl: the emitted -1.4989385332046727
 // (`logpdf(Normal(0.1, 1), exp(0.5))`) vs the marginal -1.8280121234846454
@@ -2092,7 +2092,7 @@ fn lawof_of_a_draw_parameterized_measure_marginalizes() {
     // carried the later query's point; the marginal carries the prior's, widened.
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp_m = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
+lp_m = logdensityof(lawof(draw(Normal(mu = a, sigma = 1.0))), 0.5)
 lp_a = logdensityof(lawof(a), 0.1)";
     let lp_m = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp_m");
     assert!(
@@ -2126,7 +2126,7 @@ lp_a = logdensityof(lawof(a), 0.1)";
             "pushforward of the stochastic law",
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(pushfwd(exp, lawof(Normal(mu = a, sigma = 1.0))))
+y = draw(pushfwd(exp, lawof(draw(Normal(mu = a, sigma = 1.0)))))
 lp_y = logdensityof(lawof(y), 1.6487212707001282)
 lp_a = logdensityof(lawof(a), 0.1)",
         ),
@@ -2134,7 +2134,7 @@ lp_a = logdensityof(lawof(a), 0.1)",
             "named, so it cannot depend on the argument being inline",
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-ml = lawof(Normal(mu = a, sigma = 1.0))
+ml = lawof(draw(Normal(mu = a, sigma = 1.0)))
 y = draw(pushfwd(exp, ml))
 lp_y = logdensityof(lawof(y), 1.6487212707001282)
 lp_a = logdensityof(lawof(a), 0.1)",
@@ -2152,180 +2152,23 @@ lp_a = logdensityof(lawof(a), 0.1)",
     }
 
     // Control: a measure argument whose parameters are FIXED is not stochastic, and
-    // `lawof(lawof(z))` / `lawof(truncate(lawof(z), …))` are deterministic measures
+    // `lawof(z)` / `lawof(truncate(lawof(z), …))` are deterministic measures
     // built from another law — none of these may be caught.
     for src in [
         "\
 p = elementof(reals)
-lp = logdensityof(lawof(Normal(mu = p, sigma = 1.0)), 0.5)",
+lp = logdensityof(lawof(draw(Normal(mu = p, sigma = 1.0))), 0.5)",
         "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(lawof(z)), 0.3)",
+lp = logdensityof(lawof(z), 0.3)",
         "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
+lp = logdensityof(truncate(lawof(z), interval(0.0, inf)), 0.3)",
     ] {
         let pir = flatppl_flatpir::write(&determinize_src(src));
         assert!(
             pir.contains("builtin_logdensityof"),
             "a deterministic measure's law must still lower:\n{pir}"
-        );
-    }
-}
-
-// The measure-expression guard tested `Type::Measure`, and a REIFICATION types as
-// `Kernel` — so `F = functionof(Normal(mu = a, sigma = 1.0))` with `a` latent slipped
-// past it and `logdensityof(lawof(F), 0.5)` emitted the conditional `Normal(0.1, 1)`
-// where §04 "Reification to measures" asks for the TOTAL law, the marginal
-// `Normal(0, √2)` — a conformance-passing number wrong by 0.329 nats.
-//
-// The marginal now LOWERS in the reified spelling too. A `CONJUGATE_TABLE` row reads a
-// bare distribution constructor and the wrapper is not one, so the routing unwraps a
-// CLOSED reification (no boundary inputs) to its body first — §04 forbids a nullary
-// callable "as this would make them equivalent to known values", so the body IS the
-// reification's value. Pinned as BYTE-IDENTICAL emission against the plain spelling:
-// anything less would let the two spellings drift back apart.
-#[test]
-fn lawof_of_a_closed_reification_lowers_identically_to_its_body() {
-    for (reified, plain) in [
-        // Direct query on the reification's law — the shape that emitted the number.
-        (
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = functionof(Normal(mu = a, sigma = 1.0))
-lp = logdensityof(lawof(F), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = Normal(mu = a, sigma = 1.0)
-lp = logdensityof(lawof(F), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        ),
-        // Inline, so the routing cannot depend on the reification being named.
-        (
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(functionof(Normal(mu = a, sigma = 1.0))), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        ),
-        // NESTED wrappers unwrap to a fixpoint. §04's rationale clause applies at every
-        // level, so two closed layers mean the body just as one does, and the routing
-        // must not stop after the first. Before the fixpoint this refused.
-        (
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = functionof(functionof(Normal(mu = a, sigma = 1.0)))
-lp = logdensityof(lawof(F), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = Normal(mu = a, sigma = 1.0)
-lp = logdensityof(lawof(F), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        ),
-        // The `kernelof(Normal(…))` row that used to sit here is GONE: §04 says
-        // `kernelof`'s "`x` must not be a measure", and `infer` now rejects it, so the
-        // spelling can no longer reach the determiniser to be compared against
-        // anything. Its replacement is the rejection test
-        // `kernelof_of_a_measure_is_a_static_error` below. A spec-legal `kernelof`
-        // spelling stays covered by
-        // `kernelof_of_a_value_lowers_identically_to_lawof_of_that_value`.
-    ] {
-        let pir_reified = flatppl_flatpir::write(&determinize_src(reified));
-        let pir_plain = flatppl_flatpir::write(&determinize_src(plain));
-        // The marginal is `Normal(0, √2)`, NOT the conditional `Normal(0.1, 1)` at the
-        // later-pinned `a` — the 0.329-nat error this shape once emitted.
-        assert!(
-            pir_reified.contains("1.4142135623730951"),
-            "must lower to the marginal Normal(0, √2):\n{pir_reified}"
-        );
-        assert_eq!(
-            pir_reified, pir_plain,
-            "reified and plain spellings lower to identical FlatPDL:\nreified:\n{pir_reified}\nplain:\n{pir_plain}"
-        );
-    }
-
-    // A PARAMETERISED reification (one WITH boundary inputs) keeps refusing: reaching
-    // its body needs a value bound to each input, which is §04 kernel-boundary
-    // semantics, not an unwrapping. The message must say so rather than blame the rows.
-    for src in [
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-s = elementof(posreals)
-F = functionof(Normal(mu = a, sigma = s))
-lp = logdensityof(lawof(F), 0.5)",
-        // `kernelof` takes a VALUE (§04), so the parameterised kernel spelling wraps the
-        // measure in a `draw` — §04's identity law makes that equivalent to the kernel.
-        // The pre-gate spelling `kernelof(Normal(…))` is now a static error and would
-        // make this a determiniser assertion about an ill-formed module.
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-s = elementof(posreals)
-K = kernelof(draw(Normal(mu = a, sigma = s)))
-lp = logdensityof(lawof(K), 0.5)",
-    ] {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m)
-            .expect_err("a parameterised reification's law is not yet lowerable — refuse");
-        assert!(
-            err.reason.contains("PARAMETERISED reification")
-                && err.reason.contains("boundary input"),
-            "must refuse naming the boundary inputs, not the conjugate rows: {}",
-            err.reason
-        );
-    }
-
-    // A `draw` OF the reification reaches the same conclusion by the value-side half
-    // of the guard, whose reason names the ancestor rather than the law. Asserted
-    // separately so neither half is credited with the other's coverage.
-    for src in [
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = functionof(Normal(mu = a, sigma = 1.0))
-w = draw(F)
-lp = logdensityof(lawof(w), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-F = functionof(Normal(mu = a, sigma = 1.0))
-y = draw(pushfwd(exp, F))
-lp = logdensityof(lawof(y), 1.6487212707001282)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-    ] {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        determinize(&m).expect_err("a draw of a draw-parameterized reification must refuse too");
-    }
-
-    // Control: what makes this a guard and not a ban on `lawof(<reification>)`. A
-    // reification over FIXED or literal parameters has no stochastic ancestor to
-    // integrate out and must still lower to its one density term.
-    for src in [
-        "\
-p = elementof(reals)
-F = functionof(Normal(mu = p, sigma = 1.0))
-lp = logdensityof(lawof(F), 0.5)",
-        "\
-F = functionof(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(F), 0.5)",
-    ] {
-        let out = determinize_src(src);
-        let pir = flatppl_flatpir::write(&out);
-        assert_eq!(
-            pir_binding(&pir, "lp")
-                .matches("builtin_logdensityof")
-                .count(),
-            1,
-            "a reification over fixed parameters must still lower:\n{pir}"
-        );
-        assert!(
-            flatppl_determinizer::is_flatpdl(&out).is_ok(),
-            "is_flatpdl failed:\n{pir}"
         );
     }
 }
@@ -2354,48 +2197,11 @@ lp = logdensityof(lawof(a), 0.5)";
     );
 }
 
-// The unwrap is CLOSED-only, and "closed" is not the same as "boundary lists nothing".
-// A `%autoinputs` reification whose body holds a free `%local` placeholder auto-traces
-// to ZERO inputs — a `%local` is never an `elementof` leaf — yet the placeholder is
-// bound by nothing once the wrapper is gone. §04 "Placeholders and holes" forbids the
-// module ("All placeholders must appear both in the expression to be reified and the
-// boundary input keyword arguments"), and `infer` now rejects it at the front door
-// (`reification_type`'s undeclared-placeholder error). This guard stays the backstop for
-// a caller that reaches the determiniser without acting on inference's diagnostics, and
-// must refuse rather than score a dangling ref.
-//
-// The placeholder sits in SCALE position deliberately. In `mu` position the conjugate
-// row and the pre-existing reified-measure path emit the same dangling ref either way,
-// so the guard would not be observable; in `sigma` position the row fires on the
-// unwrapped body and would emit
-// `(%field sigma (sqrt (add 1.0 (pow (%ref %local _v_) 2.0))))` — which is what this
-// test catches. Verified discriminating by mutation, not assumed.
-#[test]
-fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
-    let pir = "(%module\n\
-      (%bind a (draw (Normal (%kwarg mu 0.0) (%kwarg sigma 1.0))))\n\
-      (%bind F (functionof (Normal (%kwarg mu (%ref self a)) (%kwarg sigma (%ref %local _v_))) %autoinputs %deferred))\n\
-      (%bind lp (logdensityof (lawof (%ref self F)) 0.5)))";
-    let mut m = flatppl_flatpir::read(pir).expect("probe FlatPIR must parse");
-    let _ = flatppl_infer::infer(&mut m);
-    match determinize(&m) {
-        Ok(out) => panic!(
-            "must refuse rather than emit a dangling placeholder:\n{}",
-            flatppl_flatpir::write(&out)
-        ),
-        Err(e) => assert!(
-            e.reason.contains("placeholder"),
-            "refusal must name the placeholder, not the boundary inputs it does not have: {}",
-            e.reason
-        ),
-    }
-}
-
 // §04 "Kernels and `kernelof`": "`kernelof(x, kwargs...)` is equivalent to
 // `functionof(lawof(x), kwargs...)` […]" — the elided tail scopes what the inner `lawof`
 // marginalizes over to the subgraph the `kwargs` delimit, which is vacuous for the
 // boundary-less spellings here. So `M = kernelof(a)` and `M = functionof(lawof(a))` are
-// one expression in two spellings, and `logdensityof(lawof(M), 0.5)` is one request
+// one expression in two spellings, and `logdensityof(M, 0.5)` is one request
 // either way. The `functionof(lawof(a))` spelling lowered while `kernelof(a)` refused:
 // both wrappers are `Kernel`-typed, but only the `kernelof` one made the
 // measure-expression guard admit the WRAPPER and then run the draw walk on `a`'s own
@@ -2419,7 +2225,7 @@ fn lawof_of_a_closed_kernelof_lowers_identically_to_its_section_04_equivalent() 
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 M = {reifier}
-lp = logdensityof(lawof(M), 0.5)"
+lp = logdensityof(M, 0.5)"
         );
         let pir = flatppl_flatpir::write(&determinize_src(&src));
         assert!(
@@ -2462,7 +2268,7 @@ lp = logdensityof(M, 0.5)",
 
 // §04's `kernelof` equivalence holds for ANY `x`, not just a bare `draw`, so the fix
 // generalizes past the roster pair above and these classes must be pinned too. Each row
-// is `lawof(kernelof(b))` against the plain `lawof(b)`, BYTE-IDENTICAL — the `kernelof` is
+// is `kernelof(b)` against the plain `lawof(b)`, BYTE-IDENTICAL — the `kernelof` is
 // written inline so both modules carry the same bindings and the whole emission compares.
 //
 // All three refused at `b79517a`, the first two through the MARGINAL-law fall-through and
@@ -2492,7 +2298,7 @@ fn lawof_of_a_closed_kernelof_over_a_derived_value_matches_the_plain_spelling() 
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 b = {body}
-lp = logdensityof(lawof(kernelof(b)), 0.5)"
+lp = logdensityof(kernelof(b), 0.5)"
         )));
         let plain = flatppl_flatpir::write(&determinize_src(&format!(
             "\
@@ -2502,7 +2308,7 @@ lp = logdensityof(lawof(b), 0.5)"
         )));
         assert_eq!(
             reified, plain,
-            "`lawof(kernelof(b))` must lower as `lawof(b)` for b = {body}:\nreified:\n{reified}\nplain:\n{plain}"
+            "`kernelof(b)` must lower as `lawof(b)` for b = {body}:\nreified:\n{reified}\nplain:\n{plain}"
         );
         assert!(
             reified.contains(expected),
@@ -2568,7 +2374,7 @@ fn nested_kernelof_is_a_static_error() {
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 M = kernelof(kernelof(a))
-lp = logdensityof(lawof(M), 0.5)",
+lp = logdensityof(M, 0.5)",
     )
     .unwrap();
     let diags = flatppl_infer::infer(&mut m);
@@ -2585,7 +2391,7 @@ lp = logdensityof(lawof(M), 0.5)",
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 M = kernelof(a)
-lp = logdensityof(lawof(M), 0.5)",
+lp = logdensityof(M, 0.5)",
     )
     .unwrap();
     let ok_diags = flatppl_infer::infer(&mut ok);
@@ -2619,21 +2425,21 @@ fn draw_of_an_unnormalized_measure_is_a_static_error() {
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 S = interval(0.0, 3.0)
-y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), S))
+y = draw(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), S))
 lp = logdensityof(lawof(y), 0.5)",
         ),
         (
             "inline set, so it cannot depend on the set being named",
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
+y = draw(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), interval(0.0, 3.0)))
 lp = logdensityof(lawof(y), 0.5)",
         ),
         (
             "half-line, an unbounded truncation set",
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
+y = draw(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), interval(0.0, inf)))
 lp = logdensityof(lawof(y), 0.3)",
         ),
     ] {
@@ -2659,7 +2465,7 @@ lp = logdensityof(lawof(y), 0.3)",
     // base does reach `builtin_touniform`. Both layers refuse, so nothing unsafe lowers.
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
+y = draw(normalize(truncate(lawof(draw(Normal(mu = a, sigma = 1.0))), interval(0.0, 3.0))))
 lp = logdensityof(lawof(y), 0.5)";
     let mut m = flatppl_syntax::parse(src).unwrap();
     let diags = flatppl_infer::infer(&mut m);
@@ -2708,12 +2514,12 @@ w = y + 1.0
 lp = logdensityof(locscale(lawof(y), 1.0, 2.0), 0.3)",
             "(%bind w 0.65)",
         ),
-        // `lawof(lawof(y))` — the unwrap must carry the point through.
+        // `lawof(y)` — the unwrap must carry the point through.
         (
             "\
 y = draw(Normal(mu = 0.0, sigma = 1.0))
 w = y + 1.0
-lp = logdensityof(lawof(lawof(y)), 0.3)",
+lp = logdensityof(lawof(y), 0.3)",
             "(%bind w 1.3)",
         ),
         // A reified body.
@@ -2938,7 +2744,7 @@ fn an_autoinputs_reification_reaching_an_undeclared_placeholder_refuses_to_score
     let pir = "(%module\n\
       (%bind F (functionof (Normal (%kwarg mu (%ref %local _v_)) (%kwarg sigma 1.0)) \
       %autoinputs %deferred))\n\
-      (%bind lp (logdensityof (lawof (%ref self F)) 0.5)))";
+      (%bind lp (logdensityof (%ref self F) 0.5)))";
     let mut m = flatppl_flatpir::read(pir).expect("probe FlatPIR must parse");
     let _ = flatppl_infer::infer(&mut m);
     match determinize(&m) {

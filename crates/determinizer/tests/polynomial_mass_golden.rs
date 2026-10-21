@@ -18,7 +18,8 @@ use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn determinize_pir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diagnostics = flatppl_infer::infer(&mut m);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let out = determinize(&m).expect("must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
@@ -27,7 +28,8 @@ fn determinize_pir(src: &str) -> String {
 
 fn refusal(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diagnostics = flatppl_infer::infer(&mut m);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let err = determinize(&m).expect_err("must refuse");
     format!("{err:?}")
 }
@@ -41,7 +43,7 @@ fn linear_polynomial_over_symmetric_interval() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-10.0, 10.0)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-10.0, 10.0)),
 )
 lp = logdensityof(px, 0.5)",
     );
@@ -112,7 +114,7 @@ fn unbounded_interval_refuses_on_the_endpoints() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-inf, inf)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-inf, inf)),
 )
 lp = logdensityof(px, 0.5)",
     );
@@ -130,7 +132,7 @@ fn mass_rule_is_reached_through_an_alias() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-10.0, 10.0)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-10.0, 10.0)),
 )
 mm = px
 lp = logdensityof(mm, 0.5)",

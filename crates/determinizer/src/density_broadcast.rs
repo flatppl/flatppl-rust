@@ -27,12 +27,20 @@ pub(crate) fn lower_query(m: &mut Module, id: NodeId) -> Option<NodeId> {
         return None;
     }
     let (resolved, _) = resolve_ref_chain(m, values);
-    let cell = match m.type_of(values).or_else(|| m.type_of(resolved)).cloned() {
-        Some(Type::Array { elem, .. }) => *elem,
-        Some(Type::Table { columns, .. }) => Type::Record(columns),
-        Some(ty) => ty,
-        None => Type::Any,
+    let (cell, rank) = match m.type_of(values).or_else(|| m.type_of(resolved)).cloned() {
+        Some(Type::Array { elem, shape }) => (*elem, shape.len()),
+        Some(Type::Table { columns, .. }) => (Type::Record(columns), 1),
+        Some(ty) => (ty, 0),
+        None => (Type::Any, 0),
     };
+    if rank == 0 {
+        return Some(m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(op),
+            args: vec![measure, values].into(),
+            named: vec![].into(),
+            inputs: None,
+        })));
+    }
     let (label, reference, point) = placeholder(m, cell);
     let query = m.alloc(Node::Call(Call {
         head: CallHead::Builtin(op),
@@ -40,14 +48,14 @@ pub(crate) fn lower_query(m: &mut Module, id: NodeId) -> Option<NodeId> {
         named: vec![].into(),
         inputs: None,
     }));
-    let head = CallHead::Builtin(m.intern("functionof"));
-    let function = m.alloc(Node::Call(Call {
-        head,
-        args: vec![query].into(),
-        named: vec![].into(),
-        inputs: Some(Inputs::Spec(vec![(label, reference)].into())),
-    }));
-    Some(build_call(m, "broadcast", &[function, values]))
+    let body = expand_objects(m, query, &mut std::collections::HashMap::new());
+    Some(map_body(
+        m,
+        body,
+        vec![(label, reference)],
+        vec![values],
+        rank,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,6 +157,213 @@ pub(crate) fn placeholder(m: &mut Module, cell: Type) -> (Symbol, Ref, NodeId) {
     // local target, so serialized density functions retain their scope.
     let label = m.intern(&format!("density_point_{serial}"));
     (label, point_ref, point)
+}
+
+fn has_object(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Measure { .. }
+            | Type::Kernel { .. }
+            | Type::Function { .. }
+            | Type::Likelihood { .. }
+            | Type::Module
+            | Type::Tuple(_)
+    )
+}
+
+/// Sequence callbacks receive objects at compile time. Specialize those objects
+/// into the body, then carry only their live value leaves through the loop.
+pub(crate) fn specialize_sequence_parameters(m: &mut Module) -> bool {
+    fn walk(
+        m: &mut Module,
+        id: NodeId,
+        memo: &mut std::collections::HashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        if let Some(&result) = memo.get(&id) {
+            return result;
+        }
+        let children = m.node(id).children();
+        let mapped: Vec<_> = children.iter().map(|&child| walk(m, child, memo)).collect();
+        let current = if mapped == children {
+            id
+        } else {
+            crate::driver::rebuild_with_children(m, id, &mapped)
+        };
+        let result = specialize(m, current).unwrap_or(current);
+        memo.insert(id, result);
+        result
+    }
+
+    fn specialize(m: &mut Module, id: NodeId) -> Option<NodeId> {
+        let Node::Call(call) = m.node(id) else {
+            return None;
+        };
+        let CallHead::Builtin(head) = call.head else {
+            return None;
+        };
+        let base_arity = match m.resolve(head) {
+            "scan" => 3,
+            "reduce" => 2,
+            _ => return None,
+        };
+        if call.args.len() != base_arity + 1 {
+            return None;
+        }
+        let parameter = call.args[base_arity];
+        let (resolved, _) = resolve_ref_chain(m, parameter);
+        if !m
+            .type_of(parameter)
+            .or_else(|| m.type_of(resolved))
+            .is_some_and(has_object)
+        {
+            return None;
+        }
+        let mut function = crate::kernel::resolve_reified(m, call.args[0])?;
+        if function.auto || function.inputs.len() != 3 {
+            return None;
+        }
+        let mut args = call.args[..base_arity].to_vec();
+        let (_, parameter_ref) = function.inputs.pop()?;
+        let body = crate::kernel::substitute_admitted(
+            m,
+            function.body,
+            &[(parameter_ref, parameter)],
+            crate::kernel::Substitute::All,
+            false,
+        );
+        let body = expand_objects(m, body, &mut std::collections::HashMap::new());
+        let body = crate::canon::inline_expression(m, body);
+        // Inlined helpers may expose further object aliases or projections.
+        let body = expand_objects(m, body, &mut std::collections::HashMap::new());
+        let live: Vec<_> = captures(m, body, &function.inputs)
+            .into_iter()
+            .filter(|(_, value)| {
+                let resolved = resolve_ref_chain(m, *value).0;
+                m.phase_of(*value).or_else(|| m.phase_of(resolved))
+                    != Some(flatppl_core::Phase::Fixed)
+            })
+            .collect();
+        let mut replacements = Vec::new();
+        if !live.is_empty() {
+            let types: Vec<_> = live
+                .iter()
+                .map(|(_, value)| {
+                    m.type_of(*value)
+                        .or_else(|| m.type_of(resolve_ref_chain(m, *value).0))
+                        .cloned()
+                        .unwrap_or(Type::Any)
+                })
+                .collect();
+            let ty = if types.len() == 1 {
+                types[0].clone()
+            } else {
+                Type::Tuple(types.clone().into())
+            };
+            let (label, reference, point) = placeholder(m, ty);
+            function.inputs.push((label, reference));
+            for (i, (capture, _)) in live.iter().enumerate() {
+                let value = if live.len() == 1 {
+                    point
+                } else {
+                    let index = m.alloc(Node::Lit(Scalar::Int((i + 1) as i64)));
+                    let value = build_call(m, "get", &[point, index]);
+                    m.set_type(value, types[i].clone());
+                    value
+                };
+                replacements.push((*capture, value));
+            }
+            let values: Vec<_> = live.iter().map(|(_, value)| *value).collect();
+            args.push(if values.len() == 1 {
+                values[0]
+            } else {
+                build_call(m, "tuple", &values)
+            });
+        }
+        let body = crate::driver::map_tree(m, body, &mut |m, id| {
+            replacements
+                .iter()
+                .find_map(|(capture, value)| {
+                    let matches = match capture {
+                        Capture::Reference(reference) => m.node(id) == &Node::Ref(*reference),
+                        Capture::Projection(projection) => *projection == id,
+                    };
+                    matches.then_some(*value)
+                })
+                .or_else(|| matches!(m.node(id), Node::Call(c) if c.inputs.is_some()).then_some(id))
+        });
+        let reify = CallHead::Builtin(m.intern("functionof"));
+        args[0] = m.alloc(Node::Call(Call {
+            head: reify,
+            args: vec![body].into(),
+            named: Box::new([]),
+            inputs: Some(Inputs::Spec(function.inputs.into())),
+        }));
+        Some(m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: args.into(),
+            named: Box::new([]),
+            inputs: None,
+        })))
+    }
+
+    let bindings: Vec<_> = m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    let mut memo = std::collections::HashMap::new();
+    let mut changed = false;
+    for (bid, root) in bindings {
+        let mapped = walk(m, root, &mut memo);
+        if mapped != root {
+            m.set_binding_rhs(bid, mapped);
+            changed = true;
+        }
+    }
+    changed
+}
+
+// Resolve static object structure while preserving value references as the
+// identity-bearing leaves of the enclosing computation and its derivatives.
+fn expand_objects(
+    m: &mut Module,
+    id: NodeId,
+    memo: &mut std::collections::HashMap<NodeId, NodeId>,
+) -> NodeId {
+    if let Some(&result) = memo.get(&id) {
+        return result;
+    }
+    memo.insert(id, id);
+    if matches!(m.node(id), Node::Call(c) if c.inputs.is_some()) {
+        return id;
+    }
+    let resolved = resolve_ref_chain(m, id).0;
+    let object_ref = matches!(m.node(id), Node::Ref(_))
+        && m.type_of(id)
+            .or_else(|| m.type_of(resolved))
+            .is_some_and(has_object);
+    if resolved != id && object_ref {
+        let result = expand_objects(m, resolved, memo);
+        memo.insert(id, result);
+        return result;
+    }
+    let children = m.node(id).children();
+    let mapped: Vec<_> = children
+        .iter()
+        .map(|&child| expand_objects(m, child, memo))
+        .collect();
+    let result = if children == mapped {
+        id
+    } else {
+        crate::driver::rebuild_with_children(m, id, &mapped)
+    };
+    let projected = if matches!(builtin_name(m, result), Some("get" | "get0")) {
+        let promoted = crate::canon::promoted_input_names(m);
+        crate::canon::project_tuple(m, result, &promoted)
+            .or_else(|| crate::canon::project(m, result, &promoted))
+            .map(|value| expand_objects(m, value, memo))
+            .unwrap_or(result)
+    } else {
+        result
+    };
+    memo.insert(id, projected);
+    projected
 }
 
 pub(super) fn sum_density(

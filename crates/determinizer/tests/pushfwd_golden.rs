@@ -104,7 +104,7 @@ fn pushfwd_noninvertible_lambda_refuses() {
         "d = pushfwd(x -> x * x, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("non-injective must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("nonzero coefficient"), "got: {e:?}");
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn pushfwd_zero_scale_affine_refuses() {
         "d = pushfwd(x -> 0.0 * x + 1.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("literal-zero mul scale must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("nonzero coefficient"), "got: {e:?}");
 }
 
 #[test]
@@ -127,7 +127,21 @@ fn pushfwd_zero_divisor_affine_refuses() {
         "d = pushfwd(x -> x / 0.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("literal-zero divide denominator must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("nonzero denominator"), "got: {e:?}");
+}
+
+#[test]
+fn symbolic_affine_coefficients_keep_unproved_inversion_refusals() {
+    for (domain, body, reason) in [
+        ("reals", "p*x", "provably nonzero coefficient"),
+        ("posreals", "exp(p*x)", "nonlinear compositions"),
+    ] {
+        let source = format!(
+            "p = external({domain})\nM = pushfwd((x,p) -> {body}, Normal(0,1), p)\nscore = logdensityof(M,1.0)"
+        );
+        let error = determinize(&parse_infer(&source)).expect_err("inverse needs a proof");
+        assert!(error.reason.contains(reason), "{error:?}");
+    }
 }
 
 #[test]

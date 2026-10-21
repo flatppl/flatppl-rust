@@ -14,9 +14,9 @@
 //! Two shapes reach it: an unresolved callee, and an arity mismatch at the call
 //! site.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Module, Node, NodeId};
+use flatppl_core::{CallHead, Module, Node, NodeId, Symbol};
 
 use crate::driver::rebuild_with_children;
 use crate::kernel::reduce_kernel_application;
@@ -37,7 +37,7 @@ pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
         // `reduce_kernel_application` needs `&mut Module` and returns a fresh
         // body `NodeId`, so apply it via a manual bottom-up walk rather than
         // `map_tree` (whose closure only gets `&Module`, no `alloc`).
-        let new = inline_walk(m, root, &mut mapped);
+        let new = inline_walk(m, root, &mut mapped, None);
         if new != root {
             m.set_binding_rhs(bid, new);
             changed = true;
@@ -46,13 +46,24 @@ pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
     changed
 }
 
+/// Specialize a callback body before its remaining live values are reified.
+pub(crate) fn inline_expression(m: &mut Module, root: NodeId) -> NodeId {
+    let promoted = super::promoted_input_names(m);
+    inline_walk(m, root, &mut HashMap::new(), Some(&promoted))
+}
+
 /// Bottom-up: inline within children first (so a callee itself containing a
 /// user call is reduced before we look at this node), then attempt to reduce
 /// this node if it is a user call. Rebuilds via `rebuild_with_children` for
 /// the child layer — the same rebuild `map_tree` uses, kept in one place so
 /// both stay consistent in how a `Call`'s children decode back into
 /// head/args/named.
-fn inline_walk(m: &mut Module, id: NodeId, mapped: &mut HashMap<NodeId, NodeId>) -> NodeId {
+fn inline_walk(
+    m: &mut Module,
+    id: NodeId,
+    mapped: &mut HashMap<NodeId, NodeId>,
+    projections: Option<&HashSet<Symbol>>,
+) -> NodeId {
     if let Some(&result) = mapped.get(&id) {
         return result;
     }
@@ -61,7 +72,7 @@ fn inline_walk(m: &mut Module, id: NodeId, mapped: &mut HashMap<NodeId, NodeId>)
     let new_children: Vec<NodeId> = children
         .iter()
         .map(|&c| {
-            let nc = inline_walk(m, c, mapped);
+            let nc = inline_walk(m, c, mapped, projections);
             any_child_changed |= nc != c;
             nc
         })
@@ -72,6 +83,11 @@ fn inline_walk(m: &mut Module, id: NodeId, mapped: &mut HashMap<NodeId, NodeId>)
     } else {
         id
     };
+    if let Some(promoted) = projections {
+        id = super::project_tuple(m, id, promoted)
+            .or_else(|| super::project(m, id, promoted))
+            .unwrap_or(id);
+    }
     // Then reduce this node if it is a user call.
     if let Node::Call(c) = m.node(id)
         && matches!(c.head, CallHead::User(_))
@@ -81,7 +97,7 @@ fn inline_walk(m: &mut Module, id: NodeId, mapped: &mut HashMap<NodeId, NodeId>)
         } else if let Some(reduced) = reduce_kernel_application(m, id) {
             // The reduced body may itself contain further user calls
             // (e.g. a function whose body calls another function).
-            id = inline_walk(m, reduced, mapped);
+            id = inline_walk(m, reduced, mapped, projections);
         }
     }
     mapped.insert(original, id);

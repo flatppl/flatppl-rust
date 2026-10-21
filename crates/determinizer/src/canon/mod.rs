@@ -10,9 +10,10 @@ use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Symbol
 mod dce;
 pub(crate) use dce::retain_reachable;
 mod flatten;
+pub(crate) use flatten::{project, project_tuple};
 mod fold;
 mod inline;
-pub(crate) use inline::inline_user_calls;
+pub(crate) use inline::{inline_expression, inline_user_calls};
 mod integrals;
 mod sharing;
 

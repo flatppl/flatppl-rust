@@ -28,8 +28,8 @@
 //! (§13 "Output reduction") with the latents it reads sampled once each and
 //! referenced by name.
 use crate::density::{
-    build_call, build_record, build_user_call, builtin_name, draw_argument, expect_builtin_call,
-    iid_static_shape, refuse, resolve_ref_one, split_kernel_constructor,
+    build_call, build_callback_call, build_record, builtin_name, draw_argument,
+    expect_builtin_call, iid_static_shape, refuse, resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -461,114 +461,41 @@ fn lower_pushfwd_sample(
     pushfwd_node: NodeId,
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let (map, base) = {
+    let (map, base, parameter) = {
         let c = expect_builtin_call(m, pushfwd_node, "pushfwd")
             .ok_or_else(|| refuse(pushfwd_node, m, "expected pushfwd"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(
-                pushfwd_node,
-                m,
-                "pushfwd expects 2 args (map, base measure)",
-            ));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(pushfwd_node, m, "pushfwd expects 2 or 3 args"));
         }
-        // `pushfwd(f, M)` is function-FIRST (§06): the map is arg 0, the base
-        // measure arg 1.
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
+    let resolved = crate::density::resolve_ref_chain(m, map).0;
+    let map = expect_builtin_call(m, resolved, "bijection")
+        .and_then(|c| c.args.first().copied())
+        .unwrap_or(map);
     let (value, rng_out) = lower_closed_measure_sample(m, base, rng)?;
-    // A bare builtin map needs no reduction — the head rewrite handles it — EXCEPT over
-    // a record variate, where the application is §04 auto-splatting against that
-    // operator's own argument names. `flatppl_infer` exposes ordered parameter names
-    // only for measure constructors; a deterministic builtin's catalogue row is
-    // `Sig::Function { params: Vec<ParamSig> }` — argument TYPES, no names.
-    //
-    // So the whole record-valued case refuses, over-refusing a name-matching map like
-    // `pushfwd(exp, lawof(record(x = y1)))`. Nothing downstream would catch a MISmatch:
-    // `infer` reports no diagnostic and `is_flatpdl` is structural, so
-    // `exp(record(y = …))` passes every gate and fails only in the engine.
-    if matches!(m.node(map), Node::Const(_)) {
+    let applied = build_callback_call(m, map, value, parameter)?;
+    if matches!(
+        m.node(crate::density::resolve_ref_chain(m, map).0),
+        Node::Const(_)
+    ) {
         if expect_builtin_call(m, value, "record").is_some() {
             return Err(refuse(
                 pushfwd_node,
                 m,
-                "pushfwd's map is a bare built-in over a record variate: §04 auto-splatting needs \
-                 argument names the catalogue lacks — use a functionof or lambda over the fields",
+                "pushfwd's bare built-in map cannot consume a whole record variate",
             ));
         }
-        return Ok((build_user_call(m, map, value), rng_out));
+        return Ok((applied, rng_out));
     }
-    // For a RECORD-valued variate the forward application is an auto-splatting
-    // call, whose §04 correspondence rule the reducer does not enforce — check it
-    // before reducing (see [`record_splat_mismatch`]).
-    if let Some(kernel) = crate::kernel::resolve_reified(m, map)
-        && let Some(why) = record_splat_mismatch(m, value, &kernel.inputs)
-    {
-        return Err(refuse(
-            pushfwd_node,
-            m,
-            &format!(
-                "pushfwd's map does not correspond to its base measure's record variate \
-                     ({why}); §04 \"Calling conventions\" makes a field/argument-name mismatch a \
-                     static error"
-            ),
-        ));
-    }
-    let applied = build_user_call(m, map, value);
     let reduced = crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
         refuse(
             pushfwd_node,
             m,
-            "pushfwd's map does not reduce at the sampled variate: its parameters do not bind the \
-             base domain (§04 binds a record's fields by name), leaving a residual call",
+            "pushfwd's map does not reduce at the sampled variate and optional parameter",
         )
     })?;
     Ok((reduced, rng_out))
-}
-
-/// Do the map's parameter names correspond EXACTLY to the fields of a
-/// record-valued variate? Returns `None` when they do, or when `value` is not a
-/// record literal (there is nothing to splat); otherwise the offending name, for
-/// the refusal message.
-///
-/// §04 "Calling conventions": "A call with field or column names that do not match the
-/// callable's argument names is a static error". [`crate::kernel::reduce_kernel_application`]'s
-/// record branch binds each input from a like-named field and never checks that every
-/// FIELD was consumed, so a map declaring a strict SUBSET reduces to a projection of
-/// the variate — a different measure, hence a wrong sample.
-fn record_splat_mismatch(m: &Module, value: NodeId, inputs: &[(Symbol, Ref)]) -> Option<String> {
-    let fields: Vec<Symbol> = {
-        let c = expect_builtin_call(m, value, "record")?;
-        c.named.iter().map(|n| n.name).collect()
-    };
-    let params: Vec<Symbol> = inputs.iter().map(|&(n, _)| n).collect();
-    // Name BOTH sides in the message. Blaming the odd name alone reads absurdly for
-    // a map whose whole purpose is selecting that coordinate ("variate field `y1`
-    // binds no map parameter", for a map that projects onto `y1`); showing the two
-    // lists makes it a correspondence failure, which is what it is.
-    let listing = |syms: &[Symbol]| {
-        syms.iter()
-            .map(|&s| format!("`{}`", m.resolve(s)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let sides = format!(
-        "map parameters {} vs variate fields {}",
-        listing(&params),
-        listing(&fields)
-    );
-    if let Some(f) = fields.iter().find(|f| !params.contains(f)) {
-        return Some(format!(
-            "{sides} — field `{}` binds no parameter",
-            m.resolve(*f)
-        ));
-    }
-    if let Some(p) = params.iter().find(|p| !fields.contains(p)) {
-        return Some(format!(
-            "{sides} — parameter `{}` names no field",
-            m.resolve(*p)
-        ));
-    }
-    None
 }
 
 /// Sample `measure`, threading `rng`; returns `(value_node, advanced_rng_node)`.

@@ -592,9 +592,9 @@ y2 = draw(Normal(mu = z, sigma = 1.0))
     for query in [
         // Named closed reification.
         "M = functionof(lawof(record(y1 = y1, y2 = y2)))\n\
-         lp = logdensityof(lawof(M), record(y1 = 0.5, y2 = 0.7))",
+         lp = logdensityof(M, record(y1 = 0.5, y2 = 0.7))",
         // Inline.
-        "lp = logdensityof(lawof(functionof(lawof(record(y1 = y1, y2 = y2)))), \
+        "lp = logdensityof(functionof(lawof(record(y1 = y1, y2 = y2))), \
          record(y1 = 0.5, y2 = 0.7))",
     ] {
         let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");
@@ -751,7 +751,7 @@ fn repeated_raw_measure_retains_its_free_parameter() {
 fn one_constructor_law_marginalizes_beside_a_fixed_sibling() {
     assert_score_matches(
         "z ~ Normal(0.0, 1.0)\n\
-         lp = logdensityof(joint(a = lawof(Normal(z, 1.0)), b = Exponential(1.0)), \
+         lp = logdensityof(joint(a = lawof(draw(Normal(z, 1.0))), b = Exponential(1.0)), \
                            record(a = 0.5, b = 0.7))",
         "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + logdensityof(Exponential(1.0), 0.7)",
     );
@@ -785,7 +785,7 @@ fn a_sole_reified_component_keeps_its_direct_path_at_every_variate_shape() {
 fn constructor_laws_over_disjoint_latents_form_a_product() {
     assert_score_matches(
         "z1 ~ Normal(0.0, 1.0)\nz2 ~ Normal(0.0, 1.0)\n\
-         lp = logdensityof(joint(a = lawof(Normal(z1, 1.0)), b = lawof(Normal(z2, 1.0))), \
+         lp = logdensityof(joint(a = lawof(draw(Normal(z1, 1.0))), b = lawof(draw(Normal(z2, 1.0)))), \
                            record(a = 0.5, b = 0.7))",
         "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + \
               logdensityof(Normal(0.0, sqrt(2.0)), 0.7)",
