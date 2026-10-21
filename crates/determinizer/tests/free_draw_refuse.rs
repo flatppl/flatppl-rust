@@ -26,6 +26,18 @@ const SHARED_PARAMETER: &str = "z = draw(Normal(mu = 0.4, sigma = 1.0))\n\
      f2 = Normal(mu = z, sigma = 1.5)), record(f1 = 0.5, f2 = 0.7))\n";
 
 #[test]
+fn inference_accepts_a_stochastic_constructor_parameter() {
+    // The model is legal: `lp` is a stochastic-phase value. Only a density OUTPUT
+    // needs a deterministic value, so only determinization refuses.
+    let mut m = flatppl_syntax::parse(SHARED_PARAMETER).unwrap();
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn a_stochastic_constructor_parameter_refuses_and_names_the_draw() {
     let reason = refusal(SHARED_PARAMETER);
     assert!(
