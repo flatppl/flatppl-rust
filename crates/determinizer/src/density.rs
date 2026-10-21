@@ -2482,7 +2482,11 @@ fn marginalize_or_refuse_record_law(
         match marginal {
             Some(built) => {
                 let built = built?;
-                if integrated.contains(&built.latent) {
+                if built
+                    .latents
+                    .iter()
+                    .any(|latent| integrated.contains(latent))
+                {
                     // The fields are correlated through the shared ancestor, so no product of
                     // per-field marginals is the joint. One shape has a closed form for the
                     // joint itself; everything else refuses.
@@ -2505,8 +2509,8 @@ fn marginalize_or_refuse_record_law(
                         // The law requires every field to share ONE latent, so it must be the
                         // one the repeat was detected on. A mismatch would mean the two
                         // ancestry paths disagree.
-                        debug_assert_eq!(
-                            law.latent, built.latent,
+                        debug_assert!(
+                            built.latents.contains(&law.latent),
                             "the record law must integrate the repeated latent"
                         );
                         return lower_shared_latent_record_law(m, record_node, v, &law).map(Some);
@@ -2522,7 +2526,7 @@ fn marginalize_or_refuse_record_law(
                          their marginals, and no closed form covers this shape",
                     ));
                 }
-                integrated.push(built.latent);
+                integrated.extend(built.latents);
                 marginals.push((name, built.form));
             }
             None => {

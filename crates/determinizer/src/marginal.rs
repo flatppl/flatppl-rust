@@ -718,16 +718,17 @@ fn matches_latent_path(m: &Module, value: NodeId, path: &LatentPath, latent: Sym
 // The implicit `lawof` spelling
 // ---------------------------------------------------------------------------
 
-/// A marginal this module built for the implicit spelling: the closed form, and the latent
-/// it integrated out.
+/// A marginal this module built for the implicit spelling: the closed form, and every
+/// latent it integrated out.
 ///
-/// The `latent` is not diagnostics. A caller building a PRODUCT of several marginals must
-/// know which latent each one integrated: two marginals over the SAME latent are not
+/// The `latents` are not diagnostics. A caller building a PRODUCT of several marginals must
+/// know which latents each one integrated: two marginals over a SHARED latent are not
 /// independent, and adding their log-densities is a wrong number
-/// ([`crate::density::marginalize_or_refuse_record_law`]).
+/// ([`crate::density::marginalize_or_refuse_record_law`]). A chained marginal integrates
+/// its direct latent and each latent above it, so all of them are listed.
 pub(crate) struct ImplicitMarginal {
     pub form: MarginalForm,
-    pub latent: Symbol,
+    pub latents: Vec<Symbol>,
 }
 
 /// The closed-form conjugate marginal of `likelihood` — a distribution constructor one
@@ -745,27 +746,45 @@ pub(crate) struct ImplicitMarginal {
 /// [`measure_stochastic_ancestors`] — the sibling fields of a record product, whose
 /// dependence is the chain rule, not a marginal.
 ///
-/// **One latent, whose prior is itself ancestor-free.** Two latents feeding two
-/// parameters is not a single conjugate integral, and neither is a two-level hierarchy
-/// (`z ~ Normal(mu = w, …)` with `w` latent) — the row's closed form integrates ONE
-/// prior. Both return `None` rather than a marginal that silently conditions on the
-/// ancestor it did not integrate.
+/// **One direct latent.** Two latents feeding two parameters is not a single conjugate
+/// integral and returns `None`. A latent whose prior has latents of its own
+/// (`z ~ Normal(mu = w, …)` with `w` latent) is a chain: `y` reaches `w` only through
+/// `z`, so `lawof(y)` is the row applied to `lawof(z)`. The prior's own marginal is built
+/// first and used as the row's prior. Without a closed-form constructor for it, or with a
+/// prior that reaches an `exempt` site, this returns `None` rather than a marginal that
+/// silently conditions on an ancestor it did not integrate.
 ///
 /// **A marginal is correct only for the ONE variate it is the law of.** This returns a
 /// marginal, never a licence to multiply marginals together: the returned [`ImplicitMarginal`]
-/// carries the latent so a caller assembling a product can refuse when two of them share it.
+/// carries its latents so a caller assembling a product can refuse when two of them share one.
 pub(crate) fn conjugate_marginal_measure(
     m: &mut Module,
     likelihood: NodeId,
     exempt: &[NodeId],
 ) -> Option<Result<ImplicitMarginal, RefuseError>> {
     let (latent, prior) = sole_named_ancestor(m, likelihood, exempt)?;
-    if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
-        return None;
-    }
+    let above = measure_stochastic_ancestors(m, prior, &[]);
+    let (prior, mut latents) = if above.is_empty() {
+        (prior, Vec::new())
+    } else {
+        // A carried sibling above the latent makes the law conditional on it, which is
+        // not the integral this composes.
+        if measure_stochastic_ancestors(m, prior, exempt).len() != above.len() {
+            return None;
+        }
+        match conjugate_marginal_measure(m, prior, exempt)? {
+            Ok(ImplicitMarginal {
+                form: MarginalForm::Measure(marginal),
+                latents,
+            }) => (marginal, latents),
+            Ok(_) => return None,
+            Err(err) => return Some(Err(err)),
+        }
+    };
+    latents.push(latent);
     Some(
         build_conjugate_marginal(m, prior, likelihood, latent)?
-            .map(|form| ImplicitMarginal { form, latent }),
+            .map(|form| ImplicitMarginal { form, latents }),
     )
 }
 
