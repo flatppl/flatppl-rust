@@ -115,35 +115,47 @@ pub(crate) fn lower_kchain_marginal(
     // and the continuous conjugate path need the kernel body.
     let kernel = resolve_reified(m, k_arg)
         .ok_or_else(|| refuse_kchain(node, "kchain kernel is not a recognisable kernelof(...)"))?;
-    // The kchain marginal substitutes the enumerated latent's atoms into
-    // `kernel.inputs[0]`, ASSUMING that boundary input IS the latent dependency —
-    // which holds only for a `%specinputs` boundary. An `%autoinputs` boundary
-    // traces the reified body's `elementof` FREE parameters (never the
-    // `draw`-bound latent), so substituting the latent's atoms into it would
-    // replace the WRONG node — a free parameter that must stay symbolic — and
-    // emit a `logsumexp` that silently eliminates it (a wrong density
-    // `is_flatpdl` cannot catch). Refuse rather than mislower.
-    if kernel.auto {
-        return Err(refuse_kchain(
-            node,
-            "kchain marginal over an %autoinputs kernel: the auto-traced boundary is a free \
-             parameter, not the enumerated latent — refuse rather than mislower",
-        ));
-    }
-    // The kchain marginal path substitutes ONE latent into the kernel; a
-    // multi-input kernel is not the single-step shape it handles.
     if kernel.inputs.len() != 1 {
         return Err(refuse_kchain(
             node,
             "single-input kernel only; multi-input kchain kernels are out of scope",
         ));
     }
-    if latent.field.is_some_and(|name| name != kernel.inputs[0].0) {
-        return Err(refuse_kchain(
-            node,
-            "latent record field must match the kernel input name",
-        ));
-    }
+    // Normalize the ordinary application before recognizing conjugacy. This
+    // keeps one-field record adapters equivalent to their scalar conditional.
+    let reference = Ref {
+        ns: RefNs::Local,
+        name: m.intern(&format!("_kchain_{}_", m.node_count())),
+    };
+    let coordinate = m.alloc(Node::Ref(reference));
+    let point = latent
+        .field
+        .map(|name| build_record(m, &[(name, coordinate)]))
+        .unwrap_or(coordinate);
+    let names: Vec<_> = kernel.inputs.iter().map(|(name, _)| *name).collect();
+    let values = crate::kernel::bind_call_args(m, &names, &[point], &[], kernel.auto)
+        .ok_or_else(|| refuse_kchain(node, "latent point does not bind the kernel interface"))?;
+    let bound: Vec<_> = kernel
+        .inputs
+        .iter()
+        .zip(values)
+        .map(|((_, target), value)| (*target, value))
+        .collect();
+    let absorbed = crate::kernel::resolve_kernel(m, k_arg).is_some();
+    let body = crate::kernel::substitute_admitted(
+        m,
+        kernel.body,
+        &bound,
+        crate::kernel::Substitute::All,
+        absorbed,
+    );
+    let body = crate::canon::inline_expression(m, body);
+    let label = m.intern("latent");
+    let kernel = Kernel {
+        body,
+        inputs: vec![(label, reference)],
+        auto: false,
+    };
     if let Some(result) = try_conjugate_marginal(m, latent.dist, &kernel, v) {
         return result;
     }

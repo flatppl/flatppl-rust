@@ -26,7 +26,7 @@ fn record_queries_match_explicit_field_projections() {
             "x ~ Normal(mu = 0.0, sigma = 1.0)\ny ~ Normal(mu = x, sigma = 2.0)",
             "elementof(cartprod(x = reals))",
             "record(x = point.x)",
-            "likelihoodof(kernelof(record(y = y), x = x), record(y = 1.0))",
+            "likelihoodof(pars -> kernelof(record(y = y), x = x)(x = pars.x), record(y = 1.0))",
         ),
         (
             "",

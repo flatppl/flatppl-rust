@@ -80,7 +80,7 @@ fn normal_normal_conjugate_marginal() {
     let src = "\
 z = draw(Normal(mu = 0.0, sigma = 2.0))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -156,7 +156,7 @@ fn gamma_poisson_conjugate_marginal() {
     let src = "\
 z = draw(Gamma(shape = 2.0, rate = 3.0))
 k = kernelof(record(y = draw(Poisson(rate = z))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -225,7 +225,7 @@ fn kchain_conjugate_marginals_for_the_expression_and_sqrt_rows() {
         "\
 p = draw(Beta(alpha = 2.0, beta = 3.0))
 kk = kernelof(record(k = draw(Binomial(n = 10, p = p))), p = p)
-pp = kchain(lawof(record(p = p)), kk)
+pp = kchain(lawof(record(p = p)), pars -> kk(p = pars.p))
 lp = logdensityof(pp, record(k = 7))",
     );
     let pir = flatppl_flatpir::write(&out);
@@ -258,7 +258,7 @@ lp = logdensityof(pp, record(k = 7))",
         "\
 v = draw(Exponential(rate = 0.5))
 kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = sqrt(v)))), v = v)
-pp = kchain(lawof(record(v = v)), kk)
+pp = kchain(lawof(record(v = v)), pars -> kk(v = pars.v))
 lp = logdensityof(pp, record(y = 4.0))",
     );
     let pir = flatppl_flatpir::write(&out);
@@ -278,7 +278,7 @@ lp = logdensityof(pp, record(y = 4.0))",
         "\
 v = draw(InverseGamma(shape = 2.5, scale = 3.0))
 kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = sqrt(v)))), v = v)
-pp = kchain(lawof(record(v = v)), kk)
+pp = kchain(lawof(record(v = v)), pars -> kk(v = pars.v))
 lp = logdensityof(pp, record(y = 5.0))",
     );
     let pir = flatppl_flatpir::write(&out);

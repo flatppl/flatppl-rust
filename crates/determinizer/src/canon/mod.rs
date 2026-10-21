@@ -13,7 +13,9 @@ mod flatten;
 pub(crate) use flatten::{project, project_tuple};
 mod fold;
 mod inline;
-pub(crate) use inline::{inline_expression, inline_user_calls};
+pub(crate) use inline::{
+    expand_composed_call, inline_expression, inline_user_calls, normalize_call_wrappers,
+};
 mod integrals;
 mod sharing;
 

@@ -774,6 +774,42 @@ fn lower_likelihood_query(
     // module boundaries freely). Grafting brings the kernel's own parameter
     // bindings into the host too. A same-module `k` is returned unchanged.
     let k = resolve_cross_module_kernel(m, bundle, k, imports)?;
+    if crate::kernel::resolve_reified(m, k).is_some()
+        || matches!(m.type_of(k), Some(Type::Kernel { inputs, .. }) if !inputs.is_empty())
+    {
+        // Likelihood factors project a shared named parameter point onto
+        // their own inputs. An ordered unary kernel takes the point whole.
+        let named = if let Some(kernel) = crate::kernel::resolve_reified(m, k)
+            && (kernel.auto || kernel.inputs.len() != 1)
+        {
+            kernel
+                .inputs
+                .iter()
+                .map(|(name, _)| {
+                    crate::kernel::record_field(m, theta, *name).map(|value| NamedArg {
+                        kind: NamedKind::Kwarg,
+                        name: *name,
+                        value,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| refuse(theta, m, "likelihood point is missing a kernel input"))?
+        } else {
+            Vec::new()
+        };
+        let args = if named.is_empty() {
+            vec![theta]
+        } else {
+            Vec::new()
+        };
+        let applied = m.alloc(Node::Call(Call {
+            head: CallHead::User(k),
+            args: args.into(),
+            named: named.into(),
+            inputs: None,
+        }));
+        return lower_measure_density_at_point(m, applied, obs);
+    }
     let theta_map = theta_field_map(m, k, theta)?;
     let density = lower_measure_density_at_point(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
@@ -1753,11 +1789,7 @@ fn lower_applied_kernel_joint_inner(
     lower_measure_density_at(m, rebuilt, v, origin)
 }
 
-/// Bind an applied fan-out's argument list to the union signature, by keyword, by §04
-/// record/table splat, or by position. The three forms and their refusals mirror
-/// [`crate::kernel::reduce_kernel_application`]'s, because the calling convention is
-/// §04's and does not depend on whether the callee is a reification or a measure-algebra
-/// op that produced a kernel.
+/// Joint kernels expose the union of input names as a keyword-only interface.
 fn bind_fan_out_inputs(
     m: &mut Module,
     node: NodeId,
@@ -1765,56 +1797,17 @@ fn bind_fan_out_inputs(
     args: &[NodeId],
     kwargs: &[(Symbol, NodeId)],
 ) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
-    let bad_arity = |m: &Module| {
-        refuse(
-            node,
-            m,
-            "the applied fan-out kernel's arguments do not bind its inputs exactly (§04 \
-             calling conventions): every input supplied once, and no argument without a \
-             matching input",
-        )
-    };
-    if !kwargs.is_empty() {
-        if !args.is_empty() || kwargs.len() != union.len() {
-            return Err(bad_arity(m));
-        }
-        let mut out = Vec::with_capacity(union.len());
-        for name in union {
-            let value = kwargs
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, value)| *value)
-                .ok_or_else(|| bad_arity(m))?;
-            out.push((*name, value));
-        }
-        return Ok(out);
-    }
-    // §04's splat covers `record(...)` AND `table(...)` ("`f(record(a = x, b = y, ...))`
-    // and `f(table(a = x, b = y, ...))` are equivalent to `f(a = x, b = y, ...)`"), plus
-    // an OPAQUE table whose columns come from its type. Reuse `kernel`'s own two helpers
-    // rather than re-test for a `record` head, so this path cannot drift from the
-    // reification path: recognising only `record` sent a sole positional TABLE down the
-    // positional arm below, which bound the whole `table(...)` node to every input.
-    if args.len() == 1 && crate::kernel::is_splattable(m, args[0]) {
-        let mut out = Vec::with_capacity(union.len());
-        for name in union {
-            let value = crate::kernel::record_field(m, args[0], *name).ok_or_else(|| {
-                refuse(
-                    node,
-                    m,
-                    "the applied fan-out kernel's sole positional record or table carries no \
-                     field or column for one of its inputs: §04 auto-splatting binds by name, \
-                     and a name mismatch is an error rather than a whole-value bind",
-                )
-            })?;
-            out.push((*name, value));
-        }
-        return Ok(out);
-    }
-    if args.len() != union.len() {
-        return Err(bad_arity(m));
-    }
-    Ok(union.iter().copied().zip(args.iter().copied()).collect())
+    let named: Vec<_> = kwargs
+        .iter()
+        .map(|(name, value)| NamedArg {
+            kind: NamedKind::Kwarg,
+            name: *name,
+            value: *value,
+        })
+        .collect();
+    let values = crate::kernel::bind_call_args(m, union, args, &named, true)
+        .ok_or_else(|| refuse(node, m, "joint kernel inputs must be supplied once by name"))?;
+    Ok(union.iter().copied().zip(values).collect())
 }
 
 /// Re-spell a `joint` with `replacements` in place of its components, keeping the
@@ -2032,6 +2025,9 @@ fn lower_measure_density_in_reference(
     // level: `M = g1` is a §04 bare-name alias of `g1`'s expression, so stopping
     // at `M`'s ref-node right-hand side would refuse it as a non-constructor.
     let (measure_node, _binding_opt) = resolve_ref_chain(m, measure_expr);
+    if let Some(expanded) = crate::canon::expand_composed_call(m, measure_node) {
+        return lower_measure_density_in_reference(m, expanded, v, origin, atoms);
+    }
 
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
@@ -2144,6 +2140,9 @@ fn lower_measure_density_in_reference(
 
     match builtin_name(m, measure_node) {
         Some("record") => lower_record_of_draws(m, measure_node, v),
+        Some("vector") if vector_of_draws(m, measure_node) => {
+            lower_vector_of_draws(m, measure_node, v)
+        }
         // A `lawof`-wrapped measure reached as a SUB-measure (e.g. a
         // `bayesupdate` prior — `lower_bayesupdate` hands its prior straight to
         // this dispatcher, unlike the `logdensityof(lawof(M), v)` query ENTRY
@@ -2299,6 +2298,9 @@ fn marginalize_or_refuse_stochastic_law(
 ) -> Result<Option<NodeId>, RefuseError> {
     let referent = resolve_ref_chain(m, arg).0;
     let resolved = crate::kernel::resolve_closed_reification(m, referent).unwrap_or(referent);
+    if vector_of_draws(m, resolved) {
+        return lower_vector_of_draws(m, resolved, v).map(Some);
+    }
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
@@ -2316,6 +2318,68 @@ fn marginalize_or_refuse_stochastic_law(
         ));
     }
     Ok(None)
+}
+
+/// A vector of scalar draw sites uses the same conditional-product machinery
+/// as a record DAG. Only the point projections differ.
+fn vector_of_draws(m: &Module, node: NodeId) -> bool {
+    expect_builtin_call(m, node, "vector").is_some_and(|call| {
+        !call.args.is_empty()
+            && call
+                .args
+                .iter()
+                .all(|id| draw_argument(m, crate::kernel::declared_body(m, *id)).is_some())
+    })
+}
+
+fn lower_vector_of_draws(
+    m: &mut Module,
+    node: NodeId,
+    value: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let values = expect_builtin_call(m, node, "vector")
+        .map(|c| c.args.to_vec())
+        .ok_or_else(|| refuse(node, m, "expected a vector of scalar draws"))?;
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|id| draw_argument(m, crate::kernel::declared_body(m, *id)).is_none())
+    {
+        return Err(refuse(
+            node,
+            m,
+            "vector law requires explicit scalar draw components",
+        ));
+    }
+    if let Some(Type::Array { shape, .. }) = m.type_of(value) {
+        if shape.as_ref() != [flatppl_core::Dim::Static(values.len() as u32)] {
+            return Err(refuse(
+                value,
+                m,
+                "vector law point must match its component count",
+            ));
+        }
+    } else if m
+        .type_of(value)
+        .is_some_and(|t| !matches!(t, Type::Any | Type::Deferred))
+    {
+        return Err(refuse(value, m, "vector law needs a vector point"));
+    }
+    let mut fields = Vec::with_capacity(values.len());
+    let mut point = Vec::with_capacity(values.len());
+    for (i, source) in values.into_iter().enumerate() {
+        let name = m.intern(&format!("component_{}", i + 1));
+        let index = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let part = build_call(m, "get0", &[value, index]);
+        fields.push((name, source));
+        point.push((name, part));
+    }
+    let record = build_record(m, &fields);
+    let point = build_record(m, &point);
+    if let Some(marginal) = marginalize_or_refuse_record_law(m, record, point)? {
+        return Ok(marginal);
+    }
+    lower_record_of_draws(m, record, point)
 }
 
 /// Score a conjugate row's closed form at the variate `v`. A [`MarginalForm::Measure`] goes
@@ -6986,11 +7050,6 @@ fn named_or_positional(m: &Module, c: &Call, name: &str) -> Option<NodeId> {
         return Some(v);
     }
     let arg = *c.args.first()?;
-    if let Some(rec) = expect_builtin_call(m, arg, "record")
-        && let Some(v) = field(&rec.named)
-    {
-        return Some(v);
-    }
     Some(arg)
 }
 
@@ -8131,53 +8190,15 @@ pub(crate) fn split_kernel_constructor(
     // positional constructor call → None.
     let param_names = flatppl_infer::constructor_param_names(m.resolve(sym))?;
 
-    // §04 "Calling conventions" auto-splatting: `Ctor(record(p1 = …, p2 = …))`
-    // is equivalent to `Ctor(p1 = …, p2 = …)`. When the sole positional arg is
-    // a RECORD whose field names match the constructor's parameter names,
-    // distribute its fields across the params instead of (mis)binding the whole
-    // record to `param_names[0]` and dropping the rest. §04 keys auto-splat off
-    // the argument's TYPE, not its surface syntax, so this fires for both a
-    // literal `record(…)` and an opaque multi-output call returning a record
-    // (e.g. `gamma_shape_rate(μ, σ)` whose body is `record(shape = …, rate =
-    // …)`) — the latter can't be read field-wise from the node, so each field
-    // is pulled with `get(arg, "field")` (the same lowering as `arg.field`,
-    // §07). Regression for buffy #247. A single positional arg that is NOT a
-    // param-matching record falls through to positional index-binding below.
-    // §04 auto-splat applies at ANY arity: a positional `record(...)` whose
-    // field names match the callable's parameter names binds those fields to
-    // the parameters, so `Dirac(record(value = v))` is `Dirac(value = v)` (a
-    // point mass at `v`, NOT at the record). The record-VALUE form is the
-    // keyword `Dirac(value = record(...))`, which is not a positional splat and
-    // reaches the index-binding path below. Inference resolves the same way (it
-    // splats a positional record for §08 distributions and, via the
-    // fundamental-measure arms, for `Dirac`/`Lebesgue`/`Counting`), so the two
-    // engines stay in step.
-    if kwargs.is_empty() && pos_args.len() == 1 {
-        let arg = pos_args[0];
-        let record_field_names: Option<Vec<String>> = match m.type_of(arg) {
-            Some(Type::Record(fields)) => Some(
-                fields
-                    .iter()
-                    .map(|(s, _)| m.resolve(*s).to_string())
-                    .collect(),
-            ),
-            _ => None,
-        };
-        if let Some(field_names) = record_field_names {
-            let params: std::collections::BTreeSet<&str> =
-                param_names.iter().map(String::as_str).collect();
-            let fields: std::collections::BTreeSet<&str> =
-                field_names.iter().map(String::as_str).collect();
-            if params == fields {
-                let mut args: Vec<(Symbol, NodeId)> = Vec::with_capacity(param_names.len());
-                for p in &param_names {
-                    let key = m.alloc(Node::Lit(Scalar::Str(p.clone().into_boxed_str())));
-                    let getter = build_call(m, "get", &[arg, key]);
-                    args.push((m.intern(p), getter));
-                }
-                return Some((sym, args));
-            }
-        }
+    // Constructor domains do not decide whether the argument is spread.
+    if param_names.len() != 1
+        && kwargs.is_empty()
+        && pos_args.len() == 1
+        && crate::kernel::is_splattable(m, pos_args[0])
+    {
+        let names: Vec<_> = param_names.iter().map(|name| m.intern(name)).collect();
+        let values = crate::kernel::bind_call_args(m, &names, &pos_args, &[], false)?;
+        return Some((sym, names.into_iter().zip(values).collect()));
     }
 
     if pos_args.len() > param_names.len() {

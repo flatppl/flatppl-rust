@@ -111,7 +111,8 @@ fn ordered_args(
         slots[index] = Some(value);
         Some(())
     };
-    if named.is_empty()
+    if names.len() != 1
+        && named.is_empty()
         && let [(node, ty, phase)] = args
     {
         match ty {

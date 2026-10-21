@@ -167,7 +167,7 @@ mu = elementof(reals)
 x ~ Normal(mu, 1.0)
 K = kernelof(x, input = mu)
 KJ = joint(a = K, b = Normal(mu, 1.0))
-score = logdensityof(KJ(3.0), record(a = 3.5, b = mu - 0.25))
+score = logdensityof(KJ(input = 3.0), record(a = 3.5, b = mu - 0.25))
 F = functionof(score, mu = mu)
 lp = F(7.0)",
         "lp = logdensityof(Normal(3.0, 1.0), 3.5) + \

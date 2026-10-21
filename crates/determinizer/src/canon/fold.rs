@@ -83,6 +83,10 @@ fn fold_scalar(
     };
     let op = m.resolve(sym).to_string();
     let nargs = c.args.len();
+    if op == "checked" && nargs == 2 && child_scalars[1] == Some(Scalar::Bool(true)) {
+        out.insert(id, c.args[0]);
+        return child_scalars[0].clone();
+    }
     // Binary arithmetic on two literal operands. IEEE-754-EXACT cases only, so
     // the folded literal is bit-identical to what the JS engine computes (the
     // det-js numeric equivalence gate, Buffy #263):

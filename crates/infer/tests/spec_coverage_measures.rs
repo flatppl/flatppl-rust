@@ -1453,7 +1453,7 @@ fn a_joint_mixing_positional_and_keyword_kernel_components_is_a_static_error() {
                KJ = joint(K1, q = K2)\n\
                M  = KJ(z = 0.0, w = 0.0)";
     assert!(
-        rejects(src, "mixes positional and keyword components"),
+        rejects(src, "either positional or keyword"),
         "the mixed spelling is refused on its own terms: {:?}",
         diags_of(src)
     );
@@ -1473,7 +1473,7 @@ fn a_joint_mixing_positional_and_keyword_kernel_components_is_a_static_error() {
 fn a_joint_mixing_positional_and_keyword_measure_components_is_a_static_error() {
     let src = "j = joint(Normal(0.0, 1.0), b = Exponential(1.0))";
     assert!(
-        rejects(src, "mixes positional and keyword components"),
+        rejects(src, "either positional or keyword"),
         "the mixed spelling is refused on its own terms: {:?}",
         diags_of(src)
     );

@@ -260,7 +260,7 @@ fn functionof_broadcast_kernel_scores_via_likelihood() {
     let src = "\
 lam = elementof(posreals)
 k = functionof(broadcast(Poisson, [lam, lam, lam]), lam = lam)
-L = likelihoodof(k, [1, 2, 3])
+L = likelihoodof(pars -> k(lam = pars.lam), [1, 2, 3])
 lp = logdensityof(L, record(lam = 1.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);

@@ -175,10 +175,18 @@ fn normalize_member_call(m: &mut Module, id: NodeId, module: &str, member: &str)
     };
     let mut call = call.clone();
     let names = flatppl_infer::builtin_catalogue().module_param_names(module, member)?;
+    let arity = flatppl_infer::builtin_catalogue().module_arity(module, member)?;
     let names: Vec<_> = names.iter().map(|name| m.intern(name)).collect();
     let offset =
         usize::from(matches!(call.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast"));
-    let bound = crate::kernel::bind_call_args(m, &names, &call.args[offset..], &call.named, false)?;
+    let bound = crate::kernel::bind_optional_call_args(
+        m,
+        &names,
+        arity.min,
+        &call.args[offset..],
+        &call.named,
+        false,
+    )?;
     let args: Vec<_> = call.args[..offset].iter().copied().chain(bound).collect();
     if call.named.is_empty() && call.args.as_ref() == args {
         return None;

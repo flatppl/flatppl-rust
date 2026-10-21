@@ -345,6 +345,7 @@ fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolve
         set_element: res.set_element.map(|t| reintern_type(into, from, &t)),
         phase: res.phase,
         catalogue: res.catalogue,
+        interface: res.interface,
     }
 }
 
@@ -374,6 +375,7 @@ pub(crate) struct Resolved {
     /// (`load_module`) references — those resolve to a dependency binding, not
     /// a catalogue sig.
     pub(crate) catalogue: Option<CatalogueRef>,
+    pub(crate) interface: Option<crate::callable::Interface>,
 }
 
 // This transient return value is not stored in a collection. Keep cached
@@ -442,6 +444,7 @@ pub(crate) struct InferSession<'b> {
 struct InferredDependency {
     module: Module,
     sets: HashMap<NodeId, (Type, ValueSet)>,
+    interfaces: HashMap<NodeId, crate::callable::Interface>,
 }
 
 impl<'b> InferSession<'b> {
@@ -548,11 +551,17 @@ impl<'b> InferSession<'b> {
         key: (String, String),
         module: Module,
         sets: HashMap<NodeId, (Type, ValueSet)>,
+        interfaces: HashMap<NodeId, crate::callable::Interface>,
     ) {
         self.stack.borrow_mut().pop();
-        self.memo
-            .borrow_mut()
-            .insert(key, InferredDependency { module, sets });
+        self.memo.borrow_mut().insert(
+            key,
+            InferredDependency {
+                module,
+                sets,
+                interfaces,
+            },
+        );
     }
 
     pub(crate) fn input_metadata(&self) -> InputMetadata {
@@ -728,6 +737,7 @@ impl<'b> InferSession<'b> {
             set_element: dependency.sets.get(&rhs).map(|(ty, _)| ty.clone()),
             result: callable_body_result(dep_annotated, rhs),
             catalogue: None,
+            interface: dependency.interfaces.get(&rhs).cloned(),
         };
         Ok(reintern_resolved(importer, dep_annotated, raw))
     }
@@ -772,6 +782,7 @@ fn resolve_standard(
         vset: ValueSet::Unknown,
         set_element: None,
         result: None,
+        interface: crate::callable::Interface::from_sig(sig),
         catalogue: Some(CatalogueRef {
             module: path.clone(),
             member: binding_name.to_string(),

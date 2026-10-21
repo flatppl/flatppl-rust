@@ -328,6 +328,41 @@ impl<'m> Builder<'m> {
             inputs: Some(Inputs::Auto),
         }))
     }
+
+    /// Keep a record-valued parameter point while applying a named interface.
+    pub fn record_adapter(&mut self, callable: NodeId, parameters: &[String]) -> NodeId {
+        let label = self.sym("parameters");
+        let reference = Ref {
+            ns: RefNs::Local,
+            name: self.sym(&format!("_parameters_{}_", self.m.node_count())),
+        };
+        let point = self.m.alloc(Node::Ref(reference));
+        let named = parameters
+            .iter()
+            .map(|name| {
+                let key = self.str_lit(name);
+                let value = self.call("get", &[point, key]);
+                NamedArg {
+                    kind: NamedKind::Kwarg,
+                    name: self.sym(name),
+                    value,
+                }
+            })
+            .collect();
+        let body = self.m.alloc(Node::Call(Call {
+            head: CallHead::User(callable),
+            args: Box::default(),
+            named,
+            inputs: None,
+        }));
+        let head = self.sym("functionof");
+        self.m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: Box::new([body]),
+            named: Box::default(),
+            inputs: Some(Inputs::Spec(Box::new([(label, reference)]))),
+        }))
+    }
 }
 
 #[cfg(test)]

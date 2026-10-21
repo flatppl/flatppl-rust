@@ -2,18 +2,9 @@
 //! (`marginal.rs`), the `jointchain` product (`jointchain.rs`), and
 //! `density.rs`'s `lower_measure_density` reified-application dispatch.
 //!
-//! A `kernelof(body, %specinputs([(name, ref), …]))` reifies a measure `body`
-//! with named boundary inputs. Each entry is `(name, Ref)`: `name` is what the
-//! kernel input is called (matched to a prior variate field by auto-splat);
-//! `Ref` is how the body references it — the SAME symbol as `name` for a
-//! real-binding input (`(a (%ref self a))`), a placeholder (`(b (%ref %local
-//! _b_))`) for an intermediate-variate input. Substitution replaces the `Ref`'s
-//! symbol, so callers apply `substitute_ref(body, ref.name, value)`.
-//!
-//! `functionof(body, %specinputs(…))` over a measure-valued `body` is the same
-//! reification under a different builtin name (spec §04 "Reification to
-//! functions and kernels") — `resolve_reified` accepts both, but `resolve_kernel`
-//! stays `kernelof`-only since `marginal.rs`/`jointchain.rs` depend on that.
+//! Boundary entries pair public input names with references inside the body.
+//! Explicit boundaries are ordered; inferred boundaries are keyword-only. Call
+//! binding selects the argument shape before simultaneous, scoped substitution.
 
 use std::collections::HashMap;
 
@@ -297,12 +288,6 @@ pub(crate) fn has_free_local(m: &Module, root: NodeId) -> bool {
     walk(m, root, &mut Vec::new())
 }
 
-/// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree at
-/// `root` with `new_id`. [`substitute_refs`] for a single name.
-pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id: NodeId) -> NodeId {
-    substitute_refs(m, root, &[(name, new_id)])
-}
-
 /// Replace every `(%ref self n)` / `(%ref %local n)` in the subtree at `root` with
 /// `map`'s value for `n`, for every entry of `map` SIMULTANEOUSLY. Append-only.
 ///
@@ -525,57 +510,9 @@ fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
     }
 }
 
-/// If `node` is a reified-callable application `k(input)` / `k(a, b, …)`
-/// where `k` resolves to a `kernelof(body, %specinputs(…))` OR a
-/// `functionof(body, %specinputs(…))` over a measure-valued `body`
-/// (`resolve_reified`), β-reduce it: substitute each boundary input's
-/// body-ref with the bound argument, and return the reduced measure body.
-/// `None` for any other shape.
-///
-/// Three application forms are recognized, distinguished structurally by the
-/// application's own argument shape (not by which reifier produced `k` —
-/// spec §04 does not tie the reifier name to the argument form):
-/// - KEYWORD arguments (`k(name = value)`): each boundary input is bound BY
-///   NAME to the supplied keyword of the same name. This is the only form an
-///   `%autoinputs` (keyword-only) kernel supports (§04: "no argument order can
-///   be inferred"), and a `%specinputs` kernel supports it too (§04: an
-///   explicit boundary supports keyword args in addition to positional).
-///   Binding is an exact bijection: every boundary input supplied once, and no
-///   keyword without a matching boundary name — a missing or extra name refuses
-///   (`None`), never leaving a boundary input free (a silent wrong density).
-/// - a single `record(...)` or `table(...)` argument: each boundary input is bound BY
-///   FIELD/COLUMN NAME (the `k(record(mu = 1.5))` idiom — `is_splattable` /
-///   `record_field`).
-/// - one or more POSITIONAL arguments: bound BY POSITION, arg\[i\] → the
-///   i-th boundary entry (the `mk(0.0)` idiom). Positional binding is
-///   `%specinputs`-ONLY: an `%autoinputs` kernel is keyword-only (§04), so a
-///   positional application of one refuses rather than attach an argument to an
-///   arbitrarily-ordered traced input. Arity must match the input count
-///   exactly; a mismatch refuses (`None`) rather than guessing.
-///
-/// Note the auto-splatting form binds BY NAME even when the kernel has exactly one
-/// boundary input: `k(record(mu = 1.5))` looks up the input's own name as a field of
-/// the record — it never binds the record as a whole positionally to that single
-/// input. §04 "Calling conventions" is explicit that this is not a fallback: "A sole
-/// positional record or table therefore always splats: whether its field or column
-/// names match the callable's argument names decides only whether the call is valid,
-/// never whether the splat occurs" (flatppl-design#74). So a name mismatch cleanly
-/// refuses (`None`) via `record_field`'s `?`, rather than falling back to binding the
-/// whole value positionally. `is_splattable` covers `table` for the same reason — see
-/// its comment for why flatppl-design#78's single-input exemption cannot reach here.
-///
-/// An `%autoinputs` (keyword-only, boundary-less) reification IS handled: its
-/// auto-traced boundary names + refs are read from the module's auto-inputs
-/// side-table via [`boundary_inputs`] ([`Module::auto_inputs_of`]), so the
-/// keyword form binds them by name and the positional form refuses.
-///
-/// `body` is commonly a bare `(%ref self x)` pointing at a `draw`-bound
-/// stochastic value — the `x ~ Dist(...); k = kernelof(x, ...)` idiom (see
-/// `fixtures/flatppl/minimal.flatppl`) — rather than an inline measure
-/// expression. `substitute_ref` only rewrites literal descendants of its
-/// root, so it cannot see through that ref into `x`'s own binding; resolve
-/// one level of ref indirection and, if present, one level of `draw(...)`
-/// unwrapping to reach the actual measure/law BEFORE substituting.
+/// Apply a reified callable using its ordered or keyword-only boundary.
+/// A sole record/table is whole for an ordered unary callable, and supplies
+/// named fields otherwise. Bind the complete interface before substitution.
 pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<NodeId> {
     reduce_kernel_application_bound(m, node, Substitute::All).map(|app| app.body)
 }
@@ -711,17 +648,34 @@ pub(crate) fn bind_call_args(
     named: &[NamedArg],
     keyword_only: bool,
 ) -> Option<Vec<NodeId>> {
-    if named.is_empty() && args.len() == 1 && is_splattable(m, args[0]) {
+    bind_optional_call_args(m, names, names.len(), args, named, keyword_only)
+}
+
+/// Bind a catalogue interface with an optional trailing parameter suffix.
+pub(crate) fn bind_optional_call_args(
+    m: &mut Module,
+    names: &[Symbol],
+    required: usize,
+    args: &[NodeId],
+    named: &[NamedArg],
+    keyword_only: bool,
+) -> Option<Vec<NodeId>> {
+    if (keyword_only || required > 1 || names.is_empty())
+        && named.is_empty()
+        && args.len() == 1
+        && is_splattable(m, args[0])
+    {
         let fields = splat_fields(m, args[0])?;
-        if fields.len() != names.len() || !names.iter().all(|name| fields.contains(name)) {
+        if fields.len() < required || !fields.iter().all(|name| names.contains(name)) {
             return None;
         }
-        return names
+        return names[..fields.len()]
             .iter()
             .map(|name| record_field(m, args[0], *name))
             .collect();
     }
-    if args.len() + named.len() != names.len() || (keyword_only && !args.is_empty()) {
+    let count = args.len() + named.len();
+    if count < required || count > names.len() || (keyword_only && !args.is_empty()) {
         return None;
     }
     let mut values = vec![None; names.len()];
@@ -737,28 +691,10 @@ pub(crate) fn bind_call_args(
             return None;
         }
     }
-    values.into_iter().collect()
+    values.into_iter().take(count).collect()
 }
 
-/// Does `rec` (after one level of ref-resolution) denote a `record(...)` or `table(...)`
-/// call? Used to distinguish the by-name auto-splatting application form from the
-/// positional one in [`reduce_kernel_application`].
-///
-/// §04 "Calling conventions" names BOTH: "`f(record(a = x, b = y, ...))` and
-/// `f(table(a = x, b = y, ...))` are equivalent to `f(a = x, b = y, ...)`", and a sole
-/// positional one of either "therefore always splats". Recognising only `record` sent a
-/// sole positional TABLE down the positional arm, where a single-input reification bound
-/// the whole table to that input — the whole-value reading §04 now rules out.
-///
-/// **The §04 amendment under review does not exempt this site.** flatppl-design#78 (OPEN,
-/// owner-accepted, PENDING review) exempts "a callable with exactly one input whose
-/// documented domain admits records or tables", so that `sum(t)` and `lengthof(t)` reduce
-/// over the table. Its test is the CALLEE's arity and DOCUMENTED domain. Every callee
-/// reaching here is a user `functionof`/`kernelof` reification ([`resolve_reified`] off a
-/// `CallHead::User`), which has no documented domain at all — §07's "Domains" column
-/// covers built-ins — so the exemption cannot apply however many inputs it declares. A
-/// bare-builtin callee never reaches this function: `canon` rewrites it to a direct
-/// builtin call, and the two `pushfwd` sites screen it off beforehand.
+/// Whether the value exposes record fields or table columns for named binding.
 pub(crate) fn is_splattable(m: &Module, rec: NodeId) -> bool {
     splat_fields(m, rec).is_some()
 }

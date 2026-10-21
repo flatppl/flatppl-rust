@@ -129,6 +129,7 @@ pub fn determinize_with_options(
     if grafted_application {
         crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
+    crate::canon::normalize_call_wrappers(&mut work);
 
     let mut specialize_sequences = true;
     loop {

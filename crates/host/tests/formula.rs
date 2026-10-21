@@ -455,7 +455,7 @@ fn formula_inverse_links_compile_in_likelihood_queries() -> Result<(), Box<dyn s
         } else if family == "von_mises" {
             "record(temp_Intercept = eta, kappa = 1)"
         } else {
-            "record(temp_Intercept = eta)"
+            "temp_Intercept = eta"
         };
         let query = context.parse(
             &format!(

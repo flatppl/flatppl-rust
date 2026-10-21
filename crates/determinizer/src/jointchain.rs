@@ -11,8 +11,8 @@
 //! Each kernel's boundary inputs bind to the realized variates of the
 //! components to its left (spec: `b ~ K(a)`). This module recognizes two
 //! variate families and refuses everything else (refuse-don't-mislower):
-//!   * record-form — component record fields merge; kernel inputs bind to prior
-//!     fields by name (auto-splat).
+//!   * record-form — component record fields merge; ordinary application passes
+//!     the record of prior fields to the next kernel.
 //!   * scalar-cat — components are scalar draws; output is a vector; a kernel's
 //!     single input binds to the `cat` of all prior slices.
 
@@ -21,11 +21,9 @@ use crate::density::{
     draw_argument, expect_builtin_call, fold_add, lookup_field, lower_measure_density,
     materialize_record_value, resolve_ref_chain, resolve_ref_one,
 };
-use crate::kernel::{Kernel, resolve_kernel, resolve_reified, substitute_ref};
+use crate::kernel::{Kernel, resolve_kernel, resolve_reified};
 use crate::refuse::RefuseError;
-use flatppl_core::{
-    Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Scalar, Symbol, Type,
-};
+use flatppl_core::{Call, CallHead, Module, NamedKind, Node, NodeId, Scalar, Symbol, Type};
 
 /// A resolved single-draw component: its variate field name (record-form) or
 /// `None` (scalar-cat), and its distribution constructor. Kernel inputs are
@@ -178,25 +176,11 @@ fn lower_record_family(
             }
             let kernel = resolve_reified(m, component)
                 .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
-            let mut named = Vec::with_capacity(kernel.inputs.len());
-            for (name, _) in &kernel.inputs {
-                let value = env
-                    .iter()
-                    .find(|(field, _)| field == name)
-                    .map(|(_, value)| *value)
-                    .ok_or_else(|| {
-                        refuse_jc(node, "kernel input names a non-prior variate field")
-                    })?;
-                named.push(NamedArg {
-                    kind: NamedKind::Kwarg,
-                    name: *name,
-                    value,
-                });
-            }
+            let prior = build_record(m, &env);
             let applied = m.alloc(Node::Call(Call {
                 head: CallHead::User(component),
-                args: Box::new([]),
-                named: named.into(),
+                args: Box::new([prior]),
+                named: Box::default(),
                 inputs: None,
             }));
             (applied, record_fields(m, kernel.body))
@@ -337,12 +321,16 @@ fn lower_scalar_family(
         } else {
             build_call(m, "vector", &env)
         };
-        let target = kernel.inputs[0].1.name;
-        let dist_i = substitute_ref(m, comp.dist, target, cat);
+        let applied = m.alloc(Node::Call(Call {
+            head: CallHead::User(k_arg),
+            args: Box::new([cat]),
+            named: Box::default(),
+            inputs: None,
+        }));
 
         let idx = m.alloc(Node::Lit(Scalar::Int((i + 1) as i64)));
         let si = build_call(m, "get0", &[v, idx]);
-        terms.push(build_density_term(m, dist_i, si)?);
+        terms.push(lower_measure_density(m, applied, si)?);
         env.push(si);
     }
 

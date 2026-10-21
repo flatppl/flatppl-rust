@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Symbol};
+use flatppl_core::{Call, CallHead, Module, NamedKind, Node, NodeId, Symbol};
 
 use crate::driver::rebuild_with_children;
 use crate::kernel::reduce_kernel_application;
@@ -29,6 +29,16 @@ use crate::kernel::reduce_kernel_application;
 /// driver's exit gate, so the module refuses rather than reaching a consuming
 /// engine that cannot evaluate it.
 pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
+    rewrite_calls(m, true)
+}
+
+/// Resolve wrappers before density recognition without applying reified draw
+/// boundaries early or pinning their provenance.
+pub(crate) fn normalize_call_wrappers(m: &mut Module) -> bool {
+    rewrite_calls(m, false)
+}
+
+fn rewrite_calls(m: &mut Module, reduce: bool) -> bool {
     let mut changed = false;
     let mut mapped = HashMap::new();
     let pairs: Vec<(flatppl_core::BindingId, NodeId)> =
@@ -37,7 +47,7 @@ pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
         // `reduce_kernel_application` needs `&mut Module` and returns a fresh
         // body `NodeId`, so apply it via a manual bottom-up walk rather than
         // `map_tree` (whose closure only gets `&Module`, no `alloc`).
-        let new = inline_walk(m, root, &mut mapped, None);
+        let new = inline_walk(m, root, &mut mapped, None, reduce);
         if new != root {
             m.set_binding_rhs(bid, new);
             changed = true;
@@ -49,7 +59,7 @@ pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
 /// Specialize a callback body before its remaining live values are reified.
 pub(crate) fn inline_expression(m: &mut Module, root: NodeId) -> NodeId {
     let promoted = super::promoted_input_names(m);
-    inline_walk(m, root, &mut HashMap::new(), Some(&promoted))
+    inline_walk(m, root, &mut HashMap::new(), Some(&promoted), true)
 }
 
 /// Bottom-up: inline within children first (so a callee itself containing a
@@ -63,6 +73,7 @@ fn inline_walk(
     id: NodeId,
     mapped: &mut HashMap<NodeId, NodeId>,
     projections: Option<&HashSet<Symbol>>,
+    reduce: bool,
 ) -> NodeId {
     if let Some(&result) = mapped.get(&id) {
         return result;
@@ -72,7 +83,7 @@ fn inline_walk(
     let new_children: Vec<NodeId> = children
         .iter()
         .map(|&c| {
-            let nc = inline_walk(m, c, mapped, projections);
+            let nc = inline_walk(m, c, mapped, projections, reduce);
             any_child_changed |= nc != c;
             nc
         })
@@ -94,12 +105,15 @@ fn inline_walk(
     {
         if let Some(head) = builtin_callee_head(m, id) {
             id = rebuild_with_head(m, id, head);
-        } else if let Some(reduced) = reduce_kernel_application(m, id) {
+        } else if let Some(expanded) = expand_composed_call(m, id) {
+            id = inline_walk(m, expanded, mapped, projections, reduce);
+        } else if reduce && let Some(reduced) = reduce_kernel_application(m, id) {
             // The reduced body may itself contain further user calls
             // (e.g. a function whose body calls another function).
-            id = inline_walk(m, reduced, mapped, projections);
+            id = inline_walk(m, reduced, mapped, projections, reduce);
         }
     }
+    id = normalize_builtin_call(m, id).unwrap_or(id);
     mapped.insert(original, id);
     id
 }
@@ -122,10 +136,113 @@ fn builtin_callee_head(m: &Module, id: NodeId) -> Option<CallHead> {
     let CallHead::User(callee) = c.head else {
         return None;
     };
-    match m.node(callee) {
+    match m.node(crate::density::resolve_ref_chain(m, callee).0) {
         Node::Const(sym) => Some(CallHead::Builtin(*sym)),
         _ => None,
     }
+}
+
+/// Composition preserves the first interface; each later stage is one ordinary
+/// application to the previous result. Lifting delegates to broadcast's cell call.
+pub(crate) fn expand_composed_call(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = m.node(id) else {
+        return None;
+    };
+    let CallHead::User(callee) = call.head else {
+        return None;
+    };
+    let mut call = call.clone();
+    let callee = crate::density::resolve_ref_chain(m, callee).0;
+    let Node::Call(wrapper) = m.node(callee) else {
+        return None;
+    };
+    let CallHead::Builtin(op) = wrapper.head else {
+        return None;
+    };
+    let name = m.resolve(op).to_string();
+    let components = wrapper.args.to_vec();
+    let mut wrapper = wrapper.clone();
+    let first = *components.first()?;
+    match name.as_str() {
+        "fchain" => {
+            call.head = CallHead::User(first);
+            let mut result = m.alloc(Node::Call(call));
+            for &next in &components[1..] {
+                result = m.alloc(Node::Call(Call {
+                    head: CallHead::User(next),
+                    args: Box::new([result]),
+                    named: Box::default(),
+                    inputs: None,
+                }));
+            }
+            Some(result)
+        }
+        "bijection" => {
+            call.head = CallHead::User(first);
+            Some(m.alloc(Node::Call(call)))
+        }
+        "broadcasted" => {
+            call.head = CallHead::Builtin(m.intern("broadcast"));
+            call.args = std::iter::once(first)
+                .chain(call.args.iter().copied())
+                .collect();
+            Some(m.alloc(Node::Call(call)))
+        }
+        "normalize" | "truncate" | "locscale" | "iid" | "relabel" | "pushfwd" | "weighted"
+        | "logweighted"
+            if matches!(m.type_of(callee), Some(flatppl_core::Type::Kernel { .. })) =>
+        {
+            let index = usize::from(matches!(
+                name.as_str(),
+                "pushfwd" | "weighted" | "logweighted"
+            ));
+            call.head = CallHead::User(*components.get(index)?);
+            wrapper.args[index] = m.alloc(Node::Call(call));
+            Some(m.alloc(Node::Call(wrapper)))
+        }
+        _ => None,
+    }
+}
+
+/// Numeric backends receive positional operands in the catalogue's order.
+/// Record/table construction and special operations have no ordinary named
+/// signature and are left intact.
+fn normalize_builtin_call(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(op) = call.head else {
+        return None;
+    };
+    if call.inputs.is_some() || call.named.iter().any(|arg| arg.kind != NamedKind::Kwarg) {
+        return None;
+    }
+    let cat = flatppl_infer::builtin_catalogue();
+    let name = m.resolve(op);
+    if flatppl_infer::constructor_param_names(name).is_some() {
+        return None;
+    }
+    let names = cat.base_param_names(name)?;
+    let arity = cat.base_arity(name)?;
+    if arity.max != Some(names.len()) {
+        return None;
+    }
+    let mut call = call.clone();
+    let names: Vec<_> = names.iter().map(|name| m.intern(name)).collect();
+    let args = crate::kernel::bind_optional_call_args(
+        m,
+        &names,
+        arity.min,
+        &call.args,
+        &call.named,
+        false,
+    )?;
+    if call.named.is_empty() && call.args.as_ref() == args {
+        return None;
+    }
+    call.args = args.into();
+    call.named = Box::default();
+    Some(m.alloc(Node::Call(call)))
 }
 
 /// Re-allocate `id`'s call with `head`, keeping its positional/named arguments

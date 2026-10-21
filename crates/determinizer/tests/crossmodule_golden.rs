@@ -91,7 +91,7 @@ a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, record(a = 0.0))";
+lp = logdensityof(L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -134,7 +134,7 @@ center = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = center)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, record(center = 0.0))";
+lp = logdensityof(L, 0.0)";
 
     // Empty bundle: the `helpers.flatppl` dependency is not present.
     let bundle = ModuleBundle::new();
@@ -175,7 +175,7 @@ L = likelihoodof(functionof(Normal(mu = center, sigma = 1.0), center = center), 
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, record(a = 0.0))";
+lp = logdensityof(helpers.L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -259,7 +259,7 @@ flatppl_compat = \"0.1\"
 center = elementof(reals)
 scale = 10.0
 helpers = load_module(\"helpers.flatppl\", center = center)
-lp = logdensityof(helpers.L, record(center = 0.0))";
+lp = logdensityof(helpers.L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -296,7 +296,7 @@ L = likelihoodof(k, obs_data)";
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, record(a = 0.0))";
+lp = logdensityof(helpers.L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -348,7 +348,7 @@ L = likelihoodof(obs_kernel, input_data)";
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, record(a = 0.0))";
+lp = logdensityof(helpers.L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -424,7 +424,7 @@ scale = 10.0
 helpers = load_module(\"helpers.flatppl\", center = center)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, record(center = 0.0))";
+lp = logdensityof(L, 0.0)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -736,7 +736,7 @@ lp = logdensityof(outer.x, 0.5)";
 /// GAP #194 — a cross-module kernel APPLICATION as the `logdensityof` target:
 /// the submodule defines a reified SCALAR kernel `k = functionof(Normal(mu =
 /// center, sigma = 1.0), center = center)`, the host `load_module`s it and
-/// scores the APPLIED kernel `logdensityof(m.k(record(center = 0.0)), 0.5)`.
+/// scores the APPLIED kernel `logdensityof(m.k(center = 0.0), 0.5)`.
 /// The target is `%call { head: User((%ref m k)), args: [record(center = 0.0)] }`
 /// — a `%call` whose CALLEE is a cross-module ref. Spec §04: a kernelof
 /// application and a cross-module measure both cross module boundaries, so this
@@ -760,7 +760,7 @@ k = functionof(Normal(mu = center, sigma = 1.0), center = center)";
     let model = "\
 flatppl_compat = \"0.1\"
 m = load_module(\"helpers.flatppl\")
-lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+lp = logdensityof(m.k(center = 0.0), 0.5)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -798,7 +798,7 @@ k = functionof(Normal(mu = center, sigma = scale), center = center)";
 flatppl_compat = \"0.1\"
 scale = 10.0
 m = load_module(\"helpers.flatppl\")
-lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+lp = logdensityof(m.k(center = 0.0), 0.5)";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -1489,7 +1489,7 @@ fn reexported_kernel_applies_through_aliases() {
     );
     assert_outputs(
         "w = load_module(\"wrapper.flatppl\")\n\
-         outputs = logdensityof(w.k(record(center = 0.0)), 0.5)",
+         outputs = logdensityof(w.k(center = 0.0), 0.5)",
         &bundle,
         "outputs = logdensityof(Normal(0.0, 1.0), 0.5)",
     );
@@ -1581,7 +1581,7 @@ fn imported_likelihood_keeps_public_input_labels() {
         "helper.flatppl",
         Arc::new(parse(
             "center = elementof(reals)\n\
-         k = functionof(Normal(center, 1.0), center = center)",
+         k = functionof(Normal(center, 1.0))",
         )),
     );
     let mut model = parse(

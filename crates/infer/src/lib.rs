@@ -22,6 +22,7 @@
 
 mod axes;
 pub mod builtins;
+mod callable;
 mod catalogue;
 mod consteval;
 mod modules;

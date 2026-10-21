@@ -582,140 +582,15 @@ impl Catalogue {
         sig_arity(self.base(name)?)
     }
 
-    /// Base builtins whose documented domain admits a record or a TABLE, and so
-    /// take a sole positional aggregate whole instead of auto-splatting it —
-    /// §04's single-input carve-out (flatppl-design#78, pending owner review):
-    /// "A callable with exactly one input whose documented domain admits records
-    /// or tables is exempt and receives a sole positional record or table whole,
-    /// so that `sum(t)` and `lengthof(t)` reduce over the table rather than
-    /// splatting."
-    ///
-    /// Derived by classifying all 96 single-input base builtins against §07's
-    /// Domains column and prose, not by taking #78's two examples as the list. Each
-    /// member, with where its aggregate domain is documented:
-    ///
-    /// - `lengthof` ("vectors, tables"), `reverse` ("vectors, tables"), `indicesof`
-    ///   and `indicesof0` ("vectors, arrays, tables") — the Domains cell names
-    ///   tables outright. §03 "Tables" backs `lengthof`: "`lengthof(t)` returns the
-    ///   number of table rows."
-    /// - `identity` ("any") — an unrestricted domain admits records and tables, and
-    ///   a function returning its argument unchanged must not restructure it.
-    /// - `sum`, `mean`, `var`, `std`, `prod`, `maximum`, `minimum` — their Domains
-    ///   cells say only "real/complex arrays" / "real arrays"; the table domain
-    ///   lives in §07's **Table reductions** paragraph ("When `sum`, `mean`, `var`,
-    ///   `std`, `prod`, `maximum`, or `minimum` is applied to a table, the reduction
-    ///   operates column-wise and returns a record whose fields are the column
-    ///   names"). #78 names `sum(t)` normatively for exactly this reason. `std` was
-    ///   added to that paragraph by an owner ruling on 2026-08-10 (flatppl-design
-    ///   `4c93237`, onto #77) — it is $\sqrt{\mathrm{var}}$, so a column-wise `var`
-    ///   implies a column-wise `std`. `prod`, `maximum`, `minimum` were added by
-    ///   design PR #79 (owner-merge pending as of this change; landed ahead of spec
-    ///   per the owner's ruling that the engine work need not wait).
-    /// - `median`, `lany`, `lall` — added to the same **Table reductions** paragraph
-    ///   by the `missing-reductions` spec draft (flatppl-design `ee4c6fb`), which
-    ///   also states under §07 "Boolean reductions" that `lany` and `lall` "reduce a
-    ///   table column-wise". Unmerged, landed ahead of spec under the same ruling.
-    ///
-    /// Deliberately ABSENT, each checked against its own row rather than assumed:
-    ///
-    /// - `quantile` — two inputs, so the arity half of #78's condition excludes it
-    ///   whatever its domain. It is also absent from §07's Table reductions
-    ///   paragraph.
-    /// - `linfnorm`, `cummax`, `cummin` — "real/complex vectors" / "real vectors",
-    ///   arrays only, exactly like `l1norm`/`l2norm` and `cumsum`/`cumprod`.
-    ///
-    /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
-    ///   qualified, so these do not admit aggregates.
-    /// - `sizeof` ("vectors, arrays") and every other reduction/norm/stack row —
-    ///   arrays only.
-    /// - `qr` — RETURNS `record(Q, R)`, but its domain is "$m \times n$ matrices".
-    ///   The carve-out is about the domain, not the result.
-    /// - `totalmass` — §06, and its input is a measure, not an aggregate.
-    /// - `log2`, `log10`, `gamma`, `loggamma` — §07 gives all four the `posreals`
-    ///   domain, a scalar set, so none of them admits an aggregate.
-    /// - Every single-input §08 constructor (`Poisson`, `Dirichlet`, `Categorical`,
-    ///   `Exponential`, …) — scalar or vector domains, never aggregates. This is
-    ///   what keeps `Poisson(record(zzz = 0.5))` a static error.
-    /// - `get`, `get0` ("records, arrays, tables, tuples") and `filter` ("function,
-    ///   array or table") DO admit aggregates in their cells, but they are
-    ///   MULTI-input, so #78's "exactly one input" half excludes them and they never
-    ///   reach this list. They are also absent from the single-input arity set, so
-    ///   the exclusion holds twice over.
-    ///
-    /// The caller pairs this with the arity half of #78's condition, so a row that
-    /// later gains a second parameter stops being exempt without this list changing
-    /// — see [`Catalogue::base_takes_aggregate_whole`].
-    const AGGREGATE_DOMAIN_BUILTINS: &[&str] = &[
-        "identity",
-        "indicesof",
-        "indicesof0",
-        "lall",
-        "lany",
-        "lengthof",
-        "maximum",
-        "mean",
-        "median",
-        "minimum",
-        "prod",
-        "reverse",
-        "std",
-        "sum",
-        "var",
-    ];
-
-    /// True iff base builtin `name` satisfies BOTH halves of §04's single-input
-    /// carve-out: exactly one declared input, and a documented domain admitting
-    /// records or tables ([`Self::AGGREGATE_DOMAIN_BUILTINS`]).
-    ///
-    /// Both halves are read off the CALLEE's signature, never the caller's field
-    /// names, which is what keeps the rule decidable at the call site and leaves
-    /// every multi-input splat alone. Arity is checked here rather than trusted of
-    /// the list: `Exponential(record(rate = 1.0))` is one input but a `reals`
-    /// domain, and a hypothetical two-input `sum` would stop being exempt on its
-    /// own.
+    /// A sole positional aggregate is kept whole when the declared interface
+    /// admits one positional argument, before checking its domain.
     pub(crate) fn base_takes_aggregate_whole(&self, name: &str) -> bool {
-        let single_input = matches!(
-            self.base_arity(name),
-            Some(Arity {
-                min: 1,
-                max: Some(1)
-            })
-        );
-        single_input && Self::AGGREGATE_DOMAIN_BUILTINS.contains(&name)
+        self.base_arity(name).is_some_and(|arity| arity.admits(1))
     }
 
-    /// The declared parameter NAMES of base builtin `name`, for the §04
-    /// name-binding rule. A `Distribution` row carries them as its `params`; a
-    /// `Function` / `Structural` row carries them in `names`, alongside the
-    /// `ParamSig` type tags in `params`.
-    ///
-    /// **An empty list answers `None`, which the caller reads as "accept".** So a
-    /// row documenting no names stays permissive rather than refusing every
-    /// splatted call — prove-it-is-wrong, the same discipline the determiniser's
-    /// shape guards use. Two groups are deliberately nameless:
-    ///
-    /// - **Every VARIADIC row** (`cat`, `get`, `get0`, `vector`, `builtin_sample`).
-    ///   These have no name list to declare, because §04 makes their variadic inputs
-    ///   UNNAMED: "Special operations have zero to three distinguished, **unnamed**,
-    ///   ordered inputs of fixed arity", then "`cat`, `fchain`, `kchain`: Variadic
-    ///   unnamed inputs with significant order", "`get`: One distinguished input plus
-    ///   variadic unnamed input", "`vector`: Unnamed variadic inputs with significant
-    ///   order". (§04 lists `cat` and `get`; `get0` inherits via §07's "zero-based
-    ///   variant of `get`".)
-    ///
-    ///   **Nameless here no longer means the splat is accepted.** An earlier revision
-    ///   deferred that on blast-radius grounds; the owner has since ruled ("we do not
-    ///   want hidden magic") and the positional column bind is closed —
-    ///   [`Self::base_has_unnamed_variadic`] makes a splatted aggregate onto one of
-    ///   these rows a §04 static error, reported by
-    ///   `ops::refuse_splat_onto_unnamed_variadic` and pinned by
-    ///   `crates/infer/tests/variadic_splat.rs`. So every nameless VARIADIC row is
-    ///   refused before the name check is reached, and the permissive default below
-    ///   is left with no fixed-arity row to cover: `length` is deleted (superseded by
-    ///   `lengthof`) and `log2` now declares `x` off its §07 entry. That is pinned by
-    ///   `crates/infer/tests/builtin_param_names.rs`.
-    /// - **Rows whose §07 "Arguments" cell is not a name list** (a formula or a
-    ///   dash), where there is nothing to read.
+    /// Declared input names for ordinary keyword binding and aggregate spreading.
+    /// A missing name list cannot name-bind a splatted aggregate; an interface
+    /// that admits one positional input keeps that aggregate whole instead.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
         sig_param_names(self.base(name)?)
     }
@@ -726,72 +601,8 @@ impl Catalogue {
         self.base(name).map_or(&[], sig_param_sets)
     }
 
-    /// Does `name` declare a VARIADIC parameter and NO names for its fixed inputs? Such a row
-    /// offers a splatted field nothing to bind to, so a sole positional aggregate has no defined
-    /// value on it.
-    ///
-    /// Read structurally off the declared parameter list (`params.iter().any(Variadic)`), so a
-    /// variadic row added later is covered on arrival instead of needing to be remembered here.
-    ///
-    /// **`any`, not `last`, deliberately.** The live rows all put the variadic parameter last, so
-    /// the two agree today — but [`Arity::of`] is itself position-agnostic (any `Variadic` removes
-    /// the upper bound), so matching it keeps this guard covering exactly the set of rows the
-    /// arity rule treats as unbounded. Checking `last` would leave a hypothetical mid-list
-    /// variadic unbounded on arity yet unguarded here, which is the fail-open direction.
-    ///
-    /// ## Why the guard steps aside for a row that declares names
-    ///
-    /// **This is the primary exclusion, and it replaced a name list.** A row that documents names
-    /// for its fixed inputs is one §04's "unnamed" premise is simply FALSE for, so the guard has
-    /// no basis on it — a field CAN bind, and the ordinary name check should decide instead.
-    /// Keying on [`Self::base_param_names`] rather than on a hardcoded name states that reason
-    /// directly and is self-maintaining: giving any variadic row its documented names removes it
-    /// from this guard in the same edit, with no second place to remember.
-    ///
-    /// `builtin_sample` is why this matters and is the case that proved the name list wrong. §04's
-    /// special-operations list omits it entirely, so it is an ORDINARY callable — "All built-in
-    /// ordinary callables have a defined input order and accept both positional and keyword
-    /// arguments" — and §07 "Measure kernel evaluation primitives" documents its three
-    /// distinguished inputs by name: "`builtin_sample(rngstate, kernel, kernel_input, n, m,
-    /// ...)`". Its row alone among the six primitives carried no names, so the structural read
-    /// caught its trailing `Variadic(Scalar(Integer))` — the optional sample shape — and refused a
-    /// splat §04 makes valid. Adjudicated NON-CONFORMANT in `wave-CATADJ-report.md` §6.
-    ///
-    /// ## The remaining exclusions
-    ///
-    /// **Rows whose variadic inputs §04 documents as NAMED** — `record`/`table`,
-    /// `functionof`/`kernelof`, `broadcast`, `load_module`. None is a base catalogue row today
-    /// (`ops.rs` types them structurally, so this method never sees them); the list is
-    /// future-proofing. `cartprod`, `joint` and `jointchain` are deliberately NOT excluded even
-    /// though §04 gives them "Variadic unnamed **or named** inputs": if one gains a row with
-    /// unnamed variadic inputs, an exclusion would silently accept the splat this guard closes.
-    ///
-    /// **`vector`, on §07 and §03 grounds** — the one row where a sole aggregate has a plausible
-    /// NON-splat reading. §07 gives it the arguments `x1, x2, ...` over the domain "**scalars**",
-    /// so its arguments *are* the elements of the result and `vector(pars)` reads as "a
-    /// one-element array holding `pars`" — what `ys ~ transport.(xs, [pars])` means in
-    /// `flatppl-js/packages/engine/test/fixtures/simple-transport1.flatppl` and
-    /// `packages/web/demo/transport-model.flatppl`. §03 "Arrays" ("collections of scalar values …
-    /// or arrays") already refuses that accurately, and it diagnoses the shape the author asked
-    /// for; the splat message would advise a different-length array. Pinned by
-    /// `variadic_splat.rs::vector_keeps_the_sec03_element_diagnosis`.
-    ///
-    /// ## What the surviving refusals rest on — NOT §04's always-splat rule
-    ///
-    /// `wave-CATADJ-report.md` §1 rules the auto-splat bullet's scope over special operations
-    /// **UNDERDETERMINED**: §04 never states the exclusion, while §03 "Tables" applies splatting
-    /// to `table(r)`/`record(t)` — both on §04's special-operations list — and §05 publishes a
-    /// shorter roster omitting these rows entirely. So the behaviour below is justified per row,
-    /// on grounds that hold under either reading of that question:
-    ///
-    /// - **`cat` — §07 SILENCE.** Its three bullets are all written with two-or-more operands and
-    ///   no sentence assigns a value to a one-argument `cat`. "Arity 1..∞" is this crate's row,
-    ///   not spec text — the word "arity" appears once in the whole spec and never with a number
-    ///   for `cat`. Refusing contradicts no sentence; accepting is not granted either.
-    /// - **`get`/`get0` — the REQUIRED SELECTOR.** §07 gives `get(container, selectors...)` and
-    ///   every documented form supplies a selector; §07 defines no zero-selector `get`, and
-    ///   `get0` is "zero-based variant of `get`", inheriting the requirement.
-    /// - **A table on any of them** additionally fails the row's own §07 Domains cell.
+    /// Whether a variadic row has no declared names to bind splatted fields.
+    /// This is consulted only after one-positional-input admission has failed.
     pub(crate) fn base_has_unnamed_variadic(&self, name: &str) -> bool {
         /// §04 rows whose variadic inputs may be NAMED — a splat can bind on these.
         const NAMED_VARIADIC: &[&str] = &[
@@ -808,7 +619,7 @@ impl Catalogue {
             return false;
         }
         // §07's `vector` takes its ELEMENTS as arguments, so a sole aggregate is an element
-        // question for §03, not a binding question for §04. See the doc comment.
+        // question for §03, not a binding question for §04.
         if name == "vector" || NAMED_VARIADIC.contains(&name) {
             return false;
         }
@@ -817,38 +628,6 @@ impl Catalogue {
             _ => return false,
         };
         params.iter().any(|p| matches!(p, ParamSig::Variadic(_)))
-    }
-
-    /// Base builtins that never accept a sole positional record/table splat, even
-    /// when its field or column names match the declared parameter names —
-    /// owner ruling on design PR #78 (decisions-log 2026-08-18): "§07's keyword
-    /// form owns `checked`; no special operation splats a sole record/table
-    /// argument." §04 lists `checked` among the special operations ("Two
-    /// distinguished inputs"), and that listing wins the double-listing against
-    /// §07's own named-parameter row for it — the double-listing itself is
-    /// `wave-rustbatch` item 2's authority (`designpass2-report.md` PR 78).
-    ///
-    /// Unlike [`Self::base_has_unnamed_variadic`], `checked`'s row DOES declare
-    /// names (`value`, `condition`) — the general ordinary-callable splat would
-    /// otherwise bind `checked(record(value = 1.0, condition = true))` by name
-    /// and succeed, silently narrowing the result to the `value` field's type
-    /// where §07 says `checked` "returns it with identical type and phase" (the
-    /// whole record). So this is a distinct carve-out from the unnamed-variadic
-    /// one, keyed by name rather than structurally, because nothing about
-    /// `checked`'s signature distinguishes it from an ordinary two-input row
-    /// like `atan2` — the exemption is about which construct OWNS the splatted
-    /// spelling (§07's keyword form), not about what `checked`'s parameters look
-    /// like.
-    ///
-    /// `cat`, `get`, `get0` already refuse a sole-record splat too, but through
-    /// [`Self::base_has_unnamed_variadic`] — a different mechanism for a
-    /// different reason (their inputs are genuinely UNNAMED, so a splat has
-    /// nothing to bind to regardless of field names). That refusal's wording
-    /// ("has no name to bind to") stays accurate under this same ruling: it
-    /// never claimed a name match would help, so the now-universal
-    /// no-splat-onto-a-special-operation rule does not contradict it.
-    pub(crate) fn base_never_splats(&self, name: &str) -> bool {
-        name == "checked"
     }
 
     /// The spec section that documents `name`'s parameter names, for a diagnostic

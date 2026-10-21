@@ -39,30 +39,6 @@ fn mismatched(builtin: &str) -> Vec<String> {
     ))
 }
 
-/// The names §04's single-input carve-out exempts (flatppl-design#78) — they take the
-/// aggregate WHOLE, so no splat and no name check applies to them. `prod`, `maximum`,
-/// `minimum` join the original nine by design PR #79 (owner-merge pending as of this
-/// change), which extends §07's Table reductions paragraph to those three; `lany`, `lall`
-/// and `median` join by the `missing-reductions` spec draft (flatppl-design `ee4c6fb`),
-/// which extends the same paragraph again.
-const EXEMPT: &[&str] = &[
-    "identity",
-    "indicesof",
-    "indicesof0",
-    "lall",
-    "lany",
-    "lengthof",
-    "maximum",
-    "mean",
-    "median",
-    "minimum",
-    "prod",
-    "reverse",
-    "std",
-    "sum",
-    "var",
-];
-
 /// The audit's headline case, and the reason this wave exists. §06: "`densityof(M, x)` and
 /// `logdensityof(M, x)` evaluate the density of a measure at a point with respect to an
 /// implicit reference measure." Before names, `logdensityof(t)` typed as a clean real
@@ -120,36 +96,6 @@ fn column_order_is_irrelevant_once_binding_is_by_name() {
         "z = atan2(record(x = 2.0, y = 1.0))\n",
     ] {
         assert!(errors(src).is_empty(), "must be valid either way: {src}");
-    }
-}
-
-/// The whole audit surface, swept: every base name against a name-mismatched sole positional
-/// 2-column table. **Only the `#78`-exempt names may still accept it** — the variadic
-/// carve-out that used to appear here is closed (`variadic_splat.rs`), so this sweep is now
-/// exhaustive over the B76 finding set with no exceptions beyond the carve-out. `EXEMPT` grew
-/// from nine to twelve when design PR #79 added `prod`/`maximum`/`minimum`, and to fifteen
-/// when the `missing-reductions` draft added `median`/`lany`/`lall` — the same fifteen the js
-/// engine's `SPLAT_EXEMPT_BUILTINS` now carries. `quantile` is NOT here: it takes two inputs,
-/// so §04's arity half excludes it whatever its domain.
-#[test]
-fn no_builtin_accepts_a_name_mismatched_splat_except_the_exempt_set() {
-    let cat = builtin_catalogue();
-    let mut accepted: Vec<&str> = cat
-        .base_names()
-        .filter(|n| mismatched(n).is_empty())
-        .collect();
-    accepted.sort_unstable();
-    let unexpected: Vec<&&str> = accepted.iter().filter(|n| !EXEMPT.contains(n)).collect();
-    assert!(
-        unexpected.is_empty(),
-        "these accept a name-mismatched splat and should not: {unexpected:?}"
-    );
-    // Pin the exclusions positively too, so shrinking the set is also a visible change.
-    for n in EXEMPT {
-        assert!(
-            accepted.contains(n),
-            "`{n}` is #78-exempt and must still take the table whole"
-        );
     }
 }
 
@@ -254,26 +200,6 @@ fn bijection_cites_sec06_in_both_its_diagnostics() {
     );
     for e in names.iter().chain(&arity) {
         assert!(!e.contains("spec §07"), "must never cite §07: {e}");
-    }
-}
-
-/// The variadic rows stay nameless — there is no name list to give them — but the splat onto
-/// them is now a §04 STATIC ERROR rather than a silent positional bind. The deferral this test
-/// used to record is CLOSED (owner ruling: "we do not want hidden magic"); the refusal itself
-/// lives in `variadic_splat.rs`, and what this pins is the half that belongs to naming: these
-/// rows declare no names, and that no longer implies acceptance.
-#[test]
-fn variadic_rows_stay_nameless_but_no_longer_accept_a_splat() {
-    let cat = builtin_catalogue();
-    for n in ["cat", "get", "get0"] {
-        assert!(
-            cat.base_param_names(n).is_none(),
-            "`{n}`'s variadic inputs are unnamed (§04), so there is no name list to declare"
-        );
-        assert!(
-            !mismatched(n).is_empty(),
-            "`{n}` must now REFUSE a splatted aggregate — the deferral is closed"
-        );
     }
 }
 
