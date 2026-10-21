@@ -9,6 +9,8 @@
 //! rewrites the shared binding, so a later check could not tell a draw from the
 //! point another output scored it at.
 
+use std::collections::HashSet;
+
 use crate::density::{builtin_name, draw_argument, refuse};
 use crate::refuse::RefuseError;
 use flatppl_core::{BindingId, Module, Node, NodeId, Ref, RefNs, Symbol};
@@ -18,105 +20,129 @@ use flatppl_core::{BindingId, Module, Node, NodeId, Ref, RefNs, Symbol};
 /// The outputs are `roots`, or every binding when `roots` is `None`. The walk
 /// does not enter reified callables: a query inside one is scored at that
 /// callable's inputs, and §04 makes the callable fixed.
+///
+/// Both walks are iterative and visit each binding once, so a deep chain of
+/// bindings cannot overflow the stack and shared bindings are not re-expanded.
+/// Children are pushed in reverse, so the traversal and hence the reported
+/// draw match a recursive pre-order walk.
 pub(crate) fn refuse_free_draws(m: &Module, roots: Option<&[Symbol]>) -> Result<(), RefuseError> {
     let starts: Vec<BindingId> = match roots {
         Some(names) => names.iter().filter_map(|&n| m.binding_by_name(n)).collect(),
         None => m.bindings().map(|(bid, _)| bid).collect(),
     };
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
+    // Bindings a finished query walk proved free of draws. The walk is
+    // context-free, so a later query can skip them.
+    let mut clean = HashSet::new();
+    let mut stack = Vec::new();
     for bid in starts {
-        visit_binding(m, bid, &mut seen)?;
+        stack.push(Item::Binding(bid));
+        while let Some(item) = stack.pop() {
+            let (node, output) = match item {
+                Item::Binding(bid) => {
+                    if !seen.insert(bid) {
+                        continue;
+                    }
+                    let binding = m.binding(bid);
+                    (binding.rhs, binding.name)
+                }
+                Item::Node(node, output) => (node, output),
+            };
+            match m.node(node) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => {
+                    if let Some(bid) = m.binding_by_name(*name) {
+                        stack.push(Item::Binding(bid));
+                    }
+                }
+                Node::Call(c) => {
+                    match builtin_name(m, node) {
+                        Some("lawof" | "functionof" | "kernelof" | "fn") => continue,
+                        Some("logdensityof" | "densityof") if !c.args.is_empty() => {
+                            if let Some((site, name)) = free_draw(m, c.args[0], &mut clean) {
+                                return Err(refusal(m, site, name, output));
+                            }
+                        }
+                        _ => {}
+                    }
+                    let children = c
+                        .args
+                        .iter()
+                        .chain(c.named.iter().map(|entry| &entry.value));
+                    let first = stack.len();
+                    stack.extend(children.map(|&arg| Item::Node(arg, output)));
+                    stack[first..].reverse();
+                }
+                _ => {}
+            }
+        }
     }
     Ok(())
 }
 
-fn visit_binding(m: &Module, bid: BindingId, seen: &mut Vec<BindingId>) -> Result<(), RefuseError> {
-    if seen.contains(&bid) {
-        return Ok(());
-    }
-    seen.push(bid);
-    let binding = m.binding(bid);
-    visit(m, binding.rhs, binding.name, seen)
+/// A pending node of the output walk, or a binding whose right-hand side it
+/// reaches under that binding's own name.
+enum Item {
+    Binding(BindingId),
+    Node(NodeId, Symbol),
 }
 
-fn visit(
-    m: &Module,
-    node: NodeId,
-    output: Symbol,
-    seen: &mut Vec<BindingId>,
-) -> Result<(), RefuseError> {
-    match m.node(node) {
-        Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) => match m.binding_by_name(*name) {
-            Some(bid) => visit_binding(m, bid, seen),
-            None => Ok(()),
-        },
-        Node::Call(c) => {
-            match builtin_name(m, node) {
-                Some("lawof" | "functionof" | "kernelof" | "fn") => return Ok(()),
-                Some("logdensityof" | "densityof") if !c.args.is_empty() => {
-                    if let Some((site, name)) = free_draw(m, c.args[0], &mut Vec::new()) {
-                        return Err(refusal(m, site, name, output));
-                    }
-                }
-                _ => {}
-            }
-            for &arg in c.args.iter() {
-                visit(m, arg, output, seen)?;
-            }
-            for entry in c.named.iter() {
-                visit(m, entry.value, output, seen)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// The first draw `measure` reads outside every `lawof`, with the binding that
-/// names it when it has one.
+/// The first draw `measure` reads outside every `lawof`, in pre-order, with the
+/// binding that names it when it has one.
+///
+/// `visited` per call doubles as the cycle guard. A binding reached a second
+/// time already yielded no draw, or the walk would have returned. When the
+/// walk finds no draw, every binding it visited joins `clean`.
 fn free_draw(
     m: &Module,
-    node: NodeId,
-    path: &mut Vec<BindingId>,
+    measure: NodeId,
+    clean: &mut HashSet<BindingId>,
 ) -> Option<(NodeId, Option<Symbol>)> {
-    match m.node(node) {
-        Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) => {
-            let bid = m.binding_by_name(*name)?;
-            if path.contains(&bid) {
-                return None;
+    let mut visited = HashSet::new();
+    let mut stack = vec![measure];
+    while let Some(node) = stack.pop() {
+        match m.node(node) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                let Some(bid) = m.binding_by_name(*name) else {
+                    continue;
+                };
+                if clean.contains(&bid) || !visited.insert(bid) {
+                    continue;
+                }
+                let rhs = m.binding(bid).rhs;
+                if draw_argument(m, rhs).is_some() {
+                    return Some((rhs, Some(*name)));
+                }
+                stack.push(rhs);
             }
-            let rhs = m.binding(bid).rhs;
-            if draw_argument(m, rhs).is_some() {
-                return Some((rhs, Some(*name)));
+            Node::Call(c) => {
+                if draw_argument(m, node).is_some() {
+                    return Some((node, None));
+                }
+                if matches!(
+                    builtin_name(m, node),
+                    Some("lawof" | "functionof" | "kernelof" | "fn")
+                ) {
+                    continue;
+                }
+                let first = stack.len();
+                stack.extend(
+                    c.args
+                        .iter()
+                        .chain(c.named.iter().map(|entry| &entry.value)),
+                );
+                stack[first..].reverse();
             }
-            path.push(bid);
-            let found = free_draw(m, rhs, path);
-            path.pop();
-            found
+            _ => {}
         }
-        Node::Call(c) => {
-            if draw_argument(m, node).is_some() {
-                return Some((node, None));
-            }
-            if matches!(
-                builtin_name(m, node),
-                Some("lawof" | "functionof" | "kernelof" | "fn")
-            ) {
-                return None;
-            }
-            c.args
-                .iter()
-                .chain(c.named.iter().map(|entry| &entry.value))
-                .find_map(|&arg| free_draw(m, arg, path))
-        }
-        _ => None,
     }
+    clean.extend(visited);
+    None
 }
 
 fn refusal(m: &Module, site: NodeId, name: Option<Symbol>, output: Symbol) -> RefuseError {

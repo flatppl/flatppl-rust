@@ -335,3 +335,72 @@ fn determinize_emit_flatpir_renders_flatpir() {
         "surface syntax must stay the default:\n{default_out}"
     );
 }
+
+/// Determinize `src` with `--keep lp`, failing if it runs past `limit`. The bound
+/// is generous for a debug build under load; the walks it guards were exponential.
+fn determinize_within(name: &str, src: &str, limit: std::time::Duration) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("flatppl-det-cli-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.flatppl");
+    std::fs::write(&input, src).unwrap();
+    let mut child = flatppl()
+        .arg("determinize")
+        .arg(&input)
+        .args(["--keep", "lp", "-o"])
+        .arg(dir.join("out.flatppl"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{name}: determinize ran past {limit:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// `x_i` reads `x_{i-1}` once per `prev` in `step`, so a walk without a visited
+/// set expands that many paths per level.
+fn shared_value_dag(n: usize, base: &str, step: &str) -> String {
+    let mut src = String::from(base);
+    for i in 1..=n {
+        let prev = format!("x{}", i - 1);
+        src += &format!("x{i} = {}\n", step.replace("prev", &prev));
+    }
+    src + &format!("lp = logdensityof(Normal(mu = x{n}, sigma = 1.0), 0.5)\n")
+}
+
+const PARAMETER: &str = "p0 = elementof(reals)\nx0 = p0\n";
+
+#[test]
+fn determinize_walks_a_shared_value_dag_in_linear_time() {
+    let limit = std::time::Duration::from_secs(10);
+    for (name, n, base, step) in [
+        ("dag-double", 30, "x0 = 1.0\n", "prev + prev"),
+        ("dag-triple", 22, PARAMETER, "prev * prev + prev"),
+    ] {
+        let out = determinize_within(name, &shared_value_dag(n, base, step), limit);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn determinize_walks_a_deep_value_chain_without_overflow() {
+    let src = shared_value_dag(80_000, PARAMETER, "prev + 1.0");
+    let out = determinize_within("chain", &src, std::time::Duration::from_secs(120));
+    assert!(
+        out.status.success(),
+        "a deep chain must lower, not overflow: {:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
