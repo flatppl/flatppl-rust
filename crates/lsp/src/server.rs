@@ -2813,12 +2813,9 @@ mod tests {
         let Message::Response(resp) = resp_msg else {
             panic!("expected a Response, got: {resp_msg:?}");
         };
-        assert!(
-            resp.error.is_none(),
-            "hover response must not be an error: {:?}",
-            resp.error
-        );
-        let result = resp.result.expect("hover result must be non-null");
+        let result = resp
+            .response_result
+            .unwrap_or_else(|e| panic!("hover response must not be an error: {e:?}"));
         assert!(
             result != serde_json::Value::Null,
             "hover on cross-file ref must return non-null (FileSet was stale without fix)"
@@ -2954,7 +2951,7 @@ mod tests {
         let Message::Response(resp) = resp_msg else {
             panic!("expected a Response, got: {resp_msg:?}");
         };
-        let result = resp.result.expect("hover result present");
+        let result = resp.response_result.expect("hover result present");
         assert!(
             result != serde_json::Value::Null && result.to_string().to_lowercase().contains("real"),
             "hover on `c.m` must resolve through the fed URL chain to a real type; got: {result}"
@@ -3069,12 +3066,9 @@ mod tests {
         let Message::Response(resp) = resp_msg else {
             panic!("expected Response, got: {resp_msg:?}");
         };
-        assert!(
-            resp.error.is_none(),
-            "documentSymbol must not error: {:?}",
-            resp.error
-        );
-        let result = resp.result.expect("documentSymbol result must be present");
+        let result = resp
+            .response_result
+            .unwrap_or_else(|e| panic!("documentSymbol must not error: {e:?}"));
         // The server should have loaded "alpha = elementof(reals)" → at least one symbol.
         let syms = result.to_string();
         assert!(
@@ -3104,14 +3098,9 @@ mod tests {
         let Message::Response(resp2) = resp_msg2 else {
             panic!("expected Response, got: {resp_msg2:?}");
         };
-        assert!(
-            resp2.error.is_none(),
-            "second documentSymbol must not error: {:?}",
-            resp2.error
-        );
         let result2 = resp2
-            .result
-            .expect("second documentSymbol result must be present");
+            .response_result
+            .unwrap_or_else(|e| panic!("second documentSymbol must not error: {e:?}"));
         let syms2 = result2.to_string();
         assert!(
             syms2.contains("beta"),

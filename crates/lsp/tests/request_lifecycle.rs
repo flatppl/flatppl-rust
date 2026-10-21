@@ -167,7 +167,11 @@ impl Drop for Server {
 }
 
 fn code_of(resp: &Response) -> i32 {
-    resp.error.as_ref().map(|e| e.code).unwrap_or(0)
+    resp.response_result
+        .as_ref()
+        .err()
+        .map(|e| e.code)
+        .unwrap_or(0)
 }
 
 /// A flood of requests followed by an edit: every single request is answered,
@@ -214,7 +218,7 @@ fn a_request_flood_across_an_edit_answers_every_request() {
             allowed.contains(&code),
             "unexpected code {code} for {:?}: {:?}",
             resp.id,
-            resp.error
+            resp.response_result.as_ref().err()
         );
     }
 }
@@ -242,7 +246,7 @@ fn a_cancelled_request_is_answered_request_cancelled() {
         code_of(resp),
         ErrorCode::RequestCanceled as i32,
         "expected RequestCancelled (-32800); got {:?}",
-        resp.error
+        resp.response_result.as_ref().err()
     );
 }
 
@@ -283,8 +287,8 @@ fn malformed_params_are_invalid_params_not_an_empty_success() {
             code_of(resp),
             ErrorCode::InvalidParams as i32,
             "{method} must answer InvalidParams (-32602); got {:?} / {:?}",
-            resp.error,
-            resp.result
+            resp.response_result.as_ref().err(),
+            resp.response_result.as_ref().ok()
         );
     }
 }

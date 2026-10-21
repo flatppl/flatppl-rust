@@ -40,7 +40,7 @@ fn position(uri: &str, line: u32, character: u32) -> Value {
 
 fn hover(client: &Connection, uri: &str, line: u32, character: u32) -> String {
     request(client, "textDocument/hover", position(uri, line, character))
-        .result
+        .response_result
         .unwrap()
         .to_string()
 }
@@ -96,12 +96,12 @@ fn mounted_archives_preserve_identity_navigation_and_readonly_lifecycle() {
         "textDocument/definition",
         position(first_uri, 2, 10),
     );
-    assert_eq!(definition.result.unwrap()["uri"], nested_uri);
+    assert_eq!(definition.response_result.unwrap()["uri"], nested_uri);
 
     let mut references = position(nested_uri, 0, 0);
     references["context"] = json!({ "includeDeclaration": true });
     let references = request(&client, "textDocument/references", references)
-        .result
+        .response_result
         .unwrap();
     let uris: Vec<&str> = references
         .as_array()
@@ -112,7 +112,7 @@ fn mounted_archives_preserve_identity_navigation_and_readonly_lifecycle() {
     assert!(uris.contains(&first_uri));
     assert!(uris.contains(&nested_uri));
     let symbols = request(&client, "workspace/symbol", json!({"query": "theta"}))
-        .result
+        .response_result
         .unwrap();
     assert_eq!(symbols[0]["location"]["uri"], nested_uri);
 
@@ -122,7 +122,8 @@ fn mounted_archives_preserve_identity_navigation_and_readonly_lifecycle() {
             "textDocument/prepareRename",
             position(nested_uri, 0, 0)
         )
-        .result,
+        .response_result
+        .ok(),
         Some(Value::Null)
     );
     assert_eq!(
@@ -131,20 +132,21 @@ fn mounted_archives_preserve_identity_navigation_and_readonly_lifecycle() {
             "textDocument/prepareRename",
             position(root_uri, 2, 6)
         )
-        .result,
+        .response_result
+        .ok(),
         Some(Value::Null)
     );
     let mut rename = position(root_uri, 2, 6);
     rename["newName"] = json!("renamed");
     assert!(
         request(&client, "textDocument/rename", rename)
-            .error
-            .is_some()
+            .response_result
+            .is_err()
     );
     let mut rename = position(root_uri, 0, 0);
     rename["newName"] = json!("renamed");
     let renamed = request(&client, "textDocument/rename", rename)
-        .result
+        .response_result
         .unwrap();
     assert_eq!(renamed["changes"].as_object().unwrap().len(), 1);
     assert!(renamed["changes"][root_uri].is_array());
@@ -254,7 +256,9 @@ fn archive_sources_do_not_resolve_missing_edges_outside_the_mount() {
         }
     }
     assert_eq!(
-        request(&client, "textDocument/definition", position(uri, 1, 6)).result,
+        request(&client, "textDocument/definition", position(uri, 1, 6))
+            .response_result
+            .ok(),
         Some(Value::Null)
     );
     request(&client, "shutdown", Value::Null);

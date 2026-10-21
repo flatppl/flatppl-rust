@@ -71,7 +71,7 @@ fn hover_text(client: &Connection, id: i32, line: u32, character: u32) -> String
             if resp.id != want {
                 continue;
             }
-            let value = resp.result.expect("hover result");
+            let value = resp.response_result.expect("hover result");
             let hover: lsp_types::Hover = serde_json::from_value(value).expect("a hover, not null");
             let lsp_types::HoverContents::Markup(m) = hover.contents else {
                 panic!("expected markup hover contents");
