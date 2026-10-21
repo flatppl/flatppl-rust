@@ -77,7 +77,7 @@ fn hover_type(client: &Connection, id: i32, uri: &str) -> Option<String> {
     while std::time::Instant::now() < deadline {
         match client.receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(Message::Response(resp)) if resp.id == want => {
-                let value = resp.result?;
+                let value = resp.response_result.ok()?;
                 if value.is_null() {
                     return None;
                 }

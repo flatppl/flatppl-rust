@@ -85,8 +85,7 @@ impl Outbound {
                             serde_json::from_str(&result).unwrap_or(serde_json::Value::Null);
                         Message::Response(lsp_server::Response {
                             id,
-                            result: Some(value),
-                            error: None,
+                            response_result: Ok(value),
                         })
                     }
                 };
@@ -200,8 +199,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(r#"[{"name":"x"}]"#).unwrap();
         out.send(Message::Response(lsp_server::Response {
             id: RequestId::from(7i32),
-            result: Some(value),
-            error: None,
+            response_result: Ok(value),
         }))
         .unwrap();
         let typed = String::from_utf8(drain_to_vec(&rx).unwrap()).unwrap();
@@ -246,7 +244,7 @@ mod tests {
         };
         assert_eq!(resp.id, RequestId::from(3i32));
         assert_eq!(
-            resp.result.unwrap(),
+            resp.response_result.unwrap(),
             serde_json::json!([{ "name": "x" }]),
             "a channel host sees the same result a stream client would parse"
         );

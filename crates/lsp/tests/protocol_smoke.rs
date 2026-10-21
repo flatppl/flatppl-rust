@@ -203,12 +203,14 @@ fn initialize_did_open_hover_smoke() {
 
     // ── 6. Assert the hover response is non-null with type information ────────
     assert!(
-        hover_response.error.is_none(),
+        hover_response.response_result.is_ok(),
         "hover response must not be an error; got: {:?}",
-        hover_response.error
+        hover_response.response_result.as_ref().err()
     );
 
-    let result = hover_response.result.expect("hover result must be present");
+    let result = hover_response
+        .response_result
+        .expect("hover result must be present");
     assert!(
         !result.is_null(),
         "hover result must be non-null at offset {HOVER_OFFSET} in {SRC:?}"
@@ -296,11 +298,13 @@ fn pb_capabilities_smoke() {
         let resp = round_trip(&client_conn, comp_req);
 
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "completion response must not be an error; got: {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
-        let result = resp.result.expect("completion result must be present");
+        let result = resp
+            .response_result
+            .expect("completion result must be present");
         assert!(
             !result.is_null(),
             "completion result must be non-null for PB_SRC"
@@ -352,11 +356,13 @@ fn pb_capabilities_smoke() {
         let resp = round_trip(&client_conn, sym_req);
 
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "documentSymbol response must not be an error; got: {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
-        let result = resp.result.expect("documentSymbol result must be present");
+        let result = resp
+            .response_result
+            .expect("documentSymbol result must be present");
         assert!(
             !result.is_null(),
             "documentSymbol result must be non-null for PB_SRC"
@@ -410,11 +416,13 @@ fn pb_capabilities_smoke() {
         let resp = round_trip(&client_conn, def_req);
 
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "definition response must not be an error; got: {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
-        let result = resp.result.expect("definition result must be present");
+        let result = resp
+            .response_result
+            .expect("definition result must be present");
         assert!(
             !result.is_null(),
             "definition result must be non-null for 'x' reference in PB_SRC"
@@ -464,12 +472,12 @@ fn pb_capabilities_smoke() {
         let resp = round_trip(&client_conn, ws_req);
 
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "workspace/symbol response must not be an error; got: {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
         let result = resp
-            .result
+            .response_result
             .expect("workspace/symbol result must be present");
         assert!(
             !result.is_null(),
@@ -518,11 +526,13 @@ fn pb_capabilities_smoke() {
         let resp = round_trip(&client_conn, inlay_req);
 
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "inlayHint response must not be an error; got: {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
-        let result = resp.result.expect("inlayHint result must be present");
+        let result = resp
+            .response_result
+            .expect("inlayHint result must be present");
         assert!(!result.is_null(), "inlayHint result must be non-null");
         let hints: Vec<lsp_types::InlayHint> =
             serde_json::from_value(result).expect("inlayHint result must deserialize");
@@ -653,11 +663,13 @@ fn did_close_lets_watched_file_changes_take_over() {
     };
     let resp = round_trip(&client_conn, ds_req);
     assert!(
-        resp.error.is_none(),
+        resp.response_result.is_ok(),
         "documentSymbol must not error; got: {:?}",
-        resp.error
+        resp.response_result.as_ref().err()
     );
-    let result = resp.result.expect("documentSymbol result must be present");
+    let result = resp
+        .response_result
+        .expect("documentSymbol result must be present");
     let syms = result.to_string();
     assert!(
         syms.contains("beta"),
@@ -738,11 +750,13 @@ fn stale_did_change_is_ignored() {
     };
     let resp = round_trip(&client_conn, ds_req);
     assert!(
-        resp.error.is_none(),
+        resp.response_result.is_ok(),
         "documentSymbol must not error; got: {:?}",
-        resp.error
+        resp.response_result.as_ref().err()
     );
-    let result = resp.result.expect("documentSymbol result must be present");
+    let result = resp
+        .response_result
+        .expect("documentSymbol result must be present");
     let syms = result.to_string();
     assert!(
         syms.contains("v5"),
@@ -978,17 +992,16 @@ fn request_during_edit_does_not_return_stale_result() {
         "every request needs a response (JSON-RPC 2.0 §5); a cancelled revision \
          gets ContentModified, never silence",
     );
-    match resp.error {
+    match resp.response_result {
         // Cancelled by the edit: the protocol's own code for it.
-        Some(e) => assert_eq!(
+        Err(e) => assert_eq!(
             e.code,
             lsp_server::ErrorCode::ContentModified as i32,
             "the only acceptable error here is ContentModified (-32801); got: {e:?}"
         ),
         // Answered: the result must be a well-formed hover over the post-edit
         // document, never stale pre-edit content.
-        None => {
-            let result = resp.result.expect("a non-error response carries a result");
+        Ok(result) => {
             if !result.is_null() {
                 let hover: lsp_types::Hover = serde_json::from_value(result)
                     .expect("non-null hover result must deserialize to lsp_types::Hover");
@@ -1013,12 +1026,12 @@ fn request_during_edit_does_not_return_stale_result() {
     };
     let resp = round_trip(&client_conn, ds_req);
     assert!(
-        resp.error.is_none(),
+        resp.response_result.is_ok(),
         "post-edit documentSymbol must not error; got: {:?}",
-        resp.error
+        resp.response_result.as_ref().err()
     );
     let syms = resp
-        .result
+        .response_result
         .expect("documentSymbol result must be present")
         .to_string();
     assert!(
@@ -1165,12 +1178,12 @@ fn references_rename_signature_smoke() {
             },
         );
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "references must not error; got {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
         let locs: Vec<lsp_types::Location> =
-            serde_json::from_value(resp.result.expect("references result"))
+            serde_json::from_value(resp.response_result.expect("references result"))
                 .expect("references result must deserialize to Location[]");
         let uris: Vec<&str> = locs.iter().map(|l| l.uri.as_str()).collect();
         assert_eq!(
@@ -1194,9 +1207,9 @@ fn references_rename_signature_smoke() {
                 params: serde_json::to_value(shifted_decl()).unwrap(),
             },
         );
-        assert!(resp.error.is_none(), "prepareRename must not error");
+        assert!(resp.response_result.is_ok(), "prepareRename must not error");
         let range: lsp_types::Range =
-            serde_json::from_value(resp.result.expect("prepareRename result"))
+            serde_json::from_value(resp.response_result.expect("prepareRename result"))
                 .expect("prepareRename must return a Range");
         assert_eq!(range.start.character, 0);
         assert_eq!(
@@ -1227,10 +1240,10 @@ fn references_rename_signature_smoke() {
             },
         );
         assert_eq!(
-            resp.result,
-            Some(serde_json::Value::Null),
+            resp.response_result.as_ref().ok(),
+            Some(&serde_json::Value::Null),
             "prepareRename over a built-in must be null; got {:?}",
-            resp.result
+            resp.response_result
         );
     }
 
@@ -1255,8 +1268,8 @@ fn references_rename_signature_smoke() {
             },
         );
         let err = resp
-            .error
-            .expect("a collision with an existing binding must refuse");
+            .response_result
+            .expect_err("a collision with an existing binding must refuse");
         assert!(
             err.message.contains("already bound"),
             "the refusal must carry the reason; got {}",
@@ -1283,9 +1296,9 @@ fn references_rename_signature_smoke() {
             },
         );
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "public → private must be performed, not refused; got {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
     }
 
@@ -1305,12 +1318,12 @@ fn references_rename_signature_smoke() {
             },
         );
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "rename must not error; got {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
         let edit: lsp_types::WorkspaceEdit =
-            serde_json::from_value(resp.result.expect("rename result"))
+            serde_json::from_value(resp.response_result.expect("rename result"))
                 .expect("rename must return a WorkspaceEdit");
         #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
         let changes = edit.changes.expect("changes keyed by document URI");
@@ -1367,12 +1380,12 @@ fn references_rename_signature_smoke() {
             },
         );
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "signatureHelp must not error; got {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
         let help: lsp_types::SignatureHelp =
-            serde_json::from_value(resp.result.expect("signatureHelp result"))
+            serde_json::from_value(resp.response_result.expect("signatureHelp result"))
                 .expect("signatureHelp must return a SignatureHelp");
         assert_eq!(
             help.signatures[0].label, "Normal(mu, sigma)",
@@ -1410,7 +1423,7 @@ fn references_rename_signature_smoke() {
             },
         );
         let range: lsp_types::Range =
-            serde_json::from_value(prep.result.expect("prepareRename result"))
+            serde_json::from_value(prep.response_result.expect("prepareRename result"))
                 .expect("an argument must be renameable, not declined");
         assert_eq!((range.start.character, range.end.character), (6, 7));
 
@@ -1428,12 +1441,13 @@ fn references_rename_signature_smoke() {
             },
         );
         assert!(
-            resp.error.is_none(),
+            resp.response_result.is_ok(),
             "renaming an argument must not error; got {:?}",
-            resp.error
+            resp.response_result.as_ref().err()
         );
         let edit: lsp_types::WorkspaceEdit =
-            serde_json::from_value(resp.result.expect("rename result")).expect("WorkspaceEdit");
+            serde_json::from_value(resp.response_result.expect("rename result"))
+                .expect("WorkspaceEdit");
         #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
         let changes = edit.changes.expect("changes keyed by document URI");
         assert_eq!(
@@ -1497,7 +1511,7 @@ fn initialize_advertises_the_new_capabilities() {
         panic!("expected the InitializeResult response; got {msg:?}");
     };
     let result: lsp_types::InitializeResult =
-        serde_json::from_value(resp.result.expect("initialize result"))
+        serde_json::from_value(resp.response_result.expect("initialize result"))
             .expect("InitializeResult must deserialize");
     let caps = result.capabilities;
 
