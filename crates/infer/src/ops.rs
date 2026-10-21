@@ -65,9 +65,25 @@ pub(crate) fn call_rule(
     named: &[NamedInfo],
     joined: Phase,
 ) -> RuleStep<(Type, Phase)> {
+    if !args.is_empty()
+        && !named.is_empty()
+        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "load_module"))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "ordinary calls use either positional or keyword arguments, not both",
+        ));
+        return Ready((Type::Failed("mixed ordinary call arguments".into()), joined));
+    }
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
+        let resolved = resolve_binding_refs(inf, callee_node);
+        if let Node::Const(op) = inf.module.node(resolved) {
+            let mut call = call.clone();
+            call.head = CallHead::Builtin(*op);
+            return call_rule(inf, id, &call, None, args, named, joined);
+        }
         // `true`/`false` are lexed unconditionally to a bool `Lit` (never a
         // `Ref`), so `true(0.5)` is postfix APPLICATION on that literal (spec
         // §11), reaching this `CallHead::User` path instead of the
@@ -96,7 +112,7 @@ pub(crate) fn call_rule(
         if let Some(ty) = pyhf::call_type(inf, id, callee_node, args, named, false) {
             return Ready((ty, joined));
         }
-        if let Some(ty) = user_arity_check(inf, id, callee_node, &callee_ty, args, named) {
+        if let Some(ty) = user_arity_check(inf, id, callee_node, args, named) {
             return Ready((ty, joined));
         }
         return user_call_type(inf, callee_node, &callee_ty, args, named)
@@ -675,12 +691,17 @@ pub(crate) fn call_rule(
         // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
         // result is a function with `f1`'s input signature (output type is not
         // tracked by `Type::Function`).
-        "fchain" => match arg_ty(args, 0) {
-            Some(Type::Function { inputs }) => Type::Function {
-                inputs: inputs.clone(),
-            },
-            _ => Type::Deferred,
-        },
+        "fchain" => args
+            .first()
+            .and_then(|(node, ..)| crate::callable::interface(inf, *node))
+            .map(|interface| Type::Function {
+                inputs: interface
+                    .names
+                    .iter()
+                    .map(|name| inf.module.intern(name))
+                    .collect(),
+            })
+            .unwrap_or(Type::Deferred),
         // `disintegrate(selector, joint)` (spec §06) splits a joint measure into
         // a `(forward_kernel, marginal)` tuple. When the joint is a record-domain
         // measure and the selector is a static set of field names, the marginal
@@ -694,9 +715,7 @@ pub(crate) fn call_rule(
         // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
         // §06): the measure is the SECOND argument.
         "weighted" | "logweighted" => fresh_measure(arg_ty(args, 1)),
-        // Reference measures (spec §06): measures over their support set. The
-        // `support` set is given as the named kwarg, auto-splatted from a
-        // positional `record(support = S)` (§04), or as the plain positional set.
+        // Unary reference measures take their support set whole.
         "Lebesgue" | "Counting" => {
             let support_node = lebesgue_counting_support_node(inf, args, named);
             Type::Measure {
@@ -705,19 +724,14 @@ pub(crate) fn call_rule(
             }
         }
         // `Dirac(value = v)` (spec §06) is the point-mass probability measure at
-        // `v`, for any variate type: the domain is `v`'s type. `value` is given
-        // as the named kwarg (spec form), auto-splatted from a positional
-        // `record(value = v)` (§04 — so `Dirac(record(value = v))` is a point
-        // mass at `v`, NOT at the record), or as a plain positional value. Mass
+        // `v`, for any variate type: the domain is `v`'s type. A positional
+        // record is the point itself, just as a keyword-bound record is. Mass
         // is normalized (total mass 1) — set in `fill_mass`.
         "Dirac" => {
             let v = named
                 .iter()
                 .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
                 .map(|(_, _, t, _)| t.clone())
-                .or_else(|| {
-                    splat_field(inf, args, named, "value").and_then(|n| inf.lookup_type(n).cloned())
-                })
                 .or_else(|| arg_ty(args, 0).cloned());
             match v {
                 Some(t) => Type::Measure {
@@ -1061,35 +1075,7 @@ fn scan_state_join(state: &Type, next: &Type) -> Option<Type> {
     }
 }
 
-/// A positional argument vector with each keyword argument moved to its DECLARED position,
-/// or `None` when the call needs no normalizing or cannot be normalized unambiguously.
-///
-/// §04 "Calling conventions": "All built-in ordinary callables have a defined input order and
-/// accept both positional and keyword arguments." So `f(a = x, b = y)`, `f(x, y)` and the mixed
-/// `f(x, b = y)` are the same call, and every rule that reads argument POSITIONS should see the
-/// same vector for all three. §04 also fixes the mixed form's order — positional arguments bind
-/// "in order", keyword arguments "by name" — so a positional prefix occupies `0..args.len()` and
-/// each keyword lands at its own declared index.
-///
-/// **This is the one place the two spellings are reconciled.** The alternative — teaching each
-/// per-op rule to look in both `args` and `named` — is two sites deriving one rule, which is how
-/// the asymmetry it fixes arose in the first place: `arg_ty` reads only positions, so the
-/// kernel-type check on the five `builtin_*` transports and the integer-domain check on
-/// `div`/`mod` fired on `f(1.0, …)` and stayed silent on `f(rngstate = 1.0, …)`.
-///
-/// **Normalizes only an UNAMBIGUOUS mapping** — `None` for anything else, leaving the call
-/// exactly as it arrived so the existing arity and name checks report it:
-///
-/// * no keyword arguments, or the row declares no parameter names (nothing to map by);
-/// * a keyword whose name the row does not declare (the name check's business);
-/// * a keyword targeting a position something else already fills — positionally, or by an
-///   earlier keyword — a double-bound parameter. `arity_check` now calls
-///   [`check_double_bound`] before this function ever runs and catches BOTH spellings of the
-///   collision, so on a row with declared names the call already failed and returned there;
-///   the two guards below (splat and mixed) are unreachable for such a row and stay only as
-///   a defensive backstop should a nameless-row caller ever reach this branch;
-/// * a GAP — a position neither spelling supplies — since a vector cannot carry a hole and
-///   fabricating one would hide the under-supplied call the arity check exists to catch.
+/// Bind the ordinary builtin interface before any domain-specific rule.
 fn normalize_keyword_args(
     module: &flatppl_core::Module,
     name: &str,
@@ -1097,61 +1083,91 @@ fn normalize_keyword_args(
     named: &[NamedInfo],
 ) -> Option<Vec<ArgInfo>> {
     let cat = crate::catalogue::builtin();
-    let declared = cat.base_param_names(name)?;
+    normalize_arguments(
+        module,
+        cat.base_param_names(name)?,
+        args,
+        named,
+        cat.base_takes_aggregate_whole(name),
+    )
+}
+
+/// Return arguments in declared order when a keyword or aggregate spelling
+/// needs normalization. Plain positional calls keep their original vector.
+fn normalize_arguments(
+    module: &flatppl_core::Module,
+    declared: &[String],
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    takes_one: bool,
+) -> Option<Vec<ArgInfo>> {
+    let mut slots: Vec<Option<ArgInfo>> = Vec::new();
     if named.is_empty() {
-        // The SPLAT spelling. §04 makes `f(record(a = x, b = y))` "equivalent to
-        // `f(a = x, b = y, ...)`", so it must reach the same per-op rules as the keyword form
-        // it is defined as — which is the whole reason a splat inherited the keyword hole.
-        // `arg_reading` splats for COUNTING and NAMING only; nothing rewrote `args`, so the
-        // rules still saw one aggregate argument.
-        //
-        // The synthesized entries carry the AGGREGATE's node, not a per-field one: a
-        // type-level splat has no per-field node (an opaque table has no field expressions),
-        // and `supplied_arg_names` already anchors splat diagnostics at the aggregate for the
-        // same reason. Types and positions are what the rules read.
-        if cat.base_takes_aggregate_whole(name) {
-            return None; // §04's single-input carve-out — no splat happens at all
+        if takes_one {
+            return None;
         }
         let [(node, ty, phase)] = args else {
             return None;
         };
-        let fields: &[(Symbol, Type)] = match ty {
-            Type::Record(f) => f,
-            Type::Table { columns, .. } => columns,
+        let (fields, rows) = match ty {
+            Type::Record(fields) => (fields.as_ref(), None),
+            Type::Table { columns, nrows } => (columns.as_ref(), Some(*nrows)),
             _ => return None,
         };
-        let mut slots: Vec<Option<ArgInfo>> = Vec::new();
-        for (sym, fty) in fields {
-            let supplied = module.resolve(*sym);
-            let pos = declared.iter().position(|d| d.as_str() == supplied)?;
-            if pos < slots.len() && slots[pos].is_some() {
-                return None;
+        let mut source = *node;
+        for _ in 0..module.node_count() {
+            let Node::Ref(r) = module.node(source) else {
+                break;
+            };
+            if r.ns != RefNs::SelfMod {
+                break;
             }
+            let Some(binding) = module.binding_by_name(r.name) else {
+                break;
+            };
+            source = module.binding(binding).rhs;
+        }
+        for (sym, ty) in fields {
+            let pos = declared
+                .iter()
+                .position(|name| name == module.resolve(*sym))?;
             while slots.len() <= pos {
                 slots.push(None);
             }
-            slots[pos] = Some((*node, fty.clone(), *phase));
+            let field = match module.node(source) {
+                Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if matches!(module.resolve(head), "record" | "table")) => {
+                    call.named
+                        .iter()
+                        .find(|field| field.name == *sym)
+                        .map(|field| field.value)
+                        .unwrap_or(*node)
+                }
+                _ => *node,
+            };
+            let ty = match rows {
+                Some(nrows) => Type::Array {
+                    shape: vec![nrows].into(),
+                    elem: Box::new(ty.clone()),
+                },
+                None => ty.clone(),
+            };
+            slots[pos] = Some((field, ty, *phase));
         }
-        return slots.into_iter().collect();
-    }
-    let mut slots: Vec<Option<ArgInfo>> = Vec::new();
-    // The positional prefix keeps its order (§04: "bound to the inputs in order").
-    for a in args {
-        slots.push(Some(a.clone()));
-    }
-    for (sym, node, ty, phase) in named {
-        // `named` carries interned symbols; compare against the declared spelling.
-        let supplied = module.resolve(*sym);
-        let pos = declared.iter().position(|d| d.as_str() == supplied)?;
-        if pos < slots.len() && slots[pos].is_some() {
-            return None; // double-bound parameter — `check_double_bound` already caught this
+    } else {
+        slots.extend(args.iter().cloned().map(Some));
+        for (sym, node, ty, phase) in named {
+            let pos = declared
+                .iter()
+                .position(|name| name == module.resolve(*sym))?;
+            while slots.len() <= pos {
+                slots.push(None);
+            }
+            if slots[pos].is_some() {
+                return None;
+            }
+            slots[pos] = Some((*node, ty.clone(), *phase));
         }
-        while slots.len() <= pos {
-            slots.push(None);
-        }
-        slots[pos] = Some((*node, ty.clone(), *phase));
     }
-    // A hole means the call is under-supplied; hand it back unchanged for the arity check.
     slots.into_iter().collect()
 }
 
@@ -2712,17 +2728,6 @@ fn reduce_type(head: &str, a: Option<&Type>) -> Type {
 /// the column names and values are the per-column reductions." So the result is a
 /// `Record` with one field per column, named for the column.
 ///
-/// `std` is in the set by the owner ruling of 2026-08-10 which adds it to that
-/// paragraph (flatppl-design `4c93237`). **That commit is NOT on design `main`** — it
-/// sits on the `mul-divide-rows` branch — so `std`'s membership rests on unmerged
-/// spec, exactly as its splat exemption does. `prod`, `maximum`, `minimum` are in
-/// the set by design PR #79 (owner-merge pending as of this change), which extends
-/// the same paragraph to those three; the engine work lands ahead of the spec merge
-/// per the owner's ruling, with the spec gap recorded in `flatppl-dev`.
-/// `median`, `lany` and `lall` are in the set by the `missing-reductions` spec draft
-/// (flatppl-design `ee4c6fb`), quoted above; that branch is likewise unmerged, and
-/// this engine work lands ahead of it under the same ruling.
-///
 /// The per-column value is whatever that reduction gives for an array of the
 /// column's element type, so the two forms agree by construction rather than by a
 /// second set of rules:
@@ -3280,6 +3285,35 @@ fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]
             }
             _ => (Box::new([]), Type::Deferred),
         },
+        (Some(Type::Measure { domain, .. }), None) => match domain.as_ref() {
+            Type::Array { shape, elem } if shape.len() == 1 => {
+                let selector = resolve_binding_refs(inf, call.args[0]);
+                let selected = match inf.module.node(selector) {
+                    Node::Lit(Scalar::Int(_)) => Some(1),
+                    Node::Call(c)
+                        if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
+                            && c.args.iter().all(|n| {
+                                matches!(inf.module.node(*n), Node::Lit(Scalar::Int(_)))
+                            }) =>
+                    {
+                        Some(c.args.len())
+                    }
+                    _ => None,
+                };
+                let n = match (shape[0], selected) {
+                    (Dim::Static(n), Some(k)) if n > k as u32 => Dim::Static(n - k as u32),
+                    _ => Dim::Dynamic,
+                };
+                (
+                    Box::new([inf.module.intern("complement")]),
+                    Type::Array {
+                        shape: Box::new([n]),
+                        elem: elem.clone(),
+                    },
+                )
+            }
+            _ => (Box::new([]), Type::Deferred),
+        },
         _ => (Box::new([]), Type::Deferred),
     };
     Type::Tuple(Box::new([
@@ -3384,9 +3418,6 @@ fn poisson_process_type(
         .iter()
         .find(|(n, _, _, _)| inf.module.resolve(*n) == "intensity")
         .map(|(_, _, t, _)| t.clone())
-        .or_else(|| {
-            splat_field(inf, args, named, "intensity").and_then(|n| inf.lookup_type(n).cloned())
-        })
         .or_else(|| arg_ty(args, 0).cloned());
     let Some(Type::Measure { domain, .. }) = intensity else {
         return Type::Deferred;
@@ -5187,145 +5218,68 @@ fn cat_or_diagnose(
     }
 }
 
-/// The input names of a callee that is a LOCAL measure-algebra expression typed
-/// as a kernel — a fan-out `joint(K1, K2, …)`, a nested one, `truncate(K)` — where
-/// the parameter list lives in the type because there is no boundary node to read.
-/// `None` for anything else, so [`user_arity_check`] stays silent rather than
-/// guessing.
-///
-/// Deliberately gated on the callee resolving, through self-module refs, to a
-/// LOCAL builtin call with no `inputs` boundary. That excludes the two sources
-/// whose declared list this function has no business policing:
-///
-/// - a cross-module `(%ref <alias> member)`, whose input list rode a side-table
-///   from the dependency's own inference rather than being declared here — the
-///   case the doc comment's "declares no parameter list here" already excepted;
-/// - a reification, which [`user_arity_check`] reads from the boundary first and
-///   never reaches this fallback for.
-///
-/// **An EMPTY list is a don't-know sentinel, never a declaration, and is
-/// declined.** §04 forbids the thing it would otherwise mean: "No callables may
-/// have nullary inputs, as this would make them equivalent to known values." So a
-/// kernel type carrying zero inputs cannot be a well-formed declaration, and at
-/// least one rule uses the empty list to say exactly that — `disintegrate_type`
-/// documents "Falls back to empty kernel inputs … when the joint isn't a record
-/// measure or the selector isn't a static field-name set", and the element reaches
-/// here through a `get`, which IS a local builtin call with no boundary. Reading
-/// that sentinel as `want = 0` blamed the call site for the arity of a kernel
-/// whose inputs the engine could not determine, turning a program that inferred
-/// and deferred honestly into a hard static error.
-///
-/// Declining the empty list is preferred over allowlisting heads the way
-/// [`kernel_mass_is_own_rules`] does, for two reasons. It rests on a spec sentence
-/// rather than on a list that has to be maintained, and it keeps the §04 check
-/// reachable for every op that lifts pointwise to a kernel — an allowlist would
-/// silently stop checking the next one added. It does not defend against a future
-/// rule inventing a DIFFERENT sentinel (a wrong non-empty list); nothing does that
-/// today.
-fn local_kernel_inputs(
-    inf: &Inferencer<'_, '_>,
-    callee: NodeId,
-    callee_ty: &Type,
-) -> Option<Vec<Symbol>> {
-    let Type::Kernel { inputs, .. } = callee_ty else {
-        return None;
-    };
-    if inputs.is_empty() {
-        return None;
-    }
-    let mut node = callee;
-    loop {
-        match inf.module.node(node) {
-            Node::Ref(r) if r.ns == RefNs::SelfMod => {
-                let binding = inf.module.binding_by_name(r.name)?;
-                node = inf.module.binding(binding).rhs;
-            }
-            Node::Call(c) if c.inputs.is_none() => {
-                let CallHead::Builtin(_) = c.head else {
-                    return None;
-                };
-                return Some(inputs.to_vec());
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// Reject an application of a user-defined callable whose argument count
-/// contradicts the callable's declared parameter list. Returns
-/// `Some(Type::Failed)` for a mismatch, `None` when the count matches, the
-/// count is not knowable (see [`supplied_arg_count`]), or the callee declares no
-/// parameter list this function can read (a cross-module callee's list is
-/// carried in a side-table, not declared here).
-///
-/// Without this the call still types — `substituted_result` binds parameters to
-/// arguments by keyword then position and ignores the rest — so a wrong-arity
-/// application reaches the determiniser as a `ResidualUserCall` refusal instead
-/// of a static error naming the callee.
-///
-/// **Two sources for the parameter list.** A reification declares its inputs on
-/// the node ([`local_reification`] + [`input_entries`]). A callable built by a
-/// measure-algebra op — a fan-out kernel `joint(K1, K2, …)`, and by the same
-/// token `truncate(K)` or a nested `joint` — declares them in its TYPE instead,
-/// because there is no boundary to read ([`local_kernel_inputs`]). §04 "Calling
-/// conventions" governs both ("A call with field or column names that do not
-/// match the callable's argument names is a static error"), so reading only the
-/// first source abandoned the whole check for the second: `KJ()`,
-/// `KJ(nope = 0.0)` and `KJ(z = 0.0, extra = 1.0)` all typed as a closed
-/// `%measure`, and `draw(KJ())` as a concrete `%record`, with the declared input
-/// never bound.
+/// Check the callable's interface before reading the argument's domain.
 fn user_arity_check(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     callee: NodeId,
-    callee_ty: &Type,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    // A §09 standard-module application is checked against its catalogue row,
-    // not against a local reification's inputs.
-    if let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) {
+    if let Some(sig) = inf
+        .module_catalogue_ref(resolve_binding_refs(inf, callee))
+        .map(|c| c.sig.clone())
+    {
         return module_member_arity_check(inf, id, callee, &sig, args, named);
     }
-    let declared: Vec<Symbol> = match local_reification(inf, callee) {
-        Some((reif_id, _)) => input_entries(inf, reif_id)?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect(),
-        None => local_kernel_inputs(inf, callee, callee_ty)?,
-    };
-    let want = declared.len();
-    // §04 scopes auto-splatting to "built-in or user defined value functions,
-    // constructors or transition kernels", so a user call reads a sole record
-    // argument exactly as a builtin call does. #78's single-input carve-out turns
-    // on a DOCUMENTED DOMAIN, which a user callable does not have — its boundary
-    // declares parameters, not domains — so a user call is never exempt.
-    let reading = arg_reading(inf, args, named, false)?;
-    let got = reading.count;
+    let interface = crate::callable::interface(inf, callee)?;
+    let reading = arg_reading(inf, args, named, interface.takes_one())?;
     let who = match inf.module.node(callee) {
-        Node::Ref(r) if r.ns == RefNs::SelfMod => {
-            format!("`{}`", inf.module.resolve(r.name))
-        }
+        Node::Ref(r) if r.ns == RefNs::SelfMod => format!("`{}`", inf.module.resolve(r.name)),
         _ => "callable".to_string(),
     };
-    if got == want {
-        // The count is right; the names still have to be the declared inputs.
-        let names: Vec<String> = declared
-            .iter()
-            .map(|n| inf.module.resolve(*n).to_string())
-            .collect();
-        return arg_name_check(inf, &names, &who, None, &reading, args, named);
+    if !interface.ordered && !args.is_empty() && !reading.splatting {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!("{who} has keyword-only inputs"),
+        ));
+        return Some(Type::Failed("keyword-only callable".into()));
     }
-    let noun = if want == 1 { "parameter" } else { "parameters" };
-    // Same reason as `arity_check`'s: a splatting call reports the field count, not
-    // the one argument written. This is the path the transport-model spelling hits.
+    if interface.arity.admits(reading.count) {
+        return check_double_bound(inf, &interface.names, &who, "§04", args, named)
+            .or_else(|| arg_name_check(inf, &interface.names, &who, None, &reading, args, named))
+            .or_else(|| {
+                missing_required_args(
+                    inf,
+                    id,
+                    &interface.names,
+                    interface.arity.min,
+                    &reading,
+                    args,
+                    named,
+                )
+            });
+    }
     let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    let count = interface.arity.min;
+    let parameters = if count == 1 {
+        "parameter"
+    } else {
+        "parameters"
+    };
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("{who} declares {want} {noun}, got {got} arguments{hint}"),
+        format!(
+            "{who} declares {count} {parameters}, got {} arguments{hint}",
+            reading.count
+        ),
     ));
     Some(Type::Failed(
-        format!("user call declares {want} {noun}, got {got}").into(),
+        format!(
+            "user call declares {count} {parameters}, got {} arguments",
+            reading.count
+        )
+        .into(),
     ))
 }
 
@@ -5363,7 +5317,7 @@ fn module_member_arity_check(
     named: &[NamedInfo],
 ) -> Option<Type> {
     let arity = crate::catalogue::sig_arity(sig)?;
-    let reading = arg_reading(inf, args, named, false)?;
+    let reading = arg_reading(inf, args, named, arity.admits(1))?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) => match r.ns {
@@ -5381,7 +5335,8 @@ fn module_member_arity_check(
         if let Some(ty) = check_double_bound(inf, &names, &who, "§09", args, named) {
             return Some(ty);
         }
-        return arg_name_check(inf, &names, &who, Some("§09"), &reading, args, named);
+        return arg_name_check(inf, &names, &who, Some("§09"), &reading, args, named)
+            .or_else(|| missing_required_args(inf, id, &names, arity.min, &reading, args, named));
     }
     let declared = arity.describe();
     let hint = if reading.splatting { SPLAT_HINT } else { "" };
@@ -5425,6 +5380,29 @@ fn user_call_type(
     named: &[NamedInfo],
 ) -> RuleStep<Type> {
     let resolved = resolve_binding_refs(inf, callee);
+    if let Node::Call(wrapper) = inf.module.node(resolved)
+        && let CallHead::Builtin(op) = wrapper.head
+    {
+        let op = inf.module.resolve(op).to_string();
+        let components = wrapper.args.to_vec();
+        match op.as_str() {
+            "fchain" => return composed_call_type(inf, &components, args, named),
+            "broadcasted" if !components.is_empty() => {
+                let head = components[0];
+                let mut lifted = vec![(
+                    head,
+                    inf.lookup_type(head).cloned().unwrap_or(Type::Any),
+                    Phase::Fixed,
+                )];
+                lifted.extend_from_slice(args);
+                return broadcast_type(inf, resolved, &lifted, named);
+            }
+            "bijection" if !components.is_empty() => {
+                return ordinary_call_type(inf, components[0], args, named);
+            }
+            _ => {}
+        }
+    }
     if matches!(inf.module.node(resolved), Node::Ref(r) if matches!(r.ns, RefNs::Module(_)))
         && inf.module_catalogue_ref(resolved).is_none()
         && args
@@ -5453,12 +5431,25 @@ fn user_call_type(
     // Surface the honest-degrade note (spec policy): when this catalogue
     // row's support/shape is a sound approximation of the spec entry that
     // the type system cannot express exactly, the user sees why.
-    if let Some(cref) = inf.module_catalogue_ref(callee) {
+    if let Some(cref) = inf.module_catalogue_ref(resolved) {
         let note = cref.degraded.clone(); // clone to drop the borrow before &mut inf call
         if let Some(note) = note {
             inf.note_once_str(&note);
         }
-        return Ready(catalogue_call_type(inf, callee, args));
+        let bound = crate::callable::interface(inf, resolved).and_then(|interface| {
+            normalize_arguments(
+                inf.module,
+                &interface.names,
+                args,
+                named,
+                interface.takes_one(),
+            )
+        });
+        return Ready(catalogue_call_type(
+            inf,
+            resolved,
+            bound.as_deref().unwrap_or(args),
+        ));
     }
     // Prefer the per-call substituted body type (arg types bound to the
     // callable's parameters); fall back to the un-substituted body type for
@@ -5511,6 +5502,58 @@ fn user_call_type(
         }
         _ => Ready(Type::Deferred),
     }
+}
+
+/// Apply composition stages using the ordinary interface before inspecting domains.
+fn composed_call_type(
+    inf: &mut Inferencer<'_, '_>,
+    components: &[NodeId],
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let Some((&first, rest)) = components.split_first() else {
+        return Ready(Type::Deferred);
+    };
+    let rest = rest.to_vec();
+    ordinary_call_type(inf, first, args, named).and_then(inf, move |inf, ty| {
+        if rest.is_empty() || matches!(ty, Type::Failed(_)) {
+            Ready(ty)
+        } else {
+            composed_call_type(inf, &rest, &[(first, ty, Phase::Fixed)], &[])
+        }
+    })
+}
+
+fn ordinary_call_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let call = Call {
+        head: CallHead::User(callee),
+        args: args.iter().map(|(node, ..)| *node).collect(),
+        named: named
+            .iter()
+            .map(|(name, node, ..)| flatppl_core::NamedArg {
+                kind: flatppl_core::NamedKind::Kwarg,
+                name: *name,
+                value: *node,
+            })
+            .collect(),
+        inputs: None,
+    };
+    let ty = inf.lookup_type(callee).cloned().unwrap_or(Type::Any);
+    call_rule(
+        inf,
+        callee,
+        &call,
+        Some((callee, ty)),
+        args,
+        named,
+        Phase::Fixed,
+    )
+    .map(inf, |_, (ty, _)| ty)
 }
 
 /// Apply a §09 standard-module reference resolved against the catalogue. The
@@ -5763,6 +5806,20 @@ fn substituted_result(
     let Some(inputs) = input_entries(inf, reif_id) else {
         return Ready(None);
     };
+    let normalized;
+    let args = if let Some(interface) = crate::callable::interface(inf, callee)
+        && let Some(bound) = normalize_arguments(
+            inf.module,
+            &interface.names,
+            args,
+            named,
+            interface.takes_one(),
+        ) {
+        normalized = bound;
+        normalized.as_slice()
+    } else {
+        args
+    };
 
     // Seed targets: for each parameter bound to a call argument, the body nodes
     // that read it (every matching `%local` placeholder ref, or a self-bound
@@ -5780,13 +5837,19 @@ fn substituted_result(
         let Some((arg_node, ty, phase)) = arg else {
             continue;
         };
+        let vset = if inf.lookup_type(arg_node) == Some(&ty) {
+            inf.lookup_valueset(arg_node)
+        } else {
+            ValueSet::natural_of(&ty)
+        };
         let res = crate::modules::Resolved {
             ty,
             phase,
-            vset: inf.lookup_valueset(arg_node),
+            vset,
             result: None,
             set_element: None,
             catalogue: None,
+            interface: crate::callable::interface(inf, arg_node),
         };
         match decl.ns {
             RefNs::Local => {
@@ -5832,16 +5895,20 @@ fn substituted_result(
 /// bound RHS, returning `(reification_node, body_node)` when the RHS is a
 /// reification (a call carrying an inputs boundary). `None` otherwise.
 fn local_reification(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<(NodeId, NodeId)> {
-    loop {
+    for _ in 0..inf.module.node_count() {
         match inf.module.node(node) {
             Node::Ref(r) if r.ns == RefNs::SelfMod => {
                 let binding = inf.module.binding_by_name(r.name)?;
                 node = inf.module.binding(binding).rhs;
             }
             Node::Call(c) if c.inputs.is_some() => return Some((node, *c.args.first()?)),
+            Node::Call(c) if matches!(c.head, CallHead::User(_)) => {
+                node = crate::callable::forwarded_result(inf, node)?;
+            }
             _ => return None,
         }
     }
+    None
 }
 
 /// The ordered input parameters of a reification: `(param-name, declaration-ref)`
@@ -5961,10 +6028,47 @@ fn broadcast_type(
         // a reified lambda body `dist.(params)` — whose params are still `%local`
         // placeholders, hence no array yet — must classify as a MEASURE so the
         // reification becomes a kernel rather than a plain function; the
-        // call-site substitution then refines the concrete shape. A deterministic
-        // op or a user-callable head with no array input stays a shape-wise
-        // no-op (`%deferred`).
-        return Ready(broadcast_distribution_no_shape(inf, head_node));
+        // call-site substitution then refines the concrete shape. Unknown inputs
+        // may still carry collection axes, even when the ordinary scalar call
+        // has a known result type.
+        let unknown_shape = args[1..]
+            .iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+            .any(|ty| {
+                matches!(
+                    ty,
+                    Type::Any | Type::Deferred | Type::Var(_) | Type::TVector { .. }
+                )
+            });
+        let cell = |ty: &Type| match ty {
+            Type::TVector { elem, .. } => elem.as_ref().clone(),
+            ty => ty.clone(),
+        };
+        let cell_args: Vec<_> = args[1..]
+            .iter()
+            .map(|(node, ty, phase)| (*node, cell(ty), *phase))
+            .collect();
+        let cell_named: Vec<_> = named
+            .iter()
+            .map(|(name, node, ty, phase)| (*name, *node, cell(ty), *phase))
+            .collect();
+        return ordinary_call_type(inf, head_node, &cell_args, &cell_named).map(
+            inf,
+            move |_, ty| {
+                if !unknown_shape {
+                    return ty;
+                }
+                match ty {
+                    Type::Measure { mass, .. } => Type::Measure {
+                        domain: Box::new(Type::Deferred),
+                        mass,
+                    },
+                    Type::Failed(_) => ty,
+                    _ => Type::Deferred,
+                }
+            },
+        );
     };
 
     // User-callable head (`broadcast(predict, x = x_data)`): the cell comes from
@@ -5987,13 +6091,9 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            return substituted_result(inf, head_node, &cell_args, &cell_named, None, true).map(
+            return ordinary_call_type(inf, head_node, &cell_args, &cell_named).map(
                 inf,
-                move |inf, sub| {
-                    let cell = sub
-                        .map(|(ty, _)| ty)
-                        .or_else(|| reified_result_type(inf, head_node))
-                        .unwrap_or(Type::Deferred);
+                move |inf, cell| {
                     if let Type::Record(columns) = cell {
                         if shape.len() != 1 {
                             inf.diags.push(crate::Diagnostic::error_at(
@@ -6024,16 +6124,12 @@ fn broadcast_type(
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            return substituted_result(inf, head_node, &cell_args, &cell_named, None, true).map(
+            return ordinary_call_type(inf, head_node, &cell_args, &cell_named).map(
                 inf,
-                move |inf, sub| {
-                    let cell = match sub
-                        .map(|(ty, _)| ty)
-                        .or_else(|| reified_result_type(inf, head_node))
-                    {
-                        Some(Type::Measure { domain, .. }) => *domain,
-                        Some(value_ty) => value_ty,
-                        None => return Type::Deferred,
+                move |_, cell| {
+                    let cell = match cell {
+                        Type::Measure { domain, .. } => *domain,
+                        value_ty => value_ty,
                     };
                     Type::Measure {
                         domain: Box::new(Type::Array {
@@ -6216,79 +6312,8 @@ mod broadcast_shape_join_tests {
     }
 }
 
-/// `broadcast` with no concrete array argument (e.g. a reified lambda body
-/// `dist.(params)` whose params are still `%local` placeholders): a distribution
-/// head is nonetheless a measure — its broadcast is an independent product over a
-/// not-yet-known shape — so report `(%measure %deferred · normalized)` to flag
-/// it as a measure (the reification then classifies as a kernel; the call-site
-/// substitution supplies the concrete domain). A §08 builtin or §09 module
-/// distribution both count; anything else (deterministic op, user callable) is a
-/// shape-wise no-op and stays `%deferred`.
-fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: NodeId) -> Type {
-    use crate::catalogue::Sig;
-    // §09 module distribution head (catalogue-ref side-table). `.map().unwrap_or`
-    // drops the borrow before the `&mut inf` call below.
-    let module_dist = inf
-        .module_catalogue_ref(head_node)
-        .map(|c| matches!(c.sig, Sig::Distribution { .. }))
-        .unwrap_or(false);
-    // §08 builtin distribution head: resolve the name (immutable borrow ends with
-    // the owned `String`), then probe `distribution_domain` (needs `&mut inf`).
-    let builtin_name = match inf.module.node(head_node) {
-        Node::Const(op) => Some(inf.module.resolve(*op).to_string()),
-        _ => None,
-    };
-    let builtin_dist = builtin_name
-        .map(|n| distribution_domain(inf, &n, &[], &[]).is_some())
-        .unwrap_or(false);
-    if module_dist || builtin_dist {
-        Type::Measure {
-            domain: Box::new(Type::Deferred),
-            mass: Mass::Normalized,
-        }
-    } else {
-        Type::Deferred
-    }
-}
-
-/// Reject a call whose argument count contradicts the callee's declared
-/// parameter list — §07 for a function or arity-only row, §08 for a
-/// distribution constructor. Returns `Some(Type::Failed)` for a mis-arity call
-/// and `None` when the call is admissible, the count is not knowable
-/// (see [`supplied_arg_count`]), or the catalogue declares no arity for `name`.
-/// The refusal for a sole positional record or table splatted onto a row that declares no names
-/// for its inputs — `cat`, `get`, `get0` today.
-///
-/// **Grounded PER ROW, not on §04's always-splat rule.** `wave-CATADJ-report.md` §1 adjudicates
-/// the auto-splat bullet's scope over special operations as **UNDERDETERMINED**: §04 never states
-/// the exclusion, §03 "Tables" applies splatting to `table(r)`/`record(t)` — both on §04's
-/// special-operations list — and §05 publishes a shorter roster omitting these rows. So the
-/// justification below stands on §07, which holds under either reading:
-///
-/// - **`cat` — §07 defines no one-argument form.** Its three bullets
-///   (`cat(scalar1, scalar2, ...)`, `cat(vector1, vector2, ...)`, `cat(record1, record2, ...)`)
-///   are all written with two-or-more operands, and no sentence assigns a value to `cat(r)`.
-///   "Arity 1..∞" is this crate's catalogue row, not spec text: "arity" occurs once in the whole
-///   spec and never with a number for `cat`. Refusing contradicts no sentence.
-/// - **`get`/`get0` — §07 requires a selector.** "`get(container, selectors...)` — unified element
-///   access and subset selection", with every documented form supplying one and no zero-selector
-///   form defined. `get0` is the "zero-based variant of `get`" and inherits the requirement.
-/// - **A table** additionally falls outside each row's §07 Domains cell (`cat`'s reads "scalars,
-///   vectors, or records").
-///
-/// §04's mismatch clause ("A call with field or column names that do not match the callable's
-/// argument names is a static error") is still what the message cites for the *rule*, because on
-/// a row with no declared names nothing can match — that part is not in dispute. What the
-/// adjudication removed is the claim that §04's list settles which rows are in scope.
-///
-/// **Deliberately does NOT append [`SPLAT_HINT`].** That tail advises the keyword spelling
-/// (`f(pars = record(...))`), which is unusable here: a row declaring no input names has no
-/// keyword to address them by, so pointing at one would send the author down a path that cannot
-/// work. The honest fix is to pass the arguments explicitly, which is what this message says.
-///
-/// A row that DOES declare names never reaches here — see
-/// [`crate::catalogue::Catalogue::base_has_unnamed_variadic`], which steps aside for it so the
-/// ordinary name check decides. That is what makes `builtin_sample`'s matching splat valid.
+/// A callable that cannot take one positional argument needs declared names
+/// to bind fields from a sole record/table.
 fn refuse_splat_onto_unnamed_variadic(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -6358,58 +6383,6 @@ fn refuse_splat_onto_unnamed_variadic(
         ),
     ));
     Type::Failed(format!("{name} cannot splat an aggregate onto unnamed variadic inputs").into())
-}
-
-/// Reject a sole positional record/table splat onto a [`Catalogue::base_never_splats`]
-/// row — currently `checked` alone (design PR #78, owner ruling, decisions-log
-/// 2026-08-18). Unlike [`refuse_splat_onto_unnamed_variadic`], the row DOES declare
-/// parameter names, so the diagnostic cannot say "no name to bind to" (a name-matched
-/// splat, e.g. `checked(record(value = 1.0, condition = true))`, WOULD bind if let
-/// through) — the point instead is that §07's keyword spelling owns this construct.
-fn refuse_checked_splat(
-    inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
-    name: &str,
-    cat: &crate::catalogue::Catalogue,
-    args: &[ArgInfo],
-) -> Type {
-    let section = cat.base_param_section(name);
-    let names = cat.base_param_names(name).unwrap_or(&[]);
-    let keyword_form = format!(
-        "{name}({})",
-        names
-            .iter()
-            .map(|n| format!("{n} = ..."))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let fields = splatted_field_names(inf, &args[0].1);
-    let listed = if fields.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " (its {} {})",
-            if fields.len() == 1 {
-                "name is"
-            } else {
-                "names are"
-            },
-            fields
-                .iter()
-                .map(|f| format!("`{f}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    inf.diags.push(crate::Diagnostic::error_at(
-        id,
-        format!(
-            "`{name}` has no special-operation splat (spec {section} owns the keyword form): \
-             a sole positional record or table{listed} does not bind, whether or not its \
-             names match. Use the keyword form instead, as in `{keyword_form}`"
-        ),
-    ));
-    Type::Failed(format!("{name} does not splat a sole record or table argument").into())
 }
 
 /// The field or column names of a CONFIRMED record/table type, in declaration order; empty
@@ -6562,15 +6535,6 @@ fn arity_check(
     if reading.splatting && cat.base_has_unnamed_variadic(name) {
         return Some(refuse_splat_onto_unnamed_variadic(inf, id, name, cat, args));
     }
-    // `checked` (design PR #78, owner ruling, decisions-log 2026-08-18): §07's
-    // keyword form owns it, so a sole positional record/table never splats here
-    // even when its field names match `value`/`condition` — precedes the arity
-    // and name checks the same way the unnamed-variadic refusal above does, for
-    // the same reason: a fitting field count would otherwise let the splat
-    // through before this can object.
-    if reading.splatting && cat.base_never_splats(name) {
-        return Some(refuse_checked_splat(inf, id, name, cat, args));
-    }
     if arity.admits(got) {
         // Positional calls cannot introduce unknown names or double bindings.
         if named.is_empty() && !reading.splatting {
@@ -6585,7 +6549,8 @@ fn arity_check(
         if let Some(ty) = check_double_bound(inf, &names, &who, section, args, named) {
             return Some(ty);
         }
-        return arg_name_check(inf, &names, &who, Some(section), &reading, args, named);
+        return arg_name_check(inf, &names, &who, Some(section), &reading, args, named)
+            .or_else(|| missing_required_args(inf, id, &names, arity.min, &reading, args, named));
     }
     // Same section mapping as the name check below, so a row documented outside §07 —
     // `bijection`, `logdensityof` — cites §06 in BOTH its diagnostics rather than only one.
@@ -7773,25 +7738,7 @@ fn refuse_nonmeasure_operand(
     ))
 }
 
-/// The explanation appended to any diagnostic whose argument count or names came
-/// from an auto-splat. The splat is the surprising step — the author wrote one
-/// argument and the error talks about several, or about names they never typed — so
-/// every diagnostic on a splatting call says the splat happened and names the
-/// spelling that passes the aggregate as one value (§04: "Passing a record or table
-/// as one ordinary argument requires the keyword spelling, as in
-/// `f(pars = record(...))`").
-///
-/// Deliberately does NOT say "always splats". #78's single-input carve-out made
-/// that false: `sum(t)` and `lengthof(t)` do not splat. The wording states what
-/// happened to THIS call instead of asserting a universal rule, which is both true
-/// and the more useful thing to read. It also stays quiet about the carve-out —
-/// naming it would be noise on `Poisson(record(zzz = 0.5))`, where no exemption
-/// could apply.
-///
-/// Shared by all three paths that can report on a splatting call: the two arity
-/// mismatches ([`arity_check`] for builtins, [`user_arity_check`] for user
-/// callables) and the name check ([`arg_name_check`]). A call that does not splat
-/// gets none of it — an ordinary over-arity call has nothing to explain.
+/// Explain the named reading only when this call actually spreads its argument.
 const SPLAT_HINT: &str = " — this sole positional record or table splatted into one \
                           argument per field (spec §04), so its field names bind as \
                           argument names; to pass it as one ordinary argument use \
@@ -7806,55 +7753,9 @@ struct ArgReading {
     splatting: bool,
 }
 
-/// The reading of a call's arguments, or `None` when no reading can be trusted.
-///
-/// The plain reading counts positional plus keyword arguments: every §07
-/// parameter and every §08 distribution parameter is nameable (§04 "Calling
-/// conventions": "All built-in ordinary callables have a defined input order and
-/// accept both positional and keyword arguments"), so `checked(value_expr,
-/// condition = …)` and `Normal(mu = m, sigma = s)` each supply two.
-///
-/// A record or table given as the call's SOLE positional argument ALWAYS
-/// auto-splats, supplying one argument per field or column — §04 "Calling
-/// conventions": "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y, ...))`
-/// are equivalent to `f(a = x, b = y, ...)`", and, as amended by design#74, "A
-/// sole positional record or table therefore always splats: whether its field or
-/// column names match the callable's argument names decides only whether the call
-/// is valid, never whether the splat occurs."
-///
-/// So the callee's parameter NAMES do not influence the reading: they cannot make a
-/// sole positional record read as one ordinary value. Passing a record as one
-/// argument takes the keyword spelling instead — §04: "Passing a record or table as
-/// one ordinary argument requires the keyword spelling, as in
-/// `f(pars = record(...))`" — which lands in the `!named.is_empty()` arm below and
-/// does not splat, as do the other two non-splatting cases §04 names ("a record
-/// given alongside other arguments, or bound to a parameter by keyword").
-///
-/// `takes_aggregate_whole` is §04's SINGLE-INPUT CARVE-OUT (flatppl-design#78,
-/// pending owner review): "A callable with exactly one input whose documented
-/// domain admits records or tables is exempt and receives a sole positional record
-/// or table whole, so that `sum(t)` and `lengthof(t)` reduce over the table rather
-/// than splatting." Without it the splat binds by name, so `sum(t)` and
-/// `lengthof(t)` were valid for no table at any column count — which made §07's
-/// **Table reductions** paragraph dead prose. The exempt set is
-/// `Catalogue::base_takes_aggregate_whole`, keyed on the callee's own arity and
-/// documented domain; a USER callable is never exempt, having no documented domain
-/// to read.
-///
-/// Because the splat is unconditional, the field names are always the binding
-/// names, so `arg_name_check` now name-checks every sole-record call — including
-/// the single-parameter §08 constructors that the earlier either-reading rule left
-/// unchecked (`Poisson(record(zzz = 0.5))` was silently accepted).
-///
-/// §04 scopes all of this to ORDINARY callables ("built-in or user defined value
-/// functions, constructors or transition kernels"). Special operations have
-/// "distinguished, unnamed, ordered inputs" and never splat — they are excluded
-/// structurally rather than here, since [`arity_check`] returns at its
-/// `base_arity` lookup for a head the catalogue declares no parameter list for,
-/// which is every special operation.
-///
-/// When the sole argument's type is still open, the reading is not knowable
-/// unless the node is structurally a scalar literal, which can never splat.
+/// Select the whole-object or named reading from the input interface alone.
+/// An unresolved argument type defers a possible spread, never changes the
+/// interface's decision after a domain check fails.
 fn arg_reading(
     inf: &Inferencer<'_, '_>,
     args: &[ArgInfo],
@@ -7996,6 +7897,35 @@ fn check_double_bound(
 }
 
 /// Reject a call that binds an argument to a name the callee does not declare.
+fn missing_required_args(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    declared: &[String],
+    required: usize,
+    reading: &ArgReading,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    if named.is_empty() && !reading.splatting {
+        return None;
+    }
+    let supplied = supplied_arg_names(inf, reading, args, named);
+    let supplied_positionals = if reading.splatting { 0 } else { args.len() };
+    let missing = declared
+        .iter()
+        .take(required)
+        .skip(supplied_positionals)
+        .find(|name| !supplied.iter().any(|(supplied, _)| supplied == *name))?;
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!("missing required argument `{missing}`"),
+    ));
+    Some(Type::Failed(
+        format!("missing required argument `{missing}`").into(),
+    ))
+}
+
+/// Reject a call that binds an argument to a name the callee does not declare.
 ///
 /// §04 "Calling conventions" makes keyword arguments bind by name — "Arguments
 /// are bound to inputs by name, the order of the arguments is not relevant" —
@@ -8010,12 +7940,7 @@ fn check_double_bound(
 /// attributes the parameter list ("spec §08" for a constructor row, `None` for a
 /// user callable, whose parameters are declared in the module itself).
 ///
-/// A SPLATTING call gets the keyword spelling named too. Its field names bind
-/// because §04 makes a sole positional record splat unconditionally, so the author
-/// who meant to pass the record as one value has an actionable fix rather than a
-/// bare "no parameter" — §04: "Passing a record or table as one ordinary argument
-/// requires the keyword spelling, as in `f(pars = record(...))`". The hint goes on
-/// every diagnostic, not once, because each is read on its own line in an editor.
+/// A call that spreads its aggregate also explains that name-binding step.
 fn arg_name_check(
     inf: &mut Inferencer<'_, '_>,
     declared: &[String],
@@ -8324,45 +8249,7 @@ fn record_field_dim(inf: &Inferencer<'_, '_>, rec: Option<NodeId>, kwarg: &str) 
     Dim::Dynamic
 }
 
-/// The value NODE of `field` when a call auto-splats a positional record (§04
-/// "Calling conventions"): auto-splat fires ONLY when a record is the call's
-/// SOLE argument, so this returns `None` unless there are no keyword arguments,
-/// exactly one positional argument, and that argument is a `record(...)` call
-/// carrying `field`. A record alongside other arguments, or bound to a
-/// parameter by keyword, is an ordinary value and is not splatted.
-///
-/// The §06 fundamental measures (`Dirac`/`Lebesgue`/`Counting`) resolve their
-/// single argument by hand (they are not in the §08 catalogue), so they consult
-/// this to splat a sole positional record the way the catalogue param path does
-/// for distributions — `Dirac(record(value = v))` binds `value = v`, not the
-/// whole record.
-fn splat_field(
-    inf: &Inferencer<'_, '_>,
-    args: &[ArgInfo],
-    named: &[NamedInfo],
-    field: &str,
-) -> Option<NodeId> {
-    if !named.is_empty() || args.len() != 1 {
-        return None;
-    }
-    let Node::Call(c) = inf.module.node(args[0].0) else {
-        return None;
-    };
-    if !matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "record") {
-        return None;
-    }
-    c.named
-        .iter()
-        .find(|na| inf.module.resolve(na.name) == field)
-        .map(|na| na.value)
-}
-
-/// The `support` argument NODE of a `Lebesgue`/`Counting` call (spec §06
-/// "Fundamental measures" table: parameter name `support`, e.g. `Lebesgue(reals)`
-/// or `Counting(integers)` — §11 mass-class worked example). Resolves the named
-/// kwarg, an auto-splatted positional `record(support = S)` (§04), or the plain
-/// positional set, in that order — every caller of this rule (the type-domain
-/// arm and the `%mass` arm) must accept all three spellings alike.
+/// The whole support argument of a unary reference-measure constructor.
 fn lebesgue_counting_support_node(
     inf: &Inferencer<'_, '_>,
     args: &[ArgInfo],
@@ -8372,7 +8259,6 @@ fn lebesgue_counting_support_node(
         .iter()
         .find(|(n, _, _, _)| inf.module.resolve(*n) == "support")
         .map(|(_, node, _, _)| *node)
-        .or_else(|| splat_field(inf, args, named, "support"))
         .or_else(|| args.first().map(|a| a.0))
 }
 

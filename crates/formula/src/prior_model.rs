@@ -89,7 +89,12 @@ pub(crate) fn build(b: &mut Builder<'_>, parameters: &[ParameterPrior]) -> Resul
                 .filter(|(i, _)| done.contains(i))
                 .map(|(_, name)| name.clone())
                 .collect::<Vec<_>>();
-            parameter_function(b, "functionof", measure, &inputs)
+            let kernel = parameter_function(b, "functionof", measure, &inputs);
+            if inputs.len() == 1 {
+                b.record_adapter(kernel, &inputs)
+            } else {
+                kernel
+            }
         };
         chain.push(component);
         done.extend(ready.into_iter().map(|(i, _)| i));

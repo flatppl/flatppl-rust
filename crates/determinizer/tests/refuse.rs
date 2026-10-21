@@ -318,51 +318,16 @@ lp = logdensityof(L, record(mu = 2.0))";
     );
 }
 
-// A likelihood query whose θ record names a parameter with NO module binding.
-// `logdensityof(likelihoodof(K, obs), θ)` inlines each θ field into the density
-// subtree by matching `(%ref self <name>)` against the emitted kernel's free
-// params. A θ field naming something that is not a declared param (here
-// `nonexistent`) has no such ref to bind and no corresponding param decl — it is
-// a mislowering hazard (a θ point that silently scores nothing), not a valid
-// parameter point. `theta_field_map` must REFUSE such a θ up front rather than
-// build a density that ignores the stray field.
+// Named kernel interfaces require the corresponding fields in a likelihood point.
 #[test]
-fn likelihoodof_query_theta_names_unbound_param_refuses() {
-    let src = "\
-mu = elementof(reals)
-k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)
-L = likelihoodof(k, record(y = 0.5))
-lp = logdensityof(L, record(nonexistent = 2.0))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err(
-        "a θ field naming a parameter with no module binding is not a valid point — refuse",
-    );
-    assert!(
-        err.reason.contains("no module binding"),
-        "refusal explains the θ field has no corresponding param binding: {err:?}"
-    );
-}
-
-// A likelihood query whose θ argument is NOT a record. `logdensityof(L, θ)` reads
-// θ as the parameter point, which §06 models as a field-keyed record (one field
-// per free param). A scalar θ (here `2.0`) has no field structure to inline, so
-// `theta_field_map` must REFUSE naming the record requirement rather than treat
-// the scalar as the variate (the measure-query path) — the likelihood-query entry
-// has already committed to the θ interpretation.
-#[test]
-fn likelihoodof_query_theta_not_a_record_refuses() {
-    let src = "\
-mu = elementof(reals)
-k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)
-L = likelihoodof(k, record(y = 0.5))
-lp = logdensityof(L, 2.0)";
-    let m = parse_infer(src);
-    let err =
-        determinize(&m).expect_err("a non-record θ in a likelihood query is malformed — refuse");
-    assert!(
-        err.reason.contains("θ must be a record"),
-        "refusal explains θ must be a field-keyed record: {err:?}"
-    );
+fn likelihoodof_named_interface_requires_its_parameter_fields() {
+    for point in ["record(nonexistent = 2.0)", "2.0"] {
+        let source = format!(
+            "mu=elementof(reals)\nk=functionof(joint(y=Normal(mu,1)))\nL=likelihoodof(k,record(y=0.5))\nlp=logdensityof(L,{point})"
+        );
+        let error = determinize(&parse_infer(&source)).expect_err("the point must supply mu");
+        assert!(error.reason.contains("missing a kernel input"), "{error:?}");
+    }
 }
 
 // A MEASURE-side `record` built with POSITIONAL args instead of `%field name =`

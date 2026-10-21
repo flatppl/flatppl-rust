@@ -214,48 +214,19 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
-// §04 auto-splat applies at ANY arity: a positional record whose field names
-// match the callable's parameter names splats — including a single-param
-// callable. `Dirac`'s sole `value` param: `Dirac(record(value = 5.0))` splats to
-// `Dirac(value = 5.0)` (a point mass at the SCALAR, extracted via `get` at
-// build time), NOT at the record. Both engines agree — inference types the
-// variate scalar and the determiniser extracts the field. The record-VALUE
-// form is the keyword `Dirac(value = record(...))`, which is not a positional
-// splat. Regression for the §04-literal auto-splat arity semantics AND
-// re-baselined for buffy #263 Pass 3: the splat's container here is ALREADY a
-// literal `record(...)`, so `flatten_structural` resolves the `get` this test
-// used to pin immediately — the determinized FlatPDL shows the literal `5.0`
-// directly, not a `get` accessor.
 #[test]
-fn positional_record_auto_splats_at_any_arity_keyword_record_is_the_value() {
-    // Positional record → splat → `value` bound to the record's `value`
-    // field, which canon Pass 3 flattens directly to the literal `5.0` (no
-    // residual `get`); the scored variate is the scalar.
-    let splat = "\
-a = draw(Dirac(record(value = 5.0)))
-lp = logdensityof(lawof(record(a = a)), record(a = 5.0))";
-    let out_splat = determinize_src(splat);
-    let pir_splat = flatppl_flatpir::write(&out_splat);
-    assert!(
-        pir_splat.contains("builtin_logdensityof Dirac")
-            && pir_splat.contains("(%field value 5.0)"),
-        "positional Dirac(record(value=v)) auto-splats to the literal value field:\n{pir_splat}"
+fn unary_dirac_keeps_the_same_record_with_positional_and_keyword_binding() {
+    let positional = determinize_src(
+        "a = draw(Dirac(record(value = 5.0)))\nlp = logdensityof(lawof(record(a = a)), record(a = record(value = 5.0)))",
     );
-    assert!(
-        !pir_splat.contains("(get "),
-        "canon Pass 3 (flatten_structural) resolves the splat's static get accessor:\n{pir_splat}"
+    let keyword = determinize_src(
+        "a = draw(Dirac(value = record(value = 5.0)))\nlp = logdensityof(lawof(record(a = a)), record(a = record(value = 5.0)))",
     );
-    assert!(flatppl_determinizer::is_flatpdl(&out_splat).is_ok());
-
-    // Keyword record → NOT a splat → `value` bound to the whole record.
-    let value = "\
-a = draw(Dirac(value = record(value = 5.0)))
-lp = logdensityof(lawof(record(a = a)), record(a = record(value = 5.0)))";
-    let pir_value = flatppl_flatpir::write(&determinize_src(value));
-    assert!(
-        pir_value.contains("builtin_logdensityof Dirac") && !pir_value.contains("(get "),
-        "keyword Dirac(value = record(...)) is the record value, not a splat:\n{pir_value}"
+    assert_eq!(
+        flatppl_flatpir::write(&positional),
+        flatppl_flatpir::write(&keyword)
     );
+    assert!(flatppl_determinizer::is_flatpdl(&positional).is_ok());
 }
 
 // A record-of-draws prior with a BIJECTION-TRANSFORMED field
@@ -871,7 +842,7 @@ fn kchain_discrete_bernoulli_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Bernoulli(p = 0.3))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -919,7 +890,7 @@ fn kchain_discrete_categorical_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Categorical(p = [0.2, 0.3, 0.5]))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -975,7 +946,7 @@ fn kchain_discrete_categorical0_latent_lowers_to_zero_based_atoms() {
     let src = "\
 z = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -1037,7 +1008,7 @@ fn kchain_discrete_binomial_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Binomial(n = 2, p = 0.5))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), k)
+pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);

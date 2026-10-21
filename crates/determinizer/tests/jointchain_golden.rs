@@ -20,7 +20,7 @@ fn jointchain_record_single_step() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
-j = jointchain(lawof(record(a = a)), k)
+j = jointchain(lawof(record(a = a)), pars -> k(a = pars.a))
 lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -84,7 +84,7 @@ fn jointchain_record_base_scalar_kernel_refuses() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
-j = jointchain(lawof(record(a = a)), k)
+j = jointchain(lawof(record(a = a)), pars -> k(a = pars.a))
 lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("record base + scalar kernel step must refuse, not panic");
@@ -104,7 +104,7 @@ fn jointchain_record_multi_step() {
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 k1 = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
 k2 = kernelof(record(c = draw(Normal(mu = _b_, sigma = 0.25))), b = _b_)
-j = jointchain(lawof(record(a = a)), k1, k2)
+j = jointchain(lawof(record(a = a)), pars -> k1(a = pars.a), pars -> k2(b = pars.b))
 lp = logdensityof(j, record(a = 0.3, b = 0.7, c = 1.1))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -134,25 +134,10 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7, c = 1.1))";
     );
 }
 
-// A kernel input that names no PRIOR variate field (a forward / unknown
-// reference) cannot be bound — refuse rather than emit a dangling ref.
 #[test]
 fn jointchain_unbindable_input_refuses() {
-    let src = "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(b = draw(Normal(mu = _c_, sigma = 0.5))), c = _c_)
-j = jointchain(lawof(record(a = a)), k)
-lp = logdensityof(j, record(a = 0.3, b = 0.7))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("input naming a non-prior field must refuse");
-    assert!(
-        err.construct.contains("jointchain"),
-        "names jointchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("non-prior"),
-        "explains the unbindable input: {err:?}"
-    );
+    let source = "a ~ Normal(0,1)\nc=elementof(reals)\nk=functionof(joint(b=Normal(c,0.5)))\nj=jointchain(lawof(record(a=a)),k)\nlp=logdensityof(j,record(a=0.3,b=0.7))";
+    assert!(determinize(&parse_infer(source)).is_err());
 }
 
 // Scalar-cat jointchain: output is a VECTOR variate; slices via get0. Base

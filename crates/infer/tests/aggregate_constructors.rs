@@ -86,7 +86,7 @@ fn distinct_field_names_still_type() {
 fn a_mixed_cartprod_spelling_is_refused() {
     assert_refuses(
         "s = cartprod(reals, a = integers)\nv = elementof(s)\n",
-        "mixes positional and keyword components",
+        "either positional or keyword",
     );
 }
 

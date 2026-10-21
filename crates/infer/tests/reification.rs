@@ -237,7 +237,7 @@ fn auto_inputs_descend_through_user_call() {
     let src = r#"
 a = elementof(reals)
 helper = functionof(mul(a, a))
-applied = helper(a)
+applied = helper(a = a)
 model = functionof(add(applied, a))
 "#;
     let module = infer_src(src, Level::Type);

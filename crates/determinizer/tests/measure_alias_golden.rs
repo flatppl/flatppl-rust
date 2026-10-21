@@ -140,12 +140,12 @@ fn likelihoodof_alias() {
     assert_alias_matches_direct(
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 lik = likelihoodof(k, [2.0, 3.0])
 lp = logdensityof(lik, record(mu = 1.0))",
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 lik = likelihoodof(k, [2.0, 3.0])
 top = lik
 lp = logdensityof(top, record(mu = 1.0))",
@@ -158,12 +158,12 @@ fn likelihoodof_alias_chain() {
     assert_alias_matches_direct(
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 lik = likelihoodof(k, [2.0, 3.0])
 lp = logdensityof(lik, record(mu = 1.0))",
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 lik = likelihoodof(k, [2.0, 3.0])
 top = lik
 top2 = top
@@ -177,14 +177,14 @@ fn joint_likelihood_alias() {
     assert_alias_matches_direct(
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 l1 = likelihoodof(k, [2.0, 3.0])
 l2 = likelihoodof(k, [1.0])
 j = joint_likelihood(l1, l2)
 lp = logdensityof(j, record(mu = 1.0))",
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 l1 = likelihoodof(k, [2.0, 3.0])
 l2 = likelihoodof(k, [1.0])
 j = joint_likelihood(l1, l2)
@@ -200,13 +200,13 @@ fn joint_likelihood_aliased_component() {
     assert_alias_matches_direct(
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 l1 = likelihoodof(k, [2.0, 3.0])
 l2 = likelihoodof(k, [1.0])
 lp = logdensityof(joint_likelihood(l1, l2), record(mu = 1.0))",
         "\
 mu = elementof(reals)
-k = functionof(Normal.(mu))
+k = functionof(Normal.(mu, 1.0))
 l1 = likelihoodof(k, [2.0, 3.0])
 l2 = likelihoodof(k, [1.0])
 a1 = l1
@@ -223,14 +223,14 @@ fn bayesupdate_aliased_likelihood() {
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
 k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
-lik = likelihoodof(k, [2.0, 3.0])
+lik = likelihoodof(pars -> k(mu = pars.mu), [2.0, 3.0])
 post = bayesupdate(lik, prior)
 lp = logdensityof(post, record(mu = 1.0))",
         "\
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
 k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
-lik = likelihoodof(k, [2.0, 3.0])
+lik = likelihoodof(pars -> k(mu = pars.mu), [2.0, 3.0])
 alias = lik
 post = bayesupdate(alias, prior)
 lp = logdensityof(post, record(mu = 1.0))",

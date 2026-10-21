@@ -39,6 +39,7 @@ struct Scope {
     active_bindings: HashSet<BindingId>,
     noted_gaps: HashSet<Symbol>,
     module_callable_results: HashMap<NodeId, Type>,
+    module_callable_interfaces: HashMap<NodeId, crate::callable::Interface>,
     module_set_elements: HashMap<NodeId, Type>,
     module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
 }
@@ -72,6 +73,7 @@ impl InferredBody {
                     && x.vset == y.vset
                     && x.result.is_none()
                     && y.result.is_none()
+                    && x.interface == y.interface
                     && x.catalogue.is_none()
                     && y.catalogue.is_none()
             })
@@ -129,6 +131,7 @@ pub(crate) struct Inferencer<'m, 's> {
     /// reaches its body type — the body lives in the dependency's interner and
     /// cannot be looked up by node here. Populated in the `RefNs::Module` arm.
     module_callable_results: HashMap<NodeId, Type>,
+    module_callable_interfaces: HashMap<NodeId, crate::callable::Interface>,
     /// Original element types for imported set objects, distinct from supports.
     module_set_elements: HashMap<NodeId, Type>,
     /// For a §09 standard-module reference (`hepphys.CrystalBall`), the
@@ -214,6 +217,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             active_bindings: HashSet::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
+            module_callable_interfaces: HashMap::new(),
             module_set_elements: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
             kernel_tag_nodes,
@@ -222,6 +226,11 @@ impl<'m, 's> Inferencer<'m, 's> {
     }
 
     fn seed_inputs(&mut self, seeds: &[(NodeId, crate::modules::Resolved)]) {
+        self.module_callable_interfaces.extend(
+            seeds
+                .iter()
+                .filter_map(|(id, r)| r.interface.clone().map(|interface| (*id, interface))),
+        );
         self.seeds = seeds
             .iter()
             .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
@@ -238,6 +247,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             active_bindings: std::mem::take(&mut self.active_bindings),
             noted_gaps: std::mem::take(&mut self.noted_gaps),
             module_callable_results: std::mem::take(&mut self.module_callable_results),
+            module_callable_interfaces: std::mem::take(&mut self.module_callable_interfaces),
             module_set_elements: std::mem::take(&mut self.module_set_elements),
             module_catalogue_refs: std::mem::take(&mut self.module_catalogue_refs),
         }
@@ -252,6 +262,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.active_bindings = scope.active_bindings;
         self.noted_gaps = scope.noted_gaps;
         self.module_callable_results = scope.module_callable_results;
+        self.module_callable_interfaces = scope.module_callable_interfaces;
         self.module_set_elements = scope.module_set_elements;
         self.module_catalogue_refs = scope.module_catalogue_refs;
     }
@@ -376,6 +387,13 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// for local callables (their body is looked up by node instead).
     pub(crate) fn module_callable_result(&self, id: NodeId) -> Option<&Type> {
         self.module_callable_results.get(&id)
+    }
+
+    pub(crate) fn module_callable_interface(
+        &self,
+        id: NodeId,
+    ) -> Option<&crate::callable::Interface> {
+        self.module_callable_interfaces.get(&id)
     }
 
     pub(crate) fn module_set_element(&self, id: NodeId) -> Option<&Type> {
@@ -582,6 +600,13 @@ impl<'m, 's> Inferencer<'m, 's> {
                     // imported metadata still belong to this inference scope.
                     let exported: Vec<_> =
                         self.module.public_bindings().map(|(_, b)| b.rhs).collect();
+                    let interfaces = exported
+                        .iter()
+                        .filter_map(|&node| {
+                            crate::callable::interface(self, node)
+                                .map(|interface| (node, interface))
+                        })
+                        .collect();
                     let sets = exported
                         .into_iter()
                         .filter_map(|node| {
@@ -601,7 +626,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.auto_inputs = frame.auto_inputs;
                     self.restore_scope(frame.scope);
                     self.session
-                        .finish_dependency(frame.key.clone(), dependency, sets);
+                        .finish_dependency(frame.key.clone(), dependency, sets, interfaces);
                     let result = self.session.resolved_binding(
                         self.module,
                         &frame.key,
@@ -713,6 +738,9 @@ impl<'m, 's> Inferencer<'m, 's> {
             Ok(res) => {
                 if let Some(result) = res.result {
                     self.module_callable_results.insert(node, result);
+                }
+                if let Some(interface) = res.interface {
+                    self.module_callable_interfaces.insert(node, interface);
                 }
                 if let Some(element) = res.set_element {
                     self.module_set_elements.insert(node, element);
@@ -1122,6 +1150,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                         result: None,
                         set_element: None,
                         catalogue: None,
+                        interface: crate::callable::interface(self, value),
                     },
                 )
             })

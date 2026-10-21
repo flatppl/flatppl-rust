@@ -326,19 +326,11 @@ fn the_table_diagnostic_names_column_access() {
     );
 }
 
-/// The carve-out: §04 "Calling conventions" — "Auto-splatting is shallow and occurs
-/// only when a record or table is the call's SOLE argument" — so a sole positional
-/// aggregate is a splat, not an operand, and must NOT be refused. `gt(record(a = x,
-/// b = y))` is `gt(a = x, b = y)`, a perfectly ordinary scalar comparison.
+/// Binary comparison spreads a sole record. A table spreads too, but its array
+/// columns fail the comparison's scalar domain check.
 #[test]
 fn a_sole_positional_aggregate_still_splats() {
-    for src in [
-        "a = elementof(reals)\nb = elementof(reals)\nr = gt(record(a = a, b = b))\n",
-        "v1 = elementof(cartpow(reals, [3]))\nv2 = elementof(cartpow(reals, [3]))\nr = gt(table(a = v1, b = v2))\n",
-    ] {
-        assert!(
-            errors(src).is_empty(),
-            "a sole positional aggregate splats, and this refusal must not intercept it: {src}"
-        );
-    }
+    let src = "a = elementof(reals)\nb = elementof(reals)\nr = gt(record(a = a, b = b))\n";
+    assert!(errors(src).is_empty());
+    assert!(!errors("r = gt(table(a=[1.0],b=[2.0]))").is_empty());
 }

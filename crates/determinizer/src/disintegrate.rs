@@ -1,17 +1,10 @@
 //! Structural disintegration split for the explicit-DAG case (spec §06
 //! "Structural disintegration").
 //!
-//! `disintegrate(selector, lawof(record(field…)))` returns `(kernel,
-//! marginal)`, the structural inverse of `jointchain(marginal, kernel) ≡
-//! joint`. The SELECTED fields (named by the selector) become the kernel's
-//! output law, conditioned on the NON-selected fields, which are the kernel's
-//! `%specinputs` boundary; the NON-selected fields also form the marginal law.
-//!
-//! Only the explicit `lawof(record(…))` DAG case is handled here — every other
-//! shape (a non-`lawof(record)` measure, a selector that is not a clean
-//! field-name partition of the record, an empty selected or non-selected set)
-//! yields `None`, and the caller refuses (§06 permits refusing intractable /
-//! non-explicit disintegrations; refuse-don't-mislower).
+//! A literal record split exposes its complement fields as keyword-only inputs.
+//! A literal vector split exposes one ordered input, `complement`, containing the
+//! non-selected values in source order. Both preserve the selected value DAG and
+//! refuse empty or causally reversed partitions, and repeated vector selectors.
 
 use crate::density::{expect_builtin_call, resolve_ref_one};
 use flatppl_core::{
@@ -24,7 +17,7 @@ use std::collections::HashSet;
 /// disintegration").
 ///
 /// - `kernel` = `kernelof(record(<selected %fields, verbatim value nodes>),
-///   %specinputs([(non_sel_name, non_sel_value_ref), …]))` — the conditional of
+///   <keyword-only non-selected fields>)` — the conditional of
 ///   the SELECTED fields, with the NON-selected fields as boundary inputs (so
 ///   `likelihoodof(kernel, data)` scores the selected fields given the rest).
 /// - `marginal` = `lawof(record(<non-selected %fields, verbatim value nodes>))`
@@ -54,8 +47,25 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
 
     // 2. Parse the selector into the SELECTED field-name set, then run the shared
     //    structural split on `M`.
-    let selected_names = selector_names(m, selector)?;
-    split_law_record(m, &selected_names, measure)
+    if let Some(selected_names) = selector_names(m, selector) {
+        let (kernel, marginal) = split_law_record(m, &selected_names, measure)?;
+        if matches!(m.node(selector), Node::Lit(Scalar::Str(_))) {
+            let Node::Call(mut call) = m.node(kernel).clone() else {
+                return None;
+            };
+            let selected = expect_builtin_call(m, call.args[0], "record")?
+                .named
+                .first()?
+                .value;
+            call.args = Box::new([selected]);
+            let scalar = m.alloc(Node::Call(call));
+            m.set_auto_inputs(scalar, m.auto_inputs_of(kernel)?.to_vec().into());
+            return Some((scalar, marginal));
+        }
+        Some((kernel, marginal))
+    } else {
+        split_law_vector(m, selector, measure)
+    }
 }
 
 /// The core structural split (spec §06 "Structural disintegration"), factored out
@@ -205,8 +215,9 @@ fn split_law_record(
         head: CallHead::Builtin(kernelof_sym),
         args: vec![kernel_body].into(),
         named: Vec::<NamedArg>::new().into(),
-        inputs: Some(Inputs::Spec(spec_inputs.into())),
+        inputs: Some(Inputs::Auto),
     }));
+    m.set_auto_inputs(kernel, spec_inputs.into());
 
     // Build the marginal: `lawof(record(<non-selected fields>))`.
     let marginal_body = m.alloc(Node::Call(Call {
@@ -231,6 +242,90 @@ fn split_law_record(
         inputs: None,
     }));
 
+    Some((kernel, marginal))
+}
+
+/// Indexed explicit DAGs retain their vector complement as one ordered input.
+fn split_law_vector(m: &mut Module, selector: NodeId, measure: NodeId) -> Option<(NodeId, NodeId)> {
+    let measure = crate::density::resolve_ref_chain(m, measure).0;
+    let law = expect_builtin_call(m, measure, "lawof")?;
+    let vector = crate::density::resolve_ref_chain(m, *law.args.first()?).0;
+    let values = expect_builtin_call(m, vector, "vector")?.args.to_vec();
+    let (indices, scalar) = match m.node(selector) {
+        Node::Lit(Scalar::Int(index)) => (vec![*index], true),
+        Node::Call(call) if matches!(call.head, CallHead::Builtin(op) if m.resolve(op) == "vector") => {
+            (
+                call.args
+                    .iter()
+                    .map(|id| match m.node(*id) {
+                        Node::Lit(Scalar::Int(index)) => Some(*index),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                false,
+            )
+        }
+        _ => return None,
+    };
+    if indices.is_empty()
+        || indices.iter().any(|i| *i < 1 || *i as usize > values.len())
+        || indices.iter().collect::<HashSet<_>>().len() != indices.len()
+    {
+        return None;
+    }
+    let fields: Vec<_> = values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| (m.intern(&format!("component_{}", i + 1)), *value))
+        .collect();
+    let selected: Vec<Box<str>> = indices
+        .iter()
+        .map(|i| format!("component_{i}").into())
+        .collect();
+    let record = crate::density::build_record(m, &fields);
+    let record_law = crate::density::build_call(m, "lawof", &[record]);
+    let (named_kernel, _) = split_law_record(m, &selected, record_law)?;
+    let boundary = m.auto_inputs_of(named_kernel)?.to_vec();
+    let selected_values: Vec<_> = indices.iter().map(|i| values[*i as usize - 1]).collect();
+    let body = if scalar {
+        selected_values[0]
+    } else {
+        crate::density::build_call(m, "vector", &selected_values)
+    };
+    let complement: Vec<_> = values
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !indices.contains(&(*i as i64 + 1)))
+        .map(|(_, value)| *value)
+        .collect();
+    let marginal_body = crate::density::build_call(m, "vector", &complement);
+    let marginal = crate::density::build_call(m, "lawof", &[marginal_body]);
+    let label = m.intern("complement");
+    let reference = Ref {
+        ns: RefNs::Local,
+        name: m.intern(&format!("_complement_{}_", m.node_count())),
+    };
+    let point = m.alloc(Node::Ref(reference));
+    let bound: Vec<_> = boundary
+        .iter()
+        .enumerate()
+        .map(|(i, (_, target))| {
+            let index = m.alloc(Node::Lit(Scalar::Int(i as i64 + 1)));
+            (
+                *target,
+                crate::density::build_call(m, "get", &[point, index]),
+            )
+        })
+        .collect();
+    let body =
+        crate::kernel::substitute_admitted(m, body, &bound, crate::kernel::Substitute::All, true);
+    let kernelof = m.intern("kernelof");
+    let kernel = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(kernelof),
+        args: Box::new([body]),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(Box::new([(label, reference)]))),
+    }));
     Some((kernel, marginal))
 }
 
@@ -601,9 +696,8 @@ forward_kernel, prior = disintegrate([\"obs\"], joint_model)";
             "kernel body `obs` field must carry the verbatim `(%ref self obs)`"
         );
         // Boundary inputs are exactly the NON-selected fields, as `(name, ref)`.
-        let Some(Inputs::Spec(entries)) = &k.inputs else {
-            panic!("kernel must carry %specinputs");
-        };
+        assert!(matches!(k.inputs, Some(Inputs::Auto)));
+        let entries = m.auto_inputs_of(kernel).expect("keyword-only boundary");
         let got: Vec<(String, RefNs, String)> = entries
             .iter()
             .map(|(nm, r)| {
@@ -736,9 +830,8 @@ fk, pr = disintegrate([\"data\"], joint_model)";
             "obs",
             "the selected field `data` must carry the verbatim `(%ref self obs)`"
         );
-        let Some(Inputs::Spec(entries)) = &k.inputs else {
-            panic!("kernel must carry %specinputs");
-        };
+        assert!(matches!(k.inputs, Some(Inputs::Auto)));
+        let entries = m.auto_inputs_of(kernel).expect("keyword-only boundary");
         let got: Vec<(String, String)> = entries
             .iter()
             .map(|(nm, r)| (m.resolve(*nm).to_string(), m.resolve(r.name).to_string()))
