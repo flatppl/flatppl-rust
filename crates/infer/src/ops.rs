@@ -3686,310 +3686,10 @@ fn kernel_joint_type(
             _ => return Type::Deferred,
         }
     }
-    if let Some(failed) = diagnose_shared_node_input_names(inf, id, &components) {
-        return failed;
-    }
     Type::Kernel {
         inputs: inputs.into(),
         mass: joint_mass(inf, args, named),
     }
-}
-
-/// What a `joint` component binds as boundary inputs, for the ancestry clause.
-enum Binds {
-    /// A LOCAL reification whose boundary this pass read, as `(input name, target
-    /// name)` pairs.
-    Declared(Vec<(Symbol, Symbol)>),
-    /// Proven to bind nothing. §06 "Uniform kernel extension" identifies a measure
-    /// with a nullary kernel, so a `Type::Measure` component declares no boundary
-    /// input at all — the case `kernel-joint-w1-maths.md` calls out by name ("in
-    /// particular a measure component, which binds nothing").
-    ///
-    /// A `Type::Kernel` component whose boundary this pass cannot read is NOT this:
-    /// it is unknown, and it stays excluded from the check entirely.
-    Nothing,
-}
-
-/// The Q1/W1 ancestry clause (§06 `joint` entry, flatppl-design#85):
-/// "Components that share a stochastic node must agree on that node's ancestry:
-/// every ancestor of the shared node that any component binds as a boundary input
-/// must be bound by every sharing component, under the same input name. A `joint`
-/// in which a sharing component binds such an ancestor under a different name, or
-/// does not bind it at all — in particular a measure component, which binds
-/// nothing — is a static error."
-///
-/// Why it is an error rather than a convention: under union-by-name the retained
-/// node has one parent value. Two components substituting its boundary ancestor
-/// with DIFFERENT inputs leave that parent undefined at any application where the
-/// two inputs differ (`kernel-joint-q4-maths.md` §4), and a component that binds
-/// the ancestor under NO name reads the ambient module parameter instead, so the
-/// same single node would need two laws at once (`kernel-joint-w1-maths.md` §3).
-/// Both halves are one incoherence in one proof shape, which is why they are one
-/// clause and not two rules. The all-or-none boundary rule (§04 "Specifying
-/// reification boundaries") already excludes the half-substituted and
-/// same-name-different-node variants, so these are the only conflict shapes.
-///
-/// **Detection is SOUND, not complete**, and each narrowing costs only
-/// diagnostics, never a wrong type:
-///
-/// - Sharing is decided by NODE IDENTITY of `draw` nodes reached through the
-///   binding DAG ([`component_draw_nodes`]) — the intersection the maths doc §10
-///   prescribes. Two components reaching the same `draw` node genuinely share it;
-///   a component whose trace this walk cannot follow (a cross-module ref, a
-///   lambda kernel, a depth-capped path) contributes no draws and so triggers
-///   nothing.
-/// - A component's own boundary SEVERS the walk ([`component_draw_nodes`]'s
-///   `boundary` argument): §04 substitutes a boundary node with a fresh input in the
-///   reified graph, so a draw at or beyond the boundary is not in that component's
-///   trace and cannot be shared through it. Without the cut, `K2 = kernelof(a2, u =
-///   u)` would look like a sharing non-binder of `u`'s own ancestor and be rejected,
-///   though it shares nothing (`kernel-joint-w1-maths.md` §5, third bullet).
-/// - Only a `Type::Measure` component counts as a proven non-binder ([`Binds`]). A
-///   kernel component whose boundary this pass cannot read is unknown, not a
-///   non-binder, so it is skipped rather than rejected.
-/// - The conflict is reported only for a boundary target the shared node's own
-///   subtree actually reaches ([`subtree_reaches_name`]) — "every ancestor of the
-///   shared node that any component binds", not "any boundary the two components
-///   happen to share". A boundary that is NOT an ancestor of the shared node is
-///   legal (the retained node's parent is still single-valued), so widening the test
-///   would reject a well-formed program.
-///
-/// The two directions are checked symmetrically, because "any component binds" makes
-/// the obligation mutual: the binder may be either side, and only one of them
-/// declares the ancestor in the W1 shape.
-///
-/// This is not the cross-component ancestry oracle `product_mass` deliberately
-/// avoids: it only ever ADDS a diagnostic on a proven identity, and never
-/// strengthens a mass class or a type on an unproven one.
-fn diagnose_shared_node_input_names(
-    inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
-    components: &[(NodeId, &Type)],
-) -> Option<Type> {
-    /// One inspectable component: the `draw` nodes its trace reaches, and what it
-    /// binds as boundary inputs.
-    struct Traced {
-        draws: Vec<NodeId>,
-        binds: Binds,
-    }
-    let mut traced: Vec<Traced> = Vec::new();
-    for (node, t) in components {
-        let binds = match t {
-            Type::Measure { .. } => Binds::Nothing,
-            Type::Kernel { .. } => {
-                let Some((reif, _)) = local_reification(inf, *node) else {
-                    continue;
-                };
-                let Some(entries) = input_entries(inf, reif) else {
-                    continue;
-                };
-                Binds::Declared(entries.iter().map(|(name, r)| (*name, r.name)).collect())
-            }
-            _ => continue,
-        };
-        let boundary: Vec<Symbol> = match &binds {
-            Binds::Declared(entries) => entries.iter().map(|(_, target)| *target).collect(),
-            Binds::Nothing => Vec::new(),
-        };
-        traced.push(Traced {
-            draws: component_draw_nodes(inf, *node, &boundary),
-            binds,
-        });
-    }
-    for i in 0..traced.len() {
-        for j in (i + 1)..traced.len() {
-            for shared in traced[i]
-                .draws
-                .iter()
-                .filter(|d| traced[j].draws.contains(d))
-            {
-                for (binder, other) in [(&traced[i], &traced[j]), (&traced[j], &traced[i])] {
-                    let Binds::Declared(entries) = &binder.binds else {
-                        continue;
-                    };
-                    for (input, target) in entries {
-                        if !subtree_reaches_name(inf, *shared, *target) {
-                            continue;
-                        }
-                        let counterpart = match &other.binds {
-                            Binds::Declared(theirs) => {
-                                theirs.iter().find(|(_, t)| t == target).map(|(n, _)| *n)
-                            }
-                            Binds::Nothing => None,
-                        };
-                        if counterpart == Some(*input) {
-                            continue;
-                        }
-                        let target = inf.module.resolve(*target).to_string();
-                        let mine = inf.module.resolve(*input).to_string();
-                        let (message, summary) = match counterpart {
-                            Some(theirs) => {
-                                let theirs = inf.module.resolve(theirs).to_string();
-                                (
-                                    format!(
-                                        "`joint` components share a stochastic node whose \
-                                         boundary ancestor `{target}` is bound under different \
-                                         input names (`{mine}` and `{theirs}`): the shared \
-                                         node's parent has no well-defined value where the two \
-                                         inputs differ, so every sharing component must bind it \
-                                         under the same name (spec §06 `joint`)"
-                                    ),
-                                    "joint kernel components disagree on a shared node's input \
-                                     name",
-                                )
-                            }
-                            // The non-binder's KIND is read off `other.binds`, not assumed:
-                            // a measure component binds nothing by being nullary, while a
-                            // kernel component that simply omits the ancestor from its own
-                            // boundary is the same clause and a different mistake. Naming
-                            // the wrong one sends the reader looking for a measure component
-                            // that is not there.
-                            None => {
-                                // The non-binder's KIND names the component, and the reason
-                                // follows the verb rather than interrupting it — reading
-                                // "while a measure component, which binds nothing, binds it
-                                // under no name" doubles the verb and reads as a typo.
-                                let (who, why) = match &other.binds {
-                                    Binds::Nothing => (
-                                        "a measure component",
-                                        "measure components are nullary and declare no boundary \
-                                         inputs",
-                                    ),
-                                    Binds::Declared(_) => (
-                                        "another kernel component",
-                                        "its own boundary omits that ancestor",
-                                    ),
-                                };
-                                (
-                                    format!(
-                                        "`joint` components share a stochastic node whose \
-                                         boundary ancestor `{target}` one component binds as \
-                                         `{mine}` while {who} binds it under no name ({why}): \
-                                         the shared node would carry the applied input's law \
-                                         and the ambient `{target}`'s law at once, so every \
-                                         sharing component must bind that ancestor under the \
-                                         same name (spec §06 `joint`)"
-                                    ),
-                                    "joint components disagree on a shared node's ancestry: one \
-                                     binds it under no name",
-                                )
-                            }
-                        };
-                        inf.diags.push(crate::Diagnostic::error_at(id, message));
-                        return Some(Type::Failed(summary.into()));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The `draw` nodes a `joint` component's subtree reaches, by NODE IDENTITY,
-/// following self-module refs the way [`joint_component_is_trace_clean`] does and
-/// under the same `depth` cap. A stochastic node enters a `joint`'s composed trace
-/// only through a reified component or a stochastic constructor parameter (§04
-/// "Trace of the reified law", §06 `joint` entry), and both channels are subtrees
-/// of the component, so both are covered by one walk.
-///
-/// Node identity is what makes the answer meaningful: `u ~ Normal(…)` has ONE
-/// `draw` node in the binding DAG, so two components that both reach it through
-/// `(%ref self u)` reach the same `NodeId`, while two independent draws never do.
-/// The result is deliberately a proof of sharing only — a path this walk cannot
-/// follow yields fewer draws, never a spurious one.
-///
-/// `boundary` names the component's OWN boundary targets, and the walk stops at each
-/// of them without recording anything beyond. §04 "Specifying reification
-/// boundaries" is why: "A specified boundary node `a` can be thought of as being
-/// substituted with a new node, generated via `elementof(valueset(a))`, in the
-/// reified graph", so a draw at or past the boundary is not in this component's trace
-/// and cannot be shared through it.
-fn component_draw_nodes(
-    inf: &Inferencer<'_, '_>,
-    node: NodeId,
-    boundary: &[Symbol],
-) -> Vec<NodeId> {
-    fn walk(
-        inf: &Inferencer<'_, '_>,
-        node: NodeId,
-        boundary: &[Symbol],
-        depth: u32,
-        seen: &mut std::collections::HashSet<NodeId>,
-        out: &mut Vec<NodeId>,
-    ) {
-        if depth > 64 || !seen.insert(node) {
-            return;
-        }
-        if let Node::Ref(r) = inf.module.node(node) {
-            if r.ns == RefNs::SelfMod
-                && !boundary.contains(&r.name)
-                && let Some(b) = inf.module.binding_by_name(r.name)
-            {
-                let rhs = inf.module.binding(b).rhs;
-                walk(inf, rhs, boundary, depth + 1, seen, out);
-            }
-            return;
-        }
-        if let Node::Call(c) = inf.module.node(node)
-            && let CallHead::Builtin(op) = c.head
-            && inf.module.resolve(op) == "draw"
-        {
-            out.push(node);
-        }
-        let mut children = Vec::new();
-        inf.module
-            .for_each_child(node, |child| children.push(child));
-        for child in children {
-            walk(inf, child, boundary, depth + 1, seen, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(
-        inf,
-        node,
-        boundary,
-        0,
-        &mut std::collections::HashSet::new(),
-        &mut out,
-    );
-    out
-}
-
-/// Does the subtree at `root` reach `(%ref self name)`, following self-module refs
-/// under the same `depth` cap as [`component_draw_nodes`]? Used to restrict the Q1
-/// conflict to a boundary target that is genuinely an ANCESTOR of the shared node.
-fn subtree_reaches_name(inf: &Inferencer<'_, '_>, root: NodeId, name: Symbol) -> bool {
-    fn walk(
-        inf: &Inferencer<'_, '_>,
-        node: NodeId,
-        name: Symbol,
-        depth: u32,
-        seen: &mut std::collections::HashSet<NodeId>,
-    ) -> bool {
-        if depth > 64 || !seen.insert(node) {
-            return false;
-        }
-        if let Node::Ref(r) = inf.module.node(node) {
-            if r.ns != RefNs::SelfMod {
-                return false;
-            }
-            if r.name == name {
-                return true;
-            }
-            let Some(b) = inf.module.binding_by_name(r.name) else {
-                return false;
-            };
-            let rhs = inf.module.binding(b).rhs;
-            return walk(inf, rhs, name, depth + 1, seen);
-        }
-        let mut children = Vec::new();
-        inf.module
-            .for_each_child(node, |child| children.push(child));
-        children
-            .into_iter()
-            .any(|child| walk(inf, child, name, depth + 1, seen))
-    }
-    walk(inf, root, name, 0, &mut std::collections::HashSet::new())
 }
 
 /// The output measure of an APPLIED kernel `joint` — `joint(K1, K2, …)(a)`.
@@ -9563,42 +9263,19 @@ pub(crate) fn fill_mass(
     Type::Measure { domain, mass }
 }
 
-/// The total-mass class of a `joint`, measure or kernel: [`product_mass`] over
-/// the components, qualified by per-component trace cleanliness.
-///
-/// One fold for both, because §06 gives the kernel case no rule of its own — at
-/// each input the fan-out kernel's output IS a measure-`joint`, and §11 makes a
-/// kernel's `%mass` "the total-mass class of the output measure, uniform over all
-/// inputs" (`kernel-joint-q4-maths.md` §7, Q5). A kernel component is read for its
-/// own class the same way [`fill_mass`]'s `arg_mass` and `jointchain`'s arm read
-/// one: a `%normalized` kernel is a Markov kernel, so a fan-out of Markov kernels
-/// is a Markov kernel.
-///
-/// Keyword and positional `joint` are mutually exclusive forms ([`joint_type`]):
-/// the split is mirrored here so both spellings of the same joint fold
-/// identically.
+/// The mass of an independent product, pointwise for kernel components.
 fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Mass {
-    let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
+    let masses: Vec<Mass> = if !named.is_empty() {
         named
             .iter()
-            .map(|(_, node, t, _)| {
-                (
-                    component_mass(inf, *node, t),
-                    !joint_component_is_trace_clean(inf, *node, 0),
-                )
-            })
-            .unzip()
+            .map(|(_, node, ty, _)| component_mass(inf, *node, ty))
+            .collect()
     } else {
         args.iter()
-            .map(|(node, t, _)| {
-                (
-                    component_mass(inf, *node, t),
-                    !joint_component_is_trace_clean(inf, *node, 0),
-                )
-            })
-            .unzip()
+            .map(|(node, ty, _)| component_mass(inf, *node, ty))
+            .collect()
     };
-    product_mass(&masses, &not_clean)
+    product_mass(&masses)
 }
 
 /// The mass class [`joint_mass`] folds for one component.
@@ -9671,40 +9348,9 @@ fn kernel_mass_is_own_rules(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
     }
 }
 
-/// The mass of a `joint`'s components (spec §06 `joint` entry: "a stochastic
-/// node shared between component traces … remains a single node of the
-/// composed trace. Components that share no stochastic node are independent,
-/// and their `joint` is the product measure"). For trace-disjoint components
-/// the product-of-classes rule below is exact. For components sharing a
-/// stochastic ancestor it is exact only up to one non-normalized member:
-/// `%finite`x`%finite` composed through a shared ancestor can be infinite
-/// (Student-t/`y^2` counterexample, kernel-joint-q4-maths.md §7), so once two
-/// or more components that MAY share an ancestor are non-normalized, no class
-/// stronger than `%unknown` is statically justified.
-///
-/// `not_clean[i]` says component `i` is not PROVABLY free of any stochastic
-/// trace node (see [`joint_component_is_trace_clean`]) — i.e. it may
-/// participate in sharing. A component that IS provably clean cannot share
-/// with anything (spec §04 "Identity law": `joint(m, m)` over a bare
-/// constructor `m` is the product of two independent draws, never the
-/// diagonal) and so is exempt from the degrade below regardless of its own
-/// mass class — only the "may share" components are counted toward the
-/// two-or-more threshold.
-///
-/// An EMPTY component list (`joint()`) is `%deferred`, not `%normalized`:
-/// `joint_type`'s domain arm already leaves a zero-component `joint`'s domain
-/// `%deferred` (nothing resolves the variate shape), so the mass side
-/// matching that honestly, rather than vacuously satisfying `all()` and
-/// claiming a definite class the domain itself does not support, keeps the
-/// two slots consistent. `joint()`'s legality is a separate, unaddressed
-/// question (spec §06 spells the construct `joint(M1, M2, ...)`).
-fn product_mass(masses: &[Mass], not_clean: &[bool]) -> Mass {
+/// Total-mass class of an independent product.
+fn product_mass(masses: &[Mass]) -> Mass {
     use Mass::*;
-    // `zip` below truncates silently on a length mismatch, which would
-    // under-count the degrade and hand back a class stronger than justified.
-    // The single call site builds both slices from one `unzip`, so they
-    // always agree; this documents the invariant for the next caller.
-    debug_assert_eq!(masses.len(), not_clean.len());
     if masses.is_empty() {
         return Deferred;
     }
@@ -9713,14 +9359,6 @@ fn product_mass(masses: &[Mass], not_clean: &[bool]) -> Mass {
     }
     if masses.iter().all(|m| *m == Normalized) {
         return Normalized;
-    }
-    let ambiguous_nonnormalized = masses
-        .iter()
-        .zip(not_clean)
-        .filter(|(m, dirty)| !matches!(m, Normalized | Deferred) && **dirty)
-        .count();
-    if ambiguous_nonnormalized >= 2 {
-        return Unknown;
     }
     if masses.iter().all(|m| matches!(m, Normalized | Finite)) {
         return Finite;
@@ -9732,103 +9370,6 @@ fn product_mass(masses: &[Mass], not_clean: &[bool]) -> Mass {
         return LocallyFinite;
     }
     Unknown
-}
-
-/// Whether a `joint` COMPONENT provably carries no stochastic trace node,
-/// following self-module refs the way [`law_phase`] does (bounded by the same
-/// `depth` cap). Spec §04 "Trace of the reified law": a stochastic node
-/// enters a `joint`'s composed trace only through a REIFIED component
-/// (`lawof`/`kernelof`) or, per §06's `joint` entry, "a stochastic
-/// constructor parameter". A subtree containing neither channel cannot carry
-/// or close over a stochastic node, so it cannot share one with any sibling
-/// component (§04 "Identity law": `joint(m, m)` over a bare constructor `m`
-/// is the product of two independent draws, never the diagonal).
-///
-/// The disqualifier list is `draw`/`rand` (§04 "Phases": "`draw` nodes are
-/// stochastic" — the only source of a stochastic node at all) plus the three
-/// ways a value can carry or close over a REIFIED trace — `lawof`,
-/// `kernelof`, `functionof` — plus `rnginit`/`rngstate` (an RNG state is not
-/// itself a stochastic node, but `rand` consuming a shared state is close
-/// enough to correlation that refusing to call it clean costs nothing).
-/// Deliberately NOT [`is_opaque_value_source`]'s whole catalogue: that
-/// predicate answers a different question (value identity), and its
-/// `elementof`/`external`/`load_data` members are §04-classified
-/// *parameterized* or *fixed*, never stochastic — kernel-joint-q4-maths.md §8
-/// is explicit that "a shared input name is a shared value, not a shared
-/// stochastic node". Any of the disqualifiers ANYWHERE in the subtree answers
-/// `false` ("not provably clean"), never "definitely shares" — this only ever
-/// RULES OUT sharing, never proves it, so it is not the ancestry oracle the
-/// wave brief forbids inventing: it never compares two components against
-/// each other, only asks a local question of one.
-///
-/// Memoized (`memo`) because the walk follows refs through the binding DAG,
-/// which is a DAG and not a tree: an unmemoized walk revisits a
-/// diamond-shared binding once per PATH to it, which is exponential in depth
-/// on a chain of repeated sub-expressions. Caching each node's answer makes
-/// the walk linear in the number of distinct nodes visited. The `depth > 64`
-/// bailout is intentionally NOT cached — it is a conservative fallback for a
-/// pathologically deep single path, not that node's true answer, and caching
-/// it could make a later, shorter path to the same node see a stale `false`.
-fn joint_component_is_trace_clean(inf: &Inferencer<'_, '_>, node: NodeId, depth: u32) -> bool {
-    fn walk(
-        inf: &Inferencer<'_, '_>,
-        node: NodeId,
-        depth: u32,
-        memo: &mut std::collections::HashMap<NodeId, bool>,
-    ) -> bool {
-        if let Some(&clean) = memo.get(&node) {
-            return clean;
-        }
-        if depth > 64 {
-            return false; // safe: "not provably clean" on a cycle/depth cap
-        }
-        if let Node::Ref(r) = inf.module.node(node) {
-            let clean = if r.ns != flatppl_core::RefNs::SelfMod {
-                false // cross-module: conservatively not provably clean
-            } else {
-                match inf.module.binding_by_name(r.name) {
-                    Some(b) => {
-                        let rhs = inf.module.binding(b).rhs;
-                        walk(inf, rhs, depth + 1, memo)
-                    }
-                    None => false,
-                }
-            };
-            memo.insert(node, clean);
-            return clean;
-        }
-        if let Node::Call(c) = inf.module.node(node) {
-            match c.head {
-                CallHead::Builtin(op) => {
-                    let name = inf.module.resolve(op);
-                    if matches!(
-                        name,
-                        "draw"
-                            | "rand"
-                            | "rnginit"
-                            | "rngstate"
-                            | "lawof"
-                            | "kernelof"
-                            | "functionof"
-                    ) {
-                        memo.insert(node, false);
-                        return false;
-                    }
-                }
-                CallHead::User(_) => {
-                    memo.insert(node, false); // user-callable application: conservative
-                    return false;
-                }
-            }
-        }
-        let mut clean = true;
-        inf.module.for_each_child(node, |child| {
-            clean = clean && walk(inf, child, depth + 1, memo);
-        });
-        memo.insert(node, clean);
-        clean
-    }
-    walk(inf, node, depth, &mut std::collections::HashMap::new())
 }
 
 /// Broadcasting a kernel over data cells: an independent product per cell.
@@ -10089,7 +9630,7 @@ mod no_laundering_tests {
     /// one. `%deferred` is §11's "not yet inferred", which is the honest answer.
     #[test]
     fn an_empty_product_is_deferred_not_normalized() {
-        assert_eq!(product_mass(&[], &[]), Mass::Deferred);
+        assert_eq!(product_mass(&[]), Mass::Deferred);
     }
 
     /// A non-empty all-normalized product still answers `Normalized`, so the arm
@@ -10097,7 +9638,7 @@ mod no_laundering_tests {
     #[test]
     fn a_normalized_product_is_still_normalized() {
         assert_eq!(
-            product_mass(&[Mass::Normalized, Mass::Normalized], &[false, false]),
+            product_mass(&[Mass::Normalized, Mass::Normalized]),
             Mass::Normalized
         );
     }

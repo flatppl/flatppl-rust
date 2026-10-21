@@ -1243,43 +1243,7 @@ fn substitute_applied_boundary(
 /// `joint(K1, K2, …)(a)` — the APPLIED fan-out kernel. `None` when `node` is not an
 /// application of a `joint`.
 ///
-/// §06 *Uniform kernel extension* defines the construct pointwise ("On a kernel, the
-/// operation applies to the output measure at each input point"), and the `joint` entry
-/// fans the input out, so `joint(K1, K2)(a) = joint(K1(a), K2(a))`. That is exactly the
-/// rewrite performed here: each kernel component is replaced by the measure it denotes
-/// at the fed input, and the rewritten `joint` goes through [`lower_joint`] — the same
-/// machinery a written measure `joint` reaches. Nothing about ancestry, the record law,
-/// the singular refusal, or the trace-disjoint product is re-derived.
-///
-/// A kernel component becomes `lawof(<its reified body>)`, which is §04 *Kernels and
-/// `kernelof`* read literally: "`kernelof(x, kwargs...)` is equivalent to
-/// `functionof(lawof(x), kwargs...)`". Handing `lawof(x)` rather than `x`'s LAW is what
-/// keeps §06 RETAIN and the singular refusal both working, because
-/// [`joint_component_coordinate`] maps `lawof(x)` to the reified value `x` itself and
-/// node identity survives: two components off distinct draws over a shared latent give
-/// the correlated record law (`kernel-joint-q4-maths.md` §3.1's commuting identity),
-/// while `joint(K, K)` gives one draw referenced twice, which
-/// `match_independent_record`'s rank check refuses as §06's singular joint. Reducing to
-/// the law instead would synthesize a FRESH draw per component and score `joint(K, K)`
-/// as a product — a density for a shape §06 says has none.
-///
-/// **Only two component shapes are lowered**, and the restriction is the W1 clause's
-/// conservative side:
-///
-/// - a reification whose boundary this pass binds, and
-/// - a measure reaching no `draw` at all — Q3's nullary case ("Measure components are
-///   permitted and are the nullary case: they ignore the input").
-///
-/// Any other component refuses. The shape this protects against is
-/// `kernel-joint-w1-maths.md`'s: a measure component sharing a stochastic node whose
-/// ancestor a kernel component binds has NO law (§3 — the single shared node would carry
-/// two laws at once), yet the record path would happily score it as the chain-rule joint,
-/// which is reading A's number for a question the source text does not ask. Inference
-/// rejects that shape first, so this is the backstop for a caller that ignores
-/// diagnostics — and a backstop must not need the ancestry oracle to be safe. The cost is
-/// disclosed: the two LEGAL shapes with a draw-reaching measure component
-/// (`kernel-joint-w1-maths.md` §5's closed shared node and its no-shared-node case)
-/// refuse here rather than lower.
+/// Apply each kernel in its own scope, then form the independent product.
 fn lower_applied_kernel_joint(
     m: &mut Module,
     node: NodeId,
@@ -1741,171 +1705,53 @@ fn lower_applied_kernel_joint_inner(
         resolved.push(k);
     }
     let supplied = bind_fan_out_inputs(m, node, &union, supplied_args, supplied_kwargs)?;
-    // The same guard the reification path gets, and for the same reason: the finish
-    // below rewrites the whole emitted density, and §04 scopes the substitution to the
-    // REIFIED graph, which the query point is not in. Without it a point written as the
-    // ambient `z` is scored at the applied value.
-    let bound_targets: Vec<(Ref, NodeId)> = supplied
-        .iter()
-        .flat_map(|(name, value)| {
-            resolved.iter().flatten().flat_map(move |k| {
-                k.inputs
+    let mut rewritten = Vec::with_capacity(components.len());
+    for (&component, kernel) in components.iter().zip(&resolved) {
+        let Some(kernel) = kernel else {
+            rewritten.push(component);
+            continue;
+        };
+        if kernel.inputs.is_empty() {
+            rewritten.push(component);
+            continue;
+        }
+        let named = kernel
+            .inputs
+            .iter()
+            .map(|(name, _)| NamedArg {
+                kind: NamedKind::Kwarg,
+                name: *name,
+                value: supplied
                     .iter()
-                    .filter(move |(n, _)| n == name)
-                    .map(move |(_, target)| (*target, *value))
+                    .find(|(n, _)| n == name)
+                    .expect("union input")
+                    .1,
             })
-        })
-        .collect();
-    refuse_boundary_named_query_point(m, v, &bound_targets)?;
-
-    let mut bound: Vec<(Ref, NodeId)> = Vec::new();
-    let mut rewritten: Vec<NodeId> = Vec::with_capacity(components.len());
-    for (&component, kernel) in components.iter().zip(resolved.iter()) {
-        match kernel {
-            Some(k) => {
-                let mut component_bound: Vec<(Ref, NodeId)> = Vec::with_capacity(k.inputs.len());
-                for (name, target) in &k.inputs {
-                    let value = supplied
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, value)| *value)
-                        .ok_or_else(|| {
-                            let name = m.resolve(*name).to_string();
-                            refuse(
-                                node,
-                                m,
-                                &format!(
-                                    "the applied fan-out kernel binds no value to its input \
-                                     `{name}`"
-                                ),
-                            )
-                        })?;
-                    component_bound.push((*target, value));
-                }
-                // `LocalOnly`, exactly as the reification path: a same-module target is
-                // substituted ONCE, by the finish below. One SIMULTANEOUS pass over the
-                // component's whole binding, so a cross-named applied value is not
-                // captured by the sibling entry that named it.
-                let body = crate::kernel::substitute_admitted(
-                    m,
-                    k.body,
-                    &component_bound,
-                    crate::kernel::Substitute::LocalOnly,
-                    false,
-                );
-                bound.extend(component_bound);
-                let coordinate = build_call(m, "lawof", &[body]);
-                let mass = match m.type_of(component) {
-                    Some(Type::Kernel { mass, .. } | Type::Measure { mass, .. }) => *mass,
-                    _ => Mass::Unknown,
-                };
-                annotate_synthesized_lawof(m, coordinate, body, mass);
-                rewritten.push(coordinate);
-            }
-            None => {
-                if component_reaches_draw(m, component) {
-                    return Err(refuse(
-                        component,
-                        m,
-                        "a `joint` component of an applied fan-out that is not a reification \
-                         and yet reaches a stochastic node is not lowerable: if it shares that \
-                         node with a kernel component whose boundary binds one of the node's \
-                         ancestors, the shape has no law at all (§06 `joint`: a sharing \
-                         component that binds such an ancestor \"under no name\" is a static \
-                         error), and this pass does not carry the ancestry oracle that would \
-                         tell the legal case apart — refuse rather than score a rewritten \
-                         question",
-                    ));
-                }
-                rewritten.push(component);
-            }
-        }
-    }
-
-    let rebuilt = rebuild_joint(m, joint_node, named, &rewritten);
-    let density = lower_measure_density_at(m, rebuilt, v, origin)?;
-    substitute_applied_boundary(m, node, density, &bound)
-}
-
-/// Does this `joint` component's subtree reach a `draw` node, following same-module
-/// binding refs?
-///
-/// Deliberately NOT [`measure_reaches_draw`]: that one answers "is this measure
-/// expression parameterized by a latent", and it excludes the draw a `lawof` REIFIES,
-/// since that draw is the measure's own variate rather than an ancestor. Here the question
-/// is whether the component carries a stochastic node into the composed trace at all —
-/// §06's ancestry rule reads "a stochastic node shared between component traces (through a
-/// reified component — `lawof`, `kernelof` — or a stochastic constructor parameter)", so
-/// the reified draw counts and `lawof(u)` must answer yes. Reading it the other way is what
-/// let the W1 shape through the backstop.
-///
-/// The walk mirrors `infer`'s `component_draw_nodes`, including its depth cap: an
-/// unfollowable path yields fewer draws, so the answer is a proof of REACHING only. That
-/// direction is the safe one here, since reaching is what refuses.
-fn component_reaches_draw(m: &Module, component: NodeId) -> bool {
-    fn walk(
-        m: &Module,
-        id: NodeId,
-        depth: u32,
-        seen: &mut std::collections::HashSet<NodeId>,
-    ) -> bool {
-        // The shared limit, so this site cannot disagree with the readers
-        // about how deep is too deep; it was a local 64. This walk keeps a
-        // BOOL rather than the shared `TooDeep` refusal because it is a
-        // predicate whose conservative answer is "does not reach", and it
-        // keeps its own visited set, which is a separate mechanism from the
-        // depth budget (a re-walked DAG is a complexity problem, not a
-        // stack-safety one).
-        if depth as usize > flatppl_core::DEFAULT_MAX_DEPTH || !seen.insert(id) {
-            return false;
-        }
-        if let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) = m.node(id)
-        {
-            return match m.binding_by_name(*name) {
-                Some(bid) => walk(m, m.binding(bid).rhs, depth + 1, seen),
-                None => false,
+            .collect::<Vec<_>>();
+        let applied = m.alloc(Node::Call(Call {
+            head: CallHead::User(component),
+            args: Box::new([]),
+            named: named.into(),
+            inputs: None,
+        }));
+        // Preserve the variate type until inference sees the new call. The
+        // product lowering needs it to split a positional point correctly.
+        let (body, _) = resolve_ref_one(m, kernel.body);
+        if let Some(ty) = m.type_of(kernel.body).or_else(|| m.type_of(body)).cloned() {
+            let domain = match ty {
+                Type::Measure { domain, .. } => domain,
+                other => Box::new(other),
             };
+            let mass = match m.type_of(component) {
+                Some(Type::Kernel { mass, .. }) => *mass,
+                _ => Mass::Unknown,
+            };
+            m.set_type(applied, Type::Measure { domain, mass });
         }
-        if builtin_name(m, id) == Some("draw") {
-            return true;
-        }
-        let mut children = Vec::new();
-        m.for_each_child(id, |c| children.push(c));
-        children.into_iter().any(|c| walk(m, c, depth + 1, seen))
+        rewritten.push(applied);
     }
-    walk(m, component, 0, &mut std::collections::HashSet::new())
-}
-
-/// Give a `lawof(x)` node synthesized mid-pass the type `infer` would give it, so the
-/// guards downstream can read it.
-///
-/// [`lower_joint`]'s positional path fails CLOSED on a component whose measure domain is
-/// not known — it must, since `get0(v, i)` assigns each component one scalar `cat` slot
-/// and an unknown arity could silently drop slots. A node this pass allocates has no
-/// inferred type until the driver's next loop iteration, which is after the lowering, so
-/// without this the positional fan-out refuses on its own synthesized node rather than on
-/// anything about the model.
-///
-/// Preserve the source kernel's inferred mass. A reified improper law must not
-/// become normalized merely because its boundary has been supplied.
-fn annotate_synthesized_lawof(m: &mut Module, lawof_node: NodeId, body: NodeId, mass: Mass) {
-    let (resolved, _) = resolve_ref_one(m, body);
-    let Some(domain) = m.type_of(body).or_else(|| m.type_of(resolved)).cloned() else {
-        return;
-    };
-    if matches!(domain, Type::Deferred | Type::Any) {
-        return;
-    }
-    m.set_type(
-        lawof_node,
-        Type::Measure {
-            domain: Box::new(domain),
-            mass,
-        },
-    );
+    let rebuilt = rebuild_joint(m, joint_node, named, &rewritten);
+    lower_measure_density_at(m, rebuilt, v, origin)
 }
 
 /// Bind an applied fan-out's argument list to the union signature, by keyword, by §04
@@ -2622,14 +2468,8 @@ fn score_marginal_form(
 /// Any other shared-latent shape refuses (a scale latent, another family, two shared
 /// latents, a derived mean, a transformed field, a partly-shared record).
 ///
-/// `iid` over the same shape still emits the product — it redraws its reified sub-DAG
-/// afresh per copy, never sharing ancestors (§06 "iid" entry). `joint` reaches this same law
-/// through both routes §06 "Joint composition" names for a shared node: reified components
-/// (`joint(a = lawof(y1), b = lawof(y2))` is `lawof(record(a = y1, b = y2))` — §06
-/// "Equivalent record law") and constructor components carrying a stochastic parameter
-/// (`joint(a = Normal(mu = z, …), b = Normal(mu = z, …))`, whose coordinates are fresh
-/// draws). [`lower_keyword_joint`] builds the record and dispatches here rather than
-/// assuming independence; [`joint_component_coordinate`] decides which components join it.
+/// This dependence belongs to a single record law. `joint` and `iid` instead
+/// compose their measure values independently.
 ///
 /// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
 /// marginalized: its law is the pushforward of the marginal under that map, which the
@@ -7847,15 +7687,11 @@ fn emit_kernel_broadcast_per_cell(
 }
 
 /// `logdensityof(joint(M₁,…,Mₖ), v)` — the positional `cat` form of `joint`
-/// (§06 "Joint composition", §06 "Density of composed measures"). For components sharing
-/// no stochastic node this is `Σ logdensityof(Mᵢ, get0(v, i))`; for two or more components
-/// whose traces can reach one — a reified `lawof(x)`, or a constructor carrying a
-/// stochastic parameter — it is the cat-law counterpart of the keyword/record form. See the
-/// shared-trace group handling below and [`lower_keyword_joint`], which builds the same
-/// rewrite for the named spelling.
+/// (§06 "Joint composition", §06 "Density of composed measures"). This is
+/// `Σ logdensityof(Mᵢ, get0(v, i))`: each law is scored independently.
 ///
 /// **Scope:** scalar or record variates. Records route their fields through
-/// [`lower_keyword_joint`], retaining its shared-trace handling. For scalars,
+/// [`lower_keyword_joint`]. For scalars,
 /// `joint`'s variate is the positional `cat`
 /// of the component variates; for scalar-variate components the destructuring is
 /// `get0(v, i)`, one slot per component. Vector component variates need
@@ -7885,6 +7721,20 @@ fn lower_joint(
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
         (c.args.to_vec(), c.named.to_vec())
     };
+    for component in positional
+        .iter()
+        .copied()
+        .chain(named.iter().map(|n| n.value))
+    {
+        let (resolved, _) = resolve_ref_chain(m, component);
+        if matches!(m.type_of(resolved), Some(Type::Kernel { inputs, .. }) if !inputs.is_empty()) {
+            return Err(refuse(
+                node,
+                m,
+                "a joint of kernels must be applied before its density can be scored",
+            ));
+        }
+    }
 
     if !positional.is_empty() && !named.is_empty() {
         return Err(refuse(
@@ -7918,7 +7768,7 @@ fn lower_joint(
         .collect();
     if let Some(record_fields) = record_fields {
         // Positional records concatenate fields. Reassemble each component's
-        // subrecord, then reuse the named joint's dependence-aware scoring.
+        // subrecord, then reuse the named joint's independent scoring.
         let value = materialize_record_value(m, v);
         let value_fields = expect_builtin_call(m, value, "record")
             .filter(|call| call.args.is_empty())
@@ -7992,163 +7842,13 @@ fn lower_joint(
             ));
         }
     }
-    // §06 "Joint composition": EVERY component whose trace reaches a stochastic node goes
-    // through the record law that scores `lawof(record(...))` — build `record(_0 = x₀, …)`
-    // from their coordinates ([`joint_component_coordinate`]), keyed to a matching value
-    // record sliced from `v` by `get0`, and dispatch through the SAME machinery
-    // [`lower_keyword_joint`] uses (the shared-latent record law, its singular-joint
-    // refusal, and its independent-fields fallback), rather than re-deriving
-    // ancestry-sharing here. A component reaching no draw shares no node with any sibling
-    // and stays on the per-slot path below.
-    //
-    // **A component's own law does not depend on its siblings.** It is the TOTAL law of its
-    // coordinate (§04 "Reification to measures"), so a lone constructor-with-a-latent
-    // marginalizes exactly as it does beside a second one. Gating the rewrite on a count of
-    // two contributors made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower to
-    // the product of both marginals while the strictly easier `joint(a = Normal(mu = z1, …),
-    // b = Exponential(…))` refused. But the wrapper is not free for a SOLE reified
-    // contributor — it adds a nesting level that breaks the record-valued case — so
-    // [`needs_record_wrapper`], not the count and not "reaches a draw", decides.
-    let mut shared: Vec<(usize, Symbol, Coordinate)> = Vec::new();
-    for (i, &mi) in inner.iter().enumerate() {
-        if let Some(coord) = joint_component_coordinate(m, mi) {
-            let name = m.intern(&format!("_j{i}"));
-            shared.push((i, name, coord));
-        }
-    }
-    let coordinates: Vec<Coordinate> = shared.iter().map(|&(_, _, c)| c).collect();
-    if !needs_record_wrapper(&coordinates) {
-        shared.clear();
-    }
-
     let mut terms = Vec::with_capacity(inner.len());
-    if !shared.is_empty() {
-        let record_fields: Vec<(Symbol, NodeId)> = shared
-            .iter()
-            .map(|&(_, name, c)| (name, c.value()))
-            .collect();
-        let mut pinned_fields = Vec::with_capacity(shared.len());
-        for &(i, name, _) in &shared {
-            let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
-            let elem = build_call(m, "get0", &[v, idx]);
-            pinned_fields.push((name, elem));
-        }
-        terms.push(lower_shared_trace_joint_group(
-            m,
-            &record_fields,
-            &pinned_fields,
-            VariateOrigin::Other,
-        )?);
-    }
     for (i, &mi) in inner.iter().enumerate() {
-        if shared.iter().any(|&(ri, _, _)| ri == i) {
-            continue;
-        }
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let elem = build_call(m, "get0", &[v, idx]);
         terms.push(lower_measure_density(m, mi, elem)?);
     }
     Ok(fold_add(m, &terms))
-}
-
-/// The shared tail of the shared-trace rewrite both [`lower_joint`]'s positional path and
-/// [`lower_keyword_joint`] use (§06 "Joint composition"): build `record(name₁ = x₁, …)` from
-/// the components' coordinates, wrap it in `lawof`, and score it at the matching value record
-/// `record(name₁ = pinned₁, …)` — through `lower_measure_density_at`, the same dispatcher
-/// entry a written `lawof(record(...))` reaches. The two callers differ only in how each
-/// name's coordinate and pinned point are obtained (`get0(v, i)` slices for the positional
-/// `cat` form, record-field lookup for the keyword form), so only that gathering stays in
-/// each caller.
-fn lower_shared_trace_joint_group(
-    m: &mut Module,
-    coordinates: &[(Symbol, NodeId)],
-    pinned: &[(Symbol, NodeId)],
-    origin: VariateOrigin,
-) -> Result<NodeId, RefuseError> {
-    let record_node = build_record(m, coordinates);
-    let lawof_node = build_call(m, "lawof", &[record_node]);
-    let value_record = build_record(m, pinned);
-    lower_measure_density_at(m, lawof_node, value_record, origin)
-}
-
-/// Which of §06's two shared-node routes produced a component's coordinate. The value is the
-/// coordinate either way; the distinction decides whether a SOLE contributor needs the
-/// record wrapper at all (see [`lower_joint`]'s gate).
-#[derive(Clone, Copy)]
-enum Coordinate {
-    /// A reified `lawof(x)` component: the coordinate IS the reified value `x`, which the
-    /// per-component path can already score directly at any variate shape.
-    Reified(NodeId),
-    /// A constructor carrying a stochastic parameter: the coordinate is a draw synthesized
-    /// here, and only the record path consumes it — the per-component path would score the
-    /// conditional and leave the latent's own `draw` unconsumed.
-    FreshDraw(NodeId),
-}
-
-impl Coordinate {
-    fn value(self) -> NodeId {
-        match self {
-            Coordinate::Reified(x) | Coordinate::FreshDraw(x) => x,
-        }
-    }
-
-    fn is_fresh_draw(self) -> bool {
-        matches!(self, Coordinate::FreshDraw(_))
-    }
-}
-
-/// The value node a `joint` component contributes to the COMPOSED TRACE, or `None` when
-/// the component reaches no stochastic node and so shares nothing with any sibling.
-///
-/// §06 *Joint composition* names two ways a component's trace can reach a shared node:
-/// "a stochastic node shared between component traces (through a reified component —
-/// `lawof`, `kernelof` — or a stochastic constructor parameter) remains a single node of
-/// the composed trace". The two shapes differ only in where the coordinate comes from:
-///
-/// * a REIFIED component — a `lawof(x)` call reached through aliases — contributes the
-///   reified value `x` itself, since §04 *Trace of the reified law* has a reified measure
-///   carry "its traced sub-DAG as part of its value";
-/// * a CONSTRUCTOR component whose parameters reach a draw (`Normal(mu = z, sigma = s)`
-///   over a latent `z`) contributes a FRESH draw of that constructor. The shared node is
-///   the PARAMETER `z`, not the coordinate: §06 has each component contribute "a fresh
-///   coordinate", so two components off the same constructor are two conditionally
-///   independent draws over one `z`, not one draw counted twice.
-///
-/// A constructor with no stochastic parameter shares no node with anything (§06: "Components
-/// that share no stochastic node are independent"), so it gets `None` and stays on the
-/// per-component product path.
-///
-/// The fresh draw is built over the RESOLVED constructor rather than the component as
-/// written, so the record law downstream reads the constructor directly instead of a ref hop.
-fn joint_component_coordinate(m: &mut Module, measure: NodeId) -> Option<Coordinate> {
-    let (resolved, _) = resolve_ref_chain(m, measure);
-    if let Some(c) = expect_builtin_call(m, resolved, "lawof") {
-        return (c.args.len() == 1).then_some(Coordinate::Reified(c.args[0]));
-    }
-    measure_reaches_draw(m, resolved, &[])
-        .then(|| Coordinate::FreshDraw(build_call(m, "draw", &[resolved])))
-}
-
-/// Does this contributor set need the `lawof(record(...))` wrapper?
-///
-/// TWO OR MORE contributors always do — that is the whole point, since only the record law
-/// sees the shared node. A SOLE contributor needs it only when its coordinate is a
-/// synthesized draw: the per-component path would score that constructor's CONDITIONAL and
-/// leave the latent's `draw` unconsumed (the refusal wave F3 exists to remove).
-///
-/// A sole REIFIED contributor must NOT be wrapped. It already has a working direct path for
-/// every variate shape, and wrapping adds a nesting level that breaks the record-valued case:
-/// `joint(a = lawof(record(u = u, w = w)), b = Exponential(…))` becomes
-/// `lawof(record(_j0 = record(u = u, w = w)))`, whose single field reaches TWO draws, so
-/// `match_independent_record`'s one-draw-per-field rule refuses a shape §06 *Keyword form*
-/// blesses ("a record-valued component becomes a nested record under its name"). Gating the
-/// wrapper on a bare contributor COUNT regressed exactly that.
-fn needs_record_wrapper(coordinates: &[Coordinate]) -> bool {
-    match coordinates {
-        [] => false,
-        [sole] => sole.is_fresh_draw(),
-        _ => true,
-    }
 }
 
 /// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` — the keyword/record form of
@@ -8157,25 +7857,7 @@ fn needs_record_wrapper(coordinates: &[Coordinate]) -> bool {
 /// the joint's named components — unlike the positional form's flat `cat` vector, so there
 /// is no `get0`-slicing.
 ///
-/// **Components with a shared trace** (§06 "Joint composition"): two or more NAMED
-/// components whose traces can reach a stochastic node are scored as
-/// `lawof(record(name₁ = x₁, …))` — built here and dispatched through that spelling's OWN
-/// machinery, not re-derived. That one lowering already covers the shared-latent record
-/// law when the traces do share a node, the refusal for a singular joint (the same draw
-/// referenced twice, or a deterministic transform of another component's draw — §06
-/// "Singular joints"), and the per-field fallback when the traces turn out disjoint. Which
-/// components qualify, and what each contributes as its coordinate, is
-/// [`joint_component_coordinate`]: a reified `lawof(x)` contributes `x`, a constructor with
-/// a stochastic parameter contributes a fresh draw of itself. A constructor reaching no
-/// draw shares no node with any sibling, so it is excluded from the group and scored on its
-/// own, below.
-///
-/// Each non-grouped component is matched to its OWN record field by name and scored there
-/// directly, whatever shape that field's value has — the downstream `lower_measure_density`
-/// / `build_density_term` recursion domain-checks it against its own pinned field value, so
-/// no upfront kind inspection is needed here (contrast [`lower_joint`]'s positional path,
-/// which DOES need one because `get0(v, i)`'s value infers to `%deferred` and so bypasses
-/// that same check).
+/// Each component is scored independently at its own record field.
 ///
 /// Called only from [`lower_joint`] once it has confirmed `named` is
 /// non-empty and `args` is empty, so `named` here is always non-empty.
@@ -8184,8 +7866,7 @@ fn needs_record_wrapper(coordinates: &[Coordinate]) -> bool {
 /// `%field` (a malformed named arg); the value `v` has no known record shape;
 /// `v`'s record carries a positional (non-named) element alongside its
 /// named fields; `v`'s record is missing a field that one of the joint's
-/// named components expects; or — via the record-law dispatch — the reified
-/// group turns out to be a singular joint.
+/// named components expects.
 ///
 /// An extra value-record field NOT named by the joint (e.g. `record(x=.., y=..,
 /// z=..)` against `joint(x=.., y=..)`) is silently ignored — this matches the
@@ -8220,47 +7901,8 @@ fn lower_keyword_joint(
     }
     let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
 
-    // §06 "Joint composition": group the named components whose traces reach a stochastic
-    // node ([`joint_component_coordinate`]) and reroute them through `lawof(record(...))`'s
-    // own machinery, when [`needs_record_wrapper`] says the group needs it — see
-    // [`lower_joint`]'s note on why neither a bare count nor "reaches a draw" is the gate.
-    let mut shared: Vec<(Symbol, Coordinate)> = Vec::new();
-    for f in named {
-        if let Some(coord) = joint_component_coordinate(m, f.value) {
-            shared.push((f.name, coord));
-        }
-    }
-    let coordinates: Vec<Coordinate> = shared.iter().map(|&(_, c)| c).collect();
-    if !needs_record_wrapper(&coordinates) {
-        shared.clear();
-    }
-
     let mut terms = Vec::with_capacity(named.len());
-    if !shared.is_empty() {
-        let mut pinned_fields = Vec::with_capacity(shared.len());
-        for &(name, _) in &shared {
-            let pinned = lookup_field(m, &vrec_named, name).ok_or_else(|| {
-                refuse(
-                    v,
-                    m,
-                    &format!("missing field {} in joint value record", m.resolve(name)),
-                )
-            })?;
-            pinned_fields.push((name, pinned));
-        }
-        let record_fields: Vec<(Symbol, NodeId)> =
-            shared.iter().map(|&(name, c)| (name, c.value())).collect();
-        terms.push(lower_shared_trace_joint_group(
-            m,
-            &record_fields,
-            &pinned_fields,
-            origin,
-        )?);
-    }
     for field in named {
-        if shared.iter().any(|&(name, _)| name == field.name) {
-            continue;
-        }
         let pinned = lookup_field(m, &vrec_named, field.name).ok_or_else(|| {
             refuse(
                 v,

@@ -11,11 +11,12 @@ fn parse(src: &str) -> flatppl_core::Module {
 
 fn assert_outputs(model: &str, bundle: &ModuleBundle, expected: &str) {
     let mut model = parse(model);
-    let (_, bundle) = flatppl_infer::infer_module_with_inputs(
+    let (diags, bundle) = flatppl_infer::infer_module_with_inputs(
         &mut model,
         bundle.clone(),
         flatppl_infer::Level::Shape,
     );
+    assert!(diags.is_empty(), "fixture must infer: {diags:?}");
     let roots = [model.intern("inputs"), model.intern("outputs")];
     let actual = determinize_with_roots(&model, &bundle, Some(&roots)).unwrap();
     let mut expected = parse(expected);
@@ -1446,7 +1447,7 @@ fn imported_values_inside_expressions_keep_load_substitutions() {
 }
 
 #[test]
-fn reexported_laws_preserve_shared_stochastic_ancestors() {
+fn reexported_laws_form_independent_marginals() {
     let mut bundle = ModuleBundle::new();
     bundle.insert(
         "leaf.flatppl",
@@ -1465,8 +1466,8 @@ fn reexported_laws_preserve_shared_stochastic_ancestors() {
         "w = load_module(\"wrapper.flatppl\")\nleft = w.left\nright = w.right\n\
          outputs = logdensityof(joint(a = left, b = right), record(a = 0.0, b = 1.0))",
         &bundle,
-        "z ~ Normal(0.0, 1.0)\na ~ Normal(z, 1.0)\nb ~ Normal(z, 1.0)\n\
-         outputs = logdensityof(lawof(record(a = a, b = b)), record(a = 0.0, b = 1.0))",
+        "outputs = logdensityof(Normal(0.0, sqrt(2.0)), 0.0) + \
+                   logdensityof(Normal(0.0, sqrt(2.0)), 1.0)",
     );
 }
 
