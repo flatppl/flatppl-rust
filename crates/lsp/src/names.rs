@@ -163,9 +163,10 @@ pub fn def_name_range(text: &str, rhs_start: u32, name: &str) -> Option<(u32, u3
 /// top-level binding names `inputs` and `outputs` are reserved for the
 /// determinization signature." §04 "Name resolution" adds: "`self` and `base`
 /// themselves are reserved names and cannot be bound to something else."
-/// Numeric constants `im`, `pi`, and `inf` cannot be shadowed (§04/§05).
+/// Every other built-in, the numeric constants `im`, `pi` and `inf` included,
+/// is shadowable and so absent here.
 const RESERVED: &[&str] = &[
-    "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base", "im", "pi", "inf",
+    "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base",
 ];
 
 /// Does `name` match §04's public-binding form?
@@ -533,14 +534,26 @@ mod tests {
     #[test]
     fn reserved_words_are_refused() {
         for bad in [
-            "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base", "im", "pi",
-            "inf",
+            "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base",
         ] {
             let err = check_new_name(bad).expect_err("reserved name must refuse");
             assert!(
                 err.0.contains("reserved"),
                 "refusal must say why; got {}",
                 err.0
+            );
+        }
+    }
+
+    /// §04 "Name resolution": every built-in is shadowable, including the
+    /// numeric constants.
+    #[test]
+    fn numeric_constants_are_bindable() {
+        for ok in ["im", "pi", "inf"] {
+            assert!(check_new_name(ok).is_ok(), "`{ok}` must be bindable");
+            assert!(
+                check_new_argument_name(ok).is_ok(),
+                "`{ok}` must be a legal argument name"
             );
         }
     }

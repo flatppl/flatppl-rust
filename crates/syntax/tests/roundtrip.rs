@@ -643,12 +643,9 @@ fn binding_name_rules() {
         "false = 1",
         "self = 1",
         "base = 1",
-        "im = 1",
-        "pi = 1",
-        "inf = 1",
-        "f = im -> im",
-        "f(pi) = pi",
-        "f = (x, inf) -> x + inf",
+        "f = self -> self",
+        "f(base) = base",
+        "f = (x, true) -> x",
         "_x_ = 1",
     ] {
         assert!(parse(src).is_err(), "`{src}` should be rejected");
@@ -667,6 +664,74 @@ fn binding_name_rules() {
     let printed = print(&parse("__0x1 = 1\n_ = 2").unwrap());
     assert!(printed.contains("__0x1 = 1"), "got:\n{printed}");
     assert!(printed.contains("__0x2 = 2"), "got:\n{printed}");
+}
+
+/// Every built-in name is shadowable, the numeric constants included (spec
+/// §04 "Name resolution"): a module binding or lambda argument wins over the
+/// built-in, and an unshadowed name still means the built-in.
+#[test]
+fn numeric_constants_are_shadowable() {
+    // A module binding resolves to the binding, not the constant.
+    let m = parse("pi = 3.0\ny = pi + 1.0").unwrap();
+    let pir = flatppl_flatpir::write(&m);
+    assert!(pir.contains("(%ref self pi)"), "got:\n{pir}");
+    assert_eq!(
+        print_with(&m, Syntax::Minimal),
+        "pi = 3.0\ny = add(pi, 1.0)"
+    );
+    // `base.pi` still selects the constant and prints through `base.`.
+    let m = parse("pi = 3.0\ny = base.pi").unwrap();
+    assert!(
+        print_with(&m, Syntax::Minimal).contains("y = base.pi"),
+        "got:\n{}",
+        print_with(&m, Syntax::Minimal)
+    );
+    let y = m.bindings().last().unwrap();
+    assert!(matches!(m.node(y.1.rhs), Node::Const(_)));
+
+    for name in ["im", "inf"] {
+        let m = parse(&format!("{name} = 2.0\ny = {name}")).unwrap();
+        let pir = flatppl_flatpir::write(&m);
+        assert!(pir.contains(&format!("(%ref self {name})")), "got:\n{pir}");
+    }
+
+    // A bound callable named like a constant is called, not the constant.
+    let m = parse("inf = x -> 2 * x\ny = inf(3.0)").unwrap();
+    let pir = flatppl_flatpir::write(&m);
+    assert!(pir.contains("(%call (%ref self inf) 3.0)"), "got:\n{pir}");
+
+    // A lambda or function-definition argument shadows the constant inside
+    // the body only.
+    let lower = |src: &str| print_with(&parse(src).unwrap(), Syntax::Minimal);
+    assert_eq!(
+        lower("f = inf -> inf + 1.0\ny = inf"),
+        "f = functionof(add(_inf_, 1.0), inf = _inf_)\ny = inf"
+    );
+    assert_eq!(
+        lower("f(pi, im) = pi * im"),
+        "f = functionof(mul(_pi_, _im_), pi = _pi_, im = _im_)"
+    );
+
+    // Unshadowed, the names are still the constants.
+    let m = parse("y = pi\nz = inf\nw = im").unwrap();
+    let pir = flatppl_flatpir::write(&m);
+    assert!(!pir.contains("%ref self pi"), "got:\n{pir}");
+    assert_eq!(print_with(&m, Syntax::Minimal), "y = pi\nz = inf\nw = im");
+
+    // Shadowed output round-trips: the printed text re-parses to the same IR.
+    for src in [
+        "pi = 3.0\ny = pi + base.pi",
+        "inf = 1.0\nf = x -> x + base.inf",
+    ] {
+        let first = parse(src).unwrap();
+        let printed = print(&first);
+        let second = parse(&printed).unwrap();
+        assert_eq!(
+            flatppl_flatpir::write(&first),
+            flatppl_flatpir::write(&second),
+            "`{src}` printed as:\n{printed}"
+        );
+    }
 }
 
 /// `:` lowers to the `all` selector, a trailing `!` to `only`, and a `!` not

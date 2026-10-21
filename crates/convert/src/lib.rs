@@ -5,10 +5,16 @@ use flatppl_core::node::{
 };
 use flatppl_core::{Binding, Doc, Markup, Module};
 
-/// FlatPPL reserved words that may not be a binding name (spec §05 / the parser's
-/// `check_binding_name`). The name allocator must never hand one of these back.
+/// Names a converted document may not bind. The first group is what the parser
+/// refuses (spec §05 / its `check_binding_name`). The numeric constants `im`,
+/// `pi` and `inf` are legal FlatPPL bindings (spec §04 "Name resolution": every
+/// built-in is shadowable) but stay refused here: the converter emits the
+/// built-in constant (`inf` bounds, `pi` in expressions), and HS3 / pyhf
+/// expression text reads a bare `pi` as the constant, so a source parameter of
+/// that name could not be told apart from it. The name allocator must never
+/// hand any of these back.
 const RESERVED: &[&str] = &[
-    "true", "false", "in", "all", "only", "im", "pi", "inf", "self", "base",
+    "true", "false", "in", "all", "only", "self", "base", "im", "pi", "inf",
 ];
 
 /// Reserved top-level binding names: the determinization signature (spec §05
