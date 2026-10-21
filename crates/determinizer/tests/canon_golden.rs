@@ -464,3 +464,33 @@ outputs = q";
         "an unpromoted literal binding is still inlined:\n{pir}"
     );
 }
+
+// A reference carries its binding's folded value, so a chain of literal
+// bindings folds in one sweep. A binding promoted by `inputs` keeps its
+// references: its value is the function argument, not the literal.
+#[test]
+fn const_fold_follows_references_to_literal_bindings() {
+    let out = determinize_src(
+        "a = 1.0
+b = a + 1.0
+c = b * 3.0
+k = 2.0
+p = elementof(reals)
+folded = c + 1.0
+promoted = k + p
+inputs = (k, p)
+outputs = (folded, promoted)",
+    );
+    let text = flatppl_syntax::print_with(&out, flatppl_syntax::Syntax::Minimal);
+    assert!(text.contains("folded = 7.0"), "{text}");
+    assert!(text.contains("promoted = add(k, p)"), "{text}");
+}
+
+// Folding through references terminates on a reference cycle (inference
+// reports it; the fold must not loop on it).
+#[test]
+fn const_fold_terminates_on_a_reference_cycle() {
+    let mut m = flatppl_syntax::parse("x = y + 1.0\ny = x + 1.0\n").unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let _ = determinize(&m);
+}

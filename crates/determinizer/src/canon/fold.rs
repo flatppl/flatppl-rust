@@ -1,7 +1,7 @@
 //! Pass 1: constant folding, trivial-alias ref resolution, and dead-binding
 //! elimination — the canonicalization foundation (Buffy #263).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Ref, RefNs, Scalar};
 
@@ -19,27 +19,45 @@ pub(crate) fn const_fold(m: &mut Module) -> bool {
     // This phase only allocates new nodes, so cached values stay valid until
     // replacements are applied below. Rewrites get a fresh cache next sweep.
     let mut scalars = HashMap::new();
+    let promoted = super::promoted_input_names(m);
     let mut pending = m
         .bindings()
         .map(|(_, b)| (b.rhs, false))
         .collect::<Vec<_>>();
     pending.reverse();
+    // Nodes pushed as `ready = true` and not yet finished. A node reached again
+    // while still in this set is on a reference cycle.
+    let mut open: HashSet<NodeId> = HashSet::new();
     while let Some((id, ready)) = pending.pop() {
         if scalars.contains_key(&id) {
             continue;
         }
         if ready {
-            let value = fold_scalar(m, id, &scalars, &mut replacements);
+            open.remove(&id);
+            let value = match self_ref_target(m, id, &promoted) {
+                // A reference carries its binding's folded value, so a chain of
+                // literal bindings folds in one sweep rather than one link per
+                // fixpoint round. The reference itself stays for alias
+                // resolution.
+                Some(rhs) => scalars.get(&rhs).cloned().flatten(),
+                None => fold_scalar(m, id, &scalars, &mut replacements),
+            };
             scalars.insert(id, value);
+        } else if open.contains(&id) {
+            continue;
         } else {
+            open.insert(id);
             pending.push((id, true));
-            pending.extend(
-                m.node(id)
-                    .children()
-                    .into_iter()
-                    .rev()
-                    .map(|id| (id, false)),
-            );
+            match self_ref_target(m, id, &promoted) {
+                Some(rhs) => pending.push((rhs, false)),
+                None => pending.extend(
+                    m.node(id)
+                        .children()
+                        .into_iter()
+                        .rev()
+                        .map(|id| (id, false)),
+                ),
+            }
         }
     }
     if replacements.is_empty() {
@@ -59,6 +77,27 @@ pub(crate) fn const_fold(m: &mut Module) -> bool {
         }
     }
     changed
+}
+
+/// The right-hand side a `(%ref self x)` node reads its value from, unless `x`
+/// is missing or promoted to a function argument by the `inputs` ABI (whose
+/// value is not the binding's own, see [`resolve_alias_refs`]).
+fn self_ref_target(
+    m: &Module,
+    id: NodeId,
+    promoted: &HashSet<flatppl_core::Symbol>,
+) -> Option<NodeId> {
+    let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = m.node(id)
+    else {
+        return None;
+    };
+    if promoted.contains(name) {
+        return None;
+    }
+    Some(m.binding(m.binding_by_name(*name)?).rhs)
 }
 
 /// Fold one node after its children. `None` is cached too: shared nonconstant
