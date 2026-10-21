@@ -130,6 +130,7 @@ pub fn determinize_with_options(
         crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
     crate::canon::normalize_call_wrappers(&mut work);
+    crate::free_draw::refuse_free_draws(&work, roots)?;
 
     let mut specialize_sequences = true;
     loop {

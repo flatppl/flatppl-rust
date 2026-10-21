@@ -380,3 +380,25 @@ lp = logdensityof(prod, 0.5)";
         "is_flatpdl failed:\n{pir}"
     );
 }
+
+// The conjugate row builds a fresh marginal with no inferred domain, so the kchain's
+// own domain must reject a record point against its scalar variate.
+#[test]
+fn kchain_conjugate_marginal_refuses_a_point_of_the_wrong_kind() {
+    let model = "mu = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+                 pp = kchain(lawof(record(mu = mu)), x -> Normal(mu = get(x, \"mu\"), sigma = 1.0))\n";
+    let err = determinize(&parse_infer(&format!(
+        "{model}lp = logdensityof(pp, record(mu = 0.0))"
+    )))
+    .expect_err("a record point does not lie in the scalar marginal's domain");
+    assert!(
+        err.reason.contains("does not match the measure's domain"),
+        "{}",
+        err.reason
+    );
+    // The scalar point still reaches the Normal(0, sqrt(2)) marginal.
+    let out = flatppl_flatpir::write(&determinize_src(&format!(
+        "{model}lp = logdensityof(pp, 0.3)"
+    )));
+    assert!(out.contains("1.4142135623730951"), "{out}");
+}

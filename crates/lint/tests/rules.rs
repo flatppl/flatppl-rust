@@ -122,3 +122,13 @@ fn missing_doc_does_not_fire_for_private_binding() {
     let src = "_mu = 0.0\n_x ~ Normal(mu = _mu, sigma = 1.0)\n";
     assert!(!fired_with_doc_enabled(src).contains(&RuleId::MissingDoc));
 }
+
+#[test]
+fn a_density_of_a_stochastic_constructor_parameter_is_not_flagged() {
+    // `lp` is a stochastic-phase value, which is legal. Only determinization of a
+    // density output refuses it (§13 "Output reduction").
+    let src = "z = draw(Normal(mu = 0.4, sigma = 1.0))\n\
+               lp = logdensityof(joint(f1 = Normal(mu = z, sigma = 0.5), \
+               f2 = Normal(mu = z, sigma = 1.5)), record(f1 = 0.5, f2 = 0.7))\n";
+    assert!(fired(src).is_empty(), "{:?}", fired(src));
+}

@@ -904,3 +904,62 @@ fn a_marginal_law_with_fixed_sibling_is_a_product() {
         "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + logdensityof(Normal(0.0, 1.0), 0.7)",
     );
 }
+
+// A Gaussian chain adds variances along the path: Var(f2) = 1 + 0.5² + 1.5² = 3.5.
+#[test]
+fn a_two_step_gaussian_chain_marginalizes_both_latents() {
+    assert_score_matches(
+        "z ~ Normal(0.4, 1.0)\nf1 ~ Normal(z, 0.5)\nf2 ~ Normal(f1, 1.5)\n\
+         lp = logdensityof(lawof(f2), 0.7)",
+        "lp = logdensityof(Normal(0.4, sqrt(3.5)), 0.7)",
+    );
+}
+
+#[test]
+fn a_three_step_gaussian_chain_marginalizes_every_latent() {
+    let lp = score_pir(
+        "w ~ Normal(-1.0, 1.0)\nz ~ Normal(w, 2.0)\ny ~ Normal(z, 0.5)\n\
+         lp = logdensityof(lawof(y), 0.3)",
+    );
+    assert!(
+        lp.contains("(%field mu (%meta ((%scalar real) %fixed reals) (neg 1.0)))"),
+        "{lp}"
+    );
+    let sigma: f64 = lp
+        .split("(%field sigma ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no literal sigma: {lp}"));
+    // Var(y) = 1 + 2² + 0.5² = 5.25; the composed rows round differently from sqrt(5.25).
+    assert!((sigma - 5.25_f64.sqrt()).abs() < 1e-14, "sigma {sigma}");
+}
+
+#[test]
+fn a_joint_of_chain_marginals_is_the_product_of_both_marginals() {
+    // Var(f1) = 1.25 and Var(f2) = 3.5; the joint ignores Cov(f1, f2) = 1.25.
+    assert_score_matches(
+        "z ~ Normal(0.4, 1.0)\nf1 ~ Normal(z, 0.5)\nf2 ~ Normal(f1, 1.5)\n\
+         lp = logdensityof(joint(f1 = lawof(f1), f2 = lawof(f2)), record(f1 = 0.5, f2 = 0.7))",
+        "lp = logdensityof(Normal(0.4, sqrt(1.25)), 0.5) + \
+              logdensityof(Normal(0.4, sqrt(3.5)), 0.7)",
+    );
+}
+
+#[test]
+fn a_record_law_sharing_a_latent_above_a_chain_is_not_a_product() {
+    // `a` and `y` share `w` two levels up, so Cov(a, y) = 1 and the product is wrong.
+    let src = "w ~ Normal(0.0, 1.0)\na ~ Normal(w, 1.0)\nz ~ Normal(w, 1.0)\ny ~ Normal(z, 1.0)\n\
+               lp = logdensityof(lawof(record(a = a, b = y)), record(a = 0.5, b = 0.7))";
+    match determinize(&parse_infer(src)) {
+        Err(err) => assert!(err.reason.contains("SAME latent"), "{}", err.reason),
+        Ok(out) => {
+            let lp = pir_binding(&flatppl_flatpir::write(&out), "lp");
+            let product = score_pir(
+                "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + \
+                      logdensityof(Normal(0.0, sqrt(3.0)), 0.7)",
+            );
+            assert_ne!(lp, product, "the shared ancestor was dropped");
+        }
+    }
+}
