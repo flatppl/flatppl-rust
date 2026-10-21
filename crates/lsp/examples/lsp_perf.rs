@@ -76,7 +76,7 @@ fn main() {
     let new_lookup = min_ns(20, || {
         let mut acc = 0usize;
         for &off in &offsets {
-            if let Some(id) = node_at_offset_indexed(black_box(&index), black_box(off)) {
+            if let Some(id) = node_at_offset_indexed(black_box(index), black_box(off)) {
                 acc += id.index();
             }
         }

@@ -944,7 +944,7 @@ mod tests {
         let index = crate::queries::node_span_index(&db, f, fs, cats);
         let found = offsets
             .iter()
-            .find_map(|&off| hover(&db, f, fs, cats, off, &index));
+            .find_map(|&off| hover(&db, f, fs, cats, off, index));
         let s = found.expect("at least one offset inside 'x = add(1, 2)' must yield hover info");
         assert!(
             s.to_lowercase().contains("type"),
@@ -960,7 +960,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![f]);
         let index = crate::queries::node_span_index(&db, f, fs, cats);
         assert!(
-            hover(&db, f, fs, cats, 9999, &index).is_none(),
+            hover(&db, f, fs, cats, 9999, index).is_none(),
             "offset past end of source must yield None"
         );
     }
@@ -986,7 +986,7 @@ mod tests {
         let index = crate::queries::node_span_index(&db, f, fs, cats);
         let found = offsets
             .iter()
-            .find_map(|&off| hover(&db, f, fs, cats, off, &index));
+            .find_map(|&off| hover(&db, f, fs, cats, off, index));
         let s = found.expect("at least one offset inside 'elementof(reals)' must yield hover info");
         assert!(
             s.contains("value-set"),
@@ -1014,7 +1014,7 @@ mod tests {
         let index = crate::queries::node_span_index(&db, f, fs, cats);
         let s = offsets
             .iter()
-            .find_map(|&off| hover(&db, f, fs, cats, off, &index))
+            .find_map(|&off| hover(&db, f, fs, cats, off, index))
             .expect("a record binding must yield hover info");
         assert!(
             s.contains("value-set"),
@@ -1044,7 +1044,7 @@ mod tests {
             let index = crate::queries::node_span_index(&db, f, fs, cats);
             let s = [4_u32, 9, 14]
                 .iter()
-                .find_map(|&off| hover(&db, f, fs, cats, off, &index))
+                .find_map(|&off| hover(&db, f, fs, cats, off, index))
                 .expect("an elementof binding must yield hover info");
             assert!(
                 s.contains(&format!("**value-set:** {want}")),
@@ -1067,7 +1067,7 @@ mod tests {
         // Offset of the `mu` argument inside `add(mu, 1)`.
         let off = "% Prior mean.\nmu = 0\ny = add(".len() as u32;
         let index = crate::queries::node_span_index(&db, f, fs, cats);
-        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `mu` use");
+        let s = hover(&db, f, fs, cats, off, index).expect("hover over `mu` use");
         assert!(
             s.contains("Prior mean."),
             "hover must include the referenced binding's doc; got: {s:?}"
@@ -1093,7 +1093,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![helpers, model]);
         let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32;
         let index = crate::queries::node_span_index(&db, model, fs, cats);
-        let s = hover(&db, model, fs, cats, off, &index).expect("hover over `h.shifted`");
+        let s = hover(&db, model, fs, cats, off, index).expect("hover over `h.shifted`");
         assert!(
             s.contains("The shift value."),
             "hover must follow the member ref to the origin's doc; got: {s:?}"
@@ -1111,7 +1111,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![f]);
         let off = "% Original doc.\norig = 1.0\nalias_b = orig\nz = add(".len() as u32;
         let index = crate::queries::node_span_index(&db, f, fs, cats);
-        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `alias_b` use");
+        let s = hover(&db, f, fs, cats, off, index).expect("hover over `alias_b` use");
         assert!(
             s.contains("Original doc."),
             "hover must follow a bare alias to the origin's doc; got: {s:?}"
@@ -1129,7 +1129,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![f]);
         let off = "mu = 0\ny = add(".len() as u32;
         let index = crate::queries::node_span_index(&db, f, fs, cats);
-        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `mu` use");
+        let s = hover(&db, f, fs, cats, off, index).expect("hover over `mu` use");
         assert!(
             s.contains("type"),
             "hover must still carry type info; got: {s:?}"
@@ -1197,7 +1197,7 @@ mod tests {
         // Parse failure means no module, so hover must always return None.
         let index = crate::queries::node_span_index(&db, f, fs, cats);
         assert!(
-            hover(&db, f, fs, cats, 0, &index).is_none(),
+            hover(&db, f, fs, cats, 0, index).is_none(),
             "hover on a parse-error file must return None"
         );
     }
@@ -1329,7 +1329,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![f]);
         let off = "x = 1\ny = add(".len() as u32; // on the `x` argument
         let index = node_span_index(&db, f, fs, cats);
-        let loc = goto_definition(&db, f, fs, cats, off, &index).expect("definition");
+        let loc = goto_definition(&db, f, fs, cats, off, index).expect("definition");
         assert_eq!(loc.path, "m.flatppl");
         // x's binding rhs is the literal `1` at byte 4
         assert!(loc.start <= 4 && 4 < loc.end);
@@ -1353,7 +1353,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![helpers, model]);
         let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32; // on `shifted`
         let index = node_span_index(&db, model, fs, cats);
-        let loc = goto_definition(&db, model, fs, cats, off, &index).expect("cross-file def");
+        let loc = goto_definition(&db, model, fs, cats, off, index).expect("cross-file def");
         assert_eq!(loc.path, "helpers.flatppl");
     }
 
