@@ -39,10 +39,10 @@ jobs:
     env:
       FLATPPL_JS_DIR: ${{ github.workspace }}/.flatppl-js
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
 
       - name: Check out flatppl-js (cross-engine parity reference)
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: flatppl/flatppl-js
           ref: main
@@ -73,7 +73,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.13
+        uses: taiki-e/install-action@v2.87.17
         with:
           tool: cargo-llvm-cov
 
@@ -98,7 +98,7 @@ jobs:
         # For public repos the upload works without CODECOV_TOKEN; set the
         # secret if rate-limited. fail_ci_if_error stays off so a Codecov
         # outage doesn't mask a green test run.
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           files: lcov.info
           fail_ci_if_error: false
