@@ -170,7 +170,7 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
 
         // Runtime-determined value sources: known `%dynamic`, never a gap
         // (`external`/`load_data` are compile-time-unknown; the
-        // parameterized/stochastic sources are already non-fixed). The same set is
+        // parametric/stochastic sources are already non-fixed). The same set is
         // what [`crate::ops::is_opaque_value_source`] names, so it is enumerated
         // there once and read here.
         name if crate::ops::is_opaque_value_source(name) => ConstEval::Dynamic,

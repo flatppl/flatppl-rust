@@ -545,7 +545,7 @@ sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
 y = draw(sp)",
         ),
         (
-            "the complement pattern with a parameterized weight",
+            "the complement pattern with a parametric weight",
             "\
 w = elementof(unitinterval)
 n = Normal(mu = 0.0, sigma = 1.0)
@@ -924,9 +924,9 @@ fn normalize_of_two_lebesgue_joint_is_a_static_error() {
 }
 
 /// Shared free constructor parameters do not weaken the product mass class.
-/// The normalization gate still rejects this parameterized Lebesgue product.
+/// The normalization gate still rejects this parametric Lebesgue product.
 #[test]
-fn normalize_of_elementof_parameterized_joint_is_a_static_error() {
+fn normalize_of_elementof_parametric_joint_is_a_static_error() {
     assert!(rejects(
         "a = elementof(reals)\n\
          c1 = locscale(Lebesgue(reals), a, 2.0)\n\

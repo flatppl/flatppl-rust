@@ -10,7 +10,7 @@
            (load_module "helpers.flatppl" (%assign center (%ref self a)))))
 
   (%bind a
-    (%meta ((%scalar real) %parameterized reals) (elementof reals)))
+    (%meta ((%scalar real) %parametric reals) (elementof reals)))
 
   (%bind b
     (%meta ((%scalar real) %stochastic reals)

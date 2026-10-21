@@ -243,7 +243,7 @@ fn infer_emits_annotated_flatpir() {
     );
 
     let written = fs::read_to_string(&out_path).unwrap();
-    assert!(written.contains("(%meta ((%scalar real) %parameterized reals) (elementof reals))"));
+    assert!(written.contains("(%meta ((%scalar real) %parametric reals) (elementof reals))"));
     assert!(written.contains("(%meta ((%scalar real) %stochastic reals) (draw "));
     assert!(
         written.contains("(%meta (%deferred %stochastic %unknown) (BinnedPoissonProcess "),

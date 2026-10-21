@@ -337,7 +337,7 @@ fn render_valueset(module: &Module, set: &ValueSet) -> String {
 fn render_phase(phase: Phase) -> &'static str {
     match phase {
         Phase::Fixed => "%fixed",
-        Phase::Parameterized => "%parameterized",
+        Phase::Parametric => "%parametric",
         Phase::Stochastic => "%stochastic",
     }
 }

@@ -1,6 +1,6 @@
 //! Reification is module-local (spec §04).
 //!
-//! `functionof`/`kernelof` reify within the current module only: a parameterized
+//! `functionof`/`kernelof` reify within the current module only: a parametric
 //! value reached through a loaded-module reference cannot become an input —
 //! neither auto-collected nor named as an explicit boundary — so such a
 //! reification is a static error. A loaded module's callables and values are
@@ -24,7 +24,7 @@ fn refused(diags: &[Diagnostic]) -> bool {
     diags.iter().any(|d| d.message.contains("module-local"))
 }
 
-/// A boundary-less reification whose trace reaches a cross-module parameterized
+/// A boundary-less reification whose trace reaches a cross-module parametric
 /// value is a static error (`%failed` + a diagnostic) — never a silent
 /// mis-reification.
 #[test]
@@ -102,7 +102,7 @@ fn lawof_may_reference_a_cross_module_value() {
 /// The spec's explicit consequence (§04): a measure that carries a parametric
 /// dependency on another module's node is a legal *measure* (`lawof` above), but
 /// it "cannot then be reified to a kernel" — `functionof` over such a measure
-/// would auto-collect the cross-module parameterized node as an input, so it is
+/// would auto-collect the cross-module parametric node as an input, so it is
 /// refused, exactly like a direct value reification.
 #[test]
 fn a_measure_with_a_cross_module_parametric_dep_cannot_be_reified_to_a_kernel() {

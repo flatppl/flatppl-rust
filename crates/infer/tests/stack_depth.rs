@@ -124,7 +124,7 @@ fn shape_substitutions_stop_at_each_boundary() {
             .bindings()
             .find(|(_, b)| module.resolve(b.name) == format!("n{i}"))
             .unwrap();
-        assert_eq!(module.phase_of(boundary.rhs), Some(Phase::Parameterized));
+        assert_eq!(module.phase_of(boundary.rhs), Some(Phase::Parametric));
     }
     let (_, result) = module
         .bindings()

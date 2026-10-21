@@ -348,7 +348,7 @@ pub enum Dim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Fixed,
-    Parameterized,
+    Parametric,
     Stochastic,
 }
 
@@ -409,11 +409,11 @@ impl fmt::Display for Dim {
 }
 
 impl Phase {
-    /// The spec §04 phase keyword (`fixed` / `parameterized` / `stochastic`).
+    /// The spec §04 phase keyword (`fixed` / `parametric` / `stochastic`).
     pub fn name(self) -> &'static str {
         match self {
             Phase::Fixed => "fixed",
-            Phase::Parameterized => "parameterized",
+            Phase::Parametric => "parametric",
             Phase::Stochastic => "stochastic",
         }
     }

@@ -7,17 +7,17 @@
   (%public center spread obs_kernel shifted_value)
 
   (%bind center
-    (%meta ((%scalar real) %parameterized reals) (elementof reals)))
+    (%meta ((%scalar real) %parametric reals) (elementof reals)))
 
   (%bind spread
-    (%meta ((%scalar real) %parameterized posreals) (elementof posreals)))
+    (%meta ((%scalar real) %parametric posreals) (elementof posreals)))
 
   (%bind obs_kernel
     (%meta ((%kernel (%inputs center spread x) (%mass %normalized)) %fixed %unknown)
       (functionof
-        (%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %parameterized reals)
+        (%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %parametric reals)
           (Normal
-            (%kwarg mu (%meta ((%scalar real) %parameterized reals)
+            (%kwarg mu (%meta ((%scalar real) %parametric reals)
                          (add (%ref self center) (%ref %local _x_))))
             (%kwarg sigma (%ref self spread))))
         %specinputs
@@ -26,4 +26,4 @@
          (x (%ref %local _x_))))))
 
   (%bind shifted_value
-    (%meta ((%scalar real) %parameterized reals) (add (%ref self center) 1.0))))
+    (%meta ((%scalar real) %parametric reals) (add (%ref self center) 1.0))))

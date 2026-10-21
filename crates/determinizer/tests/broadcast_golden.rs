@@ -83,7 +83,7 @@ lp = logdensityof(broadcast(Poisson, rates), [0, 1, 2])";
 // size) declares a dynamic-length parameter array.
 #[test]
 fn broadcast_kernel_density_is_axis_native_for_dynamic_length() {
-    // Dynamic length: the array size `n` is a parameterized-phase scalar (not a
+    // Dynamic length: the array size `n` is a parametric-phase scalar (not a
     // literal), so `cartpow(_, n)` carries a `%dynamic` dimension (spec §11) —
     // the size is a valid, statically-unresolved size expression, NOT an omitted
     // arg (`cartpow(S)` with no size is ill-formed: spec §03 requires the size).

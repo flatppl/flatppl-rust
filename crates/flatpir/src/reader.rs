@@ -874,7 +874,7 @@ fn read_phase(form: &Sexpr) -> Result<Option<Phase>> {
         SexprKind::Atom(s) => match s.as_str() {
             "%deferred" => Ok(None),
             "%fixed" => Ok(Some(Phase::Fixed)),
-            "%parameterized" => Ok(Some(Phase::Parameterized)),
+            "%parametric" => Ok(Some(Phase::Parametric)),
             "%stochastic" => Ok(Some(Phase::Stochastic)),
             other => Err(err(form, format!("unknown phase `{other}`"))),
         },

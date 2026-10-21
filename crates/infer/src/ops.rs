@@ -222,7 +222,7 @@ pub(crate) fn call_rule(
         let Type::Measure { domain, .. } = &result_type else {
             return Ready((result_type, joined));
         };
-        let mut inputs = vec![(args[1].0, *domain.clone(), Phase::Parameterized)];
+        let mut inputs = vec![(args[1].0, *domain.clone(), Phase::Parametric)];
         inputs.extend(args.get(2).cloned());
         let function = args[0].0;
         let callable = matches!(
@@ -925,11 +925,11 @@ pub(crate) fn call_rule(
         // A bound coordinate is internal to the integral, not a host parameter.
         // Its value set stays unknown, so constant evaluation cannot read it.
         flatppl_core::INTEGRATION_POINT => Phase::Fixed,
-        "elementof" => Phase::Parameterized,
+        "elementof" => Phase::Parametric,
         "external" | "load_data" | "load_module" | "standard_module" => Phase::Fixed,
         "draw" => Phase::Stochastic,
         // `lawof` reifies a value into its law; the law is deterministic
-        // (parameterized or fixed) — `lawof` absorbs the stochasticity of the
+        // (parametric or fixed) — `lawof` absorbs the stochasticity of the
         // `draw` ancestors rather than propagating it (spec §04 "Phase of the
         // reified law"). Trace the argument's law-phase instead of inheriting
         // the stochastic `joined`.
@@ -3566,16 +3566,16 @@ fn collect_axis_dims(
 /// The phase of `lawof(arg)` — the phase of the **reified law** of `arg`.
 ///
 /// `lawof` absorbs the stochasticity of `draw` ancestors into the law, so the
-/// result is deterministic: parameterized if the law depends on a free
+/// result is deterministic: parametric if the law depends on a free
 /// `elementof` leaf, else fixed; never stochastic (spec §04 "Phase of the
 /// reified law"). We re-derive the phase over the argument's ancestor subgraph
 /// with two overrides vs the normal join: a `draw` contributes the law-phase of
 /// its *measure operand* (absorbing the draw), and the recursion bottoms out at
-/// `elementof` (parameterized) / fixed leaves — mirroring how `functionof`
+/// `elementof` (parametric) / fixed leaves — mirroring how `functionof`
 /// traces to parametric leaves. Ref/`draw` cycles are bounded by `depth`.
 fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
     if depth > 64 {
-        return Phase::Parameterized; // safe non-stochastic fallback
+        return Phase::Parametric; // safe non-stochastic fallback
     }
     match inf.module.node(node).clone() {
         Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
@@ -3584,13 +3584,13 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
                     let rhs = inf.module.binding(b).rhs;
                     law_phase(inf, rhs, depth + 1)
                 }
-                None => Phase::Parameterized,
+                None => Phase::Parametric,
             }
         }
         Node::Call(c) => match c.head {
             flatppl_core::CallHead::Builtin(op) => match inf.module.resolve(op) {
                 // Parametric leaf: the law depends on this free input.
-                "elementof" => Phase::Parameterized,
+                "elementof" => Phase::Parametric,
                 // Closed-over fixed leaves.
                 "external" | "load_data" | "load_module" | "standard_module" => Phase::Fixed,
                 // Absorb: the draw's stochasticity collapses into the law of
@@ -3606,13 +3606,13 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
                 }),
             },
             // User-callable application within a law: conservatively
-            // parameterized (deterministic, may depend on inputs).
-            _ => Phase::Parameterized,
+            // parametric (deterministic, may depend on inputs).
+            _ => Phase::Parametric,
         },
         // Literals and named constants are fixed; anything else (holes,
         // cross-module refs) is conservatively non-stochastic.
         Node::Lit(_) | Node::Const(_) => Phase::Fixed,
-        _ => Phase::Parameterized,
+        _ => Phase::Parametric,
     }
 }
 
@@ -4451,13 +4451,13 @@ fn reification_type(
                 };
                 let (entries, cross_module) = inf.collect_auto_inputs(*body);
                 if cross_module {
-                    // Reification is module-local (spec §04): a parameterized value
+                    // Reification is module-local (spec §04): a parametric value
                     // reached through a loaded-module reference cannot become an
                     // input. (A cross-module callable/value may be USED — applied or
                     // referenced — just not taken as a reified input.)
                     inf.diags.push(crate::Diagnostic::error_at(
                         id,
-                        "reification is module-local: this depends on a parameterized \
+                        "reification is module-local: this depends on a parametric \
                          value from a loaded module, which cannot become an input \
                          (spec §04); use the dependency's callables/values instead, or \
                          reify within the module that defines it",
@@ -4752,7 +4752,7 @@ fn undeclared_placeholders(
 ///   phase — that is, all `elementof` leaves", so the set is outside the
 ///   subgraph. This mirrors [`Inferencer::collect_auto_inputs`];
 /// * any node whose already-inferred phase is **not** stochastic. Phase joins
-///   upward, so a `%fixed` or `%parameterized` node has no stochastic
+///   upward, so a `%fixed` or `%parametric` node has no stochastic
 ///   descendant reaching the output through it. An absent phase does NOT prune
 ///   — the same "soundly does extra work, never skips" convention
 ///   `walk_auto` uses.
@@ -9023,7 +9023,7 @@ fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> b
 /// reading the spelling tells you nothing about which value you get, so two
 /// occurrences of one spelling may denote two different values.
 ///
-/// §04 is explicit for the parameterized case — `functionof` "traces the ancestor
+/// §04 is explicit for the parametric case — `functionof` "traces the ancestor
 /// subgraph of its argument back to all leaves of parametric phase — that is, all
 /// `elementof` leaves. These **leaf nodes** become the inputs of the reified
 /// callable" — so each `elementof` occurrence is its own parameter, exactly as each
@@ -9094,7 +9094,7 @@ fn decimal_literal(node: &Node) -> Option<(i128, u32)> {
 /// The complement pattern: exactly two weights, `e` and `1 - e` with the same
 /// `e`, where `e` is provably in [0, 1]. Then the weights sum to one whatever
 /// `e` turns out to be — the one sum-to-one proof that survives a stochastic or
-/// parameterized weight.
+/// parametric weight.
 fn complement_pair(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
     let [a, b] = weights else {
         return false;

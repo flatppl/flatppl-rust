@@ -1912,7 +1912,7 @@ lp_z = logdensityof(lawof(z), 0.1)";
 
 // A measure built from ANOTHER value's law is not parameterized by that value.
 // §04 "Reification to measures", *Phase of the reified law*: "the resulting measure
-// is itself deterministic (of parameterized or fixed phase): `lawof` absorbs
+// is itself deterministic (of parametric or fixed phase): `lawof` absorbs
 // stochasticity into the reified law rather than propagating it outward." So in
 // `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, not its value:
 // `z` is no ancestor of `y`, and `lawof(y)` is an honest LogNormal. The

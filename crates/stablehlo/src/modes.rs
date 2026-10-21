@@ -5,8 +5,8 @@
 //!
 //! **Free parameters vs. fixed data.** A determinized module's top-level
 //! bindings carry a `Phase` (spec §04): `elementof(...)`-declared parameters
-//! are `Phase::Parameterized`, everything derived from them (including the
-//! query itself) is *also* `Parameterized` (phase is a taint over the whole
+//! are `Phase::Parametric`, everything derived from them (including the
+//! query itself) is *also* `Parametric` (phase is a taint over the whole
 //! dependent subtree, not a leaf marker), and already-pinned observed data is
 //! `Phase::Fixed`. The phase alone therefore cannot identify the free
 //! parameters — [`is_free_param`] also checks that the binding's RHS is
@@ -251,7 +251,7 @@ pub fn check_query_inputs(
 /// `source`; values are never baked), or a derived fixed value such as
 /// `rnginit(seed)`, which §13's phase table promotes to a "function argument,
 /// replacing the computed value". [`bind_input`] builds each entry's
-/// argument(s). A parameterized binding that is not an `elementof` declaration
+/// argument(s). A parametric binding that is not an `elementof` declaration
 /// is a function OF the parameters, not an argument, and refuses. `inputs` is
 /// authoritative and exhaustive for runtime leaves reached by the outputs,
 /// respecting reified callable boundaries. A fixed-phase binding
@@ -665,11 +665,11 @@ fn bind_input(
         ))
     })?;
     let rhs = m.binding(bid).rhs;
-    // Accept `elementof` (parameterized) and ANY fixed-phase binding. §13's
+    // Accept `elementof` (parametric) and ANY fixed-phase binding. §13's
     // phase table gives fixed bindings four rows and maps every one listed in
     // `inputs` to a function argument: `external`, `load_data`, and a *derived*
     // value such as `rnginit(seed)` — "function argument, replacing the
-    // computed value". A parameterized binding that is not itself an
+    // computed value". A parametric binding that is not itself an
     // `elementof` declaration is a function OF the parameters, not an argument,
     // and a stochastic binding is not a value at all; both refuse.
     if !is_free_param(m, rhs) && m.phase_of(rhs) != Some(Phase::Fixed) {
@@ -793,12 +793,12 @@ fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
     }
 }
 
-/// A free-parameter declaration: `Phase::Parameterized` (spec §04 "Phase of
+/// A free-parameter declaration: `Phase::Parametric` (spec §04 "Phase of
 /// an expression") AND structurally a bare `elementof(...)` call. The phase
 /// check alone is not enough — see the module doc comment on why phase is a
 /// taint over the whole dependent subtree, not a parameter-leaf marker.
 fn is_free_param(m: &Module, rhs: NodeId) -> bool {
-    m.phase_of(rhs) == Some(Phase::Parameterized) && is_builtin_call(m, rhs, "elementof")
+    m.phase_of(rhs) == Some(Phase::Parametric) && is_builtin_call(m, rhs, "elementof")
 }
 
 /// A fixed-phase input construct: structurally a bare `external(...)` or

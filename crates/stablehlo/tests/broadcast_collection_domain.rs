@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! $ flatppl infer     # y = sum.(v)
-//! (%bind y (%meta (%deferred %parameterized %unknown) (broadcast sum (%ref self v))))
+//! (%bind y (%meta (%deferred %parametric %unknown) (broadcast sum (%ref self v))))
 //! $ flatppl stablehlo
 //! %1 = stablehlo.reduce(%arg0 init: %0) applies stablehlo.add across dimensions = [0]
 //!      : (tensor<4xf32>, tensor<f32>) -> tensor<f32>

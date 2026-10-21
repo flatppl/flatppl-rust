@@ -142,7 +142,7 @@ fn meta_annotations_populate_side_tables() {
         .expect("shifted_value binding");
     let rhs = m.binding(sv).rhs;
     assert_eq!(m.type_of(rhs), Some(&Type::Scalar(ScalarType::Real)));
-    assert_eq!(m.binding_phase(sv), Some(Phase::Parameterized));
+    assert_eq!(m.binding_phase(sv), Some(Phase::Parametric));
 }
 
 /// A bare (unannotated) module carries no `%meta` side-table entries.

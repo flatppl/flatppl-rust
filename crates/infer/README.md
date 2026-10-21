@@ -8,7 +8,7 @@ The type-domain trace over [`flatppl-core`](../core) modules: annotate FlatPIR i
 * Levels form a hierarchy, each including the previous: `Phase` (binding classes only) ⊂ `Type` ⊂
   `Valueset` ⊂ `Normalization` (total-mass classes) ⊂ `Shape` (fixed-phase dims).
 
-Phases follow the spec-§04 ancestor rule (`stochastic > parameterized > fixed`); the per-op rule
+Phases follow the spec-§04 ancestor rule (`stochastic > parametric > fixed`); the per-op rule
 catalogue (`ops.rs`) is the one source of truth per op. Pure library (no binary).
 
 See [`ARCHITECTURE.md`](../../ARCHITECTURE.md) for where this sits in the pipeline.

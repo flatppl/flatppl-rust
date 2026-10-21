@@ -386,7 +386,7 @@ fn pushfwd_elementwise_exp_lowers() {
     // placeholder, not get rewritten to the outer's substituted value.
     assert!(
         p.contains(
-            "(functionof (%meta ((%scalar real) %parameterized reals) (log (%ref %local _x_))) \
+            "(functionof (%meta ((%scalar real) %parametric reals) (log (%ref %local _x_))) \
              %specinputs ((x (%ref %local _x_))))"
         ),
         "nested per-cell map must keep its OWN _x_ unsubstituted (no capture):\n{p}"
