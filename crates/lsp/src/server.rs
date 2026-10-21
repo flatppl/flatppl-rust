@@ -1465,7 +1465,7 @@ fn upsert_bundle_sources(
             .copied()
             .or(url_source)
             .unwrap_or_else(|| SourceFile::new(db, identity.clone(), text.to_owned()));
-        if file.path(db) != *identity {
+        if *file.path(db) != *identity {
             file.set_path(db).to(identity.clone());
         }
         // A delayed dependency snapshot must not replace a newer editor buffer.
@@ -1554,7 +1554,7 @@ fn handle_hover(
             character: lsp_pos.character,
         });
         let index = node_span_index(db, file, fs, cats);
-        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset, &index)?;
+        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset, index)?;
         Some(lsp_types::Hover {
             contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
@@ -1671,8 +1671,7 @@ fn handle_goto_definition(
             character: lsp_pos.character,
         });
         let index = node_span_index(db, file, fs, cats);
-        let def_loc =
-            crate::capabilities::goto_definition(db, file, fs, cats, byte_offset, &index)?;
+        let def_loc = crate::capabilities::goto_definition(db, file, fs, cats, byte_offset, index)?;
         let target_uri = file_uri_for(db, fs, &def_loc.path)?;
         // Build the target range: find the dep SourceFile and use its cached
         // line index (avoids a per-request LineIndex::new rebuild).
@@ -1680,9 +1679,9 @@ fn handle_goto_definition(
             .files(db)
             .iter()
             .copied()
-            .find(|f| f.path(db) == def_loc.path);
+            .find(|f| *f.path(db) == def_loc.path);
         let target_li = dep_file
-            .map(|f| line_index(db, f))
+            .map(|f| line_index(db, f).clone())
             .unwrap_or_else(|| crate::line_index::LineIndex::new(""));
         let start = target_li.position(def_loc.start);
         let end = target_li.position(def_loc.end);
@@ -1759,7 +1758,7 @@ pub(crate) fn source_uri(db: &dyn salsa::Database, file: SourceFile) -> Option<U
     if let Some(bundle) = file.bundle(db) {
         Uri::from_str(&bundle.uri).ok()
     } else {
-        path_uri(&file.path(db))
+        path_uri(file.path(db))
     }
 }
 
@@ -1781,7 +1780,7 @@ fn file_by_path(db: &Database, fs: FileSet, path: &str) -> Option<SourceFile> {
 /// Convert a byte range in the file stored at `path` to an LSP `Range`.
 fn range_in(db: &Database, fs: FileSet, path: &str, start: u32, end: u32) -> lsp_types::Range {
     let li = file_by_path(db, fs, path)
-        .map(|f| line_index(db, f))
+        .map(|f| line_index(db, f).clone())
         .unwrap_or_else(|| crate::line_index::LineIndex::new(""));
     let s = li.position(start);
     let e = li.position(end);
@@ -1831,7 +1830,7 @@ fn handle_references(
             fs,
             cats,
             byte,
-            &index,
+            index,
             params.context.include_declaration,
         );
         Some(
@@ -1873,12 +1872,12 @@ fn handle_prepare_rename(
             return None;
         }
         let index = node_span_index(db, file, fs, cats);
-        if crate::capabilities::goto_definition(db, file, fs, cats, byte, &index)
+        if crate::capabilities::goto_definition(db, file, fs, cats, byte, index)
             .is_some_and(|definition| definition.path.starts_with("flatppl-zip:"))
         {
             return None;
         }
-        let (start, end) = crate::rename::prepare_rename(db, file, fs, cats, byte, &index).ok()?;
+        let (start, end) = crate::rename::prepare_rename(db, file, fs, cats, byte, index).ok()?;
         Some(range_in(db, fs, &file.path(db).clone(), start, end))
     })();
 
@@ -1913,7 +1912,7 @@ fn handle_rename(
         );
     };
     let index = node_span_index(db, file, fs, cats);
-    let locs = match crate::rename::rename_edits(db, file, fs, cats, byte, &index, &params.new_name)
+    let locs = match crate::rename::rename_edits(db, file, fs, cats, byte, index, &params.new_name)
     {
         Ok(locs) => locs,
         Err(refusal) => {

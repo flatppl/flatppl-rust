@@ -10,16 +10,14 @@ use std::sync::Arc;
 // ── ArcCatalogues wrapper ────────────────────────────────────────────────────
 //
 // `flatppl_infer::Catalogue` derives only `Clone + Debug` — not `PartialEq`,
-// `Eq`, `Hash`, or `salsa::Update` — so `Arc<Vec<Catalogue>>` satisfies none
-// of the bounds salsa's `#[salsa::tracked]` function return type requires
-// (`Eq` for backdating, `Update` for the update dispatch).
+// `Eq`, or `Hash` — so `Arc<Vec<Catalogue>>` has no `PartialEq`, which salsa's
+// `#[salsa::tracked]` function return type requires for backdating.
 //
 // `ArcCatalogues` wraps `Arc<Vec<Catalogue>>` and provides pointer-identity
 // `PartialEq`/`Eq` (two separately-created arcs are never pointer-equal, so
 // salsa will always re-propagate; over-recomputes rather than under-computes —
-// the same conservative policy used by `ArcModule`). The `Update` impl
-// likewise falls back to pointer identity: if the arc pointer changed the
-// value definitely changed, so we always overwrite and return `true`.
+// the same conservative policy used by `ArcModule`). If the arc pointer
+// changed the value definitely changed, so salsa sees a change.
 //
 // `errors` carries per-source parse diagnostics produced at catalogue-parse time
 // so `analyze` does not re-parse the sources a second time just to emit them.
@@ -55,22 +53,6 @@ impl Eq for ArcCatalogues {}
 impl std::hash::Hash for ArcCatalogues {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(Arc::as_ptr(&self.cats), state);
-    }
-}
-
-// SAFETY: pointer-identity equality is conservative (may over-recompute but
-// never under-computes). `maybe_update` always overwrites `old_pointer` with
-// `new_value`; returning `true` tells salsa the value changed, triggering
-// downstream recomputation. This is sound because we never suppress a genuine
-// change.
-unsafe impl salsa::Update for ArcCatalogues {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.cats, &new_value.cats) {
-            return false;
-        }
-        *old = new_value;
-        true
     }
 }
 
@@ -116,7 +98,7 @@ thread_local! {
 /// Sorted span table for offset→node lookup. Entries are `(start, end, node)`
 /// sorted by `start` ascending, then `end` descending, so a binary search to
 /// the last `start <= offset` gives a short candidate prefix.
-#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanIndex {
     spans: Vec<(u32, u32, NodeId)>,
 }
@@ -205,7 +187,7 @@ thread_local! {
 /// The `textDocument/documentSymbol` answer for one file, built once per
 /// revision and handed out as an `Arc` clone.
 ///
-/// `lsp_types::DocumentSymbol` has neither `Hash` nor `Update`, so the tracked
+/// `lsp_types::DocumentSymbol` has neither `Hash` nor `PartialEq`, so the tracked
 /// return type is this wrapper with pointer-identity equality — the same
 /// conservative policy as [`ArcModule`]: two separately-built trees are never
 /// pointer-equal, so salsa always sees a change and over-recomputes downstream
@@ -231,20 +213,6 @@ impl Eq for ArcSymbols {}
 impl std::hash::Hash for ArcSymbols {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(Arc::as_ptr(&self.0), state);
-    }
-}
-
-// SAFETY: pointer-identity comparison is conservative — a differing pointer
-// always overwrites and reports a change, so a genuine change is never
-// suppressed.
-unsafe impl salsa::Update for ArcSymbols {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.0, &new_value.0) {
-            return false;
-        }
-        *old = new_value;
-        true
     }
 }
 
@@ -326,19 +294,6 @@ impl std::hash::Hash for ArcJson {
     }
 }
 
-// SAFETY: as `ArcSymbols` — a differing pointer always overwrites and reports a
-// change, so a genuine change is never suppressed.
-unsafe impl salsa::Update for ArcJson {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.0, &new_value.0) {
-            return false;
-        }
-        *old = new_value;
-        true
-    }
-}
-
 /// The `documentSymbol` response body for `file`, serialised once per revision.
 ///
 /// `DocumentSymbolResponse::Nested` is an untagged wrapper around the vec, so
@@ -371,9 +326,8 @@ thread_local! {
 // ── Salsa field-compatibility wrapper ───────────────────────────────────────
 //
 // salsa tracked-struct fields (even `#[returns(ref)]` ones) must satisfy
-// `Hash + Update` (the latter is either the `salsa::Update` trait or the
-// fallback `'static + PartialEq`).  `Module` derives only `Clone + Debug +
-// Default`; it has neither `Hash` nor `PartialEq`.
+// `Hash + PartialEq`. `Module` derives only `Clone + Debug + Default`; it has
+// neither `Hash` nor `PartialEq`.
 //
 // `ArcModule` wraps `Arc<Module>` and provides pointer-identity `Hash`,
 // `PartialEq`, and `Eq`.  Pointer identity is sound for salsa's purposes:
@@ -411,10 +365,10 @@ impl std::hash::Hash for ArcModule {
 // ── ImportBundle wrapper ─────────────────────────────────────────────────────
 //
 // `flatppl_infer::ModuleBundle` holds `Arc<Module>` deps but is neither `Eq`
-// nor `salsa::Update` (its `Module`s have f64 literals, so no structural `Eq`).
+// nor `PartialEq` (its `Module`s have f64 literals, so no structural `Eq`).
 // `import_bundle` is a `#[salsa::tracked]` query, whose return type must satisfy
-// `Eq + Update + Debug + Send + Sync`. `ImportBundle` wraps `Arc<ModuleBundle>`
-// and supplies the same pointer-identity `Eq`/`Hash`/`Update` policy as
+// `PartialEq + Debug + Send + Sync`. `ImportBundle` wraps `Arc<ModuleBundle>`
+// and supplies the same pointer-identity `Eq`/`Hash` policy as
 // `ArcModule`/`ArcCatalogues`: two separately-assembled bundles are never
 // pointer-equal, so salsa always re-propagates on a genuine recompute
 // (over-recomputes rather than under-computes — conservatively correct).
@@ -478,21 +432,6 @@ impl Eq for ImportBundle {}
 impl std::hash::Hash for ImportBundle {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(Arc::as_ptr(&self.bundle), state);
-    }
-}
-
-// SAFETY: pointer-identity equality is conservative (may over-recompute but
-// never under-computes). `maybe_update` overwrites `old_pointer` with
-// `new_value` on a pointer difference and returns `true`, telling salsa the
-// value changed. Sound because we never suppress a genuine change.
-unsafe impl salsa::Update for ImportBundle {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.bundle, &new_value.bundle) {
-            return false;
-        }
-        *old = new_value;
-        true
     }
 }
 
@@ -590,20 +529,20 @@ pub fn resolve_path(
     if let Some(bundle) = importer.bundle(db)
         && let Some(target) = bundle.modules.get(directive_path)
     {
-        return fs.files(db).iter().copied().find(|f| f.path(db) == *target);
+        return fs.files(db).iter().copied().find(|f| f.path(db) == target);
     }
     // A missing archive member must not fall through to a workspace file with
     // the same name. The client supplies every permitted archive edge (§04).
     if importer.path(db).starts_with("flatppl-zip:") {
         return None;
     }
-    let joined = Location::parse(&importer.path(db)).join(directive_path);
+    let joined = Location::parse(importer.path(db)).join(directive_path);
     let direct = Location::parse(directive_path).normalized();
     let find = |target: &Location| {
         fs.files(db)
             .iter()
             .copied()
-            .find(|f| &Location::parse(&f.path(db)).normalized() == target)
+            .find(|f| &Location::parse(f.path(db)).normalized() == target)
     };
     find(&joined).or_else(|| find(&direct))
 }
@@ -1210,8 +1149,8 @@ mod tests {
         ANALYZE_RUNS.with(|c| c.set(0));
 
         // Edit the Catalogues input: a new Vec is a new Arc (pointer-identity
-        // change), so ArcCatalogues::maybe_update returns `true` and salsa marks
-        // all dependents stale. The source file `f` did not change.
+        // change), so `ArcCatalogues`'s pointer-identity `PartialEq` reports a
+        // change and salsa marks all dependents stale. The source file `f` did not change.
         use salsa::Setter;
         let cat_v2 = r#"Catalogue(base:[],modules:[])"#; // module removed
         cats.set_sources(&mut db).to(vec![cat_v2.to_string()]);
@@ -1385,7 +1324,7 @@ mod tests {
         let index = node_span_index(&db, f, fs, cats);
         for off in 0..(src.len() as u32) {
             assert_eq!(
-                node_at_offset_indexed(&index, off),
+                node_at_offset_indexed(index, off),
                 module.node_at_offset(off),
                 "mismatch at offset {off}"
             );

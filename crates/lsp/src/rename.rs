@@ -664,7 +664,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         // Cursor on the declaration of `x`.
-        let locs = references(&db, f, fs, cats, 0, &index, true);
+        let locs = references(&db, f, fs, cats, 0, index, true);
         let texts: Vec<&str> = locs
             .iter()
             .map(|l| &src[l.start as usize..l.end as usize])
@@ -686,7 +686,7 @@ mod tests {
         let src = "x = 1\ny = add(x, 2)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = references(&db, f, fs, cats, 0, &index, false);
+        let locs = references(&db, f, fs, cats, 0, index, false);
         assert_eq!(locs.len(), 1, "only the use in `add(x, 2)`; got {locs:?}");
         assert!(locs.iter().all(|l| l.start != 0));
     }
@@ -696,7 +696,7 @@ mod tests {
         let src = "x = 1\nxy = 2\nz = add(x, xy)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = references(&db, f, fs, cats, 0, &index, true);
+        let locs = references(&db, f, fs, cats, 0, index, true);
         assert_eq!(locs.len(), 2, "`x` decl + one use, not `xy`; got {locs:?}");
         for l in &locs {
             assert_eq!(&src[l.start as usize..l.end as usize], "x");
@@ -710,7 +710,7 @@ mod tests {
         let src = "mu = 0.0\nx ~ Normal(mu, 1.0)\ny = add(x, 1.0)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = references(&db, f, fs, cats, 9, &index, true);
+        let locs = references(&db, f, fs, cats, 9, index, true);
         assert_eq!(locs.len(), 2, "`x` decl + its use; got {locs:?}");
     }
 
@@ -719,7 +719,7 @@ mod tests {
         let src = "f(a) = add(a, 1)\nz = f(3)\nw = f(4)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = references(&db, f, fs, cats, 0, &index, true);
+        let locs = references(&db, f, fs, cats, 0, index, true);
         assert_eq!(locs.len(), 3, "`f` decl + two calls; got {locs:?}");
     }
 
@@ -742,7 +742,7 @@ mod tests {
 
         // Ask from the DEFINING file, on the declaration of `shifted`.
         let index = node_span_index(&db, helpers, fs, cats);
-        let locs = references(&db, helpers, fs, cats, 0, &index, true);
+        let locs = references(&db, helpers, fs, cats, 0, index, true);
         let by_file = |p: &str| locs.iter().filter(|l| l.path == p).count();
         assert_eq!(
             by_file("helpers.flatppl"),
@@ -775,7 +775,7 @@ mod tests {
         let index = node_span_index(&db, model, fs, cats);
         // Cursor on the `s` of `h.s`.
         let off = nth_offset(model.text(&db), "h.s", 0) + 2;
-        let locs = references(&db, model, fs, cats, off, &index, true);
+        let locs = references(&db, model, fs, cats, off, index, true);
         assert!(
             locs.iter().any(|l| l.path == "helpers.flatppl"),
             "the definition in the loaded module must be found; got {locs:?}"
@@ -800,7 +800,7 @@ mod tests {
         let cats = Catalogues::new(&db, vec![]);
         let index = node_span_index(&db, model, fs, cats);
         // Cursor on the alias declaration `h`.
-        let locs = references(&db, model, fs, cats, 0, &index, true);
+        let locs = references(&db, model, fs, cats, 0, index, true);
         assert_eq!(
             locs.len(),
             3,
@@ -819,7 +819,7 @@ mod tests {
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add", 0);
         assert!(
-            references(&db, f, fs, cats, off, &index, true).is_empty(),
+            references(&db, f, fs, cats, off, index, true).is_empty(),
             "a built-in is not a binding, so it has no references to report"
         );
     }
@@ -832,7 +832,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add(x", 0) + 4;
-        assert_eq!(prepare_rename(&db, f, fs, cats, off, &index), Ok((14, 15)));
+        assert_eq!(prepare_rename(&db, f, fs, cats, off, index), Ok((14, 15)));
     }
 
     #[test]
@@ -845,7 +845,7 @@ mod tests {
         let cats = Catalogues::new(&db, vec![]);
         let index = node_span_index(&db, model, fs, cats);
         let dot = nth_offset(src, "h.s", 0);
-        let range = prepare_rename(&db, model, fs, cats, dot + 2, &index).expect("renameable");
+        let range = prepare_rename(&db, model, fs, cats, dot + 2, index).expect("renameable");
         assert_eq!(
             &src[range.0 as usize..range.1 as usize],
             "s",
@@ -859,7 +859,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add", 0);
-        let err = prepare_rename(&db, f, fs, cats, off, &index).expect_err("builtin must refuse");
+        let err = prepare_rename(&db, f, fs, cats, off, index).expect_err("builtin must refuse");
         assert!(
             err.0.contains("built-in"),
             "refusal must name the reason; got {}",
@@ -876,7 +876,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add(a", 0) + 4;
-        let range = prepare_rename(&db, f, fs, cats, off, &index)
+        let range = prepare_rename(&db, f, fs, cats, off, index)
             .expect("a function argument is renameable");
         assert_eq!(&src[range.0 as usize..range.1 as usize], "a");
     }
@@ -887,7 +887,7 @@ mod tests {
         let src = "f(a) = add(a, 1)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let range = prepare_rename(&db, f, fs, cats, 2, &index).expect("declaration renameable");
+        let range = prepare_rename(&db, f, fs, cats, 2, index).expect("declaration renameable");
         assert_eq!(range, (2, 3));
     }
 
@@ -901,7 +901,7 @@ mod tests {
         let cats = Catalogues::new(&db, vec![ron.to_string()]);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "e.MyDist", 0) + 3;
-        let err = prepare_rename(&db, f, fs, cats, off, &index)
+        let err = prepare_rename(&db, f, fs, cats, off, index)
             .expect_err("a §09 member must refuse rename");
         assert!(
             err.0.contains("standard-module"),
@@ -918,7 +918,7 @@ mod tests {
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "s.a", 0) + 2;
         assert!(
-            prepare_rename(&db, f, fs, cats, off, &index).is_err(),
+            prepare_rename(&db, f, fs, cats, off, index).is_err(),
             "a record field must not be renameable"
         );
     }
@@ -930,7 +930,7 @@ mod tests {
         let src = "x = 1\ny = add(x, 2)\nz = mul(x, x)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 0, &index, "theta").expect("rename allowed");
+        let locs = rename_edits(&db, f, fs, cats, 0, index, "theta").expect("rename allowed");
         assert_eq!(
             apply(src, &locs, "theta"),
             "theta = 1\ny = add(theta, 2)\nz = mul(theta, theta)"
@@ -949,7 +949,7 @@ mod tests {
         let index = node_span_index(&db, model, fs, cats);
         // Rename from the IMPORTER, on the member half of `h.shifted`.
         let off = nth_offset(model_src, "h.shifted", 0) + 2;
-        let locs = rename_edits(&db, model, fs, cats, off, &index, "offset").expect("allowed");
+        let locs = rename_edits(&db, model, fs, cats, off, index, "offset").expect("allowed");
 
         let h_edits: Vec<NameLoc> = locs
             .iter()
@@ -978,8 +978,7 @@ mod tests {
         let src = "x = 1\ny = 2\nz = add(x, y)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let err =
-            rename_edits(&db, f, fs, cats, 0, &index, "y").expect_err("collision must refuse");
+        let err = rename_edits(&db, f, fs, cats, 0, index, "y").expect_err("collision must refuse");
         assert!(
             err.0.contains("already bound"),
             "refusal must say the name is taken; got {}",
@@ -994,7 +993,7 @@ mod tests {
         let index = node_span_index(&db, f, fs, cats);
         for bad in ["in", "1x", "_x_", "__gen", "self", "x-y"] {
             assert!(
-                rename_edits(&db, f, fs, cats, 0, &index, bad).is_err(),
+                rename_edits(&db, f, fs, cats, 0, index, bad).is_err(),
                 "`{bad}` must be refused as a binding name"
             );
         }
@@ -1006,7 +1005,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add", 0);
-        assert!(rename_edits(&db, f, fs, cats, off, &index, "plus").is_err());
+        assert!(rename_edits(&db, f, fs, cats, off, index, "plus").is_err());
     }
 
     #[test]
@@ -1015,7 +1014,7 @@ mod tests {
         let src = "x = 1\ny = add(x, 2)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 0, &index, "sqrt")
+        let locs = rename_edits(&db, f, fs, cats, 0, index, "sqrt")
             .expect("shadowing a built-in is legal");
         assert_eq!(apply(src, &locs, "sqrt"), "sqrt = 1\ny = add(sqrt, 2)");
     }
@@ -1039,7 +1038,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![helpers, model]);
         let cats = Catalogues::new(&db, vec![]);
         let index = node_span_index(&db, helpers, fs, cats);
-        let locs = rename_edits(&db, helpers, fs, cats, 0, &index, "_s")
+        let locs = rename_edits(&db, helpers, fs, cats, 0, index, "_s")
             .expect("no rule forbids making a binding private");
         let pick =
             |p: &str| -> Vec<NameLoc> { locs.iter().filter(|l| l.path == p).cloned().collect() };
@@ -1083,7 +1082,7 @@ mod tests {
         let src = "s = 1.0\nu = add(s, 1.0)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 0, &index, "_s")
+        let locs = rename_edits(&db, f, fs, cats, 0, index, "_s")
             .expect("no cross-module reference, so the visibility change is safe");
         assert_eq!(apply(src, &locs, "_s"), "_s = 1.0\nu = add(_s, 1.0)");
     }
@@ -1094,7 +1093,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let locs =
-            rename_edits(&db, f, fs, cats, 0, &index, "s").expect("widening visibility is legal");
+            rename_edits(&db, f, fs, cats, 0, index, "s").expect("widening visibility is legal");
         assert_eq!(apply(src, &locs, "s"), "s = 1.0\nu = add(s, 1.0)");
     }
 
@@ -1105,7 +1104,7 @@ mod tests {
         let src = "f(a, b) = add(mul(a, a), b)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = references(&db, f, fs, cats, 2, &index, true);
+        let locs = references(&db, f, fs, cats, 2, index, true);
         assert_eq!(locs.len(), 3, "declaration + two body uses; got {locs:?}");
         for l in &locs {
             assert_eq!(&src[l.start as usize..l.end as usize], "a");
@@ -1117,7 +1116,7 @@ mod tests {
         let src = "f(a, b) = add(mul(a, a), b)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, &index, "scale").expect("allowed");
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "scale").expect("allowed");
         assert_eq!(
             apply(src, &locs, "scale"),
             "f(scale, b) = add(mul(scale, scale), b)"
@@ -1132,7 +1131,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "(a, b)", 0) + 1;
-        let locs = rename_edits(&db, f, fs, cats, off, &index, "x").expect("allowed");
+        let locs = rename_edits(&db, f, fs, cats, off, index, "x").expect("allowed");
         assert_eq!(apply(src, &locs, "x"), "g = (x, b) -> add(x, b)");
     }
 
@@ -1142,7 +1141,7 @@ mod tests {
         let src = "s = a -> add(a, 1)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 4, &index, "v").expect("allowed");
+        let locs = rename_edits(&db, f, fs, cats, 4, index, "v").expect("allowed");
         assert_eq!(apply(src, &locs, "v"), "s = v -> add(v, 1)");
     }
 
@@ -1154,7 +1153,7 @@ mod tests {
         let src = "f(a) = add(a, 1)\ng(a) = mul(a, 2)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, &index, "z").expect("allowed");
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "z").expect("allowed");
         assert_eq!(apply(src, &locs, "z"), "f(z) = add(z, 1)\ng(a) = mul(a, 2)");
     }
 
@@ -1163,7 +1162,7 @@ mod tests {
         let src = "f(a) = add(a, sum(broadcast(a -> add(a, 1), [1, 2])))\ny = f(3)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, &index, "scale").unwrap();
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "scale").unwrap();
         assert_eq!(
             apply(src, &locs, "scale"),
             "f(scale) = add(scale, sum(broadcast(a -> add(a, 1), [1, 2])))\ny = f(3)"
@@ -1175,7 +1174,7 @@ mod tests {
         let src = "x = (\n # x = ignored\n 1)\ny = x";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").unwrap();
+        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, index, "renamed").unwrap();
         assert_eq!(
             apply(src, &locs, "renamed"),
             "renamed = (\n # x = ignored\n 1)\ny = renamed"
@@ -1187,7 +1186,7 @@ mod tests {
         let src = "text = \"x = ignored\"\nx = 1\ny = x";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").unwrap();
+        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, index, "renamed").unwrap();
         assert_eq!(
             apply(src, &locs, "renamed"),
             "text = \"x = ignored\"\nrenamed = 1\ny = renamed"
@@ -1201,7 +1200,7 @@ mod tests {
             let (db, f, fs, cats) = single_file(&src);
             let index = node_span_index(&db, f, fs, cats);
             assert!(
-                rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").is_err(),
+                rename_edits(&db, f, fs, cats, src.len() as u32 - 1, index, "renamed").is_err(),
                 "a rename must include the declaration"
             );
         }
@@ -1213,7 +1212,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let cursor = nth_offset(src, "add(a", 0) + 4;
-        let edits = rename_edits(&db, f, fs, cats, cursor, &index, "value").unwrap();
+        let edits = rename_edits(&db, f, fs, cats, cursor, index, "value").unwrap();
         assert_eq!(
             apply(src, &edits, "value"),
             "f(\n # argument\n value) = add(value, 1)\ny = f(3)"
@@ -1226,7 +1225,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let cursor = nth_offset(src, "f(3)", 0);
-        let locs = rename_edits(&db, f, fs, cats, cursor, &index, "identity").unwrap();
+        let locs = rename_edits(&db, f, fs, cats, cursor, index, "identity").unwrap();
         assert_eq!(
             apply(src, &locs, "identity"),
             "identity(f) = f\ny = identity(3)"
@@ -1238,13 +1237,13 @@ mod tests {
         let src = "f(a) = a -> add(a, 1)\ny = f(3)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let outer = rename_edits(&db, f, fs, cats, 2, &index, "outer").unwrap();
+        let outer = rename_edits(&db, f, fs, cats, 2, index, "outer").unwrap();
         assert_eq!(
             apply(src, &outer, "outer"),
             "f(outer) = a -> add(a, 1)\ny = f(3)"
         );
         for cursor in [nth_offset(src, "a ->", 0), nth_offset(src, "add(a", 0) + 4] {
-            let inner = rename_edits(&db, f, fs, cats, cursor, &index, "inner").unwrap();
+            let inner = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap();
             assert_eq!(
                 apply(src, &inner, "inner"),
                 "f(a) = inner -> add(inner, 1)\ny = f(3)"
@@ -1260,7 +1259,7 @@ mod tests {
         let declaration = nth_offset(src, "a ->", 0);
         let body_use = nth_offset(src, "add(a, 1)", 0) + 4;
         for cursor in [declaration, body_use] {
-            let locs = rename_edits(&db, f, fs, cats, cursor, &index, "inner").unwrap();
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap();
             assert_eq!(
                 apply(src, &locs, "inner"),
                 "f(a) = add(a, sum(broadcast(inner -> add(inner, 1), [1, 2])))\ny = f(3)"
@@ -1277,7 +1276,7 @@ mod tests {
         let src = "f(a, b) = add(a, b)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, &index, "b").expect("allowed");
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "b").expect("allowed");
         let renamed = apply(src, &locs, "b");
         assert_eq!(renamed, "f(b, b) = add(b, b)");
         let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
@@ -1315,7 +1314,7 @@ mod tests {
         for candidate in ["__gen", "sqrt", "_priv"] {
             let (db, f, fs, cats) = single_file(src);
             let index = node_span_index(&db, f, fs, cats);
-            let locs = rename_edits(&db, f, fs, cats, 2, &index, candidate)
+            let locs = rename_edits(&db, f, fs, cats, 2, index, candidate)
                 .unwrap_or_else(|e| panic!("`{candidate}` must be a legal argument name: {}", e.0));
             assert_eq!(
                 apply(src, &locs, candidate),
@@ -1331,7 +1330,7 @@ mod tests {
         let src = "f(a) = add(a, 1)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let err = rename_edits(&db, f, fs, cats, 2, &index, "_x_")
+        let err = rename_edits(&db, f, fs, cats, 2, index, "_x_")
             .expect_err("the placeholder form is not a legal argument name");
         assert!(err.0.contains("placeholder"), "got {}", err.0);
         // Confirm the premise: the parser really does reject it.
@@ -1347,7 +1346,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "_mu_", 0);
-        let err = rename_edits(&db, f, fs, cats, off, &index, "nu")
+        let err = rename_edits(&db, f, fs, cats, off, index, "nu")
             .expect_err("no recorded span for the boundary keyword");
         assert!(
             err.0.contains("recorded span"),
@@ -1362,7 +1361,7 @@ mod tests {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         assert!(
-            rename_edits(&db, f, fs, cats, 0, &index, "x")
+            rename_edits(&db, f, fs, cats, 0, index, "x")
                 .expect("allowed")
                 .is_empty()
         );
@@ -1377,7 +1376,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![helpers, model]);
         let cats = Catalogues::new(&db, vec![]);
         let index = node_span_index(&db, model, fs, cats);
-        let locs = rename_edits(&db, model, fs, cats, 0, &index, "helpers").expect("allowed");
+        let locs = rename_edits(&db, model, fs, cats, 0, index, "helpers").expect("allowed");
         assert!(
             locs.iter().all(|l| l.path == "model.flatppl"),
             "an alias is local to its module; got {locs:?}"

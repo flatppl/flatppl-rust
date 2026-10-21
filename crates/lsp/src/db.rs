@@ -45,9 +45,9 @@ pub struct FileSet {
 /// source strings.
 ///
 /// Storage choice: `flatppl_infer::Catalogue` derives only `Clone + Debug` —
-/// it is neither `Hash`/`Eq` nor `salsa::Update`, so a `Vec<Catalogue>` cannot
+/// it is neither `Hash` nor `PartialEq`, so a `Vec<Catalogue>` cannot
 /// be a salsa input field. Rather than wrap it, we store the RON *sources*
-/// (`Vec<String>`, trivially `Update`) and parse them inside `analyze` via
+/// (`Vec<String>`, trivially `PartialEq`) and parse them inside `analyze` via
 /// [`flatppl_infer::parse_catalogue`]. A RON parse failure becomes an `Error`
 /// diagnostic on the analyzed file (offset 0) rather than a panic.
 #[salsa::input]
