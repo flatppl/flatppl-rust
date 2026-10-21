@@ -112,7 +112,7 @@ fn paper_product_converts() {
     // product (§12), not a joint.
     assert!(
         text.contains(
-            "prod = normalize(logweighted(functionof(logdensityof(g2, _x_), x = _x_), g1))"
+            "prod = normalize(logweighted(functionof(logdensityof(_parameters_, _x_), x = _x_, parameters = _parameters_), g1, g2))"
         ),
         "shared-variate product_dist lowering mismatch, got:\n{text}"
     );

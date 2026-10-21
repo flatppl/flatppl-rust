@@ -46,7 +46,7 @@
 //!
 //! The forward body is a linear chain of ops `f = gₙ∘…∘g₁` terminating at the
 //! single input placeholder — each op either a [`REGISTRY`] unary or an AFFINE
-//! node with ONE literal operand `c` and ONE sub-expression `u`
+//! node with ONE variate-independent operand `c` and ONE sub-expression `u`
 //! (`mul`/`divide`/`add`/`sub`). We invert it by:
 //!
 //! * **`f_inv(y) = g₁_inv(…(gₙ_inv(y))…)`** — apply the per-op inverses
@@ -125,10 +125,10 @@
 //!
 //! Refuse-don't-mislower: an UNRECOGNISED forward function returns `Ok(None)`
 //! (the caller refuses); a RECOGNISED-but-non-invertible shape returns `Err`
-//! (refuse) — a non-affine `mul`/`add`/`sub` (both operands non-literal, e.g.
-//! `x*x`, or both literal), a `mul`/`divide` whose literal coefficient is
-//! ZERO (`0.0 * u` collapses to the constant 0; `u / 0.0` is undefined), a
-//! `divide` without a literal denominator, a `pow` inside a composition (its
+//! (refuse) — a non-affine `mul`/`add`/`sub` (both operands depend on the variate,
+//! e.g. `x*x`, or neither does), a `mul`/`divide` whose coefficient is not proven
+//! nonzero (`0.0 * u` collapses to the constant 0; `u / 0.0` is undefined), a
+//! symbolic affine coefficient in a nonlinear composition, a `pow` inside a composition (its
 //! input domain is not verifiable here), or any other recognised builtin op.
 //! A wrong `(f_inv, logvol)` is never synthesised.
 //!
@@ -163,7 +163,7 @@ pub(crate) struct Bijection {
 }
 
 /// One op `gᵢ` in a scalar chain, carrying what its inverse and local logvol
-/// need: for a [`REGISTRY`] unary the shared entry, for the affine ops the literal
+/// need: for a [`REGISTRY`] unary the shared entry, for the affine ops the independent
 /// operand `c`. Neither leg needs a node off the FORWARD body — both are built at
 /// the op's output point, which [`derive_chain`]'s inverse walk already holds.
 enum ChainOp {
@@ -174,15 +174,15 @@ enum ChainOp {
         entry: &'static UnaryEntry,
     },
     /// `c·z`: inverse `divide(acc, c)`; local logvol `log(abs(c))`.
-    MulByLit(NodeId),
+    MulBy(NodeId),
     /// `z/c`: inverse `mul(acc, c)`; local logvol `neg(log(abs(c)))`.
-    DivByLit(NodeId),
+    DivBy(NodeId),
     /// `z+c`: inverse `sub(acc, c)`; local logvol `0`.
-    AddLit(NodeId),
+    AddConstant(NodeId),
     /// `z−c`: inverse `add(acc, c)`; local logvol `0`.
-    SubLit(NodeId),
+    SubConstant(NodeId),
     /// `c−z`: inverse `sub(c, acc)`; local logvol `0` (derivative −1, log|−1| = 0).
-    RSubLit(NodeId),
+    RSubConstant(NodeId),
 }
 
 /// The recognised surface shape of a `pushfwd`'s forward argument.
@@ -574,7 +574,8 @@ impl ImageOp {
     }
 
     /// The image reading of one chain op. `None` where an affine op's coefficient is
-    /// not a numeric literal, which [`classify`] admits none of.
+    /// not a numeric literal. Such coefficients are admitted for purely affine maps;
+    /// the base density then supplies their support check through the inverse.
     fn of_chain_op(m: &Module, op: &ChainOp) -> Option<ImageOp> {
         let affine = |c: NodeId, map: EndpointMap, op: &'static str, literal_first: bool| {
             Some(ImageOp {
@@ -589,22 +590,20 @@ impl ImageOp {
         };
         match op {
             ChainOp::Registry { op, entry, .. } => Some(ImageOp::unary(op, entry)),
-            ChainOp::MulByLit(c) => {
-                affine(*c, EndpointMap::Scale(literal_real(m, *c)?), "mul", false)
-            }
-            ChainOp::DivByLit(c) => affine(
+            ChainOp::MulBy(c) => affine(*c, EndpointMap::Scale(literal_real(m, *c)?), "mul", false),
+            ChainOp::DivBy(c) => affine(
                 *c,
                 EndpointMap::Divide(literal_real(m, *c)?),
                 "divide",
                 false,
             ),
-            ChainOp::AddLit(c) => {
+            ChainOp::AddConstant(c) => {
                 affine(*c, EndpointMap::Shift(literal_real(m, *c)?), "add", false)
             }
-            ChainOp::SubLit(c) => {
+            ChainOp::SubConstant(c) => {
                 affine(*c, EndpointMap::Shift(-literal_real(m, *c)?), "sub", false)
             }
-            ChainOp::RSubLit(c) => {
+            ChainOp::RSubConstant(c) => {
                 affine(*c, EndpointMap::Reflect(literal_real(m, *c)?), "sub", true)
             }
         }
@@ -1731,6 +1730,21 @@ fn derive_chain(
     let Some(ops) = flatten_chain(m, body, ph)? else {
         return Ok(None);
     };
+    let symbolic_affine = ops.iter().any(|op| match op {
+        ChainOp::MulBy(c)
+        | ChainOp::DivBy(c)
+        | ChainOp::AddConstant(c)
+        | ChainOp::SubConstant(c)
+        | ChainOp::RSubConstant(c) => !is_lit(m, *c),
+        _ => false,
+    });
+    if symbolic_affine && ops.iter().any(|op| matches!(op, ChainOp::Registry { .. })) {
+        return Err(refuse(
+            body,
+            m,
+            "symbolic affine coefficients in nonlinear compositions require an explicit bijection",
+        ));
+    }
 
     // §06 case 1's domain restriction, applied to the chain. A domain-restricted op
     // (`log`, `log10`, `log1p`, `logit`, `probit`, `sqrt`) lowered outside its domain
@@ -1827,7 +1841,7 @@ fn flatten_chain(
         if is_placeholder_ref(m, cur, ph) {
             return Ok(Some(ops));
         }
-        match classify(m, cur)? {
+        match classify(m, cur, ph)? {
             Some((op, child)) => {
                 ops.push(op);
                 cur = child;
@@ -1842,7 +1856,7 @@ fn flatten_chain(
 /// for an unrecognised head (a user-function call, or a non-call leaf that is not
 /// the placeholder), `Err` for a recognised builtin with no analytic inverse
 /// here (refuse-don't-mislower).
-fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, RefuseError> {
+fn classify(m: &Module, cur: NodeId, ph: Symbol) -> Result<Option<(ChainOp, NodeId)>, RefuseError> {
     let (name, args) = match m.node(cur) {
         Node::Call(c) => match c.head {
             CallHead::Builtin(sym) => (m.resolve(sym).to_string(), c.args.to_vec()),
@@ -1863,55 +1877,63 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
         return Ok(Some((ChainOp::Registry { op, entry }, args[0])));
     }
     match name.as_str() {
-        // Affine multiply: exactly one literal operand (the scale `c`), and that
-        // literal must be nonzero — `0.0 * u` collapses the forward map to the
+        // Affine multiply: exactly one independent coefficient (the scale `c`),
+        // proven nonzero — `0.0 * u` collapses the forward map to the
         // constant 0, which is not injective (refuse rather than synthesize a
         // degenerate `f_inv = divide(acc, 0.0)`).
         "mul" if args.len() == 2 => {
-            match (is_nonzero_lit(m, args[0]), is_nonzero_lit(m, args[1])) {
-                (true, false) => Ok(Some((ChainOp::MulByLit(args[0]), args[1]))),
-                (false, true) => Ok(Some((ChainOp::MulByLit(args[1]), args[0]))),
+            match (
+                is_nonzero_coefficient(m, args[0], ph),
+                is_nonzero_coefficient(m, args[1], ph),
+            ) {
+                (true, false) => Ok(Some((ChainOp::MulBy(args[0]), args[1]))),
+                (false, true) => Ok(Some((ChainOp::MulBy(args[1]), args[0]))),
                 _ => Err(refuse(
                     cur,
                     m,
-                    "mul with two non-literal (or two literal, or a literal-zero scale) \
-                     operands is not an invertible affine map — refuse rather than mislower",
+                    "mul needs one variate-independent, provably nonzero coefficient",
                 )),
             }
         }
-        // Affine divide: only `u / c` (literal denominator) is affine; `c / u`
-        // (reciprocal) is out of the grammar. The literal denominator must also
+        // Affine divide: only `u / c` (independent denominator) is affine; `c / u`
+        // (reciprocal) is out of the grammar. The denominator must also
         // be nonzero — `u / 0.0` is undefined everywhere (refuse rather than
         // synthesize a degenerate `f_inv = mul(acc, 0.0)`).
-        "divide" if args.len() == 2 => match (is_lit(m, args[0]), is_nonzero_lit(m, args[1])) {
-            (false, true) => Ok(Some((ChainOp::DivByLit(args[1]), args[0]))),
+        "divide" if args.len() == 2 => match (
+            !refs_placeholder(m, args[0], ph),
+            is_nonzero_coefficient(m, args[1], ph),
+        ) {
+            (false, true) => Ok(Some((ChainOp::DivBy(args[1]), args[0]))),
             _ => Err(refuse(
                 cur,
                 m,
-                "divide is an invertible affine map only with a literal, nonzero denominator \
-                 (u / c) — refuse rather than mislower",
+                "divide needs a variate-independent, provably nonzero denominator",
             )),
         },
-        // Affine add: exactly one literal operand (the shift `c`).
-        "add" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
-            (true, false) => Ok(Some((ChainOp::AddLit(args[0]), args[1]))),
-            (false, true) => Ok(Some((ChainOp::AddLit(args[1]), args[0]))),
+        // Affine add: exactly one independent operand (the shift `c`).
+        "add" if args.len() == 2 => match (
+            !refs_placeholder(m, args[0], ph),
+            !refs_placeholder(m, args[1], ph),
+        ) {
+            (true, false) => Ok(Some((ChainOp::AddConstant(args[0]), args[1]))),
+            (false, true) => Ok(Some((ChainOp::AddConstant(args[1]), args[0]))),
             _ => Err(refuse(
                 cur,
                 m,
-                "add with two non-literal (or two literal) operands is not an invertible \
-                 affine map — refuse rather than mislower",
+                "add needs exactly one variate-independent shift",
             )),
         },
         // Affine subtract: `u − c` (shift) or `c − u` (reflect+shift).
-        "sub" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
-            (false, true) => Ok(Some((ChainOp::SubLit(args[1]), args[0]))),
-            (true, false) => Ok(Some((ChainOp::RSubLit(args[0]), args[1]))),
+        "sub" if args.len() == 2 => match (
+            !refs_placeholder(m, args[0], ph),
+            !refs_placeholder(m, args[1], ph),
+        ) {
+            (false, true) => Ok(Some((ChainOp::SubConstant(args[1]), args[0]))),
+            (true, false) => Ok(Some((ChainOp::RSubConstant(args[0]), args[1]))),
             _ => Err(refuse(
                 cur,
                 m,
-                "sub with two non-literal (or two literal) operands is not an invertible \
-                 affine map — refuse rather than mislower",
+                "sub needs exactly one variate-independent shift",
             )),
         },
         // `pow` is invertible only as the single top-level op over a strictly-
@@ -1938,11 +1960,11 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
 fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
     match op {
         ChainOp::Registry { entry, .. } => entry.inverse.at(m, acc),
-        ChainOp::MulByLit(c) => build_call(m, "divide", &[acc, *c]),
-        ChainOp::DivByLit(c) => build_call(m, "mul", &[acc, *c]),
-        ChainOp::AddLit(c) => build_call(m, "sub", &[acc, *c]),
-        ChainOp::SubLit(c) => build_call(m, "add", &[acc, *c]),
-        ChainOp::RSubLit(c) => build_call(m, "sub", &[*c, acc]),
+        ChainOp::MulBy(c) => build_call(m, "divide", &[acc, *c]),
+        ChainOp::DivBy(c) => build_call(m, "mul", &[acc, *c]),
+        ChainOp::AddConstant(c) => build_call(m, "sub", &[acc, *c]),
+        ChainOp::SubConstant(c) => build_call(m, "add", &[acc, *c]),
+        ChainOp::RSubConstant(c) => build_call(m, "sub", &[*c, acc]),
     }
 }
 
@@ -1958,18 +1980,18 @@ fn local_logvol(m: &mut Module, op: &ChainOp, out: NodeId) -> Option<NodeId> {
             LogVol::At(build) => Some(build(m, out)),
         },
         // log|d/dz (c·z)| = log|c|.
-        ChainOp::MulByLit(c) => {
+        ChainOp::MulBy(c) => {
             let absc = build_call(m, "abs", &[*c]);
             Some(build_call(m, "log", &[absc]))
         }
         // log|d/dz (z/c)| = −log|c|.
-        ChainOp::DivByLit(c) => {
+        ChainOp::DivBy(c) => {
             let absc = build_call(m, "abs", &[*c]);
             let logabs = build_call(m, "log", &[absc]);
             Some(build_call(m, "neg", &[logabs]))
         }
         // Derivative ±1 ⇒ log|g'| = 0: contributes nothing to the sum.
-        ChainOp::AddLit(_) | ChainOp::SubLit(_) | ChainOp::RSubLit(_) => None,
+        ChainOp::AddConstant(_) | ChainOp::SubConstant(_) | ChainOp::RSubConstant(_) => None,
     }
 }
 
@@ -2640,8 +2662,16 @@ fn is_lit(m: &Module, id: NodeId) -> bool {
 /// literal-zero scale/divisor is not a Task-1 recognised invertible affine
 /// map: `mul(0.0, u)` collapses to the constant 0 (not injective) and
 /// `divide(u, 0.0)` is undefined everywhere.
-fn is_nonzero_lit(m: &Module, id: NodeId) -> bool {
+fn is_nonzero_coefficient(m: &Module, id: NodeId, ph: Symbol) -> bool {
+    if refs_placeholder(m, id, ph) {
+        return false;
+    }
     literal_real(m, id).is_some_and(|c| c != 0.0)
+        || match m.valueset_of(id) {
+            Some(ValueSet::PosReals | ValueSet::PosIntegers) => true,
+            Some(ValueSet::Interval(lo, hi)) => *lo > 0.0 || *hi < 0.0,
+            _ => false,
+        }
 }
 
 /// Build a `functionof` lambda `<input_name> -> <body>` with the given boundary

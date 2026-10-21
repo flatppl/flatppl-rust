@@ -3,10 +3,10 @@ use crate::builder::Builder;
 use crate::dist_spec::{self, Variate};
 use crate::error::{Error, Result};
 use crate::expr;
-use crate::expr::wrap_lambda_multi;
+use crate::expr::{Callback, wrap_callback};
 use crate::model::Distribution;
 use flatppl_core::id::NodeId;
-use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs};
+use flatppl_core::node::{Call, CallHead, NamedArg, NamedKind, Node};
 
 /// Build a FlatPPL array node from a JSON array of scalars (numbers/strings).
 fn array_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeId> {
@@ -35,16 +35,18 @@ fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeI
 /// Context for conditional distribution parameter resolution.
 ///
 /// When a parameter value names a `generic_function` of an observable axis,
-/// `field_node_ctx` emits `func(axis)` (a `CallHead::User` call) rather than a
+/// `field_node_ctx` emits `func(axis, parameters)` (a user call) rather than a
 /// bare `self_ref`. Without this context the behaviour is identical to
 /// `field_node`.
 pub struct CondCtx<'a> {
     /// Maps a `generic_function` name → its observable axis name.
     pub funcs: &'a std::collections::BTreeMap<&'a str, &'a str>,
+    /// Explicit parameter objects of fixed helper functions.
+    pub parameters: &'a std::collections::BTreeMap<String, NodeId>,
 }
 
 /// Resolve a parameter value. With a conditional context, a value that names a
-/// `generic_function` of an observable axis emits `func(axis)` (a user-call);
+/// `generic_function` of an observable axis emits `func(axis, parameters)`;
 /// otherwise behaves exactly like `field_node`.
 fn field_node_ctx(
     b: &mut Builder,
@@ -56,16 +58,32 @@ fn field_node_ctx(
     {
         let func = b.self_ref(name);
         let arg = b.self_ref(axis);
+        let mut args = vec![arg];
+        args.extend(ctx.parameters.get(name).copied());
         return Ok(b
             .m
             .alloc(flatppl_core::node::Node::Call(flatppl_core::node::Call {
                 head: flatppl_core::node::CallHead::User(func),
-                args: Box::new([arg]),
+                args: args.into_boxed_slice(),
                 named: Box::new([]),
                 inputs: None,
             })));
     }
     field_node(b, v)
+}
+
+fn named_weight(
+    b: &mut Builder,
+    name: &str,
+    measure: NodeId,
+    operator: &str,
+    cond: Option<&CondCtx>,
+) -> NodeId {
+    Callback {
+        function: b.self_ref(name),
+        parameters: cond.and_then(|ctx| ctx.parameters.get(name).copied()),
+    }
+    .apply_weight(b, operator, measure)
 }
 
 /// Lower a scalar JSON field value to a FlatPPL node: numbers become real
@@ -367,7 +385,7 @@ pub fn emit_distribution(
             let obs = generic_obs.unwrap_or("x");
             let weight_fn = expr::parse_expr_as_fn(b, expression, obs)?;
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[weight_fn, lebesgue]);
+            let weighted = weight_fn.apply_weight(b, "weighted", lebesgue);
             let measure = match domain {
                 Some((lo, hi)) => {
                     let lo_node = b.lit_real(lo);
@@ -388,9 +406,8 @@ pub fn emit_distribution(
                 .get("function")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Unsupported("density_function_dist missing `function` field".into()))?;
-            let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[fn_ref, lebesgue]);
+            let weighted = named_weight(b, fname, lebesgue, "weighted", cond);
             let measure = match domain {
                 Some((lo, hi)) => {
                     let lo_node = b.lit_real(lo);
@@ -411,9 +428,8 @@ pub fn emit_distribution(
                 .get("function")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Unsupported("log_density_function_dist missing `function` field".into()))?;
-            let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
-            let logweighted = b.call("logweighted", &[fn_ref, lebesgue]);
+            let logweighted = named_weight(b, fname, lebesgue, "logweighted", cond);
             let measure = match domain {
                 Some((lo, hi)) => {
                     let lo_node = b.lit_real(lo);
@@ -446,9 +462,8 @@ pub fn emit_distribution(
                 .ok_or_else(|| {
                     Error::Unsupported("efficiency_product_pdf_dist missing `pdf` field".into())
                 })?;
-            let eff_ref = b.self_ref(eff_name);
             let pdf_ref = b.self_ref(pdf_name);
-            Ok(b.call("weighted", &[eff_ref, pdf_ref]))
+            Ok(named_weight(b, eff_name, pdf_ref, "weighted", cond))
         }
 
         // §08: rate_extended_dist → PoissonProcess(weighted(<rate>, self_ref(<distribution>)))
@@ -477,9 +492,8 @@ pub fn emit_distribution(
                 .get("function")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Unsupported("rate_density_dist missing `function` field".into()))?;
-            let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[fn_ref, lebesgue]);
+            let weighted = named_weight(b, fname, lebesgue, "weighted", cond);
             Ok(b.call("PoissonProcess", &[weighted]))
         }
 
@@ -519,9 +533,8 @@ pub fn emit_distribution(
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| Error::Unsupported("bincounts_density_dist missing `axes` field".into()))?;
             let bins = build_bins(b, axes)?;
-            let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[fn_ref, lebesgue]);
+            let weighted = named_weight(b, fname, lebesgue, "weighted", cond);
             Ok(b.call("BinnedPoissonProcess", &[bins, weighted]))
         }
 
@@ -553,7 +566,7 @@ pub fn emit_distribution(
                 .map(|v| field_node(b, v))
                 .collect::<Result<_>>()?;
             let coeff_vec = b.array(&coeff_elems);
-            // Build functionof(polynomial([...], _x_), x = _x_) with obs_name from the `x` field.
+            // Bind the observable and pass nonliteral coefficients explicitly.
             let obs_name = d
                 .extra
                 .get("x")
@@ -561,7 +574,7 @@ pub fn emit_distribution(
                 .unwrap_or("x");
             let weight_fn = build_polynomial_fn(b, coeff_vec, obs_name);
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[weight_fn, lebesgue]);
+            let weighted = weight_fn.apply_weight(b, "weighted", lebesgue);
             let lo_node = b.lit_real(lo);
             let hi_node = b.lit_real(hi);
             let interval = b.call("interval", &[lo_node, hi_node]);
@@ -611,7 +624,7 @@ pub fn emit_distribution(
         //   t = (2x − lo − hi) / (hi − lo)   (rescale [lo,hi] → [−1,1])
         //   T_k = Chebyshev polynomial of the first kind (degree k)
         //   a_1..a_N = coefficients[0..N-1]  (degrees start at 1; T_0=1 is the implicit leading 1)
-        // Emits: normalize(truncate(weighted(functionof(WEIGHT, x=_x_), Lebesgue(reals)), interval(lo,hi)))
+        // The fixed series callback receives coefficients through its final parameter object.
         //
         // NUMERIC CONVENTION PENDING: Phase-4 rf207 end-to-end confirmation vs ROOT required.
         "chebychev_dist" => {
@@ -633,13 +646,7 @@ pub fn emit_distribution(
                 .get("x")
                 .and_then(|v| v.as_str())
                 .unwrap_or("x");
-            // Build the placeholder ref for the observable.
-            let ph_name = format!("_{obs_name}_");
-            let ph_sym = b.m.intern(&ph_name);
-            let x_ref = b.m.alloc(Node::Ref(Ref {
-                ns: RefNs::Local,
-                name: ph_sym,
-            }));
+            let x_ref = b.self_ref(obs_name);
             // t = divide(sub(mul(2.0, _x_), lo+hi), hi-lo)  — real division.
             // (NOT `div`, which is integer floor division and would quantize t.)
             let two = b.lit_real(2.0);
@@ -657,24 +664,9 @@ pub fn emit_distribution(
                 let term = b.call("mul", &[coeff, cheby]);
                 weight = b.call("add", &[weight, term]);
             }
-            // functionof(weight, obs_name = _obs_name_)
-            let name_sym = b.m.intern(obs_name);
-            let functionof_sym = b.m.intern("functionof");
-            let entry = (
-                name_sym,
-                Ref {
-                    ns: RefNs::Local,
-                    name: ph_sym,
-                },
-            );
-            let weight_fn = b.m.alloc(Node::Call(Call {
-                head: CallHead::Builtin(functionof_sym),
-                args: Box::new([weight]),
-                named: Box::new([]),
-                inputs: Some(Inputs::Spec(Box::new([entry]))),
-            }));
+            let weight_fn = wrap_callback(b, weight, &[obs_name], false);
             let lebesgue = build_lebesgue_reals(b);
-            let weighted = b.call("weighted", &[weight_fn, lebesgue]);
+            let weighted = weight_fn.apply_weight(b, "weighted", lebesgue);
             let lo_node = b.lit_real(lo);
             let hi_node = b.lit_real(hi);
             let interval = b.call("interval", &[lo_node, hi_node]);
@@ -786,39 +778,11 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
     Ok(b.array(&edges))
 }
 
-/// Build `functionof(polynomial(coeff_vec, _x_), x = _x_)`.
-///
-/// This produces a callable weight function over the observable `obs_name`:
-/// `obs_name -> polynomial([c1, c2, ...], obs_name)`.
-///
-/// The placeholder name follows the same convention as `expr::wrap_lambda`:
-/// `obs_name` → `_<obs_name>_`.
-pub(crate) fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> NodeId {
-    let name_sym = b.m.intern(obs_name);
-    let ph_name = format!("_{obs_name}_");
-    let ph_sym = b.m.intern(&ph_name);
-    // Build Local ref for the placeholder — this is the `x` argument to polynomial.
-    let local_ref = b.m.alloc(Node::Ref(Ref {
-        ns: RefNs::Local,
-        name: ph_sym,
-    }));
-    // polynomial([...], _x_)
-    let body = b.call("polynomial", &[coeff_vec, local_ref]);
-    // functionof(body, inputs: Spec[(obs_name -> Local(_ph_))])
-    let head = CallHead::Builtin(b.m.intern("functionof"));
-    let entry = (
-        name_sym,
-        Ref {
-            ns: RefNs::Local,
-            name: ph_sym,
-        },
-    );
-    b.m.alloc(Node::Call(Call {
-        head,
-        args: Box::new([body]),
-        named: Box::new([]),
-        inputs: Some(Inputs::Spec(Box::new([entry]))),
-    }))
+/// Build a fixed polynomial callback with explicit coefficient parameters.
+pub(crate) fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> Callback {
+    let observable = b.self_ref(obs_name);
+    let body = b.call("polynomial", &[coeff_vec, observable]);
+    wrap_callback(b, body, &[obs_name], false)
 }
 
 /// Build `Lebesgue(reals)` — the continuous reference measure on ℝ.
@@ -835,7 +799,7 @@ fn build_lebesgue_reals(b: &mut Builder) -> NodeId {
 ///   (RooProdPdf of same-observable pdfs): the normalized pointwise density
 ///   product. Take the first factor as the base measure and reweight it, in log
 ///   space, by the sum of the other factors' log-densities:
-///   `normalize(logweighted(functionof(add(logdensityof(M2, _), …, logdensityof(Mₙ, _))), M1))`.
+///   `normalize(logweighted((x, p) -> logdensityof(p[1], x) + …, M1, (M2, …)))`.
 ///   This is flat in the factor count (one `add`-fold of N−1 log-densities, no
 ///   nesting) and the reweighted base yields the unnormalized product `∏ᵢ gᵢ`,
 ///   which `normalize` renders a probability measure (§06).
@@ -857,11 +821,7 @@ pub fn emit_product(
             // product_shared_variate guarantees factor 0 is a Single variate.
             _ => unreachable!("product_shared_variate ensures a single variate"),
         };
-        let ph_sym = b.m.intern(&format!("_{var}_"));
-        let point = b.m.alloc(Node::Ref(Ref {
-            ns: RefNs::Local,
-            name: ph_sym,
-        }));
+        let point = b.self_ref(&var);
         // add-fold of logdensityof(factorᵢ, point) for the non-base factors.
         let mut body: Option<NodeId> = None;
         for f in &factors[1..] {
@@ -873,23 +833,9 @@ pub fn emit_product(
             });
         }
         let body = body.expect("shared variate implies >= 2 factors");
-        // functionof(body, var = _var_) — the single-argument weight function.
-        let head = CallHead::Builtin(b.m.intern("functionof"));
-        let entry = (
-            b.m.intern(&var),
-            Ref {
-                ns: RefNs::Local,
-                name: ph_sym,
-            },
-        );
-        let weight_fn = b.m.alloc(Node::Call(Call {
-            head,
-            args: Box::new([body]),
-            named: Box::new([]),
-            inputs: Some(Inputs::Spec(Box::new([entry]))),
-        }));
+        let weight_fn = wrap_callback(b, body, &[&var], false);
         let base = b.self_ref(&factors[0]);
-        let lw = b.call("logweighted", &[weight_fn, base]);
+        let lw = weight_fn.apply_weight(b, "logweighted", base);
         Ok(b.call("normalize", &[lw]))
     } else {
         // Independent product → joint keyed by each factor's VARIATE name, so the
@@ -1078,7 +1024,7 @@ pub fn needs_hepphys(kind: &str) -> bool {
 }
 
 /// Emit a conditional/multivariate distribution as a joint-normalized density:
-/// `normalize(logweighted((axes…) -> logdensityof(<dist>, obs), Lebesgue(support = cartprod(…))))`.
+/// `normalize(logweighted((point, p) -> logdensityof(<dist>, point.obs), Lebesgue(support = cartprod(…)), p))`.
 ///
 /// `obs` is this distribution's own observable; `record_axes` is every observable
 /// in the record with its `(lo, hi)` interval, in axis order.
@@ -1093,9 +1039,9 @@ pub fn emit_conditional(
     let inner = emit_distribution(b, d, None, None, Some(cond))?;
     let obs_ref = b.self_ref(obs);
     let body = b.call("logdensityof", &[inner, obs_ref]);
-    // Lambda over the record axes, in order.
+    // A whole-record variate followed by the explicit parameter object.
     let names: Vec<&str> = record_axes.iter().map(|(n, _)| n.as_str()).collect();
-    let lambda = wrap_lambda_multi(b, body, &names);
+    let lambda = wrap_callback(b, body, &names, true);
     // Build interval nodes in a separate pass to avoid interleaving borrows.
     let intervals: Vec<NodeId> = record_axes
         .iter()
@@ -1113,7 +1059,7 @@ pub fn emit_conditional(
         .collect();
     let support = b.call_fields("cartprod", &axis_fields);
     let lebesgue = b.call_kw("Lebesgue", &[("support", support)]);
-    let lw = b.call("logweighted", &[lambda, lebesgue]);
+    let lw = lambda.apply_weight(b, "logweighted", lebesgue);
     Ok(b.call("normalize", &[lw]))
 }
 
@@ -1567,7 +1513,10 @@ mod tests {
         let text = {
             let mut b = Builder::new(&mut m);
             let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
-            let ctx = CondCtx { funcs: &funcs };
+            let ctx = CondCtx {
+                funcs: &funcs,
+                parameters: &BTreeMap::new(),
+            };
             let d = dist(
                 "gaussian_dist",
                 &[
@@ -1593,7 +1542,10 @@ mod tests {
         let text = {
             let mut b = Builder::new(&mut m);
             let funcs: BTreeMap<&str, &str> = [("fc", "y")].into_iter().collect();
-            let ctx = CondCtx { funcs: &funcs };
+            let ctx = CondCtx {
+                funcs: &funcs,
+                parameters: &BTreeMap::new(),
+            };
             let d = dist(
                 "exponential_dist",
                 &[
@@ -1615,7 +1567,10 @@ mod tests {
         let text = {
             let mut b = Builder::new(&mut m);
             let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
-            let ctx = CondCtx { funcs: &funcs };
+            let ctx = CondCtx {
+                funcs: &funcs,
+                parameters: &BTreeMap::new(),
+            };
             let d = dist(
                 "gaussian_dist",
                 &[
@@ -1637,11 +1592,12 @@ mod tests {
             text.contains("normalize(logweighted(functionof("),
             "got: {text}"
         );
-        // Minimal syntax: functionof(<body>, x = _x_, y = _y_); obs/axis refs rewritten to locals.
+        // The weight receives the observable record whole and sigma explicitly.
         assert!(
-            text.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
+            text.contains("logdensityof(Normal(mu = fy(get(_point_, \"y\")), sigma = _parameters_), get(_point_, \"x\"))"),
             "got: {text}"
         );
+        assert!(text.trim_end().ends_with(", sigma))"), "got: {text}");
         assert!(
             text.contains(
                 "Lebesgue(support = cartprod(x = interval(-5.0, 5.0), y = interval(-5.0, 5.0)))"

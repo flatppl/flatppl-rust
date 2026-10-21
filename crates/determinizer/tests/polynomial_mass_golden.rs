@@ -18,7 +18,8 @@ use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn determinize_pir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diagnostics = flatppl_infer::infer(&mut m);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let out = determinize(&m).expect("must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
@@ -27,7 +28,8 @@ fn determinize_pir(src: &str) -> String {
 
 fn refusal(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diagnostics = flatppl_infer::infer(&mut m);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let err = determinize(&m).expect_err("must refuse");
     format!("{err:?}")
 }
@@ -41,7 +43,7 @@ fn linear_polynomial_over_symmetric_interval() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-10.0, 10.0)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-10.0, 10.0)),
 )
 lp = logdensityof(px, 0.5)",
     );
@@ -76,26 +78,31 @@ lp = logdensityof(px, 0.5)",
 /// `1·5 + 0.5·2.5 − 0.25·(35/3) + 0.125·(65/4) = 515/96`.
 #[test]
 fn cubic_polynomial_over_asymmetric_interval() {
-    let pir = determinize_pir(
-        "\
-px = normalize(
-  truncate(
-    weighted(x -> polynomial([1.0, 0.5, -0.25, 0.125], x), Lebesgue(reals)),
-    interval(-2.0, 3.0),
-  ),
-)
-lp = logdensityof(px, 1.0)",
-    );
     let exact = 515.0_f64 / 96.0;
     let folded = 5.0 + 0.5 * 2.5 + -0.25 * (35.0 / 3.0) + 0.125 * (65.0 / 4.0);
     assert!(
         (folded - exact).abs() <= 4.0 * f64::EPSILON * exact,
         "the term-wise power rule must equal the exact integral 515/96: {folded} vs {exact}"
     );
-    assert!(
-        pir.contains(&folded.to_string()),
-        "Z = 515/96 = {folded}:\n{pir}"
-    );
+    for weight in [
+        "weighted(x -> polynomial([1.0, 0.5, -0.25, 0.125], x), Lebesgue(reals))",
+        "weighted((x,p) -> polynomial([1.0, p, -0.25, 0.125], x), Lebesgue(reals), 0.5)",
+    ] {
+        let pir = determinize_pir(&format!(
+            "\
+px = normalize(
+  truncate(
+    {weight},
+    interval(-2.0, 3.0),
+  ),
+)
+lp = logdensityof(px, 1.0)",
+        ));
+        assert!(
+            pir.contains(&folded.to_string()),
+            "Z = 515/96 = {folded}:\n{pir}"
+        );
+    }
 }
 
 /// A polynomial's mass over an unbounded interval is infinite, so §06's
@@ -107,7 +114,7 @@ fn unbounded_interval_refuses_on_the_endpoints() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-inf, inf)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-inf, inf)),
 )
 lp = logdensityof(px, 0.5)",
     );
@@ -125,7 +132,7 @@ fn mass_rule_is_reached_through_an_alias() {
         "\
 a = elementof(reals)
 px = normalize(
-  truncate(weighted(x -> polynomial([1.0, a], x), Lebesgue(reals)), interval(-10.0, 10.0)),
+  truncate(weighted((x,p) -> polynomial([1.0, p], x), Lebesgue(reals), a), interval(-10.0, 10.0)),
 )
 mm = px
 lp = logdensityof(mm, 0.5)",

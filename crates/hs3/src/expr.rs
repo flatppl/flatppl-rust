@@ -1,8 +1,8 @@
 //! Small recursive-descent / Pratt parser for HS3 C-like expression strings.
 //!
 //! `parse_expr_as_fn` is the primary entry point: it wraps the parsed
-//! expression in a FlatPPL lambda `x -> <expr>` so that the result is a
-//! callable usable as the weight argument to `weighted(w, Lebesgue(reals))`.
+//! expression in a fixed FlatPPL lambda `(x, parameters) -> <expr>`, together
+//! with the parameter object supplied to `weighted(w, Lebesgue(reals), p)`.
 //!
 //! `parse_expr_inline` returns the raw expression node (no lambda wrapper),
 //! for cases where a plain value is needed (e.g. `functions` block entries
@@ -49,14 +49,28 @@ use flatppl_core::node::{Call, CallHead, Inputs, Node, Ref, RefNs};
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Parse an HS3 expression string, returning a FlatPPL *function* node
-/// `<obs_name> -> <expr>` (a lambda over the observable variable name).
+/// Parse an HS3 expression into a fixed callback over the observable and its
+/// remaining parameters, together with the object passed as the final argument.
 ///
 /// The observable variable name must match the one used in the expression;
 /// by HS3 convention this is `"x"` for most distributions.
-pub fn parse_expr_as_fn(b: &mut Builder, src: &str, obs_name: &str) -> Result<NodeId> {
+pub(crate) fn parse_expr_as_fn(b: &mut Builder, src: &str, obs_name: &str) -> Result<Callback> {
     let body = parse_expr_inline(b, src)?;
-    Ok(wrap_lambda(b, body, obs_name))
+    Ok(wrap_callback(b, body, &[obs_name], false))
+}
+
+/// A fixed callable and its explicit value reference or parameter tuple.
+pub(crate) struct Callback {
+    pub function: NodeId,
+    pub parameters: Option<NodeId>,
+}
+
+impl Callback {
+    pub fn apply_weight(self, b: &mut Builder, operator: &str, measure: NodeId) -> NodeId {
+        let mut args = vec![self.function, measure];
+        args.extend(self.parameters);
+        b.call(operator, &args)
+    }
 }
 
 /// Parse an HS3 expression string into an inline FlatPPL expression node.
@@ -127,58 +141,134 @@ pub fn free_identifiers(src: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Lambda wrapper — builds `obs_name -> body` in the IR
+// Lambda wrapper with explicit parameter values
 // ---------------------------------------------------------------------------
 
-// Lambda wrapper — builds `(name0, name1, ...) -> body` in the IR.
-pub(crate) fn wrap_lambda_multi(b: &mut Builder, body: NodeId, obs_names: &[&str]) -> NodeId {
+/// Bind the observable (or whole observable record) and pass all other value
+/// references through one explicit parameter. Two or more references form a
+/// tuple; a sole reference is passed directly because tuples need two entries.
+/// User-call heads remain fixed helpers
+/// or standard modules; their varying arguments occur in the call's children.
+pub(crate) fn wrap_callback(
+    b: &mut Builder,
+    body: NodeId,
+    obs_names: &[&str],
+    record: bool,
+) -> Callback {
+    fn collect(b: &Builder, node: NodeId, names: &mut Vec<flatppl_core::id::Symbol>) {
+        match b.m.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if !names.contains(&r.name) {
+                    names.push(r.name);
+                }
+            }
+            Node::Call(call) => {
+                for &arg in call.args.iter().chain(call.named.iter().map(|a| &a.value)) {
+                    collect(b, arg, names);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut captures = Vec::new();
+    collect(b, body, &mut captures);
+    captures.retain(|name| !obs_names.contains(&b.m.resolve(*name)));
     let mut rewritten = body;
-    let mut entries: Vec<(flatppl_core::id::Symbol, Ref)> = Vec::with_capacity(obs_names.len());
-    for name in obs_names {
-        let name_sym = b.m.intern(name);
-        let ph_sym = b.m.intern(&format!("_{name}_"));
-        rewritten = rewrite_self_to_local(b, rewritten, name_sym, ph_sym);
+    let mut entries = Vec::new();
+    let point_sym = b.m.intern("_point_");
+    if record {
         entries.push((
-            name_sym,
+            b.m.intern("point"),
             Ref {
                 ns: RefNs::Local,
-                name: ph_sym,
+                name: point_sym,
             },
         ));
     }
+    for name in obs_names {
+        let name_sym = b.m.intern(name);
+        let ph_sym = b.m.intern(&format!("_{name}_"));
+        let local = b.m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: if record { point_sym } else { ph_sym },
+        }));
+        let replacement = if record {
+            let field = b.str_lit(name);
+            b.call("get", &[local, field])
+        } else {
+            entries.push((
+                name_sym,
+                Ref {
+                    ns: RefNs::Local,
+                    name: ph_sym,
+                },
+            ));
+            local
+        };
+        rewritten = rewrite_self_ref(b, rewritten, name_sym, replacement);
+    }
+    let parameters = if captures.is_empty() {
+        None
+    } else {
+        let mut name = "parameters".to_string();
+        while obs_names.contains(&name.as_str()) {
+            name.push('_');
+        }
+        let parameter_sym = b.m.intern(&format!("_{name}_"));
+        let parameter_ref = Ref {
+            ns: RefNs::Local,
+            name: parameter_sym,
+        };
+        entries.push((b.m.intern(&name), parameter_ref));
+        let local = b.m.alloc(Node::Ref(parameter_ref));
+        let single = captures.len() == 1;
+        let mut values = Vec::new();
+        for (index, capture) in captures.into_iter().enumerate() {
+            values.push(b.m.alloc(Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name: capture,
+            })));
+            let value = if single {
+                local
+            } else {
+                let index = b.lit_int((index + 1) as i64);
+                b.call("get", &[local, index])
+            };
+            rewritten = rewrite_self_ref(b, rewritten, capture, value);
+        }
+        Some(if single {
+            values[0]
+        } else {
+            b.call("tuple", &values)
+        })
+    };
     let head = CallHead::Builtin(b.m.intern("functionof"));
-    b.m.alloc(Node::Call(Call {
+    let function = b.m.alloc(Node::Call(Call {
         head,
         args: Box::new([rewritten]),
         named: Box::new([]),
         inputs: Some(Inputs::Spec(entries.into_boxed_slice())),
-    }))
-}
-
-pub(crate) fn wrap_lambda(b: &mut Builder, body: NodeId, obs_name: &str) -> NodeId {
-    wrap_lambda_multi(b, body, &[obs_name])
+    }));
+    Callback {
+        function,
+        parameters,
+    }
 }
 
 /// Recursively copy the sub-graph rooted at `node`, replacing every
-/// `SelfMod` ref named `target_sym` with a `Local` ref named `ph_sym`.
+/// `SelfMod` ref named `target_sym` with the supplied expression.
 /// Returns the (possibly new) root NodeId.
-fn rewrite_self_to_local(
+fn rewrite_self_ref(
     b: &mut Builder,
     node: NodeId,
     target_sym: flatppl_core::id::Symbol,
-    ph_sym: flatppl_core::id::Symbol,
+    replacement: NodeId,
 ) -> NodeId {
     // Only Ref and Call nodes need handling. Inspect by reference and clone the
     // Call (which owns boxed children) lazily — leaves (Lit/Const/Hole/Axis) carry
     // no refs and are returned unchanged without an allocation.
     match b.m.node(node) {
-        Node::Ref(r) if r.ns == RefNs::SelfMod && r.name == target_sym => {
-            // Replace: emit a Local ref (the lambda placeholder).
-            b.m.alloc(Node::Ref(Ref {
-                ns: RefNs::Local,
-                name: ph_sym,
-            }))
-        }
+        Node::Ref(r) if r.ns == RefNs::SelfMod && r.name == target_sym => replacement,
         Node::Call(_) => {
             // Clone the Call so we can recurse without holding a borrow of `b.m`.
             let Node::Call(call) = b.m.node(node).clone() else {
@@ -187,21 +277,21 @@ fn rewrite_self_to_local(
             // Rewrite head if it is a User(callee) node.
             let new_head = match call.head {
                 CallHead::User(callee_id) => {
-                    CallHead::User(rewrite_self_to_local(b, callee_id, target_sym, ph_sym))
+                    CallHead::User(rewrite_self_ref(b, callee_id, target_sym, replacement))
                 }
                 other => other,
             };
             let new_args: Vec<NodeId> = call
                 .args
                 .iter()
-                .map(|&a| rewrite_self_to_local(b, a, target_sym, ph_sym))
+                .map(|&a| rewrite_self_ref(b, a, target_sym, replacement))
                 .collect();
             let new_named: Vec<_> = call
                 .named
                 .iter()
                 .map(|na| {
                     let mut na2 = *na;
-                    na2.value = rewrite_self_to_local(b, na.value, target_sym, ph_sym);
+                    na2.value = rewrite_self_ref(b, na.value, target_sym, replacement);
                     na2
                 })
                 .collect();
@@ -844,7 +934,10 @@ mod tests {
         };
         {
             let mut b = Builder::new(&mut m);
-            b.bind("result", node);
+            if let Some(parameters) = node.parameters {
+                b.bind("parameters", parameters);
+            }
+            b.bind("result", node.function);
         }
         print_with(&m, Syntax::Minimal)
     }
@@ -934,7 +1027,7 @@ mod tests {
             "missing lambda, got: {text}"
         );
         // x should NOT appear as a free self-ref (it's the lambda param)
-        // mu and sigma still reference the module scope
+        // mu and sigma are supplied in the explicit parameter tuple.
         assert!(text.contains("mu"), "missing mu, got: {text}");
         assert!(text.contains("sigma"), "missing sigma, got: {text}");
         let rt = parse(&text);
@@ -955,7 +1048,7 @@ mod tests {
             let reals_sym = b.m.intern("reals");
             let reals_node = b.m.alloc(flatppl_core::node::Node::Const(reals_sym));
             let lebesgue = b.call("Lebesgue", &[reals_node]);
-            let weighted = b.call("weighted", &[fn_node, lebesgue]);
+            let weighted = fn_node.apply_weight(&mut b, "weighted", lebesgue);
             let norm = b.call("normalize", &[weighted]);
             b.bind("gauss_density", norm);
         }
@@ -1085,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_lambda_multi_builds_two_param_lambda() {
+    fn wrap_callback_binds_both_observables() {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
@@ -1095,8 +1188,9 @@ mod tests {
             let normal = b.call_kw("Normal", &[("mu", y), ("sigma", one)]);
             let x = b.self_ref("x");
             let body = b.call("logdensityof", &[normal, x]);
-            let lam = super::wrap_lambda_multi(&mut b, body, &["x", "y"]);
-            b.bind("w", lam);
+            let lam = super::wrap_callback(&mut b, body, &["x", "y"], false);
+            assert!(lam.parameters.is_none());
+            b.bind("w", lam.function);
         }
         let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
         // Minimal syntax prints the lambda as `functionof(<body>, x = _x_, y = _y_)`

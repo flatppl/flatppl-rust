@@ -18,7 +18,8 @@ use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn determinize_pir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(diags.is_empty(), "fixture must infer: {diags:?}");
     let out = determinize(&m).expect("must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
@@ -221,14 +222,14 @@ fn bayesupdate_aliased_likelihood() {
         "\
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
-k = functionof(Normal.(mu))
+k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
 lik = likelihoodof(k, [2.0, 3.0])
 post = bayesupdate(lik, prior)
 lp = logdensityof(post, record(mu = 1.0))",
         "\
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
-k = functionof(Normal.(mu))
+k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
 lik = likelihoodof(k, [2.0, 3.0])
 alias = lik
 post = bayesupdate(alias, prior)

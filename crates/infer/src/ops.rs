@@ -192,6 +192,61 @@ pub(crate) fn call_rule(
         return Ready((ty, joined));
     }
 
+    if let Some(ty) = callback_arity_check(inf, id, &name, args) {
+        return Ready((ty, joined));
+    }
+
+    if matches!(name.as_str(), "weighted" | "logweighted")
+        && (args.len() == 3 || matches!(arg_ty(args, 0), Some(Type::Function { .. })))
+    {
+        let result_type = fresh_measure(arg_ty(args, 1));
+        let Type::Measure { domain, .. } = &result_type else {
+            return Ready((result_type, joined));
+        };
+        let mut inputs = vec![(args[1].0, *domain.clone(), Phase::Parameterized)];
+        inputs.extend(args.get(2).cloned());
+        let function = args[0].0;
+        let callable = matches!(
+            args[0].1,
+            Type::Function { .. } | Type::Any | Type::Deferred
+        );
+        let resolved = resolve_binding_refs(inf, function);
+        let result = if let Node::Const(op) = inf.module.node(resolved) {
+            // Builtin function values use the ordinary call checks too.
+            let application = Call {
+                head: CallHead::Builtin(*op),
+                args: inputs.iter().map(|arg| arg.0).collect(),
+                named: Box::new([]),
+                inputs: None,
+            };
+            call_rule(inf, id, &application, None, &inputs, &[], joined)
+                .map(inf, |_, (ty, _)| Some(ty))
+        } else {
+            substituted_result(inf, function, &inputs, &[], None, false)
+                .map(inf, |_, result| result.map(|(ty, _)| ty))
+        };
+        return result.map(inf, move |inf, result| {
+            let ty = result.or_else(|| reified_result_type(inf, function));
+            if ty.as_ref().is_some_and(|ty| {
+                !matches!(
+                    ty,
+                    Type::Scalar(ScalarType::Real | ScalarType::Integer)
+                        | Type::Any
+                        | Type::Deferred
+                        | Type::Failed(_)
+                )
+            }) || !callable
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "a weight callback must return a real scalar from the whole variate and optional parameter",
+                ));
+                return (Type::Failed("invalid weight function".into()), joined);
+            }
+            (result_type, joined)
+        });
+    }
+
     let ty = match name.as_str() {
         flatppl_core::LOG_INTEGRAL
         | flatppl_core::LOG_INTERVAL_MASS
@@ -402,6 +457,7 @@ pub(crate) fn call_rule(
         // (a vector of reals reduces to a real, a vector of vectors to a vector).
         "reduce" => match arg_ty(args, 1) {
             Some(Type::Array { elem, .. }) => (**elem).clone(),
+            Some(Type::Table { columns, .. }) => Type::Record(columns.clone()),
             _ => Type::Deferred,
         },
         // filter(pred, data) keeps a subset of data's elements/rows: same type
@@ -507,7 +563,7 @@ pub(crate) fn call_rule(
         }
 
         // ---- measure algebra (spec §06) ----
-        "lawof" => match lawof_mass_gate(inf, args) {
+        "lawof" => match lawof_value_gate(inf, args) {
             Some(failed) => failed,
             None => lawof_type(args.first().map(|(_, t, _)| t)),
         },
@@ -868,6 +924,48 @@ pub(crate) fn call_rule(
     Ready((ty, phase))
 }
 
+/// Higher-order operations pass whole objects in a fixed callback signature.
+fn callback_arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    op: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let (base, parameter_at) = match op {
+        "weighted" | "logweighted" | "pushfwd" | "filter" => (1, 2),
+        "reduce" => (2, 2),
+        "scan" | "kscan" => (2, 3),
+        "markovchain" => (1, 3),
+        _ => return None,
+    };
+    let callback = args.first()?;
+    let expected = base + usize::from(args.len() > parameter_at);
+    let count = match &callback.1 {
+        Type::Function { inputs } | Type::Kernel { inputs, .. } => Some(inputs.len()),
+        _ => {
+            let node = resolve_binding_refs(inf, callback.0);
+            match inf.module.node(node) {
+                Node::Const(name) => {
+                    let arity =
+                        crate::catalogue::builtin().base_arity(inf.module.resolve(*name))?;
+                    if arity.admits(expected) {
+                        return None;
+                    }
+                    Some(arity.min)
+                }
+                _ => None,
+            }
+        }
+    }?;
+    if count == expected {
+        return None;
+    }
+    inf.diags.push(crate::Diagnostic::error_at(id, format!(
+        "`{op}` calls its callback with {expected} whole argument(s), but the callback declares {count}"
+    )));
+    Some(Type::Failed("callback arity mismatch".into()))
+}
+
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
 }
@@ -876,7 +974,7 @@ fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
 /// integer initial value into a real-valued recurrence. Infer the step with
 /// state and row types, just as broadcast infers its callable on cell types.
 fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
-    let [function, init, xs] = args else {
+    let [function, init, xs, parameters @ ..] = args else {
         return Ready(Type::Deferred);
     };
     let (len, item) = match &xs.1 {
@@ -885,17 +983,20 @@ fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
         _ => return Ready(Type::Deferred),
     };
     let seed = (xs.0, item, xs.2);
-    scan_state_type(inf, function.0, init.clone(), seed).map(inf, move |_, state| match state {
-        Type::Record(columns) => Type::Table {
-            columns,
-            nrows: len,
+    scan_state_type(inf, function.0, init.clone(), seed, parameters.to_vec()).map(
+        inf,
+        move |_, state| match state {
+            Type::Record(columns) => Type::Table {
+                columns,
+                nrows: len,
+            },
+            state @ (Type::Scalar(_) | Type::Array { .. }) => Type::Array {
+                shape: Box::new([len]),
+                elem: Box::new(state),
+            },
+            _ => Type::Deferred,
         },
-        state @ (Type::Scalar(_) | Type::Array { .. }) => Type::Array {
-            shape: Box::new([len]),
-            elem: Box::new(state),
-        },
-        _ => Type::Deferred,
-    })
+    )
 }
 
 fn scan_state_type(
@@ -903,33 +1004,31 @@ fn scan_state_type(
     function: NodeId,
     state: ArgInfo,
     item: ArgInfo,
+    parameters: Vec<ArgInfo>,
 ) -> RuleStep<Type> {
-    substituted_result(
+    let mut arguments = vec![state.clone(), item.clone()];
+    arguments.extend(parameters.iter().cloned());
+    substituted_result(inf, function, &arguments, &[], None, false).and_then(
         inf,
-        function,
-        &[state.clone(), item.clone()],
-        &[],
-        None,
-        false,
+        move |inf, result| {
+            let result = result
+                .map(|(ty, _)| ty)
+                .or_else(|| reified_result_type(inf, function));
+            let Some(joined) = result
+                .as_ref()
+                .and_then(|next| scan_state_join(&state.1, next))
+            else {
+                return Ready(Type::Deferred);
+            };
+            if joined == state.1 {
+                Ready(joined)
+            } else {
+                // The structure cannot change. Every leaf only widens through
+                // the finite boolean/integer/real/complex inclusion chain.
+                scan_state_type(inf, function, (state.0, joined, state.2), item, parameters)
+            }
+        },
     )
-    .and_then(inf, move |inf, result| {
-        let result = result
-            .map(|(ty, _)| ty)
-            .or_else(|| reified_result_type(inf, function));
-        let Some(joined) = result
-            .as_ref()
-            .and_then(|next| scan_state_join(&state.1, next))
-        else {
-            return Ready(Type::Deferred);
-        };
-        if joined == state.1 {
-            Ready(joined)
-        } else {
-            // The structure cannot change. Every leaf only widens through
-            // the finite boolean/integer/real/complex inclusion chain.
-            scan_state_type(inf, function, (state.0, joined, state.2), item)
-        }
-    })
 }
 
 fn scan_state_join(state: &Type, next: &Type) -> Option<Type> {
@@ -2842,25 +2941,11 @@ fn indices_type(input: Option<&Type>) -> Type {
     }
 }
 
-/// Value laws are normalized; measure and kernel arguments keep deferred proofs.
+/// The law of a value is normalized. Non-value objects are rejected separately.
 fn lawof_type(arg: Option<&Type>) -> Type {
-    match arg {
-        // `lawof(m)` = `lawof(draw(m))`: retain m's domain and deferred proof.
-        // The mass gate validates settled classes.
-        Some(Type::Measure { domain, mass }) => Type::Measure {
-            domain: domain.clone(),
-            mass: *mass,
-        },
-        // Pointwise lift over a kernel's output measure — same propagation.
-        Some(Type::Kernel { inputs, mass }) => Type::Kernel {
-            inputs: inputs.clone(),
-            mass: *mass,
-        },
-        // A value: the law of that value.
-        other => Type::Measure {
-            domain: Box::new(other.cloned().unwrap_or(Type::Any)),
-            mass: Mass::Normalized,
-        },
+    Type::Measure {
+        domain: Box::new(arg.cloned().unwrap_or(Type::Any)),
+        mass: Mass::Normalized,
     }
 }
 
@@ -2914,44 +2999,26 @@ fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
     Some(Type::Failed("rand from an unnormalized measure".into()))
 }
 
-/// `lawof(m)` requires a normalized measure, pointwise for kernels.
-fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    if let Some(offending) = unprovable_normalization(args) {
-        let (arg_node, _, _) = args.first()?;
-        inf.diags.push(crate::Diagnostic::error_at(
-            *arg_node,
-            format!(
-                "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
-                 total mass is `{offending}`: an unnormalized measure is not its own law. \
-                 Wrap it in `normalize(...)` to state that intent — `lawof` never \
-                 normalizes its argument"
-            ),
-        ));
-        return Some(Type::Failed("lawof of an unnormalized measure".into()));
-    }
+/// `lawof` reifies a value node; measures and callables are already objects.
+fn lawof_value_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let (arg_node, arg_ty, _) = args.first()?;
-    let Type::Kernel { mass, .. } = arg_ty else {
+    if !matches!(
+        arg_ty,
+        Type::Measure { .. }
+            | Type::Kernel { .. }
+            | Type::Function { .. }
+            | Type::Likelihood { .. }
+            | Type::Tuple(_)
+            | Type::Module
+    ) {
         return None;
-    };
-    let offending = match mass {
-        // Proven normalized at every input, or not yet inferred — let it
-        // through, exactly as the measure arm does.
-        Mass::Normalized | Mass::Deferred => return None,
-        Mass::Null => "%null",
-        Mass::Finite => "%finite",
-        Mass::LocallyFinite => "%locallyfinite",
-        Mass::Unknown => "%unknown",
-    };
+    }
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
-        format!(
-            "`lawof` lifts pointwise over a kernel (spec §04), but this kernel's output \
-             measures' total mass is `{offending}`: an unnormalized measure is not its \
-             own law. Wrap it in `normalize(...)` to state that intent — `lawof` never \
-             normalizes its argument"
-        ),
+        "`lawof` requires a value node; use the measure directly, or take the law \
+         of an explicit draw from a probability measure",
     ));
-    Some(Type::Failed("lawof of an unnormalized kernel".into()))
+    Some(Type::Failed("lawof of a non-value object".into()))
 }
 
 /// Nodes one read of a set expression may resolve. A **work** budget, not a depth
@@ -4269,12 +4336,8 @@ fn ksuperpose_cell_variate(
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
 /// A `functionof` whose body is a measure *is* a kernel.
 ///
-/// Returns the phase as well as the type, because a reification's phase follows
-/// its CAPTURED ancestors rather than being `%fixed` by construction. A
-/// `functionof` that captures a `draw` node — one its boundary does not name and
-/// no `lawof` absorbs — is itself of stochastic phase: the callable is
-/// conditional on that draw's single realization, which it shares with the rest
-/// of the graph. See [`captured_draws`].
+/// Every admitted reification is fixed: parameters become boundary inputs and
+/// draws must be boundary inputs or absorbed into a law.
 fn reification_type(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -4440,39 +4503,57 @@ fn reification_type(
             return (Type::Failed("undeclared placeholder".into()), Phase::Fixed);
         }
     }
-    // §04 reification, the PHASE of a reified callable. A `functionof` may
-    // reference `draw` nodes of the enclosing graph: they stay shared ancestors
-    // with a single realization, so the callable is conditional on that
-    // realization — never resampled per call, never marginalized. What that
-    // costs is determinism, and the phase is where it is paid: a reification
-    // that captures a draw, or a node descending from one, is itself
-    // STOCHASTIC. §04's no-closures sentence then narrows to the deterministic
-    // ancestors it names, "a fixed ancestor is resolved to its value".
-    //
-    // A boundary-named ancestor is not captured — §04 substitutes it with a
-    // fresh `elementof(valueset(a))` input before the trace runs — so
-    // `functionof(m, raw_syst = raw_syst)` is the conditional kernel and stays
-    // `%fixed`. `functionof(lawof(m))` likewise: `lawof` absorbs, so nothing
-    // stochastic is captured.
-    //
-    // `kernelof` is never stochastic. §04 "Kernels and `kernelof`" makes
-    // `kernelof(x, kwargs…)` equivalent to `functionof(lawof(x), kwargs…)`, so
-    // its whole body sits under an implicit `lawof` and every draw it reaches is
-    // absorbed — the marginalization the eight-schools `forward_kernel` and the
-    // `prior_predictive` example rely on.
-    let phase = match (name, args.first()) {
-        ("functionof", Some((body, _, _)))
-            if !captured_draws(inf, *body, &boundary_targets).is_empty() =>
-        {
-            Phase::Stochastic
+    if matches!(call.inputs, Some(Inputs::Spec(_)))
+        && let Some((body, _, _)) = args.first()
+        && let Some(parameter) = unbound_parameter(inf, *body, &boundary_targets)
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            parameter,
+            "an explicit reification boundary must cover every remaining `elementof` \
+             dependency; add the parameter or a descendant that cuts its path to the boundary",
+        ));
+        return (
+            Type::Failed("unbound reification parameter".into()),
+            Phase::Fixed,
+        );
+    }
+    // Boundaries cut before tracing. kernelof absorbs the remaining draws,
+    // while functionof must have no free draw in its reified graph.
+    if name == "functionof"
+        && let Some((body, _, _)) = args.first()
+    {
+        let captures = captured_draws(inf, *body, &boundary_targets);
+        for (binding, at) in &captures {
+            let draw = binding
+                .map(|s| format!("draw `{}`", inf.module.resolve(s)))
+                .unwrap_or_else(|| "an inline draw".into());
+            inf.diags.push(crate::Diagnostic::error_at(
+                *at,
+                format!(
+                    "a reified callable cannot capture {draw}; expose it as a boundary \
+                     input, or reify its law with `lawof` or `kernelof`"
+                ),
+            ));
         }
-        _ => Phase::Fixed,
-    };
+        if !captures.is_empty() {
+            return (Type::Failed("captured draw".into()), Phase::Fixed);
+        }
+    }
     let body_ty = args.first().map(|(_, t, _)| t);
     let ty = match (name, body_ty) {
         // `kernelof` reifies a value's law after cutting the input boundary.
         // A measure body belongs to functionof; it is not wrapped again.
-        ("kernelof", Some(body @ (Type::Measure { .. } | Type::Kernel { .. }))) => {
+        (
+            "kernelof",
+            Some(
+                body @ (Type::Measure { .. }
+                | Type::Kernel { .. }
+                | Type::Function { .. }
+                | Type::Likelihood { .. }
+                | Type::Tuple(_)
+                | Type::Module),
+            ),
+        ) => {
             let anchor = args.first().map_or(id, |(n, _, _)| *n);
             // §04's sentence names the measure case; a KERNEL body fails the same
             // clause one step earlier (it is not a value node either) and #73's
@@ -4484,10 +4565,14 @@ fn reification_type(
                     "use `functionof` to reify a measure node to a kernel directly, \
                      or pass the value you meant to take the law of",
                 ),
-                _ => (
+                Type::Kernel { .. } => (
                     "a kernel",
                     "a kernel is already a reified law — pass the value node you meant \
                      to reify, or drop the outer `kernelof`",
+                ),
+                _ => (
+                    "a non-value object",
+                    "pass the value node whose law you meant to reify",
                 ),
             };
             inf.diags.push(crate::Diagnostic::error_at(
@@ -4510,14 +4595,41 @@ fn reification_type(
         ("functionof", _) => Type::Function { inputs },
         _ => Type::Deferred,
     };
-    // A `%failed` reification carries no meaningful phase; keep it `%fixed` so a
-    // downstream phase join is not reddened twice for one error.
-    let phase = if matches!(ty, Type::Failed(_)) {
-        Phase::Fixed
-    } else {
-        phase
-    };
-    (ty, phase)
+    (ty, Phase::Fixed)
+}
+
+/// Boundary substitution precedes tracing, including for descendant boundaries.
+/// Laws absorb draws, but their parameter dependencies still need a boundary.
+fn unbound_parameter(
+    inf: &Inferencer<'_, '_>,
+    body: NodeId,
+    boundaries: &[Symbol],
+) -> Option<NodeId> {
+    let mut pending = vec![body];
+    let mut seen = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) || inf.lookup_phase(node) == Some(Phase::Fixed) {
+            continue;
+        }
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if !boundaries.contains(&r.name)
+                    && let Some(binding) = inf.module.binding_by_name(r.name)
+                {
+                    pending.push(inf.module.binding(binding).rhs);
+                }
+            }
+            Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => return Some(node),
+            Node::Call(c) => {
+                if matches!(c.head, CallHead::Builtin(h) if inf.module.resolve(h) == "elementof") {
+                    return Some(node);
+                }
+                pending.extend(inf.module.node(node).children());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Every `%local` placeholder the reified expression at `body` reaches that
@@ -4581,11 +4693,8 @@ fn undeclared_placeholders(
 /// `(binding name, node)` pairs in walk order. The name is `None` for a
 /// `draw(…)` written inline in the reified expression.
 ///
-/// A non-empty result makes the reification stochastic-phase. A captured draw
-/// is a shared ancestor with a single realization, so the callable is
-/// conditional on that realization rather than a function of its inputs alone.
-/// That is exactly what `%stochastic` records; the names are kept so a caller
-/// can say WHICH draws a callable is conditional on.
+/// A non-empty result makes the reification invalid. Names identify the free
+/// draws that must become boundary inputs or be absorbed by a law.
 ///
 /// `draw` is the only source of a stochastic node (§04 "Phases"; §07 *Random
 /// value generation* makes `rand`/`rnginit`/`rngstate` ordinary functions whose
@@ -4614,15 +4723,8 @@ fn undeclared_placeholders(
 ///   — the same "soundly does extra work, never skips" convention
 ///   `walk_auto` uses.
 ///
-/// A nested `functionof` is deliberately **not** a cut in itself. §04 gives a
-/// reified callable the same ancestor rule as any other binding, so
-/// `z = inner()` outside a reification is stochastic exactly when `inner`
-/// captures a draw — and a `functionof` over that same expression must capture
-/// it too. The phase cut above is what stops the walk at a nested reification
-/// that captures nothing, which is the useful half of the old blanket cut.
-/// (Without this, `inner = functionof(resolution)` over a drawn `raw_syst`
-/// followed by `outer = functionof(inner())` came out `%fixed` while the JS
-/// analyzer's `reificationCapturesDraw` called it stochastic.)
+/// Nested reifications are validated at their own construction, including
+/// those beneath a law that absorbs the outer graph's stochasticity.
 ///
 /// A cross-module reference is also a cut: a stochastic dependency binding is
 /// invisible across the load boundary (`modules.rs` refuses it there), so no
@@ -5525,12 +5627,21 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<
     let Some((f_node, _, _)) = args.first() else {
         return Ready(None);
     };
-    let f_node = *f_node;
+    let mut f_node = *f_node;
+    let resolved = resolve_binding_refs(inf, f_node);
+    if let Node::Call(call) = inf.module.node(resolved)
+        && matches!(call.head, CallHead::Builtin(name) if inf.module.resolve(name) == "bijection")
+        && let Some(forward) = call.args.first()
+    {
+        f_node = *forward;
+    }
     let seed = match args.get(1) {
         Some((m_node, Type::Measure { domain, .. }, m_phase))
             if !matches!(domain.as_ref(), Type::Deferred) =>
         {
-            Some(vec![(*m_node, (**domain).clone(), *m_phase)])
+            let mut inputs = vec![(*m_node, (**domain).clone(), *m_phase)];
+            inputs.extend(args.get(2).cloned());
+            Some(inputs)
         }
         _ => None,
     };
@@ -6039,8 +6150,8 @@ fn broadcast_type(
         }
         ("neg", [a]) => a.clone(),
         (
-            "exp" | "log" | "sqrt" | "invlogit" | "logit" | "log1p" | "expm1" | "abs" | "sin"
-            | "cos" | "tan" | "tanh",
+            "exp" | "log" | "sqrt" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1" | "abs"
+            | "sin" | "cos" | "tan" | "atan" | "tanh",
             [a],
         ) => real_or_complex(Some(a)),
         // The comparisons and the logical connectives, whose per-cell result is a
@@ -6770,6 +6881,8 @@ enum SpecialArity {
     /// that it "only accepts positional arguments, not keyword arguments", which
     /// is now what EVERY distinguished input does, so the carve-out folded in.
     Distinguished(usize),
+    /// A fixed positional prefix with one optional positional input.
+    DistinguishedOptional(usize),
     /// `n` distinguished inputs plus optional variadic NAMED inputs
     /// (`load_module`'s substitutions).
     DistinguishedPlusNamed(usize),
@@ -6834,9 +6947,17 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
             Distinguished(2),
             "§06 `tilt(M, B)` takes two positional arguments",
         ),
-        "aggregate" | "metricsum" | "markovchain" | "kscan" => (
+        "aggregate" | "metricsum" => (
             Distinguished(3),
-            "\"`aggregate`, `metricsum`, `markovchain`, `kscan`: Three distinguished inputs\"",
+            "\"`aggregate`, `metricsum`: Three distinguished inputs\"",
+        ),
+        "markovchain" | "kscan" | "scan" => (
+            DistinguishedOptional(3),
+            "three distinguished inputs and an optional fourth positional parameter value",
+        ),
+        "weighted" | "logweighted" | "pushfwd" | "reduce" => (
+            DistinguishedOptional(2),
+            "two distinguished inputs and an optional third positional parameter value",
         ),
         "load_module" => (
             DistinguishedPlusNamed(1),
@@ -6944,7 +7065,7 @@ fn special_arity_check(
     let (pos, kw) = (args.len(), named.len());
     let total = pos + kw;
     match declared {
-        SpecialArity::Distinguished(n) => {
+        SpecialArity::Distinguished(n) | SpecialArity::DistinguishedOptional(n) => {
             // Spelling first: on a keyword call the COUNT may well be right, and
             // reporting "takes 3 inputs, got 3" would be both true and useless.
             if kw > 0 {
@@ -6959,8 +7080,14 @@ fn special_arity_check(
                     cite,
                 );
             }
-            if pos != n {
-                return refuse(inf, format!("takes {n} input(s), got {pos}"), cite);
+            let optional = matches!(declared, SpecialArity::DistinguishedOptional(_));
+            if pos != n && !(optional && pos == n + 1) {
+                let expected = if optional {
+                    format!("{n} or {}", n + 1)
+                } else {
+                    n.to_string()
+                };
+                return refuse(inf, format!("takes {expected} input(s), got {pos}"), cite);
             }
         }
         SpecialArity::DistinguishedPlusNamed(n) => {
@@ -9601,27 +9728,6 @@ mod cat_compose_tests {
 
 #[cfg(test)]
 mod no_laundering_tests {
-    //! Design-PR #73 option C's **no-laundering rider** (owner ruling,
-    //! decisions-log 2026-08-18): an engine that admits a `%deferred`-mass
-    //! argument to `lawof` must leave the RESULT's mass `%deferred`, never stamp
-    //! `%normalized` — stamping it would record an unproven assumption as §11's
-    //! "statically KNOWN" class.
-    //!
-    //! **This coverage used to live in `tests/spec_coverage_measures.rs` and ran
-    //! through `joint()`**, described there as "the one measure reachable from
-    //! source whose mass is genuinely `%deferred` (`product_mass`'s empty-list
-    //! arm)". §04 forbids that call — "Nullary calls (`f()`) are not allowed",
-    //! and of the special operations "The total number of inputs is never zero" —
-    //! so `ops::special_arity_check` now refuses it and the source-level fixture
-    //! is gone. The rider is not, so it is asserted here instead, directly
-    //! against the two internal surfaces that implement it.
-    //!
-    //! Testing the functions rather than a model is the stronger position, not a
-    //! fallback: the old fixture could only reach `Mass::Deferred` by way of one
-    //! spellable expression, so a change to `joint`'s arity silently took the
-    //! rider's coverage with it. These assertions hold whatever the surface
-    //! syntax admits.
-
     use super::*;
 
     /// The empty-product arm. `masses.iter().all(..)` is vacuously true on an
@@ -9641,59 +9747,5 @@ mod no_laundering_tests {
             product_mass(&[Mass::Normalized, Mass::Normalized]),
             Mass::Normalized
         );
-    }
-
-    /// The rider itself, measure side: `lawof` of a `%deferred`-mass measure
-    /// carries `%deferred` onward.
-    #[test]
-    fn lawof_of_a_deferred_mass_measure_stays_deferred() {
-        let arg = Type::Measure {
-            domain: Box::new(Type::Scalar(ScalarType::Real)),
-            mass: Mass::Deferred,
-        };
-        let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
-            panic!("lawof of a measure is a measure");
-        };
-        assert_eq!(
-            mass,
-            Mass::Deferred,
-            "must not launder an unproven assumption into `%normalized`"
-        );
-    }
-
-    /// The rider's kernel side, which `lawof_mass_gate` admits by the same three
-    /// rules as the measure side (2026-08-19, `lawof-kernel-mass-maths.md`).
-    #[test]
-    fn lawof_of_a_deferred_mass_kernel_stays_deferred() {
-        let arg = Type::Kernel {
-            inputs: Box::new([]),
-            mass: Mass::Deferred,
-        };
-        let Type::Kernel { mass, .. } = lawof_type(Some(&arg)) else {
-            panic!("lawof of a kernel is a kernel");
-        };
-        assert_eq!(mass, Mass::Deferred, "same rider, kernel side");
-    }
-
-    /// Every other mass class passes through `lawof_type` unchanged too, so the
-    /// pass-through is the rule and `Deferred` is not a special case bolted on.
-    #[test]
-    fn lawof_passes_every_mass_class_through() {
-        for m in [
-            Mass::Normalized,
-            Mass::Finite,
-            Mass::LocallyFinite,
-            Mass::Unknown,
-            Mass::Deferred,
-        ] {
-            let arg = Type::Measure {
-                domain: Box::new(Type::Scalar(ScalarType::Real)),
-                mass: m,
-            };
-            let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
-                unreachable!()
-            };
-            assert_eq!(mass, m, "lawof must not restate a measure's own mass");
-        }
     }
 }

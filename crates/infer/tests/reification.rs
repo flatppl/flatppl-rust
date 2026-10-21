@@ -147,6 +147,33 @@ model = functionof(broadcast(Poisson, expected))
     }
 }
 
+#[test]
+fn explicit_boundaries_cover_parameters_after_descendant_substitution() {
+    for source in [
+        "p = elementof(reals)\nf(x) = x + p",
+        "p = elementof(reals)\ny ~ Normal(p, 1)\nf(x) = logdensityof(lawof(y), x)",
+        "p = elementof(reals)\nz = elementof(reals)\ny ~ Normal(p, 1)\nf = kernelof(y, unused = z)",
+    ] {
+        let mut module = flatppl_syntax::parse(source).unwrap();
+        let diagnostics = infer_module(&mut module, &ModuleBundle::new(), Level::Shape);
+        assert!(
+            diagnostics.iter().any(|d| d.severity == Severity::Error),
+            "{source}"
+        );
+    }
+    let module = infer_src(
+        "p = elementof(reals)\nz ~ Normal(p, 1)\ny = z + p\nfixed_offset = 2\n\
+         f = functionof(y + fixed_offset, y = y)\n\
+         g = kernelof(y, y = y, z = z)\n\
+         law = functionof(lawof(z), p = p)\nanswer = f(3.0)",
+        Level::Shape,
+    );
+    assert_eq!(
+        binding_ty(&module, "answer"),
+        Some(&Type::Scalar(flatppl_core::ScalarType::Real))
+    );
+}
+
 /// A leaf reached by two distinct paths (a shared sub-expression / diamond) is
 /// recorded once: the ancestor walk's visited-set both dedupes the input and
 /// stops the second traversal from re-descending the shared subgraph.
@@ -476,418 +503,64 @@ fn an_autoinputs_list_that_misses_the_placeholder_still_errors() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// §04 reification: the PHASE of a reified callable follows its CAPTURED
-// ancestors.
-//
-// A `functionof` may reference `draw` nodes of the enclosing graph. They stay
-// shared ancestors with a single realization, so the callable is conditional on
-// that realization — never resampled per call, never marginalized. What that
-// costs is determinism, and the phase is where it is paid: a reification that
-// captures a draw is itself `%stochastic`. §04's "FlatPPL has no closures"
-// narrows to the deterministic ancestors it names ("a fixed ancestor is
-// resolved to its value").
-//
-// Before this, EVERY reification typed `%fixed` by construction, so the §02
-// overview's `model_R` claimed determinism while its density depended on the
-// drawn `raw_syst`. The reified callable's own annotation is now the record of
-// what it is conditional on.
-// ---------------------------------------------------------------------------
-
-/// The inferred phase of binding `name`'s right-hand side.
-fn binding_phase(module: &flatppl_core::Module, name: &str) -> Option<flatppl_core::Phase> {
-    let rhs = module
-        .bindings()
-        .find(|(_, b)| module.resolve(b.name) == name)?
-        .1
-        .rhs;
-    module.phase_of(rhs)
-}
-
-/// Infer and assert the module is error-free; return it. `Level::Type` rather
-/// than `Level::Phase` because a `Phase` run annotates no types, and these tests
-/// read the input list alongside the phase.
-fn infer_phases(src: &str) -> flatppl_core::Module {
-    infer_src(src, Level::Type)
-}
-
-/// The §02 overview shape: a boundary-less `functionof` over a measure whose
-/// intensity descends from a drawn systematic. Accepted, and STOCHASTIC — the
-/// kernel is conditional on `raw_syst`'s single realization.
+// A callable has fixed phase. Its inputs may be stochastic at a call site,
+// but its construction may not capture an unbound draw.
 #[test]
-fn a_boundary_less_functionof_that_captures_a_draw_is_stochastic() {
-    let src = "\
-n_sig = elementof(reals)
-raw_syst ~ Normal(mu = 0.0, sigma = 1.0)
-resolution = mul(2.5, exp(mul(0.12, raw_syst)))
-intensity = weighted(n_sig, Normal(mu = 125.0, sigma = resolution))
-model_R = functionof(PoissonProcess(intensity = truncate(intensity, interval(2.0, 8.0))))";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "model_R"),
-        Some(flatppl_core::Phase::Stochastic),
-        "capturing the drawn `raw_syst` makes the reification stochastic"
-    );
-    // The captured draw is NOT an input: only the `elementof` leaf is.
-    match binding_ty(&module, "model_R") {
-        Some(Type::Kernel { inputs, .. }) => assert_eq!(
-            input_names(&module, inputs),
-            ["n_sig"],
-            "a captured draw is an ancestor, not a boundary input"
-        ),
-        other => panic!("model_R should be a Kernel; got {other:?}"),
-    }
-}
-
-/// Naming the draw as a boundary input is the CONDITIONAL kernel: §04
-/// substitutes it with a fresh `elementof(valueset(a))` input before the trace
-/// runs, so nothing is captured and the callable is `%fixed`.
-#[test]
-fn a_boundary_input_over_the_draw_is_a_fixed_conditional_kernel() {
-    let src = "\
-n_sig = elementof(reals)
-raw_syst ~ Normal(mu = 0.0, sigma = 1.0)
-resolution = mul(2.5, exp(mul(0.12, raw_syst)))
-intensity = weighted(n_sig, Normal(mu = 125.0, sigma = resolution))
-model_R = functionof(PoissonProcess(intensity = truncate(intensity, interval(2.0, 8.0))),
-    n_sig = n_sig, raw_syst = raw_syst)";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "model_R"),
-        Some(flatppl_core::Phase::Fixed),
-        "a boundary-named draw is substituted away, so nothing is captured"
-    );
-    match binding_ty(&module, "model_R") {
-        Some(Type::Kernel { inputs, .. }) => assert_eq!(
-            input_names(&module, inputs),
-            ["n_sig", "raw_syst"],
-            "both boundary inputs ride into the kernel type"
-        ),
-        other => panic!("model_R should be a Kernel; got {other:?}"),
-    }
-}
-
-/// `lawof` absorbs, so a body over a reified measure captures nothing and stays
-/// `%fixed`. §04 "Phase of the reified law": "`lawof` absorbs stochasticity into
-/// the reified law rather than propagating it outward."
-#[test]
-fn a_functionof_over_a_lawof_reified_measure_is_fixed() {
-    let src = "\
-m = elementof(reals)
-x ~ Normal(mu = m, sigma = 1.0)
-f = functionof(lawof(x))";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "f"),
-        Some(flatppl_core::Phase::Fixed),
-        "the draw is absorbed by `lawof`, not captured"
-    );
-    assert!(
-        matches!(binding_ty(&module, "f"), Some(Type::Kernel { .. })),
-        "f should be a Kernel; got {:?}",
-        binding_ty(&module, "f")
-    );
-}
-
-/// `kernelof` is never stochastic. §04 "Kernels and `kernelof`" makes
-/// `kernelof(x, kwargs…)` equivalent to `functionof(lawof(x), kwargs…)`, so its
-/// whole body sits under an implicit `lawof`. Both the fully-cut and the
-/// marginalizing spelling are `%fixed` — the second is the `prior_predictive`
-/// case §04 blesses ("they are internal stochastic nodes in the traced sub-DAG,
-/// not boundary inputs, so `lawof` integrates them out").
-#[test]
-fn kernelof_is_fixed_whatever_its_boundary_leaves_uncut() {
-    for src in [
-        "m = elementof(reals)\nx ~ Normal(mu = m, sigma = 1.0)\nk = kernelof(x)",
-        "m = elementof(reals)\nx ~ Normal(mu = m, sigma = 1.0)\nk = kernelof(x, m = m)",
-        "mu ~ Normal(mu = 0.0, sigma = 1.0)\n\
-         y ~ Normal(mu = mu, sigma = 1.0)\n\
-         k = kernelof(record(y = y))",
+fn reification_rejects_free_draws_at_every_construction() {
+    for body in [
+        "f = functionof(2*z)",
+        "f(x) = x + z",
+        "f = fn(_ + z)",
+        "f = x -> x + self.z",
+        "out = broadcast(x -> x+z, [1, 2])",
+        "f = x -> lawof((y -> y+z)(x))",
+        "f = functionof(draw(Normal(0, 1)))",
+        "f = x -> Normal(x, exp(z))",
     ] {
-        let module = infer_phases(src);
-        assert_eq!(
-            binding_phase(&module, "k"),
-            Some(flatppl_core::Phase::Fixed),
-            "`kernelof` reifies the law, so it captures no draw: `{src}`"
+        let source = format!("z ~ Normal(0, 1)\n{body}");
+        let mut module = flatppl_syntax::parse(&source).unwrap();
+        let diags = infer_module(&mut module, &ModuleBundle::new(), Level::Type);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("cannot capture")),
+            "{source}: {diags:?}"
         );
     }
 }
 
-/// A draw written INLINE in the body is captured just as a bound one is.
 #[test]
-fn an_inline_draw_in_the_body_is_captured() {
-    let src = "f = functionof(mul(2.0, draw(Normal(mu = 0.0, sigma = 1.0))))";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "f"),
-        Some(flatppl_core::Phase::Stochastic),
-        "an anonymous draw is still a captured stochastic ancestor"
-    );
-}
-
-/// A boundary that cuts one draw and leaves another is still stochastic: the
-/// remaining capture is what decides. Substitution runs before the trace, so the
-/// cut draw is out of the subgraph entirely.
-#[test]
-fn a_partial_boundary_stays_stochastic_on_the_uncut_draw() {
-    let src = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-b ~ Normal(mu = 0.0, sigma = 1.0)
-f = functionof(add(a, b), a = a)";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "f"),
-        Some(flatppl_core::Phase::Stochastic),
-        "`b` is still captured"
-    );
-    // The control: cutting BOTH leaves nothing captured.
-    let both = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-b ~ Normal(mu = 0.0, sigma = 1.0)
-f = functionof(add(a, b), a = a, b = b)";
-    assert_eq!(
-        binding_phase(&infer_phases(both), "f"),
-        Some(flatppl_core::Phase::Fixed),
-        "both draws substituted away"
-    );
-}
-
-/// A reification over a REFERENCE to a capturing callable captures too. §04
-/// gives a reified callable the same ancestor rule as any other binding, so
-/// `z = inner(c)` outside a reification is stochastic exactly because `inner`
-/// captures `a` — and a `functionof` over that same expression cannot be more
-/// deterministic than the expression is. `z` is asserted alongside to pin the
-/// two against each other.
-///
-/// This was `%fixed` when the walk cut at any nested reification, which put it
-/// at odds with the JS analyzer's `reificationCapturesDraw`.
-#[test]
-fn a_reification_over_a_capturing_callable_reference_is_stochastic() {
-    let src = "\
-c = elementof(reals)
-a ~ Normal(mu = 0.0, sigma = 1.0)
-inner = functionof(add(a, c))
-outer = functionof(inner(c))
-z = inner(c)";
-    let module = infer_phases(src);
-    for name in ["inner", "z", "outer"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Stochastic),
-            "`{name}` is conditional on `a`'s realization"
-        );
+fn reification_cuts_explicit_inputs_and_absorbs_laws() {
+    let source = "\
+mu = elementof(reals)
+z ~ Normal(mu, 1)
+f = functionof(2*self.z, z=z)
+g = x -> (functionof(2*z, z=z))(x)
+F = functionof(lawof(z))
+K = kernelof(z, mu=mu)
+h = x -> x+1
+y = h(z)";
+    let module = infer_src(source, Level::Type);
+    for (name, phase) in [
+        ("f", flatppl_core::Phase::Fixed),
+        ("g", flatppl_core::Phase::Fixed),
+        ("F", flatppl_core::Phase::Fixed),
+        ("K", flatppl_core::Phase::Fixed),
+        ("h", flatppl_core::Phase::Fixed),
+        ("y", flatppl_core::Phase::Stochastic),
+    ] {
+        let rhs = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)
+            .unwrap()
+            .1
+            .rhs;
+        assert_eq!(module.phase_of(rhs), Some(phase), "{name}");
     }
-}
-
-/// The same for a nested reification LITERAL: its own body captures the draw, so
-/// the literal is stochastic by its own rule and the enclosing `functionof`
-/// captures a stochastic ancestor.
-#[test]
-fn a_reification_over_a_capturing_nested_literal_is_stochastic() {
-    let src = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-resolution = mul(2.5, exp(mul(0.12, a)))
-lit = functionof(functionof(resolution))";
-    assert_eq!(
-        binding_phase(&infer_phases(src), "lit"),
-        Some(flatppl_core::Phase::Stochastic),
-        "the nested literal captures `a`, so the outer one does too"
-    );
-}
-
-/// The control that keeps the reference case from swallowing everything:
-/// `lawof` absorbs, so a `functionof` over the LAW of a capturing callable's
-/// output is `%fixed`. §04 "Phase of the reified law".
-#[test]
-fn a_functionof_over_the_law_of_a_capturing_callable_is_fixed() {
-    let src = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-resolution = mul(2.5, exp(mul(0.12, a)))
-inner = functionof(Normal(mu = resolution, sigma = 1.0))
-ctrl = functionof(lawof(inner))";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "inner"),
-        Some(flatppl_core::Phase::Stochastic),
-        "`inner` captures `a`"
-    );
-    assert_eq!(
-        binding_phase(&module, "ctrl"),
-        Some(flatppl_core::Phase::Fixed),
-        "`lawof` absorbs the capture before the outer reification sees it"
-    );
-}
-
-/// The other control: a nested reification that captures NOTHING is settled
-/// non-stochastic by its own rule, and the phase cut stops the walk there. This
-/// is the useful half of the old blanket nested-reification cut.
-#[test]
-fn a_reification_over_a_deterministic_callable_is_fixed() {
-    let src = "\
-c = elementof(reals)
-inner = functionof(add(c, 1.0))
-outer = functionof(inner(c))";
-    let module = infer_phases(src);
-    for name in ["inner", "outer"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Fixed),
-            "`{name}` captures nothing"
-        );
-    }
-}
-
-/// An INNER boundary cuts inside the inner body only. Here the outer boundary
-/// names `a` and the inner one names `a` as well, so `a` is substituted at both
-/// levels — but `b`, which neither names, is still captured through the nested
-/// callable. Pins that entering a reification adds its names rather than
-/// replacing the enclosing scope, and that the addition does not leak outward.
-#[test]
-fn an_inner_boundary_cuts_inside_the_inner_body_only() {
-    let src = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-b ~ Normal(mu = 0.0, sigma = 1.0)
-inner = functionof(add(a, b), a = a)
-outer = functionof(inner(a), a = a)";
-    let module = infer_phases(src);
-    for name in ["inner", "outer"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Stochastic),
-            "`{name}` still captures `b`, which no boundary names"
-        );
-    }
-    // Cutting `b` as well at both levels settles both back to fixed.
-    let cut = "\
-a ~ Normal(mu = 0.0, sigma = 1.0)
-b ~ Normal(mu = 0.0, sigma = 1.0)
-inner = functionof(add(a, b), a = a, b = b)
-outer = functionof(inner(a, b), a = a, b = b)";
-    let module = infer_phases(cut);
-    for name in ["inner", "outer"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Fixed),
-            "`{name}` captures nothing once both draws are named"
-        );
-    }
-}
-
-/// A fully-cut nesting is fixed at both levels.
-#[test]
-fn a_fully_cut_nesting_is_fixed_at_both_levels() {
-    let src = "\
-c = elementof(reals)
-a ~ Normal(mu = 0.0, sigma = 1.0)
-inner = functionof(add(a, c), a = a, c = c)
-outer = functionof(inner(a, c), a = a, c = c)";
-    let module = infer_phases(src);
-    for name in ["inner", "outer"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Fixed),
-            "`{name}` captures nothing"
-        );
-    }
-}
-
-/// A lambda is `functionof` with placeholders (§04 *Lambda notation*), so it
-/// captures the same way: a lambda over a drawn value is stochastic. This is the
-/// shape both `flatppl-examples` models use, and it now infers.
-#[test]
-fn a_lambda_closing_over_a_draw_is_stochastic() {
-    let src = "\
-s ~ normalize(truncate(Cauchy(0.0, 1.0), interval(0.0, inf)))
-step = prev -> Normal(mu = prev, sigma = s)";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "step"),
-        Some(flatppl_core::Phase::Stochastic),
-        "the lambda is conditional on `s`'s realization"
-    );
-}
-
-/// The control: a lambda over parameterized and fixed ancestors only stays
-/// `%fixed`. A parameterized ancestor is not a draw.
-#[test]
-fn a_lambda_over_a_parametric_ancestor_is_fixed() {
-    let src = "\
-s = elementof(posreals)
-step = prev -> Normal(mu = prev, sigma = s)";
-    assert_eq!(
-        binding_phase(&infer_phases(src), "step"),
-        Some(flatppl_core::Phase::Fixed),
-        "a parameterized ancestor is not a captured draw"
-    );
-}
-
-/// The phase rides outward through an ordinary consumer: a value derived from a
-/// stochastic reification is stochastic too, by §04's ancestor rule. This is
-/// what makes the capture visible to everything downstream rather than stopping
-/// at the callable.
-#[test]
-fn the_captured_phase_propagates_to_a_consumer() {
-    let src = "\
-s ~ Normal(mu = 0.0, sigma = 1.0)
-f = functionof(mul(2.0, s))
-y = f
-z = add(y, 1.0)";
-    let module = infer_phases(src);
-    for name in ["f", "y", "z"] {
-        assert_eq!(
-            binding_phase(&module, name),
-            Some(flatppl_core::Phase::Stochastic),
-            "`{name}` inherits the capture"
-        );
-    }
-}
-
-/// A stochastic reification captured by `markovchain` is ONE shared value across
-/// every step, not a fresh draw per step. The chain's step kernel is the §04
-/// lambda that captures it, so this pins the ruling's "single realisation" at the
-/// place it matters most.
-#[test]
-fn a_markovchain_step_kernel_captures_one_shared_draw() {
-    let src = "\
-sigma_step ~ normalize(truncate(Cauchy(0.0, 1.0), interval(0.0, inf)))
-step_kernel = prev -> Normal(mu = prev, sigma = sigma_step)
-x ~ markovchain(step_kernel, 0.0, 120)";
-    let module = infer_phases(src);
-    assert_eq!(
-        binding_phase(&module, "step_kernel"),
-        Some(flatppl_core::Phase::Stochastic),
-        "the step kernel captures `sigma_step`"
-    );
-    assert_eq!(
-        binding_phase(&module, "x"),
-        Some(flatppl_core::Phase::Stochastic),
-        "the chain is stochastic through both its own draw and the capture"
-    );
-    // The capture is recorded ONCE, as a single ancestor binding — the property
-    // that makes it one realization shared by all 120 steps rather than 120
-    // independent draws. `sigma_step` appears once in the step kernel's trace.
-    let rhs = module
-        .bindings()
-        .find(|(_, b)| module.resolve(b.name) == "step_kernel")
-        .expect("step_kernel is bound")
-        .1
-        .rhs;
-    let mut refs = 0;
-    let mut pending = vec![rhs];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
+    for name in ["F", "K"] {
+        match binding_ty(&module, name) {
+            Some(Type::Kernel { inputs, .. }) => assert_eq!(input_names(&module, inputs), ["mu"]),
+            other => panic!("{name}: {other:?}"),
         }
-        if let flatppl_core::Node::Ref(r) = module.node(id)
-            && module.resolve(r.name) == "sigma_step"
-        {
-            refs += 1;
-        }
-        pending.extend(module.node(id).children());
     }
-    assert_eq!(
-        refs, 1,
-        "one ref node to the captured draw, not one per step"
-    );
 }

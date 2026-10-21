@@ -124,13 +124,13 @@ fn set_names_and_constants_resolve() {
     );
 }
 
-/// A built-in used as a VALUE — the `sum` in `reduce(sum, …)`, the `Poisson` in
+/// A built-in used as a VALUE — the `add` in `reduce(add, …)`, the `Poisson` in
 /// `broadcast(Poisson, …)` — is a bare atom in an ordinary argument position.
 #[test]
 fn builtins_as_values_resolve() {
     assert_clean(
         "v = [1.0, 2.0, 3.0]\n\
-         y = reduce(sum, v)\n\
+         y = reduce(add, v)\n\
          m = broadcast(Poisson, v)\n",
     );
 }

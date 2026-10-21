@@ -765,11 +765,7 @@ fn first_sample_term(pir: &str) -> String {
     panic!("unbalanced builtin_sample term in:\n{pir}");
 }
 
-// `pushfwd` over a RECORD law with a map whose parameter names are the record's fields
-// (§04 auto-splatting) — the capability the `refuse.rs` guards around it are scoped
-// against. Without this golden a tightening of `record_splat_mismatch` could make the
-// correct spelling refuse with every other test still green.
-//
+// A pushforward callback receives its record variate whole.
 // Two INDEPENDENT draws in the base: 2 logical samples, 3 syntactic occurrences.
 // The first sample's node is shared — its value is `sub`'s left operand and its
 // advanced rng seeds the second sample — and the FlatPIR writer has no
@@ -781,10 +777,11 @@ fn pushfwd_over_independent_record_law_applies_map_to_both_draws() {
 s = rnginit([42, 0, 0, 0])
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
-f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
+f = r -> r.y1 - r.y2
 draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
-    let out = determinize(&m).expect("pushfwd over a record law with a field-named map must lower");
+    let out =
+        determinize(&m).expect("pushfwd over a record law with a whole-record map must lower");
     let pir = flatppl_flatpir::write(&out);
     assert_eq!(
         pir.matches("builtin_sample").count(),
@@ -837,7 +834,7 @@ s = rnginit([42, 0, 0, 0])
 mu = draw(Normal(mu = 0.0, sigma = 10.0))
 y1 = draw(Normal(mu = mu, sigma = 1.0))
 y2 = draw(Normal(mu = mu, sigma = 1.0))
-f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
+f = r -> r.y1 - r.y2
 draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     let m = parse_infer(src);
     let out =

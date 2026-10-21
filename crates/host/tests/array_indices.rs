@@ -3,7 +3,7 @@ use flatppl_host::{BatchSpec, Context, EmitOptions};
 #[test]
 fn index_vectors_construct_a_batched_lag_matrix() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
-        "y = elementof(cartpow(reals, 5))\n\
+        "y = external(cartpow(reals, 5))\n\
          times = indicesof(zeros(3)) .+ 2\n\
          lagged(t) = y[t .- indicesof(zeros(2))]\n\
          X = rowstack(lagged.(times))\n\

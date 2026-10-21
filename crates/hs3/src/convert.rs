@@ -44,9 +44,9 @@ pub fn document_to_module(doc: &Document) -> Result<Module> {
     // 1.  Free-parameter declarations.
     declare_free_params(&mut m, doc, &dist_names, &fn_names)?;
     // 1b. Functions block → deterministic bindings.
-    emit_functions(&mut m, doc)?;
+    let function_parameters = emit_functions(&mut m, doc)?;
     // 2.  Distributions → bindings (relabel with the variate).
-    emit_distributions(&mut m, doc)?;
+    emit_distributions(&mut m, doc, &function_parameters)?;
     // 2b. Native histfactory_dist distributions → channel assembly (pyhf-shared).
     emit_histfactory_channels(&mut m, doc)?;
     // 3.  Presets (domains, parameter_points).
@@ -650,17 +650,18 @@ fn doc_uses_specfun(doc: &Document) -> bool {
 }
 
 /// Step 1b: lower each `functions` block entry to a deterministic binding.
-fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
+fn emit_functions(m: &mut Module, doc: &Document) -> Result<BTreeMap<String, NodeId>> {
     let observables = observable_names(doc);
+    let mut parameters = BTreeMap::new();
     let mut b = Builder::new(m);
     // Bind the special-functions standard module once if any expression uses erf/erfc.
     if doc_uses_specfun(doc) {
         crate::pyhf::bind_standard_module(&mut b, "specfun", "special-functions", "0.1");
     }
     for f in &doc.functions {
-        emit_function(&mut b, f, &observables)?;
+        emit_function(&mut b, f, &observables, &mut parameters)?;
     }
-    Ok(())
+    Ok(parameters)
 }
 
 /// The observable record a conditional distribution over `obs` is normalized
@@ -794,7 +795,11 @@ fn function_observable<'a>(f: &'a Function, axis_set: &BTreeSet<&'a str>) -> Opt
 /// Step 2: emit each non-histfactory distribution as a binding, wrapping with a
 /// `relabel` over its variate. Binds the `hepphys` standard module once up front
 /// if any distribution needs it and no histfactory channel path will bind it.
-fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
+fn emit_distributions(
+    m: &mut Module,
+    doc: &Document,
+    function_parameters: &BTreeMap<String, NodeId>,
+) -> Result<()> {
     let domains = domain_bounds(doc)?;
     let observables = observable_names(doc);
     // Conditional detection support. `axis_set` is every dataset observable axis;
@@ -932,7 +937,10 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 .filter(|ax| Some(*ax) != own_obs.as_deref())
                 .collect();
             if let Some(obs) = own_obs.as_deref().filter(|_| !cond_axes.is_empty()) {
-                let ctx = crate::distribution::CondCtx { funcs: &funcs_axis };
+                let ctx = crate::distribution::CondCtx {
+                    funcs: &funcs_axis,
+                    parameters: function_parameters,
+                };
                 let mut needed_axes = cond_axes.clone();
                 needed_axes.insert(obs);
                 let record = ordered_record_axes(doc, &d.name, obs, &needed_axes, &domains);
@@ -981,7 +989,11 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 }
                 _ => None,
             };
-            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref(), None)?;
+            let ctx = crate::distribution::CondCtx {
+                funcs: &BTreeMap::new(),
+                parameters: function_parameters,
+            };
+            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref(), Some(&ctx))?;
             // A shared-variate product factor stays scalar (see above).
             let bound = if shared_product_factors.contains(d.name.as_str()) {
                 dist
@@ -1232,10 +1244,14 @@ fn find_histfactory_observed(doc: &Document, dist_name: &str) -> Option<Vec<f64>
 ///
 /// - `product`: `name = mul(f1, mul(f2, ...))` (fold).
 /// - `sum`:     `name = add(s1, add(s2, ...))` (fold).
-/// - `generic_function`: `name = <parsed expression>` (the expression may
-///   reference other bindings via `self_ref`; it is *not* wrapped in a lambda
-///   here — the expression is a deterministic scalar/function-valued formula).
-fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) -> Result<()> {
+/// - `generic_function`: a scalar expression when it depends only on parameters;
+///   otherwise a fixed callback with explicit observable and parameter inputs.
+fn emit_function(
+    b: &mut Builder,
+    f: &Function,
+    observables: &BTreeSet<String>,
+    parameters: &mut BTreeMap<String, NodeId>,
+) -> Result<()> {
     match f.kind.as_str() {
         "product" => fold_function(
             b,
@@ -1244,6 +1260,7 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
             "mul",
             "HS3 product function → fold of mul",
             observables,
+            parameters,
         )?,
         "sum" => fold_function(
             b,
@@ -1252,6 +1269,7 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
             "add",
             "HS3 sum function → fold of add",
             observables,
+            parameters,
         )?,
         "generic_function" => {
             let expression = f
@@ -1283,7 +1301,13 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
                 _ => generic_observable(expression, observables),
             };
             let node = match &obs_name {
-                Some(obs) => expr::parse_expr_as_fn(b, expression, obs)?,
+                Some(obs) => {
+                    let callback = expr::parse_expr_as_fn(b, expression, obs)?;
+                    if let Some(p) = callback.parameters {
+                        parameters.insert(f.name.clone(), p);
+                    }
+                    callback.function
+                }
                 None => expr::parse_expr_inline(b, expression)?,
             };
             b.bind_doc(
@@ -1309,10 +1333,13 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
                 .collect::<Result<_>>()?;
             let coeff_vec = b.array(&coeff_elems);
             let obs_name = f.extra.get("x").and_then(|v| v.as_str()).unwrap_or("x");
-            let node = crate::distribution::build_polynomial_fn(b, coeff_vec, obs_name);
+            let callback = crate::distribution::build_polynomial_fn(b, coeff_vec, obs_name);
+            if let Some(p) = callback.parameters {
+                parameters.insert(f.name.clone(), p);
+            }
             b.bind_doc(
                 &f.name,
-                node,
+                callback.function,
                 &["HS3 polynomial function → polynomial(coefficients, x)"],
             );
         }
@@ -1336,7 +1363,7 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
 /// `generic_function` and `polynomial` already do. rf302's
 /// `{"type":"sum","summands":["a0","y"]}` emitted the bare `fy_3 = a0 + y`,
 /// leaving the observable `y` unresolvable at module level; it is now
-/// `fy_3 = y -> a0 + y`. A fold over parameters only stays a bare scalar
+/// a fixed callback receiving both `y` and `a0`. A fold over parameters only stays a bare scalar
 /// binding, since wrapping it would make it function-valued where a real is
 /// expected.
 fn fold_function(
@@ -1346,6 +1373,7 @@ fn fold_function(
     op: &str,
     doc: &str,
     observables: &BTreeSet<String>,
+    parameters: &mut BTreeMap<String, NodeId>,
 ) -> Result<()> {
     let operands = f.extra.get(key).and_then(|v| v.as_array()).ok_or_else(|| {
         Error::Unsupported(format!("{} function `{}` missing `{key}`", f.kind, f.name))
@@ -1393,7 +1421,13 @@ fn fold_function(
         .reduce(|acc, x| b.call(op, &[acc, x]))
         .expect("non-empty operands checked above");
     let node = match obs_name {
-        Some(obs) => crate::expr::wrap_lambda(b, folded, obs),
+        Some(obs) => {
+            let callback = expr::wrap_callback(b, folded, &[obs], false);
+            if let Some(p) = callback.parameters {
+                parameters.insert(f.name.clone(), p);
+            }
+            callback.function
+        }
         None => folded,
     };
     b.bind_doc(&f.name, node, &[doc]);

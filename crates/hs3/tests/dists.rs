@@ -819,8 +819,8 @@ fn polynomial_dist_converts() {
     // against Lebesgue(reals), and relabeled onto the observed variate p_obs.
     assert!(
         text.contains(
-            "poly_d = normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
-             p_obs = _p_obs_), Lebesgue(reals)), interval(-5.0, 5.0)))"
+            "poly_d = normalize(truncate(weighted(functionof(polynomial([1.0, _parameters_, 0.5], _p_obs_), \
+             p_obs = _p_obs_, parameters = _parameters_), Lebesgue(reals), c1), interval(-5.0, 5.0)))"
         ),
         "polynomial_dist body mismatch, got:\n{text}"
     );
@@ -1005,7 +1005,11 @@ fn string_literal_coefficient_lowers_to_literal_not_param() {
     let m = flatppl_hs3::read_hs3(STRING_LITERAL_COEFF_JSON).expect("read_hs3");
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
     // The "1.0" string coefficient becomes a literal inside the polynomial array.
-    assert!(text.contains("polynomial([1.0, a]"), "got:\n{text}");
+    assert!(
+        text.contains("polynomial([1.0, _parameters_]"),
+        "got:\n{text}"
+    );
+    assert!(text.contains("Lebesgue(reals), a)"), "got:\n{text}");
     // And is NOT declared as a free parameter binding.
     assert!(
         !text.contains("1.0 = elementof"),
@@ -1102,13 +1106,12 @@ fn rf309_conditional_gaussian_lowers_to_joint_normalized_density() {
     eprintln!("=== rf309 conditional gaussian ===\n{out}\n=== end ===");
     assert!(out.contains("normalize("), "got:\n{out}");
     assert!(out.contains("logweighted("), "got:\n{out}");
-    // Minimal syntax rewrites the lambda's bound vars to placeholders (`_x_`,
-    // `_y_`): the functional mean is `fy(_y_)` (func applied to its axis), the
-    // scored point is `_x_`. The full inner call pins the mu→fy(y) binding, the
+    // The whole record supplies x/y; a0, a1 and sigma are explicit parameters.
+    // The full inner call pins the mu→fy(y) binding, the
     // sigma kwarg, and the observable being scored — a swapped or dropped piece
     // would not match.
     assert!(
-        out.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
+        out.contains("logdensityof(Normal(mu = fy(get(_point_, \"y\"), (get(_parameters_, 1), get(_parameters_, 2))), sigma = get(_parameters_, 3)), get(_point_, \"x\"))"),
         "got:\n{out}"
     );
     // The joint Lebesgue support is the record's cartesian product, with x's

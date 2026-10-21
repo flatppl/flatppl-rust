@@ -4129,8 +4129,8 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
-                    } else if name == "scan" {
-                        self.lower_scan(id, &call.args)?.tensor(id)
+                    } else if matches!(name.as_str(), "scan" | "reduce") {
+                        self.lower_sequence(id, &call.args, name == "reduce")?.tensor(id)
                     } else if name == "mul" {
                         // A BARE `mul` is the surface `*`, which spec §07 "Linear
                         // algebra" defines as the MATRIX product ("Matrix
@@ -4176,7 +4176,7 @@ impl<'m> Emitter<'m> {
                         if let Some(field) = self.named_field_projection(&call.args) {
                             return self.lower_node(field);
                         }
-                        if let Some(field) = self.sequence_field(&call.args) {
+                        if let Some(field) = self.sequence_field(&call.args, base) {
                             return field;
                         }
                         if let Some(elem) = self.tuple_projection(&call.args, base) {

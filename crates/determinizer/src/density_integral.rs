@@ -168,11 +168,11 @@ fn expectation(
         let Node::Call(call) = m.node(resolved) else {
             return None;
         };
-        let [weight, base] = call.args.as_ref() else {
+        if !matches!(call.args.len(), 2 | 3) {
             return None;
-        };
-        let (weight, base) = (*weight, *base);
-        if !weight_is_variate_dependent(m, weight) {
+        }
+        let (weight, base, parameter) = (call.args[0], call.args[1], call.args.get(2).copied());
+        if parameter.is_none() && !weight_is_variate_dependent(m, weight) {
             let score = expectation(m, base, conditional)?;
             return Some(score.map(|score| {
                 let weight = if logarithmic {
@@ -185,7 +185,8 @@ fn expectation(
         }
         return expectation(m, base, &mut |m, point| {
             let score = conditional(m, point)?;
-            let weight = build_weight_call(m, weight, point)?;
+            let weight = build_callback_call(m, weight, point, parameter)?;
+            let weight = crate::canon::inline_expression(m, weight);
             let weight = if logarithmic {
                 weight
             } else {
@@ -515,7 +516,9 @@ fn bounds(m: &mut Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
         let support = match m.resolve(head) {
             "truncate" => c.args.get(1).copied(),
             "Lebesgue" | "Uniform" => named_or_positional(m, &c, "support"),
-            "weighted" | "logweighted" if c.args.len() == 2 => return bounds(m, c.args[1]),
+            "weighted" | "logweighted" if matches!(c.args.len(), 2 | 3) => {
+                return bounds(m, c.args[1]);
+            }
             "normalize" if c.args.len() == 1 => return bounds(m, c.args[0]),
             _ => None,
         };
@@ -562,7 +565,7 @@ fn continuous(m: &Module, measure: NodeId) -> bool {
         "Lebesgue" | "Uniform" | "Normal" | "Exponential" | "Gamma" | "InverseGamma" | "Beta"
         | "StudentT" | "Cauchy" | "Laplace" | "Logistic" | "LogNormal" | "Weibull"
         | "ChiSquared" | "GeneralizedNormal" | "Pareto" | "VonMises" => true,
-        "weighted" | "logweighted" if c.args.len() == 2 => continuous(m, c.args[1]),
+        "weighted" | "logweighted" if matches!(c.args.len(), 2 | 3) => continuous(m, c.args[1]),
         "truncate" | "normalize" => c.args.first().is_some_and(|&base| continuous(m, base)),
         _ => false,
     }

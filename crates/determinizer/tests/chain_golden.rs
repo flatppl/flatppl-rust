@@ -131,26 +131,6 @@ lp = logdensityof(lawof(t), [0.5, 1.5])";
     );
 }
 
-// A step kernel with the wrong arity is refused on the §06 signature rather than
-// bound by a guessed position: `markovchain`'s kernel takes ONE input (the
-// state), `kscan`'s takes TWO (state, exogenous input).
-#[test]
-fn markovchain_two_input_kernel_refuses() {
-    let src = "\
-f = (s, x) -> Normal(s + x, 1.0)
-t = draw(markovchain(f, 0.0, 3))
-lp = logdensityof(lawof(t), [0.5, 1.5, 1.0])";
-    let err = determinize(&parse_infer(src)).expect_err("arity mismatch must refuse");
-    assert!(
-        err.construct.contains("markovchain"),
-        "refusal names markovchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("boundary input") && err.reason.contains("§06"),
-        "refusal names the §06 signature: {err:?}"
-    );
-}
-
 // A RECORD state makes the trajectory a table (§06: "If `init` and `traj[i]` are
 // records, then the trajectories are tables, not arrays"), which inference leaves
 // with a deferred domain — so there is no static array length to unroll and no
@@ -168,23 +148,14 @@ lp = logdensityof(lawof(t), [record(a = 0.5), record(a = 1.5), record(a = 1.0)])
     );
 }
 
-// A step kernel that CAPTURES a drawn value: `sigma_step` is a `draw` node the
-// lambda references rather than takes as an argument. §04 makes such a capture a
-// shared ancestor with a SINGLE realization — the callable is conditional on it,
-// never resampled per call — so every step of the chain must score against the
-// same value, and the chain must contribute exactly `n` terms plus the captured
-// draw's own prior term.
-//
-// This is the shape `flatppl-examples/examples/ar1-noise-estimation.flatppl`
-// uses. `infer` types the step kernel `%stochastic` for the capture; the
-// determiniser has to agree that one realization is shared, and a per-step
-// resample would show up here as a `sigma` that is not the query point.
+// The supplied parameter stays constant across the trajectory. Its prior
+// contributes once, while each transition scores at the supplied scale.
 #[test]
-fn a_captured_draw_in_a_step_kernel_is_one_shared_value() {
+fn a_chain_parameter_is_one_shared_value() {
     let src = "\
 sigma_step ~ normalize(truncate(Cauchy(0.0, 1.0), interval(0.0, inf)))
-step_kernel = prev -> Normal(mu = prev, sigma = sigma_step)
-x ~ markovchain(step_kernel, 0.0, 3)
+step_kernel(prev, sigma) = Normal(mu = prev, sigma = sigma)
+x ~ markovchain(step_kernel, 0.0, 3, sigma_step)
 prior = lawof(record(sigma_step = sigma_step))
 forward_kernel = kernelof(record(x = x), sigma_step = sigma_step)
 L = likelihoodof(forward_kernel, record(x = [0.1, 0.2, 0.3]))
@@ -196,16 +167,16 @@ lp = logdensityof(posterior, record(sigma_step = 0.7))";
     assert_eq!(
         pir.matches("(%field sigma 0.7)").count(),
         3,
-        "all three steps share one realization of the captured draw:\n{pir}"
+        "all three steps use the supplied scale:\n{pir}"
     );
     // The means chain through the trajectory: init, then the observed slots.
     for mu in ["(%field mu 0.0)", "(%field mu 0.1)", "(%field mu 0.2)"] {
         assert!(pir.contains(mu), "step means chain through {mu}:\n{pir}");
     }
-    // The captured draw keeps its own prior term, scored once, not per step.
+    // The scale prior is scored once, not per step.
     assert_eq!(
         pir.matches("builtin_logdensityof Cauchy").count(),
         1,
-        "the captured draw's prior is scored once:\n{pir}"
+        "the scale prior is scored once:\n{pir}"
     );
 }

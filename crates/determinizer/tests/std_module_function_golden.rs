@@ -37,7 +37,7 @@ fn probe_model(loads: &str, expr: &str) -> String {
         "{loads}
 probe = {expr}
 sig = Normal(mu = probe, sigma = 1.0)
-lp = logdensityof(lawof(sig), 0.0)"
+lp = logdensityof(sig, 0.0)"
     )
 }
 
@@ -323,7 +323,7 @@ e = hep.kallen(3.0, 1.0, 2.0)
 f = hep.breakup_momentum(3.0, 1.0, 0.5)
 g = hep.blatt_weisskopf(2, 0.3, 1.5)
 sig = Normal(mu = a + d + e + f + g, sigma = 1.0)
-lp = logdensityof(lawof(sig), 0.0)";
+lp = logdensityof(sig, 0.0)";
     let pir = lower(src);
     // The two interpolators keep their (literal-conditioned) branch switch, so the
     // in-range value shows up as the innermost `ifelse` arm.
@@ -385,7 +385,7 @@ fn a_distribution_member_is_untouched_by_the_function_lowering() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 sig = hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0)
-lp = logdensityof(lawof(sig), 5.28)";
+lp = logdensityof(sig, 5.28)";
     let pir = lower(src);
     assert!(
         pir.contains("builtin_logdensityof CrystalBall"),

@@ -12,13 +12,16 @@ pub(super) struct Components {
 
 impl Components {
     pub(super) fn tensor(self, id: NodeId) -> Result<Value, EmitError> {
-        if self.fields.is_some() {
-            return Err(EmitError::at(id, "record/table requires field projection"));
+        if self.fields.is_some() || self.values.len() != 1 {
+            return Err(EmitError::at(id, "structured object requires a projection"));
         }
         Ok(self.values.into_iter().next().expect("one tensor leaf"))
     }
 
     fn align(mut self, template: &Self, id: NodeId) -> Result<Self, EmitError> {
+        if self.values.len() != template.values.len() {
+            return Err(EmitError::at(id, "scan: step changes the state structure"));
+        }
         if self.fields != template.fields {
             let (Some(fields), Some(expected)) = (&self.fields, &template.fields) else {
                 return Err(EmitError::at(id, "scan: step changes the state structure"));
@@ -230,6 +233,33 @@ impl Emitter<'_> {
             }
             resolved = next;
         }
+        if let Some(Type::Tuple(items)) = self.type_of(id) {
+            let values = (0..items.len())
+                .map(|i| self.columns.get(&(resolved, i.to_string())).cloned())
+                .collect::<Option<Vec<_>>>();
+            if let Some(values) = values {
+                return Ok(Components {
+                    fields: None,
+                    values,
+                });
+            }
+            if let Node::Call(c) = self.m.node(resolved)
+                && matches!(c.head, CallHead::Builtin(h) if self.m.resolve(h) == "tuple")
+            {
+                let values = c
+                    .args
+                    .iter()
+                    .map(|&arg| {
+                        self.lower_node(arg)
+                            .map(|value| self.typed_axes(arg, value))
+                    })
+                    .collect::<Result<_, _>>()?;
+                return Ok(Components {
+                    fields: None,
+                    values,
+                });
+            }
+        }
         let fields = match self.type_of(id) {
             Some(
                 Type::Record(fields)
@@ -259,7 +289,8 @@ impl Emitter<'_> {
             && let CallHead::Builtin(head) = c.head
         {
             match self.m.resolve(head) {
-                "scan" => return self.lower_scan(resolved, &c.args),
+                "scan" => return self.lower_sequence(resolved, &c.args, false),
+                "reduce" => return self.lower_sequence(resolved, &c.args, true),
                 "record" | "table" => {
                     let mut fields = Vec::with_capacity(c.named.len());
                     let mut values = Vec::with_capacity(c.named.len());
@@ -323,7 +354,11 @@ impl Emitter<'_> {
                 self.scoped_inputs.insert(node, types[index].clone());
                 self.memo.remove(&node);
                 let arg = &args[index];
-                if let Some(fields) = &arg.fields {
+                if matches!(types[index], Type::Tuple(_)) {
+                    for (i, value) in arg.values.iter().enumerate() {
+                        self.bind_column(node, i.to_string(), value.clone());
+                    }
+                } else if let Some(fields) = &arg.fields {
                     for (&field, value) in fields.iter().zip(&arg.values) {
                         self.bind_column(node, self.m.resolve(field).to_owned(), value.clone());
                     }
@@ -371,8 +406,29 @@ impl Emitter<'_> {
         result
     }
 
-    pub(super) fn sequence_field(&mut self, args: &[NodeId]) -> Option<Result<Value, EmitError>> {
+    pub(super) fn sequence_field(
+        &mut self,
+        args: &[NodeId],
+        base: i64,
+    ) -> Option<Result<Value, EmitError>> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
+        if matches!(self.type_of(container), Some(Type::Tuple(_)))
+            && self
+                .columns
+                .contains_key(&(self.resolve_ref_one(container), "0".to_owned()))
+        {
+            let Node::Lit(Scalar::Int(index)) = self.m.node(selector) else {
+                return None;
+            };
+            let index = usize::try_from(index - base).ok()?;
+            return Some(self.lower_components(container).and_then(|parts| {
+                parts
+                    .values
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| EmitError::at(container, "tuple index out of range"))
+            }));
+        }
         let field = match self.m.node(selector) {
             Node::Lit(Scalar::Str(s)) => s.as_ref(),
             Node::Const(name) => self.m.resolve(*name),
@@ -398,31 +454,60 @@ impl Emitter<'_> {
         }))
     }
 
-    pub(super) fn lower_scan(
+    pub(super) fn lower_sequence(
         &mut self,
         id: NodeId,
         args: &[NodeId],
+        reduce: bool,
     ) -> Result<Components, EmitError> {
         let frame = self.broadcast_frame.clone();
         let previous = std::mem::replace(&mut self.call_frame, frame);
-        let result = self.lower_scan_in_frame(id, args);
+        let result = self.lower_sequence_in_frame(id, args, reduce);
         self.call_frame = previous;
         result
     }
 
-    fn lower_scan_in_frame(
+    fn lower_sequence_in_frame(
         &mut self,
         id: NodeId,
         args: &[NodeId],
+        reduce: bool,
     ) -> Result<Components, EmitError> {
-        let [function, init, xs] = crate::ops::args_exact(id, args)?;
+        let (function, init, xs, parameters) = match (reduce, args) {
+            (false, [function, init, xs, parameters @ ..]) => {
+                (*function, Some(*init), *xs, parameters)
+            }
+            (true, [function, xs, parameters @ ..]) => (*function, None, *xs, parameters),
+            _ => {
+                return Err(EmitError::at(
+                    id,
+                    "sequence callback: invalid argument count",
+                ));
+            }
+        };
         let item_type = self.sequence_item_type(xs)?;
-        let state_type = self.sequence_item_type(id)?;
+        let state_type = if reduce {
+            item_type.clone()
+        } else {
+            self.sequence_item_type(id)?
+        };
         let (body, entries) = self.callable_parts(function)?;
-        if entries.len() != 2 {
-            return Err(EmitError::at(id, "scan: step must take state and input"));
+        if parameters.len() > 1 || entries.len() != 2 + parameters.len() {
+            return Err(EmitError::at(
+                id,
+                "scan: step must take state, input and optional parameter",
+            ));
         }
-        let mut state = self.lower_components(init)?;
+        let parameter = parameters
+            .first()
+            .map(|&node| {
+                let ty = self
+                    .type_of(node)
+                    .cloned()
+                    .ok_or_else(|| EmitError::at(node, "scan: unresolved parameter type"))?;
+                Ok((self.lower_components(node)?, ty))
+            })
+            .transpose()?;
         let xs = self.lower_components(xs)?;
         let Some(Some(n)) = xs
             .values
@@ -445,6 +530,20 @@ impl Emitter<'_> {
                 "scan: expected a vector or equal-length table columns",
             ));
         }
+        let mut state = if let Some(init) = init {
+            self.lower_components(init)?
+        } else {
+            if n == 0 {
+                return Err(EmitError::at(id, "reduce: input must be non-empty"));
+            }
+            let zero = self.int_value_const(0);
+            let values = xs
+                .values
+                .iter()
+                .map(|value| self.scan_slice(value, &zero))
+                .collect::<Vec<_>>();
+            xs.with_values(&values)
+        };
         if let Some(fields) = &state.fields {
             let cached = fields
                 .iter()
@@ -462,7 +561,7 @@ impl Emitter<'_> {
         }
 
         let carry_types = match (self.type_of(id), &state.fields) {
-            (Some(Type::Table { columns, .. }), Some(fields)) => fields
+            (Some(Type::Table { columns, .. } | Type::Record(columns)), Some(fields)) => fields
                 .iter()
                 .map(|name| {
                     columns
@@ -472,6 +571,7 @@ impl Emitter<'_> {
                         .ok_or_else(|| EmitError::at(id, "scan: unresolved state field"))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            (Some(ty), None) if reduce => vec![ty.clone()],
             (Some(Type::Array { elem, .. }), None) => vec![(**elem).clone()],
             _ => return Err(EmitError::at(id, "scan: unresolved state type")),
         };
@@ -490,7 +590,7 @@ impl Emitter<'_> {
             *value = self.finish_broadcast(value, &frame, frame.len());
         }
         let mut buffers = Vec::with_capacity(state.values.len());
-        for value in &state.values {
+        for value in state.values.iter().filter(|_| !reduce) {
             let mut dims = shape(&value.ty).to_vec();
             dims.insert(self.batch_rank(value), Some(n));
             let zero = match value.elem {
@@ -503,8 +603,8 @@ impl Emitter<'_> {
             axes.layers.insert(0, 1);
             buffers.push(self.axes_view(&buffer, axes));
         }
-        if n > 0 {
-            let counter = self.int_value_const(0);
+        if n > u64::from(reduce) {
+            let counter = self.int_value_const(i64::from(reduce));
             let mut inits = vec![counter];
             inits.extend(xs.values.clone());
             let start = inits.len();
@@ -532,13 +632,14 @@ impl Emitter<'_> {
                     for (value, original) in args[start..out_start].iter().zip(&state.values) {
                         carries.push(e.axes_view(value, e.axes_of(original)));
                     }
+                    let mut arguments = vec![state.with_values(&carries), xs.with_values(&items)];
+                    let mut types = vec![state_type.clone(), item_type.clone()];
+                    if let Some((value, ty)) = &parameter {
+                        arguments.push(value.clone());
+                        types.push(ty.clone());
+                    }
                     let output = e
-                        .call_components(
-                            body,
-                            &entries,
-                            &[state.with_values(&carries), xs.with_values(&items)],
-                            &[state_type.clone(), item_type.clone()],
-                        )?
+                        .call_components(body, &entries, &arguments, &types)?
                         .align(&state, id)?;
                     let mut next = Vec::with_capacity(args.len());
                     let one = e.int_value_const(1);
@@ -563,11 +664,19 @@ impl Emitter<'_> {
                     Ok(next)
                 },
             )?;
-            buffers = results[out_start..].to_vec();
+            buffers = if reduce {
+                results[start..out_start].to_vec()
+            } else {
+                results[out_start..].to_vec()
+            };
+        } else if reduce {
+            buffers = state.values.clone();
         }
         for (buffer, value) in buffers.iter_mut().zip(&state.values) {
             let mut axes = self.axes_of(value);
-            axes.layers.insert(0, 1);
+            if !reduce {
+                axes.layers.insert(0, 1);
+            }
             *buffer = self.axes_view(buffer, axes);
         }
         if let Some(fields) = &state.fields {

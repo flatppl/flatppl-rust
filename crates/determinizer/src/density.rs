@@ -1510,8 +1510,7 @@ fn lower_applied_ksuperpose_inner(
 /// `covs = [cA, cB]` infers to — carries the parameter's axes in its ELEMENT, so
 /// the single index already lands on the whole matrix. §03 keeps those two
 /// spellings distinct types, so reading the total axis count would emit one `all`
-/// too many for the nested one. `get` is 1-based (§07), as
-/// [`build_weight_call`]'s own component split is.
+/// too many for the nested one. `get` is 1-based (§07).
 ///
 /// **Unrolled, where the scalar family is axis-native.** §06 makes $N$ "not
 /// necessarily statically known" and the axis-native form honours that; the slice
@@ -1902,8 +1901,17 @@ fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Op
     let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     let mut visited_bindings: std::collections::HashSet<BindingId> =
         std::collections::HashSet::new();
+    let promoted = crate::canon::promoted_input_names(m);
     while let Some(id) = stack.pop() {
         if !visited.insert(id) {
+            continue;
+        }
+        // Only the selected object component contributes to the query point.
+        // For (kernel, observation)[2], the kernel's boundary is not a dependency.
+        if let Some(value) = crate::canon::project_tuple(m, id, &promoted)
+            .or_else(|| crate::canon::project(m, id, &promoted))
+        {
+            stack.push(value);
             continue;
         }
         match m.node(id) {
@@ -2237,14 +2245,7 @@ fn lower_measure_density_in_reference(
     }
 }
 
-/// `lawof(M)` reached as a sub-measure (e.g. a `bayesupdate` prior): unwrap to
-/// `M` and recurse through [`lower_measure_density`] (spec §06: `lawof` names
-/// the law of its argument without changing it — `lawof(draw m) ≡ m`, and a
-/// `lawof` over a record of `~`-bound draws is the joint law of those draws, so
-/// the unwrapped `M` reaching `lower_record_of_draws` via the `"record"` arm is
-/// exactly the shape that arm already scores).
-///
-/// A `lawof` with anything but exactly one argument refuses (refuse-don't-mislower).
+/// Score a value law reached as a sub-measure, preserving its shared draws.
 fn lower_lawof(
     m: &mut Module,
     node: NodeId,
@@ -2260,141 +2261,50 @@ fn lower_lawof(
         }
         c.args[0]
     };
+    validate_law_argument(m, arg)?;
     if let Some(marginal) = marginalize_or_refuse_stochastic_law(m, arg, v)? {
         return marginal_in_reference(m, arg, v, marginal, atoms);
     }
     lower_measure_density_in_reference(m, arg, v, origin, atoms)
 }
 
-/// Marginalize — or refuse — `lawof(<measure expression>)` whose measure is
-/// parameterized by a draw: `lawof(Normal(mu = a, sigma = 1))` with `a` latent, whose
-/// total law is the marginal `N(0, √2)`, not `N(a, 1)` at whatever value `a` later takes.
-///
-/// `Ok(None)` means no marginalization is called for and the caller lowers as usual;
-/// `Ok(Some(node))` is the emitted closed-form marginal density at `v`; `Err` is the
-/// refusal.
-///
-/// This is the measure-expression half of the marginalization guard;
-/// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Neither
-/// subsumes the other: a measure argument is scored by `build_density_term`, which
-/// succeeds, so `lower_value_law` never runs. Called from both places a `lawof` is
-/// stripped — [`lower_lawof`], and [`lower_density_core`] at the query entry.
-///
-/// Only a MEASURE-EXPRESSION argument is checked. Running [`measure_reaches_draw`]
-/// on a VALUE argument would refuse every §06 stochastic-node `lawof(z)`. An
-/// argument whose type did not resolve is left alone rather than refused on a guess.
-/// A RECORD argument gets [`marginalize_or_refuse_record_law`] instead: a dependent
-/// component `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws`
-/// scores when `z` is a sibling FIELD, and only a marginal when it is not.
-///
-/// A CLOSED reification is UNWRAPPED to its body first
-/// ([`crate::kernel::classify_reification`]), before the record path, the
-/// measure-expression disjunction and the conjugate dispatch below all run — so each
-/// of them sees `Normal(mu = a, …)` where the author wrote
-/// `functionof(Normal(mu = a, …))`, and the two spellings cannot drift apart. A
-/// reification that survives the unwrap keeps its own refusal arm, whose message
-/// names WHY it survived (boundary inputs, a free placeholder, an unfilled boundary).
-///
-/// A reification counts as a measure expression, admitted by head as well as type:
-/// `F = functionof(Normal(mu = a, sigma = 1.0))` types as `Kernel`, so a
-/// `Type::Measure`-only test let `lawof(F)` through and emitted the conditional at a
-/// later-pinned `a`. Once a wrapper is unwrapped the admission is decided by the BODY
-/// alone, never by the wrapper's own type: a closed `kernelof(a)` over a VALUE also
-/// types as `Kernel`, and admitting it ran the draw walk on `a`'s own `draw` and
-/// refused. §04 *Kernels and `kernelof`* makes `kernelof(a)` "equivalent to
-/// `functionof(lawof(a))`", the spelling that already lowered, so the two must agree.
-/// [`measure_reaches_draw`] keeps this from over-refusing —
-/// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
-///
-/// The marginal is `kchain(lawof(a), a -> Normal(mu = a, …))`, which
-/// [`crate::marginal::conjugate_marginal_measure`] answers in closed form for a
-/// recognised pair, from the prior, the likelihood, and the symbol linking them. No
-/// row applying is what keeps the refusal.
+fn validate_law_argument(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
+    let resolved = resolve_ref_chain(m, arg).0;
+    if is_measure_expr_type(m, arg)
+        || is_measure_expr_type(m, resolved)
+        || matches!(
+            m.type_of(arg),
+            Some(Type::Tuple(_) | Type::Function { .. } | Type::Likelihood { .. } | Type::Module)
+        )
+        || matches!(
+            builtin_name(m, resolved),
+            Some("functionof" | "kernelof" | "tuple")
+        )
+    {
+        return Err(refuse(
+            arg,
+            m,
+            "lawof requires a value node, not a measure or callable",
+        ));
+    }
+    Ok(())
+}
+
+/// Marginalize a value law or an already-applied kernel body. The latter may
+/// be a measure constructor after its draw was unwrapped by beta reduction.
 fn marginalize_or_refuse_stochastic_law(
     m: &mut Module,
     arg: NodeId,
     v: NodeId,
 ) -> Result<Option<NodeId>, RefuseError> {
-    let (referent, _) = resolve_ref_one(m, arg);
-    // A CLOSED reification of a measure IS that measure — §06 "Uniform kernel
-    // extension" identifies "measures with nullary kernels", and makes `logdensityof`
-    // require exactly such a closed measure. So route the reified spelling exactly as
-    // the plain one: the conjugate rows below read a bare constructor and the wrapper
-    // is not one. A PARAMETERISED reification keeps its own arm.
-    let (resolved, unwrapped) = match crate::kernel::resolve_closed_reification(m, referent) {
-        Some(body) => (body, true),
-        None => (referent, false),
-    };
+    let referent = resolve_ref_chain(m, arg).0;
+    let resolved = crate::kernel::resolve_closed_reification(m, referent).unwrap_or(referent);
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
-    // Once a wrapper is unwrapped its BODY is the construct's value, so the
-    // measure-expression test reads the body alone. Reading the wrapper's own type
-    // instead admitted a closed `kernelof(a)` over a VALUE — it types as `Kernel` —
-    // and then ran `measure_reaches_draw` on `a`'s own `draw`, the one thing this
-    // guard must not do. The head test stays unconditional: an unwrap can stop on a
-    // PARAMETERISED reification, which keeps its own arm below.
-    let is_measure_expr = is_measure_expr_type(m, resolved)
-        || (!unwrapped && is_measure_expr_type(m, arg))
-        || matches!(
-            builtin_name(m, resolved),
-            Some("functionof") | Some("kernelof")
-        );
-    if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
-        // One variate, so no product to get wrong: the marginal's own latent is not needed.
+    if is_measure_expr_type(m, resolved) && measure_reaches_draw(m, resolved, &[]) {
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
             return score_marginal_form(m, &marginal?.form, v).map(Some);
-        }
-        // A reification still standing here was NOT unwrapped, and the reason decides
-        // the message. Reading it off `classify_reification` keeps the refusal from
-        // asserting boundary inputs that a shape with an EMPTY boundary does not have.
-        match crate::kernel::classify_reification(m, resolved) {
-            crate::kernel::Reification::Parameterised => {
-                return Err(refuse(
-                    resolved,
-                    m,
-                    "lawof of a PARAMETERISED reification (one with boundary inputs) is not yet \
-                     lowerable: reaching the reified body needs a value bound to each boundary \
-                     input, which is §04 kernel-boundary semantics, not an unwrapping. A CLOSED \
-                     reification (no boundary inputs) lowers as its body does",
-                ));
-            }
-            crate::kernel::Reification::FreePlaceholder => {
-                return Err(refuse(
-                    resolved,
-                    m,
-                    "this reification declares no boundary input, yet its body references a \
-                     `%local` placeholder — §04 \"Placeholders and holes\" requires every \
-                     placeholder to appear in the boundary keyword arguments too. Unwrapping it \
-                     would score a dangling placeholder, so refuse",
-                ));
-            }
-            crate::kernel::Reification::Unfilled => {
-                return Err(refuse(
-                    resolved,
-                    m,
-                    "this reification's auto-traced boundary is not filled in, so its inputs are \
-                     UNKNOWN rather than known to be none; re-run inference over the module \
-                     before scoring it",
-                ));
-            }
-            crate::kernel::Reification::Closed(_) | crate::kernel::Reification::Plain => {}
-        }
-        // A `draw` HEAD that reaches this measure-expression guard carries a MEASURE
-        // inferred type itself — a `draw` of a measure expression
-        // (`draw(truncate(lawof(…), S))`) does. It is still a VALUE, so no conjugate row
-        // was ever the blocker: it is that value-versus-measure discrimination. A draw
-        // whose own type is an ordinary value no longer arrives here, since the
-        // measure-expression test above reads the unwrapped body rather than a wrapper.
-        if draw_argument(m, resolved).is_some() && is_measure_expr_type(m, resolved) {
-            return Err(refuse(
-                resolved,
-                m,
-                "lawof of a draw OF a measure expression is not yet lowerable: this draw \
-                 node carries a MEASURE inferred type, so the measure-expression guard \
-                 admitted a value. The blocker is that value-versus-measure \
-                 discrimination, not a missing conjugate row",
-            ));
         }
         if let Some(numerical) = integral::marginal(m, resolved, v) {
             return numerical.map(Some);
@@ -2402,8 +2312,7 @@ fn marginalize_or_refuse_stochastic_law(
         return Err(refuse(
             resolved,
             m,
-            "lawof of a draw-parameterized measure is the MARGINAL law (§04: lawof reifies the \
-             TOTAL law), and no conjugate closed form covers this kchain marginal",
+            "the applied kernel retains a latent dependency without a supported marginal",
         ));
     }
     Ok(None)
@@ -3482,26 +3391,27 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
 /// A constant/scalar
 /// weight is used as-is (`log(w) + density`); a variate-dependent (function)
 /// weight is **applied at the variate** per §06 "Weight arity" — see
-/// [`build_weight_call`].
+/// [`build_callback_call`].
 fn lower_weighted(
     m: &mut Module,
     node: NodeId,
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (w_node, m_inner) = {
+    let (w_node, m_inner, parameter) = {
         let c = expect_builtin_call(m, node, "weighted")
             .ok_or_else(|| refuse(node, m, "expected weighted"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(node, m, "weighted expects 2 args"));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(node, m, "weighted expects 2 or 3 args"));
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
-    let w_scored = if weight_is_variate_dependent(m, w_node) {
-        build_weight_call(m, w_node, v)?
+    let w_scored = if parameter.is_some() || weight_is_variate_dependent(m, w_node) {
+        let applied = build_callback_call(m, w_node, v, parameter)?;
+        crate::canon::inline_expression(m, applied)
     } else {
         w_node
     };
@@ -3529,133 +3439,104 @@ fn lower_weighted(
 /// The log-weight is
 /// already in log space, so there is no outer `log`: a constant/scalar `ℓ` is used
 /// as-is, and a variate-dependent (function) log-weight is **applied at the
-/// variate** per §06 "Weight arity" — see [`build_weight_call`].
+/// variate** per §06 "Weight arity" — see [`build_callback_call`].
 fn lower_logweighted(
     m: &mut Module,
     node: NodeId,
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (lw_node, m_inner) = {
+    let (lw_node, m_inner, parameter) = {
         let c = expect_builtin_call(m, node, "logweighted")
             .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(node, m, "logweighted expects 2 args"));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(node, m, "logweighted expects 2 or 3 args"));
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
-    let lw_scored = if weight_is_variate_dependent(m, lw_node) {
-        build_weight_call(m, lw_node, v)?
+    let lw_scored = if parameter.is_some() || weight_is_variate_dependent(m, lw_node) {
+        let applied = build_callback_call(m, lw_node, v, parameter)?;
+        crate::canon::inline_expression(m, applied)
     } else {
         lw_node
     };
     Ok(build_call(m, "add", &[lw_scored, inner_density]))
 }
 
-/// The declared parameter names of a variate-dependent `weighted`/`logweighted`
-/// weight, for the §06 "Weight arity" check in [`build_weight_call`]. Mirrors
-/// [`weight_is_variate_dependent`]'s two detection paths (a reified callable's
-/// inferred `Type::Function`/`Type::Kernel`, or an inline `functionof`/`kernelof`
-/// reification whose type inference left `%deferred`), reading the boundary's
-/// `%specinputs` list directly in the second case since the type carries no count.
-fn weight_declared_inputs(m: &Module, w_node: NodeId) -> Option<Vec<Symbol>> {
-    if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(w_node) {
-        return Some(inputs.to_vec());
-    }
-    let (resolved, _) = resolve_ref_one(m, w_node);
-    if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(resolved)
+/// Apply a callback with its variate and optional parameter object intact.
+/// Naming a unary input prevents ordinary record/table auto-splatting.
+pub(crate) fn build_callback_call(
+    m: &mut Module,
+    callback: NodeId,
+    value: NodeId,
+    parameter: Option<NodeId>,
+) -> Result<NodeId, RefuseError> {
+    let inputs = crate::kernel::resolve_reified(m, callback)
+        .map(|function| {
+            function
+                .inputs
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| match m.type_of(callback) {
+            Some(Type::Function { inputs } | Type::Kernel { inputs, .. }) => Some(inputs.to_vec()),
+            _ => None,
+        });
+    let expected = 1 + usize::from(parameter.is_some());
+    if inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.len() != expected)
     {
-        return Some(inputs.to_vec());
+        return Err(refuse(
+            callback,
+            m,
+            "callback must take one whole variate and the optional parameter",
+        ));
     }
-    if let Node::Call(c) = m.node(resolved)
-        && let Some(Inputs::Spec(entries)) = &c.inputs
-    {
-        return Some(entries.iter().map(|(name, _)| *name).collect());
+    if let Some(parameter) = parameter {
+        return Ok(build_user_call_n(m, callback, vec![value, parameter]));
     }
-    None
-}
-
-/// The static length of a 1-D array type, or `None` for a non-array or a
-/// dynamically-sized array — the latter can never satisfy the k-parameter form,
-/// since §06 "Weight arity" requires a FIXED k-element variate.
-fn array_len(m: &Module, node: NodeId) -> Option<usize> {
-    match m.type_of(node) {
-        Some(Type::Array { shape, .. }) if shape.len() == 1 => match shape[0] {
-            Dim::Static(n) => Some(n as usize),
-            Dim::Dynamic => None,
-        },
-        _ => None,
-    }
-}
-
-/// Apply a variate-dependent `weighted`/`logweighted` weight at the variate `v`,
-/// per §06 "Weight arity": a one-parameter weight receives the variate whole
-/// (`w(v)`); when `v` is a k-element array (k ≥ 2), a weight of exactly k scalar
-/// parameters instead receives one component per parameter, in order
-/// (`w(v[1], …, v[k])`); any other arity over a k-array is a spec error, refused
-/// here rather than left for [`crate::canon::inline::inline_user_calls`] to
-/// reject with a generic (and, for this construct, misleading — it always
-/// tried one argument) arity-mismatch message.
-///
-/// **Scope limit.** The array-length check only fires when `v` itself is a
-/// fixed-length array — a non-array variate falls back to the historical
-/// single-argument call unconditionally, even when the weight declares more
-/// than one input. That input list is not always a plain positional parameter
-/// roster: a `functionof`/`kernelof` reification's boundary can name a
-/// CAPTURED value alongside the variate parameter (e.g. `functionof(mul(coeff,
-/// _x_), x = _x_, coeff = coeff)`, closing over an outer θ), which is a
-/// different, already-guarded failure mode (θ captured inside a reification
-/// input — see `lower_likelihoodof_at_point`'s `subtree_capturing_reification_input`
-/// check) than the plain k-parameter split this function performs. Refusing
-/// here on arity alone would preempt that more specific diagnostic with a
-/// misleading "not a fixed-length array" message, for a case §06 "Weight arity"
-/// was never written to describe.
-fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let Some(inputs) = weight_declared_inputs(m, w_node) else {
-        return Ok(build_user_call(m, w_node, v));
-    };
-    // §06 passes a unary weight the whole variate. A positional record would
-    // instead auto-splat under §04's ordinary calling convention.
-    if let [name] = inputs.as_slice() {
+    if let Some(inputs) = inputs {
         return Ok(m.alloc(Node::Call(Call {
-            head: CallHead::User(w_node),
+            head: CallHead::User(callback),
             args: Box::new([]),
             named: vec![NamedArg {
                 kind: NamedKind::Kwarg,
-                name: *name,
-                value: v,
+                name: inputs[0],
+                value,
             }]
             .into(),
             inputs: None,
         })));
     }
-    let k = inputs.len();
-    if k <= 1 {
-        return Ok(build_user_call(m, w_node, v));
+    Ok(build_user_call(m, callback, value))
+}
+
+/// A symbolic variate and the instantiated weight expression. This view feeds
+/// closed-form recognizers without creating a callable that captures `parameter`.
+fn weight_function_body(
+    m: &mut Module,
+    weight: NodeId,
+    parameter: Option<NodeId>,
+) -> Option<(NodeId, Ref)> {
+    let function = crate::kernel::resolve_reified(m, weight)?;
+    match (function.inputs.as_slice(), parameter) {
+        ([(_, variate)], None) => Some((function.body, *variate)),
+        ([(_, variate), (_, input)], Some(parameter)) if !function.auto => {
+            let body = crate::kernel::substitute_admitted(
+                m,
+                function.body,
+                &[(*input, parameter)],
+                crate::kernel::Substitute::All,
+                false,
+            );
+            Some((body, *variate))
+        }
+        _ => None,
     }
-    let Some(v_len) = array_len(m, v) else {
-        return Ok(build_user_call(m, w_node, v));
-    };
-    if v_len != k {
-        return Err(refuse(
-            w_node,
-            m,
-            &format!(
-                "weight declares {k} parameters, but the variate is a {v_len}-element array \
-                 (spec §06 \"Weight arity\": only 1 parameter (the whole variate) or exactly \
-                 {v_len} parameters (one component each) are allowed)"
-            ),
-        ));
-    }
-    let components: Vec<NodeId> = (1..=k as i64)
-        .map(|i| {
-            let idx = m.alloc(Node::Lit(Scalar::Int(i)));
-            build_call(m, "get", &[v, idx])
-        })
-        .collect();
-    Ok(build_user_call_n(m, w_node, components))
 }
 
 /// Add component densities only after expressing them against a common reference.
@@ -4637,12 +4518,12 @@ struct GaussianProduct {
 /// refuse-don't-mislower). Structural matching; takes `&mut` only so the shared
 /// [`normal_ctor`]/[`split_kernel_constructor`] can intern positional-arg names.
 fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<GaussianProduct> {
-    let (lw_node, base) = {
+    let (lw_node, base, parameter) = {
         let c = expect_builtin_call(m, logweighted, "logweighted")?;
-        if c.args.len() != 2 {
+        if !matches!(c.args.len(), 2 | 3) {
             return None;
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
 
     // Factor 1 (g1): the logweighted base is a `Normal` constructor.
@@ -4654,21 +4535,7 @@ fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<Gau
     // `functionof` whose single positional body scores a `Normal` AT the reified
     // argument `x` (not at a constant, which would make ℓ a constant weight, not a
     // second Gaussian factor).
-    let (lw_resolved, _) = resolve_ref_one(m, lw_node);
-    // Read the reified callable's single body and input placeholder (`x`), then
-    // drop the `&Call` borrow before `gaussian_factor_scored_at` reborrows `&mut`.
-    let (g2_body, arg_ref) = {
-        let f = expect_builtin_call(m, lw_resolved, "functionof")?;
-        if f.args.len() != 1 {
-            return None;
-        }
-        // g2 must be scored at exactly this ref, so ℓ(x) = logdensityof(g2, x).
-        let arg_ref = match &f.inputs {
-            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
-            _ => return None,
-        };
-        (f.args[0], arg_ref)
-    };
+    let (g2_body, arg_ref) = weight_function_body(m, lw_node, parameter)?;
     let (mu2, sigma2) = gaussian_factor_scored_at(m, g2_body, arg_ref)?;
 
     Some(GaussianProduct {
@@ -5154,13 +5021,13 @@ fn lower_pushfwd(
     v: NodeId,
     origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
-    let (bij_node, m_inner) = {
+    let (bij_node, m_inner, parameter) = {
         let c = expect_builtin_call(m, node, "pushfwd")
             .ok_or_else(|| refuse(node, m, "expected pushfwd"))?;
-        if c.args.len() != 2 {
-            return Err(refuse(node, m, "pushfwd expects 2 args"));
+        if !matches!(c.args.len(), 2 | 3) {
+            return Err(refuse(node, m, "pushfwd expects 2 or 3 args"));
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
 
     // Resolve `bij_node` through one level of ref indirection, then unwrap any CLOSED
@@ -5175,6 +5042,58 @@ fn lower_pushfwd(
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
     let bij_resolved =
         crate::kernel::resolve_closed_reification(m, bij_resolved).unwrap_or(bij_resolved);
+    // Analytic recognition sees the map at this parameter point. The temporary
+    // unary map is consumed here; the source callable keeps its full interface.
+    let (bij_resolved, parameter) = if let Some(parameter) = parameter
+        && expect_builtin_call(m, bij_resolved, "bijection").is_none()
+    {
+        let (body, variate) =
+            if let Some(function) = crate::kernel::resolve_reified(m, bij_resolved) {
+                let [variate, (_, input)] = function.inputs.as_slice() else {
+                    return Err(refuse(
+                        bij_resolved,
+                        m,
+                        "pushfwd map must take a variate and parameter",
+                    ));
+                };
+                (
+                    crate::kernel::substitute_admitted(
+                        m,
+                        function.body,
+                        &[(*input, parameter)],
+                        crate::kernel::Substitute::All,
+                        false,
+                    ),
+                    *variate,
+                )
+            } else if let Node::Const(operator) = *m.node(bij_resolved) {
+                let (label, reference, point) = broadcast::placeholder(m, Type::Any);
+                let body = m.alloc(Node::Call(Call {
+                    head: CallHead::Builtin(operator),
+                    args: vec![point, parameter].into(),
+                    named: Box::new([]),
+                    inputs: None,
+                }));
+                (body, (label, reference))
+            } else {
+                return Err(refuse(
+                    bij_resolved,
+                    m,
+                    "pushfwd map must be a builtin or reified function",
+                ));
+            };
+        let body = crate::canon::inline_expression(m, body);
+        let head = CallHead::Builtin(m.intern("functionof"));
+        let specialized = m.alloc(Node::Call(Call {
+            head,
+            args: vec![body].into(),
+            named: Box::new([]),
+            inputs: Some(Inputs::Spec(vec![variate].into())),
+        }));
+        (specialized, None)
+    } else {
+        (bij_resolved, parameter)
+    };
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.
@@ -5186,7 +5105,9 @@ fn lower_pushfwd(
     // NAMING the missing product structure, which is why recognition happens here
     // rather than leaving a projection to be misreported as an unrecognised
     // forward map by the bijection synthesis below.
-    if let Some(proj) = recognize_get_projection(m, bij_resolved) {
+    if parameter.is_none()
+        && let Some(proj) = recognize_get_projection(m, bij_resolved)
+    {
         return lower_projection_pushfwd(m, m_inner, &proj, v);
     }
 
@@ -5236,8 +5157,8 @@ fn lower_pushfwd(
         } else {
             refuse_variate_kind_mismatch(m, &domain, v)?;
             // Not an explicit bijection: try analytic synthesis (§06 case 1).
-            match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
-                Some(bij) => (bij.f_inv, bij.logvol, bij_node, true),
+            match crate::invert::derive_bijection(m, bij_resolved, &domain, &support)? {
+                Some(bij) => (bij.f_inv, bij.logvol, bij_resolved, true),
                 None => {
                     return Err(refuse(
                         bij_resolved,
@@ -5249,7 +5170,7 @@ fn lower_pushfwd(
         };
 
     // preimage = f_inv(v)
-    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, "f_inv")?;
+    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, parameter, "f_inv")?;
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
@@ -5262,7 +5183,7 @@ fn lower_pushfwd(
         // lattice, and gated on the snap being faithful.
         Reference::Counting => {
             let snapped = snap_to_lattice(m, preimage, &domain);
-            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain)?;
+            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain, parameter)?;
             let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
             (at_atom, Some(lattice))
         }
@@ -5270,7 +5191,8 @@ fn lower_pushfwd(
         // for an annotated one (see `logvol_in_query_point`).
         Reference::Lebesgue => {
             let at = if logvol_in_query_point { v } else { preimage };
-            let logvol_val = apply_change_of_variables(m, bij_resolved, logvol_node, at, "logvol")?;
+            let logvol_val =
+                apply_change_of_variables(m, bij_resolved, logvol_node, at, parameter, "logvol")?;
             (build_call(m, "sub", &[inner_density, logvol_val]), None)
         }
     };
@@ -5352,8 +5274,9 @@ fn on_lattice(
     v: NodeId,
     snapped: NodeId,
     domain: &Type,
+    parameter: Option<NodeId>,
 ) -> Result<NodeId, RefuseError> {
-    let back = apply_change_of_variables(m, node, forward, snapped, "f")?;
+    let back = apply_change_of_variables(m, node, forward, snapped, parameter, "f")?;
     Ok(lattice_test(m, v, back, domain))
 }
 
@@ -5488,26 +5411,22 @@ fn apply_change_of_variables(
     node: NodeId,
     callee: NodeId,
     point: NodeId,
+    parameter: Option<NodeId>,
     role: &str,
 ) -> Result<NodeId, RefuseError> {
-    let applied = build_user_call(m, callee, point);
+    let applied = build_callback_call(m, callee, point, parameter)?;
     // A bare operator (possibly reached through one alias hop) has no body to
     // substitute into; `canon`'s head rewrite is what lands it on a direct builtin
     // call, so admit it unreduced exactly as the sample side does.
     if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
-        // At a RECORD point the application is §04 auto-splatting against that
-        // operator's own argument names, which a deterministic builtin's catalogue row
-        // does not carry (argument TYPES only) — the same wall
-        // `lower_pushfwd_sample`'s bare arm hits. Unchecked it emits `op(record(…))`,
-        // which no gate rejects.
-        if expect_builtin_call(m, point, "record").is_some() {
+        // Scalar builtins cannot consume a whole record variate.
+        if parameter.is_none() && expect_builtin_call(m, point, "record").is_some() {
             return Err(refuse(
                 node,
                 m,
                 &format!(
-                    "`{role}` is a bare built-in applied to a record: §04 auto-splatting needs \
-                     argument names the catalogue lacks — use a functionof or lambda over the \
-                     fields"
+                    "`{role}` is a bare built-in applied to a whole record: use a \
+                     functionof or lambda that selects the required fields"
                 ),
             ));
         }
@@ -5566,7 +5485,7 @@ fn lower_locscale(
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
     // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
     // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
-    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, "f_inv")?;
+    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, None, "f_inv")?;
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
         // Counting reference: no volume element (§06 "Density convention"). An
@@ -5591,7 +5510,7 @@ fn lower_locscale(
             // synthesis convention (`crate::invert::Bijection`). It is CONSTANT in the
             // variate either way — `log|scale|` / `logabsdet(L)` ignore the argument —
             // so the emission is unchanged by which point it reads.
-            let logvol_val = apply_change_of_variables(m, node, bij.logvol, v, "logvol")?;
+            let logvol_val = apply_change_of_variables(m, node, bij.logvol, v, None, "logvol")?;
             Ok(build_call(m, "sub", &[inner_density, logvol_val]))
         }
     }
@@ -7131,7 +7050,10 @@ struct PolynomialOverInterval {
 ///   the polynomial itself and not a polynomial of some other quantity;
 /// * the coefficient vector must be a literal `vector` call, so its length — the
 ///   degree — is static.
-fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<PolynomialOverInterval> {
+fn recognize_polynomial_over_interval(
+    m: &mut Module,
+    node: NodeId,
+) -> Option<PolynomialOverInterval> {
     let (base, set) = {
         let c = expect_builtin_call(m, node, "truncate")?;
         if c.args.len() != 2 {
@@ -7149,13 +7071,13 @@ fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<Polyno
         (ic.args[0], ic.args[1])
     };
 
-    let (weight, reference) = {
+    let (weight, reference, parameter) = {
         let (base, _) = resolve_ref_chain(m, base);
         let c = expect_builtin_call(m, base, "weighted")?;
-        if c.args.len() != 2 {
+        if !matches!(c.args.len(), 2 | 3) {
             return None;
         }
-        (c.args[0], c.args[1])
+        (c.args[0], c.args[1], c.args.get(2).copied())
     };
 
     // The reference measure is Lebesgue over the whole line.
@@ -7172,18 +7094,7 @@ fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<Polyno
 
     // `x -> polynomial(c, x)`: a single-input reification whose body applies
     // `polynomial` to that input's own placeholder.
-    let (body, arg_ref) = {
-        let (weight, _) = resolve_ref_chain(m, weight);
-        let f = expect_builtin_call(m, weight, "functionof")?;
-        if f.args.len() != 1 {
-            return None;
-        }
-        let arg_ref = match &f.inputs {
-            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
-            _ => return None,
-        };
-        (f.args[0], arg_ref)
-    };
+    let (body, arg_ref) = weight_function_body(m, weight, parameter)?;
 
     let coefficients = {
         let p = expect_builtin_call(m, body, "polynomial")?;
@@ -8360,7 +8271,7 @@ pub(crate) fn build_density_term(
 /// The `bool` reports whether a `lawof` was stripped. The strip bypasses the
 /// dispatcher's `"lawof"` arm entirely, so §04's total-law reading — and hence the
 /// caller's [`marginalize_or_refuse_stochastic_law`] — has to be applied here too:
-/// `logdensityof(lawof(Normal(mu = a, …)), 0.5)` with `a` latent reaches
+/// `logdensityof(lawof(draw(Normal(mu = a, …))), 0.5)` with `a` latent reaches
 /// `build_density_term` directly and would otherwise score the conditional.
 ///
 /// Takes the measure argument node directly (not the enclosing `logdensityof`
@@ -8374,6 +8285,7 @@ fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<(NodeId, bool), Ref
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
+        validate_law_argument(m, law.args[0])?;
         return Ok((law.args[0], true));
     }
     Ok((measure_arg, false))
@@ -8399,9 +8311,7 @@ pub(crate) fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> No
     build_user_call_n(m, callee, vec![arg])
 }
 
-/// Allocate a user-function call `(%call callee arg1 arg2 …)` — the
-/// multi-argument form [`build_weight_call`] needs for the §06 "Weight arity"
-/// k-parameter split, where [`build_user_call`]'s single argument does not fit.
+/// Allocate a positional user-function call `(%call callee arg1 arg2 …)`.
 pub(crate) fn build_user_call_n(m: &mut Module, callee: NodeId, args: Vec<NodeId>) -> NodeId {
     m.alloc(Node::Call(Call {
         head: CallHead::User(callee),
@@ -8560,14 +8470,25 @@ pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<Binding
 /// determiniser must not hang on one.
 pub(crate) fn resolve_ref_chain(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
     let (mut node, mut bid) = resolve_ref_one(m, id);
-    for _ in 0..m.binding_count() {
+    for _ in 0..m.node_count() {
         let (next, next_bid) = resolve_ref_one(m, node);
         match next_bid {
             Some(b) => {
                 node = next;
                 bid = Some(b);
             }
-            None => break,
+            None => {
+                if !matches!(builtin_name(m, node), Some("get" | "get0")) {
+                    break;
+                }
+                let promoted = crate::canon::promoted_input_names(m);
+                let Some(projected) = crate::canon::project_tuple(m, node, &promoted)
+                    .or_else(|| crate::canon::project(m, node, &promoted))
+                else {
+                    break;
+                };
+                node = projected;
+            }
         }
     }
     (node, bid)

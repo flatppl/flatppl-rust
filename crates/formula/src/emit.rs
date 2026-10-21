@@ -117,11 +117,12 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         let variance = broadcast(&mut b, "add", &[known, residual]);
         broadcast(&mut b, "sqrt", &[variance])
     });
-    let auxiliary: Vec<_> = recipe
-        .predictors()
-        .filter(|(name, _)| *name != "mu")
-        .map(|(name, _)| (name, b.self_ref(name)))
+    let auxiliary: Vec<_> = observation_auxiliaries(recipe)
+        .into_iter()
+        .filter(|name| !(*name == "sigma" && scale.is_some()))
+        .map(|name| (name, b.self_ref(name)))
         .collect();
+    let cuts = threshold_inputs(&mut b, recipe);
     let law = recipe.family.observation(
         &mut b,
         crate::family::Observation {
@@ -129,8 +130,8 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             trials,
             scale,
             auxiliary: &auxiliary,
+            cuts: &cuts,
         },
-        thresholds,
         false,
     );
     let y = b.call("draw", &[law]);
@@ -596,10 +597,13 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         None => None,
     };
     let row_scale = scale.map(|_| argument(b, "scale"));
-    let auxiliary: Vec<_> = recipe
-        .predictors()
-        .filter(|(name, _)| *name != "mu")
-        .map(|(name, _)| (name, argument(b, name)))
+    let auxiliary: Vec<_> = observation_auxiliaries(recipe)
+        .into_iter()
+        .filter(|name| !(*name == "sigma" && scale.is_some()))
+        .map(|name| (name, argument(b, name)))
+        .collect();
+    let cuts: Vec<_> = (1..=recipe.thresholds())
+        .map(|i| argument(b, &format!("cut{i}")))
         .collect();
     let law = recipe.family.observation(
         b,
@@ -608,8 +612,8 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
             trials,
             scale: row_scale,
             auxiliary: &auxiliary,
+            cuts: &cuts,
         },
-        recipe.thresholds(),
         true,
     );
     let score = b.call("logdensityof", &[law, value]);
@@ -632,12 +636,35 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         args.push(scale);
     }
     args.extend(
+        observation_auxiliaries(recipe)
+            .into_iter()
+            .filter(|name| !(*name == "sigma" && scale.is_some()))
+            .map(|name| b.self_ref(name)),
+    );
+    args.extend(threshold_inputs(b, recipe));
+    b.call("broadcast", &args)
+}
+
+fn observation_auxiliaries(recipe: &Recipe) -> Vec<&str> {
+    if recipe.family == Family::Categorical {
         recipe
             .predictors()
-            .filter(|(name, _)| *name != "mu")
-            .map(|(name, _)| b.self_ref(name)),
-    );
-    b.call("broadcast", &args)
+            .map(|(name, _)| name)
+            .filter(|name| *name != "mu")
+            .collect()
+    } else {
+        recipe.family.auxiliaries().to_vec()
+    }
+}
+
+fn threshold_inputs(b: &mut Builder<'_>, recipe: &Recipe) -> Vec<NodeId> {
+    (1..=recipe.thresholds())
+        .map(|i| {
+            let cuts = b.self_ref("cuts");
+            let index = b.lit_int(i as i64);
+            b.call("get", &[cuts, index])
+        })
+        .collect()
 }
 
 fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {

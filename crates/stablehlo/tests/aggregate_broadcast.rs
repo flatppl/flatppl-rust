@@ -471,7 +471,7 @@ fn nested_batched_variance_keeps_fixed_selectors_and_captured_operands() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\
          matrices = elementof(cartpow(cartpow(cartpow(reals, [2, 3]), 4), 5))\n\
-         weights = elementof(cartpow(reals, 3))\n\
+         weights = external(cartpow(reals, 3))\n\
          variance(a) = aggregate(var, [], a[2, .j] * weights[.j])\n\
          group(xs) = variance.(xs)\n\
          inputs = (matrices, weights)\noutputs = group.(matrices)\n",
@@ -511,7 +511,7 @@ fn a_shared_invariant_broadcast_keeps_each_callers_batch_shape() {
 x = elementof(reals)
 a = external(reals)
 rates = broadcast(z -> exp(z), [x, x + 1.0])
-L = likelihoodof(Normal(rates[1] + rates[2], 1.0), 0.0)
+L = likelihoodof(functionof(Normal(rates[1] + rates[2], 1.0)), 0.0)
 f = t -> logdensityof(L, record(x = a)) + t
 o1 = broadcast(f, [1.0, 2.0, 3.0])
 o2 = broadcast(f, [1.0, 2.0, 3.0, 4.0])

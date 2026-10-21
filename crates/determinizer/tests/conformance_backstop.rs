@@ -270,7 +270,7 @@ fn is_flatpdl_rejects_a_free_bare_name_without_inference() {
 /// as a value) is conformant, so the gate does not reject ordinary FlatPDL.
 #[test]
 fn is_flatpdl_accepts_bare_builtin_atoms() {
-    let m = infer_module("v = [1.0, 2.0]\ny = mul(pi, reduce(sum, v))\n");
+    let m = infer_module("v = [1.0, 2.0]\ny = mul(pi, reduce(add, v))\n");
     let out = determinize(&m).expect("a deterministic model must determinize");
     assert!(
         is_flatpdl(&out).is_ok(),

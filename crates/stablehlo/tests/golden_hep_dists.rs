@@ -84,7 +84,7 @@ fn crystal_ball_emits_a_selected_branch_and_an_erf_normalizer() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 x = elementof(reals)
-lp = logdensityof(lawof(hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0)), x)
+lp = logdensityof(hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0), x)
 inputs = (x)
 outputs = lp";
     let mlir = emit(src);
@@ -105,7 +105,7 @@ fn argus_at_power_half_emits_an_erf_normalizer() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 x = elementof(reals)
-lp = logdensityof(lawof(hep.Argus(resonance = 5.29, slope = -20.0, power = 0.5)), x)
+lp = logdensityof(hep.Argus(resonance = 5.29, slope = -20.0, power = 0.5), x)
 inputs = (x)
 outputs = lp";
     let mlir = emit(src);
@@ -142,7 +142,7 @@ fn iid_over_a_hep_member_emits_a_batched_density() {
             "hep = standard_module(\"particle-physics\", \"0.1\")\n\
              obs = [5.1, 5.15, 5.2, 5.22, 5.25]\n\
              x = elementof(reals)\n\
-             lp = logdensityof(lawof(iid(hep.{ctor}({args}), 5)), obs)\n\
+             lp = logdensityof(iid(hep.{ctor}({args}), 5), obs)\n\
              inputs = (x)\n\
              outputs = lp"
         );
@@ -171,7 +171,7 @@ fn batched_argus_still_reads_its_literal_power() {
 hep = standard_module(\"particle-physics\", \"0.1\")
 obs = [5.1, 5.15, 5.2]
 x = elementof(reals)
-lp = logdensityof(lawof(iid(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), 3)), obs)
+lp = logdensityof(iid(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), 3), obs)
 inputs = (x)
 outputs = lp";
     let msg = emit_err(src);
@@ -190,7 +190,7 @@ fn argus_at_another_power_refuses_naming_the_incomplete_gamma() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 x = elementof(reals)
-lp = logdensityof(lawof(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5)), x)
+lp = logdensityof(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), x)
 inputs = (x)
 outputs = lp";
     let msg = emit_err(src);

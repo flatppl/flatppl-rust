@@ -68,6 +68,7 @@ pub(crate) struct Observation<'a> {
     pub trials: Option<NodeId>,
     pub scale: Option<NodeId>,
     pub auxiliary: &'a [(&'a str, NodeId)],
+    pub cuts: &'a [NodeId],
 }
 
 impl Family {
@@ -269,7 +270,6 @@ impl Family {
         self,
         b: &mut Builder<'_>,
         observation: Observation<'_>,
-        thresholds: usize,
         scalar: bool,
     ) -> NodeId {
         let Observation {
@@ -277,7 +277,11 @@ impl Family {
             trials,
             scale,
             auxiliary,
+            cuts,
         } = observation;
+        if self == Self::Cumulative {
+            return crate::ordinal::observation(b, mu, cuts, scalar);
+        }
         if (!auxiliary.is_empty()
             || matches!(
                 self,
@@ -338,8 +342,8 @@ impl Family {
                     trials,
                     scale,
                     auxiliary: &auxiliary,
+                    cuts,
                 },
-                thresholds,
                 true,
             );
             let head = b.sym("functionof");
@@ -408,7 +412,7 @@ impl Family {
                     Self::ZeroInflatedBeta => (Self::Beta, "zi"),
                     _ => (Self::Binomial, "zi"),
                 };
-                let mut base = base.observation(b, observation, thresholds, true);
+                let mut base = base.observation(b, observation, true);
                 if matches!(self, Self::HurdlePoisson | Self::HurdleNegbinomial) {
                     let one = b.lit_real(1.0);
                     let infinity = b.call_head("inf");
@@ -470,7 +474,7 @@ impl Family {
                 let kappa = auxiliary(b, "kappa");
                 apply(b, "VonMises", &[mu, kappa])
             }
-            Self::Cumulative => crate::ordinal::observation(b, mu, thresholds),
+            Self::Cumulative => unreachable!("ordinal observations use explicit cut inputs"),
             Self::Categorical => {
                 let mut logits = vec![b.lit_real(0.0)];
                 logits.extend(observation.auxiliary.iter().map(|(_, value)| *value));

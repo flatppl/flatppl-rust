@@ -130,9 +130,23 @@ pub fn determinize_with_options(
         crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
 
+    let mut specialize_sequences = true;
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
+        if specialize_sequences {
+            specialize_sequences = false;
+            if crate::density::broadcast::specialize_sequence_parameters(&mut work) {
+                // No query has pinned latent provenance yet. Drop generic
+                // helpers whose object inputs were specialized at their uses.
+                if let Some(roots) = roots {
+                    crate::canon::retain_reachable(&mut work, roots);
+                } else {
+                    sweep_dead_measure_bindings(&mut work, &mut imports);
+                }
+                let _ = flatppl_infer::infer(&mut work);
+            }
+        }
 
         // Once every query has consumed its declared draw provenance, named
         // deterministic intermediates may also be dead. Prune their draws
@@ -285,6 +299,13 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     // `densityof(M, v)` pins latent draws exactly like `logdensityof(M, v)` does
     // (`densityof` lowers via the same core dispatch, wrapped in `exp`), so both
     // op names must be probed here before the general scan reaches a `draw`.
+    // Apply an enclosing callback before lowering queries whose measure object
+    // is still one of that callback's unbound inputs.
+    for ops in [&["logdensityof", "densityof"][..], &["rand"][..]] {
+        if let Some(hit) = find_op_node_in_scope(m, ops, true) {
+            return Some(hit);
+        }
+    }
     if let Some(hit) = find_op_node(m, &["logdensityof", "densityof"]) {
         return Some(hit);
     }
@@ -298,8 +319,16 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
 /// Find the first node (outermost, BFS) whose builtin head is named one of
 /// `ops`, including broadcast density queries, scanning bindings in source order.
 fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
+    find_op_node_in_scope(m, ops, false)
+}
+
+fn find_op_node_in_scope(
+    m: &Module,
+    ops: &[&str],
+    skip_reified: bool,
+) -> Option<(BindingId, NodeId)> {
     let density_queries = ops.contains(&"logdensityof") || ops.contains(&"densityof");
-    find_node(m, |id| {
+    find_node_in_scope(m, skip_reified, |id| {
         matches!(m.node(id), Node::Call(c)
             if matches!(c.head, CallHead::Builtin(sym) if ops.contains(&m.resolve(sym))))
             || (density_queries
@@ -312,6 +341,14 @@ fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
 /// is independent of its path, so revisit neither shared nodes nor their children.
 /// The module stays immutable for this scan; the next rewrite gets a fresh cache.
 fn find_node(m: &Module, matches: impl Fn(NodeId) -> bool) -> Option<(BindingId, NodeId)> {
+    find_node_in_scope(m, false, matches)
+}
+
+fn find_node_in_scope(
+    m: &Module,
+    skip_reified: bool,
+    matches: impl Fn(NodeId) -> bool,
+) -> Option<(BindingId, NodeId)> {
     let mut seen = vec![false; m.node_count()];
     let mut queue = Vec::new();
     for (bid, binding) in m.bindings() {
@@ -327,6 +364,9 @@ fn find_node(m: &Module, matches: impl Fn(NodeId) -> bool) -> Option<(BindingId,
             seen[id.index()] = true;
             if matches(id) {
                 return Some((bid, id));
+            }
+            if skip_reified && matches!(m.node(id), Node::Call(c) if c.inputs.is_some()) {
+                continue;
             }
             m.for_each_child(id, |child| queue.push(child));
         }
@@ -928,6 +968,31 @@ fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
     is_combinator_rhs(m, rhs)
         || is_measure_typed_rhs(m, rhs)
         || is_nested_reified_measure_rhs(m, rhs)
+        || is_reified_query(m, rhs)
+}
+
+/// An unused callback with a measure query is scaffolding after its applications
+/// have been specialized. Its unresolved formal measure inputs are not queries
+/// of the enclosing module.
+fn is_reified_query(m: &Module, rhs: NodeId) -> bool {
+    if !matches!(m.node(rhs), Node::Call(c) if c.inputs.is_some()) {
+        return false;
+    }
+    let mut pending = vec![rhs];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        if matches!(
+            crate::density::builtin_name(m, node),
+            Some("densityof" | "logdensityof" | "rand")
+        ) {
+            return true;
+        }
+        m.for_each_child(node, |child| pending.push(child));
+    }
+    false
 }
 
 /// True iff `rhs` is a CLOSED reification that wraps — to a fixpoint — a

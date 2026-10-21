@@ -569,16 +569,8 @@ y2 = draw(Normal(mu = z, sigma = 1.3))
     }
 }
 
-// The joint law must be reachable through a REIFIED spelling of the record too. §06's
-// *Uniform kernel extension* identifies a measure with a nullary kernel, so a CLOSED
-// `functionof` means its body, and the `lawof` routing unwraps it to a fixpoint. That unwrap
-// and this law are independent changes to the same dispatch area, so the composition is
-// pinned rather than assumed.
-//
-// The named spelling is compared on the `lp` binding, not the whole module: its
-// `M = functionof(record(…))` binding survives as a dead `Function`-typed one, which the
-// measure-binding sweep does not reach. That residual is byte-identical at `482d26f` with
-// this branch's changes stashed, so it is pre-existing and not this law's doing.
+// Absorbing the draws before function reification gives a closed kernel whose
+// law is the same correlated record law.
 #[test]
 fn a_reified_shared_latent_record_reaches_the_same_joint_law() {
     let model = "\
@@ -599,13 +591,10 @@ y2 = draw(Normal(mu = z, sigma = 1.0))
     );
     for query in [
         // Named closed reification.
-        "M = functionof(record(y1 = y1, y2 = y2))\n\
-         lp = logdensityof(lawof(M), record(y1 = 0.5, y2 = 0.7))",
+        "M = functionof(lawof(record(y1 = y1, y2 = y2)))\n\
+         lp = logdensityof(M, record(y1 = 0.5, y2 = 0.7))",
         // Inline.
-        "lp = logdensityof(lawof(functionof(record(y1 = y1, y2 = y2))), \
-         record(y1 = 0.5, y2 = 0.7))",
-        // Nested — §04's rationale applies at every level, so the unwrap is a fixpoint.
-        "lp = logdensityof(lawof(functionof(functionof(record(y1 = y1, y2 = y2)))), \
+        "lp = logdensityof(functionof(lawof(record(y1 = y1, y2 = y2))), \
          record(y1 = 0.5, y2 = 0.7))",
     ] {
         let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");
@@ -762,7 +751,7 @@ fn repeated_raw_measure_retains_its_free_parameter() {
 fn one_constructor_law_marginalizes_beside_a_fixed_sibling() {
     assert_score_matches(
         "z ~ Normal(0.0, 1.0)\n\
-         lp = logdensityof(joint(a = lawof(Normal(z, 1.0)), b = Exponential(1.0)), \
+         lp = logdensityof(joint(a = lawof(draw(Normal(z, 1.0))), b = Exponential(1.0)), \
                            record(a = 0.5, b = 0.7))",
         "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + logdensityof(Exponential(1.0), 0.7)",
     );
@@ -796,7 +785,7 @@ fn a_sole_reified_component_keeps_its_direct_path_at_every_variate_shape() {
 fn constructor_laws_over_disjoint_latents_form_a_product() {
     assert_score_matches(
         "z1 ~ Normal(0.0, 1.0)\nz2 ~ Normal(0.0, 1.0)\n\
-         lp = logdensityof(joint(a = lawof(Normal(z1, 1.0)), b = lawof(Normal(z2, 1.0))), \
+         lp = logdensityof(joint(a = lawof(draw(Normal(z1, 1.0))), b = lawof(draw(Normal(z2, 1.0)))), \
                            record(a = 0.5, b = 0.7))",
         "lp = logdensityof(Normal(0.0, sqrt(2.0)), 0.5) + \
               logdensityof(Normal(0.0, sqrt(2.0)), 0.7)",

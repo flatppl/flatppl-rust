@@ -58,9 +58,9 @@ sigma_step ~ normalize(truncate(Cauchy(0, 1), interval(0, inf)))
 prior = lawof(record(sigma_step = sigma_step))
 
 % One step of the walk: the state enters the mean, the drift is fixed.
-step_kernel = prev -> Normal(prev + drift, sigma_step)
+step_kernel(prev, sigma) = Normal(prev + drift, sigma)
 
-x ~ markovchain(step_kernel, x_init, n)
+x ~ markovchain(step_kernel, x_init, n, sigma_step)
 
 %%%
 The likelihood scores exactly: logdensityof(x, x_data) with a fixed
