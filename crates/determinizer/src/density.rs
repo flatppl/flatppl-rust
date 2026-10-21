@@ -2161,7 +2161,12 @@ fn lower_measure_density_in_reference(
         Some("pushfwd") => lower_pushfwd(m, measure_node, v, origin),
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
-        Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
+        // A row's marginal is a fresh constructor with no inferred domain, so the
+        // variate is checked against the kchain's own domain first.
+        Some("kchain") => {
+            refuse_domain_kind_mismatch(m, measure_node, v)?;
+            crate::marginal::lower_kchain_marginal(m, measure_node, v)
+        }
         Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
         Some("PoissonProcess") => lower_poisson_process(m, measure_node, v),
@@ -8224,33 +8229,42 @@ pub(crate) fn split_kernel_constructor(
     Some((sym, args))
 }
 
+/// Refuse scoring a measure at a variate whose structural KIND clearly
+/// mismatches the measure's variate domain — a scalar `Normal` scored at a
+/// record / tuple / vector. Inference does not reject this, so guard here per
+/// the refuse-don't-mislower discipline rather than emit an ill-typed
+/// `builtin_logdensityof`. Conservative: an unknown side or a matching kind
+/// passes; only a definite kind mismatch refuses.
+fn refuse_domain_kind_mismatch(
+    m: &Module,
+    measure: NodeId,
+    variate: NodeId,
+) -> Result<(), RefuseError> {
+    let domain_kind = match m.type_of(measure) {
+        Some(Type::Measure { domain, .. }) => variate_kind(domain),
+        _ => None,
+    };
+    let obs_kind = m.type_of(variate).and_then(variate_kind);
+    if let (Some(dk), Some(ok)) = (domain_kind, obs_kind)
+        && dk != ok
+    {
+        return Err(refuse(
+            variate,
+            m,
+            "variate type does not match the measure's domain",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_density_term(
     m: &mut Module,
     measure: NodeId,
     pinned: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    // Refuse scoring a measure at a variate whose structural KIND clearly
-    // mismatches the measure's variate domain — a scalar `Normal` scored at a
-    // record / tuple / vector. Inference does not reject
-    // this, so guard here per the refuse-don't-mislower discipline rather than
-    // emit an ill-typed `builtin_logdensityof`. Conservative: an unknown side or
-    // a matching kind passes; only a definite kind mismatch refuses. (The
-    // determinizer recursion descends into record fields, so a nested mismatch
-    // surfaces here as a scalar measure meeting a structured value.)
-    let domain_kind = match m.type_of(measure) {
-        Some(Type::Measure { domain, .. }) => variate_kind(domain),
-        _ => None,
-    };
-    let obs_kind = m.type_of(pinned).and_then(variate_kind);
-    if let (Some(dk), Some(ok)) = (domain_kind, obs_kind)
-        && dk != ok
-    {
-        return Err(refuse(
-            pinned,
-            m,
-            "variate type does not match the measure's domain",
-        ));
-    }
+    // The determinizer recursion descends into record fields, so a nested
+    // mismatch surfaces here as a scalar measure meeting a structured value.
+    refuse_domain_kind_mismatch(m, measure, pinned)?;
 
     let (ctor_sym, kwargs) = split_kernel_constructor(m, measure).ok_or_else(|| {
         refuse(
