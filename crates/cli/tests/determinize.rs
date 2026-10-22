@@ -277,7 +277,7 @@ fn determinize_refuses_with_exit_3() {
     // the Normal mean is the Normal–Normal conjugate case, which now lowers.)
     std::fs::write(
         &input,
-        "z = draw(Normal(mu = 0.0, sigma = 1.0))\nk = kernelof(record(y = draw(Normal(mu = 1.0, sigma = z))), z = z)\npp = kchain(lawof(record(z = z)), k)\nlp = logdensityof(pp, record(y = 0.5))\n",
+        "z = draw(Normal(mu = 0.0, sigma = 1.0))\nk = kernelof(record(y = draw(Normal(mu = 1.0, sigma = z))), z = z)\npp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))\nlp = logdensityof(pp, record(y = 0.5))\n",
     )
     .unwrap();
     let out = flatppl().arg("determinize").arg(&input).output().unwrap();

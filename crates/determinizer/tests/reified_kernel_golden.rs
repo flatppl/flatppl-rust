@@ -19,7 +19,7 @@ fn kernel_application_over_fixed_input_lowers_to_builtin_logdensityof() {
 mu = elementof(reals)
 y = draw(Normal(mu = mu, sigma = 2.0))
 k = kernelof(y, mu = mu)
-dist = k(record(mu = 1.5))
+dist = k(mu = 1.5)
 lp = logdensityof(dist, 0.7)";
     let pir = flatppl_flatpir::write(&determinize(&parse_infer(src)).expect("must lower"));
     assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
@@ -71,7 +71,7 @@ mu = elementof(reals)
 s = draw(Exponential(1.0))
 y = draw(Normal(mu = mu, sigma = s))
 k = kernelof(y, mu = mu)
-dist = k(record(mu = 1.5))
+dist = k(mu = 1.5)
 lp = logdensityof(dist, 0.7)";
     let err =
         determinize(&parse_infer(src)).expect_err("marginal over an internal latent must refuse");

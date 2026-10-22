@@ -165,9 +165,12 @@ fn jointchain_prefix_keep_projection_lowers() {
     // jointchain prefix keep. Distinct distributions (base Normal, kernel
     // Exponential) make a wrong keep detectable — only the Normal term may
     // survive; the trailing Exponential (b) term must be absent.
-    let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         k = kernelof(record(b = draw(Exponential(rate = a))), a = a)\n\
-         jc = jointchain(lawof(record(a = a)), k)\n\
+    // The step `k` has the keyword-only input `a`, so the chain's record variate
+    // splats over it by field name (spec §04 "Calling conventions").
+    let p = pir("z = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         a = elementof(reals)\n\
+         k = kernelof(record(b = draw(Exponential(rate = a))))\n\
+         jc = jointchain(lawof(record(a = z)), k)\n\
          m = relabel(jc, [\"a\", \"b\"])\n\
          lp = logdensityof(pushfwd(fn(get(_, [\"a\"])), m), record(a = 0.3))");
     assert_eq!(
@@ -236,11 +239,16 @@ fn jointchain_three_stage_prefix_keep_lowers() {
     // kernel integrating to 1, so the marginal is the sub-jointchain density over
     // {a, b} — the base Normal term + the b|a Exponential term; the trailing c
     // (Gamma) term is absent. Distinct distributions at every stage lock the keep.
-    let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         b = draw(Exponential(rate = a))\n\
-         kb = kernelof(record(b = b), a = a)\n\
-         kc = kernelof(record(c = draw(Gamma(shape = 2.0, rate = b))), b = b)\n\
-         jc = jointchain(lawof(record(a = a)), kb, kc)\n\
+    // Each step has keyword-only inputs, so the record fed to it splats by field
+    // name: `kb` is fed `record(a)`, and `kc` is fed the `cat` `record(a, b)` of
+    // every variate to its left, so it declares both inputs (spec §06 "Dependent
+    // composition").
+    let p = pir("z = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         a = elementof(reals)\n\
+         b = elementof(reals)\n\
+         kb = kernelof(record(b = draw(Exponential(rate = a))))\n\
+         kc = kernelof(record(c = draw(Gamma(shape = 2.0 + 0.0 * a, rate = b))))\n\
+         jc = jointchain(lawof(record(a = z)), kb, kc)\n\
          lp = logdensityof(pushfwd(fn(get(_, [\"a\", \"b\"])), jc), record(a = 0.3, b = 0.5))");
     assert_eq!(
         p.matches("builtin_logdensityof").count(),
@@ -412,10 +420,14 @@ fn scalar_cat_jointchain_index_prefix_keep_lowers() {
     // integrates to 1, so the marginal is the sub-chain: logpdf(Normal(0,1), 0.3)
     // + logpdf(Exponential(rate = 0.3), 0.5) = -2.317911337530609. The kept
     // kernel's rate must bind to the kept slot's own value 0.3.
+    // `kb` takes one positional input and is fed the scalar `a`; `kc` takes one
+    // positional input and is fed the `cat` `[a, b]` whole (spec §06 "Dependent
+    // composition").
     let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          b = draw(Exponential(rate = a))\n\
          kb = kernelof(b, a = a)\n\
-         kc = kernelof(draw(Gamma(shape = 2.0, rate = b)), b = b)\n\
+         ab = elementof(cartpow(reals, 2))\n\
+         kc = kernelof(draw(Gamma(shape = 2.0, rate = ab[2])), ab = ab)\n\
          jc = jointchain(lawof(a), kb, kc)\n\
          lp = logdensityof(pushfwd(fn(get(_, [1, 2])), jc), [0.3, 0.5])");
     let lp = pir_binding(&p, "lp");
