@@ -140,7 +140,9 @@
 //! (`pushfwd(exp, M)`) is byte-equality-pinned against the explicit
 //! `bijection(exp, log, x -> x)`.
 
-use crate::density::{build_call, expect_builtin_call, fold_add, refuse, resolve_ref_one};
+use crate::density::{
+    build_call, expect_builtin_call, fold_add, refuse, resolve_ref_one, static_real,
+};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
@@ -251,11 +253,12 @@ pub(crate) fn derive_bijection(
     }
 }
 
-/// Derive `(f_inv, logvol)` for a forward map over a VECTOR variate — the two
+/// Derive `(f_inv, logvol)` for a forward map over a VECTOR variate — the
 /// vector forms §06 case 1 mandates, and nothing else:
 ///
 /// * a matrix-vector affine map `mu + L * x` ([`derive_matrix_affine`], the
 ///   MvNormal construction, §08 `MvNormal`);
+/// * an elementwise affine map `x .* a .+ b` ([`derive_broadcast_affine`]);
 /// * an ELEMENTWISE unary map, whose diagonal Jacobian makes `logvol` the SUM of
 ///   the per-cell scalar forward log-derivatives. Both its spellings land here: the
 ///   bare operator (`pushfwd(exp, MvNormal)`) derives the per-cell map over the
@@ -288,7 +291,7 @@ fn derive_vector_bijection(
             if let Some(bij) = derive_matrix_affine(m, body, ph)? {
                 return Ok(Some(bij));
             }
-            if let Some(bij) = derive_broadcast_affine(m, body, ph, &elem_domain)? {
+            if let Some(bij) = derive_broadcast_affine(m, body, ph, domain)? {
                 return Ok(Some(bij));
             }
             if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
@@ -297,55 +300,185 @@ fn derive_vector_bijection(
             Err(refuse(
                 f,
                 m,
-                "forward map over a vector variate is not a recognised matrix-affine (mu + L * x) \
-                 or elementwise (broadcast(g, x)) map",
+                "forward map over a vector variate is not a recognised matrix-affine (mu + L * x), \
+                 elementwise affine (x .* a .+ b) or elementwise (broadcast(g, x)) map",
             ))
         }
         Recognized::Unrecognized => Ok(None),
     }
 }
 
-/// A scalar location-scale map broadcast over a vector has a diagonal Jacobian.
-/// Keep the captured scalar parameters shared and reuse the scalar inverse.
+/// An elementwise location-scale map `x .* a .+ b` over a vector has the diagonal
+/// Jacobian `diag(a)`, so `f_inv(y) = (y .- b) ./ a` and `logvol = Σᵢ log|aᵢ|`.
+/// Either coefficient may be absent, a scalar, or a vector of the variate's length.
+/// A scalar `a` contributes `log|a|` once per cell.
 fn derive_broadcast_affine(
     m: &mut Module,
     body: NodeId,
     ph: Symbol,
-    elem_domain: &Type,
+    domain: &Type,
 ) -> Result<Option<Bijection>, RefuseError> {
+    let Some((scale, shift)) = broadcast_affine_operands(m, body, ph) else {
+        return Ok(None);
+    };
+    let mut vector_scale = false;
+    for (name, c) in [("scale", scale), ("shift", shift)] {
+        let Some(c) = c else { continue };
+        match coefficient_shape(m, c, domain) {
+            Some(Ok(is_vector)) => vector_scale |= name == "scale" && is_vector,
+            Some(Err(what)) => {
+                return Err(refuse(
+                    c,
+                    m,
+                    &format!(
+                        "elementwise affine forward map over a vector variate needs a {name} \
+                         that is a scalar or a vector of the variate's length, and this one is \
+                         {what} — §04 broadcasting would expand or reject it, so the map is not \
+                         provably elementwise affine. Refuse rather than mislower"
+                    ),
+                ));
+            }
+            None => return Ok(None),
+        }
+    }
+    if let Some(a) = scale
+        && has_static_zero(m, a)
+    {
+        return Err(refuse(
+            a,
+            m,
+            "elementwise affine forward map has a zero scale entry, which collapses the map onto \
+             a hyperplane: it is not a bijection and has no density (§06 case 3) — refuse",
+        ));
+    }
+    let f_inv = lambda(m, |m, y| {
+        let mut x = y;
+        for (op, c) in [("sub", shift), ("divide", scale)] {
+            if let Some(c) = c {
+                let op = bare_const(m, op);
+                x = build_call(m, "broadcast", &[op, x, c]);
+            }
+        }
+        x
+    });
+    let logvol = match scale {
+        None => lambda(m, |m, _y| real_lit(m, 0.0)),
+        Some(a) if vector_scale => lambda(m, |m, _y| {
+            let abs = bare_const(m, "abs");
+            let abs_a = build_call(m, "broadcast", &[abs, a]);
+            let log = bare_const(m, "log");
+            let log_abs_a = build_call(m, "broadcast", &[log, abs_a]);
+            build_call(m, "sum", &[log_abs_a])
+        }),
+        Some(a) => {
+            let per_cell = lambda(m, |m, _y| {
+                let abs_a = build_call(m, "abs", &[a]);
+                build_call(m, "log", &[abs_a])
+            });
+            lambda(m, |m, y| {
+                let cells = build_call(m, "broadcast", &[per_cell, y]);
+                build_call(m, "sum", &[cells])
+            })
+        }
+    };
+    Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// The `(scale, shift)` of a forward body `x .* a .+ b`, in either operand order,
+/// with either term optional. `None` for any other body, including bare `x`.
+fn broadcast_affine_operands(
+    m: &Module,
+    body: NodeId,
+    ph: Symbol,
+) -> Option<(Option<NodeId>, Option<NodeId>)> {
     fn operands(m: &Module, node: NodeId, op: &str) -> Option<(NodeId, NodeId)> {
         let call = expect_builtin_call(m, node, "broadcast")?;
         let [head, a, b] = *call.args else {
             return None;
         };
-        if !call.named.is_empty()
-            || !matches!(m.node(head), Node::Const(name) if m.resolve(*name) == op)
-        {
+        if !call.named.is_empty() || !is_const_named(m, head, op) {
             return None;
         }
         Some((a, b))
     }
-
-    let Some((a, b)) = operands(m, body, "add") else {
-        return Ok(None);
+    // `Some(None)` is the bare input, `Some(Some(a))` is `x .* a`.
+    let scaled_input = |node: NodeId| -> Option<Option<NodeId>> {
+        if is_placeholder_ref(m, node, ph) {
+            return Some(None);
+        }
+        let (a, b) = operands(m, node, "mul")?;
+        [(a, b), (b, a)]
+            .into_iter()
+            .find(|&(input, scale)| {
+                is_placeholder_ref(m, input, ph) && !refs_placeholder(m, scale, ph)
+            })
+            .map(|(_, scale)| Some(scale))
     };
-    for (linear, shift) in [(a, b), (b, a)] {
-        let Some((a, b)) = operands(m, linear, "mul") else {
-            continue;
-        };
-        for (input, scale) in [(a, b), (b, a)] {
-            if is_placeholder_ref(m, input, ph)
-                && !refs_placeholder(m, shift, ph)
-                && !refs_placeholder(m, scale, ph)
-                && matches!(m.type_of(shift), Some(Type::Scalar(_)))
-                && matches!(m.type_of(scale), Some(Type::Scalar(_)))
-            {
-                let scalar = derive_locscale(m, shift, scale, elem_domain)?;
-                return Ok(Some(wrap_elementwise(m, &scalar)));
+    let terms = match operands(m, body, "add") {
+        Some((a, b)) => vec![(a, Some(b)), (b, Some(a))],
+        None => vec![(body, None)],
+    };
+    terms.into_iter().find_map(|(linear, shift)| {
+        if shift.is_some_and(|s| refs_placeholder(m, s, ph)) {
+            return None;
+        }
+        match scaled_input(linear)? {
+            None if shift.is_none() => None,
+            scale => Some((scale, shift)),
+        }
+    })
+}
+
+/// Whether coefficient `c` fits a vector `domain` cell by cell: `Some(Ok(false))` for a
+/// scalar, `Some(Ok(true))` for a vector of the same static length, `Some(Err(_))` for a
+/// shape that broadcasting would expand or reject, and `None` for an unresolved type.
+/// A length-1 vector against a longer variate broadcasts legally (§04), but `Σᵢ log|aᵢ|`
+/// would then count `log|a₁|` once instead of n times. A dynamic length cannot exclude
+/// that, so it refuses too.
+fn coefficient_shape(m: &Module, c: NodeId, domain: &Type) -> Option<Result<bool, String>> {
+    let want = static_vector_len(domain);
+    Some(match m.type_of(c)? {
+        Type::Scalar(_) => Ok(false),
+        Type::Array { shape, elem } if shape.len() == 1 && matches!(**elem, Type::Scalar(_)) => {
+            match (shape[0], want) {
+                (Dim::Static(got), Some(want)) if i64::from(got) == want => Ok(true),
+                (Dim::Static(got), Some(want)) => {
+                    Err(format!("a vector of length {got}, not {want}"))
+                }
+                _ => Err("a vector whose length is not statically that of the variate".to_string()),
             }
         }
+        Type::Array { .. } => Err("a matrix or higher-rank array".to_string()),
+        Type::TVector { .. } => Err("a transposed (row) vector".to_string()),
+        _ => return None,
+    })
+}
+
+/// Whether a fixed scale has a zero entry. A query input or a non-literal entry is
+/// trusted, as [`derive_locscale`] trusts a symbolic scalar scale.
+fn has_static_zero(m: &Module, a: NodeId) -> bool {
+    let promoted = crate::canon::promoted_input_names(m);
+    let mut node = a;
+    for _ in 0..m.node_count() {
+        let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(node)
+        else {
+            break;
+        };
+        let Some(b) = m
+            .binding_by_name(*name)
+            .filter(|_| !promoted.contains(name))
+        else {
+            return false;
+        };
+        node = m.binding(b).rhs;
     }
-    Ok(None)
+    match expect_builtin_call(m, node, "vector") {
+        Some(c) => c.args.iter().any(|&e| static_real(m, e) == Some(0.0)),
+        None => static_real(m, node) == Some(0.0),
+    }
 }
 
 /// Lift a PER-CELL scalar change of variables to a vector variate whose forward

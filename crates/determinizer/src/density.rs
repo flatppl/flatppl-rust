@@ -7192,7 +7192,7 @@ fn recognize_polynomial_over_interval(
 /// parses to (`interval(-10.0, 10.0)` reads as `(interval (neg 10.0) 10.0)`) and
 /// admitting the built-in `inf`, so an unbounded endpoint is RECOGNIZED as
 /// infinite rather than merely unreadable. `None` for anything not static.
-fn static_real(m: &Module, id: NodeId) -> Option<f64> {
+pub(crate) fn static_real(m: &Module, id: NodeId) -> Option<f64> {
     let mut promoted = None;
     let mut node = id;
     let mut sign = 1.0;
