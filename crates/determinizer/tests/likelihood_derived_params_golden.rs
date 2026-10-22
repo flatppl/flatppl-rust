@@ -212,10 +212,8 @@ fn bi1_posterior_lp_density_is_self_contained_wrt_theta() {
 /// left as shared refs.
 const TWOHOP_POSTERIOR: &str = "\
 flatppl_compat = \"0.1\"
-theta1_dist = Normal(0, 1)
 theta2_dist = Exponential(1)
-prior = joint(theta1 = theta1_dist, theta2 = theta2_dist)
-theta1 = elementof(reals)
+prior = joint(theta2 = theta2_dist)
 theta2 = elementof(reals)
 c = 5
 d = 2
@@ -228,7 +226,7 @@ forward_kernel = kernelof(record(obs = obs))
 observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
 L = likelihoodof(forward_kernel, record(obs = observed_data))
 posterior = bayesupdate(L, prior)
-lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
+lp = logdensityof(posterior, record(theta2 = 1.0))";
 
 #[test]
 fn twohop_posterior_lp_density_is_self_contained_wrt_theta() {
@@ -237,11 +235,13 @@ fn twohop_posterior_lp_density_is_self_contained_wrt_theta() {
         .expect("two-hop derived kernel param posterior must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
 
-    // Same 3 terms as BI1_POSTERIOR: 1 obs-likelihood broadcast head + 2 prior.
+    // 1 obs-likelihood broadcast head + 1 prior term. The prior names only
+    // `theta2`: the kernel's one input is `theta2`, and a prior field that names
+    // no input is a static error (spec §04 "Calling conventions").
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        3,
-        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
+        2,
+        "expected 1 obs-likelihood broadcast head + 1 prior term; got:\n{pir}"
     );
 
     // The heart of the fix, exercised through TWO hops: `a2`'s RHS references
@@ -274,10 +274,8 @@ fn twohop_posterior_lp_density_is_self_contained_wrt_theta() {
 const DIAMOND_POSTERIOR: &str = "\
 flatppl_compat = \"0.1\"
 theta1_dist = Normal(0, 1)
-theta2_dist = Exponential(1)
-prior = joint(theta1 = theta1_dist, theta2 = theta2_dist)
+prior = joint(theta1 = theta1_dist)
 theta1 = elementof(reals)
-theta2 = elementof(reals)
 c = 5
 d = 2
 k = par -> c * par
@@ -291,7 +289,7 @@ forward_kernel = kernelof(record(obs = obs))
 observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
 L = likelihoodof(forward_kernel, record(obs = observed_data))
 posterior = bayesupdate(L, prior)
-lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
+lp = logdensityof(posterior, record(theta1 = 0.5))";
 
 #[test]
 fn diamond_posterior_lp_density_is_self_contained_wrt_theta() {
@@ -300,11 +298,12 @@ fn diamond_posterior_lp_density_is_self_contained_wrt_theta() {
         .expect("diamond-dependency posterior must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
 
-    // Same 3 terms as BI1_POSTERIOR: 1 obs-likelihood broadcast head + 2 prior.
+    // 1 obs-likelihood broadcast head + 1 prior term. The prior names only
+    // `theta1`, the kernel's one input (spec §04 "Calling conventions").
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        3,
-        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
+        2,
+        "expected 1 obs-likelihood broadcast head + 1 prior term; got:\n{pir}"
     );
 
     // The heart of the fix, exercised on a SHARED derived binding: `cc` is

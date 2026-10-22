@@ -370,7 +370,7 @@ lp = logdensityof(lawof(y), 4.0)",
 v = draw(Exponential(rate = 0.5))
 s = sqrt(v)
 kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = s))), v = v)
-pp = kchain(lawof(record(v = v)), kk)
+pp = kchain(lawof(record(v = v)), pars -> kk(v = pars.v))
 lp = logdensityof(pp, record(y = 4.0))",
     ] {
         let err = determinize(&parse_infer(src))

@@ -141,7 +141,7 @@ pub(crate) fn interface(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<In
                     }
                     // Uniform kernel extension preserves the underlying interface.
                     "normalize" | "truncate" | "locscale" | "iid" | "relabel" | "pushfwd"
-                    | "weighted" | "logweighted" => {
+                    | "weighted" | "logweighted" | "likelihoodof" => {
                         let index = usize::from(matches!(
                             m.resolve(head),
                             "pushfwd" | "weighted" | "logweighted"

@@ -1492,7 +1492,7 @@ fn bayesupdate_lowers_to_loglik_plus_logprior() {
 mu = elementof(reals)
 prior = joint(mu = Normal(mu = 0.0, sigma = 1.0))
 model = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
-L = likelihoodof(model, 0.5)
+L = likelihoodof(pars -> model(mu = pars.mu), 0.5)
 post = bayesupdate(L, prior)
 lp = logdensityof(post, record(mu = 0.3))";
     let pir = flatppl_flatpir::write(&determinize_src(src));

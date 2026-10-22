@@ -21,6 +21,7 @@
 //! and `external` / loaded data / reifications *fixed*.
 
 mod axes;
+mod boundary;
 pub mod builtins;
 mod callable;
 mod catalogue;

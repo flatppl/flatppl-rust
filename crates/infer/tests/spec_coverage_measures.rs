@@ -1310,7 +1310,7 @@ fn a_fan_out_does_not_inherit_an_unlifted_component_mass() {
                   T1 = truncate(kernelof(a1, z = z), interval(0.0, 5.0))\n\
                   T2 = truncate(kernelof(a2, z = z), interval(0.0, 5.0))\n\
                   KJ = joint(p = T1, q = T2)\n\
-                  C  = kchain(Normal(mu = 0.0, sigma = 1.0), KJ)");
+                  C  = kchain(joint(z = Normal(mu = 0.0, sigma = 1.0)), KJ)");
     assert!(
         bind_line(&out, "T1").contains("(%mass %normalized)"),
         "premise: the component's mass is un-lifted and reads %normalized; if \

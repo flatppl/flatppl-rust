@@ -23,7 +23,7 @@ mod pyhf;
 mod tilt;
 
 /// `(node, type, phase)` of an inferred positional argument.
-type ArgInfo = (NodeId, Type, Phase);
+pub(crate) type ArgInfo = (NodeId, Type, Phase);
 /// `(name, node, type, phase)` of an inferred named argument.
 type NamedInfo = (Symbol, NodeId, Type, Phase);
 
@@ -5175,7 +5175,7 @@ fn cat_shape(types: &[Type]) -> CatShape {
 
 /// The `cat` type for callers that only want the type (a deferral covers both
 /// "mixed" and "unresolved"); callers that diagnose mixing use [`cat_shape`].
-fn cat_compose(types: &[Type]) -> Type {
+pub(crate) fn cat_compose(types: &[Type]) -> Type {
     match cat_shape(types) {
         CatShape::Cat(t) => t,
         CatShape::Mixed | CatShape::DuplicateField(_) | CatShape::Unresolved => Type::Deferred,
@@ -5246,6 +5246,22 @@ fn user_arity_check(
         return Some(Type::Failed("keyword-only callable".into()));
     }
     if interface.arity.admits(reading.count) {
+        if interface.takes_one()
+            && !reading.splatting
+            && named.is_empty()
+            && let [(arg, ty, _)] = args
+        {
+            let declared = crate::boundary::declared_input_types(inf, callee);
+            if let Some(mismatch) =
+                crate::boundary::whole_binding_mismatch(inf, &interface.names, &declared, ty)
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    *arg,
+                    format!("{who}: the argument is {mismatch}"),
+                ));
+                return Some(Type::Failed("argument bound whole".into()));
+            }
+        }
         return check_double_bound(inf, &interface.names, &who, "§04", args, named)
             .or_else(|| arg_name_check(inf, &interface.names, &who, None, &reading, args, named))
             .or_else(|| {
@@ -5723,7 +5739,11 @@ fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Typ
 /// `domain` is the variate. `None` (→ caller leaves the chain domain `%deferred`)
 /// when the component is neither a measure nor a kernel, or its body / domain is
 /// not statically resolvable.
-fn component_variate(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> Option<Type> {
+pub(crate) fn component_variate(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    ty: &Type,
+) -> Option<Type> {
     match ty {
         Type::Measure { domain, .. } => match domain.as_ref() {
             Type::Deferred => None,
@@ -5894,7 +5914,10 @@ fn substituted_result(
 /// Deref a callee expression to its local reification: follow `self` refs to the
 /// bound RHS, returning `(reification_node, body_node)` when the RHS is a
 /// reification (a call carrying an inputs boundary). `None` otherwise.
-fn local_reification(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<(NodeId, NodeId)> {
+pub(crate) fn local_reification(
+    inf: &Inferencer<'_, '_>,
+    mut node: NodeId,
+) -> Option<(NodeId, NodeId)> {
     for _ in 0..inf.module.node_count() {
         match inf.module.node(node) {
             Node::Ref(r) if r.ns == RefNs::SelfMod => {
@@ -5914,7 +5937,10 @@ fn local_reification(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<(Node
 /// The ordered input parameters of a reification: `(param-name, declaration-ref)`
 /// pairs. A `%specinputs` boundary carries them inline; an `%autoinputs`
 /// (keyword-only) boundary reads them from the auto-inputs side-table.
-fn input_entries(inf: &Inferencer<'_, '_>, reif_id: NodeId) -> Option<Vec<(Symbol, Ref)>> {
+pub(crate) fn input_entries(
+    inf: &Inferencer<'_, '_>,
+    reif_id: NodeId,
+) -> Option<Vec<(Symbol, Ref)>> {
     let Node::Call(call) = inf.module.node(reif_id) else {
         return None;
     };
@@ -7171,6 +7197,8 @@ fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> O
         .or_else(|| refuse_bad_rand_operands(inf, name, args))
         .or_else(|| refuse_bad_rng_seed(inf, name, args))
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
+        .or_else(|| crate::boundary::refuse_bad_likelihood_point(inf, name, args))
+        .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args))
 }
 
 /// `rand(m, rstate)` accepts one closed measure and one explicit RNG state.
@@ -8868,7 +8896,7 @@ fn weighted_parts(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<(NodeId, Nod
 
 /// Follow `(%ref self x)` hops to the bound right-hand side. Bounded, so a
 /// reference cycle (which inference reports separately) cannot spin here.
-fn resolve_binding_refs(inf: &Inferencer<'_, '_>, node: NodeId) -> NodeId {
+pub(crate) fn resolve_binding_refs(inf: &Inferencer<'_, '_>, node: NodeId) -> NodeId {
     let mut node = node;
     for _ in 0..16 {
         let Node::Ref(r) = inf.module.node(node) else {

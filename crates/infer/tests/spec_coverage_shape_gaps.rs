@@ -252,7 +252,7 @@ fn kernel_chain_ops_infer_measures() {
     // kchain keeps the LAST component's variate (spec §06 Kleisli bind): fk's
     // output is record{y: real}.
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
-                  prior = lawof(record(lambda = lambda))\n\
+                  prior = lawof(lambda)\n\
                   fk = kernelof(record(y = lambda), lambda = lambda)\n\
                   pp = kchain(prior, fk)");
     assert!(
@@ -263,7 +263,8 @@ fn kernel_chain_ops_infer_measures() {
     // jointchain keeps ALL variates: cat of m0's record{a} and k's record{b}.
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   m0 = lawof(record(a = lambda))\n\
-                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  a = elementof(reals)\n\
+                  k = kernelof(record(b = a))\n\
                   j = jointchain(m0, k)");
     assert!(
         out.contains("(%measure (%domain (%record (a (%scalar real)) (b (%scalar real)))) (%mass %normalized))")
@@ -295,7 +296,8 @@ fn kernel_chain_ops_infer_measures() {
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   m0 = lawof(record(a = lambda))\n\
                   finite_m = superpose(m0, m0)\n\
-                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  a = elementof(reals)\n\
+                  k = kernelof(record(b = a))\n\
                   j = jointchain(finite_m, k)");
     assert!(
         out.contains("(%mass %finite)") && out.contains("(jointchain"),
