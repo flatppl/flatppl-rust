@@ -1152,10 +1152,9 @@ impl<'a> ExprParser<'a> {
             return Ok(entry.to_string());
         }
         let name = &entry[1..entry.len() - 1];
-        if matches!(
-            name,
-            "true" | "false" | "in" | "all" | "only" | "self" | "base"
-        ) {
+        // Spec §05 "Note on reserved words"; `self` and `base` are barred only
+        // as module bindings (§04), so they stay legal argument names.
+        if matches!(name, "true" | "false" | "in" | "all" | "only") {
             return Err(self.err_here(format!(
                 "placeholder `{entry}` would name its boundary input `{name}`, which is a \
                  reserved word; bind it with a keyword, as in `other = {entry}` (spec §04)"

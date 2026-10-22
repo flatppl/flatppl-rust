@@ -81,12 +81,20 @@ fn a_bare_placeholder_expands_to_its_stripped_name() {
     );
 }
 
+/// `self` and `base` are barred only as module bindings (spec §04), so a
+/// placeholder may derive them as argument names.
+#[test]
+fn a_bare_placeholder_may_derive_self_or_base() {
+    assert_equivalent(
+        "f = functionof(_self_ + _base_, _self_, _base_)\nz = f(self = 2.0, base = 3.0)",
+        "f = functionof(_self_ + _base_, self = _self_, base = _base_)\nz = f(self = 2.0, base = 3.0)",
+    );
+}
+
 /// Spec §04: "Derived names must be legal argument names".
 #[test]
 fn a_bare_placeholder_naming_a_reserved_word_is_refused() {
-    for placeholder in [
-        "_in_", "_all_", "_only_", "_true_", "_false_", "_self_", "_base_",
-    ] {
+    for placeholder in ["_in_", "_all_", "_only_", "_true_", "_false_"] {
         let source =
             format!("a = elementof(reals)\nf = functionof(a + {placeholder}, a, {placeholder})");
         let err = parse(&source).expect_err(&format!("accepted {source}"));
