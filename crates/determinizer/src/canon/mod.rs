@@ -1,6 +1,6 @@
 //! FlatPDL → FlatPDL canonicalization: post-measure-elimination normalization
 //! passes that reduce/canonicalize the determiniser's output while preserving
-//! `flatpdl.flatprof` conformance AND exact semantics (Buffy #263). Each pass
+//! `flatpdl.flatprof` conformance AND exact semantics. Each pass
 //! is idempotent and refuse-free; the driver runs them to a combined fixpoint.
 
 use std::collections::HashSet;
@@ -86,7 +86,7 @@ fn no_canon() -> bool {
 }
 
 /// Run every canonicalization pass to a combined fixpoint, then — if `roots` is
-/// given — root-based dead-code elimination (Pass 4-A, Buffy #263): only
+/// given — root-based dead-code elimination (Pass 4-A): only
 /// bindings reachable from the requested-output `roots` survive. Re-infers
 /// between sweeps because a reduction can shift inferred types/phases that a
 /// later pass reads. A no-op if `FLATPPL_DETERMINIZE_NO_CANON` is set.

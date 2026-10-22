@@ -49,7 +49,7 @@ fn pushfwd_affine_lambda_lowers() {
     );
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
     // f_inv = (y-1)/2, applied at the literal query point y = 0.5, is now
-    // beta-reduced AND const-folded to -0.25 (Buffy #263 Pass 2 inlines the
+    // beta-reduced AND const-folded to -0.25 (Pass 2 inlines the
     // residual `%call` that used to carry `divide(sub(_x_, 1.0), 2.0)`
     // unapplied; const-fold then reduces the folded arithmetic to one term).
     // §11 "Literal values" forbids a signed atom, so the negative fold result
@@ -198,7 +198,7 @@ fn pushfwd_divide_chain_lowers() {
         pir("d = pushfwd(x -> x / 2.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
     // Inverse mul(y, 2.0), applied at the literal query point y = 0.5, is now
-    // beta-reduced AND const-folded to the literal 1.0 (Buffy #263 Pass 2
+    // beta-reduced AND const-folded to the literal 1.0 (Pass 2
     // inlines the residual `%call` that used to carry `mul(_x_, 2.0)` unapplied;
     // both operands are then literal reals, so const-fold reduces it further):
     assert!(
@@ -360,7 +360,7 @@ fn pushfwd_elementwise_exp_lowers() {
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl:\n{p}"
     );
-    // Before Buffy #263 Pass 2, the f_inv- and logvol-applying `%call`s were
+    // Before Pass 2, the f_inv- and logvol-applying `%call`s were
     // left un-reduced, so `sum`'s argument type inferred `%deferred` (a
     // residual user-call, not yet a concrete array shape). Pass 2 inlines
     // both calls, so `sum`'s argument (the per-cell `broadcast`) now infers

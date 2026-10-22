@@ -89,7 +89,7 @@ fn bare_likelihoodof_of_kernel_reports_likelihood_and_kernel_violations() {
 
 // --- Pass 4 Task A review Fix 3: dangling-ref self-check ---
 //
-// Root-based DCE (Buffy #263 Pass 4-A, `canon::dce::retain_reachable`) is the
+// Root-based DCE (Pass 4-A, `canon::dce::retain_reachable`) is the
 // FIRST capability that removes bindings outright. A latent miss in its
 // reachability walk (`Module::collect_referenced_names`) could drop a binding
 // something else still points at, leaving a `(%ref self <name>)` — as an

@@ -1,5 +1,5 @@
 //! Pass 3: resolve statically-known structural projections — `get(record/table, k)`
-//! and `get0(vector, i)` over literal constructors (Buffy #263).
+//! and `get0(vector, i)` over literal constructors.
 //!
 //! Density lowering routinely builds a `get`/`get0` accessor onto a container
 //! it cannot read field-wise from the node at build time (§04 auto-splat onto

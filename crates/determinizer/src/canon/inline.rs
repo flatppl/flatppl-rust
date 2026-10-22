@@ -1,9 +1,9 @@
 //! Pass 2: inline residual user-defined function/kernel calls so no
-//! `(%call User ...)` reaches consumers (Buffy #263; unblocks #261).
+//! `(%call User ...)` reaches consumers.
 //!
 //! A live `(%call (%ref self scale) 1.5)` is exactly what flatppl-js cannot
-//! evaluate on the score path
-//! (Buffy #261): FlatPDL is defined as deterministic ops + the six
+//! evaluate on the score path:
+//! FlatPDL is defined as deterministic ops + the six
 //! `builtin_*` primitives, and a call to a user function is neither. This
 //! pass beta-reduces every such call away, because eliminating one is strictly
 //! more useful than merely detecting it.

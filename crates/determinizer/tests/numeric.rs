@@ -126,7 +126,7 @@ fn iid_normal_sum_structure() {
     // the variate `get0(v, i)`, i = 0, 1, 2.
     //
     // The variate is a NAMED binding (`data`), not an inline literal: canon
-    // Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
+    // Pass 3 (`flatten_structural`) only resolves `get0` over a
     // LITERAL `vector(...)` constructor, never through a `Ref` — so naming the
     // data here (matching `iid_lengthof_sized_lowers` below) keeps the `get0`
     // projection structure this test pins intact. An inline-literal variate
@@ -408,7 +408,7 @@ fn joint_two_gaussians_structure() {
     //   add(density(Normal(0,1), get0(v,0)), density(Normal(1,2), get0(v,1)))
     //
     // The variate is a NAMED binding (`data`), not an inline literal: canon
-    // Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
+    // Pass 3 (`flatten_structural`) only resolves `get0` over a
     // LITERAL `vector(...)` constructor, never through a `Ref`, so naming the
     // data keeps the per-component `get0` slot structure this test pins
     // intact (an inline-literal variate would flatten both projections away).
@@ -466,7 +466,7 @@ lp = logdensityof(d, 0.5)";
     let pir = flatppl_flatpir::write(&out);
     // One density term (g); the applied weight is `log(w(0.5))`, not a
     // `builtin_logdensityof`. The weight application itself is a residual
-    // user-function `%call` beta-reduced away by canon Pass 2 (Buffy #263) —
+    // user-function `%call` beta-reduced away by canon Pass 2 —
     // `w(0.5) = exp(0.5)` (unfolded: `exp` is excluded from const-fold, see
     // `canon/fold.rs`), so no `(%call` survives.
     assert_eq!(
@@ -523,8 +523,8 @@ lp = logdensityof(d, 0.5)";
         "measure layer gone and no residual user-call:\n{pir}"
     );
     // Structural: `add(ℓ(0.5), density(g1, 0.5))`. The log-weight application
-    // is a residual user-function `%call` beta-reduced away by canon Pass 2
-    // (Buffy #263): `ℓ(0.5) = logdensityof(g2, 0.5)` had ALREADY lowered to a
+    // is a residual user-function `%call` beta-reduced away by canon Pass 2:
+    // `ℓ(0.5) = logdensityof(g2, 0.5)` had ALREADY lowered to a
     // `builtin_logdensityof` term before the `%call` wrapping it was inlined,
     // so it now sits directly as a second `add` operand — being already in
     // log space, it is NOT wrapped in a top-level `log` — the emitted
