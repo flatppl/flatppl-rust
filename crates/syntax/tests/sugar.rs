@@ -23,17 +23,83 @@ fn parenthesized_records_preserve_fields_and_nested_expressions() {
 #[test]
 fn bare_reification_boundaries_preserve_written_order() {
     assert_equivalent(
-        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2 * b, b, a)\ny ~ Normal(a + 2 * b, 2.0)\nk = base.kernelof((y = y), beta = b, a)",
-        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2 * b, b = b, a = a)\ny ~ Normal(a + 2 * b, 2.0)\nk = base.kernelof(record(y = y), beta = b, a = a)",
+        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2 * b, b, a)\ny ~ Normal(a + 2 * b, 2.0)\nk = base.kernelof((y = y), b, a)",
+        "a = elementof(reals)\nb = elementof(reals)\nf = functionof(a + 2 * b, b = b, a = a)\ny ~ Normal(a + 2 * b, 2.0)\nk = base.kernelof(record(y = y), b = b, a = a)",
     );
 }
 
 #[test]
-fn mixed_boundaries_preserve_tuple_values_and_lambda_scopes() {
+fn keyword_boundaries_preserve_tuple_values_and_lambda_scopes() {
     assert_equivalent(
-        "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\nf = base.functionof(t, pair = t, a, beta = b)\ng = x -> (value = x + a)\nh = fn((value = _))\nz = f(t, a, b)",
+        "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\nf = base.functionof(t, pair = t, a = a, beta = b)\ng = x -> (value = x + a)\nh = fn((value = _))\nz = f(t, a, b)",
         "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\nf = base.functionof(t, pair = t, a = a, beta = b)\ng = x -> record(value = x + a)\nh = fn(record(value = _))\nz = f(t, a, b)",
     );
+}
+
+#[test]
+fn bare_boundaries_preserve_tuple_values() {
+    assert_equivalent(
+        "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\nf = base.functionof(t, t, a, b)\nz = f(t, a, b)",
+        "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\nf = base.functionof(t, t = t, a = a, b = b)\nz = f(t, a, b)",
+    );
+}
+
+/// Spec §04: "Boundary inputs are given either all as bare names or all as
+/// keyword arguments; mixing the two forms is a static error."
+#[test]
+fn mixed_bare_and_keyword_boundaries_are_refused() {
+    for operation in ["functionof", "kernelof"] {
+        for boundaries in [
+            "pair = t, a, beta = b",
+            "a, beta = b",
+            "a = a, b",
+            "a, _x_, beta = b",
+        ] {
+            let source = format!(
+                "a = elementof(reals)\nb = elementof(reals)\nt = (a, b)\n\
+                 f = {operation}(draw(Normal(a + b, 1.0)) + _x_, {boundaries})"
+            );
+            let err = parse(&source).expect_err(&format!("accepted {source}"));
+            assert!(
+                err.to_string().contains("mixing the two forms"),
+                "{source}: {err}"
+            );
+        }
+    }
+}
+
+/// Spec §04: in a bare boundary list "a placeholder `_x_` expands to `x = _x_`".
+#[test]
+fn a_bare_placeholder_expands_to_its_stripped_name() {
+    assert_equivalent(
+        "a = elementof(reals)\nd = elementof(reals)\nh = functionof(a * d + _x_, a, d, _x_)",
+        "a = elementof(reals)\nd = elementof(reals)\nh = functionof(a * d + _x_, a = a, d = d, x = _x_)",
+    );
+    assert_equivalent(
+        "a = elementof(reals)\nk = kernelof(draw(Normal(a + _shift_, 1.0)), _shift_, a)",
+        "a = elementof(reals)\nk = kernelof(draw(Normal(a + _shift_, 1.0)), shift = _shift_, a = a)",
+    );
+}
+
+/// `self` and `base` are barred only as module bindings (spec §04), so a
+/// placeholder may derive them as argument names.
+#[test]
+fn a_bare_placeholder_may_derive_self_or_base() {
+    assert_equivalent(
+        "f = functionof(_self_ + _base_, _self_, _base_)\nz = f(self = 2.0, base = 3.0)",
+        "f = functionof(_self_ + _base_, self = _self_, base = _base_)\nz = f(self = 2.0, base = 3.0)",
+    );
+}
+
+/// Spec §04: "Derived names must be legal argument names".
+#[test]
+fn a_bare_placeholder_naming_a_reserved_word_is_refused() {
+    for placeholder in ["_in_", "_all_", "_only_", "_true_", "_false_"] {
+        let source =
+            format!("a = elementof(reals)\nf = functionof(a + {placeholder}, a, {placeholder})");
+        let err = parse(&source).expect_err(&format!("accepted {source}"));
+        assert!(err.to_string().contains("reserved word"), "{source}: {err}");
+    }
 }
 
 #[test]
