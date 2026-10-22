@@ -660,6 +660,21 @@ pub(crate) fn bind_optional_call_args(
     named: &[NamedArg],
     keyword_only: bool,
 ) -> Option<Vec<NodeId>> {
+    // A sole tuple argument of an ordered callable that does not accept a lone
+    // positional argument splats into positional arguments (spec §04). A count
+    // outside `required..=names.len()` is a static error, refused here as it is
+    // for a record.
+    if !keyword_only
+        && required > 1
+        && named.is_empty()
+        && args.len() == 1
+        && let Some(count) = tuple_arity(m, args[0])
+    {
+        if count < required || count > names.len() {
+            return None;
+        }
+        return (0..count).map(|i| tuple_element(m, args[0], i)).collect();
+    }
     if (keyword_only || required > 1 || names.is_empty())
         && named.is_empty()
         && args.len() == 1
@@ -692,6 +707,43 @@ pub(crate) fn bind_optional_call_args(
         }
     }
     values.into_iter().take(count).collect()
+}
+
+/// The element count of a tuple value: a written `tuple(…)` literal, or a value
+/// whose inferred type is a tuple.
+fn tuple_arity(m: &Module, value: NodeId) -> Option<usize> {
+    let (resolved, _) = resolve_ref_one(m, value);
+    if matches!(splat_head(m, value), Some("tuple"))
+        && let Node::Call(c) = m.node(resolved)
+        && c.named.is_empty()
+    {
+        return Some(c.args.len());
+    }
+    match m.type_of(value).or_else(|| m.type_of(resolved))? {
+        Type::Tuple(parts) => Some(parts.len()),
+        _ => None,
+    }
+}
+
+/// Element `index` (0-based) of a tuple value. A written `tuple(…)` literal gives
+/// its element; any other value gives the projection `get(t, index + 1)`, the
+/// positional argument spec §11 resolves a splatted tuple to.
+fn tuple_element(m: &mut Module, value: NodeId, index: usize) -> Option<NodeId> {
+    let (resolved, _) = resolve_ref_one(m, value);
+    if matches!(splat_head(m, value), Some("tuple"))
+        && let Node::Call(c) = m.node(resolved)
+        && c.named.is_empty()
+    {
+        return c.args.get(index).copied();
+    }
+    let position = m.alloc(Node::Lit(Scalar::Int(i64::try_from(index).ok()? + 1)));
+    let get = m.intern("get");
+    Some(m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(get),
+        args: vec![value, position].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    })))
 }
 
 /// Whether the value exposes record fields or table columns for named binding.

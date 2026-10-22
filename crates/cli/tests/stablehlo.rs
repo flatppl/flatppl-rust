@@ -49,6 +49,35 @@ fn syntax_sugar_exports_the_same_ordered_query() {
     assert_eq!(emit(sugar), emit(explicit));
 }
 
+/// Spec §04 "Calling conventions" and §11: a sole tuple splats into positional
+/// arguments, each a projection of the original, so a tuple spelling exports the
+/// same StableHLO as the positional spelling.
+#[test]
+fn a_splatted_tuple_exports_the_same_module_as_positional_arguments() {
+    let tuple = write_model(
+        "tuple-splat",
+        "u = elementof(reals)\nv = elementof(posreals)\nf(a, b) = a * 2.0 + b\nt = (u, v)\na = elementof(reals)\nb = elementof(posreals)\nK = functionof(Normal(mu = a, sigma = b), a = a, b = b)\nlp = logdensityof(K(t), 0.3)\ninputs = (u, v)\noutputs = (f(t), add((u, 2.0)), lp)",
+    );
+    let positional = write_model(
+        "tuple-positional",
+        "u = elementof(reals)\nv = elementof(posreals)\nf(a, b) = a * 2.0 + b\na = elementof(reals)\nb = elementof(posreals)\nK = functionof(Normal(mu = a, sigma = b), a = a, b = b)\nlp = logdensityof(K(a = u, b = v), 0.3)\ninputs = (u, v)\noutputs = (f(u, v), add(u, 2.0), lp)",
+    );
+    let emit = |input| {
+        let output = flatppl()
+            .args(["stablehlo", "--dtype", "f64"])
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    assert_eq!(emit(tuple), emit(positional));
+}
+
 #[test]
 fn fixed_json_in_an_import_matches_explicit_literals() {
     let input = write_model(
