@@ -18,6 +18,8 @@ fn array_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeId>
 }
 
 /// Build a FlatPPL 2-D array (vector of vectors) from a JSON 2-D array.
+/// A matrix from HS3 rows. §03 does not read a vector of vectors as a matrix,
+/// so the rows are joined with `rowstack`.
 fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeId> {
     let rows: Vec<NodeId> = arr
         .iter()
@@ -29,7 +31,8 @@ fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeI
             }
         })
         .collect::<Result<_>>()?;
-    Ok(b.array(&rows))
+    let rows = b.array(&rows);
+    Ok(b.call("rowstack", &[rows]))
 }
 
 /// Context for conditional distribution parameter resolution.

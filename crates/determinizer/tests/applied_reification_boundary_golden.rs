@@ -184,7 +184,7 @@ lp  = logdensityof(KR(z = 0.5), record(p = 1.0, q = -1.0))",
 ///
 /// `u` is an interior latent of the reification, shared by both record fields. §06's
 /// `joint` ancestry rule keeps it ONE node, so the law at `z = 0` is
-/// `MvNormal([0,0], [[2,1],[1,2]])` and the density at `(1, -1)` is
+/// `MvNormal([0,0], rowstack([[2,1],[1,2]]))` and the density at `(1, -1)` is
 /// `-log(2*pi) - 0.5*log(3) - 1 = -3.3871832107434003`. Cloning `u` per field — what an
 /// unmemoized deep pre-substitution does — gives the `iid`-style COPY product of two
 /// `Normal(0, sqrt 2)` marginals, `-3.0310242469693`.
@@ -236,7 +236,7 @@ lp = logdensityof(lawof(record(p = a1, q = a2)), record(p = 1.0, q = -1.0))",
 /// The pinned boundary really reaches the interior latent's own prior: moving the
 /// application point moves the emitted law.
 ///
-/// At `z = 5`, `(1, -1)` the law is `MvNormal([5,5], [[2,1],[1,2]])`. The quadratic form
+/// At `z = 5`, `(1, -1)` the law is `MvNormal([5,5], rowstack([[2,1],[1,2]]))`. The quadratic form
 /// is `(y - mu)' Sigma^-1 (y - mu)` with `y - mu = (-4, -6)`:
 /// `(1/3) * (2*16 - 2*24 + 2*36) = 56/3 = 18.666666666666664`. The covariance factor is
 /// unchanged, so only that term moves — which is what a boundary that reaches the prior's

@@ -8,8 +8,7 @@ mod common;
 use common::pir_binding;
 
 const IID: &str = "iid(Normal(mu = 0.0, sigma = 1.0), 3)";
-const MVN: &str =
-    "MvNormal(mu = [0.2, -0.1, 0.4], cov = [[1.0, 0.3, 0.1], [0.3, 2.0, -0.4], [0.1, -0.4, 1.5]])";
+const MVN: &str = "MvNormal(mu = [0.2, -0.1, 0.4], cov = rowstack([[1.0, 0.3, 0.1], [0.3, 2.0, -0.4], [0.1, -0.4, 1.5]]))";
 
 fn model(prelude: &str, map: &str, base: &str) -> String {
     format!("{prelude}\nd = pushfwd({map}, {base})\nlp = logdensityof(d, [0.7, -1.2, 2.5])")

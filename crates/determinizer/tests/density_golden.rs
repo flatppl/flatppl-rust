@@ -1387,8 +1387,8 @@ fn locscale_matrix_lowers() {
     // MvNormal(mu, L Lᵀ). Matrix-affine change of variables:
     //   f_inv(y) = linsolve(L, y - mu),  logvol = logabsdet(L).
     let p = ls_pir(
-        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
-         d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), \
+        "cov = rowstack([[4.0, 1.0], [1.0, 3.0]])\n\
+         d = locscale(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), \
                       [1.0, 2.0], lower_cholesky(cov))\n\
          lp = logdensityof(d, [0.5, 0.5])",
     );
@@ -1410,15 +1410,15 @@ fn locscale_matrix_equals_affine_pushfwd() {
     // Matrix defining identity: locscale(MvNormal(0,I), mu, L) ==
     // pushfwd(x -> L * x + mu, MvNormal(0,I)). Byte-equal FlatPDL.
     let locscale = ls_pir(
-        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
+        "cov = rowstack([[4.0, 1.0], [1.0, 3.0]])\n\
          L = lower_cholesky(cov)\n\
-         d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), [1.0, 2.0], L)\n\
+         d = locscale(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), [1.0, 2.0], L)\n\
          lp = logdensityof(d, [0.5, 0.5])",
     );
     let affine = ls_pir(
-        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
+        "cov = rowstack([[4.0, 1.0], [1.0, 3.0]])\n\
          L = lower_cholesky(cov)\n\
-         d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]))\n\
+         d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))\n\
          lp = logdensityof(d, [0.5, 0.5])",
     );
     assert_eq!(
@@ -1460,7 +1460,7 @@ fn locscale_vector_variate_scalar_scale_refuses() {
     // the scalar form's single log|scale| — the same danger the vector-variate
     // guard closes for plain `pushfwd`. Must refuse rather than mislower.
     let msg = ls_refuse(
-        "d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), [1.0, 2.0], 3.0)\n\
+        "d = locscale(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), [1.0, 2.0], 3.0)\n\
          lp = logdensityof(d, [0.5, 0.5])",
     );
     assert!(msg.contains("refuse"), "got: {msg}");
@@ -2569,7 +2569,7 @@ fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
     let prelude = "\
 A = [[2.0, 0.0], [0.0, 3.0]]
 b = [1.0, 1.0]
-x = draw(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]))
+x = draw(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))
 y = A * x + b
 ";
     let bare = flatppl_flatpir::write(&determinize_src(&format!(
