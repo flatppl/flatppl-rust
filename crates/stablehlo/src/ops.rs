@@ -2766,6 +2766,11 @@ enum ElemSet {
     /// $+\infty$". CLOSED at zero.
     NonNegReals,
     UnitInterval,
+    /// §03 `integers`, `posintegers` and `nonnegintegers`. Unlike the real
+    /// sets, they hold no infinity (§03 "Note on infinities").
+    Integers,
+    PosIntegers,
+    NonNegIntegers,
 }
 
 /// `in(v, S)` (spec §06 membership predicate `_ in R`) over a §03 element set,
@@ -3000,6 +3005,27 @@ fn elem_membership(
             let below = e.compare("LE", v, &one);
             Ok(e.and(&above, &below))
         }
+        ElemSet::Integers | ElemSet::PosIntegers | ElemSet::NonNegIntegers => {
+            let integral = if matches!(v.elem, ElemKind::Int) {
+                e.compare("EQ", v, v)
+            } else {
+                // floor(inf) == inf, so finiteness is a separate test.
+                let floor = e.floor(v);
+                let whole = e.compare("EQ", &floor, v);
+                let magnitude = e.abs(v);
+                let infinity = e.constant_like(f64::INFINITY, v);
+                let finite = e.compare("LT", &magnitude, &infinity);
+                e.and(&whole, &finite)
+            };
+            let lower = match set {
+                ElemSet::PosIntegers => 1.0,
+                ElemSet::NonNegIntegers => 0.0,
+                _ => return Ok(integral),
+            };
+            let lower = e.constant_like(lower, v);
+            let above = e.compare("GE", v, &lower);
+            Ok(e.and(&integral, &above))
+        }
         ElemSet::Interval(lo_id, hi_id) => {
             let lo = e.lower_node(lo_id)?;
             let hi = e.lower_node(hi_id)?;
@@ -3022,8 +3048,9 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
     let refuse = || {
         EmitError::at(
             id,
-            "'in': only an interval(lo, hi), reals, posreals or nonnegreals set is supported \
-             (optionally under one cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
+            "'in': only an interval(lo, hi), reals, posreals, nonnegreals, unitinterval, \
+             integers, posintegers or nonnegintegers set is supported (optionally under one \
+             cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
         )
     };
     match e.node(set_id) {
@@ -3032,6 +3059,9 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
             "posreals" => Ok(ElemSet::PosReals),
             "nonnegreals" => Ok(ElemSet::NonNegReals),
             "unitinterval" => Ok(ElemSet::UnitInterval),
+            "integers" => Ok(ElemSet::Integers),
+            "posintegers" => Ok(ElemSet::PosIntegers),
+            "nonnegintegers" => Ok(ElemSet::NonNegIntegers),
             _ => Err(refuse()),
         },
         Node::Call(c) => match c.head {

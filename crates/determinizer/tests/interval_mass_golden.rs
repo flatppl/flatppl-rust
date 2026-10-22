@@ -135,3 +135,36 @@ fn a_truncated_integer_law_is_gated_at_an_integer_witness() {
         "{source}"
     );
 }
+
+#[test]
+fn discrete_named_set_normalizers_reduce_to_their_atom_ranges() {
+    // On integer atoms posreals and posintegers hold 1, 2, ..., so Z = 1 - P(0).
+    for set in ["posreals", "posintegers"] {
+        let source = lower(&format!(
+            "rate = external(posreals)\ninputs = rate\n\
+             outputs = logdensityof(normalize(truncate(Poisson(rate), {set})), 2)"
+        ));
+        assert!(
+            source.contains("expm1") && source.contains(&poisson_atom(0)),
+            "{set}: {source}"
+        );
+        assert!(!source.contains(&poisson_atom(1)), "{set}: {source}");
+    }
+    // nonnegreals and nonnegintegers hold every atom of a count law: Z = 1.
+    for set in ["nonnegreals", "nonnegintegers"] {
+        let source = lower(&format!(
+            "rate = external(posreals)\ninputs = rate\n\
+             outputs = logdensityof(normalize(truncate(Poisson(rate), {set})), 2)"
+        ));
+        assert!(
+            !source.contains("logsumexp") && !source.contains("expm1"),
+            "{set}: {source}"
+        );
+    }
+    // A finite law lists its kept atoms: Categorical0 keeps 1 and 2.
+    let source = lower(
+        "outputs = logdensityof(normalize(truncate(Categorical0(p = [0.2, 0.3, 0.5]), \
+         posintegers)), 2)",
+    );
+    assert!(source.contains("logsumexp"), "{source}");
+}

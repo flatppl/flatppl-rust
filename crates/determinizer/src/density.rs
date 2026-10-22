@@ -4142,6 +4142,21 @@ fn lower_normalize(
         }
     };
 
+    if let Some((base, lo, hi)) = truncate_shape
+        && let Some(log_z) = integral::positive_count_log_mass(m, base, lo, hi)
+    {
+        let density = lower_measure_density(m, m_inner, v)?;
+        return Ok(normalized_logdensity(m, density, log_z));
+    }
+    // A discrete law keeps the atoms of S, a static interval or a §03 named set.
+    if let Some((base, lo, hi)) = integral::discrete_truncate(m, m_inner_resolved)
+        && let Some(log_z) = integral::discrete_log_mass(m, base, lo, hi)
+    {
+        let density =
+            lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
+        return Ok(build_call(m, "sub", &[density, log_z]));
+    }
+
     if non_interval_truncation_set {
         return Err(RefuseError {
             node,
@@ -4153,10 +4168,6 @@ fn lower_normalize(
     }
 
     if let Some((base, lo, hi)) = truncate_shape {
-        if let Some(log_z) = integral::positive_count_log_mass(m, base, lo, hi) {
-            let density = lower_measure_density(m, m_inner, v)?;
-            return Ok(normalized_logdensity(m, density, log_z));
-        }
         // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
         // totalmass(truncate(base, S))` (§06 "Density of composed measures", the
         // `normalize` rule `Z = totalmass(M)`) holds ONLY when `base` is a
@@ -4215,18 +4226,6 @@ fn lower_normalize(
             let density =
                 lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?; // truncate handles the -inf gate
             let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
-            return Ok(build_call(m, "sub", &[density, log_z]));
-        }
-        let base_discrete = matches!(
-            base_ty,
-            Some(Type::Measure { domain, mass: Mass::Normalized })
-                if matches!(**domain, Type::Scalar(ScalarType::Integer))
-        );
-        if base_discrete
-            && let Some(log_z) = integral::discrete_interval_log_mass(m, base_resolved, lo, hi)
-        {
-            let density =
-                lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
             return Ok(build_call(m, "sub", &[density, log_z]));
         }
         if base_normalized {
@@ -7372,7 +7371,7 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
 
     // A discrete law restricted to an interval keeps the atoms inside it.
     if let Some((base, lo, hi)) = integral::discrete_truncate(m, node) {
-        let log_mass = integral::discrete_interval_log_mass(m, base, lo, hi)?;
+        let log_mass = integral::discrete_log_mass(m, base, lo, hi)?;
         return Some(build_call(m, "exp", &[log_mass]));
     }
 

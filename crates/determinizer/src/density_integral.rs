@@ -298,11 +298,10 @@ enum KeptAtoms {
     From(i64),
 }
 
-/// The atoms of `truncate(base, interval(lo, hi))` for a discrete `base` with
-/// static bounds, or None when a listed set or the atoms below an unbounded end
-/// would exceed [`crate::marginal::MAX_ATOMS`].
-fn kept_atoms(m: &mut Module, base: NodeId, lo: NodeId, hi: NodeId) -> Option<KeptAtoms> {
-    let (lo, hi) = (static_real(m, lo)?, static_real(m, hi)?);
+/// The atoms of a discrete `base` in the closed range [lo, hi], or None when a
+/// listed set or the atoms below an unbounded end would exceed
+/// [`crate::marginal::MAX_ATOMS`].
+fn kept_atoms(m: &mut Module, base: NodeId, lo: f64, hi: f64) -> Option<KeptAtoms> {
     if lo.is_nan() || hi.is_nan() {
         return None;
     }
@@ -330,26 +329,43 @@ fn kept_atoms(m: &mut Module, base: NodeId, lo: NodeId, hi: NodeId) -> Option<Ke
         .then(|| KeptAtoms::Listed((first as i64..=last as i64).collect()))
 }
 
-/// The (base, lo, hi) of `truncate(<discrete law>, interval(lo, hi))`.
-pub(super) fn discrete_truncate(m: &Module, node: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+/// The closed range of integer atoms a truncation set holds: a static
+/// `interval(lo, hi)`, or a §03 named set. On integer atoms `posreals` (0, inf]
+/// holds the same atoms as [1, inf].
+fn integer_set_range(m: &Module, set: NodeId) -> Option<(f64, f64)> {
+    let (set, _) = resolve_ref_one(m, set);
+    if let Some(interval) = expect_builtin_call(m, set, "interval").filter(|c| c.args.len() == 2) {
+        return Some((
+            static_real(m, interval.args[0])?,
+            static_real(m, interval.args[1])?,
+        ));
+    }
+    let Node::Const(name) = m.node(set) else {
+        return None;
+    };
+    match m.resolve(*name) {
+        "reals" | "integers" => Some((f64::NEG_INFINITY, f64::INFINITY)),
+        "posreals" | "posintegers" => Some((1.0, f64::INFINITY)),
+        "nonnegreals" | "nonnegintegers" => Some((0.0, f64::INFINITY)),
+        "unitinterval" => Some((0.0, 1.0)),
+        _ => None,
+    }
+}
+
+/// The base and the closed atom range of `truncate(<discrete law>, S)`.
+pub(super) fn discrete_truncate(m: &Module, node: NodeId) -> Option<(NodeId, f64, f64)> {
     let call = expect_builtin_call(m, node, "truncate").filter(|c| c.args.len() == 2)?;
     let (base, set) = (call.args[0], call.args[1]);
-    let (set, _) = resolve_ref_one(m, set);
-    let interval = expect_builtin_call(m, set, "interval").filter(|c| c.args.len() == 2)?;
+    let (lo, hi) = integer_set_range(m, set)?;
     let (base, _) = resolve_ref_chain(m, base);
     matches!(m.type_of(base), Some(Type::Measure { domain, .. })
         if matches!(**domain, Type::Scalar(ScalarType::Integer)))
-    .then_some((base, interval.args[0], interval.args[1]))
+    .then_some((base, lo, hi))
 }
 
-/// log M(S) for a discrete law M restricted to `interval(lo, hi)`. An unbounded
-/// upper end keeps 1 - P(X < lo), so only the atoms below lo are summed.
-pub(super) fn discrete_interval_log_mass(
-    m: &mut Module,
-    base: NodeId,
-    lo: NodeId,
-    hi: NodeId,
-) -> Option<NodeId> {
+/// log M([lo, hi]) for a discrete law M. An unbounded upper end keeps
+/// 1 - P(X < lo), so only the atoms below lo are summed.
+pub(super) fn discrete_log_mass(m: &mut Module, base: NodeId, lo: f64, hi: f64) -> Option<NodeId> {
     let (base, _) = resolve_ref_chain(m, base);
     match kept_atoms(m, base, lo, hi)? {
         KeptAtoms::Listed(atoms) => log_pmf_sum(m, base, atoms),
@@ -409,7 +425,7 @@ fn discrete_truncate_expectation(
             let coordinate = point(m);
             match conditional(m, coordinate) {
                 Ok(unit) if matches!(m.node(unit), Node::Lit(Scalar::Real(0.0))) => {
-                    discrete_interval_log_mass(m, base, lo, hi).map(Ok)
+                    discrete_log_mass(m, base, lo, hi).map(Ok)
                 }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
