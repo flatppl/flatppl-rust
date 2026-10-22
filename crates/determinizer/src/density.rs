@@ -4217,6 +4217,18 @@ fn lower_normalize(
             let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
             return Ok(build_call(m, "sub", &[density, log_z]));
         }
+        let base_discrete = matches!(
+            base_ty,
+            Some(Type::Measure { domain, mass: Mass::Normalized })
+                if matches!(**domain, Type::Scalar(ScalarType::Integer))
+        );
+        if base_discrete
+            && let Some(log_z) = integral::discrete_interval_log_mass(m, base_resolved, lo, hi)
+        {
+            let density =
+                lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
+            return Ok(build_call(m, "sub", &[density, log_z]));
+        }
         if base_normalized {
             // Normalized but NOT univariate continuous — a discrete base
             // (`Binomial`/`Poisson`/`Categorical`, `domain = Scalar(Integer)`) or a
@@ -4234,9 +4246,9 @@ fn lower_normalize(
                 construct: "normalize".to_string(),
                 reason: "normalize(truncate): closed-form Z via builtin_touniform is only \
                          defined for a univariate continuous base (touniform is the CDF only \
-                         there, §07); a discrete or multivariate base needs a different \
-                         closed-form Z (e.g. a CMF / finite-support sum), which is not yet \
-                         implemented"
+                         there, §07); a discrete base needs static interval bounds that leave \
+                         at most 256 atoms to sum, and a multivariate base has no closed-form \
+                         Z yet"
                     .to_string(),
             });
         }
@@ -5063,7 +5075,15 @@ fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<N
         _ => flatppl_infer::infer_expression_support(m, measure)?,
     };
     let w = crate::invert::support_witness(&support)?;
-    let scalar = m.alloc(Node::Lit(Scalar::Real(w)));
+    // An integer variate takes an integer witness: a kernel such as Categorical
+    // accepts only integer observations.
+    let integer = matches!(&ty, Type::Measure { domain, .. }
+        if matches!(**domain, Type::Scalar(ScalarType::Integer)));
+    let scalar = if integer && w.fract() == 0.0 {
+        m.alloc(Node::Lit(Scalar::Int(w as i64)))
+    } else {
+        m.alloc(Node::Lit(Scalar::Real(w)))
+    };
     match ty {
         Type::Measure { domain, .. } => match &*domain {
             Type::Scalar(_) => Some(scalar),
@@ -7348,6 +7368,12 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
     );
     if let Some(mass) = closed_form_polynomial_interval_mass(m, node) {
         return Some(mass);
+    }
+
+    // A discrete law restricted to an interval keeps the atoms inside it.
+    if let Some((base, lo, hi)) = integral::discrete_truncate(m, node) {
+        let log_mass = integral::discrete_interval_log_mass(m, base, lo, hi)?;
+        return Some(build_call(m, "exp", &[log_mass]));
     }
 
     if bounded_reference {

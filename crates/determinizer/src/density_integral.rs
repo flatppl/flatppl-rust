@@ -195,6 +195,9 @@ fn expectation(
             Ok(build_call(m, "add", &[weight, score]))
         });
     }
+    if let Some(expectation) = discrete_truncate_expectation(m, resolved, conditional) {
+        return Some(expectation);
+    }
     if builtin_name(m, resolved) == Some("Dirac") {
         if !matches!(m.type_of(resolved), Some(Type::Measure { domain, .. })
             if matches!(domain.as_ref(), Type::Scalar(_)))
@@ -284,6 +287,135 @@ pub(super) fn positive_count_log_mass(
         valid = build_call(m, "land", &[valid, admissible]);
     }
     Some(exponential_tilt::guard(m, log_mass, valid))
+}
+
+/// The atoms a discrete law keeps under `interval(lo, hi)`: the closed interval
+/// holds both ends (§06 truncate, §03 interval).
+enum KeptAtoms {
+    /// These atoms, listed.
+    Listed(Vec<i64>),
+    /// Every atom of a count law from `.0` on: the set's upper end is unbounded.
+    From(i64),
+}
+
+/// The atoms of `truncate(base, interval(lo, hi))` for a discrete `base` with
+/// static bounds, or None when a listed set or the atoms below an unbounded end
+/// would exceed [`crate::marginal::MAX_ATOMS`].
+fn kept_atoms(m: &mut Module, base: NodeId, lo: NodeId, hi: NodeId) -> Option<KeptAtoms> {
+    let (lo, hi) = (static_real(m, lo)?, static_real(m, hi)?);
+    if lo.is_nan() || hi.is_nan() {
+        return None;
+    }
+    let inside = |k: i64| lo <= k as f64 && k as f64 <= hi;
+    if let Some(atoms) = crate::marginal::classify_atoms(m, base) {
+        return Some(KeptAtoms::Listed(
+            atoms.into_iter().filter(|&k| inside(k)).collect(),
+        ));
+    }
+    let (constructor, _) = split_kernel_constructor(m, base)?;
+    if !matches!(
+        m.resolve(constructor),
+        "Poisson" | "Geometric" | "NegativeBinomial" | "NegativeBinomial2"
+    ) {
+        return None;
+    }
+    // Count laws live on the nonnegative integers.
+    let first = lo.ceil().max(0.0);
+    if hi == f64::INFINITY {
+        return (first <= crate::marginal::MAX_ATOMS as f64)
+            .then_some(KeptAtoms::From(first as i64));
+    }
+    let last = hi.floor();
+    (first <= last && last - first < crate::marginal::MAX_ATOMS as f64)
+        .then(|| KeptAtoms::Listed((first as i64..=last as i64).collect()))
+}
+
+/// The (base, lo, hi) of `truncate(<discrete law>, interval(lo, hi))`.
+pub(super) fn discrete_truncate(m: &Module, node: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+    let call = expect_builtin_call(m, node, "truncate").filter(|c| c.args.len() == 2)?;
+    let (base, set) = (call.args[0], call.args[1]);
+    let (set, _) = resolve_ref_one(m, set);
+    let interval = expect_builtin_call(m, set, "interval").filter(|c| c.args.len() == 2)?;
+    let (base, _) = resolve_ref_chain(m, base);
+    matches!(m.type_of(base), Some(Type::Measure { domain, .. })
+        if matches!(**domain, Type::Scalar(ScalarType::Integer)))
+    .then_some((base, interval.args[0], interval.args[1]))
+}
+
+/// log M(S) for a discrete law M restricted to `interval(lo, hi)`. An unbounded
+/// upper end keeps 1 - P(X < lo), so only the atoms below lo are summed.
+pub(super) fn discrete_interval_log_mass(
+    m: &mut Module,
+    base: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+) -> Option<NodeId> {
+    let (base, _) = resolve_ref_chain(m, base);
+    match kept_atoms(m, base, lo, hi)? {
+        KeptAtoms::Listed(atoms) => log_pmf_sum(m, base, atoms),
+        KeptAtoms::From(0) => Some(m.alloc(Node::Lit(Scalar::Real(0.0)))),
+        KeptAtoms::From(first) => {
+            let excluded = log_pmf_sum(m, base, (0..first).collect())?;
+            // expm1 keeps the mass when nearly all of it lies below lo.
+            let difference = build_call(m, "expm1", &[excluded]);
+            let mass = build_call(m, "neg", &[difference]);
+            Some(build_call(m, "log", &[mass]))
+        }
+    }
+}
+
+/// log Σ_k pmf(k) over the given atoms; None when there are none.
+fn log_pmf_sum(m: &mut Module, base: NodeId, atoms: Vec<i64>) -> Option<NodeId> {
+    if atoms.is_empty() {
+        return None;
+    }
+    let mut terms = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let point = m.alloc(Node::Lit(Scalar::Int(atom)));
+        terms.push(lower_measure_density(m, base, point).ok()?);
+    }
+    let terms = build_call(m, "vector", &terms);
+    Some(build_call(m, "logsumexp", &[terms]))
+}
+
+/// The expectation over `truncate(<discrete law>, interval)`: a sum over the
+/// kept atoms. An unbounded set is summable only for the unit integrand.
+fn discrete_truncate_expectation(
+    m: &mut Module,
+    node: NodeId,
+    conditional: &mut dyn FnMut(&mut Module, NodeId) -> Result<NodeId, RefuseError>,
+) -> Option<Result<NodeId, RefuseError>> {
+    let (base, lo, hi) = discrete_truncate(m, node)?;
+    match kept_atoms(m, base, lo, hi)? {
+        KeptAtoms::Listed(atoms) => Some((|| {
+            let mut terms = Vec::with_capacity(atoms.len());
+            for atom in atoms {
+                let point = m.alloc(Node::Lit(Scalar::Int(atom)));
+                let score = conditional(m, point)?;
+                let mass = lower_measure_density(m, base, point)?;
+                terms.push(build_call(m, "add", &[score, mass]));
+            }
+            if terms.is_empty() {
+                return Err(refuse(
+                    node,
+                    m,
+                    "the truncation set holds no atom of the law",
+                ));
+            }
+            let terms = build_call(m, "vector", &terms);
+            Ok(build_call(m, "logsumexp", &[terms]))
+        })()),
+        KeptAtoms::From(_) => {
+            let coordinate = point(m);
+            match conditional(m, coordinate) {
+                Ok(unit) if matches!(m.node(unit), Node::Lit(Scalar::Real(0.0))) => {
+                    discrete_interval_log_mass(m, base, lo, hi).map(Ok)
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+    }
 }
 
 /// Keep one interval error budget when the target cannot emit the exact CDF.

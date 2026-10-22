@@ -112,40 +112,27 @@ lp = logdensityof(d, [0.5, -0.3])";
     );
 }
 
-// `normalize(truncate(Binomial, interval(lo, hi)))` — the base is NORMALIZED
-// (a probability measure) but DISCRETE (`domain = Scalar(Integer)`). The CDF-Z
-// path `Z = touniform(base, hi) − touniform(base, lo)` is NOT valid here:
-// `builtin_touniform` is the CDF `F` only for a univariate CONTINUOUS kernel
-// (§07 "measure-eval-prims"), and use of the transport on a non-continuous kernel
-// is an undefined transport / static error — plus `Z = F(hi) − F(lo)` is a
-// univariate-continuous identity regardless. The OLD gate keyed only on
-// `base.mass == Normalized`, so it WRONGLY admitted this discrete base and
-// emitted `builtin_touniform(Binomial, …)` — an undefined transport that still
-// passes `is_flatpdl` (a silent mislowering). The tightened gate additionally
-// requires `domain = Scalar(Real)`, so a normalized discrete base now refuses.
-// This refuse is DISTINCT from the unnormalized-base one (a discrete-truncation
-// closed-form Z — e.g. a CMF / finite-support sum — is a legitimate future
-// follow-on, not an invalid model), so it names the univariate-continuous
-// restriction rather than "unnormalized".
+// `normalize(truncate(<discrete base>, interval(lo, hi)))` sums the pmf over the
+// atoms in the interval. `builtin_touniform` is the CDF only for a univariate
+// continuous kernel (§07 "measure-eval-prims"), so a discrete base never takes the
+// CDF-Z path. A sum longer than the enumeration cap refuses instead of emitting a
+// thousand-term logsumexp, and names the cap rather than the continuous restriction.
 #[test]
-fn normalize_truncate_discrete_base_refuses() {
+fn normalize_truncate_discrete_base_beyond_the_atom_cap_refuses() {
     let src = "\
-d = normalize(truncate(Binomial(n = 10, p = 0.5), interval(2, 8)))
+d = normalize(truncate(Poisson(rate = 3.0), interval(0, 1000)))
 lp = logdensityof(d, 5)";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err(
-        "normalize(truncate(<normalized discrete base>, …)) must refuse (touniform is CDF only \
-         for univariate continuous), not emit an undefined builtin_touniform transport",
+        "a 1001-atom normalizer must refuse, not emit an undefined builtin_touniform transport",
     );
     assert!(
         err.construct.contains("normalize"),
         "refusal names normalize: {err:?}"
     );
-    // Distinct from the unnormalized-base refuse: it names the univariate-continuous
-    // restriction (touniform = CDF only there), not "unnormalized".
     assert!(
-        err.reason.contains("univariate continuous") && err.reason.contains("touniform"),
-        "refusal explains the univariate-continuous-only touniform restriction: {err:?}"
+        err.reason.contains("at most 256 atoms"),
+        "refusal names the atom cap: {err:?}"
     );
     assert!(
         !err.reason.contains("unnormalized"),

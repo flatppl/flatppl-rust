@@ -54,3 +54,84 @@ fn positive_count_normalization_survives_callback_and_text_round_trip() {
     let mut reparsed = flatppl_syntax::parse(&source).unwrap();
     assert!(flatppl_infer::infer(&mut reparsed).is_empty());
 }
+
+fn lower(source: &str) -> String {
+    let mut model = flatppl_syntax::parse(source).unwrap();
+    assert!(flatppl_infer::infer(&mut model).is_empty());
+    let lowered = determinize(&model).unwrap();
+    is_flatpdl(&lowered).unwrap();
+    let printed = flatppl_syntax::print(&lowered);
+    let mut reparsed = flatppl_syntax::parse(&printed).unwrap();
+    assert!(flatppl_infer::infer(&mut reparsed).is_empty(), "{printed}");
+    printed
+}
+
+fn poisson_atom(k: i64) -> String {
+    format!("builtin_logdensityof(Poisson, record(rate = rate), {k})")
+}
+
+#[test]
+fn discrete_interval_normalizer_sums_the_atoms_on_both_closed_ends() {
+    // §03 interval(lo, hi) is closed, so Z keeps the atoms at 2 and at 4.
+    let source = lower(
+        "rate = external(posreals)\ninputs = rate\n\
+         outputs = logdensityof(normalize(truncate(Poisson(rate), interval(2, 4))), 3)",
+    );
+    assert!(!source.contains("builtin_touniform"), "{source}");
+    for k in 2..=4 {
+        assert!(
+            source.contains(&poisson_atom(k)),
+            "atom {k} missing: {source}"
+        );
+    }
+    for k in [1, 5] {
+        assert!(
+            !source.contains(&poisson_atom(k)),
+            "atom {k} is outside: {source}"
+        );
+    }
+}
+
+#[test]
+fn discrete_upper_tail_normalizer_removes_the_atoms_below_the_lower_end() {
+    // interval(2.5, inf) keeps 3, 4, ...: Z = 1 - P(0) - P(1) - P(2).
+    let source = lower(
+        "rate = external(posreals)\ninputs = rate\n\
+         outputs = logdensityof(normalize(truncate(Poisson(rate), interval(2.5, inf))), 3)",
+    );
+    assert!(source.contains("expm1"), "{source}");
+    for k in 0..=2 {
+        assert!(
+            source.contains(&poisson_atom(k)),
+            "atom {k} missing: {source}"
+        );
+    }
+    assert!(!source.contains(&poisson_atom(3)), "{source}");
+}
+
+#[test]
+fn discrete_truncate_masses_reach_a_mixture_normalizer() {
+    let source = lower(
+        "rate = external(posreals)\ninputs = rate\n\
+         outputs = logdensityof(normalize(superpose(\
+           weighted(0.3, truncate(Poisson(rate), interval(0, 5))),\
+           weighted(0.7, truncate(Binomial(n = 10, p = 0.3), interval(3, 10))))), 4)",
+    );
+    assert!(
+        source.contains(&poisson_atom(0)) && source.contains(&poisson_atom(5)),
+        "{source}"
+    );
+}
+
+#[test]
+fn a_truncated_integer_law_is_gated_at_an_integer_witness() {
+    // A Categorical kernel accepts only integer observations.
+    let source = lower(
+        "outputs = logdensityof(normalize(truncate(Categorical(p = [0.2, 0.3, 0.5]), \
+         interval(1, 2))), 1)",
+    );
+    assert!(
+        source.contains("ifelse(1 in interval(1, 2), 1, 1)"),
+        "{source}"
+    );
+}
