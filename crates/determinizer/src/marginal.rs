@@ -78,7 +78,7 @@ use flatppl_core::{
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
 /// determiniser emits one density sub-tree per atom). A finite but large latent
 /// is treated as non-enumerable.
-const MAX_ATOMS: i64 = 256;
+pub(crate) const MAX_ATOMS: i64 = 256;
 
 /// Lower `logdensityof(kchain(M, K), v)` at the `kchain` node `node` to a
 /// deterministic mass-weighted `logsumexp`, or refuse.
