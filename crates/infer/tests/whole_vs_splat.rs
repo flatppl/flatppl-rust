@@ -175,3 +175,55 @@ fn a_splatted_prior_variate_names_only_inputs() {
         ],
     );
 }
+
+#[test]
+fn the_keyword_form_chain_applies_the_same_rule() {
+    // The previous component's record variate is bound whole to a one-input step.
+    assert_refused(
+        "sigma = draw(Exponential(rate = 1.0))\n\
+         s = elementof(reals)\n\
+         reference = Normal(mu = 0.0, sigma = s)\n\
+         jc = jointchain(prior = lawof(record(sigma = sigma)), fwd = functionof(reference, sigma = s))\n",
+        &[
+            "jointchain",
+            "step 1",
+            "cannot unify",
+            "record(sigma: real)",
+            "expects real",
+        ],
+    );
+    // A scalar variate feeds a one-input step as it is.
+    assert_clean(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)\n\
+         j = jointchain(first = lawof(a), second = k)\n",
+    );
+    // A record splats over a keyword-only step's inputs, and every field names one.
+    assert_refused(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = elementof(reals)\n\
+         k = functionof(Normal(mu = b, sigma = 1.0))\n\
+         j = jointchain(first = lawof(record(c = a)), second = k)\n",
+        &["jointchain", "step 1", "no input for field `c`"],
+    );
+}
+
+const JOINT_LIKELIHOOD: &str = "\
+mu = elementof(reals)
+model1 = functionof(Normal(mu = mu, sigma = 1.0))
+model2 = functionof(Normal(mu = 2.0 * mu, sigma = 0.5))
+L = joint_likelihood(likelihoodof(model1, 1.5), likelihoodof(model2, 3.2))
+";
+
+#[test]
+fn a_joint_likelihood_splats_its_point_over_the_union_of_inputs() {
+    // §06: `joint_likelihood` is `likelihoodof(joint(K1, K2), obs)`, and a `joint`
+    // of kernels takes keyword arguments only, so the point always splats.
+    assert_clean(&format!(
+        "{JOINT_LIKELIHOOD}lp = logdensityof(L, record(mu = 0.3))\n"
+    ));
+    assert_refused(
+        &format!("{JOINT_LIKELIHOOD}lp = logdensityof(L, record(mu = 0.3, c = 1.0))\n"),
+        &["logdensityof", "splatted", "`mu`", "no input named `c`"],
+    );
+}

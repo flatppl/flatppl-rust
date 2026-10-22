@@ -16,7 +16,8 @@ use flatppl_core::{CallHead, Dim, Node, NodeId, RefNs, Symbol, Type};
 
 use crate::callable::{Interface, interface};
 use crate::ops::{
-    ArgInfo, cat_compose, component_variate, input_entries, local_reification, resolve_binding_refs,
+    ArgInfo, NamedInfo, cat_compose, component_variate, input_entries, local_reification,
+    resolve_binding_refs,
 };
 use crate::trace::Inferencer;
 
@@ -212,9 +213,38 @@ pub(crate) fn refuse_bad_likelihood_point(
         return None;
     }
     let at = args[1].0;
-    let interface = interface(inf, *likelihood)?;
-    let kernel = likelihood_kernel(inf, *likelihood)?;
+    let (interface, kernel) = match interface(inf, *likelihood) {
+        Some(interface) => (interface, likelihood_kernel(inf, *likelihood)),
+        None => (joint_likelihood_interface(inf, &args[0])?, None),
+    };
     check_point(inf, name, what, at, kernel, &interface, &point_ty)
+}
+
+/// `joint_likelihood(L1, L2, ...)` is `likelihoodof(joint(K1, K2, ...), obs)`
+/// (spec §06 "Combining likelihoods"). A `joint` of kernels takes "the union of
+/// the component kernels' inputs by name, so the result only supports keyword
+/// arguments" (§06 "Joint measures"), so its point always splats over that union.
+fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) -> Option<Interface> {
+    let node = resolve_binding_refs(inf, likelihood.0);
+    let Node::Call(call) = inf.module.node(node) else {
+        return None;
+    };
+    let CallHead::Builtin(op) = call.head else {
+        return None;
+    };
+    if inf.module.resolve(op) != "joint_likelihood" {
+        return None;
+    }
+    let Type::Likelihood { inputs, .. } = &likelihood.1 else {
+        return None;
+    };
+    Some(Interface::required(
+        inputs
+            .iter()
+            .map(|n| inf.module.resolve(*n).to_string())
+            .collect(),
+        false,
+    ))
 }
 
 fn check_point(
@@ -222,12 +252,12 @@ fn check_point(
     name: &str,
     what: &str,
     at: NodeId,
-    kernel: NodeId,
+    kernel: Option<NodeId>,
     interface: &Interface,
     point: &Type,
 ) -> Option<Type> {
     if interface.takes_one() {
-        let declared = declared_input_types(inf, kernel);
+        let declared = kernel.map_or_else(Vec::new, |k| declared_input_types(inf, k));
         let mismatch = whole_binding_mismatch(inf, &interface.names, &declared, point)?;
         let adapter = if is_aggregate(point) {
             let first = interface.names.first().map_or("x", String::as_str);
@@ -278,9 +308,15 @@ fn check_point(
     ))
 }
 
-/// Check each step of a positional `kchain` or `jointchain` against the value
-/// the chain feeds it: the `cat` of every variate to its left (spec §06
-/// "Dependent composition").
+/// Check each step of a `kchain` or `jointchain` against the value the chain
+/// feeds it: the `cat` of every variate to its left (spec §06 "Dependent
+/// composition").
+///
+/// The keyword form `jointchain(name1 = M, name2 = K1, ...)` is `jointchain` of
+/// `relabel`led components (§06), whose variates bind by name. The check feeds a
+/// step the previous component's variate itself rather than a `cat`, as
+/// flatppl-js does: §06 does not say what `relabel` makes of a scalar variate,
+/// so no record of labels is assumed.
 ///
 /// A step taking one positional input receives that value whole and the input's
 /// declared domain must admit it. Any other step splats a record, whose fields
@@ -289,12 +325,27 @@ pub(crate) fn refuse_bad_chain_boundary(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
+    named: &[NamedInfo],
 ) -> Option<Type> {
-    if !matches!(name, "kchain" | "jointchain") || args.len() < 2 {
+    if !matches!(name, "kchain" | "jointchain") {
         return None;
     }
-    let mut variates: Vec<Type> = Vec::with_capacity(args.len());
-    for (index, (node, ty, _)) in args.iter().enumerate() {
+    // Keyword form `jointchain(name1 = M, name2 = K1, ...)`: the components are
+    // the keyword values. Its fed value is the previous component's variate, not
+    // the `cat` of all of them (see the doc comment).
+    let labelled = args.is_empty() && !named.is_empty() && name == "jointchain";
+    let steps: Vec<(NodeId, &Type)> = if labelled {
+        named.iter().map(|(_, node, ty, _)| (*node, ty)).collect()
+    } else if named.is_empty() {
+        args.iter().map(|(node, ty, _)| (*node, ty)).collect()
+    } else {
+        return None;
+    };
+    if steps.len() < 2 {
+        return None;
+    }
+    let mut variates: Vec<Type> = Vec::with_capacity(steps.len());
+    for (index, (node, ty)) in steps.iter().enumerate() {
         if index > 0
             && matches!(ty, Type::Kernel { .. })
             && let Some(interface) = interface(inf, *node)
@@ -302,6 +353,7 @@ pub(crate) fn refuse_bad_chain_boundary(
             // One variate to the left is fed as it is; two or more are `cat`ed.
             let fed = match variates.as_slice() {
                 [only] => only.clone(),
+                [.., last] if labelled => last.clone(),
                 _ => cat_compose(&variates),
             };
             if !matches!(fed, Type::Deferred)
