@@ -1092,17 +1092,24 @@ fn normalize_keyword_args(
         args,
         named,
         cat.base_takes_aggregate_whole(name),
+        true,
     )
 }
 
 /// Return arguments in declared order when a keyword or aggregate spelling
 /// needs normalization. Plain positional calls keep their original vector.
+///
+/// A sole positional record or table binds by field name. A sole positional tuple
+/// of an `ordered` callable binds by position, each element a positional argument
+/// (spec §04 "Calling conventions"). A callable that accepts a lone positional
+/// argument (`takes_one`) receives the aggregate whole, so nothing is normalized.
 fn normalize_arguments(
     module: &flatppl_core::Module,
     declared: &[String],
     args: &[ArgInfo],
     named: &[NamedInfo],
     takes_one: bool,
+    ordered: bool,
 ) -> Option<Vec<ArgInfo>> {
     let mut slots: Vec<Option<ArgInfo>> = Vec::new();
     if named.is_empty() {
@@ -1111,11 +1118,6 @@ fn normalize_arguments(
         }
         let [(node, ty, phase)] = args else {
             return None;
-        };
-        let (fields, rows) = match ty {
-            Type::Record(fields) => (fields.as_ref(), None),
-            Type::Table { columns, nrows } => (columns.as_ref(), Some(*nrows)),
-            _ => return None,
         };
         let mut source = *node;
         for _ in 0..module.node_count() {
@@ -1130,6 +1132,41 @@ fn normalize_arguments(
             };
             source = module.binding(binding).rhs;
         }
+        if let Type::Tuple(parts) = ty {
+            if !ordered {
+                return None;
+            }
+            // A written `(a, b, …)` binds each element's own node; any other tuple
+            // value binds the projection, typed by its element.
+            let literal = match module.node(source) {
+                Node::Call(call)
+                    if matches!(call.head, CallHead::Builtin(head) if module.resolve(head) == "tuple")
+                        && call.args.len() == parts.len()
+                        && call.named.is_empty() =>
+                {
+                    Some(&call.args)
+                }
+                _ => None,
+            };
+            return Some(
+                parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| {
+                        (
+                            literal.map_or(*node, |elements| elements[i]),
+                            part.clone(),
+                            *phase,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        let (fields, rows) = match ty {
+            Type::Record(fields) => (fields.as_ref(), None),
+            Type::Table { columns, nrows } => (columns.as_ref(), Some(*nrows)),
+            _ => return None,
+        };
         for (sym, ty) in fields {
             let pos = declared
                 .iter()
@@ -5236,7 +5273,7 @@ fn user_arity_check(
         return module_member_arity_check(inf, id, callee, &sig, args, named);
     }
     let interface = crate::callable::interface(inf, callee)?;
-    let reading = arg_reading(inf, args, named, interface.takes_one())?;
+    let reading = arg_reading(inf, args, named, interface.takes_one(), interface.ordered)?;
     let who = match inf.module.node(callee) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => format!("`{}`", inf.module.resolve(r.name)),
         _ => "callable".to_string(),
@@ -5279,7 +5316,7 @@ fn user_arity_check(
                 )
             });
     }
-    let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    let hint = reading.hint();
     let count = interface.arity.min;
     let parameters = if count == 1 {
         "parameter"
@@ -5336,7 +5373,7 @@ fn module_member_arity_check(
     named: &[NamedInfo],
 ) -> Option<Type> {
     let arity = crate::catalogue::sig_arity(sig)?;
-    let reading = arg_reading(inf, args, named, arity.admits(1))?;
+    let reading = arg_reading(inf, args, named, arity.admits(1), true)?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) => match r.ns {
@@ -5358,7 +5395,7 @@ fn module_member_arity_check(
             .or_else(|| missing_required_args(inf, id, &names, arity.min, &reading, args, named));
     }
     let declared = arity.describe();
-    let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    let hint = reading.hint();
     inf.diags.push(crate::Diagnostic::error_at(
         id,
         format!("{who} takes {declared} (spec §09), got {got}{hint}"),
@@ -5462,6 +5499,7 @@ fn user_call_type(
                 args,
                 named,
                 interface.takes_one(),
+                interface.ordered,
             )
         });
         return Ready(catalogue_call_type(
@@ -5837,6 +5875,7 @@ fn substituted_result(
             args,
             named,
             interface.takes_one(),
+            interface.ordered,
         ) {
         normalized = bound;
         normalized.as_slice()
@@ -6570,7 +6609,7 @@ fn arity_check(
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
     let arity = cat.base_arity(name)?;
-    let reading = arg_reading(inf, args, named, cat.base_takes_aggregate_whole(name))?;
+    let reading = arg_reading(inf, args, named, cat.base_takes_aggregate_whole(name), true)?;
     let got = reading.count;
     // A splat onto a row whose variadic inputs are UNNAMED can never bind, whatever the
     // count, so this precedes the arity comparison: with a fitting column count the arity
@@ -6602,7 +6641,7 @@ fn arity_check(
     let declared = arity.describe();
     // `got` is the SPLAT count on a splatting call, so the author sees a number
     // larger than the arguments they wrote — say where it came from.
-    let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    let hint = reading.hint();
     inf.diags.push(crate::Diagnostic::error_at(
         id,
         format!("`{name}` takes {declared} (spec {section}), got {got}{hint}"),
@@ -7836,47 +7875,76 @@ const SPLAT_HINT: &str = " — this sole positional record or table splatted int
                           argument names; to pass it as one ordinary argument use \
                           the keyword spelling, as in `f(pars = record(...))`";
 
+/// Explain the positional reading when a tuple is spread over an ordered callable.
+const TUPLE_SPLAT_HINT: &str = " — this sole positional tuple splatted into one positional \
+                               argument per element (spec §04), because the callable does \
+                               not accept a lone positional argument";
+
 /// How a call's arguments read against a declared parameter count.
 struct ArgReading {
     /// The argument count the reading supplies.
     count: usize,
-    /// True when the call auto-splats a sole positional record or table, so that
-    /// argument's FIELD names — not the keyword names — are what bind.
+    /// True when the call auto-splats a sole positional record, table or tuple,
+    /// so that argument's FIELD names (record, table) or ELEMENTS (tuple) are what
+    /// bind, not the keyword names.
     splatting: bool,
+    /// True when the splatted argument is a tuple, which binds by position.
+    tuple: bool,
 }
 
-/// Select the whole-object or named reading from the input interface alone.
-/// An unresolved argument type defers a possible spread, never changes the
-/// interface's decision after a domain check fails.
+impl ArgReading {
+    /// Explain the spread reading only when this call actually spreads its argument.
+    fn hint(&self) -> &'static str {
+        if self.tuple {
+            TUPLE_SPLAT_HINT
+        } else if self.splatting {
+            SPLAT_HINT
+        } else {
+            ""
+        }
+    }
+}
+
+/// Select the whole-object or spread reading from the input interface alone
+/// (spec §04 "Calling conventions"). A callable that accepts a lone positional
+/// argument (`takes_aggregate_whole`) receives a record, table or tuple whole.
+/// Otherwise a record or table splats by name, and a tuple splats by position when
+/// the callable has `ordered` inputs. An unresolved argument type defers a
+/// possible spread, never changes the interface's decision after a domain check
+/// fails.
 fn arg_reading(
     inf: &Inferencer<'_, '_>,
     args: &[ArgInfo],
     named: &[NamedInfo],
     takes_aggregate_whole: bool,
+    ordered: bool,
 ) -> Option<ArgReading> {
     let plain = args.len() + named.len();
     let plain_reading = Some(ArgReading {
         count: plain,
         splatting: false,
+        tuple: false,
     });
     if !named.is_empty() || args.len() != 1 || takes_aggregate_whole {
         return plain_reading;
     }
-    let fields = match &args[0].1 {
-        Type::Record(fields) => fields.len(),
-        Type::Table { columns, .. } => columns.len(),
+    let (count, tuple) = match &args[0].1 {
+        Type::Record(fields) => (fields.len(), false),
+        Type::Table { columns, .. } => (columns.len(), false),
+        Type::Tuple(parts) if ordered => (parts.len(), true),
         Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_)
             if matches!(inf.module.node(args[0].0), Node::Lit(_)) =>
         {
             return plain_reading;
         }
         Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => return None,
-        // Not a record or table: an ordinary sole positional argument.
+        // Not a record, table or spreadable tuple: an ordinary sole positional argument.
         _ => return plain_reading,
     };
     Some(ArgReading {
-        count: fields,
+        count,
         splatting: true,
+        tuple,
     })
 }
 
@@ -7998,7 +8066,8 @@ fn missing_required_args(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    if named.is_empty() && !reading.splatting {
+    // A tuple binds by position, so the arity check has already counted it.
+    if (named.is_empty() && !reading.splatting) || reading.tuple {
         return None;
     }
     let supplied = supplied_arg_names(inf, reading, args, named);
@@ -8060,7 +8129,7 @@ fn arg_name_check(
         None => "declares".to_string(),
     };
     // The splat is what made these field names binding, so say so.
-    let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    let hint = reading.hint();
     for (name, at) in &unknown {
         inf.diags.push(crate::Diagnostic::error_at(
             *at,

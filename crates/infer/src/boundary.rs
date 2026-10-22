@@ -284,6 +284,34 @@ fn check_point(
             format!("{name}: the {what} is bound whole").into(),
         ));
     }
+    if let Type::Tuple(parts) = point {
+        // A tuple splats into positional arguments for ordered inputs, and "tuples
+        // with fewer elements than the callable's required inputs, or more than its
+        // inputs, are a static error" (spec §04 "Calling conventions").
+        if !interface.ordered || interface.arity.admits(parts.len()) {
+            return None;
+        }
+        inf.diags.push(crate::Diagnostic::error_at(
+            at,
+            format!(
+                "`{name}`: the {what} is a tuple of {} elements splatted over the likelihood \
+                 inputs ({}), which take {} (spec §04 \"Calling conventions\": tuples with \
+                 fewer elements than the required inputs, or more than the inputs, are a \
+                 static error)",
+                parts.len(),
+                interface
+                    .names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                interface.arity.describe(),
+            ),
+        ));
+        return Some(Type::Failed(
+            format!("{name}: the {what} tuple does not fit the likelihood inputs").into(),
+        ));
+    }
     let fields = field_names(inf, point)?;
     let unknown: Vec<&str> = fields
         .iter()
