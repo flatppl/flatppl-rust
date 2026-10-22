@@ -91,7 +91,7 @@ fn scalar_row_sampling_does_not_flatten_parameter_event_axes() {
     for (ctor, params) in [
         (
             "MvNormal",
-            "mu = [[0, 0], [1, 1]], cov = [[[1, 0], [0, 1]]]",
+            "mu = [[0, 0], [1, 1]], cov = [rowstack([[1, 0], [0, 1]])]",
         ),
         ("Categorical", "p = [[0.2, 0.8], [0.6, 0.4]]"),
         ("Binomial", "n = 3, p = [0.2, 0.8]"),

@@ -110,7 +110,7 @@ fn vector_linear_tilts_keep_covariance_and_live_coefficients() {
              x = external(cartpow(reals, 2))\n\
              v = elementof(cartpow(reals, 2))\n\
              weight = functionof(sum(theta .* v) + 2, value = v)\n\
-             B = MvNormal([1, -1], [[2, 0.5], [0.5, 3]])\n\
+             B = MvNormal([1, -1], rowstack([[2, 0.5], [0.5, 3]]))\n\
              q = {law}\ninputs = (theta, x)\noutputs = logdensityof(q, x)"
         );
         compile(&source, Mode::LogDensity);

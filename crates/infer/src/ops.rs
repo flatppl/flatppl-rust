@@ -207,6 +207,9 @@ pub(crate) fn call_rule(
     if let Some(ty) = domain_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
+    if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &name, args) {
+        return Ready((ty, joined));
+    }
 
     if let Some(ty) = callback_arity_check(inf, id, &name, args) {
         return Ready((ty, joined));
@@ -6231,6 +6234,21 @@ fn broadcast_type(
         });
     }
     if let Some(cell_domain) = distribution_domain(inf, &op_name, &[], &[]) {
+        // Each element is an argument to the constructor, so a matrix parameter's
+        // element must be a matrix too.
+        let cell_args: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, t, p)| (*n, cell_arg(t), *p))
+            .collect();
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+            .collect();
+        let cells = normalize_keyword_args(inf.module, &op_name, &cell_args, &cell_named)
+            .unwrap_or(cell_args);
+        if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &op_name, &cells) {
+            return Ready(ty);
+        }
         return Ready(Type::Measure {
             domain: Box::new(Type::Array {
                 shape,
@@ -7482,6 +7500,47 @@ fn refuse_constant_outside_declared_set(
         refused = Some(which);
     }
     refused.map(|which| Type::Failed(format!("{name}: {which} is outside its declared set").into()))
+}
+
+/// Reject a vector of vectors where §08 declares a matrix parameter: `MvNormal`'s
+/// `cov`, `Wishart`'s and `InverseWishart`'s `scale` — the rank-2 entries of the
+/// catalogue's `param_ranks`.
+///
+/// §03 "Arrays": "Vectors of vectors are not interpreted as matrices implicitly,
+/// but can be turned into matrices explicitly using `rowstack` or `colstack`".
+/// So `cov = [[1.0, 0.3], [0.3, 2.0]]` is a length-2 vector whose elements are
+/// vectors, and the call is ill-typed even though its numbers would form a valid
+/// matrix. A computed argument of unknown type is not refused.
+fn refuse_vector_of_vectors_matrix(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let ranks = crate::distribution_param_ranks(name)?;
+    let names = crate::distribution_param_names(name)?;
+    let mut refused = None;
+    for (i, (node, ty, _)) in args.iter().enumerate() {
+        let vector_of_vectors = matches!(ty, Type::Array { shape, elem }
+            if shape.len() == 1 && matches!(elem.as_ref(), Type::Array { .. } | Type::TVector { .. }));
+        if ranks.get(i) != Some(&2) || !vector_of_vectors {
+            continue;
+        }
+        let which = names
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or("matrix parameter");
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`{name}`'s `{which}` must be a matrix (spec §08), but this argument is a \
+                 vector of vectors, which spec §03 \"Arrays\" does not read as a matrix; \
+                 build the matrix with `rowstack(...)` (inner vectors as rows) or \
+                 `colstack(...)` (inner vectors as columns)"
+            ),
+        ));
+        refused = Some(which.to_string());
+    }
+    refused.map(|which| Type::Failed(format!("{name}: `{which}` is a vector of vectors").into()))
 }
 
 /// The argument positions of `name` whose domain §03 "Bool" states as boolean,

@@ -49,7 +49,7 @@ fn bare_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
     for (base, point) in [
         ("iid(Normal(mu = 0.0, sigma = 1.0), 3)", "[0.5, 0.6, 0.7]"),
         (
-            "MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]])",
+            "MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]]))",
             "[0.5, 0.5]",
         ),
     ] {
@@ -81,7 +81,7 @@ fn the_scalar_inverse_is_never_applied_to_the_whole_vector() {
     // `builtin_logdensityof`, so the only `sum` in the emission is the log-det.
     for map in ["exp", "x -> broadcast(exp, x)"] {
         let out = lp(&format!(
-            "d = pushfwd({map}, MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]))\n\
+            "d = pushfwd({map}, MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))\n\
              lp = logdensityof(d, [0.5, 0.5])"
         ));
         assert!(
@@ -175,7 +175,7 @@ fn a_matrix_variate_refuses_rather_than_taking_the_scalar_derivation() {
     // is phase/type-based and accepted both. §06 case 1 names no matrix-variate
     // forward map, so refuse.
     for base in [
-        "Wishart(nu = 5.0, scale = [[1.0, 0.0], [0.0, 1.0]])",
+        "Wishart(nu = 5.0, scale = rowstack([[1.0, 0.0], [0.0, 1.0]]))",
         "LKJ(n = 2, eta = 1.5)",
     ] {
         let reason = refusal(&format!(

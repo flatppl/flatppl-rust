@@ -56,7 +56,7 @@ fn generalized_normal_converts() {
 }
 
 // ---------------------------------------------------------------------------
-// multivariate_normal_dist → MvNormal(mu=[…], cov=[[…],…])
+// multivariate_normal_dist → MvNormal(mu=[…], cov=rowstack([[…],…]))
 // ---------------------------------------------------------------------------
 
 const MVNORMAL_JSON: &str = r#"{
@@ -83,12 +83,13 @@ fn multivariate_normal_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== MvNormal ===\n{text}\n=== end ===");
 
-    // Exact body: mean vector [mv_mu0, mv_mu1], 2×2 identity covariance, both
-    // observed names in the relabel, in order.
+    // Exact body: mean vector [mv_mu0, mv_mu1], 2×2 identity covariance as a
+    // matrix (§03 reads no vector of vectors as one), both observed names in the
+    // relabel, in order.
     assert!(
         text.contains(
-            "mv_dist = relabel(MvNormal(mu = [mv_mu0, mv_mu1], cov = [[1.0, 0.0], [0.0, 1.0]]), \
-             [\"obs0\", \"obs1\"])"
+            "mv_dist = relabel(MvNormal(mu = [mv_mu0, mv_mu1], \
+             cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), [\"obs0\", \"obs1\"])"
         ),
         "MvNormal body mismatch, got:\n{text}"
     );

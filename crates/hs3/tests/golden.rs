@@ -205,7 +205,7 @@ fn golden_argus() {
 }
 
 // ---------------------------------------------------------------------------
-// multivariate_normal_dist → MvNormal(mu = [...], cov = [[...],...])
+// multivariate_normal_dist → MvNormal(mu = [...], cov = rowstack([[...],...]))
 // ---------------------------------------------------------------------------
 #[test]
 fn golden_mvnormal() {
@@ -213,7 +213,7 @@ fn golden_mvnormal() {
         "mvnormal",
         r#"{"distributions":[{"name":"mv","type":"multivariate_normal_dist","mean":["m0","m1"],"covariances":[[1.0,0.0],[0.0,1.0]],"x":["o0","o1"]}],
             "parameter_points":[{"name":"n","entries":[{"name":"m0","value":0.0},{"name":"m1","value":0.0}]}]}"#,
-        r#"mv = relabel(MvNormal(mu = [m0, m1], cov = [[1.0, 0.0], [0.0, 1.0]]), ["o0", "o1"])"#,
+        r#"mv = relabel(MvNormal(mu = [m0, m1], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])), ["o0", "o1"])"#,
     );
 }
 
