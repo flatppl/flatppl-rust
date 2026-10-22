@@ -25,7 +25,7 @@ mod tilt;
 /// `(node, type, phase)` of an inferred positional argument.
 pub(crate) type ArgInfo = (NodeId, Type, Phase);
 /// `(name, node, type, phase)` of an inferred named argument.
-type NamedInfo = (Symbol, NodeId, Type, Phase);
+pub(crate) type NamedInfo = (Symbol, NodeId, Type, Phase);
 
 /// Maximum array rank inference materializes from a compact count expression.
 /// This is an implementation resource guard, not a FlatPPL language limit.
@@ -204,7 +204,7 @@ pub(crate) fn call_rule(
     // Argument DOMAINS, after normalization (the checks index declared positions)
     // and ahead of the per-op rules, which read an argument's type without asking
     // whether the row's documented domain admits it.
-    if let Some(ty) = domain_check(inf, &name, args) {
+    if let Some(ty) = domain_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
 
@@ -7190,7 +7190,12 @@ fn special_arity_check(
 /// `Bernoulli(p = true)` and `eye(3.0)`, neither of which any sentence forbids.
 /// The three checks below each rest on a sentence that names its exclusion
 /// outright.
-fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Option<Type> {
+fn domain_check(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
     refuse_nonboolean_domain(inf, name, args)
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
@@ -7198,7 +7203,7 @@ fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> O
         .or_else(|| refuse_bad_rng_seed(inf, name, args))
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_likelihood_point(inf, name, args))
-        .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args))
+        .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args, named))
 }
 
 /// `rand(m, rstate)` accepts one closed measure and one explicit RNG state.

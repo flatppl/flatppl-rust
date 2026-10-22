@@ -21,7 +21,7 @@ use crate::density::{
     draw_argument, expect_builtin_call, fold_add, lookup_field, lower_measure_density,
     materialize_record_value, resolve_ref_chain, resolve_ref_one,
 };
-use crate::kernel::{Kernel, resolve_kernel, resolve_reified};
+use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
 use flatppl_core::{Call, CallHead, Module, NamedKind, Node, NodeId, Scalar, Symbol, Type};
 
@@ -94,9 +94,7 @@ pub(crate) fn record_variate_fields(m: &Module, node: NodeId) -> Option<Vec<Symb
     let mut fields = Vec::with_capacity(args.len());
     fields.push(base.field?);
     for &k_arg in &args[1..] {
-        let kernel = resolve_kernel(m, k_arg)?;
-        let comp = resolve_kernel_component(m, &kernel)?;
-        fields.push(comp.field?);
+        fields.push(resolve_step_output(m, k_arg)?.field?);
     }
     Some(fields)
 }
@@ -118,10 +116,7 @@ pub(crate) fn record_variate_fields(m: &Module, node: NodeId) -> Option<Vec<Symb
 /// finite WRONG density. Reading the BODY measure's own mass closes that hole
 /// (refuse-don't-mislower).
 pub(crate) fn kernel_body_is_normalized(m: &Module, k_arg: NodeId) -> bool {
-    let Some(kernel) = resolve_kernel(m, k_arg) else {
-        return false;
-    };
-    let Some(comp) = resolve_kernel_component(m, &kernel) else {
+    let Some(comp) = resolve_step_output(m, k_arg) else {
         return false;
     };
     matches!(
@@ -224,11 +219,34 @@ fn resolve_base(m: &Module, base_arg: NodeId) -> Option<Component> {
     resolve_single_draw(m, inner).map(|(field, dist)| Component { field, dist })
 }
 
-/// Resolve a kernel body to its single-draw `Component` (no `lawof`; the inputs
-/// come from the `Kernel`).
-fn resolve_kernel_component(m: &Module, kernel: &Kernel) -> Option<Component> {
-    let (field, dist) = resolve_single_draw(m, kernel.body)?;
-    Some(Component { field, dist })
+/// Resolve a chain step to the single-draw `Component` its output measure is,
+/// looking through an adapter. The step is a reified callable (`kernelof` or
+/// `functionof`). An adapter such as `pars -> k(a = pars.a)` (spec §04, lambda
+/// sugar) reifies a call of another kernel, whose output measure is that
+/// kernel's, with its inputs bound to other arguments — so the field name and
+/// the body's mass do not depend on the arguments and are read from `k`. Only
+/// those two facts are asked of the result; a caller that needs the step's
+/// inputs reads them from the step itself ([`resolve_reified`]).
+fn resolve_step_output(m: &Module, k_arg: NodeId) -> Option<Component> {
+    let mut step = k_arg;
+    for _ in 0..8 {
+        let kernel = resolve_reified(m, step)?;
+        let (body, _) = resolve_ref_one(m, kernel.body);
+        match m.node(body) {
+            Node::Call(call) => match call.head {
+                CallHead::User(callee) => step = callee,
+                CallHead::Builtin(_) => {
+                    return resolve_single_draw(m, kernel.body)
+                        .map(|(field, dist)| Component { field, dist });
+                }
+            },
+            _ => {
+                return resolve_single_draw(m, kernel.body)
+                    .map(|(field, dist)| Component { field, dist });
+            }
+        }
+    }
+    None
 }
 
 /// Peel an optional single-field `record(f = X)` wrapper, then an optional
@@ -296,8 +314,8 @@ fn lower_scalar_family(
     env.push(s0);
 
     for (i, &k_arg) in args[1..].iter().enumerate() {
-        let kernel = resolve_kernel(m, k_arg)
-            .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a kernelof(...)"))?;
+        let kernel = resolve_reified(m, k_arg)
+            .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
         // Scalar-cat kernels take exactly one input: the cat of prior variates.
         if kernel.inputs.len() != 1 {
             return Err(refuse_jc(
@@ -305,7 +323,7 @@ fn lower_scalar_family(
                 "scalar-cat kernel must take exactly one input (the cat of priors)",
             ));
         }
-        let comp = resolve_kernel_component(m, &kernel)
+        let comp = resolve_step_output(m, k_arg)
             .ok_or_else(|| refuse_jc(node, "kernel body is not a single scalar draw"))?;
         if comp.field.is_some() {
             return Err(refuse_jc(
@@ -349,9 +367,8 @@ fn component_is_scalar(m: &Module, comp_arg: NodeId) -> bool {
         Some(flatppl_core::Type::Kernel { .. }) => {
             // A kernel's variate is its body's domain; resolve the body's draw
             // constructor and check its measure domain.
-            resolve_kernel(m, resolved)
-                .and_then(|k| resolve_single_draw(m, k.body))
-                .map(|(_, dist)| {
+            resolve_step_output(m, resolved)
+                .map(|Component { dist, .. }| {
                     matches!(
                         m.type_of(dist),
                         Some(flatppl_core::Type::Measure { domain, .. })

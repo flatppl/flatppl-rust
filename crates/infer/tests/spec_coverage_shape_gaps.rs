@@ -275,7 +275,8 @@ fn kernel_chain_ops_infer_measures() {
     // Keyword form names each component's variate (spec §06 keyword form).
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   m0 = lawof(record(a = lambda))\n\
-                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  a = elementof(reals)\n\
+                  k = kernelof(record(b = a))\n\
                   j = jointchain(prior = m0, fwd = k)");
     assert!(
         out.contains("(%measure (%domain (%record (prior (%record (a (%scalar real)))) (fwd (%record (b (%scalar real)))))) (%mass %normalized))")
