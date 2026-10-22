@@ -616,6 +616,9 @@ struct CallArgs {
     positional: Vec<NodeId>,
     named: Vec<NamedArg>,
     reify: bool,
+    /// For a reification, whether its boundary inputs so far were bare names
+    /// (`Some(true)`) or keywords (`Some(false)`); spec §04 forbids mixing them.
+    bare_boundaries: Option<bool>,
 }
 
 enum ListKind {
@@ -1015,10 +1018,14 @@ impl<'a> ExprParser<'a> {
                     if self.peek() == Some(&TokenKind::RParen) {
                         value = Some(self.finish_call(call)?);
                     } else {
+                        let mut call = call;
                         let key = if let (Some(TokenKind::Name(n)), Some(TokenKind::Assign)) =
                             (self.peek(), self.peek_at(1))
                         {
                             let key = n.clone();
+                            if call.reify && !call.positional.is_empty() {
+                                self.boundary_form(&mut call, false)?;
+                            }
                             self.advance();
                             self.advance();
                             Some(key)
@@ -1027,7 +1034,11 @@ impl<'a> ExprParser<'a> {
                                 (
                                     Some(TokenKind::Name(n)),
                                     Some(TokenKind::Comma | TokenKind::RParen),
-                                ) => Some(n.clone()),
+                                ) => {
+                                    let n = n.clone();
+                                    self.boundary_form(&mut call, true)?;
+                                    Some(self.bare_boundary_name(&n)?)
+                                }
                                 _ => {
                                     return Err(self.err_here(
                                         "expected a bare name or keyword boundary binding",
@@ -1111,9 +1122,46 @@ impl<'a> ExprParser<'a> {
                     positional: Vec::new(),
                     named: Vec::new(),
                     reify,
+                    bare_boundaries: None,
                 }));
             }
         }
+    }
+
+    /// Record a reification boundary entry's form. Spec §04: "Boundary inputs are
+    /// given either all as bare names or all as keyword arguments; mixing the two
+    /// forms is a static error."
+    fn boundary_form(&self, call: &mut CallArgs, bare: bool) -> Result<()> {
+        match call.bare_boundaries {
+            Some(seen) if seen != bare => Err(self.err_here(
+                "boundary inputs are given either all as bare names or all as keyword \
+                 arguments; mixing the two forms is a static error (spec §04)",
+            )),
+            _ => {
+                call.bare_boundaries = Some(bare);
+                Ok(())
+            }
+        }
+    }
+
+    /// The input name a bare boundary entry declares. Spec §04: a module binding
+    /// `a` expands to `a = a`, and a placeholder `_x_` to `x = _x_`; "Derived
+    /// names must be legal argument names".
+    fn bare_boundary_name(&self, entry: &str) -> Result<String> {
+        if !is_placeholder(entry) {
+            return Ok(entry.to_string());
+        }
+        let name = &entry[1..entry.len() - 1];
+        if matches!(
+            name,
+            "true" | "false" | "in" | "all" | "only" | "self" | "base"
+        ) {
+            return Err(self.err_here(format!(
+                "placeholder `{entry}` would name its boundary input `{name}`, which is a \
+                 reserved word; bind it with a keyword, as in `other = {entry}` (spec §04)"
+            )));
+        }
+        Ok(name.to_string())
     }
 
     fn finish_call(&mut self, call: CallArgs) -> Result<NodeId> {
