@@ -9,3 +9,8 @@ are not copied: as of that commit neither parses under spec §05 — one has two
 `../corpus.rs` renders every file here and every fixture under the repo's
 `fixtures/flatppl/` and fails on any row that fell back to source text.
 Refresh a copy from upstream when an example changes; cite the upstream commit.
+
+`ar1-noise-estimation`, `capture-recapture` and `poisson-model` take their
+likelihood line from `flatppl-examples@4e3fa55` (revised callable inputs: the
+adapter `pars -> forward_kernel(rcp = pars.rcp)` keeps the posterior's record
+variate); their other lines still predate that commit.
