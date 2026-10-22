@@ -378,13 +378,19 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
     }
 }
 
+/// The keywords spec §05 recognizes before `Name`, so they are never a binding,
+/// argument or keyword-argument name.
+fn is_reserved_word(name: &str) -> bool {
+    matches!(name, "true" | "false" | "in" | "all" | "only")
+}
+
 /// Reject names that cannot be bound: reserved words (spec §05), the reserved
 /// modules `self` / `base` (spec §04), and the placeholder lexical class
 /// (spec §04 binding names). `_` is allowed — it discards (see [`bind_name`]).
 fn check_binding_name(name: &str, tok: &Token) -> Result<()> {
     match name {
         "_" => Ok(()),
-        "true" | "false" | "in" | "all" | "only" => Err(err_at(
+        _ if is_reserved_word(name) => Err(err_at(
             tok,
             format!("`{name}` is a reserved word and cannot be bound"),
         )),
@@ -1023,6 +1029,12 @@ impl<'a> ExprParser<'a> {
                             (self.peek(), self.peek_at(1))
                         {
                             let key = n.clone();
+                            if is_reserved_word(&key) {
+                                return Err(self.err_here(format!(
+                                    "`{key}` is a reserved word and cannot be a keyword \
+                                     argument name (spec §05)"
+                                )));
+                            }
                             if call.reify && !call.positional.is_empty() {
                                 self.boundary_form(&mut call, false)?;
                             }
@@ -1152,9 +1164,9 @@ impl<'a> ExprParser<'a> {
             return Ok(entry.to_string());
         }
         let name = &entry[1..entry.len() - 1];
-        // Spec §05 "Note on reserved words"; `self` and `base` are barred only
-        // as module bindings (§04), so they stay legal argument names.
-        if matches!(name, "true" | "false" | "in" | "all" | "only") {
+        // `self` and `base` are barred only as module bindings (spec §04), so
+        // they stay legal argument names.
+        if is_reserved_word(name) {
             return Err(self.err_here(format!(
                 "placeholder `{entry}` would name its boundary input `{name}`, which is a \
                  reserved word; bind it with a keyword, as in `other = {entry}` (spec §04)"
