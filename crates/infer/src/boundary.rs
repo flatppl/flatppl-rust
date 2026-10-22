@@ -220,10 +220,15 @@ pub(crate) fn refuse_bad_likelihood_point(
     check_point(inf, name, what, at, kernel, &interface, &point_ty)
 }
 
-/// `joint_likelihood(L1, L2, ...)` is `likelihoodof(joint(K1, K2, ...), obs)`
-/// (spec §06 "Combining likelihoods"). A `joint` of kernels takes "the union of
-/// the component kernels' inputs by name, so the result only supports keyword
-/// arguments" (§06 "Joint measures"), so its point always splats over that union.
+/// `joint_likelihood(L1, L2, ...)` is `L(θ) = L1(θ) + L2(θ)` and is equivalent to
+/// `likelihoodof(joint(K1, K2, ...), obs)` (spec §06 "Combining likelihoods"). A
+/// `joint` of kernels takes "the union of the component kernels' inputs by name,
+/// so the result only supports keyword arguments" (§06 "Joint measures"), so a
+/// record point splats over that union when every term splats.
+///
+/// `None` when a term takes one positional input (an adapter or a one-boundary
+/// kernel), which receives the shared point whole through its own interface, or
+/// when a term's interface is unknown: the union is not an interface then.
 fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) -> Option<Interface> {
     let node = resolve_binding_refs(inf, likelihood.0);
     let Node::Call(call) = inf.module.node(node) else {
@@ -232,19 +237,22 @@ fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) ->
     let CallHead::Builtin(op) = call.head else {
         return None;
     };
-    if inf.module.resolve(op) != "joint_likelihood" {
+    if inf.module.resolve(op) != "joint_likelihood" || call.args.is_empty() {
         return None;
     }
-    let Type::Likelihood { inputs, .. } = &likelihood.1 else {
-        return None;
-    };
-    Some(Interface::required(
-        inputs
-            .iter()
-            .map(|n| inf.module.resolve(*n).to_string())
-            .collect(),
-        false,
-    ))
+    let mut names: Vec<String> = Vec::new();
+    for &term in call.args.iter() {
+        let term_interface = interface(inf, term)?;
+        if term_interface.takes_one() {
+            return None;
+        }
+        for name in term_interface.names {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Some(Interface::required(names, false))
 }
 
 fn check_point(
