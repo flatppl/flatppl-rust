@@ -227,3 +227,21 @@ fn a_joint_likelihood_splats_its_point_over_the_union_of_inputs() {
         &["logdensityof", "splatted", "`mu`", "no input named `c`"],
     );
 }
+
+#[test]
+fn a_joint_likelihood_term_taking_one_input_receives_the_point_whole() {
+    // `L(θ) = L1(θ) + L2(θ)` applies the shared point through each term's own
+    // interface, so a term that takes one positional input (an adapter, or a
+    // one-boundary kernel) receives a record whole and the union of names does not
+    // constrain the point.
+    assert_clean(
+        "mu = elementof(reals)\n\
+         a = draw(Normal(mu = mu, sigma = 1.0))\n\
+         b = draw(Normal(mu = mu, sigma = 2.0))\n\
+         K1 = kernelof(record(a = a), mu = mu)\n\
+         K2 = kernelof(record(b = b), mu = mu)\n\
+         L = joint_likelihood(likelihoodof(pars -> K1(mu = pars.mu), record(a = 0.1)), \
+                              likelihoodof(pars -> K2(mu = pars.mu), record(b = 0.2)))\n\
+         lp = logdensityof(L, record(mu = 0.3, nu = 1.0))\n",
+    );
+}
