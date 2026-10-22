@@ -19,7 +19,7 @@
 //! `cartpow(reals, [3, 3])` the set of $3 \times 3$ real matrices."
 //!
 //! §03 "Sets that govern values": "For `x = elementof(S)`, `valueset(x)` is `S`."
-//! §04 "Phase classification" puts an `elementof` node in the **parameterized** phase.
+//! §04 "Phase classification" puts an `elementof` node in the **parametric** phase.
 //!
 //! Before this, neither the element-type reader nor the value-set reader followed a
 //! `%ref`, so EVERY set-expression position lost its set through a name: `elementof`
@@ -48,7 +48,7 @@ fn bind_line(src: &str, name: &str) -> String {
 }
 
 /// The reported four-vector spelling: `elementof` of a named `cartpow(reals, 4)` is a
-/// rank-1 real array of size 4, parameterized, with the power as its value set.
+/// rank-1 real array of size 4, parametric, with the power as its value set.
 #[test]
 fn named_cartpow_scalar_size_is_a_fixed_size_vector() {
     let line = bind_line(
@@ -56,7 +56,7 @@ fn named_cartpow_scalar_size_is_a_fixed_size_vector() {
         "v1",
     );
     assert!(
-        line.contains("(%array 1 (4) (%scalar real)) %parameterized (cartpow reals 4)"),
+        line.contains("(%array 1 (4) (%scalar real)) %parametric (cartpow reals 4)"),
         "named cartpow(reals, 4) must give a size-4 real vector: {line}"
     );
 }
@@ -67,7 +67,7 @@ fn named_cartpow_scalar_size_is_a_fixed_size_vector() {
 fn named_cartpow_vector_size_is_multi_axis() {
     let line = bind_line("mats = cartpow(reals, [2, 3])\nm = elementof(mats)\n", "m");
     assert!(
-        line.contains("(%array 2 (2 3) (%scalar real)) %parameterized"),
+        line.contains("(%array 2 (2 3) (%scalar real)) %parametric"),
         "named cartpow(reals, [2, 3]) must give a rank-2 2x3 array: {line}"
     );
 }
@@ -142,7 +142,7 @@ fn a_name_that_is_not_a_set_stays_deferred() {
         "x",
     );
     assert!(
-        line.contains("(%deferred %parameterized %unknown)"),
+        line.contains("(%deferred %parametric %unknown)"),
         "`elementof` of a non-set name must stay deferred: {line}"
     );
 }
@@ -166,7 +166,7 @@ fn a_shared_subexpression_cannot_blow_up_the_traversal() {
     src.push_str("x = elementof(s20)\n");
     let line = bind_line(&src, "x");
     assert!(
-        line.contains("(%deferred %parameterized %unknown)"),
+        line.contains("(%deferred %parametric %unknown)"),
         "an over-budget set expression must read out deferred in BOTH slots: {line}"
     );
 }
@@ -200,7 +200,7 @@ fn cartpow_over_an_unreadable_set_defers_whole() {
         "x",
     );
     assert!(
-        line.contains("(%deferred %parameterized %unknown)"),
+        line.contains("(%deferred %parametric %unknown)"),
         "cartpow over an unreadable element must defer whole, not wrap it: {line}"
     );
     assert!(
@@ -251,12 +251,12 @@ fn a_long_alias_chain_defers_instead_of_overflowing_the_stack() {
     };
     let short = bind_line(&chain(200), "x");
     assert!(
-        short.contains("(%array 1 (4) (%scalar real)) %parameterized (cartpow reals 4)"),
+        short.contains("(%array 1 (4) (%scalar real)) %parametric (cartpow reals 4)"),
         "a 200-hop chain is within the depth bound and must resolve: {short}"
     );
     let long = bind_line(&chain(2000), "x");
     assert!(
-        long.contains("(%deferred %parameterized %unknown)"),
+        long.contains("(%deferred %parametric %unknown)"),
         "a 2000-hop chain must defer in both slots, not abort: {long}"
     );
 }

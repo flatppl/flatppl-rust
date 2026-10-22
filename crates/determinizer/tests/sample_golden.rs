@@ -128,7 +128,7 @@ draws = rand(lawof(record(x = x)), s)";
 // form `Normal(mu = 0.0, sigma = 1.0)` (spec §04 calling conventions: positional
 // args bind to the ordered parameter names). The sample leaf must lower it —
 // producing the identical FlatPDL as the keyword form — not refuse. Regression
-// for buffy #143 (@sample path).
+// for the @sample path.
 #[test]
 fn sample_draw_positional_constructor_lowers_same_as_keyword() {
     let positional = "\
@@ -157,8 +157,8 @@ draws = rand(lawof(record(x = x)), s)";
 // Generality across distributions on the @sample path: `Beta` has params
 // ["alpha", "beta"], so `Beta(2.0, 5.0)` positional binds alpha=2.0, beta=5.0 and
 // samples via the same builtin_sample as the keyword form. Confirms the sample
-// leaf is not Normal-specific. Regression for buffy #143 (non-Gaussian sample
-// leaf).
+// leaf is not Normal-specific. Regression for the non-Gaussian sample
+// leaf.
 #[test]
 fn sample_draw_positional_beta_lowers_same_as_keyword() {
     let positional = "\

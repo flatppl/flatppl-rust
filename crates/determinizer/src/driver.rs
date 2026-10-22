@@ -74,7 +74,7 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 }
 
 /// Like [`determinize_with`], but when `roots` is `Some`, runs root-based DCE
-/// (Buffy #263 Pass 4-A) after canonicalization: only bindings reachable from
+/// (Pass 4-A) after canonicalization: only bindings reachable from
 /// the requested-output `roots` survive in the returned module. `roots = None`
 /// keeps every binding — byte-identical to [`determinize_with`]
 /// (backward-compatible).
@@ -99,7 +99,7 @@ pub fn determinize_with_options(
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
 
-    // Cross-module alias resolution pre-pass (Buffy #359): resolve every top-level
+    // Cross-module alias resolution pre-pass: resolve every top-level
     // host binding whose RHS is a bare cross-module `(%ref <alias> member)` ref IN
     // PLACE — graft the referenced submodule subtree into the host and rewrite the
     // alias binding's RHS to the grafted-local root, deduplicated across the whole
@@ -171,7 +171,7 @@ pub fn determinize_with_options(
             None => {
                 // Measure layer gone — canonicalize the FlatPDL (and, if
                 // `roots` is given, drop bindings unreachable from them) before
-                // the conformance check and return (Buffy #263).
+                // the conformance check and return.
                 crate::canon::canonicalize(&mut work, roots);
                 match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),

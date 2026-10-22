@@ -143,15 +143,15 @@ fn addaxes_gap_count_is_a_loud_diagnostic() {
 }
 
 /// A genuinely-unknowable size stays `%dynamic` with NO diagnostic — the
-/// op-gap error must not fire for a parameterized (non-fixed) ancestor. This is
+/// op-gap error must not fire for a parametric (non-fixed) ancestor. This is
 /// the other side of the §17.1 boundary: `%dynamic` is legitimate here.
 #[test]
-fn parameterized_size_stays_dynamic_without_a_gap_error() {
+fn parametric_size_stays_dynamic_without_a_gap_error() {
     let src = "n = elementof(nonnegintegers)\nx ~ iid(Normal(0.0, 1.0), n)";
     let out = ir_at(src, Level::Shape);
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))"),
-        "parameterized n should stay %dynamic, got:\n{out}"
+        "parametric n should stay %dynamic, got:\n{out}"
     );
     let ds = diags_at(src, Level::Shape);
     assert!(
@@ -164,7 +164,7 @@ fn parameterized_size_stays_dynamic_without_a_gap_error() {
 /// `%dynamic` wins over a gap: if a size expression mixes a genuinely-dynamic
 /// operand with an unfoldable op, the result is `%dynamic` with NO error — we
 /// only nag about an op-gap when the value would otherwise be fully known. Here
-/// `add(n, max(6, 2))` has a parameterized `n` (dynamic) and an unfoldable
+/// `add(n, max(6, 2))` has a parametric `n` (dynamic) and an unfoldable
 /// `max` (gap); dynamic dominates, so no diagnostic fires.
 #[test]
 fn dynamic_dominates_a_gap_no_error() {

@@ -128,7 +128,7 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y
     // And the mask keeps the boolean-ARRAY type, so the emitter reduces `i1`
     // rather than the float dtype.
     assert!(
-        out.contains("(%array 1 (4) (%scalar boolean)) %parameterized (cartpow booleans 4)"),
+        out.contains("(%array 1 (4) (%scalar boolean)) %parametric (cartpow booleans 4)"),
         "the mask must stay a boolean array in FlatPDL:\n{out}"
     );
 }

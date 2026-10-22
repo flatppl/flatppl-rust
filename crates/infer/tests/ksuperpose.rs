@@ -369,32 +369,32 @@ fn runtime_weights_still_type_the_mixture() {
     );
 }
 
-/// PARAMETERIZED weights — mixture weights being inferred, the common real
+/// PARAMETRIC weights — mixture weights being inferred, the common real
 /// spelling — leave the total mass `%unknown`: nothing static bounds a parameter,
 /// and §06's all-zero case makes even zero admissible, which is not `%finite`'s
 /// guarantee. `normalize` still recovers a probability measure, so the model is
-/// drawable; and §04's ancestor rule carries the parameterized phase through with
+/// drawable; and §04's ancestor rule carries the parametric phase through with
 /// no `ksuperpose` override.
 #[test]
-fn parameterized_weights_leave_the_mass_unknown_but_still_normalize() {
+fn parametric_weights_leave_the_mass_unknown_but_still_normalize() {
     let out = pir("w = elementof(cartpow(nonnegreals, 2))\n\
          mix = normalize(ksuperpose(Normal, w)(mu = [-1.0, 2.0], sigma = 1.0))\n\
          y ~ mix\n");
     assert!(
-        out.contains("(%measure (%domain (%scalar real)) (%mass %unknown)) %parameterized"),
-        "a parameterized weight vector gives an unknown mass and a parameterized \
+        out.contains("(%measure (%domain (%scalar real)) (%mass %unknown)) %parametric"),
+        "a parametric weight vector gives an unknown mass and a parametric \
          measure:\n{out}"
     );
     assert!(
-        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized)) %parameterized"),
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized)) %parametric"),
         "normalize still recovers a drawable probability measure:\n{out}"
     );
 }
 
-/// §04's ancestor rule needs no `ksuperpose` override: a parameterized family
-/// argument makes the mixture parameterized through the ordinary phase join.
+/// §04's ancestor rule needs no `ksuperpose` override: a parametric family
+/// argument makes the mixture parametric through the ordinary phase join.
 #[test]
-fn a_parameterized_family_argument_makes_a_parameterized_mixture() {
+fn a_parametric_family_argument_makes_a_parametric_mixture() {
     let out = pir("w = [0.3, 1.2]\n\
          t = elementof(reals)\n\
          mix = ksuperpose(Normal, w)(mu = [1.0], sigma = t)\n");
@@ -403,7 +403,7 @@ fn a_parameterized_family_argument_makes_a_parameterized_mixture() {
         .find(|l| l.contains("(ksuperpose"))
         .unwrap_or_else(|| panic!("no ksuperpose line in:\n{out}"));
     assert!(
-        line.contains("%parameterized"),
-        "a parameterized sigma makes the applied mixture parameterized:\n{line}"
+        line.contains("%parametric"),
+        "a parametric sigma makes the applied mixture parametric:\n{line}"
     );
 }

@@ -1,4 +1,4 @@
-//! Root-based dead-code elimination (Buffy #263 Pass 4-A): keep only the
+//! Root-based dead-code elimination (Pass 4-A): keep only the
 //! bindings reachable from a requested-output root set; remove the rest. Runs
 //! after the `canonicalize` fixpoint, when the dead-set is stable. Subsumes the
 //! `synthetic`-only sweep when roots are given: it removes synthetic

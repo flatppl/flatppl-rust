@@ -145,7 +145,7 @@ fn jointchain_unbindable_input_refuses() {
 // scored at get0(v,1) with its input `a` bound to get0(v,0). The scored
 // variate here is the LITERAL point vector `[0.3, 0.7]`, so canon Pass 3
 // (`flatten_structural`) resolves every get0 slice all the way down to a bare
-// literal — re-baselined for buffy #263 Pass 3 (this test used to pin the
+// literal — re-baselined for Pass 3 (this test used to pin the
 // unresolved `get0(v, i)` shape; the flattened literals are a stronger pin,
 // not a weaker one, since they also verify the kernel's mean correctly picks
 // up the base slice's value).
@@ -191,8 +191,8 @@ lp = logdensityof(j, [0.3, 0.7])";
 // is the LITERAL point vector `[0.3, 0.7, 1.1]`, so canon Pass 3
 // (`flatten_structural`), together with Pass 1's const-fold, resolves the
 // get0/vector wrapping and the resulting `add` all the way down to bare
-// literals (`k2`'s mean folds to `0.3 + 0.7 = 1.0`) — re-baselined for buffy
-// #263 Pass 3 (this test used to pin the unresolved `vector(get0(...),
+// literals (`k2`'s mean folds to `0.3 + 0.7 = 1.0`) — re-baselined for
+// Pass 3 (this test used to pin the unresolved `vector(get0(...),
 // get0(...))` shape; the fully-flattened literal is a stronger pin, since it
 // also verifies the arithmetic).
 #[test]

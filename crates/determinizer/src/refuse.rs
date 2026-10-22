@@ -32,7 +32,7 @@ pub enum NonConformKind {
     /// A `(%ref self <name>)` — as an ordinary body sub-node OR a `functionof`/
     /// `kernelof` reification `Inputs` boundary entry — names a binding that is
     /// not present in the module. Permanent self-check against any
-    /// binding-removal pass (root-based DCE, Buffy #263 Pass 4-A, is the first
+    /// binding-removal pass (root-based DCE, Pass 4-A, is the first
     /// one) dropping a binding something still points at.
     DanglingSelfRef,
     /// A `CallHead::User` application survived into FlatPDL. FlatPDL is

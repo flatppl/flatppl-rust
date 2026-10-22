@@ -6070,9 +6070,9 @@ fn emit_logdensity_multinomial_matches_frozen_golden() {
 // spec §04) for `literal_fixed_positive_int` to read it as a Rust `u64` at
 // emit time; every fixture below binds `n` as a bare top-level literal
 // (`n = 3`), never `elementof(posintegers)` (which would make it
-// `%parameterized`, i.e. a runtime-only `%argN` with no compile-time value
+// `%parametric`, i.e. a runtime-only `%argN` with no compile-time value
 // to unroll `log_cn_lkj`'s `k` sum against — see
-// `lkj_logpdf_refuses_parameterized_n` below).
+// `lkj_logpdf_refuses_parametric_n` below).
 
 /// The Task-13 Wishart anchor fixture: a free `2x2` `scale`, free `nu`, and a
 /// free `2x2` `x_obs` scored variate (see the batch doc comment for why the
@@ -6361,14 +6361,14 @@ outputs = (lp)
     );
 }
 
-/// A `%parameterized` (`elementof`-declared) `n` — rather than a FIXED-phase
+/// A `%parametric` (`elementof`-declared) `n` — rather than a FIXED-phase
 /// literal binding — has no Rust `u64` to unroll `log_cn_lkj`'s `k` sum
 /// against and must refuse precisely, not panic reaching a `for k in 1..n`
 /// with no `n` at all. Exercises [`literal_fixed_positive_int`]'s refusal
 /// arm directly (distinct from every other guard in this batch, which all
 /// check a matrix *shape* — this one checks a scalar kwarg's *phase*).
 #[test]
-fn lkj_logpdf_refuses_parameterized_n() {
+fn lkj_logpdf_refuses_parametric_n() {
     let src = "\
 n = elementof(posintegers)
 eta = elementof(posreals)
@@ -7454,9 +7454,9 @@ fn emit_sample_binomial_matches_frozen_golden() {
 /// A non-literal (`elementof`-declared) `n` must refuse precisely — Binomial
 /// sample's uniform batch needs `n` as a Rust `u64` at EMIT time to size a
 /// static-length `tensor<NxT>`, not merely a well-typed runtime value. Mirrors
-/// `lkj_logpdf_refuses_parameterized_n`'s guard on the `@logdensity` side.
+/// `lkj_logpdf_refuses_parametric_n`'s guard on the `@logdensity` side.
 #[test]
-fn binomial_sample_refuses_parameterized_n() {
+fn binomial_sample_refuses_parametric_n() {
     let src = "\
 n = elementof(posintegers)
 s = rnginit(0)
@@ -7592,11 +7592,11 @@ fn emit_sample_multinomial_matches_frozen_golden() {
 }
 
 /// A non-literal (`elementof`-declared) `n` must refuse precisely — same
-/// reasoning as [`binomial_sample_refuses_parameterized_n`]: Multinomial's `n`
+/// reasoning as [`binomial_sample_refuses_parametric_n`]: Multinomial's `n`
 /// sizes both the pre-drawn uniform batch and the `while` bound, so it must
 /// be known at EMIT time.
 #[test]
-fn multinomial_sample_refuses_parameterized_n() {
+fn multinomial_sample_refuses_parametric_n() {
     let src = "\
 n = elementof(posintegers)
 s = rnginit(0)
@@ -8867,8 +8867,8 @@ fn inline_and_named_rng_sources_emit_the_same_program() {
 
 /// A binding named in `inputs` that is neither an `elementof` parameter nor
 /// fixed-phase must REFUSE rather than emit a partial signature: here `z` is a
-/// value computed FROM the parameter `mu`, so it is parameterized but not a
-/// parameter declaration. §13's signature subsection admits parameterized
+/// value computed FROM the parameter `mu`, so it is parametric but not a
+/// parameter declaration. §13's signature subsection admits parametric
 /// `elementof` and fixed bindings as arguments and nothing else — a function of
 /// the parameters is a result, not an argument.
 ///
@@ -8876,7 +8876,7 @@ fn inline_and_named_rng_sources_emit_the_same_program() {
 /// every fixed binding listed in `inputs`, see
 /// [`emit_logdensity_abi_promotes_fixed_literal_input`].
 #[test]
-fn emit_logdensity_abi_refuses_computed_parameterized_input() {
+fn emit_logdensity_abi_refuses_computed_parametric_input() {
     let src = "\
 mu = elementof(reals)
 z = mu * 2.0

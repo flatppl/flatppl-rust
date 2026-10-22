@@ -175,7 +175,7 @@ fn type_grammar_roundtrip_and_headless_shape() {
     let src = "\
 (%module
   (%public a b c d e)
-  (%bind a (%meta ((%array 2 (2 3) (%scalar real)) %parameterized reals) (elementof reals)))
+  (%bind a (%meta ((%array 2 (2 3) (%scalar real)) %parametric reals) (elementof reals)))
   (%bind b (%meta ((%tvector 3 (%scalar real)) %fixed reals) (elementof reals)))
   (%bind c (%meta ((%record (mu (%scalar real)) (sigma (%scalar real))) %fixed %unknown) (elementof reals)))
   (%bind d (%meta ((%tuple (%scalar real) (%scalar integer)) %fixed %unknown) (elementof reals)))
@@ -290,10 +290,10 @@ fn hole_roundtrips() {
 fn partial_meta_deferred_slots() {
     // Only the phase slot is known; type and value-set are %deferred.
     let j = rt("(%module (%public a)\
-        (%bind a (%meta (%deferred %parameterized %deferred) (elementof reals))))");
+        (%bind a (%meta (%deferred %parametric %deferred) (elementof reals))))");
     let meta = &j["%module"]["binds"][0]["expr"]["%meta"];
     assert_eq!(meta["type"]["const"], "%deferred");
-    assert_eq!(meta["phase"], "%parameterized");
+    assert_eq!(meta["phase"], "%parametric");
     assert_eq!(meta["valueset"]["const"], "%deferred");
 }
 

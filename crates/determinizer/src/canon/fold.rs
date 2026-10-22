@@ -1,5 +1,5 @@
 //! Pass 1: constant folding, trivial-alias ref resolution, and dead-binding
-//! elimination — the canonicalization foundation (Buffy #263).
+//! elimination — the canonicalization foundation.
 
 use std::collections::{HashMap, HashSet};
 
@@ -128,7 +128,7 @@ fn fold_scalar(
     }
     // Binary arithmetic on two literal operands. IEEE-754-EXACT cases only, so
     // the folded literal is bit-identical to what the JS engine computes (the
-    // det-js numeric equivalence gate, Buffy #263):
+    // det-js numeric equivalence gate):
     // * Int × Int for add/sub/mul → Int (exact integer arithmetic; `checked_*`
     //   leaves an overflowing fold un-done rather than falling back to an
     //   inexact `f64`).
@@ -395,7 +395,7 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
 /// is `!public` under that convention yet is exactly the value an external
 /// caller wants read back. An earlier cut of this sweep used `!public` alone
 /// as the eligibility guard and silently zeroed `__score__` to `0.0` — caught
-/// by the Buffy #263 numeric det-js equivalence gate (canon vs. no-canon
+/// by the numeric det-js equivalence gate (canon vs. no-canon
 /// scores diverged), not by any existing golden, because no prior test named
 /// a binding with a leading underscore. `synthetic` (set only by the parser,
 /// for a lifted anon / `%mlhs` split, and by determinizer-internal scaffolding

@@ -55,7 +55,7 @@ z = g(table({cols}))"
     let a_first = pir(&src("a = xs, b = ys"));
     let b_first = pir(&src("b = ys, a = xs"));
     assert!(
-        a_first.contains("(sub (%meta ((%scalar real) %parameterized reals) (sum (%ref self xs)))"),
+        a_first.contains("(sub (%meta ((%scalar real) %parametric reals) (sum (%ref self xs)))"),
         "`a` binds the minuend:\n{a_first}"
     );
     assert_eq!(

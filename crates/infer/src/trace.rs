@@ -297,7 +297,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             .map(|(id, ty)| {
                 (
                     *id,
-                    (ty.clone(), Phase::Parameterized, ValueSet::natural_of(ty)),
+                    (ty.clone(), Phase::Parametric, ValueSet::natural_of(ty)),
                 )
             })
             .collect();
@@ -430,7 +430,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// traced before its op rule), so the walk reads, never recurses, inference.
     /// Returns the local `elementof` leaf inputs and a flag set if the trace
     /// reached a parametric **cross-module** dependency. Reification is
-    /// module-local (spec §04): a parameterized value reached through a
+    /// module-local (spec §04): a parametric value reached through a
     /// loaded-module reference cannot become an input, so the caller turns the
     /// flag into a static error.
     pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> (Vec<(Symbol, Ref)>, bool) {
@@ -493,7 +493,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                 // A parametric cross-module dependency. Reification is module-local
                 // (spec §04): such a value cannot become a reified input — flag it so
                 // the caller errors. (A FIXED cross-module ref was pruned above, so
-                // reaching here means the referenced binding is parameterized.)
+                // reaching here means the referenced binding is parametric.)
                 Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
                     *cross_module = true;
                     Vec::new()
@@ -818,10 +818,10 @@ impl<'m, 's> Inferencer<'m, 's> {
                     }
                 },
                 // A placeholder is implicitly `elementof(anything)` (spec §04
-                // "Placeholder variables") — unconstrained, parameterized.
+                // "Placeholder variables") — unconstrained, parametric.
                 RefNs::Local => {
                     self.set_vset(id, ValueSet::Anything);
-                    (Type::Any, Phase::Parameterized)
+                    (Type::Any, Phase::Parametric)
                 }
                 RefNs::Module(_) => unreachable!("module references use scheduler frames"),
             },
@@ -1014,7 +1014,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// (Module composition → Load-time substitution): each `%assign` name must
     /// designate an `external`/`elementof` **input** of the dependency, and the
     /// substitution value's phase must match the input's kind — `external` ←
-    /// fixed, `elementof` ← parameterized. Emits anchored errors on the offending
+    /// fixed, `elementof` ← parametric. Emits anchored errors on the offending
     /// value node. No-op for non-load calls and for `standard_module` (its
     /// dependency never enters the bundle, so the inner block is skipped).
     ///
@@ -1061,7 +1061,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                         ),
                     )),
                     // An input: its phase governs what may bind to it —
-                    // `external` ← fixed, `elementof` ← parameterized — and
+                    // `external` ← fixed, `elementof` ← parametric — and
                     // (spec §04) the value's set must lie within the input's
                     // declared set.
                     Some(kind) => {
@@ -1174,7 +1174,7 @@ fn is_elementof(module: &Module, id: NodeId) -> bool {
 enum InputKind {
     /// `external(...)` — a load-time hyperparameter; bind a **fixed** value.
     External,
-    /// `elementof(...)` — a model parameter; bind a **parameterized** value.
+    /// `elementof(...)` — a model parameter; bind a **parametric** value.
     Elementof,
     /// An ordinary computed binding, not an input — may not be substituted.
     Other,
@@ -1185,7 +1185,7 @@ impl InputKind {
     fn required_phase(&self) -> Phase {
         match self {
             InputKind::External => Phase::Fixed,
-            InputKind::Elementof => Phase::Parameterized,
+            InputKind::Elementof => Phase::Parametric,
             InputKind::Other => Phase::Fixed, // unreachable: Other is rejected earlier
         }
     }
@@ -1292,12 +1292,12 @@ fn is_concrete_set(vs: &ValueSet) -> bool {
     )
 }
 
-/// `stochastic > parameterized > fixed` (spec §04 phases).
+/// `stochastic > parametric > fixed` (spec §04 phases).
 pub(crate) fn join_phase(a: Phase, b: Phase) -> Phase {
     use Phase::*;
     match (a, b) {
         (Stochastic, _) | (_, Stochastic) => Stochastic,
-        (Parameterized, _) | (_, Parameterized) => Parameterized,
+        (Parametric, _) | (_, Parametric) => Parametric,
         (Fixed, Fixed) => Fixed,
     }
 }

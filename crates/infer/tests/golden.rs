@@ -52,7 +52,7 @@ fn model_inference_single_module_part() {
 
     for expected in [
         "(%meta (%module %fixed %unknown) (load_module",
-        "(%meta ((%scalar real) %parameterized reals) (elementof reals))",
+        "(%meta ((%scalar real) %parametric reals) (elementof reals))",
         "(%meta ((%scalar real) %stochastic reals) (draw",
         "(%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals) (Normal",
         "(%meta ((%scalar real) %stochastic reals) (add",
@@ -134,9 +134,9 @@ fn phases_follow_the_ancestor_rule() {
     let src = "a = elementof(reals)\nb ~ Normal(0.0, 1.0)\nc = a + b\nd = 1 + 2";
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
-    assert!(out.contains("(%meta ((%scalar real) %parameterized reals) (elementof reals))"));
+    assert!(out.contains("(%meta ((%scalar real) %parametric reals) (elementof reals))"));
     assert!(out.contains("(%meta ((%scalar real) %stochastic reals) (draw"));
-    // c joins parameterized ⊔ stochastic = stochastic.
+    // c joins parametric ⊔ stochastic = stochastic.
     assert!(
         out.contains(
             "(%meta ((%scalar real) %stochastic reals) (add (%ref self a) (%ref self b)))"
@@ -889,11 +889,13 @@ fn set_expression_readers() {
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%meta ((%scalar real) %parameterized (interval -1.0 1.0)) (elementof"),
+        out.contains("(%meta ((%scalar real) %parametric (interval -1.0 1.0)) (elementof"),
         "got:\n{out}"
     );
     assert!(
-        out.contains("(%meta ((%array 1 (3) (%scalar integer)) %parameterized (cartpow integers 3)) (elementof"),
+        out.contains(
+            "(%meta ((%array 1 (3) (%scalar integer)) %parametric (cartpow integers 3)) (elementof"
+        ),
         "got:\n{out}"
     );
 }
@@ -912,13 +914,13 @@ fn cartpow_multi_axis_shape() {
     let out = flatppl_flatpir::write(&module);
     assert!(
         out.contains(
-            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized (cartpow (cartpow reals 3) 2)) (elementof"
+            "(%meta ((%array 2 (2 3) (%scalar real)) %parametric (cartpow (cartpow reals 3) 2)) (elementof"
         ),
         "X should infer rank-2 (2 3) real array, got:\n{out}"
     );
     assert!(
         out.contains(
-            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized (cartpow (cartpow reals 3) 2)) (broadcast pow"
+            "(%meta ((%array 2 (2 3) (%scalar real)) %parametric (cartpow (cartpow reals 3) 2)) (broadcast pow"
         ),
         "Y = X .^ 2 should carry the rank-2 (2 3) shape, got:\n{out}"
     );
@@ -942,7 +944,7 @@ fn cartpow_variadic_arity_is_rejected() {
 #[test]
 fn lawof_absorbs_stochasticity() {
     // §04 "Phase of the reified law": `lawof` absorbs the stochasticity of its
-    // `draw` ancestors — the reified law is parameterized (depends on a free
+    // `draw` ancestors — the reified law is parametric (depends on a free
     // `elementof` leaf) or fixed, never stochastic.
     let src = "a = elementof(reals)\n\
                x ~ Normal(a, 1.0)\n\
@@ -954,10 +956,10 @@ fn lawof_absorbs_stochasticity() {
                mz = lawof(z)";
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
-    // Law of x depends on the free parameter `a` → parameterized.
+    // Law of x depends on the free parameter `a` → parametric.
     assert!(
-        out.contains("%parameterized reals) (lawof (%ref self x))"),
-        "lawof(x) should be parameterized, got:\n{out}"
+        out.contains("%parametric reals) (lawof (%ref self x))"),
+        "lawof(x) should be parametric, got:\n{out}"
     );
     // Law of y is fully specified → fixed.
     assert!(
@@ -985,9 +987,7 @@ fn get_peels_one_axis_off_a_multidim_array() {
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains(
-            "(%meta ((%array 1 (4) (%scalar real)) %parameterized (cartpow reals 4)) (get"
-        ),
+        out.contains("(%meta ((%array 1 (4) (%scalar real)) %parametric (cartpow reals 4)) (get"),
         "get(A, 1) on a 3×4 matrix should peel to a length-4 real vector, got:\n{out}"
     );
 }

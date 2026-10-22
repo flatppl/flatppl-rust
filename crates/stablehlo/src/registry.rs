@@ -2888,7 +2888,7 @@ fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 // inlined directly at the call site, the way e.g. a `get`/`get0` selector
 // literal is (`ops::literal_index`). [`literal_fixed_positive_int`] follows
 // that one level via [`Emitter::resolve_ref_one`] before matching the
-// literal; a `%parameterized` (`elementof`-declared) `n` has no such literal
+// literal; a `%parametric` (`elementof`-declared) `n` has no such literal
 // to find and refuses precisely, rather than reaching a Rust `for j in
 // 1..=n` with no `n` at all.
 
@@ -2969,7 +2969,7 @@ fn require_matrix_dim(
 /// FIXED-phase field's use site is that indirection, not the literal inlined
 /// directly (see the batch doc comment) — then requires a positive
 /// `Node::Lit(Scalar::Int(_))`. Refuses (never panics) for anything else,
-/// e.g. a `%parameterized` (`elementof`-declared) `n`, which has no such
+/// e.g. a `%parametric` (`elementof`-declared) `n`, which has no such
 /// literal to find. `mode` (`"logdensity"` or `"sample"`) names which side is
 /// asking, so the message accurately says which lowering needs the literal
 /// — LKJ/LKJCholesky's `logdensity` callers pass `"logdensity"`; Binomial/

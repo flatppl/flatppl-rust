@@ -57,14 +57,14 @@ fn shape_resolver_multi_hop_ref() {
     );
 }
 
-/// A parameterized (non-fixed) integer ref cannot be resolved — the dim stays
+/// A parametric (non-fixed) integer ref cannot be resolved — the dim stays
 /// `%dynamic`.
 #[test]
-fn shape_resolver_parameterized_ref_stays_dynamic() {
+fn shape_resolver_parametric_ref_stays_dynamic() {
     let out = ir("n = elementof(nonnegintegers)\nx ~ iid(Normal(0.0,1.0), n)");
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))"),
-        "parameterized n should stay %dynamic, got:\n{out}"
+        "parametric n should stay %dynamic, got:\n{out}"
     );
 }
 

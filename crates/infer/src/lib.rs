@@ -16,8 +16,8 @@
 //! dependency or an unknown binding yields `(%failed …)` plus an error
 //! diagnostic, never a silent `%deferred`.
 //!
-//! Phases follow the spec-§04 ancestor rule: `stochastic > parameterized >
-//! fixed`, with `elementof` introducing *parameterized*, `draw` *stochastic*,
+//! Phases follow the spec-§04 ancestor rule: `stochastic > parametric >
+//! fixed`, with `elementof` introducing *parametric*, `draw` *stochastic*,
 //! and `external` / loaded data / reifications *fixed*.
 
 mod axes;
@@ -483,7 +483,7 @@ mod cross_module_value_tests {
         );
     }
 
-    /// A `fixed`/`parameterized` binding right beside the stochastic one stays
+    /// A `fixed`/`parametric` binding right beside the stochastic one stays
     /// visible — the boundary hides only stochastic bindings.
     #[test]
     fn non_stochastic_dep_binding_stays_visible() {
@@ -532,7 +532,7 @@ mod substitution_tests {
     fn substitution_flows_into_dependency() {
         // Unsubstituted, the dep gives `out: Real` (add(Real, Integer)). Seeding
         // `p` with an Integer-typed argument narrows `out` to Integer, so this
-        // assertion fails if seeding is disabled. The source `a` is parameterized
+        // assertion fails if seeding is disabled. The source `a` is parametric
         // and its set (`integers`) lies within the input's declared `reals` —
         // spec §04 compatible (phase + value set).
         let dep = flatppl_syntax::parse("p = elementof(reals)\nout = add(p, 1)").expect("dep");
@@ -561,8 +561,8 @@ mod substitution_tests {
         let dep = flatppl_syntax::parse("p = elementof(reals)\nout = p").expect("dep");
         let mut bundle = ModuleBundle::new();
         bundle.insert("d.flatppl", std::sync::Arc::new(dep));
-        // Both substitution sources are parameterized (spec §04: `elementof`
-        // input ← parameterized) but carry distinct types, so the two loads
+        // Both substitution sources are parametric (spec §04: `elementof`
+        // input ← parametric) but carry distinct types, so the two loads
         // memoize separately (Integer vs Real).
         let mut model = flatppl_syntax::parse(
             "a = elementof(integers)\nb = elementof(reals)\nd1 = load_module(\"d.flatppl\", p = a)\nd2 = load_module(\"d.flatppl\", p = b)\nv1 = d1.out\nv2 = d2.out",
@@ -597,7 +597,7 @@ mod substitution_tests {
 mod substitution_phase_tests {
     //! Spec §04 (Module composition → Load-time substitution): the phase of a
     //! loaded module's input governs what it may be bound to —
-    //! `external` ← **fixed** only, `elementof` ← **parameterized** only.
+    //! `external` ← **fixed** only, `elementof` ← **parametric** only.
     use super::*;
 
     fn bundle_with(path: &str, src: &str) -> ModuleBundle {
@@ -643,15 +643,15 @@ mod substitution_phase_tests {
             panic!("elementof ← fixed must be an error; got {diags:?}");
         });
         assert!(
-            err.message.contains("parameterized") && err.node.is_some(),
-            "error must cite the parameterized requirement and anchor to the value node; got {err:?}"
+            err.message.contains("parametric") && err.node.is_some(),
+            "error must cite the parametric requirement and anchor to the value node; got {err:?}"
         );
     }
 
-    /// `external` input ← parameterized value: also a violation (external is a
+    /// `external` input ← parametric value: also a violation (external is a
     /// load-time-fixed hyperparameter).
     #[test]
-    fn external_input_bound_to_parameterized_is_an_error() {
+    fn external_input_bound_to_parametric_is_an_error() {
         let bundle = bundle_with("d.flatppl", "c = external(reals)\nout = mul(c, 2.0)");
         let mut model = flatppl_syntax::parse(
             "p = elementof(reals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
@@ -662,14 +662,14 @@ mod substitution_phase_tests {
             diags.iter().any(|d| d.severity == Severity::Error
                 && d.message.contains("may only be bound")
                 && d.message.contains("fixed")),
-            "external ← parameterized must be an error; got {diags:?}"
+            "external ← parametric must be an error; got {diags:?}"
         );
     }
 
-    /// `elementof` input ← parameterized value: the allowed case (the
+    /// `elementof` input ← parametric value: the allowed case (the
     /// `load_module/` fixture's `center = a` shape), no phase diagnostic.
     #[test]
-    fn elementof_input_bound_to_parameterized_is_ok() {
+    fn elementof_input_bound_to_parametric_is_ok() {
         let bundle = bundle_with("d.flatppl", "c = elementof(reals)\nout = mul(c, 2.0)");
         let mut model = flatppl_syntax::parse(
             "p = elementof(reals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
@@ -680,7 +680,7 @@ mod substitution_phase_tests {
             !diags
                 .iter()
                 .any(|d| d.severity == Severity::Error && d.message.contains("may only be bound")),
-            "elementof ← parameterized is valid; got {diags:?}"
+            "elementof ← parametric is valid; got {diags:?}"
         );
     }
 

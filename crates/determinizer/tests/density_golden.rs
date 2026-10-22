@@ -73,7 +73,7 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
 // form `Normal(mu = 0.0, sigma = 1.0)` (spec §04 calling conventions: positional
 // args bind to the ordered parameter names). The density side must lower it —
 // producing the identical FlatPDL as the keyword form — not refuse. Regression
-// for buffy #143 (@logdensity path).
+// for the @logdensity path.
 #[test]
 fn positional_constructor_lowers_same_as_keyword() {
     let positional = "\
@@ -99,7 +99,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // args to the distribution's ordered §08 parameter names from the catalogue.
 // `Gamma` has params ["shape", "rate"] (two, differently named than Normal's
 // mu/sigma), so `Gamma(2.0, 3.0)` must bind `shape=2.0, rate=3.0`. Regression for
-// buffy #143 (generality across distributions, @logdensity path).
+// generality across distributions on the @logdensity path.
 #[test]
 fn positional_gamma_constructor_lowers_same_as_keyword() {
     let positional = "\
@@ -123,8 +123,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 
 // Single-parameter arity: `Exponential` has params ["rate"], so a one-positional
 // call `Exponential(1.5)` binds `rate=1.5`. Confirms the positional mapping is not
-// tied to the two-parameter shape. Regression for buffy #143 (single-arg
-// positional constructor, @logdensity path).
+// tied to the two-parameter shape. Regression for the single-arg
+// positional constructor on the @logdensity path.
 #[test]
 fn positional_exponential_single_arg_lowers_same_as_keyword() {
     let positional = "\
@@ -150,7 +150,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // catalogue — so `constructor_param_names` (not `distribution_param_names`)
 // must resolve `Dirac`'s ordered param `["value"]`. `Dirac(0)` (positional)
 // therefore binds `value=0` and lowers to the identical FlatPDL as the keyword
-// form `Dirac(value = 0)`. Regression for buffy #246 (positional Dirac was
+// form `Dirac(value = 0)`. Regression: positional Dirac was
 // refused because the distribution catalogue has no Dirac row).
 #[test]
 fn positional_dirac_constructor_lowers_same_as_keyword() {
@@ -182,8 +182,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.0))";
 // (`inline_user_calls`) then beta-reduces the call into a literal record and
 // Pass 3 (`flatten_structural`) resolves the resulting static `get` to the
 // literal field value directly — no residual `get` accessor survives.
-// Regression for buffy #247 (the splat wasn't firing → emitted `record(shape =
-// gamma_shape_rate(…))` with `rate` missing) AND re-baselined for buffy #263
+// Regression: the splat wasn't firing → emitted `record(shape =
+// gamma_shape_rate(…))` with `rate` missing. Also re-baselined for
 // Pass 3 (this test used to pin the unresolved `get(call, "field")` shape;
 // that shape is now flattened away, not weakened — both literal values still
 // land on the correct params).
@@ -233,7 +233,7 @@ fn unary_dirac_keeps_the_same_record_with_positional_and_keyword_binding() {
 // (`sigma = sqrt(sigma2)`, `sigma2` a draw) lowers the field's marginal as the
 // pushforward of the inner draw's law under the transform (§06 pushfwd
 // change-of-variables), NOT a refuse. `sqrt` is `pow(_, 0.5)`, a spec §06
-// "Known-bijection registry" member. Regression for buffy #245: the
+// "Known-bijection registry" member. Regression: the
 // record-of-draws path used to reject any field that was not a bare draw.
 #[test]
 fn transformed_draw_prior_field_lowers_as_pushfwd() {
@@ -507,7 +507,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // mass is additive/multiplicative, Z = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ (a closed-form
 // scalar), so it lowers to the superpose density minus `log(Σ wᵢ)`, NOT a refuse.
 // Weights need NOT sum to one — here 0.3 + 0.5 = 0.8 — the normalizer is the
-// general `log(add w₁ w₂)`. Regression for buffy #262 (dissimilar-mixture).
+// general `log(add w₁ w₂)`. Regression for the dissimilar mixture.
 #[test]
 fn normalize_superpose_convex_mixture_lowers_with_sum_weights_normalizer() {
     let src = "\
@@ -530,7 +530,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     // The Z = Σ wᵢ normalizer: `sub(<superpose density>, log(add(0.3, 0.5)))`.
     // Canon Pass 1 const-folds the literal `add(0.3, 0.5)` to `0.8` (the four
     // basic arithmetic ops are IEEE-754-exact, so this is safe/bit-identical);
-    // `log` itself is deliberately left unevaluated (Buffy #263 Pass 1: no
+    // `log` itself is deliberately left unevaluated (Pass 1: no
     // transcendental folding), so the normalizer surfaces as a bare `(log 0.8)`
     // — distinct from the per-mixand `(add (log 0.3) …)` terms.
     assert!(
@@ -611,8 +611,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // to a record literal (`theta = record(...)`, a `Ref(SelfMod, theta)`), not an
 // inline `record(...)`. `match_independent_record` resolves one ref level (as the
 // measure side does) so the ref form lowers the same as the inline form — no
-// "value must be a record" refuse. Regression for buffy #264 (surfaced verifying
-// #262: dissimilar-mixture's `theta = record(...)` posterior score).
+// "value must be a record" refuse. Regression: surfaced verifying the
+// dissimilar mixture's `theta = record(...)` posterior score.
 #[test]
 fn record_variate_score_value_by_ref_lowers() {
     let src = "\
@@ -640,7 +640,7 @@ lp = logdensityof(lawof(record(a = a, b = b)), theta)";
 // Same ref-valued-score fix on the keyword-`joint` value path
 // (`lower_keyword_joint`): a `joint(x = …, y = …)` scored at a `theta = record(x
 // = …, y = …)` ref lowers, not "joint value must be a record". Regression for
-// buffy #264.
+// the keyword-joint score by ref.
 #[test]
 fn keyword_joint_score_value_by_ref_lowers() {
     let src = "\
@@ -701,8 +701,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // builds a `builtin_touniform(kernel, kernel_input, ·)` pair for the closed-form
 // Z). A POSITIONAL-arg base constructor (`Normal(0.0, 1.0)`) is equivalent to the
 // keyword form (spec §04 calling conventions) and must lower to the identical
-// FlatPDL, not refuse. Regression for buffy gap A: `kernel_and_input` was the one
-// remaining keyword-only site post-#143 (`split_kernel_constructor` positional
+// FlatPDL, not refuse. Regression: `kernel_and_input` was the one
+// remaining keyword-only site after the density-side fix (`split_kernel_constructor` positional
 // support), refusing with "primitive constructor with positional args not
 // supported" on a positional truncation base.
 #[test]
@@ -1352,7 +1352,7 @@ fn locscale_scalar_lowers() {
         ls_pir("d = locscale(Normal(mu = 0.0, sigma = 1.0), 2.0, 3.0)\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
     // f_inv preimage (y - 2)/3, applied at the literal query point y = 0.5, is
-    // now beta-reduced AND const-folded to -0.5 (Buffy #263 Pass 2 inlines the
+    // now beta-reduced AND const-folded to -0.5 (Pass 2 inlines the
     // residual `%call` that used to carry `divide(sub(_x_, 2.0), 3.0)`
     // unapplied; const-fold then reduces the folded arithmetic to one term).
     // §11 "Literal values" forbids a signed atom, so the negative fold result
@@ -1912,7 +1912,7 @@ lp_z = logdensityof(lawof(z), 0.1)";
 
 // A measure built from ANOTHER value's law is not parameterized by that value.
 // §04 "Reification to measures", *Phase of the reified law*: "the resulting measure
-// is itself deterministic (of parameterized or fixed phase): `lawof` absorbs
+// is itself deterministic (of parametric or fixed phase): `lawof` absorbs
 // stochasticity into the reified law rather than propagating it outward." So in
 // `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, not its value:
 // `z` is no ancestor of `y`, and `lawof(y)` is an honest LogNormal. The

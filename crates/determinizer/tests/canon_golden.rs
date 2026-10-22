@@ -8,7 +8,7 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
 
 // Constant subexpressions in the determinised FlatPDL fold to a literal:
 // scoring a mixture with literal weights leaves `log(0.3 + 0.5)`; const-fold
-// reduces the `add(0.3, 0.5)` to `0.8`. Buffy #263 Pass 1.
+// reduces the `add(0.3, 0.5)` to `0.8`. Pass 1.
 #[test]
 fn const_fold_reduces_literal_sum_of_weights() {
     let src = "\
@@ -67,7 +67,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // int/real-mixed (`1 - 0.4`, where `1` is an Int) and integer-exponent `pow`
 // (`2.0 ^ 2`). Both IEEE-exact, structural-around-density (a weight and a
 // distribution parameter). The mixed `sub` folds to 0.6, the integer `pow` to
-// 4.0 — no residual `(sub 1 0.4)` / `(pow ` remains. Buffy #263 Pass 4-B.
+// 4.0 — no residual `(sub 1 0.4)` / `(pow ` remains. Pass 4-B.
 #[test]
 fn const_fold_completes_int_real_mixed_and_integer_pow() {
     let src = "\
@@ -126,7 +126,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 4))";
 // two tests above. The determinized FlatPDL must resolve every `w` reference
 // to its literal value — the alias itself (0.4) or its downstream fold (the
 // mixture-weight sum 0.4 + 0.5 = 0.9, once `resolve_alias_refs` exposes the
-// literal to `const_fold`) — never a residual `(%ref self w)`. Buffy #263
+// literal to `const_fold`) — never a residual `(%ref self w)`.
 // Pass 1, Step 12 golden.
 #[test]
 fn resolve_alias_refs_inlines_literal_weight_alias() {
@@ -185,7 +185,7 @@ fn alias_resolution_preserves_shared_outputs_and_inputs() {
 // synthetic — it is a plain user-chosen name — so it must survive untouched
 // even though `!public` alone (name starts with `_`) would also match it.
 // Pins the `synthetic`-vs-`!public` predicate fix the numeric det-js
-// equivalence gate caught (see task-1-report.md). Buffy #263 Pass 1, Step 12
+// equivalence gate caught. Pass 1, Step 12
 // golden.
 #[test]
 fn sweep_dead_bindings_removes_synthetic_but_preserves_scored_binding() {
@@ -211,8 +211,8 @@ __score__ = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 }
 
 // A user-defined function used deterministically must be INLINED in FlatPDL:
-// no residual `(%call ...)` reaches consumers (flatppl-js can't evaluate one —
-// Buffy #261). Buffy #263 Pass 2.
+// no residual `(%call ...)` reaches consumers (flatppl-js can't evaluate one).
+// Pass 2.
 #[test]
 fn inline_user_calls_eliminates_residual_user_call() {
     let src = "\
@@ -264,8 +264,8 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // `vector(0.5, 0.5)` variate itself (density.rs `lower_joint`). Since the
 // container is a literal constructor and the index is a literal int,
 // `flatten_structural` must resolve each `get0` to the projected element
-// directly — no residual `(get0 ` over a literal vector may remain. Buffy
-// #263 Pass 3.
+// directly — no residual `(get0 ` over a literal vector may remain.
+// Pass 3.
 #[test]
 fn flatten_structural_resolves_static_get0_vector_projection() {
     let src = "\
@@ -304,12 +304,12 @@ lp = logdensityof(d, [0.5, 0.5])";
     );
 }
 
-// §04 auto-splat (buffy #247) pulls each field of an opaque multi-output
+// §04 auto-splat pulls each field of an opaque multi-output
 // record call via `get(arg, "field")`. Once Pass 2 (`inline_user_calls`)
 // beta-reduces the call away, the call site becomes a LITERAL
 // `record(shape = 2.0, rate = 1.0)` — a static `get(record(...), "field")`
 // that `flatten_structural` must resolve to the literal field value directly.
-// Buffy #263 Pass 3.
+// Pass 3.
 #[test]
 fn flatten_structural_resolves_static_get_record_projection() {
     let src = "\

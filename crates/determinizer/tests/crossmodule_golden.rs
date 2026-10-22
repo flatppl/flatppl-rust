@@ -1148,7 +1148,7 @@ lp = logdensityof(outer.m, 0.5)";
 }
 
 // ===========================================================================
-// Buffy #359 — cross-module QUERY MODULE resolution (the pre-pass).
+// Cross-module QUERY MODULE resolution (the pre-pass).
 //
 // A query module `load_module`s a model and scores its `prior`/`posterior` at a
 // cross-module VALUE (`model.default_pars`) via top-level ALIAS bindings
@@ -1338,7 +1338,7 @@ l2 = logdensityof(posterior, x)";
     );
 }
 
-// Regression (Buffy #379): a `~` whose primitive measure is a cross-module
+// Regression: a `~` whose primitive measure is a cross-module
 // distribution ref — `x ~ h.d` (`x = draw((%ref h d))`) — must graft the
 // submodule distribution and determinize, not refuse. The module ref is NESTED
 // inside `draw(...)`, so the top-level alias-binding rewrite doesn't reach it;
@@ -1370,7 +1370,7 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
     );
 }
 
-// Regression (Buffy #379, function-callee): a REGULAR binding whose RHS applies
+// Regression (function-callee): a REGULAR binding whose RHS applies
 // a cross-module FUNCTION to a HOST value — `shifted = h.g(mu0)` — must graft
 // the callee `h.g` and determinize (the applied function feeds a distribution
 // parameter). Previously the module-ref callee nested in the application (not a
