@@ -1733,6 +1733,62 @@ fn lower_in_nonnegreals_compares_at_or_above_zero() {
     assert!(is_delimiter_balanced(&out));
 }
 
+/// §03 `posintegers` is $\{1, 2, 3, \ldots\}$ and, unlike the real sets, holds no
+/// infinity. A real point is whole (`floor(v) == v`), finite (`floor(inf)` is
+/// `inf`, so `|v| < inf` is its own test) and at least one.
+#[test]
+fn lower_in_posintegers_tests_a_real_point_for_a_finite_whole_value() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "posintegers");
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(out.contains("stablehlo.floor"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare EQ"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare LT"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// An integer point is whole and finite by its type, so `nonnegintegers` needs
+/// only the bound at zero.
+#[test]
+fn lower_in_nonnegintegers_bounds_an_integer_point_at_zero() {
+    let mut m = Module::new();
+    let k = int(&mut m, 5);
+    let set = const_node(&mut m, "nonnegintegers");
+    let cond = call(&mut m, "in", &[k, set]);
+
+    let mut e = unrestricted_emitter(&m, Dtype::F32);
+    e.bind(
+        k,
+        Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        },
+    );
+    let result = e.lower_node(cond).unwrap();
+    assert_eq!(result.elem, ElemKind::Bool);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&result],
+    );
+    assert!(!out.contains("stablehlo.floor"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
 /// §03 `cartpow(S, size)` is "the Cartesian power of `S` with shape `size`",
 /// so membership of a vector point holds when EVERY cell is in `S`: the
 /// per-cell `tensor<3xi1>` comparison is all-reduced (`stablehlo.and` combine,
