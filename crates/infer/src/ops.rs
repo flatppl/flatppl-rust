@@ -6234,6 +6234,21 @@ fn broadcast_type(
         });
     }
     if let Some(cell_domain) = distribution_domain(inf, &op_name, &[], &[]) {
+        // Each element is an argument to the constructor, so a matrix parameter's
+        // element must be a matrix too.
+        let cell_args: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, t, p)| (*n, cell_arg(t), *p))
+            .collect();
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+            .collect();
+        let cells = normalize_keyword_args(inf.module, &op_name, &cell_args, &cell_named)
+            .unwrap_or(cell_args);
+        if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &op_name, &cells) {
+            return Ready(ty);
+        }
         return Ready(Type::Measure {
             domain: Box::new(Type::Array {
                 shape,

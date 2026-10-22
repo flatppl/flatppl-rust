@@ -78,3 +78,29 @@ fn a_rowstack_or_colstack_matrix_types() {
          lp = logdensityof(w, rowstack([[1.0, 0.2], [0.2, 1.0]]))",
     );
 }
+
+#[test]
+fn a_broadcast_element_must_be_a_matrix_too() {
+    // Each element of a broadcast argument is an argument to the constructor.
+    let mus = "[[0.0, 0.0], [1.0, 1.0]]";
+    assert_refuses(
+        &format!("m = MvNormal.(mu = {mus}, cov = [[[1.0, 0.0], [0.0, 1.0]]])"),
+        "cov",
+    );
+    assert_refuses(
+        &format!("m = broadcast(MvNormal, {mus}, [[[1.0, 0.0], [0.0, 1.0]]])"),
+        "cov",
+    );
+    assert_refuses(
+        "covs = [[[1.0, 0.0], [0.0, 1.0]], [[2.0, 0.0], [0.0, 2.0]]]\n\
+         m = MvNormal.(mu = [[0.0, 0.0], [1.0, 1.0]], cov = covs)",
+        "cov",
+    );
+    assert_refuses(
+        "w = Wishart.(nu = [3.0, 4.0], scale = [[[1.0, 0.0], [0.0, 1.0]]])",
+        "scale",
+    );
+    assert_clean(&format!(
+        "m = MvNormal.(mu = {mus}, cov = [rowstack([[1.0, 0.0], [0.0, 1.0]])])"
+    ));
+}
