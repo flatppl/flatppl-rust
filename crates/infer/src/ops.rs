@@ -6019,6 +6019,99 @@ fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol,
     refs
 }
 
+/// §04 "Broadcasting", "Tuple inputs": `broadcast(f, (a, b), c)` is
+/// `(f(a, c), f(b, c))`. Tuple operands share one length, and a tuple cannot be
+/// combined with an array or table operand or broadcast through a kernel.
+fn tuple_broadcast_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    head_node: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let operands = || {
+        args[1..]
+            .iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+    };
+    let fail = |inf: &mut Inferencer<'_, '_>, what: &str| {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!("`broadcast`: {what} (spec §04 \"Broadcasting\", \"Tuple inputs\")"),
+        ));
+        Ready(Type::Failed("broadcast over tuples".into()))
+    };
+    if operands().any(|ty| {
+        matches!(
+            ty,
+            Type::Array { .. } | Type::TVector { .. } | Type::Table { .. }
+        )
+    }) {
+        return fail(
+            inf,
+            "a tuple operand cannot be combined with an array or table operand",
+        );
+    }
+    let mut lengths = operands().filter_map(|ty| match ty {
+        Type::Tuple(items) => Some(items.len()),
+        _ => None,
+    });
+    let len = lengths.next().unwrap_or(0);
+    if lengths.any(|other| other != len) {
+        return fail(inf, "tuple operands must have the same length");
+    }
+    let component = |ty: &Type, i: usize| match ty {
+        Type::Tuple(items) => items[i].clone(),
+        other => other.clone(),
+    };
+    let step = |i: usize| {
+        let cell_args: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, ty, p)| (*n, component(ty, i), *p))
+            .collect();
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, ty, p)| (*s, *n, component(ty, i), *p))
+            .collect();
+        (cell_args, cell_named)
+    };
+    let steps: Vec<_> = (0..len).map(step).collect();
+    tuple_components(inf, id, head_node, steps, Vec::new())
+}
+
+/// Type the component calls of a tuple broadcast one after another.
+fn tuple_components(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    head_node: NodeId,
+    mut steps: Vec<(Vec<ArgInfo>, Vec<NamedInfo>)>,
+    done: Vec<Type>,
+) -> RuleStep<Type> {
+    if steps.is_empty() {
+        return Ready(Type::Tuple(done.into()));
+    }
+    let (cell_args, cell_named) = steps.remove(0);
+    ordinary_call_type(inf, head_node, &cell_args, &cell_named).and_then(inf, move |inf, ty| {
+        match ty {
+            Type::Failed(_) => return Ready(ty),
+            Type::Measure { .. } => {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "`broadcast` of a kernel over tuple operands is not allowed \
+                     (spec §04 \"Broadcasting\", \"Tuple inputs\")"
+                        .to_string(),
+                ));
+                return Ready(Type::Failed("kernel broadcast over tuples".into()));
+            }
+            _ => {}
+        }
+        let mut done = done;
+        done.push(ty);
+        tuple_components(inf, id, head_node, steps, done)
+    })
+}
+
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
 /// maps elementwise over same-shape arrays (scalars ride along) into an
 /// array; a kernel / distribution-constructor head yields a **measure over
@@ -6034,6 +6127,17 @@ fn broadcast_type(
         return Ready(Type::Deferred);
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
+
+    // §04 "Broadcasting" (#210): records are non-collection inputs, "simply not
+    // iterated over but held constant". Tuple inputs are iterated component-wise.
+    if args[1..]
+        .iter()
+        .map(|(_, ty, _)| ty)
+        .chain(named.iter().map(|(_, _, ty, _)| ty))
+        .any(|ty| matches!(ty, Type::Tuple(_)))
+    {
+        return tuple_broadcast_type(inf, id, head_node, args, named);
+    }
 
     if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {
         return Ready(ty);
@@ -7043,6 +7147,37 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
     Some(entry)
 }
 
+/// Heads whose leading inputs cannot be passed by keyword although they carry a
+/// catalogue row, as `(distinguished positional inputs, keywords allowed after
+/// them, citation)`. §04 "Calling conventions" names the measure combinators
+/// (`normalize(M = mu)` is its example); §06 lists them. `restrict` keeps its
+/// keyword-splat form after the measure (§06 "Measure restriction"). `cat` and
+/// `get` are listed in §04 with unnamed variadic inputs.
+fn positional_only_inputs(name: &str) -> Option<(usize, bool, &'static str)> {
+    const MEASURE_COMBINATORS: &str = "\"The measure combinators likewise take their non-variadic \
+         inputs positionally: a keyword spelling such as `normalize(M = mu)` is a static error\"";
+    let entry = match name {
+        "normalize" | "totalmass" => (1, false, MEASURE_COMBINATORS),
+        "iid" | "truncate" | "bayesupdate" | "likelihoodof" | "disintegrate" => {
+            (2, false, MEASURE_COMBINATORS)
+        }
+        "locscale" | "bijection" => (3, false, MEASURE_COMBINATORS),
+        "restrict" => (1, true, MEASURE_COMBINATORS),
+        "cat" => (
+            0,
+            false,
+            "\"`cat`, `fchain`, `kchain`: Variadic unnamed inputs\"",
+        ),
+        "get" => (
+            1,
+            false,
+            "\"`get`: One distinguished input plus variadic unnamed input\"",
+        ),
+        _ => return None,
+    };
+    Some(entry)
+}
+
 /// Reject a special-operation application whose input count or spelling
 /// contradicts §04's declaration for it, and any nullary builtin call.
 ///
@@ -7086,6 +7221,30 @@ fn special_arity_check(
         ));
         Some(Type::Failed(format!("{name}: {what}").into()))
     };
+    // The measure combinators take their non-variadic inputs positionally (§04
+    // "Calling conventions": "a keyword spelling such as `normalize(M = mu)` is a
+    // static error"), and `cat` and `get` take unnamed variadic inputs. The count
+    // is the catalogue row's business, so only the spelling is checked here.
+    if let Some((distinguished, keywords_after, cite)) = positional_only_inputs(name)
+        && !named.is_empty()
+        && (args.len() < distinguished || !keywords_after)
+    {
+        return refuse(
+            inf,
+            format!(
+                "takes its {} positionally and cannot be given {} keyword argument(s). Where \
+                 the spec names such an input, the name identifies it in prose only — a call \
+                 binds it by position. Pass the arguments positionally",
+                if distinguished == 0 {
+                    "inputs".to_string()
+                } else {
+                    format!("{distinguished} distinguished input(s)")
+                },
+                named.len()
+            ),
+            cite,
+        );
+    }
     let Some((declared, cite)) = special_arity(name) else {
         // §04: "Nullary calls (`f()`) are not allowed." Only for a head with NO
         // declared arity anywhere: [`arity_check`] returns `Some` on a mismatch
@@ -7329,7 +7488,8 @@ const RNG_SEED_BOUND: i128 = 1 << 64;
 /// source, because a literal above `i64::MAX` is already a lex error
 /// ("invalid integer literal"), which leaves $[2^{63}, 2^{64})$ unwritable as a
 /// literal here — a front-end limit, not an `rnginit` rule. The byte vector's
-/// own $\{0, \ldots, 255\}$ element range stays unchecked, as it was.
+/// own $\{0, \ldots, 255\}$ element range is checked for a written vector, by
+/// the same rule: an element outside it is in neither form's set.
 fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Option<Type> {
     if name != "rnginit" {
         return None;
@@ -7360,6 +7520,31 @@ fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo
             ),
         ));
         return Some(Type::Failed("rnginit: seed is neither form".into()));
+    }
+    if form == "a byte vector" {
+        // A written byte vector is checked element by element; any other vector
+        // is a run-time value this pass cannot read.
+        let literal = resolve_binding_refs(inf, *node);
+        if let Node::Call(call) = inf.module.node(literal)
+            && matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
+        {
+            let elements = call.args.to_vec();
+            for element in elements {
+                if let Some(byte) = written_int(inf, element)
+                    && !(0..=255).contains(&byte)
+                {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        element,
+                        format!(
+                            "`rnginit` byte-vector seed has element {byte}, outside 0..255: spec \
+                             §07 `rnginit` states that a byte-vector seed contains integers in \
+                             $\\{{0, \\ldots, 255\\}}$"
+                        ),
+                    ));
+                    return Some(Type::Failed("rnginit: seed byte out of range".into()));
+                }
+            }
+        }
     }
     if form == "an integer seed" {
         let n = written_int(inf, *node)?;

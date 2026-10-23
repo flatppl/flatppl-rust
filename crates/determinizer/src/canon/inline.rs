@@ -94,6 +94,14 @@ fn inline_walk(
     } else {
         id
     };
+    if let Some(expanded) = expand_tuple_broadcast(m, id) {
+        let calls = m.node(expanded).children();
+        let walked: Vec<NodeId> = calls
+            .iter()
+            .map(|&call| inline_walk(m, call, mapped, projections, reduce))
+            .collect();
+        id = rebuild_with_children(m, expanded, &walked);
+    }
     if let Some(promoted) = projections {
         id = super::project_tuple(m, id, promoted)
             .or_else(|| super::project(m, id, promoted))
@@ -116,6 +124,87 @@ fn inline_walk(
     id = normalize_builtin_call(m, id).unwrap_or(id);
     mapped.insert(original, id);
     id
+}
+
+/// Spec §04 "Broadcasting", "Tuple inputs": `broadcast(f, (a, b), c)` equals
+/// `(f(a, c), f(b, c))`. A tuple operand has a static length, so the broadcast
+/// unrolls into a tuple of ordinary calls and no lowering sees a tuple operand.
+/// Other operands, records included, are held constant in every component.
+/// Inference has already rejected unequal lengths, array or table operands and
+/// kernel heads.
+fn expand_tuple_broadcast(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    if m.resolve(head) != "broadcast" || call.args.is_empty() {
+        return None;
+    }
+    let call = call.clone();
+    let callee = call.args[0];
+    let operands = || {
+        call.args[1..]
+            .iter()
+            .copied()
+            .chain(call.named.iter().map(|arg| arg.value))
+    };
+    let len = operands().find_map(|operand| tuple_len(m, operand))?;
+    if operands().any(|operand| tuple_len(m, operand).is_some_and(|other| other != len)) {
+        return None;
+    }
+    let mut components = Vec::with_capacity(len);
+    for i in 0..len {
+        let args: Vec<NodeId> = call.args[1..]
+            .iter()
+            .map(|&operand| tuple_component(m, operand, i))
+            .collect();
+        let named: Vec<flatppl_core::NamedArg> = call
+            .named
+            .iter()
+            .map(|arg| flatppl_core::NamedArg {
+                value: tuple_component(m, arg.value, i),
+                ..*arg
+            })
+            .collect();
+        components.push(m.alloc(Node::Call(Call {
+            head: CallHead::User(callee),
+            args: args.into(),
+            named: named.into(),
+            inputs: None,
+        })));
+    }
+    Some(crate::density::build_call(m, "tuple", &components))
+}
+
+/// The length of a tuple operand, read from its literal or its inferred type.
+fn tuple_len(m: &Module, operand: NodeId) -> Option<usize> {
+    let (resolved, _) = crate::density::resolve_ref_chain(m, operand);
+    if let Node::Call(c) = m.node(resolved)
+        && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "tuple")
+    {
+        return Some(c.args.len());
+    }
+    match m.type_of(operand).or_else(|| m.type_of(resolved)) {
+        Some(flatppl_core::Type::Tuple(items)) => Some(items.len()),
+        _ => None,
+    }
+}
+
+/// Component `i` of a tuple operand; any other operand is held constant.
+fn tuple_component(m: &mut Module, operand: NodeId, i: usize) -> NodeId {
+    if tuple_len(m, operand).is_none() {
+        return operand;
+    }
+    let (resolved, _) = crate::density::resolve_ref_chain(m, operand);
+    if let Node::Call(c) = m.node(resolved)
+        && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "tuple")
+    {
+        return c.args[i];
+    }
+    let index = m.alloc(Node::Lit(flatppl_core::Scalar::Int(i as i64 + 1)));
+    crate::density::build_call(m, "get", &[operand, index])
 }
 
 /// If `id` is `(%call <bare builtin> args…)`, the `Builtin` head that same application
