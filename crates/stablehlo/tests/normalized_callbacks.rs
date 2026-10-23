@@ -115,13 +115,14 @@ fn explicit_pushforward_parameters_reach_both_density_maps_and_sampling() {
 fn sequence_parameters_keep_record_fields_outside_the_iteration_axis() {
     // For p=(scale=2,shift=1), the scan is [2,7,18]; the final derivatives
     // are (11,7). The associative reduction a+x+shift is 8 at shift=1.
+    // A record or tuple is not an additional input of `scan` (spec §04 "Broadcasting",
+    // "Disallowed inputs"), so `scan` takes the fields and only `reduce` takes the record.
     let source = "p = external(cartprod(scale = reals, shift = reals))\n\
-                  step(a, x, q) = q.scale * a + x + q.shift\n\
+                  step(a, x, scale, shift) = scale * a + x + shift\n\
                   fold(a, x, q) = a + x + q.shift\ninputs = p\n\
-                  outputs = (scan(step, 0.0, [1.0, 2.0, 3.0], p), \
+                  outputs = (scan(step, 0.0, [1.0, 2.0, 3.0], p.scale, p.shift), \
                              reduce(fold, [1.0, 2.0, 3.0], p))";
     emit(source, &Mode::LogDensity);
-    // A tuple is not an additional input of `scan` (spec §04), so only `reduce` takes it.
     let tuple = source
         .replace(
             "fold(a, x, q) = a + x + q.shift",
@@ -278,15 +279,11 @@ fn keyword_additional_arguments_of_a_sequence_callback_refuse() {
 
 #[test]
 fn scan_holds_a_constant_input_at_every_step() {
-    // `scan(step, 0, [1, 2, 3], 2)` equals the scan with `[2]` repeated per step,
-    // and the record form binds its field.
+    // `scan(step, 0, [1, 2, 3], 2)` equals the scan with `[2]` repeated per step.
     let source = "mu = external(reals)\nstep(a, x, w) = w * a + x\ninputs = mu\n\
                   outputs = scan(step, 0.0, [1.0, 2.0, mu], 2.0)[3]";
     let actual = emit(source, &Mode::LogDensity);
     assert!(actual.contains("stablehlo.while"), "{actual}");
-    let record = "mu = external(reals)\nstep(a, x, p) = p.w * a + x\ninputs = mu\n\
-                  outputs = scan(step, 0.0, [1.0, 2.0, mu], record(w = 2.0))[3]";
-    assert!(emit(record, &Mode::LogDensity).contains("stablehlo.while"));
 }
 
 #[test]
