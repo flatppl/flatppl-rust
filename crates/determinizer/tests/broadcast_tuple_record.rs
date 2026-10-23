@@ -52,3 +52,23 @@ fn a_record_operand_is_held_constant_for_every_call() {
     assert!(sample.contains("builtin_sample"), "{sample}");
     pir(&format!("{rec}r = broadcast(f, [1.0, 2.0], rec)\n"));
 }
+
+#[test]
+fn a_builtin_callee_unrolls_like_a_user_function() {
+    // The callee is a bare builtin, not a user function: dot operators, a named
+    // builtin and a dotted call all become a tuple of direct builtin calls.
+    for (call, want) in [
+        ("(2.0, 3.0) .+ 10.0", "(tuple 12.0 13.0)"),
+        ("broadcast(add, (2.0, 3.0), (5.0, 7.0))", "(tuple 7.0 10.0)"),
+        ("exp.((0.0, 1.0))", "(tuple (%meta"),
+    ] {
+        let out = pir(&format!("r = {call}\n"));
+        assert!(out.contains(want), "{call}\n{out}");
+        assert!(!out.contains("%call"), "{call}: residual user call\n{out}");
+    }
+    let out = pir("r = exp.((0.0, 1.0))\n");
+    assert!(
+        out.contains("(exp 0.0)") && out.contains("(exp 1.0)"),
+        "{out}"
+    );
+}
