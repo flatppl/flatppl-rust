@@ -143,13 +143,24 @@ fn a_dependent_prior_chain_reads_the_preceding_parameters_from_the_record() {
     // parameter takes the record whole and reads its field.
     let mut spec = read(include_str!("fixtures/gaussian.formula.json")).unwrap();
     spec.formula = "y ~ 0 + x".into();
-    for (priors, chain) in [
+    // The masses pin what the positional chain reported before the keyword form: a
+    // symbolic interval bound has an unknown mass, and a proper factor reads its own law.
+    for (priors, chain, masses) in [
         (
             json!([
                 {"class":"b", "prior":"Lebesgue(interval(0, sigma))"},
                 {"class":"sigma", "prior":"exponential(1)"}
             ]),
             "iid(Lebesgue(interval(0, _point_",
+            ("unknown", "normalized"),
+        ),
+        (
+            json!([
+                {"class":"b", "prior":"Lebesgue(interval(sigma, sigma + 2))"},
+                {"class":"sigma", "prior":"exponential(1)"}
+            ]),
+            "iid(Lebesgue(interval(_point_",
+            ("unknown", "normalized"),
         ),
         (
             json!([
@@ -157,6 +168,7 @@ fn a_dependent_prior_chain_reads_the_preceding_parameters_from_the_record() {
                 {"class":"sigma", "prior":"Lebesgue(posreals)"}
             ]),
             "Normal(0, _point_",
+            ("normalized", "locallyfinite"),
         ),
     ] {
         spec.priors = serde_json::from_value(priors).unwrap();
@@ -164,8 +176,9 @@ fn a_dependent_prior_chain_reads_the_preceding_parameters_from_the_record() {
         let text = flatppl_syntax::print(&converted.module);
         assert!(text.contains("jointchain("), "{text}");
         assert!(text.contains(chain), "{chain}\n{text}");
-        assert!(converted.info.prior_factors.contains_key("b"), "{text}");
-        assert!(converted.info.prior_factors.contains_key("sigma"), "{text}");
+        let factors = &converted.info.prior_factors;
+        assert_eq!(factors["b"].mass, masses.0, "{text}");
+        assert_eq!(factors["sigma"].mass, masses.1, "{text}");
     }
 }
 
