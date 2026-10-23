@@ -569,31 +569,45 @@ fn read_valueset(module: &mut Module, form: &Sexpr) -> Result<Option<ValueSet>> 
                     )))
                 }
                 "cartprod" => {
-                    let parts: Result<Vec<ValueSet>> = items[1..]
-                        .iter()
-                        .map(|it| {
-                            read_valueset(module, it)?
-                                .ok_or_else(|| err(it, "`%deferred` is not allowed inside a set"))
-                        })
-                        .collect();
-                    Ok(Some(ValueSet::CartProd(parts?.into())))
-                }
-                "record" => {
-                    let mut fields = Vec::new();
-                    for pair in &items[1..] {
-                        let SexprKind::List(kv) = &pair.kind else {
-                            return Err(err(pair, "a record value-set field is (<name> <set>)"));
-                        };
-                        if kv.len() != 2 {
-                            return Err(err(pair, "a record value-set field is (<name> <set>)"));
-                        }
-                        let name = module.intern(atom(&kv[0])?);
-                        let set = read_valueset(module, &kv[1])?.ok_or_else(|| {
-                            err(&kv[1], "`%deferred` is not allowed inside a set")
-                        })?;
-                        fields.push((name, set));
+                    // Positional sets, or keyword `(%field <name> <set>)` entries (spec
+                    // §11 "Structural named entries"); the two do not mix.
+                    let is_field = |it: &Sexpr| {
+                        matches!(&it.kind, SexprKind::List(kv)
+                            if matches!(kv.first().map(|h| &h.kind), Some(SexprKind::Atom(h)) if h == "%field"))
+                    };
+                    let fields = items[1..].iter().filter(|it| is_field(it)).count();
+                    if fields == 0 {
+                        let parts: Result<Vec<ValueSet>> = items[1..]
+                            .iter()
+                            .map(|it| {
+                                read_valueset(module, it)?.ok_or_else(|| {
+                                    err(it, "`%deferred` is not allowed inside a set")
+                                })
+                            })
+                            .collect();
+                        return Ok(Some(ValueSet::CartProd(parts?.into())));
                     }
-                    Ok(Some(ValueSet::RecordSet(fields.into())))
+                    if fields != items.len() - 1 {
+                        return Err(err(
+                            form,
+                            "a cartprod takes either positional sets or `(%field <name> <set>)` entries, not both",
+                        ));
+                    }
+                    let mut named = Vec::with_capacity(fields);
+                    for entry in &items[1..] {
+                        let SexprKind::List(kv) = &entry.kind else {
+                            unreachable!("checked by is_field");
+                        };
+                        if kv.len() != 3 {
+                            return Err(err(entry, "a cartprod field is (%field <name> <set>)"));
+                        }
+                        let name = module.intern(atom(&kv[1])?);
+                        let set = read_valueset(module, &kv[2])?.ok_or_else(|| {
+                            err(&kv[2], "`%deferred` is not allowed inside a set")
+                        })?;
+                        named.push((name, set));
+                    }
+                    Ok(Some(ValueSet::RecordSet(named.into())))
                 }
                 other => Err(err(&items[0], format!("unknown value-set form `{other}`"))),
             }

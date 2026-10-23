@@ -222,7 +222,7 @@ fn cartprod_and_record_valuesets_roundtrip() {
     let src = "(%module \
         (%bind p (%meta ((%array 1 (2) (%scalar real)) %fixed (cartprod reals posreals)) (elementof reals))) \
         (%bind m (%meta ((%array 2 (2 3) (%scalar real)) %fixed (cartpow (cartpow reals 3) 2)) (elementof reals))) \
-        (%bind r (%meta ((%record (a (%scalar real)) (b (%scalar real))) %fixed (record (a reals) (b unitinterval))) (elementof reals))))";
+        (%bind r (%meta ((%record (a (%scalar real)) (b (%scalar real))) %fixed (cartprod (%field a reals) (%field b unitinterval))) (elementof reals))))";
     let m1 = fp_read(src).expect("initial read");
     let s1 = fp_write(&m1);
     let m2 = fp_read(&s1).expect("re-read of canonical form");
@@ -233,7 +233,7 @@ fn cartprod_and_record_valuesets_roundtrip() {
         "positional cartprod missing:\n{s1}"
     );
     assert!(
-        s1.contains("(record (a reals) (b unitinterval))"),
+        s1.contains("(cartprod (%field a reals) (%field b unitinterval))"),
         "record set missing:\n{s1}"
     );
     assert!(
@@ -249,9 +249,9 @@ fn cartprod_and_record_valuesets_roundtrip() {
 #[test]
 fn nested_record_tuple_table_types_roundtrip() {
     let src = "(%module \
-        (%bind r (%meta ((%record (a (%record (b (%scalar real)))) (d (%scalar real))) %fixed (record (a (record (b reals))) (d reals))) (elementof reals))) \
+        (%bind r (%meta ((%record (a (%record (b (%scalar real)))) (d (%scalar real))) %fixed (cartprod (%field a (cartprod (%field b reals))) (%field d reals))) (elementof reals))) \
         (%bind p (%meta ((%tuple (%tuple (%scalar real) (%scalar integer)) (%scalar boolean)) %fixed (cartprod (cartprod reals integers) booleans)) (elementof reals))) \
-        (%bind t (%meta ((%table (%columns (id (%scalar integer)) (hits (%record (x (%scalar real))))) (%nrows 2)) %fixed (record (id integers) (hits (record (x reals))))) (elementof reals))))";
+        (%bind t (%meta ((%table (%columns (id (%scalar integer)) (hits (%record (x (%scalar real))))) (%nrows 2)) %fixed (cartprod (%field id integers) (%field hits (cartprod (%field x reals))))) (elementof reals))))";
     let m1 = fp_read(src).expect("initial read");
     let s1 = fp_write(&m1);
     let m2 = fp_read(&s1).expect("re-read of canonical form");
@@ -272,9 +272,49 @@ fn nested_record_tuple_table_types_roundtrip() {
         "nested table type missing:\n{s1}"
     );
     assert!(
-        s1.contains("(record (id integers) (hits (record (x reals))))"),
+        s1.contains("(cartprod (%field id integers) (%field hits (cartprod (%field x reals))))"),
         "nested table value-set missing:\n{s1}"
     );
+}
+
+/// A table's value set is `cartpow` of its row record's `cartprod`, and a keyword
+/// `cartprod` nests under `cartpow` and `cartprod` alike (spec §03, §11 "Structural
+/// named entries").
+#[test]
+fn table_valuesets_are_a_cartpow_of_a_keyword_cartprod() {
+    let src = "(%module \
+        (%bind t (%meta ((%table (%columns (id (%scalar integer)) (x (%scalar real))) (%nrows 3)) %fixed (cartpow (cartprod (%field id integers) (%field x reals)) 3)) (elementof reals))) \
+        (%bind n (%meta ((%record (r (%record (a (%scalar real)))) (v (%array 1 (2) (%scalar real)))) %fixed (cartprod (%field r (cartprod (%field a posreals))) (%field v (cartpow reals 2)))) (elementof reals))))";
+    let s1 = fp_write(&fp_read(src).unwrap());
+    assert_eq!(
+        fp_write(&fp_read(&s1).unwrap()),
+        s1,
+        "not idempotent:\n{s1}"
+    );
+    for needle in [
+        "(cartpow (cartprod (%field id integers) (%field x reals)) 3)",
+        "(cartprod (%field r (cartprod (%field a posreals))) (%field v (cartpow reals 2)))",
+    ] {
+        assert!(s1.contains(needle), "missing {needle} in:\n{s1}");
+    }
+    assert!(!s1.contains("(record (a"), "no record head in a set:\n{s1}");
+}
+
+/// The `record` head builds a value, not a set, and a `cartprod` takes either
+/// positional sets or `%field` entries.
+#[test]
+fn the_reader_refuses_a_record_set_and_a_mixed_cartprod() {
+    for set in [
+        "(record (a reals) (b reals))",
+        "(cartprod (a reals) (b reals))",
+        "(cartprod reals (%field b reals))",
+        "(cartprod (%field a))",
+    ] {
+        let src = format!(
+            "(%module (%bind r (%meta ((%record (a (%scalar real))) %fixed {set}) (elementof reals))))"
+        );
+        assert!(fp_read(&src).is_err(), "{set} must be refused");
+    }
 }
 
 /// A nested `%deferred` type slot — a record field / tuple element / array

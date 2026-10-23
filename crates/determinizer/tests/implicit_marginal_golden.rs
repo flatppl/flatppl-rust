@@ -927,7 +927,7 @@ fn a_three_step_gaussian_chain_marginalizes_every_latent() {
     );
     let sigma: f64 = lp
         .split("(%field sigma ")
-        .nth(1)
+        .last()
         .and_then(|rest| rest.split(')').next())
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| panic!("no literal sigma: {lp}"));

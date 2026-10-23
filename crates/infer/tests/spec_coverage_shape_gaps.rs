@@ -1077,7 +1077,7 @@ fn a_power_of_a_record_set_is_a_table() {
         let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
         assert!(
             w.contains("(%table (%columns (x (%scalar real)) (y (%scalar real))) (%nrows 4))")
-                && w.contains("(cartpow (record (x reals) (y reals)) 4)"),
+                && w.contains("(cartpow (cartprod (%field x reals) (%field y reals)) 4)"),
             "`{src}` should be a 4-row table; got:\n{out}"
         );
     }
@@ -1190,7 +1190,7 @@ fn cartprod_positional_vector_components_concatenate() {
 fn cartprod_record_valueset() {
     let out = ir("r = elementof(cartprod(a = reals, b = unitinterval))");
     assert!(
-        out.contains("(record (a reals) (b unitinterval))"),
+        out.contains("(cartprod (%field a reals) (%field b unitinterval))"),
         "keyword cartprod should carry a RecordSet value-set; got:\n{out}"
     );
 }
@@ -1203,7 +1203,7 @@ fn load_data_table_valueset() {
     let out = ir("t = load_data(source = \"d.csv\", \
                   valueset = cartpow(cartprod(a = reals, b = unitinterval), 7))");
     assert!(
-        out.contains("(cartpow (record (a reals) (b unitinterval)) 7)"),
+        out.contains("(cartpow (cartprod (%field a reals) (%field b unitinterval)) 7)"),
         "load_data over a 7-row table set should carry that set; got:\n{out}"
     );
 }
@@ -1309,7 +1309,7 @@ fn likelihoodof_of_disintegrate_kernel_recovers_obstype() {
 fn set_constructor_presets_carry_their_set() {
     let out = ir("default_domain = cartprod(a = interval(0.0, 5.0), b = unitinterval)");
     assert!(
-        out.contains("(record (a (interval 0.0 5.0)) (b unitinterval))"),
+        out.contains("(cartprod (%field a (interval 0.0 5.0)) (%field b unitinterval))"),
         "cartprod preset value-set should be the denoted record set, got:\n{out}"
     );
     let out = ir("grid = cartpow(interval(-10.0, 10.0), 3)");

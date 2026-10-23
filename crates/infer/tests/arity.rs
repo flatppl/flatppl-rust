@@ -501,7 +501,7 @@ fn unary_operations_type_their_whole_table_argument() {
         assert!(
             out.contains(&format!(
                 "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
-                 %fixed (record (x reals) (y reals))) ({f}"
+                 %fixed (cartprod (%field x reals) (%field y reals))) ({f}"
             )),
             "`{f}` over a table must give a record of per-column sums, in:\n{out}"
         );
@@ -514,7 +514,7 @@ fn unary_operations_type_their_whole_table_argument() {
         assert!(
             out.contains(&format!(
                 "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
-                 %fixed (record (x nonnegreals) (y nonnegreals))) ({f}"
+                 %fixed (cartprod (%field x nonnegreals) (%field y nonnegreals))) ({f}"
             )),
             "`{f}` over a table must give a record of per-column variances, in:\n{out}"
         );
@@ -601,10 +601,16 @@ fn a_one_column_table_reduces_to_a_one_field_record() {
 fn a_table_reduction_carries_a_matching_record_value_set() {
     let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
     for (f, want) in [
-        ("sum", "(record (x reals) (y reals))"),
-        ("mean", "(record (x reals) (y reals))"),
-        ("var", "(record (x nonnegreals) (y nonnegreals))"),
-        ("std", "(record (x nonnegreals) (y nonnegreals))"),
+        ("sum", "(cartprod (%field x reals) (%field y reals))"),
+        ("mean", "(cartprod (%field x reals) (%field y reals))"),
+        (
+            "var",
+            "(cartprod (%field x nonnegreals) (%field y nonnegreals))",
+        ),
+        (
+            "std",
+            "(cartprod (%field x nonnegreals) (%field y nonnegreals))",
+        ),
     ] {
         let out = ir(&format!("{two}s = {f}(d)"));
         assert!(
@@ -648,7 +654,7 @@ fn prod_maximum_minimum_reduce_a_table_column_wise() {
         assert!(
             out.contains(&format!(
                 "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
-                 %fixed (record (x reals) (y reals))) ({f}"
+                 %fixed (cartprod (%field x reals) (%field y reals))) ({f}"
             )),
             "`{f}` over a table must give a record keyed by the column names, in:\n{out}"
         );
@@ -681,8 +687,8 @@ fn prod_maximum_minimum_reduce_a_table_column_wise() {
     for f in ["prod", "maximum", "minimum"] {
         let out = ir(&format!("{two}s = {f}(d)"));
         assert!(
-            out.contains("(record (x reals) (y reals))"),
-            "`{f}` must carry the value-set (record (x reals) (y reals)), in:\n{out}"
+            out.contains("(cartprod (%field x reals) (%field y reals))"),
+            "`{f}` must carry the value-set (cartprod (%field x reals) (%field y reals)), in:\n{out}"
         );
     }
 }

@@ -273,9 +273,9 @@ impl Module {
             ValueSet::RecordSet(fields) => {
                 let inner: Vec<String> = fields
                     .iter()
-                    .map(|(n, s)| format!("{}: {}", self.resolve(*n), self.display_valueset(s)))
+                    .map(|(n, s)| format!("{} = {}", self.resolve(*n), self.display_valueset(s)))
                     .collect();
-                format!("record({})", inner.join(", "))
+                format!("cartprod({})", inner.join(", "))
             }
             // Symbol-free atoms: defer to the plain Display impl.
             other => other.to_string(),
@@ -778,7 +778,7 @@ mod tests {
         let rs = RecordSet(Box::new([(a, Reals), (b, UnitInterval)]));
         assert_eq!(
             m.display_valueset(&rs),
-            "record(alpha: reals, beta: unitinterval)"
+            "cartprod(alpha = reals, beta = unitinterval)"
         );
         // positional + nested power render too
         let cp = CartProd(Box::new([Reals, PosReals]));
@@ -803,7 +803,7 @@ mod tests {
         let cp = CartProd(Box::new([rs, PosReals]));
         assert_eq!(
             m.display_valueset(&cp),
-            "cartprod(record(a: reals, b: unitinterval), posreals)"
+            "cartprod(cartprod(a = reals, b = unitinterval), posreals)"
         );
         // RecordSet nested inside CartPow — same recursion path, different arm.
         let a2 = m.intern("a");
@@ -812,7 +812,7 @@ mod tests {
         let cpow = CartPow(Box::new(rs2), Dim::Static(3));
         assert_eq!(
             m.display_valueset(&cpow),
-            "cartpow(record(a: reals, b: unitinterval), 3)"
+            "cartpow(cartprod(a = reals, b = unitinterval), 3)"
         );
     }
 
