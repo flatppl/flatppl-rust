@@ -26,6 +26,9 @@ impl Sum {
     }
 }
 
+/// The constructor, the parameters by name and the observations of a per-cell density.
+pub(crate) type PerCellDensity = (String, Vec<(String, NodeId)>, NodeId);
+
 impl Emitter<'_> {
     fn density_call(&self, mut id: NodeId, name: &str) -> Option<Call> {
         for _ in 0..64 {
@@ -48,6 +51,95 @@ impl Emitter<'_> {
             }
         }
         None
+    }
+
+    /// The kernel constructor, its parameters by name and the observations of a per-cell
+    /// density `broadcast`, in either spelling the determinizer emits: the record of
+    /// parameters as a broadcast operand (`broadcast(builtin_logdensityof, K,
+    /// broadcast(record, p0 = a0, ..), obs)`), or, when every parameter is a scalar, a
+    /// callee that takes the parameters and the observations as operands and builds the
+    /// record itself (`broadcast(fn(builtin_logdensityof(K, record(p0 = _, ..), _)), a0,
+    /// .., obs)`).
+    pub(crate) fn per_cell_density(&self, args: &[NodeId]) -> Option<PerCellDensity> {
+        if let [head, kernel, input, observed] = args
+            && matches!(self.m.node(*head), Node::Const(s) if self.resolve(*s) == "builtin_logdensityof")
+        {
+            let Node::Const(ctor) = self.m.node(*kernel) else {
+                return None;
+            };
+            let input = self.density_call(*input, "broadcast")?;
+            if !matches!(input.args.as_ref(), [head] if matches!(self.m.node(*head), Node::Const(s) if self.resolve(*s) == "record"))
+            {
+                return None;
+            }
+            let fields = input
+                .named
+                .iter()
+                .filter(|field| field.kind == NamedKind::Kwarg)
+                .map(|field| (self.resolve(field.name).to_string(), field.value))
+                .collect();
+            return Some((self.resolve(*ctor).to_string(), fields, *observed));
+        }
+        let (function, operands) = args.split_first()?;
+        let Node::Call(callee) = self.m.node(*function) else {
+            return None;
+        };
+        let (Some(flatppl_core::Inputs::Spec(inputs)), [body]) =
+            (callee.inputs.as_ref(), callee.args.as_ref())
+        else {
+            return None;
+        };
+        if !matches!(callee.head, CallHead::Builtin(s) if self.resolve(s) == "functionof")
+            || inputs.len() != operands.len()
+        {
+            return None;
+        }
+        let Node::Call(body) = self.m.node(*body) else {
+            return None;
+        };
+        let [kernel, record, point] = body.args.as_ref() else {
+            return None;
+        };
+        if !matches!(body.head, CallHead::Builtin(s) if self.resolve(s) == "builtin_logdensityof")
+            || !body.named.is_empty()
+        {
+            return None;
+        }
+        let Node::Const(ctor) = self.m.node(*kernel) else {
+            return None;
+        };
+        let operand_of = |node: NodeId| -> Option<NodeId> {
+            let Node::Ref(reference) = self.m.node(node) else {
+                return None;
+            };
+            let at = inputs.iter().position(|(_, input)| input == reference)?;
+            operands.get(at).copied()
+        };
+        // The point is the last input, and its operand the observations.
+        let observed = operand_of(*point).filter(|_| {
+            matches!(self.m.node(*point), Node::Ref(r) if inputs.last().is_some_and(|(_, input)| input == r))
+        })?;
+        let Node::Call(record) = self.m.node(*record) else {
+            return None;
+        };
+        if !matches!(record.head, CallHead::Builtin(s) if self.resolve(s) == "record")
+            || !record.args.is_empty()
+        {
+            return None;
+        }
+        let fields = record
+            .named
+            .iter()
+            .filter(|field| field.kind == NamedKind::Field)
+            .map(|field| {
+                Some((
+                    self.resolve(field.name).to_string(),
+                    operand_of(field.value)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (fields.len() + 1 == inputs.len())
+            .then(|| (self.resolve(*ctor).to_string(), fields, observed))
     }
 
     fn density_scalar(&mut self, id: NodeId) -> Result<Option<Value>, EmitError> {
@@ -89,19 +181,17 @@ impl Emitter<'_> {
         let Some(call) = self.density_call(arg, "broadcast") else {
             return Ok(None);
         };
-        let [head, kernel, input, observed] = call.args.as_ref() else {
-            return Ok(None);
-        };
-        if !call.named.is_empty()
-            || !matches!(self.m.node(*head), Node::Const(s) if self.resolve(*s) == "builtin_logdensityof")
-        {
+        if !call.named.is_empty() {
             return Ok(None);
         }
-        let ctor = match self.m.node(*kernel) {
-            Node::Const(s) => self.resolve(*s),
-            _ => return Ok(None),
+        // The parameters of the kernel and the observations, from either spelling of the
+        // per-cell density: `broadcast(builtin_logdensityof, K, broadcast(record, p0 = a0,
+        // ..), obs)`, or `broadcast(fn(builtin_logdensityof(K, record(p0 = _, ..), _)),
+        // a0, .., obs)` when every parameter is a scalar and the record is built per cell.
+        let Some((ctor, fields, observed)) = self.per_cell_density(call.args.as_ref()) else {
+            return Ok(None);
         };
-        let names: &[&str] = match ctor {
+        let names: &[&str] = match ctor.as_str() {
             "Normal" => &["mu", "sigma"],
             "Gamma" => &["shape", "rate"],
             "Beta" => &["alpha", "beta"],
@@ -109,29 +199,17 @@ impl Emitter<'_> {
             "Binomial" => &["n", "p"],
             _ => return Ok(None),
         };
-        let ctor = ctor.to_owned();
-        let Some(input) = self.density_call(*input, "broadcast") else {
-            return Ok(None);
-        };
-        if !matches!(input.args.as_ref(), [head] if matches!(self.m.node(*head), Node::Const(s) if self.resolve(*s) == "record"))
-            || input.named.len() != names.len()
-        {
+        if fields.len() != names.len() {
             return Ok(None);
         }
-        let fields = names
+        let Some(fields) = names
             .iter()
-            .map(|name| {
-                input.named.iter().find_map(|field| {
-                    (field.kind == NamedKind::Kwarg && self.resolve(field.name) == *name)
-                        .then_some(field.value)
-                })
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(fields) = fields else {
+            .map(|name| fields.iter().find_map(|(n, v)| (n == name).then_some(*v)))
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(None);
         };
-
-        let observations = self.lower_node(*observed)?;
+        let observations = self.lower_node(observed)?;
         // Continuous primitives can subtract/multiply integer operands before
         // widening them. Floating summaries would change that rounding order.
         if observations.elem != ElemKind::Real

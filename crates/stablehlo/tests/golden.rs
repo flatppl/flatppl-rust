@@ -358,11 +358,15 @@ outputs = (score)\n";
     );
 }
 
-/// Emit the LogDensity function of `src`, whose `lp` is its output.
+/// Emit the LogDensity function of `src`, whose `lp` or `q` is its output.
 fn emit_log_density(src: &str) -> String {
+    emit_log_density_with(src, &unrestricted_options())
+}
+
+fn emit_log_density_with(src: &str, options: &flatppl_stablehlo::EmitOptions) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
-    let roots: Vec<_> = ["inputs", "outputs", "lp"]
+    let roots: Vec<_> = ["inputs", "outputs", "lp", "q"]
         .into_iter()
         .map(|name| m.intern(name))
         .collect();
@@ -372,12 +376,7 @@ fn emit_log_density(src: &str) -> String {
         Some(&roots),
     )
     .unwrap();
-    flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap()
+    flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, options).unwrap()
 }
 
 /// A `joint(K1, K2)` kernel as a `jointchain` step (spec §06 "Joint measures") emits the
@@ -404,6 +403,41 @@ fn a_joint_kernel_chain_step_emits_the_direct_factorization() {
          + logdensityof(Normal(mu = pa + pb, sigma = 0.5), pq))\n"
     ));
     assert_eq!(chain, direct);
+}
+
+/// A kernel broadcast with scalar parameters scores each cell at the record of its
+/// parameters, which the per-cell callee builds from its own operands: no record is an
+/// operand of the outer `broadcast` (§04 "Broadcasting", "Disallowed inputs"). The emitter
+/// reads that spelling like the record-operand one it replaces, so the program is the same:
+/// fixed observations reduce to their sufficient statistics (a count, a centre and a
+/// spread) and a promoted fixed input keeps one broadcast of the parameter. Executed with
+/// JAX, the first program gives -5.327877044677734, -14.33787727355957 and
+/// -2.087877035140991 at mu = 0.7, -1.0 and 2.5 (closed form -5.327877066409345,
+/// -14.337877066409344, -2.0878770664093453), the second -4.33787727355957 at mu = 0.7
+/// (closed form -4.337877066409345).
+#[test]
+fn a_kernel_broadcast_with_scalar_parameters_emits_the_record_operand_program() {
+    let sufficient = emit_log_density(
+        "mu = elementof(reals)\nk = functionof(Normal.(mu, 1.0))\n\
+         lik = likelihoodof(k, [2.0, 3.0])\npm = elementof(reals)\n\
+         lp = logdensityof(lik, record(mu = pm))\ninputs = (pm)\noutputs = lp\n",
+    );
+    assert_eq!(
+        sufficient.trim_end(),
+        include_str!("goldens/kernel_broadcast_sufficient_statistics.mlir").trim_end()
+    );
+    // The default options, as the command line emits it, restrict the square to an Enzyme-
+    // compatible form.
+    let promoted = emit_log_density_with(
+        "y = [1.0, 2.0]\nmu = elementof(reals)\n\
+         m = lawof(record(a = draw(Normal.(mu, 1.0))))\n\
+         q = logdensityof(m, record(a = y .+ mu))\ninputs = (mu, y)\noutputs = q\n",
+        &flatppl_stablehlo::EmitOptions::default(),
+    );
+    assert_eq!(
+        promoted.trim_end(),
+        include_str!("goldens/kernel_broadcast_promoted_input.mlir").trim_end()
+    );
 }
 
 /// A placeholder node to hang a `set_type` on — its `Node` payload is
