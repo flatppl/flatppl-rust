@@ -238,10 +238,10 @@ pub(crate) fn prefix_chain(m: &mut Module, node: NodeId, k: usize) -> Option<Nod
 
 /// Keyword form (spec §06 "Keyword form"): the variate is the record of the labelled
 /// component variates, and "each later kernel receives the record of the preceding
-/// named variates, bound to its inputs by name for any number of inputs, so
-/// `jointchain(a = M, b = K)` calls `K(a = a)`". The density is the product of the
-/// conditionals: each component scored at its label's field of the point, a kernel
-/// applied to the preceding fields its inputs name.
+/// named variates by the ordinary calling convention, so `jointchain(a = M, b = K)`
+/// calls `K(record(a = a))`". The density is the product of the conditionals: each
+/// component scored at its label's field of the point, a kernel applied to the record
+/// of the preceding fields.
 fn lower_keyword_family(
     m: &mut Module,
     node: NodeId,
@@ -272,28 +272,15 @@ fn lower_keyword_family(
                     "jointchain component is not a transition kernel",
                 ));
             }
-            let kernel = resolve_reified(m, component)
+            resolve_reified(m, component)
                 .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
-            let named = kernel
-                .inputs
-                .iter()
-                .map(|(input, _)| {
-                    env.iter()
-                        .find(|(name, _)| name == input)
-                        .map(|&(name, value)| flatppl_core::NamedArg {
-                            kind: NamedKind::Kwarg,
-                            name,
-                            value,
-                        })
-                        .ok_or_else(|| {
-                            refuse_jc(node, "a kernel input names no preceding labelled variate")
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            // The kernel receives the record of the preceding labelled variates by the
+            // ordinary call; the engine decides between splat and whole.
+            let prior = build_record(m, &env);
             m.alloc(Node::Call(Call {
                 head: CallHead::User(component),
-                args: Box::new([]),
-                named: named.into(),
+                args: Box::new([prior]),
+                named: Box::default(),
                 inputs: None,
             }))
         };

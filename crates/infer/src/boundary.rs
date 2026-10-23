@@ -324,15 +324,13 @@ fn check_point(
 ///
 /// In the keyword form `jointchain(name1 = M, name2 = K1, ...)` each name holds its
 /// component's variate as it is, a record nesting under its name, and "each later
-/// kernel receives the record of the preceding named variates, bound to its inputs by
-/// name for any number of inputs, so `jointchain(a = M, b = K)` calls `K(a = a)`" (§06
-/// "Keyword form"). Every input of a later kernel must name a preceding label
-/// ([`check_labelled_step`]).
+/// kernel receives the record of the preceding named variates by the ordinary calling
+/// convention, so `jointchain(a = M, b = K)` calls `K(record(a = a))`" (§06 "Keyword
+/// form"). The fed value is that record.
 ///
-/// The positional form keeps the ordinary calling convention: a step taking one
-/// positional input receives the fed value whole and the input's declared domain
-/// must admit it. Any other step splats a record, whose fields must be exactly the
-/// step's inputs.
+/// A step taking one positional input receives the fed value whole and the input's
+/// declared domain must admit it. Any other step splats a record, whose fields must
+/// be exactly the step's inputs.
 pub(crate) fn refuse_bad_chain_boundary(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
@@ -343,8 +341,8 @@ pub(crate) fn refuse_bad_chain_boundary(
         return None;
     }
     // Keyword form `jointchain(name1 = M, name2 = K1, ...)`: the components are
-    // the keyword values. Its fed value is the previous component's variate, not
-    // the `cat` of all of them (see the doc comment).
+    // the keyword values. Its fed value is the record of the preceding labels, not
+    // the `cat` of their variates (see the doc comment).
     let labelled = args.is_empty() && !named.is_empty() && name == "jointchain";
     let steps: Vec<(NodeId, &Type)> = if labelled {
         named.iter().map(|(_, node, ty, _)| (*node, ty)).collect()
@@ -363,32 +361,27 @@ pub(crate) fn refuse_bad_chain_boundary(
     if matches!(steps[0].1, Type::Kernel { .. }) {
         return None;
     }
-    let labels: Vec<String> = if labelled {
-        named
-            .iter()
-            .map(|(label, ..)| inf.module.resolve(*label).to_string())
-            .collect()
+    let labels: Vec<Symbol> = if labelled {
+        named.iter().map(|(label, ..)| *label).collect()
     } else {
         Vec::new()
     };
     let mut variates: Vec<Type> = Vec::with_capacity(steps.len());
     for (index, (node, ty)) in steps.iter().enumerate() {
-        if labelled
-            && index > 0
-            && matches!(ty, Type::Kernel { .. })
-            && let Some(interface) = interface(inf, *node)
-            && let Some(failed) =
-                check_labelled_step(inf, index, *node, &interface, &labels[..index], &variates)
-        {
-            return Some(failed);
-        }
-        if !labelled
-            && index > 0
+        if index > 0
             && matches!(ty, Type::Kernel { .. })
             && let Some(interface) = interface(inf, *node)
         {
-            // One variate to the left is fed as it is; two or more are `cat`ed.
+            // One variate to the left is fed as it is; two or more are `cat`ed. The
+            // keyword form feeds the record of the preceding labels.
             let fed = match variates.as_slice() {
+                _ if labelled => Type::Record(
+                    labels
+                        .iter()
+                        .copied()
+                        .zip(variates.iter().cloned())
+                        .collect(),
+                ),
                 [only] => only.clone(),
                 _ => cat_compose(&variates),
             };
@@ -401,61 +394,6 @@ pub(crate) fn refuse_bad_chain_boundary(
         variates.push(component_variate(inf, *node, ty)?);
     }
     None
-}
-
-/// A later kernel of a keyword-form `jointchain` receives the record of the preceding
-/// named variates, "bound to its inputs by name for any number of inputs" (§06
-/// "Keyword form"). Each input must name a preceding label, and its declared domain
-/// must admit that label's variate.
-fn check_labelled_step(
-    inf: &mut Inferencer<'_, '_>,
-    index: usize,
-    step: NodeId,
-    interface: &Interface,
-    labels: &[String],
-    variates: &[Type],
-) -> Option<Type> {
-    let declared = declared_input_types(inf, step);
-    let list = |names: Vec<&str>| {
-        names
-            .iter()
-            .map(|n| format!("`{n}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let unmatched: Vec<&str> = interface
-        .names
-        .iter()
-        .map(String::as_str)
-        .filter(|n| !labels.iter().any(|l| l == n))
-        .collect();
-    let message = if !unmatched.is_empty() {
-        format!(
-            "`jointchain` step {index}: the kernel's input {} names no preceding component \
-             ({}); in the keyword form a later kernel receives the record of the preceding \
-             named variates, bound to its inputs by name (spec §06 \"Keyword form\")",
-            list(unmatched),
-            list(labels.iter().map(String::as_str).collect()),
-        )
-    } else {
-        let mismatch = interface.names.iter().enumerate().find_map(|(i, input)| {
-            let at = labels.iter().position(|l| l == input)?;
-            let expected = declared.get(i)?.as_ref()?;
-            incompatible(expected, variates.get(at)?)
-                .then(|| (input.clone(), expected.clone(), variates[at].clone()))
-        });
-        let (input, expected, fed) = mismatch?;
-        format!(
-            "`jointchain` step {index}: the variate of `{input}` is {}, but the kernel's input \
-             `{input}` expects {} (spec §06 \"Keyword form\")",
-            show(inf, &fed),
-            show(inf, &expected),
-        )
-    };
-    inf.diags.push(crate::Diagnostic::error_at(step, message));
-    Some(Type::Failed(
-        format!("jointchain: step {index} does not bind by name").into(),
-    ))
 }
 
 fn check_step(

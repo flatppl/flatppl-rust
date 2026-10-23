@@ -137,6 +137,39 @@ fn reference_prior_metadata_tracks_mass_and_inference_coordinates() {
 }
 
 #[test]
+fn a_dependent_prior_chain_reads_the_preceding_parameters_from_the_record() {
+    // Each later kernel receives the record of the preceding variates by the ordinary
+    // calling convention (spec §06 "Keyword form"), so a kernel of one preceding
+    // parameter takes the record whole and reads its field.
+    let mut spec = read(include_str!("fixtures/gaussian.formula.json")).unwrap();
+    spec.formula = "y ~ 0 + x".into();
+    for (priors, chain) in [
+        (
+            json!([
+                {"class":"b", "prior":"Lebesgue(interval(0, sigma))"},
+                {"class":"sigma", "prior":"exponential(1)"}
+            ]),
+            "iid(Lebesgue(interval(0, _point_",
+        ),
+        (
+            json!([
+                {"class":"b", "prior":"normal(0, sigma)"},
+                {"class":"sigma", "prior":"Lebesgue(posreals)"}
+            ]),
+            "Normal(0, _point_",
+        ),
+    ] {
+        spec.priors = serde_json::from_value(priors).unwrap();
+        let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+        let text = flatppl_syntax::print(&converted.module);
+        assert!(text.contains("jointchain("), "{text}");
+        assert!(text.contains(chain), "{chain}\n{text}");
+        assert!(converted.info.prior_factors.contains_key("b"), "{text}");
+        assert!(converted.info.prior_factors.contains_key("sigma"), "{text}");
+    }
+}
+
+#[test]
 fn exported_levels_and_names_keep_sanitized_collisions_distinct() {
     let spec = read(&json!({
         "formula":"y ~ f.a + f_a + (1 | g.a) + (1 | g_a)",

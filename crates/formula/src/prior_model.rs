@@ -1,8 +1,10 @@
 //! Compose proper laws and explicit measure factors without improper draws.
-use crate::{Error, Result, emit::parameter_function};
+use crate::{Error, Result};
 use flatppl_convert::Builder;
-use flatppl_core::{CallHead, Dim, Mass, Module, Node, NodeId, RefNs, Type};
-use std::collections::HashSet;
+use flatppl_core::{
+    Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, Node, NodeId, Ref, RefNs, Type,
+};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct ParameterPrior {
     pub name: String,
@@ -70,7 +72,9 @@ pub(crate) fn build(b: &mut Builder<'_>, parameters: &[ParameterPrior]) -> Resul
     // rather than relying on matching names to condition a measure product.
     // The keyword form of `jointchain` (spec §06 "Keyword form") labels each component's
     // variate by its parameter name, and each later kernel receives the record of the
-    // preceding variates, bound to its inputs by name, so no adapter is needed.
+    // preceding variates by the ordinary calling convention. A kernel of one input takes
+    // a sole record whole (spec §04 "Calling conventions"), so every later kernel is a
+    // function of that record and reads the preceding parameters from its fields.
     let mut done = HashSet::new();
     let mut chain: Vec<(&str, NodeId)> = Vec::new();
     while done.len() < factors.len() {
@@ -92,17 +96,107 @@ pub(crate) fn build(b: &mut Builder<'_>, parameters: &[ParameterPrior]) -> Resul
             let component = if chain.is_empty() {
                 measure
             } else {
-                let inputs = chain
+                let preceding = chain
                     .iter()
                     .map(|(name, _)| (*name).to_string())
                     .collect::<Vec<_>>();
-                parameter_function(b, "functionof", measure, &inputs)
+                record_kernel(b, measure, &preceding)
             };
             chain.push((factor.name, component));
         }
         done.extend(ready.into_iter().map(|(i, _)| i));
     }
     Ok(b.call_kw("jointchain", &chain))
+}
+
+/// `measure` as a function of the record of the `preceding` parameters: each reference to one
+/// of them, directly or through a derived binding, reads the field of the record instead.
+fn record_kernel(b: &mut Builder<'_>, measure: NodeId, preceding: &[String]) -> NodeId {
+    let point = Ref {
+        ns: RefNs::Local,
+        name: b.sym(&format!("_point_{}_", b.m.node_count())),
+    };
+    let value = b.m.alloc(Node::Ref(point));
+    let body = read_fields(b, measure, preceding, value, &mut HashMap::new());
+    let head = b.sym("functionof");
+    let label = b.sym("point");
+    b.m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Box::new([body]),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(Box::new([(label, point)]))),
+    }))
+}
+
+fn read_fields(
+    b: &mut Builder<'_>,
+    node: NodeId,
+    parameters: &[String],
+    point: NodeId,
+    seen: &mut HashMap<NodeId, NodeId>,
+) -> NodeId {
+    if let Some(&done) = seen.get(&node) {
+        return done;
+    }
+    let rewritten = match b.m.node(node).clone() {
+        Node::Ref(reference) if reference.ns == RefNs::SelfMod => {
+            let name = b.m.resolve(reference.name).to_string();
+            if parameters.contains(&name) {
+                let field = b.str_lit(&name);
+                b.call("get", &[point, field])
+            } else if let Some(binding) = b.m.binding_by_name(reference.name) {
+                let rhs = b.m.binding(binding).rhs;
+                if dependencies(b.m, rhs, parameters).is_empty() {
+                    node
+                } else {
+                    read_fields(b, rhs, parameters, point, seen)
+                }
+            } else {
+                node
+            }
+        }
+        Node::Call(call) => {
+            let head = match call.head {
+                CallHead::User(callee) => {
+                    CallHead::User(read_fields(b, callee, parameters, point, seen))
+                }
+                head => head,
+            };
+            let args: Vec<_> = call
+                .args
+                .iter()
+                .map(|&arg| read_fields(b, arg, parameters, point, seen))
+                .collect();
+            let named: Vec<_> = call
+                .named
+                .iter()
+                .map(|arg| NamedArg {
+                    kind: arg.kind,
+                    name: arg.name,
+                    value: read_fields(b, arg.value, parameters, point, seen),
+                })
+                .collect();
+            let unchanged = args.iter().eq(call.args.iter())
+                && named
+                    .iter()
+                    .zip(call.named.iter())
+                    .all(|(a, c)| a.value == c.value)
+                && head == call.head;
+            if unchanged {
+                node
+            } else {
+                b.m.alloc(Node::Call(Call {
+                    head,
+                    args: args.into(),
+                    named: named.into(),
+                    inputs: call.inputs.clone(),
+                }))
+            }
+        }
+        _ => node,
+    };
+    seen.insert(node, rewritten);
+    rewritten
 }
 
 fn group(b: &mut Builder<'_>, factors: Vec<&Factor<'_>>, named: bool) -> NodeId {
