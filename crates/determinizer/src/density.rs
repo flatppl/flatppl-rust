@@ -1474,26 +1474,7 @@ fn lower_applied_ksuperpose_inner(
     }
 
     let broadcast_sym = m.intern("broadcast");
-    let record_head = {
-        let record_sym = m.intern("record");
-        m.alloc(Node::Const(record_sym))
-    };
-    let record_kwargs: Vec<NamedArg> = fields
-        .iter()
-        .map(|&(name, value)| NamedArg {
-            kind: NamedKind::Kwarg,
-            name,
-            value,
-        })
-        .collect();
-    let kernel_inputs = m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(broadcast_sym),
-        args: vec![record_head].into(),
-        named: record_kwargs.into(),
-        inputs: None,
-    }));
-
-    let per_cell = emit_kernel_broadcast_per_cell(m, ctor_sym, kernel_inputs, v);
+    let per_cell = family_per_cell(m, ctor_sym, &fields, v);
     let log_head = {
         let log_sym = m.intern("log");
         m.alloc(Node::Const(log_sym))
@@ -7567,40 +7548,91 @@ fn lower_broadcast_kernel(
     }
     fields.extend(kw_args);
 
-    // kernel_inputs = broadcast(record, p0 = arg0, p1 = arg1, …): the `record`
-    // constructor broadcast over the param arrays yields an array of per-cell
-    // records. The field bindings are `Kwarg` on the broadcast call (each cell's
-    // `record(pᵢ = argᵢ[cell])`).
-    let broadcast_sym = m.intern("broadcast");
-    let record_head = {
-        let record_sym = m.intern("record");
-        m.alloc(Node::Const(record_sym))
-    };
-    let record_kwargs: Vec<NamedArg> = fields
-        .iter()
-        .map(|&(name, value)| NamedArg {
-            kind: NamedKind::Kwarg,
-            name,
-            value,
-        })
-        .collect();
-    let kernel_inputs = m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(broadcast_sym),
-        args: vec![record_head].into(),
-        named: record_kwargs.into(),
-        inputs: None,
-    }));
-
     // lp = sum(broadcast(builtin_logdensityof, K, kernel_inputs, obs)): the
     // `builtin_logdensityof` head is applied per cell to the scalar constructor
     // tag `K` and the zipped (kernel_input, obs) pair; `sum` reduces the array of
     // per-cell log-densities to the scalar joint density.
-    Ok(emit_kernel_broadcast_density(
-        m,
-        ctor_sym,
-        kernel_inputs,
-        obs,
-    ))
+    let per_cell = family_per_cell(m, ctor_sym, &fields, obs);
+    Ok(build_call(m, "sum", &[per_cell]))
+}
+
+/// The per-cell log-densities of a kernel broadcast or a mixture family: the kernel `K`
+/// evaluated at the record `record(p0 = arg0[cell], …)` of each cell's parameters and at
+/// `obs[cell]`.
+///
+/// When some argument is an array, `broadcast(record, p0 = arg0, …)` is an array of per-cell
+/// records, and `broadcast(builtin_logdensityof, K, kernel_inputs, obs)` zips it with the
+/// observations. Otherwise there is no axis to iterate, that broadcast would be a bare
+/// record, and §04 "Broadcasting", "Disallowed inputs" does not allow a record as an operand
+/// of the outer `broadcast`. The per-cell callee then takes the record's fields, and the
+/// observations, as operands of its own and builds the record itself:
+/// `broadcast(fn(builtin_logdensityof(K, record(p0 = _, …), _)), arg0, …, obs)`. A scalar
+/// argument is held constant and an array argument is iterated, as in the record form, and
+/// the callee captures nothing: every parameter reaches it as an operand.
+fn family_per_cell(
+    m: &mut Module,
+    ctor_sym: Symbol,
+    fields: &[(Symbol, NodeId)],
+    obs: NodeId,
+) -> NodeId {
+    let iterated = fields
+        .iter()
+        .any(|&(_, arg)| m.type_of(arg).map(outer_rank).unwrap_or(0) > 0);
+    if iterated || fields.is_empty() {
+        let broadcast_sym = m.intern("broadcast");
+        let record_head = {
+            let record_sym = m.intern("record");
+            m.alloc(Node::Const(record_sym))
+        };
+        let record_kwargs: Vec<NamedArg> = fields
+            .iter()
+            .map(|&(name, value)| NamedArg {
+                kind: NamedKind::Kwarg,
+                name,
+                value,
+            })
+            .collect();
+        let kernel_inputs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(broadcast_sym),
+            args: vec![record_head].into(),
+            named: record_kwargs.into(),
+            inputs: None,
+        }));
+        return emit_kernel_broadcast_per_cell(m, ctor_sym, kernel_inputs, obs);
+    }
+    let mut inputs = Vec::with_capacity(fields.len() + 1);
+    let mut record_fields = Vec::with_capacity(fields.len());
+    for &(name, _) in fields {
+        let (label, reference, point) = broadcast::placeholder(m, Type::Any);
+        inputs.push((label, reference));
+        record_fields.push(NamedArg {
+            kind: NamedKind::Field,
+            name,
+            value: point,
+        });
+    }
+    let (label, reference, point) = broadcast::placeholder(m, Type::Any);
+    inputs.push((label, reference));
+    let record_sym = m.intern("record");
+    let kernel_input = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(record_sym),
+        args: Box::default(),
+        named: record_fields.into(),
+        inputs: None,
+    }));
+    let kernel = m.alloc(Node::Const(ctor_sym));
+    let body = build_call(m, "builtin_logdensityof", &[kernel, kernel_input, point]);
+    let functionof_sym = m.intern("functionof");
+    let per_cell = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(functionof_sym),
+        args: vec![body].into(),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(inputs.into())),
+    }));
+    let mut operands = vec![per_cell];
+    operands.extend(fields.iter().map(|&(_, value)| value));
+    operands.push(obs);
+    build_call(m, "broadcast", &operands)
 }
 
 /// Build the singleton (all-size-1-axes) kernel-params array-of-records for

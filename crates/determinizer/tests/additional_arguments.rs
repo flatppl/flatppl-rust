@@ -158,7 +158,7 @@ fn fchain_passes_the_additional_arguments_to_every_step() {
 }
 
 #[test]
-fn kscan_holds_scalar_and_record_inputs_constant_at_every_step() {
+fn kscan_holds_scalar_inputs_constant_at_every_step() {
     // Step i is Normal(prev + xs[i], w) with the constant w, prev_0 = 0.0.
     for extras in [
         "[1.0, 2.0], 0.5",
@@ -178,10 +178,10 @@ fn kscan_holds_scalar_and_record_inputs_constant_at_every_step() {
             "{extras}\n{got}"
         );
     }
-    // A constant record stays whole, and two constants beside one sequence bind in order.
+    // Two constants beside one sequence bind in order.
     let got = pir(
-        "T = kscan((state, x, p, q) -> Normal(state + x + q, p.w), 0.0, [1.0, 2.0], \
-         record(w = 0.5), 10.0)\nlp = logdensityof(T, [0.1, 0.2])",
+        "T = kscan((state, x, p, q) -> Normal(state + x + q, p), 0.0, [1.0, 2.0], \
+         0.5, 10.0)\nlp = logdensityof(T, [0.1, 0.2])",
     );
     assert!(
         got.contains("(%field mu 11.0) (%field sigma 0.5))) 0.1)"),

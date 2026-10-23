@@ -1027,6 +1027,21 @@ fn bind_call_extras(
         }
         return ExtrasOutcome::Unchanged;
     }
+    // The sequence extras follow `broadcast`: a record is not allowed, a tuple is refused
+    // below (spec §04 "Additional arguments", "Broadcasting").
+    if head.sequences
+        && let Some(refusal) = refuse_aggregate_operand(
+            inf,
+            name,
+            extras
+                .iter()
+                .map(|(node, ty, _)| (*node, ty))
+                .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)))
+                .filter(|(_, ty)| matches!(ty, Type::Record(_))),
+        )
+    {
+        return ExtrasOutcome::Refused(refusal);
+    }
     let Some(interface) = crate::callable::interface(inf, args[0].0) else {
         // A callback whose inputs are unknown cannot take keyword arguments; positional
         // ones keep their order, which is all the later rules read.
@@ -1200,10 +1215,10 @@ fn bind_extras_to_interface(
 
 /// §04 "Additional arguments": the additional inputs of `filter`, `scan` and `kscan`
 /// follow `broadcast`. One-dimensional arrays and tables are traversed together
-/// and a length-one input repeats; other unequal lengths are an error. Scalars,
-/// records and other non-collection inputs are held constant. A tuple or an array
-/// of more than one dimension is an error, and `scan` and `kscan` need at least
-/// one array or table to traverse.
+/// and a length-one input repeats; other unequal lengths are an error. Scalars and
+/// other non-collection inputs are held constant. A record (refused before binding,
+/// see [`bind_call_extras`]), a tuple or an array of more than one dimension is an
+/// error, and `scan` and `kscan` need at least one array or table to traverse.
 fn check_sequences(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -6548,97 +6563,32 @@ fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol,
     refs
 }
 
-/// §04 "Broadcasting", "Tuple inputs": `broadcast(f, (a, b), c)` is
-/// `(f(a, c), f(b, c))`. Tuple operands share one length, and a tuple cannot be
-/// combined with an array or table operand or broadcast through a kernel.
-fn tuple_broadcast_type(
+/// The first record or tuple among the operands of `broadcast` (or the sequence extras of
+/// `scan`, `kscan` and `filter`, which follow it) is a located static error, spec §04
+/// "Broadcasting", "Disallowed inputs".
+fn refuse_aggregate_operand<'a>(
     inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
-    head_node: NodeId,
-    args: &[ArgInfo],
-    named: &[NamedInfo],
-) -> RuleStep<Type> {
-    let operands = || {
-        args[1..]
-            .iter()
-            .map(|(_, ty, _)| ty)
-            .chain(named.iter().map(|(_, _, ty, _)| ty))
-    };
-    let fail = |inf: &mut Inferencer<'_, '_>, what: &str| {
+    who: &str,
+    operands: impl Iterator<Item = (NodeId, &'a Type)>,
+) -> Option<Type> {
+    for (node, ty) in operands {
+        let kind = match ty {
+            Type::Record(_) => "a record",
+            Type::Tuple(_) => "a tuple",
+            _ => continue,
+        };
         inf.diags.push(crate::Diagnostic::error_at(
-            id,
-            format!("`broadcast`: {what} (spec §04 \"Broadcasting\", \"Tuple inputs\")"),
+            node,
+            format!(
+                "`{who}` operand is {kind}: records and tuples are not allowed as operands of \
+                 `broadcast`, which neither iterates nor holds them constant; a table row \
+                 reaching the callable as a record is unaffected (spec §04 \"Broadcasting\", \
+                 \"Disallowed inputs\")"
+            ),
         ));
-        Ready(Type::Failed("broadcast over tuples".into()))
-    };
-    if operands().any(|ty| {
-        matches!(
-            ty,
-            Type::Array { .. } | Type::TVector { .. } | Type::Table { .. }
-        )
-    }) {
-        return fail(
-            inf,
-            "a tuple operand cannot be combined with an array or table operand",
-        );
+        return Some(Type::Failed(format!("{who}: {kind} operand").into()));
     }
-    let mut lengths = operands().filter_map(|ty| match ty {
-        Type::Tuple(items) => Some(items.len()),
-        _ => None,
-    });
-    let len = lengths.next().unwrap_or(0);
-    if lengths.any(|other| other != len) {
-        return fail(inf, "tuple operands must have the same length");
-    }
-    let component = |ty: &Type, i: usize| match ty {
-        Type::Tuple(items) => items[i].clone(),
-        other => other.clone(),
-    };
-    let step = |i: usize| {
-        let cell_args: Vec<ArgInfo> = args[1..]
-            .iter()
-            .map(|(n, ty, p)| (*n, component(ty, i), *p))
-            .collect();
-        let cell_named: Vec<NamedInfo> = named
-            .iter()
-            .map(|(s, n, ty, p)| (*s, *n, component(ty, i), *p))
-            .collect();
-        (cell_args, cell_named)
-    };
-    let steps: Vec<_> = (0..len).map(step).collect();
-    tuple_components(inf, id, head_node, steps, Vec::new())
-}
-
-/// Type the component calls of a tuple broadcast one after another.
-fn tuple_components(
-    inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
-    head_node: NodeId,
-    mut steps: Vec<(Vec<ArgInfo>, Vec<NamedInfo>)>,
-    done: Vec<Type>,
-) -> RuleStep<Type> {
-    if steps.is_empty() {
-        return Ready(Type::Tuple(done.into()));
-    }
-    let (cell_args, cell_named) = steps.remove(0);
-    ordinary_call_type(inf, head_node, &cell_args, &cell_named).and_then(inf, move |inf, ty| {
-        match ty {
-            Type::Failed(_) => return Ready(ty),
-            Type::Measure { .. } => {
-                inf.diags.push(crate::Diagnostic::error_at(
-                    id,
-                    "`broadcast` of a kernel over tuple operands is not allowed \
-                     (spec §04 \"Broadcasting\", \"Tuple inputs\")"
-                        .to_string(),
-                ));
-                return Ready(Type::Failed("kernel broadcast over tuples".into()));
-            }
-            _ => {}
-        }
-        let mut done = done;
-        done.push(ty);
-        tuple_components(inf, id, head_node, steps, done)
-    })
+    None
 }
 
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
@@ -6657,15 +6607,19 @@ fn broadcast_type(
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
 
-    // §04 "Broadcasting" (#210): records are non-collection inputs, "simply not
-    // iterated over but held constant". Tuple inputs are iterated component-wise.
-    if args[1..]
-        .iter()
-        .map(|(_, ty, _)| ty)
-        .chain(named.iter().map(|(_, _, ty, _)| ty))
-        .any(|ty| matches!(ty, Type::Tuple(_)))
-    {
-        return tuple_broadcast_type(inf, id, head_node, args, named);
+    // §04 "Broadcasting", "Disallowed inputs": records and tuples are not allowed as
+    // operands, neither iterated nor held constant, because broadcasting over them stays
+    // open for later. A table row reaching the callable as a record is unaffected: a table
+    // operand is a collection of rows, each passed under the callable's own call rule.
+    if let Some(ty) = refuse_aggregate_operand(
+        inf,
+        "broadcast",
+        args[1..]
+            .iter()
+            .map(|(node, ty, _)| (*node, ty))
+            .chain(named.iter().map(|(_, node, ty, _)| (*node, ty))),
+    ) {
+        return Ready(ty);
     }
 
     if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {

@@ -34,10 +34,32 @@ fn binding_pir(pir: &str, name: &str) -> String {
     common::call_arg(&pir[at..], "%bind", 1)
 }
 
+/// Rename the generated per-cell inputs `density_point_<n>` by order of appearance: their
+/// serial number is the module's node count, which an alias changes.
+fn alpha_normalize(pir: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = String::new();
+    let mut rest = pir;
+    while let Some(at) = rest.find("density_point_") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + "density_point_".len()..];
+        let digits = tail.chars().take_while(char::is_ascii_digit).count();
+        let name = format!("density_point_{}", &tail[..digits]);
+        let index = seen.iter().position(|n| *n == name).unwrap_or_else(|| {
+            seen.push(name);
+            seen.len() - 1
+        });
+        out.push_str(&format!("density_arg_{index}"));
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Both spellings must lower the query binding to the same FlatPDL.
 fn assert_alias_matches_direct(direct: &str, aliased: &str) {
-    let d = binding_pir(&determinize_pir(direct), "lp");
-    let a = binding_pir(&determinize_pir(aliased), "lp");
+    let d = alpha_normalize(&binding_pir(&determinize_pir(direct), "lp"));
+    let a = alpha_normalize(&binding_pir(&determinize_pir(aliased), "lp"));
     assert_eq!(a, d, "aliased spelling must lower like the direct one");
 }
 

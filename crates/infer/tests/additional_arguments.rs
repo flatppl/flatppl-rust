@@ -106,7 +106,7 @@ fn scan_sequences_must_agree_in_length() {
 }
 
 #[test]
-fn scalars_records_and_objects_are_held_constant_at_every_step() {
+fn scalars_and_objects_are_held_constant_at_every_step() {
     // scan(step, 0, [10, 20], 2) steps 0 -> 20 -> 60.
     let ty = type_of(
         "step(a, x, w) = a + x * w\nr = scan(step, 0, [10, 20], 2)",
@@ -118,10 +118,37 @@ fn scalars_records_and_objects_are_held_constant_at_every_step() {
     assert_eq!(shape.as_ref(), [Dim::Static(2)]);
     for source in [
         "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], 2.0)",
-        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
         "step(a, x, w, v) = a + x * w + v\nr = scan(step, 0.0, [10.0, 20.0], 2.0, [1.0, 2.0])",
         "k(s, x, w) = Normal(s + x, w)\nM = kscan(k, 0.0, [1.0, 2.0], 0.5)",
         "within(x, lo) = lo < x\nr = filter(within, [1, 4, 9], 3)",
+    ] {
+        assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+    }
+}
+
+#[test]
+fn a_record_input_of_a_sequence_operation_is_a_static_error() {
+    // The extras of `scan`, `kscan` and `filter` follow `broadcast`, which allows neither
+    // records nor tuples as operands (spec §04 "Broadcasting", "Disallowed inputs"); a
+    // record is neither iterated nor held constant, whatever the spelling.
+    for source in [
+        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
+        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], p = record(w = 2.0))",
+        "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
+        "k(s, x, p) = Normal(s + x, p.w)\nM = kscan(k, 0.0, [1.0, 2.0], record(w = 0.5))",
+        "within(x, p) = x < p.lo\nr = filter(within, [1, 4, 9], record(lo = 3))",
+    ] {
+        let found = errors(source);
+        assert_eq!(found.len(), 1, "{source}: {found:?}");
+        assert!(
+            found[0].contains("is a record") && found[0].contains("Disallowed inputs"),
+            "{found:?}"
+        );
+    }
+    // Operations that are not broadcasts still pass a record extra whole.
+    for source in [
+        "step(a, p) = a + p.w\nr = markovchain(step, 0.0, 3, record(w = 2.0))",
+        "w(x, p) = p.s * x\nm = weighted(w, Normal(0.0, 1.0), record(s = 2.0))",
     ] {
         assert_eq!(errors(source), Vec::<String>::new(), "{source}");
     }

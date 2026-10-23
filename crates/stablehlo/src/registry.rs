@@ -363,6 +363,9 @@ pub struct Params {
     variate: Option<NodeId>,
     /// Outer axes of a broadcasted scalar kernel; primitive samplers use flat lanes.
     sample_shape: Option<Vec<u64>>,
+    /// The parameters by name when a per-cell callee builds the kernel input itself and
+    /// takes them as operands, so no kernel-input node holds them.
+    fields: Option<Vec<(String, NodeId)>>,
 }
 
 impl Params {
@@ -412,6 +415,17 @@ impl Params {
     /// `interval(lo, hi)` with no tensor form of its own to lower (see
     /// [`Emitter::valueset_of`]'s doc comment).
     pub fn field_id(&self, e: &Emitter, name: &str) -> Result<NodeId, EmitError> {
+        if let Some(fields) = &self.fields {
+            return fields
+                .iter()
+                .find_map(|(n, value)| (n == name).then_some(*value))
+                .ok_or_else(|| {
+                    EmitError::at(
+                        self.kernel_input,
+                        format!("distribution parameter '{name}' missing from kernel input"),
+                    )
+                });
+        }
         let field = match e.node(self.kernel_input) {
             Node::Call(c) => {
                 // Two kernel-input shapes carry the params as named entries keyed
@@ -590,33 +604,6 @@ pub(crate) fn lower_logdensityof_batched(
             ));
         }
     };
-    if ctor == "Dirac" {
-        let [_, kernel_input, v] = <[NodeId; 3]>::try_from(args)
-            .map_err(|_| EmitError::at(id, "builtin_logdensityof: expected 3 arguments"))?;
-        let params = Params {
-            kernel_input,
-            variate: Some(v),
-            sample_shape: None,
-        };
-        let atom = params.field_id(e, "value")?;
-        return e.lower_broadcast_cells(id, &[atom, v], |e, values| {
-            let eq = e.dirac_tensor_equal(id, &values[0], &values[1])?;
-            Ok(dirac_score(e, &eq))
-        });
-    }
-    if is_batch_safe(&ctor) {
-        return lower_logdensityof(e, id, args);
-    }
-    let Some(builder) = batched_logpdf(&ctor) else {
-        return Err(EmitError::at(
-            id,
-            format!(
-                "broadcast over builtin_logdensityof of '{ctor}' is unsupported: \
-                 its density builder is not rank-agnostic (batched density is \
-                 sound only for univariate pure-arithmetic distributions)"
-            ),
-        ));
-    };
     let [_, kernel_input, v] = <[NodeId; 3]>::try_from(args).map_err(|_| {
         EmitError::at(
             id,
@@ -630,6 +617,59 @@ pub(crate) fn lower_logdensityof_batched(
         kernel_input,
         variate: Some(v),
         sample_shape: None,
+        fields: None,
+    };
+    lower_logdensityof_batched_with(e, id, &ctor, params, v)
+}
+
+/// The batched density of a per-cell callee that builds the kernel input record itself
+/// and takes its parameters as operands: `broadcast(fn(builtin_logdensityof(K,
+/// record(p0 = _, ..), _)), a0, .., obs)`. `callee` stands for the kernel input in
+/// diagnostics, and `fields` are the operands by parameter name. The result is that of the
+/// spelling with the record as an operand.
+pub(crate) fn lower_per_cell_density(
+    e: &mut Emitter,
+    id: NodeId,
+    callee: NodeId,
+    ctor: &str,
+    fields: Vec<(String, NodeId)>,
+    v: NodeId,
+) -> Result<Value, EmitError> {
+    let params = Params {
+        kernel_input: callee,
+        variate: Some(v),
+        sample_shape: None,
+        fields: Some(fields),
+    };
+    lower_logdensityof_batched_with(e, id, ctor, params, v)
+}
+
+fn lower_logdensityof_batched_with(
+    e: &mut Emitter,
+    id: NodeId,
+    ctor: &str,
+    params: Params,
+    v: NodeId,
+) -> Result<Value, EmitError> {
+    if ctor == "Dirac" {
+        let atom = params.field_id(e, "value")?;
+        return e.lower_broadcast_cells(id, &[atom, v], |e, values| {
+            let eq = e.dirac_tensor_equal(id, &values[0], &values[1])?;
+            Ok(dirac_score(e, &eq))
+        });
+    }
+    if is_batch_safe(ctor) {
+        return score_with(e, id, ctor, params, v);
+    }
+    let Some(builder) = batched_logpdf(ctor) else {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "broadcast over builtin_logdensityof of '{ctor}' is unsupported: \
+                 its density builder is not rank-agnostic (batched density is \
+                 sound only for univariate pure-arithmetic distributions)"
+            ),
+        ));
     };
     let value = e.lower_node(v)?;
     builder(e, &params, &value)
@@ -659,14 +699,24 @@ pub(crate) fn lower_logdensityof(
             ));
         }
     };
-    let dist = lookup(&ctor)
-        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
-
     let params = Params {
         kernel_input,
         variate: Some(v),
         sample_shape: None,
+        fields: None,
     };
+    score_with(e, id, &ctor, params, v)
+}
+
+fn score_with(
+    e: &mut Emitter,
+    id: NodeId,
+    ctor: &str,
+    params: Params,
+    v: NodeId,
+) -> Result<Value, EmitError> {
+    let dist = lookup(ctor)
+        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
     if ctor == "Dirac" {
         let atom = params.field_id(e, "value")?;
         let eq = e.dirac_equal(atom, v)?;
@@ -726,6 +776,7 @@ pub(crate) fn lower_touniform(
         kernel_input,
         variate: Some(x),
         sample_shape: None,
+        fields: None,
     };
     let value = e.lower_node(x)?;
     cdf(e, &params, &value)
@@ -878,6 +929,7 @@ pub(crate) fn lower_sample(
         kernel_input,
         variate: None,
         sample_shape: broadcasted.then(|| batch_shape.clone()),
+        fields: None,
     };
     // Existing samplers consume a flat product batch. Restore its outer axes
     // after sampling, keeping the inner event axes and RNG advances unchanged.

@@ -3917,6 +3917,21 @@ impl<'m> Emitter<'m> {
                 // callable under `broadcast` survives as a first-class value).
                 // Anything else (a kernel, a `%local`, an unresolved ref) is
                 // genuinely un-lowerable and refuses — refuse-don't-mislower.
+                // A per-cell density whose callee builds the kernel-input record from its
+                // own operands lowers like the spelling with the record as an operand.
+                // Array parameters, as the per-cell callee of a density broadcast over a
+                // table or matrix has, keep the user-function path.
+                if let Some((ctor, fields, observed)) =
+                    self.per_cell_density(args).filter(|(_, fields, _)| {
+                        fields.iter().all(|(_, value)| {
+                            matches!(self.m.type_of(*value), Some(Type::Scalar(_)))
+                        })
+                    })
+                {
+                    return crate::registry::lower_per_cell_density(
+                        self, id, f, &ctor, fields, observed,
+                    );
+                }
                 if let Some(fn_id) = self.resolve_functionof(f) {
                     return self.lower_broadcast_userfn(id, fn_id, &args[1..]);
                 }

@@ -46,10 +46,9 @@ pub(super) fn lower(
                 rank = Some(shape.len());
                 cell_input(m, value, &mut inputs, &mut actuals)
             }
-            Some(Type::Table { .. } | Type::Tuple(_)) => {
+            Some(Type::Record(_) | Type::Table { .. } | Type::Tuple(_)) => {
                 Err(refuse(value, m, "broadcast sampling requires scalar cells"))
             }
-            // Records are non-collection inputs: held constant like scalars (spec §04).
             _ => Ok(value),
         }
     };
