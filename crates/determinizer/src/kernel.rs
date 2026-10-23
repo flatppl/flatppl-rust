@@ -753,7 +753,7 @@ pub(crate) fn is_splattable(m: &Module, rec: NodeId) -> bool {
 
 /// Field names come from the literal or its inferred record/table type. Opaque
 /// inputs and loaded tables obey the same splat rule without reading their values.
-fn splat_fields(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
+pub(crate) fn splat_fields(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
     let (resolved, _) = resolve_ref_one(m, rec);
     if matches!(splat_head(m, rec), Some("record") | Some("table")) {
         let Node::Call(c) = m.node(resolved) else {

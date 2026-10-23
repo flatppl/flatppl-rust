@@ -380,6 +380,13 @@ pub(crate) fn refuse_bad_chain_boundary(
     if steps.len() < 2 {
         return None;
     }
+    // A chain whose first component is a kernel is applied with additional
+    // arguments that every later step receives after its fed value (§06
+    // "Dependent composition"), so the step's whole interface is not the fed
+    // value's: the application binds each step instead.
+    if matches!(steps[0].1, Type::Kernel { .. }) {
+        return None;
+    }
     let mut variates: Vec<Type> = Vec::with_capacity(steps.len());
     for (index, (node, ty)) in steps.iter().enumerate() {
         if index > 0

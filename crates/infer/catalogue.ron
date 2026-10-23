@@ -163,7 +163,7 @@ Catalogue(
 
         // §07 "Membership, filtering, and bin selection": `filter | pred, data`,
         // `selectbins | edges, region, counts`.
-        Builtin(name: "filter",     sig: Structural(params: [Callable, Any, Optional(Any)], names: ["pred", "data", "p"])),
+        Builtin(name: "filter",     sig: Structural(params: [Callable, Any, Variadic(Any)])),
         // `selectbins`'s §07 Domains are "vector, set, vector" — `counts` are bin
         // counts, so its element kind is not real-only.
         Builtin(name: "selectbins", sig: Structural(params: [Vector(Real), Any, Any], names: ["edges", "region", "counts"])),

@@ -46,7 +46,7 @@ use crate::density::{
 };
 use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
-use flatppl_core::{Call, CallHead, Module, NamedArg, Node, NodeId, Scalar};
+use flatppl_core::{Dim, Module, Node, NodeId, Scalar, Type};
 
 /// Lower `logdensityof(markovchain(K, init, n), v)`.
 pub(crate) fn lower_markovchain(
@@ -62,27 +62,34 @@ pub(crate) fn lower_kscan(m: &mut Module, node: NodeId, v: NodeId) -> Result<Nod
     lower_chain(m, node, v, "kscan")
 }
 
-/// The shared trajectory unroll. `op` is `"markovchain"` (third arg `n`, one
-/// kernel input) or `"kscan"` (third arg `xs`, two kernel inputs).
+/// The shared trajectory unroll. `op` is `"markovchain"` (kernel, init, `n`, then
+/// additional arguments held constant) or `"kscan"` (kernel, init, then sequences
+/// traversed together, spec §04 "Additional arguments").
 fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<NodeId, RefuseError> {
     let per_step_input = op == "kscan";
-    let (k_arg, init, third, parameter) = {
+    let lead = if per_step_input { 2 } else { 3 };
+    let (k_arg, init) = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected a chain call"));
         };
-        if !c.named.is_empty() || !(3..=4).contains(&c.args.len()) {
+        if c.args.len() < lead {
             return Err(refuse(
                 node,
                 m,
                 &format!(
-                    "{op} expects 3 or 4 positional args (kernel, init, {}, optional p)",
-                    if per_step_input { "xs" } else { "n" }
+                    "{op} expects (kernel, init, {})",
+                    if per_step_input {
+                        "sequences..."
+                    } else {
+                        "n, additional arguments..."
+                    }
                 ),
             ));
         }
-        (c.args[0], c.args[1], c.args[2], c.args.get(3).copied())
+        (c.args[0], c.args[1])
     };
-    let expected_inputs = (if per_step_input { 2 } else { 1 }) + usize::from(parameter.is_some());
+    let extras = crate::extras::bind_extras(m, node, k_arg, lead, 1)?;
+    let expected_inputs = 1 + extras.len();
 
     // The step count. `None` covers a dynamic length AND a record-state chain
     // (whose trajectory is a table, left with a deferred domain by inference) —
@@ -143,6 +150,27 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
 
+    // §04 "Additional arguments": a one-dimensional array or table is traversed with
+    // the steps, a length-one one repeats, and anything else is held constant.
+    let positions: Vec<Option<usize>> = if per_step_input {
+        extras
+            .iter()
+            .map(|&extra| match extra_traversal(m, extra) {
+                Some(Some(1)) => Ok(Some(1)),
+                Some(Some(len)) if len == n => Ok(Some(len)),
+                Some(None) => Ok(None),
+                _ => Err(refuse(
+                    node,
+                    m,
+                    "kscan additional input is not statically a constant or a sequence of the \
+                     trajectory length",
+                )),
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![None; extras.len()]
+    };
+
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
         // prev₀ = init (a value, not a draw); prevᵢ = the previous trajectory slot.
@@ -152,24 +180,48 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
             let idx = m.alloc(Node::Lit(Scalar::Int((i - 1) as i64)));
             build_call(m, "get0", &[v, idx])
         };
-        let mut app_args = vec![prev];
-        if per_step_input {
-            let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
-            app_args.push(build_call(m, "get0", &[third, idx]));
+        let mut step_extras = Vec::with_capacity(extras.len());
+        for (&extra, &position) in extras.iter().zip(&positions) {
+            step_extras.push(match position {
+                Some(len) => {
+                    let at = if len == 1 { 0 } else { i as i64 };
+                    let idx = m.alloc(Node::Lit(Scalar::Int(at)));
+                    build_call(m, "get0", &[extra, idx])
+                }
+                None => extra,
+            });
         }
-        if let Some(parameter) = parameter {
-            app_args.push(parameter);
-        }
-        let step = m.alloc(Node::Call(Call {
-            head: CallHead::User(k_arg),
-            args: app_args.into(),
-            named: Vec::<NamedArg>::new().into(),
-            inputs: None,
-        }));
+        let step = crate::extras::apply_callback(m, k_arg, prev, &step_extras)?;
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let cur = build_call(m, "get0", &[v, idx]);
         // The slice IS this step measure's own variate, supplied by the point.
         terms.push(lower_measure_density_at_point(m, step, cur)?);
     }
     Ok(fold_add(m, &terms))
+}
+
+/// How an additional input of `kscan` meets the steps: `Some(Some(len))` for a
+/// one-dimensional array or table of static length `len`, `Some(None)` for a
+/// constant, and `None` when its type is not statically known.
+fn extra_traversal(m: &mut Module, extra: NodeId) -> Option<Option<usize>> {
+    let resolved = crate::density::resolve_ref_chain(m, extra).0;
+    let ty = m
+        .type_of(extra)
+        .or_else(|| m.type_of(resolved))
+        .cloned()
+        .or_else(|| {
+            flatppl_infer::infer_expression(m, extra, &[])
+                .0
+                .remove(&extra)
+        })?;
+    let dim = match ty {
+        Type::Array { shape, .. } if shape.len() == 1 => shape[0],
+        Type::Table { nrows, .. } => nrows,
+        Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => return None,
+        _ => return Some(None),
+    };
+    match dim {
+        Dim::Static(n) => Some(Some(n as usize)),
+        Dim::Dynamic => None,
+    }
 }

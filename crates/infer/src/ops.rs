@@ -65,9 +65,18 @@ pub(crate) fn call_rule(
     named: &[NamedInfo],
     joined: Phase,
 ) -> RuleStep<(Type, Phase)> {
+    // The additional arguments of an applied `fchain`/`kchain`/`jointchain` follow
+    // the leading argument in either spelling (§04 "Additional arguments").
+    let applied_chain = callee.as_ref().is_some_and(|(node, _)| {
+        let resolved = resolve_binding_refs(inf, *node);
+        matches!(inf.module.node(resolved), Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(op)
+                if matches!(inf.module.resolve(op), "fchain" | "kchain" | "jointchain")))
+    });
     if !args.is_empty()
         && !named.is_empty()
-        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "load_module"))
+        && !applied_chain
+        && !matches!(call.head, CallHead::Builtin(op) if matches!(inf.module.resolve(op), "functionof" | "kernelof" | "broadcast" | "load_module" | "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" | "scan" | "kscan" | "markovchain"))
     {
         inf.diags.push(crate::Diagnostic::error_at(
             id,
@@ -192,6 +201,17 @@ pub(crate) fn call_rule(
     // `args.len() + named.len()` and resolves the splat, so handing it a vector holding the
     // keywords as well as `named` would double every keyword. Normalization is for POSITIONS
     // only; counts and names are settled above.
+    // §04 "Additional arguments": the callback's additional arguments bind its
+    // remaining inputs, in input order, so every rule below sees them positionally.
+    let extras_bound;
+    let (args, named) = match bind_call_extras(inf, id, &name, args, named) {
+        ExtrasOutcome::Unchanged => (args, named),
+        ExtrasOutcome::Bound(bound) => {
+            extras_bound = bound;
+            (extras_bound.as_slice(), &[][..])
+        }
+        ExtrasOutcome::Refused(ty) => return Ready((ty, joined)),
+    };
     let normalized;
     let args = match normalize_keyword_args(inf.module, &name, args, named) {
         Some(v) => {
@@ -216,14 +236,14 @@ pub(crate) fn call_rule(
     }
 
     if matches!(name.as_str(), "weighted" | "logweighted")
-        && (args.len() == 3 || matches!(arg_ty(args, 0), Some(Type::Function { .. })))
+        && (args.len() >= 3 || matches!(arg_ty(args, 0), Some(Type::Function { .. })))
     {
         let result_type = fresh_measure(arg_ty(args, 1));
         let Type::Measure { domain, .. } = &result_type else {
             return Ready((result_type, joined));
         };
         let mut inputs = vec![(args[1].0, *domain.clone(), Phase::Parametric)];
-        inputs.extend(args.get(2).cloned());
+        inputs.extend(args.iter().skip(2).cloned());
         let function = args[0].0;
         let callable = matches!(
             args[0].1,
@@ -666,10 +686,16 @@ pub(crate) fn call_rule(
             trajectory_measure(arg_ty(args, 1), len)
         }
         "kscan" => {
-            let len = match arg_ty(args, 2) {
-                Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
-                _ => Dim::Dynamic,
-            };
+            // The sequences after `init` are traversed together (§04 "Additional
+            // arguments"), so the trajectory has as many steps as they agree on.
+            let lengths: Option<Vec<Option<Dim>>> = args[2.min(args.len())..]
+                .iter()
+                .map(|input| sequence_item(input).map(|(len, _)| len))
+                .collect();
+            let len = lengths
+                .map(|lengths| lengths.into_iter().flatten().collect::<Vec<_>>())
+                .filter(|lengths| !lengths.is_empty())
+                .map_or(Dim::Dynamic, |lengths| sequence_steps(&lengths));
             trajectory_measure(arg_ty(args, 1), len)
         }
         // `kchain(M, K1, …, Kn)` (spec §06): Kleisli bind — marginalizes the
@@ -941,6 +967,310 @@ pub(crate) fn call_rule(
     Ready((ty, phase))
 }
 
+/// How an operation's additional arguments reach its callback (§04 "Additional
+/// arguments", §05 table of call forms).
+struct ExtrasHead {
+    /// Arguments the operation takes before the additional ones.
+    lead: usize,
+    /// Inputs the operation itself supplies to the callback first.
+    callback_lead: usize,
+    /// Whether the additional arguments are sequences traversed together
+    /// (`filter`, `scan`, `kscan`) rather than values held constant.
+    sequences: bool,
+}
+
+fn extras_head(name: &str) -> Option<ExtrasHead> {
+    let (lead, callback_lead, sequences) = match name {
+        "weighted" | "logweighted" | "pushfwd" => (2, 1, false),
+        "reduce" => (2, 2, false),
+        "markovchain" => (3, 1, false),
+        "filter" | "scan" | "kscan" => (2, 1, true),
+        _ => return None,
+    };
+    Some(ExtrasHead {
+        lead,
+        callback_lead,
+        sequences,
+    })
+}
+
+enum ExtrasOutcome {
+    Unchanged,
+    /// The call's arguments in callback-input order, no keywords left.
+    Bound(Vec<ArgInfo>),
+    Refused(Type),
+}
+
+/// Bind the additional arguments of `name`'s callback with [`crate::extras::bind`].
+fn bind_call_extras(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> ExtrasOutcome {
+    let Some(head) = extras_head(name) else {
+        return ExtrasOutcome::Unchanged;
+    };
+    if args.len() < head.lead {
+        return ExtrasOutcome::Unchanged;
+    }
+    let extras = &args[head.lead..];
+    if extras.is_empty() && named.is_empty() {
+        if head.sequences && name != "filter" {
+            return refuse_extras(
+                inf,
+                id,
+                name,
+                "needs at least one array or table input to traverse".to_string(),
+            );
+        }
+        return ExtrasOutcome::Unchanged;
+    }
+    let Some(interface) = crate::callable::interface(inf, args[0].0) else {
+        // A callback whose inputs are unknown cannot take keyword arguments; positional
+        // ones keep their order, which is all the later rules read.
+        return if named.is_empty() {
+            ExtrasOutcome::Unchanged
+        } else {
+            refuse_extras(
+                inf,
+                id,
+                name,
+                "the callback's inputs are not known, so keyword arguments cannot bind".to_string(),
+            )
+        };
+    };
+    let bound_extras = match bind_extras_to_interface(
+        inf,
+        id,
+        name,
+        args[0].0,
+        &interface,
+        head.callback_lead,
+        extras,
+        named,
+    ) {
+        Ok(bound) => bound,
+        Err(refusal) => return ExtrasOutcome::Refused(refusal),
+    };
+    let mut bound: Vec<ArgInfo> = args[..head.lead].to_vec();
+    bound.extend(bound_extras);
+    // `filter` traverses its additional inputs with `data`, which is a sequence
+    // too; `scan` and `kscan` traverse the additional inputs alone.
+    let traversed = if name == "filter" { 1 } else { head.lead };
+    if name == "filter"
+        && let Some((node, ty, _)) = bound.get(1)
+        && !matches!(
+            ty,
+            Type::Array { .. }
+                | Type::Table { .. }
+                | Type::Deferred
+                | Type::Any
+                | Type::Var(_)
+                | Type::Failed(_)
+        )
+    {
+        return refuse_extras(
+            inf,
+            *node,
+            name,
+            "the data to filter must be an array or table".to_string(),
+        );
+    }
+    if head.sequences
+        && let Some(refusal) = check_sequences(inf, id, name, &bound[traversed..])
+    {
+        return ExtrasOutcome::Refused(refusal);
+    }
+    ExtrasOutcome::Bound(bound)
+}
+
+fn refuse_extras(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    name: &str,
+    what: String,
+) -> ExtrasOutcome {
+    ExtrasOutcome::Refused(extras_diagnostic(inf, node, name, what))
+}
+
+fn extras_diagnostic(inf: &mut Inferencer<'_, '_>, node: NodeId, name: &str, what: String) -> Type {
+    inf.diags.push(crate::Diagnostic::error_at(
+        node,
+        format!("`{name}`: {what} (spec §04 \"Additional arguments\")"),
+    ));
+    Type::Failed(format!("{name}: additional arguments").into())
+}
+
+/// The additional arguments `extras` and `named` of a call to a callback with
+/// `interface`, in the order of the callback's inputs after its first
+/// `callback_lead` ones. `who` names the operation in a diagnostic.
+#[allow(clippy::too_many_arguments)]
+fn bind_extras_to_interface(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    who: &str,
+    callback: NodeId,
+    interface: &crate::callable::Interface,
+    callback_lead: usize,
+    extras: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Result<Vec<ArgInfo>, Type> {
+    use crate::extras::{Error, Remaining, Source, bind};
+    if interface.names.len() < callback_lead {
+        return Err(extras_diagnostic(
+            inf,
+            callback,
+            who,
+            format!(
+                "the callback declares {} input(s) but is called with {callback_lead} before any additional argument",
+                interface.names.len(),
+            ),
+        ));
+    }
+    let remaining_names = interface.names[callback_lead..].to_vec();
+    let remaining = Remaining {
+        names: &remaining_names,
+        ordered: interface.ordered,
+    };
+    let aggregate_fields = match extras {
+        [(_, Type::Record(fields), _)] => Some(fields.as_ref()),
+        [(_, Type::Table { columns, .. }, _)] => Some(columns.as_ref()),
+        _ => None,
+    }
+    .filter(|_| named.is_empty());
+    let aggregate_names: Option<Vec<String>> = aggregate_fields.map(|fields| {
+        fields
+            .iter()
+            .map(|(n, _)| inf.module.resolve(*n).to_string())
+            .collect()
+    });
+    let named_names: Vec<String> = named
+        .iter()
+        .map(|(n, ..)| inf.module.resolve(*n).to_string())
+        .collect();
+    let named_refs: Vec<&str> = named_names.iter().map(String::as_str).collect();
+    let sources = bind(
+        &remaining,
+        extras.len(),
+        &named_refs,
+        aggregate_names.as_deref(),
+    )
+    .map_err(|error| {
+        let what = match error {
+            Error::KeywordOnly => {
+                "the callback has keyword-only inputs, so additional arguments bind by name"
+                    .to_string()
+            }
+            Error::TooMany { given, inputs } => format!(
+                "{given} additional argument(s) but the callback has {inputs} remaining input(s)"
+            ),
+            Error::Unknown(n) => format!("the callback has no remaining input `{n}`"),
+            Error::Twice(n) => format!("input `{n}` is bound twice"),
+            Error::Unbound(n) => format!("input `{n}` is left unbound"),
+        };
+        extras_diagnostic(inf, id, who, what)
+    })?;
+    // The sole additional record or table splats by name: its fields read through
+    // the same projection the ordinary auto-splat uses.
+    let splat =
+        if aggregate_fields.is_some() && extras.len() == 1 && !remaining.accepts_one_positional() {
+            normalize_arguments(inf.module, &remaining_names, extras, &[], false, true)
+        } else {
+            None
+        };
+    let mut bound = Vec::with_capacity(sources.len());
+    for (slot, source) in sources.iter().enumerate() {
+        bound.push(match source {
+            Source::Positional(k) => extras[*k].clone(),
+            Source::Named(j) => {
+                let (_, node, ty, phase) = &named[*j];
+                (*node, ty.clone(), *phase)
+            }
+            Source::Field(_) => match &splat {
+                Some(fields) => fields[slot].clone(),
+                // The field's type is not readable, so the call stays as written.
+                None => return Ok(extras.to_vec()),
+            },
+        });
+    }
+    Ok(bound)
+}
+
+/// §04 "Additional arguments": the additional inputs of `filter`, `scan` and `kscan`
+/// follow `broadcast`. One-dimensional arrays and tables are traversed together
+/// and a length-one input repeats; other unequal lengths are an error. Scalars,
+/// records and other non-collection inputs are held constant. A tuple or an array
+/// of more than one dimension is an error, and `scan` and `kscan` need at least
+/// one array or table to traverse.
+fn check_sequences(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    inputs: &[ArgInfo],
+) -> Option<Type> {
+    let mut len: Option<u32> = None;
+    let mut traversed = false;
+    let mut unknown = false;
+    for (node, ty, _) in inputs {
+        let dim = match ty {
+            Type::Array { shape, .. } if shape.len() == 1 => shape[0],
+            Type::Table { nrows, .. } => *nrows,
+            Type::Array { .. } | Type::Tuple(_) => {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    *node,
+                    format!(
+                        "`{name}` additional inputs are one-dimensional arrays or tables, or \
+                         constants; a tuple or a higher-dimensional array is not allowed \
+                         (spec §04 \"Additional arguments\")"
+                    ),
+                ));
+                return Some(Type::Failed(
+                    format!("{name}: input is not a sequence or a constant").into(),
+                ));
+            }
+            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => {
+                unknown = true;
+                continue;
+            }
+            _ => continue,
+        };
+        traversed = true;
+        let Dim::Static(n) = dim else { continue };
+        if n == 1 {
+            continue;
+        }
+        match len {
+            Some(previous) if previous != n => {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    *node,
+                    format!(
+                        "`{name}` sequence inputs have lengths {previous} and {n}: spec §04 \
+                         \"Additional arguments\" repeats only length-one inputs, and other \
+                         unequal lengths are an error"
+                    ),
+                ));
+                return Some(Type::Failed(
+                    format!("{name}: unequal sequence lengths").into(),
+                ));
+            }
+            _ => len = Some(n),
+        }
+    }
+    if name != "filter" && !traversed && !unknown {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!(
+                "`{name}` needs at least one array or table input to traverse; a constant is \
+                 held at every step (spec §04 \"Additional arguments\")"
+            ),
+        ));
+        return Some(Type::Failed(format!("{name}: no sequence input").into()));
+    }
+    None
+}
+
 /// Higher-order operations pass whole objects in a fixed callback signature.
 fn callback_arity_check(
     inf: &mut Inferencer<'_, '_>,
@@ -948,15 +1278,11 @@ fn callback_arity_check(
     op: &str,
     args: &[ArgInfo],
 ) -> Option<Type> {
-    let (base, parameter_at) = match op {
-        "weighted" | "logweighted" | "pushfwd" | "filter" => (1, 2),
-        "reduce" => (2, 2),
-        "scan" | "kscan" => (2, 3),
-        "markovchain" => (1, 3),
-        _ => return None,
-    };
+    let head = extras_head(op)?;
     let callback = args.first()?;
-    let expected = base + usize::from(args.len() > parameter_at);
+    // The operation supplies `callback_lead` inputs itself, and each additional
+    // argument binds one more.
+    let expected = head.callback_lead + args.len().saturating_sub(head.lead);
     let count = match &callback.1 {
         Type::Function { inputs } | Type::Kernel { inputs, .. } => Some(inputs.len()),
         _ => {
@@ -987,44 +1313,86 @@ fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
 }
 
+/// The number of steps of sequences traversed together (§04 "Additional
+/// arguments"): equal lengths, with length-one inputs repeating. An empty input
+/// combined with length-one inputs yields zero steps.
+fn sequence_steps(lengths: &[Dim]) -> Dim {
+    let mut steps = None;
+    let mut dynamic = false;
+    for length in lengths {
+        match length {
+            Dim::Static(1) => {}
+            Dim::Static(n) => steps = Some(*n),
+            Dim::Dynamic => dynamic = true,
+        }
+    }
+    match (steps, dynamic) {
+        (Some(n), _) => Dim::Static(n),
+        (None, true) => Dim::Dynamic,
+        (None, false) => Dim::Static(1),
+    }
+}
+
+/// One additional input of `scan`/`kscan`, as the step sees it: `Some(len)` with
+/// the element (row) type for a one-dimensional array or table, `None` with the
+/// whole value for a constant. A tuple, a higher-dimensional array or an input of
+/// unknown type is `None` for the whole call (inference of the step is deferred;
+/// [`check_sequences`] reports the tuple and the array).
+fn sequence_item(input: &ArgInfo) -> Option<(Option<Dim>, ArgInfo)> {
+    let (len, item) = match &input.1 {
+        Type::Array { shape, elem } if shape.len() == 1 => (Some(shape[0]), (**elem).clone()),
+        Type::Table { columns, nrows } => (Some(*nrows), Type::Record(columns.clone())),
+        Type::Array { .. }
+        | Type::Tuple(_)
+        | Type::Deferred
+        | Type::Any
+        | Type::Var(_)
+        | Type::Failed(_) => return None,
+        other => (None, other.clone()),
+    };
+    Some((len, (input.0, item, input.2)))
+}
+
 /// A scan has one fixed state type, including the numeric embedding of an
 /// integer initial value into a real-valued recurrence. Infer the step with
 /// state and row types, just as broadcast infers its callable on cell types.
+/// The sequences after `init` are traversed together, and their elements are
+/// the step's inputs after the state (§04 "Additional arguments").
 fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
-    let [function, init, xs, parameters @ ..] = args else {
+    let [function, init, sequences @ ..] = args else {
         return Ready(Type::Deferred);
     };
-    let (len, item) = match &xs.1 {
-        Type::Array { shape, elem } if shape.len() == 1 => (shape[0], (**elem).clone()),
-        Type::Table { columns, nrows } => (*nrows, Type::Record(columns.clone())),
-        _ => return Ready(Type::Deferred),
+    let Some(items) = sequences
+        .iter()
+        .map(sequence_item)
+        .collect::<Option<Vec<_>>>()
+        .filter(|items| items.iter().any(|(len, _)| len.is_some()))
+    else {
+        return Ready(Type::Deferred);
     };
-    let seed = (xs.0, item, xs.2);
-    scan_state_type(inf, function.0, init.clone(), seed, parameters.to_vec()).map(
-        inf,
-        move |_, state| match state {
-            Type::Record(columns) => Type::Table {
-                columns,
-                nrows: len,
-            },
-            state @ (Type::Scalar(_) | Type::Array { .. }) => Type::Array {
-                shape: Box::new([len]),
-                elem: Box::new(state),
-            },
-            _ => Type::Deferred,
+    let len = sequence_steps(&items.iter().filter_map(|(len, _)| *len).collect::<Vec<_>>());
+    let items: Vec<ArgInfo> = items.into_iter().map(|(_, item)| item).collect();
+    scan_state_type(inf, function.0, init.clone(), items).map(inf, move |_, state| match state {
+        Type::Record(columns) => Type::Table {
+            columns,
+            nrows: len,
         },
-    )
+        state @ (Type::Scalar(_) | Type::Array { .. }) => Type::Array {
+            shape: Box::new([len]),
+            elem: Box::new(state),
+        },
+        _ => Type::Deferred,
+    })
 }
 
 fn scan_state_type(
     inf: &mut Inferencer<'_, '_>,
     function: NodeId,
     state: ArgInfo,
-    item: ArgInfo,
-    parameters: Vec<ArgInfo>,
+    items: Vec<ArgInfo>,
 ) -> RuleStep<Type> {
-    let mut arguments = vec![state.clone(), item.clone()];
-    arguments.extend(parameters.iter().cloned());
+    let mut arguments = vec![state.clone()];
+    arguments.extend(items.iter().cloned());
     substituted_result(inf, function, &arguments, &[], None, false).and_then(
         inf,
         move |inf, result| {
@@ -1042,7 +1410,7 @@ fn scan_state_type(
             } else {
                 // The structure cannot change. Every leaf only widens through
                 // the finite boolean/integer/real/complex inclusion chain.
-                scan_state_type(inf, function, (state.0, joined, state.2), item, parameters)
+                scan_state_type(inf, function, (state.0, joined, state.2), items)
             }
         },
     )
@@ -5456,6 +5824,12 @@ fn user_call_type(
             "bijection" if !components.is_empty() => {
                 return ordinary_call_type(inf, components[0], args, named);
             }
+            "kchain" | "jointchain"
+                if components.len() >= 2
+                    && matches!(inf.lookup_type(components[0]), Some(Type::Kernel { .. })) =>
+            {
+                return chain_application_type(inf, &op, &components, args, named);
+            }
             _ => {}
         }
     }
@@ -5561,22 +5935,144 @@ fn user_call_type(
     }
 }
 
+/// Applying `kchain(K1, K2, ...)` or `jointchain(K1, K2, ...)` with a kernel first
+/// (§06 "Dependent composition"): the arguments go to `K1`, and every later kernel
+/// gets its fed value whole as its first argument and the same additional arguments
+/// (`K2(a, ...)`, `K3([a, b], ...)`). Each step binds them under §04 "Additional
+/// arguments". The result is the measure the unapplied chain would be, over its
+/// variate.
+fn chain_application_type(
+    inf: &mut Inferencer<'_, '_>,
+    op: &str,
+    components: &[NodeId],
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let Some(fed) = args.first().cloned() else {
+        return Ready(Type::Deferred);
+    };
+    let extras = args[1..].to_vec();
+    let components = components.to_vec();
+    let (op, named_extras) = (op.to_string(), named.to_vec());
+    let first_extras = (extras.clone(), named_extras.clone());
+    let (first_args, first_named) =
+        match step_arguments(inf, &op, components[0], fed, &first_extras) {
+            Ok(bound) => bound,
+            Err(refusal) => return Ready(refusal),
+        };
+    ordinary_call_type(inf, components[0], &first_args, &first_named).map(inf, move |inf, first| {
+        if matches!(first, Type::Failed(_)) {
+            return first;
+        }
+        let mut variates = Vec::with_capacity(components.len());
+        for (index, &component) in components.iter().enumerate() {
+            let ty = inf
+                .lookup_type(component)
+                .cloned()
+                .unwrap_or(Type::Deferred);
+            if index > 0
+                && (!extras.is_empty() || !named_extras.is_empty())
+                && let Some(interface) = crate::callable::interface(inf, component)
+                && let Err(refusal) = bind_extras_to_interface(
+                    inf,
+                    component,
+                    &op,
+                    component,
+                    &interface,
+                    1,
+                    &extras,
+                    &named_extras,
+                )
+            {
+                return refusal;
+            }
+            match component_variate(inf, component, &ty) {
+                Some(variate) => variates.push(variate),
+                None => return Type::Deferred,
+            }
+        }
+        let domain = if op == "kchain" {
+            variates.last().cloned().unwrap_or(Type::Deferred)
+        } else {
+            cat_compose(&variates)
+        };
+        Type::Measure {
+            domain: Box::new(domain),
+            mass: Mass::Deferred,
+        }
+    })
+}
+
+/// The arguments of one step of a composed callable: the fed value first, then the
+/// composed callable's additional arguments bound to the step's remaining inputs
+/// (§04 "Additional arguments"). A step with keyword-only inputs takes every
+/// argument by name. With no additional arguments the fed value is the only one.
+fn step_arguments(
+    inf: &mut Inferencer<'_, '_>,
+    who: &str,
+    step: NodeId,
+    fed: ArgInfo,
+    extras: &(Vec<ArgInfo>, Vec<NamedInfo>),
+) -> Result<(Vec<ArgInfo>, Vec<NamedInfo>), Type> {
+    if extras.0.is_empty() && extras.1.is_empty() {
+        return Ok((vec![fed], Vec::new()));
+    }
+    let Some(interface) = crate::callable::interface(inf, step) else {
+        return Err(Type::Deferred);
+    };
+    let mut arguments = vec![fed];
+    arguments.extend(bind_extras_to_interface(
+        inf, step, who, step, &interface, 1, &extras.0, &extras.1,
+    )?);
+    if interface.ordered {
+        return Ok((arguments, Vec::new()));
+    }
+    let named = arguments
+        .into_iter()
+        .zip(&interface.names)
+        .map(|((node, ty, phase), input)| (inf.module.intern(input), node, ty, phase))
+        .collect();
+    Ok((Vec::new(), named))
+}
+
 /// Apply composition stages using the ordinary interface before inspecting domains.
+///
+/// The composed callable passes its additional arguments unchanged to every step
+/// (§04 "Function composition": `fchain(f1, f2, f3)(x, ...)` equals
+/// `f3(f2(f1(x, ...), ...), ...)`), each later step receiving the previous result
+/// whole as its first argument.
 fn composed_call_type(
     inf: &mut Inferencer<'_, '_>,
     components: &[NodeId],
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> RuleStep<Type> {
-    let Some((&first, rest)) = components.split_first() else {
+    let Some(fed) = args.first().cloned() else {
         return Ready(Type::Deferred);
     };
+    let extras = (args[1..].to_vec(), named.to_vec());
+    compose_steps(inf, components, fed, extras)
+}
+
+fn compose_steps(
+    inf: &mut Inferencer<'_, '_>,
+    components: &[NodeId],
+    fed: ArgInfo,
+    extras: (Vec<ArgInfo>, Vec<NamedInfo>),
+) -> RuleStep<Type> {
+    let Some((&step, rest)) = components.split_first() else {
+        return Ready(Type::Deferred);
+    };
+    let (args, named) = match step_arguments(inf, "fchain", step, fed, &extras) {
+        Ok(bound) => bound,
+        Err(refusal) => return Ready(refusal),
+    };
     let rest = rest.to_vec();
-    ordinary_call_type(inf, first, args, named).and_then(inf, move |inf, ty| {
+    ordinary_call_type(inf, step, &args, &named).and_then(inf, move |inf, ty| {
         if rest.is_empty() || matches!(ty, Type::Failed(_)) {
             Ready(ty)
         } else {
-            composed_call_type(inf, &rest, &[(first, ty, Phase::Fixed)], &[])
+            compose_steps(inf, &rest, (step, ty, Phase::Fixed), extras)
         }
     })
 }
@@ -5740,7 +6236,7 @@ fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<
             if !matches!(domain.as_ref(), Type::Deferred) =>
         {
             let mut inputs = vec![(*m_node, (**domain).clone(), *m_phase)];
-            inputs.extend(args.get(2).cloned());
+            inputs.extend(args.iter().skip(2).cloned());
             Some(inputs)
         }
         _ => None,
@@ -7033,8 +7529,10 @@ enum SpecialArity {
     /// that it "only accepts positional arguments, not keyword arguments", which
     /// is now what EVERY distinguished input does, so the carve-out folded in.
     Distinguished(usize),
-    /// A fixed positional prefix with one optional positional input.
-    DistinguishedOptional(usize),
+    /// `n` distinguished POSITIONAL inputs, then zero or more additional
+    /// arguments, positional or keyword, that bind the callback's remaining
+    /// inputs (§04 "Additional arguments").
+    DistinguishedPlusTail(usize),
     /// `n` distinguished inputs plus optional variadic NAMED inputs
     /// (`load_module`'s substitutions).
     DistinguishedPlusNamed(usize),
@@ -7103,13 +7601,17 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
             Distinguished(3),
             "\"`aggregate`, `metricsum`: Three distinguished inputs\"",
         ),
-        "markovchain" | "kscan" | "scan" => (
-            DistinguishedOptional(3),
-            "three distinguished inputs and an optional fourth positional parameter value",
+        "markovchain" => (
+            DistinguishedPlusTail(3),
+            "\"`markovchain`: Three distinguished inputs, plus variadic inputs\"",
         ),
-        "weighted" | "logweighted" | "pushfwd" | "reduce" => (
-            DistinguishedOptional(2),
-            "two distinguished inputs and an optional third positional parameter value",
+        "scan" | "kscan" => (
+            DistinguishedPlusEither(2),
+            "\"`scan`, `kscan`: Two distinguished inputs, plus one or more variadic sequence inputs\"",
+        ),
+        "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" => (
+            DistinguishedPlusTail(2),
+            "two distinguished inputs and additional arguments for the callback (§04 \"Additional arguments\")",
         ),
         "load_module" => (
             DistinguishedPlusNamed(1),
@@ -7272,7 +7774,23 @@ fn special_arity_check(
     let (pos, kw) = (args.len(), named.len());
     let total = pos + kw;
     match declared {
-        SpecialArity::Distinguished(n) | SpecialArity::DistinguishedOptional(n) => {
+        SpecialArity::DistinguishedPlusTail(n) => {
+            // The distinguished prefix is positional; the tail is the callback's
+            // additional arguments, checked when they bind.
+            if pos < n {
+                return refuse(
+                    inf,
+                    format!(
+                        "takes {n} distinguished input(s) positionally, which cannot \
+                         be passed by keyword; got {pos} positional argument(s). Where \
+                         the spec names such an input, the name identifies it in prose \
+                         only — a call binds it by position"
+                    ),
+                    cite,
+                );
+            }
+        }
+        SpecialArity::Distinguished(n) => {
             // Spelling first: on a keyword call the COUNT may well be right, and
             // reporting "takes 3 inputs, got 3" would be both true and useless.
             if kw > 0 {
@@ -7287,14 +7805,8 @@ fn special_arity_check(
                     cite,
                 );
             }
-            let optional = matches!(declared, SpecialArity::DistinguishedOptional(_));
-            if pos != n && !(optional && pos == n + 1) {
-                let expected = if optional {
-                    format!("{n} or {}", n + 1)
-                } else {
-                    n.to_string()
-                };
-                return refuse(inf, format!("takes {expected} input(s), got {pos}"), cite);
+            if pos != n {
+                return refuse(inf, format!("takes {n} input(s), got {pos}"), cite);
             }
         }
         SpecialArity::DistinguishedPlusNamed(n) => {

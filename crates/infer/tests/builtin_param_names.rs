@@ -220,10 +220,12 @@ fn spot_checked_names_match_the_spec_arguments_column() {
         ("checked", &["value", "condition"][..]),
         ("load_data", &["source", "valueset"][..]),
         ("rand", &["m", "rstate"][..]),
-        ("filter", &["pred", "data", "p"][..]),
         ("diag", &["A", "k"][..]),
         ("onehot", &["i", "n"][..]),
         ("sum", &["xs"][..]),
+        // `filter(pred, data, ...)` declares no names: its additional arguments bind the
+        // callback's own inputs by keyword (§04 "Additional arguments"), so a name list
+        // would refuse them.
         // The six "Measure kernel evaluation primitives" (§07): fixed by PR #154 (rust#154);
         // audited whole here and confirmed each already matches §07's Arguments column verbatim.
         ("builtin_logdensityof", &["kernel", "kernel_input", "x"][..]),

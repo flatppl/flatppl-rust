@@ -201,6 +201,7 @@ pub(crate) fn specialize_sequence_parameters(m: &mut Module) -> bool {
         let CallHead::Builtin(head) = call.head else {
             return None;
         };
+        // Objects are non-collection additional inputs, held constant at every step.
         let base_arity = match m.resolve(head) {
             "scan" => 3,
             "reduce" => 2,

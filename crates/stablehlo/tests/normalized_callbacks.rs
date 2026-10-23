@@ -121,18 +121,29 @@ fn sequence_parameters_keep_record_fields_outside_the_iteration_axis() {
                   outputs = (scan(step, 0.0, [1.0, 2.0, 3.0], p), \
                              reduce(fold, [1.0, 2.0, 3.0], p))";
     emit(source, &Mode::LogDensity);
+    // A tuple is not an additional input of `scan` (spec §04), so only `reduce` takes it.
     let tuple = source
-        .replace("q.scale", "q[1]")
-        .replace("q.shift", "q[2]")
-        .replace(", p)", ", (p.scale, p.shift))");
+        .replace(
+            "fold(a, x, q) = a + x + q.shift",
+            "fold(a, x, q) = a + x + q[2]",
+        )
+        .replace(
+            "reduce(fold, [1.0, 2.0, 3.0], p)",
+            "reduce(fold, [1.0, 2.0, 3.0], (p.scale, p.shift))",
+        );
     assert_eq!(
         emit(source, &Mode::LogDensity),
         emit(&tuple, &Mode::LogDensity)
     );
     let nested = source
-        .replace("q.scale", "q[1].scale")
-        .replace("q.shift", "q[1].shift")
-        .replace(", p)", ", (record(scale=p.scale,shift=p.shift),0.0))");
+        .replace(
+            "fold(a, x, q) = a + x + q.shift",
+            "fold(a, x, q) = a + x + q[1].shift",
+        )
+        .replace(
+            "reduce(fold, [1.0, 2.0, 3.0], p)",
+            "reduce(fold, [1.0, 2.0, 3.0], (record(scale=p.scale,shift=p.shift),0.0))",
+        );
     assert_eq!(
         emit(source, &Mode::LogDensity),
         emit(&nested, &Mode::LogDensity)
@@ -210,7 +221,7 @@ fn sequence_object_parameters_specialize_to_live_value_leaves() {
     let source = "mu = elementof(reals)\nsigma = elementof(posreals)\n\
                   offset(x) = x+0.25\nM = Normal(mu,sigma)\n\
                   step(a,x,p) = a+logdensityof(p[1],x)+p[2](0.0)\n\
-                  inputs = (mu,sigma)\noutputs = scan(step,0.0,[1.0,2.0,3.0],(M,offset))[3]";
+                  inputs = (mu,sigma)\noutputs = reduce(step,[1.0,2.0,3.0],(M,offset))";
     let expected = source
         .replace(
             "logdensityof(p[1],x)+p[2](0.0)",
@@ -239,6 +250,43 @@ fn sequence_object_parameters_specialize_to_live_value_leaves() {
         emit(&mixed, &Mode::LogDensity),
         emit(&expected, &Mode::LogDensity)
     );
+}
+
+#[test]
+fn keyword_additional_arguments_of_a_sequence_callback_refuse() {
+    // Keyword binding is not lowered; the emitter refuses rather than reading the
+    // keyword argument as a positional one.
+    let source = "mu = external(reals)\nstep(a, x, w) = w * a + x\ninputs = mu\n\
+                  outputs = scan(step, 0.0, [1.0, 2.0, mu], w = [2.0])[3]";
+    let mut model = flatppl_syntax::parse(source).unwrap();
+    assert!(flatppl_infer::infer(&mut model).is_empty());
+    let roots = [model.intern("inputs"), model.intern("outputs")];
+    let options = EmitOptions::default();
+    let model = flatppl_determinizer::determinize_with_options(
+        &model,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &options.lowering_options(),
+    )
+    .unwrap();
+    let error = flatppl_stablehlo::emit(&model, Mode::LogDensity, &options).unwrap_err();
+    assert!(
+        error.to_string().contains("keyword additional arguments"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scan_holds_a_constant_input_at_every_step() {
+    // `scan(step, 0, [1, 2, 3], 2)` equals the scan with `[2]` repeated per step,
+    // and the record form binds its field.
+    let source = "mu = external(reals)\nstep(a, x, w) = w * a + x\ninputs = mu\n\
+                  outputs = scan(step, 0.0, [1.0, 2.0, mu], 2.0)[3]";
+    let actual = emit(source, &Mode::LogDensity);
+    assert!(actual.contains("stablehlo.while"), "{actual}");
+    let record = "mu = external(reals)\nstep(a, x, p) = p.w * a + x\ninputs = mu\n\
+                  outputs = scan(step, 0.0, [1.0, 2.0, mu], record(w = 2.0))[3]";
+    assert!(emit(record, &Mode::LogDensity).contains("stablehlo.while"));
 }
 
 #[test]

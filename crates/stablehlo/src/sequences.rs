@@ -473,11 +473,23 @@ impl Emitter<'_> {
         args: &[NodeId],
         reduce: bool,
     ) -> Result<Components, EmitError> {
-        let (function, init, xs, parameters) = match (reduce, args) {
-            (false, [function, init, xs, parameters @ ..]) => {
-                (*function, Some(*init), *xs, parameters)
+        if let Node::Call(call) = self.m.node(id)
+            && !call.named.is_empty()
+        {
+            return Err(EmitError::at(
+                id,
+                "scan/reduce: keyword additional arguments are not lowered to StableHLO",
+            ));
+        }
+        // `scan` traverses every sequence after `init` together (spec §04
+        // "Additional arguments"); `reduce` holds its additional arguments constant.
+        let (function, init, sequences, parameters) = match (reduce, args) {
+            (false, [function, init, sequences @ ..]) if !sequences.is_empty() => {
+                (*function, Some(*init), sequences, &[][..])
             }
-            (true, [function, xs, parameters @ ..]) => (*function, None, *xs, parameters),
+            (true, [function, xs, parameters @ ..]) => {
+                (*function, None, std::slice::from_ref(xs), parameters)
+            }
             _ => {
                 return Err(EmitError::at(
                     id,
@@ -485,17 +497,20 @@ impl Emitter<'_> {
                 ));
             }
         };
-        let item_type = self.sequence_item_type(xs)?;
+        let item_types = sequences
+            .iter()
+            .map(|&sequence| self.sequence_item_type(sequence))
+            .collect::<Result<Vec<_>, _>>()?;
         let state_type = if reduce {
-            item_type.clone()
+            item_types[0].clone()
         } else {
             self.sequence_item_type(id)?
         };
         let (body, entries) = self.callable_parts(function)?;
-        if parameters.len() > 1 || entries.len() != 2 + parameters.len() {
+        if parameters.len() > 1 || entries.len() != 1 + sequences.len() + parameters.len() {
             return Err(EmitError::at(
                 id,
-                "scan: step must take state, input and optional parameter",
+                "scan: step must take state, one input per sequence and, for reduce, an optional parameter",
             ));
         }
         let parameter = parameters
@@ -508,28 +523,63 @@ impl Emitter<'_> {
                 Ok((self.lower_components(node)?, ty))
             })
             .transpose()?;
-        let xs = self.lower_components(xs)?;
-        let Some(Some(n)) = xs
-            .values
-            .first()
-            .and_then(|v| shape(&v.ty).get(self.batch_rank(v)))
-            .copied()
-        else {
+        let seqs = sequences
+            .iter()
+            .map(|&sequence| self.lower_components(sequence))
+            .collect::<Result<Vec<_>, _>>()?;
+        // A one-dimensional array or table is traversed; any other input is a
+        // constant held at every step (spec §04 "Additional arguments").
+        let traversed: Vec<bool> = sequences
+            .iter()
+            .map(|&sequence| {
+                matches!(
+                    self.type_of(sequence),
+                    Some(Type::Array { .. } | Type::TVector { .. } | Type::Table { .. })
+                )
+            })
+            .collect();
+        if !traversed.iter().any(|&t| t) {
             return Err(EmitError::at(
                 id,
-                "scan: input requires a static leading extent",
-            ));
-        };
-        if xs.values.iter().any(|v| {
-            shape(&v.ty).get(self.batch_rank(v)) != Some(&Some(n))
-                || shape(&v.ty).iter().any(Option::is_none)
-                || self.axes_of(v).layers.first() != Some(&1)
-        }) {
-            return Err(EmitError::at(
-                id,
-                "scan: expected a vector or equal-length table columns",
+                "scan: needs at least one array or table input",
             ));
         }
+        let mut lengths: Vec<Option<u64>> = Vec::with_capacity(seqs.len());
+        for (xs, &is_sequence) in seqs.iter().zip(&traversed) {
+            if !is_sequence {
+                lengths.push(None);
+                continue;
+            }
+            let Some(Some(len)) = xs
+                .values
+                .first()
+                .and_then(|v| shape(&v.ty).get(self.batch_rank(v)))
+                .copied()
+            else {
+                return Err(EmitError::at(
+                    id,
+                    "scan: input requires a static leading extent",
+                ));
+            };
+            if xs.values.iter().any(|v| {
+                shape(&v.ty).get(self.batch_rank(v)) != Some(&Some(len))
+                    || shape(&v.ty).iter().any(Option::is_none)
+                    || self.axes_of(v).layers.first() != Some(&1)
+            }) {
+                return Err(EmitError::at(
+                    id,
+                    "scan: expected a vector or equal-length table columns",
+                ));
+            }
+            lengths.push(Some(len));
+        }
+        // Length-one sequences repeat; every other length must agree (§04).
+        let mut others = lengths.iter().copied().flatten().filter(|&len| len != 1);
+        let n = others.next().unwrap_or(1);
+        if others.any(|len| len != n) {
+            return Err(EmitError::at(id, "scan: sequences differ in length"));
+        }
+        let xs = &seqs[0];
         let mut state = if let Some(init) = init {
             self.lower_components(init)?
         } else {
@@ -606,7 +656,9 @@ impl Emitter<'_> {
         if n > u64::from(reduce) {
             let counter = self.int_value_const(i64::from(reduce));
             let mut inits = vec![counter];
-            inits.extend(xs.values.clone());
+            for (sequence, _) in seqs.iter().zip(&traversed).filter(|(_, t)| **t) {
+                inits.extend(sequence.values.clone());
+            }
             let start = inits.len();
             inits.extend(state.values.clone());
             let out_start = inits.len();
@@ -623,17 +675,34 @@ impl Emitter<'_> {
                     e.compare("LT", &args[0], &limit)
                 },
                 |e, args| {
-                    let mut items = Vec::with_capacity(xs.values.len());
-                    for (value, original) in args[1..start].iter().zip(&xs.values) {
-                        let value = e.axes_view(value, e.axes_of(original));
-                        items.push(e.scan_slice(&value, &args[0]));
+                    let mut sequence_items = Vec::with_capacity(seqs.len());
+                    let mut at = 1;
+                    for (sequence, &len) in seqs.iter().zip(&lengths) {
+                        let Some(len) = len else {
+                            sequence_items.push(sequence.clone());
+                            continue;
+                        };
+                        let index = if len == 1 {
+                            e.int_value_const(0)
+                        } else {
+                            args[0].clone()
+                        };
+                        let mut items = Vec::with_capacity(sequence.values.len());
+                        for (value, original) in args[at..].iter().zip(&sequence.values) {
+                            let value = e.axes_view(value, e.axes_of(original));
+                            items.push(e.scan_slice(&value, &index));
+                        }
+                        at += sequence.values.len();
+                        sequence_items.push(sequence.with_values(&items));
                     }
                     let mut carries = Vec::with_capacity(state.values.len());
                     for (value, original) in args[start..out_start].iter().zip(&state.values) {
                         carries.push(e.axes_view(value, e.axes_of(original)));
                     }
-                    let mut arguments = vec![state.with_values(&carries), xs.with_values(&items)];
-                    let mut types = vec![state_type.clone(), item_type.clone()];
+                    let mut arguments = vec![state.with_values(&carries)];
+                    arguments.extend(sequence_items);
+                    let mut types = vec![state_type.clone()];
+                    types.extend(item_types.iter().cloned());
                     if let Some((value, ty)) = &parameter {
                         arguments.push(value.clone());
                         types.push(ty.clone());

@@ -461,20 +461,25 @@ fn lower_pushfwd_sample(
     pushfwd_node: NodeId,
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let (map, base, parameter) = {
+    let (map, base) = {
         let c = expect_builtin_call(m, pushfwd_node, "pushfwd")
             .ok_or_else(|| refuse(pushfwd_node, m, "expected pushfwd"))?;
-        if !matches!(c.args.len(), 2 | 3) {
-            return Err(refuse(pushfwd_node, m, "pushfwd expects 2 or 3 args"));
+        if c.args.len() < 2 {
+            return Err(refuse(
+                pushfwd_node,
+                m,
+                "pushfwd expects a map and a measure",
+            ));
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        (c.args[0], c.args[1])
     };
     let resolved = crate::density::resolve_ref_chain(m, map).0;
     let map = expect_builtin_call(m, resolved, "bijection")
         .and_then(|c| c.args.first().copied())
         .unwrap_or(map);
+    let parameter = crate::extras::bind_extras(m, pushfwd_node, map, 2, 1)?;
     let (value, rng_out) = lower_closed_measure_sample(m, base, rng)?;
-    let applied = build_callback_call(m, map, value, parameter)?;
+    let applied = build_callback_call(m, map, value, &parameter)?;
     if matches!(
         m.node(crate::density::resolve_ref_chain(m, map).0),
         Node::Const(_)
@@ -492,7 +497,7 @@ fn lower_pushfwd_sample(
         refuse(
             pushfwd_node,
             m,
-            "pushfwd's map does not reduce at the sampled variate and optional parameter",
+            "pushfwd's map does not reduce at the sampled variate and its additional arguments",
         )
     })?;
     Ok((reduced, rng_out))

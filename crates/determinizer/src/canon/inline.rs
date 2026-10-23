@@ -254,13 +254,20 @@ pub(crate) fn expand_composed_call(m: &mut Module, id: NodeId) -> Option<NodeId>
     let first = *components.first()?;
     match name.as_str() {
         "fchain" => {
+            // Spec §04: the additional arguments reach every step unchanged; each
+            // later step takes the previous result whole as its first argument.
+            let extras = call.args.get(1..).unwrap_or_default().to_vec();
+            let named = call.named.clone();
             call.head = CallHead::User(first);
             let mut result = m.alloc(Node::Call(call));
             for &next in &components[1..] {
+                let args: Vec<NodeId> = std::iter::once(result)
+                    .chain(extras.iter().copied())
+                    .collect();
                 result = m.alloc(Node::Call(Call {
                     head: CallHead::User(next),
-                    args: Box::new([result]),
-                    named: Box::default(),
+                    args: args.into(),
+                    named: named.clone(),
                     inputs: None,
                 }));
             }

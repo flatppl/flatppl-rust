@@ -3471,19 +3471,20 @@ fn lower_weighted(
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (w_node, m_inner, parameter) = {
+    let (w_node, m_inner) = {
         let c = expect_builtin_call(m, node, "weighted")
             .ok_or_else(|| refuse(node, m, "expected weighted"))?;
-        if !matches!(c.args.len(), 2 | 3) {
-            return Err(refuse(node, m, "weighted expects 2 or 3 args"));
+        if c.args.len() < 2 {
+            return Err(refuse(node, m, "weighted expects a weight and a measure"));
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        (c.args[0], c.args[1])
     };
+    let parameters = crate::extras::bind_extras(m, node, w_node, 2, 1)?;
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
-    let w_scored = if parameter.is_some() || weight_is_variate_dependent(m, w_node) {
-        let applied = build_callback_call(m, w_node, v, parameter)?;
+    let w_scored = if !parameters.is_empty() || weight_is_variate_dependent(m, w_node) {
+        let applied = build_callback_call(m, w_node, v, &parameters)?;
         crate::canon::inline_expression(m, applied)
     } else {
         w_node
@@ -3519,18 +3520,23 @@ fn lower_logweighted(
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
-    let (lw_node, m_inner, parameter) = {
+    let (lw_node, m_inner) = {
         let c = expect_builtin_call(m, node, "logweighted")
             .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
-        if !matches!(c.args.len(), 2 | 3) {
-            return Err(refuse(node, m, "logweighted expects 2 or 3 args"));
+        if c.args.len() < 2 {
+            return Err(refuse(
+                node,
+                m,
+                "logweighted expects a log-weight and a measure",
+            ));
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        (c.args[0], c.args[1])
     };
+    let parameters = crate::extras::bind_extras(m, node, lw_node, 2, 1)?;
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
-    let lw_scored = if parameter.is_some() || weight_is_variate_dependent(m, lw_node) {
-        let applied = build_callback_call(m, lw_node, v, parameter)?;
+    let lw_scored = if !parameters.is_empty() || weight_is_variate_dependent(m, lw_node) {
+        let applied = build_callback_call(m, lw_node, v, &parameters)?;
         crate::canon::inline_expression(m, applied)
     } else {
         lw_node
@@ -3538,54 +3544,15 @@ fn lower_logweighted(
     Ok(build_call(m, "add", &[lw_scored, inner_density]))
 }
 
-/// Apply a callback with its variate and optional parameter object intact.
+/// Apply a callback with its variate and the bound additional arguments intact.
 /// Naming a unary input prevents ordinary record/table auto-splatting.
 pub(crate) fn build_callback_call(
     m: &mut Module,
     callback: NodeId,
     value: NodeId,
-    parameter: Option<NodeId>,
+    parameters: &[NodeId],
 ) -> Result<NodeId, RefuseError> {
-    let inputs = crate::kernel::resolve_reified(m, callback)
-        .map(|function| {
-            function
-                .inputs
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect::<Vec<_>>()
-        })
-        .or_else(|| match m.type_of(callback) {
-            Some(Type::Function { inputs } | Type::Kernel { inputs, .. }) => Some(inputs.to_vec()),
-            _ => None,
-        });
-    let expected = 1 + usize::from(parameter.is_some());
-    if inputs
-        .as_ref()
-        .is_some_and(|inputs| inputs.len() != expected)
-    {
-        return Err(refuse(
-            callback,
-            m,
-            "callback must take one whole variate and the optional parameter",
-        ));
-    }
-    if let Some(parameter) = parameter {
-        return Ok(build_user_call_n(m, callback, vec![value, parameter]));
-    }
-    if let Some(inputs) = inputs {
-        return Ok(m.alloc(Node::Call(Call {
-            head: CallHead::User(callback),
-            args: Box::new([]),
-            named: vec![NamedArg {
-                kind: NamedKind::Kwarg,
-                name: inputs[0],
-                value,
-            }]
-            .into(),
-            inputs: None,
-        })));
-    }
-    Ok(build_user_call(m, callback, value))
+    crate::extras::apply_callback(m, callback, value, parameters)
 }
 
 /// A symbolic variate and the instantiated weight expression. This view feeds
@@ -3593,23 +3560,34 @@ pub(crate) fn build_callback_call(
 fn weight_function_body(
     m: &mut Module,
     weight: NodeId,
-    parameter: Option<NodeId>,
+    parameters: &[NodeId],
 ) -> Option<(NodeId, Ref)> {
     let function = crate::kernel::resolve_reified(m, weight)?;
-    match (function.inputs.as_slice(), parameter) {
-        ([(_, variate)], None) => Some((function.body, *variate)),
-        ([(_, variate), (_, input)], Some(parameter)) if !function.auto => {
-            let body = crate::kernel::substitute_admitted(
-                m,
-                function.body,
-                &[(*input, parameter)],
-                crate::kernel::Substitute::All,
-                false,
-            );
-            Some((body, *variate))
-        }
-        _ => None,
+    let ([(_, variate), rest @ ..], true) = (
+        function.inputs.as_slice(),
+        parameters.is_empty() || !function.auto,
+    ) else {
+        return None;
+    };
+    if rest.len() != parameters.len() {
+        return None;
     }
+    if rest.is_empty() {
+        return Some((function.body, *variate));
+    }
+    let bound: Vec<(Ref, NodeId)> = rest
+        .iter()
+        .zip(parameters)
+        .map(|((_, input), parameter)| (*input, *parameter))
+        .collect();
+    let body = crate::kernel::substitute_admitted(
+        m,
+        function.body,
+        &bound,
+        crate::kernel::Substitute::All,
+        false,
+    );
+    Some((body, *variate))
 }
 
 /// Add component densities only after expressing them against a common reference.
@@ -4602,13 +4580,14 @@ struct GaussianProduct {
 /// refuse-don't-mislower). Structural matching; takes `&mut` only so the shared
 /// [`normal_ctor`]/[`split_kernel_constructor`] can intern positional-arg names.
 fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<GaussianProduct> {
-    let (lw_node, base, parameter) = {
+    let (lw_node, base) = {
         let c = expect_builtin_call(m, logweighted, "logweighted")?;
-        if !matches!(c.args.len(), 2 | 3) {
+        if c.args.len() < 2 {
             return None;
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        (c.args[0], c.args[1])
     };
+    let parameter = crate::extras::bind_extras(m, logweighted, lw_node, 2, 1).ok()?;
 
     // Factor 1 (g1): the logweighted base is a `Normal` constructor.
     let (g1, g1_kwargs) = normal_ctor(m, base)?;
@@ -4619,7 +4598,7 @@ fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<Gau
     // `functionof` whose single positional body scores a `Normal` AT the reified
     // argument `x` (not at a constant, which would make ℓ a constant weight, not a
     // second Gaussian factor).
-    let (g2_body, arg_ref) = weight_function_body(m, lw_node, parameter)?;
+    let (g2_body, arg_ref) = weight_function_body(m, lw_node, &parameter)?;
     let (mu2, sigma2) = gaussian_factor_scored_at(m, g2_body, arg_ref)?;
 
     Some(GaussianProduct {
@@ -5113,14 +5092,15 @@ fn lower_pushfwd(
     v: NodeId,
     origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
-    let (bij_node, m_inner, parameter) = {
+    let (bij_node, m_inner) = {
         let c = expect_builtin_call(m, node, "pushfwd")
             .ok_or_else(|| refuse(node, m, "expected pushfwd"))?;
-        if !matches!(c.args.len(), 2 | 3) {
-            return Err(refuse(node, m, "pushfwd expects 2 or 3 args"));
+        if c.args.len() < 2 {
+            return Err(refuse(node, m, "pushfwd expects a map and a measure"));
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        (c.args[0], c.args[1])
     };
+    let parameter = crate::extras::bind_extras(m, node, bij_node, 2, 1)?;
 
     // Resolve `bij_node` through one level of ref indirection, then unwrap any CLOSED
     // reification around the forward map: `functionof(v -> get(v, [1]))` has no
@@ -5136,56 +5116,66 @@ fn lower_pushfwd(
         crate::kernel::resolve_closed_reification(m, bij_resolved).unwrap_or(bij_resolved);
     // Analytic recognition sees the map at this parameter point. The temporary
     // unary map is consumed here; the source callable keeps its full interface.
-    let (bij_resolved, parameter) = if let Some(parameter) = parameter
-        && expect_builtin_call(m, bij_resolved, "bijection").is_none()
-    {
-        let (body, variate) =
-            if let Some(function) = crate::kernel::resolve_reified(m, bij_resolved) {
-                let [variate, (_, input)] = function.inputs.as_slice() else {
+    let (bij_resolved, parameter) =
+        if !parameter.is_empty() && expect_builtin_call(m, bij_resolved, "bijection").is_none() {
+            let (body, variate) =
+                if let Some(function) = crate::kernel::resolve_reified(m, bij_resolved) {
+                    let ([variate, rest @ ..], true) = (
+                        function.inputs.as_slice(),
+                        function.inputs.len() == 1 + parameter.len(),
+                    ) else {
+                        return Err(refuse(
+                            bij_resolved,
+                            m,
+                            "pushfwd map must take a variate and its additional arguments",
+                        ));
+                    };
+                    let bound: Vec<(Ref, NodeId)> = rest
+                        .iter()
+                        .zip(&parameter)
+                        .map(|((_, input), value)| (*input, *value))
+                        .collect();
+                    (
+                        crate::kernel::substitute_admitted(
+                            m,
+                            function.body,
+                            &bound,
+                            crate::kernel::Substitute::All,
+                            false,
+                        ),
+                        *variate,
+                    )
+                } else if let Node::Const(operator) = *m.node(bij_resolved) {
+                    let (label, reference, point) = broadcast::placeholder(m, Type::Any);
+                    let args: Vec<NodeId> = std::iter::once(point)
+                        .chain(parameter.iter().copied())
+                        .collect();
+                    let body = m.alloc(Node::Call(Call {
+                        head: CallHead::Builtin(operator),
+                        args: args.into(),
+                        named: Box::new([]),
+                        inputs: None,
+                    }));
+                    (body, (label, reference))
+                } else {
                     return Err(refuse(
                         bij_resolved,
                         m,
-                        "pushfwd map must take a variate and parameter",
+                        "pushfwd map must be a builtin or reified function",
                     ));
                 };
-                (
-                    crate::kernel::substitute_admitted(
-                        m,
-                        function.body,
-                        &[(*input, parameter)],
-                        crate::kernel::Substitute::All,
-                        false,
-                    ),
-                    *variate,
-                )
-            } else if let Node::Const(operator) = *m.node(bij_resolved) {
-                let (label, reference, point) = broadcast::placeholder(m, Type::Any);
-                let body = m.alloc(Node::Call(Call {
-                    head: CallHead::Builtin(operator),
-                    args: vec![point, parameter].into(),
-                    named: Box::new([]),
-                    inputs: None,
-                }));
-                (body, (label, reference))
-            } else {
-                return Err(refuse(
-                    bij_resolved,
-                    m,
-                    "pushfwd map must be a builtin or reified function",
-                ));
-            };
-        let body = crate::canon::inline_expression(m, body);
-        let head = CallHead::Builtin(m.intern("functionof"));
-        let specialized = m.alloc(Node::Call(Call {
-            head,
-            args: vec![body].into(),
-            named: Box::new([]),
-            inputs: Some(Inputs::Spec(vec![variate].into())),
-        }));
-        (specialized, None)
-    } else {
-        (bij_resolved, parameter)
-    };
+            let body = crate::canon::inline_expression(m, body);
+            let head = CallHead::Builtin(m.intern("functionof"));
+            let specialized = m.alloc(Node::Call(Call {
+                head,
+                args: vec![body].into(),
+                named: Box::new([]),
+                inputs: Some(Inputs::Spec(vec![variate].into())),
+            }));
+            (specialized, Vec::new())
+        } else {
+            (bij_resolved, parameter)
+        };
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.
@@ -5197,7 +5187,7 @@ fn lower_pushfwd(
     // NAMING the missing product structure, which is why recognition happens here
     // rather than leaving a projection to be misreported as an unrecognised
     // forward map by the bijection synthesis below.
-    if parameter.is_none()
+    if parameter.is_empty()
         && let Some(proj) = recognize_get_projection(m, bij_resolved)
     {
         return lower_projection_pushfwd(m, m_inner, &proj, v);
@@ -5262,7 +5252,7 @@ fn lower_pushfwd(
         };
 
     // preimage = f_inv(v)
-    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, parameter, "f_inv")?;
+    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, &parameter, "f_inv")?;
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
@@ -5275,7 +5265,7 @@ fn lower_pushfwd(
         // lattice, and gated on the snap being faithful.
         Reference::Counting => {
             let snapped = snap_to_lattice(m, preimage, &domain);
-            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain, parameter)?;
+            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain, &parameter)?;
             let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
             (at_atom, Some(lattice))
         }
@@ -5284,7 +5274,7 @@ fn lower_pushfwd(
         Reference::Lebesgue => {
             let at = if logvol_in_query_point { v } else { preimage };
             let logvol_val =
-                apply_change_of_variables(m, bij_resolved, logvol_node, at, parameter, "logvol")?;
+                apply_change_of_variables(m, bij_resolved, logvol_node, at, &parameter, "logvol")?;
             (build_call(m, "sub", &[inner_density, logvol_val]), None)
         }
     };
@@ -5366,7 +5356,7 @@ fn on_lattice(
     v: NodeId,
     snapped: NodeId,
     domain: &Type,
-    parameter: Option<NodeId>,
+    parameter: &[NodeId],
 ) -> Result<NodeId, RefuseError> {
     let back = apply_change_of_variables(m, node, forward, snapped, parameter, "f")?;
     Ok(lattice_test(m, v, back, domain))
@@ -5503,7 +5493,7 @@ fn apply_change_of_variables(
     node: NodeId,
     callee: NodeId,
     point: NodeId,
-    parameter: Option<NodeId>,
+    parameter: &[NodeId],
     role: &str,
 ) -> Result<NodeId, RefuseError> {
     let applied = build_callback_call(m, callee, point, parameter)?;
@@ -5512,7 +5502,7 @@ fn apply_change_of_variables(
     // call, so admit it unreduced exactly as the sample side does.
     if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
         // Scalar builtins cannot consume a whole record variate.
-        if parameter.is_none() && expect_builtin_call(m, point, "record").is_some() {
+        if parameter.is_empty() && expect_builtin_call(m, point, "record").is_some() {
             return Err(refuse(
                 node,
                 m,
@@ -5577,7 +5567,7 @@ fn lower_locscale(
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
     // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
     // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
-    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, None, "f_inv")?;
+    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, &[], "f_inv")?;
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
         // Counting reference: no volume element (§06 "Density convention"). An
@@ -5602,7 +5592,7 @@ fn lower_locscale(
             // synthesis convention (`crate::invert::Bijection`). It is CONSTANT in the
             // variate either way — `log|scale|` / `logabsdet(L)` ignore the argument —
             // so the emission is unchanged by which point it reads.
-            let logvol_val = apply_change_of_variables(m, node, bij.logvol, v, None, "logvol")?;
+            let logvol_val = apply_change_of_variables(m, node, bij.logvol, v, &[], "logvol")?;
             Ok(build_call(m, "sub", &[inner_density, logvol_val]))
         }
     }
@@ -7161,10 +7151,13 @@ fn recognize_polynomial_over_interval(
     let (weight, reference, parameter) = {
         let (base, _) = resolve_ref_chain(m, base);
         let c = expect_builtin_call(m, base, "weighted")?;
-        if !matches!(c.args.len(), 2 | 3) {
+        if c.args.len() < 2 {
             return None;
         }
-        (c.args[0], c.args[1], c.args.get(2).copied())
+        let (weight, reference) = (c.args[0], c.args[1]);
+        let weighted = base;
+        let parameter = crate::extras::bind_extras(m, weighted, weight, 2, 1).ok()?;
+        (weight, reference, parameter)
     };
 
     // The reference measure is Lebesgue over the whole line.
@@ -7181,7 +7174,7 @@ fn recognize_polynomial_over_interval(
 
     // `x -> polynomial(c, x)`: a single-input reification whose body applies
     // `polynomial` to that input's own placeholder.
-    let (body, arg_ref) = weight_function_body(m, weight, parameter)?;
+    let (body, arg_ref) = weight_function_body(m, weight, &parameter)?;
 
     let coefficients = {
         let p = expect_builtin_call(m, body, "polynomial")?;
@@ -8368,11 +8361,6 @@ pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId 
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }))
-}
-
-/// Allocate a user-function call `(%call callee arg)`.
-pub(crate) fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
-    build_user_call_n(m, callee, vec![arg])
 }
 
 /// Allocate a positional user-function call `(%call callee arg1 arg2 …)`.

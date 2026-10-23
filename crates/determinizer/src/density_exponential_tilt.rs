@@ -41,23 +41,18 @@ enum Score {
 /// Match either normalized log weighting or its equivalent `tilt` spelling.
 pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
     let node = resolve_ref_chain(m, node).0;
-    let (weight, base, reference, parameter) = match builtin_name(m, node)? {
+    let (weight, base, reference, logweighted) = match builtin_name(m, node)? {
         "normalize" => {
             let normalized = expect_builtin_call(m, node, "normalize")?;
             let [weighted] = *normalized.args else {
                 return None;
             };
             let weighted = resolve_ref_chain(m, weighted).0;
-            let weighted = expect_builtin_call(m, weighted, "logweighted")?;
-            if !matches!(weighted.args.len(), 2 | 3) {
+            let call = expect_builtin_call(m, weighted, "logweighted")?;
+            if call.args.len() < 2 {
                 return None;
             }
-            (
-                weighted.args[0],
-                weighted.args[1],
-                None,
-                weighted.args.get(2).copied(),
-            )
+            (call.args[0], call.args[1], None, weighted)
         }
         "tilt" => {
             let call = expect_builtin_call(m, node, "tilt")?;
@@ -65,19 +60,15 @@ pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
                 return None;
             };
             let source = resolve_ref_chain(m, source).0;
-            let source = expect_builtin_call(m, source, "logweighted")?;
-            if !matches!(source.args.len(), 2 | 3) {
+            let call = expect_builtin_call(m, source, "logweighted")?;
+            if call.args.len() < 2 {
                 return None;
             }
-            (
-                source.args[0],
-                base,
-                Some(source.args[1]),
-                source.args.get(2).copied(),
-            )
+            (call.args[0], base, Some(call.args[1]), source)
         }
         _ => return None,
     };
+    let parameter = crate::extras::bind_extras(m, logweighted, weight, 2, 1).ok()?;
     let base = resolve_ref_chain(m, base).0;
     let measure_type = m.type_of(base).cloned();
     let inherited = recognize(m, base);
@@ -115,7 +106,7 @@ pub(crate) fn recognize(m: &mut Module, node: NodeId) -> Option<Law> {
     {
         return None;
     }
-    let (body, input) = weight_function_body(m, weight, parameter)?;
+    let (body, input) = weight_function_body(m, weight, &parameter)?;
     let affine = affine(m, body, input, vector)?;
     let mut valid = build_call(m, "isfinite", &[affine.offset]);
     if let Some(law) = &inherited {
