@@ -1743,10 +1743,13 @@ fn mul_type(args: &[ArgInfo]) -> Type {
         _ => return Type::Deferred,
     };
     let scalarish = |t: &Type| matches!(t, Type::Scalar(_) | Type::Any);
+    // An unresolved operand (`%any`, e.g. a lambda's placeholder) may itself be an array,
+    // so only a KNOWN scalar scales an array: `L * x` with `x` unknown is not `L`'s type.
+    let scalar = |t: &Type| matches!(t, Type::Scalar(_));
     match (a, b) {
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
-        (Type::Array { .. }, s) if scalarish(s) => a.clone(),
-        (s, Type::Array { .. }) if scalarish(s) => b.clone(),
+        (Type::Array { .. }, s) if scalar(s) => a.clone(),
+        (s, Type::Array { .. }) if scalar(s) => b.clone(),
         // Matrix multiply over flat rank-2 matrices: matrix·matrix → matrix,
         // matrix·vector → vector. The left operand is a rank-2 matrix; the right
         // is a matrix (rank-2) or a vector (rank-1). The shared inner dimension
@@ -6922,6 +6925,32 @@ fn broadcast_type(
         });
     }
 
+    // The per-cell call of an operator-equivalent head obeys the row's domain: a table's
+    // cells are records, and `broadcast(add, t, 1.0)` adds a record to a number.
+    // A sole record cell splats onto the row's parameters (`broadcast(sub, table(b = .., a = ..))`).
+    let splat_cell = matches!(elems.as_slice(), [Type::Record(fields)]
+    if crate::catalogue::builtin().base_param_names(&op_name).is_some_and(|names| {
+        fields.iter().all(|(n, _)| names.iter().any(|p| p == inf.module.resolve(*n)))
+    }));
+    if let Some(domain) = operator_domain(&op_name)
+        && !splat_cell
+        && let Some(what) = elems
+            .iter()
+            .find_map(|cell| operand_outside_operator_domain(&op_name, cell))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!(
+                "`broadcast` over `{op_name}` has a cell that is {what}, outside the domain \
+                 of `{op_name}`: spec §07 \"Operator-equivalent functions\" gives it \
+                 \"{domain}\""
+            ),
+        ));
+        return Ready(Type::Failed(
+            format!("`{op_name}` broadcast over a cell outside its domain").into(),
+        ));
+    }
+
     let cell = match (op_name.as_str(), elems.as_slice()) {
         ("builtin_logdensityof", [_, _, _]) => Type::Scalar(ScalarType::Real),
         ("add" | "sub" | "mul" | "divide" | "pow" | "min" | "max", [a, b]) => {
@@ -7924,7 +7953,8 @@ fn domain_check(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    refuse_nonboolean_domain(inf, name, args)
+    refuse_operand_outside_operator_domain(inf, name, args, named)
+        .or_else(|| refuse_nonboolean_domain(inf, name, args))
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
         .or_else(|| refuse_bad_rand_operands(inf, name, args))
@@ -7932,6 +7962,276 @@ fn domain_check(
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_likelihood_point(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args, named))
+}
+
+/// The §07 "Operator-equivalent functions" rows and the Domains cell each states, as
+/// the spec writes it. The cell is quoted in the diagnostic.
+fn operator_domain(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "add" | "sub" => "scalars or arrays of same shape (real or complex)",
+        "mul" => {
+            "scalars, matrix-matrix, matrix-vector, scalar-matrix, scalar-vector, \
+             transposed-vector–vector, vector–transposed-vector, transposed-vector–matrix"
+        }
+        "divide" => "scalars, array-scalar, transposed-vector–scalar (real or complex)",
+        "neg" => "scalars or arrays (real or complex)",
+        "pow" => "scalars (real or complex; complex extension via principal branch)",
+        "equal" | "unequal" => "`integers`, `booleans`, strings",
+        "lt" | "le" | "gt" | "ge" => "`reals`",
+        _ => return None,
+    })
+}
+
+/// What an operand is, when no §07 operator-equivalent row admits it: a record, tuple,
+/// table, measure, kernel, function, likelihood, module or RNG state, or an array of
+/// such. An ordering comparison also excludes a complex scalar, since `reals` does not
+/// contain `complexes`. `None` admits the operand, including every unresolved type
+/// (`%deferred`, `%any`, a type variable): only a definite mismatch is an error.
+///
+/// Booleans and integers stay admitted: §03 embeds `booleans` in `integers` and
+/// `integers` in `reals` "where specified by the language", and the arithmetic rows say
+/// "real or complex". This is the KIND of the operand, not the scalar-embedding question
+/// that [`domain_check`] declines to sweep.
+fn operand_outside_operator_domain(name: &str, ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Record(_) => Some("a record"),
+        Type::Tuple(_) => Some("a tuple"),
+        Type::Table { .. } => Some("a table"),
+        Type::Measure { .. } => Some("a measure"),
+        Type::Kernel { .. } => Some("a kernel"),
+        Type::Function { .. } => Some("a function"),
+        Type::Likelihood { .. } => Some("a likelihood"),
+        Type::Module => Some("a module"),
+        Type::RngState => Some("an RNG state"),
+        Type::Scalar(ScalarType::Complex) if matches!(name, "lt" | "le" | "gt" | "ge") => {
+            Some("a complex number")
+        }
+        Type::Scalar(ScalarType::Real | ScalarType::Complex)
+            if matches!(name, "equal" | "unequal") =>
+        {
+            Some("a non-discrete number")
+        }
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => {
+            operand_outside_operator_domain(name, elem).map(|_| "an array of non-numbers")
+        }
+        _ => None,
+    }
+}
+
+/// How an operand of an arithmetic row sits in the row's shape clauses.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// A scalar.
+    Scalar,
+    /// A one-dimensional array of scalars.
+    Vector,
+    /// A flat rank-2 array of scalars.
+    Matrix,
+    /// A transposed vector.
+    TVector,
+    /// An array of three or more dimensions.
+    Higher,
+    /// Anything the shape clauses do not classify: unresolved types and nested arrays
+    /// (a vector of vectors is not a matrix, §03).
+    Unclassified,
+}
+
+fn shape_of(ty: &Type) -> Shape {
+    match ty {
+        Type::Scalar(_) => Shape::Scalar,
+        Type::TVector { elem, .. } if matches!(**elem, Type::Scalar(_)) => Shape::TVector,
+        Type::Array { shape, elem } if matches!(**elem, Type::Scalar(_)) => match shape.len() {
+            0 => Shape::Unclassified,
+            1 => Shape::Vector,
+            2 => Shape::Matrix,
+            _ => Shape::Higher,
+        },
+        _ => Shape::Unclassified,
+    }
+}
+
+/// The shape clauses of the arithmetic rows of §07 "Operator-equivalent functions":
+/// `add`/`sub` take scalars or arrays of the same shape, `divide` scalars, an array
+/// over a scalar, or a transposed vector over a scalar, `pow` scalars only, and `mul`
+/// exactly the listed pairs (scalars, matrix-matrix, matrix-vector, scalar-matrix,
+/// scalar-vector, transposed-vector–vector, vector–transposed-vector,
+/// transposed-vector–matrix). Only a definite mismatch is refused: an operand whose
+/// shape is not classified is never an accusation.
+fn operand_shapes_outside_domain(name: &str, a: &Type, b: &Type) -> bool {
+    use Shape::*;
+    let (sa, sb) = (shape_of(a), shape_of(b));
+    if sa == Unclassified || sb == Unclassified {
+        return false;
+    }
+    let collection = |s: Shape| !matches!(s, Scalar | Unclassified);
+    let same_extent = |x: &Type, y: &Type| match (x, y) {
+        (Type::Array { shape: p, .. }, Type::Array { shape: q, .. }) => {
+            p.len() == q.len()
+                && p.iter()
+                    .zip(q.iter())
+                    .all(|(m, n)| !matches!((m, n), (Dim::Static(m), Dim::Static(n)) if m != n))
+        }
+        (Type::TVector { len: p, .. }, Type::TVector { len: q, .. }) => {
+            !matches!((p, q), (Dim::Static(m), Dim::Static(n)) if m != n)
+        }
+        _ => false,
+    };
+    match name {
+        "add" | "sub" => match (collection(sa), collection(sb)) {
+            (false, false) => false,
+            (true, true) => !same_extent(a, b),
+            _ => true,
+        },
+        // The divisor is the discriminator: a scalar (§05 "`/` requires a scalar divisor").
+        "divide" => collection(sb),
+        "pow" => collection(sa) || collection(sb),
+        "mul" => {
+            let listed = matches!(
+                (sa, sb),
+                (Scalar, Scalar)
+                    | (Scalar, Vector)
+                    | (Vector, Scalar)
+                    | (Scalar, Matrix)
+                    | (Matrix, Scalar)
+                    | (Matrix, Matrix)
+                    | (Matrix, Vector)
+                    | (TVector, Vector)
+                    | (Vector, TVector)
+                    | (TVector, Matrix)
+            );
+            // The contracted extents must agree where both are static: the columns of the
+            // left matrix, or the length of the transposed vector, against the leading
+            // extent of the right operand.
+            let static_extent = |t: &Type, axis: usize| match t {
+                Type::TVector {
+                    len: Dim::Static(n),
+                    ..
+                } if axis == 0 => Some(*n),
+                Type::Array { shape, .. } => match shape.get(axis) {
+                    Some(Dim::Static(n)) => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let contracted = match (sa, sb) {
+                (Matrix, Matrix) | (Matrix, Vector) => (static_extent(a, 1), static_extent(b, 0)),
+                (TVector, Vector) | (TVector, Matrix) => (static_extent(a, 0), static_extent(b, 0)),
+                _ => (None, None),
+            };
+            !listed || matches!(contracted, (Some(m), Some(n)) if m != n)
+        }
+        _ => false,
+    }
+}
+
+/// Refuse an operand outside the stated domain of a §07 "Operator-equivalent functions"
+/// row (`add`, `sub`, `mul`, `divide`, `neg`, `pow`, `equal`, `unequal`, `lt`, `le`,
+/// `gt`, `ge`) with an error located at the operand.
+///
+/// A record, tuple or table is in no row's domain. Without this check `add(r, 1.5)`
+/// typed `%deferred`, because the per-row arms promote operand types without asking
+/// what they are, so `record(a = 1, b = 2) + 10.0` passed inference and a later stage
+/// met an expression with no value. A sole positional record or table splats under §04
+/// "Calling conventions" and so is not an operand itself.
+fn refuse_operand_outside_operator_domain(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let domain = operator_domain(name)?;
+    // A comparison over an array, transposed vector or table keeps its own, more
+    // specific refusal (`refuse_nonscalar_operand`), which names the elementwise route.
+    if matches!(name, "equal" | "unequal" | "lt" | "le" | "gt" | "ge")
+        && nonscalar_operand(args, named).is_some()
+    {
+        return None;
+    }
+    if let ([(a, ta, _), (_, tb, _)], true) = (args, named.is_empty())
+        && operand_outside_operator_domain(name, ta).is_none()
+        && operand_outside_operator_domain(name, tb).is_none()
+        && operand_shapes_outside_domain(name, ta, tb)
+    {
+        // §05 "No implicit operator broadcasting": the elementwise spelling is the dotted
+        // operator, which applies §04 broadcasting.
+        let dotted = match name {
+            "add" => "`a .+ b`",
+            "sub" => "`a .- b`",
+            "mul" => "`a .* b`",
+            "divide" => "`a ./ b`",
+            _ => "`a .^ b`",
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *a,
+            format!(
+                "`{name}` operands are outside its domain: spec §07 \"Operator-equivalent \
+                 functions\" gives `{name}` the domain \"{domain}\". For the elementwise \
+                 operation write {dotted}"
+            ),
+        ));
+        // `mul_type` names a contracted-extent mismatch more precisely than the row does.
+        let failed = match (name, mul_type(args)) {
+            ("mul", failed @ Type::Failed(_)) => failed,
+            _ => Type::Failed(format!("`{name}` applied to operands outside its domain").into()),
+        };
+        return Some(failed);
+    }
+    let splatting = named.is_empty() && args.len() == 1;
+    let operands = args
+        .iter()
+        .map(|(node, ty, _)| (*node, ty))
+        .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)));
+    // The sole positional record or table splats when its names are the row's own
+    // parameters (`add(record(a = 1, b = 2))`); any other is itself the operand.
+    let parameters = crate::catalogue::builtin().base_param_names(name);
+    let splats = |ty: &Type, inf: &Inferencer<'_, '_>| {
+        let fields: Vec<&str> = match ty {
+            Type::Record(fields) => fields.iter().map(|(n, _)| inf.module.resolve(*n)).collect(),
+            Type::Table { columns, .. } => columns
+                .iter()
+                .map(|(n, _)| inf.module.resolve(*n))
+                .collect(),
+            _ => return false,
+        };
+        parameters.is_some_and(|names| fields.iter().all(|f| names.iter().any(|n| n == f)))
+    };
+    for (node, ty) in operands {
+        if splatting && splats(ty, inf) {
+            continue;
+        }
+        let what = match operand_outside_operator_domain(name, ty) {
+            Some(what) => what,
+            // A set is not a value of any scalar or array type (§03 "Sets"), so no row
+            // admits it; it carries no inferred type, so it is read structurally.
+            None if !matches!(
+                ty,
+                Type::Scalar(_) | Type::Array { .. } | Type::TVector { .. }
+            ) && set_expr_valueset(inf, Some(node)) != ValueSet::Unknown =>
+            {
+                "a set"
+            }
+            None => continue,
+        };
+        // §07: exact equality "is restricted to discrete domains"; its sentence names the
+        // functions that give a discrete result, and `iszero` for an exact test of zero.
+        let way_out = if what == "a non-discrete number" {
+            ". Compare a discrete result instead, such as `integer(x)`, `floor(x)`, \
+             `ceil(x)` or `round(x)`, or test a zero with `iszero(x)`"
+        } else {
+            ""
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            node,
+            format!(
+                "`{name}` operand is {what}, outside its domain: spec §07 \"Operator-equivalent \
+                 functions\" gives `{name}` the domain \"{domain}\"{way_out}"
+            ),
+        ));
+        return Some(Type::Failed(
+            format!("`{name}` applied to an operand outside its domain").into(),
+        ));
+    }
+    None
 }
 
 /// `rand(m, rstate)` accepts one closed measure and one explicit RNG state.

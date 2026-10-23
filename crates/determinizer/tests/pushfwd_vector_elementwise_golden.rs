@@ -143,6 +143,41 @@ fn bare_domain_restricted_map_reads_the_per_cell_support() {
 }
 
 #[test]
+fn discrete_vector_base_gate_applies_every_scalar_function_per_cell() {
+    // The lattice gate round-trips the preimage through the forward map. Over a vector
+    // variate `round`, `real`, `exp` and `abs` are scalar-domain (§07), so each is applied
+    // with `broadcast`; applying one to the vector itself is outside its domain, and the
+    // emitted FlatPDL must infer clean. Scored through flatppl-js, the gate gives
+    // -0.8925742052568393 at exp([1, 4]) and -inf at the off-lattice point [1, 4].
+    for map in ["exp", "x -> broadcast(exp, x)"] {
+        let out = lp(&format!(
+            "d = pushfwd({map}, Multinomial(n = 5, p = [0.2, 0.8]))\n\
+             lp = logdensityof(d, [1.0, 4.0])"
+        ));
+        for head in [
+            "(broadcast exp ",
+            "(broadcast real ",
+            "(broadcast round ",
+            "(broadcast abs ",
+        ] {
+            assert!(out.contains(head), "`{map}`: missing `{head}` in:\n{out}");
+        }
+        let mut module = determinize_src(&format!(
+            "d = pushfwd({map}, Multinomial(n = 5, p = [0.2, 0.8]))\n\
+             lp = logdensityof(d, [1.0, 4.0])"
+        ));
+        let errors: Vec<_> = flatppl_infer::infer(&mut module)
+            .into_iter()
+            .filter(|d| d.severity == flatppl_infer::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "`{map}`: the emitted IR must infer clean: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn discrete_vector_base_carries_no_volume_term_either_way() {
     // `Multinomial`'s variate is a vector of integers, so the reference is counting
     // and there is no volume element at all (§06 "Density convention"). That is why
