@@ -6035,6 +6035,43 @@ fn broadcast_type(
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
 
+    // §04 "Broadcasting", "Disallowed inputs": "Records and tuples are not allowed as
+    // operands of `broadcast`". The operands of `broadcasted(f)(args...)` are
+    // `broadcast`'s operands as well, so a record there is never splatted.
+    //
+    // The §07 kernel-evaluation primitives are the exception the spec leaves
+    // unstated: their `kernel_input` operand is a record by definition, and
+    // the determiniser broadcasts them over points with that record held
+    // constant. Those heads are engine-internal, so only other heads are checked.
+    let primitive_head = matches!(
+        inf.module.node(head_node),
+        Node::Const(op) if inf.module.resolve(*op).starts_with("builtin_")
+    );
+    let operands = args[1..]
+        .iter()
+        .map(|(node, ty, _)| (*node, ty))
+        .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)))
+        .filter(|_| !primitive_head);
+    for (node, ty) in operands {
+        let kind = match ty {
+            Type::Record(_) => "a record",
+            Type::Tuple(_) => "a tuple",
+            _ => continue,
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            node,
+            format!(
+                "`broadcast` operand is {kind}: spec §04 \"Broadcasting\" states that \
+                 \"Records and tuples are not allowed as operands of `broadcast`\". Operands of \
+                 `broadcasted(f)(args...)` are `broadcast` operands and are never auto-splatted. \
+                 Pass a table, or the fields as separate arrays"
+            ),
+        ));
+        return Ready(Type::Failed(
+            "broadcast operand is a record or tuple".into(),
+        ));
+    }
+
     if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {
         return Ready(ty);
     }
@@ -7043,6 +7080,37 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
     Some(entry)
 }
 
+/// Heads whose leading inputs cannot be passed by keyword although they carry a
+/// catalogue row, as `(distinguished positional inputs, keywords allowed after
+/// them, citation)`. §04 "Calling conventions" names the measure combinators
+/// (`normalize(M = mu)` is its example); §06 lists them. `restrict` keeps its
+/// keyword-splat form after the measure (§06 "Measure restriction"). `cat` and
+/// `get` are listed in §04 with unnamed variadic inputs.
+fn positional_only_inputs(name: &str) -> Option<(usize, bool, &'static str)> {
+    const MEASURE_COMBINATORS: &str = "\"The measure combinators likewise take their non-variadic \
+         inputs positionally: a keyword spelling such as `normalize(M = mu)` is a static error\"";
+    let entry = match name {
+        "normalize" | "totalmass" => (1, false, MEASURE_COMBINATORS),
+        "iid" | "truncate" | "bayesupdate" | "likelihoodof" | "disintegrate" => {
+            (2, false, MEASURE_COMBINATORS)
+        }
+        "locscale" | "bijection" => (3, false, MEASURE_COMBINATORS),
+        "restrict" => (1, true, MEASURE_COMBINATORS),
+        "cat" => (
+            0,
+            false,
+            "\"`cat`, `fchain`, `kchain`: Variadic unnamed inputs\"",
+        ),
+        "get" => (
+            1,
+            false,
+            "\"`get`: One distinguished input plus variadic unnamed input\"",
+        ),
+        _ => return None,
+    };
+    Some(entry)
+}
+
 /// Reject a special-operation application whose input count or spelling
 /// contradicts §04's declaration for it, and any nullary builtin call.
 ///
@@ -7086,6 +7154,30 @@ fn special_arity_check(
         ));
         Some(Type::Failed(format!("{name}: {what}").into()))
     };
+    // The measure combinators take their non-variadic inputs positionally (§04
+    // "Calling conventions": "a keyword spelling such as `normalize(M = mu)` is a
+    // static error"), and `cat` and `get` take unnamed variadic inputs. The count
+    // is the catalogue row's business, so only the spelling is checked here.
+    if let Some((distinguished, keywords_after, cite)) = positional_only_inputs(name)
+        && !named.is_empty()
+        && (args.len() < distinguished || !keywords_after)
+    {
+        return refuse(
+            inf,
+            format!(
+                "takes its {} positionally and cannot be given {} keyword argument(s). Where \
+                 the spec names such an input, the name identifies it in prose only — a call \
+                 binds it by position. Pass the arguments positionally",
+                if distinguished == 0 {
+                    "inputs".to_string()
+                } else {
+                    format!("{distinguished} distinguished input(s)")
+                },
+                named.len()
+            ),
+            cite,
+        );
+    }
     let Some((declared, cite)) = special_arity(name) else {
         // §04: "Nullary calls (`f()`) are not allowed." Only for a head with NO
         // declared arity anywhere: [`arity_check`] returns `Some` on a mismatch
@@ -7329,7 +7421,8 @@ const RNG_SEED_BOUND: i128 = 1 << 64;
 /// source, because a literal above `i64::MAX` is already a lex error
 /// ("invalid integer literal"), which leaves $[2^{63}, 2^{64})$ unwritable as a
 /// literal here — a front-end limit, not an `rnginit` rule. The byte vector's
-/// own $\{0, \ldots, 255\}$ element range stays unchecked, as it was.
+/// own $\{0, \ldots, 255\}$ element range is checked for a written vector, by
+/// the same rule: an element outside it is in neither form's set.
 fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Option<Type> {
     if name != "rnginit" {
         return None;
@@ -7360,6 +7453,31 @@ fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo
             ),
         ));
         return Some(Type::Failed("rnginit: seed is neither form".into()));
+    }
+    if form == "a byte vector" {
+        // A written byte vector is checked element by element; any other vector
+        // is a run-time value this pass cannot read.
+        let literal = resolve_binding_refs(inf, *node);
+        if let Node::Call(call) = inf.module.node(literal)
+            && matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
+        {
+            let elements = call.args.to_vec();
+            for element in elements {
+                if let Some(byte) = written_int(inf, element)
+                    && !(0..=255).contains(&byte)
+                {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        element,
+                        format!(
+                            "`rnginit` byte-vector seed has element {byte}, outside 0..255: spec \
+                             §07 `rnginit` states that a byte-vector seed contains integers in \
+                             $\\{{0, \\ldots, 255\\}}$"
+                        ),
+                    ));
+                    return Some(Type::Failed("rnginit: seed byte out of range".into()));
+                }
+            }
+        }
     }
     if form == "an integer seed" {
         let n = written_int(inf, *node)?;
