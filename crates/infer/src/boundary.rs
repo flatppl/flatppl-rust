@@ -322,11 +322,12 @@ fn check_point(
 /// feeds it: the `cat` of every variate to its left (spec §06 "Dependent
 /// composition").
 ///
-/// The keyword form `jointchain(name1 = M, name2 = K1, ...)` is `jointchain` of
-/// `relabel`led components (§06 "Keyword form"): "Each later kernel receives the
-/// record of the preceding named variates, bound to its inputs by name for any
-/// number of inputs, so `jointchain(a = M, b = K)` calls `K(a = a)`." Every input of
-/// a later kernel must name a preceding label ([`check_labelled_step`]).
+/// In the keyword form `jointchain(name1 = M, name2 = K1, ...)` each name holds its
+/// component's variate as it is, a record nesting under its name, and "each later
+/// kernel receives the record of the preceding named variates, bound to its inputs by
+/// name for any number of inputs, so `jointchain(a = M, b = K)` calls `K(a = a)`" (§06
+/// "Keyword form"). Every input of a later kernel must name a preceding label
+/// ([`check_labelled_step`]).
 ///
 /// The positional form keeps the ordinary calling convention: a step taking one
 /// positional input receives the fed value whole and the input's declared domain
