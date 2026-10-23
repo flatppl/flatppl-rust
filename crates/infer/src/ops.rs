@@ -6922,6 +6922,26 @@ fn broadcast_type(
         });
     }
 
+    // The per-cell call of an operator-equivalent head obeys the row's domain: a table's
+    // cells are records, and `broadcast(add, t, 1.0)` adds a record to a number.
+    if let Some(domain) = operator_domain(&op_name)
+        && let Some(what) = elems
+            .iter()
+            .find_map(|cell| operand_outside_operator_domain(&op_name, cell))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!(
+                "`broadcast` over `{op_name}` has a cell that is {what}, outside the domain \
+                 of `{op_name}`: spec §07 \"Operator-equivalent functions\" gives it \
+                 \"{domain}\""
+            ),
+        ));
+        return Ready(Type::Failed(
+            format!("`{op_name}` broadcast over a cell outside its domain").into(),
+        ));
+    }
+
     let cell = match (op_name.as_str(), elems.as_slice()) {
         ("builtin_logdensityof", [_, _, _]) => Type::Scalar(ScalarType::Real),
         ("add" | "sub" | "mul" | "divide" | "pow" | "min" | "max", [a, b]) => {
@@ -7924,7 +7944,8 @@ fn domain_check(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    refuse_nonboolean_domain(inf, name, args)
+    refuse_operand_outside_operator_domain(inf, name, args, named)
+        .or_else(|| refuse_nonboolean_domain(inf, name, args))
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
         .or_else(|| refuse_bad_rand_operands(inf, name, args))
@@ -7932,6 +7953,131 @@ fn domain_check(
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_likelihood_point(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args, named))
+}
+
+/// The §07 "Operator-equivalent functions" rows and the Domains cell each states, as
+/// the spec writes it. The cell is quoted in the diagnostic.
+fn operator_domain(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "add" | "sub" => "scalars or arrays of same shape (real or complex)",
+        "mul" => {
+            "scalars, matrix-matrix, matrix-vector, scalar-matrix, scalar-vector, \
+             transposed-vector–vector, vector–transposed-vector, transposed-vector–matrix"
+        }
+        "divide" => "scalars, array-scalar, transposed-vector–scalar (real or complex)",
+        "neg" => "scalars or arrays (real or complex)",
+        "pow" => "scalars (real or complex; complex extension via principal branch)",
+        "equal" | "unequal" => "`integers`, `booleans`, strings",
+        "lt" | "le" | "gt" | "ge" => "`reals`",
+        _ => return None,
+    })
+}
+
+/// What an operand is, when no §07 operator-equivalent row admits it: a record, tuple,
+/// table, measure, kernel, function, likelihood, module or RNG state, or an array of
+/// such. An ordering comparison also excludes a complex scalar, since `reals` does not
+/// contain `complexes`. `None` admits the operand, including every unresolved type
+/// (`%deferred`, `%any`, a type variable): only a definite mismatch is an error.
+///
+/// Booleans and integers stay admitted: §03 embeds `booleans` in `integers` and
+/// `integers` in `reals` "where specified by the language", and the arithmetic rows say
+/// "real or complex". This is the KIND of the operand, not the scalar-embedding question
+/// that [`domain_check`] declines to sweep.
+fn operand_outside_operator_domain(name: &str, ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Record(_) => Some("a record"),
+        Type::Tuple(_) => Some("a tuple"),
+        Type::Table { .. } => Some("a table"),
+        Type::Measure { .. } => Some("a measure"),
+        Type::Kernel { .. } => Some("a kernel"),
+        Type::Function { .. } => Some("a function"),
+        Type::Likelihood { .. } => Some("a likelihood"),
+        Type::Module => Some("a module"),
+        Type::RngState => Some("an RNG state"),
+        Type::Scalar(ScalarType::Complex) if matches!(name, "lt" | "le" | "gt" | "ge") => {
+            Some("a complex number")
+        }
+        Type::Scalar(ScalarType::Real | ScalarType::Complex)
+            if matches!(name, "equal" | "unequal") =>
+        {
+            Some("a non-discrete number")
+        }
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => {
+            operand_outside_operator_domain(name, elem).map(|_| "an array of non-numbers")
+        }
+        _ => None,
+    }
+}
+
+/// Refuse an operand outside the stated domain of a §07 "Operator-equivalent functions"
+/// row (`add`, `sub`, `mul`, `divide`, `neg`, `pow`, `equal`, `unequal`, `lt`, `le`,
+/// `gt`, `ge`) with an error located at the operand.
+///
+/// A record, tuple or table is in no row's domain. Without this check `add(r, 1.5)`
+/// typed `%deferred`, because the per-row arms promote operand types without asking
+/// what they are, so `record(a = 1, b = 2) + 10.0` passed inference and a later stage
+/// met an expression with no value. A sole positional record or table splats under §04
+/// "Calling conventions" and so is not an operand itself.
+fn refuse_operand_outside_operator_domain(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let domain = operator_domain(name)?;
+    // A comparison over an array, transposed vector or table keeps its own, more
+    // specific refusal (`refuse_nonscalar_operand`), which names the elementwise route.
+    if matches!(name, "equal" | "unequal" | "lt" | "le" | "gt" | "ge")
+        && nonscalar_operand(args, named).is_some()
+    {
+        return None;
+    }
+    let splatting = named.is_empty() && args.len() == 1;
+    let operands = args
+        .iter()
+        .map(|(node, ty, _)| (*node, ty))
+        .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)));
+    // The sole positional record or table splats when its names are the row's own
+    // parameters (`add(record(a = 1, b = 2))`); any other is itself the operand.
+    let parameters = crate::catalogue::builtin().base_param_names(name);
+    let splats = |ty: &Type, inf: &Inferencer<'_, '_>| {
+        let fields: Vec<&str> = match ty {
+            Type::Record(fields) => fields.iter().map(|(n, _)| inf.module.resolve(*n)).collect(),
+            Type::Table { columns, .. } => columns
+                .iter()
+                .map(|(n, _)| inf.module.resolve(*n))
+                .collect(),
+            _ => return false,
+        };
+        parameters.is_some_and(|names| fields.iter().all(|f| names.iter().any(|n| n == f)))
+    };
+    for (node, ty) in operands {
+        if splatting && splats(ty, inf) {
+            continue;
+        }
+        let Some(what) = operand_outside_operator_domain(name, ty) else {
+            continue;
+        };
+        // §07: exact equality "is restricted to discrete domains"; its sentence names the
+        // functions that give a discrete result, and `iszero` for an exact test of zero.
+        let way_out = if what == "a non-discrete number" {
+            ". Compare a discrete result instead, such as `integer(x)`, `floor(x)`, \
+             `ceil(x)` or `round(x)`, or test a zero with `iszero(x)`"
+        } else {
+            ""
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            node,
+            format!(
+                "`{name}` operand is {what}, outside its domain: spec §07 \"Operator-equivalent \
+                 functions\" gives `{name}` the domain \"{domain}\"{way_out}"
+            ),
+        ));
+        return Some(Type::Failed(
+            format!("`{name}` applied to an operand outside its domain").into(),
+        ));
+    }
+    None
 }
 
 /// `rand(m, rstate)` accepts one closed measure and one explicit RNG state.

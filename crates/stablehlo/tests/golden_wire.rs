@@ -334,11 +334,23 @@ fn equal_and_unequal_compare_integers() {
 fn equal_refuses_real_operands_and_names_the_alternatives() {
     let src = "a = elementof(reals)\nb = elementof(reals)\ny = equal(a, b)\n\
                inputs = (a, b)\noutputs = (y)\n";
-    let msg = emit_err(src);
+    // Inference refuses first, with the §07 row's domain.
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let diags = flatppl_infer::infer(&mut m);
     assert!(
-        msg.contains("discrete domains"),
-        "unexpected message: {msg}"
+        diags
+            .iter()
+            .any(|d| d.message.contains("`integers`, `booleans`, strings")),
+        "infer must refuse a real operand of `equal`: {diags:?}"
     );
+    // Inference now refuses before the determiniser or the emitter see the model, so the
+    // emitter's own guard (which names the discretizing alternatives) is only a backstop.
+    let msg = diags
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(msg.contains("§07"), "the refusal must cite §07: {msg}");
     for alt in ["integer", "floor", "ceil", "round", "iszero"] {
         assert!(
             msg.contains(alt),
