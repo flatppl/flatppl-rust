@@ -6,9 +6,9 @@
 //!   non-variadic inputs positionally: a keyword spelling such as `normalize(M = mu)`
 //!   is a static error." The keyword form of `joint` stays legal.
 //! - §07 `rnginit` (#209): "A byte-vector seed must contain integers in {0, …, 255}."
-//! - §04 "Broadcasting" (#210): "Records and tuples are not allowed as operands of
-//!   `broadcast`", and the arguments of `broadcasted(f)(args...)` are operands of
-//!   `broadcast`, never auto-splatted.
+//! - §04 "Broadcasting" (#210): records are held constant like scalars, tuple operands
+//!   are iterated (not implemented, so refused), and the arguments of
+//!   `broadcasted(f)(args...)` are operands of `broadcast`, never arguments of `f`.
 
 use flatppl_infer::{Severity, infer};
 
@@ -105,12 +105,40 @@ fn a_written_byte_vector_seed_stays_within_a_byte() {
 }
 
 #[test]
-fn record_and_tuple_operands_of_broadcast_are_refused() {
+fn record_operands_of_broadcast_are_held_constant_for_every_head() {
+    // A record is a non-collection input: it is not iterated, so the broadcast
+    // axis comes from the arrays alone and the result is an array.
+    let f = "f(x, p) = x + p.a\n";
+    for source in [
+        format!("{f}r = record(a = 1.0, b = 2.0)\nz = broadcast(f, [1.0, 2.0, 3.0], r)\n"),
+        format!("{f}r = record(a = 1.0, b = 2.0)\nz = broadcasted(f)([1.0, 2.0, 3.0], r)\n"),
+        format!("{f}r = record(a = 1.0, b = 2.0)\nz = broadcast(f, x = [1.0, 2.0, 3.0], p = r)\n"),
+        // A builtin head takes a record operand like any other head.
+        "r = record(a = 1.0, b = 2.0)\nz = broadcast(builtin_logdensityof, Normal, r, [0.0, 1.0])\n"
+            .to_string(),
+    ] {
+        assert_clean(&source);
+    }
+    let mut module = flatppl_syntax::parse(
+        "f(x, p) = x + p.a\nr = record(a = 1.0)\nz = broadcast(f, [1.0, 2.0], r)\n",
+    )
+    .unwrap();
+    assert!(flatppl_infer::infer(&mut module).is_empty());
+    let rhs = module
+        .bindings()
+        .find(|(_, b)| module.resolve(b.name) == "z")
+        .unwrap()
+        .1
+        .rhs;
+    assert!(matches!(
+        module.type_of(rhs),
+        Some(flatppl_core::Type::Array { .. })
+    ));
+}
+
+#[test]
+fn tuple_operands_of_broadcast_are_refused_until_component_iteration_exists() {
     let f = "f(a, b) = a + b\n";
-    assert_refused(
-        &format!("{f}r = record(a = [1.0, 2.0], b = [3.0, 4.0])\nz = broadcast(f, r)\n"),
-        "Records and tuples are not allowed as operands",
-    );
     assert_refused(
         &format!("{f}t = ([1.0, 2.0], [3.0, 4.0])\nz = broadcast(f, t)\n"),
         "a tuple",
@@ -118,12 +146,8 @@ fn record_and_tuple_operands_of_broadcast_are_refused() {
 }
 
 #[test]
-fn the_arguments_of_broadcasted_are_operands_and_are_never_splatted() {
+fn the_arguments_of_broadcasted_are_operands_and_never_splatted_across_the_call() {
     let f = "f(a, b) = a + b\n";
-    assert_refused(
-        &format!("{f}r = record(a = [1.0, 2.0], b = [3.0, 4.0])\nz = broadcasted(f)(r)\n"),
-        "a record",
-    );
     // A table operand is traversed row-wise, and positional or keyword arrays bind as usual.
     assert_clean(&format!(
         "{f}t = table(a = [1.0, 2.0], b = [3.0, 4.0])\nz = broadcasted(f)(t)\n\

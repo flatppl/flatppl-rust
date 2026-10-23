@@ -6035,41 +6035,26 @@ fn broadcast_type(
     };
     let (head_node, head_ty) = (*head_node, head_ty.clone());
 
-    // §04 "Broadcasting", "Disallowed inputs": "Records and tuples are not allowed as
-    // operands of `broadcast`". The operands of `broadcasted(f)(args...)` are
-    // `broadcast`'s operands as well, so a record there is never splatted.
-    //
-    // The §07 kernel-evaluation primitives are the exception the spec leaves
-    // unstated: their `kernel_input` operand is a record by definition, and
-    // the determiniser broadcasts them over points with that record held
-    // constant. Those heads are engine-internal, so only other heads are checked.
-    let primitive_head = matches!(
-        inf.module.node(head_node),
-        Node::Const(op) if inf.module.resolve(*op).starts_with("builtin_")
-    );
-    let operands = args[1..]
+    // §04 "Broadcasting" (#210): records are non-collection inputs, "simply not
+    // iterated over but held constant". Tuple inputs are iterated component-wise
+    // ("`broadcast(f, (a, b), c)` equals `(f(a, c), f(b, c))`"), which no engine
+    // lowers yet, so a tuple operand is refused rather than typed as a constant.
+    for (node, ty) in args[1..]
         .iter()
         .map(|(node, ty, _)| (*node, ty))
         .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)))
-        .filter(|_| !primitive_head);
-    for (node, ty) in operands {
-        let kind = match ty {
-            Type::Record(_) => "a record",
-            Type::Tuple(_) => "a tuple",
-            _ => continue,
-        };
+    {
+        if !matches!(ty, Type::Tuple(_)) {
+            continue;
+        }
         inf.diags.push(crate::Diagnostic::error_at(
             node,
-            format!(
-                "`broadcast` operand is {kind}: spec §04 \"Broadcasting\" states that \
-                 \"Records and tuples are not allowed as operands of `broadcast`\". Operands of \
-                 `broadcasted(f)(args...)` are `broadcast` operands and are never auto-splatted. \
-                 Pass a table, or the fields as separate arrays"
-            ),
+            "`broadcast` operand is a tuple: spec §04 \"Broadcasting\" iterates tuple \
+             components, which is not implemented yet. Pass the components as separate \
+             operands, or a record to hold them constant"
+                .to_string(),
         ));
-        return Ready(Type::Failed(
-            "broadcast operand is a record or tuple".into(),
-        ));
+        return Ready(Type::Failed("broadcast operand is a tuple".into()));
     }
 
     if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {
