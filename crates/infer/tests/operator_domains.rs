@@ -89,6 +89,77 @@ fn a_sole_record_or_table_splats_and_is_not_itself_an_operand() {
 }
 
 #[test]
+fn the_shape_clauses_of_the_arithmetic_rows() {
+    // `add`/`sub`: scalars, or arrays of the same shape.
+    clean("z = add([1.0, 2.0], [3.0, 4.0])\n");
+    clean("z = sub(1.0, 2.0)\n");
+    clean("z = add(transpose([1.0, 2.0]), transpose([3.0, 4.0]))\n");
+    refused("z = add(1.0, [1.0, 2.0])\n");
+    refused("z = [1.0, 2.0] + 1.0\n");
+    refused("z = sub([1.0, 2.0], [1.0, 2.0, 3.0])\n");
+    refused("z = add(transpose([1.0, 2.0]), [3.0, 4.0])\n");
+    // `divide`: scalars, an array or transposed vector over a scalar.
+    clean("z = divide([1.0, 2.0], 2.0)\n");
+    clean("z = divide(transpose([1.0, 2.0]), 2.0)\n");
+    refused("z = divide(1.0, [1.0, 2.0])\n");
+    refused("z = divide([1.0, 2.0], [1.0, 2.0])\n");
+    // `pow`: scalars only.
+    clean("z = pow(2.0, 3.0)\n");
+    refused("z = pow([1.0, 2.0], 2.0)\n");
+    refused("z = pow(2.0, [1.0, 2.0])\n");
+    // `neg`: scalars or arrays.
+    clean("z = neg([1.0, 2.0])\n");
+    // `mul`: exactly the listed pairs.
+    for ok in [
+        "mul(2.0, 3.0)",
+        "mul(2.0, [1.0, 2.0])",
+        "mul([1.0, 2.0], 2.0)",
+        "mul(2.0, rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+        "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+        "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), [1.0, 2.0])",
+        "mul(transpose([1.0, 2.0]), [1.0, 2.0])",
+        "mul([1.0, 2.0], transpose([1.0, 2.0]))",
+        "mul(transpose([1.0, 2.0]), rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+    ] {
+        clean(&format!("z = {ok}\n"));
+    }
+    // A scalar stands on either side of a vector or a matrix; the transposed-vector
+    // pairs keep their listed order, and the contracted extents must agree.
+    clean("z = mul([1.0, 2.0], 2.0)\n");
+    clean("z = mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), 2.0)\n");
+    clean("z = mul([1.0, 2.0], transpose([1.0, 2.0, 3.0]))\n");
+    for bad in [
+        "mul(transpose([1.0, 2.0]), [1.0, 2.0, 3.0])",
+        "mul(transpose([1.0, 2.0]), rowstack([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))",
+        "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), [1.0, 2.0, 3.0])",
+        "mul(rowstack([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]]), rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+        "mul(2.0, transpose([1.0, 2.0]))",
+        "mul(transpose([1.0, 2.0]), 2.0)",
+        "mul([1.0, 2.0], rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+        "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), transpose([1.0, 2.0]))",
+        "mul(transpose([1.0, 2.0]), transpose([1.0, 2.0]))",
+    ] {
+        refused(&format!("z = {bad}\n"));
+    }
+}
+
+#[test]
+fn a_set_is_no_operand_of_any_row() {
+    // §03 "Sets": sets specify input domains, supports and regions; §07 gives the rows
+    // scalars and arrays.
+    for set in [
+        "reals",
+        "interval(0.0, 1.0)",
+        "cartpow(reals, 3)",
+        "posintegers",
+    ] {
+        refused(&format!("z = add({set}, 1.5)\n"));
+        refused(&format!("z = lt(1.5, {set})\n"));
+    }
+    refused("S = interval(0.0, 1.0)\nz = S * 2.0\n");
+}
+
+#[test]
 fn the_scalar_kind_clauses_of_the_domains() {
     // `lt`..`ge`: `reals`, so a complex number is outside; `equal`: discrete domains.
     clean("z = lt(1, 2.5)\n");
@@ -114,4 +185,17 @@ fn the_per_cell_call_of_a_broadcast_obeys_the_row_domain() {
     clean("z = [1.0, 2.0] .+ 1.0\n");
     clean("z = [1.0, 2.0] .< 2.0\n");
     clean("z = [1, 2] .== 2\n");
+}
+
+#[test]
+fn an_unresolved_operand_is_never_an_accusation() {
+    // `x` is the lambda's placeholder, so `L * x` is not known to be a matrix: it must
+    // not be typed as `L`'s shape and then fail the same-shape clause of `add`.
+    clean(
+        "cov = rowstack([[4.0, 1.0], [1.0, 3.0]])\nL = lower_cholesky(cov)\n\
+         d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], \
+         cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))\nlp = logdensityof(d, [0.5, 0.5])\n",
+    );
+    // A sole table splats its rows onto the row's parameters.
+    clean("z = broadcast(sub, table(b = [1, 2], a = [5, 7]))\n");
 }

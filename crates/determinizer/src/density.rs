@@ -5326,13 +5326,16 @@ fn lower_pushfwd(
 /// materialise `exp(round(x))` in integer arithmetic — truncating the atom's image and
 /// failing [`on_lattice`] for a point that IS an atom. The wrapper is value-identity.
 fn snap_to_lattice(m: &mut Module, x: NodeId, domain: &Type) -> NodeId {
-    let snapped = if variate_is_vector(domain) {
+    // Over a vector variate `round` and `real` are scalar functions, so they apply per cell.
+    if variate_is_vector(domain) {
         let round = m.intern("round");
         let round = m.alloc(Node::Const(round));
-        build_call(m, "broadcast", &[round, x])
-    } else {
-        build_call(m, "round", &[x])
-    };
+        let real = m.intern("real");
+        let real = m.alloc(Node::Const(real));
+        let snapped = build_call(m, "broadcast", &[round, x]);
+        return build_call(m, "broadcast", &[real, snapped]);
+    }
+    let snapped = build_call(m, "round", &[x]);
     build_call(m, "real", &[snapped])
 }
 
@@ -5358,7 +5361,17 @@ fn on_lattice(
     domain: &Type,
     parameter: &[NodeId],
 ) -> Result<NodeId, RefuseError> {
-    let back = apply_change_of_variables(m, node, forward, snapped, parameter, "f")?;
+    // A bare scalar operator over a vector variate is the elementwise map (§06 case 1
+    // spells `pushfwd(g, M)` and `pushfwd(x -> broadcast(g, x), M)` alike), so its forward
+    // is `broadcast(g, snapped)`. `g(snapped)` applies a scalar-domain function to a vector.
+    let back = if parameter.is_empty()
+        && variate_is_vector(domain)
+        && matches!(m.node(resolve_ref_one(m, forward).0), Node::Const(_))
+    {
+        build_call(m, "broadcast", &[forward, snapped])
+    } else {
+        apply_change_of_variables(m, node, forward, snapped, parameter, "f")?
+    };
     Ok(lattice_test(m, v, back, domain))
 }
 
@@ -5368,7 +5381,9 @@ fn on_lattice(
 fn lattice_test(m: &mut Module, v: NodeId, back: NodeId, domain: &Type) -> NodeId {
     let diff = build_call(m, "sub", &[v, back]);
     let scalar = if variate_is_vector(domain) {
-        let mag = build_call(m, "abs", &[diff]);
+        let abs = m.intern("abs");
+        let abs = m.alloc(Node::Const(abs));
+        let mag = build_call(m, "broadcast", &[abs, diff]);
         build_call(m, "sum", &[mag])
     } else {
         diff

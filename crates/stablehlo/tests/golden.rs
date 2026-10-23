@@ -8775,6 +8775,20 @@ fn emit_sample_categorical_single_category_iid_matches_frozen_golden() {
 // construct (a literal, a computed value) still refuses — see
 // `emit_logdensity_abi_refuses_non_elementof_input`.
 
+/// The inference refusal for a source with operands outside a §07 "Operator-equivalent
+/// functions" row. Inference refuses these shapes before the determiniser or the
+/// emitter see the model; the emitter's own guards behind it are the backstop.
+fn infer_refusal(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let found: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(!found.is_empty(), "inference must refuse:\n{src}");
+    found.join("\n")
+}
+
 /// Parse + infer `src`, then `determinize_with_roots` rooted on `roots` (the
 /// `inputs`/`outputs` binding names) — mirrors
 /// `crates/determinizer/tests/canon_dce_golden.rs`'s `determinize_roots`
@@ -10027,17 +10041,11 @@ outputs = lp
 ",
         ),
     ] {
-        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-        let err = flatppl_stablehlo::emit(
-            &d,
-            flatppl_stablehlo::Mode::LogDensity,
-            &unrestricted_options(),
-        )
-        .unwrap_err();
+        let err = infer_refusal(src);
         assert!(
-            err.msg.contains("has no meaning for these operand shapes"),
+            err.contains("operands are outside its domain"),
             "{label} must refuse, got: {}",
-            err.msg
+            err
         );
     }
 }
@@ -10139,18 +10147,12 @@ outputs = lp
 ",
         ),
     ] {
-        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-        let err = flatppl_stablehlo::emit(
-            &d,
-            flatppl_stablehlo::Mode::LogDensity,
-            &unrestricted_options(),
-        )
-        .unwrap_err();
+        let err = infer_refusal(src);
         assert!(
-            err.msg.contains("has no meaning for these operand shapes")
-                && err.msg.contains("transposed-vector–vector"),
+            err.contains("operands are outside its domain")
+                && err.contains("transposed-vector–vector"),
             "{label} must refuse citing §07's mul row, got: {}",
-            err.msg
+            err
         );
     }
 }
@@ -10195,19 +10197,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (v, w)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`*` has no meaning for these operand shapes")
-            && err.msg.contains(".*"),
+        err.contains("`mul` operands are outside its domain") && err.contains(".*"),
         "expected a `*`-undefined refusal pointing at `.*`, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10222,18 +10216,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (a, b)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`*` has no meaning for these operand shapes"),
+        err.contains("`mul` operands are outside its domain"),
         "expected a `*`-undefined refusal for a rank-3 pair, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10585,20 +10572,13 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (s, v)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`+` has no meaning for these operand shapes")
-            && err.msg.contains("arrays of same shape")
-            && err.msg.contains(".+"),
+        err.contains("`add` operands are outside its domain")
+            && err.contains("arrays of same shape")
+            && err.contains(".+"),
         "expected an `add`-domain refusal pointing at `.+`, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10614,19 +10594,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (s, v)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`-` has no meaning for these operand shapes")
-            && err.msg.contains(".-"),
+        err.contains("`sub` operands are outside its domain") && err.contains(".-"),
         "expected a `sub`-domain refusal pointing at `.-`, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10642,18 +10614,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (v, w)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`+` has no meaning for these operand shapes"),
+        err.contains("`add` operands are outside its domain"),
         "expected an `add`-domain refusal for mismatched shapes, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10717,22 +10682,16 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (s, v)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`/` has no meaning for these operand shapes")
+        err
+            .contains("`divide` operands are outside its domain")
             // The domain the message quotes must be the row the guard enforces —
             // #77's, not #75's narrower one (which said `vector-scalar`).
-            && err.msg.contains("array-scalar")
-            && err.msg.contains("./"),
+            && err.contains("array-scalar")
+            && err.contains("./"),
         "expected a `divide`-domain refusal pointing at `./`, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10747,18 +10706,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (v, w)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`/` has no meaning for these operand shapes"),
+        err.contains("`divide` operands are outside its domain"),
         "expected a `divide`-domain refusal for two vectors, got: {}",
-        err.msg
+        err
     );
 }
 
@@ -10840,18 +10792,11 @@ inputs = {inputs}
 outputs = lp
 "
         );
-        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
-        let err = flatppl_stablehlo::emit(
-            &d,
-            flatppl_stablehlo::Mode::LogDensity,
-            &unrestricted_options(),
-        )
-        .unwrap_err();
+        let err = infer_refusal(&src);
         assert!(
-            err.msg
-                .contains("`/` has no meaning for these operand shapes"),
+            err.contains("`divide` operands are outside its domain"),
             "{label} must still refuse, got: {}",
-            err.msg
+            err
         );
     }
 }
@@ -10866,19 +10811,11 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), rec
 inputs = (v)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("`^` has no meaning for these operand shapes")
-            && err.msg.contains(".^"),
+        err.contains("`pow` operands are outside its domain") && err.contains(".^"),
         "expected a `pow`-domain refusal pointing at `.^`, got: {}",
-        err.msg
+        err
     );
 }
 
