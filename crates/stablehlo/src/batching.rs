@@ -61,13 +61,16 @@ impl Emitter<'_> {
                     };
                     let name = self.m.resolve(name);
                     if name == "scan" {
-                        let [function, init, xs, parameters @ ..] = call.args.as_ref() else {
+                        let [function, init, sequences @ ..] = call.args.as_ref() else {
                             return false;
                         };
                         let Ok((body, entries)) = self.callable_parts(*function) else {
                             return false;
                         };
-                        if parameters.len() > 1 || entries.len() != 2 + parameters.len() {
+                        if !call.named.is_empty()
+                            || sequences.is_empty()
+                            || entries.len() != 1 + sequences.len()
+                        {
                             return false;
                         }
                         let item = |ty: &Type| match ty {
@@ -77,15 +80,15 @@ impl Emitter<'_> {
                             Type::Table { columns, .. } => Type::Record(columns.clone()),
                             ty => ty.clone(),
                         };
-                        let (Some(state), Some(input)) = (type_of(id), type_of(*xs)) else {
+                        let Some(state) = type_of(id) else {
                             return false;
                         };
-                        let mut arguments = vec![item(state), item(input)];
-                        for parameter in parameters {
-                            let Some(ty) = type_of(*parameter) else {
+                        let mut arguments = vec![item(state)];
+                        for sequence in sequences {
+                            let Some(input) = type_of(*sequence) else {
                                 return false;
                             };
-                            arguments.push(ty.clone());
+                            arguments.push(item(input));
                         }
                         let mut seeds = types.clone();
                         for i in 0..self.m.node_count() {
@@ -107,8 +110,8 @@ impl Emitter<'_> {
                         if !self.can_tensorize_nodes(&[body], &scope, &types) {
                             return false;
                         }
-                        pending.extend([*init, *xs]);
-                        pending.extend(parameters.iter().copied());
+                        pending.push(*init);
+                        pending.extend(sequences.iter().copied());
                         continue;
                     }
                     if name == "mul" && !matches!(type_of(id), Some(Type::Scalar(_))) {

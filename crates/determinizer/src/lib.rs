@@ -8,6 +8,7 @@ mod crossmodule;
 mod density;
 mod disintegrate;
 mod driver;
+mod extras;
 mod free_draw;
 mod invert;
 mod jointchain;
