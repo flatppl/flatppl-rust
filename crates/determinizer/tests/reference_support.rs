@@ -20,7 +20,8 @@ fn dependent_reference_bounds_survive_prior_and_likelihood_reification() {
         "bound ~ Exponential(1)\n\
          x = elementof(cartpow(reals, 2))\n\
          y ~ Normal(sum(x), 1)\n\
-         prior = jointchain(lawof(record(bound = bound)), pars -> joint(x = iid(Lebesgue(interval(0, pars.bound)), 2)))\n\
+         kx(r) = iid(Lebesgue(interval(0, r.bound)), 2)\n\
+         prior = jointchain(bound = lawof(bound), x = kx)\n\
          observation = kernelof(y, bound = bound, x = x)\n\
          posterior = bayesupdate(likelihoodof(observation, 2), prior)\n\
          point = elementof(cartprod(bound = posreals, x = cartpow(reals, 2)))\n\

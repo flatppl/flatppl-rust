@@ -166,8 +166,8 @@ fn jointchain_prefix_keep_projection_lowers() {
     // Exponential) make a wrong keep detectable — only the Normal term may
     // survive; the trailing Exponential (b) term must be absent.
     let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         k = kernelof(record(b = draw(Exponential(rate = a))), a = a)\n\
-         jc = jointchain(lawof(record(a = a)), pars -> k(a = pars.a))\n\
+         k(r) = Exponential(rate = r.a)\n\
+         jc = jointchain(a = lawof(a), b = k)\n\
          m = relabel(jc, [\"a\", \"b\"])\n\
          lp = logdensityof(pushfwd(fn(get(_, [\"a\"])), m), record(a = 0.3))");
     assert_eq!(
@@ -237,10 +237,9 @@ fn jointchain_three_stage_prefix_keep_lowers() {
     // {a, b} — the base Normal term + the b|a Exponential term; the trailing c
     // (Gamma) term is absent. Distinct distributions at every stage lock the keep.
     let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         b = draw(Exponential(rate = a))\n\
-         kb = kernelof(record(b = b), a = a)\n\
-         kc = kernelof(record(c = draw(Gamma(shape = 2.0, rate = b))), b = b)\n\
-         jc = jointchain(lawof(record(a = a)), pars -> kb(a = pars.a), pars -> kc(b = pars.b))\n\
+         kb(r) = Exponential(rate = r.a)\n\
+         kc(r) = Gamma(shape = 2.0, rate = r.b)\n\
+         jc = jointchain(a = lawof(a), b = kb, c = kc)\n\
          lp = logdensityof(pushfwd(fn(get(_, [\"a\", \"b\"])), jc), record(a = 0.3, b = 0.5))");
     assert_eq!(
         p.matches("builtin_logdensityof").count(),
@@ -415,8 +414,8 @@ fn scalar_cat_jointchain_index_prefix_keep_lowers() {
     let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          b = draw(Exponential(rate = a))\n\
          kb = kernelof(b, a = a)\n\
-         kc = kernelof(draw(Gamma(shape = 2.0, rate = b)), b = b)\n\
-         jc = jointchain(lawof(a), kb, pars -> kc(b = pars[2]))\n\
+         kc = kernelof(draw(Gamma(shape = 2.0, rate = get0(_ab_, 1))), ab = _ab_)\n\
+         jc = jointchain(lawof(a), kb, kc)\n\
          lp = logdensityof(pushfwd(fn(get(_, [1, 2])), jc), [0.3, 0.5])");
     let lp = pir_binding(&p, "lp");
     assert_eq!(

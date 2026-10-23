@@ -125,14 +125,15 @@ fn explicit_factor(module: &Module, name: &str) -> Option<NodeId> {
             continue;
         }
         match module.node(node) {
-            Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if module.resolve(head) == "joint") =>
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if matches!(module.resolve(head), "joint" | "jointchain")) =>
             {
                 if let Some(field) = call
                     .named
                     .iter()
                     .find(|field| module.resolve(field.name) == name)
                 {
-                    return Some(field.value);
+                    // A later component of a chain is a kernel: its factor is the body.
+                    return Some(kernel_body(module, field.value));
                 }
                 pending.extend(module.node(node).children());
             }
@@ -145,6 +146,19 @@ fn explicit_factor(module: &Module, name: &str) -> Option<NodeId> {
         }
     }
     None
+}
+
+/// The measure a chain component's kernel returns, or the component itself.
+fn kernel_body(module: &Module, node: NodeId) -> NodeId {
+    match module.node(node) {
+        Node::Call(call)
+            if matches!(call.head, CallHead::Builtin(head) if module.resolve(head) == "functionof")
+                && call.args.len() == 1 =>
+        {
+            call.args[0]
+        }
+        _ => node,
+    }
 }
 
 pub(crate) fn emit(module: &mut Module, info: &ModelInfo) -> Result<()> {

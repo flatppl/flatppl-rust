@@ -6307,13 +6307,10 @@ pub(crate) fn component_variate(
 /// component whose variate is not statically resolvable ⇒ `%deferred`.
 fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
     if !named.is_empty() {
-        // Keyword form `jointchain(n1 = M, n2 = K, …)`: each component's variate
-        // is nested under the supplied keyword name, producing
-        // `record{n1: variate(M), n2: variate(K), …}`. This nesting shape
-        // (`record{name: component-variate}`) is a defensible reading of spec §06's
-        // keyword form (which is defined via `relabel`, not modeled in inference).
-        // Pending spec clarification on whether the keyword names wrap or replace
-        // the component variate's own field names.
+        // Keyword form `jointchain(n1 = M, n2 = K, …)` (spec §06): "Each name holds its
+        // component's variate as it is, whether scalar, array or record ... A
+        // record-valued component becomes a nested record under its name", so the domain is
+        // `record{n1: variate(M), n2: variate(K), …}`.
         let mut fields = Vec::with_capacity(named.len());
         for (name, node, t, _) in named {
             match component_variate(inf, *node, t) {

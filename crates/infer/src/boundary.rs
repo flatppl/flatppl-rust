@@ -322,15 +322,15 @@ fn check_point(
 /// feeds it: the `cat` of every variate to its left (spec §06 "Dependent
 /// composition").
 ///
-/// The keyword form `jointchain(name1 = M, name2 = K1, ...)` is `jointchain` of
-/// `relabel`led components (§06), whose variates bind by name. The check feeds a
-/// step the previous component's variate itself rather than a `cat`, as
-/// flatppl-js does: §06 does not say what `relabel` makes of a scalar variate,
-/// so no record of labels is assumed.
+/// In the keyword form `jointchain(name1 = M, name2 = K1, ...)` each name holds its
+/// component's variate as it is, a record nesting under its name, and "each later
+/// kernel receives the record of the preceding named variates by the ordinary calling
+/// convention, so `jointchain(a = M, b = K)` calls `K(record(a = a))`" (§06 "Keyword
+/// form"). The fed value is that record.
 ///
-/// A step taking one positional input receives that value whole and the input's
-/// declared domain must admit it. Any other step splats a record, whose fields
-/// must be exactly the step's inputs.
+/// A step taking one positional input receives the fed value whole and the input's
+/// declared domain must admit it. Any other step splats a record, whose fields must
+/// be exactly the step's inputs.
 pub(crate) fn refuse_bad_chain_boundary(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
@@ -341,8 +341,8 @@ pub(crate) fn refuse_bad_chain_boundary(
         return None;
     }
     // Keyword form `jointchain(name1 = M, name2 = K1, ...)`: the components are
-    // the keyword values. Its fed value is the previous component's variate, not
-    // the `cat` of all of them (see the doc comment).
+    // the keyword values. Its fed value is the record of the preceding labels, not
+    // the `cat` of their variates (see the doc comment).
     let labelled = args.is_empty() && !named.is_empty() && name == "jointchain";
     let steps: Vec<(NodeId, &Type)> = if labelled {
         named.iter().map(|(_, node, ty, _)| (*node, ty)).collect()
@@ -361,16 +361,28 @@ pub(crate) fn refuse_bad_chain_boundary(
     if matches!(steps[0].1, Type::Kernel { .. }) {
         return None;
     }
+    let labels: Vec<Symbol> = if labelled {
+        named.iter().map(|(label, ..)| *label).collect()
+    } else {
+        Vec::new()
+    };
     let mut variates: Vec<Type> = Vec::with_capacity(steps.len());
     for (index, (node, ty)) in steps.iter().enumerate() {
         if index > 0
             && matches!(ty, Type::Kernel { .. })
             && let Some(interface) = interface(inf, *node)
         {
-            // One variate to the left is fed as it is; two or more are `cat`ed.
+            // One variate to the left is fed as it is; two or more are `cat`ed. The
+            // keyword form feeds the record of the preceding labels.
             let fed = match variates.as_slice() {
+                _ if labelled => Type::Record(
+                    labels
+                        .iter()
+                        .copied()
+                        .zip(variates.iter().cloned())
+                        .collect(),
+                ),
                 [only] => only.clone(),
-                [.., last] if labelled => last.clone(),
                 _ => cat_compose(&variates),
             };
             if !matches!(fed, Type::Deferred)

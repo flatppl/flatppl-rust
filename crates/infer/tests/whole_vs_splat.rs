@@ -190,7 +190,9 @@ fn a_prior_variate_names_only_inputs() {
 
 #[test]
 fn the_keyword_form_chain_applies_the_same_rule() {
-    // The previous component's record variate is bound whole to a one-input step.
+    // Spec §06 "Keyword form": a later kernel receives the record of the preceding
+    // named variates by the ordinary calling convention, so a one-input step takes the
+    // record whole.
     assert_refused(
         "sigma = draw(Exponential(rate = 1.0))\n\
          s = elementof(reals)\n\
@@ -200,23 +202,57 @@ fn the_keyword_form_chain_applies_the_same_rule() {
             "jointchain",
             "step 1",
             "cannot unify",
-            "record(sigma: real)",
+            "record(prior: record(sigma: real))",
             "expects real",
         ],
     );
-    // A scalar variate feeds a one-input step as it is.
-    assert_clean(
+    // The same holds for a scalar variate: the step receives `record(first = ..)`.
+    assert_refused(
         "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)\n\
          j = jointchain(first = lawof(a), second = k)\n",
+        &[
+            "jointchain",
+            "step 1",
+            "cannot unify",
+            "record(first: real)",
+        ],
     );
-    // A record splats over a keyword-only step's inputs, and every field names one.
+    // A record splats over a keyword-only step, and every field names one input.
+    assert_clean(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = elementof(reals)\n\
+         k = functionof(Normal(mu = b, sigma = 1.0))\n\
+         j = jointchain(b = lawof(a), second = k)\n",
+    );
     assert_refused(
         "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          b = elementof(reals)\n\
          k = functionof(Normal(mu = b, sigma = 1.0))\n\
          j = jointchain(first = lawof(record(c = a)), second = k)\n",
-        &["jointchain", "step 1", "no input for field `c`"],
+        &["jointchain", "step 1", "no input for field `first`"],
+    );
+    // A step that takes one input reads the record whole, and a step with several
+    // inputs splats the record of the preceding variates.
+    assert_clean(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = draw(Normal(mu = a, sigma = 1.0))\n\
+         kb(r) = Normal(mu = r.a, sigma = 1.0)\n\
+         c = draw(Normal(mu = a + b, sigma = 1.0))\n\
+         kc = kernelof(c, a = a, b = b)\n\
+         j = jointchain(a = lawof(a), b = kb, c = kc)\n",
+    );
+}
+
+#[test]
+fn the_positional_chain_keeps_the_ordinary_calling_convention() {
+    // The previous component's record variate is bound whole to a one-input step.
+    assert_refused(
+        "sigma = draw(Exponential(rate = 1.0))\n\
+         s = elementof(reals)\n\
+         reference = Normal(mu = 0.0, sigma = s)\n\
+         jc = jointchain(lawof(record(sigma = sigma)), functionof(reference, sigma = s))\n",
+        &["jointchain", "step 1", "cannot unify"],
     );
 }
 

@@ -272,14 +272,14 @@ fn kernel_chain_ops_infer_measures() {
         "jointchain domain should be cat of all variates record{{a, b}}, got:\n{out}"
     );
 
-    // Keyword form names each component's variate (spec §06 keyword form).
+    // Keyword form names each component's variate, and each later kernel's inputs name a
+    // preceding label (spec §06 "Keyword form").
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
-                  m0 = lawof(record(a = lambda))\n\
                   a = elementof(reals)\n\
                   k = kernelof(record(b = a))\n\
-                  j = jointchain(prior = m0, fwd = k)");
+                  j = jointchain(a = lawof(lambda), fwd = k)");
     assert!(
-        out.contains("(%measure (%domain (%record (prior (%record (a (%scalar real)))) (fwd (%record (b (%scalar real)))))) (%mass %normalized))")
+        out.contains("(%measure (%domain (%record (a (%scalar real)) (fwd (%record (b (%scalar real)))))) (%mass %normalized))")
             && out.contains("(jointchain"),
         "jointchain keyword form should name each component's variate, got:\n{out}"
     );
