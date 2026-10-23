@@ -189,34 +189,54 @@ fn a_prior_variate_names_only_inputs() {
 }
 
 #[test]
-fn the_keyword_form_chain_applies_the_same_rule() {
+fn the_keyword_form_chain_binds_each_kernel_by_name() {
+    // Spec §06 "Keyword form": "Each later kernel receives the record of the preceding
+    // named variates, bound to its inputs by name for any number of inputs, so
+    // `jointchain(a = M, b = K)` calls `K(a = a)`."
+    assert_clean(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)\n\
+         j = jointchain(a = lawof(a), b = k)\n",
+    );
+    // A kernel with several inputs reads several preceding labels, and may ignore one.
+    assert_clean(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = draw(Normal(mu = a, sigma = 1.0))\n\
+         kb = kernelof(b, a = a)\n\
+         c = draw(Normal(mu = a + b, sigma = 1.0))\n\
+         kc = kernelof(c, a = a, b = b)\n\
+         j = jointchain(a = lawof(a), b = kb, c = kc)\n",
+    );
+    // An input that names no preceding label is a static error.
+    assert_refused(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)\n\
+         j = jointchain(first = lawof(a), second = k)\n",
+        &[
+            "jointchain",
+            "step 1",
+            "`a`",
+            "names no preceding component",
+            "`first`",
+        ],
+    );
+    assert_refused(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         bb = fn(Normal(_, 1.0))\n\
+         j = jointchain(a = lawof(a), b = bb)\n",
+        &["jointchain", "`arg1`", "names no preceding component"],
+    );
+}
+
+#[test]
+fn the_positional_chain_keeps_the_ordinary_calling_convention() {
     // The previous component's record variate is bound whole to a one-input step.
     assert_refused(
         "sigma = draw(Exponential(rate = 1.0))\n\
          s = elementof(reals)\n\
          reference = Normal(mu = 0.0, sigma = s)\n\
-         jc = jointchain(prior = lawof(record(sigma = sigma)), fwd = functionof(reference, sigma = s))\n",
-        &[
-            "jointchain",
-            "step 1",
-            "cannot unify",
-            "record(sigma: real)",
-            "expects real",
-        ],
-    );
-    // A scalar variate feeds a one-input step as it is.
-    assert_clean(
-        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)\n\
-         j = jointchain(first = lawof(a), second = k)\n",
-    );
-    // A record splats over a keyword-only step's inputs, and every field names one.
-    assert_refused(
-        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
-         b = elementof(reals)\n\
-         k = functionof(Normal(mu = b, sigma = 1.0))\n\
-         j = jointchain(first = lawof(record(c = a)), second = k)\n",
-        &["jointchain", "step 1", "no input for field `c`"],
+         jc = jointchain(lawof(record(sigma = sigma)), functionof(reference, sigma = s))\n",
+        &["jointchain", "step 1", "cannot unify"],
     );
 }
 

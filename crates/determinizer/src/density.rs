@@ -6509,7 +6509,12 @@ fn lower_jointchain_projection(
     let args: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "jointchain")
             .ok_or_else(|| refuse_jointchain_projection(m, node))?;
-        c.args.to_vec()
+        // The components in chain order, positional or keyword.
+        if c.args.is_empty() {
+            c.named.iter().map(|arg| arg.value).collect()
+        } else {
+            c.args.to_vec()
+        }
     };
     // The dropped components are the trailing kernels `args[k..]`; each must be a
     // confirmed normalized Markov kernel (∫ K = 1) to drop cleanly. We must NOT
@@ -6536,20 +6541,16 @@ fn lower_jointchain_projection(
         }
     }
 
-    if k == 1 {
+    if k == 1 && crate::jointchain::keyword_components(m, node).is_none() {
         // Keep only the base variate: the marginal is the base measure's density.
         lower_measure_density(m, args[0], v)
     } else {
-        // Keep a ≥2-length prefix: the marginal is the sub-jointchain over the
-        // first `k` components (base + first `k-1` kernels). Re-dispatch through
-        // the existing jointchain density lowering rather than re-deriving it.
-        let jointchain_sym = m.intern("jointchain");
-        let sub = m.alloc(Node::Call(Call {
-            head: CallHead::Builtin(jointchain_sym),
-            args: args[..k].to_vec().into(),
-            named: Vec::<NamedArg>::new().into(),
-            inputs: None,
-        }));
+        // Keep a prefix: the marginal is the sub-jointchain over the first `k`
+        // components (base + first `k-1` kernels). Re-dispatch through the existing
+        // jointchain density lowering rather than re-deriving it. A keyword chain
+        // keeps its labels, so a single kept component scores at its own field.
+        let sub = crate::jointchain::prefix_chain(m, node, k)
+            .ok_or_else(|| refuse_jointchain_projection(m, node))?;
         crate::jointchain::lower_jointchain(m, sub, v)
     }
 }

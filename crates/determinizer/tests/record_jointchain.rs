@@ -42,8 +42,8 @@ fn proper_scale_then_reference_coefficients_matches_factorization() {
     let point = "p = elementof(cartprod(b = cartpow(reals, 2), sigma = posreals))\n";
     let chain = lower(&format!(
         "sigma ~ Exponential(2)\n\
-         k = pars -> joint(b = iid(Lebesgue(interval(0, pars.sigma)), 2))\n\
-         prior = jointchain(lawof((sigma = sigma)), k)\n\
+         k = sigma -> iid(Lebesgue(interval(0, sigma)), 2)\n\
+         prior = jointchain(sigma = lawof(sigma), b = k)\n\
          {point}lp = logdensityof(prior, p)"
     ));
     let direct = lower(&format!(
@@ -63,14 +63,14 @@ fn reference_scale_then_proper_law_accepts_both_reifiers() {
          + logdensityof(Normal(0, p.sigma), p.b)"
     ));
     for reified in [
-        "kernelof((b = b), sigma)",
-        "functionof(lawof((b = b)), sigma)",
-        "kernelof((b = b))",
+        "kernelof(b, sigma)",
+        "functionof(lawof(b), sigma)",
+        "kernelof(b)",
     ] {
         let chain = lower(&format!(
             "sigma = elementof(posreals)\n\
              b ~ Normal(0, sigma)\n\
-             prior = jointchain(joint(sigma = Lebesgue(posreals)), pars -> ({reified})(sigma = pars.sigma))\n\
+             prior = jointchain(sigma = Lebesgue(posreals), b = {reified})\n\
              {point}lp = logdensityof(prior, p)"
         ));
         assert_eq!(chain, direct, "{reified}");
@@ -104,7 +104,7 @@ fn composed_record_sources_keep_nested_runtime_point_types() {
     let chain = lower(&format!(
         "sigma = elementof(posreals)\n\
          r ~ joint(a = Normal(0, sigma), b = iid(Exponential(1), 2))\n\
-         prior = jointchain(joint(sigma = Lebesgue(posreals)), (pars -> kernelof((r = r), sigma)(sigma = pars.sigma)))\n\
+         prior = jointchain(sigma = Lebesgue(posreals), r = kernelof(r, sigma))\n\
          {point}lp = logdensityof(prior, p)"
     ));
     let direct = lower(&format!(
@@ -119,7 +119,7 @@ fn typed_point_vector_length_mismatch_still_refuses() {
     let mut module = flatppl_syntax::parse(
         "sigma = elementof(posreals)\n\
          b ~ iid(Normal(0, sigma), 2)\n\
-         prior = jointchain(joint(sigma = Lebesgue(posreals)), (pars -> kernelof((b = b), sigma)(sigma = pars.sigma)))\n\
+         prior = jointchain(sigma = Lebesgue(posreals), b = kernelof(b, sigma))\n\
          p = elementof(cartprod(sigma = posreals, b = cartpow(reals, 3)))\n\
          lp = logdensityof(prior, p)",
     )
@@ -163,7 +163,7 @@ fn repeated_scores_keep_their_own_conditioning_points() {
     let chain = lower(
         "sigma ~ Exponential(2)\n\
          b ~ Normal(0, sigma)\n\
-         prior = jointchain(lawof((sigma = sigma)), (pars -> kernelof((b = b), sigma)(sigma = pars.sigma)))\n\
+         prior = jointchain(sigma = lawof(sigma), b = kernelof(b, sigma))\n\
          first = logdensityof(prior, (sigma = 2, b = 1))\n\
          second = logdensityof(prior, (sigma = 3, b = 4))\n\
          lp = first + second",

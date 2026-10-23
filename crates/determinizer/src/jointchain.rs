@@ -39,13 +39,16 @@ pub(crate) fn lower_jointchain(
     node: NodeId,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
+    if let Some(components) = keyword_components(m, node) {
+        return lower_keyword_family(m, node, &components, v);
+    }
     let args: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "jointchain")
             .ok_or_else(|| refuse_jc(node, "expected jointchain"))?;
         if !c.named.is_empty() {
             return Err(refuse_jc(
                 node,
-                "keyword-form jointchain (named components) is not lowered",
+                "a jointchain with both positional and keyword components is not lowered",
             ));
         }
         if c.args.len() < 2 {
@@ -83,6 +86,10 @@ pub(crate) fn lower_jointchain(
 /// any other keep drops a depended-upon variate — the intractable `kchain`
 /// integral — and must refuse.
 pub(crate) fn record_variate_fields(m: &Module, node: NodeId) -> Option<Vec<Symbol>> {
+    if let Some(components) = keyword_components(m, node) {
+        return (components.len() >= 2)
+            .then(|| components.iter().map(|(label, _)| *label).collect());
+    }
     let args: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "jointchain")?;
         if !c.named.is_empty() || c.args.len() < 2 {
@@ -203,6 +210,96 @@ fn lower_record_family(
         env.extend(values);
     }
 
+    Ok(fold_add(m, &terms))
+}
+
+/// The `(label, component)` pairs of a keyword-form `jointchain(name1 = M, name2 = K1, ...)`,
+/// `None` for any other call.
+pub(crate) fn keyword_components(m: &Module, node: NodeId) -> Option<Vec<(Symbol, NodeId)>> {
+    let c = expect_builtin_call(m, node, "jointchain")?;
+    if !c.args.is_empty() || c.named.is_empty() {
+        return None;
+    }
+    Some(c.named.iter().map(|arg| (arg.name, arg.value)).collect())
+}
+
+/// The chain over the first `k` components of the jointchain `node`: the sub-chain whose
+/// density is the marginal of a dependency-respecting prefix.
+pub(crate) fn prefix_chain(m: &mut Module, node: NodeId, k: usize) -> Option<NodeId> {
+    let call = expect_builtin_call(m, node, "jointchain")?.clone();
+    let sym = m.intern("jointchain");
+    Some(m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(sym),
+        args: call.args.iter().copied().take(k).collect(),
+        named: call.named.iter().copied().take(k).collect(),
+        inputs: None,
+    })))
+}
+
+/// Keyword form (spec §06 "Keyword form"): the variate is the record of the labelled
+/// component variates, and "each later kernel receives the record of the preceding
+/// named variates, bound to its inputs by name for any number of inputs, so
+/// `jointchain(a = M, b = K)` calls `K(a = a)`". The density is the product of the
+/// conditionals: each component scored at its label's field of the point, a kernel
+/// applied to the preceding fields its inputs name.
+fn lower_keyword_family(
+    m: &mut Module,
+    node: NodeId,
+    components: &[(Symbol, NodeId)],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let value = materialize_record_value(m, v);
+    let point = expect_builtin_call(m, value, "record")
+        .filter(|call| call.args.is_empty())
+        .ok_or_else(|| refuse_jc(node, "keyword-form jointchain point must be a record"))?
+        .named
+        .to_vec();
+    let mut env: Vec<(Symbol, NodeId)> = Vec::new();
+    let mut terms = Vec::with_capacity(components.len());
+    for (i, &(label, component)) in components.iter().enumerate() {
+        if env.iter().any(|(name, _)| *name == label) {
+            return Err(refuse_jc(node, "jointchain labels are not distinct"));
+        }
+        let variate = lookup_field(m, &point, label)
+            .ok_or_else(|| refuse_jc(node, "point is missing a component's labelled variate"))?;
+        let measure = if i == 0 {
+            component
+        } else {
+            let (resolved, _) = resolve_ref_chain(m, component);
+            if !matches!(m.type_of(resolved), Some(Type::Kernel { .. })) {
+                return Err(refuse_jc(
+                    node,
+                    "jointchain component is not a transition kernel",
+                ));
+            }
+            let kernel = resolve_reified(m, component)
+                .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
+            let named = kernel
+                .inputs
+                .iter()
+                .map(|(input, _)| {
+                    env.iter()
+                        .find(|(name, _)| name == input)
+                        .map(|&(name, value)| flatppl_core::NamedArg {
+                            kind: NamedKind::Kwarg,
+                            name,
+                            value,
+                        })
+                        .ok_or_else(|| {
+                            refuse_jc(node, "a kernel input names no preceding labelled variate")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            m.alloc(Node::Call(Call {
+                head: CallHead::User(component),
+                args: Box::new([]),
+                named: named.into(),
+                inputs: None,
+            }))
+        };
+        terms.push(lower_measure_density(m, measure, variate)?);
+        env.push((label, variate));
+    }
     Ok(fold_add(m, &terms))
 }
 

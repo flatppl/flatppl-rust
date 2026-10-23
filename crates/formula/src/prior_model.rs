@@ -68,8 +68,11 @@ pub(crate) fn build(b: &mut Builder<'_>, parameters: &[ParameterPrior]) -> Resul
     // A reference factor may depend on a proper scale, or a proper law may
     // depend on an improper location. Bind the preceding coordinates explicitly
     // rather than relying on matching names to condition a measure product.
+    // The keyword form of `jointchain` (spec §06 "Keyword form") labels each component's
+    // variate by its parameter name, and each later kernel receives the record of the
+    // preceding variates, bound to its inputs by name, so no adapter is needed.
     let mut done = HashSet::new();
-    let mut chain = Vec::new();
+    let mut chain: Vec<(&str, NodeId)> = Vec::new();
     while done.len() < factors.len() {
         let ready: Vec<_> = factors
             .iter()
@@ -79,27 +82,27 @@ pub(crate) fn build(b: &mut Builder<'_>, parameters: &[ParameterPrior]) -> Resul
         if ready.is_empty() {
             return Err(Error("prior parameters have cyclic dependencies".into()));
         }
-        let measure = group(b, ready.iter().map(|(_, factor)| *factor).collect(), false);
-        let component = if chain.is_empty() {
-            measure
-        } else {
-            let inputs = names
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| done.contains(i))
-                .map(|(_, name)| name.clone())
-                .collect::<Vec<_>>();
-            let kernel = parameter_function(b, "functionof", measure, &inputs);
-            if inputs.len() == 1 {
-                b.record_adapter(kernel, &inputs)
+        for (_, factor) in &ready {
+            let measure = if factor.proper {
+                let value = b.self_ref(factor.name);
+                b.call("lawof", &[value])
             } else {
-                kernel
-            }
-        };
-        chain.push(component);
+                factor.measure
+            };
+            let component = if chain.is_empty() {
+                measure
+            } else {
+                let inputs = chain
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect::<Vec<_>>();
+                parameter_function(b, "functionof", measure, &inputs)
+            };
+            chain.push((factor.name, component));
+        }
         done.extend(ready.into_iter().map(|(i, _)| i));
     }
-    Ok(b.call("jointchain", &chain))
+    Ok(b.call_kw("jointchain", &chain))
 }
 
 fn group(b: &mut Builder<'_>, factors: Vec<&Factor<'_>>, named: bool) -> NodeId {

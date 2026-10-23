@@ -19,8 +19,8 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
 fn jointchain_record_single_step() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
-j = jointchain(lawof(record(a = a)), pars -> k(a = pars.a))
+k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+j = jointchain(a = lawof(a), b = k)
 lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -56,24 +56,40 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     );
 }
 
-// Keyword-form jointchain (named components) carries relabel semantics not yet
-// lowered — refuse, don't mislower.
+// Keyword-form jointchain (spec §06 "Keyword form"): each later kernel receives the record
+// of the preceding named variates, bound to its inputs by name, so
+// `jointchain(prior = lawof(a), fwd = k)` with `k`'s input `a` mismatching the label
+// `prior` is a static error, and `jointchain(a = ..., fwd = k)` calls `k(a = a)`.
 #[test]
-fn jointchain_keyword_form_refuses() {
+fn jointchain_keyword_form_binds_kernel_inputs_by_label() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
-j = jointchain(prior = lawof(record(a = a)), fwd = k)
-lp = logdensityof(j, record(prior = record(a = 0.3), fwd = record(b = 0.7)))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("keyword-form jointchain must refuse");
+k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+j = jointchain(a = lawof(a), fwd = k)
+lp = logdensityof(j, record(a = 0.3, fwd = 0.7))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(pir.matches("builtin_logdensityof").count(), 2, "{pir}");
+    assert!(pir.contains("(%field mu 0.3)"), "k(a = 0.3):\n{pir}");
+    assert!(pir.contains(" 0.7)"), "fwd scored at 0.7:\n{pir}");
+}
+
+#[test]
+fn jointchain_keyword_form_input_naming_no_label_is_a_static_error() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+j = jointchain(prior = lawof(a), fwd = k)
+lp = logdensityof(j, record(prior = 0.3, fwd = 0.7))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let errors: Vec<_> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
     assert!(
-        err.construct.contains("jointchain"),
-        "names jointchain: {err:?}"
-    );
-    assert!(
-        err.reason.contains("keyword-form"),
-        "explains keyword-form: {err:?}"
+        errors
+            .iter()
+            .any(|d| d.message.contains("names no preceding component")),
+        "{errors:?}"
     );
 }
 
@@ -84,7 +100,7 @@ fn jointchain_record_base_scalar_kernel_refuses() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
-j = jointchain(lawof(record(a = a)), pars -> k(a = pars.a))
+j = jointchain(lawof(record(a = a)), k)
 lp = logdensityof(j, record(a = 0.3, b = 0.7))";
     let m = parse_infer(src);
     let err = determinize(&m).expect_err("record base + scalar kernel step must refuse, not panic");
@@ -102,9 +118,9 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7))";
 fn jointchain_record_multi_step() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-k1 = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
-k2 = kernelof(record(c = draw(Normal(mu = _b_, sigma = 0.25))), b = _b_)
-j = jointchain(lawof(record(a = a)), pars -> k1(a = pars.a), pars -> k2(b = pars.b))
+k1 = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+k2 = kernelof(draw(Normal(mu = _b_, sigma = 0.25)), b = _b_)
+j = jointchain(a = lawof(a), b = k1, c = k2)
 lp = logdensityof(j, record(a = 0.3, b = 0.7, c = 1.1))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
