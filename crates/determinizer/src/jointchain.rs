@@ -149,6 +149,39 @@ fn record_fields(m: &Module, node: NodeId) -> Option<Vec<Symbol>> {
     }
 }
 
+/// The components of `joint(K1, K2, ...)` / `joint(n1 = K1, ...)` when `node` is such a joint
+/// kernel (spec §06 "Joint measures": a kernel that fans its input out to every component),
+/// as `(label, component)` pairs, the label being `None` in the positional form.
+fn joint_kernel(m: &Module, node: NodeId) -> Option<Vec<(Option<Symbol>, NodeId)>> {
+    let (resolved, _) = resolve_ref_chain(m, node);
+    if !matches!(m.type_of(resolved), Some(Type::Kernel { .. })) {
+        return None;
+    }
+    let call = expect_builtin_call(m, resolved, "joint")?;
+    let mut components: Vec<_> = call.args.iter().map(|&arg| (None, arg)).collect();
+    components.extend(call.named.iter().map(|arg| (Some(arg.name), arg.value)));
+    (call.args.is_empty() || call.named.is_empty()).then_some(components)
+}
+
+/// The variate fields of a joint kernel: the labels of the keyword form, or the fields of
+/// every component, in order, for the positional form. `None` unless every component's
+/// variate is a record.
+fn joint_kernel_fields(m: &Module, node: NodeId) -> Option<Vec<Symbol>> {
+    let components = joint_kernel(m, node)?;
+    if components.iter().all(|(label, _)| label.is_some()) {
+        return Some(components.iter().filter_map(|(label, _)| *label).collect());
+    }
+    let mut fields = Vec::new();
+    for (_, component) in components {
+        let own = match resolve_reified(m, component) {
+            Some(kernel) => record_fields(m, kernel.body),
+            None => joint_kernel_fields(m, component).or_else(|| record_fields(m, component)),
+        }?;
+        fields.extend(own);
+    }
+    Some(fields)
+}
+
 /// Score each record component through the ordinary measure dispatcher. Named
 /// applications retain kernel conditioning and simultaneous boundary substitution.
 fn lower_record_family(
@@ -176,8 +209,16 @@ fn lower_record_family(
                     "jointchain component is not a transition kernel",
                 ));
             }
-            let kernel = resolve_reified(m, component)
-                .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
+            let fields = match resolve_reified(m, component) {
+                Some(kernel) => record_fields(m, kernel.body),
+                None if joint_kernel(m, component).is_some() => joint_kernel_fields(m, component),
+                None => {
+                    return Err(refuse_jc(
+                        node,
+                        "jointchain kernel is not a reified callable",
+                    ));
+                }
+            };
             let prior = build_record(m, &env);
             let applied = m.alloc(Node::Call(Call {
                 head: CallHead::User(component),
@@ -185,7 +226,7 @@ fn lower_record_family(
                 named: Box::default(),
                 inputs: None,
             }));
-            (applied, record_fields(m, kernel.body))
+            (applied, fields)
         };
         let fields = fields.ok_or_else(|| {
             refuse_jc(
@@ -272,8 +313,12 @@ fn lower_keyword_family(
                     "jointchain component is not a transition kernel",
                 ));
             }
-            resolve_reified(m, component)
-                .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
+            if resolve_reified(m, component).is_none() && joint_kernel(m, component).is_none() {
+                return Err(refuse_jc(
+                    node,
+                    "jointchain kernel is not a reified callable",
+                ));
+            }
             // The kernel receives the record of the preceding labelled variates by the
             // ordinary call; the engine decides between splat and whole.
             let prior = build_record(m, &env);

@@ -53,3 +53,48 @@ fn a_field_that_names_no_input_refuses() {
     .unwrap_err();
     assert!(err.contains("missing a kernel input"), "{err}");
 }
+
+// A one-input kernel with an improper or a proper scalar prior, as the record the spec asks
+// for. The closed-form values at theta = 0.3, scored through flatppl-js on the determinized
+// module: `joint(theta = Normal(0, 1))` is log N(0.5; 0.3, 1) + log N(0.3; 0, 1) =
+// -1.9028770664093453 (-1.9028770664093457 scored); `joint(theta = Lebesgue(posreals))` is
+// log N(0.5; 0.3, 1) + 0 = -0.9389385332046727 (-0.9389385332046728 scored).
+#[test]
+fn a_one_input_kernel_scores_a_scalar_prior_held_in_a_record() {
+    let proper = lower(&format!(
+        "{ONE_INPUT}post = bayesupdate(L, joint(theta = Normal(mu = 0.0, sigma = 1.0)))\n\
+         lp = logdensityof(post, record(theta = 0.3))"
+    ))
+    .unwrap();
+    assert_eq!(
+        proper.matches("builtin_logdensityof").count(),
+        2,
+        "{proper}"
+    );
+    assert!(
+        proper.contains("(%field mu 0.3) (%field sigma 1.0))) 0.5)"),
+        "{proper}"
+    );
+    assert!(
+        proper.contains("(%field mu 0.0) (%field sigma 1.0))) 0.3)"),
+        "{proper}"
+    );
+    let improper = lower(&format!(
+        "{ONE_INPUT}post = bayesupdate(L, joint(theta = Lebesgue(posreals)))\n\
+         lp = logdensityof(post, record(theta = 0.3))"
+    ))
+    .unwrap();
+    assert_eq!(
+        improper.matches("builtin_logdensityof").count(),
+        1,
+        "{improper}"
+    );
+    assert!(
+        improper.contains("(%field mu 0.3) (%field sigma 1.0))) 0.5)"),
+        "{improper}"
+    );
+    assert!(
+        improper.contains("posreals"),
+        "the support gate remains: {improper}"
+    );
+}

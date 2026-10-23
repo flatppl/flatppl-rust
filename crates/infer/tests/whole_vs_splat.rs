@@ -299,3 +299,35 @@ L = joint_likelihood(likelihoodof(K1, record(a = 0.1)), likelihoodof(K2, record(
         &["no input named `nu`"],
     );
 }
+
+#[test]
+fn a_bare_scalar_prior_is_no_prior_for_a_one_input_likelihood() {
+    // Spec §06 `likelihoodof`: the point is `record(theta = ..)`, not `theta`, so a prior
+    // whose variate is the bare scalar does not fit, whatever the measure or the kernel's
+    // spelling. The posterior's prior is a record: `joint(theta = ..)`.
+    let kernels = [
+        ONE_BOUNDARY,
+        "theta = elementof(reals)\nK = kernelof(draw(Normal(mu = theta, sigma = 1.0)), theta = theta)\n",
+    ];
+    for kernel in kernels {
+        for prior in [
+            "Normal(mu = 0.0, sigma = 1.0)",
+            "Lebesgue(posreals)",
+            "normalize(Lebesgue(unitinterval))",
+        ] {
+            assert_refused(
+                &format!("{kernel}L = likelihoodof(K, 0.5)\npost = bayesupdate(L, {prior})\n"),
+                &[
+                    "bayesupdate",
+                    "prior's variate is real",
+                    "record(theta = ..)",
+                ],
+            );
+        }
+        assert_clean(&format!(
+            "{kernel}L = likelihoodof(K, 0.5)\n\
+             post = bayesupdate(L, joint(theta = Lebesgue(posreals)))\n\
+             lp = logdensityof(post, record(theta = 0.3))\n"
+        ));
+    }
+}

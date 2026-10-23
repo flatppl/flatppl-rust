@@ -358,6 +358,54 @@ outputs = (score)\n";
     );
 }
 
+/// Emit the LogDensity function of `src`, whose `lp` is its output.
+fn emit_log_density(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let roots: Vec<_> = ["inputs", "outputs", "lp"]
+        .into_iter()
+        .map(|name| m.intern(name))
+        .collect();
+    let d = flatppl_determinizer::determinize_with_roots(
+        &m,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+    )
+    .unwrap();
+    flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap()
+}
+
+/// A `joint(K1, K2)` kernel as a `jointchain` step (spec §06 "Joint measures") emits the
+/// program of the direct factorization: the base terms, then each component's Normal at
+/// the point read from the preceding variates. Scored through flatppl-js on the
+/// determinized module at (a = 0.5, b = 0.25, p = 0.4, q = 0.9): -3.921066632818691
+/// (closed form -3.9210666328186905).
+#[test]
+fn a_joint_kernel_chain_step_emits_the_direct_factorization() {
+    let inputs = "pa = elementof(reals)\npb = elementof(reals)\npp = elementof(reals)\n\
+                  pq = elementof(reals)\ninputs = (pa, pb, pp, pq)\noutputs = lp\n";
+    let chain = emit_log_density(&format!(
+        "x = draw(Normal(mu = 0.0, sigma = 1.0))\ny = draw(Normal(mu = 1.0, sigma = 2.0))\n\
+         a = elementof(reals)\nb = elementof(reals)\n\
+         K1 = kernelof(draw(Normal(mu = a, sigma = 1.0)))\n\
+         K2 = kernelof(draw(Normal(mu = a + b, sigma = 0.5)))\n\
+         J = joint(p = K1, q = K2)\njc = jointchain(lawof(record(a = x, b = y)), J)\n\
+         {inputs}lp = logdensityof(jc, record(a = pa, b = pb, p = pp, q = pq))\n"
+    ));
+    let direct = emit_log_density(&format!(
+        "{inputs}lp = (logdensityof(Normal(mu = 0.0, sigma = 1.0), pa) \
+         + logdensityof(Normal(mu = 1.0, sigma = 2.0), pb)) \
+         + (logdensityof(Normal(mu = pa, sigma = 1.0), pp) \
+         + logdensityof(Normal(mu = pa + pb, sigma = 0.5), pq))\n"
+    ));
+    assert_eq!(chain, direct);
+}
+
 /// A placeholder node to hang a `set_type` on — its `Node` payload is
 /// irrelevant to `mlir_type_of`, which only reads the type side-table.
 fn placeholder(m: &mut Module, ty: Type) -> flatppl_core::NodeId {
