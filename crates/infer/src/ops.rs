@@ -6611,22 +6611,14 @@ fn broadcast_type(
     // operands, neither iterated nor held constant, because broadcasting over them stays
     // open for later. A table row reaching the callable as a record is unaffected: a table
     // operand is a collection of rows, each passed under the callable's own call rule.
-    //
-    // The `builtin_*` evaluation primitives of §07 take a record as their `kernel_input`
-    // argument, and the determinizer's own lowering broadcasts them over a point with that
-    // record shared (FlatPDL, not source), so a bare `builtin_*` head is exempt.
-    let primitive = matches!(inf.module.node(resolve_binding_refs(inf, head_node)),
-        Node::Const(name) if inf.module.resolve(*name).starts_with("builtin_"));
-    if !primitive
-        && let Some(ty) = refuse_aggregate_operand(
-            inf,
-            "broadcast",
-            args[1..]
-                .iter()
-                .map(|(node, ty, _)| (*node, ty))
-                .chain(named.iter().map(|(_, node, ty, _)| (*node, ty))),
-        )
-    {
+    if let Some(ty) = refuse_aggregate_operand(
+        inf,
+        "broadcast",
+        args[1..]
+            .iter()
+            .map(|(node, ty, _)| (*node, ty))
+            .chain(named.iter().map(|(_, node, ty, _)| (*node, ty))),
+    ) {
         return Ready(ty);
     }
 

@@ -119,6 +119,11 @@ fn record_and_tuple_operands_of_broadcast_are_a_static_error_for_every_head() {
         ("broadcast(add, [1.0, 2.0], r)", "a record"),
         ("Normal.([0.0, 1.0], r)", "a record"),
         ("broadcast(Normal, r, [1.0, 2.0])", "a record"),
+        // No head is exempt, the §07 evaluation primitives included.
+        (
+            "broadcast(builtin_logdensityof, Normal, r, [0.0, 1.0])",
+            "a record",
+        ),
         ("broadcast(f, (1.0, 2.0), 10.0)", "a tuple"),
         ("broadcast(f, x = t, p = 10.0)", "a tuple"),
         ("broadcasted(f)(t, 10.0)", "a tuple"),
@@ -141,12 +146,6 @@ fn record_and_tuple_operands_of_broadcast_are_a_static_error_for_every_head() {
     assert_clean(
         "f(r) = r.a + r.b\ng(a, b) = a + b\nt = table(a = [1.0, 2.0], b = [3.0, 4.0])\n\
          z = broadcast(f, t)\nw = broadcast(g, t)\nv = broadcasted(g)(t)\nu = f.(t)\n",
-    );
-    // The §07 evaluation primitives take a record as their `kernel_input`, and the
-    // determinizer emits them broadcast over a point with it shared.
-    assert_clean(
-        "r = record(a = 1.0, b = 2.0)\n\
-         z = broadcast(builtin_logdensityof, Normal, r, [0.0, 1.0])\n",
     );
 }
 
