@@ -54,7 +54,7 @@ fn likelihood_factors_project_a_shared_point_but_ordinary_calls_are_exact() {
 #[test]
 fn record_adapter_keeps_the_normal_normal_marginal_closed_form() {
     let actual = lowered(
-        "z~Normal(0,2)\nK(z)=Normal(z,1)\nM=kchain(lawof((z=z)),pars -> K(z=pars.z))\noutputs=logdensityof(M,0.5)",
+        "z~Normal(0,2)\nK(z)=Normal(z,1)\nM=kchain(lawof(z), K)\noutputs=logdensityof(M,0.5)",
     );
     let expected = lowered("outputs=logdensityof(Normal(0,sqrt(5.0)),0.5)");
     assert_eq!(actual, expected);

@@ -158,7 +158,7 @@ step_kernel(prev, sigma) = Normal(mu = prev, sigma = sigma)
 x ~ markovchain(step_kernel, 0.0, 3, sigma_step)
 prior = lawof(record(sigma_step = sigma_step))
 forward_kernel = kernelof(record(x = x), sigma_step = sigma_step)
-L = likelihoodof(pars -> forward_kernel(sigma_step = pars.sigma_step), record(x = [0.1, 0.2, 0.3]))
+L = likelihoodof(forward_kernel, record(x = [0.1, 0.2, 0.3]))
 posterior = bayesupdate(L, prior)
 lp = logdensityof(posterior, record(sigma_step = 0.7))";
     let pir = lower(src);

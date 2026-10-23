@@ -791,11 +791,6 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
             named: Box::new([]),
             inputs: Some(Inputs::Spec(inputs)),
         }));
-        let kernel = if terms.observation_params.len() == 1 {
-            b.record_adapter(kernel, &terms.observation_params)
-        } else {
-            kernel
-        };
         all.push(b.call("likelihoodof", &[kernel, observed]));
     }
     all.extend(crate::auxiliary::likelihoods(b, &terms.constraints));

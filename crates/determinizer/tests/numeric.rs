@@ -1020,7 +1020,7 @@ mu_a = elementof(reals)
 run = joint(a = Normal(mu = mu_a, sigma = 1.0), b = Normal(mu = 0.0, sigma = 2.0))
 tab ~ iid(run, 2)
 L = likelihoodof(kernelof(record(tab = tab), mu_a = mu_a), record(tab = tab_obs))
-lp = logdensityof(L, 0.3)";
+lp = logdensityof(L, record(mu_a = 0.3))";
     let m = parse_infer(src);
     let out = determinize(&m).expect("must lower");
     let pir = flatppl_flatpir::write(&out);
@@ -1091,7 +1091,7 @@ fn conditioning_is_scoped_to_the_declaring_reification() {
 z ~ Normal(mu = 0.0, sigma = 1.0)
 L = likelihoodof(kernelof(record(y = y), z = z), record(y = 0.4))
 y ~ Normal(mu = z, sigma = 1.0)
-lp = logdensityof(L, 0.2)";
+lp = logdensityof(L, record(z = 0.2))";
     let m = parse_infer(src);
     let out = determinize(&m).expect("the declared-input query must lower");
     let printed = flatppl_syntax::print(&out);
