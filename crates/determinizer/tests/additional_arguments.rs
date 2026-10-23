@@ -192,3 +192,18 @@ fn kscan_holds_scalar_and_record_inputs_constant_at_every_step() {
         "{got}"
     );
 }
+
+#[test]
+fn fchain_passes_a_fed_record_whole_when_it_has_additional_arguments() {
+    // Spec §06: each later step "receives its fed value whole as its first argument".
+    // f1 feeds record(a = 1, b = 10); f2(r, p) reads r.a + r.b + p = 1 + 10 + 10.
+    let out = pir(
+        "f1(x, p) = record(a = x, b = p)\nf2(r, p) = r.a + r.b + p\n\
+         c = fchain(f1, f2)\nr = c(1.0, 10.0)",
+    );
+    assert!(out.contains("(%bind r") && out.contains("21.0"), "{out}");
+    // Without additional arguments the fed record still splats onto `f2(a, b)`: 1 + 2.
+    let out =
+        pir("f1(x) = record(a = x, b = 2.0)\nf2(a, b) = a + b\nc = fchain(f1, f2)\nr = c(1.0)");
+    assert!(out.contains("(%bind r") && out.contains("3.0"), "{out}");
+}
