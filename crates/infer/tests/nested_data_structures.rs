@@ -39,7 +39,9 @@ fn nested_record_type_and_valueset() {
         "record-of-record should nest in the type, got:\n{out}"
     );
     assert!(
-        out.contains("(record (a (record (b reals) (c integers))) (d reals))"),
+        out.contains(
+            "(cartprod (%field a (cartprod (%field b reals) (%field c integers))) (%field d reals))"
+        ),
         "record-of-record should nest in the value-set, got:\n{out}"
     );
 }
@@ -110,7 +112,7 @@ fn table_with_array_valued_column() {
         "array-valued column should keep its 3-vector element, got:\n{out}"
     );
     assert!(
-        out.contains("(cartpow (record (a reals) (b (cartpow reals 3))) 2)"),
+        out.contains("(cartpow (cartprod (%field a reals) (%field b (cartpow reals 3))) 2)"),
         "table value-set is cartpow(rowRecord, nrows); got:\n{out}"
     );
 }
@@ -130,7 +132,7 @@ fn table_with_table_valued_column() {
         "table-valued column should store the sub-table row record, got:\n{out}"
     );
     assert!(
-        out.contains("(cartpow (record (id integers) (hits (record (x reals) (y reals)))) 2)"),
+        out.contains("(cartpow (cartprod (%field id integers) (%field hits (cartprod (%field x reals) (%field y reals)))) 2)"),
         "table value-set is cartpow(rowRecord, nrows), row nests a record-of-records; got:\n{out}"
     );
 }

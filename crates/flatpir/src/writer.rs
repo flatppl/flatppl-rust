@@ -291,7 +291,7 @@ fn render_mass(mass: Mass) -> &'static str {
 
 /// A value set renders as its FlatPPL set expression (bare set constants,
 /// `(stdsimplex n)`, `(ordered n)`, `(zerosum n)`, `(interval lo hi)`,
-/// `(cartpow set n)`).
+/// `(cartpow set n)`, `(cartprod set...)` and the keyword `(cartprod (%field name set)...)`).
 fn render_valueset(module: &Module, set: &ValueSet) -> String {
     match set {
         ValueSet::Deferred => "%deferred".to_string(),
@@ -325,11 +325,19 @@ fn render_valueset(module: &Module, set: &ValueSet) -> String {
             format!("(cartprod {})", inner.join(" "))
         }
         ValueSet::RecordSet(fields) => {
+            // Keyword `cartprod` lowers with `(%field ...)` entries (spec §11 "Structural
+            // named entries"); the `record` head builds a value, not a set.
             let inner: Vec<String> = fields
                 .iter()
-                .map(|(n, s)| format!("({} {})", module.resolve(*n), render_valueset(module, s)))
+                .map(|(n, s)| {
+                    format!(
+                        "(%field {} {})",
+                        module.resolve(*n),
+                        render_valueset(module, s)
+                    )
+                })
                 .collect();
-            format!("(record {})", inner.join(" "))
+            format!("(cartprod {})", inner.join(" "))
         }
     }
 }

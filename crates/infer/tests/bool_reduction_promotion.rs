@@ -135,7 +135,7 @@ fn a_boolean_table_column_sums_as_integer() {
         "a boolean column's sum must be integer; got: {line}"
     );
     assert!(
-        line.contains("(flag integers)"),
+        line.contains("(%field flag integers)"),
         "and its value-set must be integers; got: {line}"
     );
     assert!(

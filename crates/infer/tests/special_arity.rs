@@ -293,7 +293,7 @@ fn load_data_is_an_ordinary_builtin_not_a_special_operation() {
     // all three give the same type — the member of the declared `valueset`.
     let want = "(%bind d (%meta ((%table (%columns (a (%scalar real)) \
                 (b (%scalar real))) (%nrows 4)) %fixed \
-                (cartpow (record (a reals) (b reals)) 4))";
+                (cartpow (cartprod (%field a reals) (%field b reals)) 4))";
     for src in [
         "d = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))\n",
         "d = load_data(source = \"x.csv\", \

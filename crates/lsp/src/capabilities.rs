@@ -1021,11 +1021,11 @@ mod tests {
             "expected a value-set line; got: {s:?}"
         );
         assert!(
-            s.contains("record(a: ") && s.contains("b: "),
+            s.contains("cartprod(a = ") && s.contains("b = "),
             "record value-set must show field names a/b; got: {s:?}"
         );
         assert!(
-            !s.contains("_: "),
+            !s.contains("_ = "),
             "record value-set must not render fields as `_`; got: {s:?}"
         );
     }

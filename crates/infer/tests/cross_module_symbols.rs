@@ -124,7 +124,7 @@ fn merged_cross_module_record_domain_keeps_its_field_names() {
         "the merged domain must keep the dependency's field names; got:\n{jb}"
     );
     assert!(
-        jb.contains("(record (zeta_alpha_uniq reals) (eta_beta_uniq reals) (loc_one reals))"),
+        jb.contains("(cartprod (%field zeta_alpha_uniq reals) (%field eta_beta_uniq reals) (%field loc_one reals))"),
         "the merged value-set must keep them too; got:\n{jb}"
     );
 }

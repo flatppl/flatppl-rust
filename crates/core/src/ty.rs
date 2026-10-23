@@ -453,8 +453,8 @@ impl fmt::Display for ValueSet {
                 write!(f, "cartprod({})", inner.join(", "))
             }
             RecordSet(fields) => {
-                let inner: Vec<String> = fields.iter().map(|(_, s)| format!("_: {s}")).collect();
-                write!(f, "record({})", inner.join(", "))
+                let inner: Vec<String> = fields.iter().map(|(_, s)| format!("_ = {s}")).collect();
+                write!(f, "cartprod({})", inner.join(", "))
             }
         }
     }

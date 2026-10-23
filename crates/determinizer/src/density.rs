@@ -4939,7 +4939,7 @@ fn refuse_truncation_set_kind_mismatch(
 ///
 /// The rendering is the §03 name for a predefined set, and otherwise the CANONICAL
 /// value-set rendering, which need not be what the user typed:
-/// `cartprod(a = interval(0, inf))` renders `record(a: interval(0, inf))`.
+/// `cartprod(a = interval(0, inf))` renders `cartprod(a = interval(0, inf))`.
 ///
 /// One level of ref indirection is resolved, so a preset set binding
 /// (`S = interval(0, 1)` … `truncate(M, S)`) is covered too.
