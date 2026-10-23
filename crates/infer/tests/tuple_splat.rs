@@ -112,18 +112,21 @@ fn splatting_is_shallow() {
 }
 
 #[test]
-fn a_tuple_point_is_checked_against_an_ordered_likelihood() {
+fn a_tuple_point_is_no_likelihood_point() {
+    // Spec §06 `likelihoodof`: the parameter point is a record bound to the inputs by
+    // name, so a tuple does not splat over an ordered likelihood.
     let model = "\
 a = elementof(reals)
 b = elementof(reals)
 K = functionof(Normal(mu = a, sigma = b), a = a, b = b)
 L = likelihoodof(K, 0.5)
 ";
-    assert_eq!(
-        errors(&format!("{model}lp = logdensityof(L, (0.1, 2.0))\n")),
-        Vec::<String>::new()
-    );
-    let found = errors(&format!("{model}lp = logdensityof(L, (0.1, 2.0, 3.0))\n"));
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("a tuple of 3 elements"), "{found:?}");
+    for point in ["(0.1, 2.0)", "(0.1, 2.0, 3.0)"] {
+        let found = errors(&format!("{model}lp = logdensityof(L, {point})\n"));
+        assert_eq!(found.len(), 1, "{point}: {found:?}");
+        assert!(
+            found[0].contains("the parameter point of a likelihood is a record"),
+            "{found:?}"
+        );
+    }
 }

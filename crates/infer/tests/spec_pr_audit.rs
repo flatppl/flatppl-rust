@@ -67,7 +67,7 @@ fn a_keyword_spelling_of_a_measure_combinators_input_is_refused() {
 fn the_positional_spellings_and_the_keyword_joint_stay_legal() {
     assert_clean(&format!(
         "{MODEL}a = normalize(mu)\nb = iid(mu, 3)\nc = truncate(mu, interval(0.0, 1.0))\n\
-         d = bayesupdate(L, mu)\n\
+         d = bayesupdate(L, joint(x = mu))\n\
          e = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Normal(mu = 1.0, sigma = 1.0))\n"
     ));
 }

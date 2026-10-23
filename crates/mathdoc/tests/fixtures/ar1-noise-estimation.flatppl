@@ -69,5 +69,5 @@ to 2e-13 across the relevant range, and the posterior below has mean
 0.8383 and sd 0.0546 against a quadrature oracle (see the header).
 %%%
 forward_kernel = kernelof(record(x = x), sigma_step = sigma_step)
-L = likelihoodof(pars -> forward_kernel(sigma_step = pars.sigma_step), record(x = x_data))
+L = likelihoodof(forward_kernel, record(x = x_data))
 posterior = bayesupdate(L, prior)

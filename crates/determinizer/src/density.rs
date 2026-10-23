@@ -777,34 +777,30 @@ fn lower_likelihood_query(
     if crate::kernel::resolve_reified(m, k).is_some()
         || matches!(m.type_of(k), Some(Type::Kernel { inputs, .. }) if !inputs.is_empty())
     {
-        // Likelihood factors project a shared named parameter point onto
-        // their own inputs. An ordered unary kernel takes the point whole.
-        let named = if let Some(kernel) = crate::kernel::resolve_reified(m, k)
-            && (kernel.auto || kernel.inputs.len() != 1)
-        {
-            kernel
-                .inputs
-                .iter()
-                .map(|(name, _)| {
-                    crate::kernel::record_field(m, theta, *name).map(|value| NamedArg {
-                        kind: NamedKind::Kwarg,
-                        name: *name,
-                        value,
-                    })
+        // Spec §06 `likelihoodof`: the parameter point is a record with one field per
+        // input of the kernel, bound to the inputs by name for any number of inputs, so a
+        // likelihood factor projects the shared point onto its own inputs by name.
+        let inputs: Vec<Symbol> = match crate::kernel::resolve_reified(m, k) {
+            Some(kernel) => kernel.inputs.iter().map(|(name, _)| *name).collect(),
+            None => match m.type_of(k) {
+                Some(Type::Kernel { inputs, .. }) => inputs.to_vec(),
+                _ => Vec::new(),
+            },
+        };
+        let named = inputs
+            .iter()
+            .map(|name| {
+                crate::kernel::record_field(m, theta, *name).map(|value| NamedArg {
+                    kind: NamedKind::Kwarg,
+                    name: *name,
+                    value,
                 })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| refuse(theta, m, "likelihood point is missing a kernel input"))?
-        } else {
-            Vec::new()
-        };
-        let args = if named.is_empty() {
-            vec![theta]
-        } else {
-            Vec::new()
-        };
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| refuse(theta, m, "likelihood point is missing a kernel input"))?;
         let applied = m.alloc(Node::Call(Call {
             head: CallHead::User(k),
-            args: args.into(),
+            args: Box::new([]),
             named: named.into(),
             inputs: None,
         }));

@@ -8,9 +8,11 @@
 //! or column that names no input is a static error.
 //!
 //! The checks here cover the places that apply the convention without a call
-//! expression: a likelihood point, the `bayesupdate` prior's variate, and the
-//! steps of `kchain` and `jointchain`. A user call is checked in `ops`, which
-//! uses [`whole_binding_mismatch`].
+//! expression: the steps of `kchain` and `jointchain`. A user call is checked in
+//! `ops`, which uses [`whole_binding_mismatch`]. The parameter point of a likelihood
+//! and the `bayesupdate` prior's variate do not follow the convention: spec §06
+//! `likelihoodof` binds the point, a record, to every input by name, one input
+//! included.
 
 use flatppl_core::{CallHead, Dim, Node, NodeId, RefNs, Symbol, Type};
 
@@ -160,20 +162,6 @@ pub(crate) fn whole_binding_mismatch(
     ))
 }
 
-/// The kernel behind a likelihood node: `K` in `likelihoodof(K, obs)`.
-fn likelihood_kernel(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<NodeId> {
-    let node = resolve_binding_refs(inf, node);
-    let Node::Call(call) = inf.module.node(node) else {
-        return None;
-    };
-    match call.head {
-        CallHead::Builtin(op) if inf.module.resolve(op) == "likelihoodof" => {
-            call.args.first().copied()
-        }
-        _ => None,
-    }
-}
-
 fn field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Option<Vec<(Symbol, String)>> {
     let fields = match ty {
         Type::Record(fields) => fields,
@@ -189,12 +177,9 @@ fn field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Option<Vec<(Symbol, Strin
 }
 
 /// `densityof(L, point)`, `logdensityof(L, point)` and `bayesupdate(L, prior)`
-/// apply the likelihood's kernel to the point, so the point follows the §04
-/// "Calling conventions" rule. For `bayesupdate` the point is the prior's variate.
-///
-/// A kernel taking one positional input receives a record point whole, and the
-/// input's declared domain must admit it. Any other kernel splats the point, and
-/// every field or column must name an input.
+/// evaluate the likelihood's kernel at the point. For `bayesupdate` the point is the
+/// prior's variate. The point is a record bound to the kernel's inputs by name, for
+/// any number of inputs (spec §06 `likelihoodof`); see [`check_point`].
 pub(crate) fn refuse_bad_likelihood_point(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
@@ -213,11 +198,11 @@ pub(crate) fn refuse_bad_likelihood_point(
         return None;
     }
     let at = args[1].0;
-    let (interface, kernel) = match interface(inf, *likelihood) {
-        Some(interface) => (interface, likelihood_kernel(inf, *likelihood)),
-        None => (joint_likelihood_interface(inf, &args[0])?, None),
+    let interface = match interface(inf, *likelihood) {
+        Some(interface) => interface,
+        None => joint_likelihood_interface(inf, &args[0])?,
     };
-    check_point(inf, name, what, at, kernel, &interface, &point_ty)
+    check_point(inf, name, what, at, &interface, &point_ty)
 }
 
 /// `joint_likelihood(L1, L2, ...)` is `L(θ) = L1(θ) + L2(θ)` and is equivalent to
@@ -226,9 +211,7 @@ pub(crate) fn refuse_bad_likelihood_point(
 /// so the result only supports keyword arguments" (§06 "Joint measures"), so a
 /// record point splats over that union when every term splats.
 ///
-/// `None` when a term takes one positional input (an adapter or a one-boundary
-/// kernel), which receives the shared point whole through its own interface, or
-/// when a term's interface is unknown: the union is not an interface then.
+/// `None` when a term's interface is unknown: the union is not an interface then.
 fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) -> Option<Interface> {
     let node = resolve_binding_refs(inf, likelihood.0);
     let Node::Call(call) = inf.module.node(node) else {
@@ -243,9 +226,6 @@ fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) ->
     let mut names: Vec<String> = Vec::new();
     for &term in call.args.iter() {
         let term_interface = interface(inf, term)?;
-        if term_interface.takes_one() {
-            return None;
-        }
         for name in term_interface.names {
             if !names.contains(&name) {
                 names.push(name);
@@ -255,72 +235,20 @@ fn joint_likelihood_interface(inf: &Inferencer<'_, '_>, likelihood: &ArgInfo) ->
     Some(Interface::required(names, false))
 }
 
+/// The parameter point of a likelihood is a record with one field per input of the
+/// kernel, "bound to those inputs by name for any number of inputs, so a kernel with
+/// the single input `mu` is evaluated at `record(mu = 1.0)`, not at `1.0`" (spec §06
+/// `likelihoodof`). A point of any other kind, a field that names no input, and an
+/// input without a field are each a located static error. An undecided type is
+/// never refused.
 fn check_point(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
     what: &str,
     at: NodeId,
-    kernel: Option<NodeId>,
     interface: &Interface,
     point: &Type,
 ) -> Option<Type> {
-    if interface.takes_one() {
-        let declared = kernel.map_or_else(Vec::new, |k| declared_input_types(inf, k));
-        let mismatch = whole_binding_mismatch(inf, &interface.names, &declared, point)?;
-        let adapter = if is_aggregate(point) {
-            let first = interface.names.first().map_or("x", String::as_str);
-            format!(
-                "; pass the value itself, or build the likelihood with an adapter such as \
-                 `likelihoodof(pars -> K({first} = pars.{first}), obs)`"
-            )
-        } else {
-            String::new()
-        };
-        inf.diags.push(crate::Diagnostic::error_at(
-            at,
-            format!("`{name}`: the {what} is {mismatch}{adapter}"),
-        ));
-        return Some(Type::Failed(
-            format!("{name}: the {what} is bound whole").into(),
-        ));
-    }
-    if let Type::Tuple(parts) = point {
-        // A tuple splats into positional arguments for ordered inputs, and "tuples
-        // with fewer elements than the callable's required inputs, or more than its
-        // inputs, are a static error" (spec §04 "Calling conventions").
-        if !interface.ordered || interface.arity.admits(parts.len()) {
-            return None;
-        }
-        inf.diags.push(crate::Diagnostic::error_at(
-            at,
-            format!(
-                "`{name}`: the {what} is a tuple of {} elements splatted over the likelihood \
-                 inputs ({}), which take {} (spec §04 \"Calling conventions\": tuples with \
-                 fewer elements than the required inputs, or more than the inputs, are a \
-                 static error)",
-                parts.len(),
-                interface
-                    .names
-                    .iter()
-                    .map(|n| format!("`{n}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                interface.arity.describe(),
-            ),
-        ));
-        return Some(Type::Failed(
-            format!("{name}: the {what} tuple does not fit the likelihood inputs").into(),
-        ));
-    }
-    let fields = field_names(inf, point)?;
-    let unknown: Vec<&str> = fields
-        .iter()
-        .map(|(_, n)| n.as_str())
-        .filter(|n| !interface.names.iter().any(|i| i == n))
-        .collect();
-    if unknown.is_empty() {
-        return None;
-    }
     let list = |names: &[&str]| {
         names
             .iter()
@@ -329,18 +257,64 @@ fn check_point(
             .join(", ")
     };
     let inputs: Vec<&str> = interface.names.iter().map(String::as_str).collect();
+    let Type::Record(_) = point else {
+        if matches!(
+            point,
+            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_)
+        ) {
+            return None;
+        }
+        let example = inputs.first().map_or_else(
+            || "record(x = 1.0)".to_string(),
+            |n| format!("record({n} = ..)"),
+        );
+        inf.diags.push(crate::Diagnostic::error_at(
+            at,
+            format!(
+                "`{name}`: the {what} is {}, but the parameter point of a likelihood is a \
+                 record with one field per input ({}), bound by name for any number of inputs \
+                 (spec §06 `likelihoodof`), so even a kernel with one input is evaluated at \
+                 `{example}`, not at the bare value",
+                show(inf, point),
+                list(&inputs),
+            ),
+        ));
+        return Some(Type::Failed(
+            format!("{name}: the {what} is not a record").into(),
+        ));
+    };
+    let fields = field_names(inf, point)?;
+    let unknown: Vec<&str> = fields
+        .iter()
+        .map(|(_, n)| n.as_str())
+        .filter(|n| !inputs.contains(n))
+        .collect();
+    let missing: Vec<&str> = inputs
+        .iter()
+        .copied()
+        .filter(|n| !fields.iter().any(|(_, f)| f == n))
+        .collect();
+    if unknown.is_empty() && missing.is_empty() {
+        return None;
+    }
+    let mut problems = Vec::new();
+    if !unknown.is_empty() {
+        problems.push(format!("has no input named {}", list(&unknown)));
+    }
+    if !missing.is_empty() {
+        problems.push(format!("has no field for the input {}", list(&missing)));
+    }
     inf.diags.push(crate::Diagnostic::error_at(
         at,
         format!(
-            "`{name}`: the {what} is splatted over the likelihood inputs ({}), but has no \
-             input named {} for its fields (spec §04 \"Calling conventions\": field or column \
-             names that do not match the callable's argument names are a static error)",
+            "`{name}`: the {what} is bound to the likelihood inputs ({}) by name, but {} (spec \
+             §06 `likelihoodof`: one field per input)",
             list(&inputs),
-            list(&unknown),
+            problems.join(" and "),
         ),
     ));
     Some(Type::Failed(
-        format!("{name}: the {what} names no likelihood input").into(),
+        format!("{name}: the {what} does not match the likelihood inputs").into(),
     ))
 }
 

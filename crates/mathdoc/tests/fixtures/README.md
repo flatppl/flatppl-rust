@@ -10,7 +10,8 @@ are not copied: as of that commit neither parses under spec §05 — one has two
 `fixtures/flatppl/` and fails on any row that fell back to source text.
 Refresh a copy from upstream when an example changes; cite the upstream commit.
 
-`ar1-noise-estimation`, `capture-recapture` and `poisson-model` take their
-likelihood line from `flatppl-examples@4e3fa55` (revised callable inputs: the
-adapter `pars -> forward_kernel(rcp = pars.rcp)` keeps the posterior's record
-variate); their other lines still predate that commit.
+`ar1-noise-estimation`, `capture-recapture` and `poisson-model` write the likelihood
+as `likelihoodof(forward_kernel, data)`: the parameter point of a likelihood is a
+record bound to the kernel's inputs by name, one input included (spec §06
+`likelihoodof`), so the posterior's record variate needs no adapter. Their other
+lines still predate `flatppl-examples@4e3fa55`.

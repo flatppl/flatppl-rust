@@ -842,7 +842,7 @@ fn kchain_discrete_bernoulli_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Bernoulli(p = 0.3))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
+pp = kchain(lawof(z), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -890,7 +890,7 @@ fn kchain_discrete_categorical_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Categorical(p = [0.2, 0.3, 0.5]))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
+pp = kchain(lawof(z), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -946,7 +946,7 @@ fn kchain_discrete_categorical0_latent_lowers_to_zero_based_atoms() {
     let src = "\
 z = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
+pp = kchain(lawof(z), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -1008,7 +1008,7 @@ fn kchain_discrete_binomial_latent_lowers_to_mass_weighted_logsumexp() {
     let src = "\
 z = draw(Binomial(n = 2, p = 0.5))
 k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
-pp = kchain(lawof(record(z = z)), pars -> k(z = pars.z))
+pp = kchain(lawof(z), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -1492,7 +1492,7 @@ fn bayesupdate_lowers_to_loglik_plus_logprior() {
 mu = elementof(reals)
 prior = joint(mu = Normal(mu = 0.0, sigma = 1.0))
 model = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
-L = likelihoodof(pars -> model(mu = pars.mu), 0.5)
+L = likelihoodof(model, 0.5)
 post = bayesupdate(L, prior)
 lp = logdensityof(post, record(mu = 0.3))";
     let pir = flatppl_flatpir::write(&determinize_src(src));

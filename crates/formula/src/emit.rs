@@ -143,11 +143,6 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let y = b.self_ref("y_data");
     let observation = b.call_fields("record", &[("y", y)]);
     let kernel = b.self_ref("K_model");
-    let kernel = if parameters.len() == 1 {
-        b.record_adapter(kernel, &parameters)
-    } else {
-        kernel
-    };
     let likelihood = b.call("likelihoodof", &[kernel, observation]);
     b.bind("L", likelihood);
     let pointwise = pointwise_log_likelihood(&mut b, recipe, scale);

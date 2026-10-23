@@ -84,7 +84,7 @@ y_obs = [1.1, 2.2, 2.9]\n\
 a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
 mu = a .+ x\n\
 y = draw(Normal.(mu, 0.5))\n\
-L = likelihoodof(pars -> kernelof(record(y = y), a = a)(a = pars.a), record(y = y_obs))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = y_obs))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
 aa = elementof(reals)\n\
 score = logdensityof(post, record(a = aa))\n\
@@ -339,7 +339,7 @@ fn invlogit_lowers_to_stablehlo_logistic() {
 a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
 p = invlogit(a)\n\
 y = draw(Bernoulli(p))\n\
-L = likelihoodof(pars -> kernelof(record(y = y), a = a)(a = pars.a), record(y = 1))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
 score = logdensityof(post, record(a = 0.7))\n\
 outputs = (score)\n";

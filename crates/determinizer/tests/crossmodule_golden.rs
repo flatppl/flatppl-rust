@@ -91,7 +91,7 @@ a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, 0.0)";
+lp = logdensityof(L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -134,7 +134,7 @@ center = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = center)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, 0.0)";
+lp = logdensityof(L, record(center = 0.0))";
 
     // Empty bundle: the `helpers.flatppl` dependency is not present.
     let bundle = ModuleBundle::new();
@@ -175,7 +175,7 @@ L = likelihoodof(functionof(Normal(mu = center, sigma = 1.0), center = center), 
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, 0.0)";
+lp = logdensityof(helpers.L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -259,7 +259,7 @@ flatppl_compat = \"0.1\"
 center = elementof(reals)
 scale = 10.0
 helpers = load_module(\"helpers.flatppl\", center = center)
-lp = logdensityof(helpers.L, 0.0)";
+lp = logdensityof(helpers.L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -296,7 +296,7 @@ L = likelihoodof(k, obs_data)";
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, 0.0)";
+lp = logdensityof(helpers.L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -348,7 +348,7 @@ L = likelihoodof(obs_kernel, input_data)";
 flatppl_compat = \"0.1\"
 a = elementof(reals)
 helpers = load_module(\"helpers.flatppl\", center = a)
-lp = logdensityof(helpers.L, 0.0)";
+lp = logdensityof(helpers.L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);
@@ -424,7 +424,7 @@ scale = 10.0
 helpers = load_module(\"helpers.flatppl\", center = center)
 input_data = 2.5
 L = likelihoodof(helpers.obs_kernel, input_data)
-lp = logdensityof(L, 0.0)";
+lp = logdensityof(L, record(center = 0.0))";
 
     let mut hmod = parse(helpers);
     let _ = flatppl_infer::infer(&mut hmod);

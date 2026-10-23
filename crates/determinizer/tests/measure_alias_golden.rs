@@ -223,14 +223,14 @@ fn bayesupdate_aliased_likelihood() {
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
 k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
-lik = likelihoodof(pars -> k(mu = pars.mu), [2.0, 3.0])
+lik = likelihoodof(k, [2.0, 3.0])
 post = bayesupdate(lik, prior)
 lp = logdensityof(post, record(mu = 1.0))",
         "\
 mu ~ Normal(mu = 0.0, sigma = 10.0)
 prior = lawof(record(mu = mu))
 k = functionof(iid(Normal(mu, 1.0), 2), mu = mu)
-lik = likelihoodof(pars -> k(mu = pars.mu), [2.0, 3.0])
+lik = likelihoodof(k, [2.0, 3.0])
 alias = lik
 post = bayesupdate(alias, prior)
 lp = logdensityof(post, record(mu = 1.0))",

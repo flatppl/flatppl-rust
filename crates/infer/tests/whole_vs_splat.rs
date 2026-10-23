@@ -1,6 +1,8 @@
 //! Spec §04 "Calling conventions": a callable that takes one positional input
 //! receives a sole record whole, one that does not splats it. The choice is made
-//! from the input interface, before the argument's domain is checked.
+//! from the input interface, before the argument's domain is checked. The parameter
+//! point of a likelihood is the exception: spec §06 `likelihoodof` binds it, a record,
+//! to every input by name, one input included.
 
 use flatppl_infer::{Severity, infer};
 
@@ -38,30 +40,28 @@ K = functionof(Normal(mu = a, sigma = b))
 ";
 
 #[test]
-fn a_record_point_is_bound_whole_to_a_one_boundary_likelihood() {
+fn a_record_point_is_bound_by_name_to_a_one_input_likelihood() {
+    // Spec §06 `likelihoodof`: the point is a record with one field per input, bound
+    // by name for any number of inputs, so a kernel with the single input `theta` is
+    // evaluated at `record(theta = 0.3)`, not at `0.3`.
+    assert_clean(&format!(
+        "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, record(theta = 0.3))\n"
+    ));
     assert_refused(
-        &format!(
-            "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, record(theta = 0.3))\n"
-        ),
+        &format!("{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, 0.3)\n"),
         &[
             "logdensityof",
-            "bound whole",
+            "the parameter point of a likelihood is a record",
             "`theta`",
-            "expects real",
-            "record(theta: real)",
+            "record(theta = ..)",
         ],
     );
-}
-
-#[test]
-fn a_value_point_and_an_adapter_are_admitted() {
-    assert_clean(&format!(
-        "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, 0.3)\n"
-    ));
-    assert_clean(&format!(
-        "{ONE_BOUNDARY}L = likelihoodof(pars -> K(theta = pars.theta), 0.5)\n\
-         lp = logdensityof(L, record(theta = 0.3))\n"
-    ));
+    assert_refused(
+        &format!(
+            "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, record(phi = 0.3))\n"
+        ),
+        &["no input named `phi`", "no field for the input `theta`"],
+    );
 }
 
 #[test]
@@ -82,13 +82,21 @@ fn a_keyword_only_callable_splats_a_record() {
 }
 
 #[test]
-fn a_splatted_likelihood_point_names_only_inputs() {
+fn a_likelihood_point_names_only_inputs() {
     assert_refused(
         &format!(
             "{KEYWORD_ONLY}L = likelihoodof(K, 0.5)\n\
              lp = logdensityof(L, record(a = 0.3, b = 1.0, c = 2.0))\n"
         ),
-        &["splatted", "`a`, `b`", "no input named `c`"],
+        &[
+            "bound to the likelihood inputs",
+            "`a`, `b`",
+            "no input named `c`",
+        ],
+    );
+    assert_refused(
+        &format!("{KEYWORD_ONLY}L = likelihoodof(K, 0.5)\nlp = logdensityof(L, record(a = 0.3))\n"),
+        &["no field for the input `b`"],
     );
 }
 
@@ -143,24 +151,28 @@ fn a_chain_record_splat_names_exactly_the_step_inputs() {
 }
 
 #[test]
-fn a_record_prior_variate_is_bound_whole_to_a_one_boundary_likelihood() {
+fn a_record_prior_variate_is_bound_by_name_to_a_one_input_likelihood() {
+    assert_clean(&format!(
+        "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\n\
+         prior = joint(theta = Normal(mu = 0.0, sigma = 1.0))\n\
+         post = bayesupdate(L, prior)\n"
+    ));
     assert_refused(
         &format!(
             "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\n\
-             prior = joint(theta = Normal(mu = 0.0, sigma = 1.0))\n\
+             prior = Normal(mu = 0.0, sigma = 1.0)\n\
              post = bayesupdate(L, prior)\n"
         ),
-        &["bayesupdate", "prior's variate", "bound whole", "`theta`"],
+        &[
+            "bayesupdate",
+            "prior's variate",
+            "the parameter point of a likelihood is a record",
+        ],
     );
-    assert_clean(&format!(
-        "{ONE_BOUNDARY}L = likelihoodof(K, 0.5)\n\
-         prior = Normal(mu = 0.0, sigma = 1.0)\n\
-         post = bayesupdate(L, prior)\n"
-    ));
 }
 
 #[test]
-fn a_splatted_prior_variate_names_only_inputs() {
+fn a_prior_variate_names_only_inputs() {
     assert_refused(
         &format!(
             "{KEYWORD_ONLY}L = likelihoodof(K, 0.5)\n\
@@ -170,7 +182,7 @@ fn a_splatted_prior_variate_names_only_inputs() {
         &[
             "bayesupdate",
             "prior's variate",
-            "splatted",
+            "bound to the likelihood inputs",
             "no input named `c`",
         ],
     );
@@ -216,32 +228,38 @@ L = joint_likelihood(likelihoodof(model1, 1.5), likelihoodof(model2, 3.2))
 ";
 
 #[test]
-fn a_joint_likelihood_splats_its_point_over_the_union_of_inputs() {
+fn a_joint_likelihood_binds_its_point_by_name_over_the_union_of_inputs() {
     // §06: `joint_likelihood` is `likelihoodof(joint(K1, K2), obs)`, and a `joint`
-    // of kernels takes keyword arguments only, so the point always splats.
+    // of kernels takes the union of the component inputs by name.
     assert_clean(&format!(
         "{JOINT_LIKELIHOOD}lp = logdensityof(L, record(mu = 0.3))\n"
     ));
     assert_refused(
         &format!("{JOINT_LIKELIHOOD}lp = logdensityof(L, record(mu = 0.3, c = 1.0))\n"),
-        &["logdensityof", "splatted", "`mu`", "no input named `c`"],
+        &[
+            "logdensityof",
+            "bound to the likelihood inputs",
+            "`mu`",
+            "no input named `c`",
+        ],
     );
 }
 
 #[test]
-fn a_joint_likelihood_term_taking_one_input_receives_the_point_whole() {
-    // `L(θ) = L1(θ) + L2(θ)` applies the shared point through each term's own
-    // interface, so a term that takes one positional input (an adapter, or a
-    // one-boundary kernel) receives a record whole and the union of names does not
-    // constrain the point.
-    assert_clean(
-        "mu = elementof(reals)\n\
-         a = draw(Normal(mu = mu, sigma = 1.0))\n\
-         b = draw(Normal(mu = mu, sigma = 2.0))\n\
-         K1 = kernelof(record(a = a), mu = mu)\n\
-         K2 = kernelof(record(b = b), mu = mu)\n\
-         L = joint_likelihood(likelihoodof(pars -> K1(mu = pars.mu), record(a = 0.1)), \
-                              likelihoodof(pars -> K2(mu = pars.mu), record(b = 0.2)))\n\
-         lp = logdensityof(L, record(mu = 0.3, nu = 1.0))\n",
+fn a_joint_likelihood_of_one_input_kernels_takes_the_one_named_point() {
+    // Every term takes the one input `mu`, so the point is `record(mu = ..)` and a
+    // field that names no input is an error.
+    let model = "\
+mu = elementof(reals)
+a = draw(Normal(mu = mu, sigma = 1.0))
+b = draw(Normal(mu = mu, sigma = 2.0))
+K1 = kernelof(record(a = a), mu = mu)
+K2 = kernelof(record(b = b), mu = mu)
+L = joint_likelihood(likelihoodof(K1, record(a = 0.1)), likelihoodof(K2, record(b = 0.2)))
+";
+    assert_clean(&format!("{model}lp = logdensityof(L, record(mu = 0.3))\n"));
+    assert_refused(
+        &format!("{model}lp = logdensityof(L, record(mu = 0.3, nu = 1.0))\n"),
+        &["no input named `nu`"],
     );
 }

@@ -19,5 +19,5 @@ R ~ Binomial(C_obs, rcp)
 
 prior = lawof(record(rcp = rcp))
 forward_kernel = kernelof(record(R = R), rcp = rcp)
-L = likelihoodof(pars -> forward_kernel(rcp = pars.rcp), record(R = R_obs))
+L = likelihoodof(forward_kernel, record(R = R_obs))
 posterior = bayesupdate(L, prior)
