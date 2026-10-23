@@ -6019,6 +6019,99 @@ fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol,
     refs
 }
 
+/// §04 "Broadcasting", "Tuple inputs": `broadcast(f, (a, b), c)` is
+/// `(f(a, c), f(b, c))`. Tuple operands share one length, and a tuple cannot be
+/// combined with an array or table operand or broadcast through a kernel.
+fn tuple_broadcast_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    head_node: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let operands = || {
+        args[1..]
+            .iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+    };
+    let fail = |inf: &mut Inferencer<'_, '_>, what: &str| {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!("`broadcast`: {what} (spec §04 \"Broadcasting\", \"Tuple inputs\")"),
+        ));
+        Ready(Type::Failed("broadcast over tuples".into()))
+    };
+    if operands().any(|ty| {
+        matches!(
+            ty,
+            Type::Array { .. } | Type::TVector { .. } | Type::Table { .. }
+        )
+    }) {
+        return fail(
+            inf,
+            "a tuple operand cannot be combined with an array or table operand",
+        );
+    }
+    let mut lengths = operands().filter_map(|ty| match ty {
+        Type::Tuple(items) => Some(items.len()),
+        _ => None,
+    });
+    let len = lengths.next().unwrap_or(0);
+    if lengths.any(|other| other != len) {
+        return fail(inf, "tuple operands must have the same length");
+    }
+    let component = |ty: &Type, i: usize| match ty {
+        Type::Tuple(items) => items[i].clone(),
+        other => other.clone(),
+    };
+    let step = |i: usize| {
+        let cell_args: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, ty, p)| (*n, component(ty, i), *p))
+            .collect();
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, ty, p)| (*s, *n, component(ty, i), *p))
+            .collect();
+        (cell_args, cell_named)
+    };
+    let steps: Vec<_> = (0..len).map(step).collect();
+    tuple_components(inf, id, head_node, steps, Vec::new())
+}
+
+/// Type the component calls of a tuple broadcast one after another.
+fn tuple_components(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    head_node: NodeId,
+    mut steps: Vec<(Vec<ArgInfo>, Vec<NamedInfo>)>,
+    done: Vec<Type>,
+) -> RuleStep<Type> {
+    if steps.is_empty() {
+        return Ready(Type::Tuple(done.into()));
+    }
+    let (cell_args, cell_named) = steps.remove(0);
+    ordinary_call_type(inf, head_node, &cell_args, &cell_named).and_then(inf, move |inf, ty| {
+        match ty {
+            Type::Failed(_) => return Ready(ty),
+            Type::Measure { .. } => {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "`broadcast` of a kernel over tuple operands is not allowed \
+                     (spec §04 \"Broadcasting\", \"Tuple inputs\")"
+                        .to_string(),
+                ));
+                return Ready(Type::Failed("kernel broadcast over tuples".into()));
+            }
+            _ => {}
+        }
+        let mut done = done;
+        done.push(ty);
+        tuple_components(inf, id, head_node, steps, done)
+    })
+}
+
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
 /// maps elementwise over same-shape arrays (scalars ride along) into an
 /// array; a kernel / distribution-constructor head yields a **measure over
@@ -6036,25 +6129,14 @@ fn broadcast_type(
     let (head_node, head_ty) = (*head_node, head_ty.clone());
 
     // §04 "Broadcasting" (#210): records are non-collection inputs, "simply not
-    // iterated over but held constant". Tuple inputs are iterated component-wise
-    // ("`broadcast(f, (a, b), c)` equals `(f(a, c), f(b, c))`"), which no engine
-    // lowers yet, so a tuple operand is refused rather than typed as a constant.
-    for (node, ty) in args[1..]
+    // iterated over but held constant". Tuple inputs are iterated component-wise.
+    if args[1..]
         .iter()
-        .map(|(node, ty, _)| (*node, ty))
-        .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)))
+        .map(|(_, ty, _)| ty)
+        .chain(named.iter().map(|(_, _, ty, _)| ty))
+        .any(|ty| matches!(ty, Type::Tuple(_)))
     {
-        if !matches!(ty, Type::Tuple(_)) {
-            continue;
-        }
-        inf.diags.push(crate::Diagnostic::error_at(
-            node,
-            "`broadcast` operand is a tuple: spec §04 \"Broadcasting\" iterates tuple \
-             components, which is not implemented yet. Pass the components as separate \
-             operands, or a record to hold them constant"
-                .to_string(),
-        ));
-        return Ready(Type::Failed("broadcast operand is a tuple".into()));
+        return tuple_broadcast_type(inf, id, head_node, args, named);
     }
 
     if let Some(ty) = pyhf::call_type(inf, id, head_node, &args[1..], named, true) {

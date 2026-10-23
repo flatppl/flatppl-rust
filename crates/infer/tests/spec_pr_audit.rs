@@ -137,11 +137,52 @@ fn record_operands_of_broadcast_are_held_constant_for_every_head() {
 }
 
 #[test]
-fn tuple_operands_of_broadcast_are_refused_until_component_iteration_exists() {
-    let f = "f(a, b) = a + b\n";
+fn tuple_operands_of_broadcast_iterate_their_components() {
+    // `broadcast(f, (a, b), c)` equals `(f(a, c), f(b, c))`: a tuple of results,
+    // typed per component.
+    let f = "f(a, c) = a * c\n";
+    for call in [
+        "broadcast(f, (1.0, 2.0), 10.0)",
+        "broadcast(f, a = (1.0, 2.0), c = 10.0)",
+        "broadcasted(f)((1.0, 2.0), 10.0)",
+        "broadcast(f, (1.0, 2.0), (3.0, 4.0))",
+    ] {
+        let source = format!("{f}z = {call}\n");
+        let mut module = flatppl_syntax::parse(&source).unwrap();
+        let diagnostics = infer(&mut module);
+        assert!(diagnostics.is_empty(), "{call}: {diagnostics:?}");
+        let rhs = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == "z")
+            .unwrap()
+            .1
+            .rhs;
+        assert!(
+            matches!(module.type_of(rhs), Some(flatppl_core::Type::Tuple(items)) if items.len() == 2),
+            "{call}: {:?}",
+            module.type_of(rhs)
+        );
+    }
+}
+
+#[test]
+fn tuple_operands_of_broadcast_must_agree_and_stay_off_arrays_and_kernels() {
+    let f = "f(a, c) = a * c\n";
     assert_refused(
-        &format!("{f}t = ([1.0, 2.0], [3.0, 4.0])\nz = broadcast(f, t)\n"),
-        "a tuple",
+        &format!("{f}z = broadcast(f, (1.0, 2.0), (1.0, 2.0, 3.0))\n"),
+        "same length",
+    );
+    assert_refused(
+        &format!("{f}z = broadcast(f, (1.0, 2.0), [1.0, 2.0])\n"),
+        "array or table",
+    );
+    assert_refused(
+        &format!("{f}t = table(a = [1.0, 2.0], c = [3.0, 4.0])\nz = broadcast(f, (1.0, 2.0), t)\n"),
+        "array or table",
+    );
+    assert_refused(
+        "K = fn(Normal(mu = _, sigma = 1.0))\nz = broadcast(K, (1.0, 2.0))\n",
+        "kernel over tuple",
     );
 }
 
