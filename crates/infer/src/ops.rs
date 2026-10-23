@@ -6289,15 +6289,48 @@ pub(crate) fn component_variate(
             Type::Deferred => None,
             d => Some(d.clone()),
         },
-        Type::Kernel { .. } => match reified_result_type(inf, node)? {
-            Type::Measure { domain, .. } => match *domain {
+        Type::Kernel { .. } => match reified_result_type(inf, node) {
+            Some(Type::Measure { domain, .. }) => match *domain {
                 Type::Deferred => None,
                 d => Some(d),
             },
-            Type::Deferred => None,
-            value_ty => Some(value_ty),
+            Some(Type::Deferred) => None,
+            Some(value_ty) => Some(value_ty),
+            None => joint_kernel_variate(inf, node),
         },
         _ => None,
+    }
+}
+
+/// The output variate of `joint(K1, K2, ...)` or `joint(n1 = K1, ...)` over kernels (spec
+/// §06 "Joint measures"): the kernel fans its input out to every component, so its
+/// variate is the joint of the components' variates, the `cat` for the positional
+/// form and a record naming each one for the keyword form. `None` when `node` is not
+/// such a joint or a component's variate is not statically resolvable.
+fn joint_kernel_variate(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Type> {
+    let node = resolve_binding_refs(inf, node);
+    let Node::Call(call) = inf.module.node(node).clone() else {
+        return None;
+    };
+    if !matches!(call.head, CallHead::Builtin(head) if inf.module.resolve(head) == "joint") {
+        return None;
+    }
+    let mut variates = Vec::new();
+    for component in call
+        .args
+        .iter()
+        .copied()
+        .chain(call.named.iter().map(|n| n.value))
+    {
+        let ty = inf.lookup_type(component)?.clone();
+        variates.push(component_variate(inf, component, &ty)?);
+    }
+    if call.named.is_empty() {
+        Some(cat_compose(&variates))
+    } else {
+        Some(Type::Record(
+            call.named.iter().map(|n| n.name).zip(variates).collect(),
+        ))
     }
 }
 
