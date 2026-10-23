@@ -204,3 +204,65 @@ fn chains_pass_additional_arguments_unchanged_to_every_step() {
         assert!(!errors(source).is_empty(), "{source}");
     }
 }
+
+#[test]
+fn a_fed_record_reaches_the_next_step_whole_when_the_chain_has_additional_arguments() {
+    // Spec §06: in `kchain(K1, K2, K3)(x, ...)` each step "receives its fed value whole as
+    // its first argument", so a call with additional arguments never auto-splats the fed
+    // record onto the next step's inputs, even when the field names match them.
+    let joint = "k1(x, p) = joint(a = Normal(x + p, 1.0), b = Normal(x, 1.0))\n";
+    for chain in ["kchain", "jointchain"] {
+        // The fed record binds `v` whole.
+        assert_eq!(
+            errors(&format!(
+                "{joint}k2(v, p) = Normal(v.a + v.b + p, 1.0)\nc = {chain}(k1, k2)\nr = c(1.0, 10.0)"
+            )),
+            Vec::<String>::new(),
+            "{chain}"
+        );
+        // Inputs named after the fields are not bound from it: `p` is left unbound.
+        let found = errors(&format!(
+            "{joint}k2(a, b, p) = Normal(a + b + p, 1.0)\nc = {chain}(k1, k2)\nr = c(1.0, 10.0)"
+        ));
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("input `p` is left unbound")),
+            "{chain}: {found:?}"
+        );
+        // With no additional arguments the ordinary calling convention still splats.
+        assert_eq!(
+            errors(&format!(
+                "k1(x) = joint(a = Normal(x, 1.0), b = Normal(x, 1.0))\n\
+                 k2(a, b) = Normal(a + b, 1.0)\nc = {chain}(k1, k2)\nr = c(1.0)"
+            )),
+            Vec::<String>::new(),
+            "{chain} without extras"
+        );
+    }
+    let f1 = "f1(x, p) = record(a = x, b = p)\n";
+    assert_eq!(
+        errors(&format!(
+            "{f1}f2(r, p) = r.a + r.b + p\nc = fchain(f1, f2)\ny = c(1.0, 10.0)"
+        )),
+        Vec::<String>::new()
+    );
+    assert!(
+        !errors(&format!(
+            "{f1}f2(a, b, p) = a + b + p\nc = fchain(f1, f2)\ny = c(1.0, 10.0)"
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        errors("f1(x) = record(a = x, b = 2.0)\nf2(a, b) = a + b\nc = fchain(f1, f2)\ny = c(1.0)"),
+        Vec::<String>::new()
+    );
+    // The fed record is typed as the step's record, so `r.a + r.b + p` is a real.
+    assert_eq!(
+        type_of(
+            &format!("{f1}f2(r, p) = r.a + r.b + p\nc = fchain(f1, f2)\ny = c(1.0, 10.0)"),
+            "y"
+        ),
+        flatppl_core::Type::Scalar(flatppl_core::ScalarType::Real)
+    );
+}
