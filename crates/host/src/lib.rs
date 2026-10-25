@@ -23,5 +23,5 @@ pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
 pub use formula::FormulaModel;
-pub use inspect::{BindingKind, Bound, Domain, DomainField};
+pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
 pub use transforms::TransformedQueries;

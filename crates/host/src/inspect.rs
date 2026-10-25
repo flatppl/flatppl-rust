@@ -1,8 +1,10 @@
 //! Per-binding metadata for hosts: kind, domain, shape, source text and edges.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{BindingId, CallHead, Dim, Module, Node, NodeId, Symbol, Type, ValueSet};
+use flatppl_core::{
+    BindingId, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, RefNs, Symbol, Type, ValueSet,
+};
 use serde::Serialize;
 
 /// The role of a binding, read from the call on its right-hand side.
@@ -129,6 +131,90 @@ impl Domain {
             ValueSet::Deferred | ValueSet::Unknown => Self::Unknown,
         }
     }
+}
+
+/// One input of a kernel or likelihood interface.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct InputInfo {
+    /// The interface name, which a boundary keyword can rename.
+    pub name: String,
+    /// The support of the value bound to the input.
+    pub domain: Domain,
+}
+
+/// The interface inputs of a kernel or likelihood binding, in interface
+/// order, each with the support of the value its boundary binds. `None` for
+/// any other binding.
+pub(crate) fn inputs(module: &Module, rhs: NodeId) -> Option<Vec<InputInfo>> {
+    let names = match module.type_of(rhs)? {
+        Type::Kernel { inputs, .. } | Type::Likelihood { inputs, .. } => inputs,
+        _ => return None,
+    };
+    let mut bound = HashMap::new();
+    collect_inputs(module, rhs, &mut bound, &mut HashSet::new());
+    Some(
+        names
+            .iter()
+            .map(|name| InputInfo {
+                name: module.resolve(*name).into(),
+                domain: Domain::of(module, bound.get(name).unwrap_or(&ValueSet::Unknown)),
+            })
+            .collect(),
+    )
+}
+
+/// Every reification boundary that `node` composes, as interface name to the
+/// bound value's set. A likelihood or a combined kernel reaches them through
+/// its argument kernels; the first binding of a name wins.
+fn collect_inputs(
+    module: &Module,
+    node: NodeId,
+    bound: &mut HashMap<Symbol, ValueSet>,
+    seen: &mut HashSet<BindingId>,
+) {
+    match module.node(node) {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            if let Some(binding) = module.binding_by_name(r.name)
+                && seen.insert(binding)
+            {
+                collect_inputs(module, module.binding(binding).rhs, bound, seen);
+            }
+        }
+        Node::Call(call) => {
+            let entries = match &call.inputs {
+                Some(Inputs::Spec(entries)) => Some(entries.as_ref()),
+                Some(Inputs::Auto) => module.auto_inputs_of(node),
+                None => None,
+            };
+            if let Some(entries) = entries {
+                for (name, source) in entries {
+                    bound
+                        .entry(*name)
+                        .or_insert_with(|| bound_set(module, source));
+                }
+                return;
+            }
+            for &arg in call.args.iter() {
+                collect_inputs(module, arg, bound, seen);
+            }
+            for named in call.named.iter() {
+                collect_inputs(module, named.value, bound, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The set of the binding a boundary entry names; a placeholder has none.
+fn bound_set(module: &Module, source: &Ref) -> ValueSet {
+    if source.ns != RefNs::SelfMod {
+        return ValueSet::Unknown;
+    }
+    module
+        .binding_by_name(source.name)
+        .and_then(|binding| module.valueset_of(module.binding(binding).rhs))
+        .cloned()
+        .unwrap_or(ValueSet::Unknown)
 }
 
 fn extent(dim: Dim) -> Option<u32> {
