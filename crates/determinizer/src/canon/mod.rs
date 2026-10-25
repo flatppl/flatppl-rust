@@ -120,6 +120,34 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
     }
 }
 
+/// Whether `m` reads a bare-name alias or literal binding that
+/// [`resolve_alias_chains`] would point at the end of its chain. False for a
+/// canonicalized module.
+pub fn has_alias_chains(m: &Module) -> bool {
+    fold::has_alias_refs(m)
+}
+
+/// Point every reference to a bare-name alias or literal binding at the end of
+/// its chain, as canonicalization does, and re-infer. Promoted `inputs` keep
+/// their references. Runs even under `FLATPPL_DETERMINIZE_NO_CANON`: a consumer
+/// that reads a fixed operand through one ref hop needs it. Returns whether
+/// anything changed.
+pub fn resolve_alias_chains(m: &mut Module) -> bool {
+    let mut changed = false;
+    // Each sweep advances every chain one link; a chain is no longer than the
+    // binding count.
+    for _ in 0..=m.binding_count() {
+        if !fold::resolve_alias_refs(m) {
+            break;
+        }
+        changed = true;
+    }
+    if changed {
+        let _ = flatppl_infer::infer(m);
+    }
+    changed
+}
+
 /// Prepare an already-determinized module for FlatPPL or FlatPIR serialization.
 ///
 /// Text expands a DAG into a tree. Name repeated cell-local arrays as separate

@@ -83,6 +83,8 @@ pub fn emit_query(
             )
         },
     )?;
+    // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
+    flatppl_determinizer::resolve_alias_chains(&mut module);
     let output_node = binding(&module, "outputs")
         .ok_or_else(|| EmitError::whole("declare at least one output"))?;
     let input_nodes = binding(&module, "inputs")

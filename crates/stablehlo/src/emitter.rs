@@ -3755,6 +3755,11 @@ impl<'m> Emitter<'m> {
     /// `(%bind n 3)`, never the literal inlined directly at the call site
     /// (spec §04's phase system). Returns `id` unchanged when it is not this
     /// shape (already a literal, a `Local`/`Module` ref, or any other node).
+    ///
+    /// One hop suffices because every entry point first points alias and
+    /// literal references at the end of their chain
+    /// (`flatppl_determinizer::resolve_alias_chains`). A promoted `inputs`
+    /// binding keeps its references, so the hop stops at its right-hand side.
     pub(crate) fn resolve_ref_one(&self, id: NodeId) -> NodeId {
         match self.m.node(id) {
             Node::Ref(Ref {

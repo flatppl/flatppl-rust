@@ -328,6 +328,16 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl_with_options(m, &opts.lowering_options())
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
+    // The emitter reads fixed operands through one ref hop (`Emitter::resolve_ref_one`).
+    let resolved;
+    let m = if flatppl_determinizer::has_alias_chains(m) {
+        let mut owned = m.clone();
+        flatppl_determinizer::resolve_alias_chains(&mut owned);
+        resolved = owned;
+        &resolved
+    } else {
+        m
+    };
     match modes::read_abi(m)? {
         Some(abi) => match mode {
             Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts),
