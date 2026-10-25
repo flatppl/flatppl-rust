@@ -3661,6 +3661,8 @@ fn set_element_type_at(
 fn measure_domain(m: Option<&Type>) -> Type {
     match m {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
+        // A failed measure fails its variate too, rather than reading as "no rule yet".
+        Some(failed @ Type::Failed(_)) => failed.clone(),
         _ => Type::Deferred,
     }
 }

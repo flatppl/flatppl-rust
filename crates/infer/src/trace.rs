@@ -575,16 +575,16 @@ impl<'m, 's> Inferencer<'m, 's> {
                     let ty = self.inferred[&frame.body].0.clone();
                     let vset = self.lookup_valueset(frame.body);
                     self.auto_inputs.pop();
-                    // A substituted body's type errors are the call's: without them a
-                    // refusal under the substitution leaves a `%failed` at exit 0. The
-                    // value-set pass re-runs bodies it already typed, so only the type
-                    // pass reports.
+                    // A substituted body whose type FAILED reports its errors for the
+                    // call: without them the refusal leaves a `%failed` at exit 0. A body
+                    // that still types keeps them local, since a speculative substitution
+                    // can fail a subterm the call's type does not use. The value-set pass
+                    // re-runs bodies it already typed, so only the type pass reports.
+                    let failed =
+                        matches!(frame.resume, CallResume::Type(..)) && contains_failed(&ty);
                     let body_errors: Vec<Diagnostic> = std::mem::take(&mut self.diags)
                         .into_iter()
-                        .filter(|d| {
-                            d.severity == crate::Severity::Error
-                                && matches!(frame.resume, CallResume::Type(..))
-                        })
+                        .filter(|d| failed && d.severity == crate::Severity::Error)
                         .collect();
                     self.restore_scope(frame.scope);
                     for diag in body_errors {
@@ -1315,5 +1315,21 @@ pub(crate) fn join_phase(a: Phase, b: Phase) -> Phase {
         (Stochastic, _) | (_, Stochastic) => Stochastic,
         (Parametric, _) | (_, Parametric) => Parametric,
         (Fixed, Fixed) => Fixed,
+    }
+}
+
+/// Whether `ty` is `%failed` or holds one in an element, field or measure domain.
+fn contains_failed(ty: &Type) -> bool {
+    match ty {
+        Type::Failed(_) => true,
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => contains_failed(elem),
+        Type::Record(fields)
+        | Type::Table {
+            columns: fields, ..
+        } => fields.iter().any(|(_, t)| contains_failed(t)),
+        Type::Tuple(parts) => parts.iter().any(contains_failed),
+        Type::Measure { domain, .. } => contains_failed(domain),
+        Type::Likelihood { obstype, .. } => contains_failed(obstype),
+        _ => false,
     }
 }
