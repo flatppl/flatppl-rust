@@ -617,7 +617,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "flatppl-core",
- "libc",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

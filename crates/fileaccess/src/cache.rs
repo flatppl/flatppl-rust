@@ -517,8 +517,7 @@ fn unsafe_dir(dir: &Path, problem: &str) -> Error {
 
 #[cfg(unix)]
 fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` has no preconditions and cannot fail (POSIX.1-2017).
-    unsafe { libc::geteuid() }
+    nix::unistd::geteuid().as_raw()
 }
 
 /// Exclusively create a cache file. Objects and metadata retain this mode when
