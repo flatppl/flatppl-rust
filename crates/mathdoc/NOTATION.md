@@ -147,6 +147,8 @@ the same rules (`.mu` → μ).
 | `cartpow(S, n)`, `cartpow(S, [m, n])` | Sⁿ, S^{m×n} |
 | `cartprod(S, T)`, `cartprod(a = S, b = T)` | S × T, {a ∈ S, b ∈ T} |
 | `stdsimplex(n)` | Δ^{n−1} |
+| `ordered(n)` | ℝⁿ_↑, the strictly increasing real n-vectors |
+| `zerosum(n)` | 𝟏ₙ^⊥, the orthogonal complement of the all-ones n-vector, of dimension n−1 |
 | `c = fixed(x)` | the row `c = x` would have, "fixed" joined to its annotation; inside a record `fixed(x)` stays in roman |
 
 ## Operators and functions

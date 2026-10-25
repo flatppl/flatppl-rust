@@ -1211,6 +1211,17 @@ impl<'m> Lowerer<'m> {
                 };
                 Math::pow(Math::Sym(Sym::Simplex), n)
             }
+            "ordered" if call.args.len() == 1 => Math::SubSup(
+                Box::new(Math::Sym(Sym::Reals)),
+                Box::new(Math::Sym(Sym::Increasing)),
+                Box::new(self.expr(call.args[0])),
+            ),
+            // 𝟏ₙ^⊥ has dimension n − 1.
+            "zerosum" if call.args.len() == 1 => Math::SubSup(
+                Box::new(Math::Sym(Sym::Ones)),
+                Box::new(self.expr(call.args[0])),
+                Box::new(Math::Sym(Sym::Perp)),
+            ),
             // ── access ───────────────────────────────────────────────────
             "get" if call.args.len() >= 2 => self.get(call),
             // ── reification and laws ─────────────────────────────────────

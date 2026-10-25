@@ -442,6 +442,10 @@ fn write_sym(out: &mut String, s: Sym) {
         Sym::Lebesgue => "<mi>λ</mi>",
         Sym::Dirac => "<mi>δ</mi>",
         Sym::Simplex => "<mi>Δ</mi>",
+        Sym::Increasing => "<mo>↑</mo>",
+        // The bold code point, as for `MeasurableSet`.
+        Sym::Ones => "<mn>𝟏</mn>",
+        Sym::Perp => "<mo>⊥</mo>",
         Sym::Ellipsis => "<mi>…</mi>",
         Sym::Placeholder => "<mo>·</mo>",
         // The code point, not `mathvariant`: MathML Core keeps only `normal`.
