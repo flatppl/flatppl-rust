@@ -9560,6 +9560,24 @@ pub(crate) fn call_valueset(
         "lawof" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // `relabel` names the variate's entries without moving any (§06).
+        "relabel" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // The point mass at `value` lies in `value`'s set.
+        "Dirac" => named_or_positional_node(inf.module, named, args, "value", 0)
+            .map_or(ValueSet::Unknown, |n| inf.lookup_valueset(n)),
+        // §06: the product measure's variate is the `cat` of the components', or a
+        // record of them by name, so its support is the product of their supports.
+        "joint" if matches!(ty, Type::Measure { .. }) => joint_support(inf, args, named),
+        // A sum of measures is supported on the union of their supports.
+        "superpose" if matches!(ty, Type::Measure { .. }) => {
+            let sets: Vec<ValueSet> = args
+                .iter()
+                .map(|(n, t, _)| support_or_natural(inf, *n, t))
+                .collect();
+            join_scalar_sets(&sets).unwrap_or(ValueSet::Unknown)
+        }
         "truncate" => {
             // Sound superset: the truncated support lies inside S.
             match set_expr_valueset(inf, args.get(1).map(|a| a.0)) {
@@ -9575,10 +9593,7 @@ pub(crate) fn call_valueset(
         "record" if args.is_empty() && !named.is_empty() => {
             let mut fields = Vec::with_capacity(named.len());
             for (name, node, field_ty, _) in named {
-                let set = match inf.lookup_valueset(*node) {
-                    ValueSet::Unknown | ValueSet::Deferred => ValueSet::natural_of(field_ty),
-                    set => set,
-                };
+                let set = support_or_natural(inf, *node, field_ty);
                 if set == ValueSet::Unknown {
                     return Ready(ValueSet::Unknown);
                 }
@@ -9693,6 +9708,49 @@ pub(crate) fn call_valueset(
             }
         }
     })
+}
+
+/// A node's value set, or for a measure its support, falling back to the
+/// natural extent of its type.
+fn support_or_natural(inf: &Inferencer<'_, '_>, node: NodeId, ty: &Type) -> ValueSet {
+    match inf.lookup_valueset(node) {
+        ValueSet::Unknown | ValueSet::Deferred => ValueSet::natural_of(ty),
+        set => set,
+    }
+}
+
+/// The support of `joint(...)` (§06): a record of the named components'
+/// supports, the merged fields of record components, or the positional
+/// product of scalar or vector components, which `cat` concatenates.
+fn joint_support(inf: &Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> ValueSet {
+    if !named.is_empty() {
+        let mut fields = Vec::with_capacity(named.len());
+        for (name, node, ty, _) in named {
+            match support_or_natural(inf, *node, ty) {
+                ValueSet::Unknown => return ValueSet::Unknown,
+                set => fields.push((*name, set)),
+            }
+        }
+        return ValueSet::RecordSet(fields.into());
+    }
+    let sets: Vec<ValueSet> = args
+        .iter()
+        .map(|(n, t, _)| support_or_natural(inf, *n, t))
+        .collect();
+    if sets.is_empty() || sets.contains(&ValueSet::Unknown) {
+        return ValueSet::Unknown;
+    }
+    if sets.iter().all(|s| matches!(s, ValueSet::RecordSet(_))) {
+        let fields: Vec<_> = sets
+            .into_iter()
+            .flat_map(|s| match s {
+                ValueSet::RecordSet(fields) => fields.to_vec(),
+                _ => Vec::new(),
+            })
+            .collect();
+        return ValueSet::RecordSet(fields.into());
+    }
+    ValueSet::CartProd(sets.into())
 }
 
 /// The leading dim of a rank-1 array result, drilling through a measure wrapper

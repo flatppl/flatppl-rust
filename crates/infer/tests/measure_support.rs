@@ -70,3 +70,40 @@ fn a_posterior_keeps_its_prior_support() {
         "cartprod(theta = reals, s = nonnegreals, p = unitinterval, w = stdsimplex(3))"
     );
 }
+
+const COMBINATORS: &str = r#"
+a = Exponential(rate = 1.0)
+b = Beta(2.0, 3.0)
+named = joint(x = a, y = b)
+positional = joint(a, b)
+records = joint(named, joint(z = Dirichlet(alpha = [1.0, 1.0])))
+sum = superpose(a, LogNormal(mu = 0.0, sigma = 1.0))
+labelled = relabel(iid(a, 2), ["p", "q"])
+point = Dirac(value = 2.0)
+"#;
+
+#[test]
+fn products_and_sums_combine_their_component_supports() {
+    let mut module = infer(COMBINATORS);
+    assert_eq!(
+        support(&mut module, "named"),
+        "cartprod(x = nonnegreals, y = unitinterval)"
+    );
+    assert_eq!(
+        support(&mut module, "positional"),
+        "cartprod(nonnegreals, unitinterval)"
+    );
+    assert_eq!(
+        support(&mut module, "records"),
+        "cartprod(x = nonnegreals, y = unitinterval, z = stdsimplex(2))"
+    );
+    // nonnegreals ∪ posreals.
+    assert_eq!(support(&mut module, "sum"), "nonnegreals");
+}
+
+#[test]
+fn relabel_and_dirac_keep_their_argument_sets() {
+    let mut module = infer(COMBINATORS);
+    assert_eq!(support(&mut module, "labelled"), "cartpow(nonnegreals, 2)");
+    assert_eq!(support(&mut module, "point"), "interval(2, 2)");
+}
