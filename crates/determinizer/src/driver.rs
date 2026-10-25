@@ -386,7 +386,7 @@ fn find_get_disintegrate(m: &Module) -> Option<(BindingId, NodeId)> {
     find_node(m, |id| match_get_disintegrate(m, id).is_some())
 }
 
-/// Match `get(D, i)` where `D` resolves (one `(%ref self …)` hop) to a
+/// Match `get(D, i)` where `D` resolves (through a `(%ref self …)` alias chain) to a
 /// `disintegrate(…)` call. Returns `(disintegrate_node, i)` — the resolved
 /// disintegrate call node and the 1-based tuple index literal — or `None` when
 /// the node is not a well-formed `get` over a disintegrate.
@@ -400,8 +400,8 @@ fn match_get_disintegrate(m: &Module, node: NodeId) -> Option<(NodeId, i64)> {
     if m.resolve(sym) != "get" || c.args.len() != 2 || !c.named.is_empty() {
         return None;
     }
-    // arg0 must resolve (one hop) to a `disintegrate(…)` call.
-    let (target, _) = crate::density::resolve_ref_one(m, c.args[0]);
+    // arg0 must resolve (through its alias chain) to a `disintegrate(…)` call.
+    let (target, _) = crate::density::resolve_ref(m, c.args[0]);
     if crate::density::builtin_name(m, target) != Some("disintegrate") {
         return None;
     }
@@ -542,7 +542,7 @@ fn apply_rule(
     let is_densityof = is_op(m, target_node, "densityof");
     if is_logdensityof || is_densityof {
         // Defer-and-reloop for a cross-module query TARGET (GAP D). When the
-        // query's measure target is (or resolves via one `(%ref self …)` hop to)
+        // query's measure target is (or resolves via a `(%ref self …)` alias chain to)
         // a cross-module `(%ref <alias> member)`, graft the referenced submodule
         // subtree into the host and rewrite the query to point at the LOCAL
         // grafted node — WITHOUT lowering yet. Returning here lets the driver loop

@@ -258,3 +258,168 @@ post = bayesupdate(alias, prior)
 lp = logdensityof(post, record(mu = 1.0))",
     );
 }
+
+// ---------------------------------------------------------------------------
+// VALUE aliases: `M = a` where `a` is a draw, scored through `lawof`.
+//
+// The query entry followed the chain, but the value-law, record-field and
+// shared-latent reads each took one hop. So `lawof(M)` refused as a
+// non-constructor, `lawof(record(y = M))` as "field is not a draw", and the
+// pin landed on the alias instead of the draw binding. Each lowering is
+// compared with the direct spelling, and the direct spelling with the closed
+// form (independently computed log densities in each comment).
+// ---------------------------------------------------------------------------
+
+/// The query binding `lp` of a module lowered for that one output.
+fn lp_pir_for_root(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(diags.is_empty(), "fixture must infer: {diags:?}");
+    let lp = m.intern("lp");
+    let out = flatppl_determinizer::determinize_with_roots(
+        &m,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&[lp]),
+    )
+    .expect("must lower, not refuse");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
+    alpha_normalize(&binding_pir(&pir, "lp"))
+}
+
+/// `logpdf(Normal(0.3, 2), 0.5) = -1.617085713764618`.
+#[test]
+fn value_alias_lawof() {
+    let direct = "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+lp = logdensityof(lawof(a), 0.5)";
+    let lp = binding_pir(&determinize_pir(direct), "lp");
+    assert!(
+        lp.contains("(record (%field mu 0.3) (%field sigma 2.0))) 0.5)"),
+        "{lp}"
+    );
+    assert_alias_matches_direct(
+        direct,
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+M = a
+lp = logdensityof(lawof(M), 0.5)",
+    );
+    assert_alias_matches_direct(
+        direct,
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+M = a
+M2 = M
+lp = logdensityof(lawof(M2), 0.5)",
+    );
+}
+
+#[test]
+fn value_alias_record_field() {
+    assert_alias_matches_direct(
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+lp = logdensityof(lawof(record(y = a)), record(y = 0.5))",
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+M = a
+lp = logdensityof(lawof(record(y = M)), record(y = 0.5))",
+    );
+}
+
+/// The total law of `y` integrates `z` out: `Normal(0, √2)`, and
+/// `logpdf(Normal(0, √2), 0.5) = -1.3280121234846454`.
+#[test]
+fn value_alias_of_a_dependent_draw_marginalizes() {
+    let direct = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(y), 0.5)";
+    let lp = binding_pir(&determinize_pir(direct), "lp");
+    assert!(
+        lp.contains("(record (%field mu 0.0) (%field sigma 1.4142135623730951))) 0.5)"),
+        "{lp}"
+    );
+    assert_alias_matches_direct(
+        direct,
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+M = y
+lp = logdensityof(lawof(M), 0.5)",
+    );
+}
+
+/// An alias of the latent a dependent draw reads, in a joint record law.
+#[test]
+fn value_alias_of_a_latent_in_a_record_law() {
+    assert_alias_matches_direct(
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.5))",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+Z = z
+y = draw(Normal(mu = Z, sigma = 1.0))
+lp = logdensityof(lawof(record(z = Z, y = y)), record(z = 0.1, y = 0.5))",
+    );
+}
+
+/// `2a` with `a ~ Normal(0.3, 2)` is `Normal(0.6, 4)`, and
+/// `logpdf(Normal(0.6, 4), 0.5) = logpdf(Normal(0.3, 2), 0.25) - log 2 = -2.305545394324563`.
+/// Lowered for `lp` alone: with every binding an output, `M` is itself a
+/// stochastic output, which refuses as the direct `c = a + 1.0` does.
+#[test]
+fn value_alias_under_a_transform() {
+    let direct = lp_pir_for_root(
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+b = a * 2.0
+lp = logdensityof(lawof(b), 0.5)",
+    );
+    assert!(
+        direct.contains("(record (%field mu 0.3) (%field sigma 2.0))) 0.25)")
+            && direct.contains("(abs 2.0)"),
+        "{direct}"
+    );
+    let aliased = lp_pir_for_root(
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+M = a
+b = M * 2.0
+lp = logdensityof(lawof(b), 0.5)",
+    );
+    assert_eq!(aliased, direct);
+}
+
+/// A closed kernel is a measure (§04), so scoring it through an alias lowers,
+/// and `lawof` of it refuses as a measure, not as a conjugate-table miss.
+#[test]
+fn kernel_alias() {
+    assert_alias_matches_direct(
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+K = kernelof(a)
+lp = logdensityof(K, 0.5)",
+        "\
+a = draw(Normal(mu = 0.3, sigma = 2.0))
+K = kernelof(a)
+K2 = K
+lp = logdensityof(K2, 0.5)",
+    );
+    for query in ["lawof(K)", "lawof(K2)"] {
+        let mut m = flatppl_syntax::parse(&format!(
+            "a = draw(Normal(mu = 0.3, sigma = 2.0))\nK = kernelof(a)\nK2 = K\n\
+             lp = logdensityof({query}, 0.5)"
+        ))
+        .unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let reason = determinize(&m).expect_err("lawof of a measure").reason;
+        assert_eq!(
+            reason, "lawof requires a value node, not a measure or callable",
+            "{query}"
+        );
+    }
+}

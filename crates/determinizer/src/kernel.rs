@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 
-use crate::density::{draw_argument, resolve_ref_chain, resolve_ref_one};
+use crate::density::{draw_argument, resolve_ref, resolve_ref_chain};
 use flatppl_core::{
-    Binding, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
-    Symbol, Type,
+    Binding, BindingId, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref,
+    RefNs, Scalar, Symbol, Type,
 };
 
 /// A resolved kernel: its reified body and its boundary inputs as
@@ -178,7 +178,7 @@ pub(crate) fn classify_reification(m: &Module, id: NodeId) -> Reification {
         seen.push(cur);
         match classify_one(m, cur) {
             Reification::Closed(body) => {
-                let (next, _) = resolve_ref_one(m, body);
+                let (next, _) = resolve_ref(m, body);
                 body_reached = Some(next);
                 cur = next;
             }
@@ -603,7 +603,7 @@ pub(crate) fn reduce_kernel_application_bound(
     let resolved = declared_body(m, kernel.body);
     let mut body = match draw_argument(m, resolved) {
         _ if mode == Substitute::All && !absorbed => kernel.body,
-        Some(law) => resolve_ref_one(m, law).0,
+        Some(law) => resolve_ref(m, law).0,
         None => resolved,
     };
 
@@ -623,7 +623,14 @@ pub(crate) fn reduce_kernel_application_bound(
 
 /// A query may have pinned this draw already. Reification still denotes its
 /// declared law, not the value supplied to that earlier query.
-pub(crate) fn declared_body(m: &Module, mut node: NodeId) -> NodeId {
+pub(crate) fn declared_body(m: &Module, node: NodeId) -> NodeId {
+    declared_binding(m, node).0
+}
+
+/// [`declared_body`], with the binding that holds it: the last binding of a
+/// bare-name alias chain, which is the one a query must pin.
+pub(crate) fn declared_binding(m: &Module, mut node: NodeId) -> (NodeId, Option<BindingId>) {
+    let mut holder = None;
     for _ in 0..m.binding_count() {
         let Node::Ref(reference) = m.node(node) else {
             break;
@@ -635,8 +642,9 @@ pub(crate) fn declared_body(m: &Module, mut node: NodeId) -> NodeId {
             break;
         };
         node = m.declared_binding_rhs(binding);
+        holder = Some(binding);
     }
-    node
+    (node, holder)
 }
 
 /// §04 calling convention: leading positionals, then keywords, or one record/table
@@ -712,7 +720,7 @@ pub(crate) fn bind_optional_call_args(
 /// The element count of a tuple value: a written `tuple(…)` literal, or a value
 /// whose inferred type is a tuple.
 fn tuple_arity(m: &Module, value: NodeId) -> Option<usize> {
-    let (resolved, _) = resolve_ref_one(m, value);
+    let (resolved, _) = resolve_ref(m, value);
     if matches!(splat_head(m, value), Some("tuple"))
         && let Node::Call(c) = m.node(resolved)
         && c.named.is_empty()
@@ -729,7 +737,7 @@ fn tuple_arity(m: &Module, value: NodeId) -> Option<usize> {
 /// its element; any other value gives the projection `get(t, index + 1)`, the
 /// positional argument spec §11 resolves a splatted tuple to.
 fn tuple_element(m: &mut Module, value: NodeId, index: usize) -> Option<NodeId> {
-    let (resolved, _) = resolve_ref_one(m, value);
+    let (resolved, _) = resolve_ref(m, value);
     if matches!(splat_head(m, value), Some("tuple"))
         && let Node::Call(c) = m.node(resolved)
         && c.named.is_empty()
@@ -754,7 +762,7 @@ pub(crate) fn is_splattable(m: &Module, rec: NodeId) -> bool {
 /// Field names come from the literal or its inferred record/table type. Opaque
 /// inputs and loaded tables obey the same splat rule without reading their values.
 pub(crate) fn splat_fields(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
-    let (resolved, _) = resolve_ref_one(m, rec);
+    let (resolved, _) = resolve_ref(m, rec);
     if matches!(splat_head(m, rec), Some("record") | Some("table")) {
         let Node::Call(c) = m.node(resolved) else {
             return None;
@@ -770,9 +778,9 @@ pub(crate) fn splat_fields(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
     }
 }
 
-/// The `record`/`table` head of `rec` after one level of ref-resolution, or `None`.
+/// The `record`/`table` head of `rec` after its alias chain, or `None`.
 fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
-    let (resolved, _) = resolve_ref_one(m, rec);
+    let (resolved, _) = resolve_ref(m, rec);
     let Node::Call(c) = m.node(resolved) else {
         return None;
     };
@@ -802,7 +810,7 @@ fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
 /// decides only whether the call is valid, never whether the splat occurs."
 pub(crate) fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
     if matches!(splat_head(m, rec), Some("record") | Some("table")) {
-        let (resolved, _) = resolve_ref_one(m, rec);
+        let (resolved, _) = resolve_ref(m, rec);
         let Node::Call(c) = m.node(resolved) else {
             return None;
         };

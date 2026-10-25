@@ -49,6 +49,31 @@ fn a_stochastic_constructor_parameter_refuses_and_names_the_draw() {
 }
 
 #[test]
+fn bare_and_iid_spellings_refuse_and_name_the_draw() {
+    for measure in [
+        "Normal(mu = z, sigma = 1.0)",
+        "iid(Normal(mu = z, sigma = 1.0), 2)",
+    ] {
+        let point = if measure.starts_with("iid") {
+            "[0.5, 0.7]"
+        } else {
+            "0.5"
+        };
+        for latent in ["", "lp_latent = logdensityof(lawof(z), 0.1)\n"] {
+            let reason = refusal(&format!(
+                "z = draw(Normal(mu = 0.0, sigma = 1.0))\n{latent}\
+                 lp = logdensityof({measure}, {point})\n"
+            ));
+            assert!(
+                reason.contains("density query in `lp` reads draw `z`")
+                    && reason.contains("put `z` in the point"),
+                "{measure}\n{reason}"
+            );
+        }
+    }
+}
+
+#[test]
 fn another_outputs_point_does_not_condition_the_query() {
     // §13 reduces per output, so `lp_latent`'s point 0.1 is not a value for `z`
     // in `lp`, in either statement order.

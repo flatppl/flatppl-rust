@@ -15,7 +15,7 @@
 //! per consumer would re-draw it and break shared-ancestor identity
 //! (measure-algebra audit, 2026-06, findings H7/M4). A `record` field's `draw` (inline or reached
 //! via a `(%ref self x)` binding reference) is resolved uniformly by
-//! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
+//! [`lower_measure_sample`]'s single `resolve_ref` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
 //!
 //! **Two dispatchers, two admissible sets.** [`lower_closed_measure_sample`]
@@ -29,7 +29,7 @@
 //! referenced by name.
 use crate::density::{
     build_call, build_callback_call, build_record, builtin_name, draw_argument,
-    expect_builtin_call, iid_static_shape, refuse, resolve_ref_one, split_kernel_constructor,
+    expect_builtin_call, iid_static_shape, refuse, resolve_ref, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -246,9 +246,9 @@ fn is_int_projection_of(m: &Module, id: NodeId, name: Symbol) -> bool {
     subject_is_name && matches!(m.node(c.args[1]), Node::Lit(Scalar::Int(_)))
 }
 
-/// `lawof(?m)` → `?m`, resolving one level of `(%ref self x)` indirection first.
+/// `lawof(?m)` → `?m`, resolving `(%ref self x)` alias chains first.
 fn strip_lawof(m: &Module, node: NodeId) -> Option<NodeId> {
-    let (resolved, _) = resolve_ref_one(m, node);
+    let (resolved, _) = resolve_ref(m, node);
     let c = expect_builtin_call(m, resolved, "lawof")?;
     (c.args.len() == 1).then(|| c.args[0])
 }
@@ -274,7 +274,7 @@ fn lower_closed_measure_sample(
     measure: NodeId,
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, measure);
+    let (resolved, _) = resolve_ref(m, measure);
     if let Some(body) = crate::kernel::reduce_kernel_application(m, resolved) {
         return lower_closed_measure_sample(m, body, rng);
     }
@@ -515,7 +515,7 @@ fn lower_measure_sample(
 ) -> Result<(NodeId, NodeId), RefuseError> {
     // Resolve a single level of `(%ref self x)` indirection on the measure side,
     // mirroring `density::lower_measure_density`'s dispatch.
-    let (resolved, _) = resolve_ref_one(m, measure);
+    let (resolved, _) = resolve_ref(m, measure);
     let op = builtin_name(m, resolved);
     match op {
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
@@ -637,7 +637,7 @@ fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<No
         if c.args.len() != 1 {
             return None;
         }
-        node = resolve_ref_one(m, c.args[0]).0;
+        node = resolve_ref(m, c.args[0]).0;
     }
     let Node::Call(c) = m.node(node) else {
         return None;
@@ -645,7 +645,7 @@ fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<No
     let CallHead::User(callee) = c.head else {
         return None;
     };
-    let (lift_node, _) = resolve_ref_one(m, callee);
+    let (lift_node, _) = resolve_ref(m, callee);
     expect_builtin_call(m, lift_node, "ksuperpose").map(|_| lift_node)
 }
 
@@ -756,7 +756,7 @@ fn lower_draw(
         }
         c.args[0]
     };
-    let (inner_resolved, _) = resolve_ref_one(m, inner_measure);
+    let (inner_resolved, _) = resolve_ref(m, inner_measure);
     if let Some(body) = crate::kernel::reduce_kernel_application(m, inner_resolved) {
         let draw = build_call(m, "draw", &[body]);
         return lower_draw(m, draw, rng, sample_name);
@@ -935,7 +935,7 @@ fn lower_iid_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
-    let (kernel, _) = resolve_ref_one(m, kernel);
+    let (kernel, _) = resolve_ref(m, kernel);
     if let Some(body) = crate::kernel::reduce_kernel_application(m, kernel) {
         return lower_iid_sample(m, body, iid_node, rng, sample_name);
     }
@@ -999,24 +999,24 @@ fn lower_iid_sample(
     ))
 }
 
-/// `iid(K, size)` → `(K, iid_node)`, resolving one level of ref indirection first
+/// `iid(K, size)` → `(K, iid_node)`, resolving alias chains first
 /// (mirroring `split_constructor`'s convention). The product axes are read from
 /// `iid_node`'s inferred domain by `density::iid_static_shape`, since a
 /// shape-dependent size (`lengthof(obs)`,
 /// arithmetic, …) is already const-folded onto the type (see that function's
 /// doc); callers pass `iid_node` straight to it.
 fn split_iid(m: &Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
-    let (resolved, _) = resolve_ref_one(m, measure);
+    let (resolved, _) = resolve_ref(m, measure);
     let c = expect_builtin_call(m, resolved, "iid")?;
     (c.args.len() == 2).then_some((c.args[0], resolved))
 }
 
 /// A primitive constructor call `Normal(mu=…, sigma=…)` → (ctor Const node,
-/// record of kwargs). Resolves one level of ref indirection, then delegates
+/// record of kwargs). Resolves alias chains, then delegates
 /// the constructor-symbol/kwargs read to `density::split_kernel_constructor`
 /// (shared with `build_density_term`'s identical need on the density side).
 fn split_constructor(m: &mut Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
-    let (resolved, _) = resolve_ref_one(m, measure);
+    let (resolved, _) = resolve_ref(m, measure);
     let (ctor_sym, kwargs) = split_kernel_constructor(m, resolved)?;
     let ctor = m.alloc(Node::Const(ctor_sym));
     let input = build_record(m, &kwargs);
@@ -1192,7 +1192,7 @@ fn lower_record_of_draws_sample(
 /// (`record(a = Normal(…))`) is `Type::Measure` and so still refuses — admitting
 /// the constructor leaf in measure position must not fabricate a draw here.
 fn is_derived_value_field(m: &mut Module, value: NodeId) -> bool {
-    let (resolved, _) = resolve_ref_one(m, value);
+    let (resolved, _) = resolve_ref(m, value);
     if matches!(builtin_name(m, resolved), Some("draw") | Some("record")) {
         return false;
     }
@@ -1244,7 +1244,7 @@ fn derived_field_latents(
         if bid.is_some() || !is_derived_value_field(m, val) {
             continue;
         }
-        let (resolved, _) = resolve_ref_one(m, val);
+        let (resolved, _) = resolve_ref(m, val);
         for latent in transitive_draw_bindings(m, resolved) {
             if !found.contains(&latent) {
                 found.push(latent);
@@ -1290,22 +1290,13 @@ fn transitive_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
     found
 }
 
-/// If `value` is `(%ref self name)` pointing at a binding whose RHS is `draw(…)`,
-/// return that binding — the latent this field consumes. Inline-draw and
-/// non-draw-ref fields return `None` (they cannot be a *shared* ancestor: an
-/// inline draw has a single syntactic site).
+/// If `value` is `(%ref self name)` reaching, through any alias chain, a binding
+/// whose RHS is `draw(…)`, return that binding — the latent this field consumes.
+/// Inline-draw and non-draw-ref fields return `None` (they cannot be a *shared*
+/// ancestor: an inline draw has a single syntactic site).
 fn field_draw_binding(m: &Module, value: NodeId) -> Option<BindingId> {
-    if let Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }) = m.node(value)
-    {
-        let bid = m.binding_by_name(*name)?;
-        if draw_argument(m, m.binding(bid).rhs).is_some() {
-            return Some(bid);
-        }
-    }
-    None
+    let (rhs, bid) = resolve_ref(m, value);
+    bid.filter(|_| draw_argument(m, rhs).is_some())
 }
 
 /// Does this record need the shared-latent binding-rewrite path (rather than the
@@ -1424,9 +1415,9 @@ fn fresh_latent_name(m: &mut Module, latent: BindingId, kind: &str) -> Symbol {
 }
 
 /// The `draw`-bindings referenced by `(%ref self name)` anywhere in the subtree
-/// at `root` (a draw's kernel input), in first-encounter order. Only bindings
-/// whose RHS is a `draw(…)` count — a reference to a deterministic binding is not
-/// a latent dependency.
+/// at `root` (a draw's kernel input), through any alias chain, in first-encounter
+/// order. Only bindings whose RHS is a `draw(…)` count — a reference to a
+/// deterministic binding is not a latent dependency.
 fn referenced_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
     let mut found: Vec<BindingId> = Vec::new();
     let mut queue = vec![root];
@@ -1434,12 +1425,8 @@ fn referenced_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
     while qi < queue.len() {
         let id = queue[qi];
         qi += 1;
-        if let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) = m.node(id)
-            && let Some(bid) = m.binding_by_name(*name)
-            && draw_argument(m, m.binding(bid).rhs).is_some()
+        if let (rhs, Some(bid)) = resolve_ref(m, id)
+            && draw_argument(m, rhs).is_some()
             && !found.contains(&bid)
         {
             found.push(bid);

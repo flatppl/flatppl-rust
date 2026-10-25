@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Symbol, Type};
 
-use crate::{density::resolve_ref_one, driver::rebuild_with_children, kernel};
+use crate::{density::resolve_ref, driver::rebuild_with_children, kernel};
 
 struct Input {
     label: Symbol,
@@ -32,7 +32,7 @@ pub(super) fn lift_broadcast(m: &mut Module, id: NodeId) -> Option<NodeId> {
         return None;
     }
     let values = call.args[1];
-    let (resolved, _) = resolve_ref_one(m, values);
+    let (resolved, _) = resolve_ref(m, values);
     if !matches!(
         m.type_of(values).or_else(|| m.type_of(resolved)),
         Some(Type::Array { .. })

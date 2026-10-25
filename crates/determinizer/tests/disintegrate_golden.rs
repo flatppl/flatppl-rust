@@ -289,6 +289,67 @@ fn disintegrate_reversed_selector_with_aliased_fields_refuses() {
     );
 }
 
+/// The reversed selector through BINDING aliases: `T1 = theta1` names the same
+/// variate (§04 *Name resolution*), so selecting `T1` still selects the upstream
+/// root `obs` depends on. The guard must resolve the selected field's alias chain
+/// to `theta1` before it intersects the non-selected closure.
+const REVERSED_DISINTEGRATE_BINDING_ALIAS: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+T1 = theta1
+T2 = theta2
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = T1, theta2 = T2, obs = obs))
+forward_kernel, prior = disintegrate([\"theta1\", \"theta2\"], joint_model)
+L = likelihoodof(forward_kernel, record(theta1 = 0.5, theta2 = 1.0))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn disintegrate_reversed_selector_through_binding_aliases_refuses() {
+    let err = determinize(&parse_infer(REVERSED_DISINTEGRATE_BINDING_ALIAS)).expect_err(
+        "a causally-reversed disintegrate through binding aliases (non-closed marginal) must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the reversed disintegrate; got: {msg}"
+    );
+}
+
+/// The valid (downstream) selector through the same binding aliases lowers to
+/// the direct spelling's posterior, byte for byte.
+#[test]
+fn disintegrate_through_binding_aliases_matches_direct() {
+    let lp = |model: &str| {
+        let src = format!(
+            "{model}forward_kernel, prior = disintegrate([\"obs\"], joint_model)\n\
+             L = likelihoodof(forward_kernel, record(obs = [1.2, 3.4]))\n\
+             posterior = bayesupdate(L, prior)\n\
+             lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))"
+        );
+        let out = determinize(&parse_infer(&src)).expect("a downstream selector lowers");
+        let pir = flatppl_flatpir::write(&out);
+        let at = pir.find("(%bind lp ").expect("lp is bound");
+        pir[at..].lines().next().unwrap().to_string()
+    };
+    let direct = lp("\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 2)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+");
+    let aliased = lp("\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+T1 = theta1
+T2 = theta2
+obs ~ iid(Normal(mu = T1, sigma = T2), 2)
+joint_model = lawof(record(theta1 = T1, theta2 = T2, obs = obs))
+");
+    assert_eq!(aliased, direct);
+}
+
 /// The `restrict` mirror of the aliased reversed direction: conditioning on the
 /// upstream params under aliased labels (`record(mu_param = …, sigma_param = …)`
 /// where those fields resolve to `theta1`/`theta2`). The disintegration on

@@ -6,7 +6,7 @@
 //! non-selected values in source order. Both preserve the selected value DAG and
 //! refuse empty or causally reversed partitions, and repeated vector selectors.
 
-use crate::density::{expect_builtin_call, resolve_ref_one};
+use crate::density::{expect_builtin_call, resolve_ref};
 use flatppl_core::{
     Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
 };
@@ -25,7 +25,7 @@ use std::collections::HashSet;
 ///
 /// Returns `None` (caller refuses) for any shape outside the explicit DAG case:
 /// - `disint_node` is not a 2-arg `disintegrate` call;
-/// - the measure (after one ref hop) is not `lawof(record(field…))`, or the
+/// - the measure (after its alias chain) is not `lawof(record(field…))`, or the
 ///   record carries positional args / a non-`%field` named entry;
 /// - the selector is not a string literal or `vector` of string literals
 ///   naming fields of the record (a name not present in the record, or an
@@ -73,7 +73,7 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
 /// ([`rewrite_restrict`]) can reuse it directly with the field-names of the
 /// observed record — without fabricating a synthetic `disintegrate(vector(…), M)`
 /// node. `selected_names` are the already-parsed SELECTED field names; `measure`
-/// is `M` (resolved one ref hop below to `lawof(record(field…))`).
+/// is `M` (resolved through its alias chain below to `lawof(record(field…))`).
 ///
 /// Returns the same `(kernel, marginal)` pair as [`split_disintegrate`], and
 /// `None` (caller refuses) for every shape outside the explicit DAG case — see
@@ -83,14 +83,14 @@ fn split_law_record(
     selected_names: &[Box<str>],
     measure: NodeId,
 ) -> Option<(NodeId, NodeId)> {
-    // Resolve `M` one ref hop to `lawof(record(field…))`.
-    let (measure_resolved, _) = resolve_ref_one(m, measure);
+    // Resolve `M` through its alias chain to `lawof(record(field…))`.
+    let (measure_resolved, _) = resolve_ref(m, measure);
     let lawof = expect_builtin_call(m, measure_resolved, "lawof")?;
     if lawof.args.len() != 1 {
         return None;
     }
     let record_arg = lawof.args[0];
-    let (record_resolved, _) = resolve_ref_one(m, record_arg);
+    let (record_resolved, _) = resolve_ref(m, record_arg);
     let record = expect_builtin_call(m, record_resolved, "record")?;
     if !record.args.is_empty() {
         // A record with positional args is not a field-keyed product.
@@ -162,10 +162,12 @@ fn split_law_record(
     // causally REVERSED selector (a silent-wrong-density). So compare like with
     // like:
     //   - `selected_bindings`: the binding names each SELECTED field's value
-    //     DIRECTLY references (one hop — a transform value's whole subtree is
-    //     scanned, but a referenced binding's rhs is NOT descended into, since we
-    //     want the selected variates themselves, not their upstream closure).
-    //     `(%field mu_param (%ref self theta1))` ⇒ `theta1`.
+    //     DIRECTLY references, plus every name a bare-name alias chain from them
+    //     reaches (a transform value's whole subtree is scanned, but a variate's
+    //     rhs is NOT descended into, since we want the selected variates
+    //     themselves, not their upstream closure).
+    //     `(%field mu_param (%ref self theta1))` ⇒ `theta1`; with `T1 = theta1`,
+    //     `(%field mu_param (%ref self T1))` ⇒ `T1`, `theta1`.
     //   - `reachable`: the transitive generative closure of the NON-selected
     //     fields (following `(%ref self …)` into each binding's rhs AND across a
     //     reified callable's `%specinputs` cut).
@@ -175,10 +177,6 @@ fn split_law_record(
     // and the selector is causally REVERSED → refuse (fail-closed,
     // refuse-don't-mislower). The reverse-direction disintegrate (§06 "two
     // formulations") is a separate follow-up, out of scope here.
-    // NOTE: one-hop resolution here can miss a chain-alias selected field (a
-    // bare-ref binding to another draw), so this guard alone isn't sufficient.
-    // Fail-closed by composition: `resolve_component_draw` (density.rs) refuses
-    // a selected field that is not a draw or a reference to a draw.
     let mut selected_bindings: HashSet<Symbol> = HashSet::new();
     for &(_, value) in &selected_fields {
         collect_selected_bindings(m, value, &mut selected_bindings);
@@ -413,7 +411,14 @@ fn collect_selected_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol
         }) = node
         {
             // A selected variate: record it, but do NOT descend into its rhs.
+            // A bare-name alias names the same variate (§04), so follow it.
             out.insert(*name);
+            if let Some(bid) = m.binding_by_name(*name)
+                && let rhs = m.binding(bid).rhs
+                && matches!(m.node(rhs), Node::Ref(r) if r.ns == RefNs::SelfMod)
+            {
+                stack.push(rhs);
+            }
             continue;
         }
         if let Node::Call(c) = node
@@ -500,7 +505,7 @@ pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<
     //    explicit `record(...)` argument, so the rest of the desugar —
     //    selector = field-names, `likelihoodof(kernel, x)`, `bayesupdate` — is
     //    unchanged for both forms). The disintegration selector is `x`'s
-    //    field-names (resolve one ref hop for the explicit form, in case `x` is
+    //    field-names (resolve the alias chain for the explicit form, in case `x` is
     //    bound by name).
     let x = match x_arg {
         XArg::Explicit(x) => x,
@@ -522,7 +527,7 @@ pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<
             }))
         }
     };
-    let (x_resolved, _) = resolve_ref_one(m, x);
+    let (x_resolved, _) = resolve_ref(m, x);
     let x_field_names = record_field_names(m, x_resolved)?;
 
     // 3. Split `M` on `x`'s field-names → the SAME (kernel, marginal) the

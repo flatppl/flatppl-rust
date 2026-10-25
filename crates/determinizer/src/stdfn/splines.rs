@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn lower_function(m: &mut Module, args: &[NodeId], member: &str) -> Option<NodeId> {
-    let centers = resolve_ref_one(m, *args.last()?).0;
+    let centers = resolve_ref(m, *args.last()?).0;
     if matches!(m.type_of(centers), Some(Type::Array { shape, .. })
         if shape.as_ref() == [flatppl_core::Dim::Static(0)])
     {

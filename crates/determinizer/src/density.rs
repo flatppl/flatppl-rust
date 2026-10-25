@@ -433,7 +433,7 @@ fn lower_bayesupdate(
 /// `mu = elementof(...)` param decls in place is valid FlatPDL (`is_flatpdl`
 /// allows `elementof` parameter declarations); they become unused free params.
 /// If `k` (a likelihood kernel argument) is a cross-module ref
-/// `(%ref <alias> member)` — directly, or via one `(%ref self …)` hop — resolve
+/// `(%ref <alias> member)` — directly, or via a `(%ref self …)` alias chain — resolve
 /// it against `bundle` and graft the referenced submodule kernel subtree into the
 /// host, returning the grafted host node. A same-module `k` is returned
 /// unchanged. The graft honors the `load_module` `%assign` load-time
@@ -465,7 +465,7 @@ fn resolve_cross_module_kernel(
     }
 }
 
-/// If `target` is — or resolves via one `(%ref self …)` hop to — a cross-module
+/// If `target` is — or resolves via a `(%ref self …)` alias chain to — a cross-module
 /// `(%ref <alias> member)` into a loaded submodule, resolve it against `bundle`
 /// and GRAFT the referenced submodule subtree into the host, returning
 /// `Some(grafted_host_node)`. Returns `Ok(None)` when `target` is a same-module
@@ -497,7 +497,7 @@ fn graft_cross_module_target(
     let module_ref = if is_module_ref(m, target) {
         target
     } else {
-        let (candidate, _) = resolve_ref_one(m, target);
+        let (candidate, _) = resolve_ref(m, target);
         if is_module_ref(m, candidate) {
             candidate
         } else {
@@ -562,7 +562,7 @@ pub(crate) fn graft_query_target(
         }
         (q.args[0], q.args[1])
     };
-    // Case 1: the target IS (or resolves via one `(%ref self …)` hop to) a
+    // Case 1: the target IS (or resolves via a `(%ref self …)` alias chain to) a
     // cross-module measure / likelihood HANDLE — graft it directly.
     if let Some(grafted) = graft_cross_module_target(m, arg1, bundle, imports)? {
         return Ok(Some(build_call(m, op, &[grafted, arg2])));
@@ -618,7 +618,7 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
 /// The application's arguments (`args` / `named` / reification `inputs`) are
 /// assumed host-local — only the callee is grafted — so they are carried over
 /// unchanged. That assumption is checked, not merely asserted: any `args` /
-/// `named` value that is itself (or resolves via one `(%ref self …)` hop to) a
+/// `named` value that is itself (or resolves via a `(%ref self …)` alias chain to) a
 /// cross-module ref is refused (see below) rather than spliced unresolved into
 /// the rebuilt call.
 ///
@@ -647,8 +647,8 @@ pub(crate) fn graft_kernel_application_callee(
     imports: &mut GraftState,
 ) -> Result<Option<NodeId>, RefuseError> {
     // The target may be inline (`logdensityof(m.k(input), pt)`) or bound by name
-    // (`ka = m.k(input); logdensityof(ka, pt)`); resolve one ref hop to the call.
-    let (call_node, _) = resolve_ref_one(m, arg1);
+    // (`ka = m.k(input); logdensityof(ka, pt)`); resolve the alias chain to the call.
+    let (call_node, _) = resolve_ref(m, arg1);
     let (head, callee, mut args, named, inputs, arg_start) = {
         let Node::Call(c) = m.node(call_node) else {
             return Ok(None);
@@ -670,8 +670,8 @@ pub(crate) fn graft_kernel_application_callee(
         )
     };
     // Only a CROSS-MODULE callee triggers the graft. A local callee (directly, or
-    // via one `(%ref self …)` hop) is left for `reduce_kernel_application`.
-    let (callee_resolved, _) = resolve_ref_one(m, callee);
+    // via a `(%ref self …)` alias chain) is left for `reduce_kernel_application`.
+    let (callee_resolved, _) = resolve_ref(m, callee);
     if !is_module_ref(m, callee) && !is_module_ref(m, callee_resolved) {
         return Ok(None);
     }
@@ -689,7 +689,7 @@ pub(crate) fn graft_kernel_application_callee(
     // WRONG DENSITY. Refuse instead; fully grafting a cross-module argument
     // (rather than just the callee) is a richer follow-up, not required here.
     let arg_is_cross_module =
-        |id: NodeId| is_module_ref(m, id) || is_module_ref(m, resolve_ref_one(m, id).0);
+        |id: NodeId| is_module_ref(m, id) || is_module_ref(m, resolve_ref(m, id).0);
     if let Some(&bad) = args[arg_start..].iter().find(|&&a| arg_is_cross_module(a)) {
         return Err(refuse(
             bad,
@@ -1295,7 +1295,7 @@ fn lower_applied_kernel_joint(
         .filter(|na| na.kind == NamedKind::Kwarg)
         .map(|na| (na.name, na.value))
         .collect();
-    let (joint_node, _) = resolve_ref_one(m, callee);
+    let (joint_node, _) = resolve_ref(m, callee);
     let joint = expect_builtin_call(m, joint_node, "joint")?;
     let positional: Vec<NodeId> = joint.args.to_vec();
     let named: Vec<NamedArg> = joint.named.to_vec();
@@ -1366,7 +1366,7 @@ fn lower_applied_ksuperpose(
         .filter(|na| na.kind == NamedKind::Kwarg)
         .map(|na| (na.name, na.value))
         .collect();
-    let (lift_node, _) = resolve_ref_one(m, callee);
+    let (lift_node, _) = resolve_ref(m, callee);
     let lift = expect_builtin_call(m, lift_node, "ksuperpose")?;
     if lift.args.len() != 2 {
         return Some(Err(refuse(
@@ -1400,7 +1400,7 @@ fn lower_applied_ksuperpose_inner(
     // shapes `lower_broadcast_kernel` accepts: a bare built-in `Const`, or a §09
     // member ref. Reifications were handled above. A value-broadcast head or `%local` is not
     // one — refuse.
-    let (ctor_node, _) = resolve_ref_one(m, component);
+    let (ctor_node, _) = resolve_ref(m, component);
     let ctor_sym = match *m.node(ctor_node) {
         Node::Const(sym) => sym,
         Node::Ref(Ref {
@@ -1748,7 +1748,7 @@ fn lower_applied_kernel_joint_inner(
         }));
         // Preserve the variate type until inference sees the new call. The
         // product lowering needs it to split a positional point correctly.
-        let (body, _) = resolve_ref_one(m, kernel.body);
+        let (body, _) = resolve_ref(m, kernel.body);
         if let Some(ty) = m.type_of(kernel.body).or_else(|| m.type_of(body)).cloned() {
             let domain = match ty {
                 Type::Measure { domain, .. } => domain,
@@ -2926,22 +2926,13 @@ fn resolve_component_draw(
     m: &Module,
     value: NodeId,
 ) -> Option<(NodeId, Option<BindingId>, Option<NodeId>, NodeId)> {
-    // One `(%ref self x)` hop: the field either IS a self-ref to a binding
-    // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
+    // The field either IS a self-ref to a binding, through any alias chain
+    // (Cases A / ref-C), or is spelled inline (Cases B / inline-C).
     //
-    // `declared_binding_rhs`, not `binding(bid).rhs`: an EARLIER query over the same
+    // Declared right-hand sides, not current ones: an EARLIER query over the same
     // measure pinned this latent to its own point, overwriting the `draw` with a
     // literal. §13 reduces per output, so this query must still see the draw.
-    let (effective, outer_binding) = match m.node(value) {
-        Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) => {
-            let bid = m.binding_by_name(*name)?;
-            (m.declared_binding_rhs(bid), Some(bid))
-        }
-        _ => (value, None),
-    };
+    let (effective, outer_binding) = crate::kernel::declared_binding(m, value);
 
     // Cases A / B: the effective RHS is a bare `draw(Mᵢ)` — `effective` IS the
     // draw site.
@@ -3405,7 +3396,7 @@ pub(crate) fn measure_stochastic_ancestors(
 /// * a reified callable bound by name — `(%ref self f)` whose inferred type is
 ///   `Type::Function` / `Type::Kernel`.
 ///
-/// We catch both: resolve one ref level and test the reification head, and test
+/// We catch both: resolve the alias chain and test the reification head, and test
 /// the inferred type of the (original) weight node. Either positive ⇒ refuse.
 fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
     // Inferred type of the weight (catches the bound-by-name `(%ref self f)` form,
@@ -3418,9 +3409,9 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
         return true;
     }
     // Reification head (catches an inline `functionof(…)`/`kernelof(…)` weight even
-    // if inference left its type `%deferred`); resolve one ref level so a named
+    // if inference left its type `%deferred`); resolve the alias chain so a named
     // reification is seen by its constructor.
-    let (resolved, _) = resolve_ref_one(m, w_node);
+    let (resolved, _) = resolve_ref(m, w_node);
     if matches!(
         builtin_name(m, resolved),
         Some("functionof") | Some("kernelof")
@@ -4043,10 +4034,10 @@ fn lower_normalize(
         c.args[0]
     };
 
-    // Read the inferred total-mass class of M. Resolve one level of ref
-    // indirection so `m = Normal(...)` referenced by name is classified by the
+    // Read the inferred total-mass class of M. Resolve the alias chain
+    // so `m = Normal(...)` referenced by name is classified by the
     // constructor's mass, not the (typeless) ref node.
-    let (m_inner_resolved, _) = resolve_ref_one(m, m_inner);
+    let (m_inner_resolved, _) = resolve_ref(m, m_inner);
     let inner_mass = match m.type_of(m_inner_resolved) {
         Some(Type::Measure { mass, .. }) => Some(*mass),
         _ => None,
@@ -4075,10 +4066,10 @@ fn lower_normalize(
         if let Some(tc) = expect_builtin_call(m, m_inner_resolved, "truncate") {
             if tc.args.len() == 2 {
                 let (base, set) = (tc.args[0], tc.args[1]);
-                // Resolve one ref level: a truncation set is usually a named
+                // Resolve the alias chain: a truncation set is usually a named
                 // binding (`window = interval(0.0, 10.0)`), and the interval is
                 // then its RHS rather than the argument node itself.
-                let (set, _) = resolve_ref_one(m, set);
+                let (set, _) = resolve_ref(m, set);
                 if let Some(ic) = expect_builtin_call(m, set, "interval") {
                     if ic.args.len() == 2 {
                         Some((base, ic.args[0], ic.args[1]))
@@ -4142,7 +4133,7 @@ fn lower_normalize(
         // If the base is not univariate-continuous-normalized, do NOT take the
         // CDF-Z path — fall through to the refuse below (exactly as the
         // unnormalized `Lebesgue` base already does).
-        let (base_resolved, _) = resolve_ref_one(m, base);
+        let (base_resolved, _) = resolve_ref(m, base);
         let base_ty = m.type_of(base_resolved);
         let base_normalized = matches!(
             base_ty,
@@ -4442,12 +4433,12 @@ fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
     let CallHead::User(callee) = c.head else {
         return None;
     };
-    let (lift_node, _) = resolve_ref_one(m, callee);
+    let (lift_node, _) = resolve_ref(m, callee);
     let lift = expect_builtin_call(m, lift_node, "ksuperpose")?;
     if lift.args.len() != 2 {
         return None;
     }
-    let (ctor_node, _) = resolve_ref_one(m, lift.args[0]);
+    let (ctor_node, _) = resolve_ref(m, lift.args[0]);
     if matches!(
         m.type_of(ctor_node),
         Some(Type::Kernel {
@@ -4496,7 +4487,7 @@ fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<No
     };
     let mut weights = Vec::with_capacity(components.len());
     for comp in components {
-        let (comp_resolved, _) = resolve_ref_one(m, comp);
+        let (comp_resolved, _) = resolve_ref(m, comp);
         let (weight, base) = {
             let w = expect_builtin_call(m, comp_resolved, "weighted")?;
             if w.args.len() != 2 {
@@ -4508,7 +4499,7 @@ fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<No
         // wᵢ · totalmass(Aᵢ) = wᵢ. Read the mass off the inferred type; anything
         // not statically `Mass::Normalized` (Finite/LocallyFinite/Unknown) has no
         // closed-form unit mass, so bail.
-        let (base_resolved, _) = resolve_ref_one(m, base);
+        let (base_resolved, _) = resolve_ref(m, base);
         let base_ty = m.type_of(base_resolved).cloned().or_else(|| {
             flatppl_infer::infer_expression(m, base_resolved, &[])
                 .0
@@ -4643,11 +4634,11 @@ fn gaussian_factor_scored_at(
     None
 }
 
-/// If `node` (after one ref hop) is a `Normal(...)` constructor (positional or
+/// If `node` (after its alias chain) is a `Normal(...)` constructor (positional or
 /// keyword arguments), return `(constructor_node, args)` with each argument
 /// bound to its parameter name; otherwise `None`.
 fn normal_ctor(m: &mut Module, node: NodeId) -> Option<(NodeId, Vec<(Symbol, NodeId)>)> {
-    let (resolved, _) = resolve_ref_one(m, node);
+    let (resolved, _) = resolve_ref(m, node);
     let (sym, kwargs) = split_kernel_constructor(m, resolved)?;
     if m.resolve(sym) != "Normal" {
         return None;
@@ -4769,7 +4760,7 @@ fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
 
 /// Extract `(kernel_const, kernel_input_record)` from a primitive constructor
 /// `Normal(mu = …, sigma = …)` — the `builtin_*` primitive's arg 0/1 shape.
-/// Resolves one level of `(%ref self x)` indirection first, so a truncation
+/// Resolves `(%ref self x)` alias chains first, so a truncation
 /// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
 /// its constructor.
 ///
@@ -4781,7 +4772,7 @@ fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
 /// parameter names). `None` (not a builtin constructor call, or a malformed
 /// positional/keyword mix) refuses cleanly rather than mislowering.
 fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
-    let (ctor_resolved, _) = resolve_ref_one(m, ctor);
+    let (ctor_resolved, _) = resolve_ref(m, ctor);
     let (ctor_sym, kwargs) = split_kernel_constructor(m, ctor_resolved).ok_or_else(|| {
         refuse(
             ctor_resolved,
@@ -4922,10 +4913,10 @@ fn refuse_truncation_set_kind_mismatch(
 /// value-set rendering, which need not be what the user typed:
 /// `cartprod(a = interval(0, inf))` renders `cartprod(a = interval(0, inf))`.
 ///
-/// One level of ref indirection is resolved, so a preset set binding
+/// Alias chains are resolved, so a preset set binding
 /// (`S = interval(0, 1)` … `truncate(M, S)`) is covered too.
 fn truncation_set_kind(m: &Module, s_node: NodeId) -> Option<(VariateKind, String)> {
-    let (s, _) = resolve_ref_one(m, s_node);
+    let (s, _) = resolve_ref(m, s_node);
     // A named set first: a bare `Node::Const`'s own value-set annotation is
     // `anything`, which would both prove nothing and misname the set.
     if let Some(named) = predefined_set_kind(m, s) {
@@ -5059,7 +5050,7 @@ fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<N
 /// proves neither reference.
 ///
 /// The forward map may be given explicitly as a `bijection(f, f_inv, logvol)`
-/// node (directly or via one level of ref), OR — per §06 case 1 — as a known
+/// node (directly or via an alias chain), OR — per §06 case 1 — as a known
 /// invertible builtin (`pushfwd(exp, M)`, `pushfwd(x -> exp(x), M)`), for which
 /// `(f_inv, logvol)` is synthesised analytically by [`crate::invert`]. Anything
 /// else refuses.
@@ -5079,7 +5070,7 @@ fn lower_pushfwd(
     };
     let parameter = crate::extras::bind_extras(m, node, bij_node, 2, 1)?;
 
-    // Resolve `bij_node` through one level of ref indirection, then unwrap any CLOSED
+    // Resolve `bij_node` through its alias chain, then unwrap any CLOSED
     // reification around the forward map: `functionof(v -> get(v, [1]))` has no
     // boundary input of its own, and §04 forbids a nullary callable "as this would
     // make them equivalent to known values", so it IS the lambda it wraps. Without
@@ -5088,7 +5079,7 @@ fn lower_pushfwd(
     // `derive_bijection` resolves the forward argument itself; both go through
     // `classify_reification`, which unwraps nested wrappers to a fixpoint, so the two
     // sites cannot disagree on depth.
-    let (bij_resolved, _) = resolve_ref_one(m, bij_node);
+    let (bij_resolved, _) = resolve_ref(m, bij_node);
     let bij_resolved =
         crate::kernel::resolve_closed_reification(m, bij_resolved).unwrap_or(bij_resolved);
     // Analytic recognition sees the map at this parameter point. The temporary
@@ -5343,7 +5334,7 @@ fn on_lattice(
     // is `broadcast(g, snapped)`. `g(snapped)` applies a scalar-domain function to a vector.
     let back = if parameter.is_empty()
         && variate_is_vector(domain)
-        && matches!(m.node(resolve_ref_one(m, forward).0), Node::Const(_))
+        && matches!(m.node(resolve_ref(m, forward).0), Node::Const(_))
     {
         build_call(m, "broadcast", &[forward, snapped])
     } else {
@@ -5492,7 +5483,7 @@ fn apply_change_of_variables(
     // A bare operator (possibly reached through one alias hop) has no body to
     // substitute into; `canon`'s head rewrite is what lands it on a direct builtin
     // call, so admit it unreduced exactly as the sample side does.
-    if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
+    if matches!(m.node(resolve_ref(m, callee).0), Node::Const(_)) {
         // Scalar builtins cannot consume a whole record variate.
         if parameter.is_empty() && expect_builtin_call(m, point, "record").is_some() {
             return Err(refuse(
@@ -5809,7 +5800,7 @@ fn lower_projection_pushfwd(
     // its own point mapping and is not covered by the sub-product marginal below.
     // Refuse by name — the diagnostic is the whole value of recognising it here.
     if !proj.subset {
-        let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+        let (m_inner, _) = resolve_ref(m, m_inner_expr);
         return Err(refuse(
             m_inner,
             m,
@@ -5823,7 +5814,7 @@ fn lower_projection_pushfwd(
             lower_index_projection(m, m_inner_expr, raw, *one_based, v)
         }
         Selector::Unsupported(what) => {
-            let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+            let (m_inner, _) = resolve_ref(m, m_inner_expr);
             Err(refuse(
                 m_inner,
                 m,
@@ -5844,7 +5835,7 @@ fn lower_named_projection(
     fields: &[Box<str>],
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+    let (m_inner, _) = resolve_ref(m, m_inner_expr);
     match builtin_name(m, m_inner) {
         // Keyword `joint(a = Mₐ, …)`: the selected components form a sub-joint.
         Some("joint") => {
@@ -5942,7 +5933,7 @@ fn lower_named_projection(
             // re-dispatch to the bare `jointchain` prefix-keep arm below — the
             // projected names and the point are already keyed by the internal
             // field names.
-            let (inner_resolved, _) = resolve_ref_one(m, inner);
+            let (inner_resolved, _) = resolve_ref(m, inner);
             if builtin_name(m, inner_resolved) == Some("jointchain") {
                 let chain_fields = crate::jointchain::record_variate_fields(m, inner_resolved)
                     .ok_or_else(|| refuse_jointchain_projection(m, inner_resolved))?;
@@ -6034,7 +6025,7 @@ fn lower_index_projection(
     one_based: bool,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+    let (m_inner, _) = resolve_ref(m, m_inner_expr);
     // The point checks run INSIDE each supported arm, not here: dispatching on the
     // base shape first lets a field-keyed base report the by-name spelling rather
     // than a variate-kind mismatch its point would also trip.
@@ -6105,7 +6096,7 @@ fn lower_index_projection(
             };
             refuse_bad_index_point(m, m_inner, v, raw.len())?;
             for &comp in &comps {
-                let (resolved, _) = resolve_ref_one(m, comp);
+                let (resolved, _) = resolve_ref(m, comp);
                 let kind = match m.type_of(resolved) {
                     Some(Type::Measure { domain, .. }) => variate_kind(domain),
                     _ => None,
@@ -6362,7 +6353,7 @@ fn refuse_unnormalized_dropped_component(
     component: NodeId,
     what: &str,
 ) -> Result<(), RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, component);
+    let (resolved, _) = resolve_ref(m, component);
     let mass = match m.type_of(resolved) {
         Some(Type::Measure { mass, .. }) => Some(*mass),
         _ => None,
@@ -6552,7 +6543,7 @@ fn lower_jointchain_projection(
 ///   dynamic/multi-axis product's components can't be named slot-by-slot here.
 /// * any other measure — not an index-keyed product with nameable slots.
 fn independent_product_components(m: &Module, inner: NodeId) -> Result<Vec<NodeId>, RefuseError> {
-    let (inner_resolved, _) = resolve_ref_one(m, inner);
+    let (inner_resolved, _) = resolve_ref(m, inner);
     match builtin_name(m, inner_resolved) {
         Some("iid") => {
             let n = iid_static_size(m, inner_resolved).ok_or_else(|| {
@@ -6628,7 +6619,7 @@ fn independent_product_components(m: &Module, inner: NodeId) -> Result<Vec<NodeI
 /// silently omit that mass as a multiplicative (additive in log-space) factor
 /// from the marginal. Refuse rather than mislower (a wrong marginal is the
 /// worst outcome) — mirroring [`lower_normalize`]'s own reading of the mass
-/// via `resolve_ref_one` + `Module::type_of`.
+/// via `resolve_ref` + `Module::type_of`.
 ///
 /// `measure_of` extracts the scored measure node from a field's raw value:
 /// for a keyword `joint` the value IS the measure; for a record-of-draws it is
@@ -6654,7 +6645,7 @@ fn refuse_unnormalized_dropped_fields(
         let Some(measure) = measure_of(m, field.value) else {
             continue;
         };
-        let (resolved, _) = resolve_ref_one(m, measure);
+        let (resolved, _) = resolve_ref(m, measure);
         let mass = match m.type_of(resolved) {
             Some(Type::Measure { mass, .. }) => Some(*mass),
             _ => None,
@@ -6847,7 +6838,7 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         }
         c.args[0]
     };
-    let (resolved, _) = resolve_ref_one(m, v);
+    let (resolved, _) = resolve_ref(m, v);
     let observed_shape = match m.type_of(v).or_else(|| m.type_of(resolved)) {
         Some(Type::Array { shape, .. }) => Some(shape.to_vec()),
         Some(Type::Table { nrows, .. }) => Some(vec![*nrows]),
@@ -7072,7 +7063,7 @@ fn static_array_variate_len(m: &Module, v: NodeId) -> Option<u32> {
     let ty = match m.type_of(v) {
         Some(t) => t,
         None => {
-            let (resolved, _) = resolve_ref_one(m, v);
+            let (resolved, _) = resolve_ref(m, v);
             m.type_of(resolved)?
         }
     };
@@ -7306,7 +7297,7 @@ fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<
 /// recognizes an overlapping but different set of `Z` shapes inline; merging the
 /// two is left out of this change.
 fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
-    let (node, _) = resolve_ref_one(m, measure);
+    let (node, _) = resolve_ref(m, measure);
 
     if let Some(weights) = recognize_markov_ksuperpose(m, node) {
         return Some(build_call(m, "sum", &[weights]));
@@ -7365,7 +7356,7 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
         let bounds = {
             let c = expect_builtin_call(m, node, "Lebesgue")?;
             let support = named_or_positional(m, c, "support")?;
-            let (set, _) = resolve_ref_one(m, support);
+            let (set, _) = resolve_ref(m, support);
             let ic = expect_builtin_call(m, set, "interval")?;
             if ic.args.len() != 2 {
                 return None;
@@ -7869,7 +7860,7 @@ fn lower_joint(
     // "unconfirmed" and "confirmed non-scalar" both refuse; only "confirmed
     // scalar" lowers.
     for &mi in inner.iter() {
-        let (mi_resolved, _) = resolve_ref_one(m, mi);
+        let (mi_resolved, _) = resolve_ref(m, mi);
         let component_kind = match m.type_of(mi_resolved) {
             Some(Type::Measure { domain, .. }) => variate_kind(domain),
             _ => None,
@@ -8137,7 +8128,7 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
 /// inferred type proves is out of domain — the same discipline as the StableHLO emitter's
 /// bare-op domain guard, which stays the backstop for the unproven cases.
 pub(crate) fn confirmed_non_scalar(m: &Module, value: NodeId) -> Option<VariateKind> {
-    let (resolved, _) = resolve_ref_one(m, value);
+    let (resolved, _) = resolve_ref(m, value);
     match variate_kind(m.type_of(resolved)?)? {
         VariateKind::Scalar => None,
         kind => Some(kind),
@@ -8212,7 +8203,7 @@ fn std_module_ctor_sym(m: &Module, callee: NodeId) -> Option<Symbol> {
     let ref_id = if crate::crossmodule::std_module_member(m, callee).is_some() {
         callee
     } else {
-        let hop = resolve_ref_one(m, callee).0;
+        let hop = resolve_ref(m, callee).0;
         crate::crossmodule::std_module_member(m, hop).map(|_| hop)?
     };
     let Node::Ref(Ref { name: member, .. }) = *m.node(ref_id) else {
@@ -8494,7 +8485,7 @@ pub(crate) fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Opt
 /// Expose a typed record input through projections, as for a literal query point.
 /// Keep the field types: density rules use them before the next inference pass.
 pub(crate) fn materialize_record_value(m: &mut Module, v: NodeId) -> NodeId {
-    let (resolved, _) = resolve_ref_one(m, v);
+    let (resolved, _) = resolve_ref(m, v);
     let promoted = matches!(m.node(v), Node::Ref(r)
         if r.ns == RefNs::SelfMod && crate::canon::promoted_input_names(m).contains(&r.name));
     if !promoted && expect_builtin_call(m, resolved, "record").is_some() {
@@ -8538,8 +8529,27 @@ pub(crate) fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
     None
 }
 
+/// Follow `(%ref self x)` indirection through every bare-name alias: return the
+/// first right-hand side that is not itself a self-ref, with the binding that
+/// holds it, or `(id, None)` when `id` is not a self-ref.
+///
+/// §04 *Name resolution* makes `M = a` name the very expression `a` names, so a
+/// caller that stopped one hop off `M` would hold the ref node `a` and refuse a
+/// legal alias. Bounded by the binding count, so a cyclic module cannot hang.
+pub(crate) fn resolve_ref(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
+    let (mut node, mut bid) = resolve_ref_one(m, id);
+    for _ in 0..m.binding_count() {
+        match resolve_ref_one(m, node) {
+            (next, Some(next_bid)) => (node, bid) = (next, Some(next_bid)),
+            (_, None) => break,
+        }
+    }
+    (node, bid)
+}
+
 /// Follow one level of `(%ref self x)` indirection: if `id` is a self-ref,
-/// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`.
+/// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`. Only a
+/// caller that inspects each hop wants this; the rest use [`resolve_ref`].
 pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
     if let Node::Ref(Ref {
         ns: RefNs::SelfMod,
@@ -8552,22 +8562,15 @@ pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<Binding
     (id, None)
 }
 
-/// Follow a CHAIN of `(%ref self x)` indirections, hopping while each resolved
-/// right-hand side is itself a self-ref.
+/// Like [`resolve_ref`], but also folds a `get` of a record or tuple literal
+/// (through promoted inputs) to the projected field, then keeps resolving.
 ///
-/// §04 *Name resolution* resolves an unqualified name to "that binding", and a
-/// module is "an unordered set of bindings of names to expressions". So a
-/// bare-name binding `M = g1` names the very expression `g1` names, and the two
-/// spellings must lower identically. One hop off `M` lands on `M`'s right-hand
-/// side — the ref node `g1` — which is not a measure op and not a constructor
-/// call, so a caller that stops there refuses a legal alias.
-///
-/// Bounded by the binding count: a cyclic module is a static error, but the
+/// Bounded by the node count: a cyclic module is a static error, but the
 /// determiniser must not hang on one.
 pub(crate) fn resolve_ref_chain(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
-    let (mut node, mut bid) = resolve_ref_one(m, id);
+    let (mut node, mut bid) = resolve_ref(m, id);
     for _ in 0..m.node_count() {
-        let (next, next_bid) = resolve_ref_one(m, node);
+        let (next, next_bid) = resolve_ref(m, node);
         match next_bid {
             Some(b) => {
                 node = next;

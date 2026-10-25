@@ -66,7 +66,7 @@
 
 use crate::density::{
     Ancestor, build_call, build_record, draw_argument, expect_builtin_call, lower_measure_density,
-    measure_stochastic_ancestors, refuse, resolve_ref_one, split_kernel_constructor,
+    measure_stochastic_ancestors, refuse, resolve_ref, split_kernel_constructor,
 };
 use crate::kernel::{Kernel, resolve_reified};
 use crate::refuse::RefuseError;
@@ -189,12 +189,12 @@ struct Latent {
 /// shape we cannot pin to a single primitive constructor (e.g. a multi-field
 /// record latent, or a combinator).
 fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
-    let (resolved, _) = resolve_ref_one(m, m_arg);
+    let (resolved, _) = resolve_ref(m, m_arg);
 
     // Strip an optional `lawof(...)`.
     let inner = match expect_builtin_call(m, resolved, "lawof") {
         Some(law) if law.args.len() == 1 => {
-            let (i, _) = resolve_ref_one(m, law.args[0]);
+            let (i, _) = resolve_ref(m, law.args[0]);
             i
         }
         Some(_) => return None,
@@ -206,7 +206,7 @@ fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
         if !rec.args.is_empty() || rec.named.len() != 1 {
             return None;
         }
-        let (v, _) = resolve_ref_one(m, rec.named[0].value);
+        let (v, _) = resolve_ref(m, rec.named[0].value);
         (v, Some(rec.named[0].name))
     } else {
         (inner, None)
@@ -217,7 +217,7 @@ fn resolve_latent(m: &Module, m_arg: NodeId) -> Option<Latent> {
         if draw.args.len() != 1 {
             return None;
         }
-        let (d, _) = resolve_ref_one(m, draw.args[0]);
+        let (d, _) = resolve_ref(m, draw.args[0]);
         d
     } else {
         value
@@ -555,7 +555,7 @@ fn variate_like_kernel(m: &Module, v: NodeId, record_field: Option<Symbol>) -> O
     let Some(field) = record_field else {
         return Some(v);
     };
-    let (resolved, _) = resolve_ref_one(m, v);
+    let (resolved, _) = resolve_ref(m, v);
     let rec = expect_builtin_call(m, resolved, "record")?;
     rec.named
         .iter()
@@ -703,7 +703,7 @@ fn matches_latent_path(m: &Module, value: NodeId, path: &LatentPath, latent: Sym
         // `a_named_sqrt_intermediate_refuses_upstream_not_in_the_row`, which records that the
         // refusal is not this row's.
         LatentPath::Sqrt => {
-            let (resolved, _) = resolve_ref_one(m, value);
+            let (resolved, _) = resolve_ref(m, value);
             match expect_builtin_call(m, resolved, "sqrt") {
                 Some(c) if c.args.len() == 1 && c.named.is_empty() => {
                     is_input_ref(m, c.args[0], latent)
@@ -828,14 +828,14 @@ struct Likelihood {
 /// `record(...)` wrapper, then an optional `draw(...)`, down to a builtin
 /// distribution-constructor call. Returns `None` for any other shape.
 fn resolve_likelihood(m: &Module, body: NodeId) -> Option<Likelihood> {
-    let (resolved, _) = resolve_ref_one(m, body);
+    let (resolved, _) = resolve_ref(m, body);
 
     // Optional single-field `record(field = X)` wrapper → remember the field.
     let (inner, record_field) = if let Some(rec) = expect_builtin_call(m, resolved, "record") {
         if !rec.args.is_empty() || rec.named.len() != 1 {
             return None;
         }
-        let (val, _) = resolve_ref_one(m, rec.named[0].value);
+        let (val, _) = resolve_ref(m, rec.named[0].value);
         (val, Some(rec.named[0].name))
     } else {
         (resolved, None)
@@ -843,7 +843,7 @@ fn resolve_likelihood(m: &Module, body: NodeId) -> Option<Likelihood> {
 
     // Optional `draw(dist)` → dist.
     let dist = if let Some(inner_dist) = draw_argument(m, inner) {
-        let (d, _) = resolve_ref_one(m, inner_dist);
+        let (d, _) = resolve_ref(m, inner_dist);
         d
     } else {
         inner

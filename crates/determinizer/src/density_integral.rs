@@ -334,7 +334,7 @@ fn kept_atoms(m: &mut Module, base: NodeId, lo: f64, hi: f64) -> Option<KeptAtom
 /// `interval(lo, hi)`, or a §03 named set. On integer atoms `posreals` (0, inf]
 /// holds the same atoms as [1, inf].
 fn integer_set_range(m: &Module, set: NodeId) -> Option<(f64, f64)> {
-    let (set, _) = resolve_ref_one(m, set);
+    let (set, _) = resolve_ref(m, set);
     if let Some(interval) = expect_builtin_call(m, set, "interval").filter(|c| c.args.len() == 2) {
         return Some((
             static_real(m, interval.args[0])?,
