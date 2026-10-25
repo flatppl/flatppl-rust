@@ -1257,31 +1257,27 @@ fn disintegrate_defers_for_non_literal_selector() {
     );
 }
 
-/// `disintegrate([], joint)` — an empty selector `[]` — must yield the deferred
-/// fallback, not a fabricated result.
+/// `disintegrate([], joint)` — an empty selector `[]` — must not yield a fabricated
+/// result.
 ///
-/// Discovery (2026-06-20): `[]` lowers to `(vector)` — a `vector` call with zero
-/// args, which matches the `vector`-literal branch of `selector_field_names` and
-/// collects to an empty vec. Without the guard, that empty vec was treated as
-/// `Some([])` — a resolved-but-empty selector — causing `disintegrate` to walk the
-/// record fields and produce non-empty kernel inputs and a full marginal domain.
-/// The fix returns `None` (→ deferred) whenever the collected name list is empty.
+/// Discovery (2026-06-20): `[]` once matched the `vector`-literal branch of
+/// `selector_field_names` and collected to an empty name list, which `disintegrate`
+/// read as a resolved-but-empty selector and so walked the record fields into a full
+/// marginal. §05 now reads `[]` as an empty axis list, a static error, and the failed
+/// selector fails the call.
 #[test]
-fn disintegrate_defers_for_empty_selector() {
-    // `[]` lowers to `(vector)` with zero args. `selector_field_names` must
-    // return `None` for an empty name list, so `disintegrate_type` falls back
-    // to the deferred path: empty kernel inputs + deferred marginal domain.
+fn disintegrate_fails_for_empty_selector() {
     let out = ir("a ~ Normal(0.0, 1.0)\n\
                   b ~ Normal(a, 1.0)\n\
                   mu = lawof(record(a = a, b = b))\n\
                   parts = disintegrate([], mu)");
+    let parts = out
+        .lines()
+        .find(|l| l.contains("(%bind parts "))
+        .unwrap_or_else(|| panic!("no `parts` binding in:\n{out}"));
     assert!(
-        out.contains("(%inputs )"),
-        "disintegrate([], mu) should have empty kernel inputs, got:\n{out}"
-    );
-    assert!(
-        out.contains("(%domain %deferred)"),
-        "disintegrate([], mu) should have a deferred marginal domain, got:\n{out}"
+        parts.contains("(%bind parts (%meta ((%failed"),
+        "disintegrate([], mu) must fail with its selector, got:\n{parts}"
     );
 }
 

@@ -57,7 +57,37 @@ pub(crate) fn const_type(name: &str) -> Type {
 /// Dispatch a call to its op rule. `joined` is the §04 ancestor-rule phase
 /// join over all inputs; rules override it only where the op itself
 /// introduces a phase (`elementof`, `draw`, reification closure, loaders).
+///
+/// A failed argument fails the call. No row has a meaning for an operand with no type,
+/// and a nominal result would hide the refusal under `%deferred` or a value. The op
+/// rule still runs, so its own diagnostics are reported. A reification's arguments are
+/// its body and boundary, not operands, so it is exempt.
 pub(crate) fn call_rule(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    call: &Call,
+    callee: Option<(NodeId, Type)>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    joined: Phase,
+) -> RuleStep<(Type, Phase)> {
+    let failed = if call.inputs.is_none() {
+        args.iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+            .find_map(first_failed)
+    } else {
+        None
+    };
+    op_rule(inf, id, call, callee, args, named, joined).map(inf, move |_, (ty, phase)| match failed
+    {
+        Some(failed) if !matches!(ty, Type::Failed(_)) => (failed, phase),
+        _ => (ty, phase),
+    })
+}
+
+/// The op rule of a call, before [`call_rule`]'s failed-argument override.
+fn op_rule(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     call: &Call,
@@ -878,7 +908,9 @@ pub(crate) fn call_rule(
 
         // ---- broadcasting (spec §04) ----
         "broadcast" => {
-            return broadcast_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
+            // A failed cell fails the broadcast, as a failed argument fails a call.
+            return broadcast_type(inf, id, args, named)
+                .map(inf, move |_, ty| (first_failed(&ty).unwrap_or(ty), joined));
         }
         // Like a bare builtin callable, the lifted callable's result depends
         // on application arguments. Kernel primitives inspect it structurally.
@@ -6600,24 +6632,42 @@ pub(crate) fn input_entries(
 
 /// Group the body's `%local` placeholder refs by name in traversal order.
 /// One call-local walk serves every parameter while seeds retain input order.
+///
+/// A nested reification that declares the same placeholder rebinds it: §04 binds each
+/// `_` to the nearest enclosing `fn`, so `fn(broadcast(fn(_ + 1), _))` has two distinct
+/// `_`. The walk skips a name inside the boundary that rebinds it.
 fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol, Vec<NodeId>> {
+    use std::rc::Rc;
     let mut refs: HashMap<Symbol, Vec<NodeId>> = HashMap::new();
-    let mut stack = vec![body];
+    let mut stack: Vec<(NodeId, Rc<HashSet<Symbol>>)> = vec![(body, Rc::new(HashSet::new()))];
     let mut seen = std::collections::HashSet::new();
-    while let Some(id) = stack.pop() {
+    while let Some((id, shadowed)) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
         match inf.module.node(id) {
-            Node::Ref(r) if r.ns == RefNs::Local => {
+            Node::Ref(r) if r.ns == RefNs::Local && !shadowed.contains(&r.name) => {
                 refs.entry(r.name).or_default().push(id);
             }
             Node::Call(c) => {
+                let inner = match input_entries(inf, id) {
+                    Some(entries) if c.inputs.is_some() => {
+                        let mut names = (*shadowed).clone();
+                        names.extend(
+                            entries
+                                .iter()
+                                .filter(|(_, r)| r.ns == RefNs::Local)
+                                .map(|(_, r)| r.name),
+                        );
+                        Rc::new(names)
+                    }
+                    _ => Rc::clone(&shadowed),
+                };
                 if let CallHead::User(callee) = c.head {
-                    stack.push(callee);
+                    stack.push((callee, Rc::clone(&shadowed)));
                 }
-                stack.extend(c.args.iter().copied());
-                stack.extend(c.named.iter().map(|n| n.value));
+                stack.extend(c.args.iter().map(|&a| (a, Rc::clone(&inner))));
+                stack.extend(c.named.iter().map(|n| (n.value, Rc::clone(&inner))));
             }
             _ => {}
         }
@@ -6870,38 +6920,47 @@ fn broadcast_type(
     // cell type, but lowering against the cell args keeps a future
     // `RealOrComplexOfArg` / `DomainMap` row correct).
     if inf.module_catalogue_ref(head_node).is_some() {
+        // A cell is an ordinary call (§04): a table contributes its row record, keyword
+        // cells bind by name, and a sole record cell auto-splats.
         let cell_args: Vec<ArgInfo> = args[1..]
             .iter()
-            .map(|(n, t, p)| {
-                let cell = match t {
-                    Type::Array { elem, .. } => elem.as_ref().clone(),
-                    other => other.clone(),
-                };
-                (*n, cell, *p)
-            })
+            .map(|(n, t, p)| (*n, cell_arg(t), *p))
             .collect();
-        return Ready(
-            match catalogue_call_type(inf, head_node, &cell_args, true) {
-                // Distribution head: an independent product over the array. Its cell
-                // domain and mass come from the catalogue sig, so a non-probability
-                // measure like `ContinuedPoisson` stays `Finite`, not forced to
-                // `Normalized` (mirrors the built-in distribution path below).
-                Type::Measure { domain, mass } => Type::Measure {
-                    domain: Box::new(Type::Array {
-                        shape,
-                        elem: domain,
-                    }),
-                    mass: broadcast_mass(mass),
-                },
-                // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
-                // elementwise into an array of the per-cell result, exactly as the
-                // built-in deterministic-op path does.
-                cell => Type::Array {
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+            .collect();
+        let bound = crate::callable::interface(inf, head_node).and_then(|interface| {
+            normalize_arguments(
+                inf.module,
+                &interface.names,
+                &cell_args,
+                &cell_named,
+                interface.takes_one(),
+                interface.ordered,
+            )
+        });
+        let cells = bound.unwrap_or(cell_args);
+        return Ready(match catalogue_call_type(inf, head_node, &cells, true) {
+            // Distribution head: an independent product over the array. Its cell
+            // domain and mass come from the catalogue sig, so a non-probability
+            // measure like `ContinuedPoisson` stays `Finite`, not forced to
+            // `Normalized` (mirrors the built-in distribution path below).
+            Type::Measure { domain, mass } => Type::Measure {
+                domain: Box::new(Type::Array {
                     shape,
-                    elem: Box::new(cell),
-                },
+                    elem: domain,
+                }),
+                mass: broadcast_mass(mass),
             },
-        );
+            // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
+            // elementwise into an array of the per-cell result, exactly as the
+            // built-in deterministic-op path does.
+            cell => Type::Array {
+                shape,
+                elem: Box::new(cell),
+            },
+        });
     }
 
     // Built-in head: a distribution constructor broadcasts into a measure
@@ -8745,16 +8804,33 @@ fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
     Some(what.to_string())
 }
 
+/// The first `%failed` in `ty`: itself, or one held in an element, field, component or
+/// measure domain.
+pub(crate) fn first_failed(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Failed(_) => Some(ty.clone()),
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => first_failed(elem),
+        Type::Record(fields)
+        | Type::Table {
+            columns: fields, ..
+        } => fields.iter().find_map(|(_, t)| first_failed(t)),
+        Type::Tuple(parts) => parts.iter().find_map(first_failed),
+        Type::Measure { domain, .. } => first_failed(domain),
+        Type::Likelihood { obstype, .. } => first_failed(obstype),
+        _ => None,
+    }
+}
+
 /// The type a catalogue row's call takes while a shaped argument is unresolved: the
 /// `%failed` of a failed argument, or `%deferred` for a `%deferred` one.
 ///
 /// A row's nominal result presumes each argument has its declared shape. `sqrt` of a
 /// `%deferred` argument typed a confirmed real scalar although that argument could be a
-/// vector, which a later scalar gate then trusted. A §08 distribution is not affected:
-/// its variate domain is fixed by the row, whatever its parameters' values. Only
-/// `%deferred` and `%failed` are propagated: `%any` and a type variable are a
-/// placeholder's honest "no constraint" (the `_` of `fn(sqrt(_))`), whose body type is
-/// the nominal result.
+/// vector, which a later scalar gate then trusted. A §08 distribution keeps its
+/// §08 variate domain for a `%deferred` argument, which the row fixes whatever its
+/// parameters' values. A `%failed` argument never reaches a row: `call_rule` fails the
+/// call first. `%any` and a type variable are a placeholder's honest "no constraint"
+/// (the `_` of `fn(sqrt(_))`), whose body type is the nominal result.
 fn unresolved_shaped_argument(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> Option<Type> {
     let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
     args.iter()
@@ -11209,6 +11285,31 @@ mod no_laundering_tests {
         assert_eq!(
             product_mass(&[Mass::Normalized, Mass::Normalized]),
             Mass::Normalized
+        );
+    }
+}
+
+#[cfg(test)]
+mod placeholder_scope_tests {
+    use super::*;
+
+    /// §04 binds each `_` to the nearest enclosing `fn`. `fn(broadcast(fn(_ + 1), _))`
+    /// desugars both holes to the same local name, so the outer body's placeholder refs
+    /// must not include the inner `fn`'s, or substituting the outer argument types the
+    /// inner `_ + 1` with it.
+    #[test]
+    fn a_nested_fn_keeps_its_own_placeholder() {
+        let mut module = flatppl_syntax::parse("f = fn(broadcast(fn(_ + 1), _))").unwrap();
+        let rhs = module.bindings().next().expect("one binding").1.rhs;
+        let bundle = crate::ModuleBundle::new();
+        let session = crate::modules::InferSession::new(&bundle);
+        let inf = Inferencer::new(&mut module, Level::Type, &session);
+        let (_, body) = local_reification(&inf, rhs).expect("`f` is a reification");
+        let refs = collect_local_refs(&inf, body);
+        let total: usize = refs.values().map(Vec::len).sum();
+        assert_eq!(
+            total, 1,
+            "only the outer `_` is the outer body's placeholder: {refs:?}"
         );
     }
 }

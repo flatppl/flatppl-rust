@@ -669,7 +669,7 @@ mod tests {
     /// bundled into a joint law and split with `disintegrate(["obs"], …)`.
     const BI3: &str = "\
 theta1 ~ Normal(mu = 0, sigma = 1)
-theta2 ~ Gamma(alpha = 2, beta = 1)
+theta2 ~ Gamma(shape = 2, rate = 1)
 obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
 joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
 forward_kernel, prior = disintegrate([\"obs\"], joint_model)";

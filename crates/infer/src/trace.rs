@@ -580,8 +580,8 @@ impl<'m, 's> Inferencer<'m, 's> {
                     // that still types keeps them local, since a speculative substitution
                     // can fail a subterm the call's type does not use. The value-set pass
                     // re-runs bodies it already typed, so only the type pass reports.
-                    let failed =
-                        matches!(frame.resume, CallResume::Type(..)) && contains_failed(&ty);
+                    let failed = matches!(frame.resume, CallResume::Type(..))
+                        && ops::first_failed(&ty).is_some();
                     let body_errors: Vec<Diagnostic> = std::mem::take(&mut self.diags)
                         .into_iter()
                         .filter(|d| failed && d.severity == crate::Severity::Error)
@@ -1315,21 +1315,5 @@ pub(crate) fn join_phase(a: Phase, b: Phase) -> Phase {
         (Stochastic, _) | (_, Stochastic) => Stochastic,
         (Parametric, _) | (_, Parametric) => Parametric,
         (Fixed, Fixed) => Fixed,
-    }
-}
-
-/// Whether `ty` is `%failed` or holds one in an element, field or measure domain.
-fn contains_failed(ty: &Type) -> bool {
-    match ty {
-        Type::Failed(_) => true,
-        Type::Array { elem, .. } | Type::TVector { elem, .. } => contains_failed(elem),
-        Type::Record(fields)
-        | Type::Table {
-            columns: fields, ..
-        } => fields.iter().any(|(_, t)| contains_failed(t)),
-        Type::Tuple(parts) => parts.iter().any(contains_failed),
-        Type::Measure { domain, .. } => contains_failed(domain),
-        Type::Likelihood { obstype, .. } => contains_failed(obstype),
-        _ => false,
     }
 }

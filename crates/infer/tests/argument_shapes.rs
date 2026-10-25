@@ -300,6 +300,24 @@ fn a_broadcast_cell_outside_the_declared_shape_is_refused() {
     ));
 }
 
+/// A §09 head broadcasts like a built-in one (§04): a table iterates its rows and splats
+/// each row record, and keyword cells obey the declared shapes as positional ones do.
+#[test]
+fn a_section_09_broadcast_reads_rows_keywords_and_splats() {
+    let hep = "hep = standard_module(\"particle-physics\", \"0.1\")\n";
+    assert_clean(&format!(
+        "{hep}tb = table(loc = [0.0, 1.0], scale = [1.0, 2.0])\nm = hep.Landau.(tb)\n\
+         n = Normal.(table(mu = [0.0, 1.0], sigma = [1.0, 2.0]))"
+    ));
+    let nested = "N = [[1.0, 2.0], [3.0, 4.0]]\n";
+    for call in ["hep.Landau.(loc = N, scale = 1.0)", "hep.Landau.(N, 1.0)"] {
+        assert_refuses(
+            &format!("{hep}{nested}m = {call}"),
+            "a `broadcast` cell of `hep.Landau` passes `loc` a vector, but spec §09 declares it a scalar",
+        );
+    }
+}
+
 /// A refusal inside a substituted callable body is the call's error, not a silent
 /// `%failed` at exit 0.
 #[test]
@@ -313,6 +331,57 @@ fn a_refusal_inside_a_substituted_body_is_reported() {
          y = draw(mk(record(mu = 1.5)))",
         "`Normal`'s `mu` is a record",
     );
+}
+
+/// A `%failed` result dominates every row that receives it, so a refusal under a
+/// substitution reaches the call's type and is reported, whichever row consumes it.
+#[test]
+fn a_refusal_under_any_consuming_row_is_reported() {
+    assert_refuses(
+        "k = functionof(Normal(mu = sqrt(_x_), sigma = 1.0), x = _x_)\ny ~ k(x = [1.0, 2.0])",
+        "`sqrt`'s `x` is a vector",
+    );
+    for body in [
+        "Normal(mu = sqrt(_x_), sigma = 1.0)",
+        "ifelse(true, 1.0, sqrt(_x_))",
+        "sum(sqrt(_x_))",
+        "lengthof([sqrt(_x_), 1.0])",
+        "checked(1.0, isfinite(sqrt(_x_)))",
+    ] {
+        assert_refuses(
+            &format!(
+                "N = [[1.0, 2.0], [3.0, 4.0]]\nk = functionof({body}, x = _x_)\n\
+                 y = broadcast(k, x = N)"
+            ),
+            "`sqrt`'s `x` is a vector",
+        );
+    }
+}
+
+/// The two census models that typed at exit 0: a scalar intercept added to a vector
+/// predictor inside a broadcast kernel (flatppl-js fixtures/random-intercepts.flatppl),
+/// and a matrix broadcast handing `MvNormal` a scalar `mu` cell
+/// (fixtures/joint-mvnormal-component.flatppl).
+#[test]
+fn the_census_kernel_broadcasts_are_refused() {
+    assert_refuses(
+        "intercepts = [0.0, 1.0]\nx_per_group = [[0.1, 0.2], [0.3, 0.4]]\n\
+         k = functionof(iid(Normal(mu = _i_ + 2.0 .* _x_, sigma = 1.0), 2), i = _i_, x = _x_)\n\
+         y = broadcast(k, i = intercepts, x = x_per_group)",
+        "`add` operands are outside its domain",
+    );
+    assert_refuses(
+        "mu_g = rowstack([[0.0, 0.0], [1.0, -1.0]])\ncov = rowstack([[1.0, 0.3], [0.3, 0.5]])\n\
+         k = functionof(MvNormal(mu = _m_, cov = cov), m = _m_)\ny = broadcast(k, m = mu_g)",
+        "`MvNormal`'s `mu` is a scalar",
+    );
+}
+
+/// A nested `fn`'s `_` is its own (§04): substituting the outer argument leaves the
+/// inner hole to the inner `broadcast`, so this types without error.
+#[test]
+fn a_nested_fn_placeholder_binds_to_the_nearest_fn() {
+    assert_clean("f = fn(broadcast(fn(_ + 1), _))\ny = f([2, 3])");
 }
 
 /// §07 "Approximation functions" gives `x` the domains "real or complex",
