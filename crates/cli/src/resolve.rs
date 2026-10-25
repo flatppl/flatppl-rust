@@ -453,7 +453,7 @@ fn terminal_url(url: &str) -> String {
 /// to disclose authority userinfo or control terminal layout. The inference
 /// engine and module bundle retain their original strings.
 pub fn terminal_message(message: &str) -> String {
-    let display = redact_url_userinfo(message);
+    let display = flatppl_fileaccess::redact_url_userinfo(message);
     // `escape_debug` also exposes bidi, zero-width, and other Unicode format
     // characters while preserving ordinary printable Unicode.
     crate::terminal_text(&display)
@@ -474,42 +474,9 @@ fn diagnostic_path(location: &Location) -> std::path::PathBuf {
     match location {
         Location::Local(path) => path.clone(),
         Location::Remote(url) | Location::Invalid(url) => {
-            std::path::PathBuf::from(redact_url_userinfo(url).as_ref())
+            std::path::PathBuf::from(flatppl_fileaccess::redact_url_userinfo(url).as_ref())
         }
     }
-}
-
-/// Redact authority userinfo in a display-only copy. The last literal `@`
-/// before the path/query/fragment is the delimiter, so encoded delimiters stay
-/// inside the redacted span and `@` elsewhere in the URL is not hidden.
-fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
-    let mut result: Option<String> = None;
-    let mut copied_through = 0;
-    let mut search_from = 0;
-    while let Some(relative_scheme_end) = text[search_from..].find("://") {
-        let scheme_end = search_from + relative_scheme_end;
-        let authority_start = scheme_end + 3;
-        let authority_end = text[authority_start..]
-            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-            .map_or(text.len(), |i| authority_start + i);
-        let authority = &text[authority_start..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            let host_start = authority_start + at + 1;
-            let output = result.get_or_insert_with(|| String::with_capacity(text.len()));
-            output.push_str(&text[copied_through..authority_start]);
-            output.push_str("<redacted>@");
-            copied_through = host_start;
-        }
-        if authority_end == text.len() {
-            break;
-        }
-        search_from = authority_end;
-    }
-    let Some(mut result) = result else {
-        return text.into();
-    };
-    result.push_str(&text[copied_through..]);
-    result.into()
 }
 
 fn terminal_url_list(urls: &[String]) -> String {
@@ -932,7 +899,27 @@ mod fetch_tests {
     }
 
     #[test]
-    fn remote_parse_diagnostic_redacts_url_userinfo() {
+    fn userinfo_refusals_never_print_the_password_in_the_terminal() {
+        let dir = std::env::temp_dir().join(format!("flatppl-userinfo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), false, true);
+        for url in [
+            "https://us er:secret@host.test/m.flatppl",
+            "https://user:p%40secret@host.test/m.flatppl",
+            "https://a@b:secret@host.test/m.flatppl",
+        ] {
+            let error = cache
+                .get(url, &InvalidRemote, &flatppl_fileaccess::ApproveAll)
+                .unwrap_err();
+            let message = terminal_fileaccess_error(error);
+            assert!(!message.contains("secret"), "{message}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache refuses userinfo before a fetch, and the refusal hides it.
+    #[test]
+    fn remote_userinfo_url_is_refused_with_a_redacted_message() {
         let dir =
             std::env::temp_dir().join(format!("flatppl-remote-diagnostic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -952,13 +939,15 @@ mod fetch_tests {
         };
 
         let error = fetch_graph(&[Location::Local(model)], &resolver)
-            .expect_err("the fetched invalid source must produce a parse diagnostic");
-        let Failure::Diagnostic { path, .. } = error else {
-            panic!("expected a parse diagnostic, got {error:?}");
+            .expect_err("a URL with userinfo must not be fetched");
+        let Failure::Plain(message) = error else {
+            panic!("expected a fetch refusal, got {error:?}");
         };
-        assert_eq!(
-            crate::terminal_path(&path),
-            "http://<redacted>@host.test/bad@name.flatppl?email=a@b"
+        assert!(
+            message.contains("`http://<redacted>@host.test/bad@name.flatppl?email=a@b`")
+                && message.contains("userinfo")
+                && !message.contains("p%40ss"),
+            "got {message}"
         );
         assert_eq!(
             Location::Remote(url.to_string()).display(),

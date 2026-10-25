@@ -26,7 +26,7 @@ mod trust;
 
 // `Location` (the spec §04 path/URL join) is the dependency-free core, always
 // available. Everything below is the host-side pull cache, gated behind `cache`.
-pub use location::Location;
+pub use location::{Location, redact_url_userinfo};
 
 #[cfg(feature = "cache")]
 use std::path::PathBuf;
@@ -64,37 +64,6 @@ fn display_text(text: &str) -> String {
 #[cfg(feature = "cache")]
 fn display_path(path: &std::path::Path) -> String {
     display_text(&path.to_string_lossy())
-}
-
-#[cfg(feature = "cache")]
-fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
-    let mut result: Option<String> = None;
-    let mut copied_through = 0;
-    let mut search_from = 0;
-    while let Some(relative_scheme_end) = url[search_from..].find("://") {
-        let scheme_end = search_from + relative_scheme_end;
-        let authority_start = scheme_end + 3;
-        let authority_end = url[authority_start..]
-            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-            .map_or(url.len(), |i| authority_start + i);
-        let authority = &url[authority_start..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            let host_start = authority_start + at + 1;
-            let output = result.get_or_insert_with(|| String::with_capacity(url.len()));
-            output.push_str(&url[copied_through..authority_start]);
-            output.push_str("<redacted>@");
-            copied_through = host_start;
-        }
-        if authority_end == url.len() {
-            break;
-        }
-        search_from = authority_end;
-    }
-    let Some(mut result) = result else {
-        return url.into();
-    };
-    result.push_str(&url[copied_through..]);
-    result.into()
 }
 
 /// Redact authority userinfo in a display-only copy. The original URL remains
@@ -612,7 +581,10 @@ mod tests {
             }
         }
 
+        // A permissive parent is the user's choice and does not leak into the
+        // layout the cache creates below it.
         let parent = TempRoot::new();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let new_root = parent.path().join("new-cache");
         let new_cache = Cache::new(new_root.clone(), false, false);
         let new_object = new_cache
@@ -664,28 +636,6 @@ mod tests {
         let k = super::cache::cache_key(URL);
         assert!(!cache.object_path(&k).exists(), "no partial object");
         assert!(!cache.meta_path(&k).exists(), "no orphan metadata");
-    }
-
-    #[test]
-    fn temp_name_does_not_reduce_the_valid_object_filename_limit() {
-        let root = TempRoot::new();
-        let cache = Cache::new(root.path(), false, true);
-        let suffix = "a".repeat(180);
-        let url = format!("https://example.test/x.{suffix}");
-
-        let object = cache
-            .get(&url, &FakeFetcher::new("body"), &DenyAll)
-            .expect("a valid final object component must be publishable");
-
-        assert!(object.is_file());
-        assert!(
-            object
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(&format!(".{suffix}")),
-            "the normative suffix remains complete: {object:?}"
-        );
     }
 
     #[cfg(feature = "net")]
@@ -799,6 +749,147 @@ mod tests {
         assert!(matches!(err, Error::Untrusted(_)), "got {err:?}");
         assert_eq!(fetcher.call_count(), 0, "trust refusal precedes fetch");
         assert_eq!(read(&planted), "attacker bytes");
+    }
+
+    #[test]
+    fn userinfo_urls_are_refused_before_any_fetch_or_write() {
+        struct RedirectToUserinfo;
+        impl Fetcher for RedirectToUserinfo {
+            fn fetch(&self, _url: &str) -> Result<FetchResult, String> {
+                Ok(FetchResult::Redirect(
+                    "https://user:secret@other.test/m.flatppl".into(),
+                ))
+            }
+        }
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true);
+        let fetcher = FakeFetcher::new("x = 1");
+        for url in [
+            "https://user:secret@example.test/m.flatppl",
+            "https://token@example.test/m.flatppl",
+            "https://evil.test\\@example.test/m.flatppl",
+        ] {
+            assert!(!cache.needs_approval(url), "no prompt for {url}");
+            let err = cache.get(url, &fetcher, &ApproveAll).unwrap_err();
+            assert!(matches!(err, Error::Fetch { .. }), "got {err:?}");
+            assert!(!err.to_string().contains("secret"), "{err}");
+        }
+        assert_eq!(fetcher.call_count(), 0);
+        let err = cache
+            .get(URL, &RedirectToUserinfo, &ApproveAll)
+            .unwrap_err();
+        assert!(matches!(err, Error::Fetch { .. }), "got {err:?}");
+        assert!(
+            !root.path().join("v1/objects").exists(),
+            "no metadata keeps the credentials"
+        );
+        // `@` after the authority is ordinary path or query text.
+        cache
+            .get(
+                "https://example.test/a@b.flatppl?k=@v",
+                &fetcher,
+                &ApproveAll,
+            )
+            .expect("no userinfo");
+    }
+
+    #[test]
+    fn userinfo_refusals_never_print_the_password() {
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true);
+        for url in [
+            "https://us er:secret@host.test/m.flatppl",
+            "https://user:se\tcret@host.test/m.flatppl",
+            "https://user:p%40secret@host.test/m.flatppl",
+            "https://a@b:secret@host.test/m.flatppl",
+            "https://user:secret@x@host.test/m.flatppl",
+        ] {
+            let err = cache
+                .get(url, &FakeFetcher::new("x"), &ApproveAll)
+                .unwrap_err();
+            for message in [err.to_string(), format!("{err:?}")] {
+                assert!(
+                    !message.contains("secret") && !message.contains("se\\tcret"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// Another user who can write a shared cache tree plants a shard symlink.
+    /// The publish must not follow it, and the planted object must not be a hit.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_shard_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempRoot::new();
+        let outside = TempRoot::new();
+        let k = super::cache::cache_key(URL);
+        std::fs::write(outside.path().join(k.key.clone() + ".flatppl"), "planted").unwrap();
+        let shard = root.path().join("v1/objects").join(&k.kk);
+        std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        symlink(outside.path(), &shard).unwrap();
+
+        let cache = Cache::new(root.path(), false, true);
+        let fetcher = FakeFetcher::new("network bytes");
+        for result in [
+            cache.get(URL, &fetcher, &ApproveAll),
+            cache.refetch(URL, &fetcher, &ApproveAll),
+        ] {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("is a symbolic link"), "got {err}");
+        }
+        assert_eq!(fetcher.call_count(), 1, "only refetch reached the network");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            1,
+            "nothing was published outside the root"
+        );
+    }
+
+    /// A root other users can write is refused, not repaired: content planted
+    /// before a `chmod` would survive it.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_writable_by_other_users_is_refused_and_left_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempRoot::new();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cache = Cache::new(root.path(), false, true);
+        let fetcher = FakeFetcher::new("x = 1");
+        let err = cache.get(URL, &fetcher, &ApproveAll).unwrap_err();
+        assert!(
+            err.to_string().contains("is writable by other users"),
+            "got {err}"
+        );
+        assert!(cache.store_prepared_json(b"{}").is_err());
+        assert_eq!(fetcher.call_count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    /// A root reached through the user's own symlink, such as a relocated
+    /// `~/.cache`, stays usable.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_symlink_owned_by_the_user_is_followed() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempRoot::new();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = parent.path().join("link");
+        symlink(&target, &link).unwrap();
+        let cache = Cache::new(link, false, true);
+        cache
+            .get(URL, &FakeFetcher::new("x = 1"), &ApproveAll)
+            .expect("an owned symlink root is usable");
+        assert!(target.join("v1/objects").is_dir());
     }
 
     #[test]

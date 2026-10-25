@@ -15,14 +15,28 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Fetcher, TrustOracle};
 
-fn require_http_url(url: &str) -> Result<(), Error> {
-    if crate::location::is_http_url(url) {
+/// Refuse a URL the cache must not fetch. RFC 9110 §4.2.4 forbids userinfo in
+/// http(s) URIs and WHATWG fetch rejects it, so such a URL is not portable, and
+/// the `_meta.json` `url` field would keep its credentials on disk.
+fn require_fetchable_url(url: &str) -> Result<(), Error> {
+    let reason = if !crate::location::is_http_url(url) {
+        "only http and https URLs can be fetched"
+    } else if has_userinfo(url) {
+        "a URL with userinfo (`user:password@`) cannot be fetched"
+    } else {
         return Ok(());
-    }
+    };
     Err(Error::Fetch {
         url: url.to_string(),
-        reason: "only http and https URLs can be fetched".into(),
+        reason: reason.into(),
     })
+}
+
+/// An `@` in the authority. A backslash does not end the authority here, so a
+/// URL that WHATWG parsers split at `\` is refused, not reinterpreted.
+fn has_userinfo(url: &str) -> bool {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    rest[..crate::location::authority_len(rest)].contains('@')
 }
 
 /// The mandatory `<key>_meta.json` sidecar (spec §sec:url-cache "Layout and
@@ -52,6 +66,28 @@ pub(crate) struct Key {
     pub ext: Option<String>,
 }
 
+/// The layout of spec §sec:url-cache "Layout and keys" below `<flatppl-cachedir>`.
+impl Key {
+    fn object_dir(&self) -> [&str; 3] {
+        ["v1", "objects", &self.kk]
+    }
+
+    fn trust_dir(&self) -> [&str; 3] {
+        ["v1", "trust", &self.kk]
+    }
+
+    fn object_name(&self) -> String {
+        match &self.ext {
+            Some(ext) => format!("{}.{}", self.key, ext),
+            None => self.key.clone(),
+        }
+    }
+
+    fn meta_name(&self) -> String {
+        format!("{}_meta.json", self.key)
+    }
+}
+
 /// Derive the cache key from a URL: SHA-256 of the URL with any `#`-fragment
 /// removed (no other normalization), plus the full trailing extension of the
 /// final path segment (everything after its first `.`; `None` if it has none).
@@ -77,9 +113,9 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The trailing extension of a URL's final path segment. A literal backslash
-/// is omitted because Windows treats it as a path separator. The URL hash still
-/// identifies that object. Percent-encoded backslashes remain inert text.
+/// The trailing extension of a URL's final path segment. Spec §sec:url-cache
+/// drops an extension outside `[A-Za-z0-9._-]` or longer than 32 characters,
+/// so it can never form a path or exceed a filename component.
 fn url_ext(url: &str) -> Option<String> {
     // Drop scheme://authority, then the query.
     let after_authority = match url.find("://") {
@@ -97,7 +133,15 @@ fn url_ext(url: &str) -> Option<String> {
         .map_or(after_authority, |i| &after_authority[..i]);
     let seg = path.rsplit('/').next().unwrap_or("");
     match seg.split_once('.') {
-        Some((_, rest)) if !rest.is_empty() && !rest.contains('\\') => Some(rest.to_string()),
+        Some((_, rest))
+            if !rest.is_empty()
+                && rest.len() <= 32
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
+        {
+            Some(rest.to_string())
+        }
         _ => None,
     }
 }
@@ -146,11 +190,8 @@ impl Cache {
     /// The absolute path remains usable after the publishing host is dropped.
     pub fn store_prepared_json(&self, bytes: &[u8]) -> Result<PathBuf, Error> {
         let key = hex(&Sha256::digest(bytes));
-        let path = self
-            .v1()
-            .join("prepared")
-            .join(&key[..2])
-            .join(format!("{key}.json"));
+        let dir = self.created_dir(&["v1", "prepared", &key[..2]])?;
+        let path = dir.join(format!("{key}.json"));
         if !is_regular_file(&path) || fs::read(&path)? != bytes {
             self.write_atomic(&path, bytes)?;
         }
@@ -168,16 +209,25 @@ impl Cache {
     /// actually happen *and* needs approval: not offline, not already cached,
     /// not blanket-trusted (`FLATPPL_TRUST`), and no per-URL marker. Lets a
     /// caller batch the trust prompt for a set of URLs before resolving them.
+    ///
+    /// A URL that [`get`](Self::get) refuses, or an unsafe cache directory,
+    /// needs no prompt: the resolve reports that error instead.
     pub fn needs_approval(&self, url: &str) -> bool {
-        if self.offline || self.trust_all {
+        if self.offline || self.trust_all || require_fetchable_url(url).is_err() {
             return false;
         }
         let k = cache_key(url);
+        let (Ok(object_dir), Ok(trust_dir)) = (
+            self.existing_dir(&k.object_dir()),
+            self.existing_dir(&k.trust_dir()),
+        ) else {
+            return false;
+        };
         // A cached object is returned without fetching → no prompt.
-        if is_regular_file(&self.object_path(&k)) {
+        if object_dir.is_some_and(|dir| is_regular_file(&dir.join(k.object_name()))) {
             return false;
         }
-        !self.trust_path(&k).exists()
+        !trust_dir.is_some_and(|dir| dir.join(&k.key).exists())
     }
 
     /// Resolve `url` to a local cached object path, fetching it on a miss.
@@ -193,13 +243,15 @@ impl Cache {
         fetcher: &dyn Fetcher,
         trust: &dyn TrustOracle,
     ) -> Result<PathBuf, Error> {
-        require_http_url(url)?;
+        require_fetchable_url(url)?;
         let k = cache_key(url);
-        let object = self.object_path(&k);
-        if is_regular_file(&object) {
-            return Ok(object);
+        if let Some(dir) = self.existing_dir(&k.object_dir())? {
+            let object = dir.join(k.object_name());
+            if is_regular_file(&object) {
+                return Ok(object);
+            }
         }
-        self.fetch_and_store(url, &k, object, fetcher, trust)
+        self.fetch_and_store(url, &k, fetcher, trust)
     }
 
     /// Re-fetch `url` and overwrite any cached object (the `--update` path):
@@ -212,8 +264,7 @@ impl Cache {
         trust: &dyn TrustOracle,
     ) -> Result<PathBuf, Error> {
         let k = cache_key(url);
-        let object = self.object_path(&k);
-        self.fetch_and_store(url, &k, object, fetcher, trust)
+        self.fetch_and_store(url, &k, fetcher, trust)
     }
 
     /// Trust-gate, fetch, and atomically publish `_meta.json` then the object.
@@ -221,7 +272,6 @@ impl Cache {
         &self,
         url: &str,
         k: &Key,
-        object: PathBuf,
         fetcher: &dyn Fetcher,
         trust: &dyn TrustOracle,
     ) -> Result<PathBuf, Error> {
@@ -232,7 +282,7 @@ impl Cache {
         let mut current = url.to_string();
         let mut hops = 0;
         let fetched = loop {
-            require_http_url(&current)?;
+            require_fetchable_url(&current)?;
             if hops > 10 {
                 return Err(Error::Fetch {
                     url: current,
@@ -240,7 +290,7 @@ impl Cache {
                 });
             }
             let hop_key = cache_key(&current);
-            if !self.trust_all && !self.trust_path(&hop_key).exists() {
+            if !self.trust_all && !self.is_trusted(&hop_key)? {
                 if !trust.approve(&current) {
                     return Err(Error::Untrusted(current));
                 }
@@ -268,51 +318,90 @@ impl Cache {
         };
         // Metadata first, then the object — so a present object always has meta.
         let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(std::io::Error::other)?;
-        self.write_atomic(&self.meta_path(k), &meta_bytes)?;
+        let dir = self.created_dir(&k.object_dir())?;
+        let object = dir.join(k.object_name());
+        self.write_atomic(&dir.join(k.meta_name()), &meta_bytes)?;
         self.write_atomic(&object, &fetched.bytes)?;
         Ok(object)
     }
 
     // ── paths ────────────────────────────────────────────────────────────────
 
-    fn v1(&self) -> PathBuf {
-        self.root.join("v1")
+    #[cfg(test)]
+    fn layout_path(&self, components: &[&str], name: &str) -> PathBuf {
+        let mut path = self.root.clone();
+        path.extend(components);
+        path.join(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn object_path(&self, k: &Key) -> PathBuf {
-        let name = match &k.ext {
-            Some(ext) => format!("{}.{}", k.key, ext),
-            None => k.key.clone(),
-        };
-        self.v1().join("objects").join(&k.kk).join(name)
+        self.layout_path(&k.object_dir(), &k.object_name())
     }
 
+    #[cfg(test)]
     pub(crate) fn meta_path(&self, k: &Key) -> PathBuf {
-        self.v1()
-            .join("objects")
-            .join(&k.kk)
-            .join(format!("{}_meta.json", k.key))
+        self.layout_path(&k.object_dir(), &k.meta_name())
     }
 
+    #[cfg(test)]
     pub(crate) fn trust_path(&self, k: &Key) -> PathBuf {
-        self.v1().join("trust").join(&k.kk).join(&k.key)
+        self.layout_path(&k.trust_dir(), &k.key)
     }
 
-    fn tmp_dir(&self) -> PathBuf {
-        self.v1().join("tmp")
+    // ── verified directories ─────────────────────────────────────────────────
+
+    /// The cache directory `<root>/<components>`, created where missing.
+    fn created_dir(&self, components: &[&str]) -> Result<PathBuf, Error> {
+        create_cache_dir_all(&self.root)?;
+        check_root(&self.root)?;
+        let mut dir = self.root.clone();
+        for component in components {
+            dir.push(component);
+            match create_cache_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+            check_cache_dir(&dir, &fs::symlink_metadata(&dir)?)?;
+        }
+        Ok(dir)
+    }
+
+    /// The cache directory `<root>/<components>`, or `None` while any part of
+    /// it is missing.
+    fn existing_dir(&self, components: &[&str]) -> Result<Option<PathBuf>, Error> {
+        match check_root(&self.root) {
+            Ok(()) => {}
+            Err(Error::Io(e)) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let mut dir = self.root.clone();
+        for component in components {
+            dir.push(component);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) => check_cache_dir(&dir, &meta)?,
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        Ok(Some(dir))
+    }
+
+    fn is_trusted(&self, k: &Key) -> Result<bool, Error> {
+        Ok(self
+            .existing_dir(&k.trust_dir())?
+            .is_some_and(|dir| dir.join(&k.key).exists()))
     }
 
     // ── write helpers ─────────────────────────────────────────────────────────
 
     /// Write `bytes` to `dest` atomically: download to `tmp/`, fsync, rename.
+    /// `dest` lies in a directory from [`created_dir`](Self::created_dir).
     /// Every failed write or rename removes its temporary file and reaches the
     /// caller. Concurrent writers may replace each other atomically.
     fn write_atomic(&self, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
-        let tmp_dir = self.tmp_dir();
-        create_cache_dir_all(&tmp_dir)?;
-        if let Some(parent) = dest.parent() {
-            create_cache_dir_all(parent)?;
-        }
+        let tmp_dir = self.created_dir(&["v1", "tmp"])?;
         let (tmp, mut file) = loop {
             let tmp = tmp_dir.join(tmp_name());
             match create_private_file(&tmp) {
@@ -336,10 +425,7 @@ impl Cache {
     /// Create the trust marker with an exclusive create. An existing marker
     /// (concurrent approval) is fine.
     fn create_trust_marker(&self, k: &Key) -> Result<(), Error> {
-        let path = self.trust_path(k);
-        if let Some(parent) = path.parent() {
-            create_cache_dir_all(parent)?;
-        }
+        let path = self.created_dir(&k.trust_dir())?.join(&k.key);
         match create_private_file(&path) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
@@ -351,16 +437,85 @@ impl Cache {
 /// Create cache-owned directories privately on Unix. Recursive creation leaves
 /// every pre-existing component, including a configured root, unchanged.
 fn create_cache_dir_all(path: &Path) -> std::io::Result<()> {
+    cache_dir_builder().recursive(true).create(path)
+}
+
+fn create_cache_dir(path: &Path) -> std::io::Result<()> {
+    cache_dir_builder().create(path)
+}
+
+fn cache_dir_builder() -> fs::DirBuilder {
+    #[allow(unused_mut)]
+    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(path)
+        builder.mode(0o700);
     }
-    #[cfg(not(unix))]
+    builder
+}
+
+/// Verify the configured root. Its ancestors are the user's choice. A symlink
+/// root must itself belong to this user or the superuser, so a link planted in
+/// a shared directory such as `/tmp` cannot be swapped after the check.
+fn check_root(root: &Path) -> Result<(), Error> {
+    let link = fs::symlink_metadata(root)?;
+    if link.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if link.uid() != effective_uid() && link.uid() != 0 {
+                return Err(unsafe_dir(root, "is a symbolic link owned by another user"));
+            }
+        }
+        return check_owned_dir(root, &fs::metadata(root)?);
+    }
+    check_owned_dir(root, &link)
+}
+
+/// Verify a directory below the root without following it. Each check runs
+/// after its parent's, and no other user can write a verified parent, so the
+/// verified chain cannot change before the publish.
+fn check_cache_dir(dir: &Path, meta: &fs::Metadata) -> Result<(), Error> {
+    if meta.file_type().is_symlink() {
+        return Err(unsafe_dir(dir, "is a symbolic link"));
+    }
+    check_owned_dir(dir, meta)
+}
+
+/// Refuse a directory another user could change. A permissive root is refused,
+/// not repaired: content another user planted would survive a `chmod`.
+fn check_owned_dir(dir: &Path, meta: &fs::Metadata) -> Result<(), Error> {
+    if !meta.is_dir() {
+        return Err(unsafe_dir(dir, "is not a directory"));
+    }
+    #[cfg(unix)]
     {
-        fs::create_dir_all(path)
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != effective_uid() {
+            return Err(unsafe_dir(dir, "is owned by another user"));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(unsafe_dir(dir, "is writable by other users"));
+        }
     }
+    Ok(())
+}
+
+fn unsafe_dir(dir: &Path, problem: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        ErrorKind::PermissionDenied,
+        format!(
+            "cache directory `{}` {problem}; only you may write the cache, so \
+             fix its ownership and mode or set FLATPPL_CACHEDIR to a private directory",
+            dir.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    nix::unistd::geteuid().as_raw()
 }
 
 /// Exclusively create a cache file. Objects and metadata retain this mode when
@@ -502,26 +657,30 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_windows_separator_cannot_create_path_components() {
-        let url = "https://h/x.a\\..\\..\\outside.flatppl";
-        let k = cache_key(url);
-        assert_eq!(k.ext, None);
-        assert_eq!(
-            Cache::new(PathBuf::from("cache"), false, true)
-                .object_path(&k)
-                .file_name()
-                .unwrap(),
-            k.key.as_str()
-        );
+    fn an_unsafe_extension_stores_the_object_under_the_bare_key() {
+        let cache = Cache::new(PathBuf::from("cache"), false, true);
+        for url in [
+            "https://h/x.a\\..\\..\\outside.flatppl",
+            "https://h/x.a%5C..%5Coutside.flatppl",
+            &format!("https://h/x.{}", "a".repeat(33)),
+        ] {
+            let k = cache_key(url);
+            assert_eq!(k.ext, None, "{url}");
+            assert_eq!(
+                cache.object_path(&k),
+                PathBuf::from("cache/v1/objects").join(&k.kk).join(&k.key),
+                "{url}"
+            );
+        }
     }
 
     #[test]
-    fn an_encoded_windows_separator_remains_inert_extension_text() {
+    fn a_safe_extension_up_to_32_characters_is_kept() {
+        let ext = format!("{}.tar-gz_..", "a".repeat(22));
+        assert_eq!(ext.len(), 32);
         assert_eq!(
-            cache_key("https://h/x.a%5C..%5Coutside.flatppl")
-                .ext
-                .as_deref(),
-            Some("a%5C..%5Coutside.flatppl")
+            cache_key(&format!("https://h/x.{ext}")).ext.as_deref(),
+            Some(ext.as_str())
         );
     }
 

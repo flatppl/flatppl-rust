@@ -24,7 +24,7 @@ path = "src/lib.rs"
 # fetches and the LSP only resolves+reads client-fed content — depends with
 # `default-features = false` and links only `Location` (no sha2/serde/TLS).
 default = ["cache"]
-cache = ["dep:sha2", "dep:dirs", "dep:serde", "dep:serde_json"]
+cache = ["dep:sha2", "dep:dirs", "dep:serde", "dep:serde_json", "dep:nix"]
 net = ["cache", "dep:ureq"]
 
 [dependencies]
@@ -34,3 +34,7 @@ dirs = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 ureq = { version = "3", optional = true }
+
+# `geteuid` for the cache ownership check.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["user"], optional = true }
