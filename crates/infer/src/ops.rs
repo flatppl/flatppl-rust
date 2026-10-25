@@ -9569,9 +9569,30 @@ pub(crate) fn call_valueset(
                 set => set,
             }
         }
-        // Reweighting never grows the support.
-        "normalize" | "bayesupdate" => args
+        // A record literal lies in the product of its field sets, so
+        // `lawof(record(a = a, b = b))` is the product of the draws' supports.
+        // A field with no tighter set keeps its type's natural extent.
+        "record" if args.is_empty() && !named.is_empty() => {
+            let mut fields = Vec::with_capacity(named.len());
+            for (name, node, field_ty, _) in named {
+                let set = match inf.lookup_valueset(*node) {
+                    ValueSet::Unknown | ValueSet::Deferred => ValueSet::natural_of(field_ty),
+                    set => set,
+                };
+                if set == ValueSet::Unknown {
+                    return Ready(ValueSet::Unknown);
+                }
+                fields.push((*name, set));
+            }
+            ValueSet::RecordSet(fields.into())
+        }
+        // Reweighting never grows the support. `bayesupdate(L, prior)` keeps
+        // the prior's.
+        "normalize" => args
             .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        "bayesupdate" => args
+            .get(1)
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
         "weighted" | "logweighted" | "tilt" => args
             .get(1)

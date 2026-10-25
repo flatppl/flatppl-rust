@@ -94,6 +94,28 @@ fn ordered_and_zerosum_domains_report_their_length() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn measure_domains_report_their_support() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings(
+        "theta ~ Normal(mu = 0.0, sigma = 1.0)
+s ~ Exponential(rate = 1.0)
+y ~ Normal(mu = theta, sigma = s)
+prior = lawof(record(theta = theta, s = s))
+L = likelihoodof(kernelof(record(y = y), theta = theta, s = s), record(y = 1.0))
+posterior = bayesupdate(L, prior)
+",
+    )?;
+    let support = json!({"set": "record", "fields": [
+        {"name": "theta", "set": {"set": "reals"}},
+        {"name": "s", "set": {"set": "nonnegreals"}},
+    ]});
+    assert_eq!(rows["s"]["domain"], json!({"set": "nonnegreals"}));
+    assert_eq!(rows["prior"]["domain"], support);
+    assert_eq!(rows["posterior"]["domain"], support);
+    assert_eq!(rows["L"]["domain"], json!({"set": "unknown"}));
+    Ok(())
+}
+
+#[test]
 fn dependencies_follow_private_bindings_and_module_aliases()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();
