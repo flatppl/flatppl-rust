@@ -330,6 +330,68 @@ pub fn placeholder_surface_name(placeholder: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// The name ranges of the `name = value` arguments of a call, given the span
+/// start of its callee reference and which part of it the callee names.
+///
+/// The IR keeps no span for a keyword, so this walks the argument list and
+/// skips nested brackets, strings and comments. An unexpected shape yields no
+/// ranges.
+pub fn call_keyword_ranges(text: &str, span_start: u32, part: RefPart) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let Some(mut head_end) = head_ident_end(text, span_start) else {
+        return out;
+    };
+    if part == RefPart::Member {
+        let Some((dot, b'.')) = next_significant(text, head_end) else {
+            return out;
+        };
+        let Some((member, _)) = next_significant(text, dot + 1) else {
+            return out;
+        };
+        let Some(end) = head_ident_end(text, member) else {
+            return out;
+        };
+        head_end = end;
+    }
+    let Some((open, b'(')) = next_significant(text, head_end) else {
+        return out;
+    };
+    let bytes = text.as_bytes();
+    let mut at = open as usize + 1;
+    loop {
+        let start = skip_trivia(bytes, at, bytes.len());
+        if let Some((s, e)) = ident_at(text, start as u32)
+            && let Some((eq, b'=')) = next_significant(text, e)
+            && bytes.get(eq as usize + 1) != Some(&b'=')
+        {
+            out.push((s, e));
+        }
+        at = start;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(at) {
+                None => return out,
+                Some(b'#' | b'%') => at = skip_comment(bytes, at, bytes.len()),
+                Some(b'"') => at = skip_string(bytes, at, bytes.len()),
+                Some(b'(' | b'[' | b'{') => {
+                    depth += 1;
+                    at += 1;
+                }
+                Some(b')' | b']' | b'}') if depth == 0 => return out,
+                Some(b')' | b']' | b'}') => {
+                    depth -= 1;
+                    at += 1;
+                }
+                Some(b',') if depth == 0 => {
+                    at += 1;
+                    break;
+                }
+                Some(_) => at += 1,
+            }
+        }
+    }
+}
+
 /// The byte ranges of the argument names declared by a callable, given the span
 /// of its reification node and the range of the enclosing binding's own name.
 ///

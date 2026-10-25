@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{BindingId, CallHead, Idx, Inputs, Node, NodeId, Ref, RefNs};
+use flatppl_core::{BindingId, CallHead, Idx, Inputs, NamedKind, Node, NodeId, Ref, RefNs};
 
 use crate::capabilities::resolve_ref_def;
 use crate::db::{Catalogues, FileSet, SourceFile};
@@ -332,13 +332,13 @@ fn occurrences(
 ) -> Vec<NameLoc> {
     match target {
         Target::Binding(t) => binding_occurrences(db, fs, cats, t, include_declaration),
-        Target::Argument(t) => argument_occurrences(db, t, include_declaration),
+        Target::Argument(t) => argument_occurrences(db, fs, cats, t, include_declaration),
     }
 }
 
 /// Every occurrence of an argument name: each `%local` reference to its
-/// placeholder inside the owning reification, plus the declaration site in the
-/// argument list.
+/// placeholder inside the owning reification, each `name = value` keyword at a
+/// call of the callable, plus the declaration site in the argument list.
 ///
 /// Confined to one reification in one file. §04 "Placeholders and holes" gives the
 /// scoping rule — "The scope of a placeholder is the nearest enclosing
@@ -347,6 +347,8 @@ fn occurrences(
 /// reifications even when they declare the same placeholder name.
 fn argument_occurrences(
     db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
     target: &ArgumentTarget,
     include_declaration: bool,
 ) -> Vec<NameLoc> {
@@ -357,15 +359,15 @@ fn argument_occurrences(
     let path = target.file.path(db).clone();
     let mut out: Vec<NameLoc> = Vec::new();
     let mut seen: HashSet<NameLoc> = HashSet::new();
-    let mut push = |start: u32, end: u32| {
-        let loc = NameLoc {
-            path: path.clone(),
-            start,
-            end,
-        };
+    let mut push = |loc: NameLoc| {
         if seen.insert(loc.clone()) {
             out.push(loc);
         }
+    };
+    let at = |start: u32, end: u32| NameLoc {
+        path: path.clone(),
+        start,
+        end,
     };
 
     let mut pending = vec![target.reification];
@@ -390,14 +392,113 @@ fn argument_occurrences(
         // The body writes the SURFACE name for a sugar argument, so the range must
         // match that, not the placeholder. A mismatch fails closed.
         if let Some((s, e)) = names::ref_name_range(text, span.start, RefPart::Head, &target.name) {
-            push(s, e);
+            push(at(s, e));
         }
     }
 
+    keyword_call_sites(db, fs, cats, target, &mut push);
     if include_declaration {
-        push(target.declaration.0, target.declaration.1);
+        push(at(target.declaration.0, target.declaration.1));
     }
     out
+}
+
+/// The `name = value` keywords that pass the target argument by name, at every
+/// call across the bundle whose callee resolves to the target's callable.
+///
+/// §04 "Reification to functions and kernels" lets a call pass an input by its
+/// name, so a rename that left `f(a = 2)` behind would leave `f` without a
+/// parameter `a`. The callable is each binding whose RHS is the reification,
+/// plus each binding that aliases one (`g = f`), across files.
+fn keyword_call_sites(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    target: &ArgumentTarget,
+    push: &mut impl FnMut(NameLoc),
+) {
+    let Some(module) = parse(db, target.file).module(db) else {
+        return;
+    };
+    let mut callables: HashSet<(SourceFile, BindingId)> = module
+        .bindings()
+        .filter(|(_, b)| b.rhs == target.reification)
+        .map(|(bid, _)| (target.file, bid))
+        .collect();
+    if callables.is_empty() {
+        return;
+    }
+    // The part of the reference that names the callable, when it is one.
+    let callable_ref =
+        |f: SourceFile, module: &flatppl_core::Module, id: NodeId, set: &HashSet<_>| {
+            let Node::Ref(r) = module.node(id) else {
+                return None;
+            };
+            let part = match r.ns {
+                RefNs::Local => return None,
+                RefNs::Module(_) => RefPart::Member,
+                RefNs::SelfMod => RefPart::Head,
+            };
+            resolve_ref_def(db, f, fs, cats, module, r)
+                .filter(|def| set.contains(def))
+                .map(|_| part)
+        };
+    loop {
+        let mut aliases = Vec::new();
+        for &f in fs.files(db) {
+            let Some(module) = parse(db, f).module(db) else {
+                continue;
+            };
+            for (bid, b) in module.bindings() {
+                if !callables.contains(&(f, bid))
+                    && callable_ref(f, module, b.rhs, &callables).is_some()
+                {
+                    aliases.push((f, bid));
+                }
+            }
+        }
+        if aliases.is_empty() {
+            break;
+        }
+        callables.extend(aliases);
+    }
+
+    for &f in fs.files(db) {
+        let Some(module) = parse(db, f).module(db) else {
+            continue;
+        };
+        let text = f.text(db);
+        for i in 0..module.node_count() {
+            let Node::Call(call) = module.node(NodeId::from_usize(i)) else {
+                continue;
+            };
+            let CallHead::User(callee) = call.head else {
+                continue;
+            };
+            if !call
+                .named
+                .iter()
+                .any(|arg| arg.kind == NamedKind::Kwarg && module.resolve(arg.name) == target.name)
+            {
+                continue;
+            }
+            let Some(part) = callable_ref(f, module, callee, &callables) else {
+                continue;
+            };
+            let Some(span) = module.span_of(callee) else {
+                continue;
+            };
+            for (s, e) in names::call_keyword_ranges(text, span.start, part) {
+                if text[s as usize..e as usize] == target.name {
+                    push(NameLoc {
+                        path: f.path(db).clone(),
+                        start: s,
+                        end: e,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Every occurrence of a module binding's name across the bundle.
@@ -1120,6 +1221,60 @@ mod tests {
         assert_eq!(
             apply(src, &locs, "scale"),
             "f(scale, b) = add(mul(scale, scale), b)"
+        );
+    }
+
+    /// §04 lets a call pass an input by name, so the keyword at each call site
+    /// is an occurrence of the argument. Leaving it would make the clean input
+    /// fail with "`f` has no parameter `a`".
+    #[test]
+    fn rename_an_argument_rewrites_named_call_site_arguments() {
+        let src =
+            "f(a, b) = add(a, b)\ny = f(b = 1, a = 2)\nz = f(b = 1, a = sqrt(f(a = 3, b = 4)))";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "scale").expect("allowed");
+        let renamed = apply(src, &locs, "scale");
+        assert_eq!(
+            renamed,
+            "f(scale, b) = add(scale, b)\ny = f(b = 1, scale = 2)\n\
+             z = f(b = 1, scale = sqrt(f(scale = 3, b = 4)))"
+        );
+        let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+        assert!(
+            diags.is_empty(),
+            "the renamed input stays clean; got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Calls through an alias and from an importing module are call sites too.
+    /// A same-named keyword of another callable or a record is not.
+    #[test]
+    fn rename_an_argument_rewrites_named_arguments_across_the_bundle() {
+        let db = Database::default();
+        let helpers_src = "g = (a, b) -> add(a, b)\nh = g\nu = h(a = 1, b = 2)";
+        let model_src = "m = load_module(\"helpers.flatppl\")\nk(a) = a\n\
+                         v = m.g(b = \"a = 1\", # a = 2\n a = [k(a = 1)])\nw = record(a = 1)";
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), helpers_src.to_string());
+        let model = SourceFile::new(&db, "model.flatppl".to_string(), model_src.to_string());
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let cats = Catalogues::new(&db, vec![]);
+        let index = node_span_index(&db, helpers, fs, cats);
+        let off = nth_offset(helpers_src, "(a, b)", 0) + 1;
+        let locs = rename_edits(&db, helpers, fs, cats, off, index, "x").expect("allowed");
+        let edits_in = |path: &str| -> Vec<NameLoc> {
+            locs.iter().filter(|l| l.path == path).cloned().collect()
+        };
+        assert_eq!(
+            apply(helpers_src, &edits_in("helpers.flatppl"), "x"),
+            "g = (x, b) -> add(x, b)\nh = g\nu = h(x = 1, b = 2)"
+        );
+        assert_eq!(
+            apply(model_src, &edits_in("model.flatppl"), "x"),
+            "m = load_module(\"helpers.flatppl\")\nk(a) = a\n\
+             v = m.g(b = \"a = 1\", # a = 2\n x = [k(a = 1)])\nw = record(a = 1)"
         );
     }
 
