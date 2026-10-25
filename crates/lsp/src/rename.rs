@@ -60,6 +60,9 @@ struct ArgumentTarget {
     name: String,
     /// The lowered placeholder the body references, e.g. `_a_`.
     placeholder: String,
+    /// The boundary value of a keyword boundary `a = _a_`, when the rename also
+    /// rewrites the placeholder, which it does when that is spelled `_a_`.
+    boundary_value: Option<(u32, u32)>,
 }
 
 /// Resolve what the cursor at `byte_offset` designates, or refuse with the
@@ -176,11 +179,10 @@ fn resolve_target(
             )
             .ok_or_else(|| {
                 Refusal(format!(
-                    "`{placeholder}` is a placeholder whose declaration site has no \
-                         recorded span: an explicit `functionof`/`kernelof` boundary \
-                         declares it as a keyword argument, which the IR stores without \
-                         a source span, so the rename cannot be applied safely. Renaming \
-                         the argument of a `f(a) = …` definition or a lambda is supported."
+                    "`{placeholder}` is declared by a bare-name `functionof`/`kernelof` \
+                     boundary, which has no keyword to rename. Renaming the argument of \
+                     a keyword boundary (`a = _a_`), a `f(a) = …` definition or a lambda \
+                     is supported."
                 ))
             })
         }
@@ -243,10 +245,11 @@ fn resolve_target(
 ///
 /// Selects the argument either by `placeholder` (when the cursor was on a body
 /// reference) or by the cursor falling inside a declared argument's range (when it
-/// was on the declaration list). Returns `None` when the node is not a
-/// reification with an ordered boundary, when the declaration list cannot be
-/// located in the source, or when the requested argument is not among the
-/// declared ones — every one a reason to fail closed rather than edit.
+/// was on the declaration list). The declaration is the keyword of a keyword
+/// boundary `functionof(…, a = _a_)`, or the surface argument of the two sugar
+/// spellings. Returns `None` when the node is not a reification with an ordered
+/// boundary, when the declarations cannot be located, or when the requested
+/// argument is not among them — every one a reason to fail closed rather than edit.
 fn argument_target_at(
     module: &flatppl_core::Module,
     text: &str,
@@ -270,43 +273,49 @@ fn argument_target_at(
     let Inputs::Spec(entries) = call.inputs.as_ref()? else {
         return None;
     };
-    let reif_span = module.span_of(reification)?;
-    let declared = names::argument_decl_ranges(text, reif_span.start, def_name);
-    if declared.is_empty() {
+    let boundary = module.boundary_spans_of(reification);
+    let declared: Vec<(String, u32, u32)> = match boundary {
+        Some(spans) => entries
+            .iter()
+            .zip(spans)
+            .map(|((sym, _), (keyword, _))| {
+                (module.resolve(*sym).to_string(), keyword.start, keyword.end)
+            })
+            .collect(),
+        None => names::argument_decl_ranges(text, module.span_of(reification)?.start, def_name),
+    };
+    if declared.len() != entries.len() {
         return None;
     }
-    let siblings: Vec<String> = declared.iter().map(|(n, _, _)| n.clone()).collect();
 
-    // The surface name we are after.
-    let name = match placeholder {
-        // A body reference: invert the parser's `_{name}_` lowering. The explicit
-        // boundary spelling (where the body writes `_mu_` itself) does not invert,
-        // and its declaration is an unspanned keyword argument, so it yields None.
-        Some(ph) => {
-            let surface = names::placeholder_surface_name(ph)?;
-            if !siblings.iter().any(|s| s == surface) {
-                return None;
-            }
-            surface.to_string()
-        }
+    let index = match placeholder {
+        // A body reference: the entry that declares this placeholder.
+        Some(ph) => entries
+            .iter()
+            .position(|(_, r)| matches!(r.ns, RefNs::Local) && module.resolve(r.name) == ph)?,
         // A declaration site: the argument whose range contains the cursor.
         None => declared
             .iter()
-            .find(|(_, s, e)| *s <= byte_offset && byte_offset < *e)
-            .map(|(n, _, _)| n.clone())?,
+            .position(|(_, s, e)| *s <= byte_offset && byte_offset < *e)?,
     };
-    // The boundary must actually declare it, so a source list that disagrees with
-    // the IR (a shape this code does not model) fails closed.
-    let entry = entries
-        .iter()
-        .find(|(sym, _)| module.resolve(*sym) == name)?;
-    let (_, start, end) = declared.iter().find(|(n, _, _)| *n == name)?;
+    let (sym, entry) = &entries[index];
+    let (name, start, end) = &declared[index];
+    // The source list must agree with the IR, so a shape this code does not
+    // model fails closed.
+    if module.resolve(*sym) != name {
+        return None;
+    }
+    let placeholder = module.resolve(entry.name).to_string();
+    let boundary_value = boundary
+        .filter(|_| matches!(entry.ns, RefNs::Local) && placeholder == format!("_{name}_"))
+        .map(|spans| (spans[index].1.start, spans[index].1.end));
     Some(Target::Argument(ArgumentTarget {
         file,
         reification,
         declaration: (*start, *end),
-        placeholder: module.resolve(entry.1.name).to_string(),
-        name,
+        name: name.clone(),
+        placeholder,
+        boundary_value,
     }))
 }
 
@@ -393,7 +402,18 @@ fn argument_occurrences(
         // match that, not the placeholder. A mismatch fails closed.
         if let Some((s, e)) = names::ref_name_range(text, span.start, RefPart::Head, &target.name) {
             push(at(s, e));
+        } else if target.boundary_value.is_some()
+            && let Some((s, e)) =
+                names::ref_name_range(text, span.start, RefPart::Head, &target.placeholder)
+        {
+            push(at(s + 1, e - 1));
         }
+    }
+    // The inner name of `_a_`, so the rename keeps the placeholder spelling.
+    if let Some((s, e)) = target.boundary_value
+        && text.get(s as usize..e as usize) == Some(target.placeholder.as_str())
+    {
+        push(at(s + 1, e - 1));
     }
 
     keyword_call_sites(db, fs, cats, target, &mut push);
@@ -606,11 +626,26 @@ pub fn prepare_rename(
     index: &SpanIndex,
 ) -> Result<(u32, u32), Refusal> {
     let target = resolve_target(db, file, fs, cats, byte_offset, index)?;
+    let text = file.text(db).as_bytes();
+    // The cursor may sit on an underscore of a `_a_` whose inner name is the
+    // occurrence.
+    let on_underscores = |l: &NameLoc| {
+        l.start > 0
+            && text.get(l.start as usize - 1) == Some(&b'_')
+            && text.get(l.end as usize) == Some(&b'_')
+            && l.start - 1 <= byte_offset
+            && byte_offset <= l.end
+    };
+    let placeholder_target = matches!(&target, Target::Argument(t) if t.boundary_value.is_some());
     // The renameable range is the occurrence under the cursor itself, so the
     // editor highlights exactly the identifier it will replace.
     occurrences(db, fs, cats, &target, true)
         .into_iter()
-        .find(|l| l.path == *file.path(db) && l.start <= byte_offset && byte_offset < l.end)
+        .find(|l| {
+            l.path == *file.path(db)
+                && ((l.start <= byte_offset && byte_offset < l.end)
+                    || (placeholder_target && on_underscores(l)))
+        })
         .map(|l| (l.start, l.end))
         .ok_or_else(|| Refusal("the name under the cursor has no editable range".to_string()))
 }
@@ -1492,22 +1527,68 @@ mod tests {
         assert!(flatppl_syntax::parse("f(_x_) = add(_x_, 1)").is_err());
     }
 
-    /// An explicit `functionof`/`kernelof` boundary declares its argument as a
-    /// keyword argument, which the IR stores without a span. That is an
-    /// implementation limit, not a doctrine refusal, and the message says so.
+    /// The brief's form: a keyword boundary whose placeholder spells the input
+    /// name. The keyword, the placeholder and the call-site keywords move
+    /// together, from any of the three cursors.
     #[test]
-    fn rename_an_explicit_boundary_argument_fails_closed() {
-        let src = "k = kernelof(Normal(_mu_, 1.0), mu = _mu_)";
+    fn rename_a_keyword_boundary_argument() {
+        let src = "f = functionof(add(_a_, 1), a = _a_)\ny = f(a = 2)";
+        let expected = "f = functionof(add(_z_, 1), z = _z_)\ny = f(z = 2)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let off = nth_offset(src, "_mu_", 0);
-        let err = rename_edits(&db, f, fs, cats, off, index, "nu")
-            .expect_err("no recorded span for the boundary keyword");
-        assert!(
-            err.0.contains("recorded span"),
-            "the message must state the implementation limit; got {}",
-            err.0
+        let keyword = nth_offset(src, "a = _a_", 0);
+        let body = nth_offset(src, "_a_", 0);
+        let value = nth_offset(src, "_a_", 1) + 1;
+        for cursor in [keyword, body, value] {
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected, "cursor {cursor}");
+        }
+        assert_eq!(
+            prepare_rename(&db, f, fs, cats, body, index),
+            Ok((body + 1, body + 2)),
+            "the inner name of `_a_` is the editable range"
         );
+        let mut m = flatppl_syntax::parse(expected).expect("still parses");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+        assert!(
+            diags.is_empty(),
+            "got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A keyword that does not spell its value renames alone: the value is a
+    /// different placeholder or a module binding.
+    #[test]
+    fn rename_a_keyword_boundary_argument_leaves_an_unrelated_value() {
+        for (src, expected) in [
+            (
+                "f = functionof(add(_x_, 1), a = _x_)\ny = f(a = 2)",
+                "f = functionof(add(_x_, 1), z = _x_)\ny = f(z = 2)",
+            ),
+            (
+                "a = 1\nf = functionof(add(a, 1), a = a)\ny = f(a = 2)",
+                "a = 1\nf = functionof(add(a, 1), z = a)\ny = f(z = 2)",
+            ),
+        ] {
+            let (db, f, fs, cats) = single_file(src);
+            let index = node_span_index(&db, f, fs, cats);
+            let cursor = nth_offset(src, ", a =", 0) + 2;
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected);
+        }
+    }
+
+    /// A bare-name boundary derives the input name from its entry, so there is
+    /// no keyword to rename.
+    #[test]
+    fn rename_a_bare_boundary_argument_fails_closed() {
+        let src = "k = kernelof(Normal(_mu_, 1.0), _mu_)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let err = rename_edits(&db, f, fs, cats, nth_offset(src, "_mu_", 0), index, "nu")
+            .expect_err("no keyword to rename");
+        assert!(err.0.contains("bare-name"), "got {}", err.0);
     }
 
     #[test]

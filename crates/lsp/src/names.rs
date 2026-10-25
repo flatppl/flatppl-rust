@@ -406,9 +406,8 @@ pub fn call_keyword_ranges(text: &str, span_start: u32, part: RefPart) -> Vec<(u
 ///   (§05 "Lambda syntax": "`(arg) -> expr` is not legal syntax").
 ///
 /// Returns the declared names in order with their ranges. An explicit
-/// `functionof(…, mu = _mu_)` boundary is NOT handled here: its argument name is
-/// a keyword argument the IR records as a `NamedArg` with no span, so there is
-/// nothing to locate. The caller must fail closed on it.
+/// `functionof(…, mu = _mu_)` boundary is not handled here: the parser records
+/// its keyword spans in `Module::boundary_spans_of`.
 pub fn argument_decl_ranges(
     text: &str,
     reif_start: u32,
