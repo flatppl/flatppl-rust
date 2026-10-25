@@ -302,8 +302,8 @@ y = specfns.erf(x)
 fn std_function_matrix_result() {
     let src = r#"
 linalg = standard_module("ext-linear-algebra", "0.1")
-A = elementof(reals)
-B = elementof(reals)
+A = elementof(cartpow(reals, [2, 2]))
+B = elementof(cartpow(reals, [2, 2]))
 M = linalg.kron(A, B)
 "#;
     let (module, diags) = infer_src(src, Level::Type);
@@ -432,8 +432,9 @@ y = hepphys.CrystalBall(0.0, 1.0, 1.5, 2.0)
 fn std_kron_dims_dynamic_without_shape_level() {
     let src = r#"
 linalg = standard_module("ext-linear-algebra", "0.1")
-A = elementof(reals)
-B = elementof(reals)
+k = external(posintegers)
+A = elementof(cartpow(reals, [k, k]))
+B = elementof(cartpow(reals, [2, 2]))
 M = linalg.kron(A, B)
 "#;
     let (module, _diags) = infer_src(src, Level::Type);

@@ -575,7 +575,23 @@ impl<'m, 's> Inferencer<'m, 's> {
                     let ty = self.inferred[&frame.body].0.clone();
                     let vset = self.lookup_valueset(frame.body);
                     self.auto_inputs.pop();
+                    // A substituted body's type errors are the call's: without them a
+                    // refusal under the substitution leaves a `%failed` at exit 0. The
+                    // value-set pass re-runs bodies it already typed, so only the type
+                    // pass reports.
+                    let body_errors: Vec<Diagnostic> = std::mem::take(&mut self.diags)
+                        .into_iter()
+                        .filter(|d| {
+                            d.severity == crate::Severity::Error
+                                && matches!(frame.resume, CallResume::Type(..))
+                        })
+                        .collect();
                     self.restore_scope(frame.scope);
+                    for diag in body_errors {
+                        if !self.diags.contains(&diag) {
+                            self.diags.push(diag);
+                        }
+                    }
                     match frame.resume {
                         CallResume::Type(mut call, resume) => {
                             if self.level >= Level::Valueset {

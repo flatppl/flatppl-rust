@@ -17,7 +17,7 @@
 //! See
 //! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hlowire-report.md`.
 
-use flatppl_core::Module;
+use flatppl_core::{Module, Type};
 
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
@@ -68,6 +68,31 @@ fn infer_err(src: &str) -> String {
 
 /// The emitter's refusal message for a source it declines to lower. `infer` and
 /// the determiniser must both be clean, so the refusal is this crate's.
+/// The emitter's refusal of `src` WITHOUT inference's shape verdict: the nodes the shape
+/// check marked `%failed` are cleared to `%deferred`, as for a module a caller hands the
+/// emitter directly. Returns the message and whether it is located at a node.
+fn ungated_emit_err(src: &str) -> (String, bool) {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut m);
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if matches!(m.type_of(id), Some(Type::Failed(r)) if r.contains("outside its declared shape"))
+        {
+            m.set_type(id, Type::Deferred);
+        }
+    }
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions {
+            restrict_enzyme_compatible: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("must refuse in the emitter");
+    (err.msg, err.node.is_some())
+}
+
 fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
@@ -822,6 +847,13 @@ fn the_linalg_heads_refuse_the_wrong_rank() {
             msg.contains(&format!("`{head}`'s `A` is a vector")),
             "`{head}` on a vector: unexpected message: {msg}"
         );
+        let (msg, located) = ungated_emit_err(&format!(
+            "{vec_abi}y = {head}(v)\ninputs = (v)\noutputs = (y)\n"
+        ));
+        assert!(
+            msg.contains("rank-2 operand is required") && located,
+            "the emitter backstop must refuse `{head}` on a vector, located: {msg}"
+        );
     }
     let mat_abi = "A = elementof(cartpow(reals, [3, 3]))\n";
     let msg = infer_err(&format!(
@@ -830,6 +862,13 @@ fn the_linalg_heads_refuse_the_wrong_rank() {
     assert!(
         msg.contains("`self_outer`'s `x` is a matrix"),
         "`self_outer` on a matrix: unexpected message: {msg}"
+    );
+    let (msg, located) = ungated_emit_err(&format!(
+        "{mat_abi}y = self_outer(A)\ninputs = (A)\noutputs = (y)\n"
+    ));
+    assert!(
+        msg.contains("self_outer") && msg.contains("rank-1 operand is required") && located,
+        "the emitter backstop must refuse `self_outer` on a matrix, located: {msg}"
     );
 }
 

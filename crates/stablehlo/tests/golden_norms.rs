@@ -69,6 +69,31 @@ fn infer_err(src: &str) -> String {
     found.join("\n")
 }
 
+/// The emitter's refusal of `src` WITHOUT inference's shape verdict: the nodes the shape
+/// check marked `%failed` are cleared to `%deferred`, as for a module a caller hands the
+/// emitter directly. Returns the message and whether it is located at a node.
+fn ungated_emit_err(src: &str) -> (String, bool) {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut m);
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if matches!(m.type_of(id), Some(Type::Failed(r)) if r.contains("outside its declared shape"))
+        {
+            m.set_type(id, Type::Deferred);
+        }
+    }
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions {
+            restrict_enzyme_compatible: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("must refuse in the emitter");
+    (err.msg, err.node.is_some())
+}
+
 fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
@@ -624,6 +649,11 @@ fn the_vector_only_heads_refuse_a_matrix() {
             err.contains(&format!("`{head}`'s `")) && err.contains("is a matrix"),
             "`{head}` must refuse a matrix on §07's vectors domain, got: {err}"
         );
+        let (err, located) = ungated_emit_err(&src);
+        assert!(
+            err.contains(head) && err.contains("the domain \"vectors\"") && located,
+            "the emitter backstop must refuse `{head}` over a matrix, located, got: {err}"
+        );
     }
 }
 
@@ -671,6 +701,13 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
         assert!(
             err.contains(&format!("`{head}`'s `xs` is a scalar")),
             "`y[.i] := {head}(…)` must refuse on §07's vectors domain, got: {err}"
+        );
+        let (err, _) = ungated_emit_err(&format!(
+            "{matrix}y[.i] := {head}(A[.i, .j])\ninputs = (A)\noutputs = (y)\n"
+        ));
+        assert!(
+            err.contains(head) && err.contains("the domain \"vectors\""),
+            "the emitter backstop must refuse `y[.i] := {head}(…)`, got: {err}"
         );
     }
 }

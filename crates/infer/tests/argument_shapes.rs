@@ -50,6 +50,10 @@ fn binding(src: &str, name: &str) -> String {
 
 const V: &str = "v = [1.0, 2.0]\n";
 const M: &str = "M = rowstack([[2.0, 0.0], [0.0, 2.0]])\n";
+/// A spec-valid `%deferred` integer scalar: one bin count of a `BinnedPoissonProcess`
+/// draw, a row with no type rule yet.
+const DEFERRED: &str = "counts ~ BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(10.0, Normal(0.0, 1.0)))\n\
+                        q = counts[1]\n";
 
 // ---- §08 scalar parameters ------------------------------------------------------
 
@@ -181,7 +185,7 @@ fn a_non_matrix_where_section_07_declares_a_matrix_is_refused() {
     // §03 "Arrays" does not read a vector of vectors as a matrix.
     assert_refuses(
         "x = det([[1.0, 0.0], [0.0, 1.0]])",
-        "`det`'s `A` is a vector of arrays, but spec §07 declares it a matrix. Spec §03",
+        "`det`'s `A` is a vector of vectors, but spec §07 declares it a matrix. Spec §03",
     );
 }
 
@@ -202,26 +206,29 @@ fn an_unresolved_argument_is_not_refused() {
     assert_clean(
         "d = load_data(\"x.csv\", anything)\nx = sqrt(d)\nm = Normal(mu = d, sigma = 1.0)",
     );
-    assert_clean("n = [[1.0, 2.0], [3.0, 4.0]]\nx = sqrt(mul(n, n))");
+    assert_clean(&format!(
+        "{DEFERRED}x = sqrt(q)\nm = Normal(mu = q, sigma = 1.0)"
+    ));
 }
 
 /// A row's nominal result presumes its argument's declared shape, so a `%deferred`
 /// argument leaves the result `%deferred` instead of a confirmed scalar.
 #[test]
 fn a_deferred_argument_leaves_the_result_deferred() {
-    let src = "n = [[1.0, 2.0], [3.0, 4.0]]\nq = mul(n, n)\ns = sqrt(q)\nf = floor(q)\n\
-               x = exp(sqrt(q))\nm = Normal(mu = q, sigma = 1.0)";
+    let src = format!(
+        "{DEFERRED}s = sqrt(q)\nf = floor(q)\nx = exp(sqrt(q))\nm = Normal(mu = q, sigma = 1.0)"
+    );
     for name in ["s", "f", "x"] {
-        let line = binding(src, name);
+        let line = binding(&src, name);
         assert!(
-            line.contains("(%meta (%deferred %fixed %unknown)"),
+            line.contains("(%meta (%deferred %stochastic %unknown)"),
             "`{name}` must stay %deferred; got: {line}"
         );
     }
     // §08 fixes a distribution's variate domain by the row, not by its parameters.
-    let line = binding(src, "m");
+    let line = binding(&src, "m");
     assert!(
-        line.contains("(%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals)"),
+        line.contains("(%measure (%domain (%scalar real)) (%mass %normalized)) %stochastic reals)"),
         "the measure keeps its §08 domain; got: {line}"
     );
 }
@@ -247,4 +254,85 @@ fn an_array_over_a_scalar_divides_to_its_shape() {
     assert!(binding(&src, "a").contains("(%meta ((%array 1 (2) (%scalar real))"));
     assert!(binding(&src, "b").contains("(%meta ((%tvector 2 (%scalar real))"));
     assert!(binding(&src, "c").contains("(%meta ((%array 2 (2 2) (%scalar real))"));
+}
+
+// ---- §09 module rows -------------------------------------------------------------
+
+/// §09 declares a member's parameters as §07 and §08 do: `erf`'s Domains cell is
+/// `reals`, and `Landau`'s `loc = elementof(reals)`.
+#[test]
+fn a_vector_where_section_09_declares_a_scalar_is_refused() {
+    let modules = "sf = standard_module(\"special-functions\", \"0.1\")\n\
+                   hep = standard_module(\"particle-physics\", \"0.1\")\n";
+    assert_refuses(
+        &format!("{modules}{V}y = sf.erf(v)"),
+        "`sf.erf`'s `x` is a vector, but spec §09 declares it a scalar",
+    );
+    assert_refuses(
+        &format!("{modules}{V}m = hep.Landau(loc = v, scale = 1.0)"),
+        "`hep.Landau`'s `loc` is a vector, but spec §09 declares it a scalar",
+    );
+    assert_clean(&format!(
+        "{modules}{V}y = sf.erf(0.5)\nz = sf.erf.(v)\nm = hep.Landau(loc = 0.0, scale = 1.0)\n\
+         n = hep.Landau.(loc = v, scale = 1.0)"
+    ));
+}
+
+// ---- per-cell checks ---------------------------------------------------------------
+
+/// A `broadcast` cell is an ordinary call of its head: over a vector of vectors each
+/// cell is a vector.
+#[test]
+fn a_broadcast_cell_outside_the_declared_shape_is_refused() {
+    let nested = "N = [[1.0, 2.0], [3.0, 4.0]]\n";
+    assert_refuses(
+        &format!("{nested}y = sqrt.(N)"),
+        "a `broadcast` cell of `sqrt` passes `x` a vector, but spec §07 declares it a scalar",
+    );
+    assert_refuses(
+        &format!("{nested}m = Normal.(mu = N, sigma = 1.0)"),
+        "a `broadcast` cell of `Normal` passes `mu` a vector",
+    );
+    // `l2norm`'s cells are the inner vectors, which its vector domain admits.
+    assert_clean(&format!("{nested}z = l2norm.(N)"));
+    assert_clean(&format!(
+        "{M}y = sqrt.(M)\nm = Normal.(mu = M, sigma = 1.0)"
+    ));
+}
+
+/// A refusal inside a substituted callable body is the call's error, not a silent
+/// `%failed` at exit 0.
+#[test]
+fn a_refusal_inside_a_substituted_body_is_reported() {
+    assert_refuses(
+        "k = functionof(sqrt(_x_), x = _x_)\ny = broadcast(k, x = [[1.0, 2.0], [3.0, 4.0]])",
+        "`sqrt`'s `x` is a vector",
+    );
+    assert_refuses(
+        "mk = kernelof(draw(Normal(mu = _m_, sigma = 1.0)), mu = _m_)\n\
+         y = draw(mk(record(mu = 1.5)))",
+        "`Normal`'s `mu` is a record",
+    );
+}
+
+/// §07 "Approximation functions" gives `x` the domains "real or complex",
+/// `unitinterval` and "real": a scalar. An array of points is a broadcast.
+#[test]
+fn an_array_x_of_an_approximation_function_is_refused() {
+    let c = "c = [1.0, 2.0, 3.0]\nxs = [0.1, 0.2]\n";
+    assert_refuses(
+        &format!("{c}y = polynomial(c, xs)"),
+        "`polynomial`'s `x` is a vector",
+    );
+    assert_refuses(
+        &format!("{c}y = bernstein(c, xs)"),
+        "`bernstein`'s `x` is a vector",
+    );
+    assert_refuses(
+        &format!("{c}y = stepwise([0.0, 1.0, 2.0], [1.0, 2.0], xs)"),
+        "`stepwise`'s `x` is a vector",
+    );
+    assert_clean(&format!(
+        "{c}y = polynomial(c, 0.5)\nz = broadcast(fn(polynomial(c, _)), xs)"
+    ));
 }

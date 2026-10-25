@@ -858,8 +858,7 @@ fn addaxes_and_splitblocks_infer() {
 /// passes its shape through and `lstsq` is a vector.
 #[test]
 fn ext_linalg_record_results_infer() {
-    let pre =
-        "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = [[4.0, 0.0], [0.0, 9.0]]\n";
+    let pre = "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = rowstack([[4.0, 0.0], [0.0, 9.0]])\n";
     let out = ir(&format!("{pre}d = e.lu(A)"));
     assert!(
         out.contains("(%record (P (%array 2")
@@ -944,8 +943,8 @@ fn distance_matrix_dims_resolve() {
 #[test]
 fn kron_resolves_kronecker_dims() {
     let out = ir("e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
-                  A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
-                  B = [[1.0, 0.0], [0.0, 1.0]]\n\
+                  A = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\n\
+                  B = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
                   k = e.kron(A, B)");
     assert!(
         out.contains("(%array 2 (4 6) (%scalar real))") && out.contains("kron"),

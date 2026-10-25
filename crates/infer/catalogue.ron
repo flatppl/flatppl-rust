@@ -275,7 +275,8 @@ Catalogue(
         // counterpart here (`crates/infer/tests/order_statistics.rs` pins it).
         Builtin(name: "cummax",       sig: Function(params: [Vector(Real)], names: ["xs"],      result: SameAsArg(0))),
         Builtin(name: "cummin",       sig: Function(params: [Vector(Real)], names: ["xs"],      result: SameAsArg(0))),
-        // real(x) = Re(x), imag(x) = Im(x): real-valued, shape-preserving (spec §07).
+        // real(x) = Re(x), imag(x) = Im(x): a real scalar (spec §07 "Scalar
+        // restrictions and constructors").
         Builtin(name: "real",         sig: Function(params: [Scalar(Complex)], names: ["x"],      result: RealOfArgShape(0))),
         Builtin(name: "imag",         sig: Function(params: [Scalar(Complex)], names: ["x"],      result: RealOfArgShape(0))),
         // ifelse(cond, a, b) returns a or b → the common type of the two branches (spec §07).
@@ -337,11 +338,12 @@ Catalogue(
         Builtin(name: "adjoint",        sig: Function(params: [Any], names: ["A"], result: TransposeOf(0))),
         // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
         Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: SameAsArg(1))),
-        // Polynomial / basis evaluations at x → real-valued, shaped like x
-        // (scalar x → scalar, array x → array).
-        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Any], names: ["coefficients", "x"], result: RealOfArgShape(1))),
-        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Any], param_sets: [Unconstrained, UnitInterval], names: ["coefficients", "x"], result: RealOfArgShape(1))),
-        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Any], names: ["edges", "values", "x"], result: RealOfArgShape(2))),
+        // Polynomial / basis evaluations at a SCALAR x (§07 "Approximation functions"
+        // Domains: "real or complex", `unitinterval`, "real"). An array of points is
+        // `broadcast(fn(polynomial(c, _)), xs)`.
+        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Scalar(Complex)], names: ["coefficients", "x"], result: RealOfArgShape(1))),
+        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Scalar(Real)], param_sets: [Unconstrained, UnitInterval], names: ["coefficients", "x"], result: RealOfArgShape(1))),
+        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], names: ["edges", "values", "x"], result: RealOfArgShape(2))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
