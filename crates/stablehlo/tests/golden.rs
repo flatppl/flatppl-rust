@@ -3255,6 +3255,15 @@ fn determinize_src(src: &str) -> Module {
     flatppl_determinizer::determinize(&m).expect("must determinize, not refuse")
 }
 
+/// Determinize `src` WITHOUT inference's verdict: its diagnostics are ignored, as for a
+/// module a caller hands the determiniser directly. The emitter's own guards are then
+/// the gate, which is what the backstop tests below exercise.
+fn determinize_ungated(src: &str) -> Module {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut m);
+    flatppl_determinizer::determinize(&m).expect("must determinize, not refuse")
+}
+
 fn emit_logdensity(m: &Module) -> String {
     flatppl_stablehlo::emit(
         m,
@@ -7359,7 +7368,8 @@ outputs = (draws)
 /// The `emit_sample` mirror of `mvnormal_logpdf_refuses_dynamic_vector_length`
 /// for rank, not length: a rank-2 `alpha` (`cartpow(posreals, [2, 2])`) must
 /// refuse precisely, not reach [`vector_elem`]'s slice+reshape idiom on an
-/// operand it was never built to accept.
+/// operand it was never built to accept. Inference refuses it first (§08 gives
+/// `alpha` as a vector); the emitter's rank guard is the backstop.
 #[test]
 fn dirichlet_sample_refuses_nonrank1_alpha() {
     let src = "\
@@ -7370,7 +7380,13 @@ draws = rand(lawof(x), s)
 inputs = (alpha)
 outputs = (draws)
 ";
-    let d = determinize_src(src);
+    let err = infer_refusal(src);
+    assert!(
+        err.contains("`Dirichlet`'s `alpha` is a matrix"),
+        "unexpected message: {err}"
+    );
+    // The emitter backstop, reached without the infer gate.
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
         .unwrap_err();
     assert!(
@@ -7789,7 +7805,8 @@ outputs = (draws)
 
 /// The rank mirror of [`multinomial_sample_refuses_dynamic_vector_length`]: a
 /// rank-2 `p` must refuse precisely, not reach [`vector_elem`]'s slice+reshape
-/// idiom on an operand it was never built to accept.
+/// idiom on an operand it was never built to accept. Inference refuses it first
+/// (§08 gives `p` as a vector); the emitter's rank guard is the backstop.
 #[test]
 fn multinomial_sample_refuses_nonrank1_p() {
     let src = "\
@@ -7801,7 +7818,13 @@ draws = rand(lawof(x), s)
 inputs = (p)
 outputs = (draws)
 ";
-    let d = determinize_src(src);
+    let err = infer_refusal(src);
+    assert!(
+        err.contains("`Multinomial`'s `p` is a matrix"),
+        "unexpected message: {err}"
+    );
+    // The emitter backstop, reached without the infer gate.
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
         .unwrap_err();
     assert!(
@@ -9862,7 +9885,7 @@ fn emit_logdensity_refuses_mixed_orientation_on_the_dotted_and_predicate_paths()
         ("`.*`", "sum(transpose(v) .* w)", "(v, w)"),
         (
             "compare inside ifelse",
-            "sum(ifelse(transpose(v) .< w, v, w))",
+            "sum(ifelse.(transpose(v) .< w, v, w))",
             "(v, w)",
         ),
         (
@@ -10434,11 +10457,10 @@ outputs = lp
     );
 }
 
-/// `ifelse`'s PREDICATE must broadcast against its branches. This case never
-/// panicked — `Emitter::select`'s second pass uses `broadcast_scalar`, which
-/// emitted an INVALID `broadcast_in_dim` (a rank-2 operand to a rank-1 result
-/// under `dims = []`) and returned success. A mislowering is worse than the
-/// abort the sibling cases had, so it refuses too.
+/// `ifelse`'s PREDICATE must broadcast against its branches. A `[3]` predicate has
+/// a different rank from `[4, 3]` branches, which §04 broadcasting does not
+/// reconcile. It once emitted an INVALID `broadcast_in_dim` (a rank-2 operand to a
+/// rank-1 result under `dims = []`) and returned success, so it refuses.
 #[test]
 fn emit_logdensity_refuses_ifelse_with_a_mismatched_predicate_shape() {
     let src = "\
@@ -10446,7 +10468,7 @@ m = elementof(cartpow(reals, [4, 3]))
 n = elementof(cartpow(reals, [4, 3]))
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 .< v2, m, n)
+z = ifelse.(v1 .< v2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (m, n, v1, v2)
 outputs = lp
@@ -10465,65 +10487,72 @@ outputs = lp
     );
 }
 
-/// A SIZE-1 predicate against `[3]` branches. The size-1 rule
-/// `require_broadcastable` applies is right for elementwise arithmetic, where
-/// `broadcast_pair` supplies identity dims, but WRONG for the predicate pass —
-/// `Emitter::broadcast_scalar` emits an empty `dims` list, valid only for a
-/// rank-0 operand. This used to emit
-/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` and exit 0:
-/// invalid StableHLO claiming to shrink 3 to 1.
+/// A SIZE-1 predicate against `[3]` branches. §04 "Broadcasting": "Size-one array axes
+/// are implicitly expanded", so the predicate expands to `[3]` under the identity
+/// dimension map and the select runs per element. It once emitted
+/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>`, invalid StableHLO.
 #[test]
-fn emit_logdensity_refuses_ifelse_with_a_size_one_predicate() {
+fn emit_logdensity_ifelse_expands_a_size_one_predicate() {
     let src = "\
 p1 = elementof(cartpow(reals, 1))
 p2 = elementof(cartpow(reals, 1))
 m = elementof(cartpow(reals, 3))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let out = emit_logdensity(&d);
     assert!(
-        err.msg.contains("does not match its branches' shape"),
-        "expected a predicate-shape refusal for a size-1 predicate, got: {}",
-        err.msg
+        out.contains("stablehlo.broadcast_in_dim %1, dims = [0] : (tensor<1xi1>) -> tensor<3xi1>"),
+        "the size-1 predicate must expand under identity dims, in:\n{out}"
     );
+    assert!(
+        out.contains(
+            "stablehlo.select %2, %arg2, %arg3 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) \
+             -> tensor<3xf32>"
+        ),
+        "the select runs per element over the branches, in:\n{out}"
+    );
+    assert!(!out.contains("dims = []"), "no empty dims list, in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
 }
 
-/// The mirror: a `[3]` predicate against SIZE-1 branches, which emitted the
-/// invalid expansion in the other direction.
+/// The mirror: a `[3]` predicate against SIZE-1 branches. Both branches expand to `[3]`
+/// before the select.
 #[test]
-fn emit_logdensity_refuses_ifelse_with_size_one_branches_under_a_wider_predicate() {
+fn emit_logdensity_ifelse_expands_size_one_branches_under_a_wider_predicate() {
     let src = "\
 p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 1))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let out = emit_logdensity(&d);
+    for arg in ["%arg2", "%arg3"] {
+        assert!(
+            out.contains(&format!(
+                "stablehlo.broadcast_in_dim {arg}, dims = [0] : (tensor<1xf32>) -> tensor<3xf32>"
+            )),
+            "branch {arg} must expand under identity dims, in:\n{out}"
+        );
+    }
     assert!(
-        err.msg.contains("does not match its branches' shape"),
-        "expected a predicate-shape refusal for size-1 branches, got: {}",
-        err.msg
+        out.contains(
+            "stablehlo.select %1, %2, %3 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) \
+             -> tensor<3xf32>"
+        ),
+        "the select runs per element over the expanded branches, in:\n{out}"
     );
+    assert!(!out.contains("dims = []"), "no empty dims list, in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
 }
 
 /// A size-1 BRANCH against a `[3]` branch under a `[3]` predicate must still
@@ -10539,7 +10568,7 @@ p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10587,7 +10616,7 @@ outputs = lp
             "\
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 .< v2, 1.0, 2.0)
+z = ifelse.(v1 .< v2, 1.0, 2.0)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (v1, v2)
 outputs = lp
@@ -11017,13 +11046,14 @@ outputs = lp
 // unchanged: `emit_logdensity_refuses_bare_pow_with_a_vector_base` (`v ^ 2.0`)
 // and `emit_logdensity_refuses_bare_divide_of_scalar_by_vector` (`s / v`).
 //
-// `infer` still reports NO diagnostic for either model, and types the
-// synthesized `sqrt(add(pow(sv, 2.0), 1.0))` as `(%scalar real)` despite the
-// `%deferred` `pow` under it — so neither refusal comes from inference.
+// Inference now refuses the first model (`Normal`'s `sigma` is a vector where §08
+// declares a scalar), so its test asserts that refusal; the row guard stays covered by
+// `crates/determinizer/tests/vector_parameter_rows_refuse.rs`. `infer` reports no
+// diagnostic for the second, whose refusal is the determiniser's.
 
 /// The Normal–Normal conjugate marginal row (`determinizer::marginal`) matched a
 /// prior whose `sigma` is a VECTOR and synthesized `pow(sigma, 2)` on it — outside
-/// §07 `pow`'s "scalars" domain. The row's parameter-scalarity guard now refuses.
+/// §07 `pow`'s "scalars" domain. Inference now refuses the vector `sigma` first.
 #[test]
 fn determinize_refuses_a_conjugate_row_over_a_vector_prior_sigma() {
     let src = "\
@@ -11034,11 +11064,10 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))
 inputs = (sv)
 outputs = lp
 ";
-    let err = determinize_err(src);
+    let err = infer_refusal(src);
     assert!(
-        err.contains("conjugate pair matched but the prior's `sigma` is a vector")
-            && err.contains("broadcast"),
-        "expected the conjugate row's non-scalar-parameter refusal, got: {err}"
+        err.contains("`Normal`'s `sigma` is a vector") && err.contains("Normal.("),
+        "expected inference's non-scalar-parameter refusal, got: {err}"
     );
 }
 

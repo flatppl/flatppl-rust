@@ -496,17 +496,17 @@ fn matmul_matrix_vector_and_matrix_matrix() {
 /// real scalar, a complex matrix a complex scalar (`ResultSig::ElemScalarKind`).
 #[test]
 fn det_infers_element_scalar_kind() {
-    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
+    let out = ir("x = det(rowstack([[1.0, 0.0], [0.0, 1.0]]))");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (det"),
         "det(real matrix) should infer a real scalar, got:\n{out}"
     );
-    let out = ir("A = [[complex(1.0, 2.0)]]\nx = det(A)");
+    let out = ir("A = rowstack([[complex(1.0, 2.0)]])\nx = det(A)");
     assert!(
         out.contains("(%scalar complex)") && out.contains("(det"),
         "det(complex matrix) should infer a complex scalar, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = trace(A)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nx = trace(A)");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (trace"),
         "trace(real matrix) should infer a real scalar, got:\n{out}"
@@ -533,7 +533,7 @@ fn real_scalar_reductions_infer() {
             "{op} should infer a real scalar over a real array, got:\n{out}"
         );
     }
-    let out = ir("x = logabsdet([[2.0, 0.0], [0.0, 2.0]])");
+    let out = ir("x = logabsdet(rowstack([[2.0, 0.0], [0.0, 2.0]]))");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (logabsdet"),
         "logabsdet should infer a real scalar, got:\n{out}"
@@ -564,7 +564,7 @@ fn vector_result_functions_infer() {
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
         "linspace should infer a real vector, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = diag(A)");
+    let out = ir("A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = diag(A)");
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(diag"),
         "diag(real matrix) should infer a real vector, got:\n{out}"
@@ -592,7 +592,7 @@ fn boolean_and_quadform_infer_scalars() {
         out.contains("(%meta ((%scalar boolean) %fixed booleans) (boolean"),
         "boolean should infer a boolean scalar, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nv = [1.0, 2.0]\nx = quadform(A, v)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nv = [1.0, 2.0]\nx = quadform(A, v)");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (quadform"),
         "quadform(real) should infer a real scalar, got:\n{out}"
@@ -604,8 +604,14 @@ fn boolean_and_quadform_infer_scalars() {
 #[test]
 fn matrix_constructors_infer_matrices() {
     for (op, src) in [
-        ("row_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = row_gram(A)"),
-        ("col_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = col_gram(A)"),
+        (
+            "row_gram",
+            "A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = row_gram(A)",
+        ),
+        (
+            "col_gram",
+            "A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = col_gram(A)",
+        ),
         ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
     ] {
         let out = ir(src);
@@ -752,7 +758,7 @@ fn reduce_and_filter_infer() {
 /// through the lowering context). The reusable record-valued result path.
 #[test]
 fn qr_infers_a_record_of_matrices() {
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nd = qr(A)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nd = qr(A)");
     assert!(
         out.contains("(%record (Q (%array 2 (%dynamic %dynamic) (%scalar real))) (R (%array 2 (%dynamic %dynamic) (%scalar real))))")
             && out.contains("(qr"),
@@ -852,8 +858,7 @@ fn addaxes_and_splitblocks_infer() {
 /// passes its shape through and `lstsq` is a vector.
 #[test]
 fn ext_linalg_record_results_infer() {
-    let pre =
-        "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = [[4.0, 0.0], [0.0, 9.0]]\n";
+    let pre = "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = rowstack([[4.0, 0.0], [0.0, 9.0]])\n";
     let out = ir(&format!("{pre}d = e.lu(A)"));
     assert!(
         out.contains("(%record (P (%array 2")
@@ -938,8 +943,8 @@ fn distance_matrix_dims_resolve() {
 #[test]
 fn kron_resolves_kronecker_dims() {
     let out = ir("e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
-                  A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
-                  B = [[1.0, 0.0], [0.0, 1.0]]\n\
+                  A = rowstack([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\n\
+                  B = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
                   k = e.kron(A, B)");
     assert!(
         out.contains("(%array 2 (4 6) (%scalar real))") && out.contains("kron"),
@@ -1252,31 +1257,27 @@ fn disintegrate_defers_for_non_literal_selector() {
     );
 }
 
-/// `disintegrate([], joint)` — an empty selector `[]` — must yield the deferred
-/// fallback, not a fabricated result.
+/// `disintegrate([], joint)` — an empty selector `[]` — must not yield a fabricated
+/// result.
 ///
-/// Discovery (2026-06-20): `[]` lowers to `(vector)` — a `vector` call with zero
-/// args, which matches the `vector`-literal branch of `selector_field_names` and
-/// collects to an empty vec. Without the guard, that empty vec was treated as
-/// `Some([])` — a resolved-but-empty selector — causing `disintegrate` to walk the
-/// record fields and produce non-empty kernel inputs and a full marginal domain.
-/// The fix returns `None` (→ deferred) whenever the collected name list is empty.
+/// Discovery (2026-06-20): `[]` once matched the `vector`-literal branch of
+/// `selector_field_names` and collected to an empty name list, which `disintegrate`
+/// read as a resolved-but-empty selector and so walked the record fields into a full
+/// marginal. §05 now reads `[]` as an empty axis list, a static error, and the failed
+/// selector fails the call.
 #[test]
-fn disintegrate_defers_for_empty_selector() {
-    // `[]` lowers to `(vector)` with zero args. `selector_field_names` must
-    // return `None` for an empty name list, so `disintegrate_type` falls back
-    // to the deferred path: empty kernel inputs + deferred marginal domain.
+fn disintegrate_fails_for_empty_selector() {
     let out = ir("a ~ Normal(0.0, 1.0)\n\
                   b ~ Normal(a, 1.0)\n\
                   mu = lawof(record(a = a, b = b))\n\
                   parts = disintegrate([], mu)");
+    let parts = out
+        .lines()
+        .find(|l| l.contains("(%bind parts "))
+        .unwrap_or_else(|| panic!("no `parts` binding in:\n{out}"));
     assert!(
-        out.contains("(%inputs )"),
-        "disintegrate([], mu) should have empty kernel inputs, got:\n{out}"
-    );
-    assert!(
-        out.contains("(%domain %deferred)"),
-        "disintegrate([], mu) should have a deferred marginal domain, got:\n{out}"
+        parts.contains("(%bind parts (%meta ((%failed"),
+        "disintegrate([], mu) must fail with its selector, got:\n{parts}"
     );
 }
 

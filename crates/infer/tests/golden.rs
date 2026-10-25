@@ -42,8 +42,8 @@ fn helpers_inference_matches_spec_golden() {
 /// model.flatpir: every single-module binding matches the golden. The `L`
 /// binding references `helpers.obs_kernel` via a cross-module ref; when no
 /// bundle is supplied (`infer` uses an empty one) the resolution fails with an
-/// anchored error ("not found") and `L`'s type is left `%deferred` because the
-/// argument that failed has `(%failed …)` which propagates through `likelihoodof`.
+/// anchored error ("not found") and `L`'s type is `%failed`: a failed argument fails
+/// the call that receives it.
 #[test]
 fn model_inference_single_module_part() {
     let mut module = flatppl_flatpir::read(&fixture("model.flatpir")).unwrap();
@@ -56,7 +56,7 @@ fn model_inference_single_module_part() {
         "(%meta ((%scalar real) %stochastic reals) (draw",
         "(%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals) (Normal",
         "(%meta ((%scalar real) %stochastic reals) (add",
-        "(%meta (%deferred %fixed %unknown) (likelihoodof",
+        "(%meta ((%failed \"cross-module resolution\") %fixed %unknown) (likelihoodof",
     ] {
         assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
     }

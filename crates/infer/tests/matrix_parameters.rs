@@ -19,11 +19,12 @@ fn errors(src: &str) -> Vec<Diagnostic> {
 fn assert_refuses(src: &str, param: &str) {
     let errs = errors(src);
     assert!(
-        errs.iter().any(
-            |d| d.message.contains(&format!("`{param}` must be a matrix"))
+        errs.iter()
+            .any(|d| d.message.contains(&format!("`{param}`"))
+                && d.message
+                    .contains("a vector of vectors, but spec §08 declares it a matrix")
                 && d.message.contains("rowstack")
-                && d.node.is_some()
-        ),
+                && d.node.is_some()),
         "`{src}` must refuse `{param}` with a located message naming rowstack; got: {errs:?}"
     );
 }

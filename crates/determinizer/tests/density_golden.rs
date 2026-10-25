@@ -2559,19 +2559,59 @@ lp = logdensityof(lawof(y), 0.3)";
 }
 
 // The bare and record spellings of one matrix-affine value law must lower identically.
-// `A * x + b` types as `%deferred` at the `add` (`mul(matrix, vector)` has no type rule
-// and deferredness propagates outward), yet `crate::invert`'s matrix-affine grammar
-// handles it and emits `linsolve`/`logabsdet`. A guard reading that deferred RESULT type
-// as "unreadable map" refused the bare spelling while the record one kept lowering. Same
-// bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd` holds for the scalar case.
+// `crate::invert`'s matrix-affine grammar emits `linsolve`/`logabsdet` for `A * x + b`. A
+// guard reading the map's RESULT type as "unreadable map" once refused the bare spelling
+// when that type was `%deferred`, while the record one kept lowering. Same bar
+// `bare_lawof_of_derived_scalar_lowers_like_pushfwd` holds for the scalar case. The
+// second test keeps the `%deferred` result: its shift `atan2.(c, c)` is a valid vector
+// that inference has no broadcast rule for yet.
 #[test]
 fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
     let prelude = "\
-A = [[2.0, 0.0], [0.0, 3.0]]
+A = rowstack([[2.0, 0.0], [0.0, 3.0]])
 b = [1.0, 1.0]
 x = draw(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))
 y = A * x + b
 ";
+    let bare = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(y), [1.0, 1.0])"
+    )));
+    let record = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(record(y = y)), record(y = [1.0, 1.0]))"
+    )));
+    let lp = pir_binding(&bare, "lp");
+    assert!(
+        lp.contains("linsolve") && lp.contains("logabsdet"),
+        "the matrix-affine inverse and its log-volume are emitted:\n{lp}"
+    );
+    assert_eq!(
+        lp,
+        pir_binding(&record, "lp"),
+        "bare and record spellings of one measure must lower identically:\n{bare}\n---\n{record}"
+    );
+}
+
+#[test]
+fn bare_matrix_affine_value_law_with_a_deferred_result_lowers_like_the_record_spelling() {
+    let prelude = "\
+A = rowstack([[2.0, 0.0], [0.0, 3.0]])
+c = [1.0, 1.0]
+b = atan2.(c, c)
+x = draw(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))
+y = A * x + b
+";
+    let mut typed = flatppl_syntax::parse(prelude).unwrap();
+    let _ = flatppl_infer::infer(&mut typed);
+    let y = typed
+        .bindings()
+        .find(|(_, b)| typed.resolve(b.name) == "y")
+        .map(|(_, b)| b.rhs)
+        .unwrap();
+    assert_eq!(
+        typed.type_of(y),
+        Some(&flatppl_core::Type::Deferred),
+        "the map's result must stay %deferred for this test to reach the guard"
+    );
     let bare = flatppl_flatpir::write(&determinize_src(&format!(
         "{prelude}lp = logdensityof(lawof(y), [1.0, 1.0])"
     )));

@@ -14,6 +14,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
+use crate::catalogue::ParamShape;
 use crate::consteval::{count_dims, count_dims_with_zero, resolve_count, resolve_dim, static_dim};
 use crate::rule::RuleStep::Ready;
 use crate::rule::{LocalTargets, RuleStep};
@@ -56,7 +57,37 @@ pub(crate) fn const_type(name: &str) -> Type {
 /// Dispatch a call to its op rule. `joined` is the §04 ancestor-rule phase
 /// join over all inputs; rules override it only where the op itself
 /// introduces a phase (`elementof`, `draw`, reification closure, loaders).
+///
+/// A failed argument fails the call. No row has a meaning for an operand with no type,
+/// and a nominal result would hide the refusal under `%deferred` or a value. The op
+/// rule still runs, so its own diagnostics are reported. A reification's arguments are
+/// its body and boundary, not operands, so it is exempt.
 pub(crate) fn call_rule(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    call: &Call,
+    callee: Option<(NodeId, Type)>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    joined: Phase,
+) -> RuleStep<(Type, Phase)> {
+    let failed = if call.inputs.is_none() {
+        args.iter()
+            .map(|(_, ty, _)| ty)
+            .chain(named.iter().map(|(_, _, ty, _)| ty))
+            .find_map(first_failed)
+    } else {
+        None
+    };
+    op_rule(inf, id, call, callee, args, named, joined).map(inf, move |_, (ty, phase)| match failed
+    {
+        Some(failed) if !matches!(ty, Type::Failed(_)) => (failed, phase),
+        _ => (ty, phase),
+    })
+}
+
+/// The op rule of a call, before [`call_rule`]'s failed-argument override.
+fn op_rule(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     call: &Call,
@@ -227,7 +258,7 @@ pub(crate) fn call_rule(
     if let Some(ty) = domain_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
-    if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &name, args) {
+    if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args, false) {
         return Ready((ty, joined));
     }
 
@@ -877,7 +908,9 @@ pub(crate) fn call_rule(
 
         // ---- broadcasting (spec §04) ----
         "broadcast" => {
-            return broadcast_type(inf, id, args, named).map(inf, move |_, ty| (ty, joined));
+            // A failed cell fails the broadcast, as a failed argument fails a call.
+            return broadcast_type(inf, id, args, named)
+                .map(inf, move |_, ty| (first_failed(&ty).unwrap_or(ty), joined));
         }
         // Like a bare builtin callable, the lifted callable's result depends
         // on application arguments. Kernel primitives inspect it structurally.
@@ -1702,9 +1735,29 @@ fn real_or_complex(a: Option<&Type>) -> Type {
 /// OR complex. The result is complex iff either operand is complex; otherwise
 /// it is real — even for integer operands, since `1 / 2 = 0.5` is real (integer
 /// floor-division is the separate `div` op). This differs from `promote2`,
-/// which would keep integer/integer as integer.
+/// which would keep integer/integer as integer. The row's "array-scalar" and
+/// "transposed-vector–scalar" forms divide each element and keep the shape.
 fn divide_type(a: Option<&Type>, b: Option<&Type>) -> Type {
     use ScalarType::*;
+    match (a, b) {
+        (Some(Type::Array { shape, elem }), Some(s @ Type::Scalar(_)))
+            if matches!(**elem, Type::Scalar(_)) =>
+        {
+            return Type::Array {
+                shape: shape.clone(),
+                elem: Box::new(divide_type(Some(elem), Some(s))),
+            };
+        }
+        (Some(Type::TVector { len, elem }), Some(s @ Type::Scalar(_)))
+            if matches!(**elem, Type::Scalar(_)) =>
+        {
+            return Type::TVector {
+                len: *len,
+                elem: Box::new(divide_type(Some(elem), Some(s))),
+            };
+        }
+        _ => {}
+    }
     let is_complex = |t: Option<&Type>| matches!(t, Some(Type::Scalar(Complex)));
     let known_scalar = |t: Option<&Type>| {
         matches!(
@@ -3640,6 +3693,8 @@ fn set_element_type_at(
 fn measure_domain(m: Option<&Type>) -> Type {
     match m {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
+        // A failed measure fails its variate too, rather than reading as "no rule yet".
+        Some(failed @ Type::Failed(_)) => failed.clone(),
         _ => Type::Deferred,
     }
 }
@@ -4763,7 +4818,7 @@ fn ksuperpose_cell_variate(
         // A §09 member reference carries its catalogue sig; a bare builtin
         // constructor reaches its domain by name. Both mirror `broadcast_type`.
         if inf.module_catalogue_ref(component).is_some() {
-            return match catalogue_call_type(inf, component, &cell_args) {
+            return match catalogue_call_type(inf, component, &cell_args, true) {
                 Type::Measure { domain, .. } => Some(*domain),
                 _ => None,
             };
@@ -5761,17 +5816,7 @@ fn module_member_arity_check(
     let arity = crate::catalogue::sig_arity(sig)?;
     let reading = arg_reading(inf, args, named, arity.admits(1), true)?;
     let got = reading.count;
-    let who = match inf.module.node(callee) {
-        Node::Ref(r) => match r.ns {
-            RefNs::Module(alias) => format!(
-                "`{}.{}`",
-                inf.module.resolve(alias),
-                inf.module.resolve(r.name)
-            ),
-            _ => format!("`{}`", inf.module.resolve(r.name)),
-        },
-        _ => "the module member".to_string(),
-    };
+    let who = format!("`{}`", member_label(inf, callee));
     if arity.admits(got) {
         let names: Vec<String> = crate::catalogue::sig_param_names(sig)?.to_vec();
         if let Some(ty) = check_double_bound(inf, &names, &who, "§09", args, named) {
@@ -5789,6 +5834,21 @@ fn module_member_arity_check(
     Some(Type::Failed(
         format!("{who} takes {declared}, got {got}").into(),
     ))
+}
+
+/// A §09 member reference as the source spells it: `alias.member`.
+fn member_label(inf: &Inferencer<'_, '_>, callee: NodeId) -> String {
+    match inf.module.node(callee) {
+        Node::Ref(r) => match r.ns {
+            RefNs::Module(alias) => format!(
+                "{}.{}",
+                inf.module.resolve(alias),
+                inf.module.resolve(r.name)
+            ),
+            _ => inf.module.resolve(r.name).to_string(),
+        },
+        _ => "the module member".to_string(),
+    }
 }
 
 /// Include record auto-splats and measures nested in argument collections.
@@ -5898,6 +5958,7 @@ fn user_call_type(
             inf,
             resolved,
             bound.as_deref().unwrap_or(args),
+            false,
         ));
     }
     // Prefer the per-call substituted body type (arg types bound to the
@@ -6139,12 +6200,40 @@ fn ordinary_call_type(
 ///     or a dynamic-dim matrix).
 ///
 /// The support is carried separately by `catalogue_call_valueset`.
-fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[ArgInfo]) -> Type {
+fn catalogue_call_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+    cell: bool,
+) -> Type {
     // Clone the sig out to drop the immutable borrow before `lower`'s closures
     // re-borrow `args` inside the `&mut inf` call frame.
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return Type::Deferred;
     };
+    // §09 declares a member's parameters as §07 and §08 do, so the same shape rule
+    // and the same `%deferred` propagation apply.
+    let head = member_label(inf, callee);
+    let names = crate::catalogue::sig_param_names(&sig)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
+    if let Some(ty) = refuse_shape_outside_sig(
+        inf,
+        &format!("`{head}`"),
+        &head,
+        "§09",
+        &sig,
+        &names,
+        args,
+        cell,
+    ) {
+        return ty;
+    }
+    if matches!(sig, crate::catalogue::Sig::Function { .. })
+        && let Some(ty) = unresolved_shaped_argument(&sig, args)
+    {
+        return ty;
+    }
     // Both Distribution and Function sigs return the lowered type directly:
     // `catalogue_lower` already embeds the catalogue `MassTag` mass in the
     // `Measure` for distributions, and the result scalar/matrix type for
@@ -6165,6 +6254,11 @@ fn catalogue_call_valueset(
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return ValueSet::Unknown;
     };
+    if matches!(sig, crate::catalogue::Sig::Function { .. })
+        && unresolved_shaped_argument(&sig, args).is_some()
+    {
+        return ValueSet::Unknown;
+    }
     catalogue_lower(&mut *inf.module, &sig, args).1
 }
 
@@ -6538,24 +6632,42 @@ pub(crate) fn input_entries(
 
 /// Group the body's `%local` placeholder refs by name in traversal order.
 /// One call-local walk serves every parameter while seeds retain input order.
+///
+/// A nested reification that declares the same placeholder rebinds it: §04 binds each
+/// `_` to the nearest enclosing `fn`, so `fn(broadcast(fn(_ + 1), _))` has two distinct
+/// `_`. The walk skips a name inside the boundary that rebinds it.
 fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol, Vec<NodeId>> {
+    use std::rc::Rc;
     let mut refs: HashMap<Symbol, Vec<NodeId>> = HashMap::new();
-    let mut stack = vec![body];
+    let mut stack: Vec<(NodeId, Rc<HashSet<Symbol>>)> = vec![(body, Rc::new(HashSet::new()))];
     let mut seen = std::collections::HashSet::new();
-    while let Some(id) = stack.pop() {
+    while let Some((id, shadowed)) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
         match inf.module.node(id) {
-            Node::Ref(r) if r.ns == RefNs::Local => {
+            Node::Ref(r) if r.ns == RefNs::Local && !shadowed.contains(&r.name) => {
                 refs.entry(r.name).or_default().push(id);
             }
             Node::Call(c) => {
+                let inner = match input_entries(inf, id) {
+                    Some(entries) if c.inputs.is_some() => {
+                        let mut names = (*shadowed).clone();
+                        names.extend(
+                            entries
+                                .iter()
+                                .filter(|(_, r)| r.ns == RefNs::Local)
+                                .map(|(_, r)| r.name),
+                        );
+                        Rc::new(names)
+                    }
+                    _ => Rc::clone(&shadowed),
+                };
                 if let CallHead::User(callee) = c.head {
-                    stack.push(callee);
+                    stack.push((callee, Rc::clone(&shadowed)));
                 }
-                stack.extend(c.args.iter().copied());
-                stack.extend(c.named.iter().map(|n| n.value));
+                stack.extend(c.args.iter().map(|&a| (a, Rc::clone(&inner))));
+                stack.extend(c.named.iter().map(|n| (n.value, Rc::clone(&inner))));
             }
             _ => {}
         }
@@ -6808,17 +6920,28 @@ fn broadcast_type(
     // cell type, but lowering against the cell args keeps a future
     // `RealOrComplexOfArg` / `DomainMap` row correct).
     if inf.module_catalogue_ref(head_node).is_some() {
+        // A cell is an ordinary call (§04): a table contributes its row record, keyword
+        // cells bind by name, and a sole record cell auto-splats.
         let cell_args: Vec<ArgInfo> = args[1..]
             .iter()
-            .map(|(n, t, p)| {
-                let cell = match t {
-                    Type::Array { elem, .. } => elem.as_ref().clone(),
-                    other => other.clone(),
-                };
-                (*n, cell, *p)
-            })
+            .map(|(n, t, p)| (*n, cell_arg(t), *p))
             .collect();
-        return Ready(match catalogue_call_type(inf, head_node, &cell_args) {
+        let cell_named: Vec<NamedInfo> = named
+            .iter()
+            .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+            .collect();
+        let bound = crate::callable::interface(inf, head_node).and_then(|interface| {
+            normalize_arguments(
+                inf.module,
+                &interface.names,
+                &cell_args,
+                &cell_named,
+                interface.takes_one(),
+                interface.ordered,
+            )
+        });
+        let cells = bound.unwrap_or(cell_args);
+        return Ready(match catalogue_call_type(inf, head_node, &cells, true) {
             // Distribution head: an independent product over the array. Its cell
             // domain and mass come from the catalogue sig, so a non-probability
             // measure like `ContinuedPoisson` stays `Finite`, not forced to
@@ -6872,7 +6995,7 @@ fn broadcast_type(
             .collect();
         let cells = normalize_keyword_args(inf.module, &op_name, &cell_args, &cell_named)
             .unwrap_or(cell_args);
-        if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &op_name, &cells) {
+        if let Some(ty) = refuse_argument_outside_declared_shape(inf, &op_name, &cells, true) {
             return Ready(ty);
         }
         return Ready(Type::Measure {
@@ -6933,6 +7056,22 @@ fn broadcast_type(
         return Ready(Type::Failed(
             format!("`{op_name}` broadcast over a cell outside its domain").into(),
         ));
+    }
+
+    // Each cell is an ordinary call of the head, so its arguments obey the row's
+    // declared shapes: `sqrt.(N)` over a vector of vectors passes `sqrt` a vector.
+    let cell_args: Vec<ArgInfo> = args[1..]
+        .iter()
+        .map(|(n, t, p)| (*n, cell_arg(t), *p))
+        .collect();
+    let cell_named: Vec<NamedInfo> = named
+        .iter()
+        .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+        .collect();
+    let cells =
+        normalize_keyword_args(inf.module, &op_name, &cell_args, &cell_named).unwrap_or(cell_args);
+    if let Some(ty) = refuse_argument_outside_declared_shape(inf, &op_name, &cells, true) {
+        return Ready(ty);
     }
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
@@ -8522,45 +8661,185 @@ fn refuse_constant_outside_declared_set(
     refused.map(|which| Type::Failed(format!("{name}: {which} is outside its declared set").into()))
 }
 
-/// Reject a vector of vectors where §08 declares a matrix parameter: `MvNormal`'s
-/// `cov`, `Wishart`'s and `InverseWishart`'s `scale` — the rank-2 entries of the
-/// catalogue's `param_ranks`.
+/// Reject an argument whose shape class is outside its parameter's declared domain:
+/// a non-scalar where §08 or §09 declares `elementof(<scalar set>)` or §07 a scalar, a
+/// non-vector where a row declares a vector, a non-matrix where it declares a matrix.
+/// The classes come from the catalogue row ([`sig_param_shapes`]), so every §07, §08
+/// and §09 row is checked by the same rule.
 ///
-/// §03 "Arrays": "Vectors of vectors are not interpreted as matrices implicitly,
-/// but can be turned into matrices explicitly using `rowstack` or `colstack`".
-/// So `cov = [[1.0, 0.3], [0.3, 2.0]]` is a length-2 vector whose elements are
-/// vectors, and the call is ill-typed even though its numbers would form a valid
-/// matrix. A computed argument of unknown type is not refused.
-fn refuse_vector_of_vectors_matrix(
+/// §07 "Elementary functions" states the scalar case outright, "All accept scalar
+/// arguments and return scalar results", and §05 "No implicit operator broadcasting"
+/// leaves `broadcast` and the dotted call as the elementwise route. Without this,
+/// `Normal(mu = v, sigma = v)` typed a measure over `reals` and `linsolve(v, v)` a
+/// vector, both at exit 0. §03 "Arrays" decides the matrix case for a nested array:
+/// "Vectors of vectors are not interpreted as matrices implicitly".
+///
+/// `cell` marks the per-cell call of a `broadcast`, whose arguments are cells: the
+/// broadcast is already the elementwise route, so no dotted remedy is offered.
+///
+/// An unresolved argument (`%deferred`, `%any`, a type variable, `%failed`) is never
+/// refused: only a decided mismatch is an error.
+///
+/// [`sig_param_shapes`]: crate::catalogue::sig_param_shapes
+fn refuse_argument_outside_declared_shape(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
+    cell: bool,
 ) -> Option<Type> {
-    let ranks = crate::distribution_param_ranks(name)?;
-    let names = crate::distribution_param_names(name)?;
+    // `refuse_nonscalar_operand` owns the connectives' array operands and names their
+    // dotted route; the catalogue marks no such class.
+    if matches!(name, "land" | "lor" | "lxor" | "lnot") {
+        return None;
+    }
+    let cat = crate::catalogue::builtin();
+    let sig = cat.base(name)?;
+    let names = cat.base_param_names(name).unwrap_or_default();
+    let who = format!("`{name}`");
+    refuse_shape_outside_sig(
+        inf,
+        &who,
+        name,
+        cat.base_param_section(name),
+        sig,
+        names,
+        args,
+        cell,
+    )
+}
+
+/// [`refuse_argument_outside_declared_shape`] for any catalogue row: `who` names the
+/// callee in the message, `head` is the name a dotted remedy calls.
+#[allow(clippy::too_many_arguments)]
+fn refuse_shape_outside_sig(
+    inf: &mut Inferencer<'_, '_>,
+    who: &str,
+    head: &str,
+    section: &str,
+    sig: &crate::catalogue::Sig,
+    names: &[String],
+    args: &[ArgInfo],
+    cell: bool,
+) -> Option<Type> {
+    let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
     let mut refused = None;
     for (i, (node, ty, _)) in args.iter().enumerate() {
-        let vector_of_vectors = matches!(ty, Type::Array { shape, elem }
-            if shape.len() == 1 && matches!(elem.as_ref(), Type::Array { .. } | Type::TVector { .. }));
-        if ranks.get(i) != Some(&2) || !vector_of_vectors {
+        let Some(Some(shape)) = shapes.get(i) else {
             continue;
-        }
+        };
+        let Some(what) = shape_mismatch(*shape, ty) else {
+            continue;
+        };
         let which = names
             .get(i)
-            .map(String::as_str)
-            .unwrap_or("matrix parameter");
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| format!("argument {}", i + 1));
+        let remedy = match (shape, ty) {
+            (ParamShape::Scalar, Type::Array { .. } | Type::TVector { .. }) if !cell => {
+                format!(". Apply {who} elementwise with `{head}.(…)` (spec §04 \"Broadcasting\")")
+            }
+            (ParamShape::Matrix, _) if what == "a vector of vectors" => {
+                ". Spec §03 \"Arrays\" does not read a vector of vectors as a matrix: build \
+                 it with `rowstack(...)` or `colstack(...)`"
+                    .to_string()
+            }
+            _ => String::new(),
+        };
+        let subject = if cell {
+            format!("a `broadcast` cell of {who} passes {which}")
+        } else {
+            format!("{who}'s {which} is")
+        };
         inf.diags.push(crate::Diagnostic::error_at(
             *node,
             format!(
-                "`{name}`'s `{which}` must be a matrix (spec §08), but this argument is a \
-                 vector of vectors, which spec §03 \"Arrays\" does not read as a matrix; \
-                 build the matrix with `rowstack(...)` (inner vectors as rows) or \
-                 `colstack(...)` (inner vectors as columns)"
+                "{subject} {what}, but spec {section} declares it {}{remedy}",
+                shape.describe()
             ),
         ));
-        refused = Some(which.to_string());
+        refused = Some(which);
     }
-    refused.map(|which| Type::Failed(format!("{name}: `{which}` is a vector of vectors").into()))
+    refused.map(|which| {
+        let who = who.trim_matches('`');
+        Type::Failed(format!("{who}: {which} is outside its declared shape").into())
+    })
+}
+
+/// What `ty` is when it is outside `shape`, or `None` when it fits or is unresolved.
+fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
+    let unresolved = |t: &Type| {
+        matches!(
+            t,
+            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_)
+        )
+    };
+    let numeric = |t: &Type| matches!(t, Type::Scalar(_)) || unresolved(t);
+    let what = match ty {
+        Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => return None,
+        Type::Scalar(_) if shape == ParamShape::Scalar => return None,
+        Type::Scalar(_) => "a scalar",
+        Type::Array { shape: dims, elem } => match (dims.len(), numeric(elem)) {
+            (1, true) if shape == ParamShape::Vector => return None,
+            (2, true) if shape == ParamShape::Matrix => return None,
+            (1, true) => "a vector",
+            (2, true) => "a matrix",
+            (n, true) => return Some(format!("an array of {n} dimensions")),
+            (1, false) if is_array_like(elem) => "a vector of vectors",
+            (_, false) => "an array of non-scalars",
+        },
+        // §03 "Arrays": "The term vector will represent both non-transposed vectors
+        // (one-dimensional arrays) and transposed vectors".
+        Type::TVector { elem, .. } if shape == ParamShape::Vector && numeric(elem) => return None,
+        Type::TVector { .. } => "a transposed vector",
+        Type::Record(_) => "a record",
+        Type::Tuple(_) => "a tuple",
+        Type::Table { .. } => "a table",
+        Type::Measure { .. } => "a measure",
+        Type::Kernel { .. } => "a kernel",
+        Type::Function { .. } => "a function",
+        Type::Likelihood { .. } => "a likelihood",
+        Type::Module => "a module",
+        Type::RngState => "an RNG state",
+    };
+    Some(what.to_string())
+}
+
+/// The first `%failed` in `ty`: itself, or one held in an element, field, component or
+/// measure domain.
+pub(crate) fn first_failed(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Failed(_) => Some(ty.clone()),
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => first_failed(elem),
+        Type::Record(fields)
+        | Type::Table {
+            columns: fields, ..
+        } => fields.iter().find_map(|(_, t)| first_failed(t)),
+        Type::Tuple(parts) => parts.iter().find_map(first_failed),
+        Type::Measure { domain, .. } => first_failed(domain),
+        Type::Likelihood { obstype, .. } => first_failed(obstype),
+        _ => None,
+    }
+}
+
+/// The type a catalogue row's call takes while a shaped argument is unresolved: the
+/// `%failed` of a failed argument, or `%deferred` for a `%deferred` one.
+///
+/// A row's nominal result presumes each argument has its declared shape. `sqrt` of a
+/// `%deferred` argument typed a confirmed real scalar although that argument could be a
+/// vector, which a later scalar gate then trusted. A §08 distribution keeps its
+/// §08 variate domain for a `%deferred` argument, which the row fixes whatever its
+/// parameters' values. A `%failed` argument never reaches a row: `call_rule` fails the
+/// call first. `%any` and a type variable are a placeholder's honest "no constraint"
+/// (the `_` of `fn(sqrt(_))`), whose body type is the nominal result.
+fn unresolved_shaped_argument(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> Option<Type> {
+    let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
+    args.iter()
+        .zip(shapes)
+        .filter(|(_, shape)| shape.is_some())
+        .find_map(|((_, ty, _), _)| match ty {
+            Type::Deferred | Type::Failed(_) => Some(ty.clone()),
+            _ => None,
+        })
 }
 
 /// The argument positions of `name` whose domain §03 "Bool" states as boolean,
@@ -9141,6 +9420,9 @@ fn function_result(
     let Sig::Function { .. } = sig else {
         return None;
     };
+    if let Some(ty) = unresolved_shaped_argument(sig, args) {
+        return Some(ty);
+    }
     // `ResultSig::Record` interns field-name Symbols into the module. Behind a
     // RefCell so the `intern` closure is a `Fn` (not `FnMut`), coexisting with
     // the immutable arg accessors. This is the one live function-row lower path,
@@ -9531,6 +9813,8 @@ pub(crate) fn call_valueset(
             let head_node = *head_node;
             let cell = |t: &Type| match t {
                 Type::Array { elem, .. } => elem.as_ref().clone(),
+                // A table's cells are its rows (§04 "Broadcasting").
+                Type::Table { columns, .. } => Type::Record(columns.clone()),
                 other => other.clone(),
             };
             let cell_args: Vec<ArgInfo> = args[1..]
@@ -9751,6 +10035,16 @@ pub(crate) fn call_valueset(
         // distribution constructors carry the support column of spec §08. A
         // bare name is one or the other — try the function row first, then fall
         // through to distribution support.
+        // A §07 function row whose type is unresolved (`unresolved_shaped_argument`, or a
+        // result threading an unresolved argument) has no set yet.
+        _ if matches!(ty, Type::Deferred | Type::Failed(_))
+            && matches!(
+                crate::catalogue::builtin().base(&name),
+                Some(crate::catalogue::Sig::Function { .. })
+            ) =>
+        {
+            ValueSet::Unknown
+        }
         _ => {
             if let Some(vs) = function_valueset(&mut *inf.module, &name, args) {
                 vs
@@ -10991,6 +11285,31 @@ mod no_laundering_tests {
         assert_eq!(
             product_mass(&[Mass::Normalized, Mass::Normalized]),
             Mass::Normalized
+        );
+    }
+}
+
+#[cfg(test)]
+mod placeholder_scope_tests {
+    use super::*;
+
+    /// §04 binds each `_` to the nearest enclosing `fn`. `fn(broadcast(fn(_ + 1), _))`
+    /// desugars both holes to the same local name, so the outer body's placeholder refs
+    /// must not include the inner `fn`'s, or substituting the outer argument types the
+    /// inner `_ + 1` with it.
+    #[test]
+    fn a_nested_fn_keeps_its_own_placeholder() {
+        let mut module = flatppl_syntax::parse("f = fn(broadcast(fn(_ + 1), _))").unwrap();
+        let rhs = module.bindings().next().expect("one binding").1.rhs;
+        let bundle = crate::ModuleBundle::new();
+        let session = crate::modules::InferSession::new(&bundle);
+        let inf = Inferencer::new(&mut module, Level::Type, &session);
+        let (_, body) = local_reification(&inf, rhs).expect("`f` is a reification");
+        let refs = collect_local_refs(&inf, body);
+        let total: usize = refs.values().map(Vec::len).sum();
+        assert_eq!(
+            total, 1,
+            "only the outer `_` is the outer body's placeholder: {refs:?}"
         );
     }
 }

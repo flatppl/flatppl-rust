@@ -91,9 +91,9 @@ pub(crate) enum Sig {
         param_sets: Vec<ParamSet>,
     },
     Function {
-        /// Declared parameter list. `lower` does not type-check arguments
-        /// (result inference is structural over the call), so only the list's
-        /// *shape* is read — by [`Arity::of`], for the call-arity rule.
+        /// Declared parameter list. Its length is read by [`Arity::of`] for the
+        /// call-arity rule, and each tag's shape class by [`sig_param_shapes`]
+        /// for the argument shape check.
         params: Vec<ParamSig>,
         /// Ordered parameter NAMES, from §07's "Arguments" column (or §06's prose
         /// for a measure operation), e.g. `atan2` → `["y", "x"]`. Parallel to
@@ -228,8 +228,8 @@ pub(crate) enum ResultSet {
 /// §07's Domains column (`quantile`'s `p` over `interval(0, 1)`).
 ///
 /// This is a VALUE constraint, not a type constraint: `ParamSig` carries the
-/// parameter's type tag and is documentation only, while a `ParamSet` is checked
-/// against a statically-known constant argument by
+/// parameter's type tag, whose shape class is checked for every argument, while
+/// a `ParamSet` is checked against a statically-known constant argument by
 /// `ops::refuse_constant_outside_declared_set`.
 ///
 /// **`Unconstrained` is the default and means "no check".** A row lists a set
@@ -367,10 +367,12 @@ pub(crate) enum MassTag {
     Unknown,
 }
 
-// Parameter-type tags. The *payloads* are documentation of the spec's declared
-// domains — `lower` does not consult them, so they are never read; the list's
-// shape is read by `Arity::of`. `Optional` and `Variadic` are trailing markers
-// (guarded by `trailing_markers_only`).
+// Parameter-type tags. The list's length is read by `Arity::of`, and each tag's
+// SHAPE class (scalar, vector, matrix) by `sig_param_shapes` for the argument
+// shape check. The `ScalarTag` payloads stay documentation: §03 admits the
+// canonical inclusions "where specified by the language", and §07's Domains
+// column does not say per row which it admits. `Optional` and `Variadic` are
+// trailing markers (guarded by `trailing_markers_only`).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum ParamSig {
@@ -541,6 +543,80 @@ pub(crate) fn sig_param_sets(sig: &Sig) -> &[ParamSet] {
         Sig::Distribution { param_sets, .. }
         | Sig::Function { param_sets, .. }
         | Sig::Structural { param_sets, .. } => param_sets,
+    }
+}
+
+/// The shape class a parameter's declared domain fixes: §07's "scalars",
+/// "vectors" and "matrices" Domains cells, and §08's `elementof(<scalar set>)`,
+/// vector and matrix parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamShape {
+    Scalar,
+    Vector,
+    Matrix,
+}
+
+impl ParamShape {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            ParamShape::Scalar => "a scalar",
+            ParamShape::Vector => "a vector",
+            ParamShape::Matrix => "a matrix",
+        }
+    }
+}
+
+/// The declared shape class of each parameter of any catalogue row, base or §09
+/// module member, parallel to its positional parameters. `None` at a position
+/// whose domain fixes no single shape class (`any`, "vectors, tables", a set,
+/// a callable), so that position is not checked.
+///
+/// A distribution row reads its existing columns. A rank-1 or rank-2
+/// `param_ranks` entry is a vector or matrix parameter. A rank-0 parameter with
+/// a declared value set is a scalar: §08 writes every such parameter as
+/// `elementof(<set>)` of a scalar set (`mu = elementof(reals)`). A rank-0
+/// parameter without a set is `Uniform`'s `support`, a set, and stays unchecked.
+///
+/// A function row reads its `ParamSig` tags, and a trailing `Variadic` tag
+/// covers every further position, so the list may be longer than `params`.
+pub(crate) fn sig_param_shapes(sig: &Sig, count: usize) -> Vec<Option<ParamShape>> {
+    fn of(p: &ParamSig) -> Option<ParamShape> {
+        match p {
+            ParamSig::Scalar(_) => Some(ParamShape::Scalar),
+            ParamSig::Vector(_) => Some(ParamShape::Vector),
+            ParamSig::Matrix => Some(ParamShape::Matrix),
+            ParamSig::Optional(inner) | ParamSig::Variadic(inner) => of(inner),
+            ParamSig::Callable | ParamSig::Any => None,
+        }
+    }
+    match sig {
+        Sig::Distribution {
+            params,
+            param_ranks,
+            param_sets,
+            ..
+        } => (0..params.len().min(count))
+            .map(|i| match param_ranks.get(i).copied().unwrap_or(0) {
+                1 => Some(ParamShape::Vector),
+                2 => Some(ParamShape::Matrix),
+                0 if param_sets
+                    .get(i)
+                    .is_some_and(|s| *s != ParamSet::Unconstrained) =>
+                {
+                    Some(ParamShape::Scalar)
+                }
+                _ => None,
+            })
+            .collect(),
+        Sig::Function { params, .. } | Sig::Structural { params, .. } => (0..count)
+            .map(|i| match params.get(i) {
+                Some(p) => of(p),
+                None => match params.last() {
+                    Some(ParamSig::Variadic(inner)) => of(inner),
+                    _ => None,
+                },
+            })
+            .collect(),
     }
 }
 

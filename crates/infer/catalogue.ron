@@ -154,10 +154,10 @@ Catalogue(
 
         // §07 "Norms and normalization": `l1unit | v`, `l2unit | v`,
         // `softmax | v`, `logsoftmax | v`. §07 gives `l1unit`/`l2unit`
-        // "real/complex vectors" (hence `Any`, there being no real-or-complex
-        // vector tag) and `softmax`/`logsoftmax` "real vectors".
-        Builtin(name: "l1unit",     sig: Structural(params: [Any], names: ["v"])),
-        Builtin(name: "l2unit",     sig: Structural(params: [Any], names: ["v"])),
+        // "real/complex vectors" (hence `Vector(Complex)`, which embeds the
+        // reals) and `softmax`/`logsoftmax` "real vectors".
+        Builtin(name: "l1unit",     sig: Structural(params: [Vector(Complex)], names: ["v"])),
+        Builtin(name: "l2unit",     sig: Structural(params: [Vector(Complex)], names: ["v"])),
         Builtin(name: "softmax",    sig: Structural(params: [Vector(Real)], names: ["v"])),
         Builtin(name: "logsoftmax", sig: Structural(params: [Vector(Real)], names: ["v"])),
 
@@ -171,10 +171,9 @@ Catalogue(
         // §07 "Random value generation": `rnginit | rngseed`, `rand | m, rstate`.
         // `rnginit`'s Domains cell states TWO forms — "byte vector (`integers` in
         // `interval(0, 255)`) or integer in `interval(0, 2^64 - 1)`" — which one
-        // `ParamSig` cannot say. The row keeps the byte vector, the form every
-        // other §07 vector row is shaped like, and `ops::refuse_bad_rng_seed`
-        // decides the argument against both.
-        Builtin(name: "rnginit", sig: Structural(params: [Vector(Integer)], names: ["rngseed"])),
+        // `ParamSig` cannot say. The row states no shape, and
+        // `ops::refuse_bad_rng_seed` decides the argument against both.
+        Builtin(name: "rnginit", sig: Structural(params: [Any], names: ["rngseed"])),
         Builtin(name: "rand",    sig: Structural(params: [Any, Any], names: ["m", "rstate"])),
 
         // §07 "Measure kernel evaluation primitives": the five fixed-arity
@@ -200,7 +199,7 @@ Catalogue(
         Builtin(name: "ceil",     sig: Function(params: [Scalar(Real)], names: ["x"],    result: Scalar(Integer))),
         Builtin(name: "round",    sig: Function(params: [Scalar(Real)], names: ["x"],    result: Scalar(Integer))),
         // integer(x): set-restrict to integers (spec §07 "Scalar restrictions").
-        Builtin(name: "integer",  sig: Function(params: [Any], names: ["x"],             result: Scalar(Integer))),
+        Builtin(name: "integer",  sig: Function(params: [Scalar(Complex)], names: ["x"],             result: Scalar(Integer))),
         // div / mod: integer Euclidean quotient/remainder (spec §07).
         Builtin(name: "div",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["a", "b"], result: Scalar(Integer))),
         Builtin(name: "mod",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["a", "b"], result: Scalar(Integer))),
@@ -220,14 +219,14 @@ Catalogue(
         Builtin(name: "logdensityof", sig: Function(params: [Any, Any], names: ["M", "x"], result: Scalar(Real))),
         Builtin(name: "densityof",    sig: Function(params: [Any, Any], names: ["M", "x"], result: Scalar(Real), result_set: NonNegReals)),
         // Norms (spec §07 "Norms and normalization"): l1/l2 norm → real scalar.
-        Builtin(name: "l1norm",       sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
-        Builtin(name: "l2norm",       sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
+        Builtin(name: "l1norm",       sig: Function(params: [Vector(Complex)], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
+        Builtin(name: "l2norm",       sig: Function(params: [Vector(Complex)], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
         // linfnorm(v) = max_i |v_i| (spec §07 "Norms and normalization"), the
         // same "real/complex vectors" domain and non-negative real result as its
         // two siblings.
-        Builtin(name: "linfnorm",     sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
+        Builtin(name: "linfnorm",     sig: Function(params: [Vector(Complex)], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
         // logsumexp (spec §07): log Σ exp(v_i) → real.
-        Builtin(name: "logsumexp",    sig: Function(params: [Any], names: ["v"],      result: Scalar(Real))),
+        Builtin(name: "logsumexp",    sig: Function(params: [Vector(Real)], names: ["v"],      result: Scalar(Real))),
         // var/std (spec §07 "Reductions") involve a division/sqrt → always real.
         Builtin(name: "var",          sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real), result_set: NonNegReals)),
         Builtin(name: "std",          sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real), result_set: NonNegReals)),
@@ -240,9 +239,8 @@ Catalogue(
         // is not always static, so `Real` is the type that covers the row (§03's
         // `integers ⊂ reals` makes it sound where the element is returned).
         Builtin(name: "median",       sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real))),
-        // `p`'s tag documents §07's `interval(0, 1)` column; the tags are not
-        // domain-checked (see `ParamSig`), and no engine can enforce that domain
-        // statically for a computed `p` anyway.
+        // `p`'s tag makes it a scalar. Its `interval(0, 1)` set is checked only
+        // for a constant `p`: no engine can enforce it statically for a computed one.
         Builtin(name: "quantile",     sig: Function(params: [Any, Scalar(Real)], param_sets: [Unconstrained, Interval(0.0, 1.0)], names: ["xs", "p"], result: Scalar(Real))),
         // maximum/minimum return an ELEMENT of the array, so the result kind
         // follows the element kind (an integer array yields an integer).
@@ -266,8 +264,8 @@ Catalogue(
         // (spec §06) → its type is f's type.
         Builtin(name: "bijection",    sig: Function(params: [Callable, Callable, Any], names: ["f", "f_inv", "logvolume"], result: SameAsArg(0))),
         Builtin(name: "reverse",      sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
-        Builtin(name: "cumsum",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
-        Builtin(name: "cumprod",      sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
+        Builtin(name: "cumsum",       sig: Function(params: [Vector(Complex)], names: ["xs"],      result: SameAsArg(0))),
+        Builtin(name: "cumprod",      sig: Function(params: [Vector(Complex)], names: ["xs"],      result: SameAsArg(0))),
         // cummax/cummin (spec §07 "Cumulative operations") are shape-preserving
         // like the pair above, but they take NO §03 boolean promotion: a running
         // maximum SELECTS an element and performs no arithmetic, so §03 "Bool"'s
@@ -275,11 +273,12 @@ Catalogue(
         // is a boolean vector. `SameAsArg(0)` is therefore exact on every element
         // kind, and `cumsum`/`cumprod`'s carve-out in `ops::call_rule` has no
         // counterpart here (`crates/infer/tests/order_statistics.rs` pins it).
-        Builtin(name: "cummax",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
-        Builtin(name: "cummin",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
-        // real(x) = Re(x), imag(x) = Im(x): real-valued, shape-preserving (spec §07).
-        Builtin(name: "real",         sig: Function(params: [Any], names: ["x"],      result: RealOfArgShape(0))),
-        Builtin(name: "imag",         sig: Function(params: [Any], names: ["x"],      result: RealOfArgShape(0))),
+        Builtin(name: "cummax",       sig: Function(params: [Vector(Real)], names: ["xs"],      result: SameAsArg(0))),
+        Builtin(name: "cummin",       sig: Function(params: [Vector(Real)], names: ["xs"],      result: SameAsArg(0))),
+        // real(x) = Re(x), imag(x) = Im(x): a real scalar (spec §07 "Scalar
+        // restrictions and constructors").
+        Builtin(name: "real",         sig: Function(params: [Scalar(Complex)], names: ["x"],      result: RealOfArgShape(0))),
+        Builtin(name: "imag",         sig: Function(params: [Scalar(Complex)], names: ["x"],      result: RealOfArgShape(0))),
         // ifelse(cond, a, b) returns a or b → the common type of the two branches (spec §07).
         Builtin(name: "ifelse",       sig: Function(params: [Scalar(Boolean), Any, Any], names: ["cond", "a", "b"], result: CommonOf(1, 2))),
 
@@ -314,7 +313,7 @@ Catalogue(
 
         // -- more linear algebra / vector constructors (spec §07) --
         // boolean(x): set-restrict to booleans → boolean scalar.
-        Builtin(name: "boolean",        sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
+        Builtin(name: "boolean",        sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
         // quadform(A, x) = xᵀ A x → scalar, element kind from A.
         Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "x"], result: ElemScalarKind(0))),
         // Gram / outer products → matrix, element kind preserved.
@@ -339,11 +338,12 @@ Catalogue(
         Builtin(name: "adjoint",        sig: Function(params: [Any], names: ["A"], result: TransposeOf(0))),
         // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
         Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: SameAsArg(1))),
-        // Polynomial / basis evaluations at x → real-valued, shaped like x
-        // (scalar x → scalar, array x → array).
-        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Any], names: ["coefficients", "x"], result: RealOfArgShape(1))),
-        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Any], param_sets: [Unconstrained, UnitInterval], names: ["coefficients", "x"], result: RealOfArgShape(1))),
-        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Any], names: ["edges", "values", "x"], result: RealOfArgShape(2))),
+        // Polynomial / basis evaluations at a SCALAR x (§07 "Approximation functions"
+        // Domains: "real or complex", `unitinterval`, "real"). An array of points is
+        // `broadcast(fn(polynomial(c, _)), xs)`.
+        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Scalar(Complex)], names: ["coefficients", "x"], result: RealOfArgShape(1))),
+        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Scalar(Real)], param_sets: [Unconstrained, UnitInterval], names: ["coefficients", "x"], result: RealOfArgShape(1))),
+        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], names: ["edges", "values", "x"], result: RealOfArgShape(2))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
@@ -372,51 +372,53 @@ Catalogue(
         Builtin(name: "lany",     sig: Function(params: [Any], names: ["xs"], result: Scalar(Boolean))),
         Builtin(name: "lall",     sig: Function(params: [Any], names: ["xs"], result: Scalar(Boolean))),
         // Scalar predicates (spec §07).
-        Builtin(name: "isfinite", sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
-        Builtin(name: "isinf",    sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
-        Builtin(name: "isnan",    sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
-        Builtin(name: "iszero",   sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
+        Builtin(name: "isfinite", sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
+        Builtin(name: "isinf",    sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
+        Builtin(name: "isnan",    sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
+        Builtin(name: "iszero",   sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
 
         // -- RealOrComplexOfArg(0): real→real, complex→complex --
-        // (spec §07 "Elementary functions": all accept reals and complexes)
-        Builtin(name: "exp",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: PosReals)),
-        Builtin(name: "log",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
+        // (spec §07 "Elementary functions": "All accept scalar arguments and
+        // return scalar results". `Scalar(Complex)` marks a row whose Domains
+        // cell lists `complexes`, `Scalar(Real)` one that lists a real set only.)
+        Builtin(name: "exp",       sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: PosReals)),
+        Builtin(name: "log",       sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
         // log2 / log10: spec §07 "Elementary functions" gives both the `posreals`
         // domain ALONE, with no `complexes` column entry beside it as `log` and
         // `sqrt` carry. So the result is real whatever the argument, and the
         // domain is a declared value set the constant-argument check enforces.
-        Builtin(name: "log2",      sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
-        Builtin(name: "log10",     sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
-        Builtin(name: "sqrt",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: NonNegReals)),
-        Builtin(name: "sin",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "cos",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "tan",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "asin",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "acos",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "atan",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "sinh",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "cosh",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: PosReals)),
-        Builtin(name: "tanh",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "asinh",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "acosh",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "atanh",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "log1p",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "expm1",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "log2",      sig: Function(params: [Scalar(Real)], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "log10",     sig: Function(params: [Scalar(Real)], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "sqrt",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: NonNegReals)),
+        Builtin(name: "sin",       sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "cos",       sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "tan",       sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "asin",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "acos",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "atan",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "sinh",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "cosh",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: PosReals)),
+        Builtin(name: "tanh",      sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "asinh",     sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "acosh",     sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "atanh",     sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "log1p",     sig: Function(params: [Scalar(Real)], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "expm1",     sig: Function(params: [Scalar(Real)], names: ["x"], result: RealOrComplexOfArg(0))),
         // gamma / loggamma: §07 gives both `posreals` alone, with no `complexes`
         // beside it — same reading as `log2`/`log10` above.
-        Builtin(name: "gamma",     sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
-        Builtin(name: "loggamma",  sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
-        Builtin(name: "logit",     sig: Function(params: [Any], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "invlogit",  sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
-        Builtin(name: "probit",    sig: Function(params: [Any], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "invprobit", sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
+        Builtin(name: "gamma",     sig: Function(params: [Scalar(Real)], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "loggamma",  sig: Function(params: [Scalar(Real)], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "logit",     sig: Function(params: [Scalar(Real)], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "invlogit",  sig: Function(params: [Scalar(Real)], names: ["x"], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
+        Builtin(name: "probit",    sig: Function(params: [Scalar(Real)], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "invprobit", sig: Function(params: [Scalar(Real)], names: ["x"], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
         // abs / abs2: |x| and |x|² are real for both real and complex inputs
         // (real_or_complex(arg) in ops.rs: complex→real, not complex→complex).
         // DomainMap captures this: Complex maps to Real; anything else defaults Real.
-        Builtin(name: "abs",  sig: Function(params: [Any], names: ["x"], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
-        Builtin(name: "abs2", sig: Function(params: [Any], names: ["x"], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
+        Builtin(name: "abs",  sig: Function(params: [Scalar(Complex)], names: ["x"], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
+        Builtin(name: "abs2", sig: Function(params: [Scalar(Complex)], names: ["x"], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
         // conj: complex conjugate — real→real, complex→complex.
-        Builtin(name: "conj", sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
+        Builtin(name: "conj", sig: Function(params: [Scalar(Complex)], names: ["x"], result: RealOrComplexOfArg(0))),
     ],
     // Standard modules (spec §09) live in their own RON files under
     // catalogues/ and are merged in by catalogue::builtin().

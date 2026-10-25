@@ -91,6 +91,41 @@ fn emit(src: &str) -> String {
     .expect("must emit @logdensity")
 }
 
+/// Inference's refusal of `src`. Inference refuses an operand outside a §07 Domains cell
+/// before the emitter sees the model; the emitter's own guard is the backstop.
+fn infer_err(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let found: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(!found.is_empty(), "inference must refuse:\n{src}");
+    found.join("\n")
+}
+
+/// The emitter's refusal of `src` WITHOUT inference's shape verdict: the nodes the shape
+/// check marked `%failed` are cleared to `%deferred`, as for a module a caller hands the
+/// emitter directly. Returns the message and whether it is located at a node.
+fn ungated_emit_err(src: &str) -> (String, bool) {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut m);
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if matches!(m.type_of(id), Some(Type::Failed(r)) if r.contains("outside its declared shape"))
+        {
+            m.set_type(id, Type::Deferred);
+        }
+    }
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect_err("must refuse in the emitter");
+    (err.msg, err.node.is_some())
+}
+
 fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
@@ -330,10 +365,15 @@ fn a_matrix_operand_refuses_for_the_cumulative_extrema() {
         let src = format!(
             "m = elementof(cartpow(reals, [2, 3]))\ny = {head}(m)\ninputs = (m)\noutputs = (y)\n"
         );
-        let msg = emit_err(&src);
+        let msg = infer_err(&src);
         assert!(
-            msg.contains("the domain \"vectors\""),
+            msg.contains(&format!("`{head}`'s `xs` is a matrix")),
             "`{head}` over a matrix must refuse, got: {msg}"
+        );
+        let (msg, located) = ungated_emit_err(&src);
+        assert!(
+            msg.contains("the domain \"vectors\"") && located,
+            "the emitter backstop must refuse `{head}` over a matrix, located, got: {msg}"
         );
     }
 }

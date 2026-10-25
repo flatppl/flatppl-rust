@@ -17,7 +17,7 @@
 //! See
 //! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hlowire-report.md`.
 
-use flatppl_core::Module;
+use flatppl_core::{Module, Type};
 
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
@@ -53,8 +53,46 @@ fn emit(src: &str) -> String {
     .expect("must emit @logdensity")
 }
 
+/// Inference's refusal of `src`. Inference refuses an argument outside a §07 Domains cell
+/// before the emitter sees the model; the emitter's own guard is the backstop.
+fn infer_err(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let found: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(!found.is_empty(), "inference must refuse:\n{src}");
+    found.join("\n")
+}
+
 /// The emitter's refusal message for a source it declines to lower. `infer` and
 /// the determiniser must both be clean, so the refusal is this crate's.
+/// The emitter's refusal of `src` WITHOUT inference's shape verdict: the nodes the shape
+/// check marked `%failed` are cleared to `%deferred`, as for a module a caller hands the
+/// emitter directly. Returns the message and whether it is located at a node.
+fn ungated_emit_err(src: &str) -> (String, bool) {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut m);
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if matches!(m.type_of(id), Some(Type::Failed(r)) if r.contains("outside its declared shape"))
+        {
+            m.set_type(id, Type::Deferred);
+        }
+    }
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions {
+            restrict_enzyme_compatible: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("must refuse in the emitter");
+    (err.msg, err.node.is_some())
+}
+
 fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
@@ -612,7 +650,7 @@ fn the_finiteness_predicates_still_accept_an_integer_operand() {
 /// A square real matrix and a matching vector as ABI arguments — the operand
 /// shape every §07 linear-algebra head below takes.
 const MAT_VEC_ABI: &str = "\
-A = elementof(cartpow(cartpow(reals, 3), 3))
+A = elementof(cartpow(reals, [3, 3]))
 v = elementof(cartpow(reals, 3))
 ";
 
@@ -684,7 +722,7 @@ fn diag_refuses_a_non_zero_offset() {
 /// `min(m, n)` §07 defines. Refusing keeps that from being silently answered.
 #[test]
 fn diag_and_trace_refuse_a_non_square_matrix() {
-    let abi = "M = elementof(cartpow(cartpow(reals, 2), 3))\n";
+    let abi = "M = elementof(cartpow(reals, [3, 2]))\n";
     for head in ["diag", "trace"] {
         let msg = emit_err(&format!(
             "{abi}y = {head}(M)\ninputs = (M)\noutputs = (y)\n"
@@ -704,7 +742,7 @@ fn diag_and_trace_refuse_a_non_square_matrix() {
 /// rejects outright. The head refuses instead of reaching the helper.
 #[test]
 fn the_real_hardcode_family_refuses_an_integer_matrix() {
-    let abi = "N = elementof(cartpow(cartpow(integers, 3), 3))\n";
+    let abi = "N = elementof(cartpow(integers, [3, 3]))\n";
     for head in ["diag", "trace", "lower_cholesky"] {
         let msg = emit_err(&format!(
             "{abi}y = {head}(N)\ninputs = (N)\noutputs = (y)\n"
@@ -742,7 +780,7 @@ fn self_outer_spreads_one_operand_along_both_axes() {
 #[test]
 fn row_gram_and_col_gram_have_different_shapes() {
     let out = emit(
-        "M = elementof(cartpow(cartpow(reals, 2), 3))\nG = row_gram(M)\nH = col_gram(M)\n\
+        "M = elementof(cartpow(reals, [3, 2]))\nG = row_gram(M)\nH = col_gram(M)\n\
          inputs = (M)\noutputs = (G, H)\n",
     );
     assert!(
@@ -785,7 +823,7 @@ fn quadform_is_two_dot_generals_and_a_scalar() {
 /// than reaching `Emitter::matvec`, which PANICS on a contracting-dim mismatch.
 #[test]
 fn quadform_refuses_a_mismatched_vector_length() {
-    let src = "A = elementof(cartpow(cartpow(reals, 3), 3))\nw = elementof(cartpow(reals, 2))\n\
+    let src = "A = elementof(cartpow(reals, [3, 3]))\nw = elementof(cartpow(reals, 2))\n\
                q = quadform(A, w)\ninputs = (A, w)\noutputs = (q)\n";
     let msg = emit_err(src);
     assert!(
@@ -794,28 +832,43 @@ fn quadform_refuses_a_mismatched_vector_length() {
     );
 }
 
-/// The rank guards, one per head: §07's domains are matrices and vectors, so a
+/// The rank refusals, one per head: §07's domains are matrices and vectors, so a
 /// vector where a matrix belongs (and the reverse) refuses instead of reaching a
-/// helper that would panic on the rank.
+/// helper that would panic on the rank. Inference refuses first; the emitter's rank
+/// guards are the backstop.
 #[test]
 fn the_linalg_heads_refuse_the_wrong_rank() {
     let vec_abi = "v = elementof(cartpow(reals, 3))\n";
     for head in ["trace", "diag", "lower_cholesky", "row_gram", "col_gram"] {
-        let msg = emit_err(&format!(
+        let msg = infer_err(&format!(
             "{vec_abi}y = {head}(v)\ninputs = (v)\noutputs = (y)\n"
         ));
         assert!(
-            msg.contains("rank-2 operand is required"),
+            msg.contains(&format!("`{head}`'s `A` is a vector")),
             "`{head}` on a vector: unexpected message: {msg}"
         );
+        let (msg, located) = ungated_emit_err(&format!(
+            "{vec_abi}y = {head}(v)\ninputs = (v)\noutputs = (y)\n"
+        ));
+        assert!(
+            msg.contains("rank-2 operand is required") && located,
+            "the emitter backstop must refuse `{head}` on a vector, located: {msg}"
+        );
     }
-    let mat_abi = "A = elementof(cartpow(cartpow(reals, 3), 3))\n";
-    let msg = emit_err(&format!(
+    let mat_abi = "A = elementof(cartpow(reals, [3, 3]))\n";
+    let msg = infer_err(&format!(
         "{mat_abi}y = self_outer(A)\ninputs = (A)\noutputs = (y)\n"
     ));
     assert!(
-        msg.contains("self_outer") && msg.contains("rank-1 operand is required"),
+        msg.contains("`self_outer`'s `x` is a matrix"),
         "`self_outer` on a matrix: unexpected message: {msg}"
+    );
+    let (msg, located) = ungated_emit_err(&format!(
+        "{mat_abi}y = self_outer(A)\ninputs = (A)\noutputs = (y)\n"
+    ));
+    assert!(
+        msg.contains("self_outer") && msg.contains("rank-1 operand is required") && located,
+        "the emitter backstop must refuse `self_outer` on a matrix, located: {msg}"
     );
 }
 
@@ -828,7 +881,7 @@ fn the_linalg_heads_refuse_the_wrong_rank() {
 #[test]
 fn linalg_module_matches_frozen_golden() {
     let src = "\
-A = elementof(cartpow(cartpow(reals, 3), 3))
+A = elementof(cartpow(reals, [3, 3]))
 v = elementof(cartpow(reals, 3))
 t = trace(A)
 d = diag(A)

@@ -1737,30 +1737,20 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     Ok(e.select(&c, &a, &b))
 }
 
-/// Refuse a `select` predicate whose shape `Emitter::select`'s second pass cannot
-/// legally broadcast the branches to.
+/// Refuse a `select` predicate whose shape `Emitter::select` cannot broadcast against
+/// its branches.
 ///
-/// That pass is NOT `broadcast_pair` — it is `Emitter::broadcast_scalar`, which
-/// emits `broadcast_in_dim(s, &[], out_ty)` whenever `s.ty != out_ty`, and an
-/// EMPTY `dims` list is valid only for a rank-0 operand. So the size-1 expansion
-/// [`require_broadcastable`] permits is wrong here: it is sound for elementwise
-/// arithmetic, where `broadcast_pair` supplies proper identity dims, but a size-1
-/// predicate against `[3]` branches (or the mirror) silently emitted
-/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` — invalid
-/// StableHLO, exit 0.
+/// `Emitter::select` reconciles the predicate with the branches through
+/// `broadcast_pair`, which expands a size-one axis under the identity dimension map and
+/// panics on a pair with no broadcast form. So the admissible cases are exactly §04
+/// "Broadcasting"'s: "Along each axis, all collections must have the same size or be
+/// singular (size one). Size-one array axes are implicitly expanded":
+/// - a SCALAR predicate, or SCALAR branches, which broadcast up from rank 0;
+/// - a ranked predicate of the branches' rank whose every axis equals the branches'
+///   reconciled axis, or is size one on either side.
 ///
-/// The admissible cases, and nothing else:
-/// - a SCALAR predicate — StableHLO's `select` takes one against ranked operands,
-///   and the branches keep their own shape;
-/// - a ranked predicate with SCALAR branches — they broadcast up from rank 0, so
-///   the empty `dims` list is correct;
-/// - a ranked predicate whose shape EQUALS the shape the branches reconcile to,
-///   making the second pass a no-op.
-///
-/// The last case compares against the RECONCILED branch shape, not against `a`
-/// alone: `broadcast_pair` has already expanded a size-1 branch axis with proper
-/// dims by the time the predicate pass runs, so `(pred [3], a [1], b [3])` is
-/// legal and emits a valid `select` — checking `c == a` would refuse it.
+/// The comparison is against the RECONCILED branch shape, since `broadcast_pair` has
+/// already expanded a size-one branch axis by the time the predicate pass runs.
 ///
 /// This checks SHAPE only, never orientation: a predicate derived from transposed
 /// vectors selecting between plain ones is deliberately admitted. `select` is
@@ -1783,19 +1773,25 @@ fn require_select_predicate(id: NodeId, c: &Value, a: &Value, b: &Value) -> Resu
     let branch_shape = match (&a.ty, &b.ty) {
         (MlirTy::Ranked(da), MlirTy::Ranked(db)) => Some(common_shape(da, db)),
         (MlirTy::Ranked(d), _) | (_, MlirTy::Ranked(d)) => Some(d.clone()),
-        // Both scalar: they broadcast up from rank 0, which `dims = []` expresses
-        // correctly whatever the predicate's shape.
         _ => None,
+    };
+    let broadcasts = |target: &[Option<u64>]| {
+        dc.len() == target.len()
+            && dc.iter().zip(target).all(|(&p, &t)| match (p, t) {
+                (Some(m), Some(n)) => m == n || m == 1 || n == 1,
+                (None, None) => true,
+                _ => false,
+            })
     };
     match branch_shape {
         None => Ok(()),
-        Some(target) if *dc == target => Ok(()),
+        Some(target) if broadcasts(&target) => Ok(()),
         Some(target) => Err(EmitError::at(
             id,
             format!(
                 "ifelse predicate shape {:?} does not match its branches' shape {:?} — a \
-                 select predicate must be a scalar or exactly the branch shape (the branch \
-                 broadcast cannot expand a non-scalar predicate)",
+                 select predicate must be a scalar or broadcast against the branches: the \
+                 same rank, each axis equal or of size one (spec §04 \"Broadcasting\")",
                 MlirTy::Ranked(dc.clone()),
                 MlirTy::Ranked(target)
             ),
