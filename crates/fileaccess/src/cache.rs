@@ -77,9 +77,9 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The trailing extension of a URL's final path segment. A literal backslash
-/// is omitted because Windows treats it as a path separator. The URL hash still
-/// identifies that object. Percent-encoded backslashes remain inert text.
+/// The trailing extension of a URL's final path segment. Spec §sec:url-cache
+/// drops an extension outside `[A-Za-z0-9._-]` or longer than 32 characters,
+/// so it can never form a path or exceed a filename component.
 fn url_ext(url: &str) -> Option<String> {
     // Drop scheme://authority, then the query.
     let after_authority = match url.find("://") {
@@ -97,7 +97,15 @@ fn url_ext(url: &str) -> Option<String> {
         .map_or(after_authority, |i| &after_authority[..i]);
     let seg = path.rsplit('/').next().unwrap_or("");
     match seg.split_once('.') {
-        Some((_, rest)) if !rest.is_empty() && !rest.contains('\\') => Some(rest.to_string()),
+        Some((_, rest))
+            if !rest.is_empty()
+                && rest.len() <= 32
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
+        {
+            Some(rest.to_string())
+        }
         _ => None,
     }
 }
@@ -502,26 +510,30 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_windows_separator_cannot_create_path_components() {
-        let url = "https://h/x.a\\..\\..\\outside.flatppl";
-        let k = cache_key(url);
-        assert_eq!(k.ext, None);
-        assert_eq!(
-            Cache::new(PathBuf::from("cache"), false, true)
-                .object_path(&k)
-                .file_name()
-                .unwrap(),
-            k.key.as_str()
-        );
+    fn an_unsafe_extension_stores_the_object_under_the_bare_key() {
+        let cache = Cache::new(PathBuf::from("cache"), false, true);
+        for url in [
+            "https://h/x.a\\..\\..\\outside.flatppl",
+            "https://h/x.a%5C..%5Coutside.flatppl",
+            &format!("https://h/x.{}", "a".repeat(33)),
+        ] {
+            let k = cache_key(url);
+            assert_eq!(k.ext, None, "{url}");
+            assert_eq!(
+                cache.object_path(&k),
+                PathBuf::from("cache/v1/objects").join(&k.kk).join(&k.key),
+                "{url}"
+            );
+        }
     }
 
     #[test]
-    fn an_encoded_windows_separator_remains_inert_extension_text() {
+    fn a_safe_extension_up_to_32_characters_is_kept() {
+        let ext = format!("{}.tar-gz_..", "a".repeat(22));
+        assert_eq!(ext.len(), 32);
         assert_eq!(
-            cache_key("https://h/x.a%5C..%5Coutside.flatppl")
-                .ext
-                .as_deref(),
-            Some("a%5C..%5Coutside.flatppl")
+            cache_key(&format!("https://h/x.{ext}")).ext.as_deref(),
+            Some(ext.as_str())
         );
     }
 

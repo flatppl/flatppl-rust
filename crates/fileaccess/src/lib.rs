@@ -666,28 +666,6 @@ mod tests {
         assert!(!cache.meta_path(&k).exists(), "no orphan metadata");
     }
 
-    #[test]
-    fn temp_name_does_not_reduce_the_valid_object_filename_limit() {
-        let root = TempRoot::new();
-        let cache = Cache::new(root.path(), false, true);
-        let suffix = "a".repeat(180);
-        let url = format!("https://example.test/x.{suffix}");
-
-        let object = cache
-            .get(&url, &FakeFetcher::new("body"), &DenyAll)
-            .expect("a valid final object component must be publishable");
-
-        assert!(object.is_file());
-        assert!(
-            object
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(&format!(".{suffix}")),
-            "the normative suffix remains complete: {object:?}"
-        );
-    }
-
     #[cfg(feature = "net")]
     fn one_http_response(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
