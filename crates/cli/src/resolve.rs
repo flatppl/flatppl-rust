@@ -931,8 +931,9 @@ mod fetch_tests {
         }
     }
 
+    /// The cache refuses userinfo before a fetch, and the refusal hides it.
     #[test]
-    fn remote_parse_diagnostic_redacts_url_userinfo() {
+    fn remote_userinfo_url_is_refused_with_a_redacted_message() {
         let dir =
             std::env::temp_dir().join(format!("flatppl-remote-diagnostic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -952,13 +953,15 @@ mod fetch_tests {
         };
 
         let error = fetch_graph(&[Location::Local(model)], &resolver)
-            .expect_err("the fetched invalid source must produce a parse diagnostic");
-        let Failure::Diagnostic { path, .. } = error else {
-            panic!("expected a parse diagnostic, got {error:?}");
+            .expect_err("a URL with userinfo must not be fetched");
+        let Failure::Plain(message) = error else {
+            panic!("expected a fetch refusal, got {error:?}");
         };
-        assert_eq!(
-            crate::terminal_path(&path),
-            "http://<redacted>@host.test/bad@name.flatppl?email=a@b"
+        assert!(
+            message.contains("`http://<redacted>@host.test/bad@name.flatppl?email=a@b`")
+                && message.contains("userinfo")
+                && !message.contains("p%40ss"),
+            "got {message}"
         );
         assert_eq!(
             Location::Remote(url.to_string()).display(),

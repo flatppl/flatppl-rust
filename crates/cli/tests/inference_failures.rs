@@ -6,22 +6,6 @@ use std::process::Command;
 mod common;
 use common::Scratch;
 
-struct FixedModule;
-
-impl flatppl_fileaccess::Fetcher for FixedModule {
-    fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::FetchResult, String> {
-        Ok(flatppl_fileaccess::FetchResult::Content(
-            flatppl_fileaccess::Fetched {
-                bytes: b"present = 1\n".to_vec(),
-                resolved_url: url.to_string(),
-                content_type: Some("text/plain".to_string()),
-                etag: None,
-                last_modified: None,
-            },
-        ))
-    }
-}
-
 #[test]
 fn static_projection_failures_exit_with_an_error() {
     let dir = Scratch::new("infer-projection-failure");
@@ -93,17 +77,13 @@ fn load_data_without_a_valueset_is_not_published() {
     assert!(!output.exists(), "invalid output was published");
 }
 
+/// The cache refuses userinfo before trust or a fetch, and the refusal hides it.
 #[test]
-fn remote_module_inference_errors_redact_url_userinfo() {
+fn remote_module_userinfo_is_refused_with_a_redacted_message() {
     let dir = Scratch::new("infer-remote-userinfo");
-    let cache_dir = dir.path("cache");
     let input = dir.path("root.flatppl");
     let output = dir.path("root.flatpir");
     let url = "https://fixture-user:p%40ss@host.test/dep@name.flatppl?email=a@b";
-
-    flatppl_fileaccess::Cache::new(cache_dir.clone(), false, true)
-        .get(url, &FixedModule, &flatppl_fileaccess::DenyAll)
-        .unwrap();
     fs::write(
         &input,
         format!("dep = load_module(\"{url}\")\nx = dep.absent\n"),
@@ -114,16 +94,15 @@ fn remote_module_inference_errors_redact_url_userinfo() {
         .arg("infer")
         .arg(&input)
         .arg(&output)
-        .env("FLATPPL_CACHEDIR", cache_dir)
+        .env("FLATPPL_CACHEDIR", dir.path("cache"))
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&result.stderr);
 
     assert_eq!(result.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains(
-            "module `https://<redacted>@host.test/dep@name.flatppl?email=a@b` has no binding `absent`"
-        ),
+        stderr.contains("`https://<redacted>@host.test/dep@name.flatppl?email=a@b`")
+            && stderr.contains("userinfo"),
         "{stderr}"
     );
     assert!(!stderr.contains("fixture-user"), "{stderr}");
