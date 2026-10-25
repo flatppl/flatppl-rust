@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
+    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
     BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
@@ -91,21 +91,29 @@ pub fn emit_query(
         .map(|id| signature(&module, id))
         .unwrap_or_default();
     let mut names = HashSet::new();
+    // An alias and its target are one object (§04), so they share a position.
+    let mut targets = HashSet::new();
     let mut declared = Vec::new();
     for node in input_nodes {
         let Node::Ref(r) = module.node(node) else {
             return Err(EmitError::at(node, "each input must name a binding"));
         };
-        if r.ns != RefNs::SelfMod || !names.insert(r.name) {
+        if r.ns != RefNs::SelfMod
+            || !names.insert(r.name)
+            || module
+                .alias_target(r.name)
+                .is_some_and(|t| !targets.insert(t))
+        {
             return Err(EmitError::at(
                 node,
                 "each input must name a distinct local binding",
             ));
         }
+        // An alias names its target's construct (§04); the input keeps its name.
         let rhs = module
             .binding(
                 module
-                    .binding_by_name(r.name)
+                    .alias_target(r.name)
                     .ok_or_else(|| EmitError::at(node, "input binding is absent"))?,
             )
             .rhs;
@@ -118,7 +126,7 @@ pub fn emit_query(
         declared.push((module.resolve(r.name).to_string(), node));
     }
     check_query_inputs(&module, &[output_node], &names, &[])?;
-    let roots = names;
+    let roots = input_roots(&module, &names);
     let mut arguments = Vec::new();
     let mut inputs = Vec::new();
     for (name, node) in declared {
@@ -265,7 +273,7 @@ pub fn emit_query(
 fn bind_inputs(
     emitter: &mut Emitter<'_>,
     module: &Module,
-    roots: &HashSet<Symbol>,
+    roots: &Roots,
     paths: &mut HashMap<NodeId, Option<InputPath>>,
     values: &HashMap<InputPath, Value>,
 ) {
@@ -353,7 +361,7 @@ fn layout(
     module: &mut Module,
     node: NodeId,
     ty: Type,
-    roots: &HashSet<Symbol>,
+    roots: &Roots,
     input: bool,
     dtype: Dtype,
     leaves: &mut Vec<Leaf>,
@@ -480,13 +488,13 @@ fn project(
     node: NodeId,
     selector: Selector,
     ty: Type,
-    roots: &HashSet<Symbol>,
+    roots: &Roots,
     input: bool,
 ) -> NodeId {
     let mut node = node;
     while let Node::Ref(r) = module.node(node)
         && r.ns == RefNs::SelfMod
-        && !roots.contains(&r.name)
+        && !roots.contains_key(&r.name)
         && let Some(binding) = module.binding_by_name(r.name)
     {
         node = module.binding(binding).rhs;
@@ -526,18 +534,45 @@ fn project(
     child
 }
 
+/// Every name on a declared input's bare-name alias chain, mapped to the
+/// declared name: an alias and its target are one object (§04), and the
+/// argument keeps the name `inputs` lists.
+type Roots = HashMap<Symbol, Symbol>;
+
+fn input_roots(module: &Module, declared: &HashSet<Symbol>) -> Roots {
+    let mut roots = Roots::new();
+    for &root in declared {
+        let mut name = root;
+        for _ in 0..=module.binding_count() {
+            roots.insert(name, root);
+            let Some(binding) = module.binding_by_name(name) else {
+                break;
+            };
+            let Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name: next,
+            }) = module.node(module.binding(binding).rhs)
+            else {
+                break;
+            };
+            name = *next;
+        }
+    }
+    roots
+}
+
 fn input_path(
     module: &Module,
     node: NodeId,
-    roots: &HashSet<Symbol>,
+    roots: &Roots,
     memo: &mut HashMap<NodeId, Option<InputPath>>,
 ) -> Option<InputPath> {
     if let Some(path) = memo.get(&node) {
         return path.clone();
     }
     let path = match module.node(node) {
-        Node::Ref(r) if r.ns == RefNs::SelfMod && roots.contains(&r.name) => {
-            Some((r.name, Vec::new()))
+        Node::Ref(r) if r.ns == RefNs::SelfMod && roots.contains_key(&r.name) => {
+            Some((roots[&r.name], Vec::new()))
         }
         Node::Ref(r) if r.ns == RefNs::SelfMod => module
             .binding_by_name(r.name)

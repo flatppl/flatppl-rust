@@ -123,6 +123,8 @@ pub(crate) fn read_abi(m: &Module) -> Result<Option<Abi>, EmitError> {
         .map(|(_, b)| tuple_elems(m, b.rhs))
         .unwrap_or_default();
     let mut inputs: Vec<Symbol> = Vec::with_capacity(declared.len());
+    // An alias and its target are one object (§04), so they share a position.
+    let mut targets = Vec::with_capacity(declared.len());
     for (position, elem) in declared.iter().enumerate() {
         let Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -138,7 +140,8 @@ pub(crate) fn read_abi(m: &Module) -> Result<Option<Abi>, EmitError> {
                 ),
             ));
         };
-        if inputs.contains(name) {
+        let target = m.alias_target(*name);
+        if inputs.contains(name) || target.is_some() && targets.contains(&target) {
             return Err(EmitError::at(
                 *elem,
                 format!(
@@ -149,6 +152,7 @@ pub(crate) fn read_abi(m: &Module) -> Result<Option<Abi>, EmitError> {
             ));
         }
         inputs.push(*name);
+        targets.push(target);
     }
     let outputs = outputs_binding
         .map(|(_, b)| tuple_elems(m, b.rhs))
@@ -179,6 +183,12 @@ pub fn check_query_inputs(
     inputs: &HashSet<Symbol>,
     bound_nodes: &[NodeId],
 ) -> Result<(), EmitError> {
+    // Every name on an input's alias chain is that input (§04).
+    let inputs: HashSet<Symbol> = inputs
+        .iter()
+        .flat_map(|&name| alias_chain(module, name))
+        .collect();
+    let inputs = &inputs;
     let mut pending = outputs
         .iter()
         .map(|&id| (id, Vec::<Symbol>::new()))
@@ -235,6 +245,27 @@ pub fn check_query_inputs(
         module.for_each_child(node, |child| pending.push((child, bound.clone())));
     }
     Ok(())
+}
+
+/// `name` and every name its bare-name alias chain passes through.
+fn alias_chain(m: &Module, name: Symbol) -> Vec<Symbol> {
+    let mut chain = vec![name];
+    let mut current = name;
+    for _ in 0..m.binding_count() {
+        let Some(bid) = m.binding_by_name(current) else {
+            break;
+        };
+        let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name: next,
+        }) = m.node(m.binding(bid).rhs)
+        else {
+            break;
+        };
+        chain.push(*next);
+        current = *next;
+    }
+    chain
 }
 
 /// Emit `@logdensity` for a determinized module `m` that declares the
@@ -658,7 +689,9 @@ fn bind_input(
     args: &mut Vec<(String, MlirTy, ElemKind)>,
     next_arg: &mut usize,
 ) -> Result<(), EmitError> {
-    let bid = m.binding_by_name(sym).ok_or_else(|| {
+    // An alias names its target's construct (§04), so classify and bind that;
+    // the argument keeps the name `inputs` lists.
+    let bid = m.alias_target(sym).ok_or_else(|| {
         EmitError::whole(format!(
             "`inputs` names `{}`, which is not a binding of the determinized module",
             m.resolve(sym)

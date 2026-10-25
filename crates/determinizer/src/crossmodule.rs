@@ -34,7 +34,7 @@ pub(crate) fn std_module_member(host: &Module, id: NodeId) -> Option<(String, St
     else {
         return None;
     };
-    let bid = host.binding_by_name(alias)?;
+    let bid = host.alias_target(alias)?;
     let Node::Call(c) = host.node(host.binding(bid).rhs) else {
         return None;
     };
@@ -69,23 +69,12 @@ fn resolve_member<'a>(
     alias: Symbol,
     member: Symbol,
 ) -> Option<ResolvedRef<'a>> {
-    let mut load = src.binding_by_name(alias)?;
-    let mut seen = HashSet::new();
-    let call = loop {
-        if !seen.insert(load) {
-            return None;
+    let load = src.alias_target(alias)?;
+    let call = match src.node(src.binding(load).rhs) {
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if src.resolve(s) == "load_module") => {
+            c
         }
-        match src.node(src.binding(load).rhs) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) => load = src.binding_by_name(*name)?,
-            Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if src.resolve(s) == "load_module") =>
-            {
-                break c;
-            }
-            _ => return None,
-        }
+        _ => return None,
     };
     let literal = flatppl_infer::module_source(src, call)?;
     let path = bundle.identity_of(importer, literal)?.to_string();
@@ -517,7 +506,7 @@ fn graft_ref(
             })
         }
         RefNs::Module(alias) => {
-            if let Some(bid) = src.binding_by_name(alias)
+            if let Some(bid) = src.alias_target(alias)
                 && crate::density::builtin_name(src, src.binding(bid).rhs)
                     == Some("standard_module")
             {

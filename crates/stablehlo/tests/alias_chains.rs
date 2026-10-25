@@ -37,7 +37,7 @@ fn emit_model(source: &str) -> String {
 }
 
 /// `head` binds `S`; `chain` binds `S` through `S1` to `S0`.
-fn assert_chain_emits_direct(emit: fn(&str) -> String, direct: &str, chain: &str, tail: &str) {
+fn assert_chain_emits_direct(emit: Emit, direct: &str, chain: &str, tail: &str) {
     assert_eq!(
         emit(&format!("{chain}{tail}")),
         emit(&format!("{direct}{tail}"))
@@ -131,5 +131,115 @@ fn pyhf_yields() {
             "R0 = rowstack([n1, n2])\nR1 = R0\nR = R1\n",
             tail,
         );
+    }
+}
+
+/// An emit path: determinize-then-emit, or emit FlatPDL as written.
+type Emit = fn(&str) -> String;
+
+/// `lp` as a model writes it and as FlatPDL writes it, scoring 0.5 under
+/// `Normal(mu, sigma)`.
+const PATHS: [(Emit, &str); 2] = [
+    (
+        emit_model,
+        "lp = logdensityof(Normal(mu = MU, sigma = SIGMA), 0.5)\n",
+    ),
+    (
+        emit_flatpdl,
+        "lp = builtin_logdensityof(Normal, record(mu = MU, sigma = SIGMA), 0.5)\n",
+    ),
+];
+
+fn score(template: &str, mu: &str, sigma: &str) -> String {
+    template.replace("MU", mu).replace("SIGMA", sigma)
+}
+
+/// `modes::read_abi` / `bind_input`: an `inputs` entry behind an alias chain is
+/// classified by the construct at the end of the chain (§04, §13), and an
+/// output may read either name.
+#[test]
+fn aliased_inputs() {
+    for (emit, lp) in PATHS {
+        let direct = emit(&format!(
+            "x = elementof(reals)\n{}inputs = (x)\noutputs = (lp)\n",
+            score(lp, "x", "1.0")
+        ));
+        for mu in ["X2", "x"] {
+            let aliased = emit(&format!(
+                "x = elementof(reals)\nX = x\nX2 = X\n{}inputs = (X2)\noutputs = (lp)\n",
+                score(lp, mu, "1.0")
+            ));
+            assert_eq!(aliased, direct, "mu = {mu}");
+        }
+    }
+}
+
+/// A fixed value behind an alias is promoted like the direct binding.
+#[test]
+fn aliased_fixed_input() {
+    for (emit, lp) in PATHS {
+        let tail = format!(
+            "x = elementof(reals)\n{}inputs = (x, s)\noutputs = (lp)\n",
+            score(lp, "x", "s")
+        );
+        assert_chain_emits_direct(
+            emit,
+            "s = external(posreals)\n",
+            "s0 = external(posreals)\ns1 = s0\ns = s1\n",
+            &tail,
+        );
+    }
+}
+
+/// An alias and its target are one object, so listing both is listing one
+/// binding twice.
+#[test]
+fn an_alias_and_its_target_are_one_input() {
+    let source = "x = elementof(reals)\nX = x\n\
+                  lp = builtin_logdensityof(Normal, record(mu = x, sigma = 1.0), 0.5)\n\
+                  inputs = (X, x)\noutputs = (lp)\n";
+    let mut model = flatppl_syntax::parse(source).unwrap();
+    let _ = flatppl_infer::infer(&mut model);
+    let err = flatppl_stablehlo::emit(&model, Mode::LogDensity, &EmitOptions::default())
+        .expect_err("one object, two argument positions");
+    assert!(err.to_string().contains("more than once"), "{err}");
+}
+
+/// A retained `pyhf-helpers` call through an aliased module (§04 *Aliasing*).
+#[test]
+fn pyhf_module_alias() {
+    let tail = "theta = elementof(cartpow(reals, 2))\ninputs = theta\n\
+                a = theta[1]\ns = theta[2]\n\
+                n1 = [1.0, 2.0]\nn2 = [3.0, 4.0]\ndelta = [0.5, 0.25] .* s\n\
+                shifts = array(cat(delta, fill(0.0, 2)), [2, 1, 2], [1, 2, 3])\n\
+                factors = array(cat(fill(a, 2), fill(1.0, 2)), [2, 1, 2], [1, 2, 3])\n\
+                outputs = P.expected_counts(P.sample_yields(rowstack([n1, n2]), shifts, factors))\n";
+    let load = "standard_module(\"pyhf-helpers\", \"0.1\")";
+    for emit in [emit_flatpdl, emit_model] {
+        assert_chain_emits_direct(
+            emit,
+            &format!("P = {load}\n"),
+            &format!("P0 = {load}\nP1 = P0\nP = P1\n"),
+            tail,
+        );
+    }
+}
+
+/// `bind_input`'s aggregate branch: a data input listed under an alias binds
+/// the columns its uses read.
+#[test]
+fn aliased_data_input() {
+    let data =
+        "data = load_data(\"data.json\", cartpow(cartprod(y = reals), 3))\nmu = elementof(reals)\n";
+    for emit in [emit_flatpdl, emit_model] {
+        let direct = emit(&format!(
+            "{data}v = sum(data.y) * mu\ninputs = (mu, data)\noutputs = (v)\n"
+        ));
+        for read in ["D", "data"] {
+            let aliased = emit(&format!(
+                "{data}D1 = data\nD = D1\nv = sum({read}.y) * mu\ninputs = (mu, D)\noutputs = (v)\n"
+            ));
+            assert_eq!(aliased, direct, "read = {read}");
+        }
     }
 }

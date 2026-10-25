@@ -2,7 +2,7 @@
 //! (optional) annotation side-tables; exposes the read / build / annotate API.
 
 use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
-use crate::node::{CallHead, Node, Ref};
+use crate::node::{CallHead, Node, Ref, RefNs};
 use crate::ty::{Mass, Phase, Type, ValueSet};
 use std::collections::{HashMap, HashSet};
 
@@ -419,6 +419,23 @@ impl Module {
         self.by_name.get(&name).copied()
     }
 
+    /// The binding `name` denotes: its own binding, or the end of its
+    /// bare-name alias chain (`H = h`, §04 *Aliasing*), whose right-hand side is
+    /// not a self-ref.
+    pub fn alias_target(&self, name: Symbol) -> Option<BindingId> {
+        let mut bid = self.binding_by_name(name)?;
+        for _ in 0..self.binding_count() {
+            match &self.nodes[self.bindings[bid].rhs] {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => bid = self.binding_by_name(*name)?,
+                _ => break,
+            }
+        }
+        Some(bid)
+    }
+
     /// Bindings in source order.
     pub fn bindings(&self) -> impl Iterator<Item = (BindingId, &Binding)> {
         self.order.iter().map(move |&id| (id, &self.bindings[id]))
@@ -564,7 +581,7 @@ impl Module {
     /// any `%ref <alias> member`. Dead-binding sweeps, root-based pruning and
     /// dependency edges all use it.
     pub fn collect_referenced_names(&self, root: NodeId, out: &mut HashSet<Symbol>) {
-        use crate::node::{Inputs, RefNs};
+        use crate::node::Inputs;
         let mut pending = vec![root];
         let mut visited = HashSet::new();
         while let Some(id) = pending.pop() {

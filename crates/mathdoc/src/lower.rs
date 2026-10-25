@@ -1378,7 +1378,7 @@ impl<'m> Lowerer<'m> {
     /// (`h = standard_module("particle-physics", …)` → `particle-physics`);
     /// `None` for a loaded module.
     fn standard_module_name(&self, alias: Symbol) -> Option<&'m str> {
-        let alias_binding = self.m.binding_by_name(alias)?;
+        let alias_binding = self.m.alias_target(alias)?;
         let Node::Call(load) = self.m.node(self.m.binding(alias_binding).rhs) else {
             return None;
         };
@@ -1676,7 +1676,7 @@ impl<'m> Lowerer<'m> {
         if rank_one
             && let Node::Ref(r) = self.m.node(id)
             && r.ns == RefNs::SelfMod
-            && let Some(b) = self.m.binding_by_name(r.name)
+            && let Some(b) = self.m.alias_target(r.name)
             && let Some(size) = self.iid_size(self.m.binding(b).rhs)
         {
             return Some(vec![AxisLen::Named(self.expr(size))]);
@@ -2621,6 +2621,24 @@ mod tests {
     }
 
     #[test]
+    fn an_aliased_iid_variate_keeps_its_named_size() {
+        // §04: `T = T0 = theta` names theta itself, so a broadcast over `T`
+        // runs over theta's named size `J`, not the static length 8.
+        let row = |src: &str| {
+            let rows = rows(src);
+            let y = &row_named(&rows, "y").statement;
+            format!("{}{}", mathml::expr(&y.lhs), mathml::expr(&y.rhs))
+        };
+        let head = "J = 8\ntheta ~ iid(Normal(0, 1), J)\n";
+        let direct = row(&format!("{head}y = Normal.(theta, 1.0)")).replace(
+            "data-flatppl-ref=\"theta\"><mi>θ</mi>",
+            "data-flatppl-ref=\"T\"><mi>T</mi>",
+        );
+        let aliased = row(&format!("{head}T0 = theta\nT = T0\ny = Normal.(T, 1.0)"));
+        assert_eq!(aliased, direct);
+    }
+
+    #[test]
     fn iid_is_a_tensor_power_and_broadcasts_are_products_or_families() {
         let src = "J = 8\nmu ~ Normal(0, 5)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), J)\ns = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]\ny ~ Normal.(theta, s)\nalpha = elementof(reals)\nbeta = elementof(reals)\nx = [1.1, 1.5, 1.3, 1.4]\nmeans = alpha .+ beta .* x";
         let rows = rows(src);
@@ -2832,7 +2850,7 @@ mod tests {
 
     #[test]
     fn reifications_print_as_named_functions_and_kernels() {
-        let src = "mu = elementof(reals)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), 8)\ny ~ Normal.(theta, 1.0)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\nK = kernelof(record(y = y), mu = mu, tau = tau, theta = theta)\nL = likelihoodof(K, record(y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))\npost = bayesupdate(L, prior)\nf = x -> 2 * x\nh = fn(abs(_) * _)\nsq(a) = a^2";
+        let src = "mu = elementof(reals)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), 8)\ny = Normal.(theta, 1.0)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\nK = kernelof(record(y = y), mu = mu, tau = tau, theta = theta)\nL = likelihoodof(K, record(y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))\npost = bayesupdate(L, prior)\nf = x -> 2 * x\nh = fn(abs(_) * _)\nsq(a) = a^2";
         let rows = rows(src);
         let prior = mathml::expr(&row_named(&rows, "prior").statement.rhs);
         assert_eq!(
