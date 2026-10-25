@@ -140,9 +140,7 @@
 //! (`pushfwd(exp, M)`) is byte-equality-pinned against the explicit
 //! `bijection(exp, log, x -> x)`.
 
-use crate::density::{
-    build_call, expect_builtin_call, fold_add, refuse, resolve_ref_one, static_real,
-};
+use crate::density::{build_call, expect_builtin_call, fold_add, refuse, resolve_ref, static_real};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
@@ -212,8 +210,8 @@ pub(crate) fn derive_bijection(
     domain: &Type,
     support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
-    // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
-    let (f_resolved, _) = resolve_ref_one(m, f);
+    // Resolve the self-ref alias chain (`pushfwd(g, M)` where `g = exp`).
+    let (f_resolved, _) = resolve_ref(m, f);
     // A MATRIX variate has no recognised forward map here: §06 case 1's set is
     // scalar, elementwise-over-a-vector, and matrix-VECTOR affine (`mu + L * x`).
     // Unrefused it took the scalar derivation, which emits one scalar log-volume
@@ -541,7 +539,7 @@ pub(crate) fn forward_image(
     y: NodeId,
     support: &ValueSet,
 ) -> Option<ImageGate> {
-    let (f_resolved, _) = resolve_ref_one(m, f);
+    let (f_resolved, _) = resolve_ref(m, f);
     // A matrix variate reaches here only through an explicit `bijection` (the
     // synthesis refuses it), and the scalar image would gate a matrix against a
     // scalar set — §07 `in` requires "The type of `x` must match the element type

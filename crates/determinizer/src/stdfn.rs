@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Type};
 
-use crate::density::{build_call, resolve_ref_one};
+use crate::density::{build_call, resolve_ref};
 use crate::refuse::RefuseError;
 
 mod pyhf;
@@ -123,9 +123,9 @@ pub(crate) fn lower_std_module_functions(
 const MAX_PASSES: usize = 64;
 
 /// Every `(node, module-name, member-name)` for a direct or broadcast call of a
-/// §09 standard-module member, anywhere in a binding RHS. One `(%ref self …)` hop is
+/// §09 standard-module member, anywhere in a binding RHS. A `(%ref self …)` alias chain is
 /// followed on the callee, so `f = hep.kallen; f(x, y, z)` is found too — the same
-/// hop `density::std_module_ctor_sym` follows for a distribution member.
+/// chain `density::std_module_ctor_sym` follows for a distribution member.
 fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
     fn walk(
         m: &Module,
@@ -158,11 +158,11 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
     out
 }
 
-/// The `(module, member)` a call callee names, directly or through one
-/// `(%ref self …)` hop.
+/// The `(module, member)` a call callee names, directly or through a
+/// `(%ref self …)` alias chain.
 pub fn standard_function(m: &Module, callee: NodeId) -> Option<(String, String)> {
     crate::crossmodule::std_module_member(m, callee).or_else(|| {
-        let hop = resolve_ref_one(m, callee).0;
+        let hop = resolve_ref(m, callee).0;
         crate::crossmodule::std_module_member(m, hop)
     })
 }
@@ -245,7 +245,7 @@ fn lower_member_broadcast(
             name,
         };
         inputs.push((label, reference));
-        let resolved = resolve_ref_one(m, arg).0;
+        let resolved = resolve_ref(m, arg).0;
         // Literal degrees must remain visible to degree-specialized formulas.
         // Keep their broadcast arguments too, preserving arity and shape checks.
         let cell = if matches!(m.node(resolved), Node::Lit(_)) {
@@ -343,7 +343,7 @@ fn arity<const N: usize>(args: &[NodeId]) -> Option<[NodeId; N]> {
 /// declined (this pass runs before constant folding, so `1 + 1` is not a literal
 /// here).
 fn literal_degree(m: &Module, id: NodeId) -> Option<i64> {
-    let node = resolve_ref_one(m, id).0;
+    let node = resolve_ref(m, id).0;
     let n = match m.node(node) {
         Node::Lit(Scalar::Int(n)) => *n,
         _ => return None,
@@ -654,7 +654,7 @@ fn breakup_momentum(m: &mut Module, [mass, ma, mb]: [NodeId; 3]) -> NodeId {
 /// for $0 \leq \ell \leq 7$; an $\ell$ outside that range is declined, as is a
 /// computed one.
 fn blatt_weisskopf(m: &mut Module, [l, p, d]: [NodeId; 3]) -> Option<NodeId> {
-    let node = resolve_ref_one(m, l).0;
+    let node = resolve_ref(m, l).0;
     let ell = match m.node(node) {
         Node::Lit(Scalar::Int(n)) => *n,
         _ => return None,
@@ -780,7 +780,7 @@ pub(crate) fn residual_std_member(m: &Module, call: NodeId) -> Option<String> {
     if let Some((module, member)) = standard_function(m, callee) {
         return Some(format!("{module}.{member}"));
     }
-    let ref_id = resolve_ref_one(m, callee).0;
+    let ref_id = resolve_ref(m, callee).0;
     let Node::Ref(Ref {
         ns: RefNs::Module(alias),
         name: member,

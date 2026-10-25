@@ -394,6 +394,42 @@ draws = rand(lawof(record(a = mu, b = mu)), s)";
     );
 }
 
+// A hierarchical draw that reads its latent through an alias: `M = mu` names
+// `mu`'s expression (§04 *Name resolution*), so `y` depends on `mu` and is
+// sampled after it, from `mu`'s advanced state. A one-hop read missed the
+// dependency and refused with "reference cycle".
+#[test]
+fn hierarchical_latent_read_through_an_alias() {
+    let src = "\
+s = rnginit(0)
+mu = draw(Normal(mu = 0.0, sigma = 1.0))
+M = mu
+y = draw(Normal(mu = M, sigma = 1.0))
+draws = rand(lawof(record(a = M, y = y)), s)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("a latent read through an alias must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        2,
+        "mu and y are each sampled once:\n{pir}"
+    );
+    assert!(
+        pir.contains(
+            "(builtin_sample (%meta (%rngstate %fixed rngstates) (get0 (%ref self __sample_mu) 1))"
+        ),
+        "y is sampled from mu's advanced state:\n{pir}"
+    );
+    assert!(
+        pir.contains("(record (%field a (%ref self mu)) (%field y (%ref self y)))"),
+        "field a reads the one sampled mu:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "FlatPDL:\n{pir}"
+    );
+}
+
 // CHAINED rand CALLS (not chained draws under one rand): the second `rand`'s
 // draw must consume the FIRST `rand`'s *advanced* rng (destructured out as
 // `s2`), never the original `rnginit(...)` source. `refuse.rs`'s

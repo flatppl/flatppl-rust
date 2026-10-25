@@ -540,7 +540,7 @@ pub(crate) fn cell_input(
     inputs: &mut Vec<(Symbol, Ref)>,
     args: &mut Vec<NodeId>,
 ) -> Result<NodeId, RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, values);
+    let (resolved, _) = resolve_ref(m, values);
     let ty = m.type_of(values).or_else(|| m.type_of(resolved)).cloned();
     let point = match ty {
         Some(Type::Array { elem, .. }) => {
@@ -600,7 +600,7 @@ fn sum_density_with(
     mut inputs: Vec<(Symbol, Ref)>,
     mut args: Vec<NodeId>,
 ) -> Result<NodeId, RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, values);
+    let (resolved, _) = resolve_ref(m, values);
     let rank = match m.type_of(values).or_else(|| m.type_of(resolved)) {
         Some(Type::Array { shape, .. }) => shape.len(),
         _ => 1,

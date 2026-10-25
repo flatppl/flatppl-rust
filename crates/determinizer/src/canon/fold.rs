@@ -288,24 +288,61 @@ fn is_canonical_neg_literal(m: &Module, rhs: NodeId) -> bool {
         && matches!(m.node(c.args[0]), Node::Lit(_))
 }
 
+/// Binding name -> trivial replacement, for every binding [`resolve_alias_refs`]
+/// inlines.
+fn trivial_bindings(m: &Module) -> HashMap<flatppl_core::Symbol, NodeId> {
+    // A binding the `inputs` ABI promotes to a function argument keeps its
+    // references: substituting its value would bake the argument away (§13's
+    // phase table replaces the computed value with the argument).
+    let promoted = super::promoted_input_names(m);
+    m.bindings()
+        .filter(|(_, b)| {
+            let is_trivial = matches!(m.node(b.rhs), Node::Lit(_) | Node::Const(_) | Node::Ref(_))
+                || is_canonical_neg_literal(m, b.rhs);
+            is_trivial && !promoted.contains(&b.name)
+        })
+        .map(|(_, b)| (b.name, b.rhs))
+        .collect()
+}
+
+/// Whether [`resolve_alias_refs`] would rewrite anything: a binding other than
+/// `inputs` reads a trivial binding. Read-only, so a canonical module costs one
+/// walk and no copy.
+pub(crate) fn has_alias_refs(m: &Module) -> bool {
+    let trivial = trivial_bindings(m);
+    if trivial.is_empty() {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    m.bindings().any(|(bid, b)| {
+        if super::is_reserved_abi_binding(m, bid) {
+            return false;
+        }
+        let mut stack = vec![b.rhs];
+        while let Some(id) = stack.pop() {
+            if let Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) = m.node(id)
+            {
+                // A binding's own self-reference is the guarded no-op case.
+                if trivial.contains_key(name) && !(id == b.rhs && *name == b.name) {
+                    return true;
+                }
+            } else if seen.insert(id) {
+                stack.extend(m.node(id).children());
+            }
+        }
+        false
+    })
+}
+
 /// Replace `(%ref self x)` where `x` binds a trivial value — another ref leaf,
 /// a `Const`, a `Lit`, or the canonical `(neg <Lit>)` shape — with that value.
 /// Non-trivial bindings are left (inlining them would duplicate shared
 /// subterms; leave that to CSE / the rewriter).
 pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
-    // A binding the `inputs` ABI promotes to a function argument keeps its
-    // references: substituting its value would bake the argument away (§13's
-    // phase table replaces the computed value with the argument).
-    let promoted = super::promoted_input_names(m);
-    // Map: binding-name Symbol -> trivial replacement NodeId.
-    let mut trivial: HashMap<flatppl_core::Symbol, NodeId> = HashMap::new();
-    for (_, b) in m.bindings() {
-        let is_trivial = matches!(m.node(b.rhs), Node::Lit(_) | Node::Const(_) | Node::Ref(_))
-            || is_canonical_neg_literal(m, b.rhs);
-        if is_trivial && !promoted.contains(&b.name) {
-            trivial.insert(b.name, b.rhs);
-        }
-    }
+    let trivial = trivial_bindings(m);
     if trivial.is_empty() {
         return false;
     }

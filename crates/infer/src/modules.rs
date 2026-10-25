@@ -505,11 +505,11 @@ impl<'b> InferSession<'b> {
     }
 
     /// Extract the `load_module` / `standard_module` directive from the binding
-    /// whose LHS is `alias` in `importer`.
+    /// whose LHS is `alias` in `importer`, through any alias chain.
     fn load_directive(&self, importer: &Module, alias: Symbol) -> Result<LoadDirective, String> {
         let alias_name = importer.resolve(alias).to_string();
         let bid: BindingId = importer
-            .binding_by_name(alias)
+            .alias_target(alias)
             .ok_or_else(|| format!("`{alias_name}` is not a module"))?;
         let rhs = importer.binding(bid).rhs;
         let Node::Call(call) = importer.node(rhs) else {

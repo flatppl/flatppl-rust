@@ -61,6 +61,12 @@ pub fn parse(input: &str) -> Result<Module> {
     for st in &statements {
         collect_module_name(st, &mut names);
     }
+    // §04 *Aliasing*: `H = h` binds the same module, so `H.x` is a member
+    // access too. Repeat until no chain grows; statement order is free.
+    while statements
+        .iter()
+        .any(|st| collect_module_alias(st, &mut names))
+    {}
 
     let mut module = Module::new();
     let mut synth: u64 = 0;
@@ -230,6 +236,22 @@ fn collect_module_name(stmt: &Stmt, names: &mut Names) {
         && let Some(TokenKind::Name(m)) = toks.first().map(|t| &t.kind)
     {
         names.modules.insert(m.clone());
+    }
+}
+
+/// Record `lhs` of a bare-name statement `lhs = rhs` whose `rhs` is a module.
+/// Returns whether that added a name.
+fn collect_module_alias(stmt: &Stmt, names: &mut Names) -> bool {
+    let [lhs, assign, rhs] = stmt.tokens.as_slice() else {
+        return false;
+    };
+    match (&lhs.kind, &assign.kind, &rhs.kind) {
+        (TokenKind::Name(lhs), TokenKind::Assign, TokenKind::Name(rhs))
+            if names.modules.contains(rhs) =>
+        {
+            names.modules.insert(lhs.clone())
+        }
+        _ => false,
     }
 }
 

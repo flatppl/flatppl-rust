@@ -3673,7 +3673,7 @@ impl<'m> Emitter<'m> {
     /// tensor form), so this side table is the ONLY way a column access can reach
     /// its argument; [`Emitter::column_arg`] is the read side.
     pub fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
-        let container = self.resolve_ref_one(container);
+        let container = self.column_container(container);
         self.columns.insert((container, name), value);
     }
 
@@ -3694,7 +3694,7 @@ impl<'m> Emitter<'m> {
             return None;
         }
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.resolve_ref_one(container);
+        let resolved = self.column_container(container);
         let field = match self.m.node(selector) {
             Node::Lit(Scalar::Str(s)) => s.as_ref(),
             Node::Const(sym) => self.m.resolve(*sym),
@@ -3755,6 +3755,11 @@ impl<'m> Emitter<'m> {
     /// `(%bind n 3)`, never the literal inlined directly at the call site
     /// (spec §04's phase system). Returns `id` unchanged when it is not this
     /// shape (already a literal, a `Local`/`Module` ref, or any other node).
+    ///
+    /// One hop suffices because every entry point first points alias and
+    /// literal references at the end of their chain
+    /// (`flatppl_determinizer::resolve_alias_chains`). A promoted `inputs`
+    /// binding keeps its references, so the hop stops at its right-hand side.
     pub(crate) fn resolve_ref_one(&self, id: NodeId) -> NodeId {
         match self.m.node(id) {
             Node::Ref(Ref {
@@ -3767,6 +3772,20 @@ impl<'m> Emitter<'m> {
                 .unwrap_or(id),
             _ => id,
         }
+    }
+
+    /// The key [`Emitter::bind_column`] and [`Emitter::column_arg`] share: the
+    /// end of `id`'s ref chain. A promoted input keeps its references, so an
+    /// aliased one (`inputs = (D)`, `D = data`) still reads through `D`.
+    fn column_container(&self, mut id: NodeId) -> NodeId {
+        for _ in 0..self.m.binding_count() {
+            let next = self.resolve_ref_one(id);
+            if next == id {
+                break;
+            }
+            id = next;
+        }
+        id
     }
 
     /// Whether `id` — resolved via [`Emitter::resolve_ref_one`] — is a

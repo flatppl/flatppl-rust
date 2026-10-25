@@ -385,12 +385,10 @@ pub(crate) fn resolve_ref_def(
     match r.ns {
         RefNs::SelfMod => Some((file, module.binding_by_name(r.name)?)),
         RefNs::Module(alias) => {
-            // Find the binding named `alias` and extract its
-            // load_module/standard_module directive path from the call's first arg.
-            let alias_name = module.resolve(alias);
-            let (_, alias_binding) = module
-                .bindings()
-                .find(|(_, b)| module.resolve(b.name) == alias_name)?;
+            // Find the binding that loads `alias`, through any alias chain, and
+            // extract its load_module/standard_module directive path from the
+            // call's first arg.
+            let alias_binding = module.binding(module.alias_target(alias)?);
             let Node::Call(call) = module.node(alias_binding.rhs) else {
                 return None;
             };
@@ -1354,6 +1352,25 @@ mod tests {
         let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32; // on `shifted`
         let index = node_span_index(&db, model, fs, cats);
         let loc = goto_definition(&db, model, fs, cats, off, index).expect("cross-file def");
+        assert_eq!(loc.path, "helpers.flatppl");
+    }
+
+    #[test]
+    fn goto_cross_file_binding_through_a_module_alias() {
+        use crate::queries::node_span_index;
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let helpers = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "shifted = 1.0".to_string(),
+        );
+        let head = "h = load_module(\"helpers.flatppl\")\nH1 = h\nH = H1\nv = H.";
+        let model = SourceFile::new(&db, "model.flatppl".to_string(), format!("{head}shifted"));
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let index = node_span_index(&db, model, fs, cats);
+        let loc = goto_definition(&db, model, fs, cats, head.len() as u32, index)
+            .expect("cross-file def");
         assert_eq!(loc.path, "helpers.flatppl");
     }
 

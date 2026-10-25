@@ -19,7 +19,7 @@
 use crate::density::{
     MEASURE_COMBINATOR_OPS, build_call, build_density_term, build_record, builtin_name,
     draw_argument, expect_builtin_call, fold_add, lookup_field, lower_measure_density,
-    materialize_record_value, resolve_ref_chain, resolve_ref_one,
+    materialize_record_value, resolve_ref, resolve_ref_chain,
 };
 use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
@@ -339,9 +339,9 @@ fn lower_keyword_family(
 /// `lawof(record(f = <draw>))` (record family) or `lawof(<draw>)` — a bare
 /// scalar draw with no record wrapper (scalar family).
 fn resolve_base(m: &Module, base_arg: NodeId) -> Option<Component> {
-    let (resolved, _) = resolve_ref_one(m, base_arg);
+    let (resolved, _) = resolve_ref(m, base_arg);
     let inner = match expect_builtin_call(m, resolved, "lawof") {
-        Some(law) if law.args.len() == 1 => resolve_ref_one(m, law.args[0]).0,
+        Some(law) if law.args.len() == 1 => resolve_ref(m, law.args[0]).0,
         Some(_) => return None,
         None => resolved,
     };
@@ -360,7 +360,7 @@ fn resolve_step_output(m: &Module, k_arg: NodeId) -> Option<Component> {
     let mut step = k_arg;
     for _ in 0..8 {
         let kernel = resolve_reified(m, step)?;
-        let (body, _) = resolve_ref_one(m, kernel.body);
+        let (body, _) = resolve_ref(m, kernel.body);
         match m.node(body) {
             Node::Call(call) => match call.head {
                 CallHead::User(callee) => step = callee,
@@ -389,20 +389,20 @@ fn resolve_step_output(m: &Module, k_arg: NodeId) -> Option<Component> {
 /// worse, a downstream refusal would then name the inner combinator instead
 /// of `jointchain`).
 fn resolve_single_draw(m: &Module, expr: NodeId) -> Option<(Option<Symbol>, NodeId)> {
-    let (resolved, _) = resolve_ref_one(m, expr);
+    let (resolved, _) = resolve_ref(m, expr);
     let (inner, field) = if let Some(rec) = expect_builtin_call(m, resolved, "record") {
         if !rec.args.is_empty() || rec.named.len() != 1 || rec.named[0].kind != NamedKind::Field {
             return None;
         }
         (
-            resolve_ref_one(m, rec.named[0].value).0,
+            resolve_ref(m, rec.named[0].value).0,
             Some(rec.named[0].name),
         )
     } else {
         (resolved, None)
     };
     let dist = match draw_argument(m, inner) {
-        Some(d) => resolve_ref_one(m, d).0,
+        Some(d) => resolve_ref(m, d).0,
         None => inner,
     };
     let name = builtin_name(m, dist)?;
@@ -488,7 +488,7 @@ fn lower_scalar_family(
 /// a SCALAR variate? Reads the inferred measure/kernel domain; fail-closed on
 /// unknown/deferred (returns false → the caller refuses).
 fn component_is_scalar(m: &Module, comp_arg: NodeId) -> bool {
-    let (resolved, _) = resolve_ref_one(m, comp_arg);
+    let (resolved, _) = resolve_ref(m, comp_arg);
     match m.type_of(resolved) {
         Some(flatppl_core::Type::Measure { domain, .. }) => {
             matches!(domain.as_ref(), flatppl_core::Type::Scalar(_))

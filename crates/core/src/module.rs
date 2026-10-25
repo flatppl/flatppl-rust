@@ -2,7 +2,7 @@
 //! (optional) annotation side-tables; exposes the read / build / annotate API.
 
 use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
-use crate::node::{CallHead, Node, Ref};
+use crate::node::{CallHead, Node, Ref, RefNs};
 use crate::ty::{Mass, Phase, Type, ValueSet};
 use std::collections::{HashMap, HashSet};
 
@@ -419,6 +419,39 @@ impl Module {
         self.by_name.get(&name).copied()
     }
 
+    /// `name` and every name its bare-name alias chain (`H = h`, §04
+    /// *Aliasing*) passes through, `name` first. The chain ends at a name whose
+    /// binding's right-hand side is not a self-ref, or at an unbound name.
+    ///
+    /// A cyclic chain (`a = b; b = a`) is a static error. Its walk stops before
+    /// the first repeated name, so `alias_chain(a)` is `[a, b]`.
+    pub fn alias_chain(&self, name: Symbol) -> Vec<Symbol> {
+        let mut chain = vec![name];
+        for _ in 0..self.binding_count() {
+            let Some(bid) = self.binding_by_name(chain[chain.len() - 1]) else {
+                break;
+            };
+            let Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name: next,
+            }) = &self.nodes[self.bindings[bid].rhs]
+            else {
+                break;
+            };
+            if chain.contains(next) {
+                break;
+            }
+            chain.push(*next);
+        }
+        chain
+    }
+
+    /// The binding `name` denotes: the binding of the last name in its
+    /// [`Module::alias_chain`], or `None` when that name is unbound.
+    pub fn alias_target(&self, name: Symbol) -> Option<BindingId> {
+        self.binding_by_name(*self.alias_chain(name).last()?)
+    }
+
     /// Bindings in source order.
     pub fn bindings(&self) -> impl Iterator<Item = (BindingId, &Binding)> {
         self.order.iter().map(move |&id| (id, &self.bindings[id]))
@@ -564,7 +597,7 @@ impl Module {
     /// any `%ref <alias> member`. Dead-binding sweeps, root-based pruning and
     /// dependency edges all use it.
     pub fn collect_referenced_names(&self, root: NodeId, out: &mut HashSet<Symbol>) {
-        use crate::node::{Inputs, RefNs};
+        use crate::node::Inputs;
         let mut pending = vec![root];
         let mut visited = HashSet::new();
         while let Some(id) = pending.pop() {
@@ -614,6 +647,52 @@ mod tests {
     use super::*;
     use crate::node::{Call, CallHead, Node, Scalar};
     use crate::ty::{ScalarType, Type};
+
+    #[test]
+    fn alias_chain_ends_at_a_value_an_unbound_name_or_a_repeat() {
+        let mut m = Module::new();
+        let bind = |m: &mut Module, name: &str, rhs: Node| {
+            let name = m.intern(name);
+            let rhs = m.alloc(rhs);
+            m.add_binding(Binding {
+                name,
+                rhs,
+                doc: None,
+                public: true,
+                synthetic: false,
+            })
+        };
+        let alias = |m: &mut Module, to: &str| {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name: m.intern(to),
+            })
+        };
+        let x = bind(&mut m, "x", Node::Lit(Scalar::Real(1.0)));
+        let to_x = alias(&mut m, "x");
+        bind(&mut m, "X", to_x);
+        let to_big_x = alias(&mut m, "X");
+        bind(&mut m, "X2", to_big_x);
+        let to_free = alias(&mut m, "free");
+        bind(&mut m, "d", to_free);
+        let to_b = alias(&mut m, "b");
+        bind(&mut m, "a", to_b);
+        let to_a = alias(&mut m, "a");
+        let b = bind(&mut m, "b", to_a);
+        let (x2, d, a) = (m.intern("X2"), m.intern("d"), m.intern("a"));
+        let names = |start| -> Vec<&str> {
+            m.alias_chain(start)
+                .into_iter()
+                .map(|s| m.resolve(s))
+                .collect()
+        };
+        assert_eq!(names(x2), ["X2", "X", "x"]);
+        assert_eq!(names(d), ["d", "free"]);
+        assert_eq!(names(a), ["a", "b"]);
+        assert_eq!(m.alias_target(x2), Some(x));
+        assert_eq!(m.alias_target(d), None);
+        assert_eq!(m.alias_target(a), Some(b));
+    }
 
     #[test]
     fn retain_bindings_drops_unlisted_from_order_and_by_name() {

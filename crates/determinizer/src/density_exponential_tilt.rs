@@ -734,7 +734,7 @@ fn depends(m: &Module, node: NodeId, input: Ref, path: &mut Vec<NodeId>) -> bool
         return true;
     }
     path.push(node);
-    let resolved = resolve_ref_one(m, node).0;
+    let resolved = resolve_ref(m, node).0;
     let found = if resolved != node {
         depends(m, resolved, input, path)
     } else {
@@ -760,7 +760,7 @@ fn affine(m: &mut Module, node: NodeId, input: Ref, vector: bool) -> Option<Affi
             offset: real(m, 0.0),
         });
     }
-    let resolved = resolve_ref_one(m, node).0;
+    let resolved = resolve_ref(m, node).0;
     if resolved != node {
         return affine(m, resolved, input, vector);
     }

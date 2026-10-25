@@ -83,17 +83,7 @@ pub(crate) fn project(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) -> Opt
             let Node::Lit(Scalar::Str(field)) = m.node(key) else {
                 return None;
             };
-            // A declared input overrides its authored constructor at runtime.
-            let container = match m.node(container) {
-                Node::Ref(Ref {
-                    ns: RefNs::SelfMod,
-                    name,
-                }) if !promoted.contains(name) => m
-                    .binding_by_name(*name)
-                    .map(|bid| m.binding(bid).rhs)
-                    .unwrap_or(container),
-                _ => container,
-            };
+            let container = authored_container(m, container, promoted);
             let rec = expect_builtin(m, container, "record")
                 .or_else(|| expect_builtin(m, container, "table"))?;
             rec.named
@@ -131,7 +121,18 @@ pub(crate) fn project_tuple(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) 
     let Node::Lit(Scalar::Int(index)) = m.node(c.args[1]) else {
         return None;
     };
-    let mut container = c.args[0];
+    let container = authored_container(m, c.args[0], promoted);
+    let tuple = expect_builtin(m, container, "tuple")?;
+    let base = i64::from(m.resolve(sym) == "get");
+    usize::try_from(index - base)
+        .ok()
+        .and_then(|i| tuple.args.get(i))
+        .copied()
+}
+
+/// Follow a bare-name alias chain to the authored container. A declared input
+/// overrides its authored constructor at runtime, so the chain stops there.
+fn authored_container(m: &Module, mut container: NodeId, promoted: &HashSet<Symbol>) -> NodeId {
     for _ in 0..m.binding_count() {
         let Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -148,12 +149,7 @@ pub(crate) fn project_tuple(m: &Module, id: NodeId, promoted: &HashSet<Symbol>) 
         };
         container = m.binding(binding).rhs;
     }
-    let tuple = expect_builtin(m, container, "tuple")?;
-    let base = i64::from(m.resolve(sym) == "get");
-    usize::try_from(index - base)
-        .ok()
-        .and_then(|i| tuple.args.get(i))
-        .copied()
+    container
 }
 
 fn expect_builtin<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a flatppl_core::Call> {
