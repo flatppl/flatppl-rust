@@ -429,7 +429,8 @@ fn argument_occurrences(
 /// §04 "Reification to functions and kernels" lets a call pass an input by its
 /// name, so a rename that left `f(a = 2)` behind would leave `f` without a
 /// parameter `a`. The callable is each binding whose RHS is the reification,
-/// plus each binding that aliases one (`g = f`), across files.
+/// plus each binding that aliases one (`g = f`), across files, plus the
+/// reification itself as an inline callee.
 fn keyword_call_sites(
     db: &dyn salsa::Database,
     fs: FileSet,
@@ -445,9 +446,6 @@ fn keyword_call_sites(
         .filter(|(_, b)| b.rhs == target.reification)
         .map(|(bid, _)| (target.file, bid))
         .collect();
-    if callables.is_empty() {
-        return;
-    }
     // The part of the reference that names the callable, when it is one.
     let callable_ref =
         |f: SourceFile, module: &flatppl_core::Module, id: NodeId, set: &HashSet<_>| {
@@ -502,13 +500,20 @@ fn keyword_call_sites(
             {
                 continue;
             }
-            let Some(part) = callable_ref(f, module, callee, &callables) else {
-                continue;
-            };
             let Some(span) = module.span_of(callee) else {
                 continue;
             };
-            for (s, e) in names::call_keyword_ranges(text, span.start, part) {
+            // An inline callee is the reification itself: `(a -> …)(a = 2)`.
+            let callee_end = if f == target.file && callee == target.reification {
+                Some(span.end)
+            } else {
+                callable_ref(f, module, callee, &callables)
+                    .and_then(|part| names::callee_ref_end(text, span.start, part))
+            };
+            let Some(callee_end) = callee_end else {
+                continue;
+            };
+            for (s, e) in names::call_keyword_ranges(text, callee_end) {
                 if text[s as usize..e as usize] == target.name {
                     push(NameLoc {
                         path: f.path(db).clone(),
@@ -1574,6 +1579,29 @@ mod tests {
             let (db, f, fs, cats) = single_file(src);
             let index = node_span_index(&db, f, fs, cats);
             let cursor = nth_offset(src, ", a =", 0) + 2;
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected);
+        }
+    }
+
+    /// An immediately invoked callable is its own call site.
+    #[test]
+    fn rename_an_inline_callee_argument_rewrites_its_keyword() {
+        for (src, cursor_at, expected) in [
+            (
+                "y = (a -> add(a, 1))(a = 2)",
+                "a ->",
+                "y = (z -> add(z, 1))(z = 2)",
+            ),
+            (
+                "y = functionof(add(_a_, 1), a = _a_)(a = 2)",
+                "a = _a_",
+                "y = functionof(add(_z_, 1), z = _z_)(z = 2)",
+            ),
+        ] {
+            let (db, f, fs, cats) = single_file(src);
+            let index = node_span_index(&db, f, fs, cats);
+            let cursor = nth_offset(src, cursor_at, 0);
             let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
             assert_eq!(apply(src, &locs, "z"), expected);
         }

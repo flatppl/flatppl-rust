@@ -330,31 +330,34 @@ pub fn placeholder_surface_name(placeholder: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
-/// The name ranges of the `name = value` arguments of a call, given the span
-/// start of its callee reference and which part of it the callee names.
+/// The end of a callee reference that starts at `span_start`, given which part
+/// of it names the callee.
+pub fn callee_ref_end(text: &str, span_start: u32, part: RefPart) -> Option<u32> {
+    let head_end = head_ident_end(text, span_start)?;
+    if part == RefPart::Head {
+        return Some(head_end);
+    }
+    let (dot, b'.') = next_significant(text, head_end)? else {
+        return None;
+    };
+    head_ident_end(text, next_significant(text, dot + 1)?.0)
+}
+
+/// The name ranges of the `name = value` arguments of a call whose callee
+/// text ends at `callee_end`, past any `)` that closes a parenthesised callee.
 ///
 /// The IR keeps no span for a keyword, so this walks the argument list and
 /// skips nested brackets, strings and comments. An unexpected shape yields no
 /// ranges.
-pub fn call_keyword_ranges(text: &str, span_start: u32, part: RefPart) -> Vec<(u32, u32)> {
+pub fn call_keyword_ranges(text: &str, callee_end: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
-    let Some(mut head_end) = head_ident_end(text, span_start) else {
-        return out;
-    };
-    if part == RefPart::Member {
-        let Some((dot, b'.')) = next_significant(text, head_end) else {
-            return out;
-        };
-        let Some((member, _)) = next_significant(text, dot + 1) else {
-            return out;
-        };
-        let Some(end) = head_ident_end(text, member) else {
-            return out;
-        };
-        head_end = end;
-    }
-    let Some((open, b'(')) = next_significant(text, head_end) else {
-        return out;
+    let mut at = callee_end;
+    let open = loop {
+        match next_significant(text, at) {
+            Some((close, b')')) => at = close + 1,
+            Some((open, b'(')) => break open,
+            _ => return out,
+        }
     };
     let bytes = text.as_bytes();
     let mut at = open as usize + 1;
