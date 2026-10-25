@@ -36,9 +36,7 @@ fn require_fetchable_url(url: &str) -> Result<(), Error> {
 /// URL that WHATWG parsers split at `\` is refused, not reinterpreted.
 fn has_userinfo(url: &str) -> bool {
     let rest = url.split_once("://").map_or("", |(_, rest)| rest);
-    rest.split(['/', '?', '#'])
-        .next()
-        .is_some_and(|authority| authority.contains('@'))
+    rest[..crate::location::authority_len(rest)].contains('@')
 }
 
 /// The mandatory `<key>_meta.json` sidecar (spec §sec:url-cache "Layout and

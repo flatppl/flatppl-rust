@@ -26,7 +26,7 @@ mod trust;
 
 // `Location` (the spec §04 path/URL join) is the dependency-free core, always
 // available. Everything below is the host-side pull cache, gated behind `cache`.
-pub use location::Location;
+pub use location::{Location, redact_url_userinfo};
 
 #[cfg(feature = "cache")]
 use std::path::PathBuf;
@@ -64,37 +64,6 @@ fn display_text(text: &str) -> String {
 #[cfg(feature = "cache")]
 fn display_path(path: &std::path::Path) -> String {
     display_text(&path.to_string_lossy())
-}
-
-#[cfg(feature = "cache")]
-fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
-    let mut result: Option<String> = None;
-    let mut copied_through = 0;
-    let mut search_from = 0;
-    while let Some(relative_scheme_end) = url[search_from..].find("://") {
-        let scheme_end = search_from + relative_scheme_end;
-        let authority_start = scheme_end + 3;
-        let authority_end = url[authority_start..]
-            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-            .map_or(url.len(), |i| authority_start + i);
-        let authority = &url[authority_start..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            let host_start = authority_start + at + 1;
-            let output = result.get_or_insert_with(|| String::with_capacity(url.len()));
-            output.push_str(&url[copied_through..authority_start]);
-            output.push_str("<redacted>@");
-            copied_through = host_start;
-        }
-        if authority_end == url.len() {
-            break;
-        }
-        search_from = authority_end;
-    }
-    let Some(mut result) = result else {
-        return url.into();
-    };
-    result.push_str(&url[copied_through..]);
-    result.into()
 }
 
 /// Redact authority userinfo in a display-only copy. The original URL remains
@@ -822,6 +791,29 @@ mod tests {
                 &ApproveAll,
             )
             .expect("no userinfo");
+    }
+
+    #[test]
+    fn userinfo_refusals_never_print_the_password() {
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true);
+        for url in [
+            "https://us er:secret@host.test/m.flatppl",
+            "https://user:se\tcret@host.test/m.flatppl",
+            "https://user:p%40secret@host.test/m.flatppl",
+            "https://a@b:secret@host.test/m.flatppl",
+            "https://user:secret@x@host.test/m.flatppl",
+        ] {
+            let err = cache
+                .get(url, &FakeFetcher::new("x"), &ApproveAll)
+                .unwrap_err();
+            for message in [err.to_string(), format!("{err:?}")] {
+                assert!(
+                    !message.contains("secret") && !message.contains("se\\tcret"),
+                    "{message}"
+                );
+            }
+        }
     }
 
     /// Another user who can write a shared cache tree plants a shard symlink.

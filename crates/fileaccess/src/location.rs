@@ -2,6 +2,7 @@
 //! — and relative-`join` resolution (spec §04 "Path resolution" for paths;
 //! the analogous origin-relative join for URLs).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// Where a `load_module` / `load_data` `source` points.
@@ -14,6 +15,39 @@ pub enum Location {
     Remote(String),
     /// An unsupported scheme or malformed local file URL. Never read or fetched.
     Invalid(String),
+}
+
+/// The byte length of the authority at the start of `rest`, the text after a
+/// `scheme://`. It ends at the first `/`, `?` or `#`. Whitespace does not end
+/// it, so the userinfo refusal and its redaction see the same span.
+pub(crate) fn authority_len(rest: &str) -> usize {
+    rest.find(['/', '?', '#']).unwrap_or(rest.len())
+}
+
+/// Redact the authority userinfo of every URL in `text`, a display-only copy.
+/// The last `@` in an authority ends its userinfo, so an encoded or repeated
+/// `@` stays inside the redacted span. Text that only looks like an authority
+/// may be over-redacted, never under-redacted.
+pub fn redact_url_userinfo(text: &str) -> Cow<'_, str> {
+    let mut result: Option<String> = None;
+    let mut copied_through = 0;
+    let mut search_from = 0;
+    while let Some(relative_scheme_end) = text[search_from..].find("://") {
+        let authority_start = search_from + relative_scheme_end + 3;
+        let authority_end = authority_start + authority_len(&text[authority_start..]);
+        if let Some(at) = text[authority_start..authority_end].rfind('@') {
+            let output = result.get_or_insert_with(|| String::with_capacity(text.len()));
+            output.push_str(&text[copied_through..authority_start]);
+            output.push_str("<redacted>@");
+            copied_through = authority_start + at + 1;
+        }
+        search_from = authority_end;
+    }
+    let Some(mut result) = result else {
+        return text.into();
+    };
+    result.push_str(&text[copied_through..]);
+    result.into()
 }
 
 /// Does `s` start with an `http://` / `https://` scheme (case-insensitive)?
