@@ -15,10 +15,16 @@
 //! outstanding clones, and the main thread drains the queue on an input write
 //! rather than waiting for it (see `server::run`).
 //!
+//! Any other panic would end the worker thread, and the pool would shrink to
+//! zero. The worker catches it, survives, and reports the request id to the
+//! pool's `on_panic` hook, which answers it `InternalError`.
+//!
 //! [`Database`]: crate::db::Database
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use lsp_server::RequestId;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -64,15 +70,26 @@ impl Pool {
     /// Spawn `threads` worker threads (at least one) over a queue holding at
     /// most `capacity` jobs. Each worker pulls jobs off the shared channel and
     /// runs them; a job is responsible for sending its own response on the
-    /// results channel it captures in its closure.
-    pub fn new(threads: usize, capacity: usize) -> Self {
+    /// results channel it captures in its closure. A job that panics instead
+    /// passes its request id to `on_panic`, which owes that request a response.
+    pub fn new(
+        threads: usize,
+        capacity: usize,
+        on_panic: impl Fn(RequestId) + Send + Sync + 'static,
+    ) -> Self {
         let (job_tx, job_rx) = bounded::<(RequestId, Job)>(capacity.max(1));
+        let on_panic = Arc::new(on_panic);
         let workers = (0..threads.max(1))
             .map(|_| {
                 let job_rx = job_rx.clone();
+                let on_panic = Arc::clone(&on_panic);
                 std::thread::spawn(move || {
-                    for (_id, job) in job_rx {
-                        job();
+                    for (id, job) in job_rx {
+                        // `AssertUnwindSafe`: the job owns its captured state,
+                        // and a panic drops all of it.
+                        if catch_unwind(AssertUnwindSafe(job)).is_err() {
+                            on_panic(id);
+                        }
                     }
                 })
             })
@@ -117,8 +134,13 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    fn pool(threads: usize, capacity: usize) -> Pool {
+        Pool::new(threads, capacity, |id| panic!("job {id} panicked"))
+    }
 
     /// Occupy the pool's single worker and return the barrier that releases it.
     /// The worker signals on `started` before parking, so the test never races
@@ -133,7 +155,7 @@ mod tests {
         })
         .expect("the first job goes straight to the idle worker");
         started_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("the worker must pick up the first job");
         gate
     }
@@ -142,7 +164,7 @@ mod tests {
     fn a_full_queue_hands_the_request_id_back() {
         // One worker, parked, and a one-slot queue: the second request fills
         // the slot and the third has nowhere to go.
-        let pool = Pool::new(1, 1);
+        let pool = pool(1, 1);
         let gate = occupy_the_worker(&pool);
         assert!(
             pool.try_spawn(RequestId::from(2i32), || {}).is_ok(),
@@ -159,7 +181,7 @@ mod tests {
     #[test]
     fn draining_returns_the_queued_ids_and_does_not_run_them() {
         let ran = Arc::new(AtomicUsize::new(0));
-        let pool = Pool::new(1, 16);
+        let pool = pool(1, 16);
         let gate = occupy_the_worker(&pool);
         for i in 2..6i32 {
             let ran = ran.clone();
@@ -185,5 +207,23 @@ mod tests {
             "a second drain finds nothing"
         );
         gate.wait();
+    }
+
+    #[test]
+    fn a_panicking_job_is_reported_and_the_worker_serves_the_next_request() {
+        let (panicked_tx, panicked_rx) = crossbeam_channel::unbounded();
+        let pool = Pool::new(1, 4, move |id| panicked_tx.send(id).unwrap());
+        pool.try_spawn(RequestId::from(1i32), || panic!("handler bug"))
+            .unwrap();
+        let (served_tx, served_rx) = crossbeam_channel::bounded(1);
+        pool.try_spawn(RequestId::from(2i32), move || served_tx.send(()).unwrap())
+            .unwrap();
+        assert_eq!(
+            panicked_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(RequestId::from(1i32))
+        );
+        served_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the only worker survives the panic");
     }
 }
