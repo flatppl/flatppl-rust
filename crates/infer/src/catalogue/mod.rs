@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 mod lower;
-pub(crate) use lower::{LowerCtx, lower, no_intern};
+pub(crate) use lower::{LowerCtx, bin_count_shape, lower, no_intern};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalogue {
@@ -314,8 +314,17 @@ impl ParamSet {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) enum DomainSig {
     Scalar(ScalarTag),
-    VectorFromParam { elem: ScalarTag, param: String },
+    VectorFromParam {
+        elem: ScalarTag,
+        param: String,
+    },
     DynMatrix,
+    /// An integer array of counts, one count per bin of the edges `param` holds:
+    /// §07 `bincounts` gives `n + 1` edges `n` bins, and a record of edge vectors
+    /// one axis per field, in field order. `BinnedPoissonProcess`'s domain.
+    BinCounts {
+        param: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -477,6 +486,9 @@ pub(crate) enum DimExpr {
     Mul(Box<DimExpr>, Box<DimExpr>),
     /// A fixed number of appended entries, as in a spline's affine columns.
     Add(Box<DimExpr>, u32),
+    /// The positive integer literal written at positional arg `i`, as in
+    /// `linspace`'s point count `n`.
+    WrittenSize(usize),
 }
 
 /// Parse a catalogue from RON source.
@@ -576,6 +588,7 @@ impl ParamShape {
 /// a declared value set is a scalar: §08 writes every such parameter as
 /// `elementof(<set>)` of a scalar set (`mu = elementof(reals)`). A rank-0
 /// parameter without a set is `Uniform`'s `support`, a set, and stays unchecked.
+/// So does the edges parameter of a `BinCounts` domain, which may be a record.
 ///
 /// A function row reads its `ParamSig` tags, and a trailing `Variadic` tag
 /// covers every further position, so the list may be longer than `params`.
@@ -591,12 +604,17 @@ pub(crate) fn sig_param_shapes(sig: &Sig, count: usize) -> Vec<Option<ParamShape
     }
     match sig {
         Sig::Distribution {
+            domain,
             params,
             param_ranks,
             param_sets,
             ..
         } => (0..params.len().min(count))
             .map(|i| match param_ranks.get(i).copied().unwrap_or(0) {
+                // §07 `bincounts` also takes a record of edge vectors.
+                _ if matches!(domain, DomainSig::BinCounts { param } if *param == params[i]) => {
+                    None
+                }
                 1 => Some(ParamShape::Vector),
                 2 => Some(ParamShape::Matrix),
                 0 if param_sets
@@ -1094,6 +1112,7 @@ mod tests {
                 param_dim: param_dim_fn,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                written_size: &|_| Dim::Dynamic,
                 intern: &no_intern,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
@@ -1249,6 +1268,7 @@ mod tests {
                 param_dim: &|_| Dim::Dynamic,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                written_size: &|_| Dim::Dynamic,
                 intern: &no_intern,
             };
             let (cat_ty, _) = lower(sig, &ctx);

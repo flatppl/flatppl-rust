@@ -30,6 +30,7 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
             (Dim::Static(x), Dim::Static(y)) => x.checked_mul(y).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
         },
+        DimExpr::WrittenSize(i) => (ctx.written_size)(*i),
         DimExpr::Add(a, offset) => match dim_of(a, ctx) {
             Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
@@ -47,6 +48,32 @@ fn flatten_dims(t: Option<&Type>) -> Vec<Dim> {
             v
         }
         _ => Vec::new(),
+    }
+}
+
+/// The count-array shape of §07 `bincounts`'s `bins`: one axis of `n` bins for a
+/// vector of `n + 1` real edges, and one such axis per field of a record of edge
+/// vectors. `None` when `bins` is neither, or a static edge vector is empty.
+pub(crate) fn bin_count_shape(bins: &Type) -> Option<Vec<Dim>> {
+    fn axis(edges: &Type) -> Option<Dim> {
+        let (len, elem) = match edges {
+            Type::Array { shape, elem } if shape.len() == 1 => (shape[0], elem),
+            Type::TVector { len, elem } => (*len, elem),
+            _ => return None,
+        };
+        if !matches!(**elem, Type::Scalar(ScalarType::Real | ScalarType::Integer)) {
+            return None;
+        }
+        match len {
+            Dim::Static(n) => n.checked_sub(1).map(Dim::Static),
+            Dim::Dynamic => Some(Dim::Dynamic),
+        }
+    }
+    match bins {
+        Type::Record(fields) if !fields.is_empty() => {
+            fields.iter().map(|(_, edges)| axis(edges)).collect()
+        }
+        edges => axis(edges).map(|d| vec![d]),
     }
 }
 
@@ -74,6 +101,8 @@ pub(crate) struct LowerCtx<'a> {
     /// its scalar kind: `SameAsArg`, `RealOfArgShape`, `CommonOf`,
     /// `ElemScalarKind`. `None` when the arg is absent.
     pub(crate) arg_type: &'a dyn Fn(usize) -> Option<Type>,
+    /// The positive integer literal written at positional arg `i`, else `%dynamic`.
+    pub(crate) written_size: &'a dyn Fn(usize) -> Dim,
     /// Intern a record field name into a `Symbol` (for `ResultSig::Record`).
     /// Lives behind a `Fn` (interior-mutable at the call site) so it doesn't
     /// conflict with the immutable arg accessors above. Call sites that never
@@ -182,6 +211,7 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
             domain,
             support: sup,
             mass: m,
+            params,
             ..
         } => {
             let (dom, vset) = match domain {
@@ -200,6 +230,28 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
                         elem: Box::new(Type::Scalar(ScalarType::Real)),
                     };
                     (ty, support_dyn(*sup))
+                }
+                DomainSig::BinCounts { param } => {
+                    let edges = params
+                        .iter()
+                        .position(|p| p == param)
+                        .and_then(|i| (ctx.arg_type)(i));
+                    match edges.as_ref().and_then(bin_count_shape) {
+                        Some(shape) => {
+                            let vs = match sup {
+                                SupportTag::CartPowNonNegIntegers => {
+                                    flatppl_core::ty::cartpow_over(ValueSet::NonNegIntegers, &shape)
+                                }
+                                other => support(*other),
+                            };
+                            let ty = Type::Array {
+                                shape: shape.into(),
+                                elem: Box::new(Type::Scalar(ScalarType::Integer)),
+                            };
+                            (ty, vs)
+                        }
+                        None => (Type::Deferred, ValueSet::Unknown),
+                    }
                 }
             };
             (
@@ -384,6 +436,7 @@ mod tests {
             param_dim: &|_| Dim::Dynamic,
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
+            written_size: &|_| Dim::Dynamic,
             intern: &no_intern,
         };
         let (ty, vset) = lower(&sig, &cx);
@@ -411,6 +464,7 @@ mod tests {
             param_dim: &|_| Dim::Dynamic,
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
+            written_size: &|_| Dim::Dynamic,
             intern: &no_intern,
         };
         let (ty, _) = lower(&sig, &cx);

@@ -2147,6 +2147,7 @@ fn lower_measure_density_in_reference(
         Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
         Some("PoissonProcess") => lower_poisson_process(m, measure_node, v),
+        Some("BinnedPoissonProcess") => lower_binned_poisson_process(m, measure_node, v),
         // `Lebesgue` is a reference measure, not a distribution constructor: its
         // density is the support gate, not a backend density builder. Lowering
         // it here keeps it out of FlatPDL ([`lower_lebesgue`]).
@@ -4168,7 +4169,7 @@ fn lower_normalize(
                     .to_string(),
             });
         }
-        if base_univariate_continuous {
+        if is_atomless_scalar_leaf(m, base_resolved) {
             let density =
                 lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?; // truncate handles the -inf gate
             let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
@@ -4756,6 +4757,58 @@ pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
 /// [`MEASURE_COMBINATOR_OPS`]) rather than a leaf distribution constructor.
 fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
     matches!(builtin_name(m, base), Some(name) if MEASURE_COMBINATOR_OPS.contains(&name))
+}
+
+/// The normalized leaf constructors over the reals that have no atom: the
+/// continuous §08 rows and the continuous §09 `particle-physics` rows. A CDF
+/// difference is an interval mass only for these. The list is closed on
+/// purpose, so a new leaf refuses until someone checks it and adds it. `Dirac`
+/// is the leaf it keeps out: its point mass on a bound is lost by `F(hi) − F(lo)`.
+const ATOMLESS_REAL_LEAVES: &[&str] = &[
+    // §08
+    "Normal",
+    "GeneralizedNormal",
+    "Cauchy",
+    "StudentT",
+    "Logistic",
+    "VonMises",
+    "Laplace",
+    "LogNormal",
+    "Gamma",
+    "InverseGamma",
+    "ChiSquared",
+    "Exponential",
+    "Weibull",
+    "Beta",
+    "Pareto",
+    "Uniform",
+    // §09 particle-physics
+    "CrystalBall",
+    "DoubleSidedCrystalBall",
+    "Argus",
+    "RelativisticBreitWigner",
+    "Voigtian",
+    "Landau",
+    "BifurcatedNormal",
+];
+
+/// True iff `node` is a normalized leaf constructor over the reals with no atom
+/// ([`ATOMLESS_REAL_LEAVES`]). Only then is the CDF difference
+/// `touniform(hi) − touniform(lo)` its mass on an interval, for a closed and a
+/// half-open interval alike.
+fn is_atomless_scalar_leaf(m: &Module, node: NodeId) -> bool {
+    let name = match m.node(node) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(sym) => Some(sym),
+            CallHead::User(callee) => std_module_ctor_sym(m, callee),
+        },
+        _ => None,
+    };
+    matches!(
+        m.type_of(node),
+        Some(Type::Measure { domain, mass: Mass::Normalized })
+            if matches!(**domain, Type::Scalar(ScalarType::Real))
+    ) && name.is_some_and(|sym| ATOMLESS_REAL_LEAVES.contains(&m.resolve(sym)))
 }
 
 /// Extract `(kernel_const, kernel_input_record)` from a primitive constructor
@@ -6987,6 +7040,228 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
         broadcast::sum_density(m, intensity, v)?
     };
     Ok(build_call(m, "sub", &[events_term, total_mass]))
+}
+
+/// `logdensityof(BinnedPoissonProcess(bins, intensity), n)` through §08's
+/// fixed-bins equivalence `pushfwd(fn(bincounts(bins, _)), PoissonProcess(intensity))`.
+/// A Poisson process puts independent Poisson counts in disjoint sets, each with
+/// mean the intensity's mass there, so with edges $e_0 < \dots < e_k$
+/// ```text
+/// Σ_j logdensityof(Poisson(rate = μ([e_j, e_{j+1}])), n[j])
+/// ```
+/// Events outside every bin are dropped, as §07 `bincounts` drops them. The
+/// per-bin densities share one `broadcast(Poisson, rates)` body.
+///
+/// Refused rather than mis-lowered: a record of edge vectors (multi-dimensional
+/// bins), edges of no static count, and an intensity whose bin mass has no closed
+/// form ([`bin_mass`]).
+fn lower_binned_poisson_process(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (bins, intensity) = {
+        let c = expect_builtin_call(m, node, "BinnedPoissonProcess")
+            .ok_or_else(|| refuse(node, m, "expected BinnedPoissonProcess"))?;
+        let keyword = |name: &str| {
+            c.named
+                .iter()
+                .find(|n| m.resolve(n.name) == name)
+                .map(|n| n.value)
+        };
+        match (keyword("bins"), keyword("intensity"), c.args.as_ref()) {
+            (Some(bins), Some(intensity), []) => (bins, intensity),
+            (None, None, [bins, intensity]) => (*bins, *intensity),
+            _ => {
+                return Err(refuse(
+                    node,
+                    m,
+                    "BinnedPoissonProcess expects `bins` and `intensity` (spec §08)",
+                ));
+            }
+        }
+    };
+
+    let record_bins = {
+        let (resolved, _) = resolve_ref_chain(m, bins);
+        matches!(
+            m.type_of(bins).or_else(|| m.type_of(resolved)),
+            Some(Type::Record(_))
+        )
+    };
+    if record_bins {
+        return Err(refuse(
+            node,
+            m,
+            "BinnedPoissonProcess with a record of edge vectors (multi-dimensional \
+             bins) is not yet supported",
+        ));
+    }
+    let edges = bin_edges(m, bins).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            "BinnedPoissonProcess's edge vector has no static length",
+        )
+    })?;
+    let bins_count = edges.len().saturating_sub(1);
+    if static_array_variate_len(m, v).is_some_and(|n| n as usize != bins_count) {
+        return Err(refuse(
+            node,
+            m,
+            "the count array's length differs from the number of bins",
+        ));
+    }
+
+    if intensity_has_atom(m, intensity) {
+        return Err(refuse(
+            node,
+            m,
+            "BinnedPoissonProcess's intensity has an atom (a `Dirac` or a law over the \
+             integers): §07 `bincounts` puts an atom on an inner edge in the upper bin, \
+             which a CDF difference misses, so its bin masses are not derived",
+        ));
+    }
+    let mut rates = Vec::with_capacity(bins_count);
+    for pair in edges.windows(2) {
+        let rate = bin_mass(m, intensity, pair[0], pair[1]).ok_or_else(|| {
+            refuse(
+                node,
+                m,
+                "BinnedPoissonProcess needs a closed-form intensity mass per bin; \
+                 only a normalized univariate continuous constructor, a `weighted` \
+                 by a variate-independent scalar, a `superpose` of such, and a \
+                 `Lebesgue` over `reals` or an `interval` are derived",
+            )
+        })?;
+        rates.push(rate);
+    }
+    let rates = build_call(m, "vector", &rates);
+    m.set_type(
+        rates,
+        Type::Array {
+            shape: Box::new([Dim::Static(bins_count as u32)]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+    );
+    let poisson = m.intern("Poisson");
+    let rate = m.intern("rate");
+    let per_bin = family_per_cell(m, poisson, &[(rate, rates)], v);
+    Ok(build_call(m, "sum", &[per_bin]))
+}
+
+/// Whether an atom-bearing leaf, a `Dirac` or a law over the integers, sits under
+/// the `superpose`/`weighted` structure [`bin_mass`] walks.
+fn intensity_has_atom(m: &Module, measure: NodeId) -> bool {
+    let (node, _) = resolve_ref(m, measure);
+    if let Some(c) = expect_builtin_call(m, node, "superpose") {
+        return c.args.iter().any(|&part| intensity_has_atom(m, part));
+    }
+    if let Some(c) = expect_builtin_call(m, node, "weighted").filter(|c| c.args.len() == 2) {
+        return intensity_has_atom(m, c.args[1]);
+    }
+    builtin_name(m, node) == Some("Dirac")
+        || matches!(
+            m.type_of(node),
+            Some(Type::Measure { domain, .. }) if matches!(**domain, Type::Scalar(ScalarType::Integer))
+        )
+}
+
+/// The edge nodes of a one-dimensional `bins`: a written vector's elements, or
+/// `get0` of each position of a static-length vector.
+fn bin_edges(m: &mut Module, bins: NodeId) -> Option<Vec<NodeId>> {
+    let (resolved, _) = resolve_ref_chain(m, bins);
+    if let Some(c) = expect_builtin_call(m, resolved, "vector") {
+        return Some(c.args.to_vec());
+    }
+    let len = static_array_variate_len(m, bins)?;
+    Some(
+        (0..len)
+            .map(|j| {
+                let j = m.alloc(Node::Lit(Scalar::Int(j.into())));
+                build_call(m, "get0", &[bins, j])
+            })
+            .collect(),
+    )
+}
+
+/// The mass $\mu([lo, hi])$ of the intensity `measure` on one bin, or `None` when
+/// no rule applies. Each rule is a §06 identity: `superpose` adds masses,
+/// `weighted` by a variate-independent `w` scales them by `w`, `Lebesgue` measures
+/// the overlap's length, and an atomless leaf ([`is_atomless_scalar_leaf`]) gives
+/// its CDF difference. The constructor's interval mass is a
+/// [`flatppl_core::LOG_INTERVAL_MASS`] placeholder, lowered per target later.
+///
+/// Every rule holds for a closed or a half-open bin alike only because no measure
+/// it admits has an atom. A discrete intensity and a `Dirac` are refused for that
+/// reason: §07 `bincounts` puts an atom on an inner edge in the upper bin.
+fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<NodeId> {
+    let (node, _) = resolve_ref(m, measure);
+
+    if let Some(parts) = expect_builtin_call(m, node, "superpose")
+        .filter(|c| !c.args.is_empty())
+        .map(|c| c.args.to_vec())
+    {
+        let mut masses = Vec::with_capacity(parts.len());
+        for part in parts {
+            masses.push(bin_mass(m, part, lo, hi)?);
+        }
+        return Some(fold_add(m, &masses));
+    }
+
+    if let Some((w, base)) = expect_builtin_call(m, node, "weighted")
+        .filter(|c| c.args.len() == 2)
+        .map(|c| (c.args[0], c.args[1]))
+    {
+        if weight_is_variate_dependent(m, w) {
+            return None;
+        }
+        let inner = bin_mass(m, base, lo, hi)?;
+        return Some(build_call(m, "mul", &[w, inner]));
+    }
+
+    // The bin's overlap with an `interval(a, b)`, or the whole bin over `reals`.
+    let overlap = |m: &mut Module, set: NodeId| -> Option<(NodeId, Option<(NodeId, NodeId)>)> {
+        let (set, _) = resolve_ref_chain(m, set);
+        let (lo, hi, bounds) = if matches!(m.node(set), Node::Const(s) if m.resolve(*s) == "reals")
+        {
+            (lo, hi, None)
+        } else {
+            let c = expect_builtin_call(m, set, "interval").filter(|c| c.args.len() == 2)?;
+            let (a, b) = (c.args[0], c.args[1]);
+            let lo = build_call(m, "max", &[lo, a]);
+            let hi = build_call(m, "min", &[hi, b]);
+            (lo, hi, Some((a, b)))
+        };
+        let width = build_call(m, "sub", &[hi, lo]);
+        let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        Some((build_call(m, "max", &[width, zero]), bounds))
+    };
+
+    if let Some(support) =
+        expect_builtin_call(m, node, "Lebesgue").and_then(|c| named_or_positional(m, c, "support"))
+    {
+        return overlap(m, support).map(|(width, _)| width);
+    }
+
+    // §08 `Uniform(support)` is flat on its support, so a bin gets its share of
+    // the support's length. No target needs a `Uniform` CDF for this.
+    if let Some(support) =
+        expect_builtin_call(m, node, "Uniform").and_then(|c| named_or_positional(m, c, "support"))
+    {
+        let (width, (a, b)) = match overlap(m, support)? {
+            (width, Some(bounds)) => (width, bounds),
+            (_, None) => return None,
+        };
+        let length = build_call(m, "sub", &[b, a]);
+        return Some(build_call(m, "divide", &[width, length]));
+    }
+
+    if is_atomless_scalar_leaf(m, node) {
+        let log_mass = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[node, lo, hi]);
+        return Some(build_call(m, "exp", &[log_mass]));
+    }
+    None
 }
 
 /// `logdensityof(Lebesgue(support = S), v)` = `0` on `S`, `−inf` outside.

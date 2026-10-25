@@ -315,6 +315,8 @@ pub(crate) fn lower_builtin(
             crate::order::OrderStatistic::Quantile,
         )),
         "fill" => lower_fill(e, id, args),
+        "linspace" => lower_linspace(e, id, args, false),
+        "extlinspace" => lower_linspace(e, id, args, true),
         "zeros" | "ones" | "eye" => {
             let [_] = args_exact(id, args)?;
             let (ty, _) = e.node_ty(id)?;
@@ -2343,6 +2345,67 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
     }
     let x = e.convert(&x, kind);
     Ok(e.fill_cell(&x, ty))
+}
+
+/// §07 `linspace(from, to, n)`: `n` evenly spaced reals with both ends included,
+/// and `extlinspace` is `cat([-inf], linspace(from, to, n), [inf])`. The count is
+/// static from the result type. Both ends are selected exactly, so no rounding of
+/// the step moves them. `n = 1` is `[from]` when `from == to`, and `[NaN]`
+/// otherwise.
+fn lower_linspace(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    overflow: bool,
+) -> Result<Value, EmitError> {
+    let [from, to, _] = args_exact(id, args)?;
+    let total = match e.node_ty(id)?.0 {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+        _ => None,
+    };
+    let n = total
+        .and_then(|total| total.checked_sub(if overflow { 2 } else { 0 }))
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| EmitError::at(id, "linspace requires a static point count"))?;
+    let from = e.lower_node(from)?;
+    let to = e.lower_node(to)?;
+    if from.ty != MlirTy::Scalar || to.ty != MlirTy::Scalar {
+        return Err(EmitError::at(
+            id,
+            "linspace: batched end points are not supported",
+        ));
+    }
+    let from = e.convert(&from, ElemKind::Real);
+    let to = e.convert(&to, ElemKind::Real);
+    let points = if n == 1 {
+        // §07 requires `from == to`. Infer checks written ends; runtime ends
+        // poison the point with NaN, as an undefined interval mass does.
+        let equal = e.compare("EQ", &from, &to);
+        let nan = e.scalar(f64::NAN);
+        let point = e.select(&equal, &from, &nan);
+        e.vector(&[point])
+    } else {
+        let index = e.index_vector(n, true);
+        let index = e.convert(&index, ElemKind::Real);
+        let width = e.sub(&to, &from);
+        let last = e.scalar((n - 1) as f64);
+        let step = e.div(&width, &last);
+        let offset = e.mul(&index, &step);
+        let points = e.add(&offset, &from);
+        let at_end = e.compare("EQ", &index, &last);
+        let points = e.select(&at_end, &to, &points);
+        let zero = e.scalar(0.0);
+        let at_start = e.compare("EQ", &index, &zero);
+        e.select(&at_start, &from, &points)
+    };
+    if !overflow {
+        return Ok(points);
+    }
+    let low = e.scalar(f64::NEG_INFINITY);
+    let low = e.vector(&[low]);
+    let high = e.scalar(f64::INFINITY);
+    let high = e.vector(&[high]);
+    e.concatenate(id, &[low, points, high])
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
