@@ -94,6 +94,104 @@ fn ordered_and_zerosum_domains_report_their_length() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn renamed_kernel_inputs_report_the_bound_values_support() -> Result<(), Box<dyn std::error::Error>>
+{
+    let rows = bindings(
+        "s ~ Exponential(rate = 1.0)
+y ~ Normal(mu = 0.0, sigma = s)
+K = kernelof(record(y = y), a = s)
+L = likelihoodof(K, record(y = 0.5))
+",
+    )?;
+    let inputs = json!([{"name": "a", "domain": {"set": "nonnegreals"}}]);
+    assert_eq!(rows["K"]["inputs"], inputs);
+    assert_eq!(rows["L"]["inputs"], inputs);
+    assert_eq!(rows["s"]["inputs"], Value::Null);
+    Ok(())
+}
+
+#[test]
+fn record_kernel_inputs_report_the_record_domain() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings(
+        "p = elementof(cartprod(a = reals, b = posreals))
+K = functionof(Normal(mu = p.a, sigma = p.b), p)
+",
+    )?;
+    assert_eq!(
+        rows["K"]["inputs"],
+        json!([{"name": "p", "domain": {"set": "record", "fields": [
+            {"name": "a", "set": {"set": "reals"}},
+            {"name": "b", "set": {"set": "posreals"}},
+        ]}}])
+    );
+    Ok(())
+}
+
+#[test]
+fn pyhf_likelihood_inputs_are_its_traced_parameters() -> Result<(), Box<dyn std::error::Error>> {
+    let source = serde_json::json!({
+        "channels": [{"name": "c", "samples": [
+            {"name": "s", "data": [5.0, 10.0],
+             "modifiers": [{"name": "mu", "type": "normfactor", "data": null}]},
+            {"name": "b", "data": [50.0, 60.0],
+             "modifiers": [{"name": "gamma", "type": "shapesys", "data": [5.0, 6.0]}]}]}],
+        "observations": [{"name": "c", "data": [52.0, 63.0]}],
+        "measurements": [{"name": "m", "config": {"poi": "mu"}}],
+        "version": "1.0.0"
+    })
+    .to_string();
+    let mut context = Context::default();
+    let model = context.import_pyhf(&source, &flatppl_host::PyhfOptions::default(), None, None)?;
+    let rows = serde_json::to_value(model.bindings())?;
+    let likelihood = rows
+        .as_array()
+        .ok_or("bindings are a list")?
+        .iter()
+        .find(|row| row["name"] == "likelihood")
+        .ok_or("no likelihood")?;
+    let names: Vec<_> = likelihood["inputs"]
+        .as_array()
+        .ok_or("inputs are a list")?
+        .iter()
+        .map(|input| input["name"].as_str().unwrap_or_default())
+        .collect();
+    // The likelihood's own interface order, as its type shows it.
+    assert_eq!(
+        likelihood["value_type"],
+        "likelihood(gamma, mu) over real[4]"
+    );
+    assert_eq!(names, ["gamma", "mu"]);
+    assert_eq!(
+        likelihood["inputs"][0]["domain"],
+        json!({"set": "cartpow", "of": {"set": "posreals"}, "shape": [2]})
+    );
+    assert_eq!(likelihood["inputs"][1]["domain"], json!({"set": "reals"}));
+    Ok(())
+}
+
+#[test]
+fn measure_domains_report_their_support() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = bindings(
+        "theta ~ Normal(mu = 0.0, sigma = 1.0)
+s ~ Exponential(rate = 1.0)
+y ~ Normal(mu = theta, sigma = s)
+prior = lawof(record(theta = theta, s = s))
+L = likelihoodof(kernelof(record(y = y), theta = theta, s = s), record(y = 1.0))
+posterior = bayesupdate(L, prior)
+",
+    )?;
+    let support = json!({"set": "record", "fields": [
+        {"name": "theta", "set": {"set": "reals"}},
+        {"name": "s", "set": {"set": "nonnegreals"}},
+    ]});
+    assert_eq!(rows["s"]["domain"], json!({"set": "nonnegreals"}));
+    assert_eq!(rows["prior"]["domain"], support);
+    assert_eq!(rows["posterior"]["domain"], support);
+    assert_eq!(rows["L"]["domain"], json!({"set": "unknown"}));
+    Ok(())
+}
+
+#[test]
 fn dependencies_follow_private_bindings_and_module_aliases()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();

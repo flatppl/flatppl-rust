@@ -9484,6 +9484,11 @@ pub(crate) fn call_valueset(
         // un-substituted body set when substitution binds nothing or yields no
         // finer set.
         let callee_node = *callee_node;
+        // `ksuperpose(kernel, w)(...)` sums components of one kernel, so its
+        // support is that kernel's output support (§06).
+        if let Some(kernel) = ksuperpose_kernel(inf, callee_node) {
+            return Ready(kernel_support(inf, kernel));
+        }
         let step = substituted_result(inf, callee_node, args, named, targets, false);
         return step.map(inf, move |inf, sub| {
             if let Some((_, vs)) = sub
@@ -9560,18 +9565,100 @@ pub(crate) fn call_valueset(
         "lawof" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // `relabel` names the variate's entries without moving any (§06).
+        "relabel" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // The point mass at `value` lies in `value`'s set.
+        "Dirac" => named_or_positional_node(inf.module, named, args, "value", 0)
+            .map_or(ValueSet::Unknown, |n| inf.lookup_valueset(n)),
+        // §06: the product measure's variate is the `cat` of the components', or a
+        // record of them by name, so its support is the product of their supports.
+        "joint" if matches!(ty, Type::Measure { .. }) => joint_support(inf, args, named),
+        // §06: the variate is the `cat` (or record) of the first measure's and
+        // each kernel's output variates, as with `joint`.
+        "jointchain" if matches!(ty, Type::Measure { .. }) => {
+            let mut parts: Vec<ValueSet> = Vec::with_capacity(args.len().max(named.len()));
+            let mut names = Vec::with_capacity(named.len());
+            let components: Vec<(Option<Symbol>, NodeId, Type)> = if named.is_empty() {
+                args.iter().map(|(n, t, _)| (None, *n, t.clone())).collect()
+            } else {
+                named
+                    .iter()
+                    .map(|(s, n, t, _)| (Some(*s), *n, t.clone()))
+                    .collect()
+            };
+            for (index, (name, node, component_ty)) in components.into_iter().enumerate() {
+                let set = if index == 0 {
+                    support_or_natural(inf, node, &component_ty)
+                } else {
+                    kernel_support(inf, node)
+                };
+                if set == ValueSet::Unknown {
+                    return Ready(ValueSet::Unknown);
+                }
+                parts.push(set);
+                names.extend(name);
+            }
+            product_support(parts, &names)
+        }
+        // §06: each trajectory entry is a draw from the kernel.
+        "markovchain" | "kscan" => match (
+            args.first()
+                .map_or(ValueSet::Unknown, |(n, _, _)| kernel_support(inf, *n)),
+            ty,
+        ) {
+            (ValueSet::Unknown, _) => ValueSet::Unknown,
+            (cell, Type::Measure { domain, .. }) => match domain.as_ref() {
+                Type::Array { shape, .. } if shape.len() == 1 => {
+                    ValueSet::CartPow(Box::new(cell), shape[0])
+                }
+                Type::Table { nrows, .. } => ValueSet::CartPow(Box::new(cell), *nrows),
+                _ => ValueSet::Unknown,
+            },
+            _ => ValueSet::Unknown,
+        },
+        // The image of a general function is not known statically.
+        "pushfwd" => ValueSet::Unknown,
+        // A sum of measures is supported on the union of their supports.
+        "superpose" if matches!(ty, Type::Measure { .. }) => {
+            let sets: Vec<ValueSet> = args
+                .iter()
+                .map(|(n, t, _)| support_or_natural(inf, *n, t))
+                .collect();
+            join_scalar_sets(&sets).unwrap_or(ValueSet::Unknown)
+        }
         "truncate" => {
-            // Sound superset: the truncated support lies inside S.
+            // The truncated support lies inside both S and supp(M).
+            let base = args
+                .first()
+                .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n));
             match set_expr_valueset(inf, args.get(1).map(|a| a.0)) {
-                ValueSet::Unknown => args
-                    .first()
-                    .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
-                set => set,
+                ValueSet::Unknown => base,
+                set => intersect_intervals(&set, &base).unwrap_or(set),
             }
         }
-        // Reweighting never grows the support.
-        "normalize" | "bayesupdate" => args
+        // A record literal lies in the product of its field sets, so
+        // `lawof(record(a = a, b = b))` is the product of the draws' supports.
+        // A field with no tighter set keeps its type's natural extent.
+        "record" if args.is_empty() && !named.is_empty() => {
+            let mut fields = Vec::with_capacity(named.len());
+            for (name, node, field_ty, _) in named {
+                let set = support_or_natural(inf, *node, field_ty);
+                if set == ValueSet::Unknown {
+                    return Ready(ValueSet::Unknown);
+                }
+                fields.push((*name, set));
+            }
+            ValueSet::RecordSet(fields.into())
+        }
+        // Reweighting never grows the support. `bayesupdate(L, prior)` keeps
+        // the prior's.
+        "normalize" => args
             .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        "bayesupdate" => args
+            .get(1)
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
         "weighted" | "logweighted" | "tilt" => args
             .get(1)
@@ -9672,6 +9759,136 @@ pub(crate) fn call_valueset(
             }
         }
     })
+}
+
+/// A node's value set, or for a measure its support, falling back to the
+/// natural extent of its type.
+fn support_or_natural(inf: &Inferencer<'_, '_>, node: NodeId, ty: &Type) -> ValueSet {
+    match inf.lookup_valueset(node) {
+        ValueSet::Unknown | ValueSet::Deferred => ValueSet::natural_of(ty),
+        set => set,
+    }
+}
+
+/// The support of `joint(...)` (§06): a record of the named components'
+/// supports, the merged fields of record components, or the positional
+/// product of scalar or vector components, which `cat` concatenates.
+fn joint_support(inf: &Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> ValueSet {
+    if !named.is_empty() {
+        let mut fields = Vec::with_capacity(named.len());
+        for (name, node, ty, _) in named {
+            match support_or_natural(inf, *node, ty) {
+                ValueSet::Unknown => return ValueSet::Unknown,
+                set => fields.push((*name, set)),
+            }
+        }
+        return ValueSet::RecordSet(fields.into());
+    }
+    let sets: Vec<ValueSet> = args
+        .iter()
+        .map(|(n, t, _)| support_or_natural(inf, *n, t))
+        .collect();
+    product_support(sets, &[])
+}
+
+/// The product of component supports: a record when `names` names every
+/// component, the merged fields of record components, or the positional
+/// product, which `cat` concatenates (§06 `joint`).
+fn product_support(sets: Vec<ValueSet>, names: &[Symbol]) -> ValueSet {
+    if sets.is_empty() || sets.contains(&ValueSet::Unknown) {
+        return ValueSet::Unknown;
+    }
+    if names.len() == sets.len() {
+        return ValueSet::RecordSet(names.iter().copied().zip(sets).collect());
+    }
+    if sets.iter().all(|s| matches!(s, ValueSet::RecordSet(_))) {
+        let fields: Vec<_> = sets
+            .into_iter()
+            .flat_map(|s| match s {
+                ValueSet::RecordSet(fields) => fields.to_vec(),
+                _ => Vec::new(),
+            })
+            .collect();
+        return ValueSet::RecordSet(fields.into());
+    }
+    ValueSet::CartProd(sets.into())
+}
+
+/// A kernel's output support: its reified body's support, or the §08 support
+/// of a bare distribution constructor used as a kernel.
+fn kernel_support(inf: &mut Inferencer<'_, '_>, node: NodeId) -> ValueSet {
+    if let Some(body) = reified_body(inf, node) {
+        return inf.lookup_valueset(body);
+    }
+    match ksuperpose_constructor_name(inf, node) {
+        Some(name) => distribution_support(inf, &name, &[], &[]),
+        None => ValueSet::Unknown,
+    }
+}
+
+/// The kernel argument of a `ksuperpose(kernel, w)` callee, following refs.
+fn ksuperpose_kernel(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
+    for _ in 0..64 {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "ksuperpose") =>
+            {
+                return c.args.first().copied();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `a ∩ b` when both are intervals or named real sets, elementwise through
+/// matching `cartpow`, `cartprod` and records. `None` where the §03 vocabulary
+/// has no form for the intersection; the caller then keeps the truncation set.
+fn intersect_intervals(a: &ValueSet, b: &ValueSet) -> Option<ValueSet> {
+    use ValueSet::*;
+    fn limits(set: &ValueSet) -> Option<(f64, f64)> {
+        match set {
+            Reals => Some((f64::NEG_INFINITY, f64::INFINITY)),
+            PosReals | NonNegReals => Some((0.0, f64::INFINITY)),
+            UnitInterval => Some((0.0, 1.0)),
+            Interval(lo, hi) => Some((*lo, *hi)),
+            _ => None,
+        }
+    }
+    if a.subset_of(b) {
+        return Some(a.clone());
+    }
+    if b.subset_of(a) {
+        return Some(b.clone());
+    }
+    match (a, b) {
+        (CartPow(x, n), CartPow(y, m)) if n == m => {
+            Some(CartPow(Box::new(intersect_intervals(x, y)?), *n))
+        }
+        (CartProd(xs), CartProd(ys)) if xs.len() == ys.len() => xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(x, y)| intersect_intervals(x, y))
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| CartProd(parts.into())),
+        (RecordSet(xs), RecordSet(ys))
+            if xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| x.0 == y.0) =>
+        {
+            xs.iter()
+                .zip(ys.iter())
+                .map(|(x, y)| intersect_intervals(&x.1, &y.1).map(|s| (x.0, s)))
+                .collect::<Option<Vec<_>>>()
+                .map(|fields| RecordSet(fields.into()))
+        }
+        _ => {
+            let ((a_lo, a_hi), (b_lo, b_hi)) = (limits(a)?, limits(b)?);
+            let (lo, hi) = (a_lo.max(b_lo), a_hi.min(b_hi));
+            (lo <= hi).then_some(Interval(lo, hi))
+        }
+    }
 }
 
 /// The leading dim of a rank-1 array result, drilling through a measure wrapper

@@ -34,6 +34,48 @@ fn lower(src: &str) -> String {
     flatppl_flatpir::write(&out)
 }
 
+/// `pir` with each record value-set field `(%field name set)` cut to
+/// `(%field name)`, inside every `cartprod`.
+fn without_record_set_fields(pir: &str) -> String {
+    // The end of the balanced form that opens at byte `start`.
+    fn close(text: &str, start: usize) -> usize {
+        let mut depth = 0;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return start + i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        text.len()
+    }
+    let mut out = String::with_capacity(pir.len());
+    let mut rest = pir;
+    while let Some(at) = rest.find("(cartprod ") {
+        out.push_str(&rest[..at]);
+        let end = close(rest, at);
+        let mut form = &rest[at..end];
+        let mut cut = String::new();
+        while let Some(field) = form.find("(%field ") {
+            cut.push_str(&form[..field]);
+            let field_end = close(form, field);
+            let name = form[field + 8..].split_whitespace().next().unwrap_or("");
+            cut.push_str(&format!("(%field {name})"));
+            form = &form[field_end..];
+        }
+        cut.push_str(form);
+        out.push_str(&cut);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn refusal(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -447,7 +489,11 @@ fn the_two_shared_argument_spellings_agree_component_for_component() {
     );
     // Everything else agrees character for character, including both `scale`
     // slices and both weight reads.
-    let lp = |pir: &str| pir_binding(pir, "lp").replace(SHARED_SELECTION, SHARED_LITERAL);
+    // The §11 value-set slot is metadata: a literal field carries its singleton
+    // set, a selected one its natural extent, and the lowering is the same.
+    let lp = |pir: &str| {
+        without_record_set_fields(&pir_binding(pir, "lp")).replace(SHARED_SELECTION, SHARED_LITERAL)
+    };
     assert_eq!(
         lp(&noncollection),
         lp(&singular),
