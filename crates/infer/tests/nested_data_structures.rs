@@ -38,9 +38,10 @@ fn nested_record_type_and_valueset() {
         ),
         "record-of-record should nest in the type, got:\n{out}"
     );
+    // Each field keeps its own set: a literal real is its singleton interval.
     assert!(
         out.contains(
-            "(cartprod (%field a (cartprod (%field b reals) (%field c integers))) (%field d reals))"
+            "(cartprod (%field a (cartprod (%field b (interval 1.0 1.0)) (%field c posintegers))) (%field d (interval 3.0 3.0)))"
         ),
         "record-of-record should nest in the value-set, got:\n{out}"
     );

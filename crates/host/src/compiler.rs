@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::Constant;
 use crate::export::{Export, emit_query};
-use crate::inspect::{self, BindingKind, Domain};
+use crate::inspect::{self, BindingKind, Domain, InputInfo};
 
 /// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
@@ -140,6 +140,9 @@ pub struct BindingInfo {
     pub column: Option<u32>,
     /// The public bindings this one references directly.
     pub dependencies: Vec<String>,
+    /// A kernel's or likelihood's interface inputs, with the support of the
+    /// value each boundary binds. `None` for other bindings.
+    pub inputs: Option<Vec<InputInfo>>,
 }
 
 /// One binding rendered as mathematics.
@@ -200,6 +203,7 @@ impl LoadedModule {
                     line: position.as_ref().map(|p| p.0),
                     column: position.as_ref().map(|p| p.1),
                     dependencies: inspect::dependencies(module, id),
+                    inputs: inspect::inputs(module, b.rhs),
                 }
             })
             .collect()
