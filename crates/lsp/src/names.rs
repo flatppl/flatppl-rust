@@ -255,7 +255,7 @@ fn is_name_production(name: &str) -> bool {
 ///
 /// §04 "Binding names" gives `^_[A-Za-z]([A-Za-z0-9_]*[A-Za-z0-9])?_$` and
 /// reserves it "for placeholder variables inside `functionof` and `kernelof`".
-fn is_placeholder_form(name: &str) -> bool {
+pub(crate) fn is_placeholder_form(name: &str) -> bool {
     name.len() >= 3
         && name.starts_with('_')
         && name.ends_with('_')
@@ -344,7 +344,8 @@ pub fn callee_ref_end(text: &str, span_start: u32, part: RefPart) -> Option<u32>
 }
 
 /// The name ranges of the `name = value` arguments of a call whose callee
-/// text ends at `callee_end`, past any `)` that closes a parenthesised callee.
+/// text ends at `callee_end`, past any `)` that closes a parenthesised callee
+/// and the `.` of a dot call.
 ///
 /// The IR keeps no span for a keyword, so this walks the argument list and
 /// skips nested brackets, strings and comments. An unexpected shape yields no
@@ -354,7 +355,7 @@ pub fn call_keyword_ranges(text: &str, callee_end: u32) -> Vec<(u32, u32)> {
     let mut at = callee_end;
     let open = loop {
         match next_significant(text, at) {
-            Some((close, b')')) => at = close + 1,
+            Some((skip, b')' | b'.')) => at = skip + 1,
             Some((open, b'(')) => break open,
             _ => return out,
         }

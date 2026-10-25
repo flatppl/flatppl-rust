@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{BindingId, CallHead, Idx, Inputs, NamedKind, Node, NodeId, Ref, RefNs};
+use flatppl_core::{BindingId, Call, CallHead, Idx, Inputs, Node, NodeId, Ref, RefNs};
 
 use crate::capabilities::resolve_ref_def;
 use crate::db::{Catalogues, FileSet, SourceFile};
@@ -300,9 +300,9 @@ fn argument_target_at(
     };
     let (sym, entry) = &entries[index];
     let (name, start, end) = &declared[index];
-    // The source list must agree with the IR, so a shape this code does not
-    // model fails closed.
-    if module.resolve(*sym) != name {
+    // The source text and the IR must agree, so a shape this code does not
+    // model, or a stale span table, fails closed.
+    if module.resolve(*sym) != name || text.get(*start as usize..*end as usize) != Some(name) {
         return None;
     }
     let placeholder = module.resolve(entry.name).to_string();
@@ -379,16 +379,7 @@ fn argument_occurrences(
         end,
     };
 
-    let mut pending = vec![target.reification];
-    let mut visited = HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id)
-            || (id != target.reification
-                && matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
-        {
-            continue;
-        }
-        module.for_each_child(id, |child| pending.push(child));
+    for id in scope_nodes(module, target.reification, false) {
         let Node::Ref(r) = module.node(id) else {
             continue;
         };
@@ -416,30 +407,164 @@ fn argument_occurrences(
         push(at(s + 1, e - 1));
     }
 
-    keyword_call_sites(db, fs, cats, target, &mut push);
+    for loc in callable_uses(db, fs, cats, target).keywords {
+        push(loc);
+    }
     if include_declaration {
         push(at(target.declaration.0, target.declaration.1));
     }
     out
 }
 
-/// The `name = value` keywords that pass the target argument by name, at every
-/// call across the bundle whose callee resolves to the target's callable.
+/// The nodes of `reification`'s body, without the bodies of nested
+/// reifications unless `nested`. §04 "Placeholders and holes" scopes a
+/// placeholder to its nearest enclosing reification.
+fn scope_nodes(module: &flatppl_core::Module, reification: NodeId, nested: bool) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut pending = vec![reification];
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id)
+            || (!nested
+                && id != reification
+                && matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
+        {
+            continue;
+        }
+        module.for_each_child(id, |child| pending.push(child));
+        out.push(id);
+    }
+    out
+}
+
+/// Refuse an argument rename that would change what the callable means or
+/// leave a call behind.
+fn check_argument_rename(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    t: &ArgumentTarget,
+    new_name: &str,
+) -> Result<(), Refusal> {
+    let module = parse(db, t.file)
+        .module(db)
+        .ok_or_else(|| Refusal("the defining file does not parse".to_string()))?;
+    let Node::Call(Call {
+        inputs: Some(Inputs::Spec(entries)),
+        ..
+    }) = module.node(t.reification)
+    else {
+        return Err(Refusal("the callable has no ordered inputs".to_string()));
+    };
+    if entries
+        .iter()
+        .any(|(sym, _)| module.resolve(*sym) == new_name)
+    {
+        return Err(Refusal(format!(
+            "`{new_name}` is already an input of this callable; a repeated input name is \
+             a static error (spec §04 \"Reification to functions and kernels\")"
+        )));
+    }
+    if t.boundary_value.is_some() {
+        let placeholder = format!("_{new_name}_");
+        if !names::is_placeholder_form(&placeholder) {
+            return Err(Refusal(format!(
+                "the placeholder would become `{placeholder}`, which is not the spec §04 \
+                 placeholder form `_name_`"
+            )));
+        }
+        let is_placeholder =
+            |r: &Ref| matches!(r.ns, RefNs::Local) && module.resolve(r.name) == placeholder;
+        if entries.iter().any(|(_, r)| is_placeholder(r))
+            || scope_nodes(module, t.reification, false)
+                .into_iter()
+                .any(|id| matches!(module.node(id), Node::Ref(r) if is_placeholder(r)))
+        {
+            return Err(Refusal(format!(
+                "`{placeholder}` is already a placeholder of this callable, so the rename \
+                 would merge two inputs (spec §04 \"Placeholders and holes\")"
+            )));
+        }
+    } else if module.boundary_spans_of(t.reification).is_none() {
+        // A sugar body spells the argument by its surface name, so the new name
+        // would capture a free reference, nested bodies included.
+        let captures = scope_nodes(module, t.reification, true)
+            .into_iter()
+            .any(|id| match module.node(id) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                })
+                | Node::Ref(Ref {
+                    ns: RefNs::Module(name),
+                    ..
+                })
+                | Node::Const(name) => module.resolve(*name) == new_name,
+                _ => false,
+            });
+        if captures {
+            return Err(Refusal(format!(
+                "the callable's body already refers to `{new_name}`, which the renamed \
+                 argument would capture (spec §05 \"Lambda syntax\": arguments shadow \
+                 module-level bindings)"
+            )));
+        }
+    }
+    if let Some(at) = callable_uses(db, fs, cats, t).escape {
+        let line = line_of(db, fs, &at);
+        return Err(Refusal(format!(
+            "the callable is used as a value at {}:{line}, where the rename cannot follow \
+             calls that pass `{}` by name",
+            at.path, t.name
+        )));
+    }
+    Ok(())
+}
+
+/// The 1-based line of `loc` in its file of the bundle.
+fn line_of(db: &dyn salsa::Database, fs: FileSet, loc: &NameLoc) -> usize {
+    fs.files(db)
+        .iter()
+        .find(|f| *f.path(db) == loc.path)
+        .map_or(0, |f| {
+            f.text(db)[..loc.start as usize].matches('\n').count() + 1
+        })
+}
+
+/// Builtins that apply their first argument, a callable, positionally and
+/// expose none of its input names: spec §06 `pushfwd`, `weighted` and
+/// `logweighted`, §04 `reduce` and `scan`.
+const POSITIONAL_CONSUMERS: &[&str] = &["pushfwd", "weighted", "logweighted", "reduce", "scan"];
+
+/// How the target's callable is used across the bundle.
+struct CallableUses {
+    /// The `name = value` keywords that pass the target argument by name.
+    keywords: Vec<NameLoc>,
+    /// The first use as a value that a rename cannot follow.
+    escape: Option<NameLoc>,
+}
+
+/// Find the keywords that pass the target argument by name, and any use of
+/// the callable as a value.
 ///
-/// §04 "Reification to functions and kernels" lets a call pass an input by its
+/// §04 lets a call, and `broadcast(f, name = array)`, pass an input by its
 /// name, so a rename that left `f(a = 2)` behind would leave `f` without a
 /// parameter `a`. The callable is each binding whose RHS is the reification,
-/// plus each binding that aliases one (`g = f`), across files, plus the
-/// reification itself as an inline callee.
-fn keyword_call_sites(
+/// each binding that aliases one (`g = f`), across files, and the reification
+/// itself as an inline callee. Any other use, such as a record field or a user
+/// function argument, can reach a keyword call this walk cannot see.
+fn callable_uses(
     db: &dyn salsa::Database,
     fs: FileSet,
     cats: Catalogues,
     target: &ArgumentTarget,
-    push: &mut impl FnMut(NameLoc),
-) {
+) -> CallableUses {
+    let mut uses = CallableUses {
+        keywords: Vec::new(),
+        escape: None,
+    };
     let Some(module) = parse(db, target.file).module(db) else {
-        return;
+        return uses;
     };
     let mut callables: HashSet<(SourceFile, BindingId)> = module
         .bindings()
@@ -486,44 +611,88 @@ fn keyword_call_sites(
             continue;
         };
         let text = f.text(db);
+        let path = f.path(db);
+        // The end of the callee text when `id` is the callable.
+        let callee_end = |id: NodeId| {
+            let span = module.span_of(id)?;
+            if f == target.file && id == target.reification {
+                return Some(span.end);
+            }
+            let part = callable_ref(f, module, id, &callables)?;
+            names::callee_ref_end(text, span.start, part)
+        };
+        let mut followed: HashSet<NodeId> = module.bindings().map(|(_, b)| b.rhs).collect();
         for i in 0..module.node_count() {
-            let Node::Call(call) = module.node(NodeId::from_usize(i)) else {
+            let id = NodeId::from_usize(i);
+            let Node::Call(call) = module.node(id) else {
                 continue;
             };
-            let CallHead::User(callee) = call.head else {
-                continue;
+            let (callee, forwards) = match call.head {
+                CallHead::User(callee) => (callee, true),
+                CallHead::Builtin(head) => {
+                    let head = module.resolve(head);
+                    let Some(&first) = call.args.first() else {
+                        continue;
+                    };
+                    if head == "broadcast" {
+                        (first, true)
+                    } else if POSITIONAL_CONSUMERS.contains(&head) {
+                        (first, false)
+                    } else {
+                        continue;
+                    }
+                }
             };
-            if !call
-                .named
-                .iter()
-                .any(|arg| arg.kind == NamedKind::Kwarg && module.resolve(arg.name) == target.name)
+            followed.insert(callee);
+            if !forwards
+                || !call
+                    .named
+                    .iter()
+                    .any(|arg| module.resolve(arg.name) == target.name)
             {
                 continue;
             }
-            let Some(span) = module.span_of(callee) else {
+            let Some(end) = callee_end(callee) else {
                 continue;
             };
-            // An inline callee is the reification itself: `(a -> …)(a = 2)`.
-            let callee_end = if f == target.file && callee == target.reification {
-                Some(span.end)
-            } else {
-                callable_ref(f, module, callee, &callables)
-                    .and_then(|part| names::callee_ref_end(text, span.start, part))
+            // `broadcast(f, a = …)` opens its list after the head, `f.(a = …)`
+            // and `f(a = …)` after the callee.
+            let explicit_head = match call.head {
+                CallHead::Builtin(_) => module.span_of(id).and_then(|span| {
+                    let head_end = names::head_ident_end(text, span.start)?;
+                    (&text[span.start as usize..head_end as usize] == "broadcast")
+                        .then_some(head_end)
+                }),
+                CallHead::User(_) => None,
             };
-            let Some(callee_end) = callee_end else {
-                continue;
-            };
-            for (s, e) in names::call_keyword_ranges(text, callee_end) {
+            let open_after = explicit_head.unwrap_or(end);
+            for (s, e) in names::call_keyword_ranges(text, open_after) {
                 if text[s as usize..e as usize] == target.name {
-                    push(NameLoc {
-                        path: f.path(db).clone(),
+                    uses.keywords.push(NameLoc {
+                        path: path.clone(),
                         start: s,
                         end: e,
                     });
                 }
             }
         }
+        if uses.escape.is_none() {
+            uses.escape = (0..module.node_count())
+                .map(NodeId::from_usize)
+                .filter(|id| !followed.contains(id))
+                .find(|&id| {
+                    (f == target.file && id == target.reification)
+                        || callable_ref(f, module, id, &callables).is_some()
+                })
+                .and_then(|id| module.span_of(id))
+                .map(|span| NameLoc {
+                    path: path.clone(),
+                    start: span.start,
+                    end: span.end,
+                });
+        }
     }
+    uses
 }
 
 /// Every occurrence of a module binding's name across the bundle.
@@ -675,16 +844,18 @@ pub fn prepare_rename(
 ///   modules": "A FlatPPL **module** is an unordered set of bindings of names to
 ///   expressions." A second binding of the same name in one module is not such a
 ///   set, so a rename onto an existing name in the defining module refuses.
+/// - **An argument rename that changes the callable or leaves a call behind**, in
+///   [`check_argument_rename`]: a new name that is already an input (§04
+///   "Reification to functions and kernels" makes a repeated input a static
+///   error) or already a placeholder of the reification (§04 "Placeholders and
+///   holes"); a placeholder `_new_` outside the §04 form; a sugar body that
+///   already refers to the new name, which the argument would capture (§05
+///   "Lambda syntax"); and a callable used as a value that a keyword call could
+///   reach unseen.
 ///
 /// Deliberately NOT refused, because no rule forbids them, or because `infer`
 /// reports the consequence precisely:
 ///
-/// - **Renaming an argument onto a sibling.** §04 "Reification to functions and
-///   kernels" makes a repeated boundary input name a static error, and `infer` now
-///   reports it at the reification — "boundary input `b` is declared more than
-///   once" (measured by `duplicate_argument_name_is_diagnosed`). So the rename is
-///   performed and the diagnostic flags the result, rather than the server blocking
-///   a legitimate "rename this, then fix the other argument" edit.
 /// - **Shadowing a built-in with a binding.** §04 "Name resolution": "This makes
 ///   built-in names shadowable: a module may bind any name except for `self` and
 ///   `base`."
@@ -733,6 +904,7 @@ pub fn rename_edits(
             if new_name == t.name {
                 return Ok(Vec::new());
             }
+            check_argument_rename(db, fs, cats, t, new_name)?;
         }
     }
 
@@ -1437,12 +1609,16 @@ mod tests {
             apply(src, &outer, "outer"),
             "f(outer) = a -> add(a, 1)\ny = f(3)"
         );
+        // The returned lambda is a value that `f(3)(a = 2)` could call by
+        // keyword, so its rename refuses. Its references stay in its own scope.
         for cursor in [nth_offset(src, "a ->", 0), nth_offset(src, "add(a", 0) + 4] {
-            let inner = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap();
+            let inner = references(&db, f, fs, cats, cursor, index, true);
             assert_eq!(
                 apply(src, &inner, "inner"),
                 "f(a) = inner -> add(inner, 1)\ny = f(3)"
             );
+            let err = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap_err();
+            assert!(err.0.contains("used as a value"), "{}", err.0);
         }
     }
 
@@ -1462,41 +1638,142 @@ mod tests {
         }
     }
 
-    /// §04 "Reification to functions and kernels" makes a repeated argument name a
-    /// static error, and `infer` reports it (see
-    /// `duplicate_argument_name_is_diagnosed`), so the server performs the edit and
-    /// lets the diagnostic flag the result instead of refusing.
-    #[test]
-    fn rename_an_argument_onto_a_sibling_is_allowed_and_diagnosed() {
-        let src = "f(a, b) = add(a, b)";
+    /// Rename at `cursor`, then check that the result parses and infers clean.
+    fn rename_clean(src: &str, cursor: u32, new_name: &str) -> String {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, index, "b").expect("allowed");
-        let renamed = apply(src, &locs, "b");
-        assert_eq!(renamed, "f(b, b) = add(b, b)");
+        let locs = rename_edits(&db, f, fs, cats, cursor, index, new_name)
+            .unwrap_or_else(|e| panic!("rename refused: {}", e.0));
+        let renamed = apply(src, &locs, new_name);
         let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
         let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("declared more than once")),
-            "the result must be diagnosed; got {:?}",
+            diags.is_empty(),
+            "{renamed}: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        renamed
+    }
+
+    /// The refusal for a rename at `cursor`.
+    fn rename_refusal(src: &str, cursor: u32, new_name: &str) -> String {
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        match rename_edits(&db, f, fs, cats, cursor, index, new_name) {
+            Ok(locs) => panic!("rename allowed: {}", apply(src, &locs, new_name)),
+            Err(e) => e.0,
+        }
+    }
+
+    /// §04 "Reification to functions and kernels" makes a repeated input name a
+    /// static error. Once call-site keywords follow the rename, a merged input
+    /// would also rewrite every call into a duplicate keyword.
+    #[test]
+    fn rename_onto_a_sibling_input_refuses() {
+        for (src, cursor) in [
+            ("f(a, b) = add(a, b)\ny = f(a = 1, b = 2)", 2),
+            (
+                "f = functionof(sub(_a_, _x_), a = _a_, b = _x_)\ny = f(a = 1, b = 2)",
+                30,
+            ),
+        ] {
+            let err = rename_refusal(src, cursor, "b");
+            assert!(err.contains("already an input"), "{err}");
+        }
+    }
+
+    /// Renaming `a` to `x` beside `b = _x_` would merge two inputs into one
+    /// placeholder, and the result would still infer clean.
+    #[test]
+    fn rename_onto_an_existing_placeholder_refuses() {
+        let src = "f = functionof(sub(_a_, _x_), a = _a_, b = _x_)\ny = f(a = 1, b = 2)";
+        let err = rename_refusal(src, nth_offset(src, "a = _a_", 0), "x");
+        assert!(err.contains("`_x_`"), "{err}");
+    }
+
+    /// §04 "Placeholders and holes" scopes a placeholder to its nearest
+    /// reification, so a nested `_z_` does not block the outer rename.
+    #[test]
+    fn rename_onto_a_nested_scope_placeholder_is_allowed() {
+        let src = "f = functionof(add(_a_, sum(broadcast(functionof(mul(_z_, 2.0), z = _z_), \
+                   [1.0]))), a = _a_)\ny = f(a = 1.0)";
+        assert_eq!(
+            rename_clean(src, nth_offset(src, "a = _a_", 0), "z"),
+            "f = functionof(add(_z_, sum(broadcast(functionof(mul(_z_, 2.0), z = _z_), \
+             [1.0]))), z = _z_)\ny = f(z = 1.0)"
         );
     }
 
-    /// The measured basis for allowing the rename above: `infer` flags a repeated
-    /// argument name, so the LSP need not refuse to keep the file legal.
     #[test]
-    fn duplicate_argument_name_is_diagnosed() {
-        let mut m = flatppl_syntax::parse("f(a, a) = add(a, a)").expect("parses");
-        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
-        assert!(
-            diags.iter().any(|d| d
-                .message
-                .contains("boundary input `a` is declared more than once")),
-            "got {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    fn rename_to_an_illegal_placeholder_refuses() {
+        let src = "f = functionof(add(_a_, 1.0), a = _a_)\ny = f(a = 2.0)";
+        let err = rename_refusal(src, nth_offset(src, "a = _a_", 0), "_q");
+        assert!(err.contains("`__q_`"), "{err}");
+    }
+
+    /// The body reads `z` free, so an argument renamed to `z` would capture it.
+    #[test]
+    fn rename_onto_a_free_body_reference_refuses() {
+        for (src, cursor, new_name) in [
+            ("z = 1.0\nf(a) = add(a, z)\ny = f(a = 2.0)", 10, "z"),
+            ("z = 1.0\nw = z\ng = a -> add(a, w)", 0, "w"),
+            (
+                "z = 1.0\nf(a) = add(a, sum(broadcast(b -> add(b, z), [1.0])))\ny = f(a = 2.0)",
+                10,
+                "z",
+            ),
+            ("f(a) = mul(a, pi)\ny = f(a = 2.0)", 2, "pi"),
+        ] {
+            let cursor = if cursor == 0 {
+                nth_offset(src, "a ->", 0)
+            } else {
+                cursor
+            };
+            let err = rename_refusal(src, cursor, new_name);
+            assert!(err.contains("capture"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn rename_onto_an_imported_alias_refuses() {
+        let db = Database::default();
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), "s = 1.0".to_string());
+        let model_src = "m = load_module(\"helpers.flatppl\")\nf(a) = add(a, m.s)";
+        let model = SourceFile::new(&db, "model.flatppl".to_string(), model_src.to_string());
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let cats = Catalogues::new(&db, vec![]);
+        let index = node_span_index(&db, model, fs, cats);
+        let cursor = nth_offset(model_src, "f(a)", 0) + 2;
+        let err = rename_edits(&db, model, fs, cats, cursor, index, "m").unwrap_err();
+        assert!(err.0.contains("capture"), "{}", err.0);
+    }
+
+    /// §04 "Broadcasting" binds `broadcast(f, name = array)` keywords to `f`.
+    #[test]
+    fn rename_an_argument_rewrites_broadcast_keywords() {
+        let src = "f(a) = mul(a, 2.0)\ny = broadcast(f, a = [1.0, 2.0])\nw = f.(a = [3.0])";
+        assert_eq!(
+            rename_clean(src, 2, "z"),
+            "f(z) = mul(z, 2.0)\ny = broadcast(f, z = [1.0, 2.0])\nw = f.(z = [3.0])"
+        );
+    }
+
+    /// A callable stored in a record can be called by keyword through the field,
+    /// which the rename cannot follow, so it refuses instead of leaving the call.
+    #[test]
+    fn rename_refuses_when_the_callable_escapes_into_a_value() {
+        let src = "f(a) = mul(a, 2.0)\ng = record(h = f)\ny = g.h(a = 2.0)";
+        let err = rename_refusal(src, 2, "z");
+        assert!(err.contains("used as a value"), "{err}");
+    }
+
+    /// `pushfwd` applies its function positionally and exposes no input name.
+    #[test]
+    fn rename_allows_a_callable_consumed_by_pushfwd() {
+        let src = "f(a) = mul(a, 2.0)\nm = pushfwd(f, Normal(0.0, 1.0))";
+        assert_eq!(
+            rename_clean(src, 2, "z"),
+            "f(z) = mul(z, 2.0)\nm = pushfwd(f, Normal(0.0, 1.0))"
         );
     }
 
