@@ -107,3 +107,52 @@ fn relabel_and_dirac_keep_their_argument_sets() {
     assert_eq!(support(&mut module, "labelled"), "cartpow(nonnegreals, 2)");
     assert_eq!(support(&mut module, "point"), "interval(2, 2)");
 }
+
+const CHAINS: &str = r#"
+K(t) = LogNormal(mu = t, sigma = 1.0)
+chain = jointchain(Normal(mu = 0.0, sigma = 1.0), K)
+R(r) = Exponential(rate = exp(r.a))
+named = jointchain(a = Normal(mu = 0.0, sigma = 1.0), b = R)
+step(s) = Gamma(shape = s + 1.0, rate = 1.0)
+trajectory = markovchain(step, 1.0, 4)
+mixture = ksuperpose(Exponential, [0.3, 0.7])(rate = [1.0, 2.0])
+"#;
+
+#[test]
+fn jointchain_composes_its_kernels_output_supports() {
+    let mut module = infer(CHAINS);
+    assert_eq!(support(&mut module, "chain"), "cartprod(reals, posreals)");
+    assert_eq!(
+        support(&mut module, "named"),
+        "cartprod(a = reals, b = nonnegreals)"
+    );
+}
+
+#[test]
+fn markovchain_repeats_its_kernels_output_support() {
+    let mut module = infer(CHAINS);
+    assert_eq!(
+        support(&mut module, "trajectory"),
+        "cartpow(nonnegreals, 4)"
+    );
+}
+
+#[test]
+fn ksuperpose_keeps_its_kernels_output_support() {
+    let mut module = infer(CHAINS);
+    assert_eq!(support(&mut module, "mixture"), "nonnegreals");
+}
+
+const TRUNCATIONS: &str = r#"
+below = truncate(Exponential(rate = 1.0), interval(-1.0, 2.0))
+above = truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, inf))
+vector = truncate(iid(Exponential(rate = 1.0), 2), cartpow(interval(-1.0, 3.0), 2))
+"#;
+
+#[test]
+fn truncate_intersects_interval_supports() {
+    let mut module = infer(TRUNCATIONS);
+    assert_eq!(support(&mut module, "below"), "interval(0, 2)");
+    assert_eq!(support(&mut module, "above"), "interval(0, inf)");
+    assert_eq!(support(&mut module, "vector"), "cartpow(interval(0, 3), 2)");
+}
