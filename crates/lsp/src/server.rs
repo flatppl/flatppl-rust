@@ -245,15 +245,25 @@ pub fn run_on(
     // Substituted for `result_rx` while the writer's backlog is full, so the
     // `select!` below waits on the client and the debounce alone.
     let no_results: crossbeam_channel::Receiver<Reply> = crossbeam_channel::never();
+    let panic_tx = result_tx.clone();
     let pool = crate::pool::Pool::new(
         std::thread::available_parallelism()
             .map(|n| n.get().min(4))
             .unwrap_or(2),
         crate::pool::QUEUE_CAPACITY,
+        move |id| {
+            // JSON-RPC 2.0 §5.1 defines -32603 "Internal JSON-RPC error".
+            let _ = panic_tx.send(Reply::Ready(Message::Response(Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                "the server failed while handling this request".to_owned(),
+            ))));
+        },
     );
     // Requests dispatched and not yet answered. JSON-RPC 2.0 §5 requires
-    // exactly one response per request, and four paths can produce one (the
-    // worker, a `$/cancelRequest`, a queue drain, a full queue), so the main
+    // exactly one response per request, and five paths can produce one (the
+    // worker, a worker panic, a `$/cancelRequest`, a queue drain, a full
+    // queue), so the main
     // thread arbitrates: a response goes out only if its id is still here.
     let mut pending: HashSet<RequestId> = HashSet::new();
     // Ids a client `$/cancelRequest` named. A job takes its own id out of this
@@ -767,7 +777,7 @@ const THROTTLE_POLL: Duration = Duration::from_millis(2);
 /// Send `reply`, dropping a duplicate response.
 ///
 /// JSON-RPC 2.0 §5 requires exactly one response per request, and several paths
-/// can produce one for the same id: the worker that ran it, a
+/// can produce one for the same id: the worker that ran it, a worker panic, a
 /// `$/cancelRequest`, a queue drain, a full queue. `pending` is the arbiter —
 /// the first path to claim the id wins and the rest are dropped. Notifications
 /// pass through untouched. A duplicate is dropped *before* its JSON is built,

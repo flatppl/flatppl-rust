@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{BindingId, CallHead, Idx, Inputs, Node, NodeId, Ref, RefNs};
+use flatppl_core::{BindingId, Call, CallHead, Idx, Inputs, Node, NodeId, Ref, RefNs};
 
 use crate::capabilities::resolve_ref_def;
 use crate::db::{Catalogues, FileSet, SourceFile};
@@ -60,6 +60,9 @@ struct ArgumentTarget {
     name: String,
     /// The lowered placeholder the body references, e.g. `_a_`.
     placeholder: String,
+    /// The boundary value of a keyword boundary `a = _a_`, when the rename also
+    /// rewrites the placeholder, which it does when that is spelled `_a_`.
+    boundary_value: Option<(u32, u32)>,
 }
 
 /// Resolve what the cursor at `byte_offset` designates, or refuse with the
@@ -176,11 +179,10 @@ fn resolve_target(
             )
             .ok_or_else(|| {
                 Refusal(format!(
-                    "`{placeholder}` is a placeholder whose declaration site has no \
-                         recorded span: an explicit `functionof`/`kernelof` boundary \
-                         declares it as a keyword argument, which the IR stores without \
-                         a source span, so the rename cannot be applied safely. Renaming \
-                         the argument of a `f(a) = …` definition or a lambda is supported."
+                    "`{placeholder}` is declared by a bare-name `functionof`/`kernelof` \
+                     boundary, which has no keyword to rename. Renaming the argument of \
+                     a keyword boundary (`a = _a_`), a `f(a) = …` definition or a lambda \
+                     is supported."
                 ))
             })
         }
@@ -243,10 +245,11 @@ fn resolve_target(
 ///
 /// Selects the argument either by `placeholder` (when the cursor was on a body
 /// reference) or by the cursor falling inside a declared argument's range (when it
-/// was on the declaration list). Returns `None` when the node is not a
-/// reification with an ordered boundary, when the declaration list cannot be
-/// located in the source, or when the requested argument is not among the
-/// declared ones — every one a reason to fail closed rather than edit.
+/// was on the declaration list). The declaration is the keyword of a keyword
+/// boundary `functionof(…, a = _a_)`, or the surface argument of the two sugar
+/// spellings. Returns `None` when the node is not a reification with an ordered
+/// boundary, when the declarations cannot be located, or when the requested
+/// argument is not among them — every one a reason to fail closed rather than edit.
 fn argument_target_at(
     module: &flatppl_core::Module,
     text: &str,
@@ -270,43 +273,49 @@ fn argument_target_at(
     let Inputs::Spec(entries) = call.inputs.as_ref()? else {
         return None;
     };
-    let reif_span = module.span_of(reification)?;
-    let declared = names::argument_decl_ranges(text, reif_span.start, def_name);
-    if declared.is_empty() {
+    let boundary = module.boundary_spans_of(reification);
+    let declared: Vec<(String, u32, u32)> = match boundary {
+        Some(spans) => entries
+            .iter()
+            .zip(spans)
+            .map(|((sym, _), (keyword, _))| {
+                (module.resolve(*sym).to_string(), keyword.start, keyword.end)
+            })
+            .collect(),
+        None => names::argument_decl_ranges(text, module.span_of(reification)?.start, def_name),
+    };
+    if declared.len() != entries.len() {
         return None;
     }
-    let siblings: Vec<String> = declared.iter().map(|(n, _, _)| n.clone()).collect();
 
-    // The surface name we are after.
-    let name = match placeholder {
-        // A body reference: invert the parser's `_{name}_` lowering. The explicit
-        // boundary spelling (where the body writes `_mu_` itself) does not invert,
-        // and its declaration is an unspanned keyword argument, so it yields None.
-        Some(ph) => {
-            let surface = names::placeholder_surface_name(ph)?;
-            if !siblings.iter().any(|s| s == surface) {
-                return None;
-            }
-            surface.to_string()
-        }
+    let index = match placeholder {
+        // A body reference: the entry that declares this placeholder.
+        Some(ph) => entries
+            .iter()
+            .position(|(_, r)| matches!(r.ns, RefNs::Local) && module.resolve(r.name) == ph)?,
         // A declaration site: the argument whose range contains the cursor.
         None => declared
             .iter()
-            .find(|(_, s, e)| *s <= byte_offset && byte_offset < *e)
-            .map(|(n, _, _)| n.clone())?,
+            .position(|(_, s, e)| *s <= byte_offset && byte_offset < *e)?,
     };
-    // The boundary must actually declare it, so a source list that disagrees with
-    // the IR (a shape this code does not model) fails closed.
-    let entry = entries
-        .iter()
-        .find(|(sym, _)| module.resolve(*sym) == name)?;
-    let (_, start, end) = declared.iter().find(|(n, _, _)| *n == name)?;
+    let (sym, entry) = &entries[index];
+    let (name, start, end) = &declared[index];
+    // The source text and the IR must agree, so a shape this code does not
+    // model, or a stale span table, fails closed.
+    if module.resolve(*sym) != name || text.get(*start as usize..*end as usize) != Some(name) {
+        return None;
+    }
+    let placeholder = module.resolve(entry.name).to_string();
+    let boundary_value = boundary
+        .filter(|_| matches!(entry.ns, RefNs::Local) && placeholder == format!("_{name}_"))
+        .map(|spans| (spans[index].1.start, spans[index].1.end));
     Some(Target::Argument(ArgumentTarget {
         file,
         reification,
         declaration: (*start, *end),
-        placeholder: module.resolve(entry.1.name).to_string(),
-        name,
+        name: name.clone(),
+        placeholder,
+        boundary_value,
     }))
 }
 
@@ -332,13 +341,13 @@ fn occurrences(
 ) -> Vec<NameLoc> {
     match target {
         Target::Binding(t) => binding_occurrences(db, fs, cats, t, include_declaration),
-        Target::Argument(t) => argument_occurrences(db, t, include_declaration),
+        Target::Argument(t) => argument_occurrences(db, fs, cats, t, include_declaration),
     }
 }
 
 /// Every occurrence of an argument name: each `%local` reference to its
-/// placeholder inside the owning reification, plus the declaration site in the
-/// argument list.
+/// placeholder inside the owning reification, each `name = value` keyword at a
+/// call of the callable, plus the declaration site in the argument list.
 ///
 /// Confined to one reification in one file. §04 "Placeholders and holes" gives the
 /// scoping rule — "The scope of a placeholder is the nearest enclosing
@@ -347,6 +356,8 @@ fn occurrences(
 /// reifications even when they declare the same placeholder name.
 fn argument_occurrences(
     db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
     target: &ArgumentTarget,
     include_declaration: bool,
 ) -> Vec<NameLoc> {
@@ -357,27 +368,18 @@ fn argument_occurrences(
     let path = target.file.path(db).clone();
     let mut out: Vec<NameLoc> = Vec::new();
     let mut seen: HashSet<NameLoc> = HashSet::new();
-    let mut push = |start: u32, end: u32| {
-        let loc = NameLoc {
-            path: path.clone(),
-            start,
-            end,
-        };
+    let mut push = |loc: NameLoc| {
         if seen.insert(loc.clone()) {
             out.push(loc);
         }
     };
+    let at = |start: u32, end: u32| NameLoc {
+        path: path.clone(),
+        start,
+        end,
+    };
 
-    let mut pending = vec![target.reification];
-    let mut visited = HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id)
-            || (id != target.reification
-                && matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
-        {
-            continue;
-        }
-        module.for_each_child(id, |child| pending.push(child));
+    for id in scope_nodes(module, target.reification, false) {
         let Node::Ref(r) = module.node(id) else {
             continue;
         };
@@ -390,14 +392,345 @@ fn argument_occurrences(
         // The body writes the SURFACE name for a sugar argument, so the range must
         // match that, not the placeholder. A mismatch fails closed.
         if let Some((s, e)) = names::ref_name_range(text, span.start, RefPart::Head, &target.name) {
-            push(s, e);
+            push(at(s, e));
+        } else if target.boundary_value.is_some()
+            && let Some((s, e)) =
+                names::ref_name_range(text, span.start, RefPart::Head, &target.placeholder)
+        {
+            push(at(s + 1, e - 1));
         }
     }
+    // The inner name of `_a_`, so the rename keeps the placeholder spelling.
+    if let Some((s, e)) = target.boundary_value
+        && text.get(s as usize..e as usize) == Some(target.placeholder.as_str())
+    {
+        push(at(s + 1, e - 1));
+    }
 
+    for loc in callable_uses(db, fs, cats, target).keywords {
+        push(loc);
+    }
     if include_declaration {
-        push(target.declaration.0, target.declaration.1);
+        push(at(target.declaration.0, target.declaration.1));
     }
     out
+}
+
+/// The nodes of `reification`'s body, without the bodies of nested
+/// reifications unless `nested`. §04 "Placeholders and holes" scopes a
+/// placeholder to its nearest enclosing reification.
+fn scope_nodes(module: &flatppl_core::Module, reification: NodeId, nested: bool) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut pending = vec![reification];
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id)
+            || (!nested
+                && id != reification
+                && matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
+        {
+            continue;
+        }
+        module.for_each_child(id, |child| pending.push(child));
+        out.push(id);
+    }
+    out
+}
+
+/// Refuse an argument rename that would change what the callable means or
+/// leave a call behind.
+fn check_argument_rename(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    t: &ArgumentTarget,
+    new_name: &str,
+) -> Result<(), Refusal> {
+    let module = parse(db, t.file)
+        .module(db)
+        .ok_or_else(|| Refusal("the defining file does not parse".to_string()))?;
+    let Node::Call(Call {
+        inputs: Some(Inputs::Spec(entries)),
+        ..
+    }) = module.node(t.reification)
+    else {
+        return Err(Refusal("the callable has no ordered inputs".to_string()));
+    };
+    if entries
+        .iter()
+        .any(|(sym, _)| module.resolve(*sym) == new_name)
+    {
+        return Err(Refusal(format!(
+            "`{new_name}` is already an input of this callable; a repeated input name is \
+             a static error (spec §04 \"Reification to functions and kernels\")"
+        )));
+    }
+    if t.boundary_value.is_some() {
+        let placeholder = format!("_{new_name}_");
+        if !names::is_placeholder_form(&placeholder) {
+            return Err(Refusal(format!(
+                "the placeholder would become `{placeholder}`, which is not the spec §04 \
+                 placeholder form `_name_`"
+            )));
+        }
+        let is_placeholder =
+            |r: &Ref| matches!(r.ns, RefNs::Local) && module.resolve(r.name) == placeholder;
+        if entries.iter().any(|(_, r)| is_placeholder(r))
+            || scope_nodes(module, t.reification, false)
+                .into_iter()
+                .any(|id| matches!(module.node(id), Node::Ref(r) if is_placeholder(r)))
+        {
+            return Err(Refusal(format!(
+                "`{placeholder}` is already a placeholder of this callable, so the rename \
+                 would merge two inputs (spec §04 \"Placeholders and holes\")"
+            )));
+        }
+    } else if module.boundary_spans_of(t.reification).is_none() {
+        // A sugar body spells the argument by its surface name, so the new name
+        // would capture a free reference or a called builtin, nested bodies
+        // included. A head lowered from an operator also counts, which is safe.
+        let captures = scope_nodes(module, t.reification, true)
+            .into_iter()
+            .any(|id| match module.node(id) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                })
+                | Node::Ref(Ref {
+                    ns: RefNs::Module(name),
+                    ..
+                })
+                | Node::Const(name)
+                | Node::Call(Call {
+                    head: CallHead::Builtin(name),
+                    ..
+                }) => module.resolve(*name) == new_name,
+                _ => false,
+            });
+        if captures {
+            return Err(Refusal(format!(
+                "the callable's body already refers to `{new_name}`, which the renamed \
+                 argument would capture (spec §05 \"Lambda syntax\": arguments shadow \
+                 module-level bindings)"
+            )));
+        }
+    }
+    if let Some(at) = callable_uses(db, fs, cats, t).escape {
+        let line = line_of(db, fs, &at);
+        return Err(Refusal(format!(
+            "the callable is used as a value at {}:{line}, where the rename cannot follow \
+             calls that pass `{}` by name",
+            at.path, t.name
+        )));
+    }
+    Ok(())
+}
+
+/// The 1-based line of `loc` in its file of the bundle.
+fn line_of(db: &dyn salsa::Database, fs: FileSet, loc: &NameLoc) -> usize {
+    fs.files(db)
+        .iter()
+        .find(|f| *f.path(db) == loc.path)
+        .map_or(0, |f| {
+            f.text(db)[..loc.start as usize].matches('\n').count() + 1
+        })
+}
+
+/// Builtins that apply their first argument, a callable, and expose none of
+/// its input names (spec §04 "Explicit callback parameters"). `pushfwd`,
+/// `weighted` and `logweighted` pass the whole variate, and `reduce`, `scan`
+/// and `kscan` pass two or more positional arguments.
+const POSITIONAL_CONSUMERS: &[&str] = &[
+    "pushfwd",
+    "weighted",
+    "logweighted",
+    "reduce",
+    "scan",
+    "kscan",
+];
+
+/// Builtins that apply the callables in arguments `from..to` to one value.
+/// §04 "Calling conventions" passes a lone positional argument whole to a
+/// one-input callable, but auto-splats a record into a callable with more
+/// inputs by name. A first `fchain` or `kchain` argument is excluded: it gives
+/// the composite its input names. Other `filter` and `markovchain` arguments
+/// are data, or the §04 callback parameter `p` that the callback receives.
+const ONE_INPUT_APPLIERS: &[(&str, usize, Option<usize>)] = &[
+    ("filter", 0, Some(1)),
+    ("markovchain", 0, Some(1)),
+    ("fchain", 1, None),
+    ("kchain", 1, None),
+    ("jointchain", 1, None),
+];
+
+/// How the target's callable is used across the bundle.
+struct CallableUses {
+    /// The `name = value` keywords that pass the target argument by name.
+    keywords: Vec<NameLoc>,
+    /// The first use as a value that a rename cannot follow.
+    escape: Option<NameLoc>,
+}
+
+/// Find the keywords that pass the target argument by name, and any use of
+/// the callable as a value.
+///
+/// §04 lets a call, and `broadcast(f, name = array)`, pass an input by its
+/// name, so a rename that left `f(a = 2)` behind would leave `f` without a
+/// parameter `a`. The callable is each binding whose RHS is the reification,
+/// each binding that aliases one (`g = f`), across files, and the reification
+/// itself as an inline callee. Any other use, such as a record field or a user
+/// function argument, can reach a keyword call this walk cannot see.
+fn callable_uses(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    target: &ArgumentTarget,
+) -> CallableUses {
+    let mut uses = CallableUses {
+        keywords: Vec::new(),
+        escape: None,
+    };
+    let Some(module) = parse(db, target.file).module(db) else {
+        return uses;
+    };
+    let mut callables: HashSet<(SourceFile, BindingId)> = module
+        .bindings()
+        .filter(|(_, b)| b.rhs == target.reification)
+        .map(|(bid, _)| (target.file, bid))
+        .collect();
+    let one_input = matches!(
+        module.node(target.reification),
+        Node::Call(Call { inputs: Some(Inputs::Spec(entries)), .. }) if entries.len() == 1
+    );
+    // The part of the reference that names the callable, when it is one.
+    let callable_ref =
+        |f: SourceFile, module: &flatppl_core::Module, id: NodeId, set: &HashSet<_>| {
+            let Node::Ref(r) = module.node(id) else {
+                return None;
+            };
+            let part = match r.ns {
+                RefNs::Local => return None,
+                RefNs::Module(_) => RefPart::Member,
+                RefNs::SelfMod => RefPart::Head,
+            };
+            resolve_ref_def(db, f, fs, cats, module, r)
+                .filter(|def| set.contains(def))
+                .map(|_| part)
+        };
+    loop {
+        let mut aliases = Vec::new();
+        for &f in fs.files(db) {
+            let Some(module) = parse(db, f).module(db) else {
+                continue;
+            };
+            for (bid, b) in module.bindings() {
+                if !callables.contains(&(f, bid))
+                    && callable_ref(f, module, b.rhs, &callables).is_some()
+                {
+                    aliases.push((f, bid));
+                }
+            }
+        }
+        if aliases.is_empty() {
+            break;
+        }
+        callables.extend(aliases);
+    }
+
+    for &f in fs.files(db) {
+        let Some(module) = parse(db, f).module(db) else {
+            continue;
+        };
+        let text = f.text(db);
+        let path = f.path(db);
+        // The end of the callee text when `id` is the callable.
+        let callee_end = |id: NodeId| {
+            let span = module.span_of(id)?;
+            if f == target.file && id == target.reification {
+                return Some(span.end);
+            }
+            let part = callable_ref(f, module, id, &callables)?;
+            names::callee_ref_end(text, span.start, part)
+        };
+        let mut followed: HashSet<NodeId> = module.bindings().map(|(_, b)| b.rhs).collect();
+        for i in 0..module.node_count() {
+            let id = NodeId::from_usize(i);
+            let Node::Call(call) = module.node(id) else {
+                continue;
+            };
+            let (callee, forwards) = match call.head {
+                CallHead::User(callee) => (callee, true),
+                CallHead::Builtin(head) => {
+                    let head = module.resolve(head);
+                    let Some(&first) = call.args.first() else {
+                        continue;
+                    };
+                    if head == "broadcast" {
+                        (first, true)
+                    } else if POSITIONAL_CONSUMERS.contains(&head) {
+                        (first, false)
+                    } else {
+                        if one_input
+                            && let Some(&(_, from, to)) =
+                                ONE_INPUT_APPLIERS.iter().find(|(name, ..)| *name == head)
+                        {
+                            let to = to.unwrap_or(call.args.len()).min(call.args.len());
+                            followed.extend(call.args.get(from..to).unwrap_or_default());
+                        }
+                        continue;
+                    }
+                }
+            };
+            followed.insert(callee);
+            if !forwards
+                || !call
+                    .named
+                    .iter()
+                    .any(|arg| module.resolve(arg.name) == target.name)
+            {
+                continue;
+            }
+            let Some(end) = callee_end(callee) else {
+                continue;
+            };
+            // `broadcast(f, a = …)` opens its list after the head, `f.(a = …)`
+            // and `f(a = …)` after the callee.
+            let explicit_head = match call.head {
+                CallHead::Builtin(_) => module.span_of(id).and_then(|span| {
+                    let head_end = names::head_ident_end(text, span.start)?;
+                    (&text[span.start as usize..head_end as usize] == "broadcast")
+                        .then_some(head_end)
+                }),
+                CallHead::User(_) => None,
+            };
+            let open_after = explicit_head.unwrap_or(end);
+            for (s, e) in names::call_keyword_ranges(text, open_after) {
+                if text[s as usize..e as usize] == target.name {
+                    uses.keywords.push(NameLoc {
+                        path: path.clone(),
+                        start: s,
+                        end: e,
+                    });
+                }
+            }
+        }
+        if uses.escape.is_none() {
+            uses.escape = (0..module.node_count())
+                .map(NodeId::from_usize)
+                .filter(|id| !followed.contains(id))
+                .find(|&id| {
+                    (f == target.file && id == target.reification)
+                        || callable_ref(f, module, id, &callables).is_some()
+                })
+                .and_then(|id| module.span_of(id))
+                .map(|span| NameLoc {
+                    path: path.clone(),
+                    start: span.start,
+                    end: span.end,
+                });
+        }
+    }
+    uses
 }
 
 /// Every occurrence of a module binding's name across the bundle.
@@ -505,11 +838,26 @@ pub fn prepare_rename(
     index: &SpanIndex,
 ) -> Result<(u32, u32), Refusal> {
     let target = resolve_target(db, file, fs, cats, byte_offset, index)?;
+    let text = file.text(db).as_bytes();
+    // The cursor may sit on an underscore of a `_a_` whose inner name is the
+    // occurrence.
+    let on_underscores = |l: &NameLoc| {
+        l.start > 0
+            && text.get(l.start as usize - 1) == Some(&b'_')
+            && text.get(l.end as usize) == Some(&b'_')
+            && l.start - 1 <= byte_offset
+            && byte_offset <= l.end
+    };
+    let placeholder_target = matches!(&target, Target::Argument(t) if t.boundary_value.is_some());
     // The renameable range is the occurrence under the cursor itself, so the
     // editor highlights exactly the identifier it will replace.
     occurrences(db, fs, cats, &target, true)
         .into_iter()
-        .find(|l| l.path == *file.path(db) && l.start <= byte_offset && byte_offset < l.end)
+        .find(|l| {
+            l.path == *file.path(db)
+                && ((l.start <= byte_offset && byte_offset < l.end)
+                    || (placeholder_target && on_underscores(l)))
+        })
         .map(|l| (l.start, l.end))
         .ok_or_else(|| Refusal("the name under the cursor has no editable range".to_string()))
 }
@@ -534,16 +882,18 @@ pub fn prepare_rename(
 ///   modules": "A FlatPPL **module** is an unordered set of bindings of names to
 ///   expressions." A second binding of the same name in one module is not such a
 ///   set, so a rename onto an existing name in the defining module refuses.
+/// - **An argument rename that changes the callable or leaves a call behind**, in
+///   [`check_argument_rename`]: a new name that is already an input (§04
+///   "Reification to functions and kernels" makes a repeated input a static
+///   error) or already a placeholder of the reification (§04 "Placeholders and
+///   holes"); a placeholder `_new_` outside the §04 form; a sugar body that
+///   already refers to the new name, which the argument would capture (§05
+///   "Lambda syntax"); and a callable used as a value that a keyword call could
+///   reach unseen.
 ///
 /// Deliberately NOT refused, because no rule forbids them, or because `infer`
 /// reports the consequence precisely:
 ///
-/// - **Renaming an argument onto a sibling.** §04 "Reification to functions and
-///   kernels" makes a repeated boundary input name a static error, and `infer` now
-///   reports it at the reification — "boundary input `b` is declared more than
-///   once" (measured by `duplicate_argument_name_is_diagnosed`). So the rename is
-///   performed and the diagnostic flags the result, rather than the server blocking
-///   a legitimate "rename this, then fix the other argument" edit.
 /// - **Shadowing a built-in with a binding.** §04 "Name resolution": "This makes
 ///   built-in names shadowable: a module may bind any name except for `self` and
 ///   `base`."
@@ -592,6 +942,7 @@ pub fn rename_edits(
             if new_name == t.name {
                 return Ok(Vec::new());
             }
+            check_argument_rename(db, fs, cats, t, new_name)?;
         }
     }
 
@@ -1123,6 +1474,60 @@ mod tests {
         );
     }
 
+    /// §04 lets a call pass an input by name, so the keyword at each call site
+    /// is an occurrence of the argument. Leaving it would make the clean input
+    /// fail with "`f` has no parameter `a`".
+    #[test]
+    fn rename_an_argument_rewrites_named_call_site_arguments() {
+        let src =
+            "f(a, b) = add(a, b)\ny = f(b = 1, a = 2)\nz = f(b = 1, a = sqrt(f(a = 3, b = 4)))";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 2, index, "scale").expect("allowed");
+        let renamed = apply(src, &locs, "scale");
+        assert_eq!(
+            renamed,
+            "f(scale, b) = add(scale, b)\ny = f(b = 1, scale = 2)\n\
+             z = f(b = 1, scale = sqrt(f(scale = 3, b = 4)))"
+        );
+        let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+        assert!(
+            diags.is_empty(),
+            "the renamed input stays clean; got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Calls through an alias and from an importing module are call sites too.
+    /// A same-named keyword of another callable or a record is not.
+    #[test]
+    fn rename_an_argument_rewrites_named_arguments_across_the_bundle() {
+        let db = Database::default();
+        let helpers_src = "g = (a, b) -> add(a, b)\nh = g\nu = h(a = 1, b = 2)";
+        let model_src = "m = load_module(\"helpers.flatppl\")\nk(a) = a\n\
+                         v = m.g(b = \"a = 1\", # a = 2\n a = [k(a = 1)])\nw = record(a = 1)";
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), helpers_src.to_string());
+        let model = SourceFile::new(&db, "model.flatppl".to_string(), model_src.to_string());
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let cats = Catalogues::new(&db, vec![]);
+        let index = node_span_index(&db, helpers, fs, cats);
+        let off = nth_offset(helpers_src, "(a, b)", 0) + 1;
+        let locs = rename_edits(&db, helpers, fs, cats, off, index, "x").expect("allowed");
+        let edits_in = |path: &str| -> Vec<NameLoc> {
+            locs.iter().filter(|l| l.path == path).cloned().collect()
+        };
+        assert_eq!(
+            apply(helpers_src, &edits_in("helpers.flatppl"), "x"),
+            "g = (x, b) -> add(x, b)\nh = g\nu = h(x = 1, b = 2)"
+        );
+        assert_eq!(
+            apply(model_src, &edits_in("model.flatppl"), "x"),
+            "m = load_module(\"helpers.flatppl\")\nk(a) = a\n\
+             v = m.g(b = \"a = 1\", # a = 2\n x = [k(a = 1)])\nw = record(a = 1)"
+        );
+    }
+
     #[test]
     fn rename_a_lambda_argument() {
         // §05 "Lambda syntax": `(a, b) -> expr`. The reification span starts at the
@@ -1242,12 +1647,16 @@ mod tests {
             apply(src, &outer, "outer"),
             "f(outer) = a -> add(a, 1)\ny = f(3)"
         );
+        // The returned lambda is a value that `f(3)(a = 2)` could call by
+        // keyword, so its rename refuses. Its references stay in its own scope.
         for cursor in [nth_offset(src, "a ->", 0), nth_offset(src, "add(a", 0) + 4] {
-            let inner = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap();
+            let inner = references(&db, f, fs, cats, cursor, index, true);
             assert_eq!(
                 apply(src, &inner, "inner"),
                 "f(a) = inner -> add(inner, 1)\ny = f(3)"
             );
+            let err = rename_edits(&db, f, fs, cats, cursor, index, "inner").unwrap_err();
+            assert!(err.0.contains("used as a value"), "{}", err.0);
         }
     }
 
@@ -1267,41 +1676,194 @@ mod tests {
         }
     }
 
-    /// §04 "Reification to functions and kernels" makes a repeated argument name a
-    /// static error, and `infer` reports it (see
-    /// `duplicate_argument_name_is_diagnosed`), so the server performs the edit and
-    /// lets the diagnostic flag the result instead of refusing.
-    #[test]
-    fn rename_an_argument_onto_a_sibling_is_allowed_and_diagnosed() {
-        let src = "f(a, b) = add(a, b)";
+    /// Rename at `cursor`, then check that the result parses and infers clean.
+    fn rename_clean(src: &str, cursor: u32, new_name: &str) -> String {
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let locs = rename_edits(&db, f, fs, cats, 2, index, "b").expect("allowed");
-        let renamed = apply(src, &locs, "b");
-        assert_eq!(renamed, "f(b, b) = add(b, b)");
+        let locs = rename_edits(&db, f, fs, cats, cursor, index, new_name)
+            .unwrap_or_else(|e| panic!("rename refused: {}", e.0));
+        let renamed = apply(src, &locs, new_name);
         let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
         let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("declared more than once")),
-            "the result must be diagnosed; got {:?}",
+            diags.is_empty(),
+            "{renamed}: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        renamed
+    }
+
+    /// The refusal for a rename at `cursor`.
+    fn rename_refusal(src: &str, cursor: u32, new_name: &str) -> String {
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        match rename_edits(&db, f, fs, cats, cursor, index, new_name) {
+            Ok(locs) => panic!("rename allowed: {}", apply(src, &locs, new_name)),
+            Err(e) => e.0,
+        }
+    }
+
+    /// §04 "Reification to functions and kernels" makes a repeated input name a
+    /// static error. Once call-site keywords follow the rename, a merged input
+    /// would also rewrite every call into a duplicate keyword.
+    #[test]
+    fn rename_onto_a_sibling_input_refuses() {
+        for (src, cursor) in [
+            ("f(a, b) = add(a, b)\ny = f(a = 1, b = 2)", 2),
+            (
+                "f = functionof(sub(_a_, _x_), a = _a_, b = _x_)\ny = f(a = 1, b = 2)",
+                30,
+            ),
+        ] {
+            let err = rename_refusal(src, cursor, "b");
+            assert!(err.contains("already an input"), "{err}");
+        }
+    }
+
+    /// Renaming `a` to `x` beside `b = _x_` would merge two inputs into one
+    /// placeholder, and the result would still infer clean.
+    #[test]
+    fn rename_onto_an_existing_placeholder_refuses() {
+        let src = "f = functionof(sub(_a_, _x_), a = _a_, b = _x_)\ny = f(a = 1, b = 2)";
+        let err = rename_refusal(src, nth_offset(src, "a = _a_", 0), "x");
+        assert!(err.contains("`_x_`"), "{err}");
+    }
+
+    /// §04 "Placeholders and holes" scopes a placeholder to its nearest
+    /// reification, so a nested `_z_` does not block the outer rename.
+    #[test]
+    fn rename_onto_a_nested_scope_placeholder_is_allowed() {
+        let src = "f = functionof(add(_a_, sum(broadcast(functionof(mul(_z_, 2.0), z = _z_), \
+                   [1.0]))), a = _a_)\ny = f(a = 1.0)";
+        assert_eq!(
+            rename_clean(src, nth_offset(src, "a = _a_", 0), "z"),
+            "f = functionof(add(_z_, sum(broadcast(functionof(mul(_z_, 2.0), z = _z_), \
+             [1.0]))), z = _z_)\ny = f(z = 1.0)"
         );
     }
 
-    /// The measured basis for allowing the rename above: `infer` flags a repeated
-    /// argument name, so the LSP need not refuse to keep the file legal.
     #[test]
-    fn duplicate_argument_name_is_diagnosed() {
-        let mut m = flatppl_syntax::parse("f(a, a) = add(a, a)").expect("parses");
-        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
-        assert!(
-            diags.iter().any(|d| d
-                .message
-                .contains("boundary input `a` is declared more than once")),
-            "got {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    fn rename_to_an_illegal_placeholder_refuses() {
+        let src = "f = functionof(add(_a_, 1.0), a = _a_)\ny = f(a = 2.0)";
+        let err = rename_refusal(src, nth_offset(src, "a = _a_", 0), "_q");
+        assert!(err.contains("`__q_`"), "{err}");
+    }
+
+    /// The body reads `z` free, so an argument renamed to `z` would capture it.
+    #[test]
+    fn rename_onto_a_free_body_reference_refuses() {
+        for (src, cursor, new_name) in [
+            ("z = 1.0\nf(a) = add(a, z)\ny = f(a = 2.0)", 10, "z"),
+            ("z = 1.0\nw = z\ng = a -> add(a, w)", 0, "w"),
+            (
+                "z = 1.0\nf(a) = add(a, sum(broadcast(b -> add(b, z), [1.0])))\ny = f(a = 2.0)",
+                10,
+                "z",
+            ),
+            ("f(a) = mul(a, pi)\ny = f(a = 2.0)", 2, "pi"),
+            // The body would call the renamed argument instead of `add`.
+            ("f(a) = add(a, 1.0)\ny = f(a = 2.0)", 2, "add"),
+            (
+                "f(a) = mul(a, sum(broadcast(b -> add(b, 1.0), [1.0])))\ny = f(a = 2.0)",
+                2,
+                "add",
+            ),
+        ] {
+            let cursor = if cursor == 0 {
+                nth_offset(src, "a ->", 0)
+            } else {
+                cursor
+            };
+            let err = rename_refusal(src, cursor, new_name);
+            assert!(err.contains("capture"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn rename_onto_an_imported_alias_refuses() {
+        let db = Database::default();
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), "s = 1.0".to_string());
+        let model_src = "m = load_module(\"helpers.flatppl\")\nf(a) = add(a, m.s)";
+        let model = SourceFile::new(&db, "model.flatppl".to_string(), model_src.to_string());
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let cats = Catalogues::new(&db, vec![]);
+        let index = node_span_index(&db, model, fs, cats);
+        let cursor = nth_offset(model_src, "f(a)", 0) + 2;
+        let err = rename_edits(&db, model, fs, cats, cursor, index, "m").unwrap_err();
+        assert!(err.0.contains("capture"), "{}", err.0);
+    }
+
+    /// §04 "Broadcasting" binds `broadcast(f, name = array)` keywords to `f`.
+    #[test]
+    fn rename_an_argument_rewrites_broadcast_keywords() {
+        let src = "f(a) = mul(a, 2.0)\ny = broadcast(f, a = [1.0, 2.0])\nw = f.(a = [3.0])";
+        assert_eq!(
+            rename_clean(src, 2, "z"),
+            "f(z) = mul(z, 2.0)\ny = broadcast(f, z = [1.0, 2.0])\nw = f.(z = [3.0])"
+        );
+    }
+
+    /// A callable stored in a record can be called by keyword through the field,
+    /// which the rename cannot follow, so it refuses instead of leaving the call.
+    #[test]
+    fn rename_refuses_when_the_callable_escapes_into_a_value() {
+        let src = "f(a) = mul(a, 2.0)\ng = record(h = f)\ny = g.h(a = 2.0)";
+        let err = rename_refusal(src, 2, "z");
+        assert!(err.contains("used as a value"), "{err}");
+    }
+
+    /// §04 "Calling conventions": a one-input callable receives a lone
+    /// positional argument whole, so `filter` and `markovchain` expose no name.
+    #[test]
+    fn rename_allows_a_one_input_callback() {
+        for (src, cursor_at, expected) in [
+            (
+                "d = [1.0, -1.0]\ny = filter(x -> gt(x, 0.0), d)",
+                "x ->",
+                "d = [1.0, -1.0]\ny = filter(v -> gt(v, 0.0), d)",
+            ),
+            (
+                "m = markovchain(s -> Normal(s, 1.0), 0.0, 5)",
+                "s ->",
+                "m = markovchain(v -> Normal(v, 1.0), 0.0, 5)",
+            ),
+        ] {
+            assert_eq!(
+                rename_clean(src, nth_offset(src, cursor_at, 0), "v"),
+                expected
+            );
+        }
+    }
+
+    /// §04 "Explicit callback parameters" passes `p` whole to the callback,
+    /// which can call it by keyword, so a callable passed as `p` escapes.
+    #[test]
+    fn rename_refuses_a_callable_passed_as_a_callback_parameter() {
+        for src in [
+            "f(a) = gt(a, 0.0)\nd = [1.0, -1.0]\nk = filter((x, p) -> p(a = x), d, f)",
+            "f(a) = mul(a, 2.0)\nm = markovchain((s, p) -> Normal(p(a = s), 1.0), 0.0, 5, f)",
+        ] {
+            let err = rename_refusal(src, 2, "z");
+            assert!(err.contains("used as a value"), "{src}: {err}");
+        }
+    }
+
+    /// `fchain` can auto-splat a record into a multi-input callable by name.
+    #[test]
+    fn rename_refuses_a_multi_input_callable_in_fchain() {
+        let src = "g(x) = record(a = x, b = x)\nf(a, b) = add(a, b)\nh = fchain(g, f)";
+        let cursor = nth_offset(src, "f(a", 0) + 2;
+        let err = rename_refusal(src, cursor, "z");
+        assert!(err.contains("used as a value"), "{err}");
+    }
+
+    /// `pushfwd` applies its function positionally and exposes no input name.
+    #[test]
+    fn rename_allows_a_callable_consumed_by_pushfwd() {
+        let src = "f(a) = mul(a, 2.0)\nm = pushfwd(f, Normal(0.0, 1.0))";
+        assert_eq!(
+            rename_clean(src, 2, "z"),
+            "f(z) = mul(z, 2.0)\nm = pushfwd(f, Normal(0.0, 1.0))"
         );
     }
 
@@ -1337,22 +1899,91 @@ mod tests {
         assert!(flatppl_syntax::parse("f(_x_) = add(_x_, 1)").is_err());
     }
 
-    /// An explicit `functionof`/`kernelof` boundary declares its argument as a
-    /// keyword argument, which the IR stores without a span. That is an
-    /// implementation limit, not a doctrine refusal, and the message says so.
+    /// The brief's form: a keyword boundary whose placeholder spells the input
+    /// name. The keyword, the placeholder and the call-site keywords move
+    /// together, from any of the three cursors.
     #[test]
-    fn rename_an_explicit_boundary_argument_fails_closed() {
-        let src = "k = kernelof(Normal(_mu_, 1.0), mu = _mu_)";
+    fn rename_a_keyword_boundary_argument() {
+        let src = "f = functionof(add(_a_, 1), a = _a_)\ny = f(a = 2)";
+        let expected = "f = functionof(add(_z_, 1), z = _z_)\ny = f(z = 2)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let off = nth_offset(src, "_mu_", 0);
-        let err = rename_edits(&db, f, fs, cats, off, index, "nu")
-            .expect_err("no recorded span for the boundary keyword");
-        assert!(
-            err.0.contains("recorded span"),
-            "the message must state the implementation limit; got {}",
-            err.0
+        let keyword = nth_offset(src, "a = _a_", 0);
+        let body = nth_offset(src, "_a_", 0);
+        let value = nth_offset(src, "_a_", 1) + 1;
+        for cursor in [keyword, body, value] {
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected, "cursor {cursor}");
+        }
+        assert_eq!(
+            prepare_rename(&db, f, fs, cats, body, index),
+            Ok((body + 1, body + 2)),
+            "the inner name of `_a_` is the editable range"
         );
+        let mut m = flatppl_syntax::parse(expected).expect("still parses");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+        assert!(
+            diags.is_empty(),
+            "got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A keyword that does not spell its value renames alone: the value is a
+    /// different placeholder or a module binding.
+    #[test]
+    fn rename_a_keyword_boundary_argument_leaves_an_unrelated_value() {
+        for (src, expected) in [
+            (
+                "f = functionof(add(_x_, 1), a = _x_)\ny = f(a = 2)",
+                "f = functionof(add(_x_, 1), z = _x_)\ny = f(z = 2)",
+            ),
+            (
+                "a = 1\nf = functionof(add(a, 1), a = a)\ny = f(a = 2)",
+                "a = 1\nf = functionof(add(a, 1), z = a)\ny = f(z = 2)",
+            ),
+        ] {
+            let (db, f, fs, cats) = single_file(src);
+            let index = node_span_index(&db, f, fs, cats);
+            let cursor = nth_offset(src, ", a =", 0) + 2;
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected);
+        }
+    }
+
+    /// An immediately invoked callable is its own call site.
+    #[test]
+    fn rename_an_inline_callee_argument_rewrites_its_keyword() {
+        for (src, cursor_at, expected) in [
+            (
+                "y = (a -> add(a, 1))(a = 2)",
+                "a ->",
+                "y = (z -> add(z, 1))(z = 2)",
+            ),
+            (
+                "y = functionof(add(_a_, 1), a = _a_)(a = 2)",
+                "a = _a_",
+                "y = functionof(add(_z_, 1), z = _z_)(z = 2)",
+            ),
+        ] {
+            let (db, f, fs, cats) = single_file(src);
+            let index = node_span_index(&db, f, fs, cats);
+            let cursor = nth_offset(src, cursor_at, 0);
+            let locs = rename_edits(&db, f, fs, cats, cursor, index, "z").expect("allowed");
+            assert_eq!(apply(src, &locs, "z"), expected);
+        }
+    }
+
+    /// A bare-name boundary derives the input name from its entry, so there is
+    /// no keyword to rename.
+    #[test]
+    fn rename_a_bare_boundary_argument_fails_closed() {
+        let src = "k = kernelof(Normal(_mu_, 1.0), _mu_)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let err = rename_edits(&db, f, fs, cats, nth_offset(src, "_mu_", 0), index, "nu")
+            .expect_err("no keyword to rename");
+        assert!(err.0.contains("bare-name"), "got {}", err.0);
     }
 
     #[test]

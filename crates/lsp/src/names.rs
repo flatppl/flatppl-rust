@@ -255,7 +255,7 @@ fn is_name_production(name: &str) -> bool {
 ///
 /// §04 "Binding names" gives `^_[A-Za-z]([A-Za-z0-9_]*[A-Za-z0-9])?_$` and
 /// reserves it "for placeholder variables inside `functionof` and `kernelof`".
-fn is_placeholder_form(name: &str) -> bool {
+pub(crate) fn is_placeholder_form(name: &str) -> bool {
     name.len() >= 3
         && name.starts_with('_')
         && name.ends_with('_')
@@ -330,6 +330,72 @@ pub fn placeholder_surface_name(placeholder: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// The end of a callee reference that starts at `span_start`, given which part
+/// of it names the callee.
+pub fn callee_ref_end(text: &str, span_start: u32, part: RefPart) -> Option<u32> {
+    let head_end = head_ident_end(text, span_start)?;
+    if part == RefPart::Head {
+        return Some(head_end);
+    }
+    let (dot, b'.') = next_significant(text, head_end)? else {
+        return None;
+    };
+    head_ident_end(text, next_significant(text, dot + 1)?.0)
+}
+
+/// The name ranges of the `name = value` arguments of a call whose callee
+/// text ends at `callee_end`, past any `)` that closes a parenthesised callee
+/// and the `.` of a dot call.
+///
+/// The IR keeps no span for a keyword, so this walks the argument list and
+/// skips nested brackets, strings and comments. An unexpected shape yields no
+/// ranges.
+pub fn call_keyword_ranges(text: &str, callee_end: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut at = callee_end;
+    let open = loop {
+        match next_significant(text, at) {
+            Some((skip, b')' | b'.')) => at = skip + 1,
+            Some((open, b'(')) => break open,
+            _ => return out,
+        }
+    };
+    let bytes = text.as_bytes();
+    let mut at = open as usize + 1;
+    loop {
+        let start = skip_trivia(bytes, at, bytes.len());
+        if let Some((s, e)) = ident_at(text, start as u32)
+            && let Some((eq, b'=')) = next_significant(text, e)
+            && bytes.get(eq as usize + 1) != Some(&b'=')
+        {
+            out.push((s, e));
+        }
+        at = start;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(at) {
+                None => return out,
+                Some(b'#' | b'%') => at = skip_comment(bytes, at, bytes.len()),
+                Some(b'"') => at = skip_string(bytes, at, bytes.len()),
+                Some(b'(' | b'[' | b'{') => {
+                    depth += 1;
+                    at += 1;
+                }
+                Some(b')' | b']' | b'}') if depth == 0 => return out,
+                Some(b')' | b']' | b'}') => {
+                    depth -= 1;
+                    at += 1;
+                }
+                Some(b',') if depth == 0 => {
+                    at += 1;
+                    break;
+                }
+                Some(_) => at += 1,
+            }
+        }
+    }
+}
+
 /// The byte ranges of the argument names declared by a callable, given the span
 /// of its reification node and the range of the enclosing binding's own name.
 ///
@@ -344,9 +410,8 @@ pub fn placeholder_surface_name(placeholder: &str) -> Option<&str> {
 ///   (§05 "Lambda syntax": "`(arg) -> expr` is not legal syntax").
 ///
 /// Returns the declared names in order with their ranges. An explicit
-/// `functionof(…, mu = _mu_)` boundary is NOT handled here: its argument name is
-/// a keyword argument the IR records as a `NamedArg` with no span, so there is
-/// nothing to locate. The caller must fail closed on it.
+/// `functionof(…, mu = _mu_)` boundary is not handled here: the parser records
+/// its keyword spans in `Module::boundary_spans_of`.
 pub fn argument_decl_ranges(
     text: &str,
     reif_start: u32,

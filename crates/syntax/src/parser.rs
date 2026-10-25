@@ -605,7 +605,8 @@ enum ExprFrame {
     List(ListArgs),
     ListItem(ListArgs),
     Call(CallArgs),
-    CallItem(CallArgs, Option<String>),
+    /// A call argument and its keyword with the keyword's span, if it has one.
+    CallItem(CallArgs, Option<(String, Option<Span>)>),
     Lambda(usize, Vec<String>),
     Fn(usize),
 }
@@ -643,6 +644,8 @@ struct CallArgs {
     start: usize,
     positional: Vec<NodeId>,
     named: Vec<NamedArg>,
+    /// The span of each `named` entry's keyword. A bare boundary name has none.
+    keyword_spans: Vec<Option<Span>>,
     reify: bool,
     /// For a reification, whether its boundary inputs so far were bare names
     /// (`Some(true)`) or keywords (`Some(false)`); spec §04 forbids mixing them.
@@ -1060,9 +1063,14 @@ impl<'a> ExprParser<'a> {
                             if call.reify && !call.positional.is_empty() {
                                 self.boundary_form(&mut call, false)?;
                             }
+                            let token = &self.toks[self.pos];
+                            let span = Span {
+                                start: token.start,
+                                end: token.end,
+                            };
                             self.advance();
                             self.advance();
-                            Some(key)
+                            Some((key, Some(span)))
                         } else if call.reify && !call.positional.is_empty() {
                             match (self.peek(), self.peek_at(1)) {
                                 (
@@ -1071,7 +1079,7 @@ impl<'a> ExprParser<'a> {
                                 ) => {
                                     let n = n.clone();
                                     self.boundary_form(&mut call, true)?;
-                                    Some(self.bare_boundary_name(&n)?)
+                                    Some((self.bare_boundary_name(&n)?, None))
                                 }
                                 _ => {
                                     return Err(self.err_here(
@@ -1093,12 +1101,13 @@ impl<'a> ExprParser<'a> {
                 }
                 ExprFrame::CallItem(mut call, key) => {
                     let arg = value.take().unwrap();
-                    if let Some(key) = key {
+                    if let Some((key, span)) = key {
                         call.named.push(NamedArg {
                             kind: NamedKind::Kwarg,
                             name: self.module.intern(&key),
                             value: arg,
                         });
+                        call.keyword_spans.push(span);
                     } else {
                         call.positional.push(arg);
                     }
@@ -1155,6 +1164,7 @@ impl<'a> ExprParser<'a> {
                     start,
                     positional: Vec::new(),
                     named: Vec::new(),
+                    keyword_spans: Vec::new(),
                     reify,
                     bare_boundaries: None,
                 }));
@@ -1215,9 +1225,22 @@ impl<'a> ExprParser<'a> {
             start,
             positional,
             named,
+            keyword_spans,
+            reify,
             ..
         } = call;
-        match target {
+        // Capture the boundary spans now: the reification keeps its entries as
+        // plain data and drops the value nodes from its tree.
+        let boundary_spans: Option<Box<[(Span, Span)]>> = if reify {
+            named
+                .iter()
+                .zip(&keyword_spans)
+                .map(|(arg, keyword)| Some(((*keyword)?, self.module.span_of(arg.value)?)))
+                .collect()
+        } else {
+            None
+        };
+        let id = match target {
             CallTarget::Name(name) => self.make_call(&name, positional, named, start),
             CallTarget::Builtin(name) => self.make_builtin_call(&name, positional, named, start),
             CallTarget::Record => self.make_builtin_call("record", positional, named, start),
@@ -1239,7 +1262,20 @@ impl<'a> ExprParser<'a> {
                     start,
                 ))
             }
+        }?;
+        if let Some(spans) = boundary_spans
+            && !spans.is_empty()
+            && matches!(
+                self.module.node(id),
+                Node::Call(Call {
+                    inputs: Some(Inputs::Spec(_)),
+                    ..
+                })
+            )
+        {
+            self.module.set_boundary_spans(id, spans);
         }
+        Ok(id)
     }
 
     fn finish_list(&mut self, list: ListArgs) -> Result<NodeId> {

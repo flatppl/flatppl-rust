@@ -52,6 +52,11 @@ pub struct Module {
     /// (`flatppl-infer`, phase inference). Inference metadata: projected into
     /// the `%autoinputs` slot on FlatPIR write, dropped on FlatPPL write.
     auto_inputs: SecondaryMap<NodeId, Box<[(Symbol, Ref)]>>,
+    /// Source spans of a keyword-form `%specinputs` boundary (`flatppl-syntax`),
+    /// one `(keyword, value)` pair per entry, in entry order. An entry is plain
+    /// data, not a node, so it has no span of its own. Editor metadata: not
+    /// projected into any output format.
+    boundary_spans: SecondaryMap<NodeId, Box<[(Span, Span)]>>,
     /// Bindings a determinization query replaced with the point it was scored at
     /// (`flatppl-determinizer`), each mapped to the RHS the pin replaced. The RHS is
     /// then a literal indistinguishable from a model constant, and a later query
@@ -583,6 +588,15 @@ impl Module {
     }
     pub fn set_auto_inputs(&mut self, id: NodeId, entries: Box<[(Symbol, Ref)]>) {
         self.auto_inputs.insert(id, entries);
+    }
+
+    /// The `(keyword, value)` spans of a reification's keyword boundary
+    /// `functionof(…, a = _a_)`, aligned with its `%specinputs` entries.
+    pub fn boundary_spans_of(&self, id: NodeId) -> Option<&[(Span, Span)]> {
+        self.boundary_spans.get(id).map(|spans| spans.as_ref())
+    }
+    pub fn set_boundary_spans(&mut self, id: NodeId, spans: Box<[(Span, Span)]>) {
+        self.boundary_spans.insert(id, spans);
     }
 
     /// Collect the local bindings and module aliases that `root`'s subtree
