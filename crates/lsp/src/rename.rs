@@ -549,17 +549,18 @@ const POSITIONAL_CONSUMERS: &[&str] = &[
     "kscan",
 ];
 
-/// Builtins that apply their callables from the given argument on to one
-/// value. §04 "Calling conventions" passes a lone positional argument whole to
-/// a one-input callable, but auto-splats a record into a callable with more
+/// Builtins that apply the callables in arguments `from..to` to one value.
+/// §04 "Calling conventions" passes a lone positional argument whole to a
+/// one-input callable, but auto-splats a record into a callable with more
 /// inputs by name. A first `fchain` or `kchain` argument is excluded: it gives
-/// the composite its input names.
-const ONE_INPUT_APPLIERS: &[(&str, usize)] = &[
-    ("filter", 0),
-    ("markovchain", 0),
-    ("fchain", 1),
-    ("kchain", 1),
-    ("jointchain", 1),
+/// the composite its input names. Other `filter` and `markovchain` arguments
+/// are data, or the §04 callback parameter `p` that the callback receives.
+const ONE_INPUT_APPLIERS: &[(&str, usize, Option<usize>)] = &[
+    ("filter", 0, Some(1)),
+    ("markovchain", 0, Some(1)),
+    ("fchain", 1, None),
+    ("kchain", 1, None),
+    ("jointchain", 1, None),
 ];
 
 /// How the target's callable is used across the bundle.
@@ -670,10 +671,11 @@ fn callable_uses(
                         (first, false)
                     } else {
                         if one_input
-                            && let Some(&(_, from)) =
-                                ONE_INPUT_APPLIERS.iter().find(|(name, _)| *name == head)
+                            && let Some(&(_, from, to)) =
+                                ONE_INPUT_APPLIERS.iter().find(|(name, ..)| *name == head)
                         {
-                            followed.extend(call.args.iter().skip(from));
+                            let to = to.unwrap_or(call.args.len()).min(call.args.len());
+                            followed.extend(call.args.get(from..to).unwrap_or_default());
                         }
                         continue;
                     }
@@ -1830,6 +1832,19 @@ mod tests {
                 rename_clean(src, nth_offset(src, cursor_at, 0), "v"),
                 expected
             );
+        }
+    }
+
+    /// §04 "Explicit callback parameters" passes `p` whole to the callback,
+    /// which can call it by keyword, so a callable passed as `p` escapes.
+    #[test]
+    fn rename_refuses_a_callable_passed_as_a_callback_parameter() {
+        for src in [
+            "f(a) = gt(a, 0.0)\nd = [1.0, -1.0]\nk = filter((x, p) -> p(a = x), d, f)",
+            "f(a) = mul(a, 2.0)\nm = markovchain((s, p) -> Normal(p(a = s), 1.0), 0.0, 5, f)",
+        ] {
+            let err = rename_refusal(src, 2, "z");
+            assert!(err.contains("used as a value"), "{src}: {err}");
         }
     }
 
