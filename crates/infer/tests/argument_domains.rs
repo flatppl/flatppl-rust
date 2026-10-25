@@ -289,15 +289,18 @@ fn a_value_where_a_measure_operation_wants_a_measure_is_refused() {
     }
 }
 
-/// A real measure argument still types, and so does a `%deferred` one: §08's
-/// composite rows have no catalogue entry, so `BinnedPoissonProcess(...)` is
-/// honestly `%deferred`, and this check must not turn that into an error.
+/// A real measure argument still types, and so does a `%deferred` one: §08 admits a
+/// kernel intensity, so `BinnedPoissonProcess(bins, K)` is honestly `%deferred`, and
+/// this check must not turn that into an error.
 #[test]
 fn measure_and_deferred_operands_still_type() {
     assert_clean("m = normalize(Normal(mu = 0.0, sigma = 1.0))\n");
     assert_clean("m = truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, 1.0))\n");
     assert_clean("m = weighted(2.0, Normal(mu = 0.0, sigma = 1.0))\n");
-    assert_clean("b = BinnedPoissonProcess([1.0, 2.0], [0.0, 1.0, 2.0])\nm = normalize(b)\n");
+    assert_clean(
+        "K = mu -> Normal(mu = mu, sigma = 1.0)\n\
+         b = BinnedPoissonProcess([0.0, 1.0, 2.0], K)\nm = normalize(b)\n",
+    );
 }
 
 // ---- §07 `rnginit`: a byte vector or a single integer -----------------------

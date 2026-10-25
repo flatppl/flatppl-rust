@@ -556,13 +556,14 @@ fn maximum_minimum_thread_element_kind() {
 // ---- Round 3: linear-algebra matrix/vector results via the catalogue ----
 
 /// Vector-result functions infer a rank-1 array with the right element kind:
-/// `linspace` → real, `diag` → the matrix's element kind.
+/// `linspace` → real, of its literal point count `n` (§07), `diag` → the matrix's
+/// element kind.
 #[test]
 fn vector_result_functions_infer() {
     let out = ir("x = linspace(0.0, 1.0, 5)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
-        "linspace should infer a real vector, got:\n{out}"
+        out.contains("(%array 1 (5) (%scalar real))") && out.contains("(linspace"),
+        "linspace should infer a real vector of 5 points, got:\n{out}"
     );
     let out = ir("A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = diag(A)");
     assert!(

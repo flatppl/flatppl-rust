@@ -73,3 +73,22 @@ outputs = logdensityof(posterior, record(s = t_s, b = t_b))";
         "the logdensity entry is emitted:\n{out}"
     );
 }
+
+/// `BinnedPoissonProcess` leaves only Poisson densities over bin masses, so it
+/// emits with no registry entry: CDF differences for a `Normal` shape, overlap
+/// lengths for a flat `Uniform`, whose CDF the emitter does not define.
+#[test]
+fn binned_poisson_process_emits() {
+    let src = "\
+flatppl_compat = \"0.1\"
+n_edge = elementof(posreals)
+s = elementof(posreals)
+proc = BinnedPoissonProcess([0.0, 1.0, 3.0, 6.0], superpose(weighted(n_edge, Uniform(interval(0.0, 6.0))), weighted(s, Normal(mu = 2.0, sigma = 0.7))))
+inputs = (n_edge, s)
+outputs = logdensityof(proc, [2, 7, 4])";
+    let out = emit_logdensity(src);
+    assert!(
+        !out.contains("BinnedPoissonProcess") && out.contains("func.func @logdensity"),
+        "the logdensity entry emits with no measure-layer symbol:\n{out}"
+    );
+}

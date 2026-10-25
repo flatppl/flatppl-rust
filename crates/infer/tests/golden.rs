@@ -221,23 +221,23 @@ fn reference_cycle_is_an_error() {
 
 /// An op with no type rule defers honestly rather than guessing.
 ///
-/// The op must be a REAL built-in — `BinnedPoissonProcess` is a §08 distribution with no
-/// `catalogue.ron` row. An invented name (this test used `frobnicate`) is an
+/// The op must be a REAL built-in — `sort` is a keyword-list built-in with no type
+/// rule. An invented name (this test used `frobnicate`) is an
 /// unresolvable name under spec §04 "Name resolution" and errors instead of
 /// deferring, which would make this a test of the wrong thing. See
 /// `tests/unbound_name.rs` for the two behaviours side by side.
 #[test]
 fn unknown_op_is_an_honest_gap() {
-    let (module, diags) = infer_src("x = BinnedPoissonProcess(1, 2)");
+    let (module, diags) = infer_src("x = sort([2, 1])");
     assert!(
-        diags.iter().any(|d| d.severity == Severity::Note
-            && d.message
-                .contains("no type rule for `BinnedPoissonProcess`")),
+        diags
+            .iter()
+            .any(|d| d.severity == Severity::Note && d.message.contains("no type rule for `sort`")),
         "got: {diags:?}"
     );
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (BinnedPoissonProcess 1 2))"),
+        out.contains("(%meta (%deferred %fixed %unknown) (sort "),
         "got:\n{out}"
     );
 }
@@ -459,6 +459,129 @@ fn poisson_process_is_a_measure_over_configurations() {
         ),
         "got:\n{out}"
     );
+}
+
+/// `BinnedPoissonProcess(bins, intensity)` (spec §08) is "the pushforward of a
+/// `PoissonProcess` through `bincounts`": an integer count array with §07
+/// `bincounts`'s shape, one axis of `n` bins per `n + 1` edges, and one axis per
+/// field of a record of edge vectors. A kernel intensity has no closed measure.
+#[test]
+fn binned_poisson_process_is_a_measure_over_bin_counts() {
+    let src = "s = elementof(posreals)\n\
+               flat = BinnedPoissonProcess([0.0, 0.5, 1.0, 1.5, 2.0], weighted(s, Normal(1.0, 0.5)))\n\
+               grid = BinnedPoissonProcess(intensity = weighted(s, joint(a = Normal(0.0, 1.0), b = Normal(0.0, 1.0))), \
+                                           bins = record(a = [0.0, 1.0, 2.0], b = [0.0, 1.0]))\n\
+               K = mu -> Normal(mu = mu, sigma = 1.0)\n\
+               family = BinnedPoissonProcess([0.0, 1.0], K)";
+    let (module, diags) = infer_src(src);
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.severity != Severity::Error && !d.message.contains("no type rule")),
+        "got: {diags:?}"
+    );
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains(
+            "(%bind flat (%meta ((%measure (%domain (%array 1 (4) (%scalar integer))) \
+             (%mass %normalized)) %parametric (cartpow nonnegintegers 4))"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "(%bind grid (%meta ((%measure (%domain (%array 2 (2 1) (%scalar integer))) \
+             (%mass %normalized)) %parametric (cartpow (cartpow nonnegintegers 1) 2))"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind family (%meta (%deferred "),
+        "got:\n{out}"
+    );
+}
+
+/// §08 gives `bins` §07 `bincounts`'s format and `intensity` "finite-mass measure or
+/// kernel", and pairs edge vectors with scalar events and a record of edge vectors
+/// with record events. Each violation is refused at its node: per-bin rates, an
+/// infinite intensity, and either form mismatch.
+#[test]
+fn binned_poisson_process_refuses_arguments_outside_their_domains() {
+    let (_, diags) = infer_src(
+        "joint_events = weighted(2.0, joint(a = Normal(0.0, 1.0), b = Normal(0.0, 1.0)))\n\
+         a = BinnedPoissonProcess(1.0, Normal(0.0, 1.0))\n\
+         b = BinnedPoissonProcess([0.0, 1.0, 2.0], [3.0, 4.0])\n\
+         c = BinnedPoissonProcess([0.0, 1.0, 3.0], Lebesgue(reals))\n\
+         d = BinnedPoissonProcess([0.0, 1.0, 3.0], joint_events)\n\
+         e = BinnedPoissonProcess(record(a = [0.0, 1.0]), Normal(0.0, 1.0))\n\
+         f = BinnedPoissonProcess(record(a = [0.0, 1.0], c = [0.0, 1.0]), joint_events)",
+    );
+    let located = |needle: &str| {
+        diags.iter().any(|d| {
+            d.severity == Severity::Error && d.node.is_some() && d.message.contains(needle)
+        })
+    };
+    assert!(located("`bins` must be bin edges"), "got: {diags:?}");
+    assert!(located("`intensity` is an array"), "got: {diags:?}");
+    assert!(
+        located("`intensity` has infinite total mass"),
+        "got: {diags:?}"
+    );
+    assert!(
+        located("has non-scalar events, but `bins` is an edge vector"),
+        "got: {diags:?}"
+    );
+    assert!(
+        located("has non-record events, but `bins` is a record"),
+        "got: {diags:?}"
+    );
+    assert!(located("has no event field `c`"), "got: {diags:?}");
+}
+
+/// §07 `linspace(from, to, n)` has `n` points and `extlinspace` two more, so a
+/// literal `n` gives a static length, and §07's own edge forms bin statically.
+#[test]
+fn linspace_with_a_literal_count_has_a_static_length() {
+    let (module, diags) = infer_src(
+        "a = linspace(0.0, 2.0, 5)\n\
+         b = extlinspace(0.0, 2.0, 3)\n\
+         n = elementof(posintegers)\n\
+         c = linspace(0.0, 2.0, n)\n\
+         p = BinnedPoissonProcess(extlinspace(0.0, 2.0, 3), Normal(1.0, 0.5))",
+    );
+    assert!(
+        diags.iter().all(|d| d.severity != Severity::Error),
+        "got: {diags:?}"
+    );
+    let out = flatppl_flatpir::write(&module);
+    for needle in [
+        "(%bind a (%meta ((%array 1 (5) (%scalar real))",
+        "(%bind b (%meta ((%array 1 (5) (%scalar real))",
+        "(%bind c (%meta ((%array 1 (%dynamic) (%scalar real))",
+        "(%bind p (%meta ((%measure (%domain (%array 1 (4) (%scalar integer)))",
+    ] {
+        assert!(out.contains(needle), "{needle} missing in:\n{out}");
+    }
+}
+
+/// §07 `linspace`: "When `n = 1`, `from` and `to` must be equal." A single point
+/// between written unequal ends is refused at the call, for `extlinspace` too.
+#[test]
+fn a_single_point_linspace_needs_equal_ends() {
+    let (_, diags) = infer_src(
+        "a = linspace(0.0, 2.0, 1)\n\
+         b = extlinspace(0.0, 2.0, 1)\n\
+         c = linspace(1.5, 1.5, 1)",
+    );
+    let refused: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.severity == Severity::Error
+                && d.node.is_some()
+                && d.message.contains("`from` and `to` must be equal")
+        })
+        .collect();
+    assert_eq!(refused.len(), 2, "a and b refuse, c types: {diags:?}");
 }
 
 #[test]

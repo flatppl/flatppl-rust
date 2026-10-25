@@ -227,6 +227,9 @@ fn op_rule(
     if let Some(ty) = written_size_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
+    if let Some(ty) = single_point_linspace_check(inf, id, &name, args, named) {
+        return Ready((ty, joined));
+    }
 
     // AFTER `arity_check`, which must see the call as WRITTEN: it counts
     // `args.len() + named.len()` and resolves the splat, so handing it a vector holding the
@@ -643,6 +646,7 @@ fn op_rule(
         },
         "iid" => iid_type(inf, args),
         "PoissonProcess" => poisson_process_type(inf, args, named),
+        "BinnedPoissonProcess" => binned_poisson_process_type(inf, &name, args, named),
         // Measure-transforming ops keep the domain but get a FRESH mass slot
         // — their total mass differs from the base's and is computed by the
         // normalization-level rules (inheriting it via the type clone would
@@ -3919,6 +3923,103 @@ fn poisson_process_type(
     }
 }
 
+/// `BinnedPoissonProcess(bins, intensity)` (spec §08): "the pushforward of a
+/// `PoissonProcess` through `bincounts`", so the variate is the count array §07
+/// `bincounts(bins, _)` returns. The catalogue row's `BinCounts` domain builds it.
+///
+/// §08 gives `bins` "Same format as for `bincounts`", an edge vector or a record of
+/// edge vectors, and `intensity` "finite-mass measure or kernel". Anything else is
+/// refused. A kernel intensity carries no domain, so the call stays `%deferred`, as
+/// for [`poisson_process_type`]. Keyword arguments arrive in declared positions.
+fn binned_poisson_process_type(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    let open = |t: &Type| {
+        matches!(
+            t,
+            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_)
+        )
+    };
+    let mut refused = None;
+    if let Some((node, bins, _)) = args.first()
+        && !open(bins)
+        && crate::catalogue::bin_count_shape(bins).is_none()
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            "`BinnedPoissonProcess`'s `bins` must be bin edges in §07 `bincounts`'s \
+             format: a non-empty vector of edges or a record of edge vectors (spec §08)",
+        ));
+        refused = Some("bins");
+    }
+    if let Some((node, intensity, _)) = args.get(1)
+        && let Some(kind) =
+            non_measure_kind(intensity).filter(|_| !matches!(intensity, Type::Kernel { .. }))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`BinnedPoissonProcess`'s `intensity` is {kind}, but spec §08 declares it \
+                 a finite-mass measure or kernel over the event space"
+            ),
+        ));
+        refused = Some("intensity");
+    }
+    // §08 pairs an edge vector with scalar events and a record of edge vectors
+    // with record events whose fields hold the bin coordinates.
+    if refused.is_none()
+        && let (Some((_, bins, _)), Some((node, Type::Measure { domain, .. }, _))) =
+            (args.first(), args.get(1))
+    {
+        let mismatch = match (bins, domain.as_ref()) {
+            _ if open(bins) || open(domain) => None,
+            (Type::Record(coordinates), Type::Record(fields)) => coordinates
+                .iter()
+                .find(|(c, _)| fields.iter().all(|(f, _)| f != c))
+                .map(|(c, _)| {
+                    format!(
+                        "has no event field `{}` for the bin coordinate of that name",
+                        inf.module.resolve(*c)
+                    )
+                }),
+            (Type::Record(_), _) => Some("has non-record events, but `bins` is a record".into()),
+            (_, Type::Scalar(_)) => None,
+            _ => Some("has non-scalar events, but `bins` is an edge vector".into()),
+        };
+        if let Some(why) = mismatch {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`BinnedPoissonProcess`'s `intensity` {why}: spec §08 bins scalar \
+                     events with an edge vector and record events with a record of edge \
+                     vectors whose fields match theirs"
+                ),
+            ));
+            refused = Some("intensity");
+        }
+    }
+    if let Some(which) = refused {
+        return Type::Failed(
+            format!("BinnedPoissonProcess: `{which}` is outside its domain").into(),
+        );
+    }
+    match (args.first(), args.get(1)) {
+        (Some((_, bins, _)), Some((_, Type::Measure { .. }, _))) if !open(bins) => {
+            match distribution_domain(inf, name, args, named) {
+                Some(domain) => Type::Measure {
+                    domain: Box::new(domain),
+                    mass: Mass::Deferred,
+                },
+                None => Type::Deferred,
+            }
+        }
+        _ => Type::Deferred,
+    }
+}
+
 /// A measure over a length-`len` trajectory in `init`'s state space (spec §06
 /// `markovchain` / `kscan`): domain is `array[len]` of `init`'s type. The
 /// initial state is excluded from the trajectory, so the element type is
@@ -6303,6 +6404,7 @@ fn catalogue_lower(
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        written_size: &|i| literal_size(&module.borrow(), args, i),
         intern: &|s| module.borrow_mut().intern(s),
     };
     lower(sig, &ctx)
@@ -7328,6 +7430,40 @@ fn written_size_check(
         refused = true;
     }
     refused.then(|| Type::Failed(format!("{name}: non-positive written size").into()))
+}
+
+/// §07 `linspace`: "When `n = 1`, `from` and `to` must be equal." `extlinspace` is
+/// `linspace` with two overflow edges, so the same rule holds. Only written values
+/// are compared, as for [`written_size_check`].
+fn single_point_linspace_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    if !matches!(name, "linspace" | "extlinspace") {
+        return None;
+    }
+    let node = |key: &str, pos: usize| named_or_positional_node(inf.module, named, args, key, pos);
+    let (from, to, n) = (node("from", 0)?, node("to", 1)?, node("n", 2)?);
+    if written_int(inf, n) != Some(1) {
+        return None;
+    }
+    let (from, to) = (written_scalar(inf, from)?, written_scalar(inf, to)?);
+    if from == to {
+        return None;
+    }
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` with `n = 1` has the single point `from`, so `from` and `to` must be \
+             equal (spec §07 `linspace`); they are written as `{from}` and `{to}`"
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: one point between unequal ends").into(),
+    ))
 }
 
 /// The value of an integer size WRITTEN at this node: a literal, or `neg` over
@@ -9439,10 +9575,22 @@ fn function_result(
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        written_size: &|i| literal_size(&module.borrow(), args, i),
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (ty, _) = lower(sig, &ctx);
     Some(ty)
+}
+
+/// The positive integer literal written at positional arg `i` as a static dim,
+/// else `%dynamic`.
+fn literal_size(module: &flatppl_core::Module, args: &[ArgInfo], i: usize) -> Dim {
+    match args.get(i).map(|(node, _, _)| module.node(*node)) {
+        Some(Node::Lit(Scalar::Int(n))) if *n > 0 => {
+            u32::try_from(*n).map_or(Dim::Dynamic, Dim::Static)
+        }
+        _ => Dim::Dynamic,
+    }
 }
 
 /// The value-set of a per-name catalogue `Sig::Function` result — its `result_set`
@@ -9474,6 +9622,7 @@ fn function_valueset(
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        written_size: &|i| literal_size(&module.borrow(), args, i),
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (_, vset) = lower(sig, &ctx);
@@ -9508,6 +9657,7 @@ fn distribution_domain(
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
+        written_size: &|_| Dim::Dynamic,
         intern: &crate::catalogue::no_intern,
     };
     let (ty, _vset) = lower(sig, &ctx);
@@ -9613,6 +9763,7 @@ fn kernel_variate(
             arg_scalar: &|_| None,
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
+            written_size: &|_| Dim::Dynamic,
             intern: &no_intern,
         };
         match lower(sig, &ctx).0 {
@@ -10396,11 +10547,15 @@ fn distribution_support(
         return set_expr_valueset(inf, args.first().map(|a| a.0));
     }
     // All other distributions: lower via the catalogue to get the support ValueSet.
+    // A `BinCounts` support reads its edges by position, so bind keywords first.
+    let declared = normalize_keyword_args(inf.module, name, args, named);
+    let declared = declared.as_deref().unwrap_or(args);
     let ctx = LowerCtx {
         param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
-        arg_type: &|i| arg_ty(args, i).cloned(),
+        arg_type: &|i| arg_ty(declared, i).cloned(),
+        written_size: &|_| Dim::Dynamic,
         intern: &crate::catalogue::no_intern,
     };
     let (_ty, vs) = lower(sig, &ctx);
@@ -10770,6 +10925,31 @@ pub(crate) fn fill_mass(
         "lawof" => mass,
         // The broadcast rule already classified the product, even if deferred.
         "broadcast" => mass,
+        // §08 gives `intensity` as a "finite-mass measure or kernel". An infinite
+        // intensity puts infinitely many events in some bin, so it is refused.
+        "BinnedPoissonProcess" => {
+            let intensity = named
+                .iter()
+                .find(|(n, ..)| inf.module.resolve(*n) == "intensity")
+                .map(|(_, node, t, _)| (*node, t))
+                .or_else(|| args.get(1).map(|(node, t, _)| (*node, t)));
+            if let Some((
+                node,
+                Type::Measure {
+                    mass: Mass::LocallyFinite,
+                    ..
+                },
+            )) = intensity
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    node,
+                    "`BinnedPoissonProcess`'s `intensity` has infinite total mass, but \
+                     spec §08 declares it a finite-mass measure or kernel",
+                ));
+                return Type::Failed("BinnedPoissonProcess: infinite intensity".into());
+            }
+            Mass::Normalized
+        }
         // Every §08 distribution is a probability measure.
         // `Dirac(value)` is a point-mass probability measure (total mass 1).
         "Dirac" => Mass::Normalized,

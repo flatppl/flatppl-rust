@@ -50,10 +50,11 @@ fn binding(src: &str, name: &str) -> String {
 
 const V: &str = "v = [1.0, 2.0]\n";
 const M: &str = "M = rowstack([[2.0, 0.0], [0.0, 2.0]])\n";
-/// A spec-valid `%deferred` integer scalar: one bin count of a `BinnedPoissonProcess`
-/// draw, a row with no type rule yet.
-const DEFERRED: &str = "counts ~ BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(10.0, Normal(0.0, 1.0)))\n\
-                        q = counts[1]\n";
+/// A spec-valid `%deferred` real scalar: one field of a record-state `markovchain` draw.
+/// §06 makes that trajectory a table, which the type rule does not build yet.
+const DEFERRED: &str = "step = s -> joint(a = Normal(mu = s.a, sigma = 1.0))\n\
+                        traj ~ markovchain(step, record(a = 0.0), 3)\n\
+                        q = traj[1].a\n";
 
 // ---- §08 scalar parameters ------------------------------------------------------
 

@@ -74,6 +74,14 @@ Catalogue(
         Builtin(name: "LKJ",            sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["n", "eta"], param_sets: [PosIntegers, PosReals])),
         Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["n", "eta"], param_sets: [PosIntegers, PosReals])),
 
+        // ---- Composite ----
+        // BinnedPoissonProcess: spec §08 "integer arrays", one count per bin of
+        // `bins`. `bins` is an edge vector (rank 1) or a record of edge vectors,
+        // and `intensity` a measure or kernel, so neither has a scalar set. The
+        // type rule in ops.rs checks both. PoissonProcess keeps its structural
+        // rule: its domain is the intensity's own point space.
+        Builtin(name: "BinnedPoissonProcess", sig: Distribution(domain: BinCounts(param: "bins"), support: CartPowNonNegIntegers, mass: Normalized, params: ["bins", "intensity"], param_ranks: [1, 0])),
+
         // ---- base per-name functions (spec §07) ----
         // Per-name signatures expressible via ResultSig: constant scalar output,
         // RealOrComplexOfArg, DomainMap, Matrix, and the arg-threading forms
@@ -303,9 +311,10 @@ Catalogue(
         Builtin(name: "diag",           sig: Function(params: [Matrix, Optional(Scalar(Integer))], names: ["A", "k"], result: Vector(len: Dyn, elem: OfArg(0)))),
         // cross(a, b): 3-vector cross product, element kind from a.
         Builtin(name: "cross",          sig: Function(params: [Vector(Real), Vector(Real)], names: ["a", "b"], result: Vector(len: Dyn, elem: OfArg(0)))),
-        // linspace / extlinspace: real vector of grid points.
-        Builtin(name: "linspace",       sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], names: ["from", "to", "n"], result: Vector(len: Dyn, elem: Real))),
-        Builtin(name: "extlinspace",    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], names: ["from", "to", "n"], result: Vector(len: Dyn, elem: Real))),
+        // linspace / extlinspace: real vector of grid points. §07: `n` points, and
+        // `extlinspace` adds the two infinite end points.
+        Builtin(name: "linspace",       sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], names: ["from", "to", "n"], result: Vector(len: WrittenSize(2), elem: Real))),
+        Builtin(name: "extlinspace",    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], names: ["from", "to", "n"], result: Vector(len: Add(WrittenSize(2), 2), elem: Real))),
         // sizeof(x): the dimensions of x as an integer vector.
         Builtin(name: "sizeof",         sig: Function(params: [Any], names: ["x"], result: Vector(len: Dyn, elem: Integer))),
         // totalmass(M): total mass Z = ∫ dM as a real scalar (spec §06).
