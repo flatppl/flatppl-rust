@@ -487,7 +487,8 @@ fn check_argument_rename(
         }
     } else if module.boundary_spans_of(t.reification).is_none() {
         // A sugar body spells the argument by its surface name, so the new name
-        // would capture a free reference, nested bodies included.
+        // would capture a free reference or a called builtin, nested bodies
+        // included. A head lowered from an operator also counts, which is safe.
         let captures = scope_nodes(module, t.reification, true)
             .into_iter()
             .any(|id| match module.node(id) {
@@ -499,7 +500,11 @@ fn check_argument_rename(
                     ns: RefNs::Module(name),
                     ..
                 })
-                | Node::Const(name) => module.resolve(*name) == new_name,
+                | Node::Const(name)
+                | Node::Call(Call {
+                    head: CallHead::Builtin(name),
+                    ..
+                }) => module.resolve(*name) == new_name,
                 _ => false,
             });
         if captures {
@@ -531,10 +536,31 @@ fn line_of(db: &dyn salsa::Database, fs: FileSet, loc: &NameLoc) -> usize {
         })
 }
 
-/// Builtins that apply their first argument, a callable, positionally and
-/// expose none of its input names: spec §06 `pushfwd`, `weighted` and
-/// `logweighted`, §04 `reduce` and `scan`.
-const POSITIONAL_CONSUMERS: &[&str] = &["pushfwd", "weighted", "logweighted", "reduce", "scan"];
+/// Builtins that apply their first argument, a callable, and expose none of
+/// its input names (spec §04 "Explicit callback parameters"). `pushfwd`,
+/// `weighted` and `logweighted` pass the whole variate, and `reduce`, `scan`
+/// and `kscan` pass two or more positional arguments.
+const POSITIONAL_CONSUMERS: &[&str] = &[
+    "pushfwd",
+    "weighted",
+    "logweighted",
+    "reduce",
+    "scan",
+    "kscan",
+];
+
+/// Builtins that apply their callables from the given argument on to one
+/// value. §04 "Calling conventions" passes a lone positional argument whole to
+/// a one-input callable, but auto-splats a record into a callable with more
+/// inputs by name. A first `fchain` or `kchain` argument is excluded: it gives
+/// the composite its input names.
+const ONE_INPUT_APPLIERS: &[(&str, usize)] = &[
+    ("filter", 0),
+    ("markovchain", 0),
+    ("fchain", 1),
+    ("kchain", 1),
+    ("jointchain", 1),
+];
 
 /// How the target's callable is used across the bundle.
 struct CallableUses {
@@ -571,6 +597,10 @@ fn callable_uses(
         .filter(|(_, b)| b.rhs == target.reification)
         .map(|(bid, _)| (target.file, bid))
         .collect();
+    let one_input = matches!(
+        module.node(target.reification),
+        Node::Call(Call { inputs: Some(Inputs::Spec(entries)), .. }) if entries.len() == 1
+    );
     // The part of the reference that names the callable, when it is one.
     let callable_ref =
         |f: SourceFile, module: &flatppl_core::Module, id: NodeId, set: &HashSet<_>| {
@@ -639,6 +669,12 @@ fn callable_uses(
                     } else if POSITIONAL_CONSUMERS.contains(&head) {
                         (first, false)
                     } else {
+                        if one_input
+                            && let Some(&(_, from)) =
+                                ONE_INPUT_APPLIERS.iter().find(|(name, _)| *name == head)
+                        {
+                            followed.extend(call.args.iter().skip(from));
+                        }
                         continue;
                     }
                 }
@@ -1723,6 +1759,13 @@ mod tests {
                 "z",
             ),
             ("f(a) = mul(a, pi)\ny = f(a = 2.0)", 2, "pi"),
+            // The body would call the renamed argument instead of `add`.
+            ("f(a) = add(a, 1.0)\ny = f(a = 2.0)", 2, "add"),
+            (
+                "f(a) = mul(a, sum(broadcast(b -> add(b, 1.0), [1.0])))\ny = f(a = 2.0)",
+                2,
+                "add",
+            ),
         ] {
             let cursor = if cursor == 0 {
                 nth_offset(src, "a ->", 0)
@@ -1764,6 +1807,38 @@ mod tests {
     fn rename_refuses_when_the_callable_escapes_into_a_value() {
         let src = "f(a) = mul(a, 2.0)\ng = record(h = f)\ny = g.h(a = 2.0)";
         let err = rename_refusal(src, 2, "z");
+        assert!(err.contains("used as a value"), "{err}");
+    }
+
+    /// §04 "Calling conventions": a one-input callable receives a lone
+    /// positional argument whole, so `filter` and `markovchain` expose no name.
+    #[test]
+    fn rename_allows_a_one_input_callback() {
+        for (src, cursor_at, expected) in [
+            (
+                "d = [1.0, -1.0]\ny = filter(x -> gt(x, 0.0), d)",
+                "x ->",
+                "d = [1.0, -1.0]\ny = filter(v -> gt(v, 0.0), d)",
+            ),
+            (
+                "m = markovchain(s -> Normal(s, 1.0), 0.0, 5)",
+                "s ->",
+                "m = markovchain(v -> Normal(v, 1.0), 0.0, 5)",
+            ),
+        ] {
+            assert_eq!(
+                rename_clean(src, nth_offset(src, cursor_at, 0), "v"),
+                expected
+            );
+        }
+    }
+
+    /// `fchain` can auto-splat a record into a multi-input callable by name.
+    #[test]
+    fn rename_refuses_a_multi_input_callable_in_fchain() {
+        let src = "g(x) = record(a = x, b = x)\nf(a, b) = add(a, b)\nh = fchain(g, f)";
+        let cursor = nth_offset(src, "f(a", 0) + 2;
+        let err = rename_refusal(src, cursor, "z");
         assert!(err.contains("used as a value"), "{err}");
     }
 
