@@ -225,7 +225,7 @@ fn pushfwd_matrix_affine_lowers() {
     // = -n/2·log 2π - ½‖L⁻¹(v-mu)‖² - log|det L|
     // = -n/2·log 2π - ½(v-mu)ᵀΣ⁻¹(v-mu) - ½·log|det Σ|  ≡  log N(v; mu, Σ).
     let p = pir("mu = [0.0, 0.0]\n\
-         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
@@ -252,11 +252,11 @@ fn pushfwd_matrix_affine_nonidentity_logdet() {
     // synthesized change-of-variables, not just that `logabsdet` appears
     // somewhere).
     let synth = pir("mu = [1.0, 2.0]\n\
-         L = [[2.0, 0.0], [0.0, 3.0]]\n\
+         L = rowstack([[2.0, 0.0], [0.0, 3.0]])\n\
          d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     let explicit = pir("mu = [1.0, 2.0]\n\
-         L = [[2.0, 0.0], [0.0, 3.0]]\n\
+         L = rowstack([[2.0, 0.0], [0.0, 3.0]])\n\
          d = pushfwd(bijection(x -> mu + L * x, x -> linsolve(L, x - mu), x -> logabsdet(L)), iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
@@ -276,11 +276,11 @@ fn pushfwd_matrix_affine_broadcast_add_lowers() {
     // the plain-`add` version with identical mu/L: both outer forms must
     // synthesize the exact same change-of-variables.
     let broadcast = pir("mu = [0.0, 0.0]\n\
-         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> mu .+ L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     let plain = pir("mu = [0.0, 0.0]\n\
-         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     assert!(
@@ -315,7 +315,7 @@ fn pushfwd_coupled_nonlinear_multivariate_refuses() {
     // constant L and logabsdet(L) would be the wrong log-volume. Refuse rather
     // than mislower (the shift `mu` must not reference the input placeholder).
     let e = determinize(&parse_infer(
-        "L = [[1.0, 0.0], [0.0, 1.0]]\n\
+        "L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> exp(x) + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])",
     ))

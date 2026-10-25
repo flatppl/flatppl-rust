@@ -14,6 +14,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
+use crate::catalogue::ParamShape;
 use crate::consteval::{count_dims, count_dims_with_zero, resolve_count, resolve_dim, static_dim};
 use crate::rule::RuleStep::Ready;
 use crate::rule::{LocalTargets, RuleStep};
@@ -228,6 +229,9 @@ pub(crate) fn call_rule(
         return Ready((ty, joined));
     }
     if let Some(ty) = refuse_vector_of_vectors_matrix(inf, &name, args) {
+        return Ready((ty, joined));
+    }
+    if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args) {
         return Ready((ty, joined));
     }
 
@@ -1702,9 +1706,29 @@ fn real_or_complex(a: Option<&Type>) -> Type {
 /// OR complex. The result is complex iff either operand is complex; otherwise
 /// it is real — even for integer operands, since `1 / 2 = 0.5` is real (integer
 /// floor-division is the separate `div` op). This differs from `promote2`,
-/// which would keep integer/integer as integer.
+/// which would keep integer/integer as integer. The row's "array-scalar" and
+/// "transposed-vector–scalar" forms divide each element and keep the shape.
 fn divide_type(a: Option<&Type>, b: Option<&Type>) -> Type {
     use ScalarType::*;
+    match (a, b) {
+        (Some(Type::Array { shape, elem }), Some(s @ Type::Scalar(_)))
+            if matches!(**elem, Type::Scalar(_)) =>
+        {
+            return Type::Array {
+                shape: shape.clone(),
+                elem: Box::new(divide_type(Some(elem), Some(s))),
+            };
+        }
+        (Some(Type::TVector { len, elem }), Some(s @ Type::Scalar(_)))
+            if matches!(**elem, Type::Scalar(_)) =>
+        {
+            return Type::TVector {
+                len: *len,
+                elem: Box::new(divide_type(Some(elem), Some(s))),
+            };
+        }
+        _ => {}
+    }
     let is_complex = |t: Option<&Type>| matches!(t, Some(Type::Scalar(Complex)));
     let known_scalar = |t: Option<&Type>| {
         matches!(
@@ -8563,6 +8587,137 @@ fn refuse_vector_of_vectors_matrix(
     refused.map(|which| Type::Failed(format!("{name}: `{which}` is a vector of vectors").into()))
 }
 
+/// Reject an argument whose shape class is outside its parameter's declared domain:
+/// a non-scalar where §08 declares `elementof(<scalar set>)` or §07 a scalar, a
+/// non-vector where either declares a vector, a non-matrix where either declares a
+/// matrix. The classes come from the catalogue row ([`sig_param_shapes`]), so every
+/// §07 and §08 row is checked by the same rule.
+///
+/// §07 "Elementary functions" states the scalar case outright, "All accept scalar
+/// arguments and return scalar results", and §05 "No implicit operator broadcasting"
+/// leaves `broadcast` and the dotted call as the elementwise route. Without this,
+/// `Normal(mu = v, sigma = v)` typed a measure over `reals` and `linsolve(v, v)` a
+/// vector, both at exit 0.
+///
+/// An unresolved argument (`%deferred`, `%any`, a type variable, `%failed`) is never
+/// refused: only a decided mismatch is an error.
+///
+/// [`sig_param_shapes`]: crate::catalogue::sig_param_shapes
+fn refuse_argument_outside_declared_shape(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    // `refuse_nonscalar_operand` owns the connectives and names their dotted route.
+    if matches!(name, "land" | "lor" | "lxor" | "lnot") {
+        return None;
+    }
+    let cat = crate::catalogue::builtin();
+    let sig = cat.base(name)?;
+    let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
+    let names = cat.base_param_names(name).unwrap_or_default();
+    let section = cat.base_param_section(name);
+    let mut refused = None;
+    for (i, (node, ty, _)) in args.iter().enumerate() {
+        let Some(Some(shape)) = shapes.get(i) else {
+            continue;
+        };
+        let Some(what) = shape_mismatch(*shape, ty) else {
+            continue;
+        };
+        let which = names
+            .get(i)
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| format!("argument {}", i + 1));
+        let remedy = match (shape, ty) {
+            (ParamShape::Scalar, Type::Array { .. } | Type::TVector { .. }) => format!(
+                ". Apply `{name}` elementwise with `{name}.(…)` (spec §04 \"Broadcasting\")"
+            ),
+            (ParamShape::Matrix, _) if what == "a vector of arrays" => {
+                ". Spec §03 \"Arrays\" does not read a vector of vectors as a matrix: build \
+                 it with `rowstack(...)` or `colstack(...)`"
+                    .to_string()
+            }
+            _ => String::new(),
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`{name}`'s {which} is {what}, but spec {section} declares it {}{remedy}",
+                shape.describe()
+            ),
+        ));
+        refused = Some(which);
+    }
+    refused
+        .map(|which| Type::Failed(format!("{name}: {which} is outside its declared shape").into()))
+}
+
+/// What `ty` is when it is outside `shape`, or `None` when it fits or is unresolved.
+fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<&'static str> {
+    let unresolved = |t: &Type| {
+        matches!(
+            t,
+            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_)
+        )
+    };
+    if unresolved(ty) {
+        return None;
+    }
+    let numeric = |t: &Type| matches!(t, Type::Scalar(_)) || unresolved(t);
+    let what = match ty {
+        Type::Scalar(_) if shape == ParamShape::Scalar => return None,
+        Type::Scalar(_) => "a scalar",
+        Type::Array { shape: dims, elem } => match (dims.len(), numeric(elem)) {
+            (1, true) if shape == ParamShape::Vector => return None,
+            (2, true) if shape == ParamShape::Matrix => return None,
+            (1, true) => "a vector",
+            (2, true) => "a matrix",
+            (1, false) if matches!(**elem, Type::Array { .. } | Type::TVector { .. }) => {
+                "a vector of arrays"
+            }
+            (_, true) => "an array of three or more dimensions",
+            (_, false) => "an array of non-scalars",
+        },
+        // §03 "Arrays": "The term vector will represent both non-transposed vectors
+        // (one-dimensional arrays) and transposed vectors".
+        Type::TVector { elem, .. } if shape == ParamShape::Vector && numeric(elem) => return None,
+        Type::TVector { .. } => "a transposed vector",
+        Type::Record(_) => "a record",
+        Type::Tuple(_) => "a tuple",
+        Type::Table { .. } => "a table",
+        Type::Measure { .. } => "a measure",
+        Type::Kernel { .. } => "a kernel",
+        Type::Function { .. } => "a function",
+        Type::Likelihood { .. } => "a likelihood",
+        Type::Module => "a module",
+        Type::RngState => "an RNG state",
+        Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => return None,
+    };
+    Some(what)
+}
+
+/// The type a catalogue row's call takes while a shaped argument is unresolved: the
+/// `%failed` of a failed argument, or `%deferred` for a `%deferred` one.
+///
+/// A row's nominal result presumes each argument has its declared shape. `sqrt` of a
+/// `%deferred` argument typed a confirmed real scalar although that argument could be a
+/// vector, which a later scalar gate then trusted. A §08 distribution is not affected:
+/// its variate domain is fixed by the row, whatever its parameters' values. Only
+/// `%deferred` and `%failed` are propagated: `%any` and a type variable are a
+/// placeholder's honest "no constraint" (the `_` of `fn(sqrt(_))`), whose body type is
+/// the nominal result.
+fn unresolved_shaped_argument(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> Option<Type> {
+    let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
+    args.iter()
+        .zip(shapes)
+        .filter(|(_, shape)| shape.is_some())
+        .find_map(|((_, ty, _), _)| match ty {
+            Type::Deferred | Type::Failed(_) => Some(ty.clone()),
+            _ => None,
+        })
+}
+
 /// The argument positions of `name` whose domain §03 "Bool" states as boolean,
 /// or `None` for every other head. `ifelse` constrains only `cond`; the four
 /// connectives constrain every operand.
@@ -9141,6 +9296,9 @@ fn function_result(
     let Sig::Function { .. } = sig else {
         return None;
     };
+    if let Some(ty) = unresolved_shaped_argument(sig, args) {
+        return Some(ty);
+    }
     // `ResultSig::Record` interns field-name Symbols into the module. Behind a
     // RefCell so the `intern` closure is a `Fn` (not `FnMut`), coexisting with
     // the immutable arg accessors. This is the one live function-row lower path,
@@ -9751,6 +9909,8 @@ pub(crate) fn call_valueset(
         // distribution constructors carry the support column of spec §08. A
         // bare name is one or the other — try the function row first, then fall
         // through to distribution support.
+        // A row whose type `unresolved_shaped_argument` left unresolved has no set yet.
+        _ if matches!(ty, Type::Deferred | Type::Failed(_)) => ValueSet::Unknown,
         _ => {
             if let Some(vs) = function_valueset(&mut *inf.module, &name, args) {
                 vs

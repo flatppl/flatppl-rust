@@ -7359,7 +7359,8 @@ outputs = (draws)
 /// The `emit_sample` mirror of `mvnormal_logpdf_refuses_dynamic_vector_length`
 /// for rank, not length: a rank-2 `alpha` (`cartpow(posreals, [2, 2])`) must
 /// refuse precisely, not reach [`vector_elem`]'s slice+reshape idiom on an
-/// operand it was never built to accept.
+/// operand it was never built to accept. Inference refuses it first (§08 gives
+/// `alpha` as a vector); the emitter's rank guard is the backstop.
 #[test]
 fn dirichlet_sample_refuses_nonrank1_alpha() {
     let src = "\
@@ -7370,18 +7371,10 @@ draws = rand(lawof(x), s)
 inputs = (alpha)
 outputs = (draws)
 ";
-    let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
-        .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("Dirichlet sample: 'alpha' must be a rank-1 vector"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert!(
-        err.node.is_some(),
-        "expected the refusal localized to the 'alpha' node, got node: None"
+        err.contains("`Dirichlet`'s `alpha` is a matrix"),
+        "unexpected message: {err}"
     );
 }
 
@@ -7789,7 +7782,8 @@ outputs = (draws)
 
 /// The rank mirror of [`multinomial_sample_refuses_dynamic_vector_length`]: a
 /// rank-2 `p` must refuse precisely, not reach [`vector_elem`]'s slice+reshape
-/// idiom on an operand it was never built to accept.
+/// idiom on an operand it was never built to accept. Inference refuses it first
+/// (§08 gives `p` as a vector); the emitter's rank guard is the backstop.
 #[test]
 fn multinomial_sample_refuses_nonrank1_p() {
     let src = "\
@@ -7801,18 +7795,10 @@ draws = rand(lawof(x), s)
 inputs = (p)
 outputs = (draws)
 ";
-    let d = determinize_src(src);
-    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &unrestricted_options())
-        .unwrap_err();
+    let err = infer_refusal(src);
     assert!(
-        err.msg
-            .contains("Multinomial sample: 'p' must be a rank-1 vector"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert!(
-        err.node.is_some(),
-        "expected the refusal localized to the 'p' node, got node: None"
+        err.contains("`Multinomial`'s `p` is a matrix"),
+        "unexpected message: {err}"
     );
 }
 
@@ -9862,7 +9848,7 @@ fn emit_logdensity_refuses_mixed_orientation_on_the_dotted_and_predicate_paths()
         ("`.*`", "sum(transpose(v) .* w)", "(v, w)"),
         (
             "compare inside ifelse",
-            "sum(ifelse(transpose(v) .< w, v, w))",
+            "sum(ifelse.(transpose(v) .< w, v, w))",
             "(v, w)",
         ),
         (
@@ -10446,7 +10432,7 @@ m = elementof(cartpow(reals, [4, 3]))
 n = elementof(cartpow(reals, [4, 3]))
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 .< v2, m, n)
+z = ifelse.(v1 .< v2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (m, n, v1, v2)
 outputs = lp
@@ -10479,7 +10465,7 @@ p1 = elementof(cartpow(reals, 1))
 p2 = elementof(cartpow(reals, 1))
 m = elementof(cartpow(reals, 3))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10507,7 +10493,7 @@ p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 1))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10539,7 +10525,7 @@ p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 .< p2, m, n)
+z = ifelse.(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10587,7 +10573,7 @@ outputs = lp
             "\
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 .< v2, 1.0, 2.0)
+z = ifelse.(v1 .< v2, 1.0, 2.0)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (v1, v2)
 outputs = lp
@@ -11017,13 +11003,14 @@ outputs = lp
 // unchanged: `emit_logdensity_refuses_bare_pow_with_a_vector_base` (`v ^ 2.0`)
 // and `emit_logdensity_refuses_bare_divide_of_scalar_by_vector` (`s / v`).
 //
-// `infer` still reports NO diagnostic for either model, and types the
-// synthesized `sqrt(add(pow(sv, 2.0), 1.0))` as `(%scalar real)` despite the
-// `%deferred` `pow` under it — so neither refusal comes from inference.
+// Inference now refuses the first model (`Normal`'s `sigma` is a vector where §08
+// declares a scalar), so its test asserts that refusal; the row guard stays covered by
+// `crates/determinizer/tests/vector_parameter_rows_refuse.rs`. `infer` reports no
+// diagnostic for the second, whose refusal is the determiniser's.
 
 /// The Normal–Normal conjugate marginal row (`determinizer::marginal`) matched a
 /// prior whose `sigma` is a VECTOR and synthesized `pow(sigma, 2)` on it — outside
-/// §07 `pow`'s "scalars" domain. The row's parameter-scalarity guard now refuses.
+/// §07 `pow`'s "scalars" domain. Inference now refuses the vector `sigma` first.
 #[test]
 fn determinize_refuses_a_conjugate_row_over_a_vector_prior_sigma() {
     let src = "\
@@ -11034,11 +11021,10 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))
 inputs = (sv)
 outputs = lp
 ";
-    let err = determinize_err(src);
+    let err = infer_refusal(src);
     assert!(
-        err.contains("conjugate pair matched but the prior's `sigma` is a vector")
-            && err.contains("broadcast"),
-        "expected the conjugate row's non-scalar-parameter refusal, got: {err}"
+        err.contains("`Normal`'s `sigma` is a vector") && err.contains("Normal.("),
+        "expected inference's non-scalar-parameter refusal, got: {err}"
     );
 }
 

@@ -2559,15 +2559,15 @@ lp = logdensityof(lawof(y), 0.3)";
 }
 
 // The bare and record spellings of one matrix-affine value law must lower identically.
-// `A * x + b` types as `%deferred` at the `add` (`mul(matrix, vector)` has no type rule
-// and deferredness propagates outward), yet `crate::invert`'s matrix-affine grammar
-// handles it and emits `linsolve`/`logabsdet`. A guard reading that deferred RESULT type
-// as "unreadable map" refused the bare spelling while the record one kept lowering. Same
-// bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd` holds for the scalar case.
+// `crate::invert`'s matrix-affine grammar emits `linsolve`/`logabsdet` for `A * x + b`. A
+// guard reading the map's RESULT type as "unreadable map" once refused the bare spelling
+// (with `A` a vector of vectors, which §03 does not read as a matrix, `mul` typed
+// `%deferred`) while the record one kept lowering. Same bar
+// `bare_lawof_of_derived_scalar_lowers_like_pushfwd` holds for the scalar case.
 #[test]
 fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
     let prelude = "\
-A = [[2.0, 0.0], [0.0, 3.0]]
+A = rowstack([[2.0, 0.0], [0.0, 3.0]])
 b = [1.0, 1.0]
 x = draw(MvNormal(mu = [0.0, 0.0], cov = rowstack([[1.0, 0.0], [0.0, 1.0]])))
 y = A * x + b

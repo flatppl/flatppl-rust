@@ -265,7 +265,7 @@ fn matrix_affine_emits_no_gate() {
     // `mu + L * x` with square `L` is onto ℝⁿ — nothing to gate. Pins that the
     // vector arm reads the elementwise shape rather than gating every vector map.
     let out = lp("mu = [0.0, 0.0]\n\
-         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         L = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
          lp = logdensityof(d, [0.5, 0.5])");
     assert!(

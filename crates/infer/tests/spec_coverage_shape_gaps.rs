@@ -496,17 +496,17 @@ fn matmul_matrix_vector_and_matrix_matrix() {
 /// real scalar, a complex matrix a complex scalar (`ResultSig::ElemScalarKind`).
 #[test]
 fn det_infers_element_scalar_kind() {
-    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
+    let out = ir("x = det(rowstack([[1.0, 0.0], [0.0, 1.0]]))");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (det"),
         "det(real matrix) should infer a real scalar, got:\n{out}"
     );
-    let out = ir("A = [[complex(1.0, 2.0)]]\nx = det(A)");
+    let out = ir("A = rowstack([[complex(1.0, 2.0)]])\nx = det(A)");
     assert!(
         out.contains("(%scalar complex)") && out.contains("(det"),
         "det(complex matrix) should infer a complex scalar, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = trace(A)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nx = trace(A)");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (trace"),
         "trace(real matrix) should infer a real scalar, got:\n{out}"
@@ -533,7 +533,7 @@ fn real_scalar_reductions_infer() {
             "{op} should infer a real scalar over a real array, got:\n{out}"
         );
     }
-    let out = ir("x = logabsdet([[2.0, 0.0], [0.0, 2.0]])");
+    let out = ir("x = logabsdet(rowstack([[2.0, 0.0], [0.0, 2.0]]))");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (logabsdet"),
         "logabsdet should infer a real scalar, got:\n{out}"
@@ -564,7 +564,7 @@ fn vector_result_functions_infer() {
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
         "linspace should infer a real vector, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = diag(A)");
+    let out = ir("A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = diag(A)");
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(diag"),
         "diag(real matrix) should infer a real vector, got:\n{out}"
@@ -592,7 +592,7 @@ fn boolean_and_quadform_infer_scalars() {
         out.contains("(%meta ((%scalar boolean) %fixed booleans) (boolean"),
         "boolean should infer a boolean scalar, got:\n{out}"
     );
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nv = [1.0, 2.0]\nx = quadform(A, v)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nv = [1.0, 2.0]\nx = quadform(A, v)");
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (quadform"),
         "quadform(real) should infer a real scalar, got:\n{out}"
@@ -604,8 +604,14 @@ fn boolean_and_quadform_infer_scalars() {
 #[test]
 fn matrix_constructors_infer_matrices() {
     for (op, src) in [
-        ("row_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = row_gram(A)"),
-        ("col_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = col_gram(A)"),
+        (
+            "row_gram",
+            "A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = row_gram(A)",
+        ),
+        (
+            "col_gram",
+            "A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = col_gram(A)",
+        ),
         ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
     ] {
         let out = ir(src);
@@ -752,7 +758,7 @@ fn reduce_and_filter_infer() {
 /// through the lowering context). The reusable record-valued result path.
 #[test]
 fn qr_infers_a_record_of_matrices() {
-    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nd = qr(A)");
+    let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nd = qr(A)");
     assert!(
         out.contains("(%record (Q (%array 2 (%dynamic %dynamic) (%scalar real))) (R (%array 2 (%dynamic %dynamic) (%scalar real))))")
             && out.contains("(qr"),

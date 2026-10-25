@@ -56,6 +56,19 @@ fn emit(src: &str) -> String {
     .expect("must emit @logdensity")
 }
 
+/// Inference's refusal of `src`. Inference refuses an operand outside a §07 Domains cell
+/// before the emitter sees the model; the emitter's own guard is the backstop.
+fn infer_err(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let found: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(!found.is_empty(), "inference must refuse:\n{src}");
+    found.join("\n")
+}
+
 fn emit_err(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_abi(src),
@@ -606,10 +619,10 @@ fn the_vector_only_heads_refuse_a_matrix() {
         let src = format!(
             "A = elementof(cartpow(reals, [2, 3]))\ny = {head}(A)\ninputs = (A)\noutputs = (y)\n"
         );
-        let err = emit_err(&src);
+        let err = infer_err(&src);
         assert!(
-            err.contains(head) && err.contains("the domain \"vectors\""),
-            "`{head}` must refuse a matrix citing §07's vectors domain, got: {err}"
+            err.contains(&format!("`{head}`'s `")) && err.contains("is a matrix"),
+            "`{head}` must refuse a matrix on §07's vectors domain, got: {err}"
         );
     }
 }
@@ -650,12 +663,13 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
             "`aggregate({head}, …)` must refuse on §04's eligibility rule, got: {err}"
         );
 
-        // `cumsum` in the BODY of the `:=` sum-aggregate — §07's vectors domain.
-        let err = emit_err(&format!(
+        // `cumsum` in the BODY of the `:=` sum-aggregate — §07's vectors domain, which
+        // inference enforces on the scalar cell.
+        let err = infer_err(&format!(
             "{matrix}y[.i] := {head}(A[.i, .j])\ninputs = (A)\noutputs = (y)\n"
         ));
         assert!(
-            err.contains(head) && err.contains("the domain \"vectors\""),
+            err.contains(&format!("`{head}`'s `xs` is a scalar")),
             "`y[.i] := {head}(…)` must refuse on §07's vectors domain, got: {err}"
         );
     }
