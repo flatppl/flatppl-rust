@@ -2850,7 +2850,7 @@ mod tests {
 
     #[test]
     fn reifications_print_as_named_functions_and_kernels() {
-        let src = "mu = elementof(reals)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), 8)\ny = Normal.(theta, 1.0)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\nK = kernelof(record(y = y), mu = mu, tau = tau, theta = theta)\nL = likelihoodof(K, record(y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))\npost = bayesupdate(L, prior)\nf = x -> 2 * x\nh = fn(abs(_) * _)\nsq(a) = a^2";
+        let src = "mu = elementof(reals)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), 8)\ny ~ Normal.(theta, 1.0)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\nK = kernelof(record(y = y), mu = mu, tau = tau, theta = theta)\nL = likelihoodof(K, record(y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))\npost = bayesupdate(L, prior)\nf = x -> 2 * x\nh = fn(abs(_) * _)\nsq(a) = a^2";
         let rows = rows(src);
         let prior = mathml::expr(&row_named(&rows, "prior").statement.rhs);
         assert_eq!(

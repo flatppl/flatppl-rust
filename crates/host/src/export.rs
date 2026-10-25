@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
+    Call, CallHead, Dim, Idx, Module, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
 };
 use flatppl_stablehlo::{
     BatchSpec, Dtype, ElemKind, EmitError, EmitOptions, Emitter, MlirTy, Value, check_query_inputs,
@@ -540,25 +540,15 @@ fn project(
 type Roots = HashMap<Symbol, Symbol>;
 
 fn input_roots(module: &Module, declared: &HashSet<Symbol>) -> Roots {
-    let mut roots = Roots::new();
-    for &root in declared {
-        let mut name = root;
-        for _ in 0..=module.binding_count() {
-            roots.insert(name, root);
-            let Some(binding) = module.binding_by_name(name) else {
-                break;
-            };
-            let Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name: next,
-            }) = module.node(module.binding(binding).rhs)
-            else {
-                break;
-            };
-            name = *next;
-        }
-    }
-    roots
+    declared
+        .iter()
+        .flat_map(|&root| {
+            module
+                .alias_chain(root)
+                .into_iter()
+                .map(move |name| (name, root))
+        })
+        .collect()
 }
 
 fn input_path(

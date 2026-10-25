@@ -186,7 +186,7 @@ pub fn check_query_inputs(
     // Every name on an input's alias chain is that input (§04).
     let inputs: HashSet<Symbol> = inputs
         .iter()
-        .flat_map(|&name| alias_chain(module, name))
+        .flat_map(|&name| module.alias_chain(name))
         .collect();
     let inputs = &inputs;
     let mut pending = outputs
@@ -245,27 +245,6 @@ pub fn check_query_inputs(
         module.for_each_child(node, |child| pending.push((child, bound.clone())));
     }
     Ok(())
-}
-
-/// `name` and every name its bare-name alias chain passes through.
-fn alias_chain(m: &Module, name: Symbol) -> Vec<Symbol> {
-    let mut chain = vec![name];
-    let mut current = name;
-    for _ in 0..m.binding_count() {
-        let Some(bid) = m.binding_by_name(current) else {
-            break;
-        };
-        let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name: next,
-        }) = m.node(m.binding(bid).rhs)
-        else {
-            break;
-        };
-        chain.push(*next);
-        current = *next;
-    }
-    chain
 }
 
 /// Emit `@logdensity` for a determinized module `m` that declares the
