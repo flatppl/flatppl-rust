@@ -126,6 +126,12 @@ pub enum Sym {
     Dirac,
     /// Δ for the standard simplex.
     Simplex,
+    /// ↑, the subscript of ℝⁿ_↑ for `ordered(n)`.
+    Increasing,
+    /// The bold all-ones vector 𝟏 of 𝟏ₙ^⊥ for `zerosum(n)`.
+    Ones,
+    /// ⊥, the orthogonal complement.
+    Perp,
     /// `…`
     Ellipsis,
     /// `·` as a placeholder argument (`A_{·,j}`, `p_K(data | ·)`).

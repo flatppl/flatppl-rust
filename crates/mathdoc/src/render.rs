@@ -363,6 +363,44 @@ mod tests {
     }
 
     #[test]
+    fn ordered_and_zerosum_sets_take_their_symbols_in_every_format() {
+        let src = "n = external(posintegers)\na = elementof(ordered(3))\nb = elementof(ordered(n))\nc = elementof(zerosum(3))\nd = elementof(zerosum(n))";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        for (name, tex, typst, mathml) in [
+            (
+                "a",
+                r"{\mathbb{R}}_{\uparrow}^{3}",
+                "attach(ℝ, br: arrow.t, tr: 3)",
+                "<msubsup><mi>ℝ</mi><mo>↑</mo><mn>3</mn></msubsup>",
+            ),
+            (
+                "b",
+                r"{\mathbb{R}}_{\uparrow}^{n}",
+                "attach(ℝ, br: arrow.t, tr: n)",
+                "<msubsup><mi>ℝ</mi><mo>↑</mo><mi data-flatppl-ref=\"n\">n</mi></msubsup>",
+            ),
+            (
+                "c",
+                r"{\mathbf{1}}_{3}^{\perp}",
+                "attach(bold(1), br: 3, tr: perp)",
+                "<msubsup><mn>𝟏</mn><mn>3</mn><mo>⊥</mo></msubsup>",
+            ),
+            (
+                "d",
+                r"{\mathbf{1}}_{n}^{\perp}",
+                "attach(bold(1), br: n, tr: perp)",
+                "<msubsup><mn>𝟏</mn><mi data-flatppl-ref=\"n\">n</mi><mo>⊥</mo></msubsup>",
+            ),
+        ] {
+            let row = r.bindings.iter().find(|b| b.name == name).unwrap();
+            assert_eq!(crate::tex::expr(&row.statement.rhs), tex, "{name}");
+            assert_eq!(crate::typst::expr(&row.statement.rhs), typst, "{name}");
+            assert_eq!(crate::mathml::expr(&row.statement.rhs), mathml, "{name}");
+        }
+    }
+
+    #[test]
     fn statistical_symbols_keep_parameter_roles_and_extended_support() {
         let r = render_source("s = elementof(reals)\nx ~ StudentT(5)\ny ~ ChiSquared(3)\nu = Uniform(unitinterval)\ng = Gamma(2, 3)\nL = lawof(x)", "m.flatppl", &HashMap::new()).unwrap();
         for (name, markup) in [
