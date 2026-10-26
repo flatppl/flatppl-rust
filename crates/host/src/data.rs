@@ -1,12 +1,49 @@
-//! Host-side JSON data loading. Declared domains determine shape and selection.
+//! Host-side data loading (spec §07 `load_data`). The declared domain determines
+//! shape and selection; [`crate::readers`] decodes the source by its extension.
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Dim, Module, Node, NodeId, RefNs, Scalar, Symbol, Type};
-use serde_json::Value;
+use flatppl_core::{CallHead, Dim, Module, Node, NodeId, RefNs, Scalar, ScalarType, Symbol, Type};
 
 use crate::Constant;
 use crate::compiler::resolve_ref;
+use crate::readers::{Datum, decode, format};
+
+/// A `load_data` source that cannot be loaded, localized to its call when the
+/// call is known.
+#[derive(Debug)]
+pub struct DataError {
+    /// The `load_data` call, in the module passed to [`load_fixed_data`].
+    pub node: Option<NodeId>,
+    /// The source as the call names it, after path resolution.
+    pub source: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => write!(f, "load_data({source:?}): {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl From<String> for DataError {
+    fn from(message: String) -> Self {
+        DataError {
+            node: None,
+            source: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for DataError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
 
 /// Resolve data source names before a module is grafted into its importer.
 /// The caller supplies the declaring file's path and bundle policy; no data is read.
@@ -49,12 +86,13 @@ pub fn resolve_data_sources(
 }
 
 /// Bake reached, unpromoted `load_data` values into a determinized module.
-/// Numeric JSON scalars, arrays, records and column-oriented tables are supported.
-/// `read` retains the caller's file-access/cache policy. Runtime inputs are never read.
+/// Scalars, arrays, records and tables are read from JSON, CSV, WSV, Arrow IPC
+/// and Safetensors sources (§07). `read` retains the caller's file-access/cache
+/// policy. Runtime inputs are never read.
 pub fn load_fixed_data(
     module: &mut Module,
     mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
-) -> Result<(), String> {
+) -> Result<(), DataError> {
     let inputs: HashSet<Symbol> = binding(module, "inputs")
         .map(|node| signature(module, node))
         .unwrap_or_default()
@@ -104,13 +142,18 @@ pub fn load_fixed_data(
             let Node::Lit(Scalar::Str(source)) = module.node(resolve_ref(module, source)) else {
                 return Err("load_data requires a fixed source string".into());
             };
-            let fail = |message| format!("load_data({source:?}): {message}");
-            let json: Value = serde_json::from_slice(&read(source).map_err(fail)?)
-                .map_err(|error| fail(error.to_string()))?;
+            let fail = |message: String| DataError {
+                node: Some(node),
+                source: Some(source.to_string()),
+                message,
+            };
+            let format = format(source).map_err(fail)?;
+            let bytes = read(source).map_err(fail)?;
+            let datum = decode(format, &bytes).map_err(fail)?;
             let ty = module
                 .type_of(node)
                 .ok_or_else(|| fail("unresolved data type".into()))?;
-            let value = selected_value(module, &json, ty)
+            let value = selected_value(module, &datum, ty)
                 .map_err(fail)?
                 .validated(module, node)
                 .map_err(fail)?;
@@ -126,23 +169,15 @@ pub fn load_fixed_data(
             .into_iter()
             .find(|error| error.severity == flatppl_infer::Severity::Error)
         {
-            return Err(error.message);
+            return Err(error.message.into());
         }
     }
     Ok(())
 }
 
-fn selected_value(module: &Module, json: &Value, ty: &Type) -> Result<Constant, String> {
+fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant, String> {
     match ty {
-        Type::Scalar(_) => match json {
-            Value::Bool(value) => Ok(Constant::Bool(*value)),
-            Value::Number(value) => value
-                .as_i64()
-                .map(Constant::Integer)
-                .or_else(|| value.as_f64().map(Constant::Real))
-                .ok_or_else(|| "number is not representable".into()),
-            _ => Err("expected a numeric scalar".into()),
-        },
+        Type::Scalar(scalar) => scalar_value(datum, *scalar),
         Type::Array { shape, elem } => {
             let dims = shape
                 .iter()
@@ -151,52 +186,137 @@ fn selected_value(module: &Module, json: &Value, ty: &Type) -> Result<Constant, 
                     Dim::Dynamic => Err("load_data dimensions must be fixed".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // §07 lets a delimited or Arrow source with one column hold a vector.
+            let datum = match datum {
+                Datum::Columns(columns) if dims.len() == 1 && columns.len() == 1 => &columns[0].1,
+                Datum::Columns(columns) if dims.len() == 1 => {
+                    return Err(format!(
+                        "a vector reads a source with exactly one column, and this one has {}",
+                        columns.len()
+                    ));
+                }
+                datum => datum,
+            };
             let mut data = Vec::new();
-            array_prefix(module, json, &dims, elem, &mut data)?;
+            match datum {
+                Datum::Tensor {
+                    shape,
+                    data: leaves,
+                } => tensor_prefix(module, shape, leaves, &dims, elem, &mut data)?,
+                datum => array_prefix(module, datum, &dims, elem, &mut data)?,
+            }
             Ok(Constant::Array { shape: dims, data })
         }
         Type::Record(fields) => fields
             .iter()
             .map(|(name, ty)| {
                 let name = module.resolve(*name);
-                let field = json
-                    .get(name)
+                let field = datum
+                    .field(name)
                     .ok_or_else(|| format!("missing field `{name}`"))?;
                 Ok((name.into(), selected_value(module, field, ty)?))
             })
             .collect::<Result<_, _>>()
             .map(Constant::Record),
-        Type::Table { columns, nrows } => columns
-            .iter()
-            .map(|(name, ty)| {
-                let name = module.resolve(*name);
-                let field = json
-                    .get(name)
-                    .ok_or_else(|| format!("missing column `{name}`"))?;
-                let column = Type::Array {
-                    shape: vec![*nrows].into(),
-                    elem: Box::new(ty.clone()),
-                };
-                Ok((name.into(), selected_value(module, field, &column)?))
-            })
-            .collect::<Result<_, _>>()
-            .map(Constant::Table),
+        Type::Table { columns, nrows } => {
+            // §07 JSON: struct-of-arrays, or array-of-structs read row by row.
+            let rows = match datum {
+                Datum::List(rows) => Some(rows),
+                _ => None,
+            };
+            columns
+                .iter()
+                .map(|(name, ty)| {
+                    let name = module.resolve(*name);
+                    let transposed;
+                    let field = match rows {
+                        Some(rows) => {
+                            transposed = Datum::List(
+                                rows.iter()
+                                    .enumerate()
+                                    .map(|(i, row)| {
+                                        row.field(name).cloned().ok_or_else(|| {
+                                            format!("row {} is missing field `{name}`", i + 1)
+                                        })
+                                    })
+                                    .collect::<Result<_, _>>()?,
+                            );
+                            &transposed
+                        }
+                        None => datum
+                            .field(name)
+                            .ok_or_else(|| format!("missing column `{name}`"))?,
+                    };
+                    let column = Type::Array {
+                        shape: vec![*nrows].into(),
+                        elem: Box::new(ty.clone()),
+                    };
+                    Ok((name.into(), selected_value(module, field, &column)?))
+                })
+                .collect::<Result<_, _>>()
+                .map(Constant::Table)
+        }
         _ => Err("load_data needs a declared numeric scalar, array, record or table domain".into()),
+    }
+}
+
+/// A scalar of `kind`. Typed sources keep their own kind for the domain check; a
+/// delimited cell is text, parsed here once its set is known.
+fn scalar_value(datum: &Datum, kind: ScalarType) -> Result<Constant, String> {
+    // §03 nests booleans ⊂ integers ⊂ reals, so only a wider source kind refuses.
+    match (datum, kind) {
+        (Datum::Real(_) | Datum::Real32(_), ScalarType::Integer | ScalarType::Boolean) => {
+            return Err("a real value where the declared set holds integers or booleans".into());
+        }
+        (Datum::Int(_), ScalarType::Boolean) => {
+            return Err("an integer value where the declared set holds booleans".into());
+        }
+        _ => {}
+    }
+    match datum {
+        Datum::Bool(b) => Ok(Constant::Bool(*b)),
+        Datum::Int(i) => Ok(Constant::Integer(*i)),
+        Datum::Real(x) => Ok(Constant::Real(*x)),
+        Datum::Real32(x) => Ok(Constant::Real32(*x)),
+        Datum::Null => Err("a value is missing".into()),
+        Datum::Tensor { shape, data } if shape.is_empty() => scalar_value(&data[0], kind),
+        Datum::Text(cell) => {
+            let parsed = match kind {
+                ScalarType::Boolean if cell.eq_ignore_ascii_case("true") => {
+                    Some(Constant::Bool(true))
+                }
+                ScalarType::Boolean if cell.eq_ignore_ascii_case("false") => {
+                    Some(Constant::Bool(false))
+                }
+                ScalarType::Boolean => None,
+                ScalarType::Integer => cell.parse::<i64>().map(Constant::Integer).ok(),
+                _ => cell.parse::<i64>().map(Constant::Integer).ok().or_else(|| {
+                    cell.parse::<f64>()
+                        .ok()
+                        .filter(|x| !x.is_nan())
+                        .map(Constant::Real)
+                }),
+            };
+            parsed.ok_or_else(|| format!("cell `{cell}` is not a value of its declared set"))
+        }
+        _ => Err("expected a scalar".into()),
     }
 }
 
 fn array_prefix(
     module: &Module,
-    json: &Value,
+    datum: &Datum,
     shape: &[u32],
     elem: &Type,
     data: &mut Vec<Constant>,
 ) -> Result<(), String> {
     let Some((&n, rest)) = shape.split_first() else {
-        data.push(selected_value(module, json, elem)?);
+        data.push(selected_value(module, datum, elem)?);
         return Ok(());
     };
-    let values = json.as_array().ok_or("expected a JSON array")?;
+    let Datum::List(values) = datum else {
+        return Err("expected an array".into());
+    };
     if values.len() < n as usize {
         return Err(format!(
             "requested {n} entries but only {} are available",
@@ -205,6 +325,36 @@ fn array_prefix(
     }
     for value in &values[..n as usize] {
         array_prefix(module, value, rest, elem, data)?;
+    }
+    Ok(())
+}
+
+/// A Safetensors tensor as the declared array: the shape must match, except that a
+/// vector may read its first `n` entries (§07 "the first `n` entries").
+fn tensor_prefix(
+    module: &Module,
+    shape: &[usize],
+    leaves: &[Datum],
+    dims: &[u32],
+    elem: &Type,
+    data: &mut Vec<Constant>,
+) -> Result<(), String> {
+    let fits = shape.len() == dims.len()
+        && shape
+            .iter()
+            .zip(dims)
+            .enumerate()
+            .all(|(axis, (&have, &want))| {
+                have == want as usize || (dims.len() == 1 && axis == 0 && have >= want as usize)
+            });
+    if !fits {
+        return Err(format!(
+            "tensor shape {shape:?} does not match the declared shape {dims:?}"
+        ));
+    }
+    let count = dims.iter().map(|&d| d as usize).product::<usize>();
+    for leaf in &leaves[..count] {
+        data.push(selected_value(module, leaf, elem)?);
     }
     Ok(())
 }

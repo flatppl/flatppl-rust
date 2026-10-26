@@ -1101,7 +1101,7 @@ fn determinize_cmd(
     };
     let mut lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    load_fixed_data(&mut lowered, &resolver)?;
+    load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
     flatppl_determinizer::prepare_serialization(&mut lowered, roots);
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
@@ -1183,7 +1183,7 @@ fn stablehlo_cmd(
         &opts.lowering_options(),
     )
     .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
-    load_fixed_data(&mut lowered, &resolver)?;
+    load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
     let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
@@ -1198,11 +1198,18 @@ fn stablehlo_cmd(
     Ok(())
 }
 
+/// Bake fixed `load_data` values into `module`. A refusal names the call's binding
+/// and position in `input` when the call is one of `surface`'s own nodes (lowering
+/// appends nodes and never renumbers them).
 #[cfg(any(feature = "determinize", feature = "stablehlo"))]
 fn load_fixed_data(
     module: &mut flatppl_core::Module,
     resolver: &CliResolver,
+    input: &Path,
+    source: &str,
+    surface: &flatppl_core::Module,
 ) -> Result<(), Failure> {
+    use flatppl_core::Idx;
     flatppl_host::load_fixed_data(module, |source| {
         resolver
             .read_bytes(&Location::parse(source))
@@ -1213,5 +1220,21 @@ fn load_fixed_data(
                 | Failure::Diagnostic { message, .. } => message,
             })
     })
-    .map_err(|error| Failure::Refuse(flatppl_cli::resolve::terminal_message(&error)))
+    .map_err(|error| {
+        let mut site = String::new();
+        if let Some(node) = error.node.filter(|id| id.index() < surface.node_count()) {
+            if let Some(name) = enclosing_binding(surface, node) {
+                site.push_str(&format!(" in `{name}`"));
+            }
+            if let Some(span) = surface.span_of(node) {
+                let (line, col) = line_col(source, span.start as usize);
+                site.push_str(&format!(
+                    " ({}:{line}:{col})",
+                    flatppl_cli::terminal_path(input)
+                ));
+            }
+        }
+        let message = flatppl_cli::resolve::terminal_message(&error.to_string());
+        Failure::Refuse(format!("load_data: refuse{site}: {message}"))
+    })
 }

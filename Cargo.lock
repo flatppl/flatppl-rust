@@ -653,6 +653,7 @@ dependencies = [
 name = "flatppl-host"
 version = "0.1.0"
 dependencies = [
+ "csv",
  "flatppl-bundle",
  "flatppl-core",
  "flatppl-determinizer",
@@ -663,6 +664,7 @@ dependencies = [
  "flatppl-mathdoc",
  "flatppl-stablehlo",
  "flatppl-syntax",
+ "half",
  "serde",
  "serde_json",
  "sha2",

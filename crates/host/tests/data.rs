@@ -141,3 +141,290 @@ fn cached_data_cannot_escape_a_bundle_through_a_symlink() -> Result<(), Box<dyn 
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+// ---- §07 formats ----------------------------------------------------------
+//
+// `fixtures/data/` holds one table in every format §07 requires (regenerate with
+// `generate.py`): Arrow IPC from polars, Safetensors packed from the format
+// definition. Each test compiles a selection and compares it with the same values
+// written as literals.
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/data")
+}
+
+fn compile_at(source: &str) -> Result<String, flatppl_host::Diagnostic> {
+    let path = fixtures().join("query.flatppl");
+    let mut context = Context::default();
+    let module = context.parse(source, None, path.to_str())?;
+    module.compile(&EmitOptions::default()).map(|e| e.stablehlo)
+}
+
+/// The returned constants of an emitted module, in return order, as numbers.
+/// Fixed data emits each value as one `stablehlo.constant`, hex-packed or decimal.
+fn returned(stablehlo: &str) -> Vec<Vec<f64>> {
+    let values: std::collections::HashMap<&str, Vec<f64>> = stablehlo
+        .lines()
+        .filter_map(|line| {
+            let (ssa, rhs) = line.trim().split_once(" = stablehlo.constant dense<")?;
+            let (body, ty) = rhs.rsplit_once("> : ")?;
+            let numbers = if let Some(hex) = body.strip_prefix("\"0x") {
+                let bytes: Vec<u8> = (0..hex.len() - 1)
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                    .collect();
+                assert!(ty.ends_with("f32>"), "{ty}");
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b) as f64)
+                    .collect()
+            } else {
+                body.trim_matches(['[', ']'])
+                    .split(',')
+                    .map(|x| match x.trim() {
+                        "true" => 1.0,
+                        "false" => 0.0,
+                        x => x.parse().unwrap(),
+                    })
+                    .collect()
+            };
+            Some((ssa, numbers))
+        })
+        .collect();
+    let ret = stablehlo
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("return "))
+        .expect("a return");
+    // A matrix may arrive through a reshape and an identity transpose of its
+    // row-major constant; follow those back to it.
+    let source = |ssa: &str| {
+        stablehlo.lines().find_map(|line| {
+            let (lhs, rhs) = line.trim().split_once(" = ")?;
+            if lhs != ssa {
+                return None;
+            }
+            let operand = rhs.strip_prefix("stablehlo.reshape ").or_else(|| {
+                rhs.strip_prefix("stablehlo.transpose ")
+                    .filter(|r| r.contains("dims = [0, 1]"))
+            })?;
+            operand.split([' ', ',']).next()
+        })
+    };
+    ret.split(" : ")
+        .next()
+        .unwrap()
+        .split(", ")
+        .map(|ssa| {
+            let mut ssa = ssa;
+            while !values.contains_key(ssa) {
+                ssa = source(ssa).unwrap_or_else(|| panic!("`{ssa}` is not a constant"));
+            }
+            values[ssa].clone()
+        })
+        .collect()
+}
+
+fn refusal(source: &str) -> String {
+    compile_at(source).expect_err("must refuse").to_string()
+}
+
+#[test]
+fn every_section_07_format_reads_the_same_table() {
+    let want = vec![vec![1.5, -2.0], vec![2.0, 0.0], vec![1.0, 0.0]];
+    for file in [
+        "events.json",
+        "events_columns.json",
+        "events.csv",
+        "events.wsv",
+        "events.arrow",
+        "events.arrows",
+    ] {
+        let source = format!(
+            "data = load_data(\"{file}\", cartpow(cartprod(a = reals, b = integers, flag = booleans), 2))\n\
+             outputs = (data.a, data.b, data.flag)"
+        );
+        let out = compile_at(&source).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(
+            out.contains("-> (tensor<2xf32>, tensor<2xi32>, tensor<2xi1>)"),
+            "{file}: {out}"
+        );
+        assert_eq!(returned(&out), want, "{file}");
+    }
+}
+
+#[test]
+fn a_one_column_delimited_source_reads_as_a_vector() {
+    let out =
+        compile_at("data = load_data(\"column.csv\", cartpow(reals, 3))\noutputs = data").unwrap();
+    assert_eq!(returned(&out), vec![vec![0.5, -1.0, 2.75]]);
+    let err = refusal("data = load_data(\"events.csv\", cartpow(reals, 3))\noutputs = data");
+    assert!(
+        err.contains("exactly one column, and this one has 4"),
+        "{err}"
+    );
+}
+
+#[test]
+fn delimited_cells_are_checked_against_their_declared_set() {
+    for (domain, reason) in [
+        (
+            "cartprod(a = integers)",
+            "cell `1.5` is not a value of its declared set",
+        ),
+        ("cartprod(a = posreals)", "outside"),
+        ("cartprod(flag = reals)", "cell `true`"),
+        ("cartprod(missing = reals)", "missing column `missing`"),
+    ] {
+        let err = refusal(&format!(
+            "data = load_data(\"events.csv\", cartpow({domain}, 3))\noutputs = data"
+        ));
+        assert!(err.contains(reason), "{domain}: {err}");
+    }
+    let err = refusal(
+        "data = load_data(\"events.csv\", cartpow(cartprod(a = reals), 4))\noutputs = data.a",
+    );
+    assert!(err.contains("requested 4 entries but only 3"), "{err}");
+}
+
+#[test]
+fn safetensors_keys_form_nested_records() {
+    let source = "net = load_data(\"net.safetensors\", cartprod(\
+        W = cartpow(reals, [2, 3]), b = cartpow(reals, 2), count = integers, \
+        enc = cartprod(layer = cartprod(weight = cartpow(integers, 2), \
+        mask = cartpow(booleans, 2), half = cartpow(reals, 2)))))\n\
+        outputs = (net.W, net.b, net.count, net.enc.layer.weight, net.enc.layer.mask, net.enc.layer.half)";
+    let out = compile_at(source).unwrap();
+    assert!(
+        out.contains(
+            "-> (tensor<2x3xf32>, tensor<2xf32>, tensor<i32>, tensor<2xi32>, tensor<2xi1>, \
+             tensor<2xf32>)"
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        returned(&out),
+        vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.5],
+            vec![0.25, -0.5],
+            vec![5.0],
+            vec![3.0, -4.0],
+            vec![1.0, 0.0],
+            vec![1.5, -0.125],
+        ]
+    );
+}
+
+#[test]
+fn safetensors_dtypes_and_shapes_are_checked_against_the_value_set() {
+    for (domain, reason) in [
+        (
+            "cartprod(W = cartpow(integers, [2, 3]))",
+            "a real value where the declared set holds integers",
+        ),
+        (
+            "cartprod(enc = cartprod(layer = cartprod(weight = cartpow(booleans, 2))))",
+            "an integer value where the declared set holds booleans",
+        ),
+        (
+            "cartprod(W = cartpow(reals, [3, 2]))",
+            "tensor shape [2, 3] does not match",
+        ),
+        (
+            "cartprod(W = cartpow(reals, [2, 2]))",
+            "tensor shape [2, 3] does not match",
+        ),
+        (
+            "cartprod(b = cartpow(reals, 4))",
+            "tensor shape [3] does not match",
+        ),
+        (
+            "cartprod(enc = cartprod(other = reals))",
+            "missing field `other`",
+        ),
+    ] {
+        let err = refusal(&format!(
+            "net = load_data(\"net.safetensors\", {domain})\noutputs = net"
+        ));
+        assert!(err.contains(reason), "{domain}: {err}");
+    }
+}
+
+#[test]
+fn safetensors_key_rules_refuse_the_file() {
+    for (file, reason) in [
+        (
+            "empty_segment",
+            "key `enc..weight` has an empty path segment",
+        ),
+        ("empty_key", "key `...` is empty after trimming its dots"),
+        (
+            "duplicate_path",
+            "keys trimming to `enc.weight` name the same record path",
+        ),
+        (
+            "prefix_and_leaf",
+            "`enc` is both a tensor and a record path prefix",
+        ),
+        ("fp8", "dtype F8_E4M3 has no FlatPPL value set"),
+    ] {
+        let err = refusal(&format!(
+            "net = load_data(\"{file}.safetensors\", cartprod(x = reals))\noutputs = net"
+        ));
+        assert!(err.contains(reason), "{file}: {err}");
+    }
+}
+
+#[test]
+fn an_unknown_extension_refuses_at_the_call() {
+    let err = compile_at(
+        "x = 1.0\ndata = load_data(\"events.parquet\", cartpow(reals, 2))\noutputs = data",
+    )
+    .expect_err("must refuse");
+    let text = err.to_string();
+    assert!(
+        text.contains("unsupported file extension `.parquet`"),
+        "{text}"
+    );
+    assert_eq!(err.position.as_ref().map(|p| p.line), Some(2), "{err:?}");
+}
+
+#[test]
+fn malformed_tables_refuse_with_the_reason() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = directory("malformed");
+    let path = dir.join("query.flatppl");
+    for (file, text, reason) in [
+        ("ragged.csv", "a,b\n1,2\n3\n", "CSV"),
+        (
+            "ragged.wsv",
+            "a b\n1 2\n3\n",
+            "row 2 has 1 fields, but the first row names 2 columns",
+        ),
+        ("empty.csv", "a,b\n1,\n3,4\n", "a value is missing"),
+        (
+            "names.csv",
+            "a,a\n1,2\n",
+            "column names in the first row must be nonempty and distinct",
+        ),
+        (
+            "rows.json",
+            r#"[{"a": 1, "b": 2}, {"a": 3}]"#,
+            "row 2 is missing field `b`",
+        ),
+    ] {
+        std::fs::write(dir.join(file), text)?;
+        let source = format!(
+            "data = load_data(\"{file}\", cartpow(cartprod(a = reals, b = reals), 2))\noutputs = data.b"
+        );
+        let err = Context::default()
+            .parse(&source, None, path.to_str())?
+            .compile(&EmitOptions::default())
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains(reason), "{file}: {err}");
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
