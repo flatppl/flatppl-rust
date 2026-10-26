@@ -25,24 +25,39 @@ fn emits(outputs: &str) -> String {
     emitted(outputs).unwrap_or_else(|e| panic!("{outputs} must emit: {e}"))
 }
 
-// A non-integral or infinite `x` is an error §07 states, and a tensor has no
-// error, so it is NaN. MLIR needs the NaN as exact bits, not `NaN.0`.
+// Inference types `integer(x)` as an integer, so it lowers to an integer tensor
+// only where `x` is integral by construction. Any other real is refused: §07
+// makes a non-integral value an error, and an integer tensor has no NaN.
 #[test]
-fn integer_of_a_real_is_nan_where_it_is_not_integral() {
-    let out = emits("(integer(z0))");
-    assert!(
-        out.contains("stablehlo.floor") && out.contains("stablehlo.select"),
-        "{out}"
-    );
-    assert!(out.contains("dense<0x7FC00000>"), "a bit-exact NaN:\n{out}");
-    assert!(!out.contains("NaN.0"), "{out}");
+fn integer_lowers_an_integral_operand_and_refuses_a_computed_real() {
+    for head in ["round", "floor", "ceil"] {
+        let out = emits(&format!("(integer({head}(z0)))"));
+        assert!(
+            out.contains("stablehlo.convert") && out.contains("-> tensor<i32>"),
+            "{head}:\n{out}"
+        );
+        assert!(!out.contains("stablehlo.select"), "{head}:\n{out}");
+    }
+    // The consumers of an integer: an index, an exact comparison, `div`.
+    emits("(get([1.0, 2.0, 3.0], integer(round(z0))))");
+    emits("(ifelse(integer(floor(z0)) == 3, z0, 2.0))");
+    emits("(div(integer(ceil(z0)), 2) + 1)");
+    emits("(integer(z0 > 0.0) + integer(3.0))");
+    for expr in ["integer(z0)", "integer(z0 * 2.0)", "integer(abs(z0))"] {
+        let e = emitted(&format!("({expr})")).expect_err("a computed real must refuse");
+        assert!(
+            e.contains("`integer(x)` of a computed real has no lowering here")
+                && e.contains("`integer(round(x))`"),
+            "{expr}: {e}"
+        );
+    }
 }
 
 #[test]
 fn boolean_lowers_a_written_bit_or_a_boolean() {
     emits("(ifelse(boolean(1), z0, 2.0))");
     emits("(boolean(z0 > 0.0))");
-    let e = emitted("(boolean(integer(z0)))").expect_err("a computed number must refuse");
+    let e = emitted("(boolean(integer(round(z0))))").expect_err("a computed number must refuse");
     assert!(
         e.contains("`boolean(x)` of a computed number has no lowering here"),
         "{e}"
@@ -86,4 +101,7 @@ fn stepwise_selects_a_bin_and_is_nan_outside() {
         out.contains("compare  LE") || out.contains("compare LE"),
         "last bin closed:\n{out}"
     );
+    // MLIR needs the NaN outside the edges as exact bits, not `NaN.0`.
+    assert!(out.contains("dense<0x7FC00000>"), "a bit-exact NaN:\n{out}");
+    assert!(!out.contains("NaN.0"), "{out}");
 }

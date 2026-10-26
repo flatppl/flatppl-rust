@@ -1,42 +1,44 @@
 //! §07 "Scalar restrictions and constructors" (`integer`, `boolean`) and
 //! "Approximation functions" (`polynomial`, `bernstein`, `stepwise`).
 //!
-//! A computed integer is a float tensor holding an integral value, as `floor`
-//! and `round` already emit it, so `integer` keeps a real operand real. §07 makes
-//! a non-integral `integer(x)` an error, and StableHLO has no error, so such a
-//! point is NaN: it poisons whatever reads it, as an undefined interval mass
-//! does elsewhere in this crate.
+//! `integer` and `boolean` lower only where the value is provably in their
+//! domain. §07 makes any other value an error, and an integer or boolean
+//! tensor has no NaN to carry one.
 
-use flatppl_core::{Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
 use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::ops::{args_exact, get_literal_value};
 use crate::refuse::EmitError;
 
-/// `integer(x)`: `x` when it is an integer, NaN for a non-integral or infinite
-/// real `x`.
+/// `integer(x)`: an integer or boolean `x`, a written integral number, or
+/// `round`, `floor` or `ceil` of a real, which is integral by construction.
+/// Any other real is refused.
 pub(crate) fn lower_integer(
     e: &mut Emitter,
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
+    let integral = match e.node(e.resolve_ref_one(a)) {
+        Node::Lit(Scalar::Real(v)) => v.fract() == 0.0,
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(head) => matches!(e.resolve(head), "round" | "floor" | "ceil"),
+            CallHead::User(_) => false,
+        },
+        _ => false,
+    };
     let x = e.lower_node(a)?;
-    match x.elem {
-        ElemKind::Int => Ok(x),
-        ElemKind::Bool => Ok(e.convert(&x, ElemKind::Int)),
-        ElemKind::Real => {
-            let floor = e.floor(&x);
-            let integral = e.compare("EQ", &floor, &x);
-            let mag = e.abs(&x);
-            let inf = e.inf_like(&mag);
-            let finite = e.compare("LT", &mag, &inf);
-            let ok = e.and(&integral, &finite);
-            let nan = e.constant_like(f64::NAN, &x);
-            Ok(e.select(&ok, &x, &nan))
-        }
+    if x.elem != ElemKind::Real || integral {
+        return Ok(e.convert(&x, ElemKind::Int));
     }
+    Err(EmitError::at(
+        id,
+        "`integer(x)` of a computed real has no lowering here: §07 makes a \
+         non-integral value an error, and an integer tensor cannot carry one. Round \
+         explicitly instead, as in `integer(round(x))`",
+    ))
 }
 
 /// `boolean(x)`: a boolean passes through, and a written 0 or 1 is a constant.
