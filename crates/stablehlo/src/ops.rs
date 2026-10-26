@@ -315,6 +315,24 @@ pub(crate) fn lower_builtin(
             crate::order::OrderStatistic::Quantile,
         )),
         "fill" => lower_fill(e, id, args),
+        // §07 "Scalar restrictions and constructors" and "Approximation functions".
+        "integer" => crate::approx::lower_integer(e, id, args),
+        "boolean" => crate::approx::lower_boolean(e, id, args),
+        "conj" if !complex_arg(e, args) => {
+            let [a] = args_exact(id, args)?;
+            e.lower_node(a)
+        }
+        "complex" | "cis" | "conj" => Err(EmitError::at(
+            id,
+            format!(
+                "`{head}` makes a complex value, which has no tensor form here: project it \
+                 with `real`, `imag`, `abs` or `abs2`, which lower complex arithmetic as a \
+                 pair of real parts"
+            ),
+        )),
+        "polynomial" => crate::approx::lower_polynomial(e, id, args),
+        "bernstein" => crate::approx::lower_bernstein(e, id, args),
+        "stepwise" => crate::approx::lower_stepwise(e, id, args),
         "linspace" => lower_linspace(e, id, args, false),
         "extlinspace" => lower_linspace(e, id, args, true),
         "zeros" | "ones" | "eye" => {
@@ -389,6 +407,14 @@ pub(crate) fn lower_builtin(
             format!("unsupported builtin head '{other}'"),
         )),
     }
+}
+
+/// Is the sole argument of a call complex-typed?
+fn complex_arg(e: &Emitter, args: &[NodeId]) -> bool {
+    matches!(
+        args,
+        [a] if matches!(e.type_of(*a), Some(Type::Scalar(flatppl_core::ScalarType::Complex)))
+    )
 }
 
 // ---- arity-checked leaf combinators ----------------------------------------
@@ -1813,9 +1839,9 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// discarded" is a claim about these tables, not about every conceivable head.
 ///
 /// §07's remaining tables are UNLOWERED here, which is NOT the same as scalar-domain.
-/// Convolution (`conv`, `crosscorr`), Binning (`bincounts`), Approximation functions
-/// (`polynomial`, `bernstein`, `stepwise`) and Array and table generation (`array`) all
-/// take a collection first argument, and each is safe today only because
+/// Convolution (`conv`, `crosscorr`), Binning (`bincounts`) and Array and table
+/// generation (`array`) all take a collection first argument, and each is safe today
+/// only because
 /// [`lower_builtin`] answers "unsupported builtin head". **Wiring any of them here MUST
 /// add the head to this table in the same change**, or the dotted spelling starts
 /// discarding the wrapper again.
@@ -1928,6 +1954,21 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
         "bandedmat",
         "Array and table operations",
         "vector, positive integer",
+    ),
+    (
+        "polynomial",
+        "Approximation functions",
+        "vector, real or complex",
+    ),
+    (
+        "bernstein",
+        "Approximation functions",
+        "vector, `unitinterval`",
+    ),
+    (
+        "stepwise",
+        "Approximation functions",
+        "vector, vector, real",
     ),
 ];
 
@@ -2708,7 +2749,12 @@ fn lower_get_literal(
 }
 
 /// Select element `idx` (0-based) of `v`'s outer vector axis.
-fn get_literal_value(e: &mut Emitter, id: NodeId, v: Value, idx: u64) -> Result<Value, EmitError> {
+pub(crate) fn get_literal_value(
+    e: &mut Emitter,
+    id: NodeId,
+    v: Value,
+    idx: u64,
+) -> Result<Value, EmitError> {
     let len = match &e.cell_ty(&v) {
         MlirTy::Ranked(dims) if e.axes_of(&v).layers.first() == Some(&1) => dims[0],
         other => {

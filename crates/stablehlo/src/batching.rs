@@ -319,7 +319,7 @@ impl Emitter<'_> {
     }
 
     pub(crate) fn constant_like(&mut self, x: f64, v: &Value) -> Value {
-        let out = self.const_lit_like(&render_float_literal(x), v);
+        let out = self.const_lit_like(&float_literal(self.dtype, x), v);
         self.remember_constant(&out.ssa, [Scalar::Real(x)]);
         out
     }

@@ -349,15 +349,7 @@ impl<'m> Emitter<'m> {
     /// non-scalar `ty`) constant.
     pub fn constant(&mut self, x: f64, ty: MlirTy) -> Value {
         let ty_text = ty.render(self.dtype, ElemKind::Real);
-        let lit = if x.is_finite() {
-            render_float_literal(x)
-        } else {
-            // MLIR requires dtype-exact bits for infinities and NaNs.
-            match self.dtype {
-                Dtype::F32 => format!("0x{:08X}", (x as f32).to_bits()),
-                Dtype::F64 => format!("0x{:016X}", x.to_bits()),
-            }
-        };
+        let lit = float_literal(self.dtype, x);
         let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
         self.remember_constant(&ssa, [Scalar::Real(x)]);
         Value {
@@ -4427,6 +4419,18 @@ impl<'m> Emitter<'m> {
 /// reads back as a float attribute rather than an integer one (same
 /// reasoning as `flatpir::writer::render_real`, reimplemented locally since
 /// that helper is private to the `flatpir` crate).
+/// A float literal for `dtype`: decimal when finite; MLIR requires dtype-exact
+/// bits for infinities and NaNs.
+fn float_literal(dtype: Dtype, x: f64) -> String {
+    if x.is_finite() {
+        return render_float_literal(x);
+    }
+    match dtype {
+        Dtype::F32 => format!("0x{:08X}", (x as f32).to_bits()),
+        Dtype::F64 => format!("0x{:016X}", x.to_bits()),
+    }
+}
+
 fn render_float_literal(x: f64) -> String {
     let mut s = format!("{x}");
     if !s.contains(['.', 'e', 'E']) {
