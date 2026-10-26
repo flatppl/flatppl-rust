@@ -776,3 +776,26 @@ fn baked_integers_fit_their_emitted_width() -> Result<(), Box<dyn std::error::Er
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+/// The parser writes `-2147483648` as `neg(2147483648)`. Only the value as
+/// written has to fit the width, and a refusal names that value.
+#[test]
+fn negative_integer_literals_fit_as_written() {
+    for source in [
+        "outputs = -2147483648",
+        "outputs = [2147483647, -2147483648]",
+    ] {
+        let out = compile_at(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        let constants = integer_constants(&out);
+        assert!(constants.contains(&(-2147483648, 32)), "{out}");
+        assert!(
+            constants.iter().all(|&(v, _)| i32::try_from(v).is_ok()),
+            "{out}"
+        );
+    }
+    let err = refusal("outputs = -2147483649");
+    assert!(
+        err.contains("integer -2147483649 is outside i32, the integer width of the f32 dtype"),
+        "{err}"
+    );
+}

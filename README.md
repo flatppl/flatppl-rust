@@ -51,6 +51,8 @@ flatppl stablehlo query.flatppl --dtype f64 -o query.mlir # float64 compilation;
 ```
 
 StableHLO queries must declare `inputs` and `outputs` to define their compiled ABI.
+The f32 dtype uses i32 integer arithmetic and f64 uses i64: an integer literal
+outside that width refuses, and a computed integer beyond it wraps.
 
 The Rust determinizer lowers affine log weights to closed distribution laws for
 Normal, MvNormal, Gamma, Exponential, ChiSquared, Bernoulli, Binomial, Poisson,
