@@ -25,19 +25,99 @@ impl Table {
     }
 }
 
+/// How columns decode: dictionaries as values or factors, and how many rows a
+/// Null column, which no buffer backs, may claim.
+#[derive(Clone, Copy)]
+struct Mode {
+    decode: bool,
+    null_rows: usize,
+}
+
 fn read(bytes: &[u8], decode: bool) -> Result<Table> {
+    check_buffers(bytes)?;
+    let mode = Mode {
+        decode,
+        // Every other column needs at least a bit per row.
+        null_rows: bytes.len().saturating_mul(8),
+    };
     let cursor = Cursor::new(bytes);
     if bytes.starts_with(b"ARROW1") {
-        read_batches(
-            FileReader::try_new(cursor, None).map_err(ipc_error)?,
-            decode,
-        )
+        read_batches(FileReader::try_new(cursor, None).map_err(ipc_error)?, mode)
     } else {
         read_batches(
             StreamReader::try_new(cursor, None).map_err(ipc_error)?,
-            decode,
+            mode,
         )
     }
+}
+
+/// arrow-ipc panics on a buffer at a negative offset, so check that every
+/// buffer lies inside its message body first. Framing that does not parse is
+/// left for arrow-ipc to refuse.
+fn check_buffers(bytes: &[u8]) -> Result<()> {
+    let word = |at: usize| {
+        let word = bytes.get(at..at.checked_add(4)?)?;
+        Some(i32::from_le_bytes(word.try_into().ok()?))
+    };
+    // The end of the message at `at` once its buffers check, if it parses.
+    let check = |at: usize| -> Result<Option<usize>> {
+        let (mut at, mut length) = (at + 4, word(at));
+        if length == Some(-1) {
+            (at, length) = (at + 4, word(at));
+        }
+        let Some(length) = length
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        else {
+            return Ok(None);
+        };
+        let Some(message) = bytes
+            .get(at..at.saturating_add(length))
+            .and_then(|m| arrow_ipc::root_as_message(m).ok())
+        else {
+            return Ok(None);
+        };
+        let body = message.bodyLength();
+        if body < 0 {
+            return Ok(None);
+        }
+        let buffers = message
+            .header_as_record_batch()
+            .or_else(|| message.header_as_dictionary_batch().and_then(|d| d.data()))
+            .and_then(|batch| batch.buffers());
+        for buffer in buffers.iter().flatten() {
+            let (offset, size) = (buffer.offset(), buffer.length());
+            if offset < 0 || size < 0 || offset.checked_add(size).is_none_or(|end| end > body) {
+                return Err(Error(
+                    "Arrow IPC: malformed file (a buffer leaves its message body)".into(),
+                ));
+            }
+        }
+        Ok(usize::try_from(body)
+            .ok()
+            .and_then(|body| (at + length).checked_add(body)))
+    };
+    if !bytes.starts_with(b"ARROW1") {
+        let mut at = Some(0);
+        while let Some(next) = at {
+            at = check(next)?;
+        }
+        return Ok(());
+    }
+    let footer = bytes.len().checked_sub(10).and_then(|end| {
+        let length = usize::try_from(word(end)?).ok()?;
+        arrow_ipc::root_as_footer(bytes.get(end.checked_sub(length)?..end)?).ok()
+    });
+    let Some(footer) = footer else {
+        return Ok(());
+    };
+    let blocks = footer.dictionaries().into_iter().flatten();
+    for block in blocks.chain(footer.recordBatches().into_iter().flatten()) {
+        if let Ok(offset) = usize::try_from(block.offset()) {
+            check(offset)?;
+        }
+    }
+    Ok(())
 }
 
 fn ipc_error(error: ArrowError) -> Error {
@@ -52,7 +132,7 @@ fn ipc_error(error: ArrowError) -> Error {
     Error(format!("Arrow IPC: {error}"))
 }
 
-fn read_batches(reader: impl RecordBatchReader, decode: bool) -> Result<Table> {
+fn read_batches(reader: impl RecordBatchReader, mode: Mode) -> Result<Table> {
     let schema = reader.schema();
     // A column this reader cannot decode is kept as a reason, so that a table
     // selecting other columns still reads (§07: a value set may omit columns).
@@ -60,7 +140,7 @@ fn read_batches(reader: impl RecordBatchReader, decode: bool) -> Result<Table> {
     let mut readable = Vec::new();
     let mut columns = Vec::new();
     for (index, field) in schema.fields().iter().enumerate() {
-        match column(field, new_empty_array(field.data_type()).as_ref(), decode) {
+        match column(field, new_empty_array(field.data_type()).as_ref(), mode) {
             Ok(column) => {
                 readable.push(index);
                 columns.push(Ok(column));
@@ -75,7 +155,7 @@ fn read_batches(reader: impl RecordBatchReader, decode: bool) -> Result<Table> {
         // A value that fails in a later batch also spoils only its own column.
         for ((slot, &index), order) in columns.iter_mut().zip(&readable).zip(&mut orders) {
             let Ok(out) = slot else { continue };
-            let next = column(schema.field(index), batch.column(index).as_ref(), decode);
+            let next = column(schema.field(index), batch.column(index).as_ref(), mode);
             if let Err(error) =
                 next.and_then(|next| append(out, next, nrows, batch.num_rows(), order))
             {
@@ -173,7 +253,7 @@ fn array<T: 'static>(values: &dyn Array) -> &T {
         .expect("Arrow IPC validates array datatypes")
 }
 
-fn column(field: &Field, values: &dyn Array, decode: bool) -> Result<Column> {
+fn column(field: &Field, values: &dyn Array, mode: Mode) -> Result<Column> {
     macro_rules! integers {
         ($ty:ty) => {
             ColumnValues::Int(
@@ -224,25 +304,32 @@ fn column(field: &Field, values: &dyn Array, decode: bool) -> Result<Column> {
                 .map(Option::unwrap_or_default)
                 .collect(),
         ),
+        DataType::Null if values.len() > mode.null_rows => {
+            return Err(Error(format!(
+                "column `{}` claims {} rows of nulls, more than the file can hold",
+                field.name(),
+                values.len()
+            )));
+        }
         DataType::Null => ColumnValues::Real64(vec![0.0; values.len()]),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             return factor(field, labels(values)?, (0..values.len()).map(Some));
         }
         DataType::Dictionary(key, value) => {
-            let decode = decode
+            let decode = mode.decode
                 && !matches!(
                     value.as_ref(),
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                 );
             return match key.as_ref() {
-                DataType::Int8 => dictionary::<types::Int8Type>(field, values, decode),
-                DataType::Int16 => dictionary::<types::Int16Type>(field, values, decode),
-                DataType::Int32 => dictionary::<types::Int32Type>(field, values, decode),
-                DataType::Int64 => dictionary::<types::Int64Type>(field, values, decode),
-                DataType::UInt8 => dictionary::<types::UInt8Type>(field, values, decode),
-                DataType::UInt16 => dictionary::<types::UInt16Type>(field, values, decode),
-                DataType::UInt32 => dictionary::<types::UInt32Type>(field, values, decode),
-                DataType::UInt64 => dictionary::<types::UInt64Type>(field, values, decode),
+                DataType::Int8 => dictionary::<types::Int8Type>(field, values, decode, mode),
+                DataType::Int16 => dictionary::<types::Int16Type>(field, values, decode, mode),
+                DataType::Int32 => dictionary::<types::Int32Type>(field, values, decode, mode),
+                DataType::Int64 => dictionary::<types::Int64Type>(field, values, decode, mode),
+                DataType::UInt8 => dictionary::<types::UInt8Type>(field, values, decode, mode),
+                DataType::UInt16 => dictionary::<types::UInt16Type>(field, values, decode, mode),
+                DataType::UInt32 => dictionary::<types::UInt32Type>(field, values, decode, mode),
+                DataType::UInt64 => dictionary::<types::UInt64Type>(field, values, decode, mode),
                 _ => Err(Error(format!("unsupported Arrow dictionary key {key}"))),
             };
         }
@@ -300,10 +387,11 @@ fn dictionary<K: types::ArrowDictionaryKeyType>(
     field: &Field,
     values: &dyn Array,
     decode: bool,
+    mode: Mode,
 ) -> Result<Column> {
     let dictionary = array::<DictionaryArray<K>>(values);
     if decode {
-        let inner = column(field, dictionary.values().as_ref(), true)?;
+        let inner = column(field, dictionary.values().as_ref(), mode)?;
         return Ok(gather(inner, dictionary.keys_iter().collect()));
     }
     factor(

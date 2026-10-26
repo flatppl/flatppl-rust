@@ -670,6 +670,24 @@ fn arrow_typed_columns_read_past_every_layout() {
         "t = load_data(\"negative_body.arrows\", cartpow(cartprod(a = reals), 3))\noutputs = t.a",
     );
     assert!(err.contains("Invalid IPC message body length"), "{err}");
+    for (file, column, reason) in [
+        (
+            "negative_offset.arrows",
+            "a",
+            "malformed file (a buffer leaves its message body)",
+        ),
+        (
+            "huge_rows.arrows",
+            "n",
+            "column `n` claims 1099511627776 rows of nulls, more than the file can hold",
+        ),
+        ("bad_block.arrow", "a", "Arrow IPC"),
+    ] {
+        let err = refusal(&format!(
+            "t = load_data(\"{file}\", cartpow(cartprod({column} = reals), 3))\noutputs = t.{column}"
+        ));
+        assert!(err.contains(reason), "{file}: {err}");
+    }
 }
 
 /// A JSON integer beyond int64 refuses only when selected.
