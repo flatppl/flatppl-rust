@@ -212,6 +212,7 @@
 
 mod aggregate;
 mod approx;
+mod arrays;
 mod call_batch;
 mod complex;
 mod emitter;
