@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema"]
+# Compressed Arrow IPC buffers. zstd builds C code, so wasm leaves this off.
+arrow-compression = ["arrow", "arrow-ipc/lz4", "arrow-ipc/zstd"]
 safetensors = ["dep:half", "dep:serde_json"]
 
 [dependencies]

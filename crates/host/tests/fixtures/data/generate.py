@@ -4,7 +4,8 @@ Arrow IPC comes from polars, an independent writer. Safetensors is packed by
 hand from the format definition: an 8-byte little-endian header length, a JSON
 header of `{key: {dtype, shape, data_offsets}}`, then the data buffer.
 
-Usage: python generate.py  (writes next to this file)
+Usage: python generate.py  (writes next to this file; needs numpy, polars and
+pyarrow)
 """
 
 import json
@@ -13,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
+import pyarrow.ipc as ipc
 
 HERE = Path(__file__).parent
 
@@ -52,14 +55,15 @@ pl.DataFrame({
 }).write_ipc(HERE / "mixed.arrow")
 
 DTYPES = {np.float64: "F64", np.float32: "F32", np.float16: "F16", np.int64: "I64",
-          np.int32: "I32", np.uint8: "U8", np.bool_: "BOOL"}
+          np.int32: "I32", np.int16: "I16", np.int8: "I8", np.uint64: "U64", np.uint32: "U32",
+          np.uint16: "U16", np.uint8: "U8", np.bool_: "BOOL"}
 
 
 def safetensors(path, tensors, dtype_override=None):
     header, blobs, offset = {"__metadata__": {"format": "pt"}}, [], 0
     for key, array in tensors.items():
         blob = np.ascontiguousarray(array).astype(array.dtype.newbyteorder("<")).tobytes()
-        dtype = (dtype_override or {}).get(key, DTYPES[array.dtype.type])
+        dtype = (dtype_override or {}).get(key) or DTYPES[array.dtype.type]
         header[key] = {"dtype": dtype, "shape": list(array.shape), "data_offsets": [offset, offset + len(blob)]}
         blobs.append(blob)
         offset += len(blob)
@@ -84,3 +88,79 @@ for name, tensors in {
 }.items():
     safetensors(HERE / f"{name}.safetensors", tensors)
 safetensors(HERE / "fp8.safetensors", {"x": np.array([1], dtype=np.uint8)}, {"x": "F8_E4M3"})
+
+# Every dtype §07 maps, one tensor each. BF16 has no numpy type, so its bits are
+# packed by hand: 0x3FC0 is 1.5 and 0xC040 is -3.0.
+safetensors(HERE / "dtypes.safetensors", {
+    "f64": np.array([1.5, -2.0], dtype=np.float64),
+    "f32": np.array([1.5, -2.0], dtype=np.float32),
+    "f16": np.array([1.5, -2.0], dtype=np.float16),
+    "bf16": np.array([0x3FC0, 0xC040], dtype=np.uint16),
+    "i64": np.array([1, -2], dtype=np.int64),
+    "i32": np.array([1, -2], dtype=np.int32),
+    "i16": np.array([1, -2], dtype=np.int16),
+    "i8": np.array([1, -2], dtype=np.int8),
+    "u64": np.array([1, 2], dtype=np.uint64),
+    "u32": np.array([1, 2], dtype=np.uint32),
+    "u16": np.array([1, 2], dtype=np.uint16),
+    "u8": np.array([1, 2], dtype=np.uint8),
+    "bool": np.array([True, False]),
+}, {"bf16": "BF16"})
+safetensors(HERE / "u64.safetensors", {"x": np.array([2**63], dtype=np.uint64)})
+
+# Every Arrow layout a reader must step over, before the typed columns it reads,
+# in two record batches. A wrong buffer count shifts every later column.
+exotic = {
+    "utf8": pa.array(["a", None], pa.utf8()),
+    "large_utf8": pa.array(["a", "b"], pa.large_utf8()),
+    "view": pa.array(["a long string past the inline view", "b"], pa.string_view()),
+    "binary": pa.array([b"a", b"b"], pa.binary()),
+    "list": pa.array([[1.0], [2.0, 3.0]], pa.list_(pa.float64())),
+    "large_list": pa.array([[1.0], [2.0]], pa.large_list(pa.float64())),
+    "list_view": pa.array([[1.0], [2.0]], pa.list_view(pa.float64())),
+    "fixed_list": pa.array([[1.0, 2.0], [3.0, 4.0]], pa.list_(pa.float64(), 2)),
+    "struct": pa.array([{"u": 1.0}, {"u": 2.0}], pa.struct([("u", pa.float64())])),
+    "dict": pa.array(["x", "y"]).dictionary_encode(),
+    "sparse": pa.UnionArray.from_sparse(pa.array([0, 1], pa.int8()),
+                                         [pa.array([1.0, 2.0]), pa.array([3, 4], pa.int32())]),
+    "dense": pa.UnionArray.from_dense(pa.array([0, 1], pa.int8()), pa.array([0, 0], pa.int32()),
+                                       [pa.array([1.0]), pa.array([3], pa.int32())]),
+    "ree": pa.RunEndEncodedArray.from_arrays(pa.array([2], pa.int32()), pa.array([7.0])),
+    "time": pa.array([0, 1], pa.timestamp("us")),
+    "null": pa.nulls(2),
+}
+typed = {
+    "i8": pa.array([1, -2], pa.int8()), "i16": pa.array([1, -2], pa.int16()),
+    "i32": pa.array([1, -2], pa.int32()), "i64": pa.array([1, -2], pa.int64()),
+    "u8": pa.array([1, 2], pa.uint8()), "u16": pa.array([1, 2], pa.uint16()),
+    "u32": pa.array([1, 2], pa.uint32()), "u64": pa.array([1, 2], pa.uint64()),
+    "f16": pa.array([np.float16(1.5), np.float16(-2.0)], pa.float16()),
+    "f32": pa.array([1.5, -2.0], pa.float32()), "f64": pa.array([1.5, None], pa.float64()),
+    "bool": pa.array([True, False], pa.bool_()),
+    # Dictionary-encoded numbers: keys out of value order, and a null key.
+    "dict_f64": pa.array([1.5, -2.0]).dictionary_encode(),
+    "dict_i16": pa.DictionaryArray.from_arrays(pa.array([1, 0], pa.int8()),
+                                               pa.array([-2, 1], pa.int16())),
+    "dict_null": pa.DictionaryArray.from_arrays(pa.array([0, None], pa.int8()),
+                                                pa.array([1.5])),
+}
+batch = pa.record_batch({**exotic, **typed})
+table = pa.Table.from_batches([batch, batch])
+with ipc.new_file(HERE / "types.arrow", table.schema) as writer:
+    writer.write_table(table)
+with ipc.new_stream(HERE / "types.arrows", table.schema) as writer:
+    writer.write_table(table)
+with ipc.new_file(HERE / "compressed.arrow", table.schema,
+                  options=ipc.IpcWriteOptions(compression="lz4")) as writer:
+    writer.write_table(table)
+with ipc.new_file(HERE / "zstd.arrow", table.schema,
+                  options=ipc.IpcWriteOptions(compression="zstd")) as writer:
+    writer.write_table(table)
+# A dictionary key outside its dictionary is a malformed file.
+bad_key = pa.DictionaryArray.from_arrays(pa.array([0, 5], pa.int8()), pa.array([1.5]), safe=False)
+with ipc.new_stream(HERE / "bad_key.arrows", pa.schema([("x", bad_key.type)])) as writer:
+    writer.write_batch(pa.record_batch({"x": bad_key}))
+# The out-of-range column must not spoil the readable one beside it.
+with ipc.new_file(HERE / "u64.arrow", pa.schema([("a", pa.float64()), ("x", pa.uint64())])) as writer:
+    writer.write_table(pa.table({"a": pa.array([1.5], pa.float64()),
+                                 "x": pa.array([2**63], pa.uint64())}))
