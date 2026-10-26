@@ -369,10 +369,12 @@ pub(crate) fn lower_builtin(
         "isfinite" => lower_finiteness(e, id, args, Finiteness::Finite),
         "isinf" => lower_finiteness(e, id, args, Finiteness::Inf),
         "isnan" => lower_finiteness(e, id, args, Finiteness::Nan),
-        // `record(...)` is not a tensor — handled structurally by the mode
-        // builder (a record-typed model input's fields become separate
-        // tensor args), never reached here in a well-formed lowering.
-        "record" => Err(EmitError::at(id, "record has no tensor form")),
+        // A record or table lowers field by field (`Emitter::lower_value`); only
+        // a tensor position reaches this arm.
+        "record" | "table" => Err(crate::refuse::record_in_tensor_position(
+            id,
+            &format!("`{head}(...)`"),
+        )),
         // A `load_data` listed in `inputs` is pre-bound to its argument by the
         // mode builder and never lowered. Reaching here means it is used as one
         // monolithic value while its valueset is an aggregate, which the
@@ -1670,27 +1672,9 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 
 // ---- reductions --------------------------------------------------------------
 
-/// Lower `sum`. Over an array this is the ordinary reduction; over a TABLE it
-/// refuses, and refuses SPECIFICALLY rather than incidentally.
-///
-/// §07 "Table reductions" makes `sum(t)` return "a record whose fields are the
-/// column names and values are the per-column reductions" — and this emitter has no
-/// record value at all: every [`Value`] is a tensor, and [`lower_builtin`]'s
-/// `"record"` arm refuses with "record has no tensor form". So the result is not
-/// expressible here, and refusing is the honest outcome rather than lowering one
-/// column and calling it the answer.
-///
-/// Checked BEFORE the argument is lowered, because otherwise the argument's own
-/// refusal fires first and blames the wrong thing: a table from `load_data` gave the
-/// column-wise-destructuring message (accurate, but about `load_data` rather than
-/// about the reduction), and a table from `elementof` gave "unsupported builtin head
-/// 'elementof'", which says nothing about tables at all. Both are this message now,
-/// whatever the table's provenance.
-///
-/// The refusal itself now lives in [`crate::norms::table_reduction_refusal`],
-/// shared with `prod`/`mean`/`var`/`std` — those four used to reach
-/// "unsupported builtin head" for EVERY argument type, which made this guard
-/// `sum`-only; `crate::norms` wires them, so each needs the same table check.
+/// Lower `sum` over an array. Over a table §07 "Table reductions" gives a record
+/// of per-column sums, which `Emitter::lower_field` lowers one column at a time;
+/// only a tensor position reaches the table refusal here.
 fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     if let [arg] = args
         && let Some(value) = e.reduce_fixed_likelihood(*arg)?
@@ -1700,7 +1684,7 @@ fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
     if let [arg] = args
         && matches!(e.type_of(*arg), Some(Type::Table { .. }))
     {
-        return Err(crate::norms::table_reduction_refusal(id, "sum"));
+        return Err(crate::norms::table_reduction_in_tensor_position(id));
     }
     unary(e, id, args, Emitter::reduce_sum)
 }
@@ -1986,7 +1970,11 @@ pub(crate) fn collection_domain_remedy(name: &str) -> String {
 
 /// Predicates include literals, bindings, inputs and lowered Boolean calls.
 /// Check the emitted kind so synthesized nodes need no inferred type or head whitelist.
-fn lower_predicate(e: &mut Emitter, cond: NodeId, what: &str) -> Result<Value, EmitError> {
+pub(crate) fn lower_predicate(
+    e: &mut Emitter,
+    cond: NodeId,
+    what: &str,
+) -> Result<Value, EmitError> {
     let value = e.lower_node(cond)?;
     if value.elem == ElemKind::Bool {
         Ok(value)
@@ -2215,7 +2203,7 @@ fn lower_real(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
 }
 
 #[derive(Clone, Copy)]
-enum Extremum {
+pub(crate) enum Extremum {
     Max,
     Min,
 }
@@ -2233,7 +2221,20 @@ fn lower_extremum(
     which: Extremum,
 ) -> Result<Value, EmitError> {
     let [xs] = args_exact(id, args)?;
+    if matches!(e.type_of(xs), Some(Type::Table { .. })) {
+        return Err(crate::norms::table_reduction_in_tensor_position(id));
+    }
     let xs = e.lower_node(xs)?;
+    extremum_value(e, id, xs, which)
+}
+
+/// [`lower_extremum`] over an already-lowered operand.
+pub(crate) fn extremum_value(
+    e: &mut Emitter,
+    id: NodeId,
+    xs: Value,
+    which: Extremum,
+) -> Result<Value, EmitError> {
     if !matches!(xs.ty, MlirTy::Ranked(_)) {
         return Err(EmitError::at(
             id,
@@ -2697,14 +2698,17 @@ fn lower_get_literal(
     if idx < 0 {
         return Err(EmitError::at(id, "get/get0: index out of range"));
     }
-    let idx = idx as u64;
-
     if let Some(result) = crate::indices::projection(e, id, container, idx as usize) {
         return result;
     }
 
     let v = e.lower_node(container)?;
     let v = e.with_typed_axes(container, v);
+    get_literal_value(e, id, v, idx as u64)
+}
+
+/// Select element `idx` (0-based) of `v`'s outer vector axis.
+fn get_literal_value(e: &mut Emitter, id: NodeId, v: Value, idx: u64) -> Result<Value, EmitError> {
     let len = match &e.cell_ty(&v) {
         MlirTy::Ranked(dims) if e.axes_of(&v).layers.first() == Some(&1) => dims[0],
         other => {
@@ -2758,7 +2762,17 @@ fn lower_get_gather(
     let operand = e.lower_node(container)?;
     let operand = e.with_typed_axes(container, operand);
     let idx = e.lower_node(index)?;
+    get_gather_value(e, id, operand, idx, base)
+}
 
+/// Gather `operand`'s outer vector cells at the runtime selector `idx`.
+fn get_gather_value(
+    e: &mut Emitter,
+    id: NodeId,
+    operand: Value,
+    idx: Value,
+    base: i64,
+) -> Result<Value, EmitError> {
     let scalar = e.cell_ty(&idx) == MlirTy::Scalar;
     let vector = matches!(e.cell_ty(&idx), MlirTy::Ranked(dims) if dims.len() == 1);
     if idx.elem == ElemKind::Int
@@ -2793,6 +2807,25 @@ fn lower_get_gather(
         ));
     }
     Ok(e.gather(&operand, &idx, base))
+}
+
+/// `get(v, index)` over an already-lowered `v` whose outer axis is a vector
+/// axis — a table column indexed by row.
+pub(crate) fn get_outer(
+    e: &mut Emitter,
+    id: NodeId,
+    v: Value,
+    index: NodeId,
+    base: i64,
+) -> Result<Value, EmitError> {
+    if let Ok(selector) = literal_index(e, id, index) {
+        if selector < base {
+            return Err(EmitError::at(id, "get/get0: index out of range"));
+        }
+        return get_literal_value(e, id, v, (selector - base) as u64);
+    }
+    let idx = e.lower_node(index)?;
+    get_gather_value(e, id, v, idx, base)
 }
 
 /// `get`/`get0`'s selector must be a literal integer (matching how the

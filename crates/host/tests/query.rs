@@ -662,3 +662,68 @@ fn gpu_pyhf_pool_respects_aggregate_axes() -> Result<(), Box<dyn std::error::Err
     );
     Ok(())
 }
+
+/// A record output's schema names each field, and its tensor leaves are the
+/// function results depth-first in declared field order.
+#[test]
+fn a_record_output_exports_one_result_per_field() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "data = elementof(cartpow(cartprod(x = reals, y = reals), 4))\ninputs = data\n\
+         outputs = record(m = mean(data), first = data[1])",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let schema = serde_json::to_value(&exported)?;
+    let leaf = |index: usize| json!({"kind": "tensor", "index": index, "dtype": "float32", "shape": [], "value_type": "real"});
+    let pair = |x: usize, y: usize| {
+        json!({"kind": "record", "fields": [
+            {"name": "x", "value": leaf(x)},
+            {"name": "y", "value": leaf(y)},
+        ]})
+    };
+    assert_eq!(
+        schema["output"],
+        json!({"kind": "record", "fields": [
+            {"name": "m", "value": pair(0, 1)},
+            {"name": "first", "value": pair(2, 3)},
+        ]})
+    );
+    assert!(
+        exported
+            .stablehlo
+            .contains("-> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>)"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}
+
+/// A runtime row index gives the row record, so the host schema and the CLI
+/// both flatten `data[i]` into one result per column.
+#[test]
+fn a_runtime_row_output_exports_one_result_per_column() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "data = elementof(cartpow(cartprod(x = reals, y = reals), 4))\ni = elementof(posintegers)\n\
+         inputs = (data, i)\noutputs = data[i]",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let leaf = |index: usize| json!({"kind": "tensor", "index": index, "dtype": "float32", "shape": [], "value_type": "real"});
+    assert_eq!(
+        serde_json::to_value(&exported.output)?,
+        json!({"kind": "record", "fields": [
+            {"name": "x", "value": leaf(0)},
+            {"name": "y", "value": leaf(1)},
+        ]})
+    );
+    assert!(
+        exported.stablehlo.contains("-> (tensor<f32>, tensor<f32>)"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}

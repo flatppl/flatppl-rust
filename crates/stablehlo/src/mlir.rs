@@ -47,6 +47,59 @@ pub struct Value {
     pub elem: ElemKind,
 }
 
+/// One lowered FlatPDL value: a tensor, or a record of lowered fields in
+/// declared field order (spec §03 "Records"). A table is the record of its
+/// columns, each column carrying the row axis first. A function boundary never
+/// sees a record: [`Lowered::leaves`] flattens it to positional tensors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Lowered {
+    Tensor(Value),
+    Record(Vec<(String, Lowered)>),
+}
+
+impl Lowered {
+    /// Append the tensor leaves depth-first in declared field order — the
+    /// order of the emitted arguments and results.
+    pub(crate) fn leaves(self, out: &mut Vec<Value>) {
+        match self {
+            Lowered::Tensor(value) => out.push(value),
+            Lowered::Record(fields) => {
+                for (_, field) in fields {
+                    field.leaves(out);
+                }
+            }
+        }
+    }
+
+    /// Rebuild this structure with tensor leaves taken from `values`, in
+    /// [`Lowered::leaves`] order.
+    pub(crate) fn with_leaves(&self, values: &mut impl Iterator<Item = Value>) -> Lowered {
+        match self {
+            Lowered::Tensor(_) => Lowered::Tensor(values.next().expect("one value per leaf")),
+            Lowered::Record(fields) => Lowered::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.with_leaves(values)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Whether both have the same field names and nesting.
+    pub(crate) fn same_structure(&self, other: &Lowered) -> bool {
+        match (self, other) {
+            (Lowered::Tensor(_), Lowered::Tensor(_)) => true,
+            (Lowered::Record(a), Lowered::Record(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|((n, x), (m, y))| n == m && x.same_structure(y))
+            }
+            _ => false,
+        }
+    }
+}
+
 impl MlirTy {
     /// Render as textual MLIR: `tensor<f32>` (rank-0), `tensor<3xf32>`,
     /// `tensor<2x3xf32>`, `tensor<?x3xf32>` for a dynamic leading dim, and

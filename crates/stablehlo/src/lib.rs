@@ -77,17 +77,29 @@
 //! branch pair) — it is a limit of what the boundary can express. A host that
 //! needs the distinction must carry it out of band.
 //!
-//! ## Aggregate `load_data` inputs destructure into one argument per column
+//! ## Records flatten depth-first at the function boundary
 //!
-//! A `load_data` input whose `valueset` is a table (`cartpow(cartprod(a = S1,
-//! b = S2, …), N)`) or a record (`cartprod(a = S1, …)`) has no single tensor
-//! form. **One `inputs` entry then becomes several `func.func` arguments, one
-//! per column/field, in DECLARED column order**, each shaped from its own
-//! column set — a scalar column of an `N`-row table is `tensor<N×f32>`, a
+//! Inside the emitter a record is an ordered map of field name to value, in
+//! declared field order, and a field may itself be a record (spec §03
+//! "Records"). A table is the record of its columns, each column carrying the
+//! row axis first (§03 "Tables"). A function boundary never sees a record: an
+//! input or output record becomes one `func.func` argument or result per tensor
+//! leaf, depth-first in declared field order. No `stablehlo.tuple` is used.
+//!
+//! An `inputs` entry whose type is a table (`cartpow(cartprod(a = S1, b = S2,
+//! …), N)`) or a record (`cartprod(a = S1, …)`) therefore becomes several
+//! arguments — a scalar column of an `N`-row table is `tensor<N×f32>`, a
 //! `cartpow(reals, k)` column is `tensor<N×k×f32>`, a scalar field of a record
-//! is `tensor<f32>`. Column access on the loaded binding (`data.y`) resolves to
-//! that column's argument. Argument numbering is positional over the flattened
-//! list, so an entry after a destructured one shifts by the column count.
+//! is `tensor<f32>`, and a nested record field contributes its own leaves in
+//! place. Field access (`data.y`, `p.inner.v`) resolves to that leaf's
+//! argument. Argument numbering is positional over the flattened list, so an
+//! entry after a destructured one shifts by its leaf count.
+//!
+//! An output whose value is a record — a `record(...)`, a §07 table reduction,
+//! a table row `t[i]`, a record-valued `ifelse` or broadcast — contributes one
+//! result per leaf in the same order. The CLI writes no metadata, so this
+//! order is the ABI; `flatppl-host`'s query `Schema` records the field path of
+//! each leaf.
 //!
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a
@@ -103,7 +115,7 @@
 //! consume the RNG-state input sequentially in `outputs` order … an exported
 //! RNG state is the state after the last sampled output"), so `outputs =
 //! (v1, v2, s3)` emits three results. A record-shaped output contributes one
-//! result per field, in declared field order.
+//! result per tensor leaf, depth-first in declared field order.
 //!
 //! Results are never wrapped in a `stablehlo.tuple`. A tuple-typed result
 //! fails `hlo_call` import in Enzyme-JAX before any gradient runs, while a

@@ -156,6 +156,15 @@ fn table_row_access_is_a_record() {
         out.contains("(%bind v (%meta ((%scalar real)"),
         "t[1].hits.x should resolve to the inner real, got:\n{out}"
     );
+    // A runtime integer index selects one row in the same way.
+    let out = ir("t = table(id = [1, 2], hits = table(x = [1.0, 2.0]))\n\
+                  i = elementof(posintegers)\nrow = t[i]");
+    assert!(
+        out.contains(
+            "(%bind row (%meta ((%record (id (%scalar integer)) (hits (%record (x (%scalar real)))))"
+        ),
+        "t[i] should be the row record, got:\n{out}"
+    );
 }
 
 /// Column access `t.col` returns the column as a vector (spec §03); a

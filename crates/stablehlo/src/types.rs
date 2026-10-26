@@ -9,12 +9,13 @@
 //! nested `Array`/`TVector` element chain into ONE tensor shape.
 //!
 //! Types with no tensor form are refused, never mis-lowered: aggregates
-//! (`Record`/`Tuple`/`Table`) must be destructured, and a residual
+//! (`Record`/`Tuple`/`Table`) lower field by field (`Emitter::lower_value`,
+//! one tensor per leaf), never as one tensor, and a residual
 //! measure-layer type (`Measure`/`Kernel`/`Likelihood`) reaching here is an
 //! invariant violation — `emit` only ever runs on already-determinized FlatPDL
 //! (`flatppl_determinizer::is_flatpdl`). An aggregate ABI *input* is
-//! destructured into one argument per column by `crate::modes`, which calls
-//! [`mlir_type_of_ty`] per column, so it never reaches the aggregate refusal.
+//! destructured into one argument per tensor leaf by `crate::modes`, which
+//! calls [`mlir_type_of_ty`] per leaf, so it never reaches the aggregate refusal.
 
 use flatppl_core::{Dim, Module, NodeId, ScalarType, Type};
 

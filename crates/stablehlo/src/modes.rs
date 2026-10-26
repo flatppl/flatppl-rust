@@ -25,11 +25,16 @@
 //! handling: `Emitter::lower_node`'s ordinary `Lit` dispatch turns a fixed
 //! scalar leaf into a `stablehlo.constant` when the query walk reaches it.
 //!
-//! An input with no single tensor form — a `load_data` over a table or record
-//! valueset — is instead destructured into ONE ARGUMENT PER COLUMN
-//! ([`bind_input`]/[`aggregate_columns`]), each pre-bound through
-//! [`Emitter::bind_column`] so a column access resolves to it. The aggregate
-//! node stays unbound, so using the whole table in tensor position refuses.
+//! An input with no single tensor form — a table or record — is instead
+//! destructured into ONE ARGUMENT PER TENSOR LEAF, depth-first in declared field
+//! order ([`bind_input`]/[`bind_leaves`]), each field pre-bound through
+//! [`Emitter::bind_field`] so a field access resolves to it.
+//!
+//! **Record outputs.** An output whose value is a record or table — a
+//! `record(...)`, a §07 table reduction, a table row — contributes one result
+//! per tensor leaf in the same order ([`lower_output`]). The CLI writes no
+//! metadata, so this order is the ABI. `flatppl-host`'s query `Schema` records
+//! the field paths of the same leaves.
 //!
 //! **Designating the query.** Nothing in FlatPDL marks a binding as "the"
 //! output; the query is designated *explicitly* by the reserved
@@ -58,7 +63,7 @@
 //!
 //! **Sample results are positional.** Every declared output becomes its own
 //! `func.func` result, in declared order, and a record-shaped output becomes
-//! one result per field ([`lower_sample_output`]). The final RNG state is
+//! one result per tensor leaf ([`lower_sample_output`]). The final RNG state is
 //! appended unless an output already names it. Nothing is ever wrapped in a
 //! `stablehlo.tuple`: a tuple-typed result fails `hlo_call` import in
 //! Enzyme-JAX before any gradient runs, while a multi-result `func.func`
@@ -72,7 +77,7 @@ use flatppl_core::{
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
-use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 use crate::types::{mlir_type_of, mlir_type_of_ty};
 
@@ -295,7 +300,7 @@ pub(crate) fn emit_logdensity_abi(
         if let Some(indices) = crate::indices::outputs(&mut e, node) {
             rets_vals.extend(indices?);
         } else {
-            rets_vals.push(e.lower_node(node)?);
+            lower_output(&mut e, node, &mut rets_vals)?;
         }
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
@@ -493,7 +498,20 @@ fn lower_sample_output(
         }
         return Ok(());
     }
-    out.push(e.lower_node(resolved)?);
+    lower_output(e, resolved, out)
+}
+
+/// Append the result(s) of one output: one per tensor leaf, depth-first in
+/// declared field order, so a record output becomes one result per field.
+fn lower_output(e: &mut Emitter, node: NodeId, out: &mut Vec<Value>) -> Result<(), EmitError> {
+    let start = out.len();
+    e.lower_value(node)?.leaves(out);
+    if out.len() == start {
+        return Err(EmitError::at(
+            node,
+            "a record output with no fields contributes no result",
+        ));
+    }
     Ok(())
 }
 
@@ -646,20 +664,19 @@ fn resolve_self_ref(m: &Module, id: NodeId) -> NodeId {
 /// `emit_sample_abi`'s `%key` can sit anywhere in the list without entering the
 /// numbering.
 ///
-/// Usually one argument, typed by [`mlir_type_of`]. An entry whose type is an
-/// aggregate with columns — a table or a record, the shapes a
-/// `load_data(source, cartpow(cartprod(…), N))` / `cartprod(…)` valueset
-/// declares (spec §07 `load_data`) — has no monolithic tensor form and becomes
-/// ONE ARGUMENT PER COLUMN in declared column order (see the crate doc's
-/// flattening convention), each bound via [`Emitter::bind_column`] so a column
-/// access (`data.y`) reads its own argument. The aggregate node itself stays
-/// unbound: using the whole table in tensor position still refuses.
+/// Usually one argument, typed by [`mlir_type_of`]. An entry whose type is a
+/// table or a record — the shapes a `load_data(source, cartpow(cartprod(…), N))`
+/// / `cartprod(…)` valueset declares (spec §07 `load_data`) — has no monolithic
+/// tensor form and becomes ONE ARGUMENT PER TENSOR LEAF, depth-first in declared
+/// field order (see the crate doc's flattening convention). Each top-level
+/// field is bound via [`Emitter::bind_field`], so a field access (`data.y`,
+/// `p.inner.v`) reads its own argument.
 ///
 /// Refuses an entry that is neither an `elementof` parameter nor a fixed input
 /// (`external`/`load_data`), a `load_data` over `anything` (§07: engines must
 /// not infer the shape from the source, and §13's signature subsection says
-/// `anything` "declares none and cannot be promoted"), and a column whose own
-/// type has no tensor form (a nested table/record column), naming the column.
+/// `anything` "declares none and cannot be promoted"), and a leaf with no
+/// tensor form (a complex field), naming its path.
 fn bind_input(
     m: &Module,
     e: &mut Emitter,
@@ -722,31 +739,9 @@ fn bind_input(
             ));
         }
         for (name, column_ty) in columns {
-            let (ty, elem) = mlir_type_of_ty(rhs, &column_ty, opts.dtype).map_err(|_| {
-                EmitError::at(
-                    rhs,
-                    format!(
-                        "`inputs` entry `{}` column `{name}` has no tensor form, so this \
-                         emitter cannot destructure the entry into arguments; it handles a \
-                         scalar column and an array-valued one, but not a nested \
-                         table/record column (which §03 does permit)",
-                        m.resolve(sym)
-                    ),
-                )
-            })?;
-            e.require_static_shape(rhs, &ty)?;
-            let ssa = format!("%arg{next_arg}");
-            *next_arg += 1;
-            e.bind_column(
-                rhs,
-                name,
-                Value {
-                    ssa: ssa.clone(),
-                    ty: ty.clone(),
-                    elem,
-                },
-            );
-            args.push((ssa, ty, elem));
+            let mut path = vec![m.resolve(sym).to_owned(), name.clone()];
+            let value = bind_leaves(m, e, rhs, &column_ty, &mut path, opts, args, next_arg)?;
+            e.bind_field(rhs, name, value);
         }
         return Ok(());
     }
@@ -770,28 +765,70 @@ fn bind_input(
     Ok(())
 }
 
-/// The columns an aggregate ABI input destructures into, as
-/// `(name, per-argument type)` in declared column order — `None` for a type
-/// with a tensor form of its own (the ordinary one-argument case).
+/// Allocate one argument per tensor leaf of `ty`, depth-first in declared field
+/// order. A table's column carries the row axis first, and a column that is
+/// itself a table nests the same way (spec §03 "Tables").
+#[allow(clippy::too_many_arguments)]
+fn bind_leaves(
+    m: &Module,
+    e: &mut Emitter,
+    rhs: NodeId,
+    ty: &Type,
+    path: &mut Vec<String>,
+    opts: &EmitOptions,
+    args: &mut Vec<(String, MlirTy, ElemKind)>,
+    next_arg: &mut usize,
+) -> Result<Lowered, EmitError> {
+    if let Some(fields) = fields_of(m, ty) {
+        let mut lowered = Vec::with_capacity(fields.len());
+        for (name, field_ty) in fields {
+            path.push(name.clone());
+            let value = bind_leaves(m, e, rhs, &field_ty, path, opts, args, next_arg)?;
+            path.pop();
+            lowered.push((name, value));
+        }
+        return Ok(Lowered::Record(lowered));
+    }
+    let (ty, elem) = mlir_type_of_ty(rhs, ty, opts.dtype).map_err(|err| {
+        EmitError::at(
+            rhs,
+            format!(
+                "`inputs` field `{}` has no tensor form, so it cannot be a function argument: {}",
+                path.join("."),
+                err.msg
+            ),
+        )
+    })?;
+    e.require_static_shape(rhs, &ty)?;
+    let ssa = format!("%arg{next_arg}");
+    *next_arg += 1;
+    args.push((ssa.clone(), ty.clone(), elem));
+    Ok(Lowered::Tensor(Value { ssa, ty, elem }))
+}
+
+/// The fields of a record type, or the whole-column types of a table type.
 ///
-/// A `Table { columns, nrows }` column stores its PER-ROW element type, so the
-/// argument holding the whole column is that type under one leading `nrows`
-/// axis: a scalar column of a 4-row table is `tensor<4xf32>`, a
-/// `cartpow(reals, 3)` column `tensor<4x3xf32>`. A `Record`'s field is already
-/// the whole value, so it is taken as-is.
-fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
-    match m.type_of(rhs)? {
+/// A `Table { columns, nrows }` column stores its PER-ROW type, so the whole
+/// column is that type under one leading `nrows` axis: a scalar column of a
+/// 4-row table is `tensor<4xf32>`, a `cartpow(reals, 3)` column
+/// `tensor<4x3xf32>`, and a record-valued column a table of `nrows` rows.
+fn fields_of(m: &Module, ty: &Type) -> Option<Vec<(String, Type)>> {
+    match ty {
         Type::Table { columns, nrows } => Some(
             columns
                 .iter()
                 .map(|(name, column)| {
-                    (
-                        m.resolve(*name).to_string(),
-                        Type::Array {
-                            shape: Box::new([*nrows]),
-                            elem: Box::new(column.clone()),
+                    let column = match column {
+                        Type::Record(fields) => Type::Table {
+                            columns: fields.clone(),
+                            nrows: *nrows,
                         },
-                    )
+                        row => Type::Array {
+                            shape: Box::new([*nrows]),
+                            elem: Box::new(row.clone()),
+                        },
+                    };
+                    (m.resolve(*name).to_string(), column)
                 })
                 .collect(),
         ),
@@ -803,6 +840,13 @@ fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
         ),
         _ => None,
     }
+}
+
+/// The top-level fields an aggregate ABI input destructures into, as
+/// `(name, whole-field type)` in declared order — `None` for a type with a
+/// tensor form of its own (the ordinary one-argument case). See [`fields_of`].
+fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
+    fields_of(m, m.type_of(rhs)?)
 }
 
 /// A free-parameter declaration: `Phase::Parametric` (spec §04 "Phase of

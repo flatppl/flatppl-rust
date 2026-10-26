@@ -3325,6 +3325,12 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
             (Type::Table { columns, .. }, Node::Lit(Scalar::Int(_))) => {
                 Type::Record(columns.clone())
             }
+            // A runtime integer row index selects one row in the same way.
+            (Type::Table { columns, .. }, _)
+                if matches!(args[index + 1].1, Type::Scalar(ScalarType::Integer)) =>
+            {
+                Type::Record(columns.clone())
+            }
             // A table indexed by a column name is COLUMN access → the column as
             // a vector (spec §03); a table-valued column (stored as its per-row
             // record) returns the sub-table itself, not a vector of records.

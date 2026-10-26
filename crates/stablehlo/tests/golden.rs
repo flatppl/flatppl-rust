@@ -3087,7 +3087,10 @@ fn lower_builtin_refuses_record_in_tensor_position() {
     let node = call(&mut m, "record", &[]);
     let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
-    assert!(err.msg.contains("record has no tensor form"));
+    assert!(
+        err.msg
+            .contains("is a record, which has no single tensor form")
+    );
 }
 
 #[test]
@@ -9670,31 +9673,29 @@ outputs = q1
     );
 }
 
-/// A column with no tensor form of its own (a nested record column) refuses
-/// NAMING THE COLUMN rather than reporting the generic aggregate refusal for the
-/// whole entry — destructuring one level does not make a nested aggregate
-/// lowerable.
+/// A nested record column flattens depth-first in declared field order: `x`,
+/// then `inner.p`, then `inner.q`, each with the table's row axis first.
 #[test]
-fn emit_logdensity_abi_refuses_nested_aggregate_column() {
+fn emit_logdensity_abi_flattens_a_nested_aggregate_column_depth_first() {
     let src = "\
 a = elementof(reals)
 data = load_data(\"d.csv\", cartpow(cartprod(x = reals, inner = cartprod(p = reals, q = reals)), 4))
-m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
-q1 = logdensityof(m, record(a = a))
+q1 = logdensityof(lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0)))), record(a = a))
 inputs = (a, data)
-outputs = q1
+outputs = (q1, data.inner.q)
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &unrestricted_options(),
-    )
-    .unwrap_err();
+    let out = emit_logdensity(&d);
     assert!(
-        err.msg.contains("column `inner` has no tensor form"),
-        "expected a refusal naming the nested column `inner`, got: {}",
-        err.msg
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<4xf32>, \
+             %arg2: tensor<4xf32>, %arg3: tensor<4xf32>) -> (tensor<f32>, tensor<4xf32>)"
+        ),
+        "the nested column must flatten into `inner.p` then `inner.q`, in:\n{out}"
+    );
+    assert!(
+        out.contains("return %") && out.contains(", %arg3 :"),
+        "`data.inner.q` must read its own argument, in:\n{out}"
     );
 }
 
@@ -11914,59 +11915,8 @@ fn emit_logdensity_every_recognised_open_image_pushfwd_emits() {
     assert!(is_delimiter_balanced(&out), "pushfwd(invlogit):\n{out}");
 }
 
-/// A §07 table reduction refuses with its OWN message, naming the reason and the
-/// spelling that works, whatever the table's provenance.
-///
-/// The reduction's result type is a record ("a record whose fields are the column
-/// names and values are the per-column reductions"), and this emitter has no record
-/// value — every `Value` is a tensor, and the `record` head itself refuses with
-/// "record has no tensor form". So the lowering is not expressible and a refusal is
-/// the honest outcome; a wrong number would not be.
-///
-/// Before this, the reason came out wrong depending on where the table came from: a
-/// `load_data` table blamed the column-wise destructuring (accurate but about
-/// `load_data`, not about the reduction) and an `elementof` table reported
-/// "unsupported builtin head 'elementof'", which mentions neither tables nor
-/// reductions. Both spellings are asserted here so that stays fixed.
-#[test]
-fn emit_logdensity_refuses_a_table_reduction_with_its_own_message() {
-    let want = "a table reduction has no tensor form";
-    for (label, decl) in [
-        (
-            "load_data",
-            "data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))",
-        ),
-        (
-            "elementof",
-            "data = elementof(cartpow(cartprod(x = reals), 4))",
-        ),
-    ] {
-        let src = format!(
-            "alpha = elementof(reals)\n{decl}\n\
-             lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
-             record(y = get(sum(data), [\"x\"])))\n\
-             inputs = (alpha, data)\noutputs = (lp)\n"
-        );
-        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
-        let err = flatppl_stablehlo::emit(
-            &d,
-            flatppl_stablehlo::Mode::LogDensity,
-            &unrestricted_options(),
-        )
-        .unwrap_err();
-        assert!(
-            err.msg.contains(want) && err.msg.contains("sum(data.x)"),
-            "the {label} table must give the reduction refusal naming the column spelling, \
-             got: {}",
-            err.msg
-        );
-    }
-}
-
-/// The spelling the refusal recommends actually lowers: reducing ONE COLUMN of a
-/// destructured table emits, because a table input is already one tensor argument
-/// per column. Asserted alongside the refusal so the advice cannot rot into
-/// pointing at something that does not work.
+/// Reducing ONE COLUMN of a destructured table emits, because a table input is
+/// already one tensor argument per column.
 ///
 /// The table is 4 rows of one column, so the reduce is over a uniquely determined
 /// axis — there is no second axis the sum could have been taken along.
