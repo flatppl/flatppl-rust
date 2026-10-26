@@ -264,6 +264,9 @@ fn op_rule(
     if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args, false) {
         return Ready((ty, joined));
     }
+    if let Some(ty) = refuse_lossy_literal_conversion(inf, &name, args) {
+        return Ready((ty, joined));
+    }
 
     if let Some(ty) = callback_arity_check(inf, id, &name, args) {
         return Ready((ty, joined));
@@ -8909,8 +8912,14 @@ fn refuse_shape_outside_sig(
             .unwrap_or_else(|| format!("argument {}", i + 1));
         // §03 "Integer" and "Bool": an integer or boolean domain is checked by the
         // argument's TYPE. `eye(2.0)` passes a real, whatever number it holds.
+        // A boolean is an integer, but an integer is not a boolean (§03 "booleans ⊂
+        // integers ⊂ reals"; §03 "Bool": zero and one are not converted implicitly).
         if let Some(Some(want)) = integral.get(i)
-            && let Type::Scalar(got @ (ScalarType::Real | ScalarType::Complex)) = ty
+            && let Type::Scalar(got) = ty
+            && match want {
+                crate::catalogue::ScalarTag::Boolean => *got != ScalarType::Boolean,
+                _ => matches!(got, ScalarType::Real | ScalarType::Complex),
+            }
         {
             let subject = if cell {
                 format!("a `broadcast` cell of {who} passes {which}")
@@ -8973,6 +8982,66 @@ fn refuse_shape_outside_sig(
     })
 }
 
+/// Refuse `integer(x)` / `boolean(x)` of a WRITTEN literal that the conversion
+/// cannot represent: §07 "Scalar restrictions and constructors" makes `integer`
+/// return the integer equal to an integral `x` and `boolean` return `x` in
+/// `booleans`, so `integer(2.5)` and `boolean(2)` are static errors. `-0.0` is 0. A
+/// bound argument is not read here: only a literal's value is known.
+fn refuse_lossy_literal_conversion(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    if !matches!(name, "integer" | "boolean") {
+        return None;
+    }
+    let (node, _, _) = args.first()?;
+    let value = written_literal(inf, *node)?;
+    let representable = if name == "integer" {
+        value.fract() == 0.0
+    } else {
+        value == 0.0 || value == 1.0
+    };
+    if representable {
+        return None;
+    }
+    let want = if name == "integer" {
+        "an integral value"
+    } else {
+        "0 or 1"
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        *node,
+        format!(
+            "`{name}` of `{value}`: spec §07 \"Scalar restrictions and constructors\" converts \
+             only {want}, so this conversion has no result"
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: unrepresentable literal").into(),
+    ))
+}
+
+/// The value of a numeric or boolean literal, possibly negated, as written. Unlike
+/// [`written_scalar`] it does not follow a binding.
+fn written_literal(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<f64> {
+    match inf.module.node(node) {
+        Node::Lit(Scalar::Int(n)) => Some(*n as f64),
+        Node::Lit(Scalar::Real(x)) => Some(*x),
+        Node::Lit(Scalar::Bool(b)) => Some(f64::from(*b)),
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            if inf.module.resolve(op) != "neg" || c.args.len() != 1 {
+                return None;
+            }
+            written_literal(inf, c.args[0]).map(|x| -x)
+        }
+        _ => None,
+    }
+}
+
 /// Refuse a real or complex index (or an array of them) in a `get` / `get0` selector.
 /// An index is an integer by TYPE, alongside the separate 1-based rule: `v[1.0]` writes
 /// a real, whatever number it holds.
@@ -9011,16 +9080,17 @@ fn non_integral_message(
     want: crate::catalogue::ScalarTag,
 ) -> String {
     let (want, remedy) = match want {
-        crate::catalogue::ScalarTag::Boolean => ("a boolean", "a boolean"),
+        crate::catalogue::ScalarTag::Boolean => ("a boolean", "`true`, `false` or `boolean(…)`"),
         _ => (
             "an integer",
             "an integer literal (`2`, not `2.0`) or `integer(…)`",
         ),
     };
-    let got = if got == ScalarType::Complex {
-        "a complex"
-    } else {
-        "a real"
+    let got = match got {
+        ScalarType::Complex => "a complex",
+        ScalarType::Integer => "an integer",
+        ScalarType::Boolean => "a boolean",
+        ScalarType::Real => "a real",
     };
     format!(
         "{subject} {got}, but spec {section} declares it {want}: a domain of integers or \

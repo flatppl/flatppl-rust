@@ -57,6 +57,11 @@ fn a_real_typed_integer_parameter_is_refused_whatever_its_value() {
             "x = checked(value = 1.0, condition = 2.0)",
             "declares it a boolean",
         ),
+        // §03: booleans ⊂ integers, so an integer is not a boolean.
+        (
+            "x = checked(value = 1.0, condition = 1)",
+            "`checked`'s `condition` is an integer, but spec §07 declares it a boolean",
+        ),
     ] {
         assert_refuses(src, needle);
     }
@@ -89,6 +94,9 @@ fn integers_and_explicit_conversions_type() {
         "x = cartpow(reals, 2)",
         "x = addaxes(v, 1, 0)",
         "x = checked(value = 1.0, condition = true)",
+        "x = checked(value = 1.0, condition = boolean(1))",
+        "x = Binomial(true, 0.5)",
+        "x = v[true]",
         "x = MvNormal(v, C)",
     ] {
         let errs = errors(src);
@@ -130,6 +138,34 @@ fn a_real_typed_index_is_refused_whatever_its_value() {
         "x = v[[1, 2]]",
         "x = C[all, 1]",
         "x = record(a = 1.0).a",
+    ] {
+        let errs = errors(src);
+        assert!(errs.is_empty(), "`{src}` must type; got: {errs:?}");
+    }
+}
+
+// §07 "Scalar restrictions and constructors": `integer` converts an integral value
+// and `boolean` a value in {0, 1}. A written literal outside that has no result; a
+// bound argument is not read statically.
+#[test]
+fn a_literal_conversion_without_a_result_is_refused() {
+    for (src, needle) in [
+        ("x = integer(2.5)", "`integer` of `2.5`"),
+        ("x = integer(-2.5)", "`integer` of `-2.5`"),
+        ("x = boolean(0.5)", "`boolean` of `0.5`"),
+        ("x = boolean(2)", "`boolean` of `2`"),
+        ("x = boolean(-1)", "`boolean` of `-1`"),
+    ] {
+        assert_refuses(src, needle);
+    }
+    for src in [
+        "x = integer(2.0)",
+        "x = integer(-0.0)",
+        "x = boolean(1.0)",
+        "x = boolean(-0.0)",
+        "x = boolean(true)",
+        "k = 2.5\nx = integer(k)",
+        "k = 2.5\nx = boolean(k)",
     ] {
         let errs = errors(src);
         assert!(errs.is_empty(), "`{src}` must type; got: {errs:?}");
