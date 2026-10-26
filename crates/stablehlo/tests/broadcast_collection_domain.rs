@@ -103,8 +103,8 @@ fn the_measured_linear_algebra_mislowerers_refuse() {
     }
 }
 
-/// The forward hazard, pinned. §07's four remaining collection-domain tables — Convolution,
-/// Binning, Approximation functions, Array and table generation — are safe only because
+/// The forward hazard, pinned. §07's remaining collection-domain tables — Convolution,
+/// Binning, Array and table generation — are safe only because
 /// their heads are UNLOWERED, not because of the domain rule. This test states that
 /// out loud: each still refuses, but with "unsupported builtin head", NOT the domain
 /// message. Whoever wires one of these into `lower_builtin` will see this test flip to the
@@ -112,14 +112,7 @@ fn the_measured_linear_algebra_mislowerers_refuse() {
 /// wrapper is being discarded again, add the head to `COLLECTION_DOMAIN_HEADS`).
 #[test]
 fn the_unlowered_collection_heads_refuse_as_unsupported_not_on_the_domain_rule() {
-    for head in [
-        "conv",
-        "crosscorr",
-        "bincounts",
-        "polynomial",
-        "bernstein",
-        "stepwise",
-    ] {
+    for head in ["conv", "crosscorr", "bincounts"] {
         let err = emit_err(&nested_src(head, "reals"));
         assert!(
             err.contains(&format!("unsupported builtin head '{head}'")),

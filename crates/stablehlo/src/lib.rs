@@ -211,6 +211,7 @@
 //! every refusal rule and query-module usage.
 
 mod aggregate;
+mod approx;
 mod call_batch;
 mod complex;
 mod emitter;
