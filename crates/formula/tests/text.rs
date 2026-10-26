@@ -1,4 +1,4 @@
-use flatppl_formula::{DataMode, DataValue, GroupLevel, Table, build, prepare_data, read};
+use flatppl_formula::{DataMode, DataValue, GroupLevel, build, prepare_data, read};
 
 #[test]
 fn text_tables_share_model_frames_and_prediction_levels() -> Result<(), Box<dyn std::error::Error>>
@@ -6,7 +6,7 @@ fn text_tables_share_model_frames_and_prediction_levels() -> Result<(), Box<dyn 
     let spec = read(r#"{"formula":"y ~ x + f + flag + (1 | g)"}"#)?;
     let expected = build(
         &spec,
-        &Table::from_json(include_str!("fixtures/text/typed.json"))?,
+        &flatppl_formula::read_json_table(include_str!("fixtures/text/typed.json"))?,
     )?;
     assert_eq!(expected.data.rows, vec![0, 2, 3]);
     assert_eq!(
@@ -17,13 +17,14 @@ fn text_tables_share_model_frames_and_prediction_levels() -> Result<(), Box<dyn 
         expected.recipe.predictors["mu"].groups[0].levels,
         vec![GroupLevel::Integer(i64::MIN), GroupLevel::Integer(i64::MAX)]
     );
-    let prediction =
-        Table::from_json(r#"[{"x":5.0,"f":"a","flag":false,"g":9223372036854775807}]"#)?;
+    let prediction = flatppl_formula::read_json_table(
+        r#"[{"x":5.0,"f":"a","flag":false,"g":9223372036854775807}]"#,
+    )?;
     let expected_prediction = prepare_data(&expected.recipe, &prediction, DataMode::Prediction)?;
     for table in [
-        Table::from_csv(include_bytes!("fixtures/text/table.csv").as_slice())?,
-        Table::from_json(include_str!("fixtures/text/records.json"))?,
-        Table::from_json(include_str!("fixtures/text/columns.json"))?,
+        flatppl_formula::read_csv_table(include_bytes!("fixtures/text/table.csv").as_slice())?,
+        flatppl_formula::read_json_table(include_str!("fixtures/text/records.json"))?,
+        flatppl_formula::read_json_table(include_str!("fixtures/text/columns.json"))?,
     ] {
         let model = build(&spec, &table)?;
         assert_eq!(model.data, expected.data);
@@ -50,7 +51,7 @@ fn typed_precision_and_json_numeric_boundaries_are_preserved()
           {"name":"y","values":{"kind":"int","values":[1,2]}},
           {"name":"x","values":{"values":[0.1,0.2],"kind":"real32"}}
         ]}"#;
-    let table = Table::from_json(source)?;
+    let table = flatppl_formula::read_json_table(source)?;
     let spec = read(&format!(r#"{{"formula":"y ~ x","data":{source}}}"#))?;
     let model = build(&spec, &table)?;
     assert_eq!(model.data, build(&spec, spec.data.as_ref().unwrap())?.data);
@@ -67,7 +68,7 @@ fn typed_precision_and_json_numeric_boundaries_are_preserved()
     assert!(!sidecar.as_object().unwrap().contains_key("N"));
     let mut parsed = flatppl_syntax::parse(&flatppl_syntax::print(&loaded))?;
     assert!(flatppl_infer::infer(&mut parsed).is_empty());
-    let exact = Table::from_json(r#"{"y":[1,2],"x":[9007199254740994,1e0]}"#)?;
+    let exact = flatppl_formula::read_json_table(r#"{"y":[1,2],"x":[9007199254740994,1e0]}"#)?;
     assert_eq!(
         build(&spec, &exact)?.data.constants["x_1"],
         DataValue::Real64(vec![9007199254740994., 1.])
@@ -81,10 +82,10 @@ fn typed_precision_and_json_numeric_boundaries_are_preserved()
         r#"{"x":[true,1]}"#,
         r#"{"x":[1e999]}"#,
     ] {
-        assert!(Table::from_json(json).is_err(), "{json}");
+        assert!(flatppl_formula::read_json_table(json).is_err(), "{json}");
     }
     for csv in ["x\n9223372036854775808\n", "x\n9007199254740993\n1.0\n"] {
-        assert!(Table::from_csv(csv.as_bytes()).is_err());
+        assert!(flatppl_formula::read_csv_table(csv.as_bytes()).is_err());
     }
     Ok(())
 }

@@ -1,0 +1,21 @@
+[package]
+name = "flatppl-data"
+description = "Readers for the data formats FlatPPL `load_data` requires (spec §07)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema"]
+safetensors = ["dep:half", "dep:serde_json"]
+
+[dependencies]
+serde.workspace = true
+csv = "1.4.0"
+arrow-array = { version = "60.0.0", optional = true }
+arrow-ipc = { version = "60.0.0", optional = true }
+arrow-schema = { version = "60.0.0", optional = true }
+half = { version = "2.7.1", optional = true }
+serde_json = { workspace = true, optional = true }

@@ -1,101 +1,92 @@
 use crate::{Column, ColumnValues, Error, Result, Table};
 use serde_json::{Number, Value, value::RawValue};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 type JsonRow<'a> = BTreeMap<String, &'a RawValue>;
 
-impl Table {
-    /// Read a typed table, an array of row objects, or an object of column arrays.
-    /// Missing record fields and JSON nulls remain missing until model-frame
-    /// construction. Strings become unordered factors with sorted levels.
-    pub fn from_json(source: &str) -> Result<Self> {
-        let table = match source.trim_start().as_bytes().first() {
-            Some(b'{') => {
-                let object: JsonRow<'_> = read_json(source)?;
-                if object
-                    .get("nrows")
-                    .is_some_and(|v| !v.get().starts_with('['))
-                {
-                    let table: Self = read_json(source)?;
-                    table.validate()?;
-                    return Ok(table);
-                }
-                let mut nrows = 0;
-                let mut columns = Vec::with_capacity(object.len());
-                for (name, values) in object {
-                    let values: Vec<&RawValue> = read_json(values.get())
-                        .map_err(|_| Error(format!("JSON column `{name}` must be an array")))?;
-                    if columns.is_empty() {
-                        nrows = values.len();
-                    }
-                    let values = values
-                        .into_iter()
-                        .map(|value| json_cell(value, &name))
-                        .collect::<Result<_>>()?;
-                    columns.push(column(name, values)?);
-                }
-                Self { columns, nrows }
+/// Read a typed table, an array of row objects, or an object of column arrays.
+/// Missing record fields and JSON nulls remain missing until model-frame
+/// construction. Strings become unordered factors with sorted levels.
+pub fn read_json_table(source: &str) -> Result<Table> {
+    let table = match source.trim_start().as_bytes().first() {
+        Some(b'{') => {
+            let object: JsonRow<'_> = read_json(source)?;
+            if object
+                .get("nrows")
+                .is_some_and(|v| !v.get().starts_with('['))
+            {
+                let table: Table = read_json(source)?;
+                table.validate()?;
+                return Ok(table);
             }
-            Some(b'[') => {
-                let rows: Vec<JsonRow<'_>> = read_json(source)?;
-                let names: BTreeSet<_> = rows.iter().flat_map(|r| r.keys()).collect();
-                let columns = names
+            let mut nrows = 0;
+            let mut columns = Vec::with_capacity(object.len());
+            for (name, values) in object {
+                let values: Vec<&RawValue> = read_json(values.get())
+                    .map_err(|_| Error(format!("JSON column `{name}` must be an array")))?;
+                if columns.is_empty() {
+                    nrows = values.len();
+                }
+                let values = values
                     .into_iter()
-                    .map(|name| {
-                        column(
-                            name.clone(),
-                            rows.iter()
-                                .map(|row| {
-                                    row.get(name)
-                                        .map_or(Ok(Value::Null), |value| json_cell(value, name))
-                                })
-                                .collect::<Result<_>>()?,
-                        )
-                    })
+                    .map(|value| json_cell(value, &name))
                     .collect::<Result<_>>()?;
-                Self {
-                    columns,
-                    nrows: rows.len(),
-                }
+                columns.push(column(name, values)?);
             }
-            _ => return Err(Error("JSON table must contain records or columns".into())),
-        };
-        table.validate()?;
-        Ok(table)
-    }
-
-    /// Read a headered CSV table. Empty fields and `NA` are null, including when
-    /// quoted. Other fields are not trimmed. Columns infer booleans, integers,
-    /// finite real numbers, or unordered string factors, in that order.
-    pub fn from_csv(reader: impl Read) -> Result<Self> {
-        let mut reader = csv::Reader::from_reader(reader);
-        let names = reader
-            .headers()
-            .map_err(csv_error)?
-            .iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let mut values = vec![Vec::new(); names.len()];
-        let mut nrows = 0;
-        for record in reader.records() {
-            let record = record.map_err(csv_error)?;
-            for (column, value) in values.iter_mut().zip(&record) {
-                column.push(value.to_owned());
+            Table {
+                columns,
+                nrows,
+                unreadable: Vec::new(),
             }
-            nrows += 1;
         }
-        let columns = names
-            .into_iter()
-            .zip(values)
-            .map(|(name, values)| csv_column(name, values))
-            .collect::<Result<_>>()?;
-        let table = Self { columns, nrows };
-        table.validate()?;
-        Ok(table)
-    }
+        Some(b'[') => {
+            let rows: Vec<JsonRow<'_>> = read_json(source)?;
+            let names: BTreeSet<_> = rows.iter().flat_map(|r| r.keys()).collect();
+            let columns = names
+                .into_iter()
+                .map(|name| {
+                    column(
+                        name.clone(),
+                        rows.iter()
+                            .map(|row| {
+                                row.get(name)
+                                    .map_or(Ok(Value::Null), |value| json_cell(value, name))
+                            })
+                            .collect::<Result<_>>()?,
+                    )
+                })
+                .collect::<Result<_>>()?;
+            Table {
+                columns,
+                nrows: rows.len(),
+                unreadable: Vec::new(),
+            }
+        }
+        _ => return Err(Error("JSON table must contain records or columns".into())),
+    };
+    table.validate()?;
+    Ok(table)
+}
+
+/// Read a headered CSV table through [`flatppl_data::read_csv`], which trims
+/// fields and skips `#` comment lines. Empty fields and `NA` are null. Columns
+/// infer booleans, integers, finite real numbers, or unordered string factors, in
+/// that order.
+pub fn read_csv_table(bytes: &[u8]) -> Result<Table> {
+    let text = flatppl_data::read_csv(bytes)?;
+    let columns = text
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| csv_column(name.clone(), text.column(i).map(str::to_owned).collect()))
+        .collect::<Result<_>>()?;
+    let table = Table {
+        columns,
+        nrows: text.rows.len(),
+        unreadable: Vec::new(),
+    };
+    table.validate()?;
+    Ok(table)
 }
 
 fn read_json<'a, T: serde::Deserialize<'a>>(source: &'a str) -> Result<T> {
@@ -112,10 +103,6 @@ fn json_cell(value: &RawValue, name: &str) -> Result<Value> {
     } else {
         read_json(source)
     }
-}
-
-fn csv_error(error: csv::Error) -> Error {
-    Error(format!("invalid table CSV: {error}"))
 }
 
 fn csv_column(name: String, values: Vec<String>) -> Result<Column> {

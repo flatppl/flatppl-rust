@@ -78,8 +78,10 @@ fn external_text_data_match_direct_conversion_without_embedding() {
     let input = directory.join("model.formula.json");
     let output = directory.join("model.flatppl");
     let mut spec = flatppl_formula::read(r#"{"formula":"y ~ x + f + flag + (1 | g)"}"#).unwrap();
-    let table =
-        Table::from_json(include_str!("../../formula/tests/fixtures/text/typed.json")).unwrap();
+    let table = flatppl_formula::read_json_table(include_str!(
+        "../../formula/tests/fixtures/text/typed.json"
+    ))
+    .unwrap();
     for (name, source) in [
         (
             "table.csv",

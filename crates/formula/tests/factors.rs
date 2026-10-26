@@ -306,6 +306,7 @@ fn coefficient_names_cannot_alias_the_derived_intercept() {
 fn larger_ordered_factors_use_indicators_or_other_contrasts() {
     let table = Table {
         nrows: 17,
+        unreadable: Vec::new(),
         columns: vec![
             flatppl_formula::Column {
                 name: "y".into(),

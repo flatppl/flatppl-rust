@@ -294,8 +294,16 @@ impl LoadedModule {
                 self.source(),
             )
         })?;
-        crate::load_fixed_data(&mut lowered, |source| self.read_data(source))
-            .map_err(|error| Diagnostic::new("load_data", self.source_name(), error))?;
+        crate::load_fixed_data(&mut lowered, |source| self.read_data(source)).map_err(|error| {
+            // Lowering appends nodes and never renumbers, so only nodes of the
+            // typed root module index its source.
+            let node = error.node.filter(|id| id.index() < self.typed.node_count());
+            Diagnostic::new("load_data", self.source_name(), error.to_string()).at(
+                &self.typed,
+                node,
+                self.source(),
+            )
+        })?;
         emit_query(lowered, &self.typed, options, batch).map_err(|e| {
             // Lowering appends nodes and never renumbers, so only nodes of the
             // typed root module index its source.

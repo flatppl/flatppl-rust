@@ -1,4 +1,5 @@
 pub use crate::contrasts::Contrast;
+use crate::data::ColumnModel;
 use crate::{ColumnExpression, Error, Formula, GroupTerm, Result, Table, Term};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
