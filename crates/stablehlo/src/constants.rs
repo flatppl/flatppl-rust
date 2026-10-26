@@ -179,9 +179,7 @@ impl Emitter<'_> {
                 };
                 x.is_finite().then_some(Scalar::Real(x))
             }
-            Scalar::Int(x) if matches!(self.dtype, Dtype::F64) || i32::try_from(x).is_ok() => {
-                Some(Scalar::Int(x))
-            }
+            Scalar::Int(x) if self.int_fits(x) => Some(Scalar::Int(x)),
             Scalar::Bool(x) => Some(Scalar::Bool(x)),
             _ => None,
         }

@@ -410,7 +410,9 @@ impl<'m> Emitter<'m> {
             .iter()
             .map(|&id| match (self.m.node(id), elem) {
                 (Node::Lit(Scalar::Bool(b)), ElemKind::Bool) => Some(b.to_string()),
-                (Node::Lit(Scalar::Int(i)), ElemKind::Int) => Some(i.to_string()),
+                (Node::Lit(Scalar::Int(i)), ElemKind::Int) if self.int_fits(*i) => {
+                    Some(i.to_string())
+                }
                 (Node::Lit(Scalar::Real(x)), ElemKind::Real) if x.is_finite() => {
                     Some(render_float_literal(*x))
                 }
@@ -3008,6 +3010,11 @@ impl<'m> Emitter<'m> {
     /// `i32`/`i64`, unlike the fixed-`i32` control-flow [`Emitter::int_const`]
     /// this is deliberately distinct from — that one is a loop counter, never
     /// reaching a FlatPDL value; this is the FlatPDL integer VALUE itself).
+    /// Whether an integer value fits the dtype's integer width.
+    pub(crate) fn int_fits(&self, i: i64) -> bool {
+        matches!(self.dtype, Dtype::F64) || i32::try_from(i).is_ok()
+    }
+
     pub fn int_value_const(&mut self, i: i64) -> Value {
         let ty_text = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
         let ssa = self.pure(format!("stablehlo.constant dense<{i}> : {ty_text}"));
@@ -4091,6 +4098,14 @@ impl<'m> Emitter<'m> {
     fn lower_node_uncached(&mut self, id: NodeId) -> Result<Value, EmitError> {
         let m: &'m Module = self.m;
         match m.node(id) {
+            // An out-of-range literal would wrap or fail to parse downstream.
+            Node::Lit(Scalar::Int(i)) if !self.int_fits(*i) => Err(EmitError::at(
+                id,
+                format!(
+                    "integer {i} is outside i32, the integer width of the f32 dtype; \
+                     emit with the f64 dtype for i64 integers"
+                ),
+            )),
             Node::Lit(Scalar::Int(i)) => Ok(self.int_value_const(*i)),
             Node::Lit(Scalar::Real(x)) => Ok(self.constant(*x, MlirTy::Scalar)),
             Node::Lit(Scalar::Bool(b)) => Ok(self.bool_value_const(*b)),

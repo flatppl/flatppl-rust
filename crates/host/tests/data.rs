@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use flatppl_host::{Context, EmitOptions};
+use flatppl_host::{Context, Dtype, EmitOptions};
 
 fn directory(name: &str) -> PathBuf {
     let path =
@@ -699,6 +699,79 @@ fn an_unselected_json_integer_beyond_int64_reads() -> Result<(), Box<dyn std::er
     assert!(
         err.contains("integer 9223372036854775808 exceeds int64"),
         "{err}"
+    );
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+/// Every integer constant in an emitted module, with its element width, so a
+/// test can check each value fits the type it is written at.
+fn integer_constants(stablehlo: &str) -> Vec<(i128, u32)> {
+    stablehlo
+        .lines()
+        .filter_map(|line| {
+            let (_, rhs) = line.trim().split_once(" = stablehlo.constant dense<")?;
+            let (body, ty) = rhs.rsplit_once("> : ")?;
+            let bits = ty.trim_end_matches('>').rsplit(['<', 'x']).next()?;
+            let bits: u32 = bits.strip_prefix('i')?.parse().ok()?;
+            Some((body, bits))
+        })
+        .filter(|&(_, bits)| bits > 1)
+        .flat_map(|(body, bits)| {
+            body.split(['[', ']', ','])
+                .filter(|s| !s.trim().is_empty())
+                .map(move |s| (s.trim().parse::<i128>().expect("integer literal"), bits))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// An integer beyond the dtype's integer width refuses instead of wrapping,
+/// and an integer beyond 2^53 reads into reals with ordinary rounding.
+#[test]
+fn baked_integers_fit_their_emitted_width() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = directory("width");
+    std::fs::write(
+        dir.join("data.json"),
+        r#"{"i": [3000000000, 1], "r": [9007199254740993, 1]}"#,
+    )?;
+    let path = dir.join("query.flatppl");
+    let compile = |field: &str, set: &str, dtype: Dtype| {
+        Context::default()
+            .parse(
+                &format!(
+                    "data = load_data(\"data.json\", cartprod({field} = cartpow({set}, 2)))\noutputs = data.{field}"
+                ),
+                None,
+                path.to_str(),
+            )
+            .and_then(|model| {
+                model.compile(&EmitOptions {
+                    dtype,
+                    ..EmitOptions::default()
+                })
+            })
+            .map(|out| out.stablehlo)
+            .map_err(|e| e.to_string())
+    };
+    let err = compile("i", "integers", Dtype::F32).expect_err("must refuse");
+    assert!(
+        err.contains("integer 3000000000 is outside i32, the integer width of the f32 dtype"),
+        "{err}"
+    );
+    let wide = compile("i", "integers", Dtype::F64)?;
+    let constants = integer_constants(&wide);
+    assert!(constants.contains(&(3_000_000_000, 64)), "{wide}");
+    for (value, bits) in constants {
+        let limit = 1i128 << (bits - 1);
+        assert!(
+            (-limit..limit).contains(&value),
+            "{value} overflows i{bits}"
+        );
+    }
+    assert_eq!(
+        returned(&compile("r", "reals", Dtype::F64)?),
+        vec![vec![9007199254740992.0, 1.0]]
     );
     std::fs::remove_dir_all(dir)?;
     Ok(())

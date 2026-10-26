@@ -211,11 +211,8 @@ impl Constant {
             (Self::Bool(value), Type::Scalar(ScalarType::Real)) => {
                 Ok(Self::Real(f64::from(*value)))
             }
-            (Self::Integer(value), Type::Scalar(ScalarType::Real))
-                if (*value as f64) as i128 == i128::from(*value) =>
-            {
-                Ok(Self::Real(*value as f64))
-            }
+            // An integer is a real (§03), rounded as any real literal is.
+            (Self::Integer(value), Type::Scalar(ScalarType::Real)) => Ok(Self::Real(*value as f64)),
             (
                 Self::Array { shape, data },
                 Type::Array {
