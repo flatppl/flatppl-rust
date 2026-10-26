@@ -662,6 +662,10 @@ fn arrow_typed_columns_read_past_every_layout() {
         compile_at("t = load_data(\"u64.arrow\", cartpow(cartprod(a = reals), 1))\noutputs = t.a")
             .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(returned(&out), vec![vec![1.5]]);
+    let err = refusal(
+        "t = load_data(\"bad_key.arrows\", cartpow(cartprod(x = reals), 2))\noutputs = t.x",
+    );
+    assert!(err.contains("Arrow IPC"), "{err}");
 }
 
 /// A JSON integer beyond int64 refuses only when selected.

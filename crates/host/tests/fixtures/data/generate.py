@@ -156,6 +156,10 @@ with ipc.new_file(HERE / "compressed.arrow", table.schema,
 with ipc.new_file(HERE / "zstd.arrow", table.schema,
                   options=ipc.IpcWriteOptions(compression="zstd")) as writer:
     writer.write_table(table)
+# A dictionary key outside its dictionary is a malformed file.
+bad_key = pa.DictionaryArray.from_arrays(pa.array([0, 5], pa.int8()), pa.array([1.5]), safe=False)
+with ipc.new_stream(HERE / "bad_key.arrows", pa.schema([("x", bad_key.type)])) as writer:
+    writer.write_batch(pa.record_batch({"x": bad_key}))
 # The out-of-range column must not spoil the readable one beside it.
 with ipc.new_file(HERE / "u64.arrow", pa.schema([("a", pa.float64()), ("x", pa.uint64())])) as writer:
     writer.write_table(pa.table({"a": pa.array([1.5], pa.float64()),
