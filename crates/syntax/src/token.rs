@@ -828,15 +828,12 @@ impl Lexer {
         Ok(())
     }
 
-    /// Recognize an optional `md` / `typ` markup tag immediately after the
-    /// leading `%` / `%%%` (no intervening space). Consumes the tag and one
-    /// separating space if present.
-    /// Does a `%%%` doc block open here? §05 `DocBlock ::= HWS* "%%%"
-    /// MarkupTag? HWS* Newline`, so the fence must start its line and only a
-    /// tag and horizontal whitespace may follow it. Any other `%%%` line is a
-    /// `DocLine`, as `### text` is a `LineComment`. An unknown tag still opens
-    /// the block, so that it is refused rather than read as text.
+    /// Does a `%%%` doc block open at the current position?
     fn opens_doc_block(&self) -> bool {
+        // §05 `DocBlock ::= HWS* "%%%" MarkupTag? HWS* Newline`: the fence starts
+        // its line and only a tag and horizontal whitespace follow it. Any other
+        // `%%%` line is a `DocLine`, as `### text` is a `LineComment`. An unknown
+        // tag still opens the block, so that it is refused rather than read as text.
         if self.chars.get(self.pos..self.pos + 3) != Some(&['%'; 3][..]) {
             return false;
         }
@@ -859,6 +856,9 @@ impl Lexer {
         line_start && matches!(self.chars.get(i), None | Some('\n' | '\r'))
     }
 
+    /// Recognize an optional `md` / `typ` markup tag immediately after the
+    /// leading `%` / `%%%` (no intervening space). Consumes the tag and one
+    /// separating space if present.
     fn read_doc_tag(&mut self) -> Option<String> {
         for tag in ["md", "typ"] {
             let tag_chars: Vec<char> = tag.chars().collect();
