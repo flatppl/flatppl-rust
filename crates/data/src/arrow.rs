@@ -26,6 +26,7 @@ impl Table {
 }
 
 fn read(bytes: &[u8], decode: bool) -> Result<Table> {
+    check_buffers(bytes)?;
     let cursor = Cursor::new(bytes);
     if bytes.starts_with(b"ARROW1") {
         read_batches(
@@ -38,6 +39,113 @@ fn read(bytes: &[u8], decode: bool) -> Result<Table> {
             decode,
         )
     }
+}
+
+/// arrow-ipc trusts the lengths a file states: a buffer at a negative offset, or a
+/// footer block shorter than its message, panics, and a compressed buffer's
+/// length prefix sizes an allocation. Check them first. Framing that does not
+/// parse is left for arrow-ipc to refuse.
+fn check_buffers(bytes: &[u8]) -> Result<()> {
+    let malformed = |what: &str| Error(format!("Arrow IPC: malformed file ({what})"));
+    let word = |at: usize| {
+        let word = bytes.get(at..at.checked_add(4)?)?;
+        Some(i32::from_le_bytes(word.try_into().ok()?))
+    };
+    // Where the message at `at` ends its metadata, and its body length, once its
+    // buffers check; `None` if it does not parse.
+    let check = |at: usize| -> Result<Option<(usize, usize)>> {
+        let (mut at, mut length) = (at + 4, word(at));
+        if length == Some(-1) {
+            (at, length) = (at + 4, word(at));
+        }
+        let Some(length) = length
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        else {
+            return Ok(None);
+        };
+        let Some(message) = bytes
+            .get(at..at.saturating_add(length))
+            .and_then(|m| arrow_ipc::root_as_message(m).ok())
+        else {
+            return Ok(None);
+        };
+        let Ok(body) = usize::try_from(message.bodyLength()) else {
+            return Ok(None);
+        };
+        let start = at + length;
+        let Some(batch) = message
+            .header_as_record_batch()
+            .or_else(|| message.header_as_dictionary_batch().and_then(|d| d.data()))
+        else {
+            return Ok(Some((start, body)));
+        };
+        // A compressed buffer opens with its decompressed length, and no codec
+        // expands a byte further than this.
+        let expansion: Option<u64> = batch.compression().map(|c| {
+            if c.codec() == arrow_ipc::CompressionType::ZSTD {
+                1 << 17
+            } else {
+                256
+            }
+        });
+        for buffer in batch.buffers().iter().flatten() {
+            let (offset, size) = (buffer.offset(), buffer.length());
+            if offset < 0
+                || size < 0
+                || offset
+                    .checked_add(size)
+                    .is_none_or(|end| end as usize > body)
+            {
+                return Err(malformed("a buffer leaves its message body"));
+            }
+            let (Some(expansion), true) = (expansion, size > 0) else {
+                continue;
+            };
+            let from = start + offset as usize;
+            let Some(prefix) = bytes.get(from..from + 8).filter(|_| size >= 8) else {
+                return Err(malformed("a compressed buffer has no length prefix"));
+            };
+            let stated = i64::from_le_bytes(prefix.try_into().expect("eight bytes"));
+            let most = (size as u64 - 8)
+                .saturating_mul(expansion)
+                .saturating_add(64);
+            if stated < -1 || (stated > 0 && stated as u64 > most) {
+                return Err(malformed(&format!(
+                    "a compressed buffer of {size} bytes states {stated} decompressed bytes"
+                )));
+            }
+        }
+        Ok(Some((start, body)))
+    };
+    if !bytes.starts_with(b"ARROW1") {
+        let mut at = Some(0);
+        while let Some(next) = at {
+            at = check(next)?.and_then(|(start, body)| start.checked_add(body));
+        }
+        return Ok(());
+    }
+    let footer = bytes.len().checked_sub(10).and_then(|end| {
+        let length = usize::try_from(word(end)?).ok()?;
+        arrow_ipc::root_as_footer(bytes.get(end.checked_sub(length)?..end)?).ok()
+    });
+    let Some(footer) = footer else {
+        return Ok(());
+    };
+    // FileReader slices a message by its block's lengths, not by the message's own.
+    let blocks = footer.dictionaries().into_iter().flatten();
+    for block in blocks.chain(footer.recordBatches().into_iter().flatten()) {
+        let Ok(offset) = usize::try_from(block.offset()) else {
+            continue;
+        };
+        if let Some((start, body)) = check(offset)?
+            && (usize::try_from(block.metaDataLength()).ok() != Some(start - offset)
+                || usize::try_from(block.bodyLength()).ok() != Some(body))
+        {
+            return Err(malformed("a footer block disagrees with its message"));
+        }
+    }
+    Ok(())
 }
 
 fn ipc_error(error: ArrowError) -> Error {
@@ -224,7 +332,14 @@ fn column(field: &Field, values: &dyn Array, decode: bool) -> Result<Column> {
                 .map(Option::unwrap_or_default)
                 .collect(),
         ),
-        DataType::Null => ColumnValues::Real64(vec![0.0; values.len()]),
+        // No buffer bounds a Null array's length, and every value is missing, so
+        // selecting it refuses anyway. It is never materialised.
+        DataType::Null => {
+            return Err(Error(format!(
+                "column `{}` has the Arrow type Null, so every value is missing",
+                field.name()
+            )));
+        }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             return factor(field, labels(values)?, (0..values.len()).map(Some));
         }
@@ -256,8 +371,6 @@ fn column(field: &Field, values: &dyn Array, decode: bool) -> Result<Column> {
     Ok(Column {
         name: field.name().clone(),
         values: data,
-        // A `Null`-typed array has no validity buffer, so only its logical
-        // nulls say that every entry is missing.
         valid: values
             .logical_nulls()
             .filter(|nulls| nulls.null_count() != 0)

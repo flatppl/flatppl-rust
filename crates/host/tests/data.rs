@@ -479,7 +479,7 @@ fn arrow_columns_refuse_only_when_selected() {
     assert_eq!(returned(&out), vec![vec![1.5, 2.5]]);
     for (column, reason) in [
         ("n", "a value is missing"),
-        ("z", "a value is missing"),
+        ("z", "has the Arrow type Null, so every value is missing"),
         ("s", "column `s` holds Arrow strings"),
         ("t", "column `t` has unsupported Arrow type Timestamp"),
         ("l", "column `l` has unsupported Arrow type FixedSizeList"),
@@ -646,7 +646,7 @@ fn arrow_typed_columns_read_past_every_layout() {
             ("dense", "unsupported Arrow type"),
             ("ree", "unsupported Arrow type"),
             ("time", "unsupported Arrow type"),
-            ("null", "a value is missing"),
+            ("null", "has the Arrow type Null, so every value is missing"),
             ("dict_null", "a value is missing"),
         ] {
             let err = refusal(&format!(
@@ -666,6 +666,55 @@ fn arrow_typed_columns_read_past_every_layout() {
         "t = load_data(\"bad_key.arrows\", cartpow(cartprod(x = reals), 2))\noutputs = t.x",
     );
     assert!(err.contains("Arrow IPC"), "{err}");
+    let err = refusal(
+        "t = load_data(\"negative_body.arrows\", cartpow(cartprod(a = reals), 3))\noutputs = t.a",
+    );
+    assert!(err.contains("Invalid IPC message body length"), "{err}");
+    for (file, column, reason) in [
+        (
+            "negative_offset.arrows",
+            "a",
+            "malformed file (a buffer leaves its message body)",
+        ),
+        (
+            "huge_rows.arrows",
+            "n",
+            "column `n` has the Arrow type Null, so every value is missing",
+        ),
+        ("bad_block.arrow", "a", "Arrow IPC"),
+        (
+            "short_block.arrow",
+            "a",
+            "malformed file (a footer block disagrees with its message)",
+        ),
+        (
+            "huge_lz4_2e50.arrow",
+            "a",
+            "states 1125899906842624 decompressed bytes",
+        ),
+        (
+            "huge_lz4_2e62.arrow",
+            "a",
+            "states 4611686018427387904 decompressed bytes",
+        ),
+        (
+            "many_null_batches.arrows",
+            "n",
+            "column `n` has the Arrow type Null, so every value is missing",
+        ),
+    ] {
+        let err = refusal(&format!(
+            "t = load_data(\"{file}\", cartpow(cartprod({column} = reals), 3))\noutputs = t.{column}"
+        ));
+        assert!(err.contains(reason), "{file}: {err}");
+    }
+    let out = compile_at(
+        "t = load_data(\"lz4_runs.arrow\", cartpow(cartprod(x = reals), 1100))\noutputs = t.x",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut want = vec![1.5; 1000];
+    want.extend((0..100).map(|i| f64::from(i) * 0.25));
+    assert_eq!(returned(&out), vec![want]);
 }
 
 /// A JSON integer beyond int64 refuses only when selected.
