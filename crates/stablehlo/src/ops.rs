@@ -333,6 +333,18 @@ pub(crate) fn lower_builtin(
         "polynomial" => crate::approx::lower_polynomial(e, id, args),
         "bernstein" => crate::approx::lower_bernstein(e, id, args),
         "stepwise" => crate::approx::lower_stepwise(e, id, args),
+        // §07 array and index operations (`crate::arrays`).
+        "onehot" => crate::arrays::lower_onehot(e, id, args),
+        "reverse" => crate::arrays::lower_reverse(e, id, args),
+        "tile" => crate::arrays::lower_tile(e, id, args),
+        "splitblocks" => crate::arrays::lower_splitblocks(e, id, args),
+        "joinblocks" => crate::arrays::lower_joinblocks(e, id, args),
+        "partition" => crate::arrays::lower_partition(e, id, args),
+        "blockdiagmat" => crate::arrays::lower_blockdiagmat(e, id, args),
+        "bandedmat" => crate::arrays::lower_bandedmat(e, id, args),
+        "bincounts" => crate::arrays::lower_bincounts(e, id, args),
+        "selectbins" => crate::arrays::lower_selectbins(e, id, args),
+        "filter" => Err(crate::arrays::refuse_filter(id)),
         "linspace" => lower_linspace(e, id, args, false),
         "extlinspace" => lower_linspace(e, id, args, true),
         "zeros" | "ones" | "eye" => {
@@ -1839,9 +1851,8 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// discarded" is a claim about these tables, not about every conceivable head.
 ///
 /// §07's remaining tables are UNLOWERED here, which is NOT the same as scalar-domain.
-/// Convolution (`conv`, `crosscorr`), Binning (`bincounts`) and Array and table
-/// generation (`array`) all take a collection first argument, and each is safe today
-/// only because
+/// Convolution (`conv`, `crosscorr`) and Array and table generation (`array`) take a
+/// collection first argument, and each is safe today only because
 /// [`lower_builtin`] answers "unsupported builtin head". **Wiring any of them here MUST
 /// add the head to this table in the same change**, or the dotted spelling starts
 /// discarding the wrapper again.
@@ -1954,6 +1965,16 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
         "bandedmat",
         "Array and table operations",
         "vector, positive integer",
+    ),
+    (
+        "selectbins",
+        "Membership, filtering, and bin selection",
+        "vector, set, vector",
+    ),
+    (
+        "bincounts",
+        "Binning",
+        "vector or record of edge vectors, array or record",
     ),
     (
         "polynomial",
@@ -2400,6 +2421,25 @@ fn lower_linspace(
     args: &[NodeId],
     overflow: bool,
 ) -> Result<Value, EmitError> {
+    let points = linspace_points(e, id, args, overflow)?;
+    if !overflow {
+        return Ok(points);
+    }
+    let low = e.scalar(f64::NEG_INFINITY);
+    let low = e.vector(&[low]);
+    let high = e.scalar(f64::INFINITY);
+    let high = e.vector(&[high]);
+    e.concatenate(id, &[low, points, high])
+}
+
+/// The `linspace(from, to, n)` points of a `linspace` or `extlinspace` call `id`,
+/// without the overflow edges.
+pub(crate) fn linspace_points(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    overflow: bool,
+) -> Result<Value, EmitError> {
     let [from, to, _] = args_exact(id, args)?;
     let total = match e.node_ty(id)?.0 {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
@@ -2440,14 +2480,7 @@ fn lower_linspace(
         let at_start = e.compare("EQ", &index, &zero);
         e.select(&at_start, &from, &points)
     };
-    if !overflow {
-        return Ok(points);
-    }
-    let low = e.scalar(f64::NEG_INFINITY);
-    let low = e.vector(&[low]);
-    let high = e.scalar(f64::INFINITY);
-    let high = e.vector(&[high]);
-    e.concatenate(id, &[low, points, high])
+    Ok(points)
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {

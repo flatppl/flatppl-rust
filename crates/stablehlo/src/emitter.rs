@@ -1809,6 +1809,64 @@ impl<'m> Emitter<'m> {
         out
     }
 
+    /// `%N = stablehlo.reverse %a, dims = [...] : ty` — reverses `a` along `dims`.
+    /// Shape- and element-type-preserving.
+    pub fn reverse(&mut self, a: &Value, dims: &[u64]) -> Value {
+        let ty = a.ty.render(self.dtype, a.elem);
+        let dims_text = dims
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ssa = self.pure(format!(
+            "stablehlo.reverse {}, dims = [{dims_text}] : {ty}",
+            a.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: a.elem,
+        }
+    }
+
+    /// `%N = stablehlo.pad %a, %zero, low = [...], high = [...], interior = [...]`
+    /// — `a` placed `low[k]` cells from the start of axis `k` in a zero tensor
+    /// `low[k] + n_k + high[k]` long. `a` must be static and unbatched.
+    pub fn pad_zeros(&mut self, a: &Value, low: &[u64], high: &[u64]) -> Value {
+        let dims = shape(&a.ty);
+        let out = MlirTy::Ranked(
+            dims.iter()
+                .zip(low.iter().zip(high))
+                .map(|(d, (l, h))| d.map(|d| d + l + h))
+                .collect(),
+        );
+        let zero = match a.elem {
+            ElemKind::Int => self.int_value_const(0),
+            ElemKind::Bool => {
+                let z = self.scalar(0.0);
+                self.convert(&z, ElemKind::Bool)
+            }
+            ElemKind::Real => self.scalar(0.0),
+        };
+        let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        let interior = list(&vec![0; low.len()]);
+        let ssa = self.pure(format!(
+            "stablehlo.pad {}, {}, low = [{}], high = [{}], interior = [{interior}] : ({}, {}) -> {}",
+            a.ssa,
+            zero.ssa,
+            list(low),
+            list(high),
+            a.ty.render(self.dtype, a.elem),
+            MlirTy::Scalar.render(self.dtype, a.elem),
+            out.render(self.dtype, a.elem),
+        ));
+        Value {
+            ssa,
+            ty: out,
+            elem: a.elem,
+        }
+    }
+
     // ---- CHLO special functions ------------------------------------------
 
     /// One elementwise CHLO unary op, `%N = {op} %a : ty -> ty`. CHLO spells
