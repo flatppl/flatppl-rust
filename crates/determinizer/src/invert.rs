@@ -2617,6 +2617,20 @@ fn derive_elementwise(
     // `x` the bare input placeholder. Anything else (a non-placeholder operand such
     // as `broadcast(exp, add(x, 1.0))`, or a lone constant) is not this arm —
     // Ok(None), the caller refuses.
+    // `x .^ [1, 3]` is a per-cell exponent: a different power in each cell, which
+    // no single cell map describes.
+    if let [g, data, k] = operands[..]
+        && is_const_named(m, g, "pow")
+        && is_placeholder_ref(m, data, ph)
+        && matches!(m.type_of(k), Some(Type::Array { .. }))
+    {
+        return Err(refuse(
+            body,
+            m,
+            "x .^ k over a vector is recognised here only with one scalar exponent for every \
+             cell, and this exponent is an array; wrap the map in bijection(f, f_inv, logvol)",
+        ));
+    }
     let Some(cell) = elementwise_cell(m, body, ph) else {
         return Ok(None);
     };
