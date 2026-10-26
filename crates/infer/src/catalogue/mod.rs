@@ -327,7 +327,7 @@ pub(crate) enum DomainSig {
     },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(crate) enum ScalarTag {
     Real,
     Integer,
@@ -625,6 +625,49 @@ pub(crate) fn sig_param_shapes(sig: &Sig, count: usize) -> Vec<Option<ParamShape
                 }
                 _ => None,
             })
+            .collect(),
+        Sig::Function { params, .. } | Sig::Structural { params, .. } => (0..count)
+            .map(|i| match params.get(i) {
+                Some(p) => of(p),
+                None => match params.last() {
+                    Some(ParamSig::Variadic(inner)) => of(inner),
+                    _ => None,
+                },
+            })
+            .collect(),
+    }
+}
+
+/// The scalar type each parameter of any catalogue row must HAVE, parallel to its
+/// positional parameters: `Integer` where its domain is an integer set (a §08
+/// `elementof(posintegers)`, a §07 integer like `eye`'s `n`), `Boolean` where it is
+/// `booleans`, `None` elsewhere. The check is by type, never by value: `eye(2.0)`
+/// passes a real, whatever number it holds.
+pub(crate) fn sig_param_integral(sig: &Sig, count: usize) -> Vec<Option<ScalarTag>> {
+    fn of(p: &ParamSig) -> Option<ScalarTag> {
+        match p {
+            ParamSig::Scalar(tag @ (ScalarTag::Integer | ScalarTag::Boolean)) => Some(*tag),
+            ParamSig::Optional(inner) | ParamSig::Variadic(inner) => of(inner),
+            _ => None,
+        }
+    }
+    match sig {
+        Sig::Distribution {
+            params,
+            param_ranks,
+            param_sets,
+            ..
+        } => (0..params.len().min(count))
+            .map(
+                |i| match (param_ranks.get(i).copied().unwrap_or(0), param_sets.get(i)) {
+                    (
+                        0,
+                        Some(ParamSet::Integers | ParamSet::PosIntegers | ParamSet::NonNegIntegers),
+                    ) => Some(ScalarTag::Integer),
+                    (0, Some(ParamSet::Booleans)) => Some(ScalarTag::Boolean),
+                    _ => None,
+                },
+            )
             .collect(),
         Sig::Function { params, .. } | Sig::Structural { params, .. } => (0..count)
             .map(|i| match params.get(i) {
