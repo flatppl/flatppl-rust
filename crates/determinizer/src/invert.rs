@@ -595,7 +595,7 @@ fn scalar_image(m: &mut Module, f: NodeId, support: &ValueSet) -> Option<(Extent
 /// builtin (`pushfwd(exp, M)`) or a one-op lambda, `pow`'s own for `pow(_, k)`, and
 /// the whole chain for a longer composition. `None` for a map this pass does not
 /// recognise (no gate then).
-fn image_ops(m: &Module, f: NodeId) -> Option<Vec<ImageOp>> {
+fn image_ops(m: &mut Module, f: NodeId) -> Option<Vec<ImageOp>> {
     match recognise(m, f) {
         Recognized::BareConst(name) => {
             let (op, entry) = unary_entry(&name)?;
@@ -605,6 +605,7 @@ fn image_ops(m: &Module, f: NodeId) -> Option<Vec<ImageOp>> {
             if let Some(k_node) = single_pow(m, body, ph)
                 && !odd_power(m, k_node).is_some_and(|k| k > 0)
             {
+                let k_node = folded_exponent(m, k_node);
                 return pow_op(m, k_node).map(|op| vec![op]);
             }
             let ops = flatten_chain(m, body, ph).ok().flatten()?;
@@ -770,7 +771,7 @@ impl ImageOp {
 /// refuses `k = 0`).
 fn pow_op(m: &Module, k_node: NodeId) -> Option<ImageOp> {
     let k = exponent_value(m, k_node)?;
-    if k == 0.0 {
+    if k == 0.0 || !k.is_finite() {
         return None;
     }
     let domain = if k < 0.0 {
@@ -2217,10 +2218,9 @@ fn derive_pow(
         return Err(refuse(
             f,
             m,
-            "pow(_, k) is recognised here only when k is a numeric literal, and this exponent \
-             is an expression this pass does not evaluate; write it as a decimal literal \
-             (such as 0.3333333333333333 for 1/3), or wrap the map in \
-             bijection(f, f_inv, logvol)",
+            "pow(_, k) is recognised here only when k is a numeric literal or a quotient of \
+             literals (such as 1/3), and this exponent is an expression this pass does not \
+             evaluate; write it as a literal, or wrap the map in bijection(f, f_inv, logvol)",
         ));
     };
     let written = match literal_exponent(m, k_node) {
@@ -2229,6 +2229,13 @@ fn derive_pow(
     };
     if k == 0.0 {
         return Err(refuse(f, m, "pow with exponent 0 is not invertible"));
+    }
+    if !k.is_finite() {
+        return Err(refuse(
+            f,
+            m,
+            &format!("pow with exponent {written} is not invertible"),
+        ));
     }
     let domain = if k < 0.0 {
         Domain::PosReals
@@ -2255,6 +2262,7 @@ fn derive_pow(
         };
         return Err(refuse(f, m, &reason));
     }
+    let k_node = folded_exponent(m, k_node);
     let f_inv = lambda(m, |m, ph| pow_inverse(m, k, ph));
     let logvol = lambda(m, |m, ph| pow_logvol_out(m, k_node, k, ph));
     Ok(Some(Bijection { f_inv, logvol }))
@@ -2609,6 +2617,20 @@ fn derive_elementwise(
     // `x` the bare input placeholder. Anything else (a non-placeholder operand such
     // as `broadcast(exp, add(x, 1.0))`, or a lone constant) is not this arm —
     // Ok(None), the caller refuses.
+    // `x .^ [1, 3]` is a per-cell exponent: a different power in each cell, which
+    // no single cell map describes.
+    if let [g, data, k] = operands[..]
+        && is_const_named(m, g, "pow")
+        && is_placeholder_ref(m, data, ph)
+        && matches!(m.type_of(k), Some(Type::Array { .. }))
+    {
+        return Err(refuse(
+            body,
+            m,
+            "x .^ k over a vector is recognised here only with one scalar exponent for every \
+             cell, and this exponent is an array; wrap the map in bijection(f, f_inv, logvol)",
+        ));
+    }
     let Some(cell) = elementwise_cell(m, body, ph) else {
         return Ok(None);
     };
@@ -2970,11 +2992,20 @@ fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> N
     wrap_functionof(m, x, ph, body_node)
 }
 
-/// A `pow` exponent as written: an integer or real literal, possibly negated
-/// (`_^(-1)` parses as `pow(_, neg(1))`).
+/// A `pow` exponent §06 counts as a literal: an integer or real literal, or a
+/// quotient of two (`sqrt` = `pow(_, 1/2)`), possibly negated (`_^(-1)` parses as
+/// `pow(_, neg(1))`). A quotient is a real (§03), so it is never an odd integer.
 fn literal_exponent(m: &Module, id: NodeId) -> Option<Scalar> {
     match m.node(id) {
         Node::Lit(lit @ (Scalar::Int(_) | Scalar::Real(_))) => Some(lit.clone()),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "divide")
+                && c.args.len() == 2 =>
+        {
+            let num = signed_literal(m, c.args[0])?;
+            let den = signed_literal(m, c.args[1])?;
+            Some(Scalar::Real(num / den))
+        }
         Node::Call(c)
             if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "neg")
                 && c.args.len() == 1 =>
@@ -2986,6 +3017,52 @@ fn literal_exponent(m: &Module, id: NodeId) -> Option<Scalar> {
             }
         }
         _ => None,
+    }
+}
+
+/// A numeric literal's value, possibly negated: one operand of a quotient exponent.
+fn signed_literal(m: &Module, id: NodeId) -> Option<f64> {
+    match m.node(id) {
+        Node::Lit(_) => literal_real(m, id),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "neg")
+                && c.args.len() == 1 =>
+        {
+            literal_real(m, c.args[0]).map(|x| -x)
+        }
+        _ => None,
+    }
+}
+
+/// The exponent node to emit: a quotient exponent folds to its value, spelled as
+/// the parser spells that decimal (a negative one under `neg`), so it emits the same
+/// bytes. Any other node is kept as written.
+fn folded_exponent(m: &mut Module, k_node: NodeId) -> NodeId {
+    match exponent_value(m, k_node) {
+        Some(k) if is_quotient(m, k_node) => {
+            let magnitude = m.alloc(Node::Lit(Scalar::Real(k.abs())));
+            if k < 0.0 {
+                build_call(m, "neg", &[magnitude])
+            } else {
+                magnitude
+            }
+        }
+        _ => k_node,
+    }
+}
+
+/// Is `id` a `divide`, possibly negated?
+fn is_quotient(m: &Module, id: NodeId) -> bool {
+    let Node::Call(c) = m.node(id) else {
+        return false;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return false;
+    };
+    match m.resolve(sym) {
+        "divide" => true,
+        "neg" => c.args.len() == 1 && is_quotient(m, c.args[0]),
+        _ => false,
     }
 }
 

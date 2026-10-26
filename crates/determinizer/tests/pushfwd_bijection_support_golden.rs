@@ -299,7 +299,10 @@ fn pushfwd_real_or_even_power_over_real_support_refuses() {
             "_^2",
             "pow(_, 2) requires M's support to lie within its domain",
         ),
-        ("_^(1/3)", "only when k is a numeric literal"),
+        (
+            "_^(1/3)",
+            "pow(_, 0.3333333333333333) requires M's support to lie within its domain",
+        ),
         (
             "2 * _^3.0",
             "pow inside a composition is invertible here only with an odd positive",

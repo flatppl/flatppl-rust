@@ -297,7 +297,12 @@ fn a_dotted_power_keeps_the_per_cell_domain_and_literal_rules() {
         (
             "x .^ [1.0, 2.0, 3.0]",
             exponential,
-            "is recognised here only when k is a numeric literal",
+            "only with one scalar exponent for every cell, and this exponent is an array",
+        ),
+        (
+            "x .^ [1, 3, 5]",
+            exponential,
+            "only with one scalar exponent for every cell, and this exponent is an array",
         ),
     ] {
         let mut m = flatppl_syntax::parse(&format!(
