@@ -250,3 +250,101 @@ fn pushfwd_logit_over_a_boolean_base_refuses() {
     .expect_err("both of `booleans`' atoms are outside logit's domain");
     assert!(e.reason.contains("(0, 1)"), "got: {}", e.reason);
 }
+
+/// §06 exempts odd INTEGER exponents from `pow`'s `nonnegreals` domain: `x^k` is a
+/// bijection of the reals, so it lowers over a real-support base, alone or inside a
+/// composition. The inverse keeps the sign of `y` (`ifelse(y < 0, -1, 1)·|y|^(1/k)`)
+/// and the log-volume reads `log|y|`.
+#[test]
+fn pushfwd_odd_integer_power_over_real_support_lowers() {
+    let normal = "Normal(mu = 0.0, sigma = 1.0)";
+    let cube = pir(&format!(
+        "d = pushfwd(fn(_^3), {normal})\nlp = logdensityof(d, -8.0)"
+    ));
+    assert!(
+        cube.contains("builtin_logdensityof")
+            && cube.contains("(lt ")
+            && cube.contains("(abs ")
+            && cube.contains("0.3333333333333333"),
+        "an odd power must invert through the sign-preserving root:\n{cube}"
+    );
+    assert_eq!(
+        cube,
+        pir(&format!(
+            "d = pushfwd(fn(pow(_, 3)), {normal})\nlp = logdensityof(d, -8.0)"
+        )),
+        "`_^3` and `pow(_, 3)` are one map"
+    );
+    for forward in ["_^5", "2 * _^3 + 1", "exp(_^3)", "_^1"] {
+        pir(&format!(
+            "d = pushfwd(fn({forward}), {normal})\nlp = logdensityof(d, -1.0)"
+        ));
+    }
+}
+
+/// The exemption is by TYPE: a real literal `3.0` is a real power and keeps the
+/// domain, as does a non-literal exponent, and an even integer.
+#[test]
+fn pushfwd_real_or_even_power_over_real_support_refuses() {
+    for (forward, reason) in [
+        (
+            "_^3.0",
+            "pow(_, 3.0) requires M's support to lie within its domain",
+        ),
+        (
+            "pow(_, 3.0)",
+            "pow(_, 3.0) requires M's support to lie within its domain",
+        ),
+        (
+            "_^2",
+            "pow(_, 2) requires M's support to lie within its domain",
+        ),
+        ("_^(1/3)", "only when k is a numeric literal"),
+        (
+            "2 * _^3.0",
+            "pow inside a composition is invertible here only with an odd positive",
+        ),
+    ] {
+        let e = determinize(&parse_infer(&format!(
+            "d = pushfwd(fn({forward}), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)"
+        )))
+        .expect_err("must refuse");
+        assert!(e.reason.contains(reason), "{forward}: {e:?}");
+    }
+}
+
+/// A negative odd exponent maps the nonzero reals onto themselves. That image is two
+/// rays, which the image gate cannot express, so a support straddling 0 refuses and a
+/// positive one lowers.
+#[test]
+fn pushfwd_negative_odd_power_needs_a_one_sided_support() {
+    let e = determinize(&parse_infer(
+        "d = pushfwd(fn(_^(-1)), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("a support straddling 0 must refuse");
+    assert!(e.reason.contains("image is two rays"), "{e:?}");
+    let p = pir("d = pushfwd(fn(_^(-1)), Exponential(1.0))\nlp = logdensityof(d, 0.5)");
+    assert!(p.contains("builtin_logdensityof"), "{p}");
+    // A support at or above 0 fails on its atom at 0, not on the two rays.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(fn(_^(-1)), Poisson(rate = 2.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("an atom at 0 must refuse");
+    assert!(
+        e.reason.contains(
+            "pow(_, -1) requires M's support to lie within its domain, the positive reals"
+        ) && !e.reason.contains("two rays"),
+        "{e:?}"
+    );
+}
+
+/// Over a bounded base the image gate maps the support's endpoints through the odd
+/// power: `Uniform(-1, 2)` under `x^3` has image `[-1, 8]`.
+#[test]
+fn pushfwd_odd_power_gates_on_the_mapped_support() {
+    let p = pir(
+        "y = elementof(reals)\nd = pushfwd(fn(_^3), Uniform(interval(-1.0, 2.0)))\n\
+         lp = logdensityof(d, y)",
+    );
+    assert!(p.contains("(interval -1.0 8.0)"), "{p}");
+}

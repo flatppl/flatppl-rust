@@ -128,13 +128,17 @@
 //! (refuse) — a non-affine `mul`/`add`/`sub` (both operands depend on the variate,
 //! e.g. `x*x`, or neither does), a `mul`/`divide` whose coefficient is not proven
 //! nonzero (`0.0 * u` collapses to the constant 0; `u / 0.0` is undefined), a
-//! symbolic affine coefficient in a nonlinear composition, a `pow` inside a composition (its
-//! input domain is not verifiable here), or any other recognised builtin op.
+//! symbolic affine coefficient in a nonlinear composition, a `pow` inside a composition
+//! unless its exponent is an odd positive integer literal (any other exponent restricts
+//! its input domain, which is not verifiable here), or any other recognised builtin op.
 //! A wrong `(f_inv, logvol)` is never synthesised.
 //!
 //! Single-op `pow(_, k)` (`x -> pow(x, k)`) takes its own domain-restricted
 //! derivation ([`derive_pow`]) since the exponent comes from the call rather than
-//! the op name; a `pow` reached inside a composition is refused. `sqrt` is the same
+//! the op name; a `pow` reached inside a composition is refused. An odd positive
+//! INTEGER literal exponent is the exception (§06: "`pow`, except odd integer
+//! exponents, on `nonnegreals`"): `x^k` is then a bijection of the reals and is a
+//! chain op ([`ChainOp::OddPow`]) alone or composed. `sqrt` is the same
 //! derivation at a fixed `k = 1/2` ([`pow_inverse`]/[`pow_logvol`]), reached
 //! through the registry like any other named op. A bare builtin value
 //! (`pushfwd(exp, M)`) is byte-equality-pinned against the explicit
@@ -183,6 +187,10 @@ enum ChainOp {
     SubConstant(NodeId),
     /// `c−z`: inverse `sub(c, acc)`; local logvol `0` (derivative −1, log|−1| = 0).
     RSubConstant(NodeId),
+    /// `zᵏ` for an odd positive INTEGER literal `k` (the node): a bijection of the
+    /// reals (§06), so it needs no domain. Inverse `sign(acc)·|acc|^(1/k)`; local
+    /// logvol `log|k| + ((k−1)/k)·log|acc|`.
+    OddPow(NodeId),
 }
 
 /// The recognised surface shape of a `pushfwd`'s forward argument.
@@ -239,10 +247,13 @@ pub(crate) fn derive_bijection(
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
         Recognized::BareConst(name) => bare_bijection(m, &name, f, support),
         Recognized::Lambda { body, ph } => {
-            // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
-            // a `pow` anywhere else in a chain is refused by the chain walk (its
-            // input domain is not verifiable here).
-            if let Some(k_node) = single_pow(m, body, ph) {
+            // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation,
+            // except at an odd positive integer `k`, which the chain walk takes as
+            // a bijection of the reals. A restricted `pow` anywhere else in a chain
+            // is refused by the chain walk (its input domain is not verifiable here).
+            if let Some(k_node) = single_pow(m, body, ph)
+                && !odd_power(m, k_node).is_some_and(|k| k > 0)
+            {
                 return derive_pow(m, f, k_node, support);
             }
             derive_chain(m, body, ph, support)
@@ -589,7 +600,9 @@ fn image_ops(m: &Module, f: NodeId) -> Option<Vec<ImageOp>> {
             Some(vec![ImageOp::unary(op, entry)])
         }
         Recognized::Lambda { body, ph, .. } => {
-            if let Some(k_node) = single_pow(m, body, ph) {
+            if let Some(k_node) = single_pow(m, body, ph)
+                && !odd_power(m, k_node).is_some_and(|k| k > 0)
+            {
                 return pow_op(m, k_node).map(|op| vec![op]);
             }
             let ops = flatten_chain(m, body, ph).ok().flatten()?;
@@ -737,6 +750,15 @@ impl ImageOp {
             ChainOp::RSubConstant(c) => {
                 affine(*c, EndpointMap::Reflect(literal_real(m, *c)?), "sub", true)
             }
+            ChainOp::OddPow(k) => Some(ImageOp {
+                domain: None,
+                map: EndpointMap::Pow(odd_power(m, *k)? as f64),
+                build: Build::WithLit {
+                    op: "pow",
+                    c: *k,
+                    literal_first: false,
+                },
+            }),
         }
     }
 }
@@ -745,7 +767,7 @@ impl ImageOp {
 /// on the sign of `k` — `xᵏ` is undefined at 0 for `k < 0` ([`derive_pow`], which
 /// refuses `k = 0`).
 fn pow_op(m: &Module, k_node: NodeId) -> Option<ImageOp> {
-    let k = literal_real(m, k_node)?;
+    let k = exponent_value(m, k_node)?;
     if k == 0.0 {
         return None;
     }
@@ -1869,7 +1891,11 @@ fn derive_chain(
         | ChainOp::RSubConstant(c) => !is_lit(m, *c),
         _ => false,
     });
-    if symbolic_affine && ops.iter().any(|op| matches!(op, ChainOp::Registry { .. })) {
+    if symbolic_affine
+        && ops
+            .iter()
+            .any(|op| matches!(op, ChainOp::Registry { .. } | ChainOp::OddPow(_)))
+    {
         return Err(refuse(
             body,
             m,
@@ -2067,14 +2093,25 @@ fn classify(m: &Module, cur: NodeId, ph: Symbol) -> Result<Option<(ChainOp, Node
                 "sub needs exactly one variate-independent shift",
             )),
         },
-        // `pow` is invertible only as the single top-level op over a strictly-
-        // positive base domain ([`derive_pow`], handled before the chain walk); a
-        // `pow` reached inside a composition has an unverifiable input domain.
+        // An odd positive integer power is a bijection of the reals (§06), so it
+        // composes like any other op.
+        "pow"
+            if args.len() == 2
+                && odd_power(m, args[1]).is_some_and(|k| k > 0)
+                && refs_placeholder(m, args[0], ph) =>
+        {
+            Ok(Some((ChainOp::OddPow(args[1]), args[0])))
+        }
+        // Any other `pow` is restricted to a domain (§06: "`pow`, except odd integer
+        // exponents, on `nonnegreals`"), invertible only as the single top-level op
+        // ([`derive_pow`], handled before the chain walk). Inside a composition its
+        // input is an intermediate value this pass cannot bound.
         "pow" => Err(refuse(
             cur,
             m,
-            "pow inside a composition is not an invertible shape here (its input domain is \
-             not verifiable) — refuse rather than mislower",
+            "pow inside a composition is invertible here only with an odd positive integer \
+             exponent; any other exponent restricts pow to a domain, and its input is an \
+             intermediate value this pass cannot bound — refuse rather than mislower",
         )),
         // A recognised builtin with no analytic inverse in this grammar.
         _ => Err(refuse(
@@ -2096,6 +2133,7 @@ fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
         ChainOp::AddConstant(c) => build_call(m, "sub", &[acc, *c]),
         ChainOp::SubConstant(c) => build_call(m, "add", &[acc, *c]),
         ChainOp::RSubConstant(c) => build_call(m, "sub", &[*c, acc]),
+        ChainOp::OddPow(k) => odd_pow_inverse(m, *k, acc),
     }
 }
 
@@ -2123,31 +2161,75 @@ fn local_logvol(m: &mut Module, op: &ChainOp, out: NodeId) -> Option<NodeId> {
         }
         // Derivative ±1 ⇒ log|g'| = 0: contributes nothing to the sum.
         ChainOp::AddConstant(_) | ChainOp::SubConstant(_) | ChainOp::RSubConstant(_) => None,
+        ChainOp::OddPow(k) => odd_pow_logvol(m, *k, out),
     }
+}
+
+/// `zᵏ`'s inverse at `out` for an odd integer `k`: `sign(out)·|out|^(1/k)`, spelled
+/// `ifelse(out < 0, −1, 1) · pow(abs(out), 1/k)`. `pow` of a negative base with a
+/// non-integer exponent has no real value, so the root is taken of `|out|`.
+fn odd_pow_inverse(m: &mut Module, k_node: NodeId, out: NodeId) -> NodeId {
+    let k = odd_power(m, k_node).expect("an odd power has an integer exponent");
+    if k == 1 {
+        return out;
+    }
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let negative = build_call(m, "lt", &[out, zero]);
+    let minus_one = m.alloc(Node::Lit(Scalar::Real(-1.0)));
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let sign = build_call(m, "ifelse", &[negative, minus_one, one]);
+    let magnitude = build_call(m, "abs", &[out]);
+    let root = pow_inverse(m, k as f64, magnitude);
+    build_call(m, "mul", &[sign, root])
+}
+
+/// `zᵏ`'s log-volume at its output `out` for an odd integer `k`:
+/// `log|k| + ((k−1)/k)·log|out|`, from `log|k·zᵏ⁻¹| = log|k| + (k−1)·log|z|` at
+/// `|z| = |out|^(1/k)`, on the whole real line. At `out = ±0` this is `−inf`, so the
+/// density there is `+inf`: the forward's derivative `k·zᵏ⁻¹` vanishes at 0. `None`
+/// for `k = 1`, the identity.
+fn odd_pow_logvol(m: &mut Module, k_node: NodeId, out: NodeId) -> Option<NodeId> {
+    let k = odd_power(m, k_node).expect("an odd power has an integer exponent");
+    if k == 1 {
+        return None;
+    }
+    let magnitude = build_call(m, "abs", &[out]);
+    Some(pow_logvol_out(m, k_node, k as f64, magnitude))
 }
 
 /// `pow(_, k)`: f_inv `y -> pow(y, 1/k)`; logvol `y -> add(log(abs(k)), mul((k-1)/k, log(y)))`.
 /// Requires a nonzero literal exponent and a base whose `support` lies inside
 /// `pow`'s §06 domain — the inverse `x^{1/k}` and the log-volume's `log x` are
-/// defined only there (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
+/// defined only there (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x). An odd
+/// positive integer exponent never reaches here: it is a bijection of the reals
+/// and takes the chain's [`ChainOp::OddPow`].
 ///
 /// §06 gives that domain as `nonnegreals`. A NEGATIVE exponent needs the stricter
 /// `posreals`: `x^k` is undefined at 0, so an atom there is not mapped anywhere
 /// and its mass is lost (under a continuous base 0 is a measure-zero boundary and
-/// either domain admits it, so the split only bites on a discrete base). No
-/// spelling currently reaches it — `pow(_, -1.0)` parses as `pow(_, neg(1.0))`,
-/// which [`literal_real`] rejects, so the exponent is not a literal and this
-/// returns `Ok(None)` first; the split is what keeps `nonnegreals` from becoming
-/// wrong if that folds.
+/// either domain admits it, so the split only bites on a discrete base). An odd
+/// negative integer exponent maps the nonzero reals onto themselves, but that
+/// image is two rays, which the density's image gate cannot express, so it keeps
+/// the `posreals` restriction too.
 fn derive_pow(
     m: &mut Module,
     f: NodeId,
     k_node: NodeId,
     support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
-    let Some(k) = literal_real(m, k_node) else {
-        // A non-literal exponent is not a Task-1 recognised invertible form.
-        return Ok(None);
+    let Some(k) = exponent_value(m, k_node) else {
+        return Err(refuse(
+            f,
+            m,
+            "pow(_, k) is recognised here only when k is a numeric literal, and this exponent \
+             is an expression this pass does not evaluate; write it as a decimal literal \
+             (such as 0.3333333333333333 for 1/3), or wrap the map in \
+             bijection(f, f_inv, logvol)",
+        ));
+    };
+    let written = match literal_exponent(m, k_node) {
+        Some(Scalar::Int(i)) => i.to_string(),
+        _ => format!("{k:?}"),
     };
     if k == 0.0 {
         return Err(refuse(f, m, "pow with exponent 0 is not invertible"));
@@ -2158,14 +2240,24 @@ fn derive_pow(
         Domain::NonNegReals
     };
     if !domain.admits(support) {
-        return Err(refuse(
-            f,
-            m,
-            &format!(
-                "pow(_, {k}) requires M's support to lie within its domain, {}",
+        // Two rays only where the support reaches below 0. A support at or above 0
+        // fails on its atom at 0, which the domain message names.
+        let below_zero = Extent::of_support(support)
+            .is_some_and(|extent| extent.lo.value(f64::NEG_INFINITY) < 0.0);
+        let reason = if odd_power(m, k_node).is_some() && below_zero {
+            format!(
+                "pow(_, {written}) maps the nonzero reals onto the nonzero reals; that image is two \
+                 rays, and the density's image gate needs an interval to score 0 as outside \
+                 it, so M's support must lie within {}",
                 domain.describe()
-            ),
-        ));
+            )
+        } else {
+            format!(
+                "pow(_, {written}) requires M's support to lie within its domain, {}",
+                domain.describe()
+            )
+        };
+        return Err(refuse(f, m, &reason));
     }
     let f_inv = lambda(m, |m, ph| pow_inverse(m, k, ph));
     let logvol = lambda(m, |m, ph| pow_logvol_out(m, k_node, k, ph));
@@ -2847,6 +2939,43 @@ fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> N
     }));
     let body_node = body(m, ph_node);
     wrap_functionof(m, x, ph, body_node)
+}
+
+/// A `pow` exponent as written: an integer or real literal, possibly negated
+/// (`_^(-1)` parses as `pow(_, neg(1))`).
+fn literal_exponent(m: &Module, id: NodeId) -> Option<Scalar> {
+    match m.node(id) {
+        Node::Lit(lit @ (Scalar::Int(_) | Scalar::Real(_))) => Some(lit.clone()),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "neg")
+                && c.args.len() == 1 =>
+        {
+            match literal_exponent(m, c.args[0])? {
+                Scalar::Int(i) => Some(Scalar::Int(-i)),
+                Scalar::Real(x) => Some(Scalar::Real(-x)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A literal `pow` exponent's value.
+fn exponent_value(m: &Module, id: NodeId) -> Option<f64> {
+    match literal_exponent(m, id)? {
+        Scalar::Int(i) => Some(i as f64),
+        Scalar::Real(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// The exponent of an odd integer power. Decided by the literal's TYPE: §06 exempts
+/// odd INTEGER exponents, so `_^3.0` is a real power and keeps the domain.
+fn odd_power(m: &Module, id: NodeId) -> Option<i64> {
+    match literal_exponent(m, id)? {
+        Scalar::Int(k) if k % 2 != 0 => Some(k),
+        _ => None,
+    }
 }
 
 /// The real value of a numeric literal node (`Int` widens to `Real`), or `None`.
