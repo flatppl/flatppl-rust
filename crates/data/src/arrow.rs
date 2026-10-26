@@ -82,13 +82,7 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
         };
         // A compressed buffer opens with its decompressed length, and no codec
         // expands a byte further than this.
-        let expansion: Option<u64> = batch.compression().map(|c| {
-            if c.codec() == arrow_ipc::CompressionType::ZSTD {
-                1 << 17
-            } else {
-                256
-            }
-        });
+        let codec = batch.compression().map(|c| c.codec());
         for buffer in batch.buffers().iter().flatten() {
             let (offset, size) = (buffer.offset(), buffer.length());
             if offset < 0
@@ -99,7 +93,7 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
             {
                 return Err(malformed("a buffer leaves its message body"));
             }
-            let (Some(expansion), true) = (expansion, size > 0) else {
+            let (Some(codec), true) = (codec, size > 0) else {
                 continue;
             };
             let from = start + offset as usize;
@@ -107,12 +101,21 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
                 return Err(malformed("a compressed buffer has no length prefix"));
             };
             let stated = i64::from_le_bytes(prefix.try_into().expect("eight bytes"));
-            let most = (size as u64 - 8)
-                .saturating_mul(expansion)
-                .saturating_add(64);
-            if stated < -1 || (stated > 0 && stated as u64 > most) {
+            if stated == -1 {
+                continue;
+            }
+            let frames = bytes
+                .get(from + 8..from + size as usize)
+                .unwrap_or_default();
+            let Some(most) = frame_capacity(codec, frames) else {
+                return Err(malformed(
+                    "a compressed buffer does not hold its codec's frames",
+                ));
+            };
+            if stated < 0 || stated as u64 > most {
                 return Err(malformed(&format!(
-                    "a compressed buffer of {size} bytes states {stated} decompressed bytes"
+                    "a compressed buffer of {size} bytes states {stated} decompressed bytes, \
+                     and its frames hold at most {most}"
                 )));
             }
         }
@@ -146,6 +149,86 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The most bytes `data`, a run of zstd or LZ4 frames, can decompress to, read
+/// from the block headers without decoding: a raw or uncompressed block holds its
+/// own size, an RLE block states its size, and a compressed block yields at most
+/// the format's block maximum. `None` when the frames do not parse.
+fn frame_capacity(codec: arrow_ipc::CompressionType, data: &[u8]) -> Option<u64> {
+    let byte = |at: usize| data.get(at).copied();
+    let word = |at: usize| Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?));
+    let zstd = codec == arrow_ipc::CompressionType::ZSTD;
+    let (mut at, mut total) = (0usize, 0u64);
+    while at < data.len() {
+        let magic = word(at)?;
+        // Skippable frames (both formats) carry no output.
+        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+            at = at.checked_add(8 + word(at + 4)? as usize)?;
+            continue;
+        }
+        if zstd {
+            if magic != 0xFD2F_B528 {
+                return None;
+            }
+            let descriptor = byte(at + 4)?;
+            let single = descriptor & 0x20 != 0;
+            let content = [usize::from(single), 2, 4, 8][usize::from(descriptor >> 6)];
+            let dictionary = [0, 1, 2, 4][usize::from(descriptor & 3)];
+            at += 5 + usize::from(!single) + dictionary + content;
+            loop {
+                let header = u32::from(byte(at)?)
+                    | u32::from(byte(at + 1)?) << 8
+                    | u32::from(byte(at + 2)?) << 16;
+                let size = (header >> 3) as usize;
+                let (payload, output) = match (header >> 1) & 3 {
+                    0 => (size, size as u64),
+                    1 => (1, size as u64),
+                    2 => (size, 1 << 17),
+                    _ => return None,
+                };
+                at = at.checked_add(3 + payload)?;
+                total = total.saturating_add(output);
+                if header & 1 == 1 {
+                    break;
+                }
+            }
+            at += if descriptor & 0x04 != 0 { 4 } else { 0 };
+        } else {
+            if magic != 0x184D_2204 {
+                return None;
+            }
+            let flags = byte(at + 4)?;
+            let block_max: u64 = match (byte(at + 5)? >> 4) & 7 {
+                4 => 64 << 10,
+                5 => 256 << 10,
+                6 => 1 << 20,
+                7 => 4 << 20,
+                _ => return None,
+            };
+            at += 7 + if flags & 0x08 != 0 { 8 } else { 0 } + if flags & 0x01 != 0 { 4 } else { 0 };
+            loop {
+                let block = word(at)?;
+                at += 4;
+                if block == 0 {
+                    break;
+                }
+                let size = (block & 0x7FFF_FFFF) as usize;
+                let output = if block & 0x8000_0000 != 0 {
+                    size as u64
+                } else {
+                    block_max
+                };
+                at = at.checked_add(size + if flags & 0x10 != 0 { 4 } else { 0 })?;
+                total = total.saturating_add(output);
+            }
+            at += if flags & 0x04 != 0 { 4 } else { 0 };
+        }
+        if at > data.len() {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 fn ipc_error(error: ArrowError) -> Error {

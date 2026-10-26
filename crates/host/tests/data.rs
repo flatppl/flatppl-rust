@@ -698,6 +698,11 @@ fn arrow_typed_columns_read_past_every_layout() {
             "states 4611686018427387904 decompressed bytes",
         ),
         (
+            "zstd_claim.arrow",
+            "a",
+            "states 500000000 decompressed bytes, and its frames hold at most 131072",
+        ),
+        (
             "many_null_batches.arrows",
             "n",
             "column `n` has the Arrow type Null, so every value is missing",
@@ -712,6 +717,12 @@ fn arrow_typed_columns_read_past_every_layout() {
         "t = load_data(\"lz4_runs.arrow\", cartpow(cartprod(x = reals), 1100))\noutputs = t.x",
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    // A million zeros in a small ZSTD body: compressed blocks may expand to 128 KiB each.
+    let zeros = compile_at(
+        "t = load_data(\"zstd_zeros.arrow\", cartpow(cartprod(a = reals), 3))\noutputs = t.a",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(returned(&zeros), vec![vec![0.0; 3]]);
     let mut want = vec![1.5; 1000];
     want.extend((0..100).map(|i| f64::from(i) * 0.25));
     assert_eq!(returned(&out), vec![want]);
