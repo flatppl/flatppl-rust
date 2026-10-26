@@ -320,8 +320,9 @@ Numeric columns reject integer overflow and lossy integer-to-float promotion.
 CSV quoting supports commas, quotes and newlines in fields. Use typed JSON or
 Arrow when inference or these null tokens are unsuitable for a column.
 
-The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` (from `flatppl-data`) for uncompressed
-IPC files and streams. It preserves float32, float64, integers, logical values,
+The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` (from `flatppl-data`) for
+IPC files and streams. Compressed buffers read only with `flatppl-data`'s
+`arrow-compression` feature, which the host enables and the wasm build does not. It preserves float32, float64, integers, logical values,
 dictionary levels and orderedness, and null validity. Plain string columns use
 sorted levels. Dictionary indices are remapped across batches; ordered
 dictionaries must retain a consistent level order. Missing values remain in the

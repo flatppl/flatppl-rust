@@ -17,7 +17,7 @@ flatppl-stablehlo = { path = "../stablehlo" }
 flatppl-fileaccess = { path = "../fileaccess" }
 flatppl-hs3 = { path = "../hs3" }
 flatppl-formula = { path = "../formula", features = ["arrow"] }
-flatppl-data = { path = "../data", features = ["arrow", "safetensors"] }
+flatppl-data = { path = "../data", features = ["arrow-compression", "safetensors"] }
 flatppl-mathdoc = { path = "../mathdoc", default-features = false }
 serde.workspace = true
 serde_json.workspace = true

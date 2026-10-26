@@ -25,8 +25,10 @@ let exported = query.compile(&EmitOptions::default())?;
 
 `LoadedModule` retains its resolved imports independently of the context's lifetime. Compilation requires explicit FlatPPL `inputs` and `outputs`. It returns StableHLO text, the entry point, input and output schemas, and authored output names. Records, tables, and tuples flatten into ordered tensor leaves. Each schema's `index` identifies a tensor argument or result.
 
-Fixed `load_data` declarations can read numeric JSON scalars, arrays, records
-and column-oriented tables. The declared set selects fields and prefix lengths
+Fixed `load_data` declarations read every §07 format: JSON, CSV, WSV, Arrow
+IPC files and streams (LZ4- or ZSTD-compressed, with dictionary-encoded numbers
+read as their values) and Safetensors. A column or tensor that cannot be read
+refuses only when the declared set selects it. The declared set selects fields and prefix lengths
 and validates their values. Relative sources resolve beside the declaring
 module, including imports; inline code supplies `source_path`. Compilation
 reads only data reached by the query and retains its bytes in the context.

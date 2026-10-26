@@ -584,10 +584,15 @@ fn every_safetensors_dtype_reads_its_values() {
 }
 
 /// The typed columns after every other Arrow layout read their values across two
-/// record batches, from the file and the stream alike.
+/// record batches, from the file, the stream and LZ4- and ZSTD-compressed files.
 #[test]
 fn arrow_typed_columns_read_past_every_layout() {
-    for file in ["types.arrow", "types.arrows"] {
+    for file in [
+        "types.arrow",
+        "types.arrows",
+        "compressed.arrow",
+        "zstd.arrow",
+    ] {
         let columns = [
             ("i8", "integers"),
             ("i16", "integers"),
@@ -600,6 +605,8 @@ fn arrow_typed_columns_read_past_every_layout() {
             ("f16", "reals"),
             ("f32", "reals"),
             ("bool", "booleans"),
+            ("dict_f64", "reals"),
+            ("dict_i16", "integers"),
         ];
         let domain = columns
             .iter()
@@ -620,7 +627,8 @@ fn arrow_typed_columns_read_past_every_layout() {
         let real = vec![1.5, -2.0, 1.5, -2.0];
         let mut want = vec![signed; 4];
         want.extend(vec![unsigned; 4]);
-        want.extend(vec![real.clone(), real, vec![1.0, 0.0, 1.0, 0.0]]);
+        want.extend(vec![real.clone(), real.clone(), vec![1.0, 0.0, 1.0, 0.0]]);
+        want.extend(vec![real, vec![1.0, -2.0, 1.0, -2.0]]);
         assert_eq!(returned(&out), want, "{file}");
         for (column, reason) in [
             ("f64", "a value is missing"),
@@ -639,6 +647,7 @@ fn arrow_typed_columns_read_past_every_layout() {
             ("ree", "unsupported Arrow type"),
             ("time", "unsupported Arrow type"),
             ("null", "a value is missing"),
+            ("dict_null", "a value is missing"),
         ] {
             let err = refusal(&format!(
                 "t = load_data(\"{file}\", cartpow(cartprod({column} = reals), 4))\noutputs = t.{column}"
@@ -646,11 +655,47 @@ fn arrow_typed_columns_read_past_every_layout() {
             assert!(err.contains(reason), "{file} {column}: {err}");
         }
     }
-    let err = refusal(
-        "t = load_data(\"compressed.arrow\", cartpow(cartprod(f64 = reals), 4))\noutputs = t.f64",
-    );
-    assert!(err.contains("Arrow IPC"), "{err}");
     let err =
         refusal("t = load_data(\"u64.arrow\", cartpow(cartprod(x = integers), 1))\noutputs = t.x");
     assert!(err.contains("outside int64"), "{err}");
+    let out =
+        compile_at("t = load_data(\"u64.arrow\", cartpow(cartprod(a = reals), 1))\noutputs = t.a")
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(returned(&out), vec![vec![1.5]]);
+}
+
+/// A JSON integer beyond int64 refuses only when selected.
+#[test]
+fn an_unselected_json_integer_beyond_int64_reads() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = directory("bigint");
+    std::fs::write(
+        dir.join("data.json"),
+        r#"{"a": [1.5], "big": [9223372036854775808]}"#,
+    )?;
+    let path = dir.join("query.flatppl");
+    let read = |field: &str| {
+        Context::default()
+            .parse(
+                &format!(
+                    "data = load_data(\"data.json\", cartprod({field} = cartpow(reals, 1)))\noutputs = data.{field}"
+                ),
+                None,
+                path.to_str(),
+            )
+            .and_then(|model| model.compile(&EmitOptions::default()))
+            .map(|out| out.stablehlo)
+            .map_err(|e| e.to_string())
+    };
+    let literal = Context::default()
+        .parse("outputs = [1.5]", None, None)?
+        .compile(&EmitOptions::default())?
+        .stablehlo;
+    assert_eq!(read("a")?, literal);
+    let err = read("big").expect_err("must refuse");
+    assert!(
+        err.contains("integer 9223372036854775808 exceeds int64"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
 }

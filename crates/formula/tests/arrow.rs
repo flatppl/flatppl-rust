@@ -185,7 +185,8 @@ fn dictionary_replacements_and_missing_values_preserve_model_rows()
     );
 
     // Reversing physical dictionaries is harmless for unordered categories,
-    // but would give contradictory meanings to an ordered predictor.
+    // but would give contradictory meanings to an ordered predictor. The
+    // contradiction spoils that column only.
     let mut fields: Vec<_> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     fields[1] = fields[1].clone().with_dict_is_ordered(true);
     let ordered = Arc::new(Schema::new(fields));
@@ -193,6 +194,15 @@ fn dictionary_replacements_and_missing_values_preserve_model_rows()
         .into_iter()
         .map(|batch| RecordBatch::try_new(ordered.clone(), batch.columns().to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
-    assert!(Table::from_arrow_ipc(&stream(&batches)?).is_err());
+    let table = Table::from_arrow_ipc(&stream(&batches)?)?;
+    let error = table
+        .column(ordered.field(1).name())
+        .expect_err("contradictory order must refuse");
+    assert!(
+        error
+            .to_string()
+            .contains("change order between Arrow batches"),
+        "{error}"
+    );
     Ok(())
 }

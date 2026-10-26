@@ -5,7 +5,7 @@ use arrow_array::{
     StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array, types,
 };
 use arrow_ipc::reader::{FileReader, StreamReader};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{ArrowError, DataType, Field};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 
@@ -14,20 +14,45 @@ impl Table {
     /// Dictionary levels retain their declared order; plain strings use sorted
     /// levels. Model-frame construction, not ingestion, selects complete rows.
     pub fn from_arrow_ipc(bytes: &[u8]) -> Result<Self> {
-        let cursor = Cursor::new(bytes);
-        if bytes.starts_with(b"ARROW1") {
-            read_batches(FileReader::try_new(cursor, None).map_err(ipc_error)?)
-        } else {
-            read_batches(StreamReader::try_new(cursor, None).map_err(ipc_error)?)
-        }
+        read(bytes, false)
+    }
+
+    /// Decode an Arrow IPC file or stream as `load_data` values (§07). A
+    /// dictionary over numbers or booleans reads as its values, because §07
+    /// types a column by its values, not by their encoding.
+    pub fn from_arrow_ipc_values(bytes: &[u8]) -> Result<Self> {
+        read(bytes, true)
     }
 }
 
-fn ipc_error(error: arrow_schema::ArrowError) -> Error {
+fn read(bytes: &[u8], decode: bool) -> Result<Table> {
+    let cursor = Cursor::new(bytes);
+    if bytes.starts_with(b"ARROW1") {
+        read_batches(
+            FileReader::try_new(cursor, None).map_err(ipc_error)?,
+            decode,
+        )
+    } else {
+        read_batches(
+            StreamReader::try_new(cursor, None).map_err(ipc_error)?,
+            decode,
+        )
+    }
+}
+
+fn ipc_error(error: ArrowError) -> Error {
+    // Without a codec, arrow-ipc names a cargo feature, which a user cannot act on.
+    if let ArrowError::InvalidArgumentError(message) = &error
+        && let Some((codec, _)) = message.split_once(" IPC decompression requires")
+    {
+        return Error(format!(
+            "{codec}-compressed Arrow IPC is not supported in this build"
+        ));
+    }
     Error(format!("Arrow IPC: {error}"))
 }
 
-fn read_batches(reader: impl RecordBatchReader) -> Result<Table> {
+fn read_batches(reader: impl RecordBatchReader, decode: bool) -> Result<Table> {
     let schema = reader.schema();
     // A column this reader cannot decode is kept as a reason, so that a table
     // selecting other columns still reads (§07: a value set may omit columns).
@@ -35,75 +60,87 @@ fn read_batches(reader: impl RecordBatchReader) -> Result<Table> {
     let mut readable = Vec::new();
     let mut columns = Vec::new();
     for (index, field) in schema.fields().iter().enumerate() {
-        match column(field, new_empty_array(field.data_type()).as_ref()) {
+        match column(field, new_empty_array(field.data_type()).as_ref(), decode) {
             Ok(column) => {
                 readable.push(index);
-                columns.push(column);
+                columns.push(Ok(column));
             }
             Err(error) => unreadable.push((field.name().clone(), error.0)),
         }
     }
-    let fields: Vec<_> = readable.iter().map(|&i| schema.field(i)).collect();
     let mut orders = vec![Vec::new(); columns.len()];
     let mut nrows = 0;
     for batch in reader {
         let batch = batch.map_err(ipc_error)?;
-        let arrays: Vec<_> = readable.iter().map(|&i| batch.column(i)).collect();
-        for (((out, field), array), order) in
-            columns.iter_mut().zip(&fields).zip(arrays).zip(&mut orders)
-        {
-            append(
-                out,
-                column(field, array.as_ref())?,
-                nrows,
-                batch.num_rows(),
-                order,
-            )?;
+        // A value that fails in a later batch also spoils only its own column.
+        for ((slot, &index), order) in columns.iter_mut().zip(&readable).zip(&mut orders) {
+            let Ok(out) = slot else { continue };
+            let next = column(schema.field(index), batch.column(index).as_ref(), decode);
+            if let Err(error) =
+                next.and_then(|next| append(out, next, nrows, batch.num_rows(), order))
+            {
+                *slot = Err(error.0);
+            }
         }
         nrows += batch.num_rows();
     }
-    for ((column, field), order) in columns.iter_mut().zip(&fields).zip(orders) {
-        let ColumnValues::Factor {
-            levels,
-            codes,
-            ordered,
-        } = &mut column.values
-        else {
-            continue;
-        };
-        let indices = if *ordered {
-            ordered_indices(levels.len(), &order).ok_or_else(|| {
-                Error(format!(
-                    "ordered categories in `{}` change order between Arrow batches",
-                    column.name
-                ))
-            })?
-        } else if matches!(
-            field.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-        ) {
-            let mut indices: Vec<_> = (0..levels.len()).collect();
-            indices.sort_by_key(|&i| &levels[i]);
-            indices
-        } else {
-            continue;
-        };
-        let mut mapping = vec![0; levels.len()];
-        for (new, &old) in indices.iter().enumerate() {
-            mapping[old] = new as u32;
+    let mut kept = Vec::with_capacity(columns.len());
+    for ((slot, index), order) in columns.into_iter().zip(readable).zip(orders) {
+        let field = schema.field(index);
+        match slot.and_then(|column| finish_levels(column, field, &order)) {
+            Ok(column) => kept.push(column),
+            Err(reason) => unreadable.push((field.name().clone(), reason)),
         }
-        for (row, code) in codes.iter_mut().enumerate() {
-            if column.valid.as_ref().is_none_or(|valid| valid[row]) {
-                *code = mapping[*code as usize];
-            }
-        }
-        *levels = indices.into_iter().map(|i| levels[i].clone()).collect();
     }
     Ok(Table {
-        columns,
+        columns: kept,
         nrows,
         unreadable,
     })
+}
+
+/// Settle a categorical column's level order once every batch has arrived.
+fn finish_levels(
+    mut column: Column,
+    field: &Field,
+    order: &[(u32, u32)],
+) -> std::result::Result<Column, String> {
+    let ColumnValues::Factor {
+        levels,
+        codes,
+        ordered,
+    } = &mut column.values
+    else {
+        return Ok(column);
+    };
+    let indices = if *ordered {
+        ordered_indices(levels.len(), order).ok_or_else(|| {
+            format!(
+                "ordered categories in `{}` change order between Arrow batches",
+                column.name
+            )
+        })?
+    } else if matches!(
+        field.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        let mut indices: Vec<_> = (0..levels.len()).collect();
+        indices.sort_by_key(|&i| &levels[i]);
+        indices
+    } else {
+        return Ok(column);
+    };
+    let mut mapping = vec![0; levels.len()];
+    for (new, &old) in indices.iter().enumerate() {
+        mapping[old] = new as u32;
+    }
+    for (row, code) in codes.iter_mut().enumerate() {
+        if column.valid.as_ref().is_none_or(|valid| valid[row]) {
+            *code = mapping[*code as usize];
+        }
+    }
+    *levels = indices.into_iter().map(|i| levels[i].clone()).collect();
+    Ok(column)
 }
 
 // Each ordered dictionary constrains only its own labels. Defer the total
@@ -136,7 +173,7 @@ fn array<T: 'static>(values: &dyn Array) -> &T {
         .expect("Arrow IPC validates array datatypes")
 }
 
-fn column(field: &Field, values: &dyn Array) -> Result<Column> {
+fn column(field: &Field, values: &dyn Array, decode: bool) -> Result<Column> {
     macro_rules! integers {
         ($ty:ty) => {
             ColumnValues::Int(
@@ -191,16 +228,21 @@ fn column(field: &Field, values: &dyn Array) -> Result<Column> {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             return factor(field, labels(values)?, (0..values.len()).map(Some));
         }
-        DataType::Dictionary(key, _) => {
+        DataType::Dictionary(key, value) => {
+            let decode = decode
+                && !matches!(
+                    value.as_ref(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                );
             return match key.as_ref() {
-                DataType::Int8 => dictionary::<types::Int8Type>(field, values),
-                DataType::Int16 => dictionary::<types::Int16Type>(field, values),
-                DataType::Int32 => dictionary::<types::Int32Type>(field, values),
-                DataType::Int64 => dictionary::<types::Int64Type>(field, values),
-                DataType::UInt8 => dictionary::<types::UInt8Type>(field, values),
-                DataType::UInt16 => dictionary::<types::UInt16Type>(field, values),
-                DataType::UInt32 => dictionary::<types::UInt32Type>(field, values),
-                DataType::UInt64 => dictionary::<types::UInt64Type>(field, values),
+                DataType::Int8 => dictionary::<types::Int8Type>(field, values, decode),
+                DataType::Int16 => dictionary::<types::Int16Type>(field, values, decode),
+                DataType::Int32 => dictionary::<types::Int32Type>(field, values, decode),
+                DataType::Int64 => dictionary::<types::Int64Type>(field, values, decode),
+                DataType::UInt8 => dictionary::<types::UInt8Type>(field, values, decode),
+                DataType::UInt16 => dictionary::<types::UInt16Type>(field, values, decode),
+                DataType::UInt32 => dictionary::<types::UInt32Type>(field, values, decode),
+                DataType::UInt64 => dictionary::<types::UInt64Type>(field, values, decode),
                 _ => Err(Error(format!("unsupported Arrow dictionary key {key}"))),
             };
         }
@@ -257,13 +299,52 @@ fn labels(values: &dyn Array) -> Result<Vec<Option<String>>> {
 fn dictionary<K: types::ArrowDictionaryKeyType>(
     field: &Field,
     values: &dyn Array,
+    decode: bool,
 ) -> Result<Column> {
     let dictionary = array::<DictionaryArray<K>>(values);
+    if decode {
+        let inner = column(field, dictionary.values().as_ref(), true)?;
+        return Ok(gather(inner, dictionary.keys_iter().collect()));
+    }
     factor(
         field,
         labels(dictionary.values().as_ref())?,
         dictionary.keys_iter(),
     )
+}
+
+/// Expand dictionary values by their keys. A null key, or a key at a null
+/// value, is missing.
+fn gather(inner: Column, keys: Vec<Option<usize>>) -> Column {
+    fn take<T: Copy + Default>(values: &[T], keys: &[Option<usize>]) -> Vec<T> {
+        keys.iter()
+            .map(|key| key.map_or_else(T::default, |key| values[key]))
+            .collect()
+    }
+    let values = match &inner.values {
+        ColumnValues::Real32(v) => ColumnValues::Real32(take(v, &keys)),
+        ColumnValues::Real64(v) => ColumnValues::Real64(take(v, &keys)),
+        ColumnValues::Int(v) => ColumnValues::Int(take(v, &keys)),
+        ColumnValues::Bool(v) => ColumnValues::Bool(take(v, &keys)),
+        ColumnValues::Factor {
+            levels,
+            codes,
+            ordered,
+        } => ColumnValues::Factor {
+            levels: levels.clone(),
+            codes: take(codes, &keys),
+            ordered: *ordered,
+        },
+    };
+    let valid: Vec<bool> = keys
+        .iter()
+        .map(|key| key.is_some_and(|key| inner.valid.as_ref().is_none_or(|valid| valid[key])))
+        .collect();
+    Column {
+        name: inner.name,
+        values,
+        valid: valid.iter().any(|x| !x).then_some(valid),
+    }
 }
 
 fn factor(

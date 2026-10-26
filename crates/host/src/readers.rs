@@ -97,7 +97,7 @@ pub(crate) fn decode(format: Format, bytes: &[u8]) -> Result<Datum, String> {
         Format::Wsv => flatppl_data::read_wsv(bytes)
             .map(text_columns)
             .map_err(|e| e.0),
-        Format::Arrow => Table::from_arrow_ipc(bytes)
+        Format::Arrow => Table::from_arrow_ipc_values(bytes)
             .map(arrow_columns)
             .map_err(|e| e.0),
         Format::Safetensors => safetensors::read(bytes)
@@ -112,7 +112,7 @@ fn json_datum(json: &Value) -> Result<Datum, String> {
         Value::Bool(b) => Datum::Bool(*b),
         Value::Number(n) => match n.as_i64() {
             Some(i) => Datum::Int(i),
-            None if n.is_u64() => return Err(format!("integer {n} exceeds int64")),
+            None if n.is_u64() => Datum::Unreadable(format!("integer {n} exceeds int64")),
             None => Datum::Number(n.as_f64().ok_or("number is not representable")?),
         },
         // JSON types its values, and a string is not a number.
