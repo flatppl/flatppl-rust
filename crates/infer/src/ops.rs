@@ -264,6 +264,9 @@ fn op_rule(
     if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args, false) {
         return Ready((ty, joined));
     }
+    if let Some(ty) = refuse_lossy_literal_conversion(inf, &name, args) {
+        return Ready((ty, joined));
+    }
 
     if let Some(ty) = callback_arity_check(inf, id, &name, args) {
         return Ready((ty, joined));
@@ -369,6 +372,9 @@ fn op_rule(
             _ => table_type(inf, named),
         },
         "rowstack" | "colstack" => stack_type(arg_ty(args, 0), name == "colstack"),
+        "get" | "get0" if refuse_real_index(inf, &name, args) => {
+            Type::Failed(format!("{name}: real-typed index").into())
+        }
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
         // §07 gives every comparison ("Operator-equivalent functions") and every
@@ -7397,11 +7403,37 @@ fn written_size_check(
     named: &[NamedInfo],
 ) -> Option<Type> {
     let (_, param, pos, section) = WRITTEN_SIZE_ARGS.iter().find(|(op, ..)| *op == name)?;
-    let size_node = named
+    let (size_node, size_ty) = named
         .iter()
         .find(|(n, ..)| inf.module.resolve(*n) == *param)
-        .map(|(_, n, _, _)| *n)
-        .or_else(|| args.get(*pos).map(|(n, _, _)| *n))?;
+        .map(|(_, n, t, _)| (*n, t.clone()))
+        .or_else(|| args.get(*pos).map(|(n, t, _)| (*n, t.clone())))?;
+    // A size is an integer, or a vector of them, by TYPE: `fill(0.0, 2.0)` writes
+    // a real, whatever number it holds. A size the catalogue types as a scalar
+    // integer (`eye`'s `n`) is left to the catalogue's own type and shape checks.
+    let typed_by_catalogue = crate::catalogue::builtin()
+        .base(name)
+        .is_some_and(|sig| crate::catalogue::sig_param_integral(sig, pos + 1)[*pos].is_some());
+    let elem = match &size_ty {
+        _ if typed_by_catalogue => &Type::Any,
+        Type::Array { shape, elem } if shape.len() == 1 => elem.as_ref(),
+        other => other,
+    };
+    if let Type::Scalar(got @ (ScalarType::Real | ScalarType::Complex)) = elem {
+        let subject = format!(
+            "`{name}`'s `{param}`{} is",
+            if elem == &size_ty { "" } else { " vector" }
+        );
+        let message = non_integral_message(
+            &subject,
+            *got,
+            section,
+            crate::catalogue::ScalarTag::Integer,
+        );
+        inf.diags
+            .push(crate::Diagnostic::error_at(size_node, message));
+        return Some(Type::Failed(format!("{name}: real-typed size").into()));
+    }
     // A written size vector contributes one axis per element; a scalar size is
     // the single axis. Either way the elements are read as written.
     let axes: Vec<NodeId> = match inf.module.node(size_node).clone() {
@@ -8864,18 +8896,61 @@ fn refuse_shape_outside_sig(
     cell: bool,
 ) -> Option<Type> {
     let shapes = crate::catalogue::sig_param_shapes(sig, args.len());
+    // `div` and `mod` own an integer check that also reaches broadcast cells and
+    // names `divide` for real division (`integer_arithmetic_type`).
+    let integral = if matches!(head, "div" | "mod") {
+        Vec::new()
+    } else {
+        crate::catalogue::sig_param_integral(sig, args.len())
+    };
+    let distribution = matches!(sig, crate::catalogue::Sig::Distribution { .. });
     let mut refused = None;
     for (i, (node, ty, _)) in args.iter().enumerate() {
-        let Some(Some(shape)) = shapes.get(i) else {
-            continue;
-        };
-        let Some(what) = shape_mismatch(*shape, ty) else {
-            continue;
-        };
         let which = names
             .get(i)
             .map(|n| format!("`{n}`"))
             .unwrap_or_else(|| format!("argument {}", i + 1));
+        // §03 "Integer" and "Bool": an integer or boolean domain is checked by the
+        // argument's TYPE. `eye(2.0)` passes a real, whatever number it holds.
+        // A boolean is an integer, but an integer is not a boolean (§03 "booleans ⊂
+        // integers ⊂ reals"; §03 "Bool": zero and one are not converted implicitly).
+        if let Some(Some(want)) = integral.get(i)
+            && let Type::Scalar(got) = ty
+            && match want {
+                crate::catalogue::ScalarTag::Boolean => *got != ScalarType::Boolean,
+                _ => matches!(got, ScalarType::Real | ScalarType::Complex),
+            }
+        {
+            let subject = if cell {
+                format!("a `broadcast` cell of {who} passes {which}")
+            } else {
+                format!("{who}'s {which} is")
+            };
+            let message = non_integral_message(&subject, *got, section, *want);
+            inf.diags.push(crate::Diagnostic::error_at(*node, message));
+            refused = Some(which);
+            continue;
+        }
+        let Some(Some(shape)) = shapes.get(i) else {
+            continue;
+        };
+        // §08 declares its vector parameters "array of reals", and §03 "Arrays"
+        // makes a transposed vector a distinct type.
+        if distribution && *shape == ParamShape::Vector && matches!(ty, Type::TVector { .. }) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "{who}'s {which} is a transposed vector, but spec {section} declares it an \
+                     array; spec §03 \"Arrays\" makes transposed vectors a distinct type, so \
+                     pass the vector itself, not `transpose(…)` of it"
+                ),
+            ));
+            refused = Some(which);
+            continue;
+        }
+        let Some(what) = shape_mismatch(*shape, ty) else {
+            continue;
+        };
         let remedy = match (shape, ty) {
             (ParamShape::Scalar, Type::Array { .. } | Type::TVector { .. }) if !cell => {
                 format!(". Apply {who} elementwise with `{head}.(…)` (spec §04 \"Broadcasting\")")
@@ -8905,6 +8980,122 @@ fn refuse_shape_outside_sig(
         let who = who.trim_matches('`');
         Type::Failed(format!("{who}: {which} is outside its declared shape").into())
     })
+}
+
+/// Refuse `integer(x)` / `boolean(x)` of a WRITTEN literal that the conversion
+/// cannot represent: §07 "Scalar restrictions and constructors" makes `integer`
+/// return the integer equal to an integral `x` and `boolean` return `x` in
+/// `booleans`, so `integer(2.5)` and `boolean(2)` are static errors. `-0.0` is 0. A
+/// bound argument is not read here: only a literal's value is known.
+fn refuse_lossy_literal_conversion(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    if !matches!(name, "integer" | "boolean") {
+        return None;
+    }
+    let (node, _, _) = args.first()?;
+    let value = written_literal(inf, *node)?;
+    let representable = if name == "integer" {
+        value.fract() == 0.0
+    } else {
+        value == 0.0 || value == 1.0
+    };
+    if representable {
+        return None;
+    }
+    let want = if name == "integer" {
+        "an integral value"
+    } else {
+        "0 or 1"
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        *node,
+        format!(
+            "`{name}` of `{value}`: spec §07 \"Scalar restrictions and constructors\" converts \
+             only {want}, so this conversion has no result"
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: unrepresentable literal").into(),
+    ))
+}
+
+/// The value of a numeric or boolean literal, possibly negated, as written. Unlike
+/// [`written_scalar`] it does not follow a binding.
+fn written_literal(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<f64> {
+    match inf.module.node(node) {
+        Node::Lit(Scalar::Int(n)) => Some(*n as f64),
+        Node::Lit(Scalar::Real(x)) => Some(*x),
+        Node::Lit(Scalar::Bool(b)) => Some(f64::from(*b)),
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            if inf.module.resolve(op) != "neg" || c.args.len() != 1 {
+                return None;
+            }
+            written_literal(inf, c.args[0]).map(|x| -x)
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a real or complex index (or an array of them) in a `get` / `get0` selector.
+/// An index is an integer by TYPE, alongside the separate 1-based rule: `v[1.0]` writes
+/// a real, whatever number it holds.
+fn refuse_real_index(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> bool {
+    let mut refused = false;
+    for (i, (node, ty, _)) in args.iter().enumerate().skip(1) {
+        let elem = match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => elem.as_ref(),
+            other => other,
+        };
+        let Type::Scalar(got @ (ScalarType::Real | ScalarType::Complex)) = elem else {
+            continue;
+        };
+        let subject = format!(
+            "`{name}`'s selector {i}{} is",
+            if elem == ty { "" } else { " vector" }
+        );
+        let message = non_integral_message(
+            &subject,
+            *got,
+            &format!("§07 `{name}`"),
+            crate::catalogue::ScalarTag::Integer,
+        );
+        inf.diags.push(crate::Diagnostic::error_at(*node, message));
+        refused = true;
+    }
+    refused
+}
+
+/// The refusal of a real or complex argument where an integer or boolean domain is
+/// declared. `subject` ends in the verb, as in "`eye`'s `n` is".
+fn non_integral_message(
+    subject: &str,
+    got: ScalarType,
+    section: &str,
+    want: crate::catalogue::ScalarTag,
+) -> String {
+    let (want, remedy) = match want {
+        crate::catalogue::ScalarTag::Boolean => ("a boolean", "`true`, `false` or `boolean(…)`"),
+        _ => (
+            "an integer",
+            "an integer literal (`2`, not `2.0`) or `integer(…)`",
+        ),
+    };
+    let got = match got {
+        ScalarType::Complex => "a complex",
+        ScalarType::Integer => "an integer",
+        ScalarType::Boolean => "a boolean",
+        ScalarType::Real => "a real",
+    };
+    format!(
+        "{subject} {got}, but spec {section} declares it {want}: a domain of integers or \
+         booleans is checked by type, not by value, so write {remedy}"
+    )
 }
 
 /// What `ty` is when it is outside `shape`, or `None` when it fits or is unresolved.
