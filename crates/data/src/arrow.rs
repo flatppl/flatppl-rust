@@ -29,20 +29,28 @@ fn ipc_error(error: arrow_schema::ArrowError) -> Error {
 
 fn read_batches(reader: impl RecordBatchReader) -> Result<Table> {
     let schema = reader.schema();
-    let mut columns = schema
-        .fields()
-        .iter()
-        .map(|field| column(field, new_empty_array(field.data_type()).as_ref()))
-        .collect::<Result<Vec<_>>>()?;
+    // A column this reader cannot decode is kept as a reason, so that a table
+    // selecting other columns still reads (§07: a value set may omit columns).
+    let mut unreadable = Vec::new();
+    let mut readable = Vec::new();
+    let mut columns = Vec::new();
+    for (index, field) in schema.fields().iter().enumerate() {
+        match column(field, new_empty_array(field.data_type()).as_ref()) {
+            Ok(column) => {
+                readable.push(index);
+                columns.push(column);
+            }
+            Err(error) => unreadable.push((field.name().clone(), error.0)),
+        }
+    }
+    let fields: Vec<_> = readable.iter().map(|&i| schema.field(i)).collect();
     let mut orders = vec![Vec::new(); columns.len()];
     let mut nrows = 0;
     for batch in reader {
         let batch = batch.map_err(ipc_error)?;
-        for (((out, field), array), order) in columns
-            .iter_mut()
-            .zip(schema.fields())
-            .zip(batch.columns())
-            .zip(&mut orders)
+        let arrays: Vec<_> = readable.iter().map(|&i| batch.column(i)).collect();
+        for (((out, field), array), order) in
+            columns.iter_mut().zip(&fields).zip(arrays).zip(&mut orders)
         {
             append(
                 out,
@@ -54,7 +62,7 @@ fn read_batches(reader: impl RecordBatchReader) -> Result<Table> {
         }
         nrows += batch.num_rows();
     }
-    for ((column, field), order) in columns.iter_mut().zip(schema.fields()).zip(orders) {
+    for ((column, field), order) in columns.iter_mut().zip(&fields).zip(orders) {
         let ColumnValues::Factor {
             levels,
             codes,
@@ -91,7 +99,11 @@ fn read_batches(reader: impl RecordBatchReader) -> Result<Table> {
         }
         *levels = indices.into_iter().map(|i| levels[i].clone()).collect();
     }
-    Ok(Table { columns, nrows })
+    Ok(Table {
+        columns,
+        nrows,
+        unreadable,
+    })
 }
 
 // Each ordered dictionary constrains only its own labels. Defer the total
@@ -196,8 +208,12 @@ fn column(field: &Field, values: &dyn Array) -> Result<Column> {
     Ok(Column {
         name: field.name().clone(),
         values: data,
-        valid: (values.null_count() != 0)
-            .then(|| (0..values.len()).map(|i| values.is_valid(i)).collect()),
+        // A `Null`-typed array has no validity buffer, so only its logical
+        // nulls say that every entry is missing.
+        valid: values
+            .logical_nulls()
+            .filter(|nulls| nulls.null_count() != 0)
+            .map(|nulls| (0..values.len()).map(|i| nulls.is_valid(i)).collect()),
     })
 }
 

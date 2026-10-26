@@ -33,7 +33,11 @@ pub fn read_json_table(source: &str) -> Result<Table> {
                     .collect::<Result<_>>()?;
                 columns.push(column(name, values)?);
             }
-            Table { columns, nrows }
+            Table {
+                columns,
+                nrows,
+                unreadable: Vec::new(),
+            }
         }
         Some(b'[') => {
             let rows: Vec<JsonRow<'_>> = read_json(source)?;
@@ -55,6 +59,7 @@ pub fn read_json_table(source: &str) -> Result<Table> {
             Table {
                 columns,
                 nrows: rows.len(),
+                unreadable: Vec::new(),
             }
         }
         _ => return Err(Error("JSON table must contain records or columns".into())),
@@ -78,6 +83,7 @@ pub fn read_csv_table(bytes: &[u8]) -> Result<Table> {
     let table = Table {
         columns,
         nrows: text.rows.len(),
+        unreadable: Vec::new(),
     };
     table.validate()?;
     Ok(table)

@@ -176,6 +176,9 @@ pub fn load_fixed_data(
 }
 
 fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant, String> {
+    if let Datum::Unreadable(reason) = datum {
+        return Err(reason.clone());
+    }
     match ty {
         Type::Scalar(scalar) => scalar_value(datum, *scalar),
         Type::Array { shape, elem } => {
@@ -203,7 +206,7 @@ fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant,
                     shape,
                     data: leaves,
                 } => tensor_prefix(module, shape, leaves, &dims, elem, &mut data)?,
-                datum => array_prefix(module, datum, &dims, elem, &mut data)?,
+                datum => array_prefix(module, datum, &dims, dims.len(), elem, &mut data)?,
             }
             Ok(Constant::Array { shape: dims, data })
         }
@@ -260,10 +263,12 @@ fn selected_value(module: &Module, datum: &Datum, ty: &Type) -> Result<Constant,
     }
 }
 
-/// A scalar of `kind`. Typed sources keep their own kind for the domain check; a
-/// delimited cell is text, parsed here once its set is known.
+/// A scalar of `kind`. A typed source (Arrow, Safetensors, a JSON integer or
+/// boolean) keeps its kind for the §03 inclusion check. An untyped one (a JSON
+/// number with a fraction or exponent, a delimited cell) is decided by its value:
+/// an integral value is an integer, and `true`/`false` read as 1 and 0 in a
+/// numeric set.
 fn scalar_value(datum: &Datum, kind: ScalarType) -> Result<Constant, String> {
-    // §03 nests booleans ⊂ integers ⊂ reals, so only a wider source kind refuses.
     match (datum, kind) {
         (Datum::Real(_) | Datum::Real32(_), ScalarType::Integer | ScalarType::Boolean) => {
             return Err("a real value where the declared set holds integers or booleans".into());
@@ -278,35 +283,55 @@ fn scalar_value(datum: &Datum, kind: ScalarType) -> Result<Constant, String> {
         Datum::Int(i) => Ok(Constant::Integer(*i)),
         Datum::Real(x) => Ok(Constant::Real(*x)),
         Datum::Real32(x) => Ok(Constant::Real32(*x)),
+        Datum::Number(x) => untyped_number(*x, kind, || format!("value {x}")),
         Datum::Null => Err("a value is missing".into()),
         Datum::Tensor { shape, data } if shape.is_empty() => scalar_value(&data[0], kind),
         Datum::Text(cell) => {
-            let parsed = match kind {
-                ScalarType::Boolean if cell.eq_ignore_ascii_case("true") => {
-                    Some(Constant::Bool(true))
-                }
-                ScalarType::Boolean if cell.eq_ignore_ascii_case("false") => {
-                    Some(Constant::Bool(false))
-                }
-                ScalarType::Boolean => None,
-                ScalarType::Integer => cell.parse::<i64>().map(Constant::Integer).ok(),
-                _ => cell.parse::<i64>().map(Constant::Integer).ok().or_else(|| {
-                    cell.parse::<f64>()
-                        .ok()
-                        .filter(|x| !x.is_nan())
-                        .map(Constant::Real)
-                }),
-            };
-            parsed.ok_or_else(|| format!("cell `{cell}` is not a value of its declared set"))
+            if cell.eq_ignore_ascii_case("true") || cell.eq_ignore_ascii_case("false") {
+                return Ok(Constant::Bool(cell.eq_ignore_ascii_case("true")));
+            }
+            if kind == ScalarType::Boolean {
+                return Err(format!("cell `{cell}` is not `true` or `false`"));
+            }
+            if let Ok(i) = cell.parse::<i64>() {
+                return Ok(Constant::Integer(i));
+            }
+            match cell.parse::<f64>() {
+                Ok(x) if !x.is_nan() => untyped_number(x, kind, || format!("cell `{cell}`")),
+                _ => Err(format!("cell `{cell}` is not a value of its declared set")),
+            }
         }
         _ => Err("expected a scalar".into()),
     }
 }
 
+/// An untyped number: an integer set takes it only when it is exactly integral.
+fn untyped_number(
+    x: f64,
+    kind: ScalarType,
+    shown: impl Fn() -> String,
+) -> Result<Constant, String> {
+    match kind {
+        ScalarType::Boolean => Err(format!("{} is not a boolean", shown())),
+        ScalarType::Integer => {
+            // `i64::MAX as f64` rounds up to 2^63, which is outside int64.
+            if x.fract() == 0.0 && x >= i64::MIN as f64 && x < i64::MAX as f64 {
+                Ok(Constant::Integer(x as i64))
+            } else {
+                Err(format!("{} is not an integer", shown()))
+            }
+        }
+        _ => Ok(Constant::Real(x)),
+    }
+}
+
+/// Fill `data` from nested lists in row-major order. §07 lets a vector read its
+/// first `n` entries; a multi-dimensional array must match its shape exactly.
 fn array_prefix(
     module: &Module,
     datum: &Datum,
     shape: &[u32],
+    rank: usize,
     elem: &Type,
     data: &mut Vec<Constant>,
 ) -> Result<(), String> {
@@ -314,8 +339,16 @@ fn array_prefix(
         data.push(selected_value(module, datum, elem)?);
         return Ok(());
     };
-    let Datum::List(values) = datum else {
-        return Err("expected an array".into());
+    let values = match datum {
+        Datum::List(values) => values,
+        Datum::Text(_) => {
+            return Err(
+                "a delimited cell holds one scalar, and §07 gives an array-valued column no \
+                 CSV or WSV layout"
+                    .into(),
+            );
+        }
+        _ => return Err("expected an array".into()),
     };
     if values.len() < n as usize {
         return Err(format!(
@@ -323,8 +356,14 @@ fn array_prefix(
             values.len()
         ));
     }
+    if rank > 1 && values.len() != n as usize {
+        return Err(format!(
+            "an axis holds {} entries, but the declared shape needs exactly {n}",
+            values.len()
+        ));
+    }
     for value in &values[..n as usize] {
-        array_prefix(module, value, rest, elem, data)?;
+        array_prefix(module, value, rest, rank, elem, data)?;
     }
     Ok(())
 }

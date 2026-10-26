@@ -10,6 +10,10 @@ use std::collections::HashSet;
 pub struct Table {
     pub columns: Vec<Column>,
     pub nrows: usize,
+    /// Columns the source holds but no reader decodes, with the reason. They
+    /// refuse only when selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,10 +44,13 @@ pub enum ColumnValues {
 impl Table {
     /// The column named `name`.
     pub fn column(&self, name: &str) -> Result<&Column> {
-        self.columns
-            .iter()
-            .find(|column| column.name == name)
-            .ok_or_else(|| Error(format!("missing data column `{name}`")))
+        if let Some(column) = self.columns.iter().find(|column| column.name == name) {
+            return Ok(column);
+        }
+        match self.unreadable.iter().find(|(n, _)| n == name) {
+            Some((_, reason)) => Err(Error(reason.clone())),
+            None => Err(Error(format!("missing data column `{name}`"))),
+        }
     }
 
     /// Check distinct names, consistent lengths and valid factor codes.

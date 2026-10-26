@@ -36,6 +36,20 @@ rows = [",".join(events)] + [",".join(cells(v) for v in row) for row in zip(*eve
 rows = ["  ".join(events)] + ["\t".join(cells(v) for v in row) for row in zip(*events.values())]
 (HERE / "events.wsv").write_text("# whitespace-separated\n" + "\n".join(rows) + "\n")
 (HERE / "column.csv").write_text("x\n0.5\n-1\n2.75\n")
+# Untyped cells: an integral value is an integer, `true`/`false` read as 1/0.
+(HERE / "untyped.csv").write_text("i,flag,x\n3,true,3.5\n3.0,false,1\n1e3,TRUE,2\n")
+(HERE / "untyped.json").write_text('{"i": [3, 3.0, 1e3], "x": [3.5, 1, 2]}\n')
+
+# Arrow columns no value set reads, beside a readable one: a typed null, a
+# Null-typed column, strings, a timestamp and a fixed-size list.
+pl.DataFrame({
+    "a": pl.Series([1.5, 2.5], dtype=pl.Float64),
+    "n": pl.Series([1.0, None], dtype=pl.Float64),
+    "z": pl.Series([None, None], dtype=pl.Null),
+    "s": pl.Series(["1.5", "2"], dtype=pl.String),
+    "t": pl.Series([0, 1], dtype=pl.Datetime("us")),
+    "l": pl.Series([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=pl.Array(pl.Float64, 3)),
+}).write_ipc(HERE / "mixed.arrow")
 
 DTYPES = {np.float64: "F64", np.float32: "F32", np.float16: "F16", np.int64: "I64",
           np.int32: "I32", np.uint8: "U8", np.bool_: "BOOL"}

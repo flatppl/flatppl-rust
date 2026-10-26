@@ -15,6 +15,9 @@ pub(crate) enum Datum {
     Bool(bool),
     Int(i64),
     Real(f64),
+    /// A JSON number written with a fraction or an exponent. JSON has one
+    /// number type, so its value, not its spelling, decides its set.
+    Number(f64),
     /// A binary32 (or narrower) value, kept at its source precision.
     Real32(f32),
     /// A delimited cell, parsed only once its scalar set is known.
@@ -29,6 +32,9 @@ pub(crate) enum Datum {
         shape: Vec<usize>,
         data: Vec<Datum>,
     },
+    /// A column no value set can select, with the reason. It refuses only when
+    /// selected.
+    Unreadable(String),
 }
 
 impl Datum {
@@ -107,7 +113,7 @@ fn json_datum(json: &Value) -> Result<Datum, String> {
         Value::Number(n) => match n.as_i64() {
             Some(i) => Datum::Int(i),
             None if n.is_u64() => return Err(format!("integer {n} exceeds int64")),
-            None => Datum::Real(n.as_f64().ok_or("number is not representable")?),
+            None => Datum::Number(n.as_f64().ok_or("number is not representable")?),
         },
         Value::String(s) => Datum::Text(s.clone()),
         Value::Array(items) => Datum::List(items.iter().map(json_datum).collect::<Result<_, _>>()?),
@@ -145,31 +151,41 @@ fn text_columns(table: flatppl_data::TextTable) -> Datum {
 }
 
 fn arrow_columns(table: Table) -> Datum {
-    Datum::Columns(
+    let mut columns: Vec<(String, Datum)> = table
+        .columns
+        .into_iter()
+        .map(|column| {
+            let valid = |i: usize| column.valid.as_ref().is_none_or(|v| v[i]);
+            let cells: Vec<Datum> = match &column.values {
+                ColumnValues::Real32(v) => v.iter().map(|&x| Datum::Real32(x)).collect(),
+                ColumnValues::Real64(v) => v.iter().map(|&x| Datum::Real(x)).collect(),
+                ColumnValues::Int(v) => v.iter().map(|&x| Datum::Int(x)).collect(),
+                ColumnValues::Bool(v) => v.iter().map(|&x| Datum::Bool(x)).collect(),
+                // Arrow is typed, and a string is not a number.
+                ColumnValues::Factor { .. } => {
+                    let reason = format!(
+                        "column `{}` holds Arrow strings, and `load_data` reads numbers and \
+                         booleans",
+                        column.name
+                    );
+                    return (column.name, Datum::Unreadable(reason));
+                }
+            };
+            let cells = cells
+                .into_iter()
+                .enumerate()
+                .map(|(i, cell)| if valid(i) { cell } else { Datum::Null })
+                .collect();
+            (column.name, Datum::List(cells))
+        })
+        .collect();
+    columns.extend(
         table
-            .columns
+            .unreadable
             .into_iter()
-            .map(|column| {
-                let valid = |i: usize| column.valid.as_ref().is_none_or(|v| v[i]);
-                let cells: Vec<Datum> = match &column.values {
-                    ColumnValues::Real32(v) => v.iter().map(|&x| Datum::Real32(x)).collect(),
-                    ColumnValues::Real64(v) => v.iter().map(|&x| Datum::Real(x)).collect(),
-                    ColumnValues::Int(v) => v.iter().map(|&x| Datum::Int(x)).collect(),
-                    ColumnValues::Bool(v) => v.iter().map(|&x| Datum::Bool(x)).collect(),
-                    ColumnValues::Factor { levels, codes, .. } => codes
-                        .iter()
-                        .map(|&c| Datum::Text(levels[c as usize].clone()))
-                        .collect(),
-                };
-                let cells = cells
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, cell)| if valid(i) { cell } else { Datum::Null })
-                    .collect();
-                (column.name, Datum::List(cells))
-            })
-            .collect(),
-    )
+            .map(|(name, reason)| (name, Datum::Unreadable(reason))),
+    );
+    Datum::Columns(columns)
 }
 
 /// A Safetensors record tree, each tensor's leaves at their source kind.

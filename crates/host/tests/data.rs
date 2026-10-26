@@ -269,12 +269,12 @@ fn a_one_column_delimited_source_reads_as_a_vector() {
 #[test]
 fn delimited_cells_are_checked_against_their_declared_set() {
     for (domain, reason) in [
-        (
-            "cartprod(a = integers)",
-            "cell `1.5` is not a value of its declared set",
-        ),
+        ("cartprod(a = integers)", "cell `1.5` is not an integer"),
         ("cartprod(a = posreals)", "outside"),
-        ("cartprod(flag = reals)", "cell `true`"),
+        (
+            "cartprod(a = booleans)",
+            "cell `1.5` is not `true` or `false`",
+        ),
         ("cartprod(missing = reals)", "missing column `missing`"),
     ] {
         let err = refusal(&format!(
@@ -429,6 +429,90 @@ fn malformed_tables_refuse_with_the_reason() -> Result<(), Box<dyn std::error::E
             .to_string();
         assert!(err.contains(reason), "{file}: {err}");
     }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+/// Untyped formats carry no integer/real distinction, so the value decides: an
+/// exactly integral value is an integer, and a CSV `true`/`false` reads as 1/0.
+#[test]
+fn untyped_numbers_are_integers_when_exactly_integral() {
+    let out = compile_at(
+        "data = load_data(\"untyped.csv\", cartpow(cartprod(i = integers, flag = reals), 3))\n\
+         outputs = (data.i, data.flag)",
+    )
+    .unwrap();
+    assert_eq!(
+        returned(&out),
+        vec![vec![3.0, 3.0, 1000.0], vec![1.0, 0.0, 1.0]]
+    );
+    let out = compile_at(
+        "data = load_data(\"untyped.json\", cartprod(i = cartpow(integers, 3)))\noutputs = data.i",
+    )
+    .unwrap();
+    assert_eq!(returned(&out), vec![vec![3.0, 3.0, 1000.0]]);
+    for file in ["untyped.csv", "untyped.json"] {
+        let err = refusal(&format!(
+            "data = load_data(\"{file}\", cartprod(x = cartpow(integers, 3)))\noutputs = data.x"
+        ));
+        assert!(
+            err.contains("3.5` is not an integer") || err.contains("3.5 is not an integer"),
+            "{file}: {err}"
+        );
+    }
+}
+
+/// §07 lets a value set omit columns, so a column no reader decodes refuses only
+/// when it is selected. Arrow is typed: a missing value refuses, also in a
+/// `Null`-typed column, and a string column is not a number.
+#[test]
+fn arrow_columns_refuse_only_when_selected() {
+    let out = compile_at(
+        "data = load_data(\"mixed.arrow\", cartpow(cartprod(a = reals), 2))\noutputs = data.a",
+    )
+    .unwrap();
+    assert_eq!(returned(&out), vec![vec![1.5, 2.5]]);
+    for (column, reason) in [
+        ("n", "a value is missing"),
+        ("z", "a value is missing"),
+        ("s", "column `s` holds Arrow strings"),
+        ("t", "column `t` has unsupported Arrow type Timestamp"),
+        ("l", "column `l` has unsupported Arrow type FixedSizeList"),
+    ] {
+        let err = refusal(&format!(
+            "data = load_data(\"mixed.arrow\", cartpow(cartprod({column} = reals), 2))\n\
+             outputs = data.{column}"
+        ));
+        assert!(err.contains(reason), "{column}: {err}");
+    }
+}
+
+/// §07's first-`n` read covers vector and table entries only, so a
+/// multi-dimensional array must match its declared shape on every axis.
+#[test]
+fn a_matrix_must_match_its_declared_shape() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = directory("matrix");
+    std::fs::write(dir.join("m.json"), "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]")?;
+    let path = dir.join("query.flatppl");
+    let compile = |shape: &str| {
+        Context::default()
+            .parse(
+                &format!("m = load_data(\"m.json\", cartpow(reals, {shape}))\noutputs = m"),
+                None,
+                path.to_str(),
+            )
+            .unwrap()
+            .compile(&EmitOptions::default())
+    };
+    let err = compile("[2, 2]").err().expect("must refuse").to_string();
+    assert!(
+        err.contains("an axis holds 3 entries, but the declared shape needs exactly 2"),
+        "{err}"
+    );
+    assert_eq!(
+        returned(&compile("[3, 3]").map_err(|e| e.to_string())?.stablehlo),
+        vec![(1..=9).map(f64::from).collect::<Vec<_>>()]
+    );
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
