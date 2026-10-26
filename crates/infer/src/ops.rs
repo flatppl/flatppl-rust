@@ -8267,8 +8267,9 @@ fn operator_domain(name: &str) -> Option<&'static str> {
     Some(match name {
         "add" | "sub" => "scalars or arrays of same shape (real or complex)",
         "mul" => {
-            "scalars, matrix-matrix, matrix-vector, scalar-matrix, scalar-vector, \
-             transposed-vector–vector, vector–transposed-vector, transposed-vector–matrix"
+            "scalars, matrix-matrix, matrix-vector, scalar-matrix, matrix-scalar, scalar-vector, \
+             vector-scalar, transposed-vector–vector, vector–transposed-vector, \
+             transposed-vector–matrix"
         }
         "divide" => "scalars, array-scalar, transposed-vector–scalar (real or complex)",
         "neg" => "scalars or arrays (real or complex)",
@@ -8307,6 +8308,14 @@ fn operand_outside_operator_domain(name: &str, ty: &Type) -> Option<&'static str
             if matches!(name, "equal" | "unequal") =>
         {
             Some("a non-discrete number")
+        }
+        // §07 gives each arithmetic row real or complex arrays, and a vector of vectors
+        // is not a matrix (§03).
+        Type::Array { elem, .. } | Type::TVector { elem, .. }
+            if matches!(**elem, Type::Array { .. } | Type::TVector { .. })
+                && matches!(name, "add" | "sub" | "mul" | "divide" | "pow" | "neg") =>
+        {
+            Some("an array of arrays")
         }
         Type::Array { elem, .. } | Type::TVector { elem, .. } => {
             operand_outside_operator_domain(name, elem).map(|_| "an array of non-numbers")
@@ -8511,11 +8520,16 @@ fn refuse_operand_outside_operator_domain(
         };
         // §07: exact equality "is restricted to discrete domains"; its sentence names the
         // functions that give a discrete result, and `iszero` for an exact test of zero.
-        let way_out = if what == "a non-discrete number" {
-            ". Compare a discrete result instead, such as `integer(x)`, `floor(x)`, \
-             `ceil(x)` or `round(x)`, or test a zero with `iszero(x)`"
-        } else {
-            ""
+        let way_out = match what {
+            "a non-discrete number" => {
+                ". Compare a discrete result instead, such as `integer(x)`, `floor(x)`, \
+                 `ceil(x)` or `round(x)`, or test a zero with `iszero(x)`"
+            }
+            "an array of arrays" => {
+                ". `rowstack(…)` makes a matrix of a vector of vectors (spec §03), and a dotted \
+                 operator applies the row to each element (spec §04)"
+            }
+            _ => "",
         };
         inf.diags.push(crate::Diagnostic::error_at(
             node,
