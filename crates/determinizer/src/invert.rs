@@ -2221,9 +2221,10 @@ fn derive_pow(
         return Err(refuse(
             f,
             m,
-            "pow(_, k) is a known bijection only with a literal exponent (§06: \"`pow` with \
-             finite nonzero literal exponent\"); write the exponent as a literal, or wrap \
-             the map in bijection(f, f_inv, logvol)",
+            "pow(_, k) is recognised here only when k is a numeric literal, and this exponent \
+             is an expression this pass does not evaluate; write it as a decimal literal \
+             (such as 0.3333333333333333 for 1/3), or wrap the map in \
+             bijection(f, f_inv, logvol)",
         ));
     };
     let written = match literal_exponent(m, k_node) {
@@ -2239,7 +2240,11 @@ fn derive_pow(
         Domain::NonNegReals
     };
     if !domain.admits(support) {
-        let reason = if odd_power(m, k_node).is_some() {
+        // Two rays only where the support reaches below 0. A support at or above 0
+        // fails on its atom at 0, which the domain message names.
+        let below_zero = Extent::of_support(support)
+            .is_some_and(|extent| extent.lo.value(f64::NEG_INFINITY) < 0.0);
+        let reason = if odd_power(m, k_node).is_some() && below_zero {
             format!(
                 "pow(_, {written}) maps the nonzero reals onto the nonzero reals; that image is two \
                  rays, and the density's image gate needs an interval to score 0 as outside \
@@ -2936,7 +2941,6 @@ fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> N
     wrap_functionof(m, x, ph, body_node)
 }
 
-/// The real value of a numeric literal node (`Int` widens to `Real`), or `None`.
 /// A `pow` exponent as written: an integer or real literal, possibly negated
 /// (`_^(-1)` parses as `pow(_, neg(1))`).
 fn literal_exponent(m: &Module, id: NodeId) -> Option<Scalar> {
@@ -2974,6 +2978,7 @@ fn odd_power(m: &Module, id: NodeId) -> Option<i64> {
     }
 }
 
+/// The real value of a numeric literal node (`Int` widens to `Real`), or `None`.
 fn literal_real(m: &Module, id: NodeId) -> Option<f64> {
     match m.node(id) {
         Node::Lit(Scalar::Real(r)) => Some(*r),

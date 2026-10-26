@@ -299,7 +299,7 @@ fn pushfwd_real_or_even_power_over_real_support_refuses() {
             "_^2",
             "pow(_, 2) requires M's support to lie within its domain",
         ),
-        ("_^(1/3)", "only with a literal exponent"),
+        ("_^(1/3)", "only when k is a numeric literal"),
         (
             "2 * _^3.0",
             "pow inside a composition is invertible here only with an odd positive",
@@ -325,6 +325,17 @@ fn pushfwd_negative_odd_power_needs_a_one_sided_support() {
     assert!(e.reason.contains("image is two rays"), "{e:?}");
     let p = pir("d = pushfwd(fn(_^(-1)), Exponential(1.0))\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "{p}");
+    // A support at or above 0 fails on its atom at 0, not on the two rays.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(fn(_^(-1)), Poisson(rate = 2.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("an atom at 0 must refuse");
+    assert!(
+        e.reason.contains(
+            "pow(_, -1) requires M's support to lie within its domain, the positive reals"
+        ) && !e.reason.contains("two rays"),
+        "{e:?}"
+    );
 }
 
 /// Over a bounded base the image gate maps the support's endpoints through the odd
