@@ -4,8 +4,6 @@
 //! numeric expressions, offsets, group effects and thin-plate smooths are supported.
 //! It does not fit a model.
 
-#[cfg(feature = "arrow")]
-mod arrow;
 mod categorical;
 mod contrasts;
 mod data;
@@ -26,13 +24,16 @@ use flatppl_core::Module;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
-pub use data::{Column, ColumnValues, DataDocument, DataMode, DataValue, Table, prepare_data};
+use data::ColumnModel;
+pub use data::{DataDocument, DataMode, DataValue, prepare_data};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
+pub use flatppl_data::{Column, ColumnValues, Table};
 pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, parse_formula};
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 pub use splines::{Smooth, ThinPlate};
+pub use text::{read_csv_table, read_json_table};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -46,6 +47,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<flatppl_data::Error> for Error {
+    fn from(error: flatppl_data::Error) -> Self {
+        Error(error.0)
+    }
+}
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {

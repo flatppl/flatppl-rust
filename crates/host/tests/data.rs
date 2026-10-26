@@ -395,7 +395,11 @@ fn malformed_tables_refuse_with_the_reason() -> Result<(), Box<dyn std::error::E
     let dir = directory("malformed");
     let path = dir.join("query.flatppl");
     for (file, text, reason) in [
-        ("ragged.csv", "a,b\n1,2\n3\n", "CSV"),
+        (
+            "ragged.csv",
+            "a,b\n1,2\n3\n",
+            "row 2 has 1 fields, but the first row names 2 columns",
+        ),
         (
             "ragged.wsv",
             "a b\n1 2\n3\n",

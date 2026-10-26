@@ -700,13 +700,13 @@ fn read_formula_table(path: &Path) -> Result<flatppl_formula::Table, Failure> {
     flatppl_cli::require_regular_file(path).map_err(reading)?;
     let bytes = fs::read(path).map_err(reading)?;
     let table = match path.extension().and_then(|s| s.to_str()) {
-        Some("csv") => flatppl_formula::Table::from_csv(bytes.as_slice()),
-        Some("json") => flatppl_formula::Table::from_json(
+        Some("csv") => flatppl_formula::read_csv_table(bytes.as_slice()),
+        Some("json") => flatppl_formula::read_json_table(
             std::str::from_utf8(&bytes).map_err(|e| format!("table JSON must be UTF-8: {e}"))?,
         ),
         #[cfg(feature = "formula-arrow")]
         Some("arrow" | "arrows" | "ipc" | "feather") => {
-            flatppl_formula::Table::from_arrow_ipc(&bytes)
+            flatppl_formula::Table::from_arrow_ipc(&bytes).map_err(flatppl_formula::Error::from)
         }
         #[cfg(not(feature = "formula-arrow"))]
         Some("arrow" | "arrows" | "ipc" | "feather") => {

@@ -1,3 +1,4 @@
+use crate::data::ColumnModel;
 use crate::{ColumnValues, DataValue, Error, Result, Table};
 use serde::{Deserialize, Serialize};
 use std::fmt;

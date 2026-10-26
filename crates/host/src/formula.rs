@@ -197,11 +197,13 @@ fn read_table(path: &Path) -> Result<Table, Diagnostic> {
     let bytes = std::fs::read(path).map_err(|e| fail(e.to_string()))?;
     let table =
         match path.extension().and_then(|s| s.to_str()) {
-            Some("csv") => Table::from_csv(bytes.as_slice()),
-            Some("json") => {
-                Table::from_json(std::str::from_utf8(&bytes).map_err(|e| fail(e.to_string()))?)
+            Some("csv") => flatppl_formula::read_csv_table(bytes.as_slice()),
+            Some("json") => flatppl_formula::read_json_table(
+                std::str::from_utf8(&bytes).map_err(|e| fail(e.to_string()))?,
+            ),
+            Some("arrow" | "arrows" | "ipc" | "feather") => {
+                Table::from_arrow_ipc(&bytes).map_err(flatppl_formula::Error::from)
             }
-            Some("arrow" | "arrows" | "ipc" | "feather") => Table::from_arrow_ipc(&bytes),
             _ => return Err(fail(
                 "formula data must be .csv, .json, or Arrow IPC (.arrow, .arrows, .ipc, .feather)"
                     .into(),

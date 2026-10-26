@@ -300,7 +300,7 @@ and remaps factor labels even when new data uses a different level order.
 It rejects unseen factor and group levels.
 Build a new recipe for a new fit or cross-validation fold.
 
-`Table::from_json(text)` accepts the typed table format, an array of row objects,
+`flatppl_formula::read_json_table(text)` accepts the typed table format, an array of row objects,
 or an object of column arrays. Missing record fields and `null` cells remain
 missing until model-frame construction. String columns become unordered factors
 with sorted levels. Boolean, numeric and string values cannot be mixed in a
@@ -310,15 +310,17 @@ exactly representable; overflow and lossy promotion are errors. Typed tables
 retain explicit float32, factor levels and orderedness. All-null columns remain
 nullable numeric columns, so unused missing columns do not remove model rows.
 
-`Table::from_csv(reader)` accepts a headered CSV. Empty fields and the exact token
-`NA` are null, including quoted fields. Other whitespace and text are preserved.
+`flatppl_formula::read_csv_table(bytes)` accepts a headered CSV, read by
+`flatppl_data::read_csv`: fields are trimmed, lines starting with `#` are
+skipped, and every row must have one field per column. Empty fields and the
+exact token `NA` are null, including quoted fields.
 Columns infer `true`/`false` or `TRUE`/`FALSE` booleans, signed 64-bit integers,
 finite float64 numbers, then unordered string factors with sorted levels.
 Numeric columns reject integer overflow and lossy integer-to-float promotion.
 CSV quoting supports commas, quotes and newlines in fields. Use typed JSON or
 Arrow when inference or these null tokens are unsuitable for a column.
 
-The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` for uncompressed
+The optional `arrow` feature adds `Table::from_arrow_ipc(bytes)` (from `flatppl-data`) for uncompressed
 IPC files and streams. It preserves float32, float64, integers, logical values,
 dictionary levels and orderedness, and null validity. Plain string columns use
 sorted levels. Dictionary indices are remapped across batches; ordered

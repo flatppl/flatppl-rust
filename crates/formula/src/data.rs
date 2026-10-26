@@ -1,38 +1,7 @@
 use crate::{Error, Family, Formula, GroupLevel, Recipe, Result, Trials};
+use flatppl_data::{Column, ColumnValues, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Table {
-    pub columns: Vec<Column>,
-    pub nrows: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Column {
-    pub name: String,
-    pub values: ColumnValues,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valid: Option<Vec<bool>>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", content = "values", rename_all = "snake_case")]
-pub enum ColumnValues {
-    Real32(Vec<f32>),
-    Real64(Vec<f64>),
-    Int(Vec<i64>),
-    Bool(Vec<bool>),
-    /// Zero-based codes. Explicit level order is preserved.
-    Factor {
-        levels: Vec<String>,
-        codes: Vec<u32>,
-        #[serde(default)]
-        ordered: bool,
-    },
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataMode {
@@ -88,54 +57,21 @@ impl DataDocument {
     }
 }
 
-impl Table {
-    pub(crate) fn column(&self, name: &str) -> Result<&Column> {
-        self.columns
-            .iter()
-            .find(|column| column.name == name)
-            .ok_or_else(|| Error(format!("missing data column `{name}`")))
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        let mut names = HashSet::new();
-        for column in &self.columns {
-            if !names.insert(&column.name) {
-                return Err(Error(format!("duplicate data column `{}`", column.name)));
-            }
-            let len = match &column.values {
-                ColumnValues::Real32(v) => v.len(),
-                ColumnValues::Real64(v) => v.len(),
-                ColumnValues::Int(v) => v.len(),
-                ColumnValues::Bool(v) => v.len(),
-                ColumnValues::Factor { levels, codes, .. } => {
-                    if levels.iter().collect::<HashSet<_>>().len() != levels.len() {
-                        return Err(Error(format!("duplicate levels in `{}`", column.name)));
-                    }
-                    if codes.iter().enumerate().any(|(i, &code)| {
-                        column
-                            .valid
-                            .as_ref()
-                            .is_none_or(|mask| mask.get(i) == Some(&true))
-                            && code as usize >= levels.len()
-                    }) {
-                        return Err(Error(format!("invalid factor code in `{}`", column.name)));
-                    }
-                    codes.len()
-                }
-            };
-            if len != self.nrows || column.valid.as_ref().is_some_and(|v| v.len() != len) {
-                return Err(Error(format!(
-                    "column `{}` has inconsistent row or validity lengths",
-                    column.name
-                )));
-            }
-        }
-        Ok(())
-    }
+/// Model-frame reads of a data column.
+pub(crate) trait ColumnModel {
+    fn like_factor(&self) -> bool;
+    fn present(&self, row: usize) -> bool;
+    fn numeric(&self, rows: &[usize]) -> Result<Vec<f64>>;
+    fn counts(&self, rows: &[usize]) -> Result<Vec<i64>>;
+    fn data(&self, rows: &[usize]) -> Result<DataValue>;
+    fn factor_levels(&self, rows: &[usize]) -> Option<(Vec<String>, bool)>;
+    fn factor_codes(&self, levels: &[String], rows: &[usize]) -> Result<Vec<i64>>;
+    fn level(&self, row: usize) -> Result<GroupLevel>;
+    fn levels(&self, rows: &[usize]) -> Result<Vec<GroupLevel>>;
 }
 
-impl Column {
-    pub(crate) fn like_factor(&self) -> bool {
+impl ColumnModel for Column {
+    fn like_factor(&self) -> bool {
         matches!(
             self.values,
             ColumnValues::Factor { .. } | ColumnValues::Bool(_)
@@ -151,7 +87,7 @@ impl Column {
             }
     }
 
-    pub(crate) fn numeric(&self, rows: &[usize]) -> Result<Vec<f64>> {
+    fn numeric(&self, rows: &[usize]) -> Result<Vec<f64>> {
         let values: Vec<_> = match &self.values {
             ColumnValues::Real32(v) => rows.iter().map(|&i| f64::from(v[i])).collect(),
             ColumnValues::Real64(v) => rows.iter().map(|&i| v[i]).collect(),
@@ -218,7 +154,7 @@ impl Column {
         Ok(values)
     }
 
-    pub(crate) fn factor_levels(&self, rows: &[usize]) -> Option<(Vec<String>, bool)> {
+    fn factor_levels(&self, rows: &[usize]) -> Option<(Vec<String>, bool)> {
         match &self.values {
             ColumnValues::Factor {
                 levels,
@@ -243,7 +179,7 @@ impl Column {
         }
     }
 
-    pub(crate) fn factor_codes(&self, levels: &[String], rows: &[usize]) -> Result<Vec<i64>> {
+    fn factor_codes(&self, levels: &[String], rows: &[usize]) -> Result<Vec<i64>> {
         let indices: HashMap<_, _> = levels
             .iter()
             .enumerate()
@@ -297,7 +233,7 @@ impl Column {
         })
     }
 
-    pub(crate) fn levels(&self, rows: &[usize]) -> Result<Vec<GroupLevel>> {
+    fn levels(&self, rows: &[usize]) -> Result<Vec<GroupLevel>> {
         if let ColumnValues::Factor { levels, codes, .. } = &self.values {
             let observed: HashSet<_> = rows.iter().map(|&row| codes[row] as usize).collect();
             return Ok(levels
@@ -386,7 +322,7 @@ pub(crate) fn model_rows(
         .chain(se_columns)
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
-        .map(|name| table.column(name))
+        .map(|name| table.column(name).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
     let mut rows: Vec<_> = (0..table.nrows)
         .filter(|&row| columns.iter().all(|column| column.present(row)))

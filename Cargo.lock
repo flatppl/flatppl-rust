@@ -602,6 +602,19 @@ name = "flatppl-core"
 version = "0.1.0"
 
 [[package]]
+name = "flatppl-data"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "csv",
+ "half",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flatppl-determinizer"
 version = "0.1.0"
 dependencies = [
@@ -639,9 +652,9 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
- "csv",
  "flatppl-convert",
  "flatppl-core",
+ "flatppl-data",
  "flatppl-infer",
  "flatppl-syntax",
  "nalgebra",
@@ -653,9 +666,9 @@ dependencies = [
 name = "flatppl-host"
 version = "0.1.0"
 dependencies = [
- "csv",
  "flatppl-bundle",
  "flatppl-core",
+ "flatppl-data",
  "flatppl-determinizer",
  "flatppl-fileaccess",
  "flatppl-formula",
@@ -664,7 +677,6 @@ dependencies = [
  "flatppl-mathdoc",
  "flatppl-stablehlo",
  "flatppl-syntax",
- "half",
  "serde",
  "serde_json",
  "sha2",

@@ -27,7 +27,7 @@ fn categorical_prediction_reuses_each_category_predictor() -> Result<(), Box<dyn
         None,
     )?;
     let training = score.compile(&EmitOptions::default())?;
-    let prediction = flatppl_formula::Table::from_json(r#"{"x":[-1,2,8]}"#)?;
+    let prediction = flatppl_formula::read_json_table(r#"{"x":[-1,2,8]}"#)?;
     let prediction = model.prepare(&mut context, &prediction, DataMode::Prediction)?;
     context.register("prediction.flatppl", &prediction)?;
     let query = context.parse(
