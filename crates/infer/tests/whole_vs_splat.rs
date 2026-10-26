@@ -373,3 +373,61 @@ fn a_point_field_must_lie_in_its_input_domain() {
         ],
     );
 }
+
+#[test]
+fn a_point_field_keeps_its_rows_its_kind_and_its_field_order() {
+    // A table's row count is part of its type; §07's first-`n` rule covers what
+    // `load_data` reads, not a likelihood point.
+    let table = |rows: &str| {
+        format!(
+            "t = elementof(cartpow(cartprod(x = reals, w = reals), 3))\n\
+             y ~ Normal(sum(t.x), 1.0)\nK = kernelof(record(y = y), t = t)\n\
+             L = likelihoodof(K, record(y = 1.0))\nlp = logdensityof(L, record(t = {rows}))\n"
+        )
+    };
+    assert_clean(&table("table(x = [1.0, 2.0, 5.0], w = [3.0, 4.0, 6.0])"));
+    assert_refused(
+        &table("table(x = [1.0, 2.0], w = [3.0, 4.0])"),
+        &["of 2 rows", "declared table(x: real, w: real) of 3 rows"],
+    );
+    // §03 inclusion: booleans ⊂ integers ⊂ reals, so a real does not fill an integer
+    // input, while an integer fills a real one.
+    let count = |n: &str| {
+        format!(
+            "n = elementof(posintegers)\ny ~ Poisson(n)\nK = kernelof(record(y = y), n = n)\n\
+             L = likelihoodof(K, record(y = 3))\nlp = logdensityof(L, record(n = {n}))\n"
+        )
+    };
+    assert_clean(&count("2"));
+    assert_refused(&count("2.0"), &["binds `n` to real", "declared integer"]);
+    // §03: "Field order is part of the record's identity".
+    let record = |r: &str| {
+        format!(
+            "r = elementof(cartprod(a = reals, b = posreals))\ny ~ Normal(r.a, r.b)\n\
+             K = kernelof(record(y = y), r = r)\nL = likelihoodof(K, record(y = 1.0))\n\
+             lp = logdensityof(L, record(r = {r}))\n"
+        )
+    };
+    assert_clean(&record("record(a = 1.0, b = 2.0)"));
+    assert_refused(
+        &record("record(b = 2.0, a = 1.0)"),
+        &["field order is part of a record's identity (spec §03)"],
+    );
+}
+
+#[test]
+fn a_whole_argument_keeps_its_kind_and_its_field_order() {
+    assert_refused(
+        "n = elementof(posintegers)\nf = functionof(n * 2, n = n)\nz = f(2.0)\n",
+        &["bound whole to input `n`", "expects integer, got real"],
+    );
+    assert_clean(
+        "x = elementof(reals)\nf = functionof(x * 2.0, x = x)\nz = f(2)\n\
+         b = elementof(integers)\ng = functionof(b + 1, b = b)\nw = g(true)\n",
+    );
+    assert_refused(
+        "r = elementof(cartprod(a = reals, b = posreals))\nf = functionof(r.a + r.b, r = r)\n\
+         z = f(record(b = 2.0, a = 1.0))\n",
+        &["field order is part of a record's identity (spec §03)"],
+    );
+}

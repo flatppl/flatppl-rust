@@ -58,12 +58,25 @@ fn is_concrete_value(ty: &Type) -> bool {
 }
 
 /// True only when no value of type `actual` can lie in a domain of type
-/// `expected`. Scalar kinds are not compared: an integer is a real and the
-/// kinds are decided elsewhere. Anything undecided is compatible.
+/// `expected`. Scalar kinds follow §03's inclusion `booleans ⊂ integers ⊂ reals
+/// ⊂ complexes`, a record's field order is part of its identity (§03), and a
+/// table's row count is part of its type. Anything undecided is compatible.
 fn incompatible(expected: &Type, actual: &Type) -> bool {
     use Type::*;
+    let rank = |kind: &flatppl_core::ScalarType| match kind {
+        flatppl_core::ScalarType::Boolean => 0,
+        flatppl_core::ScalarType::Integer => 1,
+        flatppl_core::ScalarType::Real => 2,
+        flatppl_core::ScalarType::Complex => 3,
+    };
+    let fields = |a: &[(Symbol, Type)], b: &[(Symbol, Type)]| {
+        a.len() != b.len()
+            || a.iter()
+                .zip(b.iter())
+                .any(|((p, t), (q, u))| p != q || incompatible(t, u))
+    };
     match (expected, actual) {
-        (Scalar(_), Scalar(_)) => false,
+        (Scalar(want), Scalar(have)) => rank(have) > rank(want),
         (Scalar(_), Array { .. } | TVector { .. } | Record(_) | Tuple(_) | Table { .. }) => true,
         (Array { .. } | TVector { .. }, Scalar(_) | Record(_) | Tuple(_) | Table { .. }) => true,
         (Record(_), Scalar(_) | Array { .. } | TVector { .. } | Tuple(_) | Table { .. }) => true,
@@ -80,14 +93,17 @@ fn incompatible(expected: &Type, actual: &Type) -> bool {
         (TVector { len: a, elem: x }, TVector { len: b, elem: y }) => {
             matches!((a, b), (Dim::Static(p), Dim::Static(q)) if p != q) || incompatible(x, y)
         }
-        (Record(a), Record(b)) => {
-            a.len() != b.len()
-                || a.iter()
-                    .any(|(name, t)| match b.iter().find(|(n, _)| n == name) {
-                        Some((_, u)) => incompatible(t, u),
-                        None => true,
-                    })
-        }
+        (Record(a), Record(b)) => fields(a, b),
+        (
+            Table {
+                columns: a,
+                nrows: p,
+            },
+            Table {
+                columns: b,
+                nrows: q,
+            },
+        ) => matches!((p, q), (Dim::Static(m), Dim::Static(n)) if m != n) || fields(a, b),
         (Tuple(a), Tuple(b)) => {
             a.len() != b.len() || a.iter().zip(b.iter()).any(|(t, u)| incompatible(t, u))
         }
@@ -120,8 +136,8 @@ fn show(inf: &Inferencer<'_, '_>, ty: &Type) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Type::Table { columns, .. } => format!(
-            "table({})",
+        Type::Table { columns, nrows } => format!(
+            "table({}) of {nrows} rows",
             columns
                 .iter()
                 .map(|(n, t)| format!("{}: {}", inf.module.resolve(*n), show(inf, t)))
@@ -155,10 +171,11 @@ pub(crate) fn whole_binding_mismatch(
     }
     let hint = if is_aggregate(actual) { WHOLE_HINT } else { "" };
     Some(format!(
-        "bound whole to input `{}`, which expects {}, got {}{hint}",
+        "bound whole to input `{}`, which expects {}, got {}{}{hint}",
         names.first().map_or("", String::as_str),
         show(inf, expected),
         show(inf, actual),
+        type_hint(expected, actual),
     ))
 }
 
@@ -253,7 +270,7 @@ fn check_point_types(
                     "binds `{input}` to {}, but the input is declared {}{}",
                     show(inf, actual),
                     show(inf, expected),
-                    rowstack_hint(expected, actual),
+                    type_hint(expected, actual),
                 )
             })
         })
@@ -274,16 +291,25 @@ fn check_point_types(
     ))
 }
 
-/// A vector of vectors is not a matrix (spec §03); `rowstack` makes one of it.
-fn rowstack_hint(expected: &Type, actual: &Type) -> &'static str {
-    let (Type::Array { shape: matrix, .. }, Type::Array { shape: outer, elem }) =
-        (expected, actual)
-    else {
-        return "";
-    };
-    match (matrix.as_ref(), outer.as_ref(), elem.as_ref()) {
-        ([_, _], [_], Type::Array { shape: inner, .. }) if inner.len() == 1 => {
+/// The §03 rule behind a mismatch that the two spellings alone do not show: a
+/// vector of vectors is not a matrix, and field order is part of a record's
+/// identity.
+fn type_hint(expected: &Type, actual: &Type) -> &'static str {
+    match (expected, actual) {
+        (Type::Array { shape: matrix, .. }, Type::Array { shape: outer, elem })
+            if matrix.len() == 2
+                && outer.len() == 1
+                && matches!(elem.as_ref(), Type::Array { shape: inner, .. } if inner.len() == 1) =>
+        {
             "; a vector of vectors is not a matrix (spec §03), so pass `rowstack(…)` of it"
+        }
+        (Type::Record(a), Type::Record(b))
+        | (Type::Table { columns: a, .. }, Type::Table { columns: b, .. })
+            if a.len() == b.len()
+                && a.iter().zip(b.iter()).any(|((p, _), (q, _))| p != q)
+                && a.iter().all(|(n, _)| b.iter().any(|(m, _)| m == n)) =>
+        {
+            "; field order is part of a record's identity (spec §03)"
         }
         _ => "",
     }
