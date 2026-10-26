@@ -1,8 +1,8 @@
 use crate::{Column, ColumnValues, Error, Result, Table};
 use arrow_array::{
-    Array, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, RecordBatchReader, StringArray, StringViewArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array, types,
+    Array, BooleanArray, DictionaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatchReader, StringArray,
+    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array, types,
 };
 use arrow_ipc::reader::{FileReader, StreamReader};
 use arrow_schema::{DataType, Field};
@@ -155,6 +155,12 @@ fn column(field: &Field, values: &dyn Array) -> Result<Column> {
         };
     }
     let data = match values.data_type() {
+        DataType::Float16 => ColumnValues::Real32(
+            array::<Float16Array>(values)
+                .iter()
+                .map(|value| value.unwrap_or_default().to_f32())
+                .collect(),
+        ),
         DataType::Float32 => ColumnValues::Real32(
             array::<Float32Array>(values)
                 .iter()

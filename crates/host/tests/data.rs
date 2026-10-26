@@ -416,6 +416,11 @@ fn malformed_tables_refuse_with_the_reason() -> Result<(), Box<dyn std::error::E
             r#"[{"a": 1, "b": 2}, {"a": 3}]"#,
             "row 2 is missing field `b`",
         ),
+        (
+            "strings.json",
+            r#"{"a": [1, 2], "b": ["1.5", "2"]}"#,
+            "JSON string \"1.5\" is not a number or a boolean",
+        ),
     ] {
         std::fs::write(dir.join(file), text)?;
         let source = format!(
@@ -515,4 +520,137 @@ fn a_matrix_must_match_its_declared_shape() -> Result<(), Box<dyn std::error::Er
     );
     std::fs::remove_dir_all(dir)?;
     Ok(())
+}
+
+/// Every dtype §07 maps, through §03 inclusion: float into reals, integer into
+/// integers, BOOL into booleans.
+#[test]
+fn every_safetensors_dtype_reads_its_values() {
+    let fields = [
+        ("f64", "reals"),
+        ("f32", "reals"),
+        ("f16", "reals"),
+        ("bf16", "reals"),
+        ("i64", "integers"),
+        ("i32", "integers"),
+        ("i16", "integers"),
+        ("i8", "integers"),
+        ("u64", "integers"),
+        ("u32", "integers"),
+        ("u16", "integers"),
+        ("u8", "integers"),
+        ("bool", "booleans"),
+    ];
+    let domain = fields
+        .iter()
+        .map(|(name, set)| format!("{name} = cartpow({set}, 2)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outputs = fields
+        .iter()
+        .map(|(name, _)| format!("t.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let out = compile_at(&format!(
+        "t = load_data(\"dtypes.safetensors\", cartprod({domain}))\noutputs = ({outputs})"
+    ))
+    .unwrap();
+    let want: Vec<Vec<f64>> = [
+        [1.5, -2.0],
+        [1.5, -2.0],
+        [1.5, -2.0],
+        [1.5, -3.0],
+        [1.0, -2.0],
+        [1.0, -2.0],
+        [1.0, -2.0],
+        [1.0, -2.0],
+        [1.0, 2.0],
+        [1.0, 2.0],
+        [1.0, 2.0],
+        [1.0, 2.0],
+        [1.0, 0.0],
+    ]
+    .iter()
+    .map(|v| v.to_vec())
+    .collect();
+    assert_eq!(returned(&out), want);
+    let err = refusal(
+        "t = load_data(\"u64.safetensors\", cartprod(x = cartpow(integers, 1)))\noutputs = t.x",
+    );
+    assert!(
+        err.contains("U64 value 9223372036854775808 exceeds int64"),
+        "{err}"
+    );
+}
+
+/// The typed columns after every other Arrow layout read their values across two
+/// record batches, from the file and the stream alike.
+#[test]
+fn arrow_typed_columns_read_past_every_layout() {
+    for file in ["types.arrow", "types.arrows"] {
+        let columns = [
+            ("i8", "integers"),
+            ("i16", "integers"),
+            ("i32", "integers"),
+            ("i64", "integers"),
+            ("u8", "integers"),
+            ("u16", "integers"),
+            ("u32", "integers"),
+            ("u64", "integers"),
+            ("f16", "reals"),
+            ("f32", "reals"),
+            ("bool", "booleans"),
+        ];
+        let domain = columns
+            .iter()
+            .map(|(name, set)| format!("{name} = {set}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outputs = columns
+            .iter()
+            .map(|(name, _)| format!("t.{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let out = compile_at(&format!(
+            "t = load_data(\"{file}\", cartpow(cartprod({domain}), 4))\noutputs = ({outputs})"
+        ))
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let signed = vec![1.0, -2.0, 1.0, -2.0];
+        let unsigned = vec![1.0, 2.0, 1.0, 2.0];
+        let real = vec![1.5, -2.0, 1.5, -2.0];
+        let mut want = vec![signed; 4];
+        want.extend(vec![unsigned; 4]);
+        want.extend(vec![real.clone(), real, vec![1.0, 0.0, 1.0, 0.0]]);
+        assert_eq!(returned(&out), want, "{file}");
+        for (column, reason) in [
+            ("f64", "a value is missing"),
+            ("utf8", "holds Arrow strings"),
+            ("large_utf8", "holds Arrow strings"),
+            ("view", "holds Arrow strings"),
+            ("dict", "holds Arrow strings"),
+            ("binary", "unsupported Arrow type"),
+            ("list", "unsupported Arrow type"),
+            ("large_list", "unsupported Arrow type"),
+            ("list_view", "unsupported Arrow type"),
+            ("fixed_list", "unsupported Arrow type"),
+            ("struct", "unsupported Arrow type"),
+            ("sparse", "unsupported Arrow type"),
+            ("dense", "unsupported Arrow type"),
+            ("ree", "unsupported Arrow type"),
+            ("time", "unsupported Arrow type"),
+            ("null", "a value is missing"),
+        ] {
+            let err = refusal(&format!(
+                "t = load_data(\"{file}\", cartpow(cartprod({column} = reals), 4))\noutputs = t.{column}"
+            ));
+            assert!(err.contains(reason), "{file} {column}: {err}");
+        }
+    }
+    let err = refusal(
+        "t = load_data(\"compressed.arrow\", cartpow(cartprod(f64 = reals), 4))\noutputs = t.f64",
+    );
+    assert!(err.contains("Arrow IPC"), "{err}");
+    let err =
+        refusal("t = load_data(\"u64.arrow\", cartpow(cartprod(x = integers), 1))\noutputs = t.x");
+    assert!(err.contains("outside int64"), "{err}");
 }

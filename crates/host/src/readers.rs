@@ -115,7 +115,10 @@ fn json_datum(json: &Value) -> Result<Datum, String> {
             None if n.is_u64() => return Err(format!("integer {n} exceeds int64")),
             None => Datum::Number(n.as_f64().ok_or("number is not representable")?),
         },
-        Value::String(s) => Datum::Text(s.clone()),
+        // JSON types its values, and a string is not a number.
+        Value::String(s) => {
+            Datum::Unreadable(format!("JSON string {s:?} is not a number or a boolean"))
+        }
         Value::Array(items) => Datum::List(items.iter().map(json_datum).collect::<Result<_, _>>()?),
         Value::Object(fields) => Datum::Map(
             fields
