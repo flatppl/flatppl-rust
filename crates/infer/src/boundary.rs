@@ -202,7 +202,91 @@ pub(crate) fn refuse_bad_likelihood_point(
         Some(interface) => interface,
         None => joint_likelihood_interface(inf, &args[0])?,
     };
-    check_point(inf, name, what, at, &interface, &point_ty)
+    if let Some(failed) = check_point(inf, name, what, at, &interface, &point_ty) {
+        return Some(failed);
+    }
+    let declared = likelihood_kernel(inf, *likelihood)
+        .map(|kernel| declared_input_types(inf, kernel))
+        .unwrap_or_default();
+    check_point_types(inf, name, what, at, &interface, &declared, &point_ty)
+}
+
+/// The kernel of a `likelihoodof(K, obs)` binding.
+fn likelihood_kernel(inf: &Inferencer<'_, '_>, likelihood: NodeId) -> Option<NodeId> {
+    let Node::Call(call) = inf.module.node(resolve_binding_refs(inf, likelihood)) else {
+        return None;
+    };
+    let CallHead::Builtin(op) = call.head else {
+        return None;
+    };
+    (inf.module.resolve(op) == "likelihoodof")
+        .then(|| call.args.first().copied())
+        .flatten()
+}
+
+/// Each field of the point is the value of the kernel input it names, so a field
+/// whose type cannot lie in that input's declared domain is a located static error,
+/// as it is for a user call. An undecided type is never refused.
+fn check_point_types(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    what: &str,
+    at: NodeId,
+    interface: &Interface,
+    declared: &[Option<Type>],
+    point: &Type,
+) -> Option<Type> {
+    let Type::Record(fields) = point else {
+        return None;
+    };
+    let mismatches: Vec<String> = interface
+        .names
+        .iter()
+        .zip(declared)
+        .filter_map(|(input, expected)| {
+            let expected = expected.as_ref()?;
+            let (_, actual) = fields
+                .iter()
+                .find(|(field, _)| inf.module.resolve(*field) == input.as_str())?;
+            incompatible(expected, actual).then(|| {
+                format!(
+                    "binds `{input}` to {}, but the input is declared {}{}",
+                    show(inf, actual),
+                    show(inf, expected),
+                    rowstack_hint(expected, actual),
+                )
+            })
+        })
+        .collect();
+    if mismatches.is_empty() {
+        return None;
+    }
+    inf.diags.push(crate::Diagnostic::error_at(
+        at,
+        format!(
+            "`{name}`: the {what} {} (spec §06 `likelihoodof`: each field is the value of the \
+             input it names)",
+            mismatches.join(", and ")
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: the {what} lies outside the likelihood inputs").into(),
+    ))
+}
+
+/// A vector of vectors is not a matrix (spec §03); `rowstack` makes one of it.
+fn rowstack_hint(expected: &Type, actual: &Type) -> &'static str {
+    let (Type::Array { shape: matrix, .. }, Type::Array { shape: outer, elem }) =
+        (expected, actual)
+    else {
+        return "";
+    };
+    match (matrix.as_ref(), outer.as_ref(), elem.as_ref()) {
+        ([_, _], [_], Type::Array { shape: inner, .. }) if inner.len() == 1 => {
+            "; a vector of vectors is not a matrix (spec §03), so pass `rowstack(…)` of it"
+        }
+        _ => "",
+    }
 }
 
 /// `joint_likelihood(L1, L2, ...)` is `L(θ) = L1(θ) + L2(θ)` and is equivalent to

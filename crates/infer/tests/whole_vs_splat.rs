@@ -331,3 +331,45 @@ fn a_bare_scalar_prior_is_no_prior_for_a_one_input_likelihood() {
         ));
     }
 }
+
+const MATRIX_INPUT: &str = "\
+beta = elementof(cartpow(reals, 3))
+x_data = elementof(cartpow(reals, [2, 3]))
+y ~ Normal.(x_data * beta, 1.0)
+K = kernelof(record(y = y), beta = beta, x_data = x_data)
+data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 2))
+L = likelihoodof(K, record(y = data.y))
+";
+
+#[test]
+fn a_point_field_must_lie_in_its_input_domain() {
+    // Spec §06 `likelihoodof`: each field of the point is the value of the input it
+    // names. A column of 3-vectors is a vector of vectors (§03), not the declared
+    // 2 x 3 matrix, so binding it whole refuses at the point and names `rowstack`.
+    let point = |x: &str| {
+        format!(
+            "{MATRIX_INPUT}lp = logdensityof(L, record(beta = [1.0, 2.0, 3.0], x_data = {x}))\n"
+        )
+    };
+    assert_clean(&point("rowstack(data.x)"));
+    assert_refused(
+        &point("data.x"),
+        &[
+            "logdensityof",
+            "binds `x_data` to array of array of real",
+            "declared array of real [2, 3]",
+            "rowstack",
+        ],
+    );
+    assert_refused(
+        &point("2.0"),
+        &["binds `x_data` to real", "declared array of real [2, 3]"],
+    );
+    assert_refused(
+        &point("[1.0, 2.0]"),
+        &[
+            "binds `x_data` to array of real [2]",
+            "declared array of real [2, 3]",
+        ],
+    );
+}

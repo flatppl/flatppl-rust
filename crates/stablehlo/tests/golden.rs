@@ -11148,7 +11148,8 @@ outputs = lp
 /// and its `y` column is the likelihood variate. One `inputs` entry (`data`)
 /// contributes `%arg3` (`tensor<4x3xf32>`) and `%arg4` (`tensor<4xf32>`); the
 /// model's own `x_data` parameter is NOT an argument — the query point pins it
-/// to `data.x`, so it is substituted away and DCE drops it (§13: an `elementof`
+/// to `rowstack(data.x)` (a column of 3-vectors is a vector of vectors, §03, not
+/// a matrix), so it is substituted away and DCE drops it (§13: an `elementof`
 /// no output reaches "is eliminated like any other unreached binding"). The
 /// source `data.json` is never read.
 #[test]
@@ -11163,7 +11164,7 @@ y ~ Normal.(means, sigma)
 k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
 data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
 L = likelihoodof(k, record(y = data.y))
-lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = rowstack(data.x)))
 inputs = (alpha, beta, sigma, data)
 outputs = (lp)
 ";
@@ -11211,7 +11212,7 @@ y ~ Normal.(means, sigma)
 k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
 data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 20))
 L = likelihoodof(k, record(y = data.y))
-lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = rowstack(data.x)))
 inputs = (alpha, beta, sigma, data)
 outputs = (lp)
 ";

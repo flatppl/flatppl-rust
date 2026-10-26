@@ -406,3 +406,30 @@ fn an_array_x_of_an_approximation_function_is_refused() {
         "{c}y = polynomial(c, 0.5)\nz = broadcast(fn(polynomial(c, _)), xs)"
     ));
 }
+
+#[test]
+fn arithmetic_over_an_array_of_arrays_refuses() {
+    // §07 gives every arithmetic row scalars or real/complex arrays, and a vector of
+    // vectors is not a matrix (§03). The dotted operators apply the row per element.
+    let nested = "n = [[1.0, 2.0], [3.0, 4.0]]\n";
+    for (expr, op) in [
+        ("n + n", "add"),
+        ("n - n", "sub"),
+        ("n * n", "mul"),
+        ("n / 2.0", "divide"),
+        ("n ^ 2.0", "pow"),
+        ("-n", "neg"),
+    ] {
+        assert_refuses(
+            &format!("{nested}y = {expr}"),
+            &format!("`{op}` operand is an array of arrays, outside its domain"),
+        );
+    }
+    assert_refuses(
+        &format!("{nested}y = n + n"),
+        "`rowstack(…)` makes a matrix",
+    );
+    assert_clean(&format!(
+        "{nested}y = n .+ n\nz = n .* 2.0\nm = rowstack(n) * [1.0, 2.0]"
+    ));
+}
