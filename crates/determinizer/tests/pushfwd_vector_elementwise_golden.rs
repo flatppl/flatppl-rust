@@ -241,3 +241,78 @@ fn the_matrix_refusal_leaves_the_scalar_and_vector_ranks_alone() {
         );
     }
 }
+
+// `x .^ k` is `broadcast(pow, x, k)`: the exponent is a second operand, not part
+// of the operator, so the elementwise arm took it for a coupled or unknown map and
+// refused. Its cell map is `y -> y ^ k`, which the explicit per-cell spelling names.
+#[test]
+fn a_dotted_power_is_the_per_cell_power() {
+    for (k, base, point) in [
+        (
+            "3",
+            "iid(Normal(mu = 0.0, sigma = 1.0), 3)",
+            "[0.125, -1.0, 8.0]",
+        ),
+        ("2", "iid(Exponential(rate = 1.0), 3)", "[0.25, 1.0, 4.0]"),
+        (
+            "-1",
+            "iid(Gamma(shape = 3.0, rate = 2.0), 3)",
+            "[0.5, 1.0, 3.0]",
+        ),
+    ] {
+        let dotted = lp(&format!(
+            "d = pushfwd(x -> x .^ {k}, {base})\nlp = logdensityof(d, {point})"
+        ));
+        let per_cell = lp(&format!(
+            "d = pushfwd(x -> broadcast(y -> y ^ {k}, x), {base})\nlp = logdensityof(d, {point})"
+        ));
+        assert_eq!(dotted, per_cell, "`.^ {k}` over `{base}`");
+        assert!(
+            dotted.contains("(sum "),
+            "`.^ {k}`: diagonal log-det:\n{dotted}"
+        );
+    }
+}
+
+#[test]
+fn a_dotted_power_keeps_the_per_cell_domain_and_literal_rules() {
+    let normal = "iid(Normal(mu = 0.0, sigma = 1.0), 3)";
+    let exponential = "iid(Exponential(rate = 1.0), 3)";
+    for (map, base, want) in [
+        (
+            "x .^ 2",
+            normal,
+            "pow(_, 2) requires M's support to lie within its domain",
+        ),
+        (
+            "x .^ 0",
+            exponential,
+            "pow with exponent 0 is not invertible",
+        ),
+        (
+            "x .^ k",
+            exponential,
+            "pow(_, k) is recognised here only when k is a numeric literal",
+        ),
+        (
+            "x .^ [1.0, 2.0, 3.0]",
+            exponential,
+            "is recognised here only when k is a numeric literal",
+        ),
+    ] {
+        let mut m = flatppl_syntax::parse(&format!(
+            "k = 2.0\nd = pushfwd(x -> {map}, {base})\nlp = logdensityof(d, [0.25, 1.0, 4.0])"
+        ))
+        .unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let got = determinize(&m).expect_err("must refuse, not lower");
+        assert!(
+            got.reason.contains(want),
+            "`{map}` over `{base}`: got {}",
+            got.reason
+        );
+        // The synthesised cell map has no location, so the refusal names the
+        // broadcast the user wrote.
+        assert_eq!(got.construct, "broadcast", "`{map}`");
+    }
+}

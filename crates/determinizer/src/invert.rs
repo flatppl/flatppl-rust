@@ -144,7 +144,9 @@
 //! (`pushfwd(exp, M)`) is byte-equality-pinned against the explicit
 //! `bijection(exp, log, x -> x)`.
 
-use crate::density::{build_call, expect_builtin_call, fold_add, refuse, resolve_ref, static_real};
+use crate::density::{
+    build_call, expect_builtin_call, fold_add, name_construct, refuse, resolve_ref, static_real,
+};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
@@ -907,20 +909,14 @@ fn interval_witness(lo: f64, hi: f64) -> Option<f64> {
 
 /// The scalar per-cell operator of an elementwise forward map over a vector
 /// variate: the map ITSELF for the bare spelling (`pushfwd(exp, MvNormal)`), or
-/// `broadcast`'s operator for the lambda spelling (`x -> broadcast(exp, x)`).
+/// the [`elementwise_cell`] map for the lambda spelling (`x -> broadcast(exp, x)`,
+/// `x -> x .^ 3`).
 /// `None` for any other vector body — a matrix-affine map, or a coupled broadcast
 /// (both refused or onto, neither gated).
-fn elementwise_operator(m: &Module, f: NodeId) -> Option<NodeId> {
+fn elementwise_operator(m: &mut Module, f: NodeId) -> Option<NodeId> {
     match recognise(m, f) {
         Recognized::BareConst(_) => Some(f),
-        Recognized::Lambda { body, ph, .. } => {
-            let c = expect_builtin_call(m, body, "broadcast")?;
-            if !c.named.is_empty() || c.args.len() != 2 {
-                return None;
-            }
-            let (g, data) = (c.args[0], c.args[1]);
-            is_placeholder_ref(m, data, ph).then_some(g)
-        }
+        Recognized::Lambda { body, ph, .. } => elementwise_cell(m, body, ph),
         Recognized::Unrecognized => None,
     }
 }
@@ -2609,21 +2605,54 @@ fn derive_elementwise(
              elementwise unary map with a diagonal Jacobian — refuse rather than mislower",
         ));
     }
-    // The recognised shape is exactly `broadcast(g, x)`: one operand that IS the
-    // bare input placeholder. Anything else (zero operands, a non-placeholder
-    // operand such as `broadcast(exp, add(x, 1.0))`, or a lone constant) is not this
-    // arm — Ok(None), the caller refuses.
-    if data.len() != 1 || !is_placeholder_ref(m, data[0], ph) {
+    // The recognised shapes are `broadcast(g, x)` and `broadcast(pow, x, k)`, with
+    // `x` the bare input placeholder. Anything else (a non-placeholder operand such
+    // as `broadcast(exp, add(x, 1.0))`, or a lone constant) is not this arm —
+    // Ok(None), the caller refuses.
+    let Some(cell) = elementwise_cell(m, body, ph) else {
         return Ok(None);
-    }
-    // Recurse on the scalar operator `g` over the vector's element domain +
+    };
+    // Recurse on the scalar per-cell map over the vector's element domain +
     // element support (the per-cell scalar support the domain guard reads for a
     // `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
-    // recognised-but-non-invertible `g`).
-    let Some(g_bij) = derive_bijection(m, g, elem_domain, elem_support)? else {
+    // recognised-but-non-invertible `g`). A synthesised `pow` cell has no source
+    // location, so its refusal points at the broadcast.
+    let g_bij = derive_bijection(m, cell, elem_domain, elem_support).map_err(|mut e| {
+        if cell != g {
+            e.node = body;
+            e.construct = name_construct(m, body);
+        }
+        e
+    })?;
+    let Some(g_bij) = g_bij else {
         return Ok(None);
     };
     Ok(Some(wrap_elementwise(m, &g_bij)))
+}
+
+/// The scalar map an elementwise forward body applies to every cell: `g` for
+/// `broadcast(g, x)`, and `y -> pow(y, k)` for `broadcast(pow, x, k)` (`x .^ k`),
+/// whose exponent does not read the input and so is the same in every cell. The
+/// derivation and the image gate both read the cell map here, so they agree.
+fn elementwise_cell(m: &mut Module, body: NodeId, ph: Symbol) -> Option<NodeId> {
+    let args = {
+        let c = expect_builtin_call(m, body, "broadcast")?;
+        if !c.named.is_empty() {
+            return None;
+        }
+        c.args.to_vec()
+    };
+    match args[..] {
+        [g, data] => is_placeholder_ref(m, data, ph).then_some(g),
+        [g, data, k]
+            if is_const_named(m, g, "pow")
+                && is_placeholder_ref(m, data, ph)
+                && !refs_placeholder(m, k, ph) =>
+        {
+            Some(lambda(m, |m, y| build_call(m, "pow", &[y, k])))
+        }
+        _ => None,
+    }
 }
 
 /// The element type of a vector (1-D array) `domain` — the SCALAR domain a
