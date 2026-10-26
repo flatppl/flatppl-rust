@@ -149,6 +149,17 @@ impl Emitter<'_> {
             .collect()
     }
 
+    /// The value of a fixed, unbatched integer scalar.
+    pub(crate) fn constant_int(&self, value: &Value) -> Option<i64> {
+        if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
+            return None;
+        }
+        match self.constants.get(&value.ssa)?.as_ref() {
+            [Scalar::Int(n)] => Some(*n),
+            _ => None,
+        }
+    }
+
     pub(crate) fn constant_extent(&self, value: &Value) -> Option<u64> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;

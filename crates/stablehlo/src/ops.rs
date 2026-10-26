@@ -2421,6 +2421,25 @@ fn lower_linspace(
     args: &[NodeId],
     overflow: bool,
 ) -> Result<Value, EmitError> {
+    let points = linspace_points(e, id, args, overflow)?;
+    if !overflow {
+        return Ok(points);
+    }
+    let low = e.scalar(f64::NEG_INFINITY);
+    let low = e.vector(&[low]);
+    let high = e.scalar(f64::INFINITY);
+    let high = e.vector(&[high]);
+    e.concatenate(id, &[low, points, high])
+}
+
+/// The `linspace(from, to, n)` points of a `linspace` or `extlinspace` call `id`,
+/// without the overflow edges.
+pub(crate) fn linspace_points(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    overflow: bool,
+) -> Result<Value, EmitError> {
     let [from, to, _] = args_exact(id, args)?;
     let total = match e.node_ty(id)?.0 {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
@@ -2461,14 +2480,7 @@ fn lower_linspace(
         let at_start = e.compare("EQ", &index, &zero);
         e.select(&at_start, &from, &points)
     };
-    if !overflow {
-        return Ok(points);
-    }
-    let low = e.scalar(f64::NEG_INFINITY);
-    let low = e.vector(&[low]);
-    let high = e.scalar(f64::INFINITY);
-    let high = e.vector(&[high]);
-    e.concatenate(id, &[low, points, high])
+    Ok(points)
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {

@@ -13,7 +13,7 @@ use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
 
 use crate::emitter::{Axes, Emitter};
 use crate::mlir::{ElemKind, MlirTy, Value};
-use crate::ops::{args_exact, get_literal_value};
+use crate::ops::{args_exact, get_literal_value, linspace_points};
 use crate::refuse::EmitError;
 
 fn unbatched(e: &Emitter, id: NodeId, v: &Value, head: &str) -> Result<(), EmitError> {
@@ -99,7 +99,8 @@ fn layered(e: &mut Emitter, v: &Value, layers: Vec<usize>) -> Value {
     e.axes_view(v, Axes { batch: 0, layers })
 }
 
-/// `onehot(i, n)`: 1.0 at the 1-based position `i` of a length-`n` vector.
+/// `onehot(i, n)`: 1.0 at the 1-based position `i` of a length-`n` vector. A
+/// fixed `i` outside 1..n refuses, since §07 defines no value there.
 pub(crate) fn lower_onehot(
     e: &mut Emitter,
     id: NodeId,
@@ -115,6 +116,16 @@ pub(crate) fn lower_onehot(
         return Err(EmitError::at(
             id,
             "`onehot` under a broadcast has no lowering here: each cell is a vector",
+        ));
+    }
+    if let Some(k) = e.constant_int(&i)
+        && !(1..=n as i64).contains(&k)
+    {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "onehot: index {k} is outside 1..{n}; spec §07 defines `onehot(i, n)` for i ∈ {{1, …, n}}"
+            ),
         ));
     }
     let i = e.convert(&i, ElemKind::Real);
@@ -247,18 +258,33 @@ pub(crate) fn lower_partition(
     plain(e, id, xs, "partition")?;
     let sizes = written_sizes(e, id, spec, "partition")?;
     let n = sizes[0];
-    let groups = if sizes.len() == 1 {
-        (len % n == 0).then_some(len / n)
+    let k = if sizes.len() == 1 {
+        if len % n != 0 {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "partition: a vector of length {len} does not split into groups of {n}; spec §07 requires the group size to divide the length"
+                ),
+            ));
+        }
+        len / n
     } else {
-        (sizes.iter().all(|&k| k == n) && sizes.iter().sum::<u64>() == len)
-            .then_some(sizes.len() as u64)
-    };
-    let Some(k) = groups else {
-        return Err(EmitError::at(
-            id,
-            "partition: groups of unequal size make a ragged array, which has no tensor form here; \
-             equal groups lower (and the sizes must sum to the length, spec §07)",
-        ));
+        let total: u64 = sizes.iter().sum();
+        if total != len {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "partition: the group sizes sum to {total}, but the vector has length {len}; spec §07 requires them to sum to the length"
+                ),
+            ));
+        }
+        if sizes.iter().any(|&k| k != n) {
+            return Err(EmitError::at(
+                id,
+                "partition: groups of unequal size make a ragged array, which has no tensor form here; equal groups lower",
+            ));
+        }
+        sizes.len() as u64
     };
     let r = e.reshape(&v, tensor(&[k, n]));
     Ok(layered(e, &r, vec![1, 1]))
@@ -309,10 +335,12 @@ pub(crate) fn lower_blockdiagmat(
             "blockdiagmat: an empty vector of matrices has no tensor form here",
         ));
     }
+    // The element kind inference gives the result: integer blocks stay integer.
+    let kind = e.node_ty(id).map_or(ElemKind::Real, |(_, kind)| kind);
     let mut acc: Option<Value> = None;
     let (mut r0, mut c0) = (0, 0);
     for (b, (r, c)) in blocks.iter().zip(&shapes) {
-        let b = e.convert(b, ElemKind::Real);
+        let b = e.convert(b, kind);
         let p = e.pad_zeros(&b, &[r0, c0], &[rows - r0 - r, cols - c0 - c]);
         acc = Some(match acc {
             None => p,
@@ -324,7 +352,7 @@ pub(crate) fn lower_blockdiagmat(
     Ok(acc.expect("nonempty"))
 }
 
-/// `bandedmat(v, rows)`: row `i` holds `v` from column `i`.
+/// `bandedmat(v, rows)`: row `i` holds `v` from column `i`, in `v`'s element kind.
 pub(crate) fn lower_bandedmat(
     e: &mut Emitter,
     id: NodeId,
@@ -338,7 +366,6 @@ pub(crate) fn lower_bandedmat(
     let [m] = written_sizes(e, id, rows, "bandedmat")?[..] else {
         return Err(EmitError::at(id, "`bandedmat` takes a scalar row count"));
     };
-    let v = e.convert(&v, ElemKind::Real);
     let row = e.reshape(&v, tensor(&[1, k]));
     let mut acc: Option<Value> = None;
     for i in 0..m {
@@ -400,19 +427,54 @@ pub(crate) fn lower_bincounts(
     Ok(e.convert(&counts, ElemKind::Int))
 }
 
+/// The values of a fixed real scalar or vector, ±inf included. The emitter's
+/// constant table holds finite values only, so `inf`, `-inf`, a written vector
+/// holding them and `extlinspace` are read from the expression.
+fn fixed_reals(e: &mut Emitter, node: NodeId) -> Option<Vec<f64>> {
+    let node = e.resolve_ref_one(node);
+    let scalar = |e: &mut Emitter, n: NodeId| match fixed_reals(e, n)?[..] {
+        [x] => Some(x),
+        _ => None,
+    };
+    let head = match e.node(node).clone() {
+        Node::Const(s) => Some((e.resolve(s).to_owned(), Vec::new())),
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(h) => Some((e.resolve(h).to_owned(), c.args.to_vec())),
+            CallHead::User(_) => None,
+        },
+        _ => None,
+    };
+    match head.as_ref().map(|(h, a)| (h.as_str(), &a[..])) {
+        Some(("inf", [])) => return Some(vec![f64::INFINITY]),
+        Some(("neg", &[x])) => return scalar(e, x).map(|x| vec![-x]),
+        Some(("vector", args)) => return args.iter().map(|&a| scalar(e, a)).collect(),
+        Some(("extlinspace", args)) => {
+            let points = linspace_points(e, node, args, true).ok()?;
+            let mut edges = vec![f64::NEG_INFINITY];
+            edges.extend(e.constant_reals(&points)?);
+            edges.push(f64::INFINITY);
+            return Some(edges);
+        }
+        _ => {}
+    }
+    let v = e.lower_node(node).ok()?;
+    let v = if e.cell_ty(&v) == MlirTy::Scalar {
+        e.reshape(&v, MlirTy::Ranked(vec![Some(1)]))
+    } else {
+        v
+    };
+    e.constant_reals(&v)
+}
+
 /// The closed or half-open bounds of a `selectbins` region: `(lo, lo_open, hi)`.
 fn region_bounds(
     e: &mut Emitter,
     id: NodeId,
     region: NodeId,
 ) -> Result<(f64, bool, f64), EmitError> {
-    let fixed = |e: &mut Emitter, n: NodeId| -> Option<f64> {
-        let v = e.lower_node(n).ok()?;
-        if e.cell_ty(&v) != MlirTy::Scalar {
-            return None;
-        }
-        let v = e.reshape(&v, MlirTy::Ranked(vec![Some(1)]));
-        e.constant_reals(&v).map(|x| x[0])
+    let fixed = |e: &mut Emitter, n: NodeId| match fixed_reals(e, n)?[..] {
+        [x] => Some(x),
+        _ => None,
     };
     let resolved = e.resolve_ref_one(region);
     match e.node(resolved).clone() {
@@ -456,7 +518,7 @@ pub(crate) fn lower_selectbins(
     let [edges, region, counts] = args_exact(id, args)?;
     let ev = e.lower_node(edges)?;
     dims(e, id, &ev, "selectbins")?;
-    let Some(edges) = e.constant_reals(&ev) else {
+    let Some(edges) = fixed_reals(e, edges) else {
         return Err(EmitError::at(
             id,
             "selectbins: the edges must be fixed, since they decide the result length",
