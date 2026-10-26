@@ -479,7 +479,7 @@ fn arrow_columns_refuse_only_when_selected() {
     assert_eq!(returned(&out), vec![vec![1.5, 2.5]]);
     for (column, reason) in [
         ("n", "a value is missing"),
-        ("z", "a value is missing"),
+        ("z", "has the Arrow type Null, so every value is missing"),
         ("s", "column `s` holds Arrow strings"),
         ("t", "column `t` has unsupported Arrow type Timestamp"),
         ("l", "column `l` has unsupported Arrow type FixedSizeList"),
@@ -646,7 +646,7 @@ fn arrow_typed_columns_read_past_every_layout() {
             ("dense", "unsupported Arrow type"),
             ("ree", "unsupported Arrow type"),
             ("time", "unsupported Arrow type"),
-            ("null", "a value is missing"),
+            ("null", "has the Arrow type Null, so every value is missing"),
             ("dict_null", "a value is missing"),
         ] {
             let err = refusal(&format!(
@@ -679,9 +679,29 @@ fn arrow_typed_columns_read_past_every_layout() {
         (
             "huge_rows.arrows",
             "n",
-            "column `n` claims 1099511627776 rows of nulls, more than the file can hold",
+            "column `n` has the Arrow type Null, so every value is missing",
         ),
         ("bad_block.arrow", "a", "Arrow IPC"),
+        (
+            "short_block.arrow",
+            "a",
+            "malformed file (a footer block disagrees with its message)",
+        ),
+        (
+            "huge_lz4_2e50.arrow",
+            "a",
+            "states 1125899906842624 decompressed bytes",
+        ),
+        (
+            "huge_lz4_2e62.arrow",
+            "a",
+            "states 4611686018427387904 decompressed bytes",
+        ),
+        (
+            "many_null_batches.arrows",
+            "n",
+            "column `n` has the Arrow type Null, so every value is missing",
+        ),
     ] {
         let err = refusal(&format!(
             "t = load_data(\"{file}\", cartpow(cartprod({column} = reals), 3))\noutputs = t.{column}"
