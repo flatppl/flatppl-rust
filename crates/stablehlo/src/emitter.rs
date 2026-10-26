@@ -410,7 +410,9 @@ impl<'m> Emitter<'m> {
             .iter()
             .map(|&id| match (self.m.node(id), elem) {
                 (Node::Lit(Scalar::Bool(b)), ElemKind::Bool) => Some(b.to_string()),
-                (Node::Lit(Scalar::Int(i)), ElemKind::Int) => Some(i.to_string()),
+                (Node::Lit(Scalar::Int(i)), ElemKind::Int) if self.int_fits(*i) => {
+                    Some(i.to_string())
+                }
                 (Node::Lit(Scalar::Real(x)), ElemKind::Real) if x.is_finite() => {
                     Some(render_float_literal(*x))
                 }
@@ -3002,6 +3004,35 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Whether an integer value fits the dtype's integer width: the f32 dtype
+    /// uses i32 integer arithmetic and f64 uses i64, so a computed value
+    /// beyond it wraps as that arithmetic does.
+    pub(crate) fn int_fits(&self, i: i64) -> bool {
+        matches!(self.dtype, Dtype::F64) || i32::try_from(i).is_ok()
+    }
+
+    /// The integer a literal `neg(Lit(Int(p)))` spells, when `p` alone does not
+    /// fit the width. The parser writes `-2147483648` this way, and only the
+    /// negated value has to fit.
+    fn negated_wide_literal(&self, id: NodeId) -> Option<i64> {
+        let Node::Call(call) = self.m.node(id) else {
+            return None;
+        };
+        let CallHead::Builtin(head) = call.head else {
+            return None;
+        };
+        let [arg] = *call.args else {
+            return None;
+        };
+        if self.m.resolve(head) != "neg" || !call.named.is_empty() || self.memo.contains_key(&arg) {
+            return None;
+        }
+        match self.m.node(arg) {
+            Node::Lit(Scalar::Int(p)) if !self.int_fits(*p) => p.checked_neg(),
+            _ => None,
+        }
+    }
+
     /// `%N = stablehlo.constant dense<{i}> : tensor<i32|i64>` — a rank-0
     /// VALUE-path integer literal (`Node::Lit(Scalar::Int(_))`, spec §03),
     /// rendered at [`ElemKind::Int`] via [`MlirTy::render`] (dtype-configurable
@@ -4090,7 +4121,15 @@ impl<'m> Emitter<'m> {
     /// from it.
     fn lower_node_uncached(&mut self, id: NodeId) -> Result<Value, EmitError> {
         let m: &'m Module = self.m;
+        if let Some(i) = self.negated_wide_literal(id) {
+            return if self.int_fits(i) {
+                Ok(self.int_value_const(i))
+            } else {
+                Err(wide_integer(id, i))
+            };
+        }
         match m.node(id) {
+            Node::Lit(Scalar::Int(i)) if !self.int_fits(*i) => Err(wide_integer(id, *i)),
             Node::Lit(Scalar::Int(i)) => Ok(self.int_value_const(*i)),
             Node::Lit(Scalar::Real(x)) => Ok(self.constant(*x, MlirTy::Scalar)),
             Node::Lit(Scalar::Bool(b)) => Ok(self.bool_value_const(*b)),
@@ -4452,4 +4491,15 @@ fn render_bits_ty(ty: &MlirTy, dtype: Dtype) -> String {
         MlirTy::Tuple(_) => panic!("rng bits over a tuple type have no {elem} rendering"),
         MlirTy::Key => panic!("rng bits over an rng key have no {elem} rendering"),
     }
+}
+
+/// An out-of-range literal would wrap or fail to parse downstream.
+fn wide_integer(id: NodeId, i: i64) -> EmitError {
+    EmitError::at(
+        id,
+        format!(
+            "integer {i} is outside i32, the integer width of the f32 dtype; \
+             emit with the f64 dtype for i64 integers"
+        ),
+    )
 }
