@@ -160,6 +160,17 @@ with ipc.new_file(HERE / "zstd.arrow", table.schema,
 bad_key = pa.DictionaryArray.from_arrays(pa.array([0, 5], pa.int8()), pa.array([1.5]), safe=False)
 with ipc.new_stream(HERE / "bad_key.arrows", pa.schema([("x", bad_key.type)])) as writer:
     writer.write_batch(pa.record_batch({"x": bad_key}))
+# A record batch whose body length steps back onto its own message.
+sink = pa.BufferOutputStream()
+with ipc.new_stream(sink, pa.schema([("a", pa.float64()), ("b", pa.float64())])) as writer:
+    writer.write_batch(pa.record_batch({"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]}))
+stream = bytearray(sink.getvalue().to_pybytes())
+at = 8 + struct.unpack_from("<i", stream, 4)[0]  # past the schema message
+length = struct.unpack_from("<i", stream, at + 4)[0]
+metadata = stream[at + 8:at + 8 + length]
+assert metadata.count(struct.pack("<q", 48)) == 1  # the body length
+stream[at + 8:at + 8 + length] = metadata.replace(struct.pack("<q", 48), struct.pack("<q", -(8 + length)))
+(HERE / "negative_body.arrows").write_bytes(bytes(stream))
 # The out-of-range column must not spoil the readable one beside it.
 with ipc.new_file(HERE / "u64.arrow", pa.schema([("a", pa.float64()), ("x", pa.uint64())])) as writer:
     writer.write_table(pa.table({"a": pa.array([1.5], pa.float64()),

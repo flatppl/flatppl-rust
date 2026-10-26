@@ -666,6 +666,10 @@ fn arrow_typed_columns_read_past_every_layout() {
         "t = load_data(\"bad_key.arrows\", cartpow(cartprod(x = reals), 2))\noutputs = t.x",
     );
     assert!(err.contains("Arrow IPC"), "{err}");
+    let err = refusal(
+        "t = load_data(\"negative_body.arrows\", cartpow(cartprod(a = reals), 3))\noutputs = t.a",
+    );
+    assert!(err.contains("Invalid IPC message body length"), "{err}");
 }
 
 /// A JSON integer beyond int64 refuses only when selected.
