@@ -2809,10 +2809,6 @@ fn get_gather_value(
     Ok(e.gather(&operand, &idx, base))
 }
 
-/// `get`/`get0`'s selector must be a literal integer (matching how the
-/// determiniser always builds it, `Node::Lit(Scalar::Int(_))`) — refused
-/// otherwise rather than attempting to lower a general expression to a
-/// compile-time slice bound.
 /// `get(v, index)` over an already-lowered `v` whose outer axis is a vector
 /// axis — a table column indexed by row.
 pub(crate) fn get_outer(
@@ -2832,6 +2828,10 @@ pub(crate) fn get_outer(
     get_gather_value(e, id, v, idx, base)
 }
 
+/// `get`/`get0`'s selector must be a literal integer (matching how the
+/// determiniser always builds it, `Node::Lit(Scalar::Int(_))`) — refused
+/// otherwise rather than attempting to lower a general expression to a
+/// compile-time slice bound.
 fn literal_index(e: &Emitter, id: NodeId, index: NodeId) -> Result<i64, EmitError> {
     match e.node(index) {
         Node::Lit(Scalar::Int(i)) => Ok(*i),

@@ -6,44 +6,20 @@
 use super::*;
 
 impl Emitter<'_> {
-    /// The declared field names of a record- or table-typed node. A table row
-    /// `t[i]` has its table's columns as fields (spec §03 "Tables"), also when
-    /// a runtime `i` leaves the row's own type unresolved.
+    /// The declared field names of a record- or table-typed node.
     pub(crate) fn record_fields(&self, id: NodeId) -> Option<Vec<String>> {
-        let ty = match self.type_of(id) {
-            Some(ty @ (Type::Record(_) | Type::Table { .. })) => ty,
-            _ => self.row_table(id).and_then(|table| self.type_of(table))?,
-        };
-        let (Type::Record(fields)
-        | Type::Table {
-            columns: fields, ..
-        }) = ty
-        else {
-            return None;
-        };
-        Some(
-            fields
-                .iter()
-                .map(|(name, _)| self.m.resolve(*name).to_owned())
-                .collect(),
-        )
-    }
-
-    /// The table `t` when `id` is the row access `get(t, i)` or `get0(t, i)`.
-    fn row_table(&self, id: NodeId) -> Option<NodeId> {
-        let Node::Call(c) = self.m.node(self.resolve_ref_one(id)) else {
-            return None;
-        };
-        let CallHead::Builtin(head) = c.head else {
-            return None;
-        };
-        match (self.m.resolve(head), &c.args[..]) {
-            ("get" | "get0", [table, selector])
-                if matches!(self.type_of(*table), Some(Type::Table { .. }))
-                    && !matches!(self.m.node(*selector), Node::Lit(Scalar::Str(_))) =>
-            {
-                Some(*table)
-            }
+        match self.type_of(id) {
+            Some(
+                Type::Record(fields)
+                | Type::Table {
+                    columns: fields, ..
+                },
+            ) => Some(
+                fields
+                    .iter()
+                    .map(|(name, _)| self.m.resolve(*name).to_owned())
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -144,20 +120,8 @@ impl Emitter<'_> {
                 if crate::norms::TABLE_REDUCTIONS.contains(&head)
                     && matches!(self.type_of(*table), Some(Type::Table { .. })) =>
             {
-                match self.lower_field(*table, name)? {
-                    Lowered::Tensor(column) => {
-                        crate::norms::reduce_column(self, resolved, head, column)
-                            .map(Lowered::Tensor)
-                    }
-                    Lowered::Record(_) => Err(EmitError::at(
-                        resolved,
-                        format!(
-                            "{head}: column `{name}` is itself a table, and §07 \"Table \
-                             reductions\" reduces a column of values, so this has no per-column \
-                             reduction"
-                        ),
-                    )),
-                }
+                let column = self.lower_field(*table, name)?;
+                self.reduce_columns(resolved, head, column)
             }
             ("broadcast", [callable, rest @ ..])
                 if let Some(function) = self.resolve_functionof(*callable) =>
@@ -191,6 +155,26 @@ impl Emitter<'_> {
                 name,
                 &format!("a record-valued `{head}`"),
             )),
+        }
+    }
+
+    /// §07 "Table reductions" over one column. §03 "Tables" lets a column be a
+    /// table, and that column reduces column-wise in turn.
+    fn reduce_columns(
+        &mut self,
+        id: NodeId,
+        head: &str,
+        column: Lowered,
+    ) -> Result<Lowered, EmitError> {
+        match column {
+            Lowered::Tensor(column) => {
+                crate::norms::reduce_column(self, id, head, column).map(Lowered::Tensor)
+            }
+            Lowered::Record(columns) => columns
+                .into_iter()
+                .map(|(name, column)| Ok((name, self.reduce_columns(id, head, column)?)))
+                .collect::<Result<_, _>>()
+                .map(Lowered::Record),
         }
     }
 

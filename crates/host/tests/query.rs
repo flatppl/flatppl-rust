@@ -699,3 +699,31 @@ fn a_record_output_exports_one_result_per_field() -> Result<(), Box<dyn std::err
     );
     Ok(())
 }
+
+/// A runtime row index gives the row record, so the host schema and the CLI
+/// both flatten `data[i]` into one result per column.
+#[test]
+fn a_runtime_row_output_exports_one_result_per_column() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "data = elementof(cartpow(cartprod(x = reals, y = reals), 4))\ni = elementof(posintegers)\n\
+         inputs = (data, i)\noutputs = data[i]",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let leaf = |index: usize| json!({"kind": "tensor", "index": index, "dtype": "float32", "shape": [], "value_type": "real"});
+    assert_eq!(
+        serde_json::to_value(&exported.output)?,
+        json!({"kind": "record", "fields": [
+            {"name": "x", "value": leaf(0)},
+            {"name": "y", "value": leaf(1)},
+        ]})
+    );
+    assert!(
+        exported.stablehlo.contains("-> (tensor<f32>, tensor<f32>)"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}

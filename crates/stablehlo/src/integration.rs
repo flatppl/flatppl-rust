@@ -11,7 +11,8 @@ use super::*;
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum IntegralInput {
     Node(NodeId),
-    Column(NodeId, String),
+    /// Leaf `usize` of a bound record field, in `Lowered::leaves` order.
+    Column(NodeId, String, usize),
 }
 
 const NODES: [f64; 15] = [
@@ -329,11 +330,19 @@ impl Emitter<'_> {
             let resolved = self.resolve_ref_one(id);
             for (name, _) in fields {
                 let key = (resolved, self.resolve(*name).to_owned());
-                if let Some(Lowered::Tensor(value)) = self.columns.get(&key)
-                    && self.batch_rank(value) != 0
-                    && bound.insert(key.clone())
-                {
-                    inputs.push((IntegralInput::Column(key.0, key.1), value.clone()));
+                let Some(field) = self.columns.get(&key) else {
+                    continue;
+                };
+                if !bound.insert(key.clone()) {
+                    continue;
+                }
+                let mut leaves = Vec::new();
+                field.clone().leaves(&mut leaves);
+                for (leaf, value) in leaves.into_iter().enumerate() {
+                    if self.batch_rank(&value) != 0 {
+                        let input = IntegralInput::Column(key.0, key.1.clone(), leaf);
+                        inputs.push((input, value));
+                    }
                 }
             }
             if resolved != id {
@@ -439,8 +448,13 @@ impl Emitter<'_> {
                         let value = e.scan_slice(&value, &index);
                         match input {
                             IntegralInput::Node(node) => e.bind(*node, value),
-                            IntegralInput::Column(node, field) => {
-                                e.columns.insert((*node, field.clone()), Lowered::Tensor(value));
+                            IntegralInput::Column(node, field, leaf) => {
+                                let key = (*node, field.clone());
+                                let mut leaves = Vec::new();
+                                e.columns[&key].clone().leaves(&mut leaves);
+                                leaves[*leaf] = value;
+                                let rebuilt = e.columns[&key].with_leaves(&mut leaves.into_iter());
+                                e.columns.insert(key, rebuilt);
                             }
                         }
                     }

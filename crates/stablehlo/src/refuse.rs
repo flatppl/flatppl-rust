@@ -651,23 +651,18 @@
 //!   field (`Emitter::lower_value`), so this is reached only by a tensor
 //!   consumer.
 //!
+//! - a residual measure-layer type (`Measure`/`Kernel`/`Likelihood`) —
+//!   "residual measure-layer type in FlatPDL"
+//! - any other non-tensor type — "type has no MLIR tensor form: {ty:?}"
+//!   (names the offending type via `Debug`)
+//!
 //! **`records.rs`** (`Emitter::lower_value`/`lower_field`, record values):
 //! - a field the record does not declare — "the record has no field '...'"
 //! - a field of a record producer with no record lowering (a record-valued
 //!   user call, a record-valued sample slot) — "field '...' of ... has no
 //!   lowering: its producer has no record form here"
-//! - a table reduction over a column that is itself a table — "...: column
-//!   '...' is itself a table, and §07 \"Table reductions\" reduces a column
-//!   of values, ..."
 //! - `ifelse` over records with different fields — "ifelse: the two branches
 //!   are records with different fields"
-//! - (`sequences.rs`) a nested record as a scan state, broadcast argument or
-//!   Dirac atom — "field '...' is itself a record; a scan state, a broadcast
-//!   argument and a Dirac atom carry one tensor per field here"
-//! - a residual measure-layer type (`Measure`/`Kernel`/`Likelihood`) —
-//!   "residual measure-layer type in FlatPDL"
-//! - any other non-tensor type — "type has no MLIR tensor form: {ty:?}"
-//!   (names the offending type via `Debug`)
 //!
 //! Message wording is not perfectly uniform — e.g. `ops::args_exact`'s
 //! generic arity message has no primitive-name prefix, unlike
