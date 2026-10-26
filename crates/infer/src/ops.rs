@@ -369,6 +369,9 @@ fn op_rule(
             _ => table_type(inf, named),
         },
         "rowstack" | "colstack" => stack_type(arg_ty(args, 0), name == "colstack"),
+        "get" | "get0" if refuse_real_index(inf, &name, args) => {
+            Type::Failed(format!("{name}: real-typed index").into())
+        }
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
         // §07 gives every comparison ("Operator-equivalent functions") and every
@@ -8968,6 +8971,35 @@ fn refuse_shape_outside_sig(
         let who = who.trim_matches('`');
         Type::Failed(format!("{who}: {which} is outside its declared shape").into())
     })
+}
+
+/// Refuse a real or complex index (or an array of them) in a `get` / `get0` selector.
+/// An index is an integer by TYPE, alongside the separate 1-based rule: `v[1.0]` writes
+/// a real, whatever number it holds.
+fn refuse_real_index(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> bool {
+    let mut refused = false;
+    for (i, (node, ty, _)) in args.iter().enumerate().skip(1) {
+        let elem = match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => elem.as_ref(),
+            other => other,
+        };
+        let Type::Scalar(got @ (ScalarType::Real | ScalarType::Complex)) = elem else {
+            continue;
+        };
+        let subject = format!(
+            "`{name}`'s selector {i}{} is",
+            if elem == ty { "" } else { " vector" }
+        );
+        let message = non_integral_message(
+            &subject,
+            *got,
+            &format!("§07 `{name}`"),
+            crate::catalogue::ScalarTag::Integer,
+        );
+        inf.diags.push(crate::Diagnostic::error_at(*node, message));
+        refused = true;
+    }
+    refused
 }
 
 /// The refusal of a real or complex argument where an integer or boolean domain is

@@ -7,6 +7,9 @@
 //! §08 also declares its vector parameters "array of reals", and §03 "Arrays" makes a
 //! transposed vector a distinct type, so `MvNormal(transpose(v), C)` is refused.
 //!
+//! An index is an integer too, so a real `get` selector is refused alongside the
+//! separate 1-based rule.
+//!
 //! Every refusal must carry a location.
 
 use flatppl_infer::{Diagnostic, Severity, infer};
@@ -105,5 +108,30 @@ fn a_transposed_vector_is_not_an_array_parameter() {
             src,
             &format!("{param} is a transposed vector, but spec §08 declares it an array"),
         );
+    }
+}
+
+#[test]
+fn a_real_typed_index_is_refused_whatever_its_value() {
+    for (src, needle) in [
+        (
+            "x = get(v, 1.0)",
+            "`get`'s selector 1 is a real, but spec §07 `get` declares it an integer",
+        ),
+        ("x = v[1.0]", "`get`'s selector 1 is a real"),
+        ("x = C[1, 2.0]", "`get`'s selector 2 is a real"),
+        ("x = get0(v, 0.0)", "`get0`'s selector 1 is a real"),
+        ("x = v[[1.0, 2.0]]", "`get`'s selector 1 vector is a real"),
+    ] {
+        assert_refuses(src, needle);
+    }
+    for src in [
+        "x = v[1]",
+        "x = v[[1, 2]]",
+        "x = C[all, 1]",
+        "x = record(a = 1.0).a",
+    ] {
+        let errs = errors(src);
+        assert!(errs.is_empty(), "`{src}` must type; got: {errs:?}");
     }
 }
