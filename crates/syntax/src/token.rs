@@ -758,9 +758,7 @@ impl Lexer {
     fn lex_doc(&mut self) -> Result<()> {
         let start = self.byte_pos();
         let line = self.line;
-        let is_block = self.peek() == Some('%')
-            && self.peek2() == Some('%')
-            && self.chars.get(self.pos + 2).copied() == Some('%');
+        let is_block = self.opens_doc_block();
 
         if is_block {
             self.bump();
@@ -833,6 +831,34 @@ impl Lexer {
     /// Recognize an optional `md` / `typ` markup tag immediately after the
     /// leading `%` / `%%%` (no intervening space). Consumes the tag and one
     /// separating space if present.
+    /// Does a `%%%` doc block open here? §05 `DocBlock ::= HWS* "%%%"
+    /// MarkupTag? HWS* Newline`, so the fence must start its line and only a
+    /// tag and horizontal whitespace may follow it. Any other `%%%` line is a
+    /// `DocLine`, as `### text` is a `LineComment`. An unknown tag still opens
+    /// the block, so that it is refused rather than read as text.
+    fn opens_doc_block(&self) -> bool {
+        if self.chars.get(self.pos..self.pos + 3) != Some(&['%'; 3][..]) {
+            return false;
+        }
+        let line_start = self.chars[..self.pos]
+            .iter()
+            .rev()
+            .find(|&&c| c != ' ' && c != '\t')
+            .is_none_or(|&c| c == '\n' || c == '\r');
+        let mut i = self.pos + 3;
+        while self
+            .chars
+            .get(i)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            i += 1;
+        }
+        while matches!(self.chars.get(i), Some(' ' | '\t')) {
+            i += 1;
+        }
+        line_start && matches!(self.chars.get(i), None | Some('\n' | '\r'))
+    }
+
     fn read_doc_tag(&mut self) -> Option<String> {
         for tag in ["md", "typ"] {
             let tag_chars: Vec<char> = tag.chars().collect();
@@ -1142,6 +1168,54 @@ mod tests {
             assert!(error.message.contains("markup tag `rst`"), "got: {error}");
         }
         assert_eq!(docs("% rest\nx = 1")[0].lines, ["rest"]);
+    }
+
+    // §05 `DocBlock ::= HWS* "%%%" MarkupTag? HWS* Newline`. Any other `%%%`
+    // line is a `DocLine`, so it must not open a block and swallow the lines
+    // below it.
+    #[test]
+    fn a_doc_fence_with_text_is_a_single_line_doc() {
+        let got = docs("%%% Prior mean\nmu = 0.0\n%%%md note\nsigma = 1.0\n");
+        let lines: Vec<_> = got
+            .iter()
+            .map(|d| (d.tag.clone(), d.lines.clone()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (None, vec!["%% Prior mean".to_string()]),
+                (None, vec!["%%md note".to_string()]),
+            ]
+        );
+        assert!(kinds("%%% Prior mean\nmu = 0.0\n").contains(&TokenKind::Name("mu".into())));
+        let error = tokenize("%%% junk\ntext\n%%%\nx = 1\n").unwrap_err();
+        assert_eq!(error.message, "unterminated `%%%` doc block");
+        assert_eq!(error.line, 3);
+    }
+
+    #[test]
+    fn a_doc_fence_opens_only_at_line_start() {
+        let got = docs("x = 1 %%%\ny = 2\n");
+        assert_eq!(got.len(), 1);
+        assert!(got[0].trailing);
+        assert_eq!(got[0].lines, ["%%"]);
+        assert!(kinds("x = 1 %%%\ny = 2\n").contains(&TokenKind::Name("y".into())));
+    }
+
+    #[test]
+    fn a_doc_fence_may_carry_a_tag_and_trailing_whitespace() {
+        let got = docs("%%%typ  \nline\n%%%\nx = 1\n  %%%\t\nmore\n%%%\ny = 2\n");
+        let lines: Vec<_> = got
+            .iter()
+            .map(|d| (d.tag.clone(), d.lines.clone()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (Some("typ".to_string()), vec!["line".to_string()]),
+                (None, vec!["more".to_string()]),
+            ]
+        );
     }
 
     #[test]
