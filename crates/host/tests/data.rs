@@ -688,6 +688,13 @@ fn arrow_typed_columns_read_past_every_layout() {
         ));
         assert!(err.contains(reason), "{file}: {err}");
     }
+    let out = compile_at(
+        "t = load_data(\"lz4_runs.arrow\", cartpow(cartprod(x = reals), 1100))\noutputs = t.x",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut want = vec![1.5; 1000];
+    want.extend((0..100).map(|i| f64::from(i) * 0.25));
+    assert_eq!(returned(&out), vec![want]);
 }
 
 /// A JSON integer beyond int64 refuses only when selected.

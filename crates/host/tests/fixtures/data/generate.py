@@ -153,6 +153,11 @@ with ipc.new_stream(HERE / "types.arrows", table.schema) as writer:
 with ipc.new_file(HERE / "compressed.arrow", table.schema,
                   options=ipc.IpcWriteOptions(compression="lz4")) as writer:
     writer.write_table(table)
+# Long LZ4 matches and literal runs, which take extended length bytes.
+runs = np.concatenate([np.full(1000, 1.5), np.arange(100) * 0.25])
+with ipc.new_file(HERE / "lz4_runs.arrow", pa.schema([("x", pa.float64())]),
+                  options=ipc.IpcWriteOptions(compression="lz4")) as writer:
+    writer.write_table(pa.table({"x": runs}))
 with ipc.new_file(HERE / "zstd.arrow", table.schema,
                   options=ipc.IpcWriteOptions(compression="zstd")) as writer:
     writer.write_table(table)
