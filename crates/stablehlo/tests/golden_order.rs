@@ -623,26 +623,23 @@ outputs = (o1, o2)
 
 // ---- §07 "Table reductions" ---------------------------------------------------
 
-/// §07 makes `lany`/`lall` over a table a RECORD of per-column reductions, and this
-/// emitter represents every value as a tensor — so the refusal is the honest
-/// outcome, and it points at the column-wise spelling that does lower. Checked
-/// BEFORE the argument is lowered, so the blame lands on the reduction rather than
-/// on the table.
+/// §07 makes `lany`/`lall` over a table a RECORD of per-column reductions: one
+/// result per column, in declared order.
 #[test]
-fn a_table_boolean_reduction_refuses_and_names_the_column_form() {
-    let src = "\
-p = elementof(cartpow(booleans, 4))
-q = elementof(cartpow(booleans, 4))
-t = table(p = p, q = q)
-y = lall(t)
-inputs = (p, q)
-outputs = (y)
-";
-    let msg = emit_err(src);
-    assert!(
-        msg.contains("a table reduction has no tensor form") && msg.contains("`lall(data.x)`"),
-        "got: {msg}"
-    );
+fn a_table_boolean_reduction_reduces_each_column() {
+    for head in ["lany", "lall"] {
+        let query = |outputs: &str| {
+            format!(
+                "p = elementof(cartpow(booleans, 4))\nq = elementof(cartpow(booleans, 4))\n\
+                 t = table(p = p, q = q)\ninputs = (p, q)\noutputs = {outputs}\n"
+            )
+        };
+        assert_eq!(
+            emit(&query(&format!("{head}(t)"))),
+            emit(&query(&format!("({head}(p), {head}(q))"))),
+            "`{head}(t)` must reduce each column"
+        );
+    }
 }
 
 // ---- §07 the order statistics: refused ----------------------------------------

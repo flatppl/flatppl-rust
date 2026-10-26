@@ -130,39 +130,79 @@ pub(crate) enum Softmax {
 
 // ---- shared guards ------------------------------------------------------------
 
-/// The §07 "Table reductions" refusal, for a reduction head applied to a TABLE.
-///
-/// §07: "When `sum`, `mean`, `var`, `std`, `prod`, `maximum`, or `minimum` is
-/// applied to a table, the reduction operates column-wise and returns a record
-/// whose fields are the column names and values are the per-column reductions."
-/// This emitter has no record value — every [`Value`] is a tensor, and
-/// `crate::ops::lower_builtin`'s `"record"` arm refuses with "record has no
-/// tensor form" — so the result is not expressible here, and refusing is the
-/// honest outcome rather than lowering one column and calling it the answer.
-///
-/// Checked BEFORE the argument is lowered, for the reason
-/// `crate::ops::lower_sum` records: otherwise the argument's own refusal fires
-/// first and blames the wrong thing (a `load_data` table gives the
-/// column-wise-destructuring message, an `elementof` table "unsupported builtin
-/// head 'elementof'", neither of which mentions the reduction).
-pub(crate) fn table_reduction_refusal(id: NodeId, head: &str) -> EmitError {
+/// A §07 "Table reductions" head over a table reached where a tensor is
+/// required. The result is a record of per-column reductions, so only a field
+/// projection or a function result can carry it.
+pub(crate) fn table_reduction_in_tensor_position(id: NodeId) -> EmitError {
+    crate::refuse::record_in_tensor_position(id, "a table reduction")
+}
+
+/// A §07 head with the domain "vectors" applied to a table. §07 "Table
+/// reductions" lists the heads that act column-wise, and this head is not one.
+fn table_outside_vector_domain(id: NodeId, head: &str) -> EmitError {
     EmitError::at(
         id,
         format!(
-            "a table reduction has no tensor form: §07 \"Table reductions\" makes `{head}` over a \
-             table a RECORD of per-column reductions, and this emitter represents every value as a \
-             tensor. Reduce one column at a time instead — `{head}(data.x)` lowers, and a table \
-             input is already one argument per column"
+            "{head}: §07 gives this head the domain \"vectors\", and a table is not a vector; \
+             §07 \"Table reductions\" does not list `{head}` among the column-wise heads. Apply it \
+             to one column: `{head}(data.x)`"
         ),
     )
 }
 
-fn require_not_table(e: &Emitter, id: NodeId, head: &str, arg: NodeId) -> Result<(), EmitError> {
+pub(crate) fn require_not_table_vector(
+    e: &Emitter,
+    id: NodeId,
+    head: &str,
+    arg: NodeId,
+) -> Result<(), EmitError> {
     if matches!(e.type_of(arg), Some(Type::Table { .. })) {
-        return Err(table_reduction_refusal(id, head));
+        return Err(table_outside_vector_domain(id, head));
     }
     Ok(())
 }
+
+fn require_not_table(e: &Emitter, id: NodeId, arg: NodeId) -> Result<(), EmitError> {
+    if matches!(e.type_of(arg), Some(Type::Table { .. })) {
+        return Err(table_reduction_in_tensor_position(id));
+    }
+    Ok(())
+}
+
+/// One §07 "Table reductions" head applied to one column. The column carries
+/// the row axis first, so each head reduces it exactly as it reduces an array.
+pub(crate) fn reduce_column(
+    e: &mut Emitter,
+    id: NodeId,
+    head: &str,
+    column: Value,
+) -> Result<Value, EmitError> {
+    match head {
+        "sum" => Ok(e.reduce_sum(&column)),
+        "prod" => reduce_value(e, id, column, BareReduction::Prod),
+        "mean" => reduce_value(e, id, column, BareReduction::Mean),
+        "var" => reduce_value(e, id, column, BareReduction::Var),
+        "std" => reduce_value(e, id, column, BareReduction::Std),
+        "maximum" => crate::ops::extremum_value(e, id, column, crate::ops::Extremum::Max),
+        "minimum" => crate::ops::extremum_value(e, id, column, crate::ops::Extremum::Min),
+        "lany" => {
+            crate::order::boolean_reduction_value(e, id, column, crate::order::BoolReduce::Any)
+        }
+        "lall" => {
+            crate::order::boolean_reduction_value(e, id, column, crate::order::BoolReduce::All)
+        }
+        "median" => Err(crate::order::refuse_order_statistic(
+            id,
+            crate::order::OrderStatistic::Median,
+        )),
+        other => unreachable!("`{other}` is not a §07 table reduction"),
+    }
+}
+
+/// The §07 "Table reductions" heads.
+pub(crate) const TABLE_REDUCTIONS: &[&str] = &[
+    "sum", "mean", "var", "std", "prod", "maximum", "minimum", "median", "lany", "lall",
+];
 
 /// Refuse anything that is not a statically-shaped rank-1 tensor. §07 gives the
 /// cumulative pair and every norm the domain "vectors" specifically, unlike the
@@ -220,11 +260,20 @@ pub(crate) fn lower_reduction(
     args: &[NodeId],
     which: BareReduction,
 ) -> Result<Value, EmitError> {
-    let head = which.spec_name();
     let [xs_id] = args_exact(id, args)?;
-    require_not_table(e, id, head, xs_id)?;
+    require_not_table(e, id, xs_id)?;
     let xs = e.lower_node(xs_id)?;
+    reduce_value(e, id, xs, which)
+}
 
+/// [`lower_reduction`] over an already-lowered operand.
+fn reduce_value(
+    e: &mut Emitter,
+    id: NodeId,
+    xs: Value,
+    which: BareReduction,
+) -> Result<Value, EmitError> {
+    let head = which.spec_name();
     let dims = match &e.cell_ty(&xs) {
         MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => dims.clone(),
         other => {
@@ -347,7 +396,7 @@ pub(crate) fn lower_cumulative(
 ) -> Result<Value, EmitError> {
     let head = which.spec_name();
     let [xs_id] = args_exact(id, args)?;
-    require_not_table(e, id, head, xs_id)?;
+    require_not_table_vector(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
     let n = require_static_vector(id, head, &xs.ty)?;
 

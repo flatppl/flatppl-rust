@@ -26,7 +26,7 @@ use flatppl_core::{NodeId, Type};
 
 use crate::emitter::{AxisReduce, Emitter};
 use crate::mlir::{ElemKind, MlirTy, Value};
-use crate::norms::table_reduction_refusal;
+use crate::norms::{require_not_table_vector, table_reduction_in_tensor_position};
 use crate::ops::args_exact;
 use crate::refuse::EmitError;
 
@@ -93,12 +93,22 @@ pub(crate) fn lower_boolean_reduction(
     args: &[NodeId],
     which: BoolReduce,
 ) -> Result<Value, EmitError> {
-    let head = which.spec_name();
     let [xs_id] = args_exact(id, args)?;
     if matches!(e.type_of(xs_id), Some(Type::Table { .. })) {
-        return Err(table_reduction_refusal(id, head));
+        return Err(table_reduction_in_tensor_position(id));
     }
     let xs = e.lower_node(xs_id)?;
+    boolean_reduction_value(e, id, xs, which)
+}
+
+/// [`lower_boolean_reduction`] over an already-lowered operand.
+pub(crate) fn boolean_reduction_value(
+    e: &mut Emitter,
+    id: NodeId,
+    xs: Value,
+    which: BoolReduce,
+) -> Result<Value, EmitError> {
+    let head = which.spec_name();
     if !matches!(&xs.ty, MlirTy::Ranked(dims) if dims.iter().all(Option::is_some)) {
         return Err(EmitError::at(
             id,
@@ -161,9 +171,7 @@ pub(crate) fn lower_cumulative_extremum(
         other => panic!("lower_cumulative_extremum is only for Max/Min, got {other:?}"),
     };
     let [xs_id] = args_exact(id, args)?;
-    if matches!(e.type_of(xs_id), Some(Type::Table { .. })) {
-        return Err(table_reduction_refusal(id, head));
-    }
+    require_not_table_vector(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
     let n = require_static_vector(id, head, &xs)?;
     if n == 0 {

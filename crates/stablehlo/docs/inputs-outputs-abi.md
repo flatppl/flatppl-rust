@@ -59,13 +59,13 @@ whether or not the source exists. `anything` declares no shape and refuses.
 
 An aggregate valueset — a table `cartpow(cartprod(a = S1, b = S2, …), N)` or a
 record `cartprod(a = S1, …)` — has no single tensor form, so **one `inputs` entry
-becomes one argument per column/field, in declared column order**: a scalar
-column of an `N`-row table is `tensor<N×f32>`, a `cartpow(reals, k)` column is
-`tensor<N×k×f32>`, a scalar field of a record is `tensor<f32>`. Column access on
-the loaded binding (`data.y`) resolves to that column's argument, and argument
+becomes one argument per tensor leaf, depth-first in declared field order**: a
+scalar column of an `N`-row table is `tensor<N×f32>`, a `cartpow(reals, k)`
+column is `tensor<N×k×f32>`, a scalar field of a record is `tensor<f32>`, and a
+nested record field contributes its own leaves in place. Field access on the
+binding (`data.y`, `p.inner.v`) resolves to that leaf's argument, and argument
 numbering runs over the flattened list, so an entry after a destructured one
-shifts by the column count. A column that is itself an aggregate (a nested
-record) refuses, naming the column.
+shifts by its leaf count. No `stablehlo.tuple` is used.
 
 **A dynamic row count emits `?` columns, and nothing checks them at run time.**
 A valueset whose power is non-literal — `cartpow(cartprod(x, y), n)` with
@@ -87,9 +87,29 @@ ABI.
 ### `outputs` — the results
 
 Each `outputs` entry is a `logdensityof(M, point)` query (spec §06 — a measure
-and the point to evaluate it at). Determinization reduces each to a
-deterministic density expression before emission. The function returns the
-outputs in declared order (a single value, or a tuple for multiple outputs).
+and the point to evaluate it at) or any other deterministic value.
+Determinization reduces each to a deterministic expression before emission. The
+function returns the outputs in declared order (a single value, or several
+results for multiple outputs).
+
+A record-valued output — a `record(...)`, a §07 table reduction such as
+`sum(data)`, a table row `data[i]` — contributes **one result per tensor leaf,
+depth-first in declared field order**, the same flattening the inputs use. The
+CLI writes no metadata, so this order is the ABI. `flatppl-host`'s query
+`Schema` records the field path of each leaf:
+
+```
+data = elementof(cartpow(cartprod(x = reals, y = reals), 4))
+inputs  = data
+outputs = record(m = mean(data), first = data[1])
+```
+
+```mlir
+func.func @logdensity(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>)
+    -> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>)
+```
+
+The results are `m.x`, `m.y`, `first.x`, `first.y`.
 
 ## Worked examples
 
@@ -193,9 +213,11 @@ binding across the independent module namespaces and refuse. The record
   neither binding is present (the fallback signal).
 - `modes::emit_logdensity_abi` — the ABI emission path: exhaustiveness check,
   ordered arguments, ordered results.
-- `modes::bind_input` / `modes::aggregate_columns` — the argument(s) one
-  `inputs` entry contributes, including the per-column destructuring;
-  `Emitter::bind_column` / `Emitter::column_arg` route a column access to its
+- `modes::bind_input` / `modes::bind_leaves` — the argument(s) one
+  `inputs` entry contributes, including the depth-first destructuring;
+  `Emitter::bind_field` / `Emitter::lower_field` route a field access to its
   argument.
+- `modes::lower_output` — the result(s) one output contributes; a record
+  output flattens through `Emitter::lower_value`.
 - The CLI verb (`flatppl stablehlo`) recognizes `inputs`/`outputs` on the
   surface model and roots determinization DCE on them. It reads no data file.

@@ -61,13 +61,12 @@
 //!   `anything`, not only `load_data`, so the message cites the signature rule
 //!   rather than §07's don't-read-the-source clause — `elementof(anything)`
 //!   has no source to read.
-//! - a destructured aggregate entry with a column that has no tensor form of
-//!   its own (a nested record/table column) — "`inputs` entry '...' column
-//!   '...' has no tensor form, so this emitter cannot destructure the entry
-//!   into arguments; ..." (names the column, unlike `types.rs`'s generic
-//!   aggregate refusal). Worded as an EMITTER limit, not a language rule: §03
-//!   Tables says "Each column is a vector or a table", so a nested table
-//!   column is legal FlatPPL that this backend declines to flatten.
+//! - a destructured aggregate entry with a leaf that has no tensor form (a
+//!   complex field) — "`inputs` field '...' has no tensor form, so it cannot be
+//!   a function argument: ..." (names the field path). A nested record or
+//!   table column is not refused: it flattens depth-first.
+//! - a record output with no fields — "a record output with no fields
+//!   contributes no result"
 //! - (`emit_sample_abi`) `outputs` naming other than exactly one output —
 //!   "`outputs` for a sample query must name exactly one output (the sampled
 //!   value)" (`EmitError::whole`)
@@ -82,21 +81,19 @@
 //! aggregate in tensor position, not by a table ABI input.)
 //!
 //! **`ops.rs`** (the deterministic builtin-head map):
-//! - `record(...)` reached in tensor position — "record has no tensor form"
+//! - `record(...)`/`table(...)` reached in tensor position — "`record(...)` is
+//!   a record, which has no single tensor form; project one of its fields ..."
+//!   (`refuse::record_in_tensor_position`, shared with the field arm in
+//!   `emitter.rs` and the table reductions). A record lowers field by field
+//!   through `Emitter::lower_value`, so only a tensor consumer reaches this.
 //! - a destructured `load_data` input used as one monolithic value — "a
 //!   load_data input whose valueset is a table or record has no single tensor
 //!   form; read it column-wise (`data.y`) — one argument per column"
-//! - `sum` over a TABLE — the shared `norms::table_reduction_refusal`, "a table
-//!   reduction has no tensor form: §07 \"Table reductions\" makes `sum` over a
-//!   table a RECORD of per-column reductions, ...". `prod`/`mean`/`var`/`std`
-//!   raise the identical refusal from `norms.rs` (below); the message is one
-//!   function so those five cannot drift apart. **That is five of §07's SEVEN
-//!   table reductions.** §07 names "`sum`, `mean`, `var`, `std`, `prod`,
-//!   `maximum`, or `minimum`"; `maximum`/`minimum` over a table still report
-//!   "unsupported builtin head 'elementof'" — the blame-the-wrong-construct
-//!   failure this shared helper exists to prevent. Pre-existing (both were wired
-//!   before the shared helper) and a known gap, not a regression: closing it is
-//!   two more call sites. A boolean ARRAY is not refused:
+//! - `sum`/`maximum`/`minimum` over a TABLE in tensor position — "a table
+//!   reduction is a record, which has no single tensor form; ...". §07 "Table
+//!   reductions" gives a record of per-column reductions, which
+//!   `Emitter::lower_field` lowers one column at a time; only a tensor consumer
+//!   reaches this. A boolean ARRAY is not refused:
 //!   §03 "Bool" promotes it ("`sum(mask)` to count true entries"), `infer` types
 //!   the result `integers`, and `Emitter::reduce_axis` emits the matching
 //!   `stablehlo.convert` to `i32`.
@@ -461,11 +458,12 @@
 //! **`norms.rs`** (§07 "Reductions" and "Norms and normalization", reached
 //! through `ops::lower_builtin`'s twelve bare-head arms). Every site below is
 //! locked by a test in `tests/golden_norms.rs` unless noted otherwise:
-//! - `prod`/`mean`/`var`/`std` over a TABLE — the shared
-//!   `table_reduction_refusal`, also raised for `sum` from `ops.rs`. §07 "Table
-//!   reductions" makes each a RECORD of per-column reductions, and this emitter
-//!   has no record value. Checked BEFORE the argument is lowered, so the
-//!   argument's own refusal cannot blame the wrong construct.
+//! - `prod`/`mean`/`var`/`std` over a TABLE in tensor position — the shared
+//!   `table_reduction_in_tensor_position`. A field projection or an output
+//!   lowers the per-column record instead (`norms::reduce_column`).
+//! - `cumsum`/`cumprod` over a TABLE — "...: §07 gives this head the domain
+//!   \"vectors\", and a table is not a vector; ...". A scan is not among §07's
+//!   column-wise table heads.
 //! - `prod`/`mean`/`var`/`std` over a SCALAR or a dynamically-shaped operand —
 //!   "...: §07 reduces an ARRAY, so the operand must be a statically-shaped
 //!   array, got ...". Matches `ops::lower_extremum`'s guard on
@@ -524,10 +522,11 @@
 //! infinity norm and the two order statistics — the `missing-reductions` spec
 //! draft's seven heads, reached through `ops::lower_builtin`. Every site is locked
 //! by a test in `tests/golden_order.rs`):
-//! - `lany`/`lall`/`cummax`/`cummin` over a TABLE — the shared
-//!   `norms::table_reduction_refusal`, for the reason it records. The draft adds
-//!   `median`, `lany` and `lall` to §07's Table reductions paragraph, so all three
-//!   are column-wise heads with no record value to build here.
+//! - `lany`/`lall` over a TABLE in tensor position — the shared
+//!   `norms::table_reduction_in_tensor_position`; a projection or an output
+//!   reduces each column. `cummax`/`cummin` over a table — the vector-domain
+//!   refusal `cumsum` gives. `median` over a table refuses per column with the
+//!   order-statistic message below.
 //! - `lany`/`lall` over a SCALAR or a dynamically-shaped operand — "...: §07
 //!   reduces an ARRAY, so the operand must be a statically-shaped array, got ...",
 //!   matching `norms::lower_reduction`'s guard.
@@ -648,7 +647,23 @@
 //! **`types.rs`** (`mlir_type_of`):
 //! - a node with no inferred type at all — "node has no inferred type"
 //! - an aggregate type (`Record`/`Tuple`/`Table`) — "aggregate type has no
-//!   tensor form; must be destructured"
+//!   tensor form; must be destructured". A record or table lowers field by
+//!   field (`Emitter::lower_value`), so this is reached only by a tensor
+//!   consumer.
+//!
+//! **`records.rs`** (`Emitter::lower_value`/`lower_field`, record values):
+//! - a field the record does not declare — "the record has no field '...'"
+//! - a field of a record producer with no record lowering (a record-valued
+//!   user call, a record-valued sample slot) — "field '...' of ... has no
+//!   lowering: its producer has no record form here"
+//! - a table reduction over a column that is itself a table — "...: column
+//!   '...' is itself a table, and §07 \"Table reductions\" reduces a column
+//!   of values, ..."
+//! - `ifelse` over records with different fields — "ifelse: the two branches
+//!   are records with different fields"
+//! - (`sequences.rs`) a nested record as a scan state, broadcast argument or
+//!   Dirac atom — "field '...' is itself a record; a scan state, a broadcast
+//!   argument and a Dirac atom carry one tensor per field here"
 //! - a residual measure-layer type (`Measure`/`Kernel`/`Likelihood`) —
 //!   "residual measure-layer type in FlatPDL"
 //! - any other non-tensor type — "type has no MLIR tensor form: {ty:?}"
@@ -696,4 +711,17 @@ impl std::fmt::Display for EmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "stablehlo: {}", self.msg)
     }
+}
+
+/// A record or table reached where a tensor is required. A record lowers to
+/// one tensor per field, so only its fields or a function result can carry it.
+pub(crate) fn record_in_tensor_position(node: NodeId, what: &str) -> EmitError {
+    EmitError::at(
+        node,
+        format!(
+            "{what} is a record, which has no single tensor form; project one of its fields \
+             (`r.name`) where a tensor is needed, or return it as an output, which becomes one \
+             result per field"
+        ),
+    )
 }

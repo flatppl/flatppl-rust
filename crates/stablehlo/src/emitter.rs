@@ -31,7 +31,7 @@ use flatppl_core::{
 };
 
 use crate::Dtype;
-use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 
 #[path = "batching.rs"]
@@ -54,6 +54,8 @@ mod packing;
 mod pointwise;
 #[path = "pyhf.rs"]
 mod pyhf;
+#[path = "records.rs"]
+mod records;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
 #[path = "sequences.rs"]
@@ -186,13 +188,14 @@ pub struct Emitter<'m> {
     /// then broadcast over that batch via [`Emitter::binary`]'s auto-broadcast.
     /// `None` (the scalar case) leaves every draw sized exactly as before.
     batch_shape: Option<Vec<u64>>,
-    /// The per-column `func.func` arguments an aggregate ABI input was
-    /// destructured into, keyed by the aggregate's own [`NodeId`] and the
-    /// column/field name (see `crate::modes`'s destructuring and the crate doc).
-    /// A table/record has no monolithic tensor form, so the aggregate node is
-    /// never bound in `memo`; a column access reaching it resolves here instead
-    /// ([`Emitter::column_arg`]).
-    columns: HashMap<(NodeId, String), Value>,
+    /// The bound fields of record and table values, keyed by the container's
+    /// [`NodeId`] and the field name: the per-field `func.func` arguments an
+    /// aggregate ABI input was destructured into (see `crate::modes` and the
+    /// crate doc), a scan's record state, a callable's record argument. A
+    /// record has no monolithic tensor form, so its node is never bound in
+    /// `memo`; a field access reaching it resolves here instead
+    /// ([`Emitter::lower_field`]).
+    columns: HashMap<(NodeId, String), Lowered>,
 }
 
 impl<'m> Emitter<'m> {
@@ -3668,77 +3671,18 @@ impl<'m> Emitter<'m> {
 
     /// Record `value` as the `func.func` argument holding column/field `name` of
     /// the aggregate ABI input `container` — the per-column destructuring
-    /// `crate::modes::bind_input` performs for a table/record `load_data` input.
-    /// The aggregate node itself is never bound in the memo (it has no monolithic
-    /// tensor form), so this side table is the ONLY way a column access can reach
-    /// its argument; [`Emitter::column_arg`] is the read side.
+    /// `crate::modes::bind_input` performs for a table/record input. The
+    /// aggregate node itself is never bound in the memo (it has no monolithic
+    /// tensor form), so a field access reads this side table
+    /// ([`Emitter::lower_field`]).
     pub fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+        self.bind_field(container, name, Lowered::Tensor(value));
+    }
+
+    /// [`Emitter::bind_column`] for a field that may itself be a record.
+    pub(crate) fn bind_field(&mut self, container: NodeId, name: String, value: Lowered) {
         let container = self.column_container(container);
         self.columns.insert((container, name), value);
-    }
-
-    /// If `args` is `get`/`get0`'s `[container, selector]` pair and `container`
-    /// resolves (one `(%ref self x)` hop) to an aggregate ABI input that
-    /// [`Emitter::bind_column`] destructured, return the [`Value`] of the column
-    /// the `selector` names — so `data.y` reads its own `%argN` rather than
-    /// trying to index a table that has no tensor form. `None` for every other
-    /// container/selector, including a column name the destructuring did not
-    /// produce (the caller then falls through to the ordinary `get` path, which
-    /// refuses).
-    ///
-    /// Disjoint from [`Emitter::named_field_projection`], which matches a
-    /// `table(...)`/`record(...)` LITERAL: a `load_data` container is neither, so
-    /// only one of the two can ever fire for a given node.
-    fn column_arg(&self, args: &[NodeId]) -> Option<Value> {
-        if self.columns.is_empty() {
-            return None;
-        }
-        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.column_container(container);
-        let field = match self.m.node(selector) {
-            Node::Lit(Scalar::Str(s)) => s.as_ref(),
-            Node::Const(sym) => self.m.resolve(*sym),
-            _ => return None,
-        };
-        self.columns.get(&(resolved, field.to_string())).cloned()
-    }
-
-    /// If `args` is `get`/`get0`'s `[container, selector]` pair and
-    /// `container` resolves through refs and literal tuple projections to a
-    /// `table(...)` or `record(...)`
-    /// literal with a named entry matching the `selector`, return that
-    /// entry's value [`NodeId`]. The parser lowers field access `obj.name`
-    /// to `get(obj, "name")` with a string-literal selector
-    /// (`flatppl_syntax::parser`); a bare-atom `Node::Const` selector is
-    /// accepted too. A `table`/`record` has no monolithic tensor form
-    /// (`ops::lower_builtin` refuses the `table`/`record` head), but a
-    /// named-field projection selects one column/field — itself lowerable —
-    /// so `datasets.exposure` reaches the column node directly instead of
-    /// trying to lower the whole aggregate. `None` when `container` is not a
-    /// table/record literal, the selector is not a field name, or no field
-    /// matches (the caller then tries [`Emitter::tuple_projection`], else the
-    /// ordinary tensor `get`).
-    fn named_field_projection(&self, args: &[NodeId]) -> Option<NodeId> {
-        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
-        let field = match self.m.node(selector) {
-            Node::Lit(Scalar::Str(s)) => s.as_ref(),
-            Node::Const(sym) => self.m.resolve(*sym),
-            _ => return None,
-        };
-        let resolved = self.resolve_tuple_projections(container);
-        let named = match self.m.node(resolved) {
-            Node::Call(c) => match c.head {
-                CallHead::Builtin(sym) if matches!(self.m.resolve(sym), "table" | "record") => {
-                    &c.named
-                }
-                _ => return None,
-            },
-            _ => return None,
-        };
-        named
-            .iter()
-            .find(|na| self.m.resolve(na.name) == field)
-            .map(|na| na.value)
     }
 
     /// Resolve `id` through at most one level of `(%ref self x)` indirection
@@ -4067,6 +4011,19 @@ impl<'m> Emitter<'m> {
         fn_id: NodeId,
         positional_rest: &[NodeId],
     ) -> Result<Value, EmitError> {
+        self.lower_broadcast_components(id, fn_id, positional_rest)?
+            .tensor(id)
+    }
+
+    /// [`Emitter::lower_broadcast_userfn`] for any result structure: a callable
+    /// returning a record gives a table, one column per field (spec §03
+    /// "Tables").
+    fn lower_broadcast_components(
+        &mut self,
+        id: NodeId,
+        fn_id: NodeId,
+        positional_rest: &[NodeId],
+    ) -> Result<sequences::Components, EmitError> {
         let (body, entries) = self.callable_parts(fn_id)?;
         let kwargs: Vec<_> = match self.m.node(id) {
             Node::Call(c) => c
@@ -4113,10 +4070,12 @@ impl<'m> Emitter<'m> {
         }
         let result = self
             .call_components(body, &entries, &args, &types)
-            .and_then(|parts| parts.tensor(id))
-            .map(|value| {
+            .map(|mut parts| {
                 let frame = self.broadcast_frame.clone();
-                self.finish_broadcast(&value, &frame, parent.len())
+                for value in &mut parts.values {
+                    *value = self.finish_broadcast(value, &frame, parent.len());
+                }
+                parts
             });
         self.broadcast_frame = parent;
         result
@@ -4202,13 +4161,14 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
-                        // A column of a destructured aggregate ABI input reads
-                        // that column's own argument (`Emitter::column_arg`).
-                        if let Some(column) = self.column_arg(&call.args) {
-                            return Ok(column);
-                        }
-                        if let Some(field) = self.named_field_projection(&call.args) {
-                            return self.lower_node(field);
+                        if let Some((container, field)) = self.record_projection(&call.args) {
+                            return match self.lower_field(container, &field)? {
+                                Lowered::Tensor(value) => Ok(value),
+                                Lowered::Record(_) => Err(records::record_in_tensor_position(
+                                    id,
+                                    &format!("field `{field}`"),
+                                )),
+                            };
                         }
                         if let Some(field) = self.sequence_field(&call.args, base) {
                             return field;

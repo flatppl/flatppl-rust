@@ -329,7 +329,7 @@ impl Emitter<'_> {
             let resolved = self.resolve_ref_one(id);
             for (name, _) in fields {
                 let key = (resolved, self.resolve(*name).to_owned());
-                if let Some(value) = self.columns.get(&key)
+                if let Some(Lowered::Tensor(value)) = self.columns.get(&key)
                     && self.batch_rank(value) != 0
                     && bound.insert(key.clone())
                 {
@@ -440,7 +440,7 @@ impl Emitter<'_> {
                         match input {
                             IntegralInput::Node(node) => e.bind(*node, value),
                             IntegralInput::Column(node, field) => {
-                                e.columns.insert((*node, field.clone()), value);
+                                e.columns.insert((*node, field.clone()), Lowered::Tensor(value));
                             }
                         }
                     }

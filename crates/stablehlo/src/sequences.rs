@@ -7,10 +7,49 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct Components {
     pub(super) fields: Option<Vec<Symbol>>,
+    /// The tensor leaves, depth-first in declared field order.
     pub(super) values: Vec<Value>,
+    /// One structure per record field when some field is itself a record;
+    /// `None` when every field is one leaf. Its tensors are placeholders: the
+    /// leaves always come from `values`.
+    layout: Option<Vec<Lowered>>,
 }
 
 impl Components {
+    pub(super) fn flat(fields: Option<Vec<Symbol>>, values: Vec<Value>) -> Self {
+        Self {
+            fields,
+            values,
+            layout: None,
+        }
+    }
+
+    /// A record whose fields may themselves be records.
+    pub(super) fn record(fields: Vec<Symbol>, parts: Vec<Lowered>) -> Self {
+        let mut values = Vec::new();
+        for part in parts.iter().cloned() {
+            part.leaves(&mut values);
+        }
+        let nested = parts.iter().any(|part| matches!(part, Lowered::Record(_)));
+        Self {
+            fields: Some(fields),
+            values,
+            layout: nested.then_some(parts),
+        }
+    }
+
+    /// One value per record field, rebuilt from the leaves.
+    pub(super) fn field_parts(&self) -> Vec<Lowered> {
+        let Some(layout) = &self.layout else {
+            return self.values.iter().cloned().map(Lowered::Tensor).collect();
+        };
+        let mut leaves = self.values.iter().cloned();
+        layout
+            .iter()
+            .map(|part| part.with_leaves(&mut leaves))
+            .collect()
+    }
+
     pub(super) fn tensor(self, id: NodeId) -> Result<Value, EmitError> {
         if self.fields.is_some() || self.values.len() != 1 {
             return Err(EmitError::at(id, "structured object requires a projection"));
@@ -18,36 +57,49 @@ impl Components {
         Ok(self.values.into_iter().next().expect("one tensor leaf"))
     }
 
-    fn align(mut self, template: &Self, id: NodeId) -> Result<Self, EmitError> {
+    /// Whether both carry the same fields with the same nesting.
+    fn same_structure(&self, other: &Self) -> bool {
+        self.fields == other.fields
+            && self.values.len() == other.values.len()
+            && self
+                .field_parts()
+                .iter()
+                .zip(other.field_parts().iter())
+                .all(|(a, b)| a.same_structure(b))
+    }
+
+    fn align(self, template: &Self, id: NodeId) -> Result<Self, EmitError> {
         if self.values.len() != template.values.len() {
             return Err(EmitError::at(id, "scan: step changes the state structure"));
         }
-        if self.fields != template.fields {
-            let (Some(fields), Some(expected)) = (&self.fields, &template.fields) else {
-                return Err(EmitError::at(id, "scan: step changes the state structure"));
-            };
-            if fields.len() != expected.len() {
-                return Err(EmitError::at(id, "scan: step changes the state fields"));
-            }
-            self.values = expected
-                .iter()
-                .map(|name| {
-                    fields
-                        .iter()
-                        .position(|f| f == name)
-                        .map(|i| self.values[i].clone())
-                        .ok_or_else(|| EmitError::at(id, "scan: step changes the state fields"))
-                })
-                .collect::<Result<_, _>>()?;
-            self.fields = template.fields.clone();
+        if self.fields == template.fields {
+            return Ok(self);
         }
-        Ok(self)
+        let (Some(fields), Some(expected)) = (&self.fields, &template.fields) else {
+            return Err(EmitError::at(id, "scan: step changes the state structure"));
+        };
+        if fields.len() != expected.len() {
+            return Err(EmitError::at(id, "scan: step changes the state fields"));
+        }
+        let parts = self.field_parts();
+        let parts = expected
+            .iter()
+            .map(|name| {
+                fields
+                    .iter()
+                    .position(|f| f == name)
+                    .map(|i| parts[i].clone())
+                    .ok_or_else(|| EmitError::at(id, "scan: step changes the state fields"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self::record(expected.clone(), parts))
     }
 
     fn with_values(&self, values: &[Value]) -> Self {
         Self {
             fields: self.fields.clone(),
             values: values.to_vec(),
+            layout: self.layout.clone(),
         }
     }
 }
@@ -100,7 +152,7 @@ impl Emitter<'_> {
         }
         let atom = self.lower_components(atom)?;
         let value = self.lower_components(point)?;
-        if atom.fields != value.fields {
+        if !atom.same_structure(&value) {
             return Err(EmitError::at(
                 point,
                 "Dirac: record fields must match in order",
@@ -220,10 +272,7 @@ impl Emitter<'_> {
 
     pub(super) fn lower_components(&mut self, id: NodeId) -> Result<Components, EmitError> {
         if let Some(value) = self.memo.get(&id).cloned() {
-            return Ok(Components {
-                fields: None,
-                values: vec![self.typed_axes(id, value)],
-            });
+            return Ok(Components::flat(None, vec![self.typed_axes(id, value)]));
         }
         let mut resolved = id;
         for _ in 0..64 {
@@ -235,13 +284,13 @@ impl Emitter<'_> {
         }
         if let Some(Type::Tuple(items)) = self.type_of(id) {
             let values = (0..items.len())
-                .map(|i| self.columns.get(&(resolved, i.to_string())).cloned())
+                .map(|i| match self.columns.get(&(resolved, i.to_string())) {
+                    Some(Lowered::Tensor(value)) => Some(value.clone()),
+                    _ => None,
+                })
                 .collect::<Option<Vec<_>>>();
             if let Some(values) = values {
-                return Ok(Components {
-                    fields: None,
-                    values,
-                });
+                return Ok(Components::flat(None, values));
             }
             if let Node::Call(c) = self.m.node(resolved)
                 && matches!(c.head, CallHead::Builtin(h) if self.m.resolve(h) == "tuple")
@@ -254,70 +303,50 @@ impl Emitter<'_> {
                             .map(|value| self.typed_axes(arg, value))
                     })
                     .collect::<Result<_, _>>()?;
-                return Ok(Components {
-                    fields: None,
-                    values,
-                });
+                return Ok(Components::flat(None, values));
             }
         }
-        let fields = match self.type_of(id) {
-            Some(
-                Type::Record(fields)
-                | Type::Table {
-                    columns: fields, ..
-                },
-            ) => Some(fields.iter().map(|(name, _)| *name).collect::<Vec<_>>()),
-            _ => None,
-        };
-        if let Some(fields) = &fields {
-            let values = fields
-                .iter()
-                .map(|&name| {
-                    self.columns
-                        .get(&(resolved, self.m.resolve(name).to_owned()))
-                        .cloned()
-                })
-                .collect::<Option<Vec<_>>>();
-            if let Some(values) = values {
-                return Ok(Components {
-                    fields: Some(fields.clone()),
-                    values,
-                });
-            }
-        }
-        if let Node::Call(c) = self.m.node(resolved)
-            && let CallHead::Builtin(head) = c.head
+        if let Some(
+            Type::Record(fields)
+            | Type::Table {
+                columns: fields, ..
+            },
+        ) = self.type_of(id)
         {
-            match self.m.resolve(head) {
-                "scan" => return self.lower_sequence(resolved, &c.args, false),
-                "reduce" => return self.lower_sequence(resolved, &c.args, true),
-                "record" | "table" => {
-                    let mut fields = Vec::with_capacity(c.named.len());
-                    let mut values = Vec::with_capacity(c.named.len());
-                    for field in &c.named {
-                        fields.push(field.name);
-                        let value = self.lower_node(field.value)?;
-                        values.push(self.typed_axes(field.value, value));
-                    }
-                    return Ok(Components {
-                        fields: Some(fields),
-                        values,
+            let fields = fields.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            if let Node::Call(c) = self.m.node(resolved)
+                && let CallHead::Builtin(head) = c.head
+                && matches!(self.m.resolve(head), "scan" | "reduce")
+            {
+                let reduce = self.m.resolve(head) == "reduce";
+                return self.lower_sequence(resolved, &c.args, reduce);
+            }
+            let bound = fields.iter().all(|&name| {
+                self.columns
+                    .contains_key(&(resolved, self.m.resolve(name).to_owned()))
+            });
+            if !bound && let Some(entries) = self.literal_fields(resolved) {
+                let entries = entries.to_vec();
+                let mut parts = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    parts.push(match self.lower_value(entry.value)? {
+                        Lowered::Tensor(value) => {
+                            Lowered::Tensor(self.typed_axes(entry.value, value))
+                        }
+                        record => record,
                     });
                 }
-                _ => (),
+                let fields = entries.iter().map(|entry| entry.name).collect();
+                return Ok(Components::record(fields, parts));
             }
-        }
-        if fields.is_some() {
-            return Err(EmitError::at(
-                id,
-                "record/table producer has no field lowering",
-            ));
+            let Lowered::Record(lowered) = self.lower_value(id)? else {
+                unreachable!("a record-typed value lowers to a record")
+            };
+            let parts = lowered.into_iter().map(|(_, part)| part).collect();
+            return Ok(Components::record(fields, parts));
         }
         let value = self.lower_node(id)?;
-        Ok(Components {
-            fields: None,
-            values: vec![self.typed_axes(id, value)],
-        })
+        Ok(Components::flat(None, vec![self.typed_axes(id, value)]))
     }
 
     pub(super) fn call_components(
@@ -359,8 +388,8 @@ impl Emitter<'_> {
                         self.bind_column(node, i.to_string(), value.clone());
                     }
                 } else if let Some(fields) = &arg.fields {
-                    for (&field, value) in fields.iter().zip(&arg.values) {
-                        self.bind_column(node, self.m.resolve(field).to_owned(), value.clone());
+                    for (&field, part) in fields.iter().zip(arg.field_parts()) {
+                        self.bind_field(node, self.m.resolve(field).to_owned(), part);
                     }
                 } else {
                     self.bind(node, arg.values[0].clone());
@@ -429,29 +458,7 @@ impl Emitter<'_> {
                     .ok_or_else(|| EmitError::at(container, "tuple index out of range"))
             }));
         }
-        let field = match self.m.node(selector) {
-            Node::Lit(Scalar::Str(s)) => s.as_ref(),
-            Node::Const(name) => self.m.resolve(*name),
-            _ => return None,
-        };
-        if !matches!(
-            self.type_of(container),
-            Some(Type::Table { .. } | Type::Record(_))
-        ) {
-            return None;
-        }
-        Some(self.lower_components(container).and_then(|parts| {
-            let index = parts
-                .fields
-                .as_ref()
-                .and_then(|fields| {
-                    fields
-                        .iter()
-                        .position(|&name| self.m.resolve(name) == field)
-                })
-                .ok_or_else(|| EmitError::at(container, "unknown record/table field"))?;
-            Ok(parts.values[index].clone())
-        }))
+        None
     }
 
     pub(super) fn lower_sequence(
@@ -603,24 +610,29 @@ impl Emitter<'_> {
                         .cloned()
                 })
                 .collect::<Option<Vec<_>>>();
-            if let Some(values) = cached {
-                return Ok(state.with_values(&values));
+            if let Some(parts) = cached {
+                return Ok(Components::record(fields.clone(), parts));
             }
         } else if let Some(value) = self.memo.get(&id) {
             return Ok(state.with_values(std::slice::from_ref(value)));
         }
 
         let carry_types = match (self.type_of(id), &state.fields) {
-            (Some(Type::Table { columns, .. } | Type::Record(columns)), Some(fields)) => fields
-                .iter()
-                .map(|name| {
-                    columns
+            (Some(Type::Table { columns, .. } | Type::Record(columns)), Some(fields)) => {
+                let mut leaves = Vec::with_capacity(state.values.len());
+                for name in fields {
+                    let ty = columns
                         .iter()
                         .find(|(field, _)| field == name)
-                        .map(|(_, ty)| ty.clone())
-                        .ok_or_else(|| EmitError::at(id, "scan: unresolved state field"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+                        .map(|(_, ty)| ty)
+                        .ok_or_else(|| EmitError::at(id, "scan: unresolved state field"))?;
+                    leaf_types(ty, &mut leaves);
+                }
+                if leaves.len() != state.values.len() {
+                    return Err(EmitError::at(id, "scan: step changes the state structure"));
+                }
+                leaves
+            }
             (Some(ty), None) if reduce => vec![ty.clone()],
             (Some(Type::Array { elem, .. }), None) => vec![(**elem).clone()],
             _ => return Err(EmitError::at(id, "scan: unresolved state type")),
@@ -748,14 +760,15 @@ impl Emitter<'_> {
             }
             *buffer = self.axes_view(buffer, axes);
         }
-        if let Some(fields) = &state.fields {
-            for (&field, value) in fields.iter().zip(&buffers) {
-                self.bind_column(id, self.m.resolve(field).to_owned(), value.clone());
+        let result = state.with_values(&buffers);
+        if let Some(fields) = &result.fields {
+            for (&field, part) in fields.iter().zip(result.field_parts()) {
+                self.bind_field(id, self.m.resolve(field).to_owned(), part);
             }
         } else {
             self.bind(id, buffers[0].clone());
         }
-        Ok(state.with_values(&buffers))
+        Ok(result)
     }
 
     pub(super) fn scan_slice(&mut self, input: &Value, index: &Value) -> Value {
@@ -811,5 +824,17 @@ impl Emitter<'_> {
             ssa,
             ..buffer.clone()
         }
+    }
+}
+
+/// The tensor leaf types of `ty`, depth-first in declared field order.
+fn leaf_types(ty: &Type, out: &mut Vec<Type>) {
+    match ty {
+        Type::Record(fields) => {
+            for (_, field) in fields.iter() {
+                leaf_types(field, out);
+            }
+        }
+        ty => out.push(ty.clone()),
     }
 }

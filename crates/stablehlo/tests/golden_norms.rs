@@ -880,39 +880,36 @@ fn the_moments_refuse_an_empty_array_but_prod_returns_its_identity() {
 
 /// §07 "Table reductions": applied to a table these reduce column-wise "and
 /// return a record whose fields are the column names and values are the
-/// per-column reductions". This emitter has no record value, so the result is
-/// not expressible and every reduction head refuses with that reason — not with
-/// whatever its argument's own lowering would have said first.
-///
-/// `sum` already did this at 50194b2; `prod`/`mean`/`var`/`std` reached
-/// "unsupported builtin head" for every argument type and so needed no table
-/// guard until this wave wired them.
+/// per-column reductions". So `head(data).x` is `head(data.x)` and the whole
+/// record output is one result per column, whatever the table's provenance.
 #[test]
-fn every_reduction_head_refuses_a_table_with_the_section_07_reason() {
-    for head in ["sum", "prod", "mean", "var", "std"] {
-        for (label, decl) in [
-            (
-                "load_data",
-                "data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))",
-            ),
-            (
-                "elementof",
-                "data = elementof(cartpow(cartprod(x = reals), 4))",
-            ),
+fn every_reduction_head_reduces_a_table_column_wise() {
+    for head in ["sum", "prod", "mean", "var", "std", "maximum", "minimum"] {
+        for decl in [
+            "data = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))",
+            "data = elementof(cartpow(cartprod(x = reals, y = reals), 4))",
         ] {
-            let src = format!(
-                "alpha = elementof(reals)\n{decl}\n\
-                 lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
-                 record(y = get({head}(data), [\"x\"])))\n\
-                 inputs = (alpha, data)\noutputs = (lp)\n"
+            let query = |outputs: &str| format!("{decl}\ninputs = (data)\noutputs = {outputs}\n");
+            assert_eq!(
+                emit(&query(&format!("{head}(data).y"))),
+                emit(&query(&format!("{head}(data.y)"))),
+                "`{head}(data).y` must be the reduction of column `y`"
             );
-            let err = emit_err(&src);
-            assert!(
-                err.contains("a table reduction has no tensor form")
-                    && err.contains(&format!("{head}(data.x)")),
-                "the {label} table must give `{head}` the reduction refusal naming the \
-                 column spelling, got: {err}"
+            assert_eq!(
+                emit(&query(&format!("{head}(data)"))),
+                emit(&query(&format!("({head}(data.x), {head}(data.y))"))),
+                "`{head}(data)` must return one result per column, in declared order"
             );
         }
     }
+}
+
+/// `median` over a table refuses for its own reason: a column's median needs the
+/// order statistics this emitter does not compute.
+#[test]
+fn median_over_a_table_refuses_for_the_order_statistic() {
+    let err = emit_err(
+        "data = elementof(cartpow(cartprod(x = reals), 4))\ninputs = (data)\noutputs = median(data)\n",
+    );
+    assert!(err.contains("median has no lowering here"), "got: {err}");
 }

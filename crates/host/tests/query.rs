@@ -662,3 +662,40 @@ fn gpu_pyhf_pool_respects_aggregate_axes() -> Result<(), Box<dyn std::error::Err
     );
     Ok(())
 }
+
+/// A record output's schema names each field, and its tensor leaves are the
+/// function results depth-first in declared field order.
+#[test]
+fn a_record_output_exports_one_result_per_field() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "data = elementof(cartpow(cartprod(x = reals, y = reals), 4))\ninputs = data\n\
+         outputs = record(m = mean(data), first = data[1])",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let schema = serde_json::to_value(&exported)?;
+    let leaf = |index: usize| json!({"kind": "tensor", "index": index, "dtype": "float32", "shape": [], "value_type": "real"});
+    let pair = |x: usize, y: usize| {
+        json!({"kind": "record", "fields": [
+            {"name": "x", "value": leaf(x)},
+            {"name": "y", "value": leaf(y)},
+        ]})
+    };
+    assert_eq!(
+        schema["output"],
+        json!({"kind": "record", "fields": [
+            {"name": "m", "value": pair(0, 1)},
+            {"name": "first", "value": pair(2, 3)},
+        ]})
+    );
+    assert!(
+        exported
+            .stablehlo
+            .contains("-> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>)"),
+        "{}",
+        exported.stablehlo
+    );
+    Ok(())
+}
