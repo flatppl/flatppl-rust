@@ -103,6 +103,14 @@ impl Emitter<'_> {
         let head = self.m.resolve(head).to_owned();
         let args = call.args.clone();
         match (head.as_str(), &args[..]) {
+            ("qr", [matrix]) => {
+                let a = self.lower_node(*matrix)?;
+                let (q, r) = self.matrix_qr(resolved, &a)?;
+                self.bind_field(resolved, "Q".to_owned(), Lowered::Tensor(q));
+                self.bind_field(resolved, "R".to_owned(), Lowered::Tensor(r));
+                self.bound_field(resolved, name)
+                    .ok_or_else(|| unknown_field(container, name))
+            }
             // §03 "Tables": `table(r)` and `record(t)` convert between a table
             // and the record of its columns, which is one representation here.
             ("record" | "table", [inner]) => self.lower_field(*inner, name),
