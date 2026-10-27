@@ -782,6 +782,154 @@ pub(crate) fn lower_touniform(
     cdf(e, &params, &value)
 }
 
+/// Explicit closed-form subset of the §07 transports. Do not route an inverse
+/// through `probit`: its `erf_inv` path has no qualified Enzyme derivative and
+/// loses small f32 probabilities when forming `2p - 1`.
+pub(crate) fn lower_transport(
+    e: &mut Emitter,
+    id: NodeId,
+    head: &str,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [kernel, kernel_input, x] = <[NodeId; 3]>::try_from(args).map_err(|_| {
+        EmitError::at(
+            id,
+            format!("{head}: expected 3 arguments, got {}", args.len()),
+        )
+    })?;
+    let ctor = match e.node(kernel) {
+        Node::Const(sym) => e.resolve(*sym).to_string(),
+        _ => {
+            return Err(EmitError::at(
+                kernel,
+                format!("{head}: kernel must be a bare distribution constructor"),
+            ));
+        }
+    };
+    if lookup(&ctor).is_none() {
+        return Err(EmitError::at(
+            id,
+            format!("no lowering for distribution '{ctor}'"),
+        ));
+    }
+    if !matches!(
+        (head, ctor.as_str()),
+        ("builtin_tonormal" | "builtin_fromnormal", "Normal")
+            | ("builtin_fromuniform", "Cauchy" | "Exponential" | "Logistic")
+    ) {
+        return Err(EmitError::at(
+            id,
+            format!("{head}: transport for distribution '{ctor}' is unavailable or undefined"),
+        ));
+    }
+    let p = Params {
+        kernel_input,
+        variate: Some(x),
+        sample_shape: None,
+        fields: None,
+    };
+    if head == "builtin_fromuniform" {
+        let literal = match e.node(x) {
+            Node::Lit(Scalar::Real(value)) => Some(*value),
+            Node::Lit(Scalar::Int(value)) => Some(*value as f64),
+            Node::Lit(Scalar::Bool(value)) => Some(u8::from(*value) as f64),
+            _ => None,
+        };
+        if literal.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+            return Err(EmitError::at(
+                x,
+                format!("{head}: uniform variate must be in [0, 1]"),
+            ));
+        }
+    }
+    let x = e.lower_node(x)?;
+    if e.cell_ty(&x) != MlirTy::Scalar {
+        return Err(EmitError::at(
+            id,
+            format!("{head}: {ctor} requires a scalar variate"),
+        ));
+    }
+    let x = e.convert(&x, ElemKind::Real);
+    let x = if head == "builtin_fromuniform" {
+        let zero = e.scalar(0.0);
+        let one = e.scalar(1.0);
+        let lower = e.compare("GE", &x, &zero);
+        let upper = e.compare("LE", &x, &one);
+        let valid = e.and(&lower, &upper);
+        e.record_runtime_error(&valid, 5);
+        let safe = e.scalar(0.5);
+        e.select(&valid, &x, &safe)
+    } else {
+        x
+    };
+    let scalar_param = |e: &mut Emitter, name: &str| -> Result<Value, EmitError> {
+        let value = p.get(e, name)?;
+        if e.cell_ty(&value) != MlirTy::Scalar {
+            return Err(EmitError::at(
+                id,
+                format!("{head}: {ctor} parameter '{name}' must be scalar"),
+            ));
+        }
+        Ok(e.convert(&value, ElemKind::Real))
+    };
+    match (head, ctor.as_str()) {
+        ("builtin_tonormal", "Normal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let diff = e.sub(&x, &mu);
+            Ok(e.div(&diff, &sigma))
+        }
+        ("builtin_fromnormal", "Normal") => {
+            let mu = scalar_param(e, "mu")?;
+            let sigma = scalar_param(e, "sigma")?;
+            let scaled = e.mul(&sigma, &x);
+            Ok(e.add(&mu, &scaled))
+        }
+        ("builtin_fromuniform", "Exponential") => {
+            let rate = scalar_param(e, "rate")?;
+            let neg_x = e.neg(&x);
+            let log = e.log1p(&neg_x);
+            let neg_log = e.neg(&log);
+            Ok(e.div(&neg_log, &rate))
+        }
+        ("builtin_fromuniform", "Logistic") => {
+            let mu = scalar_param(e, "mu")?;
+            let scale = scalar_param(e, "s")?;
+            let z = e.logit(&x);
+            let scaled = e.mul(&scale, &z);
+            Ok(e.add(&mu, &scaled))
+        }
+        ("builtin_fromuniform", "Cauchy") => {
+            let location = scalar_param(e, "location")?;
+            let scale = scalar_param(e, "scale")?;
+            let zero = e.scalar(0.0);
+            let one = e.scalar(1.0);
+            let half = e.scalar(0.5);
+            let at_zero = e.compare("EQ", &x, &zero);
+            let at_one = e.compare("EQ", &x, &one);
+            let safe = e.select(&at_zero, &half, &x);
+            let safe = e.select(&at_one, &half, &safe);
+            let lower = e.compare("LT", &safe, &half);
+            let reflected = e.sub(&one, &safe);
+            let tail = e.select(&lower, &safe, &reflected);
+            let pi = e.scalar(std::f64::consts::PI);
+            let angle = e.mul(&pi, &tail);
+            let sine = e.sin(&angle);
+            let cosine = e.cos(&angle);
+            let cotangent = e.div(&cosine, &sine);
+            let neg_cotangent = e.neg(&cotangent);
+            let tangent = e.select(&lower, &neg_cotangent, &cotangent);
+            let scaled = e.mul(&scale, &tangent);
+            let result = e.add(&location, &scaled);
+            let inf = e.inf_like(&result);
+            let neg_inf = e.neg(&inf);
+            let result = e.select(&at_zero, &neg_inf, &result);
+            Ok(e.select(&at_one, &inf, &result))
+        }
+        _ => unreachable!("transport support checked above"),
+    }
+}
+
 /// `builtin_sample(rng, ctor, kernel_input)` (`flatppl_determinizer::sample`'s
 /// `build_sample_term`/`lower_shared_record_sample`): `rng` is the threaded
 /// RNG-state argument (spec §07 rng ABI). It is lowered to the current key and
