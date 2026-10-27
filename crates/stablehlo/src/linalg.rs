@@ -439,8 +439,7 @@ impl Emitter<'_> {
         let a = self.axes_view(&eliminated[0], a_axes);
         let b = self.axes_view(&eliminated[1], b_axes.clone());
         let valid = self.axes_view(&eliminated[2], scalar_axes);
-        // Call record_runtime_error(valid, <singular-domain-code>) here once the
-        // shared runtime-status ABI is available.
+        self.record_runtime_error(&valid, 4);
         let initial = self.constant_like(0.0, &b);
         let solved = self.matrix_loop(n, &[initial], |e, index, args| {
             let last = e.int_value_const(n as i64 - 1);
