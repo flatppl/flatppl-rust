@@ -3,4 +3,4 @@ flatppl_compat = "0.1"
 # (`m.obs_kernel(...)`) and score the result. Lowering requires grafting the
 # cross-module callee before beta-reducing the application.
 m = load_module("xmodule_kernel_helper.flatppl")
-lp = logdensityof(m.obs_kernel(record(center = 0.0)), 0.5)
+lp = logdensityof(m.obs_kernel(0.0), 0.5)
