@@ -7249,12 +7249,17 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
-        if op_name == "cross" && elems.len() == 2 && named.is_empty() {
+        if op_name == "cross" && elems.len() == 2 {
             let cells: Vec<ArgInfo> = args[1..]
                 .iter()
-                .zip(elems.iter())
-                .map(|((node, _, phase), ty)| (*node, ty.clone(), *phase))
+                .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
                 .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(name, node, ty, phase)| (*name, *node, cell_arg(ty), *phase))
+                .collect();
+            let cells =
+                normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
             let inner = cross_type(inf, id, &cells);
             if matches!(inner, Type::Failed(_)) {
                 return Ready(inner);

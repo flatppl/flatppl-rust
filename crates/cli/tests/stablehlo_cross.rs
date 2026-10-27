@@ -46,7 +46,7 @@ fn broadcast_cross_emits_vector_cells() {
     fs::write(&input, "a = elementof(cartpow(cartpow(reals, [3]), [2]))\nb = elementof(cartpow(cartpow(reals, [3]), [2]))\ninputs = (a, b)\noutputs = cross.(a, b)\n").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .arg("stablehlo")
-        .arg(input)
+        .arg(&input)
         .output()
         .unwrap();
     assert!(
@@ -55,4 +55,16 @@ fn broadcast_cross_emits_vector_cells() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(String::from_utf8_lossy(&result.stdout).contains("tensor<2x3xf32>"));
+    fs::write(&input, "a = elementof(cartpow(cartpow(reals, [3]), [2]))\nb = elementof(cartpow(cartpow(reals, [3]), [2]))\ninputs = (a, b)\noutputs = broadcast(cross, b = b, a = a)\n").unwrap();
+    let keyword = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .arg("stablehlo")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        keyword.status.success(),
+        "{}",
+        String::from_utf8_lossy(&keyword.stderr)
+    );
+    assert_eq!(keyword.stdout, result.stdout);
 }
