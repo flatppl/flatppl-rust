@@ -2761,8 +2761,7 @@ impl<'m> Emitter<'m> {
             let all = self.and(&nonnegative, &in_range);
             self.reduce_all(&all)
         };
-        // Call record_runtime_error(valid, <seed-domain-code>) when the shared
-        // runtime-status ABI is available; invalid inputs use a safe zero seed.
+        self.record_runtime_error(&valid, 6);
         let seed = self.select(&valid, &seed, &zero);
         let seed_ty = seed.ty.render(self.dtype, ElemKind::Int);
         let mut hashes = [
