@@ -46,6 +46,9 @@ pub(crate) fn lower_integer(
         }
     }
     if x.elem != ElemKind::Real || integral {
+        if x.elem == ElemKind::Real && literal_real(e, a).is_none() {
+            return Ok(e.checked_integer(&x));
+        }
         return Ok(e.convert(&x, ElemKind::Int));
     }
     Err(EmitError::at(

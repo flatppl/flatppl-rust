@@ -119,14 +119,7 @@ fn fixed_gather_materialization_is_bounded_by_result_size() {
 }
 
 #[test]
-fn invalid_fixed_indices_and_overflow_keep_runtime_lowering() {
-    let ir = emit(
-        "xs = [10.0, 20.0, 30.0]\npick(i) = xs[i]\n\
-        p = elementof(reals)\ninputs = p\noutputs = pick.([0, 4])",
-        Dtype::F32,
-    );
-    assert!(ir.contains("stablehlo.gather"), "{ir}");
-    assert!(ir.contains("dense<[-1, 3]>"), "{ir}");
+fn integer_arithmetic_overflow_keeps_runtime_lowering() {
     let ir = emit(
         "shift(t) = t .+ [2147483647, 1]\n\
         p = elementof(reals)\ninputs = p\noutputs = shift.([1, 2])",

@@ -2768,10 +2768,9 @@ fn lower_get_literal(
     selector: i64,
     base: i64,
 ) -> Result<Value, EmitError> {
-    let idx = selector - base;
-    if idx < 0 {
+    let Some(idx) = selector.checked_sub(base).filter(|index| *index >= 0) else {
         return Err(EmitError::at(id, "get/get0: index out of range"));
-    }
+    };
     if let Some(result) = crate::indices::projection(e, id, container, idx as usize) {
         return result;
     }
@@ -2860,6 +2859,10 @@ fn get_gather_value(
         && matches!(&operand.ty, MlirTy::Ranked(dims) if dims.iter().all(Option::is_some))
         && (scalar || e.batch_rank(&idx) != 0 || e.axes_of(&operand).layers.len() > 1)
     {
+        let MlirTy::Ranked(dims) = e.cell_ty(&operand) else {
+            unreachable!()
+        };
+        let idx = e.checked_index(id, &idx, dims[0].expect("static shape checked"), base)?;
         return Ok(e.gather_cells(&operand, &idx, base));
     }
 
@@ -2885,6 +2888,10 @@ fn get_gather_value(
             ),
         ));
     }
+    let MlirTy::Ranked(dims) = e.cell_ty(&operand) else {
+        unreachable!()
+    };
+    let idx = e.checked_index(id, &idx, dims[0].expect("static shape checked"), base)?;
     Ok(e.gather(&operand, &idx, base))
 }
 

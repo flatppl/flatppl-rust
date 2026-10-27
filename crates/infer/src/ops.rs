@@ -448,6 +448,10 @@ fn op_rule(
             ),
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
+        "onehot" => Type::Array {
+            shape: Box::new([args.get(1).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0))]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
         "fill" => Type::Array {
             shape: args.get(1).map_or_else(
                 || Box::new([Dim::Dynamic]) as Box<[Dim]>,
