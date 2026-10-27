@@ -2,6 +2,14 @@ use std::path::PathBuf;
 
 use flatppl_host::{Context, Dtype, EmitOptions};
 
+#[test]
+fn malformed_arrow_reports_its_format() {
+    let err = flatppl_data::Table::from_arrow_ipc_values(b"garbage")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Arrow IPC: malformed file ("), "{err}");
+}
+
 fn directory(name: &str) -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("flatppl-host-data-{name}-{}", std::process::id()));
