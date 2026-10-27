@@ -54,10 +54,18 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
     // Where the message at `at` ends its metadata, and its body length, once its
     // buffers check; `None` if it does not parse.
     let check = |at: usize| -> Result<Option<(usize, usize)>> {
-        let (mut at, mut length) = (at + 4, word(at));
+        let Some(mut next) = at.checked_add(4) else {
+            return Ok(None);
+        };
+        let mut length = word(at);
         if length == Some(-1) {
-            (at, length) = (at + 4, word(at));
+            length = word(next);
+            let Some(after) = next.checked_add(4) else {
+                return Ok(None);
+            };
+            next = after;
         }
+        let at = next;
         let Some(length) = length
             .and_then(|n| usize::try_from(n).ok())
             .filter(|&n| n > 0)
@@ -70,10 +78,19 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
         else {
             return Ok(None);
         };
-        let Ok(body) = usize::try_from(message.bodyLength()) else {
+        let body_length = message.bodyLength();
+        let Ok(body) = usize::try_from(body_length) else {
+            if body_length < 0 {
+                return Ok(None);
+            }
+            return Err(malformed("a message body leaves the file"));
+        };
+        let Some(start) = at.checked_add(length) else {
             return Ok(None);
         };
-        let start = at + length;
+        let Some(body_bytes) = bytes.get(start..).and_then(|bytes| bytes.get(..body)) else {
+            return Err(malformed("a message body leaves the file"));
+        };
         let Some(batch) = message
             .header_as_record_batch()
             .or_else(|| message.header_as_dictionary_batch().and_then(|d| d.data()))
@@ -85,28 +102,24 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
         let codec = batch.compression().map(|c| c.codec());
         for buffer in batch.buffers().iter().flatten() {
             let (offset, size) = (buffer.offset(), buffer.length());
-            if offset < 0
-                || size < 0
-                || offset
-                    .checked_add(size)
-                    .is_none_or(|end| end as usize > body)
-            {
+            let buffer_bytes = usize::try_from(offset).ok().and_then(|offset| {
+                let size = usize::try_from(size).ok()?;
+                body_bytes.get(offset..offset.checked_add(size)?)
+            });
+            let Some(buffer_bytes) = buffer_bytes else {
                 return Err(malformed("a buffer leaves its message body"));
-            }
-            let (Some(codec), true) = (codec, size > 0) else {
+            };
+            let (Some(codec), false) = (codec, buffer_bytes.is_empty()) else {
                 continue;
             };
-            let from = start + offset as usize;
-            let Some(prefix) = bytes.get(from..from + 8).filter(|_| size >= 8) else {
+            let Some(prefix) = buffer_bytes.get(..8) else {
                 return Err(malformed("a compressed buffer has no length prefix"));
             };
             let stated = i64::from_le_bytes(prefix.try_into().expect("eight bytes"));
             if stated == -1 {
                 continue;
             }
-            let frames = bytes
-                .get(from + 8..from + size as usize)
-                .unwrap_or_default();
+            let frames = &buffer_bytes[8..];
             let Some(most) = frame_capacity(codec, frames) else {
                 return Err(malformed(
                     "a compressed buffer does not hold its codec's frames",
@@ -138,13 +151,20 @@ fn check_buffers(bytes: &[u8]) -> Result<()> {
     // FileReader slices a message by its block's lengths, not by the message's own.
     let blocks = footer.dictionaries().into_iter().flatten();
     for block in blocks.chain(footer.recordBatches().into_iter().flatten()) {
-        let Ok(offset) = usize::try_from(block.offset()) else {
-            continue;
+        let block_range = usize::try_from(block.offset()).ok().and_then(|offset| {
+            let metadata = usize::try_from(block.metaDataLength()).ok()?;
+            let body = usize::try_from(block.bodyLength()).ok()?;
+            let end = offset.checked_add(metadata)?.checked_add(body)?;
+            bytes.get(offset..end)?;
+            Some((offset, metadata, body))
+        });
+        let Some((offset, metadata, body)) = block_range else {
+            return Err(malformed("a footer block leaves the file"));
         };
-        if let Some((start, body)) = check(offset)?
-            && (usize::try_from(block.metaDataLength()).ok() != Some(start - offset)
-                || usize::try_from(block.bodyLength()).ok() != Some(body))
-        {
+        let Some((start, message_body)) = check(offset)? else {
+            return Err(malformed("a footer block has no message"));
+        };
+        if metadata != start - offset || body != message_body {
             return Err(malformed("a footer block disagrees with its message"));
         }
     }

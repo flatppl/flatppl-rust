@@ -905,3 +905,39 @@ fn arrow_rejects_blocks_over_the_codec_limit_before_allocating() {
         .to_string();
     assert!(err.contains("does not hold its codec's frames"), "{err}");
 }
+
+#[test]
+fn arrow_rejects_out_of_range_message_and_buffer_offsets() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/data")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let mut stream = fixture("negative_offset.arrows");
+    let pattern = [24_i64, 0, -24, 24].map(i64::to_le_bytes).concat();
+    let at = stream
+        .windows(pattern.len())
+        .position(|w| w == pattern)
+        .unwrap();
+    stream[at + 16..at + 24].copy_from_slice(&(u32::MAX as i64 + 25).to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&stream)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a buffer leaves its message body"), "{err}");
+
+    let mut file = fixture("bad_block.arrow");
+    let old = 1_000_000_000_i64.to_le_bytes();
+    let at = file.windows(8).position(|w| w == old).unwrap();
+    let mut oversized_body = file.clone();
+    oversized_body[at..at + 8].copy_from_slice(&8_i64.to_le_bytes());
+    oversized_body[at + 16..at + 24].copy_from_slice(&i64::MAX.to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&oversized_body)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a footer block leaves the file"), "{err}");
+    file[at..at + 8].copy_from_slice(&(u32::MAX as i64).to_le_bytes());
+    assert!(flatppl_data::Table::from_arrow_ipc_values(&file).is_err());
+}
