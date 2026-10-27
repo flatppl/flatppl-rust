@@ -130,6 +130,36 @@ impl Emitter<'_> {
             .collect()
     }
 
+    /// The values of a fixed, unbatched rank-1 real or integer vector, at the
+    /// emitted dtype's precision.
+    pub(crate) fn constant_reals(&self, value: &Value) -> Option<Vec<f64>> {
+        let [Some(n)] = shape(&value.ty) else {
+            return None;
+        };
+        if self.batch_rank(value) != 0 {
+            return None;
+        }
+        let data = self.constants.get(&value.ssa)?;
+        (0..usize::try_from(*n).ok()?)
+            .map(|i| match data.get(if data.len() == 1 { 0 } else { i })? {
+                Scalar::Real(x) => Some(*x),
+                Scalar::Int(n) => Some(*n as f64),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The value of a fixed, unbatched integer scalar.
+    pub(crate) fn constant_int(&self, value: &Value) -> Option<i64> {
+        if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
+            return None;
+        }
+        match self.constants.get(&value.ssa)?.as_ref() {
+            [Scalar::Int(n)] => Some(*n),
+            _ => None,
+        }
+    }
+
     pub(crate) fn constant_extent(&self, value: &Value) -> Option<u64> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
             return None;

@@ -2231,15 +2231,14 @@ fn refuse_nonscalar_operand(
 ///   and "`cat(scalar1, scalar2, ...)` … produces a vector of those scalars". So
 ///   `cat.(v, w)` is a well-formed per-element `cat` of two scalars, not a domain error.
 ///
-/// The six tables swept are Reductions, Boolean reductions, Cumulative operations, Norms
-/// and normalization, Linear algebra, and Array and table operations.
+/// The nine tables swept are Reductions, Boolean reductions, Cumulative operations,
+/// Norms and normalization, Linear algebra, Array and table operations, Approximation
+/// functions, Binning, and Membership, filtering, and bin selection.
 ///
 /// **§07's remaining tables are UNLOWERED, not scalar-domain — a forward hazard, not a
-/// closed case.** Four of them carry a collection-domain first argument: Convolution
-/// (`conv`, `crosscorr` — "vector, vector"), Binning (`bincounts` — "vector or record of
-/// edge vectors, array or record"), Approximation functions (`polynomial`, `bernstein`,
-/// `stepwise`) and Array and table generation (`array` — "vector, integer vector, integer
-/// vector"). Dotted over scalar cells each types `%deferred` here and refuses in the
+/// closed case.** Two of them carry a collection-domain first argument: Convolution
+/// (`conv`, `crosscorr` — "vector, vector") and Array and table generation (`array` —
+/// "vector, integer vector, integer vector"). Dotted over scalar cells each types `%deferred` here and refuses in the
 /// emitter with "unsupported builtin head", so there is no live mislowering — but the
 /// safety comes from `lower_builtin` not lowering them AT ALL, not from this rule. Wiring
 /// any of them into `lower_builtin` MUST add the head to this table in the same change,
@@ -2346,6 +2345,31 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
         "bandedmat",
         "Array and table operations",
         "vector, positive integer",
+    ),
+    (
+        "selectbins",
+        "Membership, filtering, and bin selection",
+        "vector, set, vector",
+    ),
+    (
+        "bincounts",
+        "Binning",
+        "vector or record of edge vectors, array or record",
+    ),
+    (
+        "polynomial",
+        "Approximation functions",
+        "vector, real or complex",
+    ),
+    (
+        "bernstein",
+        "Approximation functions",
+        "vector, `unitinterval`",
+    ),
+    (
+        "stepwise",
+        "Approximation functions",
+        "vector, vector, real",
     ),
 ];
 

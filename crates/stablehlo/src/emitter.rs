@@ -349,15 +349,7 @@ impl<'m> Emitter<'m> {
     /// non-scalar `ty`) constant.
     pub fn constant(&mut self, x: f64, ty: MlirTy) -> Value {
         let ty_text = ty.render(self.dtype, ElemKind::Real);
-        let lit = if x.is_finite() {
-            render_float_literal(x)
-        } else {
-            // MLIR requires dtype-exact bits for infinities and NaNs.
-            match self.dtype {
-                Dtype::F32 => format!("0x{:08X}", (x as f32).to_bits()),
-                Dtype::F64 => format!("0x{:016X}", x.to_bits()),
-            }
-        };
+        let lit = float_literal(self.dtype, x);
         let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
         self.remember_constant(&ssa, [Scalar::Real(x)]);
         Value {
@@ -1815,6 +1807,64 @@ impl<'m> Emitter<'m> {
             Pointwise::Transpose(a.clone(), perm.to_vec()),
         );
         out
+    }
+
+    /// `%N = stablehlo.reverse %a, dims = [...] : ty` — reverses `a` along `dims`.
+    /// Shape- and element-type-preserving.
+    pub fn reverse(&mut self, a: &Value, dims: &[u64]) -> Value {
+        let ty = a.ty.render(self.dtype, a.elem);
+        let dims_text = dims
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ssa = self.pure(format!(
+            "stablehlo.reverse {}, dims = [{dims_text}] : {ty}",
+            a.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: a.elem,
+        }
+    }
+
+    /// `%N = stablehlo.pad %a, %zero, low = [...], high = [...], interior = [...]`
+    /// — `a` placed `low[k]` cells from the start of axis `k` in a zero tensor
+    /// `low[k] + n_k + high[k]` long. `a` must be static and unbatched.
+    pub fn pad_zeros(&mut self, a: &Value, low: &[u64], high: &[u64]) -> Value {
+        let dims = shape(&a.ty);
+        let out = MlirTy::Ranked(
+            dims.iter()
+                .zip(low.iter().zip(high))
+                .map(|(d, (l, h))| d.map(|d| d + l + h))
+                .collect(),
+        );
+        let zero = match a.elem {
+            ElemKind::Int => self.int_value_const(0),
+            ElemKind::Bool => {
+                let z = self.scalar(0.0);
+                self.convert(&z, ElemKind::Bool)
+            }
+            ElemKind::Real => self.scalar(0.0),
+        };
+        let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        let interior = list(&vec![0; low.len()]);
+        let ssa = self.pure(format!(
+            "stablehlo.pad {}, {}, low = [{}], high = [{}], interior = [{interior}] : ({}, {}) -> {}",
+            a.ssa,
+            zero.ssa,
+            list(low),
+            list(high),
+            a.ty.render(self.dtype, a.elem),
+            MlirTy::Scalar.render(self.dtype, a.elem),
+            out.render(self.dtype, a.elem),
+        ));
+        Value {
+            ssa,
+            ty: out,
+            elem: a.elem,
+        }
     }
 
     // ---- CHLO special functions ------------------------------------------
@@ -4427,6 +4477,18 @@ impl<'m> Emitter<'m> {
 /// reads back as a float attribute rather than an integer one (same
 /// reasoning as `flatpir::writer::render_real`, reimplemented locally since
 /// that helper is private to the `flatpir` crate).
+/// A float literal for `dtype`: decimal when finite; MLIR requires dtype-exact
+/// bits for infinities and NaNs.
+fn float_literal(dtype: Dtype, x: f64) -> String {
+    if x.is_finite() {
+        return render_float_literal(x);
+    }
+    match dtype {
+        Dtype::F32 => format!("0x{:08X}", (x as f32).to_bits()),
+        Dtype::F64 => format!("0x{:016X}", x.to_bits()),
+    }
+}
+
 fn render_float_literal(x: f64) -> String {
     let mut s = format!("{x}");
     if !s.contains(['.', 'e', 'E']) {
