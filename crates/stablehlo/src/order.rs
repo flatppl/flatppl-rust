@@ -277,7 +277,22 @@ pub(crate) fn order_statistic_value(
     let p = e.convert(&p, ElemKind::Real);
     let p_valid = e.compare("EQ", &p, &p);
     let zero = e.scalar(0.0);
-    let p_safe = e.select(&p_valid, &p, &zero);
+    let p_safe = if let Some(value) = e.constant_real(&p) {
+        if !value.is_nan() && !(0.0..=1.0).contains(&value) {
+            return Err(EmitError::at(id, "quantile: p must be in [0, 1]"));
+        }
+        e.select(&p_valid, &p, &zero)
+    } else {
+        let one = e.scalar(1.0);
+        let lower = e.compare("GE", &p, &zero);
+        let upper = e.compare("LE", &p, &one);
+        let in_range = e.and(&lower, &upper);
+        // §07 propagates NaN p; other out-of-domain values are errors.
+        let nan = e.compare("NE", &p, &p);
+        let valid = e.or(&in_range, &nan);
+        e.record_runtime_error(&valid, 3);
+        e.select(&in_range, &p, &zero)
+    };
     let count = e.scalar((n - 1) as f64);
     let position = e.mul(&p_safe, &count);
     let floor = e.floor(&position);

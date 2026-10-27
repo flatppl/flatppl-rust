@@ -124,6 +124,7 @@ Programs without checks retain their original result signature.
 | 0 | No error |
 | 1 | Source index outside the selected axis |
 | 2 | Real-to-integer conversion outside the target integer width |
+| 3 | Quantile probability outside [0, 1]; NaN propagates without an error |
 
 The status uses `i32` for float32 emission and `i64` for float64 emission.
 It is scalar for an ordinary call. Host batching adds the host batch shape,
