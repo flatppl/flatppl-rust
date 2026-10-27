@@ -337,7 +337,7 @@ fn subst_signature(importer: &Module, annos: &[(String, Resolved)]) -> String {
 }
 
 /// `res` with `ty`, `vset` and `result` re-interned from `from` into `into`.
-fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolved {
+pub(crate) fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolved {
     Resolved {
         ty: reintern_type(into, from, &res.ty),
         vset: reintern_valueset(into, from, &res.vset),
@@ -448,6 +448,57 @@ struct InferredDependency {
 }
 
 impl<'b> InferSession<'b> {
+    /// Prepare a fresh dependency scope for an application of a reified export.
+    pub(crate) fn callable_scope(
+        &self,
+        importer: &Module,
+        alias: Symbol,
+        name: Symbol,
+        substitutions: &[(String, Resolved)],
+    ) -> Option<(Module, Vec<(NodeId, Resolved)>)> {
+        let directive = self.load_directive(importer, alias).ok()?;
+        if directive.standard {
+            return None;
+        }
+        let identity = self
+            .bundle
+            .identity_of(&self.importer_id(), &directive.path)?;
+        if self.stack.borrow().iter().any(|active| active == identity) {
+            return None;
+        }
+        let source = self.bundle.get_by_id(identity)?;
+        let binding = source
+            .bindings()
+            .find(|(_, b)| source.resolve(b.name) == importer.resolve(name))?
+            .1;
+        if !binding.public {
+            return None;
+        }
+        let mut rhs = binding.rhs;
+        for _ in 0..=source.binding_count() {
+            match source.node(rhs) {
+                Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
+                    rhs = source.binding(source.binding_by_name(r.name)?).rhs;
+                }
+                Node::Call(c) if c.inputs.is_some() => break,
+                _ => return None,
+            }
+        }
+        if !matches!(source.node(rhs), Node::Call(c) if c.inputs.is_some()) {
+            return None;
+        }
+        let mut module = source.clone();
+        let seeds = seed_plan(source, substitutions)
+            .into_iter()
+            .map(|(node, res)| (node, reintern_resolved(&mut module, importer, res)))
+            .collect();
+        self.stack.borrow_mut().push(identity.to_owned());
+        Some((module, seeds))
+    }
+
+    pub(crate) fn finish_callable_scope(&self) {
+        self.stack.borrow_mut().pop();
+    }
     pub(crate) fn new(bundle: &'b ModuleBundle) -> Self {
         InferSession {
             bundle,

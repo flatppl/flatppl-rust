@@ -27,6 +27,7 @@ enum Work {
     LeaveBinding(BindingId),
     ResumeBody(Box<BodyFrame>),
     ResumeModule(Box<ModuleFrame>),
+    ResumeImportedCall(Box<ImportedCallFrame>),
 }
 
 /// Mutable annotations belong to one substitution context, not to the graph.
@@ -102,6 +103,15 @@ struct ModuleFrame {
     key: (String, String),
     path: String,
     binding: String,
+}
+
+struct ImportedCallFrame {
+    id: NodeId,
+    root: NodeId,
+    module: Module,
+    scope: Scope,
+    kernel_tag_nodes: Rc<HashSet<NodeId>>,
+    auto_inputs: Vec<AutoInputScope>,
 }
 
 pub(crate) struct Inferencer<'m, 's> {
@@ -651,6 +661,41 @@ impl<'m, 's> Inferencer<'m, 's> {
                     );
                     self.record_resolution(frame.node, result);
                 }
+                Work::ResumeImportedCall(frame) => {
+                    let (ty, phase) = self.node_annotation(frame.root);
+                    let set = self.lookup_valueset(frame.root);
+                    let failed = ops::first_failed(&ty).is_some();
+                    let errors = std::mem::take(&mut self.diags);
+                    let dependency = std::mem::replace(self.module, frame.module);
+                    self.kernel_tag_nodes = frame.kernel_tag_nodes;
+                    self.auto_inputs = frame.auto_inputs;
+                    self.restore_scope(frame.scope);
+                    self.session.finish_callable_scope();
+                    let result = crate::modules::reintern_resolved(
+                        self.module,
+                        &dependency,
+                        Resolved {
+                            ty,
+                            phase,
+                            vset: set,
+                            result: None,
+                            set_element: None,
+                            catalogue: None,
+                            interface: None,
+                        },
+                    );
+                    if failed {
+                        for diag in errors
+                            .into_iter()
+                            .filter(|d| d.severity == crate::Severity::Error)
+                        {
+                            self.diags
+                                .push(Diagnostic::error_at(frame.id, diag.message));
+                        }
+                    }
+                    self.set_vset(frame.id, result.vset);
+                    self.inferred.insert(frame.id, (result.ty, result.phase));
+                }
                 Work::Enter(node) => {
                     if let Some((ty, phase, vset)) = self.seeds.get(&node).cloned() {
                         self.inferred.insert(node, (ty, phase));
@@ -892,6 +937,20 @@ impl<'m, 's> Inferencer<'m, 's> {
 
         let callee = callee.map(|(n, tp)| (n, tp.0));
         let step = ops::call_rule(self, id, &call, callee.clone(), &args, &named, joined);
+        let refused = matches!(&step, RuleStep::Ready((ty, _)) if ops::first_failed(ty).is_some());
+        if !refused {
+            if let Some((callee_node, Type::Function { .. } | Type::Kernel { .. })) = &callee
+                && self.start_imported_call(id, &call, *callee_node, &args, &named, work)
+            {
+                return;
+            }
+            if matches!(call.head, CallHead::Builtin(op) if self.module.resolve(op) == "broadcast")
+                && let Some((callback, Type::Function { .. }, _)) = args.first()
+                && self.start_imported_call(id, &call, *callback, &args[1..], &named, work)
+            {
+                return;
+            }
+        }
         let frame = CallFrame {
             id,
             call,
@@ -901,6 +960,160 @@ impl<'m, 's> Inferencer<'m, 's> {
             body_result: None,
         };
         self.finish_call_type(frame, step, work);
+    }
+
+    fn start_imported_call(
+        &mut self,
+        id: NodeId,
+        call: &Call,
+        callee: NodeId,
+        args: &[ops::ArgInfo],
+        named: &[ops::NamedInfo],
+        work: &mut Vec<Work>,
+    ) -> bool {
+        let resolved = ops::resolve_binding_refs(self, callee);
+        let Node::Ref(Ref {
+            ns: RefNs::Module(alias),
+            name,
+        }) = *self.module.node(resolved)
+        else {
+            return false;
+        };
+        let substitutions = self.subst_annos_for(alias);
+        let Some((mut dependency, mut seeds)) =
+            self.session
+                .callable_scope(self.module, alias, name, &substitutions)
+        else {
+            return false;
+        };
+        let callee_name = dependency.intern(self.module.resolve(name));
+        let local = dependency.alloc(Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name: callee_name,
+        }));
+        let mut positional: Vec<_> = args
+            .iter()
+            .map(|(n, t, p)| self.imported_argument(&mut dependency, &mut seeds, *n, t, *p))
+            .collect();
+        let named_nodes: Vec<_> = named
+            .iter()
+            .map(|(_, n, t, p)| self.imported_argument(&mut dependency, &mut seeds, *n, t, *p))
+            .collect();
+        let keywords = call
+            .named
+            .iter()
+            .zip(named_nodes)
+            .map(|(n, value)| flatppl_core::NamedArg {
+                kind: n.kind,
+                name: dependency.intern(self.module.resolve(n.name)),
+                value,
+            })
+            .collect();
+        let head = if matches!(call.head, CallHead::Builtin(_)) {
+            positional.insert(0, local);
+            CallHead::Builtin(dependency.intern("broadcast"))
+        } else {
+            CallHead::User(local)
+        };
+        let root = dependency.alloc(Node::Call(Call {
+            head,
+            args: positional.into_boxed_slice(),
+            named: keywords,
+            inputs: None,
+        }));
+        let scope = self.suspend_scope();
+        let module = std::mem::replace(self.module, dependency);
+        let (tags, _) = collect_kernel_tag_nodes(self.module);
+        let kernel_tag_nodes = std::mem::replace(&mut self.kernel_tag_nodes, Rc::new(tags));
+        let auto_inputs = std::mem::replace(&mut self.auto_inputs, vec![HashMap::new()]);
+        self.seed_inputs(&seeds);
+        self.initialize_module();
+        work.push(Work::ResumeImportedCall(Box::new(ImportedCallFrame {
+            id,
+            root,
+            module,
+            scope,
+            kernel_tag_nodes,
+            auto_inputs,
+        })));
+        work.push(Work::Enter(root));
+        true
+    }
+
+    fn imported_argument(
+        &self,
+        dependency: &mut Module,
+        seeds: &mut Vec<(NodeId, Resolved)>,
+        node: NodeId,
+        ty: &Type,
+        phase: Phase,
+    ) -> NodeId {
+        let source = ops::resolve_binding_refs(self, node);
+        if let Node::Call(call) = self.module.node(source)
+            && let CallHead::Builtin(head) = call.head
+            && matches!(self.module.resolve(head), "record" | "tuple")
+            && call.inputs.is_none()
+            && call
+                .args
+                .iter()
+                .chain(call.named.iter().map(|n| &n.value))
+                .all(|child| self.inferred.contains_key(child))
+        {
+            let call = call.clone();
+            let head = dependency.intern(self.module.resolve(head));
+            let args = call
+                .args
+                .iter()
+                .map(|&child| {
+                    let (ty, phase) = self.node_annotation(child);
+                    self.seed_imported_argument(dependency, seeds, child, &ty, phase)
+                })
+                .collect();
+            let named = call
+                .named
+                .iter()
+                .map(|field| {
+                    let (ty, phase) = self.node_annotation(field.value);
+                    let value =
+                        self.seed_imported_argument(dependency, seeds, field.value, &ty, phase);
+                    flatppl_core::NamedArg {
+                        kind: field.kind,
+                        name: dependency.intern(self.module.resolve(field.name)),
+                        value,
+                    }
+                })
+                .collect();
+            return dependency.alloc(Node::Call(Call {
+                head: CallHead::Builtin(head),
+                args,
+                named,
+                inputs: None,
+            }));
+        }
+        self.seed_imported_argument(dependency, seeds, node, ty, phase)
+    }
+
+    fn seed_imported_argument(
+        &self,
+        dependency: &mut Module,
+        seeds: &mut Vec<(NodeId, Resolved)>,
+        node: NodeId,
+        ty: &Type,
+        phase: Phase,
+    ) -> NodeId {
+        let res = Resolved {
+            ty: ty.clone(),
+            phase,
+            vset: self.lookup_valueset(node),
+            result: None,
+            set_element: None,
+            catalogue: None,
+            interface: crate::callable::interface(self, node),
+        };
+        let res = crate::modules::reintern_resolved(dependency, self.module, res);
+        let target = dependency.alloc(Node::Hole);
+        seeds.push((target, res));
+        target
     }
 
     fn start_body(

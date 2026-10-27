@@ -31,6 +31,41 @@ fn binding_line<'a>(out: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{name}` binding in:\n{out}"))
 }
 
+#[test]
+fn call_results_reintern_record_fields_and_keep_argument_value_sets() {
+    let (out, diags) = xmod(
+        "dep.flatppl",
+        "f(x) = record(unique_field = x)\n",
+        "d = load_module(\"dep.flatppl\")\na = d.f(3)\nb = d.f([1.0, 2.0])\n",
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    let a = binding_line(&out, "a");
+    let b = binding_line(&out, "b");
+    assert!(
+        a.contains("(%record (unique_field (%scalar integer)))"),
+        "{a}"
+    );
+    assert!(
+        b.contains("(%record (unique_field (%array 1 (2) (%scalar real))))"),
+        "{b}"
+    );
+    assert!(a.contains("(cartprod (%field unique_field"), "{a}");
+}
+
+#[test]
+fn imported_record_splat_keeps_each_field_domain() {
+    let (out, diags) = xmod(
+        "dep.flatppl",
+        "f(a, b) = a\n",
+        "d = load_module(\"dep.flatppl\")\nx = elementof(posreals)\ny = d.f(record(a = x, b = 1))\nz = d.f((x, 1))\n",
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    let y = binding_line(&out, "y");
+    assert!(y.contains("%parametric posreals"), "{y}");
+    let z = binding_line(&out, "z");
+    assert!(z.contains("%parametric posreals"), "{z}");
+}
+
 /// A `joint` over a local and a cross-module kernel publishes the union of both
 /// input lists. The dependency's name must appear as the DEPENDENCY spelled it,
 /// so the correct application types and the misspelled one is rejected.
