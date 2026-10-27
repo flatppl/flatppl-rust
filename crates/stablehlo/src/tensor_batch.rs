@@ -28,6 +28,13 @@ impl Emitter<'_> {
         {
             return None;
         }
+        let status = self.runtime_status();
+        let mut rets = rets.to_vec();
+        if let Some(status) = &status
+            && !rets.iter().any(|value| value.ssa == status.ssa)
+        {
+            rets.push(status);
+        }
         let mut replay = TensorBatch {
             source: self,
             out: self.scratch_emitter(),
@@ -62,6 +69,11 @@ impl Emitter<'_> {
                 Some(replay.out.batch_output(&value, batch))
             })
             .collect::<Option<Vec<_>>>()?;
+        if let Some(status) = self.runtime_status()
+            && let Some(index) = rets.iter().position(|value| value.ssa == status.ssa)
+        {
+            replay.out.runtime_status = Some(outputs[index].clone());
+        }
         Some(
             replay
                 .out
