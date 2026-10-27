@@ -755,14 +755,14 @@ fn reduce_and_filter_infer() {
 }
 
 /// `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's element
-/// kind, via the RON catalogue's `ResultSig::Record` (field names interned
-/// through the lowering context). The reusable record-valued result path.
+/// kind and statically known thin-factor shapes.
 #[test]
 fn qr_infers_a_record_of_matrices() {
     let out = ir("A = rowstack([[1.0, 0.0], [0.0, 1.0]])\nd = qr(A)");
     assert!(
-        out.contains("(%record (Q (%array 2 (%dynamic %dynamic) (%scalar real))) (R (%array 2 (%dynamic %dynamic) (%scalar real))))")
-            && out.contains("(qr"),
+        out.contains(
+            "(%record (Q (%array 2 (2 2) (%scalar real))) (R (%array 2 (2 2) (%scalar real))))"
+        ) && out.contains("(qr"),
         "qr should infer record(Q: matrix, R: matrix), got:\n{out}"
     );
 }

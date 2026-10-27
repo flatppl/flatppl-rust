@@ -4077,7 +4077,7 @@ impl<'m> Emitter<'m> {
             }
         };
         let positional;
-        let rest = if matches!(fname.as_str(), "linsolve" | "cross") {
+        let rest = if matches!(fname.as_str(), "linsolve" | "conv" | "crosscorr" | "cross") {
             let named = match self.node(id) {
                 Node::Call(c) => c.named.as_ref(),
                 _ => &[],
@@ -4092,13 +4092,17 @@ impl<'m> Emitter<'m> {
                         .map(|arg| arg.value)
                         .or_else(|| args.get(index + 1).copied())
                 };
-                let first = if fname == "linsolve" { "A" } else { "a" };
+                let (first, second) = match fname.as_str() {
+                    "linsolve" => ("A", "b"),
+                    "cross" => ("a", "b"),
+                    _ => ("v", "kernel"),
+                };
                 positional = [
                     lookup(first, 0).ok_or_else(|| {
                         EmitError::at(id, format!("broadcast {fname}: missing {first}"))
                     })?,
-                    lookup("b", 1).ok_or_else(|| {
-                        EmitError::at(id, format!("broadcast {fname}: missing b"))
+                    lookup(second, 1).ok_or_else(|| {
+                        EmitError::at(id, format!("broadcast {fname}: missing {second}"))
                     })?,
                 ];
                 &positional[..]
@@ -4134,6 +4138,9 @@ impl<'m> Emitter<'m> {
                 | "det"
                 | "logabsdet"
                 | "linsolve"
+                | "conv"
+                | "crosscorr"
+                | "cross"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
