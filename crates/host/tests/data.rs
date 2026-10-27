@@ -698,6 +698,11 @@ fn arrow_typed_columns_read_past_every_layout() {
             "states 4611686018427387904 decompressed bytes",
         ),
         (
+            "zstd_claim.arrow",
+            "a",
+            "states 500000000 decompressed bytes, and its frames hold at most 131072",
+        ),
+        (
             "many_null_batches.arrows",
             "n",
             "column `n` has the Arrow type Null, so every value is missing",
@@ -712,6 +717,12 @@ fn arrow_typed_columns_read_past_every_layout() {
         "t = load_data(\"lz4_runs.arrow\", cartpow(cartprod(x = reals), 1100))\noutputs = t.x",
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    // A million zeros in a small ZSTD body: compressed blocks may expand to 128 KiB each.
+    let zeros = compile_at(
+        "t = load_data(\"zstd_zeros.arrow\", cartpow(cartprod(a = reals), 3))\noutputs = t.a",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(returned(&zeros), vec![vec![0.0; 3]]);
     let mut want = vec![1.5; 1000];
     want.extend((0..100).map(|i| f64::from(i) * 0.25));
     assert_eq!(returned(&out), vec![want]);
@@ -847,4 +858,86 @@ fn negative_integer_literals_fit_as_written() {
         err.contains("integer -2147483649 is outside i32, the integer width of the f32 dtype"),
         "{err}"
     );
+}
+
+#[test]
+fn arrow_rejects_blocks_over_the_codec_limit_before_allocating() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/data")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let mut zstd = fixture("zstd_claim.arrow");
+    let at = zstd
+        .windows(4)
+        .position(|w| w == [0x28, 0xb5, 0x2f, 0xfd])
+        .unwrap();
+    let mut skippable = zstd.clone();
+    skippable[at..at + 4].copy_from_slice(&0x184d_2a50_u32.to_le_bytes());
+    skippable[at + 4..at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&skippable)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+
+    zstd[at - 8..at].copy_from_slice(&131_073_i64.to_le_bytes());
+    let rle_header = (131_073_u32 << 3) | 3;
+    zstd[at + 7..at + 10].copy_from_slice(&rle_header.to_le_bytes()[..3]);
+    let err = flatppl_data::Table::from_arrow_ipc_values(&zstd)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+
+    let mut lz4 = fixture("lz4_runs.arrow");
+    let at = lz4
+        .windows(4)
+        .position(|w| w == [0x04, 0x22, 0x4d, 0x18])
+        .unwrap();
+    let flags = lz4[at + 4];
+    let max = 1_u32 << (16 + 2 * (u32::from((lz4[at + 5] >> 4) & 7) - 4));
+    let header = at + 7 + if flags & 8 != 0 { 8 } else { 0 } + if flags & 1 != 0 { 4 } else { 0 };
+    lz4[header..header + 4].copy_from_slice(&(0x8000_0000 | (max + 1)).to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&lz4)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+}
+
+#[test]
+fn arrow_rejects_out_of_range_message_and_buffer_offsets() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/data")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let mut stream = fixture("negative_offset.arrows");
+    let pattern = [24_i64, 0, -24, 24].map(i64::to_le_bytes).concat();
+    let at = stream
+        .windows(pattern.len())
+        .position(|w| w == pattern)
+        .unwrap();
+    stream[at + 16..at + 24].copy_from_slice(&(u32::MAX as i64 + 25).to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&stream)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a buffer leaves its message body"), "{err}");
+
+    let mut file = fixture("bad_block.arrow");
+    let old = 1_000_000_000_i64.to_le_bytes();
+    let at = file.windows(8).position(|w| w == old).unwrap();
+    let mut oversized_body = file.clone();
+    oversized_body[at..at + 8].copy_from_slice(&8_i64.to_le_bytes());
+    oversized_body[at + 16..at + 24].copy_from_slice(&i64::MAX.to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&oversized_body)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a footer block leaves the file"), "{err}");
+    file[at..at + 8].copy_from_slice(&(u32::MAX as i64).to_le_bytes());
+    assert!(flatppl_data::Table::from_arrow_ipc_values(&file).is_err());
 }
