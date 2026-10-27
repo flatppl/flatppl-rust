@@ -124,6 +124,7 @@ Programs without checks retain their original result signature.
 | 0 | No error |
 | 1 | Source index outside the selected axis |
 | 2 | Real-to-integer conversion outside the target integer width |
+| 5 | Inverse-uniform variate outside [0, 1] |
 | 6 | RNG seed outside its integer or byte-vector domain |
 
 The status uses `i32` for float32 emission and `i64` for float64 emission.

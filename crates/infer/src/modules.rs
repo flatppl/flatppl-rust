@@ -4,7 +4,8 @@
 //! `trace.rs`; everything that crosses a module boundary lives here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use flatppl_core::{
@@ -60,9 +61,8 @@ pub(crate) type InputMetadata = HashMap<String, Arc<SourceInputs>>;
 /// Dependencies are held behind `Arc<Module>` so a host that assembles the same
 /// bundle repeatedly (e.g. the LSP, once per keystroke) shares one parsed copy
 /// rather than deep-cloning each dependency `Module` on every assembly. Inserts
-/// and lookups move/borrow the `Arc`; the only deep clone of a dependency is the
-/// per-import-site working copy inference mutates, which is genuinely needed
-/// (inference annotates it in place).
+/// and lookups move/borrow the `Arc`. Inference owns its annotated import-site
+/// copies and a separate call workspace for each used dependency.
 #[derive(Debug, Default, Clone)]
 pub struct ModuleBundle {
     /// Dependencies by resolved identity.
@@ -337,7 +337,7 @@ fn subst_signature(importer: &Module, annos: &[(String, Resolved)]) -> String {
 }
 
 /// `res` with `ty`, `vset` and `result` re-interned from `from` into `into`.
-fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolved {
+pub(crate) fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolved {
     Resolved {
         ty: reintern_type(into, from, &res.ty),
         vset: reintern_valueset(into, from, &res.vset),
@@ -431,6 +431,10 @@ pub(crate) struct InferSession<'b> {
     /// (resolved identity, substitution-signature) -> the dependency's inferred
     /// (annotated) Module.
     memo: RefCell<HashMap<(String, String), InferredDependency>>,
+    /// A dependency's mutable call workspace, reused only after its prior call
+    /// has completed. Synthetic nodes append per call; inferred call scopes and
+    /// substitutions are never cached.
+    callable_workspaces: RefCell<HashMap<String, CallableWorkspace>>,
     /// Resolved identities of the modules on the current resolution chain
     /// (cycle detection). The top is the module being inferred right now, so it
     /// is also the importer whose directives resolve next.
@@ -447,12 +451,121 @@ struct InferredDependency {
     interfaces: HashMap<NodeId, crate::callable::Interface>,
 }
 
+pub(crate) struct CallableWorkspace {
+    pub(crate) module: Module,
+    pub(crate) kernel_tags: Rc<HashSet<NodeId>>,
+    pub(crate) axis_errors: Rc<Vec<(NodeId, Diagnostic)>>,
+    pub(crate) bindings: Rc<HashMap<Symbol, BindingId>>,
+}
+
 impl<'b> InferSession<'b> {
+    /// Prepare a fresh dependency scope for an application of a reified export.
+    pub(crate) fn callable_scope(
+        &self,
+        importer: &Module,
+        alias: Symbol,
+        name: Symbol,
+        substitutions: &[(String, Resolved)],
+    ) -> Option<(CallableWorkspace, Vec<(NodeId, Resolved)>)> {
+        let directive = self.load_directive(importer, alias).ok()?;
+        if directive.standard {
+            return None;
+        }
+        let identity = self
+            .bundle
+            .identity_of(&self.importer_id(), &directive.path)?;
+        if self.stack.borrow().iter().any(|active| active == identity) {
+            return None;
+        }
+        let source = self.bundle.get_by_id(identity)?;
+        let mut workspace = self
+            .callable_workspaces
+            .borrow_mut()
+            .remove(identity)
+            .unwrap_or_else(|| {
+                let module = source.clone();
+                let (tags, _) = crate::trace::collect_kernel_tag_nodes(&module);
+                let axis_errors = crate::axes::position_errors(&module);
+                let mut bindings = HashMap::new();
+                for (id, binding) in module.bindings() {
+                    bindings.entry(binding.name).or_insert(id);
+                }
+                CallableWorkspace {
+                    module,
+                    kernel_tags: Rc::new(tags),
+                    axis_errors: Rc::new(axis_errors),
+                    bindings: Rc::new(bindings),
+                }
+            });
+        let local_name = workspace.module.intern(importer.resolve(name));
+        let callable = (|| {
+            let binding = workspace
+                .module
+                .binding(*workspace.bindings.get(&local_name)?);
+            if !binding.public {
+                return None;
+            }
+            let mut rhs = binding.rhs;
+            for _ in 0..=workspace.module.binding_count() {
+                match workspace.module.node(rhs) {
+                    Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
+                        rhs = workspace
+                            .module
+                            .binding(workspace.module.binding_by_name(r.name)?)
+                            .rhs;
+                    }
+                    // Re-enter the ordinary call trace in this declaring scope.
+                    // Its module reference then resolves the next identity with
+                    // this load's substitutions and the normal active stack.
+                    Node::Ref(Ref {
+                        ns: flatppl_core::RefNs::Module(_),
+                        ..
+                    }) => return Some(()),
+                    Node::Call(c) if c.inputs.is_some() => return Some(()),
+                    _ => return None,
+                }
+            }
+            None
+        })();
+        if callable.is_none() {
+            self.callable_workspaces
+                .borrow_mut()
+                .insert(identity.to_owned(), workspace);
+            return None;
+        }
+        let seeds = substitutions
+            .iter()
+            .filter_map(|(name, res)| {
+                let symbol = workspace.module.intern(name);
+                let binding = *workspace.bindings.get(&symbol)?;
+                let node = workspace.module.binding(binding).rhs;
+                let res = substitution_seed(res);
+                Some((
+                    node,
+                    reintern_resolved(&mut workspace.module, importer, res),
+                ))
+            })
+            .collect();
+        self.stack.borrow_mut().push(identity.to_owned());
+        Some((workspace, seeds))
+    }
+
+    pub(crate) fn finish_callable_scope(&self, workspace: CallableWorkspace) {
+        let identity = self
+            .stack
+            .borrow_mut()
+            .pop()
+            .expect("active callable scope");
+        self.callable_workspaces
+            .borrow_mut()
+            .insert(identity, workspace);
+    }
     pub(crate) fn new(bundle: &'b ModuleBundle) -> Self {
         InferSession {
             bundle,
             catalogues: CatalogueSet::builtin_only(),
             memo: RefCell::new(HashMap::new()),
+            callable_workspaces: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
             dep_diags: RefCell::new(Vec::new()),
         }
@@ -469,6 +582,7 @@ impl<'b> InferSession<'b> {
             bundle,
             catalogues: CatalogueSet::with_external(external),
             memo: RefCell::new(HashMap::new()),
+            callable_workspaces: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
             dep_diags: RefCell::new(Vec::new()),
         }
@@ -811,6 +925,14 @@ fn callable_body_result(dep: &Module, rhs: NodeId) -> Option<Type> {
     dep.type_of(body).cloned()
 }
 
+fn substitution_seed(res: &Resolved) -> Resolved {
+    Resolved {
+        result: None,
+        catalogue: None,
+        ..res.clone()
+    }
+}
+
 /// Map each substitution to the dependency's input binding RHS node, paired
 /// with the importer-context annotation to seed there. Names not found in the
 /// dependency are silently skipped (unknown-input validation happens at the
@@ -827,14 +949,7 @@ pub(crate) fn seed_plan(
         {
             // Substitution seeds carry no body-result (inputs are plain
             // values, not reified callables); clone the rest from `res`.
-            seeds.push((
-                b.rhs,
-                Resolved {
-                    result: None,
-                    catalogue: None,
-                    ..res.clone()
-                },
-            ));
+            seeds.push((b.rhs, substitution_seed(res)));
         }
     }
     seeds

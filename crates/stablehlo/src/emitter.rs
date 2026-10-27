@@ -4438,6 +4438,8 @@ impl<'m> Emitter<'m> {
                         self.lower_rnginit(id, &call.args)
                     } else if name == "rngstate" {
                         Err(EmitError::at(id, "rngstate byte deserialization is not supported"))
+                    } else if matches!(name.as_str(), "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal") {
+                        crate::registry::lower_transport(self, id, &name, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "scan" | "reduce") {
