@@ -755,9 +755,15 @@ fn a_runtime_row_output_exports_one_result_per_column() -> Result<(), Box<dyn st
         ]})
     );
     assert!(
-        exported.stablehlo.contains("-> (tensor<f32>, tensor<f32>)"),
+        exported
+            .stablehlo
+            .contains("-> (tensor<f32>, tensor<f32>, tensor<i32>)"),
         "{}",
         exported.stablehlo
+    );
+    assert_eq!(
+        serde_json::to_value(&exported.runtime_status)?,
+        json!({"index": 2, "dtype": "int32", "shape": []})
     );
     Ok(())
 }

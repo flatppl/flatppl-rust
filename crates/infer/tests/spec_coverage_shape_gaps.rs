@@ -634,7 +634,7 @@ fn matrix_constructors_infer_matrices() {
 fn more_vector_results_infer() {
     let out = ir("x = onehot(1, 3)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(onehot"),
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(onehot"),
         "onehot should infer a real vector, got:\n{out}"
     );
     let out = ir("b = [0.0, 1.0, 2.0]\nd = [0.5, 1.5]\nx = bincounts(b, d)");

@@ -114,6 +114,23 @@ impl Emitter<'_> {
         Some(diagonal)
     }
 
+    pub(crate) fn constant_indices_in_bounds(
+        &self,
+        value: &Value,
+        lower: i64,
+        upper: u64,
+    ) -> Option<bool> {
+        if value.elem != ElemKind::Int {
+            return None;
+        }
+        Some(
+            self.constants
+                .get(&value.ssa)?
+                .iter()
+                .all(|value| matches!(value, Scalar::Int(n) if *n >= lower && *n as u64 <= upper)),
+        )
+    }
+
     pub(crate) fn constant_integer_vector(&self, value: &Value) -> Option<Vec<i64>> {
         let MlirTy::Ranked(dims) = &value.ty else {
             return None;
