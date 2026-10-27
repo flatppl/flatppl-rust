@@ -617,6 +617,36 @@ fn op_rule(
             }
             _ => Type::Deferred,
         },
+        "joinblocks" => match arg_ty(args, 0) {
+            Some(Type::Array { shape: outer, elem }) => match elem.as_ref() {
+                Type::Array { shape: inner, elem } if outer.len() == inner.len() => {
+                    let shape = outer
+                        .iter()
+                        .zip(inner.iter())
+                        .map(|(a, b)| match (a, b) {
+                            (Dim::Static(a), Dim::Static(b)) => {
+                                a.checked_mul(*b).map_or(Dim::Dynamic, Dim::Static)
+                            }
+                            _ => Dim::Dynamic,
+                        })
+                        .collect();
+                    Type::Array {
+                        shape,
+                        elem: elem.clone(),
+                    }
+                }
+                Type::Deferred | Type::Any => Type::Deferred,
+                _ => {
+                    inf.diags.push(crate::Diagnostic::error_at(id, "`joinblocks` requires an array of arrays with equal outer and inner ranks (spec §07)"));
+                    Type::Failed("joinblocks: invalid array nesting".into())
+                }
+            },
+            Some(Type::Deferred | Type::Any) | None => Type::Deferred,
+            Some(_) => {
+                inf.diags.push(crate::Diagnostic::error_at(id, "`joinblocks` requires an array of arrays with equal outer and inner ranks (spec §07)"));
+                Type::Failed("joinblocks: invalid array nesting".into())
+            }
+        },
         // `cat(x, y, …)` concatenates same-shape-class values (spec §07): all
         // scalars → a length-n vector, all 1-D vectors → one concatenated
         // vector, all records → a merged record. The single `cat` shape rule —
