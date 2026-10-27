@@ -4013,6 +4013,7 @@ impl<'m> Emitter<'m> {
                 | "inv"
                 | "det"
                 | "logabsdet"
+                | "cross"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {

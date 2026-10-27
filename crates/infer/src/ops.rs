@@ -347,6 +347,7 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "cross" => cross_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -1768,6 +1769,36 @@ fn fresh_measure(t: Option<&Type>) -> Type {
         },
         Some(other) => other.clone(),
         None => Type::Deferred,
+    }
+}
+
+fn cross_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    fn vector(ty: &Type) -> Option<(Dim, &Type)> {
+        match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => Some((shape[0], elem.as_ref())),
+            Type::TVector { len, elem } => Some((*len, elem.as_ref())),
+            _ => None,
+        }
+    }
+    let (Some((a_len, a)), Some((b_len, b))) = (
+        arg_ty(args, 0).and_then(vector),
+        arg_ty(args, 1).and_then(vector),
+    ) else {
+        return Type::Deferred;
+    };
+    if [a_len, b_len]
+        .iter()
+        .any(|d| matches!(d, Dim::Static(n) if *n != 3))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`cross` requires two vectors of length 3 (spec §07)",
+        ));
+        return Type::Failed("cross: vector length must be 3".into());
+    }
+    Type::Array {
+        shape: Box::new([Dim::Static(3)]),
+        elem: Box::new(promote2(Some(a), Some(b))),
     }
 }
 
@@ -7218,6 +7249,21 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
+        if op_name == "cross" && elems.len() == 2 && named.is_empty() {
+            let cells: Vec<ArgInfo> = args[1..]
+                .iter()
+                .zip(elems.iter())
+                .map(|((node, _, phase), ty)| (*node, ty.clone(), *phase))
+                .collect();
+            let inner = cross_type(inf, id, &cells);
+            if matches!(inner, Type::Failed(_)) {
+                return Ready(inner);
+            }
+            return Ready(Type::Array {
+                shape,
+                elem: Box::new(inner),
+            });
+        }
         return Ready(match broadcast_collection_cell(&op_name, &cell) {
             Some(inner) => Type::Array {
                 shape,
@@ -10442,6 +10488,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        "cross" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args
