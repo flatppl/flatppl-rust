@@ -111,6 +111,34 @@ func.func @logdensity(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>)
 
 The results are `m.x`, `m.y`, `first.x`, `first.y`.
 
+## Runtime status
+
+Programs with runtime checks return one trailing integer status after the
+authored result leaves. The module attribute `flatppl.runtime_status` gives its
+zero-based result index. `flatppl-host` also exports `runtime_status` metadata
+with its `index`, `dtype` and `shape`. The authored output schema excludes it.
+Programs without checks retain their original result signature.
+
+| Status | Meaning |
+|---|---|
+| 0 | No error |
+| 1 | Source index outside the selected axis |
+| 2 | Real-to-integer conversion outside the target integer width |
+
+The status uses `i32` for float32 emission and `i64` for float64 emission.
+It is scalar for an ordinary call. Host batching adds the host batch shape,
+with one status per call. Authored array axes and callable batch axes reduce
+into that call's status. Executed loop iterations preserve the first error.
+
+Checks execute inside StableHLO before clamping gathers or unsafe conversions.
+Invalid calls use safe internal operands, but their returned values are not
+valid results. Hosts must reject any nonzero status, including unknown codes,
+before exposing those values. A density of `-inf` is not an error.
+
+The Python adapter exposes the status through JAX `checkify`. A host may carry
+the status through a larger compiled computation and check it once afterward.
+Rust emits the program and metadata. It does not execute these checks.
+
 ## Worked examples
 
 Ordered arguments, single result — `inputs` names the three parameters, so they

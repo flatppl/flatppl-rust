@@ -22,6 +22,16 @@ pub struct Export {
     /// Host batch dimensions precede every result's authored cell dimensions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub batch_shape: Vec<u64>,
+    /// Device-side error status, separate from the authored output structure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_status: Option<RuntimeStatus>,
+}
+
+#[derive(Serialize)]
+pub struct RuntimeStatus {
+    pub index: usize,
+    pub dtype: &'static str,
+    pub shape: Vec<u64>,
 }
 
 #[derive(Serialize)]
@@ -200,6 +210,18 @@ pub fn emit_query(
         }
         returned.push(value);
     }
+    let runtime_status = emitter.runtime_status().map(|status| {
+        let index = returned.len();
+        returned.push(status);
+        RuntimeStatus {
+            index,
+            dtype: match dtype {
+                Dtype::F32 => "int32",
+                Dtype::F64 => "int64",
+            },
+            shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
+        }
+    });
     let returned = returned.iter().collect::<Vec<_>>();
     let stablehlo = if let Some(batch) = batch {
         let primitives = emitter.tensorize_batched("main", &args, &returned, batch);
@@ -211,6 +233,7 @@ pub fn emit_query(
         } else if tensorize && !batch.shape.is_empty() {
             let mut e = Emitter::with_options(&module, options);
             e.lower_for_host_batch();
+            e.set_runtime_batch_rank(batch.shape.len());
             let mut physical = Vec::new();
             let mut bound = HashMap::new();
             for (index, leaf) in arguments.iter().enumerate() {
@@ -267,6 +290,7 @@ pub fn emit_query(
         multiple_outputs,
         output_names,
         batch_shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
+        runtime_status,
     })
 }
 

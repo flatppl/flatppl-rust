@@ -172,8 +172,10 @@ fn lower_selectors(
     for (&node, &extent) in nodes.iter().zip(cell_dims) {
         let selector = match e.node(node) {
             Node::Lit(Scalar::Int(i)) => {
-                let zero = *i - base;
-                if zero < 0 || extent.is_some_and(|n| zero as u64 >= n) {
+                let Some(zero) = i.checked_sub(base).filter(|zero| *zero >= 0) else {
+                    return Err(EmitError::at(id, "get/get0: index out of range"));
+                };
+                if extent.is_some_and(|n| zero as u64 >= n) {
                     return Err(EmitError::at(id, "get/get0: index out of range"));
                 }
                 TensorSelector::Scalar(zero as u64)
@@ -191,6 +193,9 @@ fn lower_selectors(
             _ => {
                 let index = e.lower_node(node)?;
                 if index.elem == ElemKind::Int && e.cell_ty(&index) == MlirTy::Scalar {
+                    let size = extent
+                        .ok_or_else(|| EmitError::at(id, "get/get0 requires a static axis"))?;
+                    let index = e.checked_index(id, &index, size, base)?;
                     selectors.push(TensorSelector::DynamicScalar(index));
                     continue;
                 }
@@ -205,6 +210,9 @@ fn lower_selectors(
                     ));
                 }
                 vector_count += 1;
+                let size =
+                    extent.ok_or_else(|| EmitError::at(id, "get/get0 requires a static axis"))?;
+                let index = e.checked_index(id, &index, size, base)?;
                 TensorSelector::Vector(index)
             }
         };

@@ -300,7 +300,7 @@ fn segment_packing_retains_dynamic_shared_splat_and_overpadded_selections() {
              y = -x\n\
              inputs = (x, index)\noutputs = {outputs}\n"
         ));
-        assert_eq!(ir.matches("stablehlo.reduce(").count(), count, "{ir}");
+        assert_eq!(ir.matches("applies stablehlo.add").count(), count, "{ir}");
     }
 }
 

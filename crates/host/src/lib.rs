@@ -19,7 +19,7 @@ mod transforms;
 pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position};
 pub use constants::Constant;
 pub use data::{DataError, load_fixed_data, resolve_data_sources};
-pub use export::{Export, Field, Schema};
+pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
