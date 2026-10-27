@@ -24,6 +24,40 @@ fn write_model(name: &str, src: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn integer_broadcast_accepts_rounded_cells() {
+    for expression in [
+        "integer.(round.(v))",
+        "integer.(floor.(v))",
+        "integer.(ceil.(v))",
+        "sum(integer.(round.(v)))",
+    ] {
+        let input = write_model(
+            "rounded-cells",
+            &format!("v = elementof(cartpow(reals, [3]))\ninputs = v\noutputs = {expression}\n"),
+        );
+        let output = flatppl().arg("stablehlo").arg(input).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let input = write_model(
+        "unrounded-cells",
+        "v = elementof(cartpow(reals, [3]))\ninputs = v\noutputs = integer.(abs.(v))\n",
+    );
+    assert!(
+        !flatppl()
+            .arg("stablehlo")
+            .arg(input)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn syntax_sugar_exports_the_same_ordered_query() {
     let sugar = write_model(
         "syntax-sugar",
