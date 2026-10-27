@@ -2712,6 +2712,105 @@ impl<'m> Emitter<'m> {
 
     // ---- sampling (Task 6) --------------------------------------------------
 
+    /// Initialize the Threefry key by hashing the seed bytes with two FNV-1a
+    /// streams. Integer seeds use exactly their eight little-endian bytes.
+    fn lower_rnginit(&mut self, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+        let [seed] = crate::ops::args_exact(id, args)?;
+        let seed = self.lower_node(seed)?;
+        if seed.elem != ElemKind::Int || self.batch_rank(&seed) != 0 {
+            return Err(EmitError::at(
+                id,
+                "rnginit requires an unbatched integer or byte vector",
+            ));
+        }
+        let length = match &seed.ty {
+            MlirTy::Scalar => 8,
+            MlirTy::Ranked(dims) if dims.len() == 1 => match dims[0] {
+                Some(n @ 1..=4096) => n,
+                _ => {
+                    return Err(EmitError::at(
+                        id,
+                        "rnginit requires a nonempty static byte vector of at most 4096 elements",
+                    ));
+                }
+            },
+            _ => {
+                return Err(EmitError::at(
+                    id,
+                    "rnginit requires an integer or byte vector",
+                ));
+            }
+        };
+        let zero = self.int_value_const(0);
+        let nonnegative = self.compare("GE", &seed, &zero);
+        let valid = if matches!(seed.ty, MlirTy::Scalar) {
+            nonnegative
+        } else {
+            let max = self.int_value_const(255);
+            let in_range = self.compare("LE", &seed, &max);
+            let all = self.and(&nonnegative, &in_range);
+            self.reduce_all(&all)
+        };
+        // Call record_runtime_error(valid, <seed-domain-code>) when the shared
+        // runtime-status ABI is available; invalid inputs use a safe zero seed.
+        let seed = self.select(&valid, &seed, &zero);
+        let seed_ty = seed.ty.render(self.dtype, ElemKind::Int);
+        let mut hashes = [
+            self.pure("stablehlo.constant dense<14695981039346656037> : tensor<ui64>".to_string()),
+            self.pure("stablehlo.constant dense<7809847782465536322> : tensor<ui64>".to_string()),
+        ];
+        let prime = self.pure("stablehlo.constant dense<1099511628211> : tensor<ui64>".to_string());
+        let mask = self.pure("stablehlo.constant dense<255> : tensor<ui64>".to_string());
+        let scalar_seed = if matches!(seed.ty, MlirTy::Scalar) {
+            Some(self.pure(format!(
+                "stablehlo.convert {} : ({seed_ty}) -> tensor<ui64>",
+                seed.ssa
+            )))
+        } else {
+            None
+        };
+        for i in 0..length {
+            let byte = if let Some(scalar) = &scalar_seed {
+                let shift = self.pure(format!(
+                    "stablehlo.constant dense<{}> : tensor<ui64>",
+                    i * 8
+                ));
+                let shifted = self.pure(format!(
+                    "stablehlo.shift_right_logical {scalar}, {shift} : tensor<ui64>"
+                ));
+                self.pure(format!("stablehlo.and {shifted}, {mask} : tensor<ui64>"))
+            } else {
+                let part = self.slice(&seed, &[i], &[i + 1], &[1]);
+                let part = self.reshape(&part, MlirTy::Scalar);
+                let ty = part.ty.render(self.dtype, part.elem);
+                self.pure(format!(
+                    "stablehlo.convert {} : ({ty}) -> tensor<ui64>",
+                    part.ssa
+                ))
+            };
+            for hash in &mut hashes {
+                let xored = self.pure(format!("stablehlo.xor {hash}, {byte} : tensor<ui64>"));
+                *hash = self.pure(format!(
+                    "stablehlo.multiply {xored}, {prime} : tensor<ui64>"
+                ));
+            }
+        }
+        let a = self.pure(format!(
+            "stablehlo.reshape {} : (tensor<ui64>) -> tensor<1xui64>",
+            hashes[0]
+        ));
+        let b = self.pure(format!(
+            "stablehlo.reshape {} : (tensor<ui64>) -> tensor<1xui64>",
+            hashes[1]
+        ));
+        let ssa = self.pure(format!("stablehlo.concatenate {a}, {b}, dim = 0 : (tensor<1xui64>, tensor<1xui64>) -> tensor<2xui64>"));
+        Ok(Value {
+            ssa,
+            ty: MlirTy::Key,
+            elem: ElemKind::Real,
+        })
+    }
+
     /// Draw a standard `out_ty`-shaped variate from the threaded rng key
     /// (spec §07 rng ABI), advancing [`Emitter::cur_key`]. `dist` is the
     /// sampling family (`"NORMAL"`/`"UNIFORM"`), returning a standard normal
@@ -4209,6 +4308,10 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_sample(self, id, &call.args)
                     } else if name == "builtin_touniform" {
                         crate::registry::lower_touniform(self, id, &call.args)
+                    } else if name == "rnginit" {
+                        self.lower_rnginit(id, &call.args)
+                    } else if name == "rngstate" {
+                        Err(EmitError::at(id, "rngstate byte deserialization is not supported"))
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "scan" | "reduce") {
