@@ -269,7 +269,7 @@ fn ipc_error(error: ArrowError) -> Error {
             "{codec}-compressed Arrow IPC is not supported in this build"
         ));
     }
-    Error(format!("Arrow IPC: {error}"))
+    Error(format!("Arrow IPC: malformed file ({error})"))
 }
 
 fn read_batches(reader: impl RecordBatchReader, decode: bool) -> Result<Table> {
