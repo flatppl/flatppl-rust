@@ -165,6 +165,9 @@ fn frame_capacity(codec: arrow_ipc::CompressionType, data: &[u8]) -> Option<u64>
         // Skippable frames (both formats) carry no output.
         if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
             at = at.checked_add(8 + word(at + 4)? as usize)?;
+            if at > data.len() {
+                return None;
+            }
             continue;
         }
         if zstd {
@@ -181,6 +184,9 @@ fn frame_capacity(codec: arrow_ipc::CompressionType, data: &[u8]) -> Option<u64>
                     | u32::from(byte(at + 1)?) << 8
                     | u32::from(byte(at + 2)?) << 16;
                 let size = (header >> 3) as usize;
+                if size > 1 << 17 {
+                    return None;
+                }
                 let (payload, output) = match (header >> 1) & 3 {
                     0 => (size, size as u64),
                     1 => (1, size as u64),
@@ -214,6 +220,9 @@ fn frame_capacity(codec: arrow_ipc::CompressionType, data: &[u8]) -> Option<u64>
                     break;
                 }
                 let size = (block & 0x7FFF_FFFF) as usize;
+                if size as u64 > block_max {
+                    return None;
+                }
                 let output = if block & 0x8000_0000 != 0 {
                     size as u64
                 } else {

@@ -859,3 +859,41 @@ fn negative_integer_literals_fit_as_written() {
         "{err}"
     );
 }
+
+#[test]
+fn arrow_rejects_blocks_over_the_codec_limit_before_allocating() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/data")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let mut zstd = fixture("zstd_claim.arrow");
+    let at = zstd
+        .windows(4)
+        .position(|w| w == [0x28, 0xb5, 0x2f, 0xfd])
+        .unwrap();
+    zstd[at - 8..at].copy_from_slice(&131_073_i64.to_le_bytes());
+    let rle_header = (131_073_u32 << 3) | 3;
+    zstd[at + 7..at + 10].copy_from_slice(&rle_header.to_le_bytes()[..3]);
+    let err = flatppl_data::Table::from_arrow_ipc_values(&zstd)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+
+    let mut lz4 = fixture("lz4_runs.arrow");
+    let at = lz4
+        .windows(4)
+        .position(|w| w == [0x04, 0x22, 0x4d, 0x18])
+        .unwrap();
+    let flags = lz4[at + 4];
+    let max = 1_u32 << (16 + 2 * (u32::from((lz4[at + 5] >> 4) & 7) - 4));
+    let header = at + 7 + if flags & 8 != 0 { 8 } else { 0 } + if flags & 1 != 0 { 4 } else { 0 };
+    lz4[header..header + 4].copy_from_slice(&(0x8000_0000 | (max + 1)).to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&lz4)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+}
