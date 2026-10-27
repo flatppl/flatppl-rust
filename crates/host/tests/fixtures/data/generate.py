@@ -166,6 +166,33 @@ def patched(path, data, old, new, region=slice(None)):
 # are pyarrow files of one f64 column, byte-patched by hand. short_block's footer
 # Block.bodyLength reads 8 against its message's 32. The huge_lz4 files are LZ4
 # files whose data buffer's decompressed-length prefix reads 2^50 and 2^62.
+# An incompressible ZSTD buffer (4 KiB of noise) whose decompressed-length prefix
+# claims 5e8 bytes, within 2^17 times its size, with its batch and node lengths raised to match and no
+# content size in the frame, so a reader sizes its output from the prefix.
+noise = np.random.default_rng(7).random(512)
+sink = pa.BufferOutputStream()
+with ipc.new_file(sink, pa.schema([("a", pa.float64())]),
+                  options=ipc.IpcWriteOptions(compression="zstd")) as writer:
+    writer.write_batch(pa.record_batch({"a": noise}))
+claim = bytearray(sink.getvalue().to_pybytes())
+batch_at = 8 + 8 + struct.unpack_from("<i", claim, 12)[0]
+body = batch_at + 8 + struct.unpack_from("<i", claim, batch_at + 4)[0]
+assert claim[body:].count(struct.pack("<q", 8 * 512)) == 1  # the prefix
+claim[body:] = claim[body:].replace(struct.pack("<q", 8 * 512), struct.pack("<q", 500_000_000))
+assert claim[batch_at:body].count(struct.pack("<q", 512)) == 2  # batch and node length
+claim[batch_at:body] = claim[batch_at:body].replace(struct.pack("<q", 512),
+                                                    struct.pack("<q", 62_500_000))
+# Drop the frame's own content size, which the zstd crate would otherwise size its
+# output from: its 2 bytes become a 4 KiB window descriptor and a dictionary ID of 0.
+frame = body + 8
+assert claim[frame:frame + 4] == b"\x28\xb5\x2f\xfd" and claim[frame + 4] >> 5 == 0b011
+claim[frame + 4] = (claim[frame + 4] & 0x04) | 0x01
+claim[frame + 5:frame + 7] = b"\x10\x00"
+(HERE / "zstd_claim.arrow").write_bytes(bytes(claim))
+# A million zeros: highly compressible, so a small ZSTD body holds 8 MB.
+with ipc.new_file(HERE / "zstd_zeros.arrow", pa.schema([("a", pa.float64())]),
+                  options=ipc.IpcWriteOptions(compression="zstd")) as writer:
+    writer.write_batch(pa.record_batch({"a": np.zeros(1_000_000)}))
 # 400 batches of a Null column, 308224 rows each, in a file of about 38 KB.
 with ipc.new_stream(HERE / "many_null_batches.arrows", pa.schema([("n", pa.null())])) as writer:
     for _ in range(400):
