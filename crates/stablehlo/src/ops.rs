@@ -89,6 +89,7 @@ pub(crate) fn lower_builtin(
         "add" => binary(e, id, args, Emitter::add),
         "sub" => binary(e, id, args, Emitter::sub),
         "mul" => binary(e, id, args, Emitter::mul),
+        "conv" | "crosscorr" => lower_convolution(e, id, head, args),
         // §07 `divide` (real division `a / b`) — what the parser emits for `/`
         // and `./`. Distinct from §07 `div` (integer floor division, below):
         // `divide` always forces Real via `Emitter::div` (`binary_real`),
@@ -1737,6 +1738,88 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 
 // ---- reductions --------------------------------------------------------------
 
+/// Valid windows, with the kernel reversed only for convolution.
+fn lower_convolution(
+    e: &mut Emitter,
+    id: NodeId,
+    head: &str,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [v, kernel] = args_exact(id, args)?;
+    let mut v = e.lower_node(v)?;
+    let mut kernel = e.lower_node(kernel)?;
+    let (MlirTy::Ranked(vcell), MlirTy::Ranked(kcell)) = (e.cell_ty(&v), e.cell_ty(&kernel)) else {
+        return Err(EmitError::at(
+            id,
+            format!("{head} requires statically sized vectors"),
+        ));
+    };
+    let ([Some(n)], [Some(k)]) = (vcell.as_slice(), kcell.as_slice()) else {
+        return Err(EmitError::at(
+            id,
+            format!("{head} requires statically sized vectors"),
+        ));
+    };
+    if k > n {
+        return Err(EmitError::at(
+            id,
+            format!("{head} requires kernel length at most signal length"),
+        ));
+    }
+    if v.elem == ElemKind::Bool {
+        v = e.convert(&v, ElemKind::Int);
+    }
+    if kernel.elem == ElemKind::Bool {
+        kernel = e.convert(&kernel, ElemKind::Int);
+    }
+    let (MlirTy::Ranked(vdims), MlirTy::Ranked(kdims)) = (&v.ty, &kernel.ty) else {
+        unreachable!()
+    };
+    let vdims = vdims
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| EmitError::at(id, format!("{head} requires static batch dimensions")))?;
+    let kdims = kdims
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| EmitError::at(id, format!("{head} requires static batch dimensions")))?;
+    let length = n - k + 1;
+    if *k == 0 {
+        let mut dims = vdims.clone();
+        *dims.last_mut().expect("vector") = length;
+        let zero = e.constant(0.0, MlirTy::Ranked(dims.into_iter().map(Some).collect()));
+        let target = if elem_rank(v.elem) >= elem_rank(kernel.elem) {
+            v.elem
+        } else {
+            kernel.elem
+        };
+        let zero = e.convert(&zero, target);
+        return Ok(e.axes_view(&zero, e.axes_of(&v)));
+    }
+    let mut sum = None;
+    for i in 0..*k {
+        let mut start = vec![0; vdims.len()];
+        let mut end = vdims.clone();
+        *start.last_mut().expect("vector") = i;
+        *end.last_mut().expect("vector") = i + length;
+        let window = e.slice(&v, &start, &end, &vec![1; vdims.len()]);
+        let j = if head == "conv" { k - i - 1 } else { i };
+        let mut start = vec![0; kdims.len()];
+        let mut end = kdims.clone();
+        *start.last_mut().expect("vector") = j;
+        *end.last_mut().expect("vector") = j + 1;
+        let weight = e.slice(&kernel, &start, &end, &vec![1; kdims.len()]);
+        let term = e.mul(&window, &weight);
+        sum = Some(match sum {
+            Some(s) => e.add(&s, &term),
+            None => term,
+        });
+    }
+    Ok(sum.expect("nonempty kernel"))
+}
+
 /// Lower `sum` over an array. Over a table §07 "Table reductions" gives a record
 /// of per-column sums, which `Emitter::lower_field` lowers one column at a time;
 /// only a tensor position reaches the table refusal here.
@@ -1868,21 +1951,16 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 
 /// Every §07 head whose Domains cell is a COLLECTION — arrays, vectors, matrices or
 /// tables, never a scalar — with the §07 table it lives in and that cell as §07 writes
-/// it. §04 applies a broadcast head to each ELEMENT, so none of these has a tensor form
-/// under a `broadcast`: [`Emitter::lower_broadcast`] refuses them rather than lowering the
-/// head's whole-array form and discarding the wrapper, which is what `sum.(v)` did.
+/// it. §04 applies a broadcast head to each ELEMENT, so a handler must lower collection
+/// cells or refuse rather than discard the wrapper, which is what `sum.(v)` once did.
 ///
 /// SCOPE: the six §07 tables swept are Reductions, Boolean reductions, Cumulative
 /// operations, Norms and normalization, Linear algebra, and Array and table operations. A
 /// head outside all six still falls through to [`lower_builtin`], so "no wrapper is
 /// discarded" is a claim about these tables, not about every conceivable head.
 ///
-/// §07's remaining tables are UNLOWERED here, which is NOT the same as scalar-domain.
-/// Convolution (`conv`, `crosscorr`) and Array and table generation (`array`) take a
-/// collection first argument, and each is safe today only because
-/// [`lower_builtin`] answers "unsupported builtin head". **Wiring any of them here MUST
-/// add the head to this table in the same change**, or the dotted spelling starts
-/// discarding the wrapper again.
+/// Convolution and array generation also have collection-domain arguments. They belong
+/// here so scalar-cell broadcasts cannot silently discard their domain.
 ///
 /// A LOCAL copy of `flatppl_infer`'s table of the same name. This crate takes
 /// `flatppl-infer` as a dev-dependency only — the emitter reads determinized FlatPIR and
@@ -1891,6 +1969,8 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// file, which fails on any head, section or domain cell that drifts. Duplicating the
 /// list beats making the emitter depend on inference in order to refuse.
 pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
+    ("conv", "Convolution", "vector, vector"),
+    ("crosscorr", "Convolution", "vector, vector"),
     ("sum", "Reductions", "real/complex arrays"),
     ("mean", "Reductions", "real/complex arrays"),
     ("var", "Reductions", "real arrays"),

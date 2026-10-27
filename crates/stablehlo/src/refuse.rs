@@ -447,13 +447,8 @@
 //!   a general one. The nested case stays refused here because a vector of vectors has
 //!   no tensor form in this emitter.
 //!
-//!   **Forward hazard for whoever wires the next collection head.** §07's remaining
-//!   tables are UNLOWERED, not scalar-domain: Convolution (`conv`, `crosscorr`), Binning
-//!   (`bincounts`), Approximation functions (`polynomial`, `bernstein`, `stepwise`) and
-//!   Array and table generation (`array`) all take a collection first argument, and each
-//!   is safe today only because `lower_builtin` answers "unsupported builtin head". Add
-//!   the head to `ops::COLLECTION_DOMAIN_HEADS` in the SAME change that wires it, or the
-//!   dotted spelling silently emits the undotted head's answer again.
+//!   Any new collection head needs the same domain and per-cell handling; otherwise a
+//!   dotted spelling can silently emit the undotted head's answer.
 //!
 //! **`norms.rs`** (§07 "Reductions" and "Norms and normalization", reached
 //! through `ops::lower_builtin`'s twelve bare-head arms). Every site below is

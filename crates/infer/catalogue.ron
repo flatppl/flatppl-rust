@@ -299,7 +299,8 @@ Catalogue(
         // matrix inverts to a complex matrix).
         Builtin(name: "inv",            sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: OfArg(0)))),
         Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: OfArg(0)))),
-        // qr(A) → record(Q, R): both matrices with A's element kind (spec §07).
+        // qr(A) → record(Q, R). The structural rule refines shapes and widens
+        // integer/boolean elements to real (spec §07).
         Builtin(name: "qr", sig: Function(params: [Matrix], names: ["A"], result: Record([
             ("Q", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
             ("R", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
@@ -336,7 +337,7 @@ Catalogue(
         Builtin(name: "joinblocks",     sig: Function(params: [Any], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // onehot(i, n): real basis vector.
         Builtin(name: "onehot",         sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["i", "n"], result: Vector(len: Dyn, elem: Real))),
-        // conv / crosscorr: 1-D vector result, element kind from the signal.
+        // conv / crosscorr: structural rule refines the result shape and element kind.
         Builtin(name: "conv",           sig: Function(params: [Vector(Real), Vector(Real)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
         Builtin(name: "crosscorr",      sig: Function(params: [Vector(Real), Vector(Real)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
         // bincounts(bins, data): integer counts per bin.
