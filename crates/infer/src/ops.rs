@@ -347,6 +347,7 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "qr" => qr_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -1769,6 +1770,39 @@ fn fresh_measure(t: Option<&Type>) -> Type {
         Some(other) => other.clone(),
         None => Type::Deferred,
     }
+}
+
+fn qr_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    let Some(Type::Array { shape, elem }) = arg_ty(args, 0) else {
+        return Type::Deferred;
+    };
+    if shape.len() != 2 || !matches!(elem.as_ref(), Type::Scalar(_)) {
+        return Type::Deferred;
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    if matches!((rows, cols), (Dim::Static(m), Dim::Static(n)) if m < n) {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`qr` requires at least as many rows as columns (spec §07)",
+        ));
+        return Type::Failed("qr: matrix is wider than tall".into());
+    }
+    let kind = if matches!(elem.as_ref(), Type::Scalar(ScalarType::Complex)) {
+        ScalarType::Complex
+    } else {
+        ScalarType::Real
+    };
+    let q = Type::Array {
+        shape: Box::new([rows, cols]),
+        elem: Box::new(Type::Scalar(kind)),
+    };
+    let r = Type::Array {
+        shape: Box::new([cols, cols]),
+        elem: Box::new(Type::Scalar(kind)),
+    };
+    let q_name = inf.module.intern("Q");
+    let r_name = inf.module.intern("R");
+    Type::Record(Box::new([(q_name, q), (r_name, r)]))
 }
 
 /// Numeric promotion: integer ⊔ integer = integer, real dominates integer,
@@ -10442,6 +10476,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        "qr" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args

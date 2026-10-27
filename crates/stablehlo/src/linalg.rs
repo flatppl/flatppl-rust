@@ -4,6 +4,126 @@ use super::batching::tensor;
 use super::*;
 
 impl Emitter<'_> {
+    /// Thin, unpivoted Householder QR. The zero-column case uses the identity
+    /// reflector, retaining an orthonormal basis even for rank-deficient input.
+    pub(crate) fn matrix_qr(
+        &mut self,
+        id: NodeId,
+        input: &Value,
+    ) -> Result<(Value, Value), EmitError> {
+        let MlirTy::Ranked(dims) = self.cell_ty(input) else {
+            return Err(EmitError::at(
+                id,
+                "`qr` requires a static matrix (spec §07)",
+            ));
+        };
+        let [Some(m), Some(n)] = dims.as_slice() else {
+            return Err(EmitError::at(
+                id,
+                "`qr` requires a static matrix (spec §07)",
+            ));
+        };
+        if *m == 0 || *n == 0 || m < n || *m > i32::MAX as u64 {
+            return Err(EmitError::at(
+                id,
+                "`qr` requires a nonempty matrix with rows >= columns (spec §07)",
+            ));
+        }
+        let (m, n) = (*m, *n);
+        let input = self.convert(input, ElemKind::Real);
+        let batch = self.batch_rank(&input);
+        let batch_dims = shape(&input.ty)[..batch]
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| EmitError::at(id, "`qr` requires static batch dimensions"))?;
+        let r_axes = self.axes_of(&input);
+        let q_axes = Axes {
+            batch,
+            layers: vec![2],
+        };
+        let mut q_dims: Vec<Option<u64>> = batch_dims.iter().copied().map(Some).collect();
+        q_dims.extend([Some(m), Some(m)]);
+        let zero_q = self.constant(0.0, tensor(q_dims));
+        let zero_q = self.axes_view(&zero_q, q_axes.clone());
+        let rows_q = self.axis_indices(&zero_q, batch);
+        let cols_q = self.axis_indices(&zero_q, batch + 1);
+        let identity = self.compare("EQ", &rows_q, &cols_q);
+        let q = self.convert(&identity, ElemKind::Real);
+        let cols_r = self.axis_indices(&input, batch + 1);
+        let mut transpose: Vec<u64> = (0..batch as u64).collect();
+        transpose.extend([batch as u64 + 1, batch as u64]);
+        let result = self.matrix_loop(n, &[input, q], |e, index, args| {
+            let r = e.axes_view(&args[0], r_axes.clone());
+            let q = e.axes_view(&args[1], q_axes.clone());
+            let at_col = e.compare("EQ", &cols_r, index);
+            let zeros = e.constant_like(0.0, &r);
+            let col = e.select(&at_col, &r, &zeros);
+            let col = e.reduce_sum_last_axis(&col);
+            let indices = e.axis_indices(&col, batch);
+            let active = e.compare("GE", &indices, index);
+            let zeros = e.constant_like(0.0, &col);
+            let col = e.select(&active, &col, &zeros);
+            let magnitude = e.abs(&col);
+            let scale = e.reduce_max(&magnitude);
+            let zero = e.scalar(0.0);
+            let nonzero = e.compare("NE", &scale, &zero);
+            let one = e.scalar(1.0);
+            let safe_scale = e.select(&nonzero, &scale, &one);
+            let x = e.div(&col, &safe_scale);
+            let square = e.mul(&x, &x);
+            let norm2 = e.reduce_sum(&square);
+            let norm = e.sqrt(&norm2);
+            let at_pivot = e.compare("EQ", &indices, index);
+            let pivot = e.select(&at_pivot, &x, &zeros);
+            let pivot = e.reduce_sum(&pivot);
+            let negative = e.compare("LT", &pivot, &zero);
+            let minus_one = e.scalar(-1.0);
+            let sign = e.select(&negative, &minus_one, &one);
+            let alpha = e.mul(&sign, &norm);
+            let correction = e.select(&at_pivot, &alpha, &zero);
+            let v = e.add(&x, &correction);
+            let v2 = e.mul(&v, &v);
+            let v2 = e.reduce_sum(&v2);
+            let nonzero_v = e.compare("NE", &v2, &zero);
+            let safe_v2 = e.select(&nonzero_v, &v2, &one);
+            let two = e.scalar(2.0);
+            let beta = e.div(&two, &safe_v2);
+            let beta = e.select(&nonzero_v, &beta, &zero);
+            let rt = e.transpose(&r, &transpose);
+            let rt = e.axes_view(&rt, r_axes.clone());
+            let r_projection = e.matvec(&rt, &v);
+            let r_projection = e.mul(&beta, &r_projection);
+            let vr = e.matrix_expand(&v, &r, batch);
+            let pr = e.matrix_expand(&r_projection, &r, batch + 1);
+            let change_r = e.mul(&vr, &pr);
+            let r = e.sub(&r, &change_r);
+            let q_projection = e.matvec(&q, &v);
+            let q_projection = e.mul(&beta, &q_projection);
+            let pq = e.matrix_expand(&q_projection, &q, batch);
+            let vq = e.matrix_expand(&v, &q, batch + 1);
+            let change_q = e.mul(&pq, &vq);
+            let q = e.sub(&q, &change_q);
+            vec![r, q]
+        });
+        let r = self.axes_view(&result[0], r_axes);
+        let q = self.axes_view(&result[1], q_axes);
+        let mut starts = vec![0; batch];
+        starts.extend([0, 0]);
+        let mut q_limits = batch_dims.clone();
+        q_limits.extend([m, n]);
+        let mut r_limits = batch_dims;
+        r_limits.extend([n, n]);
+        let strides = vec![1; batch + 2];
+        let q = self.slice(&q, &starts, &q_limits, &strides);
+        let r = self.slice(&r, &starts, &r_limits, &strides);
+        let rows = self.axis_indices(&r, batch);
+        let cols = self.axis_indices(&r, batch + 1);
+        let upper = self.compare("LE", &rows, &cols);
+        let zero = self.constant_like(0.0, &r);
+        let r = self.select(&upper, &r, &zero);
+        Ok((q, r))
+    }
     /// Enzyme's reverse-loop tape uses i64 slice offsets. Keep its induction
     /// variable i64 too; convert only the index consumed by tensor arithmetic.
     fn matrix_loop(
