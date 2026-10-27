@@ -93,6 +93,10 @@ fn selectbins_keeps_the_bins_that_meet_the_region() {
         &format!("selectbins([-1.0, 0.0, 1.0, 2.0], posreals, {c})"),
         "tensor<2xf32>",
     );
+    refuses(
+        "selectbins([-10.0, 10.0], interval(5.0, 3.0), [z0])",
+        "no bin meets the region",
+    );
 }
 
 // Fixed edges and bounds may be infinite: `interval(a, inf)`, `interval(-inf, b)`

@@ -541,7 +541,7 @@ pub(crate) fn lower_selectbins(
             let (a, b) = (edges[i], edges[i + 1]);
             let starts = a <= hi;
             let ends = if i == last { b >= lo } else { b > lo };
-            starts && ends && !(lo_open && b <= lo)
+            lo <= hi && starts && ends && !(lo_open && b <= lo)
         })
         .map(|i| get_literal_value(e, id, cv.clone(), i as u64))
         .collect::<Result<Vec<_>, _>>()?;
