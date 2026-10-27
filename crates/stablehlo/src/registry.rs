@@ -856,8 +856,7 @@ pub(crate) fn lower_transport(
         let lower = e.compare("GE", &x, &zero);
         let upper = e.compare("LE", &x, &one);
         let valid = e.and(&lower, &upper);
-        // Call record_runtime_error(valid, <uniform-domain-code>) here when the
-        // shared runtime-status ABI is available.
+        e.record_runtime_error(&valid, 5);
         let safe = e.scalar(0.5);
         e.select(&valid, &x, &safe)
     } else {
