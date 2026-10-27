@@ -520,8 +520,7 @@
 //! - `lany`/`lall` over a TABLE in tensor position — the shared
 //!   `norms::table_reduction_in_tensor_position`; a projection or an output
 //!   reduces each column. `cummax`/`cummin` over a table — the vector-domain
-//!   refusal `cumsum` gives. `median` over a table refuses per column with the
-//!   order-statistic message below.
+//!   refusal `cumsum` gives. `median` over a table reduces each column.
 //! - `lany`/`lall` over a SCALAR or a dynamically-shaped operand — "...: §07
 //!   reduces an ARRAY, so the operand must be a statically-shaped array, got ...",
 //!   matching `norms::lower_reduction`'s guard.
@@ -550,22 +549,8 @@
 //!   boolean vector a BOOLEAN vector (a running maximum selects an element and
 //!   performs no arithmetic, so §03 "Bool"'s promotion sentence does not reach
 //!   it), so a promoted lowering would return a type the module does not declare.
-//! - `median`/`quantile`, always — "... has no lowering here: §07 defines it as
-//!   ..., which needs the operand RANKED, and this emitter has no sort ...". Not a
-//!   domain refusal and not a spec gap: the heads are fully specified, and this
-//!   backend lacks the primitive. The crate emits no `stablehlo.sort` and no top-k;
-//!   the sort-free rank-select alternative fabricates an element whenever the input
-//!   contains NaN (every comparison against NaN is false, so two elements collide
-//!   at one rank), and a wrong number with no diagnostic is worse than refusing.
-//!   That NaN guard is unbuilt and out of scope, not unbuildable — see
-//!   `order::refuse_order_statistic`. The js engine implements both.
-//!   `order::refuse_order_statistic` carries the full argument.
-//! - `aggregate(median | lany | lall, …)` — "...: `X` IS an eligible reduction
-//!   under §04 \"Multi-axis aggregation\", but has no lowering in this emitter".
-//!   A DISTINCT message from `aggregate.rs`'s ineligibility refusal, because the
-//!   draft makes all three eligible and telling the caller otherwise would
-//!   contradict §04. The BARE `lany`/`lall` do lower; only the aggregate spelling
-//!   is missing, and `aggregate::ELIGIBLE_BUT_UNLOWERED` records what it needs.
+//! - `aggregate(lany | lall, …)` — an eligible reduction without an
+//!   aggregate lowering. The bare reductions lower.
 //!
 //! **NOT refused: a length-0 operand, for any of the five heads that lower.** Unlike
 //! the `norms.rs` family above, these are no longer answered pending a ruling — the

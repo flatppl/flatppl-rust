@@ -642,17 +642,11 @@ fn a_table_boolean_reduction_reduces_each_column() {
     }
 }
 
-// ---- §07 the order statistics: refused ----------------------------------------
+// ---- §07 the order statistics -------------------------------------------------
 
-/// `median`/`quantile` refuse, localized to the call. The internal sampling sort
-/// does not implement their NaN handling or runtime rank selection. The refusal
-/// names the reason a sort-free rank-select is not substituted here: it
-/// fabricates an element whenever the input contains NaN, and a wrong number with no
-/// diagnostic is worse than refusing. The NaN guard that would make it safe is
-/// unbuilt and out of this wave's scope, not unbuildable — `order.rs` says which ops
-/// it would take, so a future wave does not read the route as closed.
+/// Both heads sort and guard NaNs before selecting order statistics.
 #[test]
-fn the_order_statistics_refuse_with_a_located_message() {
+fn the_order_statistics_sort_and_propagate_nan() {
     for (head, src) in [
         ("median", vec_src("median", "reals", 4)),
         (
@@ -661,22 +655,50 @@ fn the_order_statistics_refuse_with_a_located_message() {
                 .to_string(),
         ),
     ] {
-        let msg = emit_err(&src);
+        let msg = emit(&src);
         assert!(
-            msg.contains(&format!("{head} has no lowering here"))
-                && msg.contains("internal ordered-sampling sort")
-                && msg.contains("NaN"),
-            "`{head}` must refuse and say why, got: {msg}"
+            msg.contains("stablehlo.sort") && msg.contains("stablehlo.select"),
+            "`{head}` must sort and guard NaN, got: {msg}"
         );
     }
 }
 
-/// §04's eligible-reduction list gains `median`, `lany` and `lall`, so the aggregate
+#[test]
+fn empty_order_statistics_refuse() {
+    for expr in ["median(v)", "quantile(v, 0.5)"] {
+        let src = format!(
+            "v = elementof(cartpow(reals, [{LEN0_SENTINEL}]))\ninputs = v\noutputs = {expr}\n"
+        );
+        let mut det = determinize_abi(&src);
+        zero_the_extents(&mut det);
+        let err = flatppl_stablehlo::emit(
+            &det,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .expect_err("empty statistic must refuse");
+        assert!(err.msg.contains("empty array"), "{}", err.msg);
+    }
+}
+
+#[test]
+fn median_aggregate_and_broadcast_quantile_lower() {
+    let aggregate = emit(
+        "A = elementof(cartpow(reals, [2, 3]))\ninputs = A\noutputs = aggregate(median, [.i], A[.i, .j])\n",
+    );
+    assert!(aggregate.contains("stablehlo.sort"), "{aggregate}");
+    let broadcast = emit(
+        "v = elementof(cartpow(cartpow(reals, [4]), [2]))\np = elementof(cartpow(unitinterval, [2]))\ninputs = (v, p)\noutputs = quantile.(v, p)\n",
+    );
+    assert!(broadcast.contains("stablehlo.sort"), "{broadcast}");
+}
+
+/// §04's eligible-reduction list includes `lany` and `lall`, so the aggregate
 /// refusal must not tell the caller they are INELIGIBLE — that would contradict the
 /// spec. Two distinct messages: eligible-but-unlowered, and genuinely ineligible.
 #[test]
 fn an_aggregate_over_an_eligible_but_unlowered_reduction_says_so() {
-    for head in ["median", "lany", "lall"] {
+    for head in ["lany", "lall"] {
         let src = format!(
             "A = elementof(cartpow(reals, [2, 3]))\ny = aggregate({head}, [.i], A[.i, .j])\n\
              inputs = (A)\noutputs = (y)\n"

@@ -904,12 +904,11 @@ fn every_reduction_head_reduces_a_table_column_wise() {
     }
 }
 
-/// `median` over a table refuses for its own reason: a column's median needs the
-/// order statistics this emitter does not compute.
+/// A table median reduces its columns separately.
 #[test]
-fn median_over_a_table_refuses_for_the_order_statistic() {
-    let err = emit_err(
+fn median_over_a_table_reduces_each_column() {
+    let out = emit(
         "data = elementof(cartpow(cartprod(x = reals), 4))\ninputs = (data)\noutputs = median(data)\n",
     );
-    assert!(err.contains("median has no lowering here"), "got: {err}");
+    assert!(out.contains("stablehlo.sort"), "got: {out}");
 }

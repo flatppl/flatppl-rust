@@ -65,7 +65,7 @@ use crate::refuse::EmitError;
 /// §04 "Multi-axis aggregation" requires "an order-invariant vector-to-scalar
 /// reduction" and, as of the `missing-reductions` spec draft (flatppl-design
 /// `ee4c6fb`), lists TEN eligible built-ins: "`sum`, `prod`, `mean`, `var`, `std`,
-/// `maximum`, `minimum`, `median`, `lany` and `lall`". The last three are eligible
+/// `maximum`, `minimum`, `median`, `lany` and `lall`". The last two are eligible
 /// and have no lowering here — see [`ELIGIBLE_BUT_UNLOWERED`], which keeps the
 /// refusal from telling the caller they are ineligible when §04 says otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,6 +77,7 @@ enum Reduction {
     Std,
     Max,
     Min,
+    Median,
 }
 
 impl Reduction {
@@ -89,6 +90,7 @@ impl Reduction {
             "std" => Reduction::Std,
             "maximum" => Reduction::Max,
             "minimum" => Reduction::Min,
+            "median" => Reduction::Median,
             _ => return None,
         })
     }
@@ -101,6 +103,7 @@ impl Reduction {
             Reduction::Prod => AxisReduce::Prod,
             Reduction::Max => AxisReduce::Max,
             Reduction::Min => AxisReduce::Min,
+            Reduction::Median => unreachable!("median sorts rather than reducing"),
         }
     }
 
@@ -269,12 +272,7 @@ pub(crate) fn lower_metricsum(
 }
 
 /// §04's eligible `f_reduction`s that this module does NOT lower — a DIFFERENT
-/// refusal from an ineligible name, because telling the caller that `median` "is
-/// not an eligible reduction" would contradict §04.
-///
-/// - `median` — an order statistic, and this crate has no sort. The bare head
-///   refuses for the same reason ([`crate::order::refuse_order_statistic`], which
-///   carries the full argument).
+/// refusal from an ineligible name.
 /// - `lany`/`lall` — a genuine `i1` reduction, and [`Emitter::reduce_trailing_axes`]
 ///   has no `and`/`or` combine. Adding one means an `AxisReduce` variant plus a
 ///   frame that is NOT widened to the aggregate node's kind, which is the one thing
@@ -283,7 +281,7 @@ pub(crate) fn lower_metricsum(
 ///   spelling is missing.
 ///
 /// Recorded in `flatppl-dev/stablehlo-feature-matrix.md`.
-const ELIGIBLE_BUT_UNLOWERED: &[&str] = &["median", "lany", "lall"];
+const ELIGIBLE_BUT_UNLOWERED: &[&str] = &["lany", "lall"];
 
 /// Read the `f_reduction` argument. §04 admits only the ten built-in
 /// order-invariant reductions, named bare — a user function or a reference to a
@@ -307,8 +305,7 @@ fn read_reduction(e: &Emitter, f_id: NodeId) -> Result<Reduction, EmitError> {
             format!(
                 "aggregate: `{name}` IS an eligible reduction under §04 \"Multi-axis \
                  aggregation\", but has no lowering in this emitter. The bare `{name}(xs)` \
-                 spelling is the one to check: it lowers for `lany`/`lall` and refuses for \
-                 `median`, and its message says why"
+                 spelling lowers for `lany`/`lall`"
             ),
         ));
     }
@@ -827,6 +824,27 @@ fn reduce(
     frame: &Frame,
 ) -> Result<Value, EmitError> {
     let n_red = frame.lens.len() - frame.n_out;
+    if reduction == Reduction::Median {
+        let cell = e.convert(cell, ElemKind::Real);
+        if n_red == 0 {
+            return Ok(cell);
+        }
+        let batch = e.batch_rank(&cell);
+        let view = e.axes_view(
+            &cell,
+            Axes {
+                batch: batch + frame.n_out,
+                layers: vec![n_red],
+            },
+        );
+        let result = crate::order::order_statistic_value(e, id, view, None)?;
+        let layers = if frame.n_out == 0 {
+            vec![]
+        } else {
+            vec![frame.n_out]
+        };
+        return Ok(e.axes_view(&result, Axes { batch, layers }));
+    }
     let count = if reduction.is_moment() {
         checked_shape_product(id, "aggregate", &frame.lens[frame.n_out..])?
     } else {
@@ -914,5 +932,6 @@ fn reduction_name(r: Reduction) -> &'static str {
         Reduction::Std => "std",
         Reduction::Max => "maximum",
         Reduction::Min => "minimum",
+        Reduction::Median => "median",
     }
 }

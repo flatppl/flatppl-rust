@@ -166,6 +166,17 @@ impl Emitter<'_> {
             .collect()
     }
 
+    /// The value of a fixed, unbatched real scalar at the emitted precision.
+    pub(crate) fn constant_real(&self, value: &Value) -> Option<f64> {
+        if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {
+            return None;
+        }
+        match self.constants.get(&value.ssa)?.as_ref() {
+            [Scalar::Real(x)] => Some(*x),
+            _ => None,
+        }
+    }
+
     /// The value of a fixed, unbatched integer scalar.
     pub(crate) fn constant_int(&self, value: &Value) -> Option<i64> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {

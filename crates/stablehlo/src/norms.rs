@@ -191,10 +191,7 @@ pub(crate) fn reduce_column(
         "lall" => {
             crate::order::boolean_reduction_value(e, id, column, crate::order::BoolReduce::All)
         }
-        "median" => Err(crate::order::refuse_order_statistic(
-            id,
-            crate::order::OrderStatistic::Median,
-        )),
+        "median" => crate::order::order_statistic_value(e, id, column, None),
         other => unreachable!("`{other}` is not a §07 table reduction"),
     }
 }
