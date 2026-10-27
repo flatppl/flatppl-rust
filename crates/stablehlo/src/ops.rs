@@ -299,7 +299,7 @@ pub(crate) fn lower_builtin(
         "softmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Plain),
         "logsoftmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Log),
         // §07's boolean reductions, cumulative extrema, infinity norm and order
-        // statistics — `crate::order`, which see for why two of the six refuse.
+        // statistics — `crate::order`.
         "lany" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::Any),
         "lall" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::All),
         "cummax" => {
@@ -309,14 +309,8 @@ pub(crate) fn lower_builtin(
             crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Min)
         }
         "linfnorm" => crate::order::lower_linf_norm(e, id, args),
-        "median" => Err(crate::order::refuse_order_statistic(
-            id,
-            crate::order::OrderStatistic::Median,
-        )),
-        "quantile" => Err(crate::order::refuse_order_statistic(
-            id,
-            crate::order::OrderStatistic::Quantile,
-        )),
+        "median" => crate::order::lower_order_statistic(e, id, args, true),
+        "quantile" => crate::order::lower_order_statistic(e, id, args, false),
         "fill" => lower_fill(e, id, args),
         // §07 "Scalar restrictions and constructors" and "Approximation functions".
         "integer" => crate::approx::lower_integer(e, id, args),
