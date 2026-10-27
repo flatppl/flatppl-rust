@@ -652,7 +652,11 @@ impl Emitter<'_> {
         name: &str,
         args: &[NodeId],
     ) -> Result<Value, EmitError> {
-        let [_] = crate::ops::args_exact(id, args)?;
+        if name == "linsolve" {
+            let [_, _] = crate::ops::args_exact(id, args)?;
+        } else {
+            let [_] = crate::ops::args_exact(id, args)?;
+        }
         self.lower_broadcast_cells(id, args, |e, values| {
             if matches!(name, "sizeof" | "indicesof" | "indicesof0") {
                 let axes = e.axes_of(&values[0]);

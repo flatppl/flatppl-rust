@@ -347,6 +347,7 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "linsolve" => linsolve_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -1768,6 +1769,47 @@ fn fresh_measure(t: Option<&Type>) -> Type {
         },
         Some(other) => other.clone(),
         None => Type::Deferred,
+    }
+}
+
+fn linsolve_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    let Some(Type::Array {
+        shape: a_shape,
+        elem: a,
+    }) = arg_ty(args, 0)
+    else {
+        return Type::Deferred;
+    };
+    let (b_dim, b) = match arg_ty(args, 1) {
+        Some(Type::Array { shape, elem }) if shape.len() == 1 => (shape[0], elem),
+        Some(Type::TVector { len, elem }) => (*len, elem),
+        _ => return Type::Deferred,
+    };
+    if a_shape.len() != 2
+        || !matches!(a.as_ref(), Type::Scalar(_))
+        || !matches!(b.as_ref(), Type::Scalar(_))
+    {
+        return Type::Deferred;
+    }
+    let mismatch = matches!((a_shape[0], a_shape[1]), (Dim::Static(x), Dim::Static(y)) if x != y)
+        || matches!((a_shape[1], b_dim), (Dim::Static(x), Dim::Static(y)) if x != y);
+    if mismatch {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`linsolve` requires a square matrix and a matching vector (spec §07)",
+        ));
+        return Type::Failed("linsolve: incompatible shapes".into());
+    }
+    let kind = if matches!(a.as_ref(), Type::Scalar(ScalarType::Complex))
+        || matches!(b.as_ref(), Type::Scalar(ScalarType::Complex))
+    {
+        ScalarType::Complex
+    } else {
+        ScalarType::Real
+    };
+    Type::Array {
+        shape: Box::new([b_dim]),
+        elem: Box::new(Type::Scalar(kind)),
     }
 }
 
@@ -7218,6 +7260,26 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
+        if op_name == "linsolve" && elems.len() == 2 {
+            let cells: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(name, node, ty, phase)| (*name, *node, cell_arg(ty), *phase))
+                .collect();
+            let cells =
+                normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
+            let inner = linsolve_type(inf, id, &cells);
+            if matches!(inner, Type::Failed(_)) {
+                return Ready(inner);
+            }
+            return Ready(Type::Array {
+                shape,
+                elem: Box::new(inner),
+            });
+        }
         return Ready(match broadcast_collection_cell(&op_name, &cell) {
             Some(inner) => Type::Array {
                 shape,
@@ -10442,6 +10504,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        "linsolve" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args

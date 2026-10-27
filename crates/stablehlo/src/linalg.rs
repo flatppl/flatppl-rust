@@ -357,6 +357,126 @@ impl Emitter<'_> {
         self.select(&nonsingular, &determinant, &singular)
     }
 
+    /// Partial-pivot solve, carrying a singularity predicate with the same
+    /// elimination that transforms the right-hand side.
+    pub(crate) fn matrix_solve(
+        &mut self,
+        _id: NodeId,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Value, EmitError> {
+        let a = self.convert(a, ElemKind::Real);
+        let b = self.convert(b, ElemKind::Real);
+        let (a, b) = self.broadcast_batches(&a, &b);
+        let batch = self.batch_rank(&a);
+        let n = shape(&a.ty)[batch].expect("static square checked by caller");
+        let b = self.reshape_cell(&b, tensor(vec![Some(n), Some(1)]));
+        let a_axes = self.axes_of(&a);
+        let b_axes = self.axes_of(&b);
+        let scalar_axes = Axes {
+            batch,
+            layers: vec![],
+        };
+        let zero = self.constant(0.0, tensor(shape(&a.ty)[..batch].to_vec()));
+        let zero = self.axes_view(&zero, scalar_axes.clone());
+        let valid = self.compare("EQ", &zero, &zero);
+        let rows = self.axis_indices(&a, batch);
+        let cols = self.axis_indices(&a, batch + 1);
+        let rhs_rows = self.axis_indices(&b, batch);
+        let eliminated = self.matrix_loop(n, &[a.clone(), b.clone(), valid], |e, index, args| {
+            let a = e.axes_view(&args[0], a_axes.clone());
+            let b = e.axes_view(&args[1], b_axes.clone());
+            let valid = e.axes_view(&args[2], scalar_axes.clone());
+            let at_row = e.compare("EQ", &rows, index);
+            let at_rhs_row = e.compare("EQ", &rhs_rows, index);
+            let at_col = e.compare("EQ", &cols, index);
+            let zero = e.constant_like(0.0, &a);
+            let column = e.select(&at_col, &a, &zero);
+            let column = e.reduce_sum_last_axis(&column);
+            let indices = e.axis_indices(&column, batch);
+            let eligible = e.compare("GE", &indices, index);
+            let magnitude = e.abs(&column);
+            let infinity = e.inf_like(&column);
+            let minus_inf = e.neg(&infinity);
+            let magnitude = e.select(&eligible, &magnitude, &minus_inf);
+            let largest = e.reduce_max(&magnitude);
+            let candidates = e.compare("EQ", &magnitude, &largest);
+            let limit = e.int_value_const(n as i64);
+            let candidates = e.select(&candidates, &indices, &limit);
+            let pivot_row =
+                e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &candidates, batch);
+            let pivot_rows = e.compare("EQ", &rows, &pivot_row);
+            let pivot_rhs_rows = e.compare("EQ", &rhs_rows, &pivot_row);
+            let a = e.swap_rows(&a, &at_row, &pivot_rows);
+            let b = e.swap_rows(&b, &at_rhs_row, &pivot_rhs_rows);
+            let column = e.select(&at_col, &a, &zero);
+            let column = e.reduce_sum_last_axis(&column);
+            let row_a = e.selected_row(&a, &at_row);
+            let row_b = e.selected_row(&b, &at_rhs_row);
+            let indices = e.axis_indices(&row_a, batch);
+            let at_pivot = e.compare("EQ", &indices, index);
+            let row_zero = e.constant_like(0.0, &row_a);
+            let pivot = e.select(&at_pivot, &row_a, &row_zero);
+            let pivot = e.reduce_sum_last_axis(&pivot);
+            let zero = e.scalar(0.0);
+            let nonzero = e.compare("NE", &pivot, &zero);
+            let not_nan = e.compare("EQ", &pivot, &pivot);
+            let step_valid = e.and(&nonzero, &not_nan);
+            let valid = e.and(&valid, &step_valid);
+            let one = e.scalar(1.0);
+            let safe_pivot = e.select(&step_valid, &pivot, &one);
+            let below = e.compare("GT", &indices, index);
+            let column = e.select(&below, &column, &row_zero);
+            let factors = e.div(&column, &safe_pivot);
+            let factors_a = e.matrix_expand(&factors, &a, batch);
+            let factors_b = e.matrix_expand(&factors, &b, batch);
+            let row_a = e.matrix_expand(&row_a, &a, batch + 1);
+            let row_b = e.matrix_expand(&row_b, &b, batch + 1);
+            let change_a = e.mul(&factors_a, &row_a);
+            let change_b = e.mul(&factors_b, &row_b);
+            vec![e.sub(&a, &change_a), e.sub(&b, &change_b), valid]
+        });
+        let a = self.axes_view(&eliminated[0], a_axes);
+        let b = self.axes_view(&eliminated[1], b_axes.clone());
+        let valid = self.axes_view(&eliminated[2], scalar_axes);
+        // Call record_runtime_error(valid, <singular-domain-code>) here once the
+        // shared runtime-status ABI is available.
+        let initial = self.constant_like(0.0, &b);
+        let solved = self.matrix_loop(n, &[initial], |e, index, args| {
+            let last = e.int_value_const(n as i64 - 1);
+            let k = e.sub(&last, index);
+            let at_row = e.compare("EQ", &rows, &k);
+            let at_rhs_row = e.compare("EQ", &rhs_rows, &k);
+            let row_a = e.selected_row(&a, &at_row);
+            let row_b = e.selected_row(&b, &at_rhs_row);
+            let indices = e.axis_indices(&row_a, batch);
+            let at_pivot = e.compare("EQ", &indices, &k);
+            let zero = e.constant_like(0.0, &row_a);
+            let pivot = e.select(&at_pivot, &row_a, &zero);
+            let pivot = e.reduce_sum_last_axis(&pivot);
+            let zero_scalar = e.scalar(0.0);
+            let nonzero = e.compare("NE", &pivot, &zero_scalar);
+            let not_nan = e.compare("EQ", &pivot, &pivot);
+            let pivot_ok = e.and(&nonzero, &not_nan);
+            let one = e.scalar(1.0);
+            let safe_pivot = e.select(&pivot_ok, &pivot, &one);
+            let above = e.compare("GT", &indices, &k);
+            let offdiag = e.select(&above, &row_a, &zero);
+            let x = e.axes_view(&args[0], b_axes.clone());
+            let offdiag = e.matrix_expand(&offdiag, &x, batch);
+            let products = e.mul(&offdiag, &x);
+            let sum = e.reduce_axis("stablehlo.add", "0.000000e+00", &products, batch);
+            let residual = e.sub(&row_b, &sum);
+            let row = e.div(&residual, &safe_pivot);
+            let row = e.matrix_expand(&row, &x, batch + 1);
+            vec![e.select(&at_rhs_row, &row, &x)]
+        });
+        let x = self.axes_view(&solved[0], b_axes);
+        let zero = self.constant_like(0.0, &x);
+        let safe = self.select(&valid, &x, &zero);
+        Ok(self.reshape_cell(&safe, tensor(vec![Some(n)])))
+    }
+
     /// Partial pivoting handles indefinite metrics and zero leading pivots.
     /// Two rolled loops avoid code growth and unsupported solve adjoints.
     pub(crate) fn matrix_inverse(&mut self, id: NodeId, input: &Value) -> Result<Value, EmitError> {

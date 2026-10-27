@@ -346,6 +346,7 @@ Catalogue(
         Builtin(name: "transpose",      sig: Function(params: [Any], names: ["A"], result: TransposeOf(0))),
         Builtin(name: "adjoint",        sig: Function(params: [Any], names: ["A"], result: TransposeOf(0))),
         // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
+        // The structural rule returns a real or complex vector, widening integer b.
         Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: SameAsArg(1))),
         // Polynomial / basis evaluations at a SCALAR x (§07 "Approximation functions"
         // Domains: "real or complex", `unitinterval`, "real"). An array of points is
