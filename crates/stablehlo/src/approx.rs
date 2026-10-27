@@ -7,6 +7,7 @@
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
+use crate::Dtype;
 use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::ops::{args_exact, get_literal_value};
@@ -30,6 +31,20 @@ pub(crate) fn lower_integer(
         _ => false,
     };
     let x = e.lower_node(a)?;
+    if x.elem == ElemKind::Real
+        && let Some(value) = literal_real(e, a)
+    {
+        let limit = match e.dtype() {
+            Dtype::F32 => 2_f64.powi(31),
+            Dtype::F64 => 2_f64.powi(63),
+        };
+        if !value.is_finite() || value < -limit || value >= limit {
+            return Err(EmitError::at(
+                id,
+                "`integer(x)` value is outside the emitted integer width",
+            ));
+        }
+    }
     if x.elem != ElemKind::Real || integral {
         return Ok(e.convert(&x, ElemKind::Int));
     }
@@ -39,6 +54,33 @@ pub(crate) fn lower_integer(
          non-integral value an error, and an integer tensor cannot carry one. Round \
          explicitly instead, as in `integer(round(x))`",
     ))
+}
+
+// Only evaluate written literals, never references: an input can override a
+// fixed binding at runtime. Round each operand to the emitted real dtype first.
+fn literal_real(e: &Emitter, id: NodeId) -> Option<f64> {
+    let value = match e.node(id) {
+        Node::Lit(Scalar::Real(value)) => *value,
+        Node::Lit(Scalar::Int(value)) => *value as f64,
+        Node::Call(call) if call.args.len() == 1 && call.named.is_empty() => {
+            let CallHead::Builtin(head) = call.head else {
+                return None;
+            };
+            let value = literal_real(e, call.args[0])?;
+            match e.resolve(head) {
+                "neg" => -value,
+                "round" => value.round_ties_even(),
+                "floor" => value.floor(),
+                "ceil" => value.ceil(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(match e.dtype() {
+        Dtype::F32 => (value as f32) as f64,
+        Dtype::F64 => value,
+    })
 }
 
 /// `boolean(x)`: a boolean passes through, and a written 0 or 1 is a constant.

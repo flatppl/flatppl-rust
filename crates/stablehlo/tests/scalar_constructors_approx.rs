@@ -3,9 +3,13 @@
 //! `stepwise`) as emitter heads. Structural only: the numbers are checked by
 //! executing the modules under Enzyme-JAX against numpy/scipy in the PR.
 
-use flatppl_stablehlo::{Mode, emit};
+use flatppl_stablehlo::{Dtype, EmitOptions, Mode, emit};
 
 fn emitted(outputs: &str) -> Result<String, String> {
+    emitted_as(outputs, Dtype::F32)
+}
+
+fn emitted_as(outputs: &str, dtype: Dtype) -> Result<String, String> {
     let src = format!(
         "flatppl_compat = \"0.1\"\nz0 = elementof(reals)\ninputs = (z0)\noutputs = {outputs}"
     );
@@ -18,7 +22,15 @@ fn emitted(outputs: &str) -> Result<String, String> {
         "inference errors: {diags:?}"
     );
     let d = flatppl_determinizer::determinize(&m).expect("must lower, not refuse");
-    emit(&d, Mode::LogDensity, &Default::default()).map_err(|e| e.to_string())
+    emit(
+        &d,
+        Mode::LogDensity,
+        &EmitOptions {
+            dtype,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn emits(outputs: &str) -> String {
@@ -51,6 +63,46 @@ fn integer_lowers_an_integral_operand_and_refuses_a_computed_real() {
             "{expr}: {e}"
         );
     }
+}
+
+#[test]
+fn integer_refuses_literal_values_outside_the_emitted_integer_width() {
+    for (dtype, valid, invalid) in [
+        (
+            Dtype::F32,
+            ["2147483520.0", "-2147483648.0"],
+            ["2147483648.0", "-2147483904.0"],
+        ),
+        (
+            Dtype::F64,
+            ["9223372036854774784.0", "-9223372036854775808.0"],
+            ["9223372036854775808.0", "-9223372036854777856.0"],
+        ),
+    ] {
+        for value in valid {
+            let expr = format!("integer(round({value}))");
+            emitted_as(&expr, dtype).unwrap_or_else(|e| panic!("{expr}: {e}"));
+            if !value.starts_with('-') {
+                emitted_as(&format!("integer({value})"), dtype).unwrap();
+            }
+        }
+        for value in invalid {
+            for expr in [
+                format!("integer(round({value}))"),
+                format!("integer(floor({value}))"),
+                format!("integer(ceil({value}))"),
+            ] {
+                let err = emitted_as(&expr, dtype).expect_err(&expr);
+                assert!(err.contains("integer width"), "{expr}: {err}");
+            }
+        }
+        assert!(emitted_as(&format!("integer({})", invalid[0]), dtype).is_err());
+        assert!(emitted_as("integer(1e300)", dtype).is_err());
+        emitted_as("integer(round(z0))", dtype).unwrap();
+    }
+    assert!(emitted_as("integer(2147483600.0)", Dtype::F32).is_err());
+    assert!(emitted_as("integer(round(2147483647))", Dtype::F32).is_err());
+    assert!(emitted_as("integer(round(9223372036854775807))", Dtype::F64).is_err());
 }
 
 #[test]
@@ -104,4 +156,19 @@ fn stepwise_selects_a_bin_and_is_nan_outside() {
     // MLIR needs the NaN outside the edges as exact bits, not `NaN.0`.
     assert!(out.contains("dense<0x7FC00000>"), "a bit-exact NaN:\n{out}");
     assert!(!out.contains("NaN.0"), "{out}");
+}
+
+#[test]
+fn integer_checks_constant_bindings_without_freezing_runtime_inputs() {
+    for (bindings, succeeds) in [
+        ("x = 1e300\ninputs = z0\n", false),
+        ("x = 1e300\ninputs = (z0, x)\n", true),
+    ] {
+        let source = format!("z0 = elementof(reals)\n{bindings}outputs = integer(round(x))\n");
+        let mut module = flatppl_syntax::parse(&source).unwrap();
+        flatppl_infer::infer(&mut module);
+        let module = flatppl_determinizer::determinize(&module).unwrap();
+        let result = emit(&module, Mode::LogDensity, &Default::default());
+        assert_eq!(result.is_ok(), succeeds, "{result:?}");
+    }
 }
