@@ -66,6 +66,69 @@ fn imported_record_splat_keeps_each_field_domain() {
     assert!(z.contains("%parametric posreals"), "{z}");
 }
 
+#[test]
+fn repeated_imported_calls_keep_their_domains_and_load_substitutions() {
+    let (out, diags) = xmod(
+        "dep.flatppl",
+        "scale = external(anything)\nf(x) = record(value = x, scale = scale)\n",
+        "A = load_module(\"dep.flatppl\", scale = 1.0)\n\
+         B = load_module(\"dep.flatppl\", scale = 2)\n\
+         p = elementof(posreals)\nq = elementof(nonnegreals)\n\
+         a = A.f(p)\nb = B.f([1.0, 2.0])\nc = A.f(q)\n",
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    let a = binding_line(&out, "a");
+    let b = binding_line(&out, "b");
+    let c = binding_line(&out, "c");
+    assert!(a.contains("(%field value posreals)"), "{a}");
+    assert!(a.contains("(%field scale (interval 1.0 1.0))"), "{a}");
+    assert!(b.contains("(%array 1 (2) (%scalar real))"), "{b}");
+    assert!(b.contains("(%field scale posintegers)"), "{b}");
+    assert!(c.contains("(%field value nonnegreals)"), "{c}");
+    assert!(c.contains("(%field scale (interval 1.0 1.0))"), "{c}");
+}
+
+#[test]
+fn nested_imported_calls_reuse_scopes_without_mixing_shapes() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "a.flatppl",
+        Arc::new(flatppl_syntax::parse("B = load_module(\"b.flatppl\")\nf(x) = B.g(x)\n").unwrap()),
+    );
+    bundle.insert(
+        "b.flatppl",
+        Arc::new(flatppl_syntax::parse("g(x) = x + x\n").unwrap()),
+    );
+    let mut model = flatppl_syntax::parse(
+        "A = load_module(\"a.flatppl\")\na = A.f([1.0,2.0])\nb = A.f([1.0,2.0,3.0])\n",
+    )
+    .unwrap();
+    let diags = infer_module(&mut model, &bundle, Level::Shape);
+    assert!(diags.is_empty(), "{diags:?}");
+    let out = flatppl_flatpir::write(&model);
+    for (name, size) in [("a", 2), ("b", 3)] {
+        let line = binding_line(&out, name);
+        assert!(
+            line.contains(&format!("(%array 1 ({size}) (%scalar real))")),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn repeated_imported_calls_keep_distinct_argument_field_names() {
+    let (out, diags) = xmod(
+        "dep.flatppl",
+        "f(x) = x\n",
+        "d = load_module(\"dep.flatppl\")\na = d.f(record(alpha = 1))\nb = d.f(record(beta = 2.0))\n",
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    let a = binding_line(&out, "a");
+    let b = binding_line(&out, "b");
+    assert!(a.contains("(%record (alpha (%scalar integer)))"), "{a}");
+    assert!(b.contains("(%record (beta (%scalar real)))"), "{b}");
+}
+
 /// A `joint` over a local and a cross-module kernel publishes the union of both
 /// input lists. The dependency's name must appear as the DEPENDENCY spelled it,
 /// so the correct application types and the misspelled one is rejected.

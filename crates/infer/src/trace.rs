@@ -13,7 +13,7 @@ use flatppl_core::{
     Type, ValueSet,
 };
 
-use crate::modules::{Dependency, InferSession, Resolution, Resolved};
+use crate::modules::{CallableWorkspace, Dependency, InferSession, Resolution, Resolved};
 use crate::ops;
 use crate::rule::{LocalTargets, Resume, RuleStep};
 use crate::{Diagnostic, Level};
@@ -112,6 +112,9 @@ struct ImportedCallFrame {
     scope: Scope,
     kernel_tag_nodes: Rc<HashSet<NodeId>>,
     auto_inputs: Vec<AutoInputScope>,
+    workspace_tags: Rc<HashSet<NodeId>>,
+    workspace_axis_errors: Rc<Vec<(NodeId, Diagnostic)>>,
+    workspace_bindings: Rc<HashMap<Symbol, BindingId>>,
 }
 
 pub(crate) struct Inferencer<'m, 's> {
@@ -181,7 +184,7 @@ pub(crate) struct Inferencer<'m, 's> {
 /// constructor pass in the observed-value, params and rngstate slots
 /// (`builtin_logdensityof(Normal, record(…), CrystalBall)` and friends lowered at
 /// exit 0). Only the tag slot is a tag.
-fn collect_kernel_tag_nodes(m: &Module) -> (HashSet<NodeId>, usize) {
+pub(crate) fn collect_kernel_tag_nodes(m: &Module) -> (HashSet<NodeId>, usize) {
     let mut out = HashSet::new();
     let mut visited = HashSet::new();
     let mut pending: Vec<NodeId> = m.bindings().map(|(_, binding)| binding.rhs).collect();
@@ -670,7 +673,6 @@ impl<'m, 's> Inferencer<'m, 's> {
                     self.kernel_tag_nodes = frame.kernel_tag_nodes;
                     self.auto_inputs = frame.auto_inputs;
                     self.restore_scope(frame.scope);
-                    self.session.finish_callable_scope();
                     let result = crate::modules::reintern_resolved(
                         self.module,
                         &dependency,
@@ -684,6 +686,12 @@ impl<'m, 's> Inferencer<'m, 's> {
                             interface: None,
                         },
                     );
+                    self.session.finish_callable_scope(CallableWorkspace {
+                        module: dependency,
+                        kernel_tags: frame.workspace_tags,
+                        axis_errors: frame.workspace_axis_errors,
+                        bindings: frame.workspace_bindings,
+                    });
                     if failed {
                         for diag in errors
                             .into_iter()
@@ -980,12 +988,18 @@ impl<'m, 's> Inferencer<'m, 's> {
             return false;
         };
         let substitutions = self.subst_annos_for(alias);
-        let Some((mut dependency, mut seeds)) =
+        let Some((workspace, mut seeds)) =
             self.session
                 .callable_scope(self.module, alias, name, &substitutions)
         else {
             return false;
         };
+        let CallableWorkspace {
+            module: mut dependency,
+            kernel_tags,
+            axis_errors,
+            bindings,
+        } = workspace;
         let callee_name = dependency.intern(self.module.resolve(name));
         let local = dependency.alloc(Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -1023,11 +1037,17 @@ impl<'m, 's> Inferencer<'m, 's> {
         }));
         let scope = self.suspend_scope();
         let module = std::mem::replace(self.module, dependency);
-        let (tags, _) = collect_kernel_tag_nodes(self.module);
-        let kernel_tag_nodes = std::mem::replace(&mut self.kernel_tag_nodes, Rc::new(tags));
+        let kernel_tag_nodes =
+            std::mem::replace(&mut self.kernel_tag_nodes, Rc::clone(&kernel_tags));
         let auto_inputs = std::mem::replace(&mut self.auto_inputs, vec![HashMap::new()]);
         self.seed_inputs(&seeds);
-        self.initialize_module();
+        for (node, diag) in axis_errors.iter() {
+            self.inferred.insert(
+                *node,
+                (Type::Failed("axis out of position".into()), Phase::Fixed),
+            );
+            self.diags.push(diag.clone());
+        }
         work.push(Work::ResumeImportedCall(Box::new(ImportedCallFrame {
             id,
             root,
@@ -1035,6 +1055,9 @@ impl<'m, 's> Inferencer<'m, 's> {
             scope,
             kernel_tag_nodes,
             auto_inputs,
+            workspace_tags: kernel_tags,
+            workspace_axis_errors: axis_errors,
+            workspace_bindings: bindings,
         })));
         work.push(Work::Enter(root));
         true
