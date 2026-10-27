@@ -3985,7 +3985,33 @@ impl<'m> Emitter<'m> {
                 ));
             }
         };
-        let rest = &args[1..];
+        let positional;
+        let rest = if fname == "cross" {
+            let named = match self.node(id) {
+                Node::Call(c) => c.named.as_ref(),
+                _ => &[],
+            };
+            if named.is_empty() {
+                &args[1..]
+            } else {
+                let lookup = |name: &str, index: usize| {
+                    named
+                        .iter()
+                        .find(|arg| self.resolve(arg.name) == name)
+                        .map(|arg| arg.value)
+                        .or_else(|| args.get(index + 1).copied())
+                };
+                positional = [
+                    lookup("a", 0)
+                        .ok_or_else(|| EmitError::at(id, "broadcast cross: missing a"))?,
+                    lookup("b", 1)
+                        .ok_or_else(|| EmitError::at(id, "broadcast cross: missing b"))?,
+                ];
+                &positional[..]
+            }
+        } else {
+            &args[1..]
+        };
         if fname == "builtin_logdensityof" {
             // Batched density: `Params::field_id` reads the batched
             // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
@@ -4013,6 +4039,7 @@ impl<'m> Emitter<'m> {
                 | "inv"
                 | "det"
                 | "logabsdet"
+                | "cross"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
