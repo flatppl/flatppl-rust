@@ -225,6 +225,7 @@ mod ops;
 mod order;
 mod refuse;
 mod registry;
+mod runtime;
 mod types;
 
 pub use call_batch::BatchSpec;

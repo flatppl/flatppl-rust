@@ -652,7 +652,7 @@ impl Emitter<'_> {
         name: &str,
         args: &[NodeId],
     ) -> Result<Value, EmitError> {
-        if name == "linsolve" {
+        if matches!(name, "linsolve" | "cross") {
             let [_, _] = crate::ops::args_exact(id, args)?;
         } else {
             let [_] = crate::ops::args_exact(id, args)?;

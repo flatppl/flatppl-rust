@@ -348,6 +348,7 @@ fn op_rule(
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
         "linsolve" => linsolve_type(inf, id, args),
+        "cross" => cross_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -463,6 +464,10 @@ fn op_rule(
                 || Box::new([Dim::Dynamic]) as Box<[Dim]>,
                 |a| count_dims(inf, a.0),
             ),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        "onehot" => Type::Array {
+            shape: Box::new([args.get(1).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0))]),
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
         "fill" => Type::Array {
@@ -1810,6 +1815,36 @@ fn linsolve_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> 
     Type::Array {
         shape: Box::new([b_dim]),
         elem: Box::new(Type::Scalar(kind)),
+    }
+}
+
+fn cross_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    fn vector(ty: &Type) -> Option<(Dim, &Type)> {
+        match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => Some((shape[0], elem.as_ref())),
+            Type::TVector { len, elem } => Some((*len, elem.as_ref())),
+            _ => None,
+        }
+    }
+    let (Some((a_len, a)), Some((b_len, b))) = (
+        arg_ty(args, 0).and_then(vector),
+        arg_ty(args, 1).and_then(vector),
+    ) else {
+        return Type::Deferred;
+    };
+    if [a_len, b_len]
+        .iter()
+        .any(|d| matches!(d, Dim::Static(n) if *n != 3))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`cross` requires two vectors of length 3 (spec §07)",
+        ));
+        return Type::Failed("cross: vector length must be 3".into());
+    }
+    Type::Array {
+        shape: Box::new([Dim::Static(3)]),
+        elem: Box::new(promote2(Some(a), Some(b))),
     }
 }
 
@@ -7260,7 +7295,7 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
-        if op_name == "linsolve" && elems.len() == 2 {
+        if matches!(op_name.as_str(), "linsolve" | "cross") && elems.len() == 2 {
             let cells: Vec<ArgInfo> = args[1..]
                 .iter()
                 .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
@@ -7271,7 +7306,11 @@ fn broadcast_type(
                 .collect();
             let cells =
                 normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
-            let inner = linsolve_type(inf, id, &cells);
+            let inner = if op_name == "linsolve" {
+                linsolve_type(inf, id, &cells)
+            } else {
+                cross_type(inf, id, &cells)
+            };
             if matches!(inner, Type::Failed(_)) {
                 return Ready(inner);
             }
@@ -10504,7 +10543,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
-        "linsolve" => ValueSet::natural_of(ty),
+        "linsolve" | "cross" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args

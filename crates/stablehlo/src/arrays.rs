@@ -128,9 +128,8 @@ pub(crate) fn lower_onehot(
             ),
         ));
     }
-    let i = e.convert(&i, ElemKind::Real);
+    let i = e.checked_index(id, &i, n, 1)?;
     let idx = e.index_vector(n, false);
-    let idx = e.convert(&idx, ElemKind::Real);
     let hit = e.compare("EQ", &idx, &i);
     Ok(e.convert(&hit, ElemKind::Real))
 }
