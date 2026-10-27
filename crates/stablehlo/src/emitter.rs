@@ -4175,7 +4175,7 @@ impl<'m> Emitter<'m> {
             }
         };
         let positional;
-        let rest = if matches!(fname.as_str(), "conv" | "crosscorr" | "cross") {
+        let rest = if matches!(fname.as_str(), "linsolve" | "conv" | "crosscorr" | "cross") {
             let named = match self.node(id) {
                 Node::Call(c) => c.named.as_ref(),
                 _ => &[],
@@ -4190,10 +4190,10 @@ impl<'m> Emitter<'m> {
                         .map(|arg| arg.value)
                         .or_else(|| args.get(index + 1).copied())
                 };
-                let (first, second) = if fname == "cross" {
-                    ("a", "b")
-                } else {
-                    ("v", "kernel")
+                let (first, second) = match fname.as_str() {
+                    "linsolve" => ("A", "b"),
+                    "cross" => ("a", "b"),
+                    _ => ("v", "kernel"),
                 };
                 positional = [
                     lookup(first, 0).ok_or_else(|| {
@@ -4237,6 +4237,7 @@ impl<'m> Emitter<'m> {
                 | "inv"
                 | "det"
                 | "logabsdet"
+                | "linsolve"
                 | "conv"
                 | "crosscorr"
                 | "cross"

@@ -347,6 +347,7 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "linsolve" => linsolve_type(inf, id, args),
         "qr" => qr_type(inf, id, args),
         "cross" => cross_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -1775,6 +1776,47 @@ fn fresh_measure(t: Option<&Type>) -> Type {
         },
         Some(other) => other.clone(),
         None => Type::Deferred,
+    }
+}
+
+fn linsolve_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    let Some(Type::Array {
+        shape: a_shape,
+        elem: a,
+    }) = arg_ty(args, 0)
+    else {
+        return Type::Deferred;
+    };
+    let (b_dim, b) = match arg_ty(args, 1) {
+        Some(Type::Array { shape, elem }) if shape.len() == 1 => (shape[0], elem),
+        Some(Type::TVector { len, elem }) => (*len, elem),
+        _ => return Type::Deferred,
+    };
+    if a_shape.len() != 2
+        || !matches!(a.as_ref(), Type::Scalar(_))
+        || !matches!(b.as_ref(), Type::Scalar(_))
+    {
+        return Type::Deferred;
+    }
+    let mismatch = matches!((a_shape[0], a_shape[1]), (Dim::Static(x), Dim::Static(y)) if x != y)
+        || matches!((a_shape[1], b_dim), (Dim::Static(x), Dim::Static(y)) if x != y);
+    if mismatch {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`linsolve` requires a square matrix and a matching vector (spec §07)",
+        ));
+        return Type::Failed("linsolve: incompatible shapes".into());
+    }
+    let kind = if matches!(a.as_ref(), Type::Scalar(ScalarType::Complex))
+        || matches!(b.as_ref(), Type::Scalar(ScalarType::Complex))
+    {
+        ScalarType::Complex
+    } else {
+        ScalarType::Real
+    };
+    Type::Array {
+        shape: Box::new([b_dim]),
+        elem: Box::new(Type::Scalar(kind)),
     }
 }
 
@@ -7318,7 +7360,11 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
-        if matches!(op_name.as_str(), "conv" | "crosscorr" | "cross") && elems.len() == 2 {
+        if matches!(
+            op_name.as_str(),
+            "linsolve" | "conv" | "crosscorr" | "cross"
+        ) && elems.len() == 2
+        {
             let cells: Vec<ArgInfo> = args[1..]
                 .iter()
                 .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
@@ -7329,10 +7375,10 @@ fn broadcast_type(
                 .collect();
             let cells =
                 normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
-            let inner = if op_name == "cross" {
-                cross_type(inf, id, &cells)
-            } else {
-                convolution_type(inf, id, &op_name, &cells)
+            let inner = match op_name.as_str() {
+                "linsolve" => linsolve_type(inf, id, &cells),
+                "cross" => cross_type(inf, id, &cells),
+                _ => convolution_type(inf, id, &op_name, &cells),
             };
             if matches!(inner, Type::Failed(_)) {
                 return Ready(inner);
@@ -10566,8 +10612,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
-        "qr" => ValueSet::natural_of(ty),
-        "cross" => ValueSet::natural_of(ty),
+        "linsolve" | "qr" | "cross" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args

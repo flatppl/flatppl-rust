@@ -193,6 +193,7 @@ pub(crate) fn lower_builtin(
         // for `lower_transpose`'s reason: this crate has no complex element type,
         // so over the elements it emits conjugation is the identity.
         "lower_cholesky" => lower_cholesky_head(e, id, args),
+        "linsolve" => lower_linsolve(e, id, args),
         "inv" => {
             let [arg] = args_exact(id, args)?;
             let a = e.lower_node(arg)?;
@@ -845,6 +846,23 @@ fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<V
     square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
     require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
+}
+
+fn lower_linsolve(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, b_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    let n = square_dim(id, &e.cell_ty(&a), "linsolve")?;
+    if n == 0
+        || n > i32::MAX as u64
+        || !matches!(e.cell_ty(&b), MlirTy::Ranked(dims) if dims.as_slice() == [Some(n)])
+    {
+        return Err(EmitError::at(
+            id,
+            "`linsolve` requires a nonempty static square matrix and matching vector (spec §07)",
+        ));
+    }
+    e.matrix_solve(id, &a, &b)
 }
 
 fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
