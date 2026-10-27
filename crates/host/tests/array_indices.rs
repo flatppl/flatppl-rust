@@ -1,6 +1,19 @@
 use flatppl_host::{BatchSpec, Context, EmitOptions};
 
 #[test]
+fn onehot_has_a_static_length_with_a_runtime_index() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "k = external(integers)\ninputs = k\noutputs = onehot(k, 3)",
+        None,
+        None,
+    )?;
+    let exported = query.compile(&EmitOptions::default())?;
+    let schema = serde_json::to_value(exported)?;
+    assert_eq!(schema["output"]["shape"], serde_json::json!([3]));
+    Ok(())
+}
+
+#[test]
 fn index_vectors_construct_a_batched_lag_matrix() -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(
         "y = external(cartpow(reals, 5))\n\

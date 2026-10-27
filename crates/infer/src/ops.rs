@@ -347,6 +347,8 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "qr" => qr_type(inf, id, args),
+        "cross" => cross_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -388,6 +390,7 @@ fn op_rule(
             _ => table_type(inf, named),
         },
         "rowstack" | "colstack" => stack_type(arg_ty(args, 0), name == "colstack"),
+        "conv" | "crosscorr" => convolution_type(inf, id, &name, args),
         "get" | "get0" if refuse_real_index(inf, &name, args) => {
             Type::Failed(format!("{name}: real-typed index").into())
         }
@@ -462,6 +465,10 @@ fn op_rule(
                 || Box::new([Dim::Dynamic]) as Box<[Dim]>,
                 |a| count_dims(inf, a.0),
             ),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        "onehot" => Type::Array {
+            shape: Box::new([args.get(1).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0))]),
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
         "fill" => Type::Array {
@@ -1771,6 +1778,69 @@ fn fresh_measure(t: Option<&Type>) -> Type {
     }
 }
 
+fn qr_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    let Some(Type::Array { shape, elem }) = arg_ty(args, 0) else {
+        return Type::Deferred;
+    };
+    if shape.len() != 2 || !matches!(elem.as_ref(), Type::Scalar(_)) {
+        return Type::Deferred;
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    if matches!((rows, cols), (Dim::Static(m), Dim::Static(n)) if m < n) {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`qr` requires at least as many rows as columns (spec §07)",
+        ));
+        return Type::Failed("qr: matrix is wider than tall".into());
+    }
+    let kind = if matches!(elem.as_ref(), Type::Scalar(ScalarType::Complex)) {
+        ScalarType::Complex
+    } else {
+        ScalarType::Real
+    };
+    let q = Type::Array {
+        shape: Box::new([rows, cols]),
+        elem: Box::new(Type::Scalar(kind)),
+    };
+    let r = Type::Array {
+        shape: Box::new([cols, cols]),
+        elem: Box::new(Type::Scalar(kind)),
+    };
+    let q_name = inf.module.intern("Q");
+    let r_name = inf.module.intern("R");
+    Type::Record(Box::new([(q_name, q), (r_name, r)]))
+}
+
+fn cross_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    fn vector(ty: &Type) -> Option<(Dim, &Type)> {
+        match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => Some((shape[0], elem.as_ref())),
+            Type::TVector { len, elem } => Some((*len, elem.as_ref())),
+            _ => None,
+        }
+    }
+    let (Some((a_len, a)), Some((b_len, b))) = (
+        arg_ty(args, 0).and_then(vector),
+        arg_ty(args, 1).and_then(vector),
+    ) else {
+        return Type::Deferred;
+    };
+    if [a_len, b_len]
+        .iter()
+        .any(|d| matches!(d, Dim::Static(n) if *n != 3))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`cross` requires two vectors of length 3 (spec §07)",
+        ));
+        return Type::Failed("cross: vector length must be 3".into());
+    }
+    Type::Array {
+        shape: Box::new([Dim::Static(3)]),
+        elem: Box::new(promote2(Some(a), Some(b))),
+    }
+}
+
 /// Numeric promotion: integer ⊔ integer = integer, real dominates integer,
 /// complex dominates real; `Any` (placeholders) is absorbed.
 fn promote2(a: Option<&Type>, b: Option<&Type>) -> Type {
@@ -2295,15 +2365,11 @@ fn refuse_nonscalar_operand(
 /// Norms and normalization, Linear algebra, Array and table operations, Approximation
 /// functions, Binning, and Membership, filtering, and bin selection.
 ///
-/// **§07's remaining tables are UNLOWERED, not scalar-domain — a forward hazard, not a
-/// closed case.** Two of them carry a collection-domain first argument: Convolution
-/// (`conv`, `crosscorr` — "vector, vector") and Array and table generation (`array` —
-/// "vector, integer vector, integer vector"). Dotted over scalar cells each types `%deferred` here and refuses in the
-/// emitter with "unsupported builtin head", so there is no live mislowering — but the
-/// safety comes from `lower_builtin` not lowering them AT ALL, not from this rule. Wiring
-/// any of them into `lower_builtin` MUST add the head to this table in the same change,
-/// or the dotted mislowering re-opens.
+/// Convolution and array generation also have collection-domain arguments. Their
+/// inclusion here keeps scalar-cell broadcasts from discarding that domain.
 pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
+    ("conv", "Convolution", "vector, vector"),
+    ("crosscorr", "Convolution", "vector, vector"),
     ("sum", "Reductions", "real/complex arrays"),
     ("mean", "Reductions", "real/complex arrays"),
     ("var", "Reductions", "real arrays"),
@@ -2649,6 +2715,40 @@ fn stack_type(a: Option<&Type>, columns: bool) -> Type {
             _ => Type::Deferred,
         },
         _ => Type::Deferred,
+    }
+}
+
+fn convolution_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+) -> Type {
+    let (Some(Type::Array { shape: v, elem: ve }), Some(Type::Array { shape: k, elem: ke })) =
+        (arg_ty(args, 0), arg_ty(args, 1))
+    else {
+        return Type::Deferred;
+    };
+    if v.len() != 1 || k.len() != 1 {
+        return Type::Deferred;
+    }
+    let length = match (v[0], k[0]) {
+        (Dim::Static(n), Dim::Static(m)) if m > n => {
+            inf.diags.push(crate::Diagnostic::error_at(
+                id,
+                format!("`{name}` requires kernel length at most signal length (spec §07)"),
+            ));
+            return Type::Failed(format!("{name}: kernel too long").into());
+        }
+        (Dim::Static(n), Dim::Static(m)) => n
+            .checked_sub(m)
+            .and_then(|x| x.checked_add(1))
+            .map_or(Dim::Dynamic, Dim::Static),
+        _ => Dim::Dynamic,
+    };
+    Type::Array {
+        shape: Box::new([length]),
+        elem: Box::new(promote2(Some(ve), Some(ke))),
     }
 }
 
@@ -7218,6 +7318,30 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
+        if matches!(op_name.as_str(), "conv" | "crosscorr" | "cross") && elems.len() == 2 {
+            let cells: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(name, node, ty, phase)| (*name, *node, cell_arg(ty), *phase))
+                .collect();
+            let cells =
+                normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
+            let inner = if op_name == "cross" {
+                cross_type(inf, id, &cells)
+            } else {
+                convolution_type(inf, id, &op_name, &cells)
+            };
+            if matches!(inner, Type::Failed(_)) {
+                return Ready(inner);
+            }
+            return Ready(Type::Array {
+                shape,
+                elem: Box::new(inner),
+            });
+        }
         return Ready(match broadcast_collection_cell(&op_name, &cell) {
             Some(inner) => Type::Array {
                 shape,
@@ -10442,6 +10566,8 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        "qr" => ValueSet::natural_of(ty),
+        "cross" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args
@@ -10468,6 +10594,7 @@ pub(crate) fn call_valueset(
         {
             table_reduction_valueset(&name, arg_ty(args, 0))
         }
+        "conv" | "crosscorr" => ValueSet::natural_of(ty),
         // Mirrors the `cumsum`/`cumprod` §03-promotion type arm. The catalogue's
         // `SameAsArg(0)` row would hand back the ARGUMENT's set, `cartpow(booleans,
         // n)`, against an integer-element type — a set that excludes the value

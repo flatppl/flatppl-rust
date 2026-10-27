@@ -56,6 +56,9 @@ mod pointwise;
 mod pyhf;
 #[path = "records.rs"]
 mod records;
+#[path = "runtime_status.rs"]
+mod runtime_status;
+use runtime_status::append_runtime_status;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
 #[path = "sequences.rs"]
@@ -142,6 +145,9 @@ pub struct Emitter<'m> {
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
     host_batch: bool,
+    runtime_batch_rank: usize,
+    runtime_status: Option<Value>,
+    runtime_unmapped_check: bool,
     /// Prevent sibling yield discovery while lowering a shared lane buffer.
     pooling_yields: bool,
     integrating: bool,
@@ -207,6 +213,9 @@ impl<'m> Emitter<'m> {
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,
+            runtime_batch_rank: 0,
+            runtime_status: None,
+            runtime_unmapped_check: false,
             pooling_yields: false,
             integrating: false,
             next: 0,
@@ -244,6 +253,7 @@ impl<'m> Emitter<'m> {
         emitter.integration = self.integration;
         emitter.target = self.target;
         emitter.host_batch = self.host_batch;
+        emitter.runtime_batch_rank = self.runtime_batch_rank;
         emitter
     }
 
@@ -3603,7 +3613,7 @@ impl<'m> Emitter<'m> {
         );
 
         // Region block-argument names (the iterArgs), shared by cond and body.
-        let arg_names: Vec<String> = inits.iter().map(|_| self.fresh()).collect();
+        let mut arg_names: Vec<String> = inits.iter().map(|_| self.fresh()).collect();
         // The multi-result group name (%r:N -> %r#0, %r#1, ...).
         let result_name = self.fresh();
 
@@ -3611,34 +3621,113 @@ impl<'m> Emitter<'m> {
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
+        let incoming_status = self.runtime_status.take();
+        let incoming_unmapped = std::mem::take(&mut self.runtime_unmapped_check);
         let pred = cond(&mut *self, &arg_names);
+        let condition_status = self.runtime_status.take();
         let cond_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
         self.expanded = saved_expanded;
+        if condition_status.is_some() {
+            self.runtime_status = incoming_status;
+            self.runtime_unmapped_check = incoming_unmapped;
+            return Err(EmitError::whole(
+                "runtime checks in a while condition are not supported",
+            ));
+        }
 
         // do region, captured into its own buffer.
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
         let next = body(&mut *self, &arg_names);
-        let do_body = std::mem::replace(&mut self.body, saved);
+        let body_status = self.runtime_status.take();
+        let body_unmapped = std::mem::take(&mut self.runtime_unmapped_check);
+        let mut do_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
         self.expanded = saved_expanded;
-        let next = next?;
+        self.runtime_status = incoming_status.clone();
+        self.runtime_unmapped_check = incoming_unmapped;
+        let mut next = next?;
+        if body_unmapped {
+            return Err(EmitError::whole(
+                "runtime checks in a flattened host batch loop are not supported",
+            ));
+        }
         assert_eq!(
             next.len(),
             inits.len(),
             "while_loop: body must return one value per carried variable"
         );
 
-        let arity = inits.len();
+        let mut loop_inits = inits.to_vec();
+        let mut loop_tys = carried_tys.to_vec();
+        if let Some(body_status) = body_status {
+            let status_ty = match &incoming_status {
+                Some(old)
+                    if old.ty != MlirTy::Scalar
+                        && body_status.ty != MlirTy::Scalar
+                        && old.ty != body_status.ty =>
+                {
+                    return Err(EmitError::whole(
+                        "runtime status shapes differ across a while loop",
+                    ));
+                }
+                Some(old) if old.ty != MlirTy::Scalar => old.ty.clone(),
+                _ => body_status.ty.clone(),
+            };
+            if shape(&status_ty).iter().any(Option::is_none) {
+                return Err(EmitError::whole(
+                    "runtime status in a while loop requires static batch dimensions",
+                ));
+            }
+            let initial = incoming_status.unwrap_or_else(|| self.int_value_const(0));
+            let initial = if initial.ty == status_ty {
+                initial
+            } else {
+                self.broadcast_scalar(&initial, &status_ty)
+            };
+            let status_arg = self.fresh();
+            let status_axes = if body_status.ty == status_ty {
+                self.axes_of(&body_status)
+            } else {
+                self.axes_of(&initial)
+            };
+            self.remember_axes(&status_arg, status_axes);
+            let carried = Value {
+                ssa: status_arg.clone(),
+                ty: status_ty.clone(),
+                elem: ElemKind::Int,
+            };
+            let saved = std::mem::replace(&mut self.body, do_body);
+            let saved_pure_ops = std::mem::take(&mut self.pure_ops);
+            let saved_expanded = std::mem::take(&mut self.expanded);
+            let merged = self.merge_runtime_status(&carried, &body_status);
+            do_body = std::mem::replace(&mut self.body, saved);
+            self.pure_ops = saved_pure_ops;
+            self.expanded = saved_expanded;
+            arg_names.push(status_arg);
+            loop_inits.push(initial.ssa);
+            loop_tys.push(status_ty.render(self.dtype, ElemKind::Int));
+            next.push(merged.ssa);
+            self.runtime_status = Some(Value {
+                ssa: format!("{result_name}#{}", inits.len()),
+                ty: status_ty,
+                elem: ElemKind::Int,
+            });
+            self.remember_axes(
+                &format!("{result_name}#{}", inits.len()),
+                self.axes_of(&carried),
+            );
+        }
+        let arity = loop_inits.len();
         let bindings = arg_names
             .iter()
-            .zip(inits)
+            .zip(&loop_inits)
             .map(|(n, init)| format!("{n} = {init}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let tys = carried_tys.join(", ");
+        let tys = loop_tys.join(", ");
 
         let mut text = String::new();
         text.push_str(&format!(
@@ -3662,7 +3751,9 @@ impl<'m> Emitter<'m> {
         text.push('}');
         self.push(&text);
 
-        Ok((0..arity).map(|k| format!("{result_name}#{k}")).collect())
+        Ok((0..inits.len())
+            .map(|k| format!("{result_name}#{k}"))
+            .collect())
     }
 
     /// If `args` is `get0`/`get`'s `[container, index]` pair and `container`
@@ -3985,7 +4076,40 @@ impl<'m> Emitter<'m> {
                 ));
             }
         };
-        let rest = &args[1..];
+        let positional;
+        let rest = if matches!(fname.as_str(), "conv" | "crosscorr" | "cross") {
+            let named = match self.node(id) {
+                Node::Call(c) => c.named.as_ref(),
+                _ => &[],
+            };
+            if named.is_empty() {
+                &args[1..]
+            } else {
+                let lookup = |name: &str, index: usize| {
+                    named
+                        .iter()
+                        .find(|arg| self.resolve(arg.name) == name)
+                        .map(|arg| arg.value)
+                        .or_else(|| args.get(index + 1).copied())
+                };
+                let (first, second) = if fname == "cross" {
+                    ("a", "b")
+                } else {
+                    ("v", "kernel")
+                };
+                positional = [
+                    lookup(first, 0).ok_or_else(|| {
+                        EmitError::at(id, format!("broadcast {fname}: missing {first}"))
+                    })?,
+                    lookup(second, 1).ok_or_else(|| {
+                        EmitError::at(id, format!("broadcast {fname}: missing {second}"))
+                    })?,
+                ];
+                &positional[..]
+            }
+        } else {
+            &args[1..]
+        };
         if fname == "builtin_logdensityof" {
             // Batched density: `Params::field_id` reads the batched
             // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
@@ -4013,6 +4137,9 @@ impl<'m> Emitter<'m> {
                 | "inv"
                 | "det"
                 | "logabsdet"
+                | "conv"
+                | "crosscorr"
+                | "cross"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
@@ -4352,27 +4479,29 @@ impl<'m> Emitter<'m> {
     /// identical to the previous single-`ret` output; two-or-more render the
     /// parenthesized result-type list and comma-joined return.
     pub fn finish(
-        self,
+        mut self,
         func_name: &str,
         args: &[(String, MlirTy, ElemKind)],
         rets: &[&Value],
     ) -> String {
+        let status = self.final_runtime_status();
+        let mut rets = rets.to_vec();
+        let attribute = append_runtime_status(&mut rets, status.as_ref());
         format!(
-            "module {{\n{}}}\n",
-            self.finish_function(func_name, args, rets, false)
+            "module{attribute} {{\n{}}}\n",
+            self.finish_function(func_name, args, &rets, false)
         )
     }
 
     /// Map a compiled call over host batch axes entirely inside StableHLO.
     /// This preserves per-lane control flow and exact RNG-state semantics.
     pub fn finish_batched(
-        self,
+        mut self,
         func_name: &str,
         args: &[(String, MlirTy, ElemKind)],
         rets: &[&Value],
         batch: &crate::BatchSpec,
     ) -> Result<String, EmitError> {
-        let types = rets.iter().map(|v| (&v.ty, v.elem)).collect::<Vec<_>>();
         if batch.shape.is_empty() {
             if batch.input_axes.len() != args.len()
                 || batch.input_axes.iter().any(|axes| !axes.is_empty())
@@ -4383,10 +4512,14 @@ impl<'m> Emitter<'m> {
             }
             return Ok(self.finish(func_name, args, rets));
         }
+        let status = self.final_runtime_status();
+        let mut rets = rets.to_vec();
+        let attribute = append_runtime_status(&mut rets, status.as_ref());
+        let types = rets.iter().map(|v| (&v.ty, v.elem)).collect::<Vec<_>>();
         let callee = format!("{func_name}_cell");
         let wrapper = batch.wrapper(func_name, &callee, args, &types, self.dtype)?;
-        let cell = self.finish_function(&callee, args, rets, true);
-        Ok(format!("module {{\n{wrapper}{cell}}}\n"))
+        let cell = self.finish_function(&callee, args, &rets, true);
+        Ok(format!("module{attribute} {{\n{wrapper}{cell}}}\n"))
     }
 
     fn finish_function(

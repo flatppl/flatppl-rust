@@ -45,10 +45,10 @@ fn integer_lowers_an_integral_operand_and_refuses_a_computed_real() {
     for head in ["round", "floor", "ceil"] {
         let out = emits(&format!("(integer({head}(z0)))"));
         assert!(
-            out.contains("stablehlo.convert") && out.contains("-> tensor<i32>"),
+            out.contains("stablehlo.convert") && out.contains("-> (tensor<i32>, tensor<i32>)"),
             "{head}:\n{out}"
         );
-        assert!(!out.contains("stablehlo.select"), "{head}:\n{out}");
+        assert!(out.contains("flatppl.runtime_status = 1"), "{head}:\n{out}");
     }
     // The consumers of an integer: an index, an exact comparison, `div`.
     emits("(get([1.0, 2.0, 3.0], integer(round(z0))))");
