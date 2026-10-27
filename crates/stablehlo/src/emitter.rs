@@ -4337,6 +4337,8 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_sample(self, id, &call.args)
                     } else if name == "builtin_touniform" {
                         crate::registry::lower_touniform(self, id, &call.args)
+                    } else if matches!(name.as_str(), "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal") {
+                        crate::registry::lower_transport(self, id, &name, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "scan" | "reduce") {
