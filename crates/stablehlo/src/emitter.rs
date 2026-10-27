@@ -4004,6 +4004,8 @@ impl<'m> Emitter<'m> {
                 | "std"
                 | "maximum"
                 | "minimum"
+                | "median"
+                | "quantile"
                 | "lany"
                 | "lall"
                 | "sizeof"
