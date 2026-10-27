@@ -261,6 +261,22 @@ fn op_rule(
     if let Some(ty) = domain_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
+    if name == "in"
+        && let [(point, actual, _), (set, _, _)] = args
+    {
+        let expected = set_element_type(inf, Some(*set));
+        if membership_scalar_mismatch(&expected, actual) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *point,
+                format!(
+                    "`in` expects a value matching the set's element type {}, got {} (spec §07)",
+                    crate::boundary::show(inf, &expected),
+                    crate::boundary::show(inf, actual),
+                ),
+            ));
+            return Ready((Type::Failed("membership type mismatch".into()), joined));
+        }
+    }
     if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args, false) {
         return Ready((ty, joined));
     }
@@ -331,6 +347,7 @@ fn op_rule(
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
+        "cross" => cross_type(inf, id, args),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
@@ -620,6 +637,36 @@ fn op_rule(
                 }
             }
             _ => Type::Deferred,
+        },
+        "joinblocks" => match arg_ty(args, 0) {
+            Some(Type::Array { shape: outer, elem }) => match elem.as_ref() {
+                Type::Array { shape: inner, elem } if outer.len() == inner.len() => {
+                    let shape = outer
+                        .iter()
+                        .zip(inner.iter())
+                        .map(|(a, b)| match (a, b) {
+                            (Dim::Static(a), Dim::Static(b)) => {
+                                a.checked_mul(*b).map_or(Dim::Dynamic, Dim::Static)
+                            }
+                            _ => Dim::Dynamic,
+                        })
+                        .collect();
+                    Type::Array {
+                        shape,
+                        elem: elem.clone(),
+                    }
+                }
+                Type::Deferred | Type::Any => Type::Deferred,
+                _ => {
+                    inf.diags.push(crate::Diagnostic::error_at(id, "`joinblocks` requires an array of arrays with equal outer and inner ranks (spec §07)"));
+                    Type::Failed("joinblocks: invalid array nesting".into())
+                }
+            },
+            Some(Type::Deferred | Type::Any) | None => Type::Deferred,
+            Some(_) => {
+                inf.diags.push(crate::Diagnostic::error_at(id, "`joinblocks` requires an array of arrays with equal outer and inner ranks (spec §07)"));
+                Type::Failed("joinblocks: invalid array nesting".into())
+            }
         },
         // `cat(x, y, …)` concatenates same-shape-class values (spec §07): all
         // scalars → a length-n vector, all 1-D vectors → one concatenated
@@ -1012,6 +1059,20 @@ fn op_rule(
         _ => joined,
     };
     Ready((ty, phase))
+}
+
+fn membership_scalar_mismatch(expected: &Type, actual: &Type) -> bool {
+    fn rank(ty: &Type) -> Option<u8> {
+        match ty {
+            Type::Array { elem, .. } => rank(elem),
+            Type::Scalar(ScalarType::Boolean) => Some(0),
+            Type::Scalar(ScalarType::Integer) => Some(1),
+            Type::Scalar(ScalarType::Real) => Some(2),
+            Type::Scalar(ScalarType::Complex) => Some(3),
+            _ => None,
+        }
+    }
+    matches!((rank(expected), rank(actual)), (Some(want), Some(have)) if have > want)
 }
 
 /// How an operation's additional arguments reach its callback (§04 "Additional
@@ -1712,6 +1773,36 @@ fn fresh_measure(t: Option<&Type>) -> Type {
         },
         Some(other) => other.clone(),
         None => Type::Deferred,
+    }
+}
+
+fn cross_type(inf: &mut Inferencer<'_, '_>, id: NodeId, args: &[ArgInfo]) -> Type {
+    fn vector(ty: &Type) -> Option<(Dim, &Type)> {
+        match ty {
+            Type::Array { shape, elem } if shape.len() == 1 => Some((shape[0], elem.as_ref())),
+            Type::TVector { len, elem } => Some((*len, elem.as_ref())),
+            _ => None,
+        }
+    }
+    let (Some((a_len, a)), Some((b_len, b))) = (
+        arg_ty(args, 0).and_then(vector),
+        arg_ty(args, 1).and_then(vector),
+    ) else {
+        return Type::Deferred;
+    };
+    if [a_len, b_len]
+        .iter()
+        .any(|d| matches!(d, Dim::Static(n) if *n != 3))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`cross` requires two vectors of length 3 (spec §07)",
+        ));
+        return Type::Failed("cross: vector length must be 3".into());
+    }
+    Type::Array {
+        shape: Box::new([Dim::Static(3)]),
+        elem: Box::new(promote2(Some(a), Some(b))),
     }
 }
 
@@ -7162,6 +7253,26 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
+        if op_name == "cross" && elems.len() == 2 {
+            let cells: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(name, node, ty, phase)| (*name, *node, cell_arg(ty), *phase))
+                .collect();
+            let cells =
+                normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
+            let inner = cross_type(inf, id, &cells);
+            if matches!(inner, Type::Failed(_)) {
+                return Ready(inner);
+            }
+            return Ready(Type::Array {
+                shape,
+                elem: Box::new(inner),
+            });
+        }
         return Ready(match broadcast_collection_cell(&op_name, &cell) {
             Some(inner) => Type::Array {
                 shape,
@@ -10386,6 +10497,7 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        "cross" => ValueSet::natural_of(ty),
         // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
         // rides through — otherwise it would be needlessly lost to `Unknown`.
         "checked" | "fixed" => args

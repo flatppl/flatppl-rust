@@ -323,6 +323,40 @@ fn batched_scan_keeps_one_time_loop() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
+fn scan_in_a_broadcast_callable_keeps_its_state_frame() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "q=external(reals)\na=elementof(reals)\nstep(s,x,a)=a*s+x\n\
+         states=scan(step,0.0,[1.0,2.0,3.0],a)\ntrajectory=functionof(states,a=a)\n\
+         inputs=q\noutputs=sum(sum.(trajectory.([q,q+1.0])))",
+        None,
+        None,
+    )?;
+    let outputs = [
+        query.compile(&EmitOptions::default())?,
+        query.compile_batched(
+            &EmitOptions::default(),
+            &BatchSpec {
+                shape: vec![2, 3],
+                input_axes: vec![vec![Some(0), Some(1)]],
+            },
+        )?,
+    ];
+    for export in outputs {
+        let loop_line = export
+            .stablehlo
+            .lines()
+            .find(|line| line.contains("stablehlo.while") && line.contains("tensor<3xf32>"))
+            .expect("scan loop");
+        assert!(
+            loop_line.contains("tensor<2xf32>, tensor<2x3xf32>"),
+            "{loop_line}"
+        );
+        assert!(!export.stablehlo.contains("(tensor<2xf32>) -> tensor<f32>"));
+    }
+    Ok(())
+}
+
+#[test]
 fn batched_scan_density_with_a_normalized_cauchy_prior_keeps_one_time_loop()
 -> Result<(), Box<dyn std::error::Error>> {
     let query = Context::default().parse(

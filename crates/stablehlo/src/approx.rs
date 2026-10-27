@@ -25,7 +25,13 @@ pub(crate) fn lower_integer(
     let integral = match e.node(e.resolve_ref_one(a)) {
         Node::Lit(Scalar::Real(v)) => v.fract() == 0.0,
         Node::Call(c) => match c.head {
-            CallHead::Builtin(head) => matches!(e.resolve(head), "round" | "floor" | "ceil"),
+            CallHead::Builtin(head) => {
+                matches!(e.resolve(head), "round" | "floor" | "ceil")
+                    || (e.resolve(head) == "broadcast"
+                        && c.args.len() == 2
+                        && c.named.is_empty()
+                        && matches!(e.node(c.args[0]), Node::Const(op) if matches!(e.resolve(*op), "round" | "floor" | "ceil")))
+            }
             CallHead::User(_) => false,
         },
         _ => false,
