@@ -164,7 +164,7 @@ fn frame_capacity(codec: arrow_ipc::CompressionType, data: &[u8]) -> Option<u64>
         let magic = word(at)?;
         // Skippable frames (both formats) carry no output.
         if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
-            at = at.checked_add(8 + word(at + 4)? as usize)?;
+            at = at.checked_add(8)?.checked_add(word(at + 4)? as usize)?;
             if at > data.len() {
                 return None;
             }

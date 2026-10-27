@@ -875,6 +875,14 @@ fn arrow_rejects_blocks_over_the_codec_limit_before_allocating() {
         .windows(4)
         .position(|w| w == [0x28, 0xb5, 0x2f, 0xfd])
         .unwrap();
+    let mut skippable = zstd.clone();
+    skippable[at..at + 4].copy_from_slice(&0x184d_2a50_u32.to_le_bytes());
+    skippable[at + 4..at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let err = flatppl_data::Table::from_arrow_ipc_values(&skippable)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not hold its codec's frames"), "{err}");
+
     zstd[at - 8..at].copy_from_slice(&131_073_i64.to_le_bytes());
     let rle_header = (131_073_u32 << 3) | 3;
     zstd[at + 7..at + 10].copy_from_slice(&rle_header.to_le_bytes()[..3]);
