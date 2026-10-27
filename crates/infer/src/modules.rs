@@ -514,11 +514,18 @@ impl<'b> InferSession<'b> {
                             .binding(workspace.module.binding_by_name(r.name)?)
                             .rhs;
                     }
-                    Node::Call(c) if c.inputs.is_some() => break,
+                    // Re-enter the ordinary call trace in this declaring scope.
+                    // Its module reference then resolves the next identity with
+                    // this load's substitutions and the normal active stack.
+                    Node::Ref(Ref {
+                        ns: flatppl_core::RefNs::Module(_),
+                        ..
+                    }) => return Some(()),
+                    Node::Call(c) if c.inputs.is_some() => return Some(()),
                     _ => return None,
                 }
             }
-            matches!(workspace.module.node(rhs), Node::Call(c) if c.inputs.is_some()).then_some(())
+            None
         })();
         if callable.is_none() {
             self.callable_workspaces
