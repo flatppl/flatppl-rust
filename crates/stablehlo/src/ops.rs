@@ -185,6 +185,7 @@ pub(crate) fn lower_builtin(
         "real" => lower_real(e, id, args),
         // §07 "Linear algebra" `transpose`/`adjoint`, domain "vectors, matrices".
         "transpose" | "adjoint" => lower_transpose(e, id, args, head),
+        "cross" => lower_cross(e, id, args),
         // §07 "Linear algebra", the entries that reduce to an `Emitter` matrix
         // helper already in the crate. Every one of the daggers §07 writes
         // ($\mathbf{A}\mathbf{A}^\dagger$, $\mathbf{x}\mathbf{x}^\dagger$,
@@ -850,6 +851,38 @@ fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<V
     square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
     require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
+}
+
+fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, b_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    for v in [&a, &b] {
+        if !matches!(e.cell_ty(v), MlirTy::Ranked(dims) if dims.as_slice() == [Some(3)]) {
+            return Err(EmitError::at(
+                id,
+                "`cross` requires two statically sized vectors of length 3 (spec §07)",
+            ));
+        }
+    }
+    let kind = if a.elem == ElemKind::Real || b.elem == ElemKind::Real {
+        ElemKind::Real
+    } else {
+        ElemKind::Int
+    };
+    let a = e.convert(&a, kind);
+    let b = e.convert(&b, kind);
+    let i = [1, 2, 0].map(|n| e.int_value_const(n));
+    let i = e.vector(&i);
+    let j = [2, 0, 1].map(|n| e.int_value_const(n));
+    let j = e.vector(&j);
+    let a_i = e.gather(&a, &i, 0);
+    let a_j = e.gather(&a, &j, 0);
+    let b_i = e.gather(&b, &i, 0);
+    let b_j = e.gather(&b, &j, 0);
+    let left = e.mul(&a_i, &b_j);
+    let right = e.mul(&a_j, &b_i);
+    Ok(e.sub(&left, &right))
 }
 
 /// §07 `diag(A, k)` — "extracts the $k$th diagonal of $\mathbf{A}$ as a vector

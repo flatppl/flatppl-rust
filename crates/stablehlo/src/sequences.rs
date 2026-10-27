@@ -361,6 +361,9 @@ impl Emitter<'_> {
         let memo = self.memo.clone();
         let columns = self.columns.clone();
         let inputs = self.scoped_inputs.clone();
+        // A body can reach a scan through a self-reference. Its call frame
+        // must retain the mapped arguments while that binding is lowered.
+        let call_frame = std::mem::replace(&mut self.call_frame, self.broadcast_frame.clone());
         let mut dependent = HashMap::new();
         let mut stack = vec![(body, false)];
         while let Some((node, ready)) = stack.pop() {
@@ -432,6 +435,7 @@ impl Emitter<'_> {
         self.columns = columns;
         self.scoped_inputs = inputs;
         self.scoped_types = previous_types;
+        self.call_frame = call_frame;
         result
     }
 
