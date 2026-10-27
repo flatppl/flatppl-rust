@@ -261,6 +261,22 @@ fn op_rule(
     if let Some(ty) = domain_check(inf, &name, args, named) {
         return Ready((ty, joined));
     }
+    if name == "in"
+        && let [(point, actual, _), (set, _, _)] = args
+    {
+        let expected = set_element_type(inf, Some(*set));
+        if membership_scalar_mismatch(&expected, actual) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *point,
+                format!(
+                    "`in` expects a value matching the set's element type {}, got {} (spec §07)",
+                    crate::boundary::show(inf, &expected),
+                    crate::boundary::show(inf, actual),
+                ),
+            ));
+            return Ready((Type::Failed("membership type mismatch".into()), joined));
+        }
+    }
     if let Some(ty) = refuse_argument_outside_declared_shape(inf, &name, args, false) {
         return Ready((ty, joined));
     }
@@ -1008,6 +1024,20 @@ fn op_rule(
         _ => joined,
     };
     Ready((ty, phase))
+}
+
+fn membership_scalar_mismatch(expected: &Type, actual: &Type) -> bool {
+    fn rank(ty: &Type) -> Option<u8> {
+        match ty {
+            Type::Array { elem, .. } => rank(elem),
+            Type::Scalar(ScalarType::Boolean) => Some(0),
+            Type::Scalar(ScalarType::Integer) => Some(1),
+            Type::Scalar(ScalarType::Real) => Some(2),
+            Type::Scalar(ScalarType::Complex) => Some(3),
+            _ => None,
+        }
+    }
+    matches!((rank(expected), rank(actual)), (Some(want), Some(have)) if have > want)
 }
 
 /// How an operation's additional arguments reach its callback (§04 "Additional

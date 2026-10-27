@@ -112,7 +112,7 @@ fn incompatible(expected: &Type, actual: &Type) -> bool {
 }
 
 /// A short FlatPPL-flavoured spelling of a type for a diagnostic.
-fn show(inf: &Inferencer<'_, '_>, ty: &Type) -> String {
+pub(crate) fn show(inf: &Inferencer<'_, '_>, ty: &Type) -> String {
     match ty {
         Type::Scalar(kind) => kind.to_string(),
         Type::Array { shape, elem } => {
