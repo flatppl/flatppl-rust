@@ -10113,6 +10113,10 @@ fn distribution_domain(
     let Sig::Distribution { .. } = sig else {
         return None;
     };
+    if matches!(name, "LKJ" | "LKJCholesky") {
+        let n = named_or_positional_node(inf.module, named, args, "n", 0);
+        return Some(lkj_matrix_domain(inf, n));
+    }
     // Build a context whose `param_dim` delegates to the existing helper
     // so that VectorFromParam dims (MvNormal/Dirichlet/Multinomial) resolve
     // the same way as before.  The closure borrows `inf` as `&Inferencer`
@@ -10262,7 +10266,32 @@ fn kernel_variate(
     let Sig::Distribution { .. } = sig else {
         return None;
     };
+    if matches!(name.as_str(), "LKJ" | "LKJCholesky") {
+        let input = kernel_input_node.map(|node| resolve_binding_refs(inf, node));
+        let n = input.and_then(|node| match inf.module.node(node) {
+            Node::Call(call)
+                if matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "record") =>
+            {
+                call.named
+                    .iter()
+                    .find(|field| inf.module.resolve(field.name) == "n")
+                    .map(|field| field.value)
+            }
+            _ => None,
+        });
+        return Some(lkj_matrix_domain(inf, n));
+    }
     lower_dist(inf, sig)
+}
+
+/// §08 LKJ and LKJCholesky produce n-by-n matrices. Retain the catalogue's
+/// dynamic fallback when the existing fixed-size resolver cannot prove n.
+fn lkj_matrix_domain(inf: &mut Inferencer<'_, '_>, n: Option<NodeId>) -> Type {
+    let dimension = n.map_or(Dim::Dynamic, |node| resolve_dim(inf, node));
+    Type::Array {
+        shape: Box::new([dimension, dimension]),
+        elem: Box::new(Type::Scalar(ScalarType::Real)),
+    }
 }
 
 /// Leading array dim of the kernel_input record's `kwarg` field, for shaped dists

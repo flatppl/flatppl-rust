@@ -301,8 +301,7 @@ fn categorical0_domain_integer_support_nonnegintegers() {
     );
 }
 
-/// Wishart, InverseWishart, LKJ, LKJCholesky all have a rank-2 dynamic real
-/// array domain: `(%array 2 (%dynamic %dynamic) (%scalar real))`.
+/// Matrix distributions retain dynamic dimensions without a resolved size.
 #[test]
 fn matrix_dists_domain_is_rank2_dynamic_real() {
     let expected_domain = "(%array 2 (%dynamic %dynamic) (%scalar real))";
@@ -310,8 +309,8 @@ fn matrix_dists_domain_is_rank2_dynamic_real() {
     let cases = [
         ("Wishart(3.0, eye(3))", "Wishart"),
         ("InverseWishart(3.0, eye(3))", "InverseWishart"),
-        ("LKJ(3, 1.0)", "LKJ"),
-        ("LKJCholesky(3, 1.0)", "LKJCholesky"),
+        ("LKJ(external(posintegers), 1.0)", "LKJ"),
+        ("LKJCholesky(external(posintegers), 1.0)", "LKJCholesky"),
     ];
 
     for (expr, name) in cases {

@@ -12,7 +12,7 @@
 
 use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, Type, ValueSet};
 
-use crate::emitter::Emitter;
+use crate::emitter::{Axes, Emitter};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
@@ -293,7 +293,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "LKJ",
         DistLowering {
             logpdf: lkj_logpdf,
-            sample: None,
+            sample: Some(lkj_sample),
             touniform: None,
         },
     ),
@@ -1205,6 +1205,7 @@ const FANOUT_SAFE: &[&str] = &[
     // Batched vector/matrix draws share parameters and retain independent lanes.
     "MvNormal",
     "Dirichlet",
+    "LKJ",
     "LKJCholesky",
     // Tier 3 (batched discrete NON-elementwise — inner-axis reduce / broadcast):
     // each already owns (or lacks) an inner axis a plain `[m]` fan-out cannot
@@ -3767,6 +3768,20 @@ fn beta_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let y = draw_gamma(e, &beta, &one);
     let sum = e.add(&x, &y);
     Ok(e.div(&x, &sum))
+}
+
+/// §08: `LKJ(n, eta) = pushfwd(row_gram, LKJCholesky(n, eta))`.
+/// The deterministic Gram preserves the Cholesky draw's RNG successor.
+fn lkj_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let factor = lkj_cholesky_sample(e, p)?;
+    let factor = e.axes_view(
+        &factor,
+        Axes {
+            batch: usize::from(e.batch_shape().is_some()),
+            layers: vec![2],
+        },
+    );
+    Ok(crate::ops::row_gram(e, &factor))
 }
 
 /// Onion sampling: row i has squared radius Beta(i/2, eta+(n-i-1)/2)
