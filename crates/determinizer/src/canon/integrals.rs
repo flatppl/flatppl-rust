@@ -82,7 +82,7 @@ pub(super) fn hoist_integrals(m: &mut Module) -> bool {
 
 fn is_integral(m: &Module, id: NodeId) -> bool {
     matches!(m.node(id), Node::Call(c)
-        if matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == flatppl_core::LOG_INTEGRAL))
+        if matches!(c.head, CallHead::Builtin(h) if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL)))
 }
 
 // A surviving broadcast/scan callable may bind a same-module reference, not

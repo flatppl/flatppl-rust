@@ -192,7 +192,9 @@ fn check_node(
         let is_tag = tags.contains(&id) && flatppl_infer::builtins::is_kernel_tag_name(name);
         let intrinsic = matches!(
             name,
-            flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT
+            flatppl_core::LOG_INTEGRAL
+                | flatppl_core::MASS_INTEGRAL
+                | flatppl_core::INTEGRATION_POINT
         ) || (options.vector_sort && name == flatppl_core::SORT_VECTOR);
         if !is_tag && !intrinsic && !flatppl_infer::builtins::is_base_name(name) {
             bad.push(NonConformance {
@@ -300,7 +302,7 @@ fn check_integrals(
             && let CallHead::Builtin(head) = c.head
         {
             match m.resolve(head) {
-                flatppl_core::LOG_INTEGRAL => {
+                flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL => {
                     if !options.numerical_integrals {
                         bad.push(NonConformance { node: id, kind: NonConformKind::NumericalIntegral,
                             reason: "no closed form covers this marginal or normalizer; numerical integration requires explicit opt-in".into() });

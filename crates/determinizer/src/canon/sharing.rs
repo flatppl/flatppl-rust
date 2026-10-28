@@ -136,7 +136,7 @@ fn contains_integral(m: &Module, root: NodeId) -> bool {
         }
         if let Node::Call(c) = m.node(id)
             && matches!(c.head, CallHead::Builtin(h)
-                if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::INTEGRATION_POINT))
+                if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL | flatppl_core::INTEGRATION_POINT))
         {
             return true;
         }

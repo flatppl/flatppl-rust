@@ -341,6 +341,7 @@ fn op_rule(
 
     let ty = match name.as_str() {
         flatppl_core::LOG_INTEGRAL
+        | flatppl_core::MASS_INTEGRAL
         | flatppl_core::LOG_INTERVAL_MASS
         | flatppl_core::INTEGRATION_POINT => Type::Scalar(ScalarType::Real),
         flatppl_core::SORT_VECTOR => arg_ty(args, 0).cloned().unwrap_or(Type::Deferred),

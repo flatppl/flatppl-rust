@@ -7132,18 +7132,20 @@ fn lower_binned_poisson_process(
         ));
     }
     let mut rates = Vec::with_capacity(bins_count);
+    let mut numerical_masses = Vec::new();
     for pair in edges.windows(2) {
-        let rate = bin_mass(m, intensity, pair[0], pair[1]).ok_or_else(|| {
-            refuse(
-                node,
-                m,
-                "BinnedPoissonProcess needs a closed-form intensity mass per bin; \
-                 only a normalized univariate continuous constructor, a `weighted` \
-                 by a variate-independent scalar, a `superpose` of such, and a \
-                 `Lebesgue` over `reals` or an `interval`, and bounded polynomial \
-                 weights with static bin edges are derived",
-            )
-        })?;
+        let rate =
+            bin_mass(m, intensity, pair[0], pair[1], &mut numerical_masses).ok_or_else(|| {
+                refuse(
+                    node,
+                    m,
+                    "BinnedPoissonProcess cannot derive this intensity mass per bin; \
+                     closed forms cover normalized univariate continuous constructors, \
+                     scalar weights, superpositions, Lebesgue intervals and bounded \
+                     polynomial weights. Numerical integration supports function-weighted \
+                     finite Lebesgue intervals with static bin edges and requires explicit opt-in",
+                )
+            })?;
         rates.push(rate);
     }
     let rates = build_call(m, "vector", &rates);
@@ -7157,7 +7159,23 @@ fn lower_binned_poisson_process(
     let poisson = m.intern("Poisson");
     let rate = m.intern("rate");
     let per_bin = family_per_cell(m, poisson, &[(rate, rates)], v);
-    Ok(build_call(m, "sum", &[per_bin]))
+    let mut score = build_call(m, "sum", &[per_bin]);
+    for (_, mass, raw) in numerical_masses {
+        // A finite nonnegative raw mass, or a finite log mass or -infinity,
+        // is valid. NaN and +infinity include quadrature failures.
+        let inf = m.alloc(Node::Lit(Scalar::Real(f64::INFINITY)));
+        let valid = build_call(m, "lt", &[mass, inf]);
+        let valid = if raw {
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let nonnegative = build_call(m, "ge", &[mass, zero]);
+            build_call(m, "land", &[valid, nonnegative])
+        } else {
+            valid
+        };
+        let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
+        score = build_call(m, "ifelse", &[valid, score, nan]);
+    }
+    Ok(score)
 }
 
 /// Whether an atom-bearing leaf, a `Dirac` or a law over the integers, sits under
@@ -7205,7 +7223,13 @@ fn bin_edges(m: &mut Module, bins: NodeId) -> Option<Vec<NodeId>> {
 /// Every rule holds for a closed or a half-open bin alike only because no measure
 /// it admits has an atom. A discrete intensity and a `Dirac` are refused for that
 /// reason: §07 `bincounts` puts an atom on an inner edge in the upper bin.
-fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<NodeId> {
+fn bin_mass(
+    m: &mut Module,
+    measure: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+    numerical_masses: &mut Vec<(NodeId, NodeId, bool)>,
+) -> Option<NodeId> {
     let (node, _) = resolve_ref(m, measure);
 
     // The whole intensity must have finite support, even if this bin is finite.
@@ -7230,7 +7254,7 @@ fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<N
     {
         let mut masses = Vec::with_capacity(parts.len());
         for part in parts {
-            masses.push(bin_mass(m, part, lo, hi)?);
+            masses.push(bin_mass(m, part, lo, hi, numerical_masses)?);
         }
         return Some(fold_add(m, &masses));
     }
@@ -7240,9 +7264,9 @@ fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<N
         .map(|c| (c.args[0], c.args[1]))
     {
         if weight_is_variate_dependent(m, w) {
-            return None;
+            return numerical_bin_mass(m, node, lo, hi, numerical_masses);
         }
-        let inner = bin_mass(m, base, lo, hi)?;
+        let inner = bin_mass(m, base, lo, hi, numerical_masses)?;
         return Some(build_call(m, "mul", &[w, inner]));
     }
 
@@ -7287,7 +7311,72 @@ fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<N
         let log_mass = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[node, lo, hi]);
         return Some(build_call(m, "exp", &[log_mass]));
     }
-    None
+    numerical_bin_mass(m, node, lo, hi, numerical_masses)
+}
+
+/// Approximate only direct function-weighted scalar Lebesgue intervals. The
+/// separate full-support mass detects invalid or nonconvergent intensities even
+/// when all observed bins miss the support. Conformance requires opt-in.
+fn numerical_bin_mass(
+    m: &mut Module,
+    node: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+    numerical_masses: &mut Vec<(NodeId, NodeId, bool)>,
+) -> Option<NodeId> {
+    let Node::Call(call) = m.node(node).clone() else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    if !matches!(m.resolve(head), "weighted" | "logweighted") || call.args.len() < 2 {
+        return None;
+    }
+    crate::kernel::resolve_reified(m, call.args[0])?;
+    let reference = resolve_ref_chain(m, call.args[1]).0;
+    let lebesgue = expect_builtin_call(m, reference, "Lebesgue")?;
+    let support = named_or_positional(m, lebesgue, "support")?;
+    let support = resolve_ref_chain(m, support).0;
+    let interval = expect_builtin_call(m, support, "interval")?;
+    let [a, b] = *interval.args else { return None };
+    let (a, b, lo, hi) = (
+        static_real(m, a)?,
+        static_real(m, b)?,
+        static_real(m, lo)?,
+        static_real(m, hi)?,
+    );
+    if ![a, b, lo, hi].iter().all(|v| v.is_finite()) || a >= b {
+        return None;
+    }
+    let reference_type = m.type_of(reference)?.clone();
+    let raw = m.resolve(head) == "weighted";
+    if !numerical_masses.iter().any(|&(id, _, _)| id == node) {
+        let full = if raw {
+            integral::raw_weighted_mass(m, node)?
+        } else {
+            integral::mass(m, node)?.ok()?
+        };
+        numerical_masses.push((node, full, raw));
+    }
+    let (lo, hi) = (lo.max(a), hi.min(b));
+    if lo >= hi {
+        return Some(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+    let lo = m.alloc(Node::Lit(Scalar::Real(lo)));
+    let hi = m.alloc(Node::Lit(Scalar::Real(hi)));
+    let support = build_call(m, "interval", &[lo, hi]);
+    let reference = build_call(m, "Lebesgue", &[support]);
+    m.set_type(reference, reference_type);
+    let mut clipped = call;
+    clipped.args[1] = reference;
+    let clipped = m.alloc(Node::Call(clipped));
+    if raw {
+        integral::raw_weighted_mass(m, clipped)
+    } else {
+        let log_mass = integral::mass(m, clipped)?.ok()?;
+        Some(build_call(m, "exp", &[log_mass]))
+    }
 }
 
 /// `logdensityof(Lebesgue(support = S), v)` = `0` on `S`, `−inf` outside.

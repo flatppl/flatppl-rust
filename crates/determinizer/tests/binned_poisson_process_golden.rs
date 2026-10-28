@@ -120,11 +120,11 @@ fn polynomial_bins_require_static_edges_and_finite_full_support() {
     for src in [
         "e = elementof(reals)\nI = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, e, 1], I), [0, 0])\ninputs = e\noutputs = lp",
         "I = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(reals))\nlp = logdensityof(BinnedPoissonProcess([0, 1], I), [0])",
-        "I = weighted(x -> exp(x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, 1], I), [0])",
     ] {
         let err = determinize(&parse_infer(src)).expect_err("unsupported bin mass must refuse");
         assert!(
-            err.reason.contains("closed-form intensity mass per bin"),
+            err.reason
+                .contains("cannot derive this intensity mass per bin"),
             "{err:?}"
         );
         let err = flatppl_determinizer::determinize_with_options(
@@ -136,8 +136,11 @@ fn polynomial_bins_require_static_edges_and_finite_full_support() {
                 ..Default::default()
             },
         )
-        .expect_err("numerical opt-in does not change the bin-mass subset");
-        assert!(err.reason.contains("closed-form intensity mass per bin"));
+        .expect_err("numerical opt-in still requires finite static intervals and edges");
+        assert!(
+            err.reason
+                .contains("cannot derive this intensity mass per bin")
+        );
     }
 }
 
