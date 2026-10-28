@@ -4010,10 +4010,8 @@ fn superposition_reference(
 /// closed-form mass rule here, so we **refuse** rather than emit `totalmass`
 /// (refuse-don't-mislower).
 ///
-/// The emitted `−logZ` inherits §06's `Z ≠ 0` precondition ("`normalize` … with
-/// `Z = totalmass(M)` finite and nonzero", §06 "Density of composed measures"): a
-/// degenerate/empty interval collapses `Z → 0`, so `logZ → −∞`. That is the
-/// backend's concern (a runtime `log(0)`), not statically checked here.
+/// Interval normalization requires finite log mass. A zero interval mass is
+/// valid for a bin, but cannot normalize a measure.
 fn lower_normalize(
     m: &mut Module,
     node: NodeId,
@@ -4179,7 +4177,7 @@ fn lower_normalize(
             let density =
                 lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?; // truncate handles the -inf gate
             let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base_resolved, lo, hi]);
-            return Ok(build_call(m, "sub", &[density, log_z]));
+            return Ok(normalized_logdensity(m, density, log_z));
         }
         if base_normalized {
             // Normalized but NOT univariate continuous — a discrete base
