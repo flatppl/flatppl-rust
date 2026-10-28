@@ -42,6 +42,7 @@ mod constants;
 mod enzyme;
 #[path = "integration.rs"]
 mod integration;
+pub(crate) use integration::IntegralKind;
 #[path = "likelihood_reductions.rs"]
 mod likelihood_reductions;
 #[path = "linalg.rs"]

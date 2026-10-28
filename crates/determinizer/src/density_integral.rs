@@ -247,6 +247,25 @@ pub(super) fn mass(m: &mut Module, measure: NodeId) -> Option<Result<NodeId, Ref
     })
 }
 
+/// Integrate the raw callback of a weighted scalar reference. Unlike a log
+/// normalizer this stays differentiable when a smooth nonnegative weight is zero.
+pub(super) fn raw_weighted_mass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
+    if measure_reaches_draw(m, measure, &[]) {
+        return None;
+    }
+    let (node, _) = resolve_ref_chain(m, measure);
+    let call = expect_builtin_call(m, node, "weighted")?;
+    let (&weight, &base) = (call.args.first()?, call.args.get(1)?);
+    let parameters = crate::extras::bind_extras(m, node, weight, 2, 1).ok()?;
+    let (lo, hi) = bounds(m, base)?;
+    let coordinate = point(m);
+    let body = build_callback_call(m, weight, coordinate, &parameters).ok()?;
+    let body = crate::canon::inline_expression(m, body);
+    let result = build_call(m, flatppl_core::MASS_INTEGRAL, &[body, coordinate, lo, hi]);
+    m.set_type(result, Type::Scalar(ScalarType::Real));
+    Some(result)
+}
+
 /// Restricting a nonnegative count law to [1, inf] retains mass 1 - P(0).
 pub(super) fn positive_count_log_mass(
     m: &mut Module,

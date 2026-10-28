@@ -8,6 +8,19 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegralKind {
+    Log,
+    Mass,
+}
+
+#[derive(Clone, Copy)]
+struct Integrand {
+    body: NodeId,
+    point: NodeId,
+    kind: IntegralKind,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum IntegralInput {
     Node(NodeId),
@@ -72,6 +85,7 @@ impl Emitter<'_> {
         &mut self,
         id: NodeId,
         args: &[NodeId],
+        kind: IntegralKind,
     ) -> Result<Value, EmitError> {
         if args.len() != 4 || self.integrating {
             return Err(EmitError::at(
@@ -81,21 +95,26 @@ impl Emitter<'_> {
         }
         let inputs = self.integral_inputs(args);
         if !inputs.is_empty() {
-            return self.lower_batched_integral(id, args, &inputs);
+            return self.lower_batched_integral(id, args, &inputs, kind);
         }
         let frame = std::mem::take(&mut self.broadcast_frame);
         let result = (|| {
             // Independent inner normalizers dominate adaptation and mesh replay.
             self.lower_integral_dependencies(args[0])?;
             self.integrating = true;
-            self.lower_scalar_integral(id, args)
+            self.lower_scalar_integral(id, args, kind)
         })();
         self.integrating = false;
         self.broadcast_frame = frame;
         result
     }
 
-    fn lower_scalar_integral(&mut self, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    fn lower_scalar_integral(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+        kind: IntegralKind,
+    ) -> Result<Value, EmitError> {
         let options = self
             .integration
             .ok_or_else(|| EmitError::at(id, "numerical integration requires explicit opt-in"))?;
@@ -173,8 +192,17 @@ impl Emitter<'_> {
         let one = self.scalar(1.0);
         for segment in 0..segments {
             let index = self.int_value_const(segment as i64);
-            let (mass, error, panel_valid) =
-                self.quadrature_panel(args[0], args[1], &bounds, &index, &zero, &one)?;
+            let (mass, error, panel_valid, _) = self.quadrature_panel(
+                Integrand {
+                    body: args[0],
+                    point: args[1],
+                    kind,
+                },
+                &bounds,
+                &index,
+                &zero,
+                &one,
+            )?;
             segment_ids = self.scan_update(&segment_ids, &index, &index);
             masses = self.scan_update(&masses, &mass, &index);
             errors = self.scan_update(&errors, &error, &index);
@@ -239,8 +267,17 @@ impl Emitter<'_> {
                 // A fixed two-panel rule is emitted directly; quadrature nodes are
                 // batched. Only the adaptive worklist needs a runtime loop.
                 for (child_a, child_b, target) in [(&a, &middle, &index), (&middle, &b, &s[0])] {
-                    let (mass, error, panel_valid) =
-                        e.quadrature_panel(args[0], args[1], &bounds, &segment, child_a, child_b)?;
+                    let (mass, error, panel_valid, _) = e.quadrature_panel(
+                        Integrand {
+                            body: args[0],
+                            point: args[1],
+                            kind,
+                        },
+                        &bounds,
+                        &segment,
+                        child_a,
+                        child_b,
+                    )?;
                     left = e.scan_update(&left, child_a, target);
                     right = e.scan_update(&right, child_b, target);
                     masses = e.scan_update(&masses, &mass, target);
@@ -270,7 +307,7 @@ impl Emitter<'_> {
         // outside it, as Quadax's direct adjoint does. Only discrete decisions
         // depend on parameters inside the loop; the live physical bounds are
         // applied again here. Unused slots retain the valid initial interval.
-        let value = if self.restrict_enzyme_compatible {
+        let value = if self.restrict_enzyme_compatible || kind == IntegralKind::Mass {
             let panel_axes = Axes {
                 batch: 1,
                 layers: vec![],
@@ -278,8 +315,22 @@ impl Emitter<'_> {
             let left = self.axes_view(&result[1], panel_axes.clone());
             let right = self.axes_view(&result[2], panel_axes.clone());
             let segments = self.axes_view(&result[8], panel_axes);
-            let (masses, _, _) =
-                self.quadrature_panel(args[0], args[1], &bounds, &segments, &left, &right)?;
+            let (logs, _, _, linear) = self.quadrature_panel(
+                Integrand {
+                    body: args[0],
+                    point: args[1],
+                    kind,
+                },
+                &bounds,
+                &segments,
+                &left,
+                &right,
+            )?;
+            let masses = if kind == IntegralKind::Mass {
+                linear
+            } else {
+                logs
+            };
             let masses = self.axes_view(
                 &masses,
                 Axes {
@@ -289,8 +340,17 @@ impl Emitter<'_> {
             );
             let indices = self.axis_indices(&masses, 0);
             let active = self.compare("LT", &indices, &result[0]);
-            let masses = self.select(&active, &masses, &neg_inf);
-            self.integral_logsum(&masses)
+            let inactive = if kind == IntegralKind::Mass {
+                self.scalar(0.0)
+            } else {
+                neg_inf.clone()
+            };
+            let masses = self.select(&active, &masses, &inactive);
+            if kind == IntegralKind::Mass {
+                self.reduce_sum(&masses)
+            } else {
+                self.integral_logsum(&masses)
+            }
         } else {
             result[5].clone()
         };
@@ -300,7 +360,12 @@ impl Emitter<'_> {
         let finite = self.compare("LT", &finite, &inf);
         let empty = self.and(&empty, &finite);
         // No evaluations are needed for an empty finite interval.
-        Ok(self.select(&empty, &neg_inf, &value))
+        let empty_value = if kind == IntegralKind::Mass {
+            self.scalar(0.0)
+        } else {
+            neg_inf
+        };
+        Ok(self.select(&empty, &empty_value, &value))
     }
 
     fn integral_inputs(&self, args: &[NodeId]) -> Vec<(IntegralInput, Value)> {
@@ -359,6 +424,7 @@ impl Emitter<'_> {
         id: NodeId,
         args: &[NodeId],
         inputs: &[(IntegralInput, Value)],
+        kind: IntegralKind,
     ) -> Result<Value, EmitError> {
         let mut frame = Vec::new();
         for (_, value) in inputs {
@@ -458,7 +524,7 @@ impl Emitter<'_> {
                             }
                         }
                     }
-                    let value = e.lower_integral(id, args)?;
+                    let value = e.lower_integral(id, args, kind)?;
                     let one = e.pure("stablehlo.constant dense<1> : tensor<i64>".into());
                     let mut next = vec![e.pure(format!("stablehlo.add {}, {one} : tensor<i64>", state[0]))];
                     next.extend_from_slice(&state[1..state.len() - 1]);
@@ -498,7 +564,7 @@ impl Emitter<'_> {
             if resolved != id {
                 if matches!(self.node(resolved), Node::Call(c)
                     if matches!(c.head, CallHead::Builtin(h)
-                        if self.resolve(h) == flatppl_core::LOG_INTEGRAL))
+                        if matches!(self.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL)))
                 {
                     self.lower_node(id)?;
                 } else {
@@ -656,13 +722,13 @@ impl Emitter<'_> {
 
     fn quadrature_panel(
         &mut self,
-        body: NodeId,
-        point: NodeId,
+        integrand: Integrand,
         bounds: &[Value],
         segment: &Value,
         a: &Value,
         b: &Value,
-    ) -> Result<(Value, Value, Value), EmitError> {
+    ) -> Result<(Value, Value, Value, Value), EmitError> {
+        let Integrand { body, point, kind } = integrand;
         let nodes = self.quadrature_constants(&NODES);
         let kronrod = self.quadrature_constants(&KRONROD);
         let gauss = self.quadrature_constants(&GAUSS);
@@ -716,7 +782,7 @@ impl Emitter<'_> {
         if self.cell_ty(&log) != MlirTy::Scalar || log.elem != ElemKind::Real {
             return Err(EmitError::at(
                 body,
-                "numerical integrand must be a real scalar log density",
+                "numerical integrand must be a real scalar",
             ));
         }
         let log = if log.ty == MlirTy::Scalar {
@@ -732,11 +798,52 @@ impl Emitter<'_> {
         } else {
             log
         };
-        let log = self.reshape(&log, t.ty.clone());
-        let log = self.axes_view(&log, self.axes_of(&t));
-        let log = self.add(&log, &jacobian);
+        let body = self.reshape(&log, t.ty.clone());
+        let body = self.axes_view(&body, self.axes_of(&t));
         let inf = self.scalar(f64::INFINITY);
+        let (log, raw_valid, linear) = if kind == IntegralKind::Mass {
+            let nonnegative = self.compare("GE", &body, &zero);
+            let finite = self.compare("LT", &body, &inf);
+            let valid = self.and(&nonnegative, &finite);
+            let positive = self.compare("GT", &body, &zero);
+            let safe = self.select(&positive, &body, &one);
+            let log = self.log(&safe);
+            let scale = self.floor(&log);
+            let neg_inf = self.scalar(f64::NEG_INFINITY);
+            let log = self.select(&positive, &log, &neg_inf);
+            // Replay a scaled linear quadrature sum so AD sees the raw
+            // integrand, including at zero. The per-node discrete scale does
+            // not couple a large weight at one node to another node's factor.
+            // Dividing by a huge scale can lower to a subnormal reciprocal on
+            // XLA. Two balanced multiplications keep both factors representable.
+            let half_scale = self.mul(&scale, &half);
+            let half_scale = self.neg(&half_scale);
+            let half_scale = self.exp(&half_scale);
+            let normalized = self.mul(&body, &half_scale);
+            let normalized = self.mul(&normalized, &half_scale);
+            // Combine all positive scale factors before exponentiation: an
+            // intermediate normalized * width may overflow even if the
+            // Kronrod-weighted term and final integral are finite.
+            let log_radius = self.log(&radius);
+            let log_kronrod = self.log(&kronrod);
+            let factor = self.add(&scale, &jacobian);
+            let factor = self.add(&factor, &log_radius);
+            let factor = self.add(&factor, &log_kronrod);
+            let factor = self.exp(&factor);
+            let weighted = self.mul(&normalized, &factor);
+            let mass = self.reduce_sum(&weighted);
+            let mass = self.select(&nonempty, &mass, &zero);
+            (log, Some(valid), mass)
+        } else {
+            (body, None, zero.clone())
+        };
+        let log = self.add(&log, &jacobian);
         let finite = self.compare("LT", &log, &inf);
+        let finite = if let Some(valid) = raw_valid {
+            self.and(&finite, &valid)
+        } else {
+            finite
+        };
         let lower = self.compare("GT", &t, &zero);
         let upper = self.compare("LT", &t, &one);
         let interior = self.and(&lower, &upper);
@@ -802,6 +909,7 @@ impl Emitter<'_> {
             self.select(&nonzero, &mass, &neg_inf),
             self.select(&nonzero, &error, &neg_inf),
             valid,
+            linear,
         ))
     }
 

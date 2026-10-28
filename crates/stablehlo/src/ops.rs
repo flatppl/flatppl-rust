@@ -55,7 +55,7 @@
 
 use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Type};
 
-use crate::emitter::{Axes, Emitter, elem_rank};
+use crate::emitter::{Axes, Emitter, IntegralKind, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
@@ -71,7 +71,8 @@ pub(crate) fn lower_builtin(
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     match head {
-        flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args),
+        flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args, IntegralKind::Log),
+        flatppl_core::MASS_INTEGRAL => e.lower_integral(id, args, IntegralKind::Mass),
         flatppl_core::SORT_VECTOR => {
             let [arg] = args_exact(id, args)?;
             let value = e.lower_node(arg)?;
