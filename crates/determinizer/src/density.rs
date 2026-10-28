@@ -7140,7 +7140,8 @@ fn lower_binned_poisson_process(
                 "BinnedPoissonProcess needs a closed-form intensity mass per bin; \
                  only a normalized univariate continuous constructor, a `weighted` \
                  by a variate-independent scalar, a `superpose` of such, and a \
-                 `Lebesgue` over `reals` or an `interval` are derived",
+                 `Lebesgue` over `reals` or an `interval`, and bounded polynomial \
+                 weights with static bin edges are derived",
             )
         })?;
         rates.push(rate);
@@ -7206,6 +7207,22 @@ fn bin_edges(m: &mut Module, bins: NodeId) -> Option<Vec<NodeId>> {
 /// reason: §07 `bincounts` puts an atom on an inner edge in the upper bin.
 fn bin_mass(m: &mut Module, measure: NodeId, lo: NodeId, hi: NodeId) -> Option<NodeId> {
     let (node, _) = resolve_ref(m, measure);
+
+    // The whole intensity must have finite support, even if this bin is finite.
+    // Intersect it with the bin before integrating; a disjoint bin has zero mass.
+    if let Some(shape) = recognize_polynomial_over_interval(m, node) {
+        let (support_lo, support_hi) = bounded_interval_endpoints(m, &shape)?;
+        let (lo, hi) = (static_real(m, lo)?, static_real(m, hi)?);
+        if !lo.is_finite() || !hi.is_finite() {
+            return None;
+        }
+        return Some(polynomial_interval_mass(
+            m,
+            &shape.coefficients,
+            lo.max(support_lo),
+            hi.min(support_hi),
+        ));
+    }
 
     if let Some(parts) = expect_builtin_call(m, node, "superpose")
         .filter(|c| !c.args.is_empty())
