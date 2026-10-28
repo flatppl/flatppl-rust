@@ -76,6 +76,71 @@ lp = logdensityof(proc, [2, 7, 4])",
     );
 }
 
+#[test]
+fn polynomial_intensity_uses_unnormalized_bin_masses() {
+    // Integral of 1 + 2x on [0, 1/2] and [1/2, 1]: 3/4 and 5/4.
+    for intensity in [
+        "weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))",
+        "truncate(weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(reals)), interval(0, 1))",
+    ] {
+        let text = lowered(&format!(
+            "I = {intensity}\nJ = I\nlp = logdensityof(BinnedPoissonProcess([-1, 0, 0.5, 1, 2], J), [0, 0, 0, 0])"
+        ));
+        assert!(text.contains("[0.0, 0.75, 1.25, 0.0]"), "{text}");
+        assert!(!text.contains("%log_integral"), "{text}");
+    }
+}
+
+#[test]
+fn polynomial_zero_mass_bin_keeps_positive_count_for_poisson_scoring() {
+    // The first bin does not intersect [0, 1]; its rate is zero and observing
+    // one event there has log density -infinity, not the zero-count score.
+    let text = lowered(
+        "I = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([-1, 0, 1], I), [1, 0])",
+    );
+    assert!(text.contains("[0.0, 2.0]"), "zero and full mass: {text}");
+    assert!(
+        text.contains("[1, 0]"),
+        "positive count is retained: {text}"
+    );
+    assert!(text.contains("Poisson"), "Poisson scores zero rate: {text}");
+}
+
+#[test]
+fn polynomial_intensity_preserves_live_extra_and_composition() {
+    let text = lowered(
+        "a = elementof(nonnegreals)\nI = weighted((x, p) -> polynomial([1.0, p], x), Lebesgue(interval(0, 1)), a)\nJ = superpose(weighted(2.0, I), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, 0.5, 1], J), [1, 2])\ninputs = a\noutputs = lp",
+    );
+    assert!(text.contains('a'), "live coefficient: {text}");
+    assert!(!text.contains("BinnedPoissonProcess"), "{text}");
+}
+
+#[test]
+fn polynomial_bins_require_static_edges_and_finite_full_support() {
+    for src in [
+        "e = elementof(reals)\nI = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, e, 1], I), [0, 0])\ninputs = e\noutputs = lp",
+        "I = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(reals))\nlp = logdensityof(BinnedPoissonProcess([0, 1], I), [0])",
+        "I = weighted(x -> exp(x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, 1], I), [0])",
+    ] {
+        let err = determinize(&parse_infer(src)).expect_err("unsupported bin mass must refuse");
+        assert!(
+            err.reason.contains("closed-form intensity mass per bin"),
+            "{err:?}"
+        );
+        let err = flatppl_determinizer::determinize_with_options(
+            &parse_infer(src),
+            &flatppl_infer::ModuleBundle::new(),
+            None,
+            &flatppl_determinizer::LoweringOptions {
+                numerical_integrals: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("numerical opt-in does not change the bin-mass subset");
+        assert!(err.reason.contains("closed-form intensity mass per bin"));
+    }
+}
+
 // §08 gives `bins` §07 `bincounts`'s record form for multi-dimensional bins. That
 // form is out of the lowered fragment and must refuse.
 #[test]
