@@ -193,6 +193,7 @@ pub(crate) fn lower_builtin(
         // for `lower_transpose`'s reason: this crate has no complex element type,
         // so over the elements it emits conjugation is the identity.
         "lower_cholesky" => lower_cholesky_head(e, id, args),
+        "linsolve" => lower_linsolve(e, id, args),
         "inv" => {
             let [arg] = args_exact(id, args)?;
             let a = e.lower_node(arg)?;
@@ -298,7 +299,7 @@ pub(crate) fn lower_builtin(
         "softmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Plain),
         "logsoftmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Log),
         // §07's boolean reductions, cumulative extrema, infinity norm and order
-        // statistics — `crate::order`, which see for why two of the six refuse.
+        // statistics — `crate::order`.
         "lany" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::Any),
         "lall" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::All),
         "cummax" => {
@@ -308,14 +309,8 @@ pub(crate) fn lower_builtin(
             crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Min)
         }
         "linfnorm" => crate::order::lower_linf_norm(e, id, args),
-        "median" => Err(crate::order::refuse_order_statistic(
-            id,
-            crate::order::OrderStatistic::Median,
-        )),
-        "quantile" => Err(crate::order::refuse_order_statistic(
-            id,
-            crate::order::OrderStatistic::Quantile,
-        )),
+        "median" => crate::order::lower_order_statistic(e, id, args, true),
+        "quantile" => crate::order::lower_order_statistic(e, id, args, false),
         "fill" => lower_fill(e, id, args),
         // §07 "Scalar restrictions and constructors" and "Approximation functions".
         "integer" => crate::approx::lower_integer(e, id, args),
@@ -851,6 +846,23 @@ fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<V
     square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
     require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
+}
+
+fn lower_linsolve(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, b_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    let n = square_dim(id, &e.cell_ty(&a), "linsolve")?;
+    if n == 0
+        || n > i32::MAX as u64
+        || !matches!(e.cell_ty(&b), MlirTy::Ranked(dims) if dims.as_slice() == [Some(n)])
+    {
+        return Err(EmitError::at(
+            id,
+            "`linsolve` requires a nonempty static square matrix and matching vector (spec §07)",
+        ));
+    }
+    e.matrix_solve(id, &a, &b)
 }
 
 fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {

@@ -1,6 +1,5 @@
 //! Spec §07 "Boolean reductions", "Cumulative operations" and the order
-//! statistics — the heads the `missing-reductions` spec draft (flatppl-design
-//! `ee4c6fb`) adds to §07, four of which lower here and two of which refuse.
+//! statistics.
 //!
 //! A separate module from [`crate::norms`] for the reason that module's own doc
 //! gives: several emitter waves append heads concurrently, and one module per wave
@@ -16,11 +15,7 @@
 //! arithmetic context — so `stablehlo.or`/`stablehlo.and` over `i1` compute exactly
 //! what §07 says, and widening would be the mistake.
 //!
-//! **`median`/`quantile` refuse.** Their interpolation rules are not lowered.
-//! The compiler-only vector sort used by ordered-law sampling does not add a
-//! public sort or an order-statistic lowering. See
-//! [`refuse_order_statistic`] for what a lowering would cost and why answering
-//! without one would be worse than refusing.
+//! `median` and `quantile` sort each array cell and interpolate order statistics.
 
 use flatppl_core::{NodeId, Type};
 
@@ -61,13 +56,6 @@ impl BoolReduce {
             BoolReduce::All => ("stablehlo.and", "true"),
         }
     }
-}
-
-/// Which order statistic a refused head computes, for [`refuse_order_statistic`].
-#[derive(Clone, Copy)]
-pub(crate) enum OrderStatistic {
-    Median,
-    Quantile,
 }
 
 // ---- §07 boolean reductions ----------------------------------------------------
@@ -216,58 +204,118 @@ pub(crate) fn lower_linf_norm(
     e.reduce_trailing_axes(id, AxisReduce::Max, &a, 1)
 }
 
-// ---- §07 order statistics: refused ---------------------------------------------
+// ---- §07 order statistics -----------------------------------------------------
 
-/// §07 `median(xs)` and `quantile(xs, p)` have no lowering in this emitter.
-///
-/// Both are ORDER statistics: §07 defines `median` on "the order statistics
-/// $x_{(1)} \le \dots \le x_{(n)}$" and `quantile` as "linear interpolation between
-/// the order statistics of `xs`". Every route to an order statistic needs the input
-/// ranked. The compiler-only sort used by ordered-law sampling does not implement
-/// their NaN handling, interpolation, or runtime rank selection.
-///
-/// The two ways to add one, and why neither is taken here rather than deliberately:
-///
-/// - **Extend the internal sort.** This needs a decision about where NaN sorts,
-///   plus a `p`-dependent index that is a
-///   RUNTIME value in general — so a `dynamic_slice`, not a static one. That is a
-///   feature, not a wiring.
-/// - **Rank-select without a sort**: $\mathrm{rank}(i) = \#\{j : x_j < x_i\} +
-///   \#\{j < i : x_j = x_i\}$ over an $n \times n$ comparison matrix, then select
-///   the wanted rank. Exact over the reals, and O(n²) in emitted tensor ops rather
-///   than in unrolled scalars. Unguarded it is silently WRONG in the presence of NaN:
-///   every comparison against NaN is false, so two or more elements collide at the
-///   same rank and the "sorted" vector then contains a fabricated element. A wrong
-///   number with no diagnostic is the one outcome worse than refusing. That guard is
-///   UNBUILT and out of scope here, NOT unbuildable: `lany(isnan.(x))` selecting
-///   between the rank-select result and NaN is a handful of ops on top of the O(n²)
-///   emit, and both halves already lower (`isnan` is an elementwise cell, `lany`
-///   reduces to a scalar `i1`). NaN-propagation is also what `np.median` does. So
-///   this route stays open for a future wave.
-///
-/// So this refuses, localized to the call, and names the head. The js engine
-/// implements both (its `_sortedCopy` sorts a host array), so the language has them
-/// — this backend does not, and saying so is honest. Recorded in
-/// `flatppl-dev/TODO-flatppl-rust.md` and
-/// `flatppl-dev/stablehlo-feature-matrix.md`.
-pub(crate) fn refuse_order_statistic(id: NodeId, which: OrderStatistic) -> EmitError {
-    let (head, defn) = match which {
-        OrderStatistic::Median => ("median", "the middle order statistic of `xs`"),
-        OrderStatistic::Quantile => (
-            "quantile",
-            "linear interpolation between two adjacent order statistics of `xs`",
-        ),
+pub(crate) fn lower_order_statistic(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    median: bool,
+) -> Result<Value, EmitError> {
+    let (xs_id, p_id) = if median {
+        let [xs] = args_exact(id, args)?;
+        (xs, None)
+    } else {
+        let [xs, p] = args_exact(id, args)?;
+        (xs, Some(p))
     };
-    EmitError::at(
-        id,
-        format!(
-            "{head} has no lowering here: §07 defines it as {defn}, which needs the operand \
-             RANKED. The internal ordered-sampling sort does not implement a NaN ordering \
-             rule or a runtime index for `p`, and the sort-free rank-select alternative \
-             fabricates an element on a NaN input unless it is guarded, which it is not here, so \
-             this refuses rather than answering. The js engine implements both heads"
-        ),
-    )
+    if matches!(e.type_of(xs_id), Some(Type::Table { .. })) {
+        return Err(table_reduction_in_tensor_position(id));
+    }
+    let xs = e.lower_node(xs_id)?;
+    let p = p_id.map(|p| e.lower_node(p)).transpose()?;
+    order_statistic_value(e, id, xs, p)
+}
+
+/// Reduce every cell axis, leaving callable batch axes intact. NaNs are replaced
+/// before sorting to keep the comparator ordered, then propagated per cell.
+pub(crate) fn order_statistic_value(
+    e: &mut Emitter,
+    id: NodeId,
+    xs: Value,
+    p: Option<Value>,
+) -> Result<Value, EmitError> {
+    let dims = match e.cell_ty(&xs) {
+        MlirTy::Ranked(dims) if !dims.is_empty() && dims.iter().all(Option::is_some) => dims,
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!("order statistic requires a statically shaped array, got {other:?}"),
+            ));
+        }
+    };
+    let dims: Vec<u64> = dims.into_iter().map(Option::unwrap).collect();
+    let n = crate::norms::checked_shape_product(id, "order statistic", &dims)?;
+    if n == 0 {
+        return Err(EmitError::at(
+            id,
+            "order statistic over an empty array is undefined (spec §07)",
+        ));
+    }
+    // The index calculation uses the emitted floating dtype and integer width.
+    let exact_limit = match e.dtype() {
+        crate::Dtype::F32 => 1_u64 << 24,
+        crate::Dtype::F64 => 1_u64 << 53,
+    };
+    if n > exact_limit {
+        return Err(EmitError::at(
+            id,
+            "order statistic array is too large for exact emitted indices",
+        ));
+    }
+    let xs = e.convert(&xs, ElemKind::Real);
+    let xs = e.reshape_cell(&xs, MlirTy::Ranked(vec![Some(n)]));
+    let valid = e.compare("EQ", &xs, &xs);
+    let all_valid = e.reduce_boolean("stablehlo.and", "true", &valid);
+    let zero = e.constant_like(0.0, &xs);
+    let cleaned = e.select(&valid, &xs, &zero);
+    let sorted = e.sort_vector(&cleaned);
+    let p = p.unwrap_or_else(|| e.scalar(0.5));
+    if e.cell_ty(&p) != MlirTy::Scalar {
+        return Err(EmitError::at(id, "quantile: p must be a scalar"));
+    }
+    let p = e.convert(&p, ElemKind::Real);
+    let p_valid = e.compare("EQ", &p, &p);
+    let zero = e.scalar(0.0);
+    let p_safe = if let Some(value) = e.constant_real(&p) {
+        if !value.is_nan() && !(0.0..=1.0).contains(&value) {
+            return Err(EmitError::at(id, "quantile: p must be in [0, 1]"));
+        }
+        e.select(&p_valid, &p, &zero)
+    } else {
+        let one = e.scalar(1.0);
+        let lower = e.compare("GE", &p, &zero);
+        let upper = e.compare("LE", &p, &one);
+        let in_range = e.and(&lower, &upper);
+        // §07 propagates NaN p; other out-of-domain values are errors.
+        let nan = e.compare("NE", &p, &p);
+        let valid = e.or(&in_range, &nan);
+        e.record_runtime_error(&valid, 3);
+        e.select(&in_range, &p, &zero)
+    };
+    let count = e.scalar((n - 1) as f64);
+    let position = e.mul(&p_safe, &count);
+    let floor = e.floor(&position);
+    let fraction = e.sub(&position, &floor);
+    let low_index = e.convert(&floor, ElemKind::Int);
+    let one = e.int_value_const(1);
+    let upper_index = e.add(&low_index, &one);
+    let last = e.int_value_const((n - 1) as i64);
+    let past = e.compare("GT", &upper_index, &last);
+    let upper_index = e.select(&past, &last, &upper_index);
+    let low = e.gather_cells(&sorted, &low_index, 0);
+    let high = e.gather_cells(&sorted, &upper_index, 0);
+    let one = e.scalar(1.0);
+    let complement = e.sub(&one, &fraction);
+    let left = e.mul(&complement, &low);
+    let right = e.mul(&fraction, &high);
+    let interpolated = e.add(&left, &right);
+    let zero = e.scalar(0.0);
+    let exact = e.compare("EQ", &fraction, &zero);
+    let result = e.select(&exact, &low, &interpolated);
+    let all_valid = e.and(&all_valid, &p_valid);
+    let nan = e.scalar(f64::NAN);
+    Ok(e.select(&all_valid, &result, &nan))
 }
 
 // ---- shared guard --------------------------------------------------------------

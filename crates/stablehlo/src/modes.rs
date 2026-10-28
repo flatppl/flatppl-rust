@@ -343,13 +343,10 @@ fn check_arity(abi: &Abi, emitted: usize) -> Result<(), EmitError> {
 /// can always thread the next call.
 ///
 /// **`%key`.** The threaded RNG state (spec §07's `rand(m, rstate) -> (value,
-/// new_rstate)`) is the argument the rng source reachable from the outputs is
-/// bound to ([`find_rng_source`]). §13 calls it "a promoted fixed input", so
-/// when `inputs` lists that binding, `%key` IS that declared argument, at its
-/// declared position — it is not bound a second time as a `%argN` the body
-/// never reads (NEW-C5). A module that does not list it still gets `%key`
-/// prepended as arg 0, and the binding stays exempt from the
-/// inputs-exhaustiveness check.
+/// new_rstate)`) is the promoted fixed source reachable from the outputs
+/// ([`find_rng_source`]). When listed in `inputs`, `%key` occupies its declared
+/// position; otherwise the existing ABI prepends it. A source computed from a
+/// declared input is instead lowered from that input, with no extra key argument.
 ///
 /// `abi.inputs`'s other entries are numbered `%arg0..` independently of
 /// `%key`, in declared order.
@@ -378,14 +375,42 @@ pub(crate) fn emit_sample_abi(
         )
     })?;
     let key_name = "%key".to_string();
-    e.bind(
-        src,
-        Value {
-            ssa: key_name.clone(),
-            ty: MlirTy::Key,
-            elem: ElemKind::Real,
-        },
-    );
+    let resolved_src = resolve_self_ref(m, src);
+    let source_input = match m.node(src) {
+        Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) => {
+            let source_chain = m.alias_chain(*name);
+            abi.inputs.iter().copied().find(|&s| {
+                m.alias_chain(s)
+                    .iter()
+                    .any(|name| source_chain.contains(name))
+            })
+        }
+        _ => None,
+    };
+    let computed = (m.phase_of(resolved_src) == Some(Phase::Parametric)
+        && !(source_input.is_some() && is_free_param(m, resolved_src)))
+        || (source_input.is_none() && reaches_declared_input(m, resolved_src, &abi.inputs));
+    if !computed {
+        e.bind(
+            src,
+            Value {
+                ssa: key_name.clone(),
+                ty: MlirTy::Key,
+                elem: ElemKind::Real,
+            },
+        );
+        e.bind(
+            resolved_src,
+            Value {
+                ssa: key_name.clone(),
+                ty: MlirTy::Key,
+                elem: ElemKind::Real,
+            },
+        );
+    }
 
     // Exhaustiveness over the ABI inputs, mirroring emit_logdensity_abi — with
     // ONE exemption: the rng-source binding is bound to `%key`. `src` is that
@@ -403,10 +428,9 @@ pub(crate) fn emit_sample_abi(
     // rng-argument node `find_rng_source` returned. Two samples reading the
     // same state are two distinct `(%ref self s)` nodes, and only one of them
     // is `src`: without this the other resolves through to `s`'s RHS and the
-    // walk reaches the `rnginit(seed)` call itself, refusing with "unsupported
-    // builtin head 'rnginit'" (NEW-C4) — the seed-to-state math is deliberately
-    // out of scope, because the state arrives as an argument.
-    if let Some(sym) = rng_src_sym
+    // walk would reach the seed expression instead of the promoted input.
+    if !computed
+        && let Some(sym) = rng_src_sym
         && let Some(bid) = m.binding_by_name(sym)
     {
         e.bind(
@@ -419,25 +443,33 @@ pub(crate) fn emit_sample_abi(
         );
     }
     let mut inputs = abi.inputs.iter().copied().collect::<HashSet<_>>();
-    inputs.extend(rng_src_sym);
-    check_query_inputs(m, &abi.outputs, &inputs, &[src])?;
+    if !computed {
+        inputs.extend(rng_src_sym);
+    }
+    let bound_src = [src];
+    check_query_inputs(
+        m,
+        &abi.outputs,
+        &inputs,
+        if computed { &[] } else { &bound_src },
+    )?;
 
     // Build the argument list from `inputs` in declared order. `%key` occupies
     // the rng-source entry's own position when it is declared, and is prepended
-    // otherwise. Non-key arguments are numbered `%arg0..` INDEPENDENTLY of
+    // otherwise unless the state is computed. Non-key arguments are numbered `%arg0..` INDEPENDENTLY of
     // `%key` — reproducing the pre-purge `emit_sample` signature exactly
     // (`%key`, `%arg0`, `%arg1`, …) so the frozen sample goldens stay
     // byte-identical.
     let key_arg = (key_name, MlirTy::Key, ElemKind::Real);
-    let key_declared = rng_src_sym.is_some_and(|s| abi.inputs.contains(&s));
-    let mut args: Vec<(String, MlirTy, ElemKind)> = if key_declared {
+    let key_declared = !computed && source_input.is_some();
+    let mut args: Vec<(String, MlirTy, ElemKind)> = if key_declared || computed {
         Vec::with_capacity(abi.inputs.len())
     } else {
         vec![key_arg.clone()]
     };
     let mut next_arg = 0usize;
     for &sym in &abi.inputs {
-        if key_declared && Some(sym) == rng_src_sym {
+        if key_declared && Some(sym) == source_input {
             args.push(key_arg.clone());
             continue;
         }
@@ -461,6 +493,34 @@ pub(crate) fn emit_sample_abi(
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("sample", &args, &rets))
+}
+
+/// A fixed source derived from a promoted input must be computed from that
+/// input, not replaced with a separate implicit key.
+fn reaches_declared_input(m: &Module, root: NodeId, inputs: &[Symbol]) -> bool {
+    let inputs: HashSet<Symbol> = inputs.iter().flat_map(|&s| m.alias_chain(s)).collect();
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(node)
+        {
+            if inputs.contains(name) {
+                return true;
+            }
+            if let Some(binding) = m.binding_by_name(*name) {
+                pending.push(m.binding(binding).rhs);
+            }
+        } else {
+            m.for_each_child(node, |child| pending.push(child));
+        }
+    }
+    false
 }
 
 /// Append the `func.func` result(s) one declared `@sample` output contributes.
