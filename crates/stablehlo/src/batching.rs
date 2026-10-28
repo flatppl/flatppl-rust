@@ -169,6 +169,7 @@ impl Emitter<'_> {
                             | "max"
                             | "ifelse"
                             | "iszero"
+                            | "isfinite"
                             | "in"
                             | "eq"
                             | "ne"

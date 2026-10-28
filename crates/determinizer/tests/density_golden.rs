@@ -769,7 +769,8 @@ fn normalized_student_t_half_lines_use_their_exact_mass() {
             "lp = logdensityof(normalize({restriction}), {point})"
         ));
         let expected = determinize_src(&format!(
-            "lp = logdensityof({restriction}, {point}) - {log_mass}"
+            "lp = ifelse(isfinite({log_mass}), \
+             logdensityof({restriction}, {point}) - {log_mass}, 0.0/0.0)"
         ));
         assert_eq!(
             pir_binding(&flatppl_flatpir::write(&actual), "lp"),
