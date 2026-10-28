@@ -521,14 +521,28 @@ pub(crate) fn lower_interval_mass(
             flatppl_core::LOG_INTEGRAL,
             &[integrand, coordinate, lo, hi],
         );
-        let finite = build_call(m, "isfinite", &[log_z]);
+        let inf = m.alloc(Node::Lit(Scalar::Real(f64::INFINITY)));
+        let valid = build_call(m, "lt", &[log_z, inf]);
         let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
-        return Ok(build_call(m, "ifelse", &[finite, log_z, nan]));
+        return Ok(build_call(m, "ifelse", &[valid, log_z, nan]));
     }
-    let cdf_hi = build_touniform(m, kernel, input, hi);
-    let cdf_lo = build_touniform(m, kernel, input, lo);
-    let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
-    Ok(build_call(m, "log", &[z]))
+    // Infinite endpoints have constant CDF values. Emitting their location/scale
+    // arithmetic would introduce infinity * zero in otherwise finite gradients.
+    let cdf = |m: &mut Module, x| match static_real(m, x) {
+        Some(x) if x.is_infinite() => {
+            m.alloc(Node::Lit(Scalar::Real(if x < 0.0 { 0.0 } else { 1.0 })))
+        }
+        _ => build_touniform(m, kernel, input, x),
+    };
+    let cdf_hi = cdf(m, hi);
+    let cdf_lo = cdf(m, lo);
+    let z = match (static_real(m, cdf_hi), static_real(m, cdf_lo)) {
+        (Some(hi), Some(lo)) => m.alloc(Node::Lit(Scalar::Real(hi - lo))),
+        _ => build_call(m, "sub", &[cdf_hi, cdf_lo]),
+    };
+    // An empty intersection has exactly zero mass. Keep log's argument valid
+    // before AD so its unused derivative cannot introduce 0/0 into a zero bin.
+    Ok(log_nonnegative_mass(m, z))
 }
 
 /// For nu=2m, the smaller Student-t tail is I_p(m,m), where
@@ -549,7 +563,7 @@ fn student_t_log_mass(m: &mut Module, input: NodeId, lo: NodeId, hi: NodeId) -> 
     let left = even_student_t_cdf(m, nu as usize, left);
     let right = even_student_t_cdf(m, nu as usize, right);
     let mass = build_call(m, "sub", &[right, left]);
-    Some(build_call(m, "log", &[mass]))
+    Some(log_nonnegative_mass(m, mass))
 }
 
 fn even_student_t_cdf(m: &mut Module, nu: usize, x: NodeId) -> NodeId {
