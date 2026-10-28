@@ -92,3 +92,10 @@ outputs = logdensityof(proc, [2, 7, 4])";
         "the logdensity entry emits with no measure-layer symbol:\n{out}"
     );
 }
+
+#[test]
+fn restricted_normalized_gamma_bins_keep_live_bounds() {
+    let source = "a = elementof(reals)\nI = normalize(truncate(Gamma(1, 1), interval(a, inf)))\ninputs = a\noutputs = logdensityof(BinnedPoissonProcess([1001, inf], I), [0])";
+    // This needs the exact tail rule: the emitter has no general Gamma CDF.
+    emit_logdensity(source);
+}

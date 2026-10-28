@@ -573,12 +573,26 @@ lp = logdensityof(d, 0.5)";
         !pir.contains("(normalize ") && !pir.contains("totalmass"),
         "no normalize/totalmass:\n{pir}"
     );
-    // Structural: the closed-form log-Z is `log(sub(touniform(hi), touniform(lo)))`
-    // — exactly TWO CDF transports (at the two interval endpoints), differenced,
-    // then logged, and subtracted from the gated density.
+    // The zero-mass guard shares the two CDF nodes. Text serialization repeats
+    // their operands, so count the reachable IR nodes instead.
+    let mut pending: Vec<_> = out.bindings().map(|(_, b)| b.rhs).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut cdfs = 0;
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = out.node(id);
+        if let flatppl_core::Node::Call(call) = node
+            && let flatppl_core::CallHead::Builtin(name) = call.head
+            && out.resolve(name) == "builtin_touniform"
+        {
+            cdfs += 1;
+        }
+        pending.extend(node.children());
+    }
     assert_eq!(
-        pir.matches("builtin_touniform").count(),
-        2,
+        cdfs, 2,
         "two CDF transports (one per endpoint) for Z:\n{pir}"
     );
     assert!(

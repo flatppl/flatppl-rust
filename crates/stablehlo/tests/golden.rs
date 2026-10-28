@@ -11343,8 +11343,7 @@ outputs = (lp)
 ";
 
 /// The Normal CDF `F(x) = ½·(1 + erf((x − μ)/(σ·√2)))` reaches the emitter via
-/// the truncation normaliser: `chlo.erf` must appear (exactly twice — `F(inf)`
-/// and `F(0)`), and no `stablehlo.atan2` (that is Cauchy's CDF, not Normal's).
+/// the truncation normaliser: only `F(0)` needs `chlo.erf`, since `F(inf)=1`.
 #[test]
 fn emit_touniform_normal_via_truncation_has_expected_structure() {
     let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
@@ -11355,8 +11354,8 @@ fn emit_touniform_normal_via_truncation_has_expected_structure() {
     let out = emit_logdensity(&d);
     assert_eq!(
         out.matches("chlo.erf ").count(),
-        2,
-        "Normal CDF must emit two chlo.erf (F(hi), F(lo)), in:\n{out}"
+        1,
+        "Normal CDF only evaluates the finite endpoint, in:\n{out}"
     );
     assert!(
         !out.contains("stablehlo.atan2"),
@@ -11366,8 +11365,7 @@ fn emit_touniform_normal_via_truncation_has_expected_structure() {
 }
 
 /// The Cauchy CDF `F(x) = ½ + (1/π)·atan((x − x₀)/γ)` reaches the emitter via
-/// the truncation normaliser: `stablehlo.atan2` must appear (exactly twice —
-/// `F(inf)` and `F(0)`), and no `chlo.erf` (that is Normal's CDF).
+/// the truncation normaliser: only `F(0)` needs `stablehlo.atan2`, since `F(inf)=1`.
 #[test]
 fn emit_touniform_cauchy_via_truncation_has_expected_structure() {
     let d = determinize_src(CAUCHY_TRUNC_TOUNIFORM_SRC);
@@ -11378,8 +11376,8 @@ fn emit_touniform_cauchy_via_truncation_has_expected_structure() {
     let out = emit_logdensity(&d);
     assert_eq!(
         out.matches("stablehlo.atan2").count(),
-        2,
-        "Cauchy CDF must emit two stablehlo.atan2 (F(hi), F(lo)), in:\n{out}"
+        1,
+        "Cauchy CDF only evaluates the finite endpoint, in:\n{out}"
     );
     assert!(
         !out.contains("chlo.erf "),

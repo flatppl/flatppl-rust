@@ -7134,15 +7134,16 @@ fn lower_binned_poisson_process(
     let mut rates = Vec::with_capacity(bins_count);
     let mut numerical_masses = Vec::new();
     for pair in edges.windows(2) {
-        let rate =
-            bin_mass(m, intensity, pair[0], pair[1], &mut numerical_masses).ok_or_else(|| {
+        let rate = bin_mass(m, intensity, pair[0], pair[1], None, &mut numerical_masses)
+            .ok_or_else(|| {
                 refuse(
                     node,
                     m,
                     "BinnedPoissonProcess cannot derive this intensity mass per bin; \
                      closed forms cover normalized univariate continuous constructors, \
-                     scalar weights, superpositions, Lebesgue intervals and bounded \
-                     polynomial weights. Numerical integration supports function-weighted \
+                     scalar weights, superpositions, interval restrictions, normalized \
+                     restricted constructors, Lebesgue intervals and bounded polynomial \
+                     weights. Numerical integration supports function-weighted \
                      finite Lebesgue intervals with static bin edges and requires explicit opt-in",
                 )
             })?;
@@ -7160,7 +7161,7 @@ fn lower_binned_poisson_process(
     let rate = m.intern("rate");
     let per_bin = family_per_cell(m, poisson, &[(rate, rates)], v);
     let mut score = build_call(m, "sum", &[per_bin]);
-    for (_, mass, raw) in numerical_masses {
+    for NumericalBinMass { mass, raw, .. } in numerical_masses {
         // A finite nonnegative raw mass, or a finite log mass or -infinity,
         // is valid. NaN and +infinity include quadrature failures.
         let inf = m.alloc(Node::Lit(Scalar::Real(f64::INFINITY)));
@@ -7228,7 +7229,8 @@ fn bin_mass(
     measure: NodeId,
     lo: NodeId,
     hi: NodeId,
-    numerical_masses: &mut Vec<(NodeId, NodeId, bool)>,
+    restriction: Option<(NodeId, NodeId)>,
+    numerical_masses: &mut Vec<NumericalBinMass>,
 ) -> Option<NodeId> {
     let (node, _) = resolve_ref(m, measure);
 
@@ -7254,7 +7256,7 @@ fn bin_mass(
     {
         let mut masses = Vec::with_capacity(parts.len());
         for part in parts {
-            masses.push(bin_mass(m, part, lo, hi, numerical_masses)?);
+            masses.push(bin_mass(m, part, lo, hi, restriction, numerical_masses)?);
         }
         return Some(fold_add(m, &masses));
     }
@@ -7264,10 +7266,30 @@ fn bin_mass(
         .map(|c| (c.args[0], c.args[1]))
     {
         if weight_is_variate_dependent(m, w) {
-            return numerical_bin_mass(m, node, lo, hi, numerical_masses);
+            return numerical_bin_mass(m, node, lo, hi, restriction, numerical_masses);
         }
-        let inner = bin_mass(m, base, lo, hi, numerical_masses)?;
+        let inner = bin_mass(m, base, lo, hi, restriction, numerical_masses)?;
         return Some(build_call(m, "mul", &[w, inner]));
+    }
+
+    if let Some(base) = expect_builtin_call(m, node, "normalize")
+        .filter(|c| c.args.len() == 1)
+        .map(|c| c.args[0])
+    {
+        return normalized_bin_mass(m, base, lo, hi);
+    }
+
+    if let Some((base, set)) = expect_builtin_call(m, node, "truncate")
+        .filter(|c| c.args.len() == 2)
+        .map(|c| (c.args[0], c.args[1]))
+    {
+        let set = resolve_ref_chain(m, set).0;
+        let interval = expect_builtin_call(m, set, "interval")?;
+        let [a, b] = *interval.args else { return None };
+        let (lo, hi) = intersect_bin_interval(m, lo, hi, a, b);
+        let restriction =
+            restriction.map_or((a, b), |(x, y)| intersect_bin_interval(m, x, y, a, b));
+        return bin_mass(m, base, lo, hi, Some(restriction), numerical_masses);
     }
 
     // The bin's overlap with an `interval(a, b)`, or the whole bin over `reals`.
@@ -7311,7 +7333,156 @@ fn bin_mass(
         let log_mass = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[node, lo, hi]);
         return Some(build_call(m, "exp", &[log_mass]));
     }
-    numerical_bin_mass(m, node, lo, hi, numerical_masses)
+    numerical_bin_mass(m, node, lo, hi, restriction, numerical_masses)
+}
+
+/// Intersect atomless bins before applying an interval rule. Folding constants
+/// here preserves polynomial rules and exact infinite-endpoint specializations.
+fn intersect_bin_interval(
+    m: &mut Module,
+    lo: NodeId,
+    hi: NodeId,
+    a: NodeId,
+    b: NodeId,
+) -> (NodeId, NodeId) {
+    fn bound(m: &mut Module, a: NodeId, b: NodeId, maximum: bool) -> NodeId {
+        let (x, y) = (static_real(m, a), static_real(m, b));
+        if let (Some(x), Some(y)) = (x, y) {
+            let value = if maximum { x.max(y) } else { x.min(y) };
+            return m.alloc(Node::Lit(Scalar::Real(value)));
+        }
+        let neutral = if maximum {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        if x == Some(neutral) {
+            return b;
+        }
+        if y == Some(neutral) {
+            return a;
+        }
+        build_call(m, if maximum { "max" } else { "min" }, &[a, b])
+    }
+    let lo = bound(m, lo, a, true);
+    let hi = bound(m, hi, b, false);
+    // The lower endpoint still propagates invalid values through the mass.
+    let hi = if static_real(m, hi) == Some(f64::INFINITY) {
+        hi
+    } else {
+        bound(m, lo, hi, true)
+    };
+    (lo, hi)
+}
+
+/// Normalize a restricted scalar constructor or flat reference. Positive scalar
+/// factors cancel; other compositions still need a proved normalizer.
+fn normalized_bin_mass(
+    m: &mut Module,
+    measure: NodeId,
+    bin_lo: NodeId,
+    bin_hi: NodeId,
+) -> Option<NodeId> {
+    let mut base = resolve_ref_chain(m, measure).0;
+    let mut lo = m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)));
+    let mut hi = m.alloc(Node::Lit(Scalar::Real(f64::INFINITY)));
+    let mut valid = m.alloc(Node::Lit(Scalar::Bool(true)));
+    loop {
+        if let Some(call) = expect_builtin_call(m, base, "truncate") {
+            let [inner, set] = *call.args else {
+                return None;
+            };
+            let set = resolve_ref_chain(m, set).0;
+            let interval = expect_builtin_call(m, set, "interval")?;
+            let [a, b] = *interval.args else { return None };
+            (lo, hi) = intersect_bin_interval(m, lo, hi, a, b);
+            base = resolve_ref_chain(m, inner).0;
+        } else if matches!(builtin_name(m, base), Some("weighted" | "logweighted")) {
+            let Node::Call(call) = m.node(base) else {
+                return None;
+            };
+            let [weight, inner] = *call.args else {
+                return None;
+            };
+            if weight_is_variate_dependent(m, weight) {
+                return None;
+            }
+            let logarithmic = builtin_name(m, base) == Some("logweighted");
+            let finite = build_call(m, "isfinite", &[weight]);
+            valid = build_call(m, "land", &[valid, finite]);
+            if !logarithmic {
+                let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+                let positive = build_call(m, "gt", &[weight, zero]);
+                valid = build_call(m, "land", &[valid, positive]);
+            }
+            base = resolve_ref_chain(m, inner).0;
+        } else {
+            break;
+        }
+    }
+    let flat = matches!(builtin_name(m, base), Some("Lebesgue" | "Uniform"));
+    if flat {
+        let Node::Call(call) = m.node(base) else {
+            return None;
+        };
+        let support = named_or_positional(m, call, "support")?;
+        let support = resolve_ref_chain(m, support).0;
+        if !matches!(m.node(support), Node::Const(s) if m.resolve(*s) == "reals") {
+            let interval = expect_builtin_call(m, support, "interval")?;
+            let [a, b] = *interval.args else { return None };
+            if builtin_name(m, base) == Some("Uniform") {
+                let width = build_call(m, "sub", &[b, a]);
+                let finite = build_call(m, "isfinite", &[width]);
+                valid = build_call(m, "land", &[valid, finite]);
+            }
+            (lo, hi) = intersect_bin_interval(m, lo, hi, a, b);
+        } else if builtin_name(m, base) == Some("Uniform") {
+            return None;
+        }
+    } else if !is_atomless_scalar_leaf(m, base) {
+        return None;
+    }
+    let log_mass = |m: &mut Module, a, b| {
+        if flat {
+            let width = build_call(m, "sub", &[b, a]);
+            log_nonnegative_mass(m, width)
+        } else {
+            build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[base, a, b])
+        }
+    };
+    // Z uses the full restricted support, not the observed bins. Keeping both
+    // masses logarithmic avoids underflow before their ratio is formed.
+    let total = log_mass(m, lo, hi);
+    let (lo, hi) = intersect_bin_interval(m, bin_lo, bin_hi, lo, hi);
+    let numerator = log_mass(m, lo, hi);
+    let share = normalized_logdensity(m, numerator, total);
+    let share = build_call(m, "exp", &[share]);
+    Some(exponential_tilt::guard(m, share, valid))
+}
+
+/// Log zero mass is -infinity. Sanitize log's argument before differentiation,
+/// while preserving NaN for a negative or invalid mass.
+fn log_nonnegative_mass(m: &mut Module, mass: NodeId) -> NodeId {
+    if let Some(value) = static_real(m, mass) {
+        return if value == 0.0 {
+            m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)))
+        } else {
+            build_call(m, "log", &[mass])
+        };
+    }
+    let empty = build_call(m, "iszero", &[mass]);
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let safe = build_call(m, "ifelse", &[empty, one, mass]);
+    let log_mass = build_call(m, "log", &[safe]);
+    let neg_inf = m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)));
+    build_call(m, "ifelse", &[empty, neg_inf, log_mass])
+}
+
+struct NumericalBinMass {
+    intensity: NodeId,
+    bounds: (f64, f64),
+    mass: NodeId,
+    raw: bool,
 }
 
 /// Approximate only direct function-weighted scalar Lebesgue intervals. The
@@ -7322,7 +7493,8 @@ fn numerical_bin_mass(
     node: NodeId,
     lo: NodeId,
     hi: NodeId,
-    numerical_masses: &mut Vec<(NodeId, NodeId, bool)>,
+    restriction: Option<(NodeId, NodeId)>,
+    numerical_masses: &mut Vec<NumericalBinMass>,
 ) -> Option<NodeId> {
     let Node::Call(call) = m.node(node).clone() else {
         return None;
@@ -7340,7 +7512,7 @@ fn numerical_bin_mass(
     let support = resolve_ref_chain(m, support).0;
     let interval = expect_builtin_call(m, support, "interval")?;
     let [a, b] = *interval.args else { return None };
-    let (a, b, lo, hi) = (
+    let (mut a, mut b, lo, hi) = (
         static_real(m, a)?,
         static_real(m, b)?,
         static_real(m, lo)?,
@@ -7349,15 +7521,35 @@ fn numerical_bin_mass(
     if ![a, b, lo, hi].iter().all(|v| v.is_finite()) || a >= b {
         return None;
     }
+    if let Some((lower, upper)) = restriction {
+        a = a.max(static_real(m, lower)?);
+        b = b.min(static_real(m, upper)?).max(a);
+    }
     let reference_type = m.type_of(reference)?.clone();
     let raw = m.resolve(head) == "weighted";
-    if !numerical_masses.iter().any(|&(id, _, _)| id == node) {
+    if !numerical_masses
+        .iter()
+        .any(|entry| entry.intensity == node && entry.bounds == (a, b))
+    {
+        let lower = m.alloc(Node::Lit(Scalar::Real(a)));
+        let upper = m.alloc(Node::Lit(Scalar::Real(b)));
+        let support = build_call(m, "interval", &[lower, upper]);
+        let reference = build_call(m, "Lebesgue", &[support]);
+        m.set_type(reference, reference_type.clone());
+        let mut restricted = call.clone();
+        restricted.args[1] = reference;
+        let restricted = m.alloc(Node::Call(restricted));
         let full = if raw {
-            integral::raw_weighted_mass(m, node)?
+            integral::raw_weighted_mass(m, restricted)?
         } else {
-            integral::mass(m, node)?.ok()?
+            integral::mass(m, restricted)?.ok()?
         };
-        numerical_masses.push((node, full, raw));
+        numerical_masses.push(NumericalBinMass {
+            intensity: node,
+            bounds: (a, b),
+            mass: full,
+            raw,
+        });
     }
     let (lo, hi) = (lo.max(a), hi.min(b));
     if lo >= hi {

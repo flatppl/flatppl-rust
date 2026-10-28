@@ -11,21 +11,37 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
-fn lowered(src: &str) -> String {
+fn lowered(src: &str) -> (String, std::collections::HashMap<String, usize>) {
     let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
     let text = flatppl_syntax::print(&out);
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl failed:\n{text}"
     );
-    text
+    // Count shared IR nodes once. Printed guards repeat their operands.
+    let mut pending: Vec<_> = out.bindings().map(|(_, b)| b.rhs).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut calls = std::collections::HashMap::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = out.node(id);
+        if let flatppl_core::Node::Call(call) = node
+            && let flatppl_core::CallHead::Builtin(name) = call.head
+        {
+            *calls.entry(out.resolve(name).to_owned()).or_insert(0) += 1;
+        }
+        pending.extend(node.children());
+    }
+    (text, calls)
 }
 
 // The HS3 `bincounts_extended_dist` shape. Each bin's mean is the rate times the
 // shape's CDF difference, and one Poisson broadcast scores all four counts.
 #[test]
 fn weighted_shape_lowers_to_poisson_counts_over_cdf_differences() {
-    let text = lowered(
+    let (text, calls) = lowered(
         "\
 n_bkg = elementof(posreals)
 bshape = Normal(mu = 1.0, sigma = 0.5)
@@ -42,8 +58,7 @@ lp = logdensityof(proc, [3, 12, 20, 9])",
         "one bin mass per bin:\n{text}"
     );
     assert_eq!(
-        text.matches("builtin_touniform").count(),
-        8,
+        calls["builtin_touniform"], 8,
         "two CDF evaluations per bin:\n{text}"
     );
     assert!(
@@ -57,7 +72,7 @@ lp = logdensityof(proc, [3, 12, 20, 9])",
 // binds like the positional one.
 #[test]
 fn flat_intensities_lower_to_overlap_lengths() {
-    let text = lowered(
+    let (text, _) = lowered(
         "\
 s = elementof(posreals)
 flat = Uniform(interval(0.0, 6.0))
@@ -83,7 +98,7 @@ fn polynomial_intensity_uses_unnormalized_bin_masses() {
         "weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))",
         "truncate(weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(reals)), interval(0, 1))",
     ] {
-        let text = lowered(&format!(
+        let (text, _) = lowered(&format!(
             "I = {intensity}\nJ = I\nlp = logdensityof(BinnedPoissonProcess([-1, 0, 0.5, 1, 2], J), [0, 0, 0, 0])"
         ));
         assert!(text.contains("[0.0, 0.75, 1.25, 0.0]"), "{text}");
@@ -95,7 +110,7 @@ fn polynomial_intensity_uses_unnormalized_bin_masses() {
 fn polynomial_zero_mass_bin_keeps_positive_count_for_poisson_scoring() {
     // The first bin does not intersect [0, 1]; its rate is zero and observing
     // one event there has log density -infinity, not the zero-count score.
-    let text = lowered(
+    let (text, _) = lowered(
         "I = weighted(x -> polynomial([1.0, 2.0], x), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([-1, 0, 1], I), [1, 0])",
     );
     assert!(text.contains("[0.0, 2.0]"), "zero and full mass: {text}");
@@ -108,7 +123,7 @@ fn polynomial_zero_mass_bin_keeps_positive_count_for_poisson_scoring() {
 
 #[test]
 fn polynomial_intensity_preserves_live_extra_and_composition() {
-    let text = lowered(
+    let (text, _) = lowered(
         "a = elementof(nonnegreals)\nI = weighted((x, p) -> polynomial([1.0, p], x), Lebesgue(interval(0, 1)), a)\nJ = superpose(weighted(2.0, I), Lebesgue(interval(0, 1)))\nlp = logdensityof(BinnedPoissonProcess([0, 0.5, 1], J), [1, 2])\ninputs = a\noutputs = lp",
     );
     assert!(text.contains('a'), "live coefficient: {text}");
@@ -206,32 +221,30 @@ lp = logdensityof(t, 1.0)";
 // points, so its four bins read their edges through `get0` like any static vector.
 #[test]
 fn linspace_edges_lower_through_get0() {
-    let text = lowered(
+    let (text, calls) = lowered(
         "\
 n_bkg = elementof(posreals)
 proc = BinnedPoissonProcess(extlinspace(0.0, 2.0, 3), weighted(n_bkg, Normal(1.0, 0.5)))
 lp = logdensityof(proc, [1, 12, 20, 2])",
     );
     assert_eq!(
-        text.matches("get0(extlinspace(0.0, 2.0, 3)").count(),
-        8,
-        "each of four bins reads its two edges:\n{text}"
+        calls["get0"], 5,
+        "the four bins share five edge nodes:\n{text}"
     );
 }
 
 // Any other edge vector of static length is read element by element.
 #[test]
 fn a_computed_static_edge_vector_lowers_through_get0() {
-    let text = lowered(
+    let (text, calls) = lowered(
         "\
 edges = cumsum([0.0, 1.0, 2.0])
 proc = BinnedPoissonProcess(edges, weighted(5.0, Normal(1.0, 0.5)))
 lp = logdensityof(proc, [1, 3])",
     );
     assert_eq!(
-        text.matches("get0(").count(),
-        4,
-        "each bin reads its two edges:\n{text}"
+        calls["get0"], 3,
+        "the two bins share three edge nodes:\n{text}"
     );
 }
 
@@ -252,7 +265,7 @@ lp = logdensityof(proc, [1, 3])";
 // a module-qualified `CrystalBall` intensity still gets its CDF difference.
 #[test]
 fn a_module_leaf_intensity_lowers() {
-    let text = lowered(
+    let (text, calls) = lowered(
         "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 shape = hep.CrystalBall(m0 = 1.0, sigma = 0.3, alpha = 1.5, n = 3.0)
@@ -260,8 +273,7 @@ proc = BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(10.0, shape))
 lp = logdensityof(proc, [4, 5])",
     );
     assert_eq!(
-        text.matches("builtin_touniform").count(),
-        4,
+        calls["builtin_touniform"], 4,
         "two CDF evaluations for each of two bins:\n{text}"
     );
 }
