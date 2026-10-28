@@ -1035,11 +1035,23 @@ fn lower_gram(
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     matrix_dims(id, &a.ty, head)?;
-    let at = e.transpose(&a, &[1, 0]);
     Ok(match which {
-        Gram::Row => e.matmat(&a, &at),
-        Gram::Col => e.matmat(&at, &a),
+        Gram::Row => row_gram(e, &a),
+        Gram::Col => {
+            let at = e.transpose(&a, &[1, 0]);
+            e.matmat(&at, &a)
+        }
     })
+}
+
+/// §07 row Gram of a matrix cell, preserving any independent batch prefix.
+pub(crate) fn row_gram(e: &mut Emitter, matrix: &Value) -> Value {
+    let axes = e.axes_of(matrix);
+    let mut permutation: Vec<_> = (0..axes.batch as u64 + 2).collect();
+    permutation.swap(axes.batch, axes.batch + 1);
+    let transposed = e.transpose(matrix, &permutation);
+    let transposed = e.axes_view(&transposed, axes);
+    e.matmat(matrix, &transposed)
 }
 
 /// §07 `quadform(A, x)` — "$\mathbf{x}^\dagger \mathbf{A} \mathbf{x}$", domain

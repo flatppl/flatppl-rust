@@ -7844,14 +7844,14 @@ outputs = (draws)
 
 // ---- Task 16: refuse-7 finalized -------------------------------------------
 //
-// The six distributions with NO `@sample` builder: four
-// registered-but-`sample: None` (VonMises, Wishart, InverseWishart, LKJ)
+// The five distributions with NO `@sample` builder: three
+// registered-but-`sample: None` (VonMises, Wishart, InverseWishart)
 // plus two never registered at all (PoissonProcess/
 // BinnedPoissonProcess — point-process measures with no `@logdensity`
 // builder either; spec §08). `VonMises` already has a locking test
 // (`builtin_sample_refuses_registered_ctor_without_sample_builder`, Task 7)
 // for the SHARED `dist.sample.ok_or_else` code path — not duplicated here.
-// The five tests below each lock one of the remaining five distributions to
+// The four tests below each lock one of the remaining four distributions to
 // its own specific ctor name, so a future accidental sampler registration for
 // any ONE of them (not just the shared code path) is caught.
 
@@ -7893,28 +7893,6 @@ fn builtin_sample_refuses_inverse_wishart_without_sample_builder() {
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg.contains("no @sample lowering for 'InverseWishart'"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert_eq!(err.node, Some(node));
-}
-
-/// `LKJ` is registered (`@logdensity`, Task 13) but has no `@sample` builder
-/// (`sample: None`).
-#[test]
-fn builtin_sample_refuses_lkj_without_sample_builder() {
-    let mut m = Module::new();
-    let rng = real(&mut m, 0.0);
-    let ctor = const_node(&mut m, "LKJ");
-    let n = real(&mut m, 3.0);
-    let eta = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("n", n), ("eta", eta)]);
-    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("no @sample lowering for 'LKJ'"),
         "unexpected message: {}",
         err.msg
     );
