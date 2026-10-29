@@ -53,7 +53,7 @@ impl Emitter<'_> {
         let cols_r = self.axis_indices(&input, batch + 1);
         let mut transpose: Vec<u64> = (0..batch as u64).collect();
         transpose.extend([batch as u64 + 1, batch as u64]);
-        let result = self.matrix_loop(n, &[input, q], |e, index, args| {
+        let result = self.matrix_loop(n, 8, &[input, q], |e, index, args| {
             let r = e.axes_view(&args[0], r_axes.clone());
             let q = e.axes_view(&args[1], q_axes.clone());
             let at_col = e.compare("EQ", &cols_r, index);
@@ -129,9 +129,20 @@ impl Emitter<'_> {
     fn matrix_loop(
         &mut self,
         n: u64,
+        unroll_limit: u64,
         inits: &[Value],
-        body: impl FnOnce(&mut Self, &Value, &[Value]) -> Vec<Value>,
+        mut body: impl FnMut(&mut Self, &Value, &[Value]) -> Vec<Value>,
     ) -> Vec<Value> {
+        // Pivoted elimination needs a tighter limit than rank-one updates:
+        // larger bodies increase compilation cost and can slow GPU gradients.
+        if self.target == crate::Target::Gpu && n <= unroll_limit {
+            let mut state = inits.to_vec();
+            for i in 0..n {
+                let index = self.int_value_const(i as i64);
+                state = body(self, &index, &state);
+            }
+            return state;
+        }
         let counter = Value {
             ssa: self.pure("stablehlo.constant dense<0> : tensor<i64>".into()),
             ty: MlirTy::Scalar,
@@ -184,7 +195,7 @@ impl Emitter<'_> {
         let symmetric = self.add(input, &correction);
         let zero = self.constant_like(0.0, input);
         let cols = self.axis_indices(input, batch + 1);
-        let result = self.matrix_loop(n, &[symmetric, zero.clone()], |e, index, args| {
+        let result = self.matrix_loop(n, 8, &[symmetric, zero.clone()], |e, index, args| {
             let schur = e.axes_view(&args[0], axes.clone());
             let factor = e.axes_view(&args[1], axes.clone());
             let at_col = e.compare("EQ", &cols, index);
@@ -217,7 +228,7 @@ impl Emitter<'_> {
         let rows = self.axis_indices(l, batch);
         let rhs_rows = self.axis_indices(b, batch);
         let zero = self.constant_like(0.0, b);
-        let result = self.matrix_loop(n, &[zero], |e, index, args| {
+        let result = self.matrix_loop(n, 8, &[zero], |e, index, args| {
             let x = e.axes_view(&args[0], axes.clone());
             let at_row = e.compare("EQ", &rows, index);
             let rhs_at_row = e.compare("EQ", &rhs_rows, index);
@@ -349,7 +360,7 @@ impl Emitter<'_> {
         let cols = self.axis_indices(input, batch + 1);
         let mut permutation = (0..batch as u64).collect::<Vec<_>>();
         permutation.extend([batch as u64 + 1, batch as u64]);
-        let result = self.matrix_loop(n - 1, &[input.clone(), parity], |e, index, args| {
+        let result = self.matrix_loop(n - 1, 4, &[input.clone(), parity], |e, index, args| {
             let a = e.axes_view(&args[0], axes.clone());
             let parity = e.axes_view(&args[1], scalar_axes.clone());
             let row_active = e.compare("GE", &rows, index);
@@ -468,7 +479,7 @@ impl Emitter<'_> {
         let mean_log = self.div(&prefix_log, &divisor);
         let factor = self.exp(&mean_log);
         let initial = self.select(&corank_one, &last_value, &zero);
-        let singular = self.matrix_loop(steps, &[initial], |e, _, args| {
+        let singular = self.matrix_loop(steps, 4, &[initial], |e, _, args| {
             let value = e.axes_view(&args[0], scalar_axes.clone());
             vec![e.mul(&value, &factor)]
         });
@@ -503,7 +514,7 @@ impl Emitter<'_> {
         let rows = self.axis_indices(&a, batch);
         let cols = self.axis_indices(&a, batch + 1);
         let rhs_rows = self.axis_indices(&b, batch);
-        let eliminated = self.matrix_loop(n, &[a.clone(), b.clone(), valid], |e, index, args| {
+        let eliminated = self.matrix_loop(n, 4, &[a, b, valid], |e, index, args| {
             let a = e.axes_view(&args[0], a_axes.clone());
             let b = e.axes_view(&args[1], b_axes.clone());
             let valid = e.axes_view(&args[2], scalar_axes.clone());
@@ -561,7 +572,7 @@ impl Emitter<'_> {
         let valid = self.axes_view(&eliminated[2], scalar_axes);
         self.record_runtime_error(&valid, 4);
         let initial = self.constant_like(0.0, &b);
-        let solved = self.matrix_loop(n, &[initial], |e, index, args| {
+        let solved = self.matrix_loop(n, 4, &[initial], |e, index, args| {
             let last = e.int_value_const(n as i64 - 1);
             let k = e.sub(&last, index);
             let at_row = e.compare("EQ", &rows, &k);
@@ -636,7 +647,7 @@ impl Emitter<'_> {
         let cols = self.axis_indices(&input, batch + 1);
         let diagonal = self.compare("EQ", &rows, &cols);
         let identity = self.convert(&diagonal, ElemKind::Real);
-        let reduced = self.matrix_loop(n, &[input, identity], |e, index, args| {
+        let reduced = self.matrix_loop(n, 4, &[input, identity], |e, index, args| {
             let a = e.axes_view(&args[0], axes.clone());
             let b = e.axes_view(&args[1], axes.clone());
             let at_row = e.compare("EQ", &rows, index);
@@ -681,7 +692,7 @@ impl Emitter<'_> {
         let a = self.axes_view(&reduced[0], axes.clone());
         let b = self.axes_view(&reduced[1], axes.clone());
         let zero = self.constant_like(0.0, &a);
-        let result = self.matrix_loop(n, &[zero], |e, index, args| {
+        let result = self.matrix_loop(n, 4, &[zero], |e, index, args| {
             let last = e.int_value_const(n as i64 - 1);
             let k = e.sub(&last, index);
             let at_row = e.compare("EQ", &rows, &k);
