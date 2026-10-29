@@ -1186,23 +1186,22 @@ lp = logdensityof(mix, y)";
         "emitted FlatPDL must be conformant"
     );
     let pir = flatppl_flatpir::write(&out);
-    // The three structural facts the number depends on: one density term per
+    // The three structural facts the number depends on: one shared density body for
     // component, the family axis contracted by `logsumexp`, and each argument
     // sliced by its own outer rank so the two covariances stay distinct.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        2,
-        "one density term per component:\n{pir}"
+        1,
+        "one shared density body:\n{pir}"
     );
     assert!(
         pir.contains("(logsumexp "),
         "the mixture contraction:\n{pir}"
     );
     assert!(
-        pir.contains("(get (%ref self mus) 1 all)")
-            && pir.contains("(get (%ref self mus) 2 all)")
-            && pir.contains("(get (%ref self covs) 1)")
-            && pir.contains("(get (%ref self covs) 2)"),
+        pir.contains("(get (%ref self mus) (%ref %local")
+            && pir.contains("(get (%ref self covs) (%ref %local")
+            && pir.contains("(indicesof (%ref self w))"),
         "per-component slices, one `all` for the flat mu and none for the nested cov:\n{pir}"
     );
     // §06 puts the lift's mass at sum(w), so `normalize` subtracts log(sum(w)).
