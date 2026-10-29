@@ -1465,7 +1465,7 @@ fn lower_applied_ksuperpose_inner(
     // plain broadcast require the same number of axes from every collection
     // argument and strips EVERY axis to reach its cell, so an $N \times d$ `mu`
     // beside an $N \times d \times d$ `cov` cannot be spelled that way. It gets
-    // the unrolled per-component form instead ([`lower_multivariate_ksuperpose`]).
+    // mapped component slices instead ([`lower_multivariate_ksuperpose`]).
     if fields
         .iter()
         .any(|&(_, arg)| m.type_of(arg).map(array_axes).unwrap_or(0) > 1)
@@ -1506,14 +1506,12 @@ fn lower_applied_ksuperpose_inner(
 /// axis-natively; only the per-component θᵢ differs. A family argument carrying
 /// its parameter's own axes beside the family axis cannot ride a plain
 /// `broadcast(record, …)` — §04 *Collection arguments* strips every axis to reach
-/// a cell — so each component's parameters are SLICED out and the mixture is
-/// unrolled:
+/// a cell — so a shared body slices each component's parameters:
 /// ```text
 /// tᵢ = add(log(get(w, i)), builtin_logdensityof(K, record(p = get(argₚ, i, all…), …), x))
-/// lp = logsumexp([t₁, …, t_N])
+/// lp = logsumexp(broadcast(i -> tᵢ, indicesof(w)))
 /// ```
-/// the same `logsumexp` over a `vector` [`lower_superpose`] emits for the variadic
-/// spelling. Every component is scored at the same `x`, and the reduction is
+/// Every component is scored at the same `x`, and the reduction is
 /// `logsumexp` where an independent product's is `sum`.
 ///
 /// **The selector count is the argument's OUTER rank, not its total axis count.**
@@ -1525,10 +1523,7 @@ fn lower_applied_ksuperpose_inner(
 /// spellings distinct types, so reading the total axis count would emit one `all`
 /// too many for the nested one. `get` is 1-based (§07).
 ///
-/// **Unrolled, where the scalar family is axis-native.** §06 makes $N$ "not
-/// necessarily statically known" and the axis-native form honours that; the slice
-/// extraction cannot, needing one `get` per component. A dynamic $N$ therefore
-/// refuses rather than lowering with a guessed component count.
+/// Static extents remain required for the backend and family-shape checks.
 fn lower_multivariate_ksuperpose(
     m: &mut Module,
     lift_node: NodeId,
@@ -1544,8 +1539,7 @@ fn lower_multivariate_ksuperpose(
                 lift_node,
                 m,
                 "ksuperpose over a MULTIVARIATE parameter family needs a statically known \
-                 component count (§06 admits a dynamic `N`, but the per-component slice \
-                 extraction emits one `get` per component): `weights` has no static length",
+                 component count: `weights` has no static length",
             ));
         }
     };
@@ -1588,39 +1582,40 @@ fn lower_multivariate_ksuperpose(
 
     let all_sym = m.intern("all");
     let ldo_sym = m.intern("builtin_logdensityof");
-    let mut terms: Vec<NodeId> = Vec::with_capacity(n);
-    for i in 1..=n as i64 {
-        let mut theta: Vec<(Symbol, NodeId)> = Vec::with_capacity(plan.len());
-        for &FamilyArg { name, node, slice } in &plan {
-            let value = match slice {
-                None => node,
-                Some(FamilySlice { rank, singular }) => {
-                    let row = if singular { 1 } else { i };
-                    let idx = m.alloc(Node::Lit(Scalar::Int(row)));
-                    let mut selectors = vec![node, idx];
-                    for _ in 1..rank {
-                        let all = m.alloc(Node::Const(all_sym));
-                        selectors.push(all);
-                    }
-                    build_call(m, "get", &selectors)
+    let (label, reference, index) = broadcast::placeholder(m, Type::Scalar(ScalarType::Integer));
+    let mut theta: Vec<(Symbol, NodeId)> = Vec::with_capacity(plan.len());
+    for &FamilyArg { name, node, slice } in &plan {
+        let value = match slice {
+            None => node,
+            Some(FamilySlice { rank, singular }) => {
+                let idx = if singular {
+                    m.alloc(Node::Lit(Scalar::Int(1)))
+                } else {
+                    index
+                };
+                let mut selectors = vec![node, idx];
+                for _ in 1..rank {
+                    let all = m.alloc(Node::Const(all_sym));
+                    selectors.push(all);
                 }
-            };
-            theta.push((name, value));
-        }
-        let kernel_input = build_record(m, &theta);
-        let kernel = m.alloc(Node::Const(ctor_sym));
-        let density = m.alloc(Node::Call(Call {
-            head: CallHead::Builtin(ldo_sym),
-            args: vec![kernel, kernel_input, v].into(),
-            named: Vec::<NamedArg>::new().into(),
-            inputs: None,
-        }));
-        let idx = m.alloc(Node::Lit(Scalar::Int(i)));
-        let w_i = build_call(m, "get", &[weights, idx]);
-        let log_w = build_call(m, "log", &[w_i]);
-        terms.push(build_call(m, "add", &[log_w, density]));
+                build_call(m, "get", &selectors)
+            }
+        };
+        theta.push((name, value));
     }
-    let terms_vec = build_call(m, "vector", &terms);
+    let kernel_input = build_record(m, &theta);
+    let kernel = m.alloc(Node::Const(ctor_sym));
+    let density = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(ldo_sym),
+        args: vec![kernel, kernel_input, v].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    let w_i = build_call(m, "get", &[weights, index]);
+    let log_w = build_call(m, "log", &[w_i]);
+    let term = build_call(m, "add", &[log_w, density]);
+    let indices = build_call(m, "indicesof", &[weights]);
+    let terms_vec = broadcast::map_body(m, term, vec![(label, reference)], vec![indices], 1);
     Ok(build_call(m, "logsumexp", &[terms_vec]))
 }
 

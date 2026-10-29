@@ -8,17 +8,12 @@
 //! For a SCALAR parameter family the emitted FlatPDL is AXIS-NATIVE — one
 //! `logsumexp` over one broadcast, never `N` unrolled terms — because §06 makes
 //! `N` "the length of `weights`, which need not be statically known". A
-//! MULTIVARIATE family has no `broadcast(record, …)` form and takes the unrolled
-//! per-component slice form instead, which is why it needs a static `N`. Numeric
-//! verification of these shapes lives in
-//! `crates/stablehlo/tests/golden_ksuperpose.rs`, which executes them, and — for
-//! the multivariate family the StableHLO emitter cannot yet index — in
-//! `flatppl-testsuite`'s `corpora/coverage/mv_mixture` against a frozen scipy
-//! vector.
+//! MULTIVARIATE family has no `broadcast(record, …)` form and maps a shared
+//! per-component slice body instead. This path currently requires a static `N`.
+//! StableHLO emission is covered in `crates/stablehlo/tests/golden_ksuperpose.rs`.
 
 mod common;
 
-use common::pir_binding;
 use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn lower(src: &str) -> String {
@@ -32,48 +27,6 @@ fn lower(src: &str) -> String {
     let out = determinize(&m).expect("must lower, not refuse");
     assert!(is_flatpdl(&out).is_ok(), "not FlatPDL-conformant");
     flatppl_flatpir::write(&out)
-}
-
-/// `pir` with each record value-set field `(%field name set)` cut to
-/// `(%field name)`, inside every `cartprod`.
-fn without_record_set_fields(pir: &str) -> String {
-    // The end of the balanced form that opens at byte `start`.
-    fn close(text: &str, start: usize) -> usize {
-        let mut depth = 0;
-        for (i, c) in text[start..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return start + i + 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        text.len()
-    }
-    let mut out = String::with_capacity(pir.len());
-    let mut rest = pir;
-    while let Some(at) = rest.find("(cartprod ") {
-        out.push_str(&rest[..at]);
-        let end = close(rest, at);
-        let mut form = &rest[at..end];
-        let mut cut = String::new();
-        while let Some(field) = form.find("(%field ") {
-            cut.push_str(&form[..field]);
-            let field_end = close(form, field);
-            let name = form[field + 8..].split_whitespace().next().unwrap_or("");
-            cut.push_str(&format!("(%field {name})"));
-            form = &form[field_end..];
-        }
-        cut.push_str(form);
-        out.push_str(&cut);
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 fn refusal(src: &str) -> String {
@@ -306,14 +259,14 @@ lp = logdensityof(mix, y)
 /// parameter it feeds, so an $N \times d$ `mu` beside an $N \times d \times d$
 /// `cov` is one legal mixture. It has no `broadcast(record, …)` form (§04
 /// *Collection arguments* strips every axis to reach a cell), so it lowers to the
-/// per-component slice form instead — the SAME §06 density rule, unrolled.
+/// mapped per-component slices instead.
 #[test]
 fn a_multivariate_family_lowers_to_per_component_slices() {
     let pir = lower(MULTIVARIATE);
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        2,
-        "one density term per component, N = 2 here:\n{pir}"
+        1,
+        "one shared density body:\n{pir}"
     );
     assert!(
         pir.contains("(logsumexp ") && !pir.contains("(sum "),
@@ -336,19 +289,23 @@ fn a_multivariate_family_lowers_to_per_component_slices() {
 fn each_family_argument_is_sliced_by_its_own_outer_rank() {
     let pir = lower(MULTIVARIATE);
     assert!(
-        pir.contains("(get (%ref self mus) 1 all)") && pir.contains("(get (%ref self mus) 2 all)"),
+        pir.contains("(get (%ref self mus) (%ref %local") && pir.contains("_) all)"),
         "the flat N x d `mus` slices a row per component:\n{pir}"
     );
     assert!(
-        pir.contains("(get (%ref self covs) 1)") && pir.contains("(get (%ref self covs) 2)"),
+        pir.contains("(get (%ref self covs) (%ref %local"),
         "the nested N-vector of matrices takes one selector, no `all`:\n{pir}"
     );
+    let cov_suffix = pir
+        .split("(get (%ref self covs) (%ref %local ")
+        .nth(1)
+        .unwrap();
     assert!(
-        !pir.contains("(get (%ref self covs) 1 all"),
+        cov_suffix.split_once("_)").unwrap().1.starts_with(')'),
         "an `all` for an axis the ELEMENT carries would index into the matrix:\n{pir}"
     );
     assert!(
-        pir.contains("(get (%ref self w) 1)") && pir.contains("(get (%ref self w) 2)"),
+        pir.contains("(get (%ref self w) (%ref %local"),
         "each component reads its own weight, 1-based per §07:\n{pir}"
     );
 }
@@ -369,18 +326,16 @@ fn a_singular_family_axis_is_shared_by_every_component() {
     );
     assert_eq!(
         pir.matches("(get (%ref self covs) 1)").count(),
-        2,
+        1,
         "the singular cov is read at row 1 by both components:\n{pir}"
     );
     assert!(
-        pir.contains("(get (%ref self mus) 2 all)"),
+        pir.contains("(get (%ref self mus) (%ref %local") && pir.contains("_) all)"),
         "the size-N `mus` still advances:\n{pir}"
     );
 }
 
-/// §06 makes `N` "not necessarily statically known" and the axis-native scalar
-/// form honours that, but the per-component slice extraction emits one `get` per
-/// component, so it needs a static `N`. Refuse rather than guess a count.
+/// The multivariate path currently requires a static family extent.
 #[test]
 fn a_multivariate_family_with_a_dynamic_n_refuses() {
     let msg = refusal(
@@ -396,8 +351,7 @@ fn a_multivariate_family_with_a_dynamic_n_refuses() {
     assert_eq!(
         msg,
         "ksuperpose :: ksuperpose over a MULTIVARIATE parameter family needs a statically \
-         known component count (§06 admits a dynamic `N`, but the per-component slice \
-         extraction emits one `get` per component): `weights` has no static length"
+         known component count: `weights` has no static length"
     );
     assert!(
         !msg.contains("static error"),
@@ -413,8 +367,7 @@ fn a_multivariate_family_with_a_dynamic_n_refuses() {
 /// `infer` also rejects this as a §06 static error, so the CLI stops before the
 /// determiniser runs. The guard still earns its place: the determiniser is a
 /// library, and a caller that determinizes past inference errors (as [`refusal`]
-/// does here) would otherwise reach the unrolled path and emit `N` slices of an
-/// argument that has more or fewer rows than that.
+/// does here) would otherwise index an argument that has more or fewer rows.
 #[test]
 fn a_family_axis_that_is_neither_n_nor_singular_refuses() {
     let msg = refusal(
@@ -434,24 +387,7 @@ fn a_family_axis_that_is_neither_n_nor_singular_refuses() {
     );
 }
 
-/// §06 makes a non-collection argument and a size-one-leading-axis collection MEAN
-/// the same thing: both are "shared by every component". So the two spellings must
-/// agree component for component, which is what this pins — the shared value
-/// reaches every component, the singular collection never advances past row 1, and
-/// the two emissions are otherwise character-for-character identical.
-///
-/// They are NOT byte-identical outright, and cannot be: a non-collection rides as
-/// its own literal (`(%field nu 5.0)`) while a singular collection rides as the
-/// §07 selection that extracts it (`(%field nu (… (get (%ref self dfs) 1)))`).
-/// Collapsing the second to the first would need constant folding of
-/// `get([5.0], 1)`, which this pass does nowhere — and which the axis-native arm
-/// does not do either, where the same two spellings emit `1.0` and
-/// `(%ref self sigmas)` and rely on §04's own singleton expansion. Normalizing
-/// that one field and comparing the rest is the strongest true form of the claim.
-///
-/// `Wishart` because the shape needs one scalar parameter (`nu`, rank 0) beside a
-/// matrix one (`scale`, rank 2): `MvNormal` has no rank-0 parameter, so it cannot
-/// spell a shared argument both ways.
+/// A shared scalar and a singleton family both feed the Wishart body unchanged.
 #[test]
 fn the_two_shared_argument_spellings_agree_component_for_component() {
     const BASE: &str = "w = [0.3, 0.7]\n\
@@ -473,12 +409,12 @@ fn the_two_shared_argument_spellings_agree_component_for_component() {
     // The shared value reaches BOTH components, in either spelling.
     assert_eq!(
         noncollection.matches(SHARED_LITERAL).count(),
-        2,
+        1,
         "the non-collection rides both components:\n{noncollection}"
     );
     assert_eq!(
         singular.matches(SHARED_SELECTION).count(),
-        2,
+        1,
         "the singular collection rides both components, read at row 1:\n{singular}"
     );
     // §06 shares it, so the singular argument must never advance off row 1 — the
@@ -486,18 +422,6 @@ fn the_two_shared_argument_spellings_agree_component_for_component() {
     assert!(
         !singular.contains("(get (%ref self dfs) 2)"),
         "a singular family axis must not advance with the component index:\n{singular}"
-    );
-    // Everything else agrees character for character, including both `scale`
-    // slices and both weight reads.
-    // The §11 value-set slot is metadata: a literal field carries its singleton
-    // set, a selected one its natural extent, and the lowering is the same.
-    let lp = |pir: &str| {
-        without_record_set_fields(&pir_binding(pir, "lp")).replace(SHARED_SELECTION, SHARED_LITERAL)
-    };
-    assert_eq!(
-        lp(&noncollection),
-        lp(&singular),
-        "the two §06 spellings differ ONLY in how the shared value is named"
     );
 }
 

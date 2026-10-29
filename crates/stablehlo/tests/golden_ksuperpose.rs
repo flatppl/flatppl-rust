@@ -78,6 +78,39 @@ fn emit_logdensity(src: &str) -> String {
     emit(&d, Mode::LogDensity, &Default::default()).expect("must emit")
 }
 
+#[test]
+fn multivariate_mixture_has_one_batched_density_at_any_component_count() {
+    let mut operations = Vec::new();
+    for n in [2, 128] {
+        let src = format!(
+            "flatppl_compat = \"0.1\"\n\
+             w = ones({n})\n\
+             mus = zeros([{n}, 2])\n\
+             covs = [eye(2)]\n\
+             mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
+             y = [0.2, 0.3]\n\
+             lp = logdensityof(mix, y)\n\
+             inputs = (w, mus, covs, y)\n\
+             outputs = (lp)\n"
+        );
+        let hlo = emit_logdensity(&src);
+        assert!(hlo.contains("stablehlo.gather"), "{hlo}");
+        assert!(
+            n == 2 || !hlo.contains(&format!("tensor<{n}x{n}x2xf32>")),
+            "quadratic gather operand at N={n}"
+        );
+        operations.push(
+            hlo.lines()
+                .filter(|line| line.contains("stablehlo."))
+                .count(),
+        );
+    }
+    assert_eq!(
+        operations[0], operations[1],
+        "operation count must not grow with N"
+    );
+}
+
 const NORMAL_MIXTURE_SRC: &str = "\
 flatppl_compat = \"0.1\"
 w = [0.3, 1.2]

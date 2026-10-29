@@ -1272,10 +1272,19 @@ impl<'m> Emitter<'m> {
             let selected = self.slice(operand, &[index], &[index + 1], &[1]);
             return self.reshape(&selected, MlirTy::Scalar);
         }
-        let (operand, idx) = self.broadcast_batches(operand, idx);
+        // Mapped scalar indices can select from a shared operand directly. Broadcasting
+        // it across the index batch would create a quadratic intermediate.
+        let index_batch = self.batch_rank(idx);
+        let shared =
+            self.batch_rank(operand) == 0 && index_batch > 0 && shape(&idx.ty).len() == index_batch;
+        let (operand, idx) = if shared {
+            (operand.clone(), idx.clone())
+        } else {
+            self.broadcast_batches(operand, idx)
+        };
         let batch = self.batch_rank(&operand);
         let index_rank = shape(&idx.ty).len();
-        let scalar = index_rank == batch;
+        let scalar = shared || index_rank == batch;
         let base = self.int_value_const(base);
         let idx = self.sub(&idx, &base);
         let mut index_dims = shape(&idx.ty).to_vec();
@@ -1308,14 +1317,24 @@ impl<'m> Emitter<'m> {
             .collect::<Vec<_>>()
             .join(", ");
         let mut axes = self.axes_of(&operand);
+        if shared {
+            axes.batch = index_batch;
+        }
         if scalar {
             axes.layers.remove(0);
         }
         if let Some(value) = self.fold_gather_cells(&operand, &idx, ty.clone(), axes.clone()) {
             return value;
         }
+        let batching_dims = if shared {
+            String::new()
+        } else {
+            format!(
+                "operand_batching_dims = [{batches}], start_indices_batching_dims = [{batches}], "
+            )
+        };
         let ssa = self.pure_axes(format!(
-            "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<offset_dims = [{offsets}], collapsed_slice_dims = [{batch}], operand_batching_dims = [{batches}], start_indices_batching_dims = [{batches}], start_index_map = [{batch}], index_vector_dim = {index_rank}>, indices_are_sorted = false, slice_sizes = array<i64: {sizes}>}}> : ({}, {}) -> {}",
+            "\"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<offset_dims = [{offsets}], collapsed_slice_dims = [{batch}], {batching_dims}start_index_map = [{batch}], index_vector_dim = {index_rank}>, indices_are_sorted = false, slice_sizes = array<i64: {sizes}>}}> : ({}, {}) -> {}",
             operand.ssa, idx.ssa, operand.ty.render(self.dtype, operand.elem),
             idx.ty.render(self.dtype, idx.elem), ty.render(self.dtype, operand.elem),
         ), axes);
