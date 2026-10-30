@@ -115,7 +115,7 @@ R(r) = Exponential(rate = exp(r.a))
 named = jointchain(a = Normal(mu = 0.0, sigma = 1.0), b = R)
 step(s) = Gamma(shape = s + 1.0, rate = 1.0)
 trajectory = markovchain(step, 1.0, 4)
-mixture = ksuperpose(Exponential, [0.3, 0.7])(rate = [1.0, 2.0])
+mixture = ksuperpose(Exponential, [0.3, 0.7], rate = [1.0, 2.0])
 "#;
 
 #[test]

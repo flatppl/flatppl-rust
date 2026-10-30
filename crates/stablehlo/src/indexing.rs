@@ -70,6 +70,38 @@ pub(crate) fn lower_multi_axis(
     }
 
     let selectors = lower_selectors(e, id, selector_nodes, &cell_dims, base)?;
+    // Mapped point selectors choose one scalar per batch. Flatten the shared
+    // tensor before gathering so successive axes do not replicate entire rows.
+    if e.batch_rank(&operand) == 0
+        && selectors.iter().all(|selector| {
+            matches!(selector,
+            TensorSelector::DynamicScalar(index) if e.batch_rank(index) > 0)
+        })
+    {
+        let mut linear = e.int_value_const(0);
+        let origin = e.int_value_const(base);
+        let mut size = 1u64;
+        for (selector, &dim) in selectors.iter().zip(&cell_dims) {
+            let TensorSelector::DynamicScalar(index) = selector else {
+                unreachable!()
+            };
+            let dim = dim.expect("dynamic scalar selectors require static axes");
+            size = size
+                .checked_mul(dim)
+                .filter(|&n| n <= i64::MAX as u64)
+                .ok_or_else(|| EmitError::at(id, "get/get0: tensor shape is too large"))?;
+            let extent = e.int_value_const(dim as i64);
+            linear = e.mul(&linear, &extent);
+            let zero = e.sub(index, &origin);
+            linear = e.add(&linear, &zero);
+        }
+        let flattened = e.reshape(&operand, MlirTy::Ranked(vec![Some(size)]));
+        let mut axes = e.axes_of(&operand);
+        axes.layers = vec![1];
+        let flattened = e.axes_view(&flattened, axes);
+        let selected = e.gather_cells(&flattened, &linear, 0);
+        return Ok(e.with_typed_axes(id, selected));
+    }
     let batch = e.batch_rank(&operand);
     let physical_dims = match &operand.ty {
         MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => dims,

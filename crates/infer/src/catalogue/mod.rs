@@ -69,9 +69,7 @@ pub(crate) enum Sig {
         /// Declared RANK (number of axes) of each parameter, parallel to
         /// `params` — `MvNormal` → `[1, 2]`, since §08 gives `mu` as a "mean
         /// vector" and `cov` as an "$n \times n$" matrix. Read by
-        /// [`Self::distribution_param_ranks`] for §06's `ksuperpose` family-axis
-        /// rule, which measures a family argument's axes against the rank of the
-        /// parameter it feeds.
+        /// [`Catalogue::distribution_param_ranks`] and ordinary constructor shape checks.
         ///
         /// **An empty list means every parameter is a scalar (rank 0).** That is
         /// the shape of all but the seven shaped rows below, and of every §09
@@ -1536,7 +1534,7 @@ mod tests {
     }
 
     /// A declared `param_ranks` list must cover every parameter, so the
-    /// family-axis rule never reads a rank off the wrong parameter. An empty
+    /// argument shape checks never read a rank off the wrong parameter. An empty
     /// list is the all-scalar default and is admitted.
     #[test]
     fn param_ranks_are_parallel_to_params() {

@@ -1,6 +1,5 @@
 module {
   func.func @logdensity() -> tensor<f32> {
-    %0 = stablehlo.constant dense<[0.2, 0.8]> : tensor<2xf32>
     %1 = stablehlo.constant dense<"0x1002CEBFBD7F64BE"> : tensor<2xf32>
     %6 = stablehlo.constant dense<[false, true]> : tensor<2xi1>
     %7 = stablehlo.constant dense<0.0> : tensor<f32>
@@ -20,9 +19,6 @@ module {
     %21 = stablehlo.reduce(%19 init: %20) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
     %22 = stablehlo.log %21 : tensor<f32>
     %23 = stablehlo.add %22, %16 : tensor<f32>
-    %24 = stablehlo.reduce(%0 init: %20) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %25 = stablehlo.log %24 : tensor<f32>
-    %26 = stablehlo.subtract %23, %25 : tensor<f32>
-    return %26 : tensor<f32>
+    return %23 : tensor<f32>
   }
 }
