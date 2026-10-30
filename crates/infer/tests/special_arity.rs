@@ -158,16 +158,13 @@ fn the_keyword_spelling_of_a_distinguished_input_is_refused() {
     }
 }
 
-/// `ksuperpose` takes the same refusal, from its own older rule rather than the
-/// arity table — `ops::ksuperpose_type` already cited §04 for it, which is why
-/// the adjudication records that it "needs no change". Asserted here so the two
-/// paths cannot drift into disagreeing again.
+/// The kernel and weights remain distinguished positional inputs.
 #[test]
 fn ksuperpose_refuses_the_keyword_spelling_through_its_own_rule() {
     assert_refuses(
         "k = functionof(Normal(mu = 0.0, sigma = 1.0))\nv = [1.0, 2.0]\n\
          x = ksuperpose(kernel = k, weights = v)\n",
-        "takes 2 positional arguments",
+        "takes the kernel and weights positionally",
     );
 }
 

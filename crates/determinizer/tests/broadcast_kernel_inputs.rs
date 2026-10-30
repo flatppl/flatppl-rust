@@ -56,7 +56,7 @@ fn scalar_arguments_reach_the_per_cell_callee_as_operands() {
 #[test]
 fn a_scalar_mixture_family_scores_each_component_at_its_own_weight() {
     let pir = lower(
-        "w = [0.3, 0.7]\nmix = ksuperpose(Normal, w)(mu = 0.5, sigma = 2.0)\n\
+        "w = [0.3, 0.7]\nmix = ksuperpose(Normal, w, mu = 0.5, sigma = 2.0)\n\
          lp = logdensityof(mix, 1.0)",
     );
     assert!(pir.contains("(logsumexp "), "{pir}");

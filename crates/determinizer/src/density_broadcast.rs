@@ -375,45 +375,6 @@ pub(super) fn sum_density(
     sum_density_with(m, measure, values, Vec::new(), Vec::new())
 }
 
-/// Bind varying kernel arguments before collecting invariant captures. Apply
-/// the kernel at one cell, so its composed density is lowered only once.
-pub(super) fn kernel_density(
-    m: &mut Module,
-    head: NodeId,
-    kernel: &crate::kernel::Kernel,
-    positional: &[NodeId],
-    named: &[(Symbol, NodeId)],
-    values: NodeId,
-) -> Result<NodeId, RefuseError> {
-    if (kernel.auto && !positional.is_empty())
-        || positional.len() + named.len() != kernel.inputs.len()
-    {
-        return Err(refuse(
-            head,
-            m,
-            "broadcast arguments must bind each kernel input once",
-        ));
-    }
-    // Broadcast does not auto-splat table rows. Normalize to keywords before
-    // constructing an ordinary application, which otherwise would auto-splat.
-    let mut bound = Vec::new();
-    for (i, &(name, _)) in kernel.inputs.iter().enumerate() {
-        let mut keywords = named.iter().filter(|(n, _)| *n == name);
-        let value = match (positional.get(i), keywords.next(), keywords.next()) {
-            (Some(&value), None, None) | (None, Some(&(_, value)), None) => value,
-            _ => {
-                return Err(refuse(
-                    head,
-                    m,
-                    "broadcast arguments must bind each kernel input once",
-                ));
-            }
-        };
-        bound.push((name, value));
-    }
-    call_density(m, CallHead::User(head), &[], &bound, values)
-}
-
 /// Composed measures use the same per-cell lowering as reified kernels. Measure
 /// operands stay invariant even when their variates are arrays.
 pub(super) fn call_density(
@@ -438,50 +399,138 @@ pub(super) fn call_density(
 /// and weight axes vary; independent coordinates inside a component stay inside.
 pub(super) fn mixture_density(
     m: &mut Module,
-    head: NodeId,
+    head: CallHead,
     positional: &[NodeId],
     named: &[(Symbol, NodeId)],
     weights: NodeId,
     value: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    if positional
-        .iter()
-        .chain(named.iter().map(|(_, value)| value))
-        .any(|&value| {
-            let (resolved, _) = resolve_ref_chain(m, value);
-            m.type_of(value)
-                .or_else(|| m.type_of(resolved))
-                .map(array_axes)
-                .unwrap_or(0)
-                > 1
-        })
-    {
-        return Err(refuse(
-            head,
-            m,
-            "reified ksuperpose needs a one-axis parameter family",
-        ));
-    }
+    let operands: Vec<_> = std::iter::once(weights)
+        .chain(positional.iter().copied())
+        .chain(named.iter().map(|(_, v)| *v))
+        .collect();
+    let frame_shape = broadcast_collection_shape(m, &operands);
+    let rank = std::iter::once(&weights)
+        .chain(positional.iter())
+        .chain(named.iter().map(|(_, v)| v))
+        .filter_map(|&v| m.type_of(v))
+        .map(outer_rank)
+        .max()
+        .unwrap_or(0);
     let BoundCall {
         measure,
         mut inputs,
         mut args,
-    } = bind_call(m, CallHead::User(head), positional, named)?;
+    } = bind_call(m, head, positional, named)?;
     if !matches!(
         superposition_reference(m, measure, &mut Vec::new()),
         Some(SuperpositionReference::Counting | SuperpositionReference::Lebesgue)
     ) {
         return Err(refuse(
-            head,
+            measure,
             m,
             "ksuperpose kernel needs a common counting or Lebesgue reference",
         ));
     }
-    let weight = cell_input(m, weights, &mut inputs, &mut args)?;
+    let weight = if m.type_of(weights).is_some_and(|t| outer_rank(t) > 0) {
+        cell_input(m, weights, &mut inputs, &mut args)?
+    } else {
+        weights
+    };
     let weighted = build_call(m, "weighted", &[weight, measure]);
     let body = lower_measure_density(m, weighted, value)?;
-    let terms = map_body(m, body, inputs, args, 1);
+    let terms = if inputs.is_empty() {
+        body
+    } else {
+        map_body(m, body, inputs, args, rank)
+    };
+    if rank == 0 {
+        return Ok(terms);
+    }
+    let terms = if rank > 1 {
+        if let Some(shape) = frame_shape {
+            m.set_type(
+                terms,
+                Type::Array {
+                    shape: shape.into(),
+                    elem: Box::new(Type::Scalar(ScalarType::Real)),
+                },
+            );
+        }
+        match flatten_terms(m, terms)? {
+            Some(terms) => terms,
+            None => return Ok(m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)))),
+        }
+    } else {
+        terms
+    };
     Ok(build_call(m, "logsumexp", &[terms]))
+}
+
+/// logsumexp's public input is a vector. Enumerate a tensor's coordinates
+/// with one shared gather body; the expression size depends on rank, not size.
+fn flatten_terms(m: &mut Module, terms: NodeId) -> Result<Option<NodeId>, RefuseError> {
+    let ty = m.type_of(terms).cloned().or_else(|| {
+        flatppl_infer::infer_expression(m, terms, &[])
+            .0
+            .remove(&terms)
+    });
+    let shape = match ty.as_ref() {
+        Some(Type::Array { shape, .. }) => shape
+            .iter()
+            .map(|d| match d {
+                Dim::Static(n) => Some(*n),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        refuse(
+            terms,
+            m,
+            "multiple-axis ksuperpose needs a statically known broadcast shape",
+        )
+    })?;
+    if shape.contains(&0) {
+        return Ok(None);
+    }
+    let count = shape
+        .iter()
+        .try_fold(1u64, |n, d| n.checked_mul(u64::from(*d)))
+        .and_then(|n| i64::try_from(n).ok())
+        .ok_or_else(|| refuse(terms, m, "ksuperpose broadcast shape is too large"))?;
+    let count = m.alloc(Node::Lit(Scalar::Int(count)));
+    let zeros = build_call(m, "zeros", &[count]);
+    let indices = build_call(m, "indicesof0", &[zeros]);
+    let (label, reference, index) = placeholder(m, Type::Scalar(ScalarType::Integer));
+    let one = m.alloc(Node::Lit(Scalar::Int(1)));
+    let mut stride = 1u64;
+    let mut coordinates = Vec::new();
+    for &dim in shape.iter().rev() {
+        let divisor = m.alloc(Node::Lit(Scalar::Int(stride as i64)));
+        let quotient = build_call(m, "div", &[index, divisor]);
+        let extent = m.alloc(Node::Lit(Scalar::Int(dim as i64)));
+        let coordinate = build_call(m, "mod", &[quotient, extent]);
+        coordinates.push(build_call(m, "add", &[coordinate, one]));
+        stride *= u64::from(dim);
+    }
+    let tensor_type = Type::Array {
+        shape: shape.iter().copied().map(Dim::Static).collect(),
+        elem: Box::new(Type::Scalar(ScalarType::Real)),
+    };
+    let (tensor_label, tensor_ref, tensor) = placeholder(m, tensor_type);
+    let mut selectors = vec![tensor];
+    selectors.extend(coordinates.into_iter().rev());
+    let cell = build_call(m, "get", &selectors);
+    let singleton = build_call(m, "vector", &[terms]);
+    Ok(Some(map_body(
+        m,
+        cell,
+        vec![(label, reference), (tensor_label, tensor_ref)],
+        vec![indices, singleton],
+        1,
+    )))
 }
 
 struct BoundCall {
@@ -506,6 +555,33 @@ fn bind_call(
             }
             _ => Ok(value),
         }
+    };
+    let names: Option<Vec<Symbol>> = match head {
+        CallHead::User(node) => crate::kernel::resolve_reified(m, node)
+            .map(|k| k.inputs.iter().map(|(n, _)| *n).collect()),
+        CallHead::Builtin(sym) => flatppl_infer::constructor_param_names(m.resolve(sym))
+            .map(|names| names.iter().map(|n| m.intern(n)).collect()),
+    };
+    let mixed: Vec<_> = if !positional.is_empty() && !named.is_empty() {
+        names
+            .as_ref()
+            .filter(|ns| ns.len() >= positional.len())
+            .map(|ns| {
+                positional
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (ns[i], v))
+                    .chain(named.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let (positional, named) = if mixed.is_empty() {
+        (positional, named)
+    } else {
+        (&[][..], mixed.as_slice())
     };
     let positional = positional
         .iter()

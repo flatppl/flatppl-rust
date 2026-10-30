@@ -1172,11 +1172,11 @@ fn a_multivariate_mixture_agrees_with_scipy_and_lowers_to_per_component_slices()
 
     let src = "\
 w = [0.5, 1.5]
-mus = rowstack([[-1.0, 0.5], [2.0, -1.5]])
+mus = [[-1.0, 0.5], [2.0, -1.5]]
 cA = rowstack([[2.0, 0.5], [0.5, 1.0]])
 cB = rowstack([[1.0, -0.4], [-0.4, 0.8]])
 covs = [cA, cB]
-mix = normalize(ksuperpose(MvNormal, w)(mu = mus, cov = covs))
+mix = normalize(ksuperpose(MvNormal, w, mu = mus, cov = covs))
 y = elementof(cartpow(reals, 2))
 lp = logdensityof(mix, y)";
     let m = parse_infer(src);
@@ -1199,10 +1199,8 @@ lp = logdensityof(mix, y)";
         "the mixture contraction:\n{pir}"
     );
     assert!(
-        pir.contains("(get (%ref self mus) (%ref %local")
-            && pir.contains("(get (%ref self covs) (%ref %local")
-            && pir.contains("(indicesof (%ref self w))"),
-        "per-component slices, one `all` for the flat mu and none for the nested cov:\n{pir}"
+        pir.contains("(%ref self mus)") && pir.contains("(%ref self covs)"),
+        "both nested parameter collections feed the mapped body:\n{pir}"
     );
     // §06 puts the lift's mass at sum(w), so `normalize` subtracts log(sum(w)).
     assert!(

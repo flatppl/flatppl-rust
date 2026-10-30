@@ -125,17 +125,7 @@ leaf = t[1].hits.x";
     );
 }
 
-/// `ksuperpose(kernel, weights)` and its APPLICATION to a parameter family
-/// (spec §06 "Additive superposition", §04's arity row). The interesting shape is
-/// the curried call-of-a-call `ksuperpose(Normal, w)(mu = …, sigma = …)`: the
-/// application's callee is the lift's own call node, not a name, so a printer
-/// that lost the nesting would produce something that re-parses differently.
-/// Covers the keyword, positional and table-splat spellings of the family, and
-/// §08's `Dirac` categorical construction.
-///
-/// Inlined rather than added to `fixtures/flatppl/` so it stays out of the
-/// cross-engine corpus — `flatppl-js` does not implement `ksuperpose` yet — the
-/// same reasoning as `full_syntax_wraps_wide_statements`.
+/// Direct positional, keyword, mixed and table arguments roundtrip in both syntaxes.
 #[test]
 fn ksuperpose_and_its_application_roundtrip() {
     let src = "\
@@ -143,13 +133,13 @@ w = [0.3, 1.2]
 mus = [-1.0, 2.0]
 sigmas = [1.0, 0.5]
 params = table(mu = [-1.0, 2.0], sigma = [1.0, 0.5])
-lift = ksuperpose(Normal, w)
-kw = normalize(ksuperpose(Normal, w)(mu = mus, sigma = sigmas))
-pos = ksuperpose(Normal, w)([-1.0, 2.0], [1.0, 0.5])
-tbl = ksuperpose(Normal, w)(params)
-scalar_held = ksuperpose(Normal, w)(mu = mus, sigma = 1.0)
+mixed = ksuperpose(Normal, w, mus, sigma = sigmas)
+kw = normalize(ksuperpose(Normal, w, mu = mus, sigma = sigmas))
+pos = ksuperpose(Normal, w, [-1.0, 2.0], [1.0, 0.5])
+tbl = ksuperpose(Normal, w, params)
+scalar_held = ksuperpose(Normal, w, mu = mus, sigma = 1.0)
 labels = [0.0, 1.5]
-cat = normalize(ksuperpose(Dirac, w)(value = labels))";
+cat = normalize(ksuperpose(Dirac, w, value = labels))";
     for syntax in [Syntax::Full, Syntax::Minimal] {
         let m1 = parse(src).expect("parse ksuperpose");
         let printed = print_with(&m1, syntax);

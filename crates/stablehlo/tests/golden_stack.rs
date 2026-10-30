@@ -94,7 +94,7 @@ fn callable_body_size_does_not_grow_with_observation_count() {
     let emit = |n| {
         emit_logdensity(&determinize_abi(&format!(
             "mu = external(reals)\nx = elementof(cartpow(reals, {n}))\n\
-         M = ksuperpose(Normal, [0.4, 0.6])(mu = [mu, 3.0], sigma = [1.0, 2.0])\n\
+         M = ksuperpose(Normal, [0.4, 0.6], mu = [mu, 3.0], sigma = [1.0, 2.0])\n\
          score = sum(fn(logdensityof(M, _)).(x))\ninputs = (mu, x)\noutputs = (score)\n"
         )))
     };

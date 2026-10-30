@@ -80,7 +80,7 @@ pub(crate) fn interface(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<In
                     continue;
                 };
                 match m.resolve(head) {
-                    "fchain" | "broadcasted" | "bijection" | "ksuperpose" => {
+                    "fchain" | "broadcasted" | "bijection" => {
                         node = *call.args.first()?;
                     }
                     "get" | "get0" => {

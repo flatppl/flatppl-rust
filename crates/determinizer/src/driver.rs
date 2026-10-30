@@ -154,7 +154,7 @@ pub fn determinize_with_options(
         // deterministic intermediates may also be dead. Prune their draws
         // before the generic scan can reject an unreachable measure node.
         if let Some(roots) = roots
-            && find_op_node(&work, &["logdensityof", "densityof", "rand"]).is_none()
+            && find_op_node(&work, &["logdensityof", "densityof", "totalmass", "rand"]).is_none()
         {
             // Applying an explicit stochastic boundary can remove the final
             // draw dependency from a deterministic derived-value query.
@@ -303,12 +303,15 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     // op names must be probed here before the general scan reaches a `draw`.
     // Apply an enclosing callback before lowering queries whose measure object
     // is still one of that callback's unbound inputs.
-    for ops in [&["logdensityof", "densityof"][..], &["rand"][..]] {
+    for ops in [
+        &["logdensityof", "densityof", "totalmass"][..],
+        &["rand"][..],
+    ] {
         if let Some(hit) = find_op_node_in_scope(m, ops, true) {
             return Some(hit);
         }
     }
-    if let Some(hit) = find_op_node(m, &["logdensityof", "densityof"]) {
+    if let Some(hit) = find_op_node(m, &["logdensityof", "densityof", "totalmass"]) {
         return Some(hit);
     }
     if let Some(hit) = find_op_node(m, &["rand"]) {
@@ -529,6 +532,27 @@ fn apply_rule(
         // `M = lawof(record(…))` joint binding is now unreferenced (dead
         // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
         // never reaches the bare `lawof(record(…))` and refuses.
+        sweep_dead_measure_bindings(m, imports);
+        return Ok(());
+    }
+
+    if is_op(m, target_node, "totalmass") {
+        let Node::Call(call) = m.node(target_node) else {
+            unreachable!()
+        };
+        let measure = call
+            .args
+            .first()
+            .copied()
+            .filter(|_| call.args.len() == 1 && call.named.is_empty())
+            .ok_or_else(|| {
+                crate::density::refuse(target_node, m, "totalmass expects one positional measure")
+            })?;
+        let root = crate::density::closed_form_totalmass(m, measure).ok_or_else(|| {
+            crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
+        })?;
+        let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, root);
+        m.set_binding_rhs(bid, rhs);
         sweep_dead_measure_bindings(m, imports);
         return Ok(());
     }
@@ -913,7 +937,8 @@ fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule:
     // (`Module::declared_binding_rhs`). Until the last query is lowered, that prior
     // is live even though no CURRENT right-hand side mentions it. Once the measure
     // layer is gone the exemption lifts and `canon` sweeps the prior for real.
-    let queries_pending = find_op_node(m, &["logdensityof", "densityof", "rand"]).is_some();
+    let queries_pending =
+        find_op_node(m, &["logdensityof", "densityof", "totalmass", "rand"]).is_some();
 
     // Iterate to a fixpoint so dead-binding *cascades* are fully eliminated.
     // A `kchain` marginal leaves a chain `pp = kchain(M, k)` → `k = kernelof(…)`

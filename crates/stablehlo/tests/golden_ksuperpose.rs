@@ -1,68 +1,9 @@
-//! StableHLO emission for the §06 `ksuperpose` mixture density.
+//! StableHLO emission for direct weighted kernel broadcasts (§06).
 //!
-//! The emitter needed NO new code for this construct: the determiniser lowers an
-//! applied `ksuperpose` to `logsumexp(broadcast(add, broadcast(log, w),
-//! broadcast(builtin_logdensityof, K, broadcast(record, …), x)))`, every head of
-//! which the emitter already lowers — the batched-density path
-//! (`Emitter::lower_broadcast`), elementwise `log`/`add`, and the shift-by-max
-//! `logsumexp`. These goldens pin the emitted text; the numbers below were
-//! EXECUTED and matched against an independent scipy oracle.
-//!
-//! # Numeric verification (EXECUTED, not asserted here)
-//!
-//! Route: `iree-base-compiler` + `iree-base-runtime`,
-//! `compile_str(src, target_backends=["llvm-cpu"], input_type="stablehlo")` run
-//! under `local-task` in a python-mcp scratch env — the route
-//! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hloagg-report.md`
-//! documents. Oracle:
-//! `logsumexp(log(w) + norm.logpdf(x, mu, sigma)) − log(w.sum())`, computed
-//! before any engine output was read.
-//!
-//! The `gold` column says where the executed module came from. `Y` means the
-//! frozen file in `tests/goldens/` was read off disk and compiled, so for those
-//! three rows the pinned text and the verified number cannot diverge. The other
-//! seven were emitted from the source shown below into a scratch directory and
-//! compiled from there — they exercise the same lowering but pin no file, so a
-//! future emitter change could move them without reddening a golden.
-//!
-//! `w = [0.3, 1.2]` (unnormalized, so `Z = 1.5` and `log Z = 0.405465108`),
-//! `mus = [-1.0, 2.0]`, `sigmas = [1.0, 0.5]`.
-//!
-//! | case | x | gold | IREE f32 | scipy oracle | abs diff |
-//! |---|---|---|---|---|---|
-//! | normal mixture, normalized | 0.5 | Y | −3.411415339 | −3.411415108 | 2.3e−07 |
-//! | normal mixture, normalized | −1.0 | — | −2.528376579 | −2.528376324 | 2.6e−07 |
-//! | normal mixture, normalized | 2.0 | — | −0.447547168 | −0.447547243 | 7.5e−08 |
-//! | normal mixture, normalized | 5.0 | — | −18.331153870 | −18.331151868 | 2.0e−06 |
-//! | normal mixture, UNnormalized | 0.5 | — | −3.005950212 | −3.005949999 | 2.1e−07 |
-//! | shared scalar sigma | 0.5 | Y | −2.043938637 | −2.043938533 | 1.0e−07 |
-//! | singular (size-one) mu | 0.5 | — | −1.380489111 | −1.380489098 | 1.3e−08 |
-//! | Dirac superposition | 1.5 | Y | −0.223143533 | −0.223143551 | 1.8e−08 |
-//! | Dirac superposition | 0.0 | — | −1.609437943 | −1.609437912 | 3.0e−08 |
-//! | one zero weight (drops out) | 0.5 | — | −4.543469906 | −4.543469796 | 1.1e−07 |
-//!
-//! Every difference is f32 roundoff (relative error ≤ 1.1e−07; the 2.0e−06 entry
-//! is on a value of magnitude 18).
-//!
-//! The normalized and UNnormalized rows at x = 0.5 differ by exactly
-//! `log Z = log 1.5 = 0.405465108`, which is the arithmetic check that catches a
-//! transcribed pair swapped between them — an earlier revision of this table
-//! carried the unnormalized numbers on both rows.
-//!
-//! # Known deviation from §06: ALL-zero weights give NaN, not −∞
-//!
-//! §06: "When $\sum_i w_i = 0$, every weight being zero, the result is the zero
-//! measure: its density is $0$ and its log-density $-\infty$ everywhere". The
-//! emitted module returns **NaN** instead. The cause is the shared
-//! shift-by-max `logsumexp` (`ops::lower_logsumexp`): with every term `−∞`, the
-//! max is `−∞` and `term − max` is `−∞ − (−∞) = NaN`.
-//!
-//! This is PRE-EXISTING and not specific to the lift — the variadic spelling
-//! `superpose(weighted(0.0, N₁), weighted(0.0, N₂))` was executed through the
-//! same route and also returns NaN. Fixing it belongs to `lower_logsumexp`, whose
-//! output every `superpose` golden pins, so it is reported rather than changed
-//! here. No test below asserts the NaN: pinning non-conformant output would
-//! entrench it.
+//! Scalar goldens preserve the existing logsumexp density calculation.
+//! Structural checks cover nested cells, multiple axes and compact emission.
+//! Numeric value and derivative oracles live in flatppl-testsuite's
+//! `tests/test_mixture_families.py`.
 
 use flatppl_stablehlo::{Mode, emit};
 
@@ -85,16 +26,16 @@ fn multivariate_mixture_has_one_batched_density_at_any_component_count() {
         let src = format!(
             "flatppl_compat = \"0.1\"\n\
              w = ones({n})\n\
-             mus = zeros([{n}, 2])\n\
+             mus = external(cartpow(cartpow(reals, 2), {n}))\n\
              covs = [eye(2)]\n\
-             mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
+             mix = ksuperpose(MvNormal, w, mu = mus, cov = covs)\n\
              y = [0.2, 0.3]\n\
              lp = logdensityof(mix, y)\n\
              inputs = (w, mus, covs, y)\n\
              outputs = (lp)\n"
         );
         let hlo = emit_logdensity(&src);
-        assert!(hlo.contains("stablehlo.gather"), "{hlo}");
+        assert!(hlo.contains("stablehlo.triangular_solve"), "{hlo}");
         assert!(
             n == 2 || !hlo.contains(&format!("tensor<{n}x{n}x2xf32>")),
             "quadratic gather operand at N={n}"
@@ -116,7 +57,7 @@ flatppl_compat = \"0.1\"
 w = [0.3, 1.2]
 mus = [-1.0, 2.0]
 sigmas = [1.0, 0.5]
-mix = normalize(ksuperpose(Normal, w)(mu = mus, sigma = sigmas))
+mix = normalize(ksuperpose(Normal, w, mu = mus, sigma = sigmas))
 lp = logdensityof(mix, 0.5)
 outputs = (lp)
 ";
@@ -125,7 +66,7 @@ const SCALAR_SIGMA_SRC: &str = "\
 flatppl_compat = \"0.1\"
 w = [0.3, 1.2]
 mus = [-1.0, 2.0]
-mix = normalize(ksuperpose(Normal, w)(mu = mus, sigma = 1.0))
+mix = normalize(ksuperpose(Normal, w, mu = mus, sigma = 1.0))
 lp = logdensityof(mix, 0.5)
 outputs = (lp)
 ";
@@ -134,7 +75,7 @@ const DIRAC_SRC: &str = "\
 flatppl_compat = \"0.1\"
 p = [0.2, 0.8]
 labels = [0.0, 1.5]
-c = normalize(ksuperpose(Dirac, p)(value = labels))
+c = normalize(ksuperpose(Dirac, p, value = labels))
 lp = logdensityof(c, 1.5)
 outputs = (lp)
 ";
@@ -166,7 +107,7 @@ fn scalar_sigma_mixture_matches_frozen_golden() {
 }
 
 /// §08's categorical over arbitrary values,
-/// `normalize(ksuperpose(Dirac, p)(value = labels))`. Executed == scipy oracle at
+/// `normalize(ksuperpose(Dirac, p, value = labels))`. Executed == scipy oracle at
 /// both support points.
 #[test]
 fn dirac_superposition_matches_frozen_golden() {
@@ -214,7 +155,7 @@ fn the_normalizer_is_a_sum_reduce_over_the_weights() {
          w = [0.3, 1.2]\n\
          mus = [-1.0, 2.0]\n\
          sigmas = [1.0, 0.5]\n\
-         mix = ksuperpose(Normal, w)(mu = mus, sigma = sigmas)\n\
+         mix = ksuperpose(Normal, w, mu = mus, sigma = sigmas)\n\
          lp = logdensityof(mix, 0.5)\n\
          outputs = (lp)\n",
     );
@@ -241,7 +182,7 @@ fn a_singular_family_argument_emits_against_the_component_axis() {
     let out = emit_logdensity(
         "flatppl_compat = \"0.1\"\n\
          w = [0.3, 1.2]\n\
-         mix = normalize(ksuperpose(Normal, w)(mu = [1.0], sigma = [0.5, 2.0]))\n\
+         mix = normalize(ksuperpose(Normal, w, mu = [1.0], sigma = [0.5, 2.0]))\n\
          lp = logdensityof(mix, 0.5)\n\
          outputs = (lp)\n",
     );
@@ -269,7 +210,7 @@ fn a_non_batch_safe_component_refuses_at_the_existing_gate() {
     let mut m = flatppl_syntax::parse(
         "flatppl_compat = \"0.1\"\n\
          w = [0.3, 1.2]\n\
-         mix = ksuperpose(NegativeBinomial2, w)(mu = [1.0, 2.0], psi = 2.0)\n\
+         mix = ksuperpose(NegativeBinomial2, w, mu = [1.0, 2.0], psi = 2.0)\n\
          lp = logdensityof(mix, 3)\n\
          outputs = (lp)\n",
     )
@@ -278,4 +219,74 @@ fn a_non_batch_safe_component_refuses_at_the_existing_gate() {
     let d = flatppl_determinizer::determinize(&m).expect("determinizes");
     let err = emit(&d, Mode::LogDensity, &Default::default()).expect_err("must refuse");
     assert!(err.msg.contains("not rank-agnostic"), "got: {}", err.msg);
+}
+
+#[test]
+fn ordinary_broadcast_mixtures_emit_expanded_normalizers() {
+    for (weights, means) in [
+        ("[2.]", "[-1.,2.]"),
+        ("2.", "[-1.,2.]"),
+        ("rowstack([[2.],[3.]])", "rowstack([[-1.,2.,3.]])"),
+    ] {
+        let hlo = emit_logdensity(&format!(
+            "w = {weights}\nmeans = {means}\nm = ksuperpose(Normal, w, means, sigma = 1.)\nz = totalmass(m)\nlp = logdensityof(normalize(m), 0.5)\noutputs = (lp,z)"
+        ));
+        assert!(hlo.contains("stablehlo.reduce"), "{hlo}");
+        assert!(
+            !hlo.contains("tensor<6x3xf32>"),
+            "flattening must not duplicate tensor rows: {hlo}"
+        );
+    }
+}
+
+#[test]
+fn empty_broadcasts_keep_zero_mass_and_empty_density_reductions() {
+    // Derived zero extents are dynamic in source inference. As in golden_norms,
+    // instantiate a zero-length backend input after determinizing valid source.
+    fn empty_type(ty: flatppl_core::Type) -> flatppl_core::Type {
+        use flatppl_core::{Dim, Type};
+        match ty {
+            Type::Array { shape, elem } => Type::Array {
+                shape: shape
+                    .iter()
+                    .map(|d| {
+                        if *d == Dim::Static(7) {
+                            Dim::Static(0)
+                        } else {
+                            *d
+                        }
+                    })
+                    .collect(),
+                elem: Box::new(empty_type(*elem)),
+            },
+            other => other,
+        }
+    }
+    for (weights, means, input) in [
+        ("[1.]", "external(cartpow(reals, 7))", "means"),
+        ("2.", "external(cartpow(reals, 7))", "means"),
+        ("external(cartpow(nonnegreals, 7))", "[0.]", "w"),
+    ] {
+        let source = format!(
+            "w = {weights}\nmeans = {means}\nm = ksuperpose(Normal, w, means, sigma = 1.)\nz = totalmass(m)\nlp = logdensityof(m, 0.5)\ninputs = {input}\noutputs = (z,lp)"
+        );
+        let mut module = flatppl_syntax::parse(&source).unwrap();
+        flatppl_infer::infer(&mut module);
+        let mut lowered = flatppl_determinizer::determinize(&module).unwrap();
+        use flatppl_core::Idx;
+        for i in 0..lowered.node_count() {
+            let id = flatppl_core::NodeId::from_usize(i);
+            if let Some(ty) = lowered.type_of(id).cloned() {
+                lowered.set_type(id, empty_type(ty));
+            }
+        }
+        let hlo = emit(&lowered, Mode::LogDensity, &Default::default()).unwrap();
+        // Empty sums return 0 and the empty logsumexp returns -infinity.
+        assert!(hlo.contains("tensor<0xf32>"), "{hlo}");
+        assert!(hlo.contains("dense<0xFF800000>"), "{hlo}");
+        assert!(
+            hlo.contains("stablehlo.add across dimensions = [0]"),
+            "{hlo}"
+        );
+    }
 }

@@ -61,7 +61,7 @@ pub fn distribution_param_names(name: &str) -> Option<Vec<String>> {
 
 /// Declared parameter RANKS for a built-in distribution, parallel to
 /// [`distribution_param_names`] — `MvNormal` → `[1, 2]` for a mean vector and an
-/// $n \times n$ covariance matrix. Read by §06's `ksuperpose` family-axis rule.
+/// $n \times n$ covariance matrix. Used by ordinary constructor argument shape checks.
 /// `None` if `name` isn't a known distribution.
 pub fn distribution_param_ranks(name: &str) -> Option<Vec<usize>> {
     catalogue::builtin().distribution_param_ranks(name)

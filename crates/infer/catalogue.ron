@@ -59,7 +59,7 @@ Catalogue(
         // ---- Multivariate ----
         // MvNormal: domain ℝ^n, support CartPow(Reals, n) where n = length(mu).
         // `mu` is a mean vector (rank 1) and `cov` an n x n matrix (rank 2), which
-        // §06's ksuperpose family rule measures a family argument against.
+        // ordinary calls and broadcast cells check against the declared ranks.
         Builtin(name: "MvNormal",    sig: Distribution(domain: VectorFromParam(elem: Real,    param: "mu"),    support: CartPowReals,          mass: Normalized, params: ["mu", "cov"], param_sets: [Unconstrained, Unconstrained], param_ranks: [1, 2])),
         // Dirichlet: domain Δ^n (standard simplex), support StdSimplex(n) where n = length(alpha).
         Builtin(name: "Dirichlet",   sig: Distribution(domain: VectorFromParam(elem: Real,    param: "alpha"), support: StdSimplex,            mass: Normalized, params: ["alpha"], param_sets: [Unconstrained], param_ranks: [1])),

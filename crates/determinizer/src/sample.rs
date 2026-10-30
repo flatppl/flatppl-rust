@@ -626,11 +626,7 @@ fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
     )
 }
 
-/// The applied `ksuperpose(K, w)(θ)` node inside `resolved`, looking through one
-/// `normalize` wrapper — `normalize(ksuperpose(…)(…))` is §06's own spelling of
-/// a mixture, so it is the shape a sample query actually carries. Returns the
-/// LIFT node, so the refusal points at the construct that is not sampled rather
-/// than at the enclosing `normalize`.
+/// Find a direct mixture, looking through its optional normalization wrapper.
 fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<NodeId> {
     let mut node = resolved;
     if let Some(c) = expect_builtin_call(m, node, "normalize") {
@@ -639,14 +635,7 @@ fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<No
         }
         node = resolve_ref(m, c.args[0]).0;
     }
-    let Node::Call(c) = m.node(node) else {
-        return None;
-    };
-    let CallHead::User(callee) = c.head else {
-        return None;
-    };
-    let (lift_node, _) = resolve_ref(m, callee);
-    expect_builtin_call(m, lift_node, "ksuperpose").map(|_| lift_node)
+    expect_builtin_call(m, node, "ksuperpose").map(|_| node)
 }
 
 /// `ksuperpose`: refused in SAMPLE mode, and not because it is intractable.
