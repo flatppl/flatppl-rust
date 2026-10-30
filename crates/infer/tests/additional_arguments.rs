@@ -127,25 +127,23 @@ fn scalars_and_objects_are_held_constant_at_every_step() {
 }
 
 #[test]
-fn a_record_input_of_a_sequence_operation_is_a_static_error() {
-    // The extras of `scan`, `kscan` and `filter` follow `broadcast`, which allows neither
-    // records nor tuples as operands (spec §04 "Broadcasting", "Disallowed inputs"); a
-    // record is neither iterated nor held constant, whatever the spelling.
-    for source in [
-        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
-        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], p = record(w = 2.0))",
-        "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
-        "k(s, x, p) = Normal(s + x, p.w)\nM = kscan(k, 0.0, [1.0, 2.0], record(w = 0.5))",
-        "within(x, p) = x < p.lo\nr = filter(within, [1, 4, 9], record(lo = 3))",
-    ] {
-        let found = errors(source);
-        assert_eq!(found.len(), 1, "{source}: {found:?}");
-        assert!(
-            found[0].contains("is a record") && found[0].contains("Disallowed inputs"),
-            "{found:?}"
-        );
+fn sequence_callbacks_receive_record_parameters_whole() {
+    // §04 "Explicit callback parameters": the final p is passed whole,
+    // independently of the arrays or tables traversed by the operation.
+    for (sequence, parameter) in [("", "record(w = 2.0)"), ("x = ", "p = record(w = 2.0)")] {
+        for source in [
+            format!(
+                "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, {sequence}[10.0, 20.0], {parameter})"
+            ),
+            format!(
+                "k(s, x, p) = Normal(s + x * p.w, 1.0)\nM = kscan(k, 0.0, {sequence}[1.0, 2.0], {parameter})"
+            ),
+            format!("within(x, p) = x > p.w\nr = filter(within, [1.0, 4.0, 9.0], {parameter})"),
+        ] {
+            assert_eq!(errors(&source), Vec::<String>::new(), "{source}");
+        }
     }
-    // Operations that are not broadcasts still pass a record extra whole.
+    // Non-sequence operations retain the same whole-parameter rule.
     for source in [
         "step(a, p) = a + p.w\nr = markovchain(step, 0.0, 3, record(w = 2.0))",
         "w(x, p) = p.s * x\nm = weighted(w, Normal(0.0, 1.0), record(s = 2.0))",
