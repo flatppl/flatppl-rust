@@ -2739,10 +2739,18 @@ impl<'m> Emitter<'m> {
 
     /// Solve `l @ y = b` for matrix cells `[n, n]` and `[n, k]`, preserving
     /// the RHS shape. Enzyme-restricted small GPU matrices use unrolled
-    /// forward substitution.
+    /// forward substitution. Tiny CPU matrices with two RHS columns use the
+    /// same arithmetic decomposition.
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let (l, b) = self.broadcast_batches(l, b);
-        if self.target == crate::Target::Gpu && self.decompose_small_matrix(&l, MATRIX_UNROLL_LIMIT)
+        let limit = match self.target {
+            crate::Target::Cpu => 2,
+            crate::Target::Gpu => MATRIX_UNROLL_LIMIT,
+        };
+        // Native vector solves let mapped points fold into shared RHS columns.
+        let two_rhs_columns = shape(&b.ty).last() == Some(&Some(2));
+        if self.decompose_small_matrix(&l, limit)
+            && (self.target == crate::Target::Gpu || two_rhs_columns)
         {
             return self.tri_solve_decomposed(&l, &b);
         }

@@ -51,6 +51,20 @@ fn cpu_mvnormal_uses_native_operations_above_the_matrix_limit() {
 }
 
 #[test]
+fn cpu_wishart_decomposes_the_tiny_two_column_solve() {
+    let ir = emit(
+        "scale = elementof(cartpow(reals, [2, 2]))\n\
+         nu = elementof(posreals)\n\
+         x = elementof(cartpow(reals, [2, 2]))\n\
+         inputs = (scale, nu, x)\n\
+         outputs = logdensityof(Wishart(nu, scale), x)\n",
+        Target::Cpu,
+    );
+    assert!(!ir.contains("stablehlo.triangular_solve"), "{ir}");
+    assert_eq!(ir.matches("stablehlo.while").count(), 3, "{ir}");
+}
+
+#[test]
 fn gpu_mvnormal_unrolls_at_the_matrix_limit() {
     let ir = normal(8, Target::Gpu);
     assert!(!ir.contains("stablehlo.cholesky"), "{ir}");
