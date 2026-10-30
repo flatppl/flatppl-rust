@@ -1139,21 +1139,6 @@ fn bind_call_extras(
         }
         return ExtrasOutcome::Unchanged;
     }
-    // The sequence extras follow `broadcast`: a record is not allowed, a tuple is refused
-    // below (spec §04 "Additional arguments", "Broadcasting").
-    if head.sequences
-        && let Some(refusal) = refuse_aggregate_operand(
-            inf,
-            name,
-            extras
-                .iter()
-                .map(|(node, ty, _)| (*node, ty))
-                .chain(named.iter().map(|(_, node, ty, _)| (*node, ty)))
-                .filter(|(_, ty)| matches!(ty, Type::Record(_))),
-        )
-    {
-        return ExtrasOutcome::Refused(refusal);
-    }
     let Some(interface) = crate::callable::interface(inf, args[0].0) else {
         // A callback whose inputs are unknown cannot take keyword arguments; positional
         // ones keep their order, which is all the later rules read.
@@ -1261,8 +1246,12 @@ fn bind_extras_to_interface(
         names: &remaining_names,
         ordered: interface.ordered,
     };
+    // Sequence callbacks receive record parameters whole; table columns retain
+    // their existing binding to the callback's remaining inputs.
     let aggregate_fields = match extras {
-        [(_, Type::Record(fields), _)] => Some(fields.as_ref()),
+        [(_, Type::Record(fields), _)] if !matches!(who, "scan" | "kscan" | "filter") => {
+            Some(fields.as_ref())
+        }
         [(_, Type::Table { columns, .. }, _)] => Some(columns.as_ref()),
         _ => None,
     }
@@ -1326,10 +1315,9 @@ fn bind_extras_to_interface(
 }
 
 /// §04 "Additional arguments": the additional inputs of `filter`, `scan` and `kscan`
-/// follow `broadcast`. One-dimensional arrays and tables are traversed together
-/// and a length-one input repeats; other unequal lengths are an error. Scalars and
-/// other non-collection inputs are held constant. A record (refused before binding,
-/// see [`bind_call_extras`]), a tuple or an array of more than one dimension is an
+/// traverse one-dimensional arrays and tables together. A length-one input repeats;
+/// other unequal lengths are an error. Scalars, records and other non-collection
+/// inputs are held constant. A tuple or an array of more than one dimension is an
 /// error, and `scan` and `kscan` need at least one array or table to traverse.
 fn check_sequences(
     inf: &mut Inferencer<'_, '_>,
@@ -7016,8 +7004,7 @@ fn collect_local_refs(inf: &Inferencer<'_, '_>, body: NodeId) -> HashMap<Symbol,
     refs
 }
 
-/// The first record or tuple among the operands of `broadcast` (or the sequence extras of
-/// `scan`, `kscan` and `filter`, which follow it) is a located static error, spec §04
+/// The first record or tuple among the operands of `broadcast` is a located static error, spec §04
 /// "Broadcasting", "Disallowed inputs".
 fn refuse_aggregate_operand<'a>(
     inf: &mut Inferencer<'_, '_>,
