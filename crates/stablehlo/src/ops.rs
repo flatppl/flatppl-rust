@@ -834,8 +834,8 @@ fn require_real_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitErro
 
 /// §07 `lower_cholesky(A)` — "lower-triangular $\mathbf{L}$ with
 /// $\mathbf{A} = \mathbf{L}\mathbf{L}^\dagger$ and positive diagonal entries",
-/// domain "positive definite `A`". Enzyme compatibility uses a decomposition;
-/// unrestricted emission uses native `stablehlo.cholesky` with `lower = true`.
+/// domain "positive definite `A`". Enzyme-restricted small matrices use a
+/// decomposition; other paths use native `stablehlo.cholesky` with `lower = true`.
 ///
 /// Positive-definiteness is §07's precondition on the CALLER, not something a
 /// static emitter can check: `stablehlo.cholesky` is documented to produce

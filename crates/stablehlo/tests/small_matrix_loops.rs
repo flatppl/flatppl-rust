@@ -35,15 +35,49 @@ fn emit(source: &str, target: Target) -> String {
 }
 
 #[test]
-fn gpu_unrolls_small_matrix_loops_only() {
-    for n in [2, 8] {
-        let gpu = normal(n, Target::Gpu);
-        assert!(!gpu.contains("stablehlo.while"), "{gpu}");
-        let cpu = normal(n, Target::Cpu);
-        assert_eq!(cpu.matches("stablehlo.while").count(), 2, "{cpu}");
-    }
-    let gpu = normal(9, Target::Gpu);
-    assert_eq!(gpu.matches("stablehlo.while").count(), 2, "{gpu}");
+fn cpu_mvnormal_decomposes_small_cholesky_and_keeps_native_solve() {
+    let ir = normal(2, Target::Cpu);
+    assert!(!ir.contains("stablehlo.cholesky"), "{ir}");
+    assert_eq!(ir.matches("stablehlo.triangular_solve").count(), 1, "{ir}");
+    assert_eq!(ir.matches("stablehlo.while").count(), 1, "{ir}");
+}
+
+#[test]
+fn cpu_mvnormal_uses_native_operations_above_the_matrix_limit() {
+    let ir = normal(3, Target::Cpu);
+    assert_eq!(ir.matches("stablehlo.cholesky").count(), 1, "{ir}");
+    assert_eq!(ir.matches("stablehlo.triangular_solve").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.while"), "{ir}");
+}
+
+#[test]
+fn cpu_wishart_decomposes_the_tiny_two_column_solve() {
+    let ir = emit(
+        "scale = elementof(cartpow(reals, [2, 2]))\n\
+         nu = elementof(posreals)\n\
+         x = elementof(cartpow(reals, [2, 2]))\n\
+         inputs = (scale, nu, x)\n\
+         outputs = logdensityof(Wishart(nu, scale), x)\n",
+        Target::Cpu,
+    );
+    assert!(!ir.contains("stablehlo.triangular_solve"), "{ir}");
+    assert_eq!(ir.matches("stablehlo.while").count(), 3, "{ir}");
+}
+
+#[test]
+fn gpu_mvnormal_unrolls_at_the_matrix_limit() {
+    let ir = normal(8, Target::Gpu);
+    assert!(!ir.contains("stablehlo.cholesky"), "{ir}");
+    assert!(!ir.contains("stablehlo.triangular_solve"), "{ir}");
+    assert!(!ir.contains("stablehlo.while"), "{ir}");
+}
+
+#[test]
+fn gpu_mvnormal_uses_native_operations_above_the_matrix_limit() {
+    let ir = normal(9, Target::Gpu);
+    assert_eq!(ir.matches("stablehlo.cholesky").count(), 1, "{ir}");
+    assert_eq!(ir.matches("stablehlo.triangular_solve").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.while"), "{ir}");
 }
 
 #[test]
