@@ -70,6 +70,8 @@ pub(crate) use batching::Axes;
 use batching::shape;
 use pointwise::Pointwise;
 
+const MATRIX_UNROLL_LIMIT: u64 = 8;
+
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
 /// negative infinity, spelled as the raw bit pattern MLIR's float-attribute
 /// hex-literal syntax expects (`0xFF800000` / `0xFFF0000000000000`). A finite
@@ -2372,10 +2374,30 @@ impl<'m> Emitter<'m> {
     // ---- matrix helpers -----------------------------------------------------
 
     /// Lower Cholesky factor with the input's matrix-cell and batch shapes.
-    /// Enzyme compatibility decomposes the native op for first derivatives.
+    /// Enzyme-restricted small matrices use arithmetic decomposition.
     pub fn cholesky(&mut self, a: &Value) -> Value {
-        if self.restrict_enzyme_compatible {
-            return self.cholesky_decomposed(a);
+        let a = if self.restrict_enzyme_compatible {
+            // Retain the symmetric cotangent even when the native op reads one
+            // triangle. This form also avoids overflowing on a symmetric input.
+            let batch = self.batch_rank(a);
+            let mut permutation = (0..batch as u64).collect::<Vec<_>>();
+            permutation.extend([batch as u64 + 1, batch as u64]);
+            let transpose = self.transpose(a, &permutation);
+            let transpose = self.axes_view(&transpose, self.axes_of(a));
+            let difference = self.sub(&transpose, a);
+            let half = self.scalar(0.5);
+            let correction = self.mul(&half, &difference);
+            self.add(a, &correction)
+        } else {
+            a.clone()
+        };
+        // Tiny CPU gradients favor arithmetic over native adjoint solve calls.
+        let limit = match self.target {
+            crate::Target::Cpu => 2,
+            crate::Target::Gpu => MATRIX_UNROLL_LIMIT,
+        };
+        if self.decompose_small_matrix(&a, limit) {
+            return self.cholesky_decomposed(&a);
         }
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
@@ -2383,7 +2405,7 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.cholesky {}, lower = true : {ty_text}",
             a.ssa
         ));
-        self.remember_axes(&ssa, self.axes_of(a));
+        self.remember_axes(&ssa, self.axes_of(&a));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -2716,11 +2738,12 @@ impl<'m> Emitter<'m> {
     }
 
     /// Solve `l @ y = b` for matrix cells `[n, n]` and `[n, k]`, preserving
-    /// the RHS shape. Enzyme compatibility uses forward substitution because
-    /// the imported native triangular solve has no adjoint.
+    /// the RHS shape. Enzyme-restricted small GPU matrices use unrolled
+    /// forward substitution.
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let (l, b) = self.broadcast_batches(l, b);
-        if self.restrict_enzyme_compatible {
+        if self.target == crate::Target::Gpu && self.decompose_small_matrix(&l, MATRIX_UNROLL_LIMIT)
+        {
             return self.tri_solve_decomposed(&l, &b);
         }
         let ssa = self.fresh();

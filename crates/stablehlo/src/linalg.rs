@@ -53,7 +53,7 @@ impl Emitter<'_> {
         let cols_r = self.axis_indices(&input, batch + 1);
         let mut transpose: Vec<u64> = (0..batch as u64).collect();
         transpose.extend([batch as u64 + 1, batch as u64]);
-        let result = self.matrix_loop(n, 8, &[input, q], |e, index, args| {
+        let result = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &[input, q], |e, index, args| {
             let r = e.axes_view(&args[0], r_axes.clone());
             let q = e.axes_view(&args[1], q_axes.clone());
             let at_col = e.compare("EQ", &cols_r, index);
@@ -179,23 +179,20 @@ impl Emitter<'_> {
         result.into_iter().skip(1).collect()
     }
 
-    /// Right-looking Cholesky through rank-one Schur updates. Symmetrizing the
-    /// input gives the symmetric cotangent on the positive-definite domain.
+    pub(super) fn decompose_small_matrix(&self, input: &Value, limit: u64) -> bool {
+        self.restrict_enzyme_compatible
+            && shape(&input.ty)[self.batch_rank(input)].is_some_and(|n| n <= limit)
+    }
+
+    /// Right-looking Cholesky through rank-one Schur updates.
     pub(super) fn cholesky_decomposed(&mut self, input: &Value) -> Value {
         let batch = self.batch_rank(input);
         let axes = self.axes_of(input);
         let n = shape(&input.ty)[batch].expect("static Cholesky dimension");
-        let mut permutation = (0..batch as u64).collect::<Vec<_>>();
-        permutation.extend([batch as u64 + 1, batch as u64]);
-        let transpose = self.transpose(input, &permutation);
-        let transpose = self.axes_view(&transpose, axes.clone());
-        let difference = self.sub(&transpose, input);
-        let half = self.scalar(0.5);
-        let correction = self.mul(&half, &difference);
-        let symmetric = self.add(input, &correction);
         let zero = self.constant_like(0.0, input);
         let cols = self.axis_indices(input, batch + 1);
-        let result = self.matrix_loop(n, 8, &[symmetric, zero.clone()], |e, index, args| {
+        let initial = [input.clone(), zero.clone()];
+        let result = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &initial, |e, index, args| {
             let schur = e.axes_view(&args[0], axes.clone());
             let factor = e.axes_view(&args[1], axes.clone());
             let at_col = e.compare("EQ", &cols, index);
@@ -220,7 +217,7 @@ impl Emitter<'_> {
     }
 
     /// Forward substitution for lower-triangular matrix cells and matrix RHSs.
-    /// The fixed loop bound permits reverse AD without a native solve adjoint.
+    /// Unrolling avoids native kernel-launch overhead for small GPU matrices.
     pub(super) fn tri_solve_decomposed(&mut self, l: &Value, b: &Value) -> Value {
         let batch = self.batch_rank(l);
         let n = shape(&l.ty)[batch].expect("static triangular solve dimension");
@@ -228,7 +225,7 @@ impl Emitter<'_> {
         let rows = self.axis_indices(l, batch);
         let rhs_rows = self.axis_indices(b, batch);
         let zero = self.constant_like(0.0, b);
-        let result = self.matrix_loop(n, 8, &[zero], |e, index, args| {
+        let result = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &[zero], |e, index, args| {
             let x = e.axes_view(&args[0], axes.clone());
             let at_row = e.compare("EQ", &rows, index);
             let rhs_at_row = e.compare("EQ", &rhs_rows, index);
