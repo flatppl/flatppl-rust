@@ -129,6 +129,7 @@ Programs without checks retain their original result signature.
 | 5 | Inverse-uniform variate outside [0, 1] |
 | 6 | RNG seed outside its integer or byte-vector domain |
 | 7 | Categorical probabilities with a negative or non-finite cell, or a zero total; this includes the weights of a sampled `ksuperpose` mixture |
+| 8 | `bincounts` edges that do not strictly increase; this includes the `__bin_edge_check_<n>` term a determinized `BinnedPoissonProcess` keeps for edges known only at run time |
 
 The status uses `i32` for float32 emission and `i64` for float64 emission.
 It is scalar for an ordinary call. Host batching adds the host batch shape,

@@ -1,4 +1,4 @@
-// `BinnedPoissonProcess(bins, intensity)` — spec §08's fixed-bins equivalence
+// `BinnedPoissonProcess(bins, intensity)` — spec §06's fixed-bins equivalence
 // `pushfwd(fn(bincounts(bins, _)), PoissonProcess(intensity))`, lowered as one
 // Poisson count per bin with mean the intensity's mass there — and the limits it
 // refuses instead of mis-lowering.
@@ -68,8 +68,7 @@ lp = logdensityof(proc, [3, 12, 20, 9])",
 }
 
 // Bin masses of a flat `Uniform`, a `Lebesgue` window and their `superpose` are
-// overlap lengths, so no `Uniform` CDF reaches the target. The keyword spelling
-// binds like the positional one.
+// overlap lengths, so no `Uniform` CDF reaches the target.
 #[test]
 fn flat_intensities_lower_to_overlap_lengths() {
     let (text, _) = lowered(
@@ -77,7 +76,7 @@ fn flat_intensities_lower_to_overlap_lengths() {
 s = elementof(posreals)
 flat = Uniform(interval(0.0, 6.0))
 window = Lebesgue(support = interval(0.5, 5.0))
-proc = BinnedPoissonProcess(intensity = superpose(weighted(s, flat), weighted(0.3, window)), bins = [0.0, 1.0, 3.0, 6.0])
+proc = BinnedPoissonProcess([0.0, 1.0, 3.0, 6.0], superpose(weighted(s, flat), weighted(0.3, window)))
 lp = logdensityof(proc, [2, 7, 4])",
     );
     assert!(
@@ -130,6 +129,24 @@ fn polynomial_intensity_preserves_live_extra_and_composition() {
     assert!(!text.contains("BinnedPoissonProcess"), "{text}");
 }
 
+// §07 `bincounts`: "Each edge vector must be strictly increasing". Written edges
+// fail inference first, so the determiniser sees them through an unchecked parse.
+#[test]
+fn non_increasing_static_edges_are_refused() {
+    for edges in ["[0.0, 2.0, 1.0, 3.0]", "[0.0, 1.0, 1.0, 3.0]"] {
+        let src = format!(
+            "I = weighted(5.0, Normal(1.0, 0.5))\n\
+             lp = logdensityof(BinnedPoissonProcess({edges}, I), [1, 0, 2])"
+        );
+        let err = determinize(&flatppl_syntax::parse(&src).unwrap())
+            .expect_err("non-increasing edges must refuse");
+        assert!(
+            err.reason.contains("strictly increasing"),
+            "{edges}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn polynomial_bins_require_static_edges_and_finite_full_support() {
     for src in [
@@ -159,7 +176,7 @@ fn polynomial_bins_require_static_edges_and_finite_full_support() {
     }
 }
 
-// §08 gives `bins` §07 `bincounts`'s record form for multi-dimensional bins. That
+// §06 gives `bins` §07 `bincounts`'s record form for multi-dimensional bins. That
 // form is out of the lowered fragment and must refuse.
 #[test]
 fn a_record_of_edge_vectors_refuses() {
@@ -246,6 +263,28 @@ lp = logdensityof(proc, [1, 3])",
         calls["get0"], 3,
         "the two bins share three edge nodes:\n{text}"
     );
+}
+
+// Edges known only at run time keep `bincounts`' own edge check in the score,
+// bound to a named synthetic binding. Literal edges were checked statically.
+#[test]
+fn computed_edges_keep_a_named_edge_check() {
+    let (text, _) = lowered(
+        "\
+edges = cumsum([0.0, 1.0, 2.0])
+proc = BinnedPoissonProcess(edges, weighted(5.0, Normal(1.0, 0.5)))
+lp = logdensityof(proc, [1, 3])",
+    );
+    assert!(
+        text.contains("__bin_edge_check_") && text.contains("bincounts(edges, edges)"),
+        "{text}"
+    );
+    let (text, _) = lowered(
+        "\
+proc = BinnedPoissonProcess([0.0, 1.0, 3.0], weighted(5.0, Normal(1.0, 0.5)))
+lp = logdensityof(proc, [1, 3])",
+    );
+    assert!(!text.contains("bincounts"), "{text}");
 }
 
 #[test]

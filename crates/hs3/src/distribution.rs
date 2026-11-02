@@ -469,7 +469,7 @@ pub fn emit_distribution(
             Ok(named_weight(b, eff_name, pdf_ref, "weighted", cond))
         }
 
-        // §08: rate_extended_dist → PoissonProcess(weighted(<rate>, self_ref(<distribution>)))
+        // §06: rate_extended_dist → PoissonProcess(weighted(<rate>, self_ref(<distribution>)))
         // No own variate — the inner distribution carries it.
         "rate_extended_dist" => {
             let rate = d
@@ -487,7 +487,7 @@ pub fn emit_distribution(
             Ok(b.call("PoissonProcess", &[weighted]))
         }
 
-        // §08: rate_density_dist → PoissonProcess(weighted(self_ref(<function>), Lebesgue(reals)))
+        // §06: rate_density_dist → PoissonProcess(weighted(self_ref(<function>), Lebesgue(reals)))
         // No own variate.
         "rate_density_dist" => {
             let fname = d
@@ -500,7 +500,7 @@ pub fn emit_distribution(
             Ok(b.call("PoissonProcess", &[weighted]))
         }
 
-        // §08: bincounts_extended_dist → BinnedPoissonProcess(<bins>, weighted(<rate>, self_ref(<distribution>)))
+        // §06: bincounts_extended_dist → BinnedPoissonProcess(<bins>, weighted(<rate>, self_ref(<distribution>)))
         "bincounts_extended_dist" => {
             let rate = d
                 .extra
@@ -523,7 +523,7 @@ pub fn emit_distribution(
             Ok(b.call("BinnedPoissonProcess", &[bins, weighted]))
         }
 
-        // §08: bincounts_density_dist → BinnedPoissonProcess(<bins>, weighted(self_ref(<function>), Lebesgue(reals)))
+        // §06: bincounts_density_dist → BinnedPoissonProcess(<bins>, weighted(self_ref(<function>), Lebesgue(reals)))
         "bincounts_density_dist" => {
             let fname = d
                 .extra

@@ -23,7 +23,7 @@
 //!
 //! What the keyword list uniquely and correctly carries: the §03 set names, the
 //! constants, the measure ops and structural constructs `ops.rs` types by hand,
-//! and the four §08 distributions with no catalogue row at all — `Dirac`,
+//! and the four §06 measure constructors with no catalogue row at all — `Dirac`,
 //! `Lebesgue`, `Counting`, `PoissonProcess`.
 
 use flatppl_core::{Call, CallHead, Module, Node, NodeId};
@@ -490,12 +490,12 @@ mod tests {
         }
     }
 
-    /// The four §08 distributions with no catalogue row of any kind still
+    /// The four §06 measure constructors with no catalogue row of any kind still
     /// resolve — they are base builtins the keyword list is the only record of.
     #[test]
     fn rowless_base_distributions_are_base_names() {
         for name in ["Dirac", "Lebesgue", "Counting", "PoissonProcess"] {
-            assert!(is_base_name(name), "`{name}` is a §08 distribution");
+            assert!(is_base_name(name), "`{name}` is a §06 measure constructor");
         }
     }
 

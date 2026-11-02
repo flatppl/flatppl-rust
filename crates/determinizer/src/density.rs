@@ -6804,14 +6804,14 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     broadcast::sum_density(m, m_inner, v)
 }
 
-/// `logdensityof(PoissonProcess(intensity = M), v)` — the extended unbinned
+/// `logdensityof(PoissonProcess(M), v)` — the extended unbinned
 /// log-likelihood
 /// ```text
 /// Σ_j logdensityof(M, v[j]) − totalmass(M)
 /// ```
-/// which is §08 `PoissonProcess`'s density w.r.t. `iid(Lebesgue, k)`,
+/// which is §06 `PoissonProcess`'s density w.r.t. `iid(Lebesgue, k)`,
 /// $\left(\prod_i \lambda(t_i)\right)\exp\left(-\int\lambda\right)$, in log
-/// space, with $\lambda$ the intensity's own density. §08's note names it: "In
+/// space, with $\lambda$ the intensity's own density. §06's note names it: "In
 /// particle physics, a likelihood based on a Poisson process is often called an
 /// extended likelihood."
 ///
@@ -6821,7 +6821,7 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
 ///   argument for [`lower_iid`]'s `iid_static_size` to read. The per-event sum is
 ///   unrolled over the VARIATE's own statically-known length instead
 ///   ([`static_array_variate_len`]). A dynamic-length variate is refused; so is a
-///   TABLE variate (§08's record-valued points), whose per-row access is not
+///   TABLE variate (§06's record-valued points), whose per-row access is not
 ///   `get0`.
 /// * **`Λ = totalmass(M)` must be closed form**, since `totalmass` is a
 ///   measure-layer query and not FlatPDL ([`closed_form_totalmass`]).
@@ -6833,13 +6833,16 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
     let intensity = {
         let c = expect_builtin_call(m, node, "PoissonProcess")
             .ok_or_else(|| refuse(node, m, "expected PoissonProcess"))?;
-        named_or_positional(m, c, "intensity").ok_or_else(|| {
-            refuse(
-                node,
-                m,
-                "PoissonProcess expects one `intensity` measure (spec §08)",
-            )
-        })?
+        match c.args.as_ref() {
+            [intensity] if c.named.is_empty() => *intensity,
+            _ => {
+                return Err(refuse(
+                    node,
+                    m,
+                    "PoissonProcess expects one positional `intensity` measure (spec §06)",
+                ));
+            }
+        }
     };
 
     let n = static_array_variate_len(m, v).ok_or_else(|| {
@@ -6873,7 +6876,7 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
     Ok(build_call(m, "sub", &[events_term, total_mass]))
 }
 
-/// `logdensityof(BinnedPoissonProcess(bins, intensity), n)` through §08's
+/// `logdensityof(BinnedPoissonProcess(bins, intensity), n)` through §06's
 /// fixed-bins equivalence `pushfwd(fn(bincounts(bins, _)), PoissonProcess(intensity))`.
 /// A Poisson process puts independent Poisson counts in disjoint sets, each with
 /// mean the intensity's mass there, so with edges $e_0 < \dots < e_k$
@@ -6894,20 +6897,13 @@ fn lower_binned_poisson_process(
     let (bins, intensity) = {
         let c = expect_builtin_call(m, node, "BinnedPoissonProcess")
             .ok_or_else(|| refuse(node, m, "expected BinnedPoissonProcess"))?;
-        let keyword = |name: &str| {
-            c.named
-                .iter()
-                .find(|n| m.resolve(n.name) == name)
-                .map(|n| n.value)
-        };
-        match (keyword("bins"), keyword("intensity"), c.args.as_ref()) {
-            (Some(bins), Some(intensity), []) => (bins, intensity),
-            (None, None, [bins, intensity]) => (*bins, *intensity),
+        match c.args.as_ref() {
+            [bins, intensity] if c.named.is_empty() => (*bins, *intensity),
             _ => {
                 return Err(refuse(
                     node,
                     m,
-                    "BinnedPoissonProcess expects `bins` and `intensity` (spec §08)",
+                    "BinnedPoissonProcess expects positional `bins` and `intensity` (spec §06)",
                 ));
             }
         }
@@ -6935,6 +6931,18 @@ fn lower_binned_poisson_process(
             "BinnedPoissonProcess's edge vector has no static length",
         )
     })?;
+    // §07 `bincounts`: "Each edge vector must be strictly increasing".
+    let values: Vec<Option<f64>> = edges.iter().map(|&edge| static_real(m, edge)).collect();
+    let not_increasing = values
+        .windows(2)
+        .any(|pair| matches!(pair, [Some(lo), Some(hi)] if hi <= lo));
+    if not_increasing {
+        return Err(refuse(
+            node,
+            m,
+            "BinnedPoissonProcess's bin edges must be strictly increasing (spec §07 `bincounts`)",
+        ));
+    }
     let bins_count = edges.len().saturating_sub(1);
     if static_array_variate_len(m, v).is_some_and(|n| n as usize != bins_count) {
         return Err(refuse(
@@ -6998,7 +7006,46 @@ fn lower_binned_poisson_process(
         let nan = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
         score = build_call(m, "ifelse", &[valid, score, nan]);
     }
+    if values.iter().any(Option::is_none) {
+        score = add_bin_edge_check(m, bins, score);
+    }
     Ok(score)
+}
+
+/// Add the edge-validity check of edges known only at run time to `score`.
+///
+/// FlatPDL has no runtime parameter check, and the closed form drops the edges. So
+/// the score keeps a `bincounts` call, whose own edge check (§07 "Each edge vector
+/// must be strictly increasing") fails at run time, as StableHLO status 8 or a JS
+/// error. FlatPDL has no empty vector literal, so the edges bin themselves: for
+/// strictly increasing edges every edge lands in a bin, and the term
+/// `sum(bincounts(bins, bins)) - lengthof(bins)` is zero. It is bound to a synthetic
+/// `__bin_edge_check_<n>` binding so the output names it.
+fn add_bin_edge_check(m: &mut Module, bins: NodeId, score: NodeId) -> NodeId {
+    let counts = build_call(m, "bincounts", &[bins, bins]);
+    let total = build_call(m, "sum", &[counts]);
+    let length = build_call(m, "lengthof", &[bins]);
+    let check = build_call(m, "sub", &[total, length]);
+    let mut index = m.binding_count();
+    let name = loop {
+        let name = m.intern(&format!("__bin_edge_check_{index}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        index += 1;
+    };
+    m.add_binding(flatppl_core::Binding {
+        name,
+        rhs: check,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    let check = m.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }));
+    build_call(m, "add", &[score, check])
 }
 
 /// Whether an atom-bearing leaf, a `Dirac` or a law over the integers, sits under
