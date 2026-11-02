@@ -406,8 +406,11 @@ impl Emitter<'_> {
         }
         let n = self.cell_len(value);
         let p = self.convert(value, ElemKind::Real);
-        let least = self.per_call(&p, false);
         let zero = self.scalar(0.0);
+        if let Some(flag) = self.simplex_violation_one_reduction(&p, n) {
+            return vec![flag];
+        }
+        let least = self.per_call(&p, false);
         let negative = self.compare("LT", &least, &zero);
         let total = self.reduce_sum_last_axis(&p);
         let one = self.scalar(1.0);
@@ -424,6 +427,39 @@ impl Emitter<'_> {
         let infinite = self.compare("EQ", &largest, &infinity);
         let flag = self.either(&negative, &far);
         vec![self.either(&flag, &infinite)]
+    }
+}
+
+impl Emitter<'_> {
+    /// [`Emitter::simplex_violations`] for an unbatched vector, with one
+    /// reduction: `[p, p - |p|]` sums to the total and to twice the sum of the
+    /// negative cells, which is negative exactly when a cell is. On XLA's CPU
+    /// backend each separate reduction is its own small kernel.
+    fn simplex_violation_one_reduction(&mut self, p: &Value, n: usize) -> Option<Value> {
+        if self.batch_rank(p) != 0 || !matches!(&p.ty, MlirTy::Ranked(dims) if dims.len() == 1) {
+            return None;
+        }
+        let magnitude = self.abs(p);
+        let negative_part = self.sub(p, &magnitude);
+        let both = self.vector(&[p.clone(), negative_part]);
+        let sums = self.reduce_sum_last_axis(&both);
+        let total = self.slice(&sums, &[0], &[1], &[1]);
+        let total = self.reshape(&total, MlirTy::Scalar);
+        let negatives = self.slice(&sums, &[1], &[2], &[1]);
+        let negatives = self.reshape(&negatives, MlirTy::Scalar);
+        let zero = self.scalar(0.0);
+        let negative = self.compare("LT", &negatives, &zero);
+        let one = self.scalar(1.0);
+        let error = self.sub(&total, &one);
+        let error = self.abs(&error);
+        let scale = self.max(&total, &one);
+        let rounding = self.scalar(simplex_tolerance(n, self.dtype));
+        let tolerance = self.mul(&scale, &rounding);
+        let far = self.compare("GT", &error, &tolerance);
+        let infinity = self.scalar(f64::INFINITY);
+        let infinite = self.compare("EQ", &total, &infinity);
+        let flag = self.either(&negative, &far);
+        Some(self.either(&flag, &infinite))
     }
 }
 

@@ -200,7 +200,12 @@ fn a_runtime_simplex_checks_cells_and_total() {
         "posintegers",
     ));
     assert!(checked(&ir), "{ir}");
-    assert!(ir.contains("applies stablehlo.minimum"), "{ir}");
+    // The total and the negative cells come from one reduction of `[p, p - |p|]`.
+    assert!(
+        ir.contains("(tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>"),
+        "{ir}"
+    );
+    assert!(!ir.contains("applies stablehlo.minimum"), "{ir}");
     // The f32 allowance for three cells, 8 * 3 * 2^-23.
     assert!(ir.contains("dense<0.00000286102294921875>"), "{ir}");
     // One status merge covers the cells and the total.
