@@ -2886,8 +2886,7 @@ fn require_square_cov(e: &Emitter, blame: NodeId, cov: &Value, n: u64) -> Result
 /// §08 MvNormal, verbatim: `log f = -(n/2)*log(2*pi) - 1/2*log|Sigma| -
 /// 1/2*(x-mu)^T Sigma^-1 (x-mu)`. Cholesky supplies the log determinant;
 /// solving `L y = x-mu` supplies the quadratic form without an inverse.
-/// The solve requires matrix RHS cells, so reshape each vector to `[n, 1]`
-/// and restore `[n]` before reduction. Broadcast axes remain separate.
+/// Broadcast axes remain separate.
 fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu_id = p.field_id(e, "mu")?;
     let mu = e.lower_node(mu_id)?;
@@ -2906,11 +2905,7 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let neg_half_log_det = e.mul(&neg_half, &log_det);
 
     let diff = e.sub(v, &mu);
-    let vec_ty = MlirTy::Ranked(vec![Some(n)]);
-    let col_ty = MlirTy::Ranked(vec![Some(n), Some(1)]);
-    let diff_col = e.reshape_cell(&diff, col_ty);
-    let y_col = e.tri_solve(&l, &diff_col);
-    let y = e.reshape_cell(&y_col, vec_ty);
+    let y = e.tri_solve_vector(&l, &diff, n);
     let y_sq = e.mul(&y, &y);
     let quad = e.reduce_sum(&y_sq);
     let neg_half_quad = e.mul(&neg_half, &quad);
