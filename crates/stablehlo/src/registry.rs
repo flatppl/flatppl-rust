@@ -4093,6 +4093,7 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
+    check_categorical_probabilities(e, probs_id, &probs, n)?;
     let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let mut cum = e.scalar(0.0);
@@ -4119,6 +4120,51 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
         count = e.broadcast_in_dim(&count, &[], batch_ty);
     }
     Ok(count)
+}
+
+/// §08 draws only from `p` in `stdsimplex(n)`. The inverse CDF would turn a
+/// negative, non-finite or zero-total `p` into a plausible index, so a runtime
+/// `p` with any of these reports status 7. A constant `p` is checked here.
+fn check_categorical_probabilities(
+    e: &mut Emitter,
+    id: NodeId,
+    probs: &Value,
+    n: u64,
+) -> Result<(), EmitError> {
+    if let Some(values) = e.constant_reals(probs) {
+        let valid =
+            values.iter().all(|p| p.is_finite() && *p >= 0.0) && values.iter().sum::<f64>() > 0.0;
+        if !valid {
+            return Err(EmitError::at(
+                id,
+                "Categorical sample: 'p' needs finite, nonnegative cells with a positive total",
+            ));
+        }
+        return Ok(());
+    }
+    let zero = e.scalar(0.0);
+    let infinity = e.scalar(f64::INFINITY);
+    let mut total = e.scalar(0.0);
+    let mut valid: Option<Value> = None;
+    for j in 0..n {
+        let p_j = vector_elem(e, probs, j);
+        // NaN fails both comparisons.
+        let nonnegative = e.compare("GE", &p_j, &zero);
+        let finite = e.compare("LT", &p_j, &infinity);
+        let cell = e.and(&nonnegative, &finite);
+        valid = Some(match valid {
+            Some(valid) => e.and(&valid, &cell),
+            None => cell,
+        });
+        total = e.add(&total, &p_j);
+    }
+    let positive = e.compare("GT", &total, &zero);
+    let valid = match valid {
+        Some(valid) => e.and(&valid, &positive),
+        None => positive,
+    };
+    e.record_runtime_error(&valid, 7);
+    Ok(())
 }
 
 /// §08 Categorical's sampler (1-based): [`draw_categorical`] with `base = 1.0`

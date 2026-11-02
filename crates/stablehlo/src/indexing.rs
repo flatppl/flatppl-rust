@@ -223,7 +223,7 @@ fn lower_selectors(
                 TensorSelector::Scalar(0)
             }
             _ => {
-                let index = e.lower_node(node)?;
+                let index = crate::ops::lower_selector(e, node)?;
                 if index.elem == ElemKind::Int && e.cell_ty(&index) == MlirTy::Scalar {
                     let size = extent
                         .ok_or_else(|| EmitError::at(id, "get/get0 requires a static axis"))?;

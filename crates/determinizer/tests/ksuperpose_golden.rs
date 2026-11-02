@@ -237,27 +237,92 @@ fn a_multivariate_family_lowers_to_per_component_slices() {
     );
 }
 
-/// §06 says the mixture "is sampleable whenever `kernel` is", so the refusal must
-/// read as UNIMPLEMENTED — a component-index draw that is not built — and must not
-/// be confused with `weighted`'s genuine intractability.
+/// A mixture draw is a component-index draw, then one draw of that component.
 #[test]
-fn sampling_a_mixture_refuses_as_unimplemented_not_intractable() {
+fn sampling_a_mixture_draws_an_index_then_its_component() {
+    for draw in [
+        "x = draw(mix)\ndraws = rand(lawof(x), s)",
+        "draws = rand(mix, s)",
+        "draws = rand(iid(mix, 5), s)",
+    ] {
+        let pir = lower(&format!(
+            "s = rnginit(0)\n\
+             w = [0.3, 1.2]\n\
+             mix = normalize(ksuperpose(Normal, w, mu = [-1.0, 2.0], sigma = 1.0))\n\
+             {draw}\n"
+        ));
+        assert_eq!(pir.matches("(builtin_sample ").count(), 2, "{draw}:\n{pir}");
+        assert!(pir.contains("Categorical0"), "{draw}:\n{pir}");
+        assert!(!pir.contains("ksuperpose"), "{draw}:\n{pir}");
+    }
+}
+
+/// §04 draws only from a probability measure, and §06 makes normalization
+/// explicit. A mixture whose unit mass is not proven needs `normalize`.
+#[test]
+fn an_unnormalized_mixture_refuses_to_sample() {
     let msg = refusal(
         "s = rnginit(0)\n\
-         w = [0.3, 1.2]\n\
-         mix = normalize(ksuperpose(Normal, w, mu = [-1.0, 2.0], sigma = 1.0))\n\
-         x = draw(mix)\n\
+         x = draw(ksuperpose(Normal, [0.3, 1.2], mu = [-1.0, 2.0], sigma = 1.0))\n\
          draws = rand(lawof(x), s)\n",
     );
     assert!(
-        msg.contains("ksuperpose") && msg.contains("not implemented"),
+        msg.contains("probability measure") && msg.contains("normalize"),
         "got: {msg}"
     );
-    assert!(
-        !msg.contains("intractable"),
-        "§06 makes the mixture sampleable in principle; the message must not say \
-         otherwise: {msg}"
+}
+
+/// §06 "Provably normalized superpositions": unexpanded simplex weights and
+/// literal weights that sum to one need no `normalize`.
+#[test]
+fn a_provably_normalized_mixture_samples_without_normalize() {
+    for weights in ["p", "[0.25, 0.75]"] {
+        let pir = lower(&format!(
+            "p = external(stdsimplex(2))\n\
+             x = draw(ksuperpose(Normal, {weights}, mu = [-1.0, 2.0], sigma = 1.0))\n\
+             draws = rand(lawof(x), rnginit(0))\n"
+        ));
+        assert!(pir.contains("Categorical0"), "{weights}:\n{pir}");
+    }
+}
+
+/// All-zero weights give the zero measure, which §06 `normalize` leaves undefined.
+#[test]
+fn a_zero_mass_mixture_refuses_to_sample() {
+    let msg = refusal(
+        "x = draw(normalize(ksuperpose(Normal, [0.0, 0.0], mu = [-1.0, 2.0], sigma = 1.0)))\n\
+         draws = rand(lawof(x), rnginit(0))\n",
     );
+    assert!(msg.contains("zero measure"), "got: {msg}");
+}
+
+/// Tables supply rows through both the splat and the unary record interface.
+#[test]
+fn table_rows_sample_through_both_kernel_interfaces() {
+    for kernel in ["Normal", "(r -> Normal(r.mu, r.sigma))"] {
+        for draw in ["rand(mix, s)", "rand(iid(mix, 4), s)"] {
+            let pir = lower(&format!(
+                "s = rnginit(0)\n\
+                 p = table(mu = [-1., 2.], sigma = [1., 0.5])\n\
+                 mix = normalize(ksuperpose({kernel}, [0.3, 1.2], p))\n\
+                 draws = {draw}\n"
+            ));
+            assert_eq!(
+                pir.matches("(builtin_sample ").count(),
+                2,
+                "{kernel}:\n{pir}"
+            );
+        }
+    }
+}
+
+#[test]
+fn iid_mixtures_of_vector_components_refuse() {
+    let msg = refusal(
+        "mix = normalize(ksuperpose(MvNormal, [1.0, 3.0], mu = [[0., 0.], [3., 3.]], cov = [eye(2)]))\n\
+         draws = rand(iid(mix, 4), rnginit(0))\n",
+    );
+    assert!(msg.contains("scalar components only"), "got: {msg}");
 }
 
 /// A single zero weight contributes `log 0 = −∞` and drops out of the

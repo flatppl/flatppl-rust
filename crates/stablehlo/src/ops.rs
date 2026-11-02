@@ -2977,7 +2977,7 @@ fn lower_get_gather(
 ) -> Result<Value, EmitError> {
     let operand = e.lower_node(container)?;
     let operand = e.with_typed_axes(container, operand);
-    let idx = e.lower_node(index)?;
+    let idx = lower_selector(e, index)?;
     get_gather_value(e, id, operand, idx, base)
 }
 
@@ -3048,8 +3048,26 @@ pub(crate) fn get_outer(
         }
         return get_literal_value(e, id, v, (selector - base) as u64);
     }
-    let idx = e.lower_node(index)?;
+    let idx = lower_selector(e, index)?;
     get_gather_value(e, id, v, idx, base)
+}
+
+/// Lower a runtime selector. Discrete samplers hold their integer values in
+/// real tensors, so an integer-typed real converts exactly.
+pub(crate) fn lower_selector(e: &mut Emitter, node: NodeId) -> Result<Value, EmitError> {
+    let value = e.lower_node(node)?;
+    let integer = match e.type_of(node) {
+        Some(Type::Scalar(flatppl_core::ScalarType::Integer)) => true,
+        Some(Type::Array { elem, .. }) => {
+            matches!(**elem, Type::Scalar(flatppl_core::ScalarType::Integer))
+        }
+        _ => false,
+    };
+    Ok(if integer && value.elem == ElemKind::Real {
+        e.convert(&value, ElemKind::Int)
+    } else {
+        value
+    })
 }
 
 /// `get`/`get0`'s selector must be a literal integer (matching how the

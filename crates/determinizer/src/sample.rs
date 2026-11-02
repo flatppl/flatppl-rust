@@ -39,6 +39,8 @@ use flatppl_core::{
 
 #[path = "sample_broadcast.rs"]
 mod broadcast;
+#[path = "sample_ksuperpose.rs"]
+mod mixture;
 
 /// `rand(m, rng)` → a deterministic sample of the closed measure `m`.
 ///
@@ -280,6 +282,9 @@ fn lower_closed_measure_sample(
     }
     if let Some(law) = crate::density::exponential_tilt::recognize(m, resolved) {
         return sample_exponential_tilt(m, law, rng, None);
+    }
+    if let Some((mix, normalized)) = mixture::recognize(m, resolved) {
+        return mixture::lower(m, mix, normalized, None, rng, None);
     }
     match builtin_name(m, resolved) {
         Some("lawof") => {
@@ -579,9 +584,6 @@ fn lower_measure_sample(
 /// [`lower_closed_measure_sample`]'s fallback, and (via
 /// [`classify_drawn_measure`]) the two places a `draw`'s inner measure is read.
 fn classify_intractable_or_deferred(m: &Module, resolved: NodeId) -> Option<RefuseError> {
-    if let Some(lift) = applied_ksuperpose_under_normalize(m, resolved) {
-        return Some(refuse_ksuperpose_sample(m, lift));
-    }
     match builtin_name(m, resolved) {
         Some("weighted") | Some("logweighted") | Some("bayesupdate") => {
             Some(refuse_weighted_family(m, resolved))
@@ -623,38 +625,6 @@ fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
         m,
         "draw(pushfwd(f, M)) is a fresh, independent draw from the pushforward law, not a function \
          of the draws inside M; resampling M independently is not implemented",
-    )
-}
-
-/// Find a direct mixture, looking through its optional normalization wrapper.
-fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<NodeId> {
-    let mut node = resolved;
-    if let Some(c) = expect_builtin_call(m, node, "normalize") {
-        if c.args.len() != 1 {
-            return None;
-        }
-        node = resolve_ref(m, c.args[0]).0;
-    }
-    expect_builtin_call(m, node, "ksuperpose").map(|_| node)
-}
-
-/// `ksuperpose`: refused in SAMPLE mode, and not because it is intractable.
-///
-/// §06 is explicit the other way: "Because the weights do not depend on the
-/// variate, the mixture is sampleable whenever `kernel` is." Drawing it is the
-/// two-stage ancestral sample — pick a component index with probability
-/// proportional to `w`, then sample that component — which needs a discrete
-/// index sampler threaded through the family axis, and that is not built. So this
-/// refuses as UNIMPLEMENTED, deliberately worded apart from
-/// [`refuse_weighted_family`]'s intractability: a reader must not conclude the
-/// mixture cannot be sampled in principle.
-fn refuse_ksuperpose_sample(m: &Module, id: NodeId) -> RefuseError {
-    refuse(
-        id,
-        m,
-        "sampling a ksuperpose mixture is not implemented (§06 makes it sampleable \
-         whenever the component kernel is, via a component-index draw, but the \
-         two-stage sampler over the family axis is not built)",
     )
 }
 
@@ -752,6 +722,9 @@ fn lower_draw(
     }
     if let Some(law) = crate::density::exponential_tilt::recognize(m, inner_resolved) {
         return sample_exponential_tilt(m, law, rng, sample_name);
+    }
+    if let Some((mix, normalized)) = mixture::recognize(m, inner_resolved) {
+        return mixture::lower(m, mix, normalized, None, rng, sample_name);
     }
     if let Some(err) = classify_drawn_measure(m, inner_resolved) {
         return Err(err);
@@ -942,6 +915,9 @@ fn lower_iid_sample(
             "iid sample size is not a statically-resolved shape (dynamic or unresolved domain)",
         )
     })?;
+    if let Some((mix, normalized)) = mixture::recognize(m, kernel) {
+        return mixture::lower(m, mix, normalized, Some(&shape), rng, sample_name);
+    }
     if let Some(law) = crate::density::exponential_tilt::recognize(m, kernel) {
         let (ctor, parameters) = exponential_tilt_constructor(m, &law)
             .ok_or_else(|| refuse(law.measure, m, "exponential tilt needs a primitive law"))?;

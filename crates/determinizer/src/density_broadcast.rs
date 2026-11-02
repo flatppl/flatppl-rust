@@ -469,7 +469,7 @@ pub(super) fn mixture_density(
 
 /// logsumexp's public input is a vector. Enumerate a tensor's coordinates
 /// with one shared gather body; the expression size depends on rank, not size.
-fn flatten_terms(m: &mut Module, terms: NodeId) -> Result<Option<NodeId>, RefuseError> {
+pub(crate) fn flatten_terms(m: &mut Module, terms: NodeId) -> Result<Option<NodeId>, RefuseError> {
     let ty = m.type_of(terms).cloned().or_else(|| {
         flatppl_infer::infer_expression(m, terms, &[])
             .0
@@ -504,24 +504,14 @@ fn flatten_terms(m: &mut Module, terms: NodeId) -> Result<Option<NodeId>, Refuse
     let zeros = build_call(m, "zeros", &[count]);
     let indices = build_call(m, "indicesof0", &[zeros]);
     let (label, reference, index) = placeholder(m, Type::Scalar(ScalarType::Integer));
-    let one = m.alloc(Node::Lit(Scalar::Int(1)));
-    let mut stride = 1u64;
-    let mut coordinates = Vec::new();
-    for &dim in shape.iter().rev() {
-        let divisor = m.alloc(Node::Lit(Scalar::Int(stride as i64)));
-        let quotient = build_call(m, "div", &[index, divisor]);
-        let extent = m.alloc(Node::Lit(Scalar::Int(dim as i64)));
-        let coordinate = build_call(m, "mod", &[quotient, extent]);
-        coordinates.push(build_call(m, "add", &[coordinate, one]));
-        stride *= u64::from(dim);
-    }
+    let coordinates = flat_coordinates(m, index, &shape);
     let tensor_type = Type::Array {
         shape: shape.iter().copied().map(Dim::Static).collect(),
         elem: Box::new(Type::Scalar(ScalarType::Real)),
     };
     let (tensor_label, tensor_ref, tensor) = placeholder(m, tensor_type);
     let mut selectors = vec![tensor];
-    selectors.extend(coordinates.into_iter().rev());
+    selectors.extend(coordinates);
     let cell = build_call(m, "get", &selectors);
     let singleton = build_call(m, "vector", &[terms]);
     Ok(Some(map_body(
@@ -531,6 +521,23 @@ fn flatten_terms(m: &mut Module, terms: NodeId) -> Result<Option<NodeId>, Refuse
         vec![indices, singleton],
         1,
     )))
+}
+
+/// The one-based coordinates of a zero-based row-major flat `index` in `shape`.
+pub(crate) fn flat_coordinates(m: &mut Module, index: NodeId, shape: &[u32]) -> Vec<NodeId> {
+    let one = m.alloc(Node::Lit(Scalar::Int(1)));
+    let mut stride = 1u64;
+    let mut coordinates = Vec::with_capacity(shape.len());
+    for &dim in shape.iter().rev() {
+        let divisor = m.alloc(Node::Lit(Scalar::Int(stride as i64)));
+        let quotient = build_call(m, "div", &[index, divisor]);
+        let extent = m.alloc(Node::Lit(Scalar::Int(dim as i64)));
+        let coordinate = build_call(m, "mod", &[quotient, extent]);
+        coordinates.push(build_call(m, "add", &[coordinate, one]));
+        stride *= u64::from(dim);
+    }
+    coordinates.reverse();
+    coordinates
 }
 
 struct BoundCall {

@@ -1430,7 +1430,7 @@ fn lower_ksuperpose_inner(
 }
 
 /// The number of axes belonging to a collection, excluding its element's axes.
-fn outer_rank(t: &Type) -> usize {
+pub(crate) fn outer_rank(t: &Type) -> usize {
     match t {
         Type::Array { shape, .. } => shape.len(),
         Type::TVector { .. } | Type::Table { .. } => 1,
@@ -4169,7 +4169,7 @@ pub(crate) fn normalized_scalar_weight(m: &mut Module, node: NodeId) -> Option<(
 }
 
 /// Join only collection axes; nested element axes remain inside each cell.
-fn broadcast_collection_shape(m: &Module, operands: &[NodeId]) -> Option<Vec<Dim>> {
+pub(crate) fn broadcast_collection_shape(m: &Module, operands: &[NodeId]) -> Option<Vec<Dim>> {
     let mut shape: Option<Vec<Dim>> = None;
     for &operand in operands {
         let axes = match m.type_of(operand) {
@@ -4242,22 +4242,33 @@ fn recognize_markov_ksuperpose(m: &mut Module, node: NodeId) -> Option<NodeId> {
     if shape.contains(&Dim::Static(0)) {
         return Some(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
+    let expanded = ksuperpose_expanded_weights(m, &operands, &shape)?;
+    if shape.is_empty() {
+        return Some(expanded);
+    }
+    Some(build_call(m, "sum", &[expanded]))
+}
+
+/// The weights of every broadcast element, in the broadcast shape. `operands`
+/// starts with the weights; `shape` is their joint broadcast shape.
+pub(crate) fn ksuperpose_expanded_weights(
+    m: &mut Module,
+    operands: &[NodeId],
+    shape: &[Dim],
+) -> Option<NodeId> {
+    let weights = *operands.first()?;
     let weight_shape = match m.type_of(weights) {
         Some(Type::Array { shape, .. }) => shape.to_vec(),
         _ => Vec::new(),
     };
-    let rank = shape.len();
     let unexpanded = shape == weight_shape && shape.iter().all(|d| matches!(d, Dim::Static(_)));
-    if rank == 0 {
+    if shape.is_empty() || unexpanded {
         return Some(weights);
-    }
-    if unexpanded {
-        return Some(build_call(m, "sum", &[weights]));
     }
     let mut inputs = Vec::new();
     let mut args = Vec::new();
     let mut weight_cell = weights;
-    for (i, operand) in operands.into_iter().enumerate() {
+    for (i, &operand) in operands.iter().enumerate() {
         if m.type_of(operand).is_some_and(|t| outer_rank(t) > 0) {
             let cell = broadcast::cell_input(m, operand, &mut inputs, &mut args).ok()?;
             if i == 0 {
@@ -4265,8 +4276,13 @@ fn recognize_markov_ksuperpose(m: &mut Module, node: NodeId) -> Option<NodeId> {
             }
         }
     }
-    let expanded = broadcast::map_body(m, weight_cell, inputs, args, rank);
-    Some(build_call(m, "sum", &[expanded]))
+    Some(broadcast::map_body(
+        m,
+        weight_cell,
+        inputs,
+        args,
+        shape.len(),
+    ))
 }
 
 /// Recognize `superpose(weighted(w₁, A₁), …, weighted(wₖ, Aₖ))` (k ≥ 2) as a
