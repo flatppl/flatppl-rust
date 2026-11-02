@@ -494,6 +494,9 @@ fn graft_cross_module_target(
     bundle: &ModuleBundle,
     imports: &mut GraftState,
 ) -> Result<Option<NodeId>, RefuseError> {
+    if crate::boxes::is_box_ref(m, target) {
+        return Ok(None);
+    }
     let module_ref = if is_module_ref(m, target) {
         target
     } else {
@@ -712,6 +715,7 @@ pub(crate) fn graft_kernel_application_callee(
     // primitive constructor whose tag is the bare member name.
     if crate::crossmodule::std_module_member(m, callee).is_some()
         || crate::crossmodule::std_module_member(m, callee_resolved).is_some()
+        || crate::boxes::is_box_ref(m, callee)
     {
         return Ok(None);
     }
@@ -1772,6 +1776,9 @@ fn lower_measure_density_in_reference(
     // level: `M = g1` is a §04 bare-name alias of `g1`'s expression, so stopping
     // at `M`'s ref-node right-hand side would refuse it as a non-constructor.
     let (measure_node, _binding_opt) = resolve_ref_chain(m, measure_expr);
+    if let Some(term) = crate::boxes::density_leaf(m, measure_node, v) {
+        return term;
+    }
     if let Some(expanded) = crate::canon::expand_composed_call(m, measure_node) {
         return lower_measure_density_in_reference(m, expanded, v, origin, atoms);
     }
@@ -6735,6 +6742,9 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // The empty product has log density zero without evaluating a density body.
     if shape.contains(&0) {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+    if let Some(term) = crate::boxes::iid_density(m, m_inner, v, &shape) {
+        return term;
     }
     if shape.len() > 1 {
         return broadcast::sum_density(m, m_inner, v);

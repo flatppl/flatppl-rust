@@ -98,6 +98,7 @@ pub fn determinize_with_options(
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
+    crate::boxes::refuse_unnormalized_draws(&work)?;
 
     // Cross-module alias resolution pre-pass: resolve every top-level
     // host binding whose RHS is a bare cross-module `(%ref <alias> member)` ref IN

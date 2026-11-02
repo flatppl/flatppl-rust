@@ -36,6 +36,8 @@ use crate::refuse::EmitError;
 
 #[path = "batching.rs"]
 mod batching;
+#[path = "boxes.rs"]
+mod boxes;
 #[path = "constants.rs"]
 mod constants;
 #[path = "enzyme.rs"]
@@ -175,6 +177,9 @@ pub struct Emitter<'m> {
     constants: HashMap<String, constants::Constant>,
     broadcast_frame: Vec<Option<u64>>,
     call_frame: Vec<Option<u64>>,
+    /// Nesting depth of region bodies being emitted. A box query must stay a
+    /// top-level operation, so the executor can bind it.
+    region_depth: usize,
     body: String,
     /// The threaded rng-state key (spec §07 rng ABI). Set by
     /// [`crate::registry::lower_sample`] from a `builtin_sample`'s rng arg
@@ -233,6 +238,7 @@ impl<'m> Emitter<'m> {
             constants: HashMap::new(),
             broadcast_frame: Vec::new(),
             call_frame: Vec::new(),
+            region_depth: 0,
             body: String::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
@@ -257,6 +263,7 @@ impl<'m> Emitter<'m> {
         emitter.target = self.target;
         emitter.host_batch = self.host_batch;
         emitter.runtime_batch_rank = self.runtime_batch_rank;
+        emitter.region_depth = self.region_depth + 1;
         emitter
     }
 
@@ -3801,7 +3808,9 @@ impl<'m> Emitter<'m> {
         let saved_expanded = std::mem::take(&mut self.expanded);
         let incoming_status = self.runtime_status.take();
         let incoming_unmapped = std::mem::take(&mut self.runtime_unmapped_check);
+        self.region_depth += 1;
         let pred = cond(&mut *self, &arg_names);
+        self.region_depth -= 1;
         let condition_status = self.runtime_status.take();
         let cond_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
@@ -3818,7 +3827,9 @@ impl<'m> Emitter<'m> {
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
+        self.region_depth += 1;
         let next = body(&mut *self, &arg_names);
+        self.region_depth -= 1;
         let body_status = self.runtime_status.take();
         let body_unmapped = std::mem::take(&mut self.runtime_unmapped_check);
         let mut do_body = std::mem::replace(&mut self.body, saved);
@@ -4218,6 +4229,9 @@ impl<'m> Emitter<'m> {
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
+        if let Some(result) = self.lower_box_broadcast(id, args) {
+            return result;
+        }
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
@@ -4511,7 +4525,12 @@ impl<'m> Emitter<'m> {
                     // dispatch to the distribution registry (`crate::registry`),
                     // never to `ops::lower_builtin`'s deterministic
                     // (non-distribution) map — see that module's doc comment.
-                    if name == "builtin_logdensityof" {
+                    if let Some(result) = matches!(name.as_str(), "builtin_logdensityof" | "builtin_sample")
+                        .then(|| self.lower_box_primitive(id, &name, &call.args))
+                        .flatten()
+                    {
+                        result
+                    } else if name == "builtin_logdensityof" {
                         crate::registry::lower_logdensityof(self, id, &call.args)
                     } else if name == "builtin_sample" {
                         crate::registry::lower_sample(self, id, &call.args)
@@ -4608,7 +4627,9 @@ impl<'m> Emitter<'m> {
                         crate::ops::lower_builtin(self, id, &name, &call.args)
                     }
                 }
-                CallHead::User(callee) => self.lower_pyhf_call(id, callee, &call.args, false)
+                CallHead::User(callee) => self
+                    .lower_box_application(id, callee, &call.args)
+                    .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
                     .unwrap_or_else(|| Err(EmitError::at(
                         id,
                         "user-callable application has no lowering (expected to be inlined by determinize)",

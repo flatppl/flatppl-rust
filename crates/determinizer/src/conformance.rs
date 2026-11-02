@@ -117,7 +117,10 @@ fn check_node(
             reason: "stochastic-phase node (a `draw` survives)".into(),
         });
     }
+    // A box member in a primitive's tag slot is the box's own measure or kernel.
+    let box_tag = (kernel_allowed || tags.contains(&id)) && crate::boxes::is_box_ref(m, id);
     match m.type_of(id) {
+        _ if box_tag => {}
         Some(Type::Measure { .. }) => bad.push(NonConformance {
             node: id,
             kind: NonConformKind::MeasureTyped,
@@ -212,6 +215,8 @@ fn check_node(
         // primitives"), and the surface printer spells a user call `f(x)` exactly like a
         // builtin one, so nothing downstream can tell them apart.
         let retained = match c.head {
+            // A box function application is a primitive query of the box.
+            CallHead::User(callee) if crate::boxes::is_box_ref(m, callee) => true,
             CallHead::User(callee) if !options.retain_standard_functions.is_empty() => {
                 crate::stdfn::standard_function(m, callee)
                     .is_some_and(|(module, member)| options.retains(&module, &member))
@@ -246,7 +251,16 @@ fn check_node(
         // never fires and a mis-arity primitive would pass the gate.
         if let CallHead::Builtin(op) = c.head {
             let name = m.resolve(op);
-            if let Some((want, variadic)) = builtin_primitive_arity(name) {
+            if let Some((mut want, variadic)) = builtin_primitive_arity(name) {
+                // A box measure is a nullary kernel and takes no input argument.
+                let tag = usize::from(name == "builtin_sample");
+                if c.args
+                    .get(tag)
+                    .and_then(|&t| crate::boxes::box_ref(m, t))
+                    .is_some_and(|target| target.member().kind == flatppl_core::BoxKind::Measure)
+                {
+                    want -= 1;
+                }
                 let got = c.args.len() + c.named.len();
                 if got < want || (!variadic && got > want) {
                     bad.push(NonConformance {

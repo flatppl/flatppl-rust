@@ -200,6 +200,12 @@ enum Command {
         /// bindings are kept (backward-compatible).
         #[arg(long = "keep")]
         keep: Vec<String>,
+        /// Bind a black-box interface module to a box: `ALIAS=BOX:DESCRIBE`.
+        /// `ALIAS` is a top-level `load_module` binding of the model, `BOX` the
+        /// box name on its server, and `DESCRIBE` a file holding the box's
+        /// describe JSON (flatppl-bridge protocol). Repeatable.
+        #[arg(long = "box", value_name = "ALIAS=BOX:DESCRIBE")]
+        boxes: Vec<String>,
         /// Output form: canonical FlatPPL surface syntax, or FlatPIR
         /// S-expressions.
         #[arg(long, value_enum, default_value_t = EmitForm::Flatppl)]
@@ -242,6 +248,12 @@ enum Command {
         /// Maximum adaptive quadrature intervals. Failed convergence returns NaN.
         #[arg(long, default_value_t = 128, requires = "numerical_integrals")]
         integration_max_intervals: u32,
+        /// Bind a black-box interface module to a box: `ALIAS=BOX:DESCRIBE`.
+        /// `ALIAS` is a top-level `load_module` binding of the model, `BOX` the
+        /// box name on its server, and `DESCRIBE` a file holding the box's
+        /// describe JSON (flatppl-bridge protocol). Repeatable.
+        #[arg(long = "box", value_name = "ALIAS=BOX:DESCRIBE")]
+        boxes: Vec<String>,
         /// Output file (`.mlir`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -408,7 +420,8 @@ fn main() -> ExitCode {
             output,
             keep,
             emit,
-        } => determinize_cmd(&input, output.as_deref(), &keep, emit),
+            boxes,
+        } => determinize_cmd(&input, output.as_deref(), &keep, emit, &boxes),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             input,
@@ -420,10 +433,12 @@ fn main() -> ExitCode {
             integration_rtol,
             integration_atol,
             integration_max_intervals,
+            boxes,
             output,
         } => stablehlo_cmd(
             &input,
             &mode,
+            &boxes,
             &flatppl_stablehlo::EmitOptions {
                 dtype: if dtype == "f64" {
                     flatppl_stablehlo::Dtype::F64
@@ -970,6 +985,7 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
 fn load_and_infer(
     input: &Path,
     resolver: &CliResolver,
+    boxes: &[String],
 ) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
     let in_loc = resolver.model_location(&Location::Local(input.to_path_buf()))?;
     let source = resolver.read_string(&in_loc)?;
@@ -990,6 +1006,12 @@ fn load_and_infer(
     // `load_module` dependencies from the local cache (+ local files) so the
     // determiniser can graft in cross-module measure refs, same as `infer`.
     let bundle = flatppl_cli::resolve::compilation_bundle(&mut module, &in_loc, resolver)?;
+    let specs = boxes
+        .iter()
+        .map(|arg| parse_box_arg(arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    flatppl_host::bind_boxes(&mut module, &bundle, &specs)
+        .map_err(|e| Failure::Usage(format!("--box: {e}")))?;
     let (diags, bundle) =
         flatppl_infer::infer_module_with_inputs(&mut module, bundle, flatppl_infer::Level::Shape);
     let mut errors = 0u32;
@@ -1016,6 +1038,22 @@ fn load_and_infer(
     }
 
     Ok((module, bundle, source))
+}
+
+/// Read one `--box ALIAS=BOX:DESCRIBE` argument.
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn parse_box_arg(arg: &str) -> Result<(String, std::sync::Arc<flatppl_host::BoxSpec>), Failure> {
+    let usage = || Failure::Usage(format!("--box `{arg}`: expected ALIAS=BOX:DESCRIBE"));
+    let (alias, rest) = arg.split_once('=').ok_or_else(usage)?;
+    let (name, path) = rest.split_once(':').ok_or_else(usage)?;
+    if alias.is_empty() || path.is_empty() {
+        return Err(usage());
+    }
+    let json = fs::read_to_string(path)
+        .map_err(|e| Failure::Plain(format!("--box: reading `{path}`: {e}")))?;
+    let spec = flatppl_host::parse_describe(name, &json)
+        .map_err(|e| Failure::Usage(format!("--box: {e}")))?;
+    Ok((alias.to_string(), std::sync::Arc::new(spec)))
 }
 
 /// Render a determiniser refusal so the reader can find it in their own model: the
@@ -1090,9 +1128,10 @@ fn determinize_cmd(
     output: Option<&Path>,
     keep: &[String],
     emit: EmitForm,
+    boxes: &[String],
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
-    let (mut module, bundle, source) = load_and_infer(input, &resolver)?;
+    let (mut module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
     let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
     let roots = if syms.is_empty() {
         None
@@ -1130,11 +1169,12 @@ fn determinize_cmd(
 fn stablehlo_cmd(
     input: &Path,
     mode: &str,
+    boxes: &[String],
     opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
-    let (module, bundle, source) = load_and_infer(input, &resolver)?;
+    let (module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
 
     let mode = match mode {
         "logdensity" => flatppl_stablehlo::Mode::LogDensity,

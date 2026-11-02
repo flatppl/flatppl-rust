@@ -22,6 +22,7 @@
 
 mod axes;
 mod boundary;
+pub mod boxes;
 pub mod builtins;
 mod callable;
 mod catalogue;
@@ -37,8 +38,9 @@ use crate::modules::InferSession;
 use flatppl_core::{Module, NodeId, Type};
 use std::collections::HashMap;
 
+pub use boxes::{BOX_INPUT, box_input_names};
 pub use catalogue::{Catalogue, parse_catalogue};
-pub use modules::{ModuleBundle, module_source};
+pub use modules::{ModuleBundle, module_source, reintern_type};
 
 /// Return the process-global built-in catalogue (parsed once from the bundled
 /// `catalogue.ron`).

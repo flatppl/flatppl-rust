@@ -248,7 +248,19 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None)
+        self.compile_export(options, None, &[])
+    }
+
+    /// Compile with `load_module` aliases bound to black boxes. Each entry
+    /// names a top-level alias and the parsed describe reply of its box.
+    /// Box queries become `stablehlo.custom_call @flatppl.box` operations
+    /// that the executor binds.
+    pub fn compile_with_boxes(
+        &self,
+        options: &EmitOptions,
+        boxes: &[(String, Arc<crate::BoxSpec>)],
+    ) -> Result<Export, Diagnostic> {
+        self.compile_export(options, None, boxes)
     }
 
     /// Compile independent calls over explicit host batch axes.
@@ -257,18 +269,47 @@ impl LoadedModule {
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch))
+        self.compile_export(options, Some(batch), &[])
+    }
+
+    /// The typed root with `boxes` bound, inferred again.
+    fn typed_with_boxes(
+        &self,
+        boxes: &[(String, Arc<crate::BoxSpec>)],
+    ) -> Result<Module, Diagnostic> {
+        let mut typed = self.parsed().clone();
+        crate::bind_boxes(&mut typed, &self.bundle, boxes)
+            .map_err(|message| Diagnostic::new("boxes", self.source_name(), message))?;
+        let diagnostics = flatppl_infer::infer_module(&mut typed, &self.bundle, Level::Shape);
+        if let Some(d) = diagnostics
+            .into_iter()
+            .find(|d| d.severity == Severity::Error)
+        {
+            return Err(Diagnostic::new("infer", self.source_name(), d.message).at(
+                &typed,
+                d.node,
+                self.source(),
+            ));
+        }
+        Ok(typed)
     }
 
     fn compile_export(
         &self,
         options: &EmitOptions,
         batch: Option<&BatchSpec>,
+        boxes: &[(String, Arc<crate::BoxSpec>)],
     ) -> Result<Export, Diagnostic> {
-        let roots: Vec<_> = self
-            .typed
+        let bound;
+        let typed = if boxes.is_empty() {
+            &self.typed
+        } else {
+            bound = self.typed_with_boxes(boxes)?;
+            &bound
+        };
+        let roots: Vec<_> = typed
             .public_bindings()
-            .filter(|(_, b)| matches!(self.typed.resolve(b.name), "inputs" | "outputs"))
+            .filter(|(_, b)| matches!(typed.resolve(b.name), "inputs" | "outputs"))
             .map(|(_, b)| b.name)
             .collect();
         if roots.is_empty() {
@@ -279,7 +320,7 @@ impl LoadedModule {
             ));
         }
         let mut lowered = flatppl_determinizer::determinize_with_options(
-            &self.typed,
+            typed,
             &self.bundle,
             Some(&roots),
             &flatppl_determinizer::LoweringOptions {
@@ -289,7 +330,7 @@ impl LoadedModule {
         )
         .map_err(|e| {
             Diagnostic::new("determinize", self.source_name(), e.reason).at(
-                &self.typed,
+                typed,
                 Some(e.node),
                 self.source(),
             )
@@ -297,22 +338,18 @@ impl LoadedModule {
         crate::load_fixed_data(&mut lowered, |source| self.read_data(source)).map_err(|error| {
             // Lowering appends nodes and never renumbers, so only nodes of the
             // typed root module index its source.
-            let node = error.node.filter(|id| id.index() < self.typed.node_count());
+            let node = error.node.filter(|id| id.index() < typed.node_count());
             Diagnostic::new("load_data", self.source_name(), error.to_string()).at(
-                &self.typed,
+                typed,
                 node,
                 self.source(),
             )
         })?;
-        emit_query(lowered, &self.typed, options, batch).map_err(|e| {
+        emit_query(lowered, typed, options, batch).map_err(|e| {
             // Lowering appends nodes and never renumbers, so only nodes of the
             // typed root module index its source.
-            let node = e.node.filter(|id| id.index() < self.typed.node_count());
-            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(
-                &self.typed,
-                node,
-                self.source(),
-            )
+            let node = e.node.filter(|id| id.index() < typed.node_count());
+            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
         })
     }
 

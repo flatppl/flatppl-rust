@@ -910,9 +910,15 @@ fn op_rule(
                 .or_else(|| {
                     k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(2).map(|a| a.0)))
                 });
+            let first_size =
+                if k.is_some_and(|(n, _, _)| crate::boxes::is_box_measure(inf.module, *n)) {
+                    2
+                } else {
+                    3
+                };
             match variate {
                 Some(v) => {
-                    let size_args = args.get(3..).unwrap_or(&[]);
+                    let size_args = args.get(first_size..).unwrap_or(&[]);
                     let variate = if size_args.is_empty() {
                         v
                     } else {
@@ -7544,6 +7550,13 @@ fn arity_check(
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
     let arity = cat.base_arity(name)?;
+    let tag = crate::builtins::kernel_tag_index(name);
+    if tag
+        .and_then(|i| args.get(i))
+        .is_some_and(|(n, _, _)| crate::boxes::is_box_measure(inf.module, *n))
+    {
+        return None;
+    }
     let reading = arg_reading(inf, args, named, cat.base_takes_aggregate_whole(name), true)?;
     let got = reading.count;
     // A splat onto a row whose variadic inputs are UNNAMED can never bind, whatever the

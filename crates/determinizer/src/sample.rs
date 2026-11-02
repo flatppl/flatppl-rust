@@ -277,6 +277,9 @@ fn lower_closed_measure_sample(
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let (resolved, _) = resolve_ref(m, measure);
+    if let Some(sample) = crate::boxes::sample_leaf(m, resolved, rng, &[]) {
+        return Ok(sample_slots(m, sample?, None));
+    }
     if let Some(body) = crate::kernel::reduce_kernel_application(m, resolved) {
         return lower_closed_measure_sample(m, body, rng);
     }
@@ -716,6 +719,9 @@ fn lower_draw(
         c.args[0]
     };
     let (inner_resolved, _) = resolve_ref(m, inner_measure);
+    if let Some(sample) = crate::boxes::sample_leaf(m, inner_resolved, rng, &[]) {
+        return Ok(sample_slots(m, sample?, sample_name));
+    }
     if let Some(body) = crate::kernel::reduce_kernel_application(m, inner_resolved) {
         let draw = build_call(m, "draw", &[body]);
         return lower_draw(m, draw, rng, sample_name);
@@ -915,6 +921,9 @@ fn lower_iid_sample(
             "iid sample size is not a statically-resolved shape (dynamic or unresolved domain)",
         )
     })?;
+    if let Some(sample) = crate::boxes::sample_leaf(m, kernel, rng, &shape) {
+        return Ok(sample_slots(m, sample?, sample_name));
+    }
     if let Some((mix, normalized)) = mixture::recognize(m, kernel) {
         return mixture::lower(m, mix, normalized, Some(&shape), rng, sample_name);
     }
