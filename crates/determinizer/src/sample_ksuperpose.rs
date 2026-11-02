@@ -39,35 +39,15 @@ pub(super) fn lower(
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let mix = bind(m, mixture, normalized)?;
-    let (index, valid, rng) = draw_index(m, &mix, lanes, rng)?;
-    let (value, next) = match lanes {
+    let (index, rng) = draw_index(m, &mix, lanes, rng)?;
+    match lanes {
         None => {
             let component = component_at(m, &mix, index);
             let draw = build_call(m, "draw", &[component]);
-            lower_draw(m, draw, rng, sample_name)?
+            lower_draw(m, draw, rng, sample_name)
         }
-        Some(lanes) => draw_lanes(m, &mix, index, lanes.len(), rng, sample_name)?,
-    };
-    let domain = match measure_type(m, mixture) {
-        Some(Type::Measure { domain, .. }) => Some(*domain),
-        _ => None,
-    };
-    let integer = matches!(
-        domain,
-        Some(Type::Scalar(ScalarType::Integer | ScalarType::Boolean))
-    );
-    if lanes.is_none() && matches!(domain, Some(Type::Scalar(_))) {
-        let value = crate::density::exponential_tilt::guard_sample(m, value, valid, integer);
-        return Ok((value, next));
+        Some(lanes) => draw_lanes(m, &mix, index, lanes.len(), rng, sample_name),
     }
-    // An invalid mass makes every cell undefined, so the guard keeps the shape.
-    let sentinel = if integer {
-        m.alloc(Node::Lit(Scalar::Int(-1)))
-    } else {
-        m.alloc(Node::Lit(Scalar::Real(f64::NAN)))
-    };
-    let value = crate::density::tilt::elementwise(m, "ifelse", &[valid, value, sentinel]);
-    Ok((value, next))
 }
 
 fn measure_type(m: &mut Module, node: NodeId) -> Option<Type> {
@@ -213,14 +193,13 @@ fn literal_zero_weights(m: &Module, weights: NodeId) -> bool {
     }
 }
 
-/// Draw the zero-based flat component index. The guard rejects a runtime
-/// weight sum that is zero or not finite, and any negative weight.
+/// Draw the zero-based flat component index.
 fn draw_index(
     m: &mut Module,
     mix: &Mixture,
     lanes: Option<&[usize]>,
     rng: NodeId,
-) -> Result<(NodeId, NodeId, NodeId), RefuseError> {
+) -> Result<(NodeId, NodeId), RefuseError> {
     let operands: Vec<_> = std::iter::once(mix.weights)
         .chain(mix.positional.iter().copied())
         .chain(mix.named.iter().map(|(_, v)| *v))
@@ -247,16 +226,10 @@ fn draw_index(
             flatten_terms(m, expanded)?.expect("non-empty broadcast")
         }
     };
+    // A zero, non-finite or negative weight leaves `p` outside the simplex,
+    // which the Categorical sampler reports as a runtime status.
     let total = build_call(m, "sum", &[weights]);
     let probabilities = crate::density::tilt::elementwise(m, "divide", &[weights, total]);
-    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
-    let finite = build_call(m, "isfinite", &[total]);
-    let positive = build_call(m, "gt", &[total, zero]);
-    let smallest = build_call(m, "minimum", &[weights]);
-    let nonnegative = build_call(m, "ge", &[smallest, zero]);
-    let valid = build_call(m, "land", &[finite, positive]);
-    let valid = build_call(m, "land", &[valid, nonnegative]);
-
     let p = m.intern("p");
     let input = build_record(m, &[(p, probabilities)]);
     let categorical = m.intern("Categorical0");
@@ -274,7 +247,7 @@ fn draw_index(
         None => build_sample_term(m, categorical, input, rng, Some(name)),
         Some(lanes) => build_iid_sample_term(m, categorical, input, lanes, rng, Some(name)),
     };
-    Ok((index, valid, rng))
+    Ok((index, rng))
 }
 
 /// The component measure call at a zero-based flat `index`. A unit axis of an

@@ -81,3 +81,18 @@ fn single_and_iid_mixtures_emit_in_both_precisions() {
         }
     }
 }
+
+/// §08 draws only from `p` in `stdsimplex(n)`. Runtime weights that leave the
+/// simplex report status 7 rather than a plausible index.
+#[test]
+fn runtime_weights_report_a_status_and_constant_probabilities_do_not() {
+    let runtime = emit(
+        "w = external(cartpow(reals, 2))\ninputs = w\n\
+         outputs = rand(normalize(ksuperpose(Normal, w, mu = [-3.0, 3.0], sigma = 1.0)), \
+         rnginit(5))",
+    );
+    assert!(runtime.contains("flatppl.runtime_status"), "{runtime}");
+    assert!(runtime.contains("dense<7>"), "{runtime}");
+    let constant = emit("outputs = rand(Categorical(p = [0.25, 0.75]), rnginit(5))");
+    assert!(!constant.contains("flatppl.runtime_status"), "{constant}");
+}
