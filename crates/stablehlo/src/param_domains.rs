@@ -303,8 +303,8 @@ impl Emitter<'_> {
         self.select(a, a, b)
     }
 
-    /// `stdsimplex(n)`: a negative cell, or a sum farther than
-    /// [`simplex_tolerance`] from one.
+    /// `stdsimplex(n)`: a negative cell, an infinite sum, or a sum farther
+    /// than [`simplex_tolerance`] from one.
     fn simplex_violations(&mut self, value: &Value) -> Vec<Value> {
         if self.cell_ty(value) == MlirTy::Scalar {
             return Vec::new();
@@ -318,21 +318,28 @@ impl Emitter<'_> {
         let one = self.scalar(1.0);
         let error = self.sub(&total, &one);
         let error = self.abs(&error);
-        let error = self.per_call(&error, true);
-        let tolerance = self.scalar(simplex_tolerance(n, self.dtype));
-        let far = self.compare("GT", &error, &tolerance);
-        vec![self.either(&negative, &far)]
+        let scale = self.max(&total, &one);
+        let rounding = self.scalar(simplex_tolerance(n, self.dtype));
+        let tolerance = self.mul(&scale, &rounding);
+        let excess = self.sub(&error, &tolerance);
+        let excess = self.per_call(&excess, true);
+        let far = self.compare("GT", &excess, &zero);
+        let largest = self.per_call(&total, true);
+        let infinity = self.scalar(f64::INFINITY);
+        let infinite = self.compare("EQ", &largest, &infinity);
+        let flag = self.either(&negative, &far);
+        vec![self.either(&flag, &infinite)]
     }
 }
 
-/// The rounding allowance on the sum of an `n`-cell probability vector: each
-/// normalized cell and each partial sum rounds once.
+/// The relative rounding allowance on the sum of an `n`-cell probability
+/// vector, `8 n ε`, as for `in(p, stdsimplex(n))`. It scales with `max(sum, 1)`.
 pub(crate) fn simplex_tolerance(n: usize, dtype: Dtype) -> f64 {
     let epsilon = match dtype {
         Dtype::F32 => f64::from(f32::EPSILON),
         Dtype::F64 => f64::EPSILON,
     };
-    4.0 * n.max(1) as f64 * epsilon
+    8.0 * n.max(1) as f64 * epsilon
 }
 
 /// Whether every value a computation proves for a parameter lies in `set`.
@@ -385,9 +392,11 @@ fn constant_violates(set: ParamSet, values: &[f64], n: usize, dtype: Dtype) -> b
     };
     if set == ParamSet::StdSimplex {
         return values.iter().any(|p| *p < 0.0)
-            || values
-                .chunks(n.max(1))
-                .any(|cell| (cell.iter().sum::<f64>() - 1.0).abs() > simplex_tolerance(n, dtype));
+            || values.chunks(n.max(1)).any(|cell| {
+                let total = cell.iter().sum::<f64>();
+                total == f64::INFINITY
+                    || (total - 1.0).abs() > simplex_tolerance(n, dtype) * total.max(1.0)
+            });
     }
     values.iter().any(|x| violates(*x))
 }

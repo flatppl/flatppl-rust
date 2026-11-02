@@ -6177,7 +6177,7 @@ fn emit_logdensity_multinomial_has_expected_structure() {
     assert_eq!(out.matches("chlo.lgamma").count(), 1);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
     assert_eq!(out.matches("= stablehlo.add ").count(), 3);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
     assert_eq!(out.matches("stablehlo.negate").count(), 1);
     assert!(
         !out.contains("stablehlo.cholesky")

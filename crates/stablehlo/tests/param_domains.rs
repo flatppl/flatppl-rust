@@ -201,8 +201,8 @@ fn a_runtime_simplex_checks_cells_and_total() {
     ));
     assert!(checked(&ir), "{ir}");
     assert!(ir.contains("applies stablehlo.minimum"), "{ir}");
-    // The f32 allowance for three cells, 4 * 3 * 2^-23.
-    assert!(ir.contains("dense<0.000001430511474609375>"), "{ir}");
+    // The f32 allowance for three cells, 8 * 3 * 2^-23.
+    assert!(ir.contains("dense<0.00000286102294921875>"), "{ir}");
     // One status merge covers the cells and the total.
     assert_eq!(ir.matches("dense<9>").count(), 1, "{ir}");
 }

@@ -139,8 +139,9 @@ into that call's status. Executed loop iterations preserve the first error.
 Status 9 checks each parameter of a §08 or §09 distribution against the value
 set that section declares, for example `sigma = elementof(posreals)` for
 `Normal`. A scalar set on a vector parameter applies to each element.
-`stdsimplex(n)` requires nonnegative cells whose sum is within `4 n ε` of one,
-with `ε` the machine epsilon of the emitted precision. A NaN parameter propagates
+`stdsimplex(n)` requires nonnegative cells with a finite sum within
+`8 n ε max(sum, 1)` of one, the tolerance of `in(p, stdsimplex(n))`, with `ε` the
+machine epsilon of the emitted precision. A NaN parameter propagates
 without an error, as for status 3, so a `reals` parameter has no check. A
 positive definite matrix requires a Cholesky factor with a positive, finite
 diagonal. The check reads the factor that the density or sampler computes anyway.
