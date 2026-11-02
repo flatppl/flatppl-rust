@@ -233,3 +233,37 @@ fn fixed_data_summaries_check_their_parameters() {
     let ir = emit(source);
     assert!(checked(&ir), "{ir}");
 }
+
+#[test]
+fn unchecked_emission_keeps_the_static_checks_only() {
+    let source = density("sigma = elementof(reals)", "Normal(0.0, sigma)", "reals");
+    let mut module = flatppl_syntax::parse(&source).expect("parse");
+    assert!(flatppl_infer::infer(&mut module).is_empty());
+    let roots = [module.intern("inputs"), module.intern("outputs")];
+    let lowered = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .expect("determinize");
+    let options = EmitOptions {
+        restrict_enzyme_compatible: false,
+        check_parameters: false,
+        ..Default::default()
+    };
+    let ir = flatppl_stablehlo::emit(&lowered, Mode::LogDensity, &options).expect("emit");
+    assert!(!ir.contains("flatppl.runtime_status"), "{ir}");
+    let source = density("", "Dirichlet([1.0, -1.0])", "stdsimplex(2)");
+    let mut module = flatppl_syntax::parse(&source).expect("parse");
+    assert!(flatppl_infer::infer(&mut module).is_empty());
+    let roots = [module.intern("inputs"), module.intern("outputs")];
+    let lowered = flatppl_determinizer::determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &flatppl_stablehlo::LOWERING_OPTIONS,
+    )
+    .expect("determinize");
+    assert!(flatppl_stablehlo::emit(&lowered, Mode::LogDensity, &options).is_err());
+}

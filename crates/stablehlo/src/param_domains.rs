@@ -56,6 +56,9 @@ impl Emitter<'_> {
                 }
                 continue;
             }
+            if !self.check_parameters {
+                continue;
+            }
             // A check outside every region holds wherever the value is used.
             let key = (value.ssa.clone(), format!("{set:?}"));
             if self.checked_parameters.contains(&key) {
@@ -98,15 +101,13 @@ impl Emitter<'_> {
         name: &str,
         value: &Value,
     ) -> Result<(Value, Value), EmitError> {
-        let known = if self.proven_set(id) == Some(ParamSet::PosDefinite) {
-            true
-        } else if let Some(values) = self.constant_elements(value) {
+        let known = if let Some(values) = self.constant_elements(value) {
             if !constant_positive_definite(&values) {
                 return Err(outside(id, ctor, name, ParamSet::PosDefinite));
             }
             true
         } else {
-            false
+            !self.check_parameters || self.proven_set(id) == Some(ParamSet::PosDefinite)
         };
         let factor = self.cholesky(value);
         let diagonal = self.diag(&factor);

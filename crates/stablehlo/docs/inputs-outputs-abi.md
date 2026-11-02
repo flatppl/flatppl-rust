@@ -155,7 +155,9 @@ emit time:
   `stdsimplex(n)`. The dotted form applies the same rule to each element.
 
 Input arguments are always checked. The ABI does not enforce the set an `inputs`
-entry declares.
+entry declares. `flatppl stablehlo --check-parameters=false`
+(`EmitOptions::check_parameters`) emits no runtime parameter checks. Constants
+are still checked at emit time.
 
 Checks execute inside StableHLO before clamping gathers or unsafe conversions.
 Invalid calls use safe internal operands, but their returned values are not

@@ -148,6 +148,7 @@ pub struct Emitter<'m> {
     m: &'m Module,
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
+    check_parameters: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
@@ -223,6 +224,7 @@ impl<'m> Emitter<'m> {
             m,
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
+            check_parameters: true,
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,
@@ -256,6 +258,7 @@ impl<'m> Emitter<'m> {
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
+        emitter.check_parameters = opts.check_parameters;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
         emitter
@@ -265,6 +268,7 @@ impl<'m> Emitter<'m> {
     pub(super) fn scratch_emitter(&self) -> Self {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
+        emitter.check_parameters = self.check_parameters;
         emitter.integration = self.integration;
         emitter.target = self.target;
         emitter.host_batch = self.host_batch;
