@@ -163,7 +163,9 @@ are still checked at emit time.
 Checks execute inside StableHLO before clamping gathers or unsafe conversions.
 Invalid calls use safe internal operands, but their returned values are not
 valid results. Hosts must reject any nonzero status, including unknown codes,
-before exposing those values. A density of `-inf` is not an error.
+before exposing those values. For status 9 a host may instead replace the call's
+results with NaN, which an MCMC sampler rejects as a proposal. A density of `-inf`
+is not an error.
 
 The Python adapter exposes the status through JAX `checkify`. A host may carry
 the status through a larger compiled computation and check it once afterward.
