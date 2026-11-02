@@ -184,8 +184,12 @@ fn a_vector_parameter_is_checked_per_element() {
         "stdsimplex(3)",
     ));
     assert!(checked(&ir), "{ir}");
-    assert!(ir.contains("stablehlo.compare LE, %arg0"), "{ir}");
-    assert!(ir.contains("applies stablehlo.or"), "{ir}");
+    // The vector reduces to its minimum, which stays in the surrounding fusion.
+    assert!(
+        ir.contains("stablehlo.reduce(%arg0 init: %0) applies stablehlo.minimum"),
+        "{ir}"
+    );
+    assert!(!ir.contains("applies stablehlo.or"), "{ir}");
 }
 
 #[test]
@@ -196,7 +200,7 @@ fn a_runtime_simplex_checks_cells_and_total() {
         "posintegers",
     ));
     assert!(checked(&ir), "{ir}");
-    assert!(ir.contains("stablehlo.compare LT, %arg0"), "{ir}");
+    assert!(ir.contains("applies stablehlo.minimum"), "{ir}");
     // The f32 allowance for three cells, 4 * 3 * 2^-23.
     assert!(ir.contains("dense<0.000001430511474609375>"), "{ir}");
     // One status merge covers the cells and the total.

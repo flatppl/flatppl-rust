@@ -77,19 +77,24 @@ impl Emitter<'_> {
                 },
             },
         );
-        let valid = if rank == 0 {
-            valid
-        } else if valid_when_true {
-            self.reduce_boolean("stablehlo.and", "true", &valid)
-        } else {
-            self.reduce_boolean("stablehlo.or", "false", &valid)
-        };
         let zero = self.int_value_const(0);
         let failure = self.int_value_const(code);
         let mut current = if valid_when_true {
+            let valid = if rank == 0 {
+                valid
+            } else {
+                self.reduce_boolean("stablehlo.and", "true", &valid)
+            };
             self.select(&valid, &zero, &failure)
         } else {
-            self.select(&valid, &failure, &zero)
+            // An integer `max` stays in the surrounding fusion, where XLA's CPU
+            // backend runs a boolean `or` reduction as a slow separate loop.
+            let mut codes = self.select(&valid, &failure, &zero);
+            let batch = self.batch_rank(&codes);
+            for _ in batch..rank {
+                codes = self.reduce_axis_lit("stablehlo.maximum", "0", &codes, batch);
+            }
+            codes
         };
         if self.runtime_batch_rank > 0 && self.call_frame.len() >= self.runtime_batch_rank {
             let frame = self.call_frame[..self.runtime_batch_rank].to_vec();

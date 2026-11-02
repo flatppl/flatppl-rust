@@ -111,10 +111,13 @@ impl Emitter<'_> {
         let factor = self.cholesky(value);
         let diagonal = self.diag(&factor);
         if !known {
+            // A NaN diagonal fails both tests: it marks a failed factorization.
+            let least = self.per_call(&diagonal, false);
+            let most = self.per_call(&diagonal, true);
             let zero = self.scalar(0.0);
             let infinity = self.scalar(f64::INFINITY);
-            let positive = self.compare("GT", &diagonal, &zero);
-            let finite = self.compare("LT", &diagonal, &infinity);
+            let positive = self.compare("GT", &least, &zero);
+            let finite = self.compare("LT", &most, &infinity);
             let valid = self.select(&positive, &finite, &positive);
             self.record_runtime_error(&valid, PARAMETER_DOMAIN_STATUS);
         }
@@ -216,77 +219,83 @@ impl Emitter<'_> {
         }
     }
 
-    /// Where a runtime `value` lies outside `set`, elementwise. Every test is an
-    /// ordered comparison, so NaN never violates. `None` when the element kind
-    /// already decides membership.
+    /// Where a runtime `value` lies outside `set`, one flag per call. A vector
+    /// reduces to its minimum and maximum first: a float `min` or `max` stays
+    /// in the surrounding fusion, where XLA's CPU backend runs a boolean
+    /// `or` reduction as a slow separate loop. Both propagate NaN, and every
+    /// test is an ordered comparison, so NaN never violates.
     fn violations(&mut self, value: &Value, set: ParamSet) -> Vec<Value> {
-        let integral = value.elem != ElemKind::Real;
-        let bound = |e: &mut Self, x: f64| {
-            if value.elem == ElemKind::Int {
-                e.int_value_const(x as i64)
-            } else {
-                e.scalar(x)
-            }
+        use ParamSet::*;
+        // (lower bound, whether the bound itself violates, upper bound, integral)
+        let (lower, strict, upper, whole) = match set {
+            Unconstrained | PosDefinite | Reals => return vec![],
+            StdSimplex => return self.simplex_violations(value),
+            PosReals => (Some(0.0), true, None, false),
+            NonNegReals => (Some(0.0), false, None, false),
+            UnitInterval => (Some(0.0), false, Some(1.0), false),
+            Interval(lo, hi) => (Some(lo), false, Some(hi), false),
+            Integers => (None, false, None, true),
+            PosIntegers => (Some(1.0), false, None, true),
+            NonNegIntegers => (Some(0.0), false, None, true),
+            Booleans => (Some(0.0), false, Some(1.0), true),
         };
-        let below = |e: &mut Self, x: f64, inclusive: bool| {
-            let x = bound(e, x);
-            e.compare(if inclusive { "LE" } else { "LT" }, value, &x)
+        let holds_bool = |x: f64| set.contains(x) == Some(true);
+        if value.elem == ElemKind::Bool && holds_bool(0.0) && holds_bool(1.0) {
+            return vec![];
+        }
+        let whole = whole && value.elem == ElemKind::Real;
+        let x = self.convert(value, ElemKind::Real);
+        let mut flags = Vec::new();
+        if let Some(lo) = lower {
+            let least = self.per_call(&x, false);
+            let lo = self.scalar(lo);
+            flags.push(self.compare(if strict { "LE" } else { "LT" }, &least, &lo));
+        }
+        if let Some(hi) = upper {
+            let most = self.per_call(&x, true);
+            let hi = self.scalar(hi);
+            flags.push(self.compare("GT", &most, &hi));
+        }
+        if whole {
+            // `x - floor(x)` is zero for an integer and NaN for an infinity.
+            let floor = self.floor(&x);
+            let fraction = self.sub(&x, &floor);
+            let fraction = self.per_call(&fraction, true);
+            let zero = self.scalar(0.0);
+            flags.push(self.compare("GT", &fraction, &zero));
+        }
+        let first = flags.remove(0);
+        vec![
+            flags
+                .iter()
+                .fold(first, |any, flag| self.either(&any, flag)),
+        ]
+    }
+
+    /// The minimum or maximum of `x` over every axis within one call, keeping
+    /// the host batch axes. Both propagate NaN.
+    fn per_call(&mut self, x: &Value, maximum: bool) -> Value {
+        let rank = shape(&x.ty).len();
+        let batch = self.batch_rank(x).min(self.runtime_batch_rank);
+        if rank == batch {
+            return x.clone();
+        }
+        let (op, identity) = if maximum {
+            ("stablehlo.maximum", reduce_max_identity(self.dtype))
+        } else {
+            ("stablehlo.minimum", pos_inf_literal(self.dtype))
         };
-        let above = |e: &mut Self, x: f64| {
-            let x = bound(e, x);
-            e.compare("GT", value, &x)
-        };
-        // `x - floor(x)` is zero for an integer and NaN for an infinity.
-        let fractional = |e: &mut Self| {
-            let floor = e.floor(value);
-            let fraction = e.sub(value, &floor);
-            let zero = e.scalar(0.0);
-            e.compare("GT", &fraction, &zero)
-        };
-        let either = |e: &mut Self, a: Value, b: Value| e.either(&a, &b);
-        let violation = match set {
-            ParamSet::Unconstrained | ParamSet::PosDefinite | ParamSet::Reals => return vec![],
-            ParamSet::StdSimplex => return self.simplex_violations(value),
-            ParamSet::PosReals => below(self, 0.0, true),
-            ParamSet::NonNegReals => below(self, 0.0, false),
-            ParamSet::UnitInterval if value.elem == ElemKind::Bool => return vec![],
-            ParamSet::UnitInterval | ParamSet::Interval(..) => {
-                let (lo, hi) = match set {
-                    ParamSet::Interval(lo, hi) => (lo, hi),
-                    _ => (0.0, 1.0),
-                };
-                let low = below(self, lo, false);
-                let high = above(self, hi);
-                either(self, low, high)
-            }
-            ParamSet::Integers if integral => return vec![],
-            ParamSet::Integers => fractional(self),
-            ParamSet::PosIntegers | ParamSet::NonNegIntegers => {
-                let lower = if set == ParamSet::PosIntegers {
-                    1.0
-                } else {
-                    0.0
-                };
-                let low = below(self, lower, false);
-                if integral {
-                    low
-                } else {
-                    let fraction = fractional(self);
-                    either(self, low, fraction)
-                }
-            }
-            ParamSet::Booleans if value.elem == ElemKind::Bool => return vec![],
-            ParamSet::Booleans => {
-                let low = below(self, 0.0, false);
-                let high = above(self, 1.0);
-                let outer = either(self, low, high);
-                let inside_low = above(self, 0.0);
-                let inside_high = below(self, 1.0, false);
-                let inside = self.select(&inside_low, &inside_high, &inside_low);
-                either(self, outer, inside)
-            }
-        };
-        vec![violation]
+        let mut x = self.axes_view(
+            x,
+            Axes {
+                batch,
+                layers: vec![rank - batch],
+            },
+        );
+        for _ in batch..rank {
+            x = self.reduce_axis(op, identity, &x, batch);
+        }
+        x
     }
 
     /// Boolean OR as a `select`, which the packing pass treats as pure.
@@ -301,19 +310,18 @@ impl Emitter<'_> {
             return Vec::new();
         }
         let n = self.cell_len(value);
+        let p = self.convert(value, ElemKind::Real);
+        let least = self.per_call(&p, false);
         let zero = self.scalar(0.0);
-        let negative = self.compare("LT", value, &zero);
-        let total = self.reduce_sum_last_axis(value);
+        let negative = self.compare("LT", &least, &zero);
+        let total = self.reduce_sum_last_axis(&p);
         let one = self.scalar(1.0);
         let error = self.sub(&total, &one);
         let error = self.abs(&error);
+        let error = self.per_call(&error, true);
         let tolerance = self.scalar(simplex_tolerance(n, self.dtype));
         let far = self.compare("GT", &error, &tolerance);
-        if matches!(self.cell_ty(value), MlirTy::Ranked(dims) if dims.len() == 1) {
-            let any_negative = self.reduce_boolean("stablehlo.or", "false", &negative);
-            return vec![self.either(&any_negative, &far)];
-        }
-        vec![negative, far]
+        vec![self.either(&negative, &far)]
     }
 }
 

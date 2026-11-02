@@ -5960,7 +5960,7 @@ fn emit_logdensity_mvnormal_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.compare").count(), 3);
     assert_eq!(out.matches("stablehlo.select").count(), 3);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 5);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -6284,7 +6284,7 @@ fn emit_logdensity_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
     assert_eq!(out.matches("stablehlo.compare").count(), 6);
     assert_eq!(out.matches("stablehlo.select").count(), 6);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 7);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 8);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
@@ -6378,7 +6378,7 @@ fn emit_logdensity_inverse_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
     assert_eq!(out.matches("stablehlo.compare").count(), 6);
     assert_eq!(out.matches("stablehlo.select").count(), 6);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 7);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 8);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
