@@ -252,13 +252,11 @@ fn check_node(
         if let CallHead::Builtin(op) = c.head {
             let name = m.resolve(op);
             if let Some((mut want, variadic)) = builtin_primitive_arity(name) {
-                // A box measure is a nullary kernel and takes no input argument.
+                // A measure is a nullary kernel and takes no input argument (§07).
                 let tag = usize::from(name == "builtin_sample");
-                if c.args
-                    .get(tag)
-                    .and_then(|&t| crate::boxes::box_ref(m, t))
-                    .is_some_and(|target| target.member().kind == flatppl_core::BoxKind::Measure)
-                {
+                if c.args.get(tag).is_some_and(|&t| {
+                    matches!(m.type_of(t), Some(flatppl_core::Type::Measure { .. }))
+                }) {
                     want -= 1;
                 }
                 let got = c.args.len() + c.named.len();

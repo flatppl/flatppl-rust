@@ -910,12 +910,11 @@ fn op_rule(
                 .or_else(|| {
                     k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(2).map(|a| a.0)))
                 });
-            let first_size =
-                if k.is_some_and(|(n, _, _)| crate::boxes::is_box_measure(inf.module, *n)) {
-                    2
-                } else {
-                    3
-                };
+            let first_size = if matches!(k, Some((_, Type::Measure { .. }, _))) {
+                2
+            } else {
+                3
+            };
             match variate {
                 Some(v) => {
                     let size_args = args.get(first_size..).unwrap_or(&[]);
@@ -7541,6 +7540,25 @@ fn written_int(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<i64> {
     }
 }
 
+/// Whether the kernel argument of measure-evaluation primitive `name` is a closed
+/// measure, which spec §07 calls a nullary kernel.
+fn nullary_kernel_tag(
+    inf: &Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> bool {
+    let Some(i) = crate::builtins::kernel_tag_index(name) else {
+        return false;
+    };
+    let tag = named
+        .iter()
+        .find(|(n, ..)| inf.module.resolve(*n) == "kernel")
+        .map(|(_, _, ty, _)| ty)
+        .or_else(|| args.get(i).map(|(_, ty, _)| ty));
+    matches!(tag, Some(Type::Measure { .. }))
+}
+
 fn arity_check(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -7549,13 +7567,14 @@ fn arity_check(
     named: &[NamedInfo],
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
-    let arity = cat.base_arity(name)?;
-    let tag = crate::builtins::kernel_tag_index(name);
-    if tag
-        .and_then(|i| args.get(i))
-        .is_some_and(|(n, _, _)| crate::boxes::is_box_measure(inf.module, *n))
-    {
-        return None;
+    let mut arity = cat.base_arity(name)?;
+    // A measure is a nullary kernel and takes no `kernel_input` (spec §07).
+    let nullary = nullary_kernel_tag(inf, name, args, named);
+    if nullary {
+        arity = crate::catalogue::Arity {
+            min: arity.min - 1,
+            max: arity.max.map(|m| m - 1),
+        };
     }
     let reading = arg_reading(inf, args, named, cat.base_takes_aggregate_whole(name), true)?;
     let got = reading.count;
@@ -7574,7 +7593,10 @@ fn arity_check(
         // The count is right; the names still have to be the declared ones. `?`
         // here means "this row declares none — accept the call", not a failure to
         // propagate; see `base_param_names` for which rows are nameless and why.
-        let names = cat.base_param_names(name)?.to_vec();
+        let mut names = cat.base_param_names(name)?.to_vec();
+        if nullary {
+            names.retain(|n| n != "kernel_input");
+        }
         let section = cat.base_param_section(name);
         let who = format!("`{name}`");
         if let Some(ty) = check_double_bound(inf, &names, &who, section, args, named) {

@@ -8612,7 +8612,7 @@ fn is_scalar_domain_kernel(m: &Module, measure_node: NodeId) -> bool {
 /// distribution. §09 "Standard modules" gives no unqualified spelling for a
 /// member, so the bare name cannot collide with a base §08 constructor: the
 /// catalogue keeps the two namespaces disjoint (`Catalogue::is_module_member`).
-fn std_module_ctor_sym(m: &Module, callee: NodeId) -> Option<Symbol> {
+pub(crate) fn std_module_ctor_sym(m: &Module, callee: NodeId) -> Option<Symbol> {
     let ref_id = if crate::crossmodule::std_module_member(m, callee).is_some() {
         callee
     } else {

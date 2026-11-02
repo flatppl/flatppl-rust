@@ -15,6 +15,7 @@ mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
+mod primitives;
 mod refuse;
 mod sample;
 mod stdfn;
