@@ -257,12 +257,23 @@ impl Emitter<'_> {
             flags.push(self.compare("GT", &most, &hi));
         }
         if whole {
-            // `x - floor(x)` is zero for an integer and NaN for an infinity.
+            // `x - floor(x)` is zero for an integer and NaN for an infinity,
+            // which no integer set holds.
             let floor = self.floor(&x);
             let fraction = self.sub(&x, &floor);
             let fraction = self.per_call(&fraction, true);
             let zero = self.scalar(0.0);
             flags.push(self.compare("GT", &fraction, &zero));
+            let infinity = self.scalar(f64::INFINITY);
+            if upper.is_none() {
+                let most = self.per_call(&x, true);
+                flags.push(self.compare("EQ", &most, &infinity));
+            }
+            if lower.is_none() {
+                let least = self.per_call(&x, false);
+                let negative = self.neg(&infinity);
+                flags.push(self.compare("EQ", &least, &negative));
+            }
         }
         let first = flags.remove(0);
         vec![
@@ -374,7 +385,7 @@ fn set_includes(set: ParamSet, proven: ParamSet) -> bool {
 /// semantics: NaN never violates. `n` is the simplex dimension.
 fn constant_violates(set: ParamSet, values: &[f64], n: usize, dtype: Dtype) -> bool {
     let violates = |x: f64| {
-        let fractional = x - x.floor() > 0.0;
+        let fractional = x - x.floor() > 0.0 || x.is_infinite();
         match set {
             ParamSet::Unconstrained
             | ParamSet::Reals
