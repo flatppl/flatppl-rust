@@ -19,6 +19,12 @@ pub(crate) fn query_head(m: &Module, id: NodeId) -> Option<Symbol> {
 /// the scalar query so the ordinary density rules eliminate it before emission.
 pub(crate) fn lower_query(m: &mut Module, id: NodeId) -> Option<NodeId> {
     let op = query_head(m, id)?;
+    lower_held_measure(m, id, op)
+}
+
+/// `broadcast(op, M, values)` with measure `M` held constant: a per-cell function
+/// of `op(M, point)`, mapped over `values`.
+pub(crate) fn lower_held_measure(m: &mut Module, id: NodeId, op: Symbol) -> Option<NodeId> {
     let call = expect_builtin_call(m, id, "broadcast")?;
     let [_, measure, values] = *call.args else {
         return None;

@@ -145,3 +145,53 @@ fn builtin_sample_non_kernel_diagnoses() {
         "a non-kernel kernel arg must emit an error diagnostic; got: {diags:?}"
     );
 }
+
+/// A measure is a nullary kernel and takes no `kernel_input` (§07), so each
+/// primitive accepts a closed measure one argument shorter.
+#[test]
+fn a_closed_measure_omits_the_kernel_input() {
+    for src in [
+        "lp = builtin_logdensityof(Normal(mu = 0.0, sigma = 1.0), 0.0)",
+        "M = Normal(0.0, 1.0)\nlp = builtin_logdensityof(M, 0.0)",
+        "lp = builtin_touniform(Exponential(2.0), 0.5)",
+        "lp = builtin_fromnormal(Normal(0.0, 1.0), 0.5)",
+        "lp = builtin_logdensityof(Lebesgue(reals), 0.5)",
+        "lp = builtin_logdensityof(kernel = Normal(0.0, 1.0), x = 0.5)",
+    ] {
+        let (_, diags) = infer_src(src);
+        assert!(diags.is_empty(), "{src}: {diags:?}");
+    }
+    let m = meta_of(
+        "state = rnginit(0)\nxs, s2 = builtin_sample(state, MvNormal([0.0, 0.0], eye(2)), 4)",
+        "builtin_sample",
+    );
+    assert!(
+        m.contains("(%tuple (%array 1 (4) (%array 1 (2) (%scalar real))) %rngstate)"),
+        "a nullary sample's sizes follow the measure; got: {m}"
+    );
+}
+
+/// A kernel still needs its input, and a measure takes none.
+#[test]
+fn nullary_arity_follows_the_kernel_argument() {
+    for (src, want) in [
+        (
+            "lp = builtin_logdensityof(Normal, 0.0)",
+            "takes 3 arguments",
+        ),
+        (
+            "lp = builtin_logdensityof(Normal(0.0, 1.0), record(mu = 0.0, sigma = 1.0), 0.0)",
+            "takes 2 arguments",
+        ),
+        (
+            "lp = builtin_logdensityof(kernel = Normal(0.0, 1.0), kernel_input = record(mu = 0.0, sigma = 1.0), x = 0.5)",
+            "takes 2 arguments",
+        ),
+    ] {
+        let (_, diags) = infer_src(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains(want)),
+            "{src}: want `{want}`, got {diags:?}"
+        );
+    }
+}

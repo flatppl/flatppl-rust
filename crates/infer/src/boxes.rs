@@ -72,18 +72,3 @@ pub(crate) fn resolve_box_member(
         interface,
     })
 }
-
-/// `true` when `tag` names a measure member of a bound box. A measure is a
-/// nullary kernel, so its primitives take no kernel-input argument.
-pub(crate) fn is_box_measure(m: &Module, tag: flatppl_core::NodeId) -> bool {
-    let flatppl_core::Node::Ref(flatppl_core::Ref {
-        ns: flatppl_core::RefNs::Module(alias),
-        name,
-    }) = *m.node(tag)
-    else {
-        return false;
-    };
-    m.box_binding(alias)
-        .and_then(|binding| binding.members.get(m.resolve(name)))
-        .is_some_and(|member| member.kind == BoxKind::Measure)
-}

@@ -137,6 +137,17 @@ pub fn determinize_with_options(
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
+        // A closed built-in measure in a primitive's kernel slot splits into its
+        // kernel and input (spec §07).
+        if crate::primitives::split_measure_kernels(&mut work) {
+            // The split leaves a named measure unreferenced.
+            if let Some(roots) = roots {
+                crate::canon::retain_reachable(&mut work, roots);
+            } else {
+                sweep_dead_measure_bindings(&mut work, &mut imports);
+            }
+            continue;
+        }
         if specialize_sequences {
             specialize_sequences = false;
             if crate::density::broadcast::specialize_sequence_parameters(&mut work) {
@@ -346,7 +357,10 @@ fn find_op_node_in_scope(
 /// Search each binding breadth-first, preserving source order. A node's match
 /// is independent of its path, so revisit neither shared nodes nor their children.
 /// The module stays immutable for this scan; the next rewrite gets a fresh cache.
-fn find_node(m: &Module, matches: impl Fn(NodeId) -> bool) -> Option<(BindingId, NodeId)> {
+pub(crate) fn find_node(
+    m: &Module,
+    matches: impl Fn(NodeId) -> bool,
+) -> Option<(BindingId, NodeId)> {
     find_node_in_scope(m, false, matches)
 }
 
