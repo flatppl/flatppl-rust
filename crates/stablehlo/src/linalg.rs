@@ -3,6 +3,10 @@
 use super::batching::tensor;
 use super::*;
 
+/// XLA CPU runs each loop-body fusion as a separate thunk. Unrolling a
+/// two-step loop lets the whole elimination fuse.
+const CPU_MATRIX_UNROLL_LIMIT: u64 = 2;
+
 impl Emitter<'_> {
     /// Thin, unpivoted Householder QR. The zero-column case uses the identity
     /// reflector, retaining an orthonormal basis even for rank-deficient input.
@@ -135,7 +139,11 @@ impl Emitter<'_> {
     ) -> Vec<Value> {
         // Pivoted elimination needs a tighter limit than rank-one updates:
         // larger bodies increase compilation cost and can slow GPU gradients.
-        if self.target == crate::Target::Gpu && n <= unroll_limit {
+        let limit = match self.target {
+            crate::Target::Cpu => unroll_limit.min(CPU_MATRIX_UNROLL_LIMIT),
+            crate::Target::Gpu => unroll_limit,
+        };
+        if n <= limit {
             let mut state = inits.to_vec();
             for i in 0..n {
                 let index = self.int_value_const(i as i64);

@@ -46,7 +46,7 @@ fn qr_record_has_thin_real_shapes_and_rejects_wide_matrices() {
 fn qr_record_fields_can_be_projected() {
     let dir = Scratch::new("qr-fields");
     let input = dir.path("model.flatppl");
-    fs::write(&input, "A = elementof(cartpow(reals, [3,2]))\nfactor = qr(A)\ninputs = A\noutputs = (factor.Q, factor.R)\n").unwrap();
+    fs::write(&input, "A = elementof(cartpow(reals, [4,3]))\nfactor = qr(A)\ninputs = A\noutputs = (factor.Q, factor.R)\n").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .arg("stablehlo")
         .arg(input)
@@ -59,8 +59,9 @@ fn qr_record_fields_can_be_projected() {
     );
     let out = String::from_utf8_lossy(&result.stdout);
     assert!(
-        out.contains("tensor<3x2xf32>") && out.contains("tensor<2x2xf32>"),
+        out.contains("tensor<4x3xf32>") && out.contains("tensor<3x3xf32>"),
         "{out}"
     );
+    // Three columns keep the CPU elimination loop, so one loop shows both fields share one QR.
     assert_eq!(out.matches("= stablehlo.while(").count(), 1, "{out}");
 }
