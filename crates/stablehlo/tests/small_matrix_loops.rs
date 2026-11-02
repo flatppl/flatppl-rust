@@ -35,11 +35,24 @@ fn emit(source: &str, target: Target) -> String {
 }
 
 #[test]
-fn cpu_mvnormal_decomposes_small_cholesky_and_keeps_native_solve() {
+fn cpu_mvnormal_unrolls_small_cholesky_and_keeps_native_solve() {
     let ir = normal(2, Target::Cpu);
     assert!(!ir.contains("stablehlo.cholesky"), "{ir}");
     assert_eq!(ir.matches("stablehlo.triangular_solve").count(), 1, "{ir}");
-    assert_eq!(ir.matches("stablehlo.while").count(), 1, "{ir}");
+    assert!(!ir.contains("stablehlo.while"), "{ir}");
+}
+
+#[test]
+fn native_vector_solve_side_follows_target() {
+    for n in [2, 3] {
+        let ir = normal(n, Target::Cpu);
+        let solve = format!(
+            "<{{left_side = false, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose TRANSPOSE>}}> : (tensor<{n}x{n}xf32>, tensor<1x{n}xf32>) -> tensor<1x{n}xf32>"
+        );
+        assert_eq!(ir.matches(&solve).count(), 1, "{ir}");
+    }
+    let gpu = normal(9, Target::Gpu);
+    assert!(gpu.contains("left_side = true"), "{gpu}");
 }
 
 #[test]
@@ -61,7 +74,7 @@ fn cpu_wishart_decomposes_the_tiny_two_column_solve() {
         Target::Cpu,
     );
     assert!(!ir.contains("stablehlo.triangular_solve"), "{ir}");
-    assert_eq!(ir.matches("stablehlo.while").count(), 3, "{ir}");
+    assert!(!ir.contains("stablehlo.while"), "{ir}");
 }
 
 #[test]
@@ -87,5 +100,15 @@ fn pivoted_inverse_keeps_a_tighter_gpu_unroll_limit() {
             format!("a = external(cartpow(reals, [{n}, {n}]))\ninputs = a\noutputs = inv(a)\n");
         let gpu = emit(&source, Target::Gpu);
         assert_eq!(gpu.matches("stablehlo.while").count(), loops, "{gpu}");
+    }
+}
+
+#[test]
+fn cpu_unrolls_only_two_step_matrix_loops() {
+    for (n, loops) in [(2, 0), (3, 2)] {
+        let source =
+            format!("a = external(cartpow(reals, [{n}, {n}]))\ninputs = a\noutputs = inv(a)\n");
+        let cpu = emit(&source, Target::Cpu);
+        assert_eq!(cpu.matches("stablehlo.while").count(), loops, "{cpu}");
     }
 }

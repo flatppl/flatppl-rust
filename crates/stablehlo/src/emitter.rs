@@ -2743,27 +2743,56 @@ impl<'m> Emitter<'m> {
     /// same arithmetic decomposition.
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let (l, b) = self.broadcast_batches(l, b);
+        if self.decompose_tri_solve(&l, *shape(&b.ty).last().unwrap()) {
+            return self.tri_solve_decomposed(&l, &b);
+        }
+        self.native_tri_solve(&l, &b, false)
+    }
+
+    /// Solve `l @ y = b` for vector cells `[n]`. On CPU the native form solves
+    /// `y^T l^T = b^T`, so mapped points fold into RHS rows without a
+    /// transpose, as in JAX's own vector solve. GPU keeps the column form,
+    /// which measured faster for A100 gradients.
+    pub fn tri_solve_vector(&mut self, l: &Value, b: &Value, n: u64) -> Value {
+        let vector = MlirTy::Ranked(vec![Some(n)]);
+        if self.target == crate::Target::Gpu || self.decompose_tri_solve(l, Some(1)) {
+            let column = self.reshape_cell(b, MlirTy::Ranked(vec![Some(n), Some(1)]));
+            let y = self.tri_solve(l, &column);
+            return self.reshape_cell(&y, vector);
+        }
+        let row = self.reshape_cell(b, MlirTy::Ranked(vec![Some(1), Some(n)]));
+        let (l, row) = self.broadcast_batches(l, &row);
+        let y = self.native_tri_solve(&l, &row, true);
+        self.reshape_cell(&y, vector)
+    }
+
+    fn decompose_tri_solve(&self, l: &Value, rhs_columns: Option<u64>) -> bool {
         let limit = match self.target {
             crate::Target::Cpu => 2,
             crate::Target::Gpu => MATRIX_UNROLL_LIMIT,
         };
         // Native vector solves let mapped points fold into shared RHS columns.
-        let two_rhs_columns = shape(&b.ty).last() == Some(&Some(2));
-        if self.decompose_small_matrix(&l, limit)
-            && (self.target == crate::Target::Gpu || two_rhs_columns)
-        {
-            return self.tri_solve_decomposed(&l, &b);
-        }
+        self.decompose_small_matrix(l, limit)
+            && (self.target == crate::Target::Gpu || rhs_columns == Some(2))
+    }
+
+    /// `right_side` solves `x @ l^T = b`, the transpose of `l @ x^T = b^T`.
+    fn native_tri_solve(&mut self, l: &Value, b: &Value, right_side: bool) -> Value {
+        let (left_side, transpose) = if right_side {
+            ("false", "TRANSPOSE")
+        } else {
+            ("true", "NO_TRANSPOSE")
+        };
         let ssa = self.fresh();
         let l_ty = l.ty.render(self.dtype, l.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = b.ty.clone();
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
-            "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = true, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = {left_side}, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose {transpose}>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
             l.ssa, b.ssa
         ));
-        self.remember_axes(&ssa, self.axes_of(&b));
+        self.remember_axes(&ssa, self.axes_of(b));
         Value {
             ssa,
             ty: result_ty,
