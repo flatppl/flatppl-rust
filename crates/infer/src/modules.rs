@@ -290,7 +290,7 @@ fn map_valueset_symbols(vs: &ValueSet, f: &mut dyn FnMut(Symbol) -> Symbol) -> V
 }
 
 /// Re-intern every name in `ty` from `from`'s interner into `into`'s.
-fn reintern_type(into: &mut Module, from: &Module, ty: &Type) -> Type {
+pub fn reintern_type(into: &mut Module, from: &Module, ty: &Type) -> Type {
     map_type_symbols(ty, &mut |s| {
         let name = from.resolve(s).to_string();
         into.intern(&name)
@@ -730,6 +730,11 @@ impl<'b> InferSession<'b> {
         binding_name: &str,
         subst_annos: &[(String, Resolved)],
     ) -> Result<Resolution, String> {
+        // A box binding needs no dependency: the describe reply types it.
+        if let Some(binding) = importer.box_binding(alias).cloned() {
+            return crate::boxes::resolve_box_member(importer, &binding, binding_name)
+                .map(Resolution::Ready);
+        }
         let directive = self.load_directive(importer, alias)?;
 
         // §09 standard modules resolve against the merged catalogue set

@@ -78,6 +78,10 @@ pub struct Module {
     /// `densityof(likelihoodof(K, obs), theta)` as `pdf(K(theta), obs)`. A stack,
     /// because reifications nest. Not projected into any output format.
     conditioned_inputs: Vec<Symbol>,
+    /// `load_module` aliases bound to black boxes, with each box's members.
+    /// Member set types use this module's interner. Set by the host before
+    /// inference. Not projected into any output format.
+    boxes: HashMap<Symbol, std::sync::Arc<crate::boxes::BoxBinding>>,
 }
 
 /// A top-level binding `name = rhs`.
@@ -115,6 +119,21 @@ pub struct Span {
 impl Module {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind the `load_module` alias `alias` to a black box.
+    pub fn bind_box(&mut self, alias: Symbol, binding: std::sync::Arc<crate::boxes::BoxBinding>) {
+        self.boxes.insert(alias, binding);
+    }
+
+    /// The black box bound to `alias`, if any.
+    pub fn box_binding(&self, alias: Symbol) -> Option<&std::sync::Arc<crate::boxes::BoxBinding>> {
+        self.boxes.get(&alias)
+    }
+
+    /// Whether any alias of this module is bound to a black box.
+    pub fn has_boxes(&self) -> bool {
+        !self.boxes.is_empty()
     }
 
     // ---- build ----

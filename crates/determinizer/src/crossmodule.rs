@@ -69,6 +69,10 @@ fn resolve_member<'a>(
     alias: Symbol,
     member: Symbol,
 ) -> Option<ResolvedRef<'a>> {
+    // A box member has no graph to graft: it stays a module reference.
+    if src.box_binding(alias).is_some() {
+        return None;
+    }
     let load = src.alias_target(alias)?;
     let call = match src.node(src.binding(load).rhs) {
         Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if src.resolve(s) == "load_module") => {

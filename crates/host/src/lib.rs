@@ -7,6 +7,7 @@
 //! [`LoadedModule::compile`] lowers explicit FlatPPL `inputs` and `outputs` to
 //! StableHLO plus a tensor ABI. The host chooses execution and differentiation.
 
+mod boxes;
 mod compiler;
 mod constants;
 mod data;
@@ -16,6 +17,7 @@ mod inspect;
 mod readers;
 mod transforms;
 
+pub use boxes::{BoxSpec, bind_boxes, parse_describe};
 pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position};
 pub use constants::Constant;
 pub use data::{DataError, load_fixed_data, resolve_data_sources};

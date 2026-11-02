@@ -307,7 +307,8 @@ impl NativeModule {
         Ok(serde_json::to_string(&self.inner.math(format)).expect("rows contain only JSON values"))
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu"))]
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", boxes=None))]
+    #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
         py: Python<'_>,
@@ -316,6 +317,7 @@ impl NativeModule {
         integration: Option<(f64, f64, u32)>,
         batch: Option<BatchArguments>,
         target: &str,
+        boxes: Option<Vec<(String, String, String)>>,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -337,12 +339,27 @@ impl NativeModule {
             }),
             target,
         };
+        let boxes = boxes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(alias, name, describe)| {
+                flatppl_host::parse_describe(&name, &describe)
+                    .map(|spec| (alias, std::sync::Arc::new(spec)))
+                    .map_err(PyValueError::new_err)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        if !boxes.is_empty() && batch.is_some() {
+            return Err(PyValueError::new_err(
+                "box queries batch in the executor, not through export batch axes",
+            ));
+        }
         let exported = py
             .detach(|| match batch {
                 Some((shape, input_axes)) => self
                     .inner
                     .compile_batched(&options, &BatchSpec { shape, input_axes }),
-                None => self.inner.compile(&options),
+                None if boxes.is_empty() => self.inner.compile(&options),
+                None => self.inner.compile_with_boxes(&options, &boxes),
             })
             .map_err(error)?;
         Ok(serde_json::to_string(&exported).expect("exports contain only JSON values"))
