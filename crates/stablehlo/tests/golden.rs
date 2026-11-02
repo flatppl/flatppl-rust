@@ -3296,7 +3296,7 @@ fn emit_logdensity_normal_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3492,7 +3492,7 @@ fn emit_logdensity_cauchy_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3570,7 +3570,7 @@ fn emit_logdensity_logistic_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3652,7 +3652,7 @@ fn emit_logdensity_laplace_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3807,7 +3807,7 @@ fn emit_logdensity_exponential_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3838,10 +3838,11 @@ fn emit_logdensity_exponential_has_expected_structure() {
         !out.contains("chlo."),
         "Exponential needs no CHLO ops, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -3884,7 +3885,7 @@ fn emit_logdensity_gamma_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -3921,10 +3922,11 @@ fn emit_logdensity_gamma_has_expected_structure() {
         3,
         "folded stablehlo.add count, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        2,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -3967,7 +3969,7 @@ fn emit_logdensity_weibull_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4013,10 +4015,11 @@ fn emit_logdensity_weibull_has_expected_structure() {
         !out.contains("chlo."),
         "Weibull needs no CHLO ops, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        2,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4059,7 +4062,7 @@ fn emit_logdensity_pareto_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4097,8 +4100,9 @@ fn emit_logdensity_pareto_has_expected_structure() {
     // op counts above are unchanged (numerically identical in-support).
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        4,
+        "expected two selects (variate guard + off-support mask) and two for status 9, in:
+{out}"
     );
     assert!(
         out.contains("stablehlo.constant dense<0x7F800000>"),
@@ -4141,7 +4145,7 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4178,10 +4182,11 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
         4,
         "folded stablehlo.add count, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        2,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4226,7 +4231,7 @@ fn emit_logdensity_chi_squared_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4268,10 +4273,11 @@ fn emit_logdensity_chi_squared_has_expected_structure() {
         3,
         "folded stablehlo.add count, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4316,7 +4322,7 @@ fn emit_logdensity_lognormal_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4357,10 +4363,11 @@ fn emit_logdensity_lognormal_has_expected_structure() {
         !out.contains("chlo."),
         "LogNormal needs no CHLO ops, in:\n{out}"
     );
-    // The known in-support observation removes the runtime support mask.
+    // The known in-support observation removes the runtime support mask. The
+    // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        0,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4523,7 +4530,7 @@ fn emit_logdensity_beta_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -4567,8 +4574,9 @@ fn emit_logdensity_beta_has_expected_structure() {
     // op counts above are unchanged (numerically identical in-support).
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+        4,
+        "expected two selects (variate guard + off-support mask) and two for status 9, in:
+{out}"
     );
     assert!(
         out.contains("stablehlo.constant dense<0x7F800000>"),
@@ -5513,7 +5521,7 @@ fn emit_logdensity_geometric_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -5936,7 +5944,7 @@ fn emit_logdensity_mvnormal_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -5950,9 +5958,9 @@ fn emit_logdensity_mvnormal_has_expected_structure() {
         2,
         "diag's row/col index tensors, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.compare").count(), 1);
-    assert_eq!(out.matches("stablehlo.select").count(), 1);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
+    assert_eq!(out.matches("stablehlo.compare").count(), 3);
+    assert_eq!(out.matches("stablehlo.select").count(), 3);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -6088,7 +6096,7 @@ fn emit_logdensity_dirichlet_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6096,7 +6104,7 @@ fn emit_logdensity_dirichlet_has_expected_structure() {
         "alpha must become a length-3 vector func arg, in:\n{out}"
     );
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
     assert_eq!(out.matches("stablehlo.subtract").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
     assert!(
@@ -6159,7 +6167,7 @@ fn emit_logdensity_multinomial_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6167,7 +6175,7 @@ fn emit_logdensity_multinomial_has_expected_structure() {
         "n (integer) / p must become scalar/vector func args, in:\n{out}"
     );
     assert_eq!(out.matches("chlo.lgamma").count(), 1);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
     assert_eq!(out.matches("= stablehlo.add ").count(), 3);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
     assert_eq!(out.matches("stablehlo.negate").count(), 1);
@@ -6262,7 +6270,7 @@ fn emit_logdensity_wishart_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6274,9 +6282,9 @@ fn emit_logdensity_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 2);
-    assert_eq!(out.matches("stablehlo.select").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
+    assert_eq!(out.matches("stablehlo.compare").count(), 6);
+    assert_eq!(out.matches("stablehlo.select").count(), 6);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 7);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
@@ -6356,7 +6364,7 @@ fn emit_logdensity_inverse_wishart_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6368,9 +6376,9 @@ fn emit_logdensity_inverse_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 2);
-    assert_eq!(out.matches("stablehlo.select").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
+    assert_eq!(out.matches("stablehlo.compare").count(), 6);
+    assert_eq!(out.matches("stablehlo.select").count(), 6);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 7);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
@@ -6450,7 +6458,7 @@ fn emit_logdensity_lkj_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6463,8 +6471,8 @@ fn emit_logdensity_lkj_has_expected_structure() {
         "LKJ needs no trace/tri_solve, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.iota").count(), 2);
-    assert_eq!(out.matches("stablehlo.compare").count(), 1);
-    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
     assert_eq!(out.matches("chlo.lgamma").count(), 4);
     assert!(is_delimiter_balanced(&out));
@@ -6579,7 +6587,7 @@ fn emit_logdensity_lkj_cholesky_has_expected_structure() {
         "missing func.func @logdensity in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
+        out.contains("-> (tensor<f32>, tensor<i32>)"),
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
@@ -6591,8 +6599,8 @@ fn emit_logdensity_lkj_cholesky_has_expected_structure() {
         "LKJCholesky's variate is already the Cholesky factor, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.iota").count(), 2);
-    assert_eq!(out.matches("stablehlo.compare").count(), 1);
-    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
     assert_eq!(out.matches("stablehlo.slice").count(), 2);
     assert_eq!(out.matches("stablehlo.reshape").count(), 2);
@@ -7019,7 +7027,7 @@ fn emit_sample_mvnormal_has_expected_structure() {
         out.contains("%arg0: tensor<2xf32>") && out.contains("%arg1: tensor<2x2xf32>"),
         "mu/cov must become vector/matrix func args, in:\n{out}"
     );
-    assert!(out.contains("-> (tensor<2xf32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<2xf32>, tensor<2xui64>, tensor<i32>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("chlo.erf_inv"));
     assert_eq!(out.matches("stablehlo.cholesky").count(), 1);
@@ -7311,7 +7319,7 @@ fn emit_sample_dirichlet_has_expected_structure() {
         out.contains("%arg0: tensor<3xf32>"),
         "alpha must become a length-3 vector func arg, in:\n{out}"
     );
-    assert!(out.contains("-> (tensor<3xf32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<3xf32>, tensor<2xui64>, tensor<i32>)"));
     assert_eq!(
         out.matches("stablehlo.while").count(),
         3,
@@ -8341,7 +8349,7 @@ fn emit_sample_mvnormal_iid_has_expected_structure() {
         "mu/cov must become vector/matrix func args after %key, in:\n{out}"
     );
     assert!(
-        out.contains("-> (tensor<3x2xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<3x2xf32>, tensor<2xui64>, tensor<i32>)"),
         "fanned MvNormal must return the [3, 2] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -9587,15 +9595,14 @@ outputs = (lp)
     assert!(
         out.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
-             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "the table entry `data` must destructure into `%arg3` (x) and `%arg4` (y), in:\n{out}"
     );
     // The x column feeds the mean and the y column the variate — each column
     // argument reaches the op the model's column access named.
     assert!(
-        out.contains("stablehlo.multiply %0, %arg3 : tensor<4xf32>")
-            && out.contains("stablehlo.subtract %arg4, "),
+        out.contains(", %arg3 : tensor<4xf32>") && out.contains("stablehlo.subtract %arg4, "),
         "x → the mean, y → the variate residual, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
@@ -9621,7 +9628,7 @@ outputs = (lp)
     assert!(
         out.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
-             %arg2: tensor<4x3xf32>, %arg3: tensor<4xf32>) -> tensor<f32>"
+             %arg2: tensor<4x3xf32>, %arg3: tensor<4xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "a `cartpow(reals, 3)` column of a 4-row table must be `tensor<4x3xf32>`, in:\n{out}"
     );
@@ -9645,7 +9652,7 @@ outputs = q1
     assert!(
         out.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
-             %arg2: tensor<f32>) -> tensor<f32>"
+             %arg2: tensor<f32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "the record entry `pars` must destructure into `mu`/`tau` args, in:\n{out}"
     );
@@ -11151,7 +11158,7 @@ outputs = (lp)
     assert!(
         out.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
-             %arg2: tensor<f32>, %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+             %arg2: tensor<f32>, %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "expected the worked probe's signature (data.x → %arg3, data.y → %arg4), in:\n{out}"
     );
@@ -11199,7 +11206,7 @@ outputs = (lp)
     assert!(
         out.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
-             %arg2: tensor<f32>, %arg3: tensor<20x3xf32>, %arg4: tensor<20xf32>) -> tensor<f32>"
+             %arg2: tensor<f32>, %arg3: tensor<20x3xf32>, %arg4: tensor<20xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "expected the 20-row fixture signature, in:\n{out}"
     );

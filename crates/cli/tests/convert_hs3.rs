@@ -163,9 +163,10 @@ outputs = score
     );
     assert!(
         String::from_utf8_lossy(&emitted.stdout).contains(
-            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<2xf32>) -> tensor<f32>"
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<2xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
-        "the query must accept the strength and both observed counts at runtime"
+        "the query must accept the strength and both observed counts at runtime, \
+         and report a negative Poisson rate from a negative strength"
     );
 }
 

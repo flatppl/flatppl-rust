@@ -342,7 +342,7 @@ fn stablehlo_abi_load_data_table_destructures_into_column_args() {
     assert!(
         stdout.contains(
             "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
-             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> (tensor<f32>, tensor<i32>)"
         ),
         "expected `data` destructured into two column args:\n{stdout}"
     );

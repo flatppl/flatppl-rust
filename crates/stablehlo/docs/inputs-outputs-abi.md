@@ -129,11 +129,32 @@ Programs without checks retain their original result signature.
 | 5 | Inverse-uniform variate outside [0, 1] |
 | 6 | RNG seed outside its integer or byte-vector domain |
 | 7 | Categorical probabilities with a negative or non-finite cell, or a zero total; this includes the weights of a sampled `ksuperpose` mixture |
+| 9 | A distribution parameter outside its declared value set |
 
 The status uses `i32` for float32 emission and `i64` for float64 emission.
 It is scalar for an ordinary call. Host batching adds the host batch shape,
 with one status per call. Authored array axes and callable batch axes reduce
 into that call's status. Executed loop iterations preserve the first error.
+
+Status 9 checks each parameter of a §08 or §09 distribution against the value
+set that section declares, for example `sigma = elementof(posreals)` for
+`Normal`. A scalar set on a vector parameter applies to each element.
+`stdsimplex(n)` requires nonnegative cells whose sum is within `4 n ε` of one,
+with `ε` the machine epsilon of the emitted precision. A NaN parameter propagates
+without an error, as for status 3, so a `reals` parameter has no check. A
+positive definite matrix requires a Cholesky factor with a positive, finite
+diagonal. The check reads the factor that the density or sampler computes anyway.
+A matrix that is not positive definite gives a NaN factor, so a NaN matrix also
+reports status 9. No check is emitted for a parameter whose value set is known at
+emit time:
+
+- A constant inside its set. A constant outside its set refuses emission.
+- A result of a function whose §07 result set lies inside the parameter's set:
+  `exp(a)` for `posreals`, `invlogit(a)` for `unitinterval`, `softmax(v)` for
+  `stdsimplex(n)`. The dotted form applies the same rule to each element.
+
+Input arguments are always checked. The ABI does not enforce the set an `inputs`
+entry declares.
 
 Checks execute inside StableHLO before clamping gathers or unsafe conversions.
 Invalid calls use safe internal operands, but their returned values are not

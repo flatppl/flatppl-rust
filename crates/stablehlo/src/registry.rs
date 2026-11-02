@@ -498,6 +498,24 @@ fn unbatch_field_id(e: &Emitter, p: &Params, name: &str) -> Result<NodeId, EmitE
     }
 }
 
+/// Check the parameters of `ctor` in `p` against their declared value sets
+/// before a builder reads them (see [`Emitter::check_parameter_domains`]). A
+/// field the kernel input lacks is left to the builder's own refusal.
+fn check_parameters(e: &mut Emitter, ctor: &str, p: &Params) -> Result<(), EmitError> {
+    let (Some(names), Some(sets)) = (
+        flatppl_infer::distribution_param_names(ctor),
+        flatppl_infer::distribution_param_sets(ctor),
+    ) else {
+        return Ok(());
+    };
+    let fields = names
+        .iter()
+        .zip(sets)
+        .filter_map(|(name, set)| Some((name.as_str(), p.field_id(e, name).ok()?, set)))
+        .collect::<Vec<_>>();
+    e.check_parameter_domains(ctor, &fields)
+}
+
 /// `builtin_logdensityof(kernel, kernel_input, v)` (`density.rs`'s
 /// `build_density_term`): `kernel` is a bare `Const(ctor)` distribution
 /// constructor symbol, `kernel_input` its kwargs record, `v` the scored
@@ -671,6 +689,7 @@ fn lower_logdensityof_batched_with(
             ),
         ));
     };
+    check_parameters(e, ctor, &params)?;
     let value = e.lower_node(v)?;
     builder(e, &params, &value)
 }
@@ -722,6 +741,7 @@ fn score_with(
         let eq = e.dirac_equal(atom, v)?;
         return Ok(dirac_score(e, &eq));
     }
+    check_parameters(e, ctor, &params)?;
     let value = e.lower_node(v)?;
     (dist.logpdf)(e, &params, &value)
 }
@@ -778,6 +798,7 @@ pub(crate) fn lower_touniform(
         sample_shape: None,
         fields: None,
     };
+    check_parameters(e, &ctor, &params)?;
     let value = e.lower_node(x)?;
     cdf(e, &params, &value)
 }
@@ -828,6 +849,7 @@ pub(crate) fn lower_transport(
         sample_shape: None,
         fields: None,
     };
+    check_parameters(e, &ctor, &p)?;
     if head == "builtin_fromuniform" {
         let literal = match e.node(x) {
             Node::Lit(Scalar::Real(value)) => Some(*value),
@@ -1079,6 +1101,7 @@ pub(crate) fn lower_sample(
         sample_shape: broadcasted.then(|| batch_shape.clone()),
         fields: None,
     };
+    check_parameters(e, &ctor_name, &params)?;
     // Existing samplers consume a flat product batch. Restore its outer axes
     // after sampling, keeping the inner event axes and RNG advances unchanged.
     if let Some(n) = batch_n {
@@ -2895,8 +2918,7 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let n = static_vector_len(e, mu_id, &mu)?;
     require_square_cov(e, cov_id, &cov, n)?;
 
-    let l = e.cholesky(&cov);
-    let diag_l = e.diag(&l);
+    let (l, diag_l) = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
     let log_diag_l = e.log(&diag_l);
     let sum_log_diag_l = e.reduce_sum(&log_diag_l);
     let two = e.scalar(2.0);
@@ -2943,7 +2965,7 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
     // Cholesky ONCE on the `[d, d]` cov, shared across every draw (scalar or
     // fanned): `L` is a deterministic function of `cov`, not of the rng.
-    let l = e.cholesky(&cov);
+    let (l, _) = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
 
     let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
@@ -3194,7 +3216,12 @@ fn literal_fixed_positive_int(
 /// `l = cholesky(A)`: `2 * sum(log(diag(l)))` — see the batch doc comment.
 fn log_det_from_chol(e: &mut Emitter, l: &Value) -> Value {
     let diag_l = e.diag(l);
-    let log_diag_l = e.log(&diag_l);
+    log_det_from_diag(e, &diag_l)
+}
+
+/// [`log_det_from_chol`] from the factor's diagonal.
+fn log_det_from_diag(e: &mut Emitter, diag_l: &Value) -> Value {
+    let log_diag_l = e.log(diag_l);
     let sum_log_diag_l = e.reduce_sum(&log_diag_l);
     let two = e.scalar(2.0);
     e.mul(&two, &sum_log_diag_l)
@@ -3312,10 +3339,10 @@ fn wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     require_matrix_dim(p.variate_id()?, v, n, "Wishart", "X")?;
     let nu = p.get(e, "nu")?;
 
-    let l_v = e.cholesky(&scale);
+    let (l_v, diag_v) = e.positive_definite_factor(scale_id, "Wishart", "scale", &scale)?;
     let l_x = e.cholesky(v);
     let log_det_x = log_det_from_chol(e, &l_x);
-    let log_det_v = log_det_from_chol(e, &l_v);
+    let log_det_v = log_det_from_diag(e, &diag_v);
     let tr = trace_via_frobenius(e, &l_v, &l_x);
 
     let half = e.scalar(0.5);
@@ -3364,9 +3391,10 @@ fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Valu
     require_matrix_dim(p.variate_id()?, v, n, "InverseWishart", "X")?;
     let nu = p.get(e, "nu")?;
 
-    let l_psi = e.cholesky(&psi);
+    let (l_psi, diag_psi) =
+        e.positive_definite_factor(scale_id, "InverseWishart", "scale", &psi)?;
     let l_x = e.cholesky(v);
-    let log_det_psi = log_det_from_chol(e, &l_psi);
+    let log_det_psi = log_det_from_diag(e, &diag_psi);
     let log_det_x = log_det_from_chol(e, &l_x);
     let tr = trace_via_frobenius(e, &l_x, &l_psi); // tr(X^-1 Psi) = tr(Psi X^-1)
 

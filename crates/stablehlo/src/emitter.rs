@@ -53,6 +53,8 @@ mod linalg;
 mod packed_gathers;
 #[path = "packing.rs"]
 mod packing;
+#[path = "param_domains.rs"]
+mod param_domains;
 #[path = "pointwise.rs"]
 mod pointwise;
 #[path = "pyhf.rs"]
@@ -153,6 +155,9 @@ pub struct Emitter<'m> {
     runtime_batch_rank: usize,
     runtime_status: Option<Value>,
     runtime_unmapped_check: bool,
+    /// Parameter values already checked against a set at the top level, keyed
+    /// by SSA name and set.
+    checked_parameters: HashSet<(String, String)>,
     /// Prevent sibling yield discovery while lowering a shared lane buffer.
     pooling_yields: bool,
     integrating: bool,
@@ -224,6 +229,7 @@ impl<'m> Emitter<'m> {
             runtime_batch_rank: 0,
             runtime_status: None,
             runtime_unmapped_check: false,
+            checked_parameters: HashSet::new(),
             pooling_yields: false,
             integrating: false,
             next: 0,
@@ -4366,7 +4372,7 @@ impl<'m> Emitter<'m> {
     /// reification directly. Returns the reification node's [`NodeId`], or
     /// `None` for anything that is not a `functionof` (a bare builtin `Const`,
     /// a kernel, a `%local`, …) — the caller handles / refuses those.
-    fn resolve_functionof(&self, callable: NodeId) -> Option<NodeId> {
+    pub(super) fn resolve_functionof(&self, callable: NodeId) -> Option<NodeId> {
         let mut id = callable;
         // Follow `SelfMod` ref hops (a fn bound to a name); bounded so a
         // pathological self-referential binding can't spin forever.

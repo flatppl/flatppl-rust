@@ -42,6 +42,17 @@ impl Emitter<'_> {
     /// Record the first failure per host batch element. Callable and authored
     /// cell axes describe work within one call and are reduced together.
     pub(crate) fn record_runtime_error(&mut self, valid: &Value, code: i64) {
+        self.record_runtime_flag(valid, code, true);
+    }
+
+    /// [`Emitter::record_runtime_error`] for a flag that is true where the
+    /// call fails, which needs no negation.
+    pub(crate) fn record_runtime_violation(&mut self, violation: &Value, code: i64) {
+        self.record_runtime_flag(violation, code, false);
+    }
+
+    fn record_runtime_flag(&mut self, flag: &Value, code: i64, valid_when_true: bool) {
+        let valid = flag;
         assert!(code > 0, "runtime error codes must be positive");
         if self.runtime_batch_rank > 0
             && self.call_frame.len() >= self.runtime_batch_rank
@@ -68,12 +79,18 @@ impl Emitter<'_> {
         );
         let valid = if rank == 0 {
             valid
-        } else {
+        } else if valid_when_true {
             self.reduce_boolean("stablehlo.and", "true", &valid)
+        } else {
+            self.reduce_boolean("stablehlo.or", "false", &valid)
         };
         let zero = self.int_value_const(0);
         let failure = self.int_value_const(code);
-        let mut current = self.select(&valid, &zero, &failure);
+        let mut current = if valid_when_true {
+            self.select(&valid, &zero, &failure)
+        } else {
+            self.select(&valid, &failure, &zero)
+        };
         if self.runtime_batch_rank > 0 && self.call_frame.len() >= self.runtime_batch_rank {
             let frame = self.call_frame[..self.runtime_batch_rank].to_vec();
             current = self.finish_broadcast(&current, &frame, frame.len());
