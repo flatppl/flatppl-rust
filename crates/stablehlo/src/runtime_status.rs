@@ -34,6 +34,12 @@ impl Emitter<'_> {
         self.runtime_batch_rank = rank;
     }
 
+    /// Every code the status can report, so a host can tell which checks it
+    /// must handle.
+    pub fn runtime_codes(&self) -> Vec<i64> {
+        self.runtime_codes.iter().copied().collect()
+    }
+
     /// The accumulated first error, or no status when no check was emitted.
     pub fn runtime_status(&self) -> Option<Value> {
         self.runtime_status.clone()
@@ -54,6 +60,7 @@ impl Emitter<'_> {
     fn record_runtime_flag(&mut self, flag: &Value, code: i64, valid_when_true: bool) {
         let valid = flag;
         assert!(code > 0, "runtime error codes must be positive");
+        self.runtime_codes.insert(code);
         if self.runtime_batch_rank > 0
             && self.call_frame.len() >= self.runtime_batch_rank
             && self.broadcast_frame.len() < self.runtime_batch_rank

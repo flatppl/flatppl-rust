@@ -116,7 +116,8 @@ The results are `m.x`, `m.y`, `first.x`, `first.y`.
 Programs with runtime checks return one trailing integer status after the
 authored result leaves. The module attribute `flatppl.runtime_status` gives its
 zero-based result index. `flatppl-host` also exports `runtime_status` metadata
-with its `index`, `dtype` and `shape`. The authored output schema excludes it.
+with its `index`, `dtype`, `shape` and the sorted nonzero `codes` the status can
+report. The authored output schema excludes it.
 Programs without checks retain their original result signature.
 
 | Status | Meaning |

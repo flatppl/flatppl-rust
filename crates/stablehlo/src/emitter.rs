@@ -24,7 +24,7 @@
 //! ([`render_i1`]) rather than extending `MlirTy` — [`Emitter::select`] does
 //! the same for its predicate operand.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
@@ -156,6 +156,8 @@ pub struct Emitter<'m> {
     runtime_batch_rank: usize,
     runtime_status: Option<Value>,
     runtime_unmapped_check: bool,
+    /// Every code a runtime check can report.
+    runtime_codes: BTreeSet<i64>,
     /// Parameter values already checked against a set at the top level, keyed
     /// by SSA name and set.
     checked_parameters: HashSet<(String, String)>,
@@ -231,6 +233,7 @@ impl<'m> Emitter<'m> {
             runtime_batch_rank: 0,
             runtime_status: None,
             runtime_unmapped_check: false,
+            runtime_codes: BTreeSet::new(),
             checked_parameters: HashSet::new(),
             pooling_yields: false,
             integrating: false,

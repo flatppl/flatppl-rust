@@ -32,6 +32,8 @@ pub struct RuntimeStatus {
     pub index: usize,
     pub dtype: &'static str,
     pub shape: Vec<u64>,
+    /// Every nonzero code the status can report.
+    pub codes: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -220,6 +222,7 @@ pub fn emit_query(
                 Dtype::F64 => "int64",
             },
             shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
+            codes: emitter.runtime_codes(),
         }
     });
     let returned = returned.iter().collect::<Vec<_>>();

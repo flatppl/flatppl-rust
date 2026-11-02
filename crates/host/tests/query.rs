@@ -763,7 +763,7 @@ fn a_runtime_row_output_exports_one_result_per_column() -> Result<(), Box<dyn st
     );
     assert_eq!(
         serde_json::to_value(&exported.runtime_status)?,
-        json!({"index": 2, "dtype": "int32", "shape": []})
+        json!({"index": 2, "dtype": "int32", "shape": [], "codes": [1]})
     );
     Ok(())
 }
