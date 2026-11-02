@@ -2918,9 +2918,11 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let n = static_vector_len(e, mu_id, &mu)?;
     require_square_cov(e, cov_id, &cov, n)?;
 
-    let (l, diag_l) = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
-    let log_diag_l = e.log(&diag_l);
+    let pd = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
+    let l = pd.factor.clone();
+    let log_diag_l = e.log(&pd.diagonal);
     let sum_log_diag_l = e.reduce_sum(&log_diag_l);
+    e.finish_positive_definite(&pd, Some(&sum_log_diag_l));
     let two = e.scalar(2.0);
     let log_det = e.mul(&two, &sum_log_diag_l);
     let neg_half = e.scalar(-0.5);
@@ -2965,7 +2967,9 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
     // Cholesky ONCE on the `[d, d]` cov, shared across every draw (scalar or
     // fanned): `L` is a deterministic function of `cov`, not of the rng.
-    let (l, _) = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
+    let pd = e.positive_definite_factor(cov_id, "MvNormal", "cov", &cov)?;
+    e.finish_positive_definite(&pd, None);
+    let l = pd.factor.clone();
 
     let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
@@ -3339,10 +3343,12 @@ fn wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     require_matrix_dim(p.variate_id()?, v, n, "Wishart", "X")?;
     let nu = p.get(e, "nu")?;
 
-    let (l_v, diag_v) = e.positive_definite_factor(scale_id, "Wishart", "scale", &scale)?;
+    let pd = e.positive_definite_factor(scale_id, "Wishart", "scale", &scale)?;
+    let l_v = pd.factor.clone();
     let l_x = e.cholesky(v);
     let log_det_x = log_det_from_chol(e, &l_x);
-    let log_det_v = log_det_from_diag(e, &diag_v);
+    let log_det_v = log_det_from_diag(e, &pd.diagonal);
+    e.finish_positive_definite(&pd, Some(&log_det_v));
     let tr = trace_via_frobenius(e, &l_v, &l_x);
 
     let half = e.scalar(0.5);
@@ -3391,10 +3397,11 @@ fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Valu
     require_matrix_dim(p.variate_id()?, v, n, "InverseWishart", "X")?;
     let nu = p.get(e, "nu")?;
 
-    let (l_psi, diag_psi) =
-        e.positive_definite_factor(scale_id, "InverseWishart", "scale", &psi)?;
+    let pd = e.positive_definite_factor(scale_id, "InverseWishart", "scale", &psi)?;
+    let l_psi = pd.factor.clone();
     let l_x = e.cholesky(v);
-    let log_det_psi = log_det_from_diag(e, &diag_psi);
+    let log_det_psi = log_det_from_diag(e, &pd.diagonal);
+    e.finish_positive_definite(&pd, Some(&log_det_psi));
     let log_det_x = log_det_from_chol(e, &l_x);
     let tr = trace_via_frobenius(e, &l_x, &l_psi); // tr(X^-1 Psi) = tr(Psi X^-1)
 

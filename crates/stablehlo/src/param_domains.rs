@@ -22,6 +22,14 @@ use super::*;
 /// Status for a distribution parameter outside its declared value set.
 pub(crate) const PARAMETER_DOMAIN_STATUS: i64 = 9;
 
+/// A positive definite parameter's Cholesky factor, whose check is pending until
+/// [`Emitter::finish_positive_definite`].
+pub(crate) struct PositiveDefiniteFactor {
+    pub(crate) factor: Value,
+    pub(crate) diagonal: Value,
+    pending: bool,
+}
+
 /// Largest constant matrix factored at emit time.
 const MAX_STATIC_FACTOR: usize = 64;
 
@@ -34,6 +42,7 @@ impl Emitter<'_> {
         ctor: &str,
         params: &[(&str, NodeId, ParamSet)],
     ) -> Result<(), EmitError> {
+        let mut pending: Vec<(Value, ParamSet)> = Vec::new();
         let mut violations: Vec<Value> = Vec::new();
         for &(name, id, set) in params {
             let id = self.sole_element(id);
@@ -67,7 +76,28 @@ impl Emitter<'_> {
             if self.region_depth == 0 {
                 self.checked_parameters.insert(key);
             }
-            violations.extend(self.violations(&value, set));
+            pending.push((value, set));
+        }
+        // Same-shaped parameters over one set share their reductions: the
+        // elementwise minimum of `alpha` and `beta` is positive exactly when
+        // both are.
+        let mut together: Vec<(ParamSet, Vec<Value>)> = Vec::new();
+        for (value, set) in pending {
+            let axes = self.axes_of(&value);
+            let shares = |e: &Self, (s, vs): &(ParamSet, Vec<Value>)| {
+                *s == set
+                    && set != ParamSet::StdSimplex
+                    && vs[0].ty == value.ty
+                    && vs[0].elem == value.elem
+                    && e.axes_of(&vs[0]) == axes
+            };
+            match together.iter().position(|group| shares(self, group)) {
+                Some(at) => together[at].1.push(value),
+                None => together.push((set, vec![value])),
+            }
+        }
+        for (set, values) in together {
+            violations.extend(self.violations(&values, set));
         }
         // One status merge per shape: same-shaped violations combine first.
         let mut groups: Vec<Value> = Vec::new();
@@ -91,16 +121,16 @@ impl Emitter<'_> {
     }
 
     /// The lower Cholesky factor of positive definite parameter `name` of `ctor`,
-    /// and its diagonal. A runtime matrix whose diagonal is nonpositive or
-    /// non-finite reports [`PARAMETER_DOMAIN_STATUS`]. A constant matrix is
-    /// factored here.
+    /// and its diagonal. A constant matrix is factored here. A runtime matrix
+    /// is checked by [`Emitter::finish_positive_definite`], which reads what
+    /// the builder computes from the factor anyway.
     pub(crate) fn positive_definite_factor(
         &mut self,
         id: NodeId,
         ctor: &str,
         name: &str,
         value: &Value,
-    ) -> Result<(Value, Value), EmitError> {
+    ) -> Result<PositiveDefiniteFactor, EmitError> {
         let known = if let Some(values) = self.constant_elements(value) {
             if !constant_positive_definite(&values) {
                 return Err(outside(id, ctor, name, ParamSet::PosDefinite));
@@ -111,18 +141,41 @@ impl Emitter<'_> {
         };
         let factor = self.cholesky(value);
         let diagonal = self.diag(&factor);
-        if !known {
-            // A NaN diagonal fails both tests: it marks a failed factorization.
-            let least = self.per_call(&diagonal, false);
-            let most = self.per_call(&diagonal, true);
-            let zero = self.scalar(0.0);
-            let infinity = self.scalar(f64::INFINITY);
-            let positive = self.compare("GT", &least, &zero);
-            let finite = self.compare("LT", &most, &infinity);
-            let valid = self.select(&positive, &finite, &positive);
-            self.record_runtime_error(&valid, PARAMETER_DOMAIN_STATUS);
+        Ok(PositiveDefiniteFactor {
+            factor,
+            diagonal,
+            pending: !known,
+        })
+    }
+
+    /// Report a factor whose diagonal is nonpositive or non-finite. A density
+    /// passes `sum(log(diagonal))`, which it computes for the log determinant
+    /// and which is finite exactly when every diagonal entry is positive and
+    /// finite. A NaN marks a failed factorization, so it reports too.
+    pub(crate) fn finish_positive_definite(
+        &mut self,
+        pd: &PositiveDefiniteFactor,
+        log_diagonal_sum: Option<&Value>,
+    ) {
+        if !pd.pending {
+            return;
         }
-        Ok((factor, diagonal))
+        let valid = match log_diagonal_sum {
+            Some(sum) => {
+                let zero = self.sub(sum, sum);
+                self.compare("EQ", &zero, &zero)
+            }
+            None => {
+                let least = self.per_call(&pd.diagonal, false);
+                let most = self.per_call(&pd.diagonal, true);
+                let zero = self.scalar(0.0);
+                let infinity = self.scalar(f64::INFINITY);
+                let positive = self.compare("GT", &least, &zero);
+                let finite = self.compare("LT", &most, &infinity);
+                self.select(&positive, &finite, &positive)
+            }
+        };
+        self.record_runtime_error(&valid, PARAMETER_DOMAIN_STATUS);
     }
 
     /// Every element of a constant value, through layout views, or `None`.
@@ -225,12 +278,17 @@ impl Emitter<'_> {
     /// in the surrounding fusion, where XLA's CPU backend runs a boolean
     /// `or` reduction as a slow separate loop. Both propagate NaN, and every
     /// test is an ordered comparison, so NaN never violates.
-    fn violations(&mut self, value: &Value, set: ParamSet) -> Vec<Value> {
+    fn violations(&mut self, values: &[Value], set: ParamSet) -> Vec<Value> {
         use ParamSet::*;
         // (lower bound, whether the bound itself violates, upper bound, integral)
         let (lower, strict, upper, whole) = match set {
             Unconstrained | PosDefinite | Reals => return vec![],
-            StdSimplex => return self.simplex_violations(value),
+            StdSimplex => {
+                return values
+                    .iter()
+                    .flat_map(|value| self.simplex_violations(value))
+                    .collect();
+            }
             PosReals => (Some(0.0), true, None, false),
             NonNegReals => (Some(0.0), false, None, false),
             UnitInterval => (Some(0.0), false, Some(1.0), false),
@@ -241,18 +299,35 @@ impl Emitter<'_> {
             Booleans => (Some(0.0), false, Some(1.0), true),
         };
         let holds_bool = |x: f64| set.contains(x) == Some(true);
-        if value.elem == ElemKind::Bool && holds_bool(0.0) && holds_bool(1.0) {
+        let elem = values[0].elem;
+        if elem == ElemKind::Bool && holds_bool(0.0) && holds_bool(1.0) {
             return vec![];
         }
-        let whole = whole && value.elem == ElemKind::Real;
-        let x = self.convert(value, ElemKind::Real);
+        let whole = whole && elem == ElemKind::Real;
+        let reals = values
+            .iter()
+            .map(|value| self.convert(value, ElemKind::Real))
+            .collect::<Vec<_>>();
+        let fold = |e: &mut Self, xs: &[Value], maximum: bool| {
+            let mut out = xs[0].clone();
+            for x in &xs[1..] {
+                out = if maximum {
+                    e.max(&out, x)
+                } else {
+                    e.min(&out, x)
+                };
+            }
+            out
+        };
         let mut flags = Vec::new();
         if let Some(lo) = lower {
+            let x = fold(self, &reals, false);
             let least = self.per_call(&x, false);
             let lo = self.scalar(lo);
             flags.push(self.compare(if strict { "LE" } else { "LT" }, &least, &lo));
         }
         if let Some(hi) = upper {
+            let x = fold(self, &reals, true);
             let most = self.per_call(&x, true);
             let hi = self.scalar(hi);
             flags.push(self.compare("GT", &most, &hi));
@@ -260,17 +335,25 @@ impl Emitter<'_> {
         if whole {
             // `x - floor(x)` is zero for an integer and NaN for an infinity,
             // which no integer set holds.
-            let floor = self.floor(&x);
-            let fraction = self.sub(&x, &floor);
+            let fractions = reals
+                .iter()
+                .map(|x| {
+                    let floor = self.floor(x);
+                    self.sub(x, &floor)
+                })
+                .collect::<Vec<_>>();
+            let fraction = fold(self, &fractions, true);
             let fraction = self.per_call(&fraction, true);
             let zero = self.scalar(0.0);
             flags.push(self.compare("GT", &fraction, &zero));
             let infinity = self.scalar(f64::INFINITY);
             if upper.is_none() {
+                let x = fold(self, &reals, true);
                 let most = self.per_call(&x, true);
                 flags.push(self.compare("EQ", &most, &infinity));
             }
             if lower.is_none() {
+                let x = fold(self, &reals, false);
                 let least = self.per_call(&x, false);
                 let negative = self.neg(&infinity);
                 flags.push(self.compare("EQ", &least, &negative));

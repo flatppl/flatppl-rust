@@ -3926,7 +3926,7 @@ fn emit_logdensity_gamma_has_expected_structure() {
     // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4019,7 +4019,7 @@ fn emit_logdensity_weibull_has_expected_structure() {
     // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4100,7 +4100,7 @@ fn emit_logdensity_pareto_has_expected_structure() {
     // op counts above are unchanged (numerically identical in-support).
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        4,
+        3,
         "expected two selects (variate guard + off-support mask) and two for status 9, in:
 {out}"
     );
@@ -4186,7 +4186,7 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
     // remaining selects report status 9 for the runtime parameters.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
+        1,
         "folded stablehlo.select count, in:\n{out}"
     );
     assert!(
@@ -4574,7 +4574,7 @@ fn emit_logdensity_beta_has_expected_structure() {
     // op counts above are unchanged (numerically identical in-support).
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        4,
+        3,
         "expected two selects (variate guard + off-support mask) and two for status 9, in:
 {out}"
     );
@@ -5958,9 +5958,9 @@ fn emit_logdensity_mvnormal_has_expected_structure() {
         2,
         "diag's row/col index tensors, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.compare").count(), 3);
-    assert_eq!(out.matches("stablehlo.select").count(), 3);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 5);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -6282,9 +6282,9 @@ fn emit_logdensity_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 6);
-    assert_eq!(out.matches("stablehlo.select").count(), 6);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 8);
+    assert_eq!(out.matches("stablehlo.compare").count(), 5);
+    assert_eq!(out.matches("stablehlo.select").count(), 5);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
@@ -6376,9 +6376,9 @@ fn emit_logdensity_inverse_wishart_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
     assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 6);
-    assert_eq!(out.matches("stablehlo.select").count(), 6);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 8);
+    assert_eq!(out.matches("stablehlo.compare").count(), 5);
+    assert_eq!(out.matches("stablehlo.select").count(), 5);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
