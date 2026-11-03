@@ -2537,16 +2537,20 @@ fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
         // an overflowing lgamma or singular reciprocal from poisoning AD.
         let small_x = e.select(&large, &safe, v);
         let small_rate = e.select(&large, &safe, &safe_rate);
-        let log_rate = e.log(&small_rate);
+        let large_x = e.select(&large, v, &cutoff);
+        let log_x = e.log(&large_x);
+        // One logarithm per element serves both branches: log(rate) for small
+        // counts, log(rate/x) for large ones.
+        let scale = e.select(&large, v, &safe);
+        let (log_rate, log_x_over_rate) = poisson_log_ratio(e, &scale, &safe_rate, &log_x);
         let x_log_rate = e.mul(&small_x, &log_rate);
         let x_plus_one = e.add(&small_x, &safe);
         let lgamma_x1 = e.lgamma(&x_plus_one);
         let small = e.sub(&x_log_rate, &small_rate);
         let small = e.sub(&small, &lgamma_x1);
 
-        let large_x = e.select(&large, v, &cutoff);
         let large_rate = e.select(&large, &safe_rate, &cutoff);
-        let stable = poisson_large_logpdf(e, &large_x, &large_rate);
+        let stable = poisson_large_logpdf(e, &large_x, &large_rate, &log_x, &log_x_over_rate);
         let regular = e.select(&large, &stable, &small);
         let zero_variate = e.compare("EQ", v, &zero);
         let inf = e.inf(MlirTy::Scalar);
@@ -2560,7 +2564,13 @@ fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
 /// Loader's saddle-point form: -D(x, rate) - log(2*pi*x)/2 - Stirling(x).
 /// Five Stirling terms at x >= 16 have absolute truncation error < 1.1e-16
 /// (DLMF 5.11.1 and 5.11(ii)). All operations remain pointwise/broadcastable.
-fn poisson_large_logpdf(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
+fn poisson_large_logpdf(
+    e: &mut Emitter,
+    x: &Value,
+    rate: &Value,
+    log_x: &Value,
+    log_x_over_rate: &Value,
+) -> Value {
     let one = e.scalar(1.0);
     let inverse = e.div(&one, x);
     let inverse2 = e.mul(&inverse, &inverse);
@@ -2576,10 +2586,9 @@ fn poisson_large_logpdf(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
         ],
     );
     let correction = e.mul(&inverse, &correction);
-    let deviance = e.native_products(|e| poisson_deviance(e, x, rate));
+    let deviance = e.native_products(|e| poisson_deviance(e, x, rate, log_x_over_rate));
     let half = e.scalar(0.5);
-    let log_x = e.log(x);
-    let half_log_x = e.mul(&half, &log_x);
+    let half_log_x = e.mul(&half, log_x);
     let constant = e.scalar(-0.5 * (2.0 * std::f64::consts::PI).ln());
     let result = e.sub(&constant, &half_log_x);
     let result = e.sub(&result, &correction);
@@ -2589,7 +2598,7 @@ fn poisson_large_logpdf(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
 /// x*log(x/rate) + rate - x without cancellation near x=rate.
 /// Loader (2002), equation 7 and the deviance series. For |v| < 0.1, eight
 /// odd terms leave < 6e-19 relative truncation error against the leading term.
-fn poisson_deviance(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
+fn poisson_deviance(e: &mut Emitter, x: &Value, rate: &Value, log_x_over_rate: &Value) -> Value {
     let zero = e.scalar(0.0);
     let difference = e.sub(x, rate);
     let half = e.scalar(0.5);
@@ -2624,23 +2633,32 @@ fn poisson_deviance(e: &mut Emitter, x: &Value, rate: &Value) -> Value {
     let tail = e.mul(&twice_x_v, &tail);
     let leading = e.mul(&difference, &v);
     let close = e.add(&leading, &tail);
-
-    // Dividing by x (at least 16 here) avoids a tiny denominator in the
-    // derivative. Logging the ratio directly also avoids subtracting two
-    // large, nearly equal logarithms. Fall back only if the ratio underflows.
-    let ratio = e.div(rate, x);
-    let positive = e.compare("GT", &ratio, &zero);
-    let one = e.scalar(1.0);
-    let safe_ratio = e.select(&positive, &ratio, &one);
-    let log_ratio = e.log(&safe_ratio);
-    let direct = e.neg(&log_ratio);
-    let log_x = e.log(x);
-    let log_rate = e.log(rate);
-    let separate = e.sub(&log_x, &log_rate);
-    let log_ratio = e.select(&positive, &direct, &separate);
-    let far = e.mul(x, &log_ratio);
+    let far = e.mul(x, log_x_over_rate);
     let far = e.sub(&far, &difference);
     e.select(&near, &close, &far)
+}
+
+/// Returns `(log(rate / scale), log(scale / rate))` from one logarithm.
+/// Dividing by `scale` (at least 16 where the deviance uses the result) avoids
+/// a tiny denominator in the derivative. Logging the ratio directly also
+/// avoids subtracting two large, nearly equal logarithms. Only if the ratio
+/// underflows does the first value become `log(rate)` and the second
+/// `log_scale - log(rate)`.
+fn poisson_log_ratio(
+    e: &mut Emitter,
+    scale: &Value,
+    rate: &Value,
+    log_scale: &Value,
+) -> (Value, Value) {
+    let zero = e.scalar(0.0);
+    let ratio = e.div(rate, scale);
+    let positive = e.compare("GT", &ratio, &zero);
+    let argument = e.select(&positive, &ratio, rate);
+    let log_argument = e.log(&argument);
+    let direct = e.neg(&log_argument);
+    let separate = e.sub(log_scale, &log_argument);
+    let log_inverse = e.select(&positive, &direct, &separate);
+    (log_argument, log_inverse)
 }
 
 /// §06 Dirac scores the whole variate: log-density 0 at the atom and -inf elsewhere.
@@ -4447,7 +4465,9 @@ fn poisson_ptrs(e: &mut Emitter, rate: &Value, active: &Value) -> Value {
             let factorial = e.lgamma(&next_x);
             let small_score = e.sub(&small_score, &factorial);
             let large_x = e.select(&large, &safe, &cutoff);
-            let large_score = poisson_large_logpdf(e, &large_x, rate);
+            let log_x = e.log(&large_x);
+            let (_, log_x_over_rate) = poisson_log_ratio(e, &large_x, rate, &log_x);
+            let large_score = poisson_large_logpdf(e, &large_x, rate, &log_x, &log_x_over_rate);
             let score = e.select(&large, &large_score, &small_score);
 
             let numerator = e.mul(&v, &inverse_alpha);

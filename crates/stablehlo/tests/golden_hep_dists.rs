@@ -258,8 +258,8 @@ fn continued_poisson_emits_a_lgamma_continuation_under_a_support_mask() {
     );
     assert_eq!(
         mlir.matches("stablehlo.log ").count(),
-        4,
-        "guarded direct and large-count logarithms:\n{mlir}"
+        2,
+        "one shared log(rate) or log(rate/x), plus log(x):\n{mlir}"
     );
     assert!(
         mlir.contains("compare GE") && mlir.contains("dense<0x7F800000>"),
