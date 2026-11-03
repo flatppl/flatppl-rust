@@ -2665,6 +2665,11 @@ fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
 /// shape, not inside the per-element loop. A `NaN` max fails the test and
 /// propagates.
 ///
+/// The terms pass through `optimization_barrier`, so XLA computes them once
+/// for both reductions. Without it, any op between the max-reduce and its
+/// broadcast lets XLA CPU recompute the terms inside each reduce fusion,
+/// which doubled the forward cost of a Poisson mixture.
+///
 /// A statically two-element `vector(a, b)` of SCALAR terms takes
 /// [`lower_logaddexp`] instead and never builds the tensor at all. That is
 /// the shape every two-mixand `superpose` reaches. Measured on
@@ -2683,6 +2688,7 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
         // the elements' own axes, which the scalar identity cannot express.
     }
     let v = e.lower_node(v)?;
+    let v = e.unary("stablehlo.optimization_barrier", &v);
     let m = e.reduce_max(&v);
     let shift = e.floor(&m);
     let mag = e.abs(&m);

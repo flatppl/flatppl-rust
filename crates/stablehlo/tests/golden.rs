@@ -1474,7 +1474,8 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
 /// Reverse-mode AD records an argmax for a max-reduce whose result reaches the
 /// output through a differentiable op. `logsumexp` must consume the max only
 /// through `floor` (zero derivative), `abs` feeding the infinity test, and a
-/// `select` whose only consumer is a `floor`.
+/// `select` whose only consumer is a `floor`. The max-reduce reads the terms
+/// through an `optimization_barrier`.
 #[test]
 fn lower_logsumexp_max_reaches_the_output_only_through_floor_and_its_gate() {
     let mut m = Module::new();
@@ -1502,6 +1503,17 @@ fn lower_logsumexp_max_reaches_the_output_only_through_floor_and_its_gate() {
         .find(|l| l.contains("applies stablehlo.maximum"))
         .expect("missing max reduce");
     let max_ssa = max_line.trim().split(' ').next().unwrap();
+    let terms = max_line
+        .split_once("stablehlo.reduce(")
+        .unwrap()
+        .1
+        .split(' ')
+        .next()
+        .unwrap();
+    assert!(
+        out.contains(&format!("{terms} = stablehlo.optimization_barrier %arg0")),
+        "max-reduce must read the barrier, in:\n{out}"
+    );
     let mut users: Vec<&str> = out
         .lines()
         .filter(|l| {
