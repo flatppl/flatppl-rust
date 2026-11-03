@@ -232,6 +232,23 @@ fn a_sampler_checks_its_parameters() {
 }
 
 #[test]
+fn sampled_ksuperpose_weights_keep_status_7() {
+    // The user wrote weights, not the Categorical `p` they normalize into, so a
+    // negative weight must report status 7. The first recorded error wins, so
+    // the status-7 check must come before the status-9 check of `p`.
+    let source = "w = external(cartpow(reals, 2))\ninputs = w\noutputs = \
+        rand(normalize(ksuperpose(Normal, w, mu = [-3.0, 3.0], sigma = 1.0)), rnginit(0))\n";
+    let ir = emit_mode(source, true).expect("emit");
+    let seven = ir
+        .find("constant dense<7> : tensor<i32>")
+        .expect("status 7");
+    let nine = ir
+        .find("constant dense<9> : tensor<i32>")
+        .expect("status 9");
+    assert!(seven < nine, "{ir}");
+}
+
+#[test]
 fn fixed_data_summaries_check_their_parameters() {
     let source = "sigma = external(reals)\n\
         inputs = sigma\noutputs = logdensityof(iid(Normal(0.0, sigma), 3), [1.0, 2.0, 4.0])";
