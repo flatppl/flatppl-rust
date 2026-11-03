@@ -290,3 +290,33 @@ fn empty_broadcasts_keep_zero_mass_and_empty_density_reductions() {
         );
     }
 }
+
+/// A mixture under `iid` emits a batched logsumexp, and batched emission
+/// replays a broadcast `select` at the full shape. The infinite-max gate must
+/// stay on the per-row shape: no full-shape `select` may feed the `exp` loop.
+#[test]
+fn iid_mixture_keeps_the_logsumexp_gate_per_row() {
+    let out = emit_logdensity(
+        "centers = [412.1, 415.7, 421.3]\n\
+         w = external(cartpow(posreals, 3))\n\
+         sigma = external(posreals)\n\
+         y = external(cartpow(reals, 4))\n\
+         line = normalize(ksuperpose(Normal, w, mu = centers, sigma = sigma))\n\
+         lp = logdensityof(iid(line, 4), y)\n\
+         inputs = (w, sigma, y)\n\
+         outputs = lp",
+    );
+    assert!(
+        out.contains("applies stablehlo.maximum across dimensions = [1] : (tensor<4x3xf32>"),
+        "expected a batched max-reduce:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.exponential") && out.contains("tensor<4x3xf32>"),
+        "expected the exp loop at 4x3:\n{out}"
+    );
+    assert!(
+        !out.lines()
+            .any(|l| l.contains("stablehlo.select") && l.contains("tensor<4x3xi1>")),
+        "a full-shape select feeds the exp loop:\n{out}"
+    );
+}
