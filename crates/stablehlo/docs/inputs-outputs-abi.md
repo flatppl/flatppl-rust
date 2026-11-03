@@ -147,7 +147,9 @@ without an error, as for status 3, so a `reals` parameter has no check. A
 positive definite matrix requires a Cholesky factor with a positive, finite
 diagonal. The check reads the factor that the density or sampler computes anyway.
 A matrix that is not positive definite gives a NaN factor, so a NaN matrix also
-reports status 9. No check is emitted for a parameter whose value set is known at
+reports status 9. A Categorical sample checks status 7 first, so `p` with a
+negative, non-finite or zero-total cell reports 7 and only a total away from one
+reports 9. No check is emitted for a parameter whose value set is known at
 emit time:
 
 - A constant inside its set. A constant outside its set refuses emission.
