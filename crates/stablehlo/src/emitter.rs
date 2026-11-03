@@ -24,7 +24,7 @@
 //! ([`render_i1`]) rather than extending `MlirTy` — [`Emitter::select`] does
 //! the same for its predicate operand.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
@@ -53,6 +53,8 @@ mod linalg;
 mod packed_gathers;
 #[path = "packing.rs"]
 mod packing;
+#[path = "param_domains.rs"]
+mod param_domains;
 #[path = "pointwise.rs"]
 mod pointwise;
 #[path = "pyhf.rs"]
@@ -146,6 +148,7 @@ pub struct Emitter<'m> {
     m: &'m Module,
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
+    check_parameters: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
@@ -153,6 +156,11 @@ pub struct Emitter<'m> {
     runtime_batch_rank: usize,
     runtime_status: Option<Value>,
     runtime_unmapped_check: bool,
+    /// Every code a runtime check can report.
+    runtime_codes: BTreeSet<i64>,
+    /// Parameter values already checked against a set at the top level, keyed
+    /// by SSA name and set.
+    checked_parameters: HashSet<(String, String)>,
     /// Prevent sibling yield discovery while lowering a shared lane buffer.
     pooling_yields: bool,
     integrating: bool,
@@ -218,12 +226,15 @@ impl<'m> Emitter<'m> {
             m,
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
+            check_parameters: true,
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,
             runtime_batch_rank: 0,
             runtime_status: None,
             runtime_unmapped_check: false,
+            runtime_codes: BTreeSet::new(),
+            checked_parameters: HashSet::new(),
             pooling_yields: false,
             integrating: false,
             next: 0,
@@ -250,6 +261,7 @@ impl<'m> Emitter<'m> {
     pub fn with_options(m: &'m Module, opts: &crate::EmitOptions) -> Self {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
+        emitter.check_parameters = opts.check_parameters;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
         emitter
@@ -259,6 +271,7 @@ impl<'m> Emitter<'m> {
     pub(super) fn scratch_emitter(&self) -> Self {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
+        emitter.check_parameters = self.check_parameters;
         emitter.integration = self.integration;
         emitter.target = self.target;
         emitter.host_batch = self.host_batch;
@@ -4366,7 +4379,7 @@ impl<'m> Emitter<'m> {
     /// reification directly. Returns the reification node's [`NodeId`], or
     /// `None` for anything that is not a `functionof` (a bare builtin `Const`,
     /// a kernel, a `%local`, …) — the caller handles / refuses those.
-    fn resolve_functionof(&self, callable: NodeId) -> Option<NodeId> {
+    pub(super) fn resolve_functionof(&self, callable: NodeId) -> Option<NodeId> {
         let mut id = callable;
         // Follow `SelfMod` ref hops (a fn bound to a name); bounded so a
         // pathological self-referential binding can't spin forever.

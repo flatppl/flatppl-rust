@@ -9,6 +9,7 @@ fn linear_solve_status_is_separate_per_host_call() -> Result<(), Box<dyn std::er
     assert_eq!(status.index, 1);
     assert_eq!(status.dtype, "int32");
     assert!(status.shape.is_empty());
+    assert_eq!(status.codes, [4]);
     let batched = query.compile_batched(
         &options,
         &BatchSpec {

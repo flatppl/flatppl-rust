@@ -338,6 +338,7 @@ impl NativeModule {
                 max_intervals,
             }),
             target,
+            check_parameters: true,
         };
         let boxes = boxes
             .unwrap_or_default()

@@ -240,11 +240,14 @@ pub(crate) enum ResultSet {
 /// Deliberately NOT `SupportTag`: that enum carries dimension-aware entries
 /// (`StdSimplex`, `CartPowReals`) and a `Structural` escape that belong to a
 /// distribution's variate support, none of which a scalar constant can be tested
-/// against. A vector or matrix parameter is left `Unconstrained` here for the same
-/// reason — §08 gives `Dirichlet`'s `alpha` as an "array of positive reals", which
-/// is a per-element claim this check does not reach.
+/// against.
+///
+/// A scalar set on a rank-1 parameter applies to every element: §08 gives
+/// `Dirichlet`'s `alpha` as an "array of positive reals". The constant check above
+/// reads scalars only, so it never reaches such a parameter. The StableHLO emitter
+/// checks every declared set at run time.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
-pub(crate) enum ParamSet {
+pub enum ParamSet {
     #[default]
     Unconstrained,
     Reals,
@@ -258,6 +261,11 @@ pub(crate) enum ParamSet {
     /// A closed real range `[lo, hi]` — §03 "Interval": "`interval(lo, hi)`
     /// denotes the closed interval $[lo, hi]$."
     Interval(f64, f64),
+    /// `stdsimplex(n)` (§03): a vector of nonnegative reals that sums to one.
+    StdSimplex,
+    /// A positive definite matrix, as §08 states for `MvNormal`'s `cov` and the
+    /// `Wishart` scale.
+    PosDefinite,
 }
 
 impl ParamSet {
@@ -274,11 +282,11 @@ impl ParamSet {
     /// `reals` admit `inf`" — so `+inf` passes those three rather than being
     /// refused as out of range. A NaN constant satisfies no comparison and so
     /// answers `false` for every set; nothing constructs one statically today.
-    pub(crate) fn contains(&self, v: f64) -> Option<bool> {
+    pub fn contains(&self, v: f64) -> Option<bool> {
         use ParamSet::*;
         let integral = v.fract() == 0.0 && v.is_finite();
         Some(match self {
-            Unconstrained => return None,
+            Unconstrained | StdSimplex | PosDefinite => return None,
             Reals => !v.is_nan(),
             PosReals => v > 0.0,
             NonNegReals => v >= 0.0,
@@ -292,7 +300,7 @@ impl ParamSet {
     }
 
     /// The set as the spec spells it, for the diagnostic.
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         use ParamSet::*;
         match self {
             Unconstrained => "anything".to_string(),
@@ -305,6 +313,8 @@ impl ParamSet {
             NonNegIntegers => "nonnegintegers".to_string(),
             Booleans => "booleans".to_string(),
             Interval(lo, hi) => format!("interval({lo}, {hi})"),
+            StdSimplex => "stdsimplex(n)".to_string(),
+            PosDefinite => "positive definite matrices".to_string(),
         }
     }
 }
@@ -934,6 +944,53 @@ impl Catalogue {
             Sig::Distribution { mass, .. } => Some(lower::mass(*mass)),
             _ => None,
         }
+    }
+
+    /// The value set of every real result of base function `name`, when its row
+    /// states one tighter than the result type: `exp` → `PosReals`. `None` for a
+    /// natural or complex result set and for a name that is no base function.
+    pub fn function_result_set(&self, name: &str) -> Option<ParamSet> {
+        let Some(Sig::Function { result_set, .. }) = self.base(name) else {
+            return None;
+        };
+        Some(match *result_set {
+            ResultSet::Natural | ResultSet::Complexes => return None,
+            ResultSet::Reals => ParamSet::Reals,
+            ResultSet::PosReals => ParamSet::PosReals,
+            ResultSet::NonNegReals => ParamSet::NonNegReals,
+            ResultSet::UnitInterval => ParamSet::UnitInterval,
+            ResultSet::Integers => ParamSet::Integers,
+            ResultSet::PosIntegers => ParamSet::PosIntegers,
+            ResultSet::NonNegIntegers => ParamSet::NonNegIntegers,
+            ResultSet::Booleans => ParamSet::Booleans,
+            ResultSet::Interval(lo, hi) => ParamSet::Interval(lo, hi),
+        })
+    }
+
+    /// Declared parameter value sets for a built-in distribution, parallel to
+    /// [`Self::distribution_param_names`]. A row that states no set reports
+    /// [`ParamSet::Unconstrained`]. `None` under the same conditions as
+    /// `distribution_param_names`.
+    pub fn distribution_param_sets(&self, name: &str) -> Option<Vec<ParamSet>> {
+        let sets = |sig: &Sig| match sig {
+            Sig::Distribution {
+                params, param_sets, ..
+            } => Some(
+                (0..params.len())
+                    .map(|i| param_sets.get(i).copied().unwrap_or_default())
+                    .collect(),
+            ),
+            Sig::Function { .. } | Sig::Structural { .. } => None,
+        };
+        if let Some(sig @ Sig::Distribution { .. }) = self.base(name) {
+            return sets(sig);
+        }
+        self.modules.iter().find_map(|m| {
+            m.bindings
+                .iter()
+                .find(|b| b.name == name)
+                .and_then(|b| sets(&b.sig))
+        })
     }
 
     /// Declared parameter RANKS for a built-in distribution, parallel to

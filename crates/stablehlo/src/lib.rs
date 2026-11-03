@@ -271,6 +271,9 @@ pub struct EmitOptions {
     pub integration: Option<IntegrationOptions>,
     /// Lowering profile. Values and derivatives do not depend on it.
     pub target: Target,
+    /// Check distribution parameters against their declared value sets at run
+    /// time (status 9). Constants are always checked at emit time.
+    pub check_parameters: bool,
 }
 
 /// Error estimates for positive scalar integrals, evaluated in log space.
@@ -307,6 +310,7 @@ impl Default for EmitOptions {
             restrict_enzyme_compatible: true,
             integration: None,
             target: Target::Cpu,
+            check_parameters: true,
         }
     }
 }

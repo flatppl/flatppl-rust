@@ -267,7 +267,7 @@ impl Emitter<'_> {
             }
         }
         let mut params = Vec::with_capacity(fields.len());
-        for field in fields {
+        for &field in &fields {
             let Some(value) = self.density_scalar(field)? else {
                 return Ok(None);
             };
@@ -450,6 +450,17 @@ impl Emitter<'_> {
             }
             _ => unreachable!(),
         };
+        let sets = flatppl_infer::distribution_param_sets(&ctor).unwrap_or_default();
+        let declared = flatppl_infer::distribution_param_names(&ctor).unwrap_or_default();
+        let checks = names
+            .iter()
+            .zip(&fields)
+            .filter_map(|(name, field)| {
+                let at = declared.iter().position(|d| d == name)?;
+                Some((*name, *field, *sets.get(at)?))
+            })
+            .collect::<Vec<_>>();
+        self.check_parameter_domains(&ctor, &checks)?;
         Ok(Some(result))
     }
 }

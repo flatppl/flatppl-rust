@@ -34,6 +34,12 @@ impl Emitter<'_> {
         self.runtime_batch_rank = rank;
     }
 
+    /// Every code the status can report, so a host can tell which checks it
+    /// must handle.
+    pub fn runtime_codes(&self) -> Vec<i64> {
+        self.runtime_codes.iter().copied().collect()
+    }
+
     /// The accumulated first error, or no status when no check was emitted.
     pub fn runtime_status(&self) -> Option<Value> {
         self.runtime_status.clone()
@@ -42,7 +48,19 @@ impl Emitter<'_> {
     /// Record the first failure per host batch element. Callable and authored
     /// cell axes describe work within one call and are reduced together.
     pub(crate) fn record_runtime_error(&mut self, valid: &Value, code: i64) {
+        self.record_runtime_flag(valid, code, true);
+    }
+
+    /// [`Emitter::record_runtime_error`] for a flag that is true where the
+    /// call fails, which needs no negation.
+    pub(crate) fn record_runtime_violation(&mut self, violation: &Value, code: i64) {
+        self.record_runtime_flag(violation, code, false);
+    }
+
+    fn record_runtime_flag(&mut self, flag: &Value, code: i64, valid_when_true: bool) {
+        let valid = flag;
         assert!(code > 0, "runtime error codes must be positive");
+        self.runtime_codes.insert(code);
         if self.runtime_batch_rank > 0
             && self.call_frame.len() >= self.runtime_batch_rank
             && self.broadcast_frame.len() < self.runtime_batch_rank
@@ -66,14 +84,25 @@ impl Emitter<'_> {
                 },
             },
         );
-        let valid = if rank == 0 {
-            valid
-        } else {
-            self.reduce_boolean("stablehlo.and", "true", &valid)
-        };
         let zero = self.int_value_const(0);
         let failure = self.int_value_const(code);
-        let mut current = self.select(&valid, &zero, &failure);
+        let mut current = if valid_when_true {
+            let valid = if rank == 0 {
+                valid
+            } else {
+                self.reduce_boolean("stablehlo.and", "true", &valid)
+            };
+            self.select(&valid, &zero, &failure)
+        } else {
+            // An integer `max` stays in the surrounding fusion, where XLA's CPU
+            // backend runs a boolean `or` reduction as a slow separate loop.
+            let mut codes = self.select(&valid, &failure, &zero);
+            let batch = self.batch_rank(&codes);
+            for _ in batch..rank {
+                codes = self.reduce_axis_lit("stablehlo.maximum", "0", &codes, batch);
+            }
+            codes
+        };
         if self.runtime_batch_rank > 0 && self.call_frame.len() >= self.runtime_batch_rank {
             let frame = self.call_frame[..self.runtime_batch_rank].to_vec();
             current = self.finish_broadcast(&current, &frame, frame.len());
