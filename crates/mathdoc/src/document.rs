@@ -420,8 +420,8 @@ fn shift_heading(level: HeadingLevel) -> HeadingLevel {
 fn converter() -> &'static math_core::LatexToMathML {
     static CONVERTER: OnceLock<math_core::LatexToMathML> = OnceLock::new();
     CONVERTER.get_or_init(|| {
-        math_core::LatexToMathML::new(math_core::MathCoreConfig::default())
-            .expect("the default configuration defines no macros")
+        math_core::LatexToMathML::new(math_core::MathCoreConfig::default(), Vec::new())
+            .expect("an empty macro list always parses")
     })
 }
 
