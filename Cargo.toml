@@ -15,6 +15,23 @@ strip = true
 lto = "fat"
 codegen-units = 1
 
+# Size-optimize the Arrow IPC reader. It shrinks the CLI by 5.5-7.3% and the
+# wasm-api by 7.9% with exact outputs and no measured throughput change.
+[profile.release.package.arrow-array]
+opt-level = "z"
+[profile.release.package.arrow-buffer]
+opt-level = "z"
+[profile.release.package.arrow-cmp]
+opt-level = "z"
+[profile.release.package.arrow-data]
+opt-level = "z"
+[profile.release.package.arrow-ipc]
+opt-level = "z"
+[profile.release.package.arrow-schema]
+opt-level = "z"
+[profile.release.package.arrow-select]
+opt-level = "z"
+
 # Size-optimized profile for the SHIPPED flatppl-lsp binary bundled into the
 # VS Code extension vsix (it is downloaded on every install). Inherits release
 # (so `strip = true` still applies) and adds aggressive size flags. Keep the
