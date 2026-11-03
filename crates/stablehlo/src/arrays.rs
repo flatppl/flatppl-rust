@@ -404,10 +404,25 @@ pub(crate) fn lower_bincounts(
         return Err(EmitError::at(id, "bincounts: the data must be a vector"));
     };
     let n = ne - 1;
+    let fixed = fixed_reals(e, bins);
     let edges = e.convert(&edges, ElemKind::Real);
     let x = e.convert(&x, ElemKind::Real);
     let lo = e.slice(&edges, &[0], &[n], &[1]);
     let hi = e.slice(&edges, &[1], &[ne], &[1]);
+    // §07: "Each edge vector must be strictly increasing".
+    match fixed {
+        Some(values) if values.windows(2).all(|pair| pair[0] < pair[1]) => {}
+        Some(_) => {
+            return Err(EmitError::at(
+                id,
+                "bincounts: the bin edges must be strictly increasing",
+            ));
+        }
+        None => {
+            let increasing = e.compare("LT", &lo, &hi);
+            e.record_runtime_error(&increasing, 8);
+        }
+    }
     let grid = tensor(&[n, m]);
     let xs = e.broadcast_in_dim(&x, &[1], grid.clone());
     let los = e.broadcast_in_dim(&lo, &[0], grid.clone());

@@ -4,7 +4,8 @@
 //!
 //! - §04 "Calling conventions" (#209): "The measure combinators likewise take their
 //!   non-variadic inputs positionally: a keyword spelling such as `normalize(M = mu)`
-//!   is a static error." The keyword form of `joint` stays legal.
+//!   is a static error." The keyword form of `joint` stays legal. Since #227,
+//!   `PoissonProcess` and `BinnedPoissonProcess` are §06 measure operations too.
 //! - §07 `rnginit` (#209): "A byte-vector seed must contain integers in {0, …, 255}."
 //! - §04 "Broadcasting" (#210): records and tuples are not allowed as operands, and the
 //!   arguments of `broadcasted(f)(args...)` are operands of `broadcast`, never arguments
@@ -53,9 +54,16 @@ fn a_keyword_spelling_of_a_measure_combinators_input_is_refused() {
         "restrict(M = mu, x = 0.0)",
         "locscale(m = mu, shift = 1.0, scale = 2.0)",
         "bijection(f = fn(exp(_)), f_inv = fn(log(_)), logvolume = fn(_))",
+        "PoissonProcess(intensity = weighted(2.0, mu))",
+        "BinnedPoissonProcess(bins = [0.0, 1.0], intensity = weighted(2.0, mu))",
     ] {
         assert_refused(&format!("{MODEL}n = {call}\n"), "positionally");
     }
+    // Its catalogue row makes the mixed spelling fail the ordinary-call rule first.
+    assert_refused(
+        &format!("{MODEL}n = BinnedPoissonProcess([0.0, 1.0], intensity = weighted(2.0, mu))\n"),
+        "not both",
+    );
     assert_refused(
         "j = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Normal(mu = 1.0, sigma = 1.0))\n\
          k1, m1 = disintegrate(selector = \"a\", joint_measure = j)\n",
@@ -68,6 +76,8 @@ fn the_positional_spellings_and_the_keyword_joint_stay_legal() {
     assert_clean(&format!(
         "{MODEL}a = normalize(mu)\nb = iid(mu, 3)\nc = truncate(mu, interval(0.0, 1.0))\n\
          d = bayesupdate(L, joint(x = mu))\n\
+         f = PoissonProcess(weighted(2.0, mu))\n\
+         g = BinnedPoissonProcess([0.0, 1.0], weighted(2.0, mu))\n\
          e = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Normal(mu = 1.0, sigma = 1.0))\n"
     ));
 }
@@ -156,5 +166,32 @@ fn the_arguments_of_broadcasted_are_operands_and_never_splatted_across_the_call(
     assert_clean(&format!(
         "{f}t = table(a = [1.0, 2.0], b = [3.0, 4.0])\nz = broadcasted(f)(t)\n\
          w = broadcasted(f)([1.0, 2.0], [3.0, 4.0])\nv = broadcasted(f)(a = [1.0], b = [2.0])\n"
+    ));
+}
+
+/// §07 `bincounts` (#227): "Each edge vector must be strictly increasing", and
+/// `BinnedPoissonProcess` takes its bins in that format. Written edges are refused
+/// statically.
+#[test]
+fn written_bin_edges_must_strictly_increase() {
+    let model = "x = [0.5, 1.5]\nI = weighted(2.0, Normal(mu = 1.0, sigma = 1.0))\n";
+    for call in [
+        "bincounts([0.0, 2.0, 1.0], x)",
+        "bincounts([0.0, 1.0, 1.0], x)",
+        "bincounts(record(a = [0.0, 1.0], b = [1.0, 0.0]), record(a = x, b = x))",
+        "bincounts(linspace(2.0, 0.0, 3), x)",
+        "bincounts(extlinspace(2.0, 0.0, 3), x)",
+        "BinnedPoissonProcess([0.0, 2.0, 1.0], I)",
+        "BinnedPoissonProcess([1.0, -inf], I)",
+    ] {
+        assert_refused(&format!("{model}n = {call}\n"), "strictly increasing");
+    }
+    assert_refused(
+        &format!("{model}e = [0.0, 0.0]\nn = bincounts(e, x)\n"),
+        "strictly increasing",
+    );
+    assert_clean(&format!(
+        "{model}a = bincounts([0.0, 1.0, inf], x)\nb = bincounts(linspace(0.0, 2.0, 3), x)\n\
+         c = BinnedPoissonProcess(extlinspace(0.0, 2.0, 3), I)\n"
     ));
 }

@@ -7856,7 +7856,7 @@ outputs = (draws)
 // registered-but-`sample: None` (VonMises, Wishart, InverseWishart)
 // plus two never registered at all (PoissonProcess/
 // BinnedPoissonProcess — point-process measures with no `@logdensity`
-// builder either; spec §08). `VonMises` already has a locking test
+// builder either; spec §06). `VonMises` already has a locking test
 // (`builtin_sample_refuses_registered_ctor_without_sample_builder`, Task 7)
 // for the SHARED `dist.sample.ok_or_else` code path — not duplicated here.
 // The four tests below each lock one of the remaining four distributions to
@@ -8015,7 +8015,7 @@ fn emit_sample_chained_rand_second_draw_consumes_first_advanced_key() {
     assert!(is_delimiter_balanced(&out));
 }
 
-/// `PoissonProcess` (spec §08) is never registered at all — no
+/// `PoissonProcess` (spec §06) is never registered at all — no
 /// `@logdensity` builder either, so it hits the SAME `registry::lookup` miss
 /// [`builtin_sample_refuses_unregistered_ctor`] exercises via `Bogus`, but
 /// pinned to this specific real distribution name so a future

@@ -425,14 +425,14 @@ fn mass_classes_compose() {
     );
 }
 
-/// `PoissonProcess(intensity)` (spec §08) is a measure over point
+/// `PoissonProcess(intensity)` (spec §06) is a measure over point
 /// CONFIGURATIONS: an array of the intensity's own point type, of
 /// dynamic length (the event count is itself random), and `%normalized`
 /// (the mass over all configurations is 1).
 #[test]
 fn poisson_process_is_a_measure_over_configurations() {
     let src = "s = elementof(posreals)\n\
-               scalar_proc = PoissonProcess(intensity = weighted(s, Normal(0.0, 1.0)))\n\
+               scalar_proc = PoissonProcess(weighted(s, Normal(0.0, 1.0)))\n\
                table_proc = PoissonProcess(weighted(s, joint(x = Normal(0.0, 1.0), y = Normal(0.0, 1.0))))";
     let (module, diags) = infer_src(src);
     // A typed head takes no gap note.
@@ -451,7 +451,7 @@ fn poisson_process_is_a_measure_over_configurations() {
         ),
         "got:\n{out}"
     );
-    // A record point space gives a TABLE variate instead (§08 "record-valued points").
+    // A record point space gives a TABLE variate instead (§06 "record-valued points").
     assert!(
         out.contains(
             "(%bind table_proc (%meta ((%measure (%domain (%table (%columns \
@@ -461,7 +461,7 @@ fn poisson_process_is_a_measure_over_configurations() {
     );
 }
 
-/// `BinnedPoissonProcess(bins, intensity)` (spec §08) is "the pushforward of a
+/// `BinnedPoissonProcess(bins, intensity)` (spec §06) is "the pushforward of a
 /// `PoissonProcess` through `bincounts`": an integer count array with §07
 /// `bincounts`'s shape, one axis of `n` bins per `n + 1` edges, and one axis per
 /// field of a record of edge vectors. A kernel intensity has no closed measure.
@@ -469,8 +469,8 @@ fn poisson_process_is_a_measure_over_configurations() {
 fn binned_poisson_process_is_a_measure_over_bin_counts() {
     let src = "s = elementof(posreals)\n\
                flat = BinnedPoissonProcess([0.0, 0.5, 1.0, 1.5, 2.0], weighted(s, Normal(1.0, 0.5)))\n\
-               grid = BinnedPoissonProcess(intensity = weighted(s, joint(a = Normal(0.0, 1.0), b = Normal(0.0, 1.0))), \
-                                           bins = record(a = [0.0, 1.0, 2.0], b = [0.0, 1.0]))\n\
+               grid = BinnedPoissonProcess(record(a = [0.0, 1.0, 2.0], b = [0.0, 1.0]), \
+                                           weighted(s, joint(a = Normal(0.0, 1.0), b = Normal(0.0, 1.0))))\n\
                K = mu -> Normal(mu = mu, sigma = 1.0)\n\
                family = BinnedPoissonProcess([0.0, 1.0], K)";
     let (module, diags) = infer_src(src);
@@ -501,7 +501,7 @@ fn binned_poisson_process_is_a_measure_over_bin_counts() {
     );
 }
 
-/// §08 gives `bins` §07 `bincounts`'s format and `intensity` "finite-mass measure or
+/// §06 gives `bins` §07 `bincounts`'s format and `intensity` "finite-mass measure or
 /// kernel", and pairs edge vectors with scalar events and a record of edge vectors
 /// with record events. Each violation is refused at its node: per-bin rates, an
 /// infinite intensity, and either form mismatch.

@@ -1,4 +1,4 @@
-// `PoissonProcess(intensity)` — spec §08's extended unbinned likelihood
+// `PoissonProcess(intensity)` — spec §06's extended unbinned likelihood
 // `Σ_j log λ(x_j) − Λ(R)` — and the limits it refuses instead of mis-lowering.
 
 use flatppl_determinizer::determinize;
@@ -27,7 +27,7 @@ b = elementof(posreals)
 sig = normalize(truncate(Normal(mu = 5.0, sigma = 0.8), window))
 bkg = weighted(0.1, Lebesgue(support = window))
 intensity = superpose(weighted(s, sig), weighted(b, bkg))
-events ~ PoissonProcess(intensity = intensity)
+events ~ PoissonProcess(intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
@@ -98,7 +98,7 @@ window = interval(0.0, 4.0)
 obs = [2.0]
 b = elementof(posreals)
 intensity = weighted(b, weighted(0.3, Lebesgue(support = window)))
-events ~ PoissonProcess(intensity = intensity)
+events ~ PoissonProcess(intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     let out = determinize_src(src);
     let text = flatppl_syntax::print(&out);
@@ -108,7 +108,7 @@ lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     );
 }
 
-// An UNBOUNDED intensity support has infinite mass, so §08's finite-mass
+// An UNBOUNDED intensity support has infinite mass, so §06's finite-mass
 // precondition fails and there is no `Λ` to emit. Refuse rather than emit an
 // infinity.
 #[test]
@@ -117,7 +117,7 @@ fn unbounded_intensity_support_refuses() {
 obs = [1.0]
 b = elementof(posreals)
 intensity = weighted(b, Lebesgue(support = reals))
-events ~ PoissonProcess(intensity = intensity)
+events ~ PoissonProcess(intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     let err = determinize(&parse_infer(src)).expect_err("infinite intensity mass must refuse");
     assert_eq!(err.construct, "PoissonProcess", "refusal names it: {err:?}");
@@ -136,7 +136,7 @@ fn dynamic_length_variate_refuses() {
 obs = elementof(cartpow(reals, n))
 n = 4
 intensity = weighted(2.0, Normal(mu = 0.0, sigma = 1.0))
-events ~ PoissonProcess(intensity = intensity)
+events ~ PoissonProcess(intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = sort(obs)))";
     let m = parse_infer(src);
     // Either inference resolves the length (then this lowers) or it does not
@@ -159,14 +159,14 @@ lp = logdensityof(lawof(record(events = events)), record(events = sort(obs)))";
     }
 }
 
-// §08 admits record-valued points (a table variate), whose rows `get0` does not
+// §06 admits record-valued points (a table variate), whose rows `get0` does not
 // index. That form is out of the implemented fragment and must refuse.
 #[test]
 fn record_valued_points_refuse() {
     let src = "\
 obs = table(x = [1.0, 2.0], y = [3.0, 4.0])
 intensity = weighted(2.0, joint(x = Normal(mu = 0.0, sigma = 1.0), y = Normal(mu = 0.0, sigma = 1.0)))
-events ~ PoissonProcess(intensity = intensity)
+events ~ PoissonProcess(intensity)
 lp = logdensityof(lawof(record(events = events)), record(events = obs))";
     let err = determinize(&parse_infer(src)).expect_err("a table variate must refuse");
     assert!(
@@ -208,7 +208,7 @@ lp = logdensityof(lawof(record(a = a)), record(a = 2.0))";
 fn poisson_process_body_size_does_not_grow_with_event_count() {
     let src = "\
 events = elementof(cartpow(reals, 4294967295))
-lp = logdensityof(PoissonProcess(intensity = Normal(mu = 0.0, sigma = 1.0)), events)
+lp = logdensityof(PoissonProcess(Normal(mu = 0.0, sigma = 1.0)), events)
 inputs = (events)
 outputs = (lp)";
     let large = determinize_src(src);

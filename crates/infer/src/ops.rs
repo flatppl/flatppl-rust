@@ -230,6 +230,9 @@ fn op_rule(
     if let Some(ty) = single_point_linspace_check(inf, id, &name, args, named) {
         return Ready((ty, joined));
     }
+    if let Some(ty) = bin_edges_check(inf, &name, args, named) {
+        return Ready((ty, joined));
+    }
 
     // AFTER `arity_check`, which must see the call as WRITTEN: it counts
     // `args.len() + named.len()` and resolves the splat, so handing it a vector holding the
@@ -706,7 +709,7 @@ fn op_rule(
             None => measure_domain(arg_ty(args, 0)),
         },
         "iid" => iid_type(inf, args),
-        "PoissonProcess" => poisson_process_type(inf, args, named),
+        "PoissonProcess" => poisson_process_type(args),
         "BinnedPoissonProcess" => binned_poisson_process_type(inf, &name, args, named),
         // Measure-transforming ops keep the domain but get a FRESH mass slot
         // — their total mass differs from the base's and is computed by the
@@ -4112,8 +4115,8 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     }
 }
 
-/// `PoissonProcess(intensity = M)` (spec §08): a measure over point
-/// CONFIGURATIONS drawn from the intensity's own point space. §08 gives the
+/// `PoissonProcess(intensity)` (spec §06): a measure over point
+/// CONFIGURATIONS drawn from the intensity's own point space. §06 gives the
 /// variate as "arrays (scalar points) or tables (record-valued points)", so the
 /// domain is [`iid_type`]'s array-or-table rule applied to `M`'s domain — a
 /// record point space gives a table (§03's Cartesian power over a record set
@@ -4121,24 +4124,15 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
 ///
 /// The length is `Dim::Dynamic`, and that is not a degrade: the event count is
 /// itself random, so `PoissonProcess` carries no count argument for a static
-/// shape to come from. §08 also makes the order carry no meaning
+/// shape to come from. §06 also makes the order carry no meaning
 /// (permutation-invariant), which no `Type` variant expresses.
 ///
-/// Mass is left `Deferred` for `fill_mass`'s §08 catch-all to make
+/// Mass is left `Deferred` for `fill_mass`'s catch-all to make
 /// `%normalized`, which is right: the mass over all configurations is
-/// $\sum_k e^{-\Lambda} \Lambda^k / k! = 1$. A KERNEL intensity (§08 admits
+/// $\sum_k e^{-\Lambda} \Lambda^k / k! = 1$. A KERNEL intensity (§06 admits
 /// one) carries no domain in `Type::Kernel`, so it stays `%deferred`.
-fn poisson_process_type(
-    inf: &mut Inferencer<'_, '_>,
-    args: &[ArgInfo],
-    named: &[NamedInfo],
-) -> Type {
-    let intensity = named
-        .iter()
-        .find(|(n, _, _, _)| inf.module.resolve(*n) == "intensity")
-        .map(|(_, _, t, _)| t.clone())
-        .or_else(|| arg_ty(args, 0).cloned());
-    let Some(Type::Measure { domain, .. }) = intensity else {
+fn poisson_process_type(args: &[ArgInfo]) -> Type {
+    let Some(Type::Measure { domain, .. }) = arg_ty(args, 0).cloned() else {
         return Type::Deferred;
     };
     let config = match *domain {
@@ -4157,14 +4151,14 @@ fn poisson_process_type(
     }
 }
 
-/// `BinnedPoissonProcess(bins, intensity)` (spec §08): "the pushforward of a
+/// `BinnedPoissonProcess(bins, intensity)` (spec §06): "the pushforward of a
 /// `PoissonProcess` through `bincounts`", so the variate is the count array §07
 /// `bincounts(bins, _)` returns. The catalogue row's `BinCounts` domain builds it.
 ///
-/// §08 gives `bins` "Same format as for `bincounts`", an edge vector or a record of
+/// §06 gives `bins` "Same format as for `bincounts`", an edge vector or a record of
 /// edge vectors, and `intensity` "finite-mass measure or kernel". Anything else is
 /// refused. A kernel intensity carries no domain, so the call stays `%deferred`, as
-/// for [`poisson_process_type`]. Keyword arguments arrive in declared positions.
+/// for [`poisson_process_type`].
 fn binned_poisson_process_type(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
@@ -4185,7 +4179,7 @@ fn binned_poisson_process_type(
         inf.diags.push(crate::Diagnostic::error_at(
             *node,
             "`BinnedPoissonProcess`'s `bins` must be bin edges in §07 `bincounts`'s \
-             format: a non-empty vector of edges or a record of edge vectors (spec §08)",
+             format: a non-empty vector of edges or a record of edge vectors (spec §06)",
         ));
         refused = Some("bins");
     }
@@ -4196,13 +4190,13 @@ fn binned_poisson_process_type(
         inf.diags.push(crate::Diagnostic::error_at(
             *node,
             format!(
-                "`BinnedPoissonProcess`'s `intensity` is {kind}, but spec §08 declares it \
+                "`BinnedPoissonProcess`'s `intensity` is {kind}, but spec §06 declares it \
                  a finite-mass measure or kernel over the event space"
             ),
         ));
         refused = Some("intensity");
     }
-    // §08 pairs an edge vector with scalar events and a record of edge vectors
+    // §06 pairs an edge vector with scalar events and a record of edge vectors
     // with record events whose fields hold the bin coordinates.
     if refused.is_none()
         && let (Some((_, bins, _)), Some((node, Type::Measure { domain, .. }, _))) =
@@ -4227,7 +4221,7 @@ fn binned_poisson_process_type(
             inf.diags.push(crate::Diagnostic::error_at(
                 *node,
                 format!(
-                    "`BinnedPoissonProcess`'s `intensity` {why}: spec §08 bins scalar \
+                    "`BinnedPoissonProcess`'s `intensity` {why}: spec §06 bins scalar \
                      events with an edge vector and record events with a record of edge \
                      vectors whose fields match theirs"
                 ),
@@ -7518,6 +7512,81 @@ fn single_point_linspace_check(
     ))
 }
 
+/// Refuse written bin edges that do not strictly increase. §07 `bincounts`: "Each
+/// edge vector must be strictly increasing", and §06 `BinnedPoissonProcess` takes
+/// its bins in that format. Edges that are not written out are checked at run time.
+fn bin_edges_check(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    if !matches!(name, "bincounts" | "BinnedPoissonProcess") {
+        return None;
+    }
+    let bins = named_or_positional_node(inf.module, named, args, "bins", 0)?;
+    let vector = non_increasing_written_edges(inf, bins, 0)?;
+    inf.diags.push(crate::Diagnostic::error_at(
+        vector,
+        format!(
+            "`{name}`'s bin edges must be strictly increasing (spec §07 `bincounts`: \
+             \"Each edge vector must be strictly increasing\")"
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: bin edges do not increase").into(),
+    ))
+}
+
+/// The written edge vector under `node` (one vector, or a `record` of them) with two
+/// adjacent written values that do not strictly increase.
+fn non_increasing_written_edges(
+    inf: &Inferencer<'_, '_>,
+    node: NodeId,
+    hops: usize,
+) -> Option<NodeId> {
+    /// Alias hops to follow before giving up, as in [`written_scalar`].
+    const MAX_ALIAS_HOPS: usize = 64;
+    if hops > MAX_ALIAS_HOPS {
+        return None;
+    }
+    match inf.module.node(node) {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let binding = inf.module.binding_by_name(r.name)?;
+            non_increasing_written_edges(inf, inf.module.binding(binding).rhs, hops + 1)
+        }
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            match inf.module.resolve(op) {
+                "vector" => {
+                    let values: Vec<Option<f64>> =
+                        c.args.iter().map(|&a| written_scalar(inf, a)).collect();
+                    values
+                        .windows(2)
+                        .any(|pair| matches!(pair, [Some(lo), Some(hi)] if hi <= lo))
+                        .then_some(node)
+                }
+                "record" => c
+                    .named
+                    .iter()
+                    .find_map(|field| non_increasing_written_edges(inf, field.value, hops + 1)),
+                // Two or more points run from `from` to `to`.
+                "linspace" | "extlinspace" => match c.args[..] {
+                    [from, to, n] if written_int(inf, n).is_some_and(|n| n >= 2) => {
+                        let (from, to) = (written_scalar(inf, from)?, written_scalar(inf, to)?);
+                        (to <= from).then_some(node)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The value of an integer size WRITTEN at this node: a literal, or `neg` over
 /// one (how the lexer spells `-3`). Anything else is not a written size.
 fn written_int(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<i64> {
@@ -8034,6 +8103,8 @@ fn positional_only_inputs(name: &str) -> Option<(usize, bool, &'static str)> {
             (2, false, MEASURE_COMBINATORS)
         }
         "locscale" | "bijection" => (3, false, MEASURE_COMBINATORS),
+        "PoissonProcess" => (1, false, MEASURE_COMBINATORS),
+        "BinnedPoissonProcess" => (2, false, MEASURE_COMBINATORS),
         "restrict" => (1, true, MEASURE_COMBINATORS),
         "cat" => (
             0,
@@ -11192,14 +11263,10 @@ pub(crate) fn fill_mass(
         "lawof" => mass,
         // The broadcast rule already classified the product, even if deferred.
         "broadcast" | "ksuperpose" => mass,
-        // §08 gives `intensity` as a "finite-mass measure or kernel". An infinite
+        // §06 gives `intensity` as a "finite-mass measure or kernel". An infinite
         // intensity puts infinitely many events in some bin, so it is refused.
         "BinnedPoissonProcess" => {
-            let intensity = named
-                .iter()
-                .find(|(n, ..)| inf.module.resolve(*n) == "intensity")
-                .map(|(_, node, t, _)| (*node, t))
-                .or_else(|| args.get(1).map(|(node, t, _)| (*node, t)));
+            let intensity = args.get(1).map(|(node, t, _)| (*node, t));
             if let Some((
                 node,
                 Type::Measure {
@@ -11211,7 +11278,7 @@ pub(crate) fn fill_mass(
                 inf.diags.push(crate::Diagnostic::error_at(
                     node,
                     "`BinnedPoissonProcess`'s `intensity` has infinite total mass, but \
-                     spec §08 declares it a finite-mass measure or kernel",
+                     spec §06 declares it a finite-mass measure or kernel",
                 ));
                 return Type::Failed("BinnedPoissonProcess: infinite intensity".into());
             }
