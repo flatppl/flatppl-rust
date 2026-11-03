@@ -7014,7 +7014,8 @@ fn lower_binned_poisson_process(
 
 /// Add the edge-validity check of edges known only at run time to `score`.
 ///
-/// FlatPDL has no runtime parameter check, and the closed form drops the edges. So
+/// Status 9 checks only the parameters of distributions that survive determinization,
+/// and the closed form drops the edges. So
 /// the score keeps a `bincounts` call, whose own edge check (§07 "Each edge vector
 /// must be strictly increasing") fails at run time, as StableHLO status 8 or a JS
 /// error. FlatPDL has no empty vector literal, so the edges bin themselves: for
