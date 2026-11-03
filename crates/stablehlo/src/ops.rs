@@ -2657,6 +2657,14 @@ fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
 /// keeps an argmax on the tape. `floor` has a zero derivative, so no adjoint
 /// reaches the max-reduce. StableHLO has no stop-gradient op.
 ///
+/// An infinite max would make `v - s` equal `(±inf) - (±inf) = NaN`. The
+/// gate tests `|m| = inf`, as [`lower_logaddexp`] does, and then subtracts
+/// `0` instead and adds `1` to the sum. The result is `s` itself: `-inf` with
+/// a zero gradient when every term is `-inf`, and `+inf` when a term is
+/// `+inf` (that term's gradient stays `NaN`). Both selects act on the reduced
+/// shape, not inside the per-element loop. A `NaN` max fails the test and
+/// propagates.
+///
 /// A statically two-element `vector(a, b)` of SCALAR terms takes
 /// [`lower_logaddexp`] instead and never builds the tensor at all. That is
 /// the shape every two-mixand `superpose` reaches. Measured on
@@ -2677,10 +2685,21 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     let v = e.lower_node(v)?;
     let m = e.reduce_max(&v);
     let shift = e.floor(&m);
-    let shift_bc = broadcast_to(e, id, &shift, &v)?;
+    let mag = e.abs(&m);
+    let inf = e.inf(MlirTy::Scalar);
+    let saturated = e.compare("EQ", &mag, &inf);
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    // Select on `m` and floor afterwards: batched emission replays a select at
+    // the broadcast shape, but never a unary op, so the shift stays per row.
+    let finite_max = e.select(&saturated, &zero, &m);
+    let finite_shift = e.floor(&finite_max);
+    let shift_bc = broadcast_to(e, id, &finite_shift, &v)?;
     let shifted = e.sub(&v, &shift_bc);
     let exp_shifted = e.exp(&shifted);
     let sum = e.reduce_sum(&exp_shifted);
+    let sum_guard = e.select(&saturated, &one, &zero);
+    let sum = e.add(&sum, &sum_guard);
     let log_sum = e.log(&sum);
     Ok(e.add(&log_sum, &shift))
 }
@@ -2740,10 +2759,7 @@ fn static_pair_terms(e: &Emitter, v: NodeId) -> Option<[NodeId; 2]> {
 /// large gap underflows `exp` to `0` and returns `max` exactly; a NaN term
 /// propagates through `max`.
 ///
-/// The reduce path above still returns NaN at an infinite tie. Fixing it
-/// there means gating a whole shifted VECTOR, which is a separate change; it
-/// is carded in `flatppl-dev/TODO-flatppl-rust.md` under the k-way
-/// `superpose`.
+/// The reduce path in [`lower_logsumexp`] uses the same `|m| = inf` test.
 fn lower_logaddexp(e: &mut Emitter, a: &Value, b: &Value) -> Value {
     let m = e.max(a, b);
     let mag = e.abs(&m);
