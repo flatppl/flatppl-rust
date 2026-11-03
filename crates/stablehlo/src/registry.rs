@@ -1101,6 +1101,9 @@ pub(crate) fn lower_sample(
         sample_shape: broadcasted.then(|| batch_shape.clone()),
         fields: None,
     };
+    if matches!(ctor_name.as_str(), "Categorical" | "Categorical0") {
+        check_categorical_sample(e, &params)?;
+    }
     check_parameters(e, &ctor_name, &params)?;
     // Existing samplers consume a flat product batch. Restore its outer axes
     // after sampling, keeping the inner event axes and RNG advances unchanged.
@@ -4109,26 +4112,9 @@ fn geometric_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// Refuses (never panics) a dynamic-length or non-rank-1 `p`, mirroring
 /// [`dirichlet_sample`]'s discipline.
 fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, EmitError> {
-    let probs_id = p.field_id(e, "p")?;
-    let probs = e.lower_node(probs_id)?;
-    let n = match &probs.ty {
-        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
-            EmitError::at(
-                probs_id,
-                "Categorical sample needs a statically-known vector length for 'p'",
-            )
-        })?,
-        other => {
-            return Err(EmitError::at(
-                probs_id,
-                format!("Categorical sample: 'p' must be a rank-1 vector, got {other:?}"),
-            ));
-        }
-    };
-
+    let (_, probs, n) = categorical_probabilities(e, p)?;
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    check_categorical_probabilities(e, probs_id, &probs, n)?;
     let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let mut cum = e.scalar(0.0);
@@ -4155,6 +4141,39 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
         count = e.broadcast_in_dim(&count, &[], batch_ty);
     }
     Ok(count)
+}
+
+/// `p` of a Categorical sampler, with its static length.
+fn categorical_probabilities(
+    e: &mut Emitter,
+    p: &Params,
+) -> Result<(NodeId, Value, u64), EmitError> {
+    let probs_id = p.field_id(e, "p")?;
+    let probs = e.lower_node(probs_id)?;
+    let n = match &probs.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
+            EmitError::at(
+                probs_id,
+                "Categorical sample needs a statically-known vector length for 'p'",
+            )
+        })?,
+        other => {
+            return Err(EmitError::at(
+                probs_id,
+                format!("Categorical sample: 'p' must be a rank-1 vector, got {other:?}"),
+            ));
+        }
+    };
+    Ok((probs_id, probs, n))
+}
+
+/// The Categorical sampler's own check of `p` (status 7). The sample path runs
+/// it before the general parameter check, so a negative, non-finite or
+/// zero-total `p` keeps code 7. That includes the weights a sampled `ksuperpose`
+/// mixture normalizes into `p`, which the user did not write as a parameter.
+fn check_categorical_sample(e: &mut Emitter, p: &Params) -> Result<(), EmitError> {
+    let (probs_id, probs, n) = categorical_probabilities(e, p)?;
+    check_categorical_probabilities(e, probs_id, &probs, n)
 }
 
 /// §08 draws only from `p` in `stdsimplex(n)`. The inverse CDF would turn a
