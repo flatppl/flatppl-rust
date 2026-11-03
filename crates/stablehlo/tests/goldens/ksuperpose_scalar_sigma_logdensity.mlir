@@ -4,16 +4,17 @@ module {
     %20 = stablehlo.constant dense<"0xC8DD4FC07849EEBF"> : tensor<2xf32>
     %21 = stablehlo.constant dense<0xFF800000> : tensor<f32>
     %22 = stablehlo.reduce(%20 init: %21) applies stablehlo.maximum across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %23 = stablehlo.broadcast_in_dim %22, dims = [] : (tensor<f32>) -> tensor<2xf32>
-    %24 = stablehlo.subtract %20, %23 : tensor<2xf32>
-    %25 = stablehlo.exponential %24 : tensor<2xf32>
-    %26 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %27 = stablehlo.reduce(%25 init: %26) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %28 = stablehlo.log %27 : tensor<f32>
-    %29 = stablehlo.add %28, %22 : tensor<f32>
-    %30 = stablehlo.reduce(%0 init: %26) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %31 = stablehlo.log %30 : tensor<f32>
-    %32 = stablehlo.subtract %29, %31 : tensor<f32>
-    return %32 : tensor<f32>
+    %23 = stablehlo.floor %22 : tensor<f32>
+    %24 = stablehlo.broadcast_in_dim %23, dims = [] : (tensor<f32>) -> tensor<2xf32>
+    %25 = stablehlo.subtract %20, %24 : tensor<2xf32>
+    %26 = stablehlo.exponential %25 : tensor<2xf32>
+    %27 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %28 = stablehlo.reduce(%26 init: %27) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+    %29 = stablehlo.log %28 : tensor<f32>
+    %30 = stablehlo.add %29, %23 : tensor<f32>
+    %31 = stablehlo.reduce(%0 init: %27) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+    %32 = stablehlo.log %31 : tensor<f32>
+    %33 = stablehlo.subtract %30, %32 : tensor<f32>
+    return %33 : tensor<f32>
   }
 }

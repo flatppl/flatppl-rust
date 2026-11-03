@@ -1411,9 +1411,10 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
     assert!(is_delimiter_balanced(&out));
 }
 
-/// `logsumexp(v)` must emit the numerically-stable shift-by-max formula in
-/// order: `max` reduce, broadcast the max back up to `v`'s shape, subtract,
-/// `exp`, `sum` reduce, `log`, then the final `+ max`.
+/// `logsumexp(v)` must emit the numerically-stable shift formula in order:
+/// `max` reduce, `floor`, broadcast the shift back up to `v`'s shape,
+/// subtract, `exp`, `sum` reduce, `log`, then the final `+ shift`. The
+/// `floor` keeps reverse-mode AD from recording an argmax for the max.
 #[test]
 fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     let mut m = Module::new();
@@ -1444,6 +1445,7 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     let max_pos = out
         .find("applies stablehlo.maximum across dimensions")
         .expect("missing max reduce");
+    let floor_pos = out.find("stablehlo.floor").expect("missing floor");
     let bc_pos = out
         .find("stablehlo.broadcast_in_dim")
         .expect("missing broadcast");
@@ -1459,7 +1461,8 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     // "applies stablehlo.add across ..." text by the `%`-operand form.
     let final_add_pos = out.find("stablehlo.add %").expect("missing final add");
 
-    assert!(max_pos < bc_pos, "max before broadcast, in:\n{out}");
+    assert!(max_pos < floor_pos, "max before floor, in:\n{out}");
+    assert!(floor_pos < bc_pos, "floor before broadcast, in:\n{out}");
     assert!(bc_pos < sub_pos, "broadcast before subtract, in:\n{out}");
     assert!(sub_pos < exp_pos, "subtract before exp, in:\n{out}");
     assert!(exp_pos < sum_pos, "exp before sum reduce, in:\n{out}");

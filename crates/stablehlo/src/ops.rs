@@ -2638,25 +2638,31 @@ fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
 
 // ---- logsumexp ---------------------------------------------------------------
 
-/// `logsumexp(v)` (spec §07) via the numerically-stable shift-by-max
-/// identity: `log(Σ exp(v - max(v))) + max(v)`. The determiniser always
+/// `logsumexp(v)` (spec §07) via the numerically-stable shift identity
+/// `log(Σ exp(v - s)) + s` with `s = floor(max(v))`. Every shifted term is
+/// below `e`, and the largest is at least `1`, so the sum neither overflows
+/// nor underflows. The determiniser always
 /// wraps its argument in a `vector(t1, …, tk)` call (superpose/discrete-
 /// marginal); `lower_node`'s `"vector"` head (below, [`Emitter::vector`])
 /// is what turns that into the rank-1 tensor `v` this function reduces
 /// over — this function itself only ever sees the one already-resolved
 /// argument node, whatever built it. `max(v)`/`Σ` reduce to a `Scalar`;
-/// `v - max(v)` needs `max(v)` broadcast back up to `v`'s shape first
+/// `v - s` needs `s` broadcast back up to `v`'s shape first
 /// (StableHLO's elementwise ops require identical operand shapes — no
 /// implicit scalar broadcast).
 ///
+/// The shift is `floor(max(v))`, not `max(v)`, for reverse-mode AD. The
+/// value and gradient do not depend on the shift, but the adjoint of a
+/// max-reduce must recover which element attained the max, so Enzyme-JAX
+/// keeps an argmax on the tape. `floor` has a zero derivative, so no adjoint
+/// reaches the max-reduce. StableHLO has no stop-gradient op.
+///
 /// A statically two-element `vector(a, b)` of SCALAR terms takes
 /// [`lower_logaddexp`] instead and never builds the tensor at all. That is
-/// the shape every two-mixand `superpose` reaches, and the reduce form is
-/// hostile to reverse-mode AD there: the adjoint of a max-reduce has to
-/// recover which element attained the max, so Enzyme-JAX emits a
-/// compare/select pair per term and keeps the argmax on the tape. Measured on
-/// `signal-background-counting`, the reduce form costs 192 bytes of gradient
-/// scratch per event and the scalar form is flat in event count.
+/// the shape every two-mixand `superpose` reaches. Measured on
+/// `signal-background-counting` before the floor shift, the reduce form cost
+/// 192 bytes of gradient scratch per event and the scalar form is flat in
+/// event count.
 fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v] = args_exact(id, args)?;
     if let Some([t0, t1]) = static_pair_terms(e, v) {
@@ -2670,12 +2676,13 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     }
     let v = e.lower_node(v)?;
     let m = e.reduce_max(&v);
-    let m_bc = broadcast_to(e, id, &m, &v)?;
-    let shifted = e.sub(&v, &m_bc);
+    let shift = e.floor(&m);
+    let shift_bc = broadcast_to(e, id, &shift, &v)?;
+    let shifted = e.sub(&v, &shift_bc);
     let exp_shifted = e.exp(&shifted);
     let sum = e.reduce_sum(&exp_shifted);
     let log_sum = e.log(&sum);
-    Ok(e.add(&log_sum, &m))
+    Ok(e.add(&log_sum, &shift))
 }
 
 /// The two element nodes of a statically two-element `vector(a, b)` argument;
