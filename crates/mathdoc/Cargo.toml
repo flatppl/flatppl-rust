@@ -28,4 +28,4 @@ serde_json = { workspace = true, optional = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
 # LaTeX math → MathML Core for doc-comments; escapes its own output and
 # refuses unknown commands with an error, which the fallback relies on.
-math-core = { version = "0.8", optional = true }
+math-core = { version = "0.9", optional = true }
