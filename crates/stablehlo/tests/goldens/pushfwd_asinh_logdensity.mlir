@@ -1,10 +1,10 @@
 module {
   func.func @logdensity(%arg0: tensor<f32>) -> tensor<f32> {
-    %0 = chlo.sinh %arg0 : tensor<f32> -> tensor<f32>
-    %1 = stablehlo.constant dense<0.0> : tensor<f32>
-    %2 = stablehlo.constant dense<1.0> : tensor<f32>
-    %6 = stablehlo.subtract %0, %1 : tensor<f32>
-    %7 = stablehlo.divide %6, %2 : tensor<f32>
+    %0 = stablehlo.constant dense<1.0> : tensor<f32>
+    %1 = chlo.sinh %arg0 : tensor<f32> -> tensor<f32>
+    %2 = stablehlo.constant dense<0.0> : tensor<f32>
+    %6 = stablehlo.subtract %1, %2 : tensor<f32>
+    %7 = stablehlo.divide %6, %0 : tensor<f32>
     %8 = stablehlo.constant dense<-0.5> : tensor<f32>
     %9 = stablehlo.multiply %7, %7 : tensor<f32>
     %10 = stablehlo.multiply %8, %9 : tensor<f32>

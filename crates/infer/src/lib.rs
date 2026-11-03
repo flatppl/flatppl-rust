@@ -39,7 +39,7 @@ use flatppl_core::{Module, NodeId, Type};
 use std::collections::HashMap;
 
 pub use boxes::{BOX_INPUT, box_input_names};
-pub use catalogue::{Catalogue, parse_catalogue};
+pub use catalogue::{Catalogue, ParamSet, parse_catalogue};
 pub use modules::{ModuleBundle, module_source, reintern_type};
 
 /// Return the process-global built-in catalogue (parsed once from the bundled
@@ -67,6 +67,21 @@ pub fn distribution_param_names(name: &str) -> Option<Vec<String>> {
 /// `None` if `name` isn't a known distribution.
 pub fn distribution_param_ranks(name: &str) -> Option<Vec<usize>> {
     catalogue::builtin().distribution_param_ranks(name)
+}
+
+/// Declared parameter value sets for a built-in distribution, parallel to
+/// [`distribution_param_names`] — `Normal` → `[Reals, PosReals]` (§08 "`sigma =
+/// elementof(posreals)`"). A scalar set on a rank-1 parameter applies to every
+/// element. `None` if `name` isn't a known distribution.
+pub fn distribution_param_sets(name: &str) -> Option<Vec<ParamSet>> {
+    catalogue::builtin().distribution_param_sets(name)
+}
+
+/// The value set of every real result of base function `name`, when §07 states
+/// one tighter than the result type: `exp` → `PosReals`, `invlogit` →
+/// `UnitInterval`. A NaN argument still gives NaN.
+pub fn function_result_set(name: &str) -> Option<ParamSet> {
+    catalogue::builtin().function_result_set(name)
 }
 
 /// Ordered constructor parameter names for a §06 *fundamental measure* —

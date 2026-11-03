@@ -116,7 +116,8 @@ The results are `m.x`, `m.y`, `first.x`, `first.y`.
 Programs with runtime checks return one trailing integer status after the
 authored result leaves. The module attribute `flatppl.runtime_status` gives its
 zero-based result index. `flatppl-host` also exports `runtime_status` metadata
-with its `index`, `dtype` and `shape`. The authored output schema excludes it.
+with its `index`, `dtype`, `shape` and the sorted nonzero `codes` the status can
+report. The authored output schema excludes it.
 Programs without checks retain their original result signature.
 
 | Status | Meaning |
@@ -130,16 +131,42 @@ Programs without checks retain their original result signature.
 | 6 | RNG seed outside its integer or byte-vector domain |
 | 7 | Categorical probabilities with a negative or non-finite cell, or a zero total; this includes the weights of a sampled `ksuperpose` mixture |
 | 8 | `bincounts` edges that do not strictly increase; this includes the `__bin_edge_check_<n>` term a determinized `BinnedPoissonProcess` keeps for edges known only at run time |
+| 9 | A distribution parameter outside its declared value set |
 
 The status uses `i32` for float32 emission and `i64` for float64 emission.
 It is scalar for an ordinary call. Host batching adds the host batch shape,
 with one status per call. Authored array axes and callable batch axes reduce
 into that call's status. Executed loop iterations preserve the first error.
 
+Status 9 checks each parameter of a §08 or §09 distribution against the value
+set that section declares, for example `sigma = elementof(posreals)` for
+`Normal`. A scalar set on a vector parameter applies to each element.
+`stdsimplex(n)` requires nonnegative cells with a finite sum within
+`8 n ε max(sum, 1)` of one, the tolerance of `in(p, stdsimplex(n))`, with `ε` the
+machine epsilon of the emitted precision. A NaN parameter propagates
+without an error, as for status 3, so a `reals` parameter has no check. A
+positive definite matrix requires a Cholesky factor with a positive, finite
+diagonal. The check reads the factor that the density or sampler computes anyway.
+A matrix that is not positive definite gives a NaN factor, so a NaN matrix also
+reports status 9. No check is emitted for a parameter whose value set is known at
+emit time:
+
+- A constant inside its set. A constant outside its set refuses emission.
+- A result of a function whose §07 result set lies inside the parameter's set:
+  `exp(a)` for `posreals`, `invlogit(a)` for `unitinterval`, `softmax(v)` for
+  `stdsimplex(n)`. The dotted form applies the same rule to each element.
+
+Input arguments are always checked. The ABI does not enforce the set an `inputs`
+entry declares. `flatppl stablehlo --check-parameters=false`
+(`EmitOptions::check_parameters`) emits no runtime parameter checks. Constants
+are still checked at emit time.
+
 Checks execute inside StableHLO before clamping gathers or unsafe conversions.
 Invalid calls use safe internal operands, but their returned values are not
 valid results. Hosts must reject any nonzero status, including unknown codes,
-before exposing those values. A density of `-inf` is not an error.
+before exposing those values. For status 9 a host may instead replace the call's
+results with NaN, which an MCMC sampler rejects as a proposal. A density of `-inf`
+is not an error.
 
 The Python adapter exposes the status through JAX `checkify`. A host may carry
 the status through a larger compiled computation and check it once afterward.

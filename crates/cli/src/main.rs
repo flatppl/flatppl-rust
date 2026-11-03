@@ -236,6 +236,13 @@ enum Command {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
               num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         restrict_enzyme_compatible: bool,
+        /// Check distribution parameters against their declared value sets at run
+        /// time, reporting status 9. Constants are always checked.
+        ///
+        /// Use --check-parameters=false to emit no runtime parameter checks.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        check_parameters: bool,
         /// Allow adaptive numerical scalar marginals and normalizers.
         #[arg(long)]
         numerical_integrals: bool,
@@ -429,6 +436,7 @@ fn main() -> ExitCode {
             dtype,
             target,
             restrict_enzyme_compatible,
+            check_parameters,
             numerical_integrals,
             integration_rtol,
             integration_atol,
@@ -446,6 +454,7 @@ fn main() -> ExitCode {
                     flatppl_stablehlo::Dtype::F32
                 },
                 restrict_enzyme_compatible,
+                check_parameters,
                 integration: numerical_integrals.then_some(flatppl_stablehlo::IntegrationOptions {
                     rtol: integration_rtol,
                     atol: integration_atol,

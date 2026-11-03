@@ -13,7 +13,7 @@ pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
 
 impl Emitter<'_> {
     /// Read a fixed element through layout views without expanding them.
-    fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<&Scalar> {
+    pub(super) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<&Scalar> {
         if index >= element_count(&value.ty)? {
             return None;
         }
@@ -506,7 +506,7 @@ impl Emitter<'_> {
     }
 }
 
-fn element_count(ty: &MlirTy) -> Option<usize> {
+pub(super) fn element_count(ty: &MlirTy) -> Option<usize> {
     shape(ty)
         .iter()
         .try_fold(1usize, |n, d| n.checked_mul(usize::try_from((*d)?).ok()?))
