@@ -12,6 +12,7 @@
 
 use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, Type, ValueSet};
 
+use crate::Dtype;
 use crate::emitter::{Axes, Emitter};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
@@ -2539,10 +2540,10 @@ fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
         let small_rate = e.select(&large, &safe, &safe_rate);
         let large_x = e.select(&large, v, &cutoff);
         let log_x = e.log(&large_x);
-        // One logarithm per element serves both branches: log(rate) for small
-        // counts, log(rate/x) for large ones.
-        let scale = e.select(&large, v, &safe);
-        let (log_rate, log_x_over_rate) = poisson_log_ratio(e, &scale, &safe_rate, &log_x);
+        // Logarithms of the rate alone stay hoistable out of a batch over the
+        // variate. Large lanes select safe_rate, so it stands for large_rate.
+        let log_rate = e.log(&safe_rate);
+        let log_x_over_rate = log_ratio(e, &large_x, &log_x, &safe_rate, &log_rate);
         let x_log_rate = e.mul(&small_x, &log_rate);
         let x_plus_one = e.add(&small_x, &safe);
         let lgamma_x1 = e.lgamma(&x_plus_one);
@@ -2638,27 +2639,61 @@ fn poisson_deviance(e: &mut Emitter, x: &Value, rate: &Value, log_x_over_rate: &
     e.select(&near, &close, &far)
 }
 
-/// Returns `(log(rate / scale), log(scale / rate))` from one logarithm.
-/// Dividing by `scale` (at least 16 where the deviance uses the result) avoids
-/// a tiny denominator in the derivative. Logging the ratio directly also
-/// avoids subtracting two large, nearly equal logarithms. Only if the ratio
-/// underflows does the first value become `log(rate)` and the second
-/// `log_scale - log(rate)`.
-fn poisson_log_ratio(
-    e: &mut Emitter,
-    scale: &Value,
-    rate: &Value,
-    log_scale: &Value,
-) -> (Value, Value) {
-    let zero = e.scalar(0.0);
-    let ratio = e.div(rate, scale);
-    let positive = e.compare("GT", &ratio, &zero);
-    let argument = e.select(&positive, &ratio, rate);
-    let log_argument = e.log(&argument);
-    let direct = e.neg(&log_argument);
-    let separate = e.sub(log_scale, &log_argument);
-    let log_inverse = e.select(&positive, &direct, &separate);
-    (log_argument, log_inverse)
+/// `log(a / b)` for positive normal `a` and `b`, without forming the ratio.
+/// Subtracting `log(a)` and `log(b)` would cancel two large logarithms, so
+/// split off exact powers of two first:
+/// `log(a / b) = log(a_m) - log(b_m) + (n_a - n_b) ln 2`. The mantissa
+/// logarithms stay below ln(2)/2 in magnitude, so the rounding bound matches
+/// that of a direct `log(a / b)`. Each split depends on one operand only, so a rate-only
+/// split hoists out of a batch over the variate. `log_a` and `log_b` only
+/// choose the exponents and may be rounded.
+fn log_ratio(e: &mut Emitter, a: &Value, log_a: &Value, b: &Value, log_b: &Value) -> Value {
+    let (a_mantissa, a_exponent) = split_exponent(e, a, log_a);
+    let (b_mantissa, b_exponent) = split_exponent(e, b, log_b);
+    let log_a = e.log(&a_mantissa);
+    let log_b = e.log(&b_mantissa);
+    let mantissas = e.sub(&log_a, &log_b);
+    let exponents = e.sub(&a_exponent, &b_exponent);
+    // Cody-Waite split of ln 2: the high part has trailing zero bits, so its
+    // product with an exponent difference is exact.
+    let (high, low) = match e.dtype() {
+        Dtype::F32 => (0.693_145_751_953_125, 1.428_606_820_309_417_2e-6),
+        Dtype::F64 => (6.931_471_803_691_238e-1, 1.908_214_929_270_587_7e-10),
+    };
+    let ln2_high = e.scalar(high);
+    let ln2_low = e.scalar(low);
+    let high = e.mul(&exponents, &ln2_high);
+    let low = e.mul(&exponents, &ln2_low);
+    let sum = e.add(&high, &mantissas);
+    e.add(&sum, &low)
+}
+
+/// `(m, n)` with `x = m * 2^n` exactly, `n` an integer and `m` in
+/// [sqrt(1/2), sqrt(2)) up to the rounding of `log_x`. The scale `2^-n` is built from integer bits; the
+/// path to it starts at `floor`, so it carries no derivative and
+/// `d log(m) / dx = 1 / x`.
+fn split_exponent(e: &mut Emitter, x: &Value, log_x: &Value) -> (Value, Value) {
+    let (mantissa_bits, bias) = match e.dtype() {
+        Dtype::F32 => (23, 127),
+        Dtype::F64 => (52, 1023),
+    };
+    let inverse_ln2 = e.scalar(std::f64::consts::LOG2_E);
+    let log2_x = e.mul(log_x, &inverse_ln2);
+    let half = e.scalar(0.5);
+    let log2_x = e.add(&log2_x, &half);
+    let exponent = e.floor(&log2_x);
+    // Keep 2^-n a normal number.
+    let lowest = e.scalar(f64::from(1 - bias));
+    let highest = e.scalar(f64::from(bias - 1));
+    let exponent = e.max(&exponent, &lowest);
+    let exponent = e.min(&exponent, &highest);
+    let n = e.convert(&exponent, ElemKind::Int);
+    let bias_value = e.int_value_const(i64::from(bias));
+    let scale_exponent = e.sub(&bias_value, &n);
+    let shift = e.int_value_const(mantissa_bits);
+    let scale_bits = e.binary("stablehlo.shift_left", &scale_exponent, &shift);
+    let scale = e.bitcast(&scale_bits, ElemKind::Real);
+    (e.mul(x, &scale), exponent)
 }
 
 /// §06 Dirac scores the whole variate: log-density 0 at the atom and -inf elsewhere.
@@ -4466,7 +4501,7 @@ fn poisson_ptrs(e: &mut Emitter, rate: &Value, active: &Value) -> Value {
             let small_score = e.sub(&small_score, &factorial);
             let large_x = e.select(&large, &safe, &cutoff);
             let log_x = e.log(&large_x);
-            let (_, log_x_over_rate) = poisson_log_ratio(e, &large_x, rate, &log_x);
+            let log_x_over_rate = log_ratio(e, &large_x, &log_x, rate, &log_rate);
             let large_score = poisson_large_logpdf(e, &large_x, rate, &log_x, &log_x_over_rate);
             let score = e.select(&large, &large_score, &small_score);
 

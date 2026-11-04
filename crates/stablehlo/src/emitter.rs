@@ -1086,6 +1086,22 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `%N = stablehlo.bitcast_convert %a : (from) -> to` between a real and
+    /// the integer of the same width. Integer results carry no derivative.
+    pub(crate) fn bitcast(&mut self, v: &Value, target: ElemKind) -> Value {
+        let from = v.ty.render(self.dtype, v.elem);
+        let to = v.ty.render(self.dtype, target);
+        let ssa = self.pure_like(
+            format!("stablehlo.bitcast_convert {} : ({from}) -> {to}", v.ssa),
+            v,
+        );
+        Value {
+            ssa,
+            ty: v.ty.clone(),
+            elem: target,
+        }
+    }
+
     // ---- shape ops (Task 4: `get`/`get0`, `logsumexp`/`in` broadcasting) ---
 
     /// `%N = stablehlo.slice %a [s0:l0, s1:l1:t1, ...] : (operand_ty) ->
