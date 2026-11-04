@@ -38,7 +38,8 @@ fn lowered(src: &str) -> (String, std::collections::HashMap<String, usize>) {
 }
 
 // The HS3 `bincounts_extended_dist` shape. Each bin's mean is the rate times the
-// shape's CDF difference, and one Poisson broadcast scores all four counts.
+// shape's CDF difference. One mass body maps over the lower and upper edges, and
+// one Poisson broadcast scores all four counts.
 #[test]
 fn weighted_shape_lowers_to_poisson_counts_over_cdf_differences() {
     let (text, calls) = lowered(
@@ -54,12 +55,16 @@ lp = logdensityof(proc, [3, 12, 20, 9])",
     );
     assert_eq!(
         text.matches("exp(").count(),
-        4,
-        "one bin mass per bin:\n{text}"
+        1,
+        "one mass body for all bins:\n{text}"
     );
     assert_eq!(
-        calls["builtin_touniform"], 8,
-        "two CDF evaluations per bin:\n{text}"
+        calls["builtin_touniform"], 2,
+        "two CDF evaluations in the shared body:\n{text}"
+    );
+    assert!(
+        text.contains("[0.0, 0.5, 1.0, 1.5]") && text.contains("[0.5, 1.0, 1.5, 2.0]"),
+        "the body maps over the lower and upper edges:\n{text}"
     );
     assert!(
         !text.contains("BinnedPoissonProcess") && !text.contains("weighted"),
@@ -85,8 +90,8 @@ lp = logdensityof(proc, [2, 7, 4])",
     );
     assert_eq!(
         text.matches("/ 6.0").count(),
-        3,
-        "the uniform's share of each bin:\n{text}"
+        1,
+        "one body gives the uniform's share of each bin:\n{text}"
     );
 }
 
@@ -235,7 +240,7 @@ lp = logdensityof(t, 1.0)";
 }
 
 // §07's own edge forms are ordinary vectors: `extlinspace(0.0, 2.0, 3)` has five
-// points, so its four bins read their edges through `get0` like any static vector.
+// points, so its four bins read their lower and upper edges as two `get0` slices.
 #[test]
 fn linspace_edges_lower_through_get0() {
     let (text, calls) = lowered(
@@ -245,12 +250,12 @@ proc = BinnedPoissonProcess(extlinspace(0.0, 2.0, 3), weighted(n_bkg, Normal(1.0
 lp = logdensityof(proc, [1, 12, 20, 2])",
     );
     assert_eq!(
-        calls["get0"], 5,
-        "the four bins share five edge nodes:\n{text}"
+        calls["get0"], 2,
+        "the four bins read two edge slices:\n{text}"
     );
 }
 
-// Any other edge vector of static length is read element by element.
+// Any other edge vector of static length is read as two slices.
 #[test]
 fn a_computed_static_edge_vector_lowers_through_get0() {
     let (text, calls) = lowered(
@@ -260,8 +265,8 @@ proc = BinnedPoissonProcess(edges, weighted(5.0, Normal(1.0, 0.5)))
 lp = logdensityof(proc, [1, 3])",
     );
     assert_eq!(
-        calls["get0"], 3,
-        "the two bins share three edge nodes:\n{text}"
+        calls["get0"], 2,
+        "the two bins read two edge slices:\n{text}"
     );
 }
 
@@ -312,7 +317,28 @@ proc = BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(10.0, shape))
 lp = logdensityof(proc, [4, 5])",
     );
     assert_eq!(
-        calls["builtin_touniform"], 4,
-        "two CDF evaluations for each of two bins:\n{text}"
+        calls["builtin_touniform"], 2,
+        "two CDF evaluations in the shared body:\n{text}"
+    );
+}
+
+// A static infinite edge has a constant CDF, which keeps `inf * 0` out of the
+// gradient. That needs each bin's own edges, so these bins stay per bin.
+#[test]
+fn a_static_infinite_edge_keeps_per_bin_masses() {
+    let (text, _) = lowered(
+        "\
+n_bkg = elementof(posreals)
+proc = BinnedPoissonProcess([-inf, 0.0, 1.0, inf], weighted(n_bkg, Normal(1.0, 0.5)))
+lp = logdensityof(proc, [1, 12, 2])",
+    );
+    assert!(
+        !text.contains("density_point"),
+        "no mapped mass body:\n{text}"
+    );
+    assert_eq!(
+        text.matches("exp(").count(),
+        3,
+        "one bin mass per bin:\n{text}"
     );
 }
