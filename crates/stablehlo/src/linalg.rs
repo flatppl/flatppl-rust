@@ -307,6 +307,11 @@ impl Emitter<'_> {
             ty,
             elem: ElemKind::Real,
         };
+        self.remember_pointwise(
+            &product.ssa,
+            &product,
+            Pointwise::Dot(value.clone(), matrix, physical, batch + 1, batch),
+        );
         let rank = shape(&product.ty).len();
         let mut permutation = (0..rank - 1).map(|i| i as u64).collect::<Vec<_>>();
         permutation.insert(physical, (rank - 1) as u64);

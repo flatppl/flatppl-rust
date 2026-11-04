@@ -23,6 +23,7 @@ pub(super) enum Pointwise {
     Compare(String, Value, Value),
     Select(Value, Value, Value),
     Convert(Value, ElemKind),
+    Bitcast(Value, ElemKind),
     Broadcast(Value, Vec<u64>),
     Reshape(Value),
     Slice(Value, Vec<u64>, Vec<u64>, Vec<u64>),
@@ -48,6 +49,7 @@ impl Pointwise {
             Self::Unary(_, a)
             | Self::ChloUnary(_, a)
             | Self::Convert(a, _)
+            | Self::Bitcast(a, _)
             | Self::Broadcast(a, _)
             | Self::Reshape(a)
             | Self::Slice(a, ..)
@@ -69,13 +71,16 @@ impl Pointwise {
         let name = match self {
             Self::Unary(op, _) | Self::ChloUnary(op, _) | Self::Binary(op, ..) => op.clone(),
             Self::Compare(dir, ..) => format!("compare {dir}"),
+            // Packets stack inputs column-wise, so predicate shapes must agree.
+            Self::Select(c, a, _) if c.ty != a.ty => return None,
             Self::Select(..) => "select".to_owned(),
             Self::Convert(..) => "convert".to_owned(),
             Self::Broadcast(_, dims) => return Some(("broadcast".to_owned(), dims.clone())),
             Self::Reduce(_, axis, op, init) => {
                 return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
             }
-            Self::Reshape(_)
+            Self::Bitcast(..)
+            | Self::Reshape(_)
             | Self::Slice(..)
             | Self::Transpose(..)
             | Self::Gather(..)
@@ -111,7 +116,7 @@ impl Emitter<'_> {
     pub(super) fn remember_pointwise(&mut self, ssa: &str, shape_source: &Value, op: Pointwise) {
         let elem = match &op {
             Pointwise::Compare(..) => ElemKind::Bool,
-            Pointwise::Convert(_, target) => *target,
+            Pointwise::Convert(_, target) | Pointwise::Bitcast(_, target) => *target,
             _ => shape_source.elem,
         };
         let value = Value {
@@ -171,6 +176,7 @@ impl Emitter<'_> {
                 let b = expand(&b);
                 self.compare(&dir, &a, &b)
             }
+            Pointwise::Select(c, ..) if c.ty == MlirTy::Scalar => return None,
             Pointwise::Select(c, a, b) => {
                 let c = expand(&c);
                 let a = expand(&a);
@@ -181,7 +187,8 @@ impl Emitter<'_> {
                 let a = expand(&a);
                 self.convert(&a, elem)
             }
-            Pointwise::Broadcast(..)
+            Pointwise::Bitcast(..)
+            | Pointwise::Broadcast(..)
             | Pointwise::Reshape(_)
             | Pointwise::Slice(..)
             | Pointwise::Transpose(..)
