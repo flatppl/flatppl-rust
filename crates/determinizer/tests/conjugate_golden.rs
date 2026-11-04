@@ -1,5 +1,8 @@
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::strip_meta;
+
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -8,54 +11,6 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
 
 fn determinize_src(src: &str) -> flatppl_core::Module {
     determinize(&parse_infer(src)).expect("must lower, not refuse")
-}
-
-/// Strip the transparent `(%meta (<triple>) <inner>)` type annotations the
-/// FlatPIR writer interleaves, leaving the bare S-expression — so a test can
-/// assert an exact nested structure without the type noise between nodes.
-fn strip_meta(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut drop_close: Vec<bool> = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if s[i..].starts_with("(%meta ") {
-            // Drop `(%meta ` + the balanced `(<triple>)` group + one space; the
-            // matching close paren is dropped when we reach it (drop_close = true).
-            i += "(%meta ".len();
-            let mut depth = 0i32;
-            loop {
-                match b[i] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                i += 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            if i < b.len() && b[i] == b' ' {
-                i += 1;
-            }
-            drop_close.push(true);
-        } else {
-            match b[i] {
-                b'(' => {
-                    out.push('(');
-                    drop_close.push(false);
-                }
-                b')' => {
-                    if !drop_close.pop().unwrap_or(false) {
-                        out.push(')');
-                    }
-                }
-                c => out.push(c as char),
-            }
-            i += 1;
-        }
-    }
-    out
 }
 
 // kchain(M, K) with a CONTINUOUS latent that forms a Normal–Normal conjugate

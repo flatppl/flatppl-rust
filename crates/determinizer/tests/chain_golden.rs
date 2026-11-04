@@ -6,6 +6,9 @@
 
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::{pir_binding, renumber_points, strip_meta};
+
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -14,7 +17,7 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
 
 fn lower(src: &str) -> String {
     let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
-    let pir = flatppl_flatpir::write(&out);
+    let pir = renumber_points(&flatppl_flatpir::write(&out));
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl:\n{pir}"
@@ -26,38 +29,50 @@ fn lower(src: &str) -> String {
     pir
 }
 
+/// The `lp` binding with type annotations stripped.
+fn lp(src: &str) -> String {
+    strip_meta(&pir_binding(&lower(src), "lp"))
+}
+
+/// One density body over the chain's step pairs. Input 0 is the previous state,
+/// read from `cat([init], v[0..n-2])`, input 1 is the current state `v`.
+fn step_sum(
+    body: &str,
+    extra_inputs: &str,
+    init: &str,
+    v: &str,
+    n: usize,
+    extra_args: &str,
+) -> String {
+    format!(
+        "(%bind lp (sum (broadcast (functionof {body} %specinputs \
+         ((density_point_0 (%ref %local _density_point_0_)) \
+         (density_point_1 (%ref %local _density_point_1_)){extra_inputs})) \
+         (cat (vector {init}) (get0 {v} (indicesof0 (zeros {})))) {v}{extra_args})))",
+        n - 1
+    )
+}
+
 // A 3-step random walk. Step i is `Normal(prevᵢ, 1.0)` with prev₀ = init = 0.0
-// and prevᵢ = the previous trajectory slot, so the terms are
-// Normal(0.0, 1)@0.5, Normal(0.5, 1)@1.5, Normal(1.5, 1)@1.0 — THREE terms for
-// n = 3, never four: §06 excludes `init` from the trajectory.
+// and prevᵢ = the previous trajectory slot. The shifted array holds THREE previous
+// states for n = 3, never four: §06 excludes `init` from the trajectory.
 #[test]
 fn markovchain_three_step_walk() {
     let src = "\
 f = s -> Normal(s, 1.0)
 t = draw(markovchain(f, 0.0, 3))
 lp = logdensityof(lawof(t), [0.5, 1.5, 1.0])";
-    let pir = lower(src);
+    let body = "(builtin_logdensityof Normal (record (%field mu (%ref %local _density_point_0_)) \
+                (%field sigma 1.0)) (%ref %local _density_point_1_))";
     assert_eq!(
-        pir.matches("builtin_logdensityof").count(),
-        3,
-        "one term per trajectory element, none for init:\n{pir}"
-    );
-    // The first step's mean is `init`, not a trajectory slot.
-    assert!(
-        pir.contains("(%field mu 0.0)"),
-        "step 1 mean is init = 0.0:\n{pir}"
-    );
-    // Later steps read the PREVIOUS slot.
-    assert!(
-        pir.contains("(%field mu 0.5)") && pir.contains("(%field mu 1.5)"),
-        "steps 2 and 3 read the previous trajectory values:\n{pir}"
+        lp(src),
+        step_sum(body, "", "0.0", "(vector 0.5 1.5 1.0)", 3, "")
     );
 }
 
-// `kscan` threads a per-step exogenous input: step i is
-// `κ(trajᵢ₋₁, xsᵢ)`. Here `dt` scales the step variance, so each term must pick
-// up its OWN `dts` element in order — a swapped or reused index would give the
-// same term count and a wrong density.
+// `kscan` threads a per-step exogenous input: step i is `κ(trajᵢ₋₁, xsᵢ)`. Here
+// `dt` scales the step, so `dts` must map cell by cell beside the trajectory as
+// input 2 — a held-constant or reordered `dts` would change the density.
 #[test]
 fn kscan_threads_per_step_input() {
     let src = "\
@@ -65,69 +80,50 @@ dts = [0.5, 2.0, 8.0]
 f = (s, dt) -> Normal(s, dt)
 t = draw(kscan(f, 0.25, dts))
 lp = logdensityof(lawof(t), [0.5, 1.5, 1.0])";
-    let pir = lower(src);
+    let body = "(builtin_logdensityof Normal (record (%field mu (%ref %local _density_point_0_)) \
+                (%field sigma (%ref %local _density_point_2_))) (%ref %local _density_point_1_))";
+    let extra = " (density_point_2 (%ref %local _density_point_2_))";
     assert_eq!(
-        pir.matches("builtin_logdensityof").count(),
-        3,
-        "one term per trajectory element:\n{pir}"
+        lp(src),
+        step_sum(
+            body,
+            extra,
+            "0.25",
+            "(vector 0.5 1.5 1.0)",
+            3,
+            " (%ref self dts)"
+        )
     );
-    assert!(
-        pir.contains("(%field mu 0.25)"),
-        "step 1 mean is init = 0.25:\n{pir}"
-    );
-    // Each step reads its OWN `dts` slot, in order — a swapped or reused index
-    // would keep the term count and change the density.
-    for i in 0..3 {
-        assert_eq!(
-            pir.matches(&format!("(get0 (%ref self dts) {i})")).count(),
-            1,
-            "step {i} reads dts[{i}] exactly once:\n{pir}"
-        );
-    }
 }
 
 // A named length resolves through inference's shape fold (`Level::Shape`), so a
-// `markovchain` whose `n` is a binding unrolls exactly as a literal one does.
+// `markovchain` whose `n` is a binding lowers exactly as a literal one does.
 #[test]
-fn markovchain_named_length_unrolls() {
-    let src = "\
+fn markovchain_named_length_lowers() {
+    let named = "\
 n = 4
 f = s -> Normal(s, 1.0)
 t = draw(markovchain(f, 0.0, n))
 lp = logdensityof(lawof(t), [0.5, 1.5, 1.0, 2.0])";
-    let pir = lower(src);
-    assert_eq!(
-        pir.matches("builtin_logdensityof").count(),
-        4,
-        "a named length folds to 4 steps:\n{pir}"
-    );
+    assert_eq!(lp(named), lp(&named.replace(", n))", ", 4))")));
+    assert!(lp(named).contains("(zeros 3)"), "{}", lp(named));
 }
 
-// The step kernel may be a COMPOSED measure, not just a bare constructor: each
-// step is handed back to the density dispatcher as a kernel application, so the
-// body reaches its own combinator rule. `logweighted(ℓ, M)` adds `ℓ` to the base
-// log-density (§06 "Density of composed measures"), so each of the two steps
-// contributes one constructor density plus its own weight term.
+// The step kernel may be a COMPOSED measure, not just a bare constructor: the step
+// is handed back to the density dispatcher as a kernel application, so the body
+// reaches its own combinator rule. `logweighted(ℓ, M)` adds `ℓ` to the base
+// log-density (§06 "Density of composed measures"), once per step through the map.
 #[test]
 fn markovchain_composed_step_kernel_lowers() {
     let src = "\
 f = s -> logweighted(0.25, Normal(s, 1.0))
 t = draw(markovchain(f, 1.0, 2))
 lp = logdensityof(lawof(t), [0.5, 1.5])";
-    let pir = lower(src);
+    let body = "(add 0.25 (builtin_logdensityof Normal (record (%field mu \
+                (%ref %local _density_point_0_)) (%field sigma 1.0)) (%ref %local _density_point_1_)))";
     assert_eq!(
-        pir.matches("builtin_logdensityof").count(),
-        2,
-        "the composed step body lowers through its own logweighted rule:\n{pir}"
-    );
-    assert!(
-        !pir.contains("logweighted"),
-        "measure layer gone from the step body too:\n{pir}"
-    );
-    assert_eq!(
-        pir.matches("0.25").count(),
-        2,
-        "each step picks up its own log-weight:\n{pir}"
+        lp(src),
+        step_sum(body, "", "1.0", "(vector 0.5 1.5)", 2, "")
     );
 }
 
@@ -161,22 +157,38 @@ forward_kernel = kernelof(record(x = x), sigma_step = sigma_step)
 L = likelihoodof(forward_kernel, record(x = [0.1, 0.2, 0.3]))
 posterior = bayesupdate(L, prior)
 lp = logdensityof(posterior, record(sigma_step = 0.7))";
-    let pir = lower(src);
-    // Three Normal step terms, each at the SAME sigma — the query point. A
-    // per-step resample could not produce three identical sigma fields.
-    assert_eq!(
-        pir.matches("(%field sigma 0.7)").count(),
-        3,
-        "all three steps use the supplied scale:\n{pir}"
+    let lp = lp(src);
+    // One step body, at the supplied scale. A per-step resample would need a
+    // mapped scale input.
+    let body = "(functionof (builtin_logdensityof Normal (record (%field mu \
+                (%ref %local _density_point_0_)) (%field sigma 0.7)) (%ref %local _density_point_1_))";
+    assert!(lp.contains(body), "{lp}");
+    assert!(
+        lp.contains("(cat (vector 0.0) (get0 (vector 0.1 0.2 0.3) (indicesof0 (zeros 2))))"),
+        "{lp}"
     );
-    // The means chain through the trajectory: init, then the observed slots.
-    for mu in ["(%field mu 0.0)", "(%field mu 0.1)", "(%field mu 0.2)"] {
-        assert!(pir.contains(mu), "step means chain through {mu}:\n{pir}");
-    }
     // The scale prior is scored once, not per step.
     assert_eq!(
-        pir.matches("builtin_logdensityof Cauchy").count(),
+        lp.matches("builtin_logdensityof Cauchy").count(),
         1,
-        "the scale prior is scored once:\n{pir}"
+        "the scale prior is scored once:\n{lp}"
+    );
+}
+
+// A chain inside `iid` sees its point as the map's bare cell. The previous
+// states select a prefix of that cell before the concatenation, so `cat` joins
+// two visible vectors (Mb_model, posteriordb).
+#[test]
+fn a_chain_inside_iid_concatenates_a_prefix_of_its_cell() {
+    let src = "\
+f = s -> Normal(s, 1.0)
+t = draw(iid(markovchain(f, 0.0, 3), 2))
+lp = logdensityof(lawof(t), [[0.5, 1.5, 1.0], [0.1, 0.2, 0.3]])";
+    let lp = lp(src);
+    assert!(
+        lp.contains(
+            "(cat (vector 0.0) (get0 (%ref %local _density_point_0_) (indicesof0 (zeros 2))))"
+        ),
+        "{lp}"
     );
 }

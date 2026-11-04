@@ -11,39 +11,43 @@
 //! Each step is one Markov kernel applied to the previous state, so the
 //! trajectory is a dependent product with no marginalization — the same shape
 //! §06 "Density of composed measures" gives `jointchain`: "the product of the
-//! constituent conditional densities". Unrolled:
+//! constituent conditional densities":
 //!
 //! ```text
 //! logdensityof(markovchain(K, init, n), v)
-//!   = Σ_{i<n} logdensityof(K(prevᵢ), get0(v, i)),  prev₀ = init, prevᵢ = get0(v, i-1)
+//!   = Σ_{i<n} logdensityof(K(prevᵢ), vᵢ)
 //!
 //! logdensityof(kscan(K, init, xs), v)
-//!   = Σ_{i<n} logdensityof(K(prevᵢ, get0(xs, i)), get0(v, i))
+//!   = Σ_{i<n} logdensityof(K(prevᵢ, xsᵢ), vᵢ),   prev = cat([init], v[0..n-2])
 //! ```
 //!
 //! `init` carries no density: it is a VALUE in the state space, not a draw, and
 //! §06 excludes it from the trajectory. So the sum has exactly `n` terms, one
 //! per trajectory element — never `n + 1`.
 //!
-//! **Static unroll only.** The trajectory length is read from the chain node's
-//! own inferred domain shape (`flatppl_infer::trajectory_measure` builds
-//! `array[len]` of `init`'s type, folding `markovchain`'s `n` at `Level::Shape`
-//! and taking `kscan`'s from `xs`'s leading dim). A dynamic length refuses: the
-//! step count would have to become a runtime loop, and FlatPDL has no loop or
-//! scan primitive to carry one. This mirrors [`crate::density::lower_iid`]'s
-//! composed-`M` fallback, which unrolls a statically-sized independent product
-//! the same way.
+//! **One mapped body, no loop.** The point `v` is observed, so term `i` reads only
+//! the known `prevᵢ` and `vᵢ`, and no term depends on another. The lowering is
+//! `sum(broadcast(body, prev, v, xs...))`, one density body mapped over the step
+//! axis, as [`crate::density::lower_iid`] maps its composed `M`. Its size does
+//! not grow with `n`. An unroll grows the program, and its compile time grows
+//! faster than linearly; a `while` loop runs the steps in sequence although
+//! they are independent.
 //!
-//! Each step is emitted as a kernel APPLICATION `K(prev)` / `K(prev, x)` handed
+//! The trajectory length is read from the chain node's own inferred domain shape
+//! (`flatppl_infer::trajectory_measure` builds `array[len]` of `init`'s type,
+//! folding `markovchain`'s `n` at `Level::Shape` and taking `kscan`'s from `xs`'s
+//! leading dim). A dynamic length refuses, since the shifted array needs a
+//! static extent.
+//!
+//! The step is emitted as a kernel APPLICATION `K(prev)` / `K(prev, x)` handed
 //! back to the density dispatcher, rather than substituted here. That reuses the
 //! applied-reification path's boundary guards (`substitute_applied_boundary`'s
 //! through-binding finish and residual check) instead of a second, weaker copy
 //! of them, and it lets a composed step body (`logweighted(ℓ, M)`, `pushfwd`, …)
 //! lower through its own combinator rule.
 
-use crate::density::{
-    build_call, fold_add, lower_measure_density_at_point, refuse, trajectory_static_len,
-};
+use crate::density::broadcast::{cell_input, map_body, placeholder};
+use crate::density::{build_call, lower_measure_density_at_point, refuse, trajectory_static_len};
 use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
 use flatppl_core::{Dim, Module, Node, NodeId, Scalar, Type};
@@ -92,8 +96,7 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
     let expected_inputs = 1 + extras.len();
 
     // The step count. `None` covers a dynamic length AND a record-state chain
-    // (whose trajectory is a table, left with a deferred domain by inference) —
-    // both need a runtime loop or a table slice FlatPDL cannot express.
+    // (whose trajectory is a table, left with a deferred domain by inference).
     let n = trajectory_static_len(m, node).ok_or_else(|| {
         refuse(
             node,
@@ -101,8 +104,7 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
             &format!(
                 "{op} trajectory length is not a statically-resolved 1-D count \
                  (a dynamic length, or a record-state chain whose trajectory is a \
-                 table): only a static length is unrolled, and FlatPDL has no loop \
-                 or scan primitive to carry a runtime step count"
+                 table): only a static-length array trajectory is lowered"
             ),
         )
     })?;
@@ -144,8 +146,7 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
 
     // Empty trajectory: the product over an empty index set is 1, so the
     // log-density is 0 — the same empty-Σ rule §06 "Density of composed
-    // measures" states for `iid`. Short-circuits before `fold_add`, which
-    // needs at least one term.
+    // measures" states for `iid`. The map needs a non-empty step axis.
     if n == 0 {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
@@ -171,33 +172,47 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
         vec![None; extras.len()]
     };
 
-    let mut terms = Vec::with_capacity(n);
-    for i in 0..n {
-        // prev₀ = init (a value, not a draw); prevᵢ = the previous trajectory slot.
-        let prev = if i == 0 {
-            init
-        } else {
-            let idx = m.alloc(Node::Lit(Scalar::Int((i - 1) as i64)));
-            build_call(m, "get0", &[v, idx])
-        };
-        let mut step_extras = Vec::with_capacity(extras.len());
-        for (&extra, &position) in extras.iter().zip(&positions) {
-            step_extras.push(match position {
-                Some(len) => {
-                    let at = if len == 1 { 0 } else { i as i64 };
-                    let idx = m.alloc(Node::Lit(Scalar::Int(at)));
-                    build_call(m, "get0", &[extra, idx])
-                }
-                None => extra,
-            });
-        }
-        let step = crate::extras::apply_callback(m, k_arg, prev, &step_extras)?;
-        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
-        let cur = build_call(m, "get0", &[v, idx]);
-        // The slice IS this step measure's own variate, supplied by the point.
-        terms.push(lower_measure_density_at_point(m, step, cur)?);
+    // Term i reads only the observed `v[i-1]` and `v[i]`, so one body maps over
+    // `prev = cat([init], v[0..n-2])` and `cur = v`.
+    let state = match m.type_of(node) {
+        Some(Type::Measure { domain, .. }) => match domain.as_ref() {
+            Type::Array { elem, .. } => (**elem).clone(),
+            _ => unreachable!("trajectory_static_len read an array domain"),
+        },
+        _ => unreachable!("trajectory_static_len read a measure type"),
+    };
+    let (prev_label, prev_ref, prev) = placeholder(m, state.clone());
+    let (cur_label, cur_ref, cur) = placeholder(m, state);
+    let mut inputs = vec![(prev_label, prev_ref), (cur_label, cur_ref)];
+    // Inside an enclosing map `v` is a bare cell, whose kind a static `cat`
+    // check cannot see. A selection from it is visibly a vector.
+    let head = build_call(m, "vector", &[init]);
+    let shifted = if n == 1 {
+        head
+    } else {
+        let count = m.alloc(Node::Lit(Scalar::Int(n as i64 - 1)));
+        let zeros = build_call(m, "zeros", &[count]);
+        let indices = build_call(m, "indicesof0", &[zeros]);
+        let leading = build_call(m, "get0", &[v, indices]);
+        build_call(m, "cat", &[head, leading])
+    };
+    let mut args = vec![shifted, v];
+    let mut step_extras = Vec::with_capacity(extras.len());
+    for (&extra, &position) in extras.iter().zip(&positions) {
+        step_extras.push(match position {
+            Some(1) => {
+                let idx = m.alloc(Node::Lit(Scalar::Int(0)));
+                build_call(m, "get0", &[extra, idx])
+            }
+            Some(_) => cell_input(m, extra, &mut inputs, &mut args)?,
+            None => extra,
+        });
     }
-    Ok(fold_add(m, &terms))
+    let step = crate::extras::apply_callback(m, k_arg, prev, &step_extras)?;
+    // The cell IS this step measure's own variate, supplied by the point.
+    let body = lower_measure_density_at_point(m, step, cur)?;
+    let terms = map_body(m, body, inputs, args, 1);
+    Ok(build_call(m, "sum", &[terms]))
 }
 
 /// How an additional input of `kscan` meets the steps: `Some(Some(len))` for a
