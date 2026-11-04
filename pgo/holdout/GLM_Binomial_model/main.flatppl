@@ -1,0 +1,30 @@
+%%%
+# Binomial regression
+
+PosteriorDB's `GLM_Binomial_data-GLM_Binomial_model`. A quadratic year
+trend determines the log odds, with independent Normal coefficient priors.
+%%%
+flatppl_compat = "0.1"
+
+N = 40
+data = load_data("data/GLM_Binomial_data.json", cartprod(
+    C = cartpow(nonnegintegers, N), N = cartpow(posintegers, N), year = cartpow(reals, N)))
+
+alpha ~ Normal(0, 100)
+beta1 ~ Normal(0, 100)
+beta2 ~ Normal(0, 100)
+eta = alpha .+ beta1 .* data.year .+ beta2 .* data.year.^2
+y ~ Binomial.(data.N, invlogit.(eta))
+
+Pi_prior = lawof(record(alpha = alpha, beta1 = beta1, beta2 = beta2))
+K_model = kernelof(record(y = y), alpha = alpha, beta1 = beta1, beta2 = beta2)
+L = likelihoodof(K_model, record(y = data.C))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(alpha = reals, beta1 = reals, beta2 = reals)
+Pi_post_input = record(alpha = 0.0, beta1 = 0.0, beta2 = 0.0)
+
+p_alpha = elementof(reals)
+p_beta1 = elementof(reals)
+p_beta2 = elementof(reals)
+inputs = (p_alpha, p_beta1, p_beta2)
+outputs = logdensityof(Pi_post, record(alpha = p_alpha, beta1 = p_beta1, beta2 = p_beta2))

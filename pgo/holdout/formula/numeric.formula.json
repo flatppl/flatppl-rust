@@ -1,0 +1,17 @@
+{
+  "formula": "y ~ x + z",
+  "priors": [
+    {
+      "class": "b",
+      "prior": "Normal(0, 2)"
+    },
+    {
+      "class": "Intercept",
+      "prior": "Normal(0, 5)"
+    },
+    {
+      "class": "sigma",
+      "prior": "Normal(0, 1)"
+    }
+  ]
+}

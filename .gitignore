@@ -2,3 +2,4 @@
 # wasm-pack build output (e.g. crates/wasm-api/pkg/ — the .wasm + JS glue the
 # flatppl-js gallery provisions). Built on demand, never committed.
 /crates/*/pkg/
+/target-pgo

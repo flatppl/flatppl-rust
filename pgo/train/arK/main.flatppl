@@ -1,0 +1,33 @@
+%%%
+# Autoregression on observed lags
+
+PosteriorDB's `arK-arK`. Each observation depends on the preceding five
+observed values. The lag matrix is fixed data, so this model needs no state
+recurrence. The normalized half-Cauchy adds log(2) to Stan's target.
+%%%
+flatppl_compat = "0.1"
+
+T = 200
+K = 5
+data = load_data("data/arK.json", cartprod(y = cartpow(reals, T)))
+times = indicesof(zeros(T - K)) .+ K
+lagged(t) = data.y[t .- indicesof(zeros(K))]
+X = rowstack(lagged.(times))
+
+alpha ~ Normal(0, 10)
+beta ~ iid(Normal(0, 10), K)
+sigma ~ normalize(truncate(Cauchy(0, 2.5), interval(0, inf)))
+y ~ Normal.(alpha .+ X * beta, sigma)
+
+Pi_prior = lawof(record(alpha = alpha, beta = beta, sigma = sigma))
+K_model = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)
+L = likelihoodof(K_model, record(y = data.y[times]))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(alpha = reals, beta = cartpow(reals, K), sigma = posreals)
+Pi_post_input = record(alpha = 0.0, beta = zeros(K), sigma = 1.0)
+
+p_alpha = elementof(reals)
+p_beta = elementof(cartpow(reals, 5))
+p_sigma = elementof(posreals)
+inputs = (p_alpha, p_beta, p_sigma)
+outputs = logdensityof(Pi_post, record(alpha = p_alpha, beta = p_beta, sigma = p_sigma))

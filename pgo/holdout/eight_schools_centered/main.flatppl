@@ -1,0 +1,30 @@
+%%%
+# Eight schools, centered
+
+PosteriorDB's `eight_schools-eight_schools_centered`. Treatment effects
+share an inferred Normal mean and scale. Keep the centered coordinates when
+comparing inference methods. The normalized half-Cauchy adds log(2) to Stan's target.
+%%%
+flatppl_compat = "0.1"
+
+J = 8
+data = load_data("data/eight_schools.json", cartprod(
+    y = cartpow(reals, J), sigma = cartpow(posreals, J)))
+
+mu ~ Normal(0, 5)
+tau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))
+theta ~ iid(Normal(mu, tau), J)
+y ~ Normal.(theta, data.sigma)
+
+Pi_prior = lawof(record(theta = theta, mu = mu, tau = tau))
+K_model = kernelof(record(y = y), theta = theta, mu = mu, tau = tau)
+L = likelihoodof(K_model, record(y = data.y))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(theta = cartpow(reals, J), mu = reals, tau = posreals)
+Pi_post_input = record(theta = zeros(J), mu = 0.0, tau = 5.0)
+
+p_theta = elementof(cartpow(reals, 8))
+p_mu = elementof(reals)
+p_tau = elementof(posreals)
+inputs = (p_theta, p_mu, p_tau)
+outputs = logdensityof(Pi_post, record(theta = p_theta, mu = p_mu, tau = p_tau))

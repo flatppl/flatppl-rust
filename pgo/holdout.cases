@@ -1,0 +1,24 @@
+# Held-out cases for the PGO exact-output check: <name> <flatppl arguments...>
+# Paths are relative to pgo/. {out} is the case's output directory.
+startup --version
+infer-gp infer --no-header holdout/gp/main.flatppl {out}/typed.flatpir
+emit-gp-cpu-f32 stablehlo --target cpu --dtype f32 holdout/gp/main.flatppl
+emit-gp-gpu-f64 stablehlo --target gpu --dtype f64 holdout/gp/main.flatppl
+infer-belle infer --no-header holdout/belle/main.flatppl {out}/typed.flatpir
+emit-belle-cpu-f32 stablehlo --target cpu --dtype f32 holdout/belle/main.flatppl
+emit-belle-gpu-f64 stablehlo --target gpu --dtype f64 holdout/belle/main.flatppl
+infer-eight_schools_centered infer --no-header holdout/eight_schools_centered/main.flatppl {out}/typed.flatpir
+emit-eight_schools_centered-cpu-f32 stablehlo --target cpu --dtype f32 holdout/eight_schools_centered/main.flatppl
+infer-arma11 infer --no-header holdout/arma11/main.flatppl {out}/typed.flatpir
+emit-arma11-cpu-f32 stablehlo --target cpu --dtype f32 holdout/arma11/main.flatppl
+emit-arma11-gpu-f64 stablehlo --target gpu --dtype f64 holdout/arma11/main.flatppl
+infer-GLM_Binomial_model infer --no-header holdout/GLM_Binomial_model/main.flatppl {out}/typed.flatpir
+emit-GLM_Binomial_model-cpu-f32 stablehlo --target cpu --dtype f32 holdout/GLM_Binomial_model/main.flatppl
+infer-low_dim_gauss_mix infer --no-header holdout/low_dim_gauss_mix/main.flatppl {out}/typed.flatpir
+emit-low_dim_gauss_mix-cpu-f32 stablehlo --target cpu --dtype f32 holdout/low_dim_gauss_mix/main.flatppl
+convert-belle convert --from pyhf --no-header holdout/belle/model.pyhf.json {out}/pyhf.flatppl
+formula-categorical convert --no-header ../crates/formula/tests/fixtures/categorical.formula.json {out}/formula.flatppl
+arrow-numeric-file convert --no-header holdout/formula/numeric.formula.json {out}/formula.flatppl --data holdout/arrow/numeric.arrow
+arrow-numeric-stream convert --no-header holdout/formula/numeric.formula.json {out}/formula.flatppl --data holdout/arrow/numeric.arrows
+arrow-dictionary-file convert --no-header holdout/formula/dictionary.formula.json {out}/formula.flatppl --data holdout/arrow/dictionary.arrow
+arrow-delta-stream convert --no-header holdout/formula/dictionary.formula.json {out}/formula.flatppl --data holdout/arrow/delta.arrows
