@@ -35,6 +35,9 @@ pub(super) enum Pointwise {
     Dot(Value, Value, usize, usize, usize),
     Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
+    // Native lower factor and triangular solve. The `bool` selects the right-side form.
+    Cholesky(Value),
+    TriSolve(Value, Value, bool),
 }
 
 #[derive(Clone)]
@@ -55,11 +58,13 @@ impl Pointwise {
             | Self::Slice(a, ..)
             | Self::Transpose(a, _)
             | Self::Gather(a, ..)
-            | Self::Reduce(a, ..) => vec![a],
+            | Self::Reduce(a, ..)
+            | Self::Cholesky(a) => vec![a],
             Self::Binary(_, a, b)
             | Self::Compare(_, a, b)
             | Self::DynamicGather(a, b, _)
-            | Self::Dot(a, b, ..) => {
+            | Self::Dot(a, b, ..)
+            | Self::TriSolve(a, b, _) => {
                 vec![a, b]
             }
             Self::Select(c, a, b) => vec![c, a, b],
@@ -86,7 +91,9 @@ impl Pointwise {
             | Self::Gather(..)
             | Self::DynamicGather(..)
             | Self::Dot(..)
-            | Self::Concat(..) => {
+            | Self::Concat(..)
+            | Self::Cholesky(_)
+            | Self::TriSolve(..) => {
                 return None;
             }
         };
@@ -196,7 +203,9 @@ impl Emitter<'_> {
             | Pointwise::DynamicGather(..)
             | Pointwise::Dot(..)
             | Pointwise::Concat(..)
-            | Pointwise::Reduce(..) => return None,
+            | Pointwise::Reduce(..)
+            | Pointwise::Cholesky(_)
+            | Pointwise::TriSolve(..) => return None,
         };
         self.expanded.insert(key, out.clone());
         Some(out)
