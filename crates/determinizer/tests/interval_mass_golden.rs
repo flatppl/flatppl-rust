@@ -168,3 +168,25 @@ fn discrete_named_set_normalizers_reduce_to_their_atom_ranges() {
     );
     assert!(source.contains("logsumexp"), "{source}");
 }
+
+#[test]
+fn a_run_time_bound_reaches_the_cdf_only_when_finite() {
+    // An infinite bound in the CDF's scale arithmetic gives infinity * zero in
+    // the adjoint of the unselected branch. The placeholder is a support point.
+    let source = lower(
+        "a = external(reals)\nb = external(reals)\ninputs = (a, b)\n\
+         outputs = logdensityof(normalize(truncate(Exponential(2.0), interval(a, b))), 0.3)",
+    );
+    for bound in ["a", "b"] {
+        let guarded = format!(
+            "builtin_touniform(Exponential, record(rate = 2.0), ifelse(isfinite({bound}), {bound}, 1.0))"
+        );
+        assert!(source.contains(&guarded), "{source}");
+    }
+    let source = lower(
+        "a = external(reals)\ninputs = a\n\
+         outputs = logdensityof(normalize(truncate(Normal(0, 1), interval(a, 2.0))), 0.3)",
+    );
+    assert!(source.contains("ifelse(isfinite(a), a, 0.0)"), "{source}");
+    assert!(!source.contains("isfinite(2.0)"), "{source}");
+}

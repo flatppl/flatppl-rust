@@ -7533,7 +7533,7 @@ fn emit_sample_bernoulli_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<i32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
@@ -7568,7 +7568,7 @@ fn emit_sample_geometric_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<i32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.log").count(), 1);
@@ -7604,7 +7604,7 @@ fn emit_sample_categorical_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<i32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 2);
@@ -7639,7 +7639,7 @@ fn emit_sample_categorical0_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<i32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 2);
@@ -7677,7 +7677,7 @@ fn emit_sample_binomial_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
-    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<i32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert!(out.contains("tensor<5xf32>"));
@@ -7754,9 +7754,10 @@ fn poisson_and_mixture_samples_preserve_the_public_abi() {
                     flatppl_stablehlo::emit(&module, flatppl_stablehlo::Mode::Sample, &options)
                         .unwrap();
                 let shape = if batched { "4x" } else { "" };
+                // §08: a count is an integer at the dtype's integer width.
                 let precision = match dtype {
-                    Dtype::F32 => "f32",
-                    Dtype::F64 => "f64",
+                    Dtype::F32 => "i32",
+                    Dtype::F64 => "i64",
                 };
                 let signature = format!(
                     "func.func @sample(%key: tensor<2xui64>) -> (tensor<{shape}{precision}>, tensor<2xui64>)"
@@ -7820,7 +7821,7 @@ fn emit_sample_multinomial_has_expected_structure() {
 
     assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
     assert!(
-        out.contains("-> (tensor<3xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<3xi32>, tensor<2xui64>)"),
         "must return a length-3 count vector, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
@@ -8649,7 +8650,7 @@ fn emit_sample_bernoulli_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned Bernoulli must return the [4] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -8684,7 +8685,7 @@ fn emit_sample_geometric_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned Geometric must return the [4] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -8782,7 +8783,7 @@ fn emit_sample_binomial_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned Binomial must return the [4] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -8829,7 +8830,7 @@ fn emit_sample_categorical_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned Categorical must return the [4] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -8873,7 +8874,7 @@ fn emit_sample_categorical0_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned Categorical0 must return the [4] batch + advanced key, in:\n{out}"
     );
     assert_eq!(
@@ -8900,7 +8901,7 @@ fn emit_sample_categorical_single_category_iid_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        out.contains("-> (tensor<4xi32>, tensor<2xui64>)"),
         "fanned single-category Categorical must return the [4] batch (not a \
          scalar) + advanced key, in:\n{out}"
     );
