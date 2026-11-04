@@ -770,3 +770,29 @@ fn domain_restricted_registry_op_inside_a_composition_refuses() {
         "expected the composition branch, not the support branch: {e:?}"
     );
 }
+
+#[test]
+fn scalar_logvolume_lowers_like_a_constant_function() {
+    // §06 `bijection`: logvolume "may be a function or a scalar value".
+    for (scalar, function) in [
+        ("0.6931471805599453", "x -> 0.6931471805599453"),
+        ("log(2.0)", "x -> log(2.0)"),
+    ] {
+        let model = |logvolume: &str| {
+            format!(
+                "y = elementof(reals)\ninputs = y\noutputs = logdensityof(pushfwd(\
+                 bijection(x -> 2.0 * x, z -> z / 2.0, {logvolume}), Normal(1.0, 2.0)), y)"
+            )
+        };
+        assert_eq!(pir(&model(scalar)), pir(&model(function)), "{scalar}");
+    }
+    let named = flatppl_syntax::print(
+        &determinize(&parse_infer(
+            "y = elementof(reals)\nlv = log(2.0)\n\
+             double = bijection(x -> 2.0 * x, z -> z / 2.0, lv)\n\
+             inputs = y\noutputs = logdensityof(pushfwd(double, Normal(2.0, 4.0)), y)",
+        ))
+        .expect("a named scalar logvolume must lower"),
+    );
+    assert!(named.contains("- lv"), "{named}");
+}
