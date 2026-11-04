@@ -24,6 +24,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual runs check the PGO build of a branch, or its reproducibility.
+  workflow_dispatch:
 
 # Only one nightly update per ref. cancel-in-progress so a rapid run of
 # pushes to main doesn't leave two jobs racing to push the shared
