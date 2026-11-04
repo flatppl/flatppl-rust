@@ -34,6 +34,8 @@ use crate::Dtype;
 use crate::mlir::{ElemKind, Lowered, MlirTy, Value};
 use crate::refuse::EmitError;
 
+#[path = "affine_scan.rs"]
+mod affine_scan;
 #[path = "batching.rs"]
 mod batching;
 #[path = "boxes.rs"]
@@ -140,6 +142,7 @@ impl AxisReduce {
 
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
+#[derive(Clone)]
 pub struct Emitter<'m> {
     /// The FlatPDL module being lowered. Read by [`Emitter::lower_node`]'s
     /// dispatch (node structure) and by [`Emitter::node`]/[`Emitter::resolve`]
