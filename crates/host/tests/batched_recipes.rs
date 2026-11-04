@@ -66,3 +66,20 @@ fn scalar_predicates_select_every_lane() -> Result<(), Box<dyn std::error::Error
     assert_tensorized(&module, "stablehlo.select");
     Ok(())
 }
+
+#[test]
+fn native_factorizations_batch_every_lane() -> Result<(), Box<dyn std::error::Error>> {
+    let source = "mu = elementof(cartpow(reals, 3))\ncov = elementof(cartpow(reals, [3, 3]))\na = draw(MvNormal(mu = mu, cov = cov))\ninputs = (mu, cov)\noutputs = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1, -0.3]))\n";
+    // The Enzyme-restricted GPU profile unrolls matrices up to 8x8.
+    for (target, restrict_enzyme_compatible) in [(Target::Cpu, true), (Target::Gpu, false)] {
+        let options = EmitOptions {
+            target,
+            restrict_enzyme_compatible,
+            ..EmitOptions::default()
+        };
+        let module = batched(source, &options)?;
+        assert_tensorized(&module, "stablehlo.cholesky");
+        assert_tensorized(&module, "\"stablehlo.triangular_solve\"");
+    }
+    Ok(())
+}

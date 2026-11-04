@@ -474,7 +474,9 @@ impl Packer<'_, '_> {
                 | Pointwise::Gather(..)
                 | Pointwise::DynamicGather(..)
                 | Pointwise::Dot(..)
-                | Pointwise::Concat(..) => unreachable!(),
+                | Pointwise::Concat(..)
+                | Pointwise::Cholesky(_)
+                | Pointwise::TriSolve(..) => unreachable!(),
             };
             return match hoisted {
                 Some((_, dims)) => self.out.broadcast_in_dim(&result, &dims, ty),
