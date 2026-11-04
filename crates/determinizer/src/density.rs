@@ -5122,8 +5122,12 @@ fn lower_pushfwd(
         // for an annotated one (see `logvol_in_query_point`).
         Reference::Lebesgue => {
             let at = if logvol_in_query_point { v } else { preimage };
-            let logvol_val =
-                apply_change_of_variables(m, bij_resolved, logvol_node, at, &parameter, "logvol")?;
+            let logvol_val = if scalar_value(m, logvol_node) {
+                // §06 admits a scalar log-volume: the same value at every point.
+                logvol_node
+            } else {
+                apply_change_of_variables(m, bij_resolved, logvol_node, at, &parameter, "logvol")?
+            };
             (build_call(m, "sub", &[inner_density, logvol_val]), None)
         }
     };
@@ -5332,6 +5336,16 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
         "the variate does not prove a reference measure (§06 \"Density convention\": Lebesgue for \
          continuous, counting for discrete), so the volume element is undecided",
     )
+}
+
+/// Whether `node` is a scalar value rather than a callable, through alias hops.
+fn scalar_value(m: &Module, node: NodeId) -> bool {
+    let (node, _) = resolve_ref(m, node);
+    matches!(m.node(node), Node::Lit(Scalar::Real(_) | Scalar::Int(_)))
+        || matches!(
+            m.type_of(node),
+            Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
+        )
 }
 
 /// Apply a change-of-variables callable (`f_inv` or `logvol`) at `point`, requiring
