@@ -68,7 +68,7 @@ impl Components {
                 .all(|(a, b)| a.same_structure(b))
     }
 
-    fn align(self, template: &Self, id: NodeId) -> Result<Self, EmitError> {
+    pub(super) fn align(self, template: &Self, id: NodeId) -> Result<Self, EmitError> {
         if self.values.len() != template.values.len() {
             return Err(EmitError::at(id, "scan: step changes the state structure"));
         }
@@ -95,7 +95,7 @@ impl Components {
         Ok(Self::record(expected.clone(), parts))
     }
 
-    fn with_values(&self, values: &[Value]) -> Self {
+    pub(super) fn with_values(&self, values: &[Value]) -> Self {
         Self {
             fields: self.fields.clone(),
             values: values.to_vec(),
@@ -655,8 +655,26 @@ impl Emitter<'_> {
             let frame = self.call_frame.clone();
             *value = self.finish_broadcast(value, &frame, frame.len());
         }
+        // The GPU profile replaces the serial loop when the step is affine in
+        // the carry. On CPU the loop is faster.
+        let affine = if reduce || self.target != crate::Target::Gpu {
+            None
+        } else {
+            let mut types = vec![state_type.clone()];
+            types.extend(item_types.iter().cloned());
+            self.try_affine_scan(&super::affine_scan::AffineScan {
+                id,
+                body,
+                entries: &entries,
+                state: &state,
+                types: &types,
+                seqs: &seqs,
+                lengths: &lengths,
+                n,
+            })
+        };
         let mut buffers = Vec::with_capacity(state.values.len());
-        for value in state.values.iter().filter(|_| !reduce) {
+        for value in state.values.iter().filter(|_| !reduce && affine.is_none()) {
             let mut dims = shape(&value.ty).to_vec();
             dims.insert(self.batch_rank(value), Some(n));
             let zero = match value.elem {
@@ -673,7 +691,9 @@ impl Emitter<'_> {
         // zero. `reduce` begins at the second item, so it runs `n - 1` steps
         // and reads the item after the counter.
         let first = u64::from(reduce);
-        if n > first {
+        if let Some(values) = affine {
+            buffers = values;
+        } else if n > first {
             let counter = self.int_value_const(0);
             let mut inits = vec![counter];
             for (sequence, _) in seqs.iter().zip(&traversed).filter(|(_, t)| **t) {
