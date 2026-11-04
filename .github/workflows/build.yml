@@ -9,10 +9,12 @@ name: Build
 # This job only needs the workspace to BUILD in release mode per target;
 # --locked additionally catches a stale Cargo.lock.
 #
-# The shipped `flatppl` is built with profile-guided optimization by
-# pgo/build.sh: each job trains on its own target and runner, then checks
-# the PGO binary against a plain build of the same commit (pgo/README.md).
-# The plain binary is uploaded as a separate artifact for hand timing.
+# Pushes to main and manual runs build the shipped `flatppl` with
+# profile-guided optimization (pgo/build.sh, pgo/README.md): each job trains
+# on its own target and runner, then checks the PGO binary against a plain
+# build of the same commit. The plain binary is uploaded as a separate
+# artifact for hand timing. Pull requests build only the plain binary,
+# because PGO triples the build time.
 #
 # Linux binaries are musl-linked (fully static) so one download runs on
 # any distro regardless of glibc version; the workspace is pure Rust, so
@@ -24,7 +26,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Manual runs check the PGO build of a branch, or its reproducibility.
+  # Manual runs build a branch with PGO, as a push to main does.
   workflow_dispatch:
 
 # Only one nightly update per ref. cancel-in-progress so a rapid run of
@@ -41,6 +43,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    env:
+      PGO: ${{ github.event_name != 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,21 +65,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-          components: llvm-tools
+          components: ${{ env.PGO == 'true' && 'llvm-tools' || '' }}
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
+      - name: Build flatppl
+        # --all-features so the shipped binary includes the optional verbs /
+        # importers (hs3, pyhf); the default feature set omits them.
+        if: env.PGO != 'true'
+        run: cargo build --release --locked --all-features -p flatppl-cli --target ${{ matrix.target }}
+
       - name: Install Rosetta 2
         # The x86_64 training run executes on the arm64 runner.
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: env.PGO == 'true' && matrix.target == 'x86_64-apple-darwin'
         run: sudo softwareupdate --install-rosetta --agree-to-license
 
       - name: Build flatppl with PGO
-        # --all-features (inside the script) so the shipped binary includes the
-        # optional verbs / importers (hs3, pyhf); the default set omits them.
+        # Builds with --all-features, as above.
+        if: env.PGO == 'true'
         shell: bash
         run: pgo/build.sh ${{ matrix.target }}
 
@@ -85,21 +95,21 @@ jobs:
       - name: Package binary with README and LICENSE
         shell: bash
         run: |
-          mkdir -p dist/stage dist/lsp dist/plain
-          cp README.md LICENSE dist/stage/
-          case "${{ matrix.target }}" in
-            *windows*)
-              cp "target-pgo/use/${{ matrix.target }}/release/flatppl.exe" dist/stage/
-              (cd dist/stage && 7z a "../flatppl-nightly-${{ matrix.target }}.zip" .)
-              cp "target/${{ matrix.target }}/release/flatppl.exe" dist/plain/
-              cp "target/${{ matrix.target }}/release/flatppl-lsp.exe" "dist/lsp/flatppl-lsp-${{ matrix.target }}.exe"
-              ;;
-            *)
-              cp "target-pgo/use/${{ matrix.target }}/release/flatppl" dist/stage/
-              tar -czf "dist/flatppl-nightly-${{ matrix.target }}.tar.gz" -C dist/stage .
-              cp "target/${{ matrix.target }}/release/flatppl" dist/plain/
-              cp "target/${{ matrix.target }}/release/flatppl-lsp" "dist/lsp/flatppl-lsp-${{ matrix.target }}"
-              ;;
+          t=${{ matrix.target }}
+          exe=
+          [[ $t == *windows* ]] && exe=.exe
+          shipped=target/$t/release
+          mkdir -p dist/stage dist/lsp
+          if [[ $PGO == true ]]; then
+            shipped=target-pgo/use/$t/release
+            mkdir -p dist/plain
+            cp "target/$t/release/flatppl$exe" dist/plain/
+          fi
+          cp README.md LICENSE "$shipped/flatppl$exe" dist/stage/
+          cp "target/$t/release/flatppl-lsp$exe" "dist/lsp/flatppl-lsp-$t$exe"
+          case $t in
+            *windows*) (cd dist/stage && 7z a "../flatppl-nightly-$t.zip" .) ;;
+            *) tar -czf "dist/flatppl-nightly-$t.tar.gz" -C dist/stage . ;;
           esac
 
       - name: Upload binary artifact
@@ -112,6 +122,7 @@ jobs:
             dist/lsp/flatppl-lsp-*
 
       - name: Upload plain binary artifact
+        if: env.PGO == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: flatppl-plain-${{ matrix.target }}

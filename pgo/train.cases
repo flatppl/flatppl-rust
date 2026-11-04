@@ -8,7 +8,7 @@ emit-arK-gpu-f64 stablehlo --target gpu --dtype f64 train/arK/main.flatppl
 infer-scan infer --no-header train/scan/main.flatppl {out}/typed.flatpir
 emit-scan-cpu-f32 stablehlo --target cpu --dtype f32 train/scan/main.flatppl
 emit-scan-gpu-f64 stablehlo --target gpu --dtype f64 train/scan/main.flatppl
-convert-pyhf-small convert --from pyhf --no-header train/train.pyhf.json {out}/pyhf.flatppl
-formula-gaussian convert --no-header train/formula/gaussian.formula.json {out}/formula.flatppl
+convert-pyhf-small convert --from pyhf --no-header ../crates/hs3/tests/fixtures/pyhf_model.json {out}/pyhf.flatppl
+formula-gaussian convert --no-header ../crates/formula/tests/fixtures/gaussian.formula.json {out}/formula.flatppl
 arrow-train-file convert --no-header train/formula/train.formula.json {out}/formula.flatppl --data train/arrow/train.arrow
 arrow-train-delta convert --no-header train/formula/train.formula.json {out}/formula.flatppl --data train/arrow/train-delta.arrows

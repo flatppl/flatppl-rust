@@ -17,7 +17,7 @@ emit-GLM_Binomial_model-cpu-f32 stablehlo --target cpu --dtype f32 holdout/GLM_B
 infer-low_dim_gauss_mix infer --no-header holdout/low_dim_gauss_mix/main.flatppl {out}/typed.flatpir
 emit-low_dim_gauss_mix-cpu-f32 stablehlo --target cpu --dtype f32 holdout/low_dim_gauss_mix/main.flatppl
 convert-belle convert --from pyhf --no-header holdout/belle/model.pyhf.json {out}/pyhf.flatppl
-formula-categorical convert --no-header holdout/formula/categorical.formula.json {out}/formula.flatppl
+formula-categorical convert --no-header ../crates/formula/tests/fixtures/categorical.formula.json {out}/formula.flatppl
 arrow-numeric-file convert --no-header holdout/formula/numeric.formula.json {out}/formula.flatppl --data holdout/arrow/numeric.arrow
 arrow-numeric-stream convert --no-header holdout/formula/numeric.formula.json {out}/formula.flatppl --data holdout/arrow/numeric.arrows
 arrow-dictionary-file convert --no-header holdout/formula/dictionary.formula.json {out}/formula.flatppl --data holdout/arrow/dictionary.arrow
