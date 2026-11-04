@@ -528,11 +528,28 @@ pub(crate) fn lower_interval_mass(
     }
     // Infinite endpoints have constant CDF values. Emitting their location/scale
     // arithmetic would introduce infinity * zero in otherwise finite gradients.
-    let cdf = |m: &mut Module, x| match static_real(m, x) {
+    // A select differentiates both branches, so an endpoint that may be
+    // infinite at run time feeds the CDF a finite interior point instead.
+    let mut interior = None;
+    let mut cdf = |m: &mut Module, x| match static_real(m, x) {
         Some(x) if x.is_infinite() => {
             m.alloc(Node::Lit(Scalar::Real(if x < 0.0 { 0.0 } else { 1.0 })))
         }
-        _ => build_touniform(m, kernel, input, x),
+        Some(_) => build_touniform(m, kernel, input, x),
+        None => {
+            let interior = *interior.get_or_insert_with(|| interior_point(m, base));
+            let finite = build_call(m, "isfinite", &[x]);
+            let safe = build_call(m, "ifelse", &[finite, x, interior]);
+            let cdf = build_touniform(m, kernel, input, safe);
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+            let negative = build_call(m, "lt", &[x, zero]);
+            let positive = build_call(m, "gt", &[x, zero]);
+            // A NaN endpoint has neither sign. Propagate it.
+            let limit = build_call(m, "ifelse", &[positive, one, x]);
+            let limit = build_call(m, "ifelse", &[negative, zero, limit]);
+            build_call(m, "ifelse", &[finite, cdf, limit])
+        }
     };
     let cdf_hi = cdf(m, hi);
     let cdf_lo = cdf(m, lo);
@@ -543,6 +560,33 @@ pub(crate) fn lower_interval_mass(
     // An empty intersection has exactly zero mass. Keep log's argument valid
     // before AD so its unused derivative cannot introduce 0/0 into a zero bin.
     Ok(log_nonnegative_mass(m, z))
+}
+
+/// A finite point inside the support of `base`. A CDF's derivatives can be
+/// infinite on a support boundary, so the placeholder avoids the boundary too.
+fn interior_point(m: &mut Module, base: NodeId) -> NodeId {
+    let Some((lo, hi)) = bounds(m, base) else {
+        return m.alloc(Node::Lit(Scalar::Real(0.0)));
+    };
+    let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    match (static_real(m, lo), static_real(m, hi)) {
+        (Some(lo), Some(hi)) => {
+            let point = match (lo.is_finite(), hi.is_finite()) {
+                (true, true) => 0.5 * (lo + hi),
+                (true, false) => lo + 1.0,
+                (false, true) => hi - 1.0,
+                (false, false) => 0.0,
+            };
+            m.alloc(Node::Lit(Scalar::Real(point)))
+        }
+        (_, Some(hi)) if hi == f64::INFINITY => build_call(m, "add", &[lo, one]),
+        (Some(lo), _) if lo == f64::NEG_INFINITY => build_call(m, "sub", &[hi, one]),
+        _ => {
+            let sum = build_call(m, "add", &[lo, hi]);
+            let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+            build_call(m, "mul", &[half, sum])
+        }
+    }
 }
 
 /// For nu=2m, the smaller Student-t tail is I_p(m,m), where
