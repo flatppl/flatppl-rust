@@ -1,5 +1,5 @@
 module {
-  func.func @sample(%key: tensor<2xui64>) -> (tensor<f32>, tensor<2xui64>) {
+  func.func @sample(%key: tensor<2xui64>) -> (tensor<i32>, tensor<2xui64>) {
     %0 = stablehlo.constant dense<0.3> : tensor<f32>
     %1 = stablehlo.constant dense<0.0> : tensor<f32>
     %2 = stablehlo.constant dense<1.0> : tensor<f32>
@@ -11,6 +11,7 @@ module {
     %9 = stablehlo.multiply %7, %8 : tensor<f32>
     %10 = stablehlo.compare LT, %9, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>
     %11 = stablehlo.select %10, %2, %1 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %11, %3 : tensor<f32>, tensor<2xui64>
+    %12 = stablehlo.convert %11 : (tensor<f32>) -> tensor<i32>
+    return %12, %3 : tensor<i32>, tensor<2xui64>
   }
 }

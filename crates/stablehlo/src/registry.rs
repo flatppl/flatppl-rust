@@ -1128,6 +1128,15 @@ pub(crate) fn lower_sample(
         shape.extend_from_slice(&dims[1..]);
         value = e.reshape(&value, MlirTy::Ranked(shape));
     }
+    // §08 gives every discrete distribution the domain `integers`, so the drawn
+    // value is integer-typed. The samplers count in reals, which hold these
+    // integers exactly.
+    if let Some(Type::Tuple(parts)) = e.type_of(id)
+        && let Some(variate) = parts.first()
+        && let Ok((_, elem)) = crate::types::mlir_type_of_ty(id, variate, e.dtype())
+    {
+        value = e.convert(&value, elem);
+    }
 
     // The builder advanced the key via `Emitter::rng`; record it for this
     // node's advanced-rng slot. Fan-out draws ONE `[n]` batch, so a fanned
@@ -4094,14 +4103,10 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // The discrete distributions' samplers (Bernoulli/Geometric/Categorical/
 // Categorical0/Binomial/Poisson/NegativeBinomial/NegativeBinomial2) plus
 // Multinomial — the last `@sample` batch, completing the §08 sampler set. Every
-// one returns an f32-holding-integer variate (a `Scalar`, or a length-`k`
-// vector for Multinomial), matching how the `@logdensity` side already reads a
-// discrete variate: `Emitter::lower_node`'s `Lit(Int)` arm lowers an integer
-// literal to an f32 `stablehlo.constant`, never an `i32` tensor, so a sampled
-// count returned as an f32 whole number round-trips through the exact same
-// tensor type a scored count is read at (no `stablehlo.convert` needed — the
-// loop counters that ARE `i32` here, Multinomial's `while` index, are internal
-// bookkeeping that never leaves the loop).
+// one counts in reals (a `Scalar`, or a length-`k` vector for Multinomial),
+// which hold these integers exactly. [`lower_sample`] converts the draw to the
+// variate's inferred integer type, because §08 gives every discrete
+// distribution the domain `integers`.
 //
 // Three shapes of sampler here:
 //
@@ -4122,8 +4127,7 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 /// §08 Bernoulli's sampler, verbatim: `select(U < p, 1, 0)`, `U ~ Uniform(0,
 /// 1)` drawn at `p`'s own shape (mirrors [`normal_sample`]'s `&mu.ty`
-/// convention). Returns an f32 `1.0`/`0.0` (see the batch doc comment on the
-/// f32-holding-integer convention).
+/// convention). Returns a real `1.0`/`0.0` (see the batch doc comment).
 fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let zero = e.scalar(0.0);
@@ -4158,8 +4162,8 @@ fn geometric_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// The `n - 1` prefix sums `cumsum(p)_1 .. cumsum(p)_{n-1}` are built with
 /// running [`Emitter::add`]s (no cumsum op needed — the task brief) and each
 /// compared to `U`, its indicator folded into the running count via
-/// [`Emitter::select`] (`1.0`/`0.0`), so the returned index is an
-/// f32-holding-integer (batch doc comment). The count is clamped to
+/// [`Emitter::select`] (`1.0`/`0.0`), so the returned index is a
+/// real-valued count (batch doc comment). The count is clamped to
 /// `[base, base + n - 1]` by construction (`n - 1` indicators), so even a `U`
 /// rounding up to `1.0` lands in the last category — never out of range.
 /// Refuses (never panics) a dynamic-length or non-rank-1 `p`, mirroring

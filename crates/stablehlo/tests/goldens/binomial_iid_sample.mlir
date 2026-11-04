@@ -1,5 +1,5 @@
 module {
-  func.func @sample(%key: tensor<2xui64>) -> (tensor<4xf32>, tensor<2xui64>) {
+  func.func @sample(%key: tensor<2xui64>) -> (tensor<4xi32>, tensor<2xui64>) {
     %1 = stablehlo.constant dense<0.3> : tensor<f32>
     %2, %3 = stablehlo.rng_bit_generator %key, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4x5xui32>)
     %4 = stablehlo.constant dense<9> : tensor<4x5xui32>
@@ -14,6 +14,7 @@ module {
     %13 = stablehlo.select %10, %11, %12 : (tensor<4x5xi1>, tensor<4x5xf32>, tensor<4x5xf32>) -> tensor<4x5xf32>
     %14 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %15 = stablehlo.reduce(%13 init: %14) applies stablehlo.add across dimensions = [1] : (tensor<4x5xf32>, tensor<f32>) -> tensor<4xf32>
-    return %15, %2 : tensor<4xf32>, tensor<2xui64>
+    %16 = stablehlo.convert %15 : (tensor<4xf32>) -> tensor<4xi32>
+    return %16, %2 : tensor<4xi32>, tensor<2xui64>
   }
 }
