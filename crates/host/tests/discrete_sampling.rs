@@ -53,7 +53,12 @@ fn discrete_draws_return_integers_through_the_host_api() -> Result<(), Box<dyn s
                 names.join(", ")
             );
             let query = Context::default().parse(&source, None, None)?;
-            for (dtype, check_parameters) in [(Dtype::F32, false), (Dtype::F64, true)] {
+            for (dtype, check_parameters) in [
+                (Dtype::F32, false),
+                (Dtype::F32, true),
+                (Dtype::F64, false),
+                (Dtype::F64, true),
+            ] {
                 let options = EmitOptions {
                     dtype,
                     check_parameters,
