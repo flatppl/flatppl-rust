@@ -812,7 +812,7 @@ fn emitter_matrix_helpers_emit_expected_ops() {
     let y = e.tri_solve(&l, &vec3);
     assert_eq!(y.ty, vec3.ty);
 
-    let out = e.finish("f", &[], &[&y]);
+    let out = e.finish("f", &[], &[&y, &d]);
     assert!(out.contains("stablehlo.cholesky"));
     assert!(out.contains("stablehlo.iota"));
     assert!(out.contains("stablehlo.dot_general"));
@@ -6365,8 +6365,9 @@ fn emit_logdensity_wishart_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
-    assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 5);
+    // Both Cholesky diagonals share one iota pair and one mask.
+    assert_eq!(out.matches("stablehlo.iota").count(), 2);
+    assert_eq!(out.matches("stablehlo.compare").count(), 4);
     assert_eq!(out.matches("stablehlo.select").count(), 5);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
@@ -6459,8 +6460,9 @@ fn emit_logdensity_inverse_wishart_has_expected_structure() {
     );
     assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
     assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
-    assert_eq!(out.matches("stablehlo.iota").count(), 4);
-    assert_eq!(out.matches("stablehlo.compare").count(), 5);
+    // Both Cholesky diagonals share one iota pair and one mask.
+    assert_eq!(out.matches("stablehlo.iota").count(), 2);
+    assert_eq!(out.matches("stablehlo.compare").count(), 4);
     assert_eq!(out.matches("stablehlo.select").count(), 5);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);

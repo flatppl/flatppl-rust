@@ -8,19 +8,14 @@ module {
     %5 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %6 = stablehlo.reduce(%4 init: %5) applies stablehlo.add across dimensions = [1] : (tensor<3x3xf32>, tensor<f32>) -> tensor<3xf32>
     %7 = stablehlo.reduce(%6 init: %5) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %8 = stablehlo.iota dim = 0 : tensor<3x3xf32>
-    %9 = stablehlo.iota dim = 1 : tensor<3x3xf32>
-    %10 = stablehlo.compare EQ, %8, %9 : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xi1>
-    %11 = stablehlo.select %10, %arg0, %3 : (tensor<3x3xi1>, tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
-    %12 = stablehlo.reduce(%11 init: %5) applies stablehlo.add across dimensions = [1] : (tensor<3x3xf32>, tensor<f32>) -> tensor<3xf32>
-    %13 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3xf32>) -> tensor<3xf32>
-    %14 = stablehlo.dot_general %arg1, %13, contracting_dims = [0] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3xf32>, tensor<3xf32>) -> tensor<f32>
-    %15 = stablehlo.broadcast_in_dim %arg1, dims = [0] : (tensor<3xf32>) -> tensor<3x3xf32>
-    %16 = stablehlo.broadcast_in_dim %arg1, dims = [1] : (tensor<3xf32>) -> tensor<3x3xf32>
-    %17 = stablehlo.multiply %15, %16 : tensor<3x3xf32>
-    %18 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x3xf32>) -> tensor<3x3xf32>
-    %19 = stablehlo.dot_general %arg0, %18, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
-    %20 = stablehlo.dot_general %18, %arg0, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
-    return %7, %12, %14, %17, %19, %20 : tensor<f32>, tensor<3xf32>, tensor<f32>, tensor<3x3xf32>, tensor<3x3xf32>, tensor<3x3xf32>
+    %8 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3xf32>) -> tensor<3xf32>
+    %9 = stablehlo.dot_general %arg1, %8, contracting_dims = [0] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3xf32>, tensor<3xf32>) -> tensor<f32>
+    %10 = stablehlo.broadcast_in_dim %arg1, dims = [0] : (tensor<3xf32>) -> tensor<3x3xf32>
+    %11 = stablehlo.broadcast_in_dim %arg1, dims = [1] : (tensor<3xf32>) -> tensor<3x3xf32>
+    %12 = stablehlo.multiply %10, %11 : tensor<3x3xf32>
+    %13 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x3xf32>) -> tensor<3x3xf32>
+    %14 = stablehlo.dot_general %arg0, %13, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
+    %15 = stablehlo.dot_general %13, %arg0, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>
+    return %7, %6, %9, %12, %14, %15 : tensor<f32>, tensor<3xf32>, tensor<f32>, tensor<3x3xf32>, tensor<3x3xf32>, tensor<3x3xf32>
   }
 }

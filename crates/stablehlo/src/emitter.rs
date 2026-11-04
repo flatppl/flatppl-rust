@@ -1051,7 +1051,8 @@ impl<'m> Emitter<'m> {
             ),
             &a,
         );
-        if c.ty == a.ty && c.elem == ElemKind::Bool {
+        // A scalar predicate stays a recipe so a host batch can broadcast it.
+        if (c.ty == a.ty || c.ty == MlirTy::Scalar) && c.elem == ElemKind::Bool {
             self.remember_pointwise(&ssa, &a, Pointwise::Select(c, a.clone(), b));
         }
         Value {
@@ -1095,6 +1096,7 @@ impl<'m> Emitter<'m> {
             format!("stablehlo.bitcast_convert {} : ({from}) -> {to}", v.ssa),
             v,
         );
+        self.remember_pointwise(&ssa, v, Pointwise::Bitcast(v.clone(), target));
         Value {
             ssa,
             ty: v.ty.clone(),
@@ -2466,23 +2468,19 @@ impl<'m> Emitter<'m> {
         let mat_ty = a.ty.clone();
         let mat_ty_text = mat_ty.render(self.dtype, ElemKind::Real);
 
-        let row_ssa = self.fresh();
-        self.push(&format!(
-            "{row_ssa} = stablehlo.iota dim = {batch} : {mat_ty_text}"
-        ));
-        self.remember_axes(&row_ssa, self.axes_of(a));
+        // Pure iotas are host-batch invariants, so a lane batch can share them.
+        let row_ssa = self.pure_like(format!("stablehlo.iota dim = {batch} : {mat_ty_text}"), a);
         let row = Value {
             ssa: row_ssa,
             ty: mat_ty.clone(),
             elem: ElemKind::Real,
         };
 
-        let col_ssa = self.fresh();
         let col_axis = batch + 1;
-        self.push(&format!(
-            "{col_ssa} = stablehlo.iota dim = {col_axis} : {mat_ty_text}"
-        ));
-        self.remember_axes(&col_ssa, self.axes_of(a));
+        let col_ssa = self.pure_like(
+            format!("stablehlo.iota dim = {col_axis} : {mat_ty_text}"),
+            a,
+        );
         let col = Value {
             ssa: col_ssa,
             ty: mat_ty.clone(),

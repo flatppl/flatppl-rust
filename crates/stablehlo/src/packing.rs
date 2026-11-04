@@ -467,7 +467,8 @@ impl Packer<'_, '_> {
                     dims.insert(PACKET_AXIS, axis as u64);
                     self.out.broadcast_in_dim(&inputs[0], &dims, ty.clone())
                 }
-                Pointwise::Reshape(_)
+                Pointwise::Bitcast(..)
+                | Pointwise::Reshape(_)
                 | Pointwise::Slice(..)
                 | Pointwise::Transpose(..)
                 | Pointwise::Gather(..)
