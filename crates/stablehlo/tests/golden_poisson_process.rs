@@ -99,3 +99,26 @@ fn restricted_normalized_gamma_bins_keep_live_bounds() {
     // This needs the exact tail rule: the emitter has no general Gamma CDF.
     emit_logdensity(source);
 }
+
+/// One bin-mass body maps over the edges, so the module does not grow with the
+/// bin count.
+#[test]
+fn binned_poisson_process_size_does_not_grow_with_bins() {
+    let lines = |bins: usize| {
+        let edges: Vec<String> = (0..=bins)
+            .map(|i| format!("{:.6}", -3.0 + 6.0 * i as f64 / bins as f64))
+            .collect();
+        let src = format!(
+            "\
+mu = elementof(reals)
+n = elementof(cartpow(nonnegintegers, {bins}))
+edges = [{}]
+proc = BinnedPoissonProcess(edges, weighted(50.0, Normal(mu, 1.0)))
+inputs = (mu, n)
+outputs = logdensityof(proc, n)",
+            edges.join(", ")
+        );
+        emit_logdensity(&src).lines().count()
+    };
+    assert_eq!(lines(10), lines(1000));
+}

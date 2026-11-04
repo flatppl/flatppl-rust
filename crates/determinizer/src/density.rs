@@ -6961,25 +6961,30 @@ fn lower_binned_poisson_process(
              which a CDF difference misses, so its bin masses are not derived",
         ));
     }
-    let mut rates = Vec::with_capacity(bins_count);
     let mut numerical_masses = Vec::new();
-    for pair in edges.windows(2) {
-        let rate = bin_mass(m, intensity, pair[0], pair[1], None, &mut numerical_masses)
-            .ok_or_else(|| {
-                refuse(
-                    node,
-                    m,
-                    "BinnedPoissonProcess cannot derive this intensity mass per bin; \
-                     closed forms cover normalized univariate continuous constructors, \
-                     scalar weights, superpositions, interval restrictions, normalized \
-                     restricted constructors, Lebesgue intervals and bounded polynomial \
-                     weights. Numerical integration supports function-weighted \
-                     finite Lebesgue intervals with static bin edges and requires explicit opt-in",
-                )
-            })?;
-        rates.push(rate);
-    }
-    let rates = build_call(m, "vector", &rates);
+    let rates = match broadcast_bin_masses(m, bins, &edges, &values, intensity) {
+        Some(rates) => rates,
+        None => {
+            let mut rates = Vec::with_capacity(bins_count);
+            for pair in edges.windows(2) {
+                let rate = bin_mass(m, intensity, pair[0], pair[1], None, &mut numerical_masses)
+                    .ok_or_else(|| {
+                        refuse(
+                            node,
+                            m,
+                            "BinnedPoissonProcess cannot derive this intensity mass per bin; \
+                             closed forms cover normalized univariate continuous constructors, \
+                             scalar weights, superpositions, interval restrictions, normalized \
+                             restricted constructors, Lebesgue intervals and bounded polynomial \
+                             weights. Numerical integration supports function-weighted \
+                             finite Lebesgue intervals with static bin edges and requires explicit opt-in",
+                        )
+                    })?;
+                rates.push(rate);
+            }
+            build_call(m, "vector", &rates)
+        }
+    };
     m.set_type(
         rates,
         Type::Array {
@@ -7010,6 +7015,59 @@ fn lower_binned_poisson_process(
         score = add_bin_edge_check(m, bins, score);
     }
     Ok(score)
+}
+
+/// The bin masses as one `(lo, hi)` mass body mapped over the lower and upper
+/// edges. Bins are independent, so the program size does not grow with the bin
+/// count, as in [`crate::chain`].
+///
+/// `None` keeps the per-bin form for a mass that needs each bin's static edges:
+/// a polynomial weight, numerical integration, or a static infinite edge, whose
+/// constant CDF keeps `inf * 0` out of the gradient.
+fn broadcast_bin_masses(
+    m: &mut Module,
+    bins: NodeId,
+    edges: &[NodeId],
+    values: &[Option<f64>],
+    intensity: NodeId,
+) -> Option<NodeId> {
+    if edges.len() < 2 || values.iter().flatten().any(|value| value.is_infinite()) {
+        return None;
+    }
+    let count = edges.len() - 1;
+    let (resolved, _) = resolve_ref_chain(m, bins);
+    let edge_type = match m.type_of(bins).or_else(|| m.type_of(resolved)) {
+        Some(Type::Array { elem, .. }) => (**elem).clone(),
+        _ => Type::Scalar(ScalarType::Real),
+    };
+    let (lo_label, lo_ref, lo) = broadcast::placeholder(m, edge_type.clone());
+    let (hi_label, hi_ref, hi) = broadcast::placeholder(m, edge_type.clone());
+    // Numerical masses need static bin edges. Their batched integral runs the
+    // lanes in sequence and was slower than one adaptive loop per bin.
+    let mass = bin_mass(m, intensity, lo, hi, None, &mut Vec::new())?;
+    let (lower, upper) = if expect_builtin_call(m, resolved, "vector").is_some() {
+        (
+            build_call(m, "vector", &edges[..count]),
+            build_call(m, "vector", &edges[1..]),
+        )
+    } else {
+        let length = m.alloc(Node::Lit(Scalar::Int(count as i64)));
+        let zeros = build_call(m, "zeros", &[length]);
+        let first = build_call(m, "indicesof0", &[zeros]);
+        let second = build_call(m, "indicesof", &[zeros]);
+        (
+            build_call(m, "get0", &[bins, first]),
+            build_call(m, "get0", &[bins, second]),
+        )
+    };
+    let slice_type = Type::Array {
+        shape: Box::new([Dim::Static(count as u32)]),
+        elem: Box::new(edge_type),
+    };
+    m.set_type(lower, slice_type.clone());
+    m.set_type(upper, slice_type);
+    let inputs = vec![(lo_label, lo_ref), (hi_label, hi_ref)];
+    Some(broadcast::map_body(m, mass, inputs, vec![lower, upper], 1))
 }
 
 /// Add the edge-validity check of edges known only at run time to `score`.
