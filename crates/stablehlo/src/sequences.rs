@@ -669,8 +669,12 @@ impl Emitter<'_> {
             axes.layers.insert(0, 1);
             buffers.push(self.axes_view(&buffer, axes));
         }
-        if n > u64::from(reduce) {
-            let counter = self.int_value_const(i64::from(reduce));
+        // Enzyme indexes its reverse-pass tapes by a counter that starts at
+        // zero. `reduce` begins at the second item, so it runs `n - 1` steps
+        // and reads the item after the counter.
+        let first = u64::from(reduce);
+        if n > first {
+            let counter = self.int_value_const(0);
             let mut inits = vec![counter];
             for (sequence, _) in seqs.iter().zip(&traversed).filter(|(_, t)| **t) {
                 inits.extend(sequence.values.clone());
@@ -687,12 +691,18 @@ impl Emitter<'_> {
                 &inits,
                 &types,
                 |e, args| {
-                    let limit = e.int_value_const(n as i64);
+                    let limit = e.int_value_const((n - first) as i64);
                     e.compare("LT", &args[0], &limit)
                 },
                 |e, args| {
                     let mut sequence_items = Vec::with_capacity(seqs.len());
                     let mut at = 1;
+                    let item = if reduce {
+                        let one = e.int_value_const(1);
+                        e.add(&args[0], &one)
+                    } else {
+                        args[0].clone()
+                    };
                     for (sequence, &len) in seqs.iter().zip(&lengths) {
                         let Some(len) = len else {
                             sequence_items.push(sequence.clone());
@@ -701,7 +711,7 @@ impl Emitter<'_> {
                         let index = if len == 1 {
                             e.int_value_const(0)
                         } else {
-                            args[0].clone()
+                            item.clone()
                         };
                         let mut items = Vec::with_capacity(sequence.values.len());
                         for (value, original) in args[at..].iter().zip(&sequence.values) {
