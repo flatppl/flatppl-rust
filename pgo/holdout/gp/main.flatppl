@@ -1,0 +1,32 @@
+%%%
+# Gaussian process regression
+
+PosteriorDB's `gp_pois_regr-gp_regr`. A squared-exponential covariance
+depends on amplitude and length scale. The diagonal adds sigma, not sigma
+squared, matching the source. Normalizing two half-Normal priors adds 2 log(2).
+%%%
+flatppl_compat = "0.1"
+
+N = 11
+data = load_data("data/gp_pois_regr.json", cartprod(
+    x = cartpow(reals, N), y = cartpow(reals, N)))
+distance_sq = (addaxes(data.x, 0, 1) .- addaxes(data.x, 1, 0)).^2
+
+rho ~ Gamma(shape = 25, rate = 4)
+alpha ~ normalize(truncate(Normal(0, 2), interval(0, inf)))
+sigma ~ normalize(truncate(Normal(0, 1), interval(0, inf)))
+covariance = alpha^2 .* exp.(-0.5 .* distance_sq ./ rho^2) + sigma * eye(N)
+y ~ MvNormal(zeros(N), covariance)
+
+Pi_prior = lawof(record(rho = rho, alpha = alpha, sigma = sigma))
+K_model = kernelof(record(y = y), rho = rho, alpha = alpha, sigma = sigma)
+L = likelihoodof(K_model, record(y = data.y))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(rho = posreals, alpha = posreals, sigma = posreals)
+Pi_post_input = record(rho = 6.0, alpha = 2.0, sigma = 1.0)
+
+p_rho = elementof(posreals)
+p_alpha = elementof(posreals)
+p_sigma = elementof(posreals)
+inputs = (p_rho, p_alpha, p_sigma)
+outputs = logdensityof(Pi_post, record(rho = p_rho, alpha = p_alpha, sigma = p_sigma))

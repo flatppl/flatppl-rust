@@ -1,0 +1,34 @@
+%%%
+# Two-component Gaussian mixture
+
+PosteriorDB's `low_dim_gauss_mix-low_dim_gauss_mix`. Each observation chooses
+between two Normal components. Ordered means remove label ambiguity while
+retaining the iid Normal prior restricted to that order.
+Normalizing that prior and both half-Normal scales adds 3 log(2) to Stan's
+target. This fixed constant leaves the posterior law unchanged.
+%%%
+flatppl_compat = "0.1"
+
+N = 1000
+data = load_data("data/low_dim_gauss_mix.json", cartprod(y = cartpow(reals, N)))
+
+mu ~ tilt(iid(Normal(0, 2), 2), Lebesgue(ordered(2)))
+sigma ~ iid(normalize(truncate(Normal(0, 2), interval(0, inf))), 2)
+theta ~ Beta(5, 5)
+component = normalize(superpose(
+    weighted(theta, Normal(mu[1], sigma[1])),
+    weighted(1 - theta, Normal(mu[2], sigma[2]))))
+y ~ iid(component, N)
+
+Pi_prior = lawof(record(mu = mu, sigma = sigma, theta = theta))
+K_model = kernelof(record(y = y), mu = mu, sigma = sigma, theta = theta)
+L = likelihoodof(K_model, record(y = data.y))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(mu = ordered(2), sigma = cartpow(posreals, 2), theta = unitinterval)
+Pi_post_input = record(mu = [-2.0, 2.0], sigma = [1.0, 1.0], theta = 0.5)
+
+p_mu = elementof(ordered(2))
+p_sigma = elementof(cartpow(posreals, 2))
+p_theta = elementof(unitinterval)
+inputs = (p_mu, p_sigma, p_theta)
+outputs = logdensityof(Pi_post, record(mu = p_mu, sigma = p_sigma, theta = p_theta))

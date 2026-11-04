@@ -1,0 +1,39 @@
+%%%
+# Autoregression with moving-average residuals
+
+PosteriorDB's `arma-arma11`. A scan carries the previous observation and
+residual. The initial prediction is mu + phi * mu. Both coefficients retain
+their original unbounded Normal priors, without stationarity constraints.
+The likelihood uses observed histories. The normalized half-Cauchy scale
+prior adds log(2) to Stan's target.
+%%%
+flatppl_compat = "0.1"
+
+T = 200
+data = load_data("data/arma.json", cartprod(y = cartpow(reals, T)))
+
+mu ~ Normal(0, 10)
+phi ~ Normal(0, 2)
+theta ~ Normal(0, 2)
+sigma ~ normalize(truncate(Cauchy(0, 2.5), interval(0, inf)))
+prediction(state, mu, phi, theta) = mu + phi * state.previous + theta * state.error
+step(state, observation, mu, phi, theta) = record(
+    previous = observation, error = observation - prediction(state, mu, phi, theta),
+    mean = prediction(state, mu, phi, theta))
+states = scan(step, record(previous = mu, error = 0.0, mean = 0.0), data.y, mu, phi, theta)
+state_mean(state) = state.mean
+y ~ Normal.(state_mean.(states), sigma)
+
+Pi_prior = lawof(record(mu = mu, phi = phi, theta = theta, sigma = sigma))
+K_model = kernelof(record(y = y), mu = mu, phi = phi, theta = theta, sigma = sigma)
+L = likelihoodof(K_model, record(y = data.y))
+Pi_post = bayesupdate(L, Pi_prior)
+Pi_post_domain = cartprod(mu = reals, phi = reals, theta = reals, sigma = posreals)
+Pi_post_input = record(mu = 0.0, phi = 0.0, theta = 0.0, sigma = 1.0)
+
+p_mu = elementof(reals)
+p_phi = elementof(reals)
+p_theta = elementof(reals)
+p_sigma = elementof(posreals)
+inputs = (p_mu, p_phi, p_theta, p_sigma)
+outputs = logdensityof(Pi_post, record(mu = p_mu, phi = p_phi, theta = p_theta, sigma = p_sigma))
