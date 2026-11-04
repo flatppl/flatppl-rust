@@ -202,6 +202,11 @@ impl TensorBatch<'_, '_> {
                 self.out.reduce_axis_lit(op, init, a, batch + axis)
             }
             Pointwise::Concat(_, axis) => self.concatenate(inputs, *axis)?,
+            Pointwise::Cholesky(_) => self.out.native_cholesky(a),
+            Pointwise::TriSolve(.., right_side) => {
+                let (l, b) = self.out.broadcast_batches(a, &inputs[1]);
+                self.out.native_tri_solve(&l, &b, *right_side)
+            }
         })
     }
 

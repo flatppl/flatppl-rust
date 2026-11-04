@@ -2440,18 +2440,25 @@ impl<'m> Emitter<'m> {
         if self.decompose_small_matrix(&a, limit) {
             return self.cholesky_decomposed(&a);
         }
+        self.native_cholesky(&a)
+    }
+
+    /// Leading axes of `a` are batch dimensions of the native factorization.
+    pub(super) fn native_cholesky(&mut self, a: &Value) -> Value {
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = stablehlo.cholesky {}, lower = true : {ty_text}",
             a.ssa
         ));
-        self.remember_axes(&ssa, self.axes_of(&a));
-        Value {
+        self.remember_axes(&ssa, self.axes_of(a));
+        let result = Value {
             ssa,
             ty: a.ty.clone(),
             elem: ElemKind::Real,
-        }
+        };
+        self.remember_pointwise(&result.ssa, &result, Pointwise::Cholesky(a.clone()));
+        result
     }
 
     /// The diagonal of a square matrix `a` (`Ranked([n, n])`) as a length-`n`
@@ -2814,7 +2821,8 @@ impl<'m> Emitter<'m> {
     }
 
     /// `right_side` solves `x @ l^T = b`, the transpose of `l @ x^T = b^T`.
-    fn native_tri_solve(&mut self, l: &Value, b: &Value, right_side: bool) -> Value {
+    /// `l` and `b` share their leading batch dimensions.
+    pub(super) fn native_tri_solve(&mut self, l: &Value, b: &Value, right_side: bool) -> Value {
         let (left_side, transpose) = if right_side {
             ("false", "TRANSPOSE")
         } else {
@@ -2830,11 +2838,17 @@ impl<'m> Emitter<'m> {
             l.ssa, b.ssa
         ));
         self.remember_axes(&ssa, self.axes_of(b));
-        Value {
+        let result = Value {
             ssa,
             ty: result_ty,
             elem: ElemKind::Real,
-        }
+        };
+        self.remember_pointwise(
+            &result.ssa,
+            &result,
+            Pointwise::TriSolve(l.clone(), b.clone(), right_side),
+        );
+        result
     }
 
     // ---- sampling (Task 6) --------------------------------------------------
