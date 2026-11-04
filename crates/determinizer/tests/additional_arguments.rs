@@ -4,10 +4,15 @@
 //! Each case equals the same model with the arguments written into the callback.
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::renumber_points;
+
 fn pir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
-    flatppl_flatpir::write(&determinize(&m).expect("must lower"))
+    renumber_points(&flatppl_flatpir::write(
+        &determinize(&m).expect("must lower"),
+    ))
 }
 
 #[test]
@@ -87,35 +92,40 @@ fn markovchain_binds_several_additional_arguments() {
 
 #[test]
 fn kscan_traverses_every_additional_sequence_together() {
-    // Step i is Normal(prev + xs[i], ws[i]) with prev_0 = 0.0.
+    // Step i is Normal(prev + xs[i], ws[i]) with prev_0 = 0.0. The step inputs are
+    // (prev, cur, x, w), mapped over the shifted trajectory, the point, xs and ws.
     let out = pir(
         "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], [0.5, 0.25])\n\
          lp = logdensityof(T, [0.1, 0.2])",
     );
     assert!(
-        out.contains("(%field mu 1.0) (%field sigma 0.5))) 0.1)"),
+        out.contains("(add (%ref %local _density_point_0_) (%ref %local _density_point_2_))"),
         "{out}"
     );
     assert!(
-        out.contains("(%field mu 2.1) (%field sigma 0.25))) 0.2)"),
+        out.contains("(%field sigma (%ref %local _density_point_3_))"),
         "{out}"
     );
+    let xs = out
+        .find("(vector 1.0 2.0))")
+        .expect("xs is a broadcast argument");
+    let ws = out
+        .find("(vector 0.5 0.25))")
+        .expect("ws is a broadcast argument");
+    assert!(xs < ws, "{out}");
 }
 
 #[test]
 fn kscan_repeats_a_length_one_sequence() {
-    let out = pir(
+    let repeated = pir(
         "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], [0.5])\n\
          lp = logdensityof(T, [0.1, 0.2])",
     );
-    assert!(
-        out.contains("(%field mu 1.0) (%field sigma 0.5))) 0.1)"),
-        "{out}"
+    let constant = pir(
+        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], 0.5)\n\
+         lp = logdensityof(T, [0.1, 0.2])",
     );
-    assert!(
-        out.contains("(%field mu 2.1) (%field sigma 0.5))) 0.2)"),
-        "{out}"
-    );
+    assert_eq!(repeated, constant);
 }
 
 #[test]
@@ -160,6 +170,10 @@ fn fchain_passes_the_additional_arguments_to_every_step() {
 #[test]
 fn kscan_holds_scalar_inputs_constant_at_every_step() {
     // Step i is Normal(prev + xs[i], w) with the constant w, prev_0 = 0.0.
+    let inline = pir(
+        "T = kscan((state, x) -> Normal(state + x, 0.5), 0.0, [1.0, 2.0])\n\
+         lp = logdensityof(T, [0.1, 0.2])",
+    );
     for extras in [
         "[1.0, 2.0], 0.5",
         "[1.0, 2.0], w = 0.5",
@@ -169,28 +183,18 @@ fn kscan_holds_scalar_inputs_constant_at_every_step() {
             "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, {extras})\n\
              lp = logdensityof(T, [0.1, 0.2])"
         ));
-        assert!(
-            got.contains("(%field mu 1.0) (%field sigma 0.5))) 0.1)"),
-            "{extras}\n{got}"
-        );
-        assert!(
-            got.contains("(%field mu 2.1) (%field sigma 0.5))) 0.2)"),
-            "{extras}\n{got}"
-        );
+        assert_eq!(got, inline, "{extras}");
     }
     // Two constants beside one sequence bind in order.
     let got = pir(
         "T = kscan((state, x, p, q) -> Normal(state + x + q, p), 0.0, [1.0, 2.0], \
          0.5, 10.0)\nlp = logdensityof(T, [0.1, 0.2])",
     );
-    assert!(
-        got.contains("(%field mu 11.0) (%field sigma 0.5))) 0.1)"),
-        "{got}"
+    let inline = pir(
+        "T = kscan((state, x) -> Normal(state + x + 10.0, 0.5), 0.0, [1.0, 2.0])\n\
+         lp = logdensityof(T, [0.1, 0.2])",
     );
-    assert!(
-        got.contains("(%field mu 12.1) (%field sigma 0.5))) 0.2)"),
-        "{got}"
-    );
+    assert_eq!(got, inline);
 }
 
 #[test]

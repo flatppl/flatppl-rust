@@ -172,10 +172,10 @@ lp = logdensityof(d, 0.5)";
     );
 }
 
-// A DYNAMIC trajectory length has no static step count, and FlatPDL has no loop
-// or scan primitive to carry one at runtime — so the unroll refuses rather than
-// pick a length. `n` here comes from a `load_data` table whose row count is
-// declared but whose contents are not, so `lengthof` does not fold to a literal.
+// A DYNAMIC trajectory length has no static step count, and the mapped step
+// pairs need a static extent — so the lowering refuses rather than pick a length.
+// `n` here comes from a `load_data` table whose row count is declared but whose
+// contents are not, so `lengthof` does not fold to a literal.
 #[test]
 fn kscan_dynamic_length_refuses() {
     let src = "\
@@ -204,8 +204,8 @@ lp = logdensityof(lawof(t), [0.1, 0.2, 0.3, 0.4])";
         "refusal names kscan: {err:?}"
     );
     assert!(
-        err.reason.contains("statically-resolved") && err.reason.contains("no loop"),
-        "refusal names the static-length limit and the missing FlatPDL loop: {err:?}"
+        err.reason.contains("statically-resolved") && err.reason.contains("static-length"),
+        "refusal names the static-length limit: {err:?}"
     );
 }
 

@@ -2890,7 +2890,9 @@ fn lower_cat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
     let values = args
         .iter()
         .map(|&arg| {
+            // A built vector of vectors and an input one must agree on nesting.
             let value = e.lower_node(arg)?;
+            let value = e.with_typed_axes(arg, value);
             Ok(e.convert(&value, target))
         })
         .collect::<Result<Vec<_>, EmitError>>()?;

@@ -97,3 +97,77 @@ pub fn pir_binding(pir: &str, name: &str) -> String {
     }
     panic!("unterminated `{name}` binding in:\n{pir}")
 }
+
+/// Number the density placeholders by first use, so equal lowerings of
+/// different sources compare equal.
+pub fn renumber_points(text: &str) -> String {
+    const STEM: &str = "density_point_";
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(STEM) {
+        let (head, tail) = rest.split_at(at + STEM.len());
+        out.push_str(head);
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        let serial = &tail[..digits];
+        let id = match seen.iter().position(|s| s == serial) {
+            Some(id) => id,
+            None => {
+                seen.push(serial.to_owned());
+                seen.len() - 1
+            }
+        };
+        out.push_str(&id.to_string());
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Strip the transparent `(%meta (<triple>) <inner>)` type annotations the
+/// FlatPIR writer interleaves, leaving the bare S-expression — so a test can
+/// assert an exact nested structure without the type noise between nodes.
+pub fn strip_meta(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut drop_close: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if s[i..].starts_with("(%meta ") {
+            // Drop `(%meta ` + the balanced `(<triple>)` group + one space; the
+            // matching close paren is dropped when we reach it (drop_close = true).
+            i += "(%meta ".len();
+            let mut depth = 0i32;
+            loop {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            if i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            drop_close.push(true);
+        } else {
+            match b[i] {
+                b'(' => {
+                    out.push('(');
+                    drop_close.push(false);
+                }
+                b')' => {
+                    if !drop_close.pop().unwrap_or(false) {
+                        out.push(')');
+                    }
+                }
+                c => out.push(c as char),
+            }
+            i += 1;
+        }
+    }
+    out
+}
