@@ -127,6 +127,69 @@ fn a_zero_or_unproven_scale_refuses_as_on_a_scalar_base() {
     }
 }
 
+const MATRIX_POINT: &str = "rowstack([[3.0, 1.0], [-2.0, 0.5]])";
+const MATRIX_BASE: &str = "iid(Normal(1.0, 2.0), [2, 2])";
+
+#[test]
+fn a_matrix_variate_lowers_with_an_explicit_bijection_and_a_scalar_scale() {
+    // Applying f_inv rebuilds the point, and the 2 x 2 iid reads its type.
+    let explicit = lowered(&format!(
+        "lp = logdensityof(pushfwd(bijection(fn(2.0 * _), fn(_ / 2.0), 4.0 * log(2.0)), \
+         {MATRIX_BASE}), {MATRIX_POINT})"
+    ));
+    assert!(explicit.contains("builtin_logdensityof"), "{explicit}");
+    let synthesised = lowered(&format!(
+        "lp = logdensityof(pushfwd(fn(2.0 * _), {MATRIX_BASE}), {MATRIX_POINT})"
+    ));
+    assert!(synthesised.contains("(mul 4.0 "), "4 cells:\n{synthesised}");
+    let y = [3.0, 1.0, -2.0, 0.5];
+    let value: f64 = y
+        .iter()
+        .map(|&v| normal_logpdf(v / 2.0, 1.0, 2.0))
+        .sum::<f64>()
+        - 4.0 * LN_2;
+    // scipy.stats.norm(2, 4).logpdf([[3, 1], [-2, 0.5]]).sum()
+    assert!((value - (-9.853_744_077_298_252)).abs() < 1e-14, "{value}");
+}
+
+#[test]
+fn a_chain_of_scalar_scales_counts_each_op_once_per_cell() {
+    // (2 x) / 4 = x / 2: logvol = 3 (log|2| - log|4|) = -3 log 2.
+    let out = lowered(&format!(
+        "lp = logdensityof(pushfwd(fn((2.0 * _) / 4.0), {BASE}), {POINT})"
+    ));
+    assert!(out.contains("(mul 3.0 ") && out.contains("(neg "), "{out}");
+    let y = [3.0, 1.0, -2.0];
+    let value: f64 = y
+        .iter()
+        .map(|&v| normal_logpdf(2.0 * v, 1.0, 2.0))
+        .sum::<f64>()
+        + 3.0 * LN_2;
+    // scipy.stats.norm(0.5, 1).logpdf([3, 1, -2]).sum()
+    assert!((value - (-9.131_815_599_614_017)).abs() < 1e-14, "{value}");
+}
+
+#[test]
+fn a_vector_scale_is_not_a_scalar_scale() {
+    // §07 `mul` has no vector-vector domain, so `v * x` refuses. The elementwise
+    // scale `x .* a` sums log|a_i| once per cell, not the cell count times the sum.
+    let e = refusal(&format!(
+        "v = [1.0, 2.0, 3.0]\nlp = logdensityof(pushfwd(fn(v * _), {BASE}), {POINT})"
+    ));
+    // The nonzero proof rejects the vector before the scalar-scale check does.
+    assert!(
+        e.contains("provably nonzero") || e.contains("needs a scalar scale"),
+        "{e}"
+    );
+    let elementwise = lowered(&format!(
+        "a = [1.0, 2.0, -3.0]\nlp = logdensityof(pushfwd(fn(_ .* a), {BASE}), {POINT})"
+    ));
+    assert!(
+        elementwise.contains("(sum ") && !elementwise.contains("(mul 3.0 "),
+        "{elementwise}"
+    );
+}
+
 #[test]
 fn a_scaled_input_plus_a_vector_shift_lowers_in_every_spelling() {
     // `2 x + c` with c = [1, 0, -1]: f_inv(y) = (y - c) / 2, logvol = 3 log 2. A
