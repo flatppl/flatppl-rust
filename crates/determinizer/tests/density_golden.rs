@@ -779,6 +779,55 @@ fn normalized_student_t_half_lines_use_their_exact_mass() {
     }
 }
 
+// §06: locscale is the pushforward under x -> scale * x + shift, so the truncation
+// mass of interval I is P_D((I - shift) / scale). The half-t prior has preimage
+// [0, inf) and mass 1/2, the same exact mass as its unscaled leaf.
+#[test]
+fn a_truncated_locscale_divides_by_the_preimage_mass_of_its_leaf() {
+    let law = "truncate(locscale(StudentT(3), 0, 10), interval(0, inf))";
+    let actual = determinize_src(&format!("lp = logdensityof(normalize({law}), 1.5)"));
+    let expected = determinize_src(&format!(
+        "lp = ifelse(isfinite(log(0.5)), logdensityof({law}, 1.5) - log(0.5), 0.0/0.0)"
+    ));
+    assert_eq!(
+        pir_binding(&flatppl_flatpir::write(&actual), "lp"),
+        pir_binding(&flatppl_flatpir::write(&expected), "lp")
+    );
+}
+
+// A negative scale reverses the interval: [0, inf) under x -> -2 x + 1 has the
+// preimage (-inf, 0.5], whose mass is the leaf CDF at 0.5.
+#[test]
+fn a_negative_locscale_scale_swaps_the_preimage_bounds() {
+    let out = determinize_src(
+        "lp = logdensityof(normalize(truncate(locscale(Normal(0, 1), 1, -2), \
+         interval(0, inf))), 0.3)",
+    );
+    let text = flatppl_syntax::print(&out);
+    assert!(
+        text.contains("builtin_touniform(Normal, record(mu = 0, sigma = 1), 0.5) - 0.0"),
+        "expected the mass F(0.5) - F(-inf):\n{text}"
+    );
+}
+
+// A run-time scale has an unknown sign, so the bounds are ordered with min/max and
+// an infinite bound becomes a selected constant, never inf arithmetic.
+#[test]
+fn a_runtime_locscale_scale_orders_the_preimage_bounds() {
+    let out = determinize_src(
+        "s = elementof(reals)\ninputs = s\n\
+         lp = logdensityof(normalize(truncate(locscale(Normal(0, 1), 1, s), \
+         interval(0, inf))), 0.3)",
+    );
+    let text = flatppl_syntax::print(&out);
+    for part in [
+        "min(-1 / s, ifelse(s > 0.0, inf, neg(inf)))",
+        "max(-1 / s, ifelse(s > 0.0, inf, neg(inf)))",
+    ] {
+        assert!(text.contains(part), "expected `{part}` in:\n{text}");
+    }
+}
+
 #[test]
 fn normalized_intervals_respect_promoted_input_bounds() {
     for (base, lo, hi, lower) in [
