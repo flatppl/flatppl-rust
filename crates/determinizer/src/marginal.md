@@ -34,13 +34,13 @@ two forms (`MarginalForm`):
 
 - **`Measure`** — a §08 distribution-constructor node, scored by the ordinary density path
   into one `builtin_logdensityof`. Rows 1, 2 and 4.
-- **`LogDensity`** — the closed-form log-density itself, built from §07 builtins at the
-  variate. Rows 3 and 5, because §08 names no `BetaBinomial` and its `StudentT(nu)` is the
-  standard form only (its location-scale form is a `pushfwd`, not a bare constructor).
+- **`LogDensity`** — the closed-form log-density itself, built at the variate. Rows 3, 5
+  and 6, because §08 names no `BetaBinomial`, its `StudentT(nu)` is the standard form only
+  (its location-scale form is a `pushfwd`, not a bare constructor), and it names no
+  exponentially modified Gaussian.
 
-Both rows' expressions use `loggamma`, a §07 builtin ("Elementary functions", domain
-`posreals`) — **not** a §09 standard-module member, so no `load_module` is involved. That
-distinction is what separates them from the deferred row at the end of this file.
+Rows 3 and 5 use `loggamma`, a §07 builtin. Row 6 calls §09 `special-functions` members,
+which determinized output may do (user ruling, 2026-11-05).
 
 Nothing about a row being closed-form requires a constructor to exist. Rows 3 and 5 were
 once recorded as blocked on a §08 addition on that false premise; do not reintroduce it.
@@ -726,33 +726,43 @@ per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does �
 now reaches this SAME law (`crates/determinizer/src/density.rs`, `lower_keyword_joint`'s
 record-law dispatch). The positional spelling reaches the cat-law counterpart the same way.
 
-## Deferred by decision — Exponential prior on the MEAN
+## Row 6 — Exponential prior on the MEAN → exponentially modified Gaussian
 
-`v ~ Exponential(rate = λ)`; `y ~ Normal(mu = v, sigma = σ)` is a **location** mixture, whose
-marginal is the exponentially modified Gaussian — verified `-1.1759117615936188` at
-`y = 0.5` with `λ = 1`, `σ = 1`, against quadrature of its own integral. It is not in the
-table, and it must not be added.
+| | |
+|---|---|
+| model | `v ~ Exponential(rate = λ)`; `y ~ Normal(mu = v, sigma = σ)` |
+| latent | `v`, feeding the likelihood's `mu` directly |
+| §08 answer | none — the row emits the log-density |
+| builder | `build_exponential_mean_marginal` / `build_exponentially_modified_normal_logpdf` |
 
-Its density needs `erfc`, which is a **§09 standard-module member**
-(`09-standard-modules.md`, `special-functions`), not a §07 builtin. The determiniser emits
-no §09 module call anywhere, and such a call would have to carry a `load_module` whose name
-**and version** match the catalogue in *both* engines. **Module loading in determinised
-output is deferred pending consortium discussion** — a settled decision, not an open
-question.
+`y = v + σε` is a **location** mixture. With $z = (\lambda\sigma^2 - y)/(\sqrt{2}\sigma)$,
 
-§13 gives nothing to appeal to: it describes the target only as "a deterministic DAG", never
-uses the name "FlatPDL", and states that determinization "is preliminary and subject to
-change. It is not part of FlatPPL semantic versioning yet." So the admissible vocabulary of
-determinised output is defined solely by `is_flatpdl`, and widening it would set profile
-policy by accident.
+$$\log f(y) = \log\lambda - \log 2 - \lambda y + \tfrac{1}{2}\lambda^2\sigma^2 + \log\operatorname{erfc}(z)
+= \log\lambda - \log 2 - \frac{y^2}{2\sigma^2} + \log\operatorname{erfcx}(z),$$
 
-Do not reimplement `erfc` from §07 builtins to route around this. If any other row you
-consider needs a §09 member, stop and report it rather than reaching for the same
-workaround. This row is recorded here so a later reader does not rediscover it and assume
-nobody had checked.
+the two forms equal because $\operatorname{erfcx}(z) = e^{z^2}\operatorname{erfc}(z)$.
+`erfc` and `erfcx` are §09 `special-functions` members (`erfcx` added by
+flatppl-design#230). The row reuses the model's own `standard_module("special-functions",
+"0.1")` alias or adds a synthetic one.
 
-The refusal test for it is `a_latent_with_no_conjugate_row_still_refuses`'s
-"exponential prior on a location" case, which is also Row 4's nearest neighbour.
+**Which form where.** `erfc(z)` underflows for large positive `z` (past 26.5 in float64,
+9.2 in float32), and `erfcx(z)` overflows for large negative `z`. So `z < 0` takes the
+`erfc` form and `z ≥ 0` the `erfcx` form, joined by `ifelse`. Each side reads `z` clamped
+to its own half-line, so the side `ifelse` drops is finite and adds no `NaN` to a
+gradient. An `erfc`-only form returns `-inf` at the mode once `λσ` passes about 13 in
+float32, which is why `erfcx` was added.
+
+| | |
+|---|---|
+| model | `v ~ Exponential(rate = 1)`; `y ~ Normal(mu = v, sigma = 1)` |
+| point | `y = 0.5` |
+| truth | `-1.1759117615936188` (`scipy.stats.exponnorm`, quadrature of the mixture) |
+| deep tail | `y = -38`: `-726.5831565643776`, where `erfc(z)` underflows |
+| narrow | `λ = 30`, `y = 0.5`: `-1.028277227488072`, `-inf` in float32 without `erfcx` |
+
+**Near-miss.** Row 4 has the same prior and likelihood, reached through `sqrt` on `sigma`.
+At `y = 0.5` the two marginals differ by only 0.017 nats (see "The latent's path to the
+conjugating parameter"), so each row matches only along its own `LatentPath`.
 
 ## Refusal is the fallback, and stays load-bearing
 
