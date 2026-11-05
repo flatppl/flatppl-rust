@@ -3931,6 +3931,13 @@ fn lower_normalize(
         // `Scalar(Real)`, passing the type gate — so we must reject it on its HEAD,
         // not rely on downstream re-inference. Refuse with a message DISTINCT from
         // the discrete/multivariate one below.
+        if base_univariate_continuous
+            && let Some(log_z) = locscale_log_interval_mass(m, base_resolved, lo, hi)
+        {
+            let density =
+                lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
+            return Ok(normalized_logdensity(m, density, log_z));
+        }
         if base_univariate_continuous && base_is_measure_combinator(m, base_resolved) {
             return Err(RefuseError {
                 node,
@@ -4584,6 +4591,83 @@ pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "joint_likelihood",
 ];
 
+/// The log mass of `interval(lo, hi)` under `locscale(... locscale(D, ...) ...)`
+/// for an atomless scalar leaf `D`. The §06 pushforward under
+/// `x -> scale * x + shift` gives the interval `I` the mass
+/// `P_D((I - shift) / scale)`, so a negative scale swaps the preimage bounds. A
+/// scale of unknown sign selects between the two orientations, which keeps every
+/// infinite bound a constant.
+fn locscale_log_interval_mass(
+    m: &mut Module,
+    base: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+) -> Option<NodeId> {
+    let [inner, shift, scale] = *expect_builtin_call(m, base, "locscale")?.args.as_ref() else {
+        return None;
+    };
+    if [shift, scale].iter().any(|&x| {
+        !matches!(
+            m.type_of(resolve_ref(m, x).0),
+            None | Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
+        )
+    }) {
+        return None;
+    }
+    let inner = resolve_ref(m, inner).0;
+    let oriented = |m: &mut Module, sign: f64| {
+        let a = preimage_bound(m, lo, shift, scale, sign);
+        let b = preimage_bound(m, hi, shift, scale, sign);
+        let (lo, hi) = if sign > 0.0 { (a, b) } else { (b, a) };
+        if is_atomless_scalar_leaf(m, inner) {
+            Some(build_call(
+                m,
+                flatppl_core::LOG_INTERVAL_MASS,
+                &[inner, lo, hi],
+            ))
+        } else {
+            locscale_log_interval_mass(m, inner, lo, hi)
+        }
+    };
+    match static_real(m, scale) {
+        Some(s) if s > 0.0 => oriented(m, 1.0),
+        Some(s) if s < 0.0 => oriented(m, -1.0),
+        Some(_) => None,
+        None => {
+            let positive = oriented(m, 1.0)?;
+            let negative = oriented(m, -1.0)?;
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let is_positive = build_call(m, "gt", &[scale, zero]);
+            Some(build_call(m, "ifelse", &[is_positive, positive, negative]))
+        }
+    }
+}
+
+/// `(bound - shift) / scale` for a scale of the given sign, folded when static.
+/// An infinite bound keeps no arithmetic: `inf * 0` in reverse mode would turn
+/// finite gradients into NaN.
+fn preimage_bound(
+    m: &mut Module,
+    bound: NodeId,
+    shift: NodeId,
+    scale: NodeId,
+    sign: f64,
+) -> NodeId {
+    match (
+        static_real(m, bound),
+        static_real(m, shift),
+        static_real(m, scale),
+    ) {
+        (Some(b), _, _) if b.is_infinite() => m.alloc(Node::Lit(Scalar::Real(b * sign))),
+        (Some(b), Some(t), _) if b == t => m.alloc(Node::Lit(Scalar::Real(0.0))),
+        (Some(b), Some(t), Some(s)) => m.alloc(Node::Lit(Scalar::Real((b - t) / s))),
+        _ => {
+            let offset = build_call(m, "sub", &[bound, shift]);
+            build_call(m, "divide", &[offset, scale])
+        }
+    }
+}
+
 /// True iff `base`'s builtin head is a measure-algebra combinator (in
 /// [`MEASURE_COMBINATOR_OPS`]) rather than a leaf distribution constructor.
 fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
@@ -4672,11 +4756,12 @@ fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), Re
 /// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
 fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
     // Student-t symmetry gives exact normalizers for half-line restrictions
-    // without requiring a general CDF implementation from the target.
+    // without requiring a general CDF implementation from the target. F(0) = 1/2
+    // holds for every nu > 0, so a run-time nu needs no static value.
     if matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
         && let Some(parameters) = expect_builtin_call(m, input, "record")
         && let Some(nu) = parameters.named.iter().find(|p| m.resolve(p.name) == "nu")
-        && static_real(m, nu.value).is_some_and(|nu| nu.is_finite() && nu > 0.0)
+        && static_real(m, nu.value).is_none_or(|nu| nu > 0.0)
         && let Some(x) = static_real(m, x)
     {
         let cdf = if x == 0.0 {
