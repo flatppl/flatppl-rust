@@ -1466,6 +1466,7 @@ mod tests {
                 &[
                     "erf",
                     "erfc",
+                    "erfcx",
                     "bessel_j",
                     "bessel_y",
                     "bessel_i",

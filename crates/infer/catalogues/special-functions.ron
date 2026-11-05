@@ -7,6 +7,8 @@
                 Binding(name: "erf",  sig: Function(params: [Scalar(Real)], names: ["x"], result: Scalar(Real), result_set: Interval(-1.0, 1.0))),
                 // erfc(x) → real
                 Binding(name: "erfc", sig: Function(params: [Scalar(Real)], names: ["x"], result: Scalar(Real), result_set: Interval(0.0, 2.0))),
+                // erfcx(x) = exp(x²)·erfc(x) → real > 0
+                Binding(name: "erfcx", sig: Function(params: [Scalar(Real)], names: ["x"], result: Scalar(Real), result_set: PosReals)),
                 // bessel_j(v, z): real order, real argument → real
                 Binding(name: "bessel_j", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["v", "z"], result: Scalar(Real))),
                 // bessel_y(v, z): real order, positive real argument → real

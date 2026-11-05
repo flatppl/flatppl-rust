@@ -281,6 +281,12 @@ fn a_member_without_a_base_op_form_stays_a_call() {
         ),
         (
             "sp = standard_module(\"special-functions\", \"0.1\")",
+            "sp.erfcx(0.5)",
+            "sp",
+            "erfcx",
+        ),
+        (
+            "sp = standard_module(\"special-functions\", \"0.1\")",
             "sp.bessel_j(1.0, 2.0)",
             "sp",
             "bessel_j",
