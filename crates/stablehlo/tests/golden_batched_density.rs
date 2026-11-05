@@ -171,3 +171,60 @@ outputs = (lp)
         "expected the batch-safety refusal, got: {msg}"
     );
 }
+
+/// One probability vector per observation: `rows[idx]` selects a vector for
+/// each variate cell, so the batched route must pair cell `i` of `p` with
+/// observation `i`. The fixed index vector made `p` a `[3, 2]` array of cells,
+/// which the shared-vector route read as a single rank-2 cell and refused.
+#[test]
+fn a_categorical_broadcast_over_gathered_rows_pairs_each_row_with_its_observation() {
+    let out = emit(
+        "\
+flatppl_compat = \"0.1\"
+a = elementof(unitinterval)
+rows = [[a, 1 - a], [1 - a, a]]
+lp = logdensityof(Categorical.(rows[[1, 2, 2]]), [1, 1, 2])
+inputs = (a)
+outputs = (lp)
+",
+    );
+    let scores = out
+        .lines()
+        .filter(|line| line.contains("\"stablehlo.gather\"") && line.contains("-> tensor<3xf32>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scores.len(),
+        1,
+        "expected one gather of the three category probabilities, in:\n{out}"
+    );
+    assert!(
+        scores[0].contains("operand_batching_dims = [0]")
+            && scores[0].contains("(tensor<3x2xf32>, tensor<3x1xi32>)"),
+        "each observation must index its own row, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log ").count(),
+        1,
+        "expected one log after the gather, in:\n{out}"
+    );
+}
+
+/// A function that returns a probability vector, broadcast over an index
+/// vector, takes the same per-cell route.
+#[test]
+fn a_categorical_broadcast_over_computed_probability_vectors_emits() {
+    let out = emit(
+        "\
+flatppl_compat = \"0.1\"
+a = elementof(reals)
+probs(s, i) = softmax([s * i, 0.0, -s])
+lp = logdensityof(Categorical.(probs.(a, [1, 2, 3, 4])), [1, 3, 2, 1])
+inputs = (a)
+outputs = (lp)
+",
+    );
+    assert!(
+        out.contains("operand_batching_dims = [0]") && out.contains("tensor<4x3xf32>"),
+        "each observation must index its own probability vector, in:\n{out}"
+    );
+}
