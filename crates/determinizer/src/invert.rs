@@ -427,6 +427,7 @@ fn derive_array_affine(
     let (Some(cells), Type::Scalar(_)) = (cells, elem.as_ref()) else {
         return Ok(None);
     };
+    let body = same_shape_broadcast_as_plain(m, body, ph, shape);
     let Some(ops) = flatten_chain(m, body, ph)? else {
         return Ok(None);
     };
@@ -472,6 +473,60 @@ fn derive_array_affine(
         build_call(m, "mul", &[count, per_cell])
     });
     Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// Rewrite `x .+ c` and `x .- c` (and `c .- x`) as plain `add`/`sub` where `c` has
+/// the variate's exact shape: §04 broadcasting of two same-shape arrays is the §07
+/// same-shape `add`/`sub`. Only the subtrees that read the input are walked. A shift of
+/// any other shape stays a broadcast, and the chain walk refuses it.
+fn same_shape_broadcast_as_plain(
+    m: &mut Module,
+    node: NodeId,
+    ph: Symbol,
+    shape: &[Dim],
+) -> NodeId {
+    if !refs_placeholder(m, node, ph) {
+        return node;
+    }
+    let Node::Call(c) = m.node(node) else {
+        return node;
+    };
+    if c.inputs.is_some() {
+        return node;
+    }
+    let children = m.node(node).children();
+    let rewritten: Vec<NodeId> = children
+        .iter()
+        .map(|&child| same_shape_broadcast_as_plain(m, child, ph, shape))
+        .collect();
+    let node = if rewritten == children {
+        node
+    } else {
+        crate::driver::rebuild_with_children(m, node, &rewritten)
+    };
+    let Some(call) = expect_builtin_call(m, node, "broadcast") else {
+        return node;
+    };
+    let [head, a, b] = *call.args else {
+        return node;
+    };
+    if !call.named.is_empty() {
+        return node;
+    }
+    let op = ["add", "sub"]
+        .into_iter()
+        .find(|op| is_const_named(m, head, op));
+    let shift = match (refs_placeholder(m, a, ph), refs_placeholder(m, b, ph)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return node,
+    };
+    match (op, m.type_of(shift)) {
+        (Some(op), Some(Type::Array { shape: s, .. })) if s.as_ref() == shape => {
+            build_call(m, op, &[a, b])
+        }
+        _ => node,
+    }
 }
 
 /// The `(scale, shift)` of a forward body `x .* a .+ b`, in either operand order,

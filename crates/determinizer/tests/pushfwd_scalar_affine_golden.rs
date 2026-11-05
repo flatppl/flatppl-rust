@@ -219,3 +219,44 @@ fn a_scaled_input_plus_a_vector_shift_lowers_in_every_spelling() {
     // scipy.stats.multivariate_normal(2 + c, 16 I).logpdf([3, 1, -2])
     assert!((value - (-7.228_198_682_973_689)).abs() < 1e-14, "{value}");
 }
+
+#[test]
+fn a_same_shape_broadcast_shift_lowers_like_the_plain_shift() {
+    // §04 broadcasting of two same-shape arrays is the §07 same-shape add/sub.
+    let spell = |map: &str| {
+        lowered(&format!(
+            "c = [1.0, 0.0, -1.0]\nlp = logdensityof(pushfwd(fn({map}), {BASE}), {POINT})"
+        ))
+    };
+    for (dotted, plain) in [
+        ("2.0 * _ .+ c", "2.0 * _ + c"),
+        ("c .+ 2.0 * _", "c + 2.0 * _"),
+        ("c .- 2.0 * _", "c - 2.0 * _"),
+        ("_ / 2.0 .- c", "_ / 2.0 - c"),
+        ("(2.0 * _ .+ c) / 4.0", "(2.0 * _ + c) / 4.0"),
+    ] {
+        assert_eq!(spell(dotted), spell(plain), "{dotted}");
+    }
+    // c - 2 x: y_i ~ Normal(c_i - 2, 4), log-volume 3 log 2.
+    let y = [3.0, 1.0, -2.0];
+    let c = [1.0, 0.0, -1.0];
+    let value: f64 = y
+        .iter()
+        .zip(c)
+        .map(|(&v, c)| normal_logpdf((c - v) / 2.0, 1.0, 2.0))
+        .sum::<f64>()
+        - 3.0 * LN_2;
+    // scipy.stats.multivariate_normal(c - 2, 16 I).logpdf([3, 1, -2])
+    assert!((value - (-7.728_198_682_973_689)).abs() < 1e-14, "{value}");
+}
+
+#[test]
+fn a_broadcast_shift_of_another_shape_still_refuses() {
+    // A scalar or shorter shift broadcasts, so it is not a same-shape shift.
+    for shift in ["1.0", "[1.0, 0.0]"] {
+        let e = refusal(&format!(
+            "c = {shift}\nlp = logdensityof(pushfwd(fn(2.0 * _ .+ c), {BASE}), {POINT})"
+        ));
+        assert!(e.contains("no analytic inverse"), "{e}");
+    }
+}
