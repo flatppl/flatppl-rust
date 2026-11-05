@@ -3932,11 +3932,10 @@ fn lower_normalize(
         // not rely on downstream re-inference. Refuse with a message DISTINCT from
         // the discrete/multivariate one below.
         if base_univariate_continuous
-            && let Some((leaf, lo, hi)) = locscale_leaf_interval(m, base_resolved, lo, hi)
+            && let Some(log_z) = locscale_log_interval_mass(m, base_resolved, lo, hi)
         {
             let density =
                 lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
-            let log_z = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &[leaf, lo, hi]);
             return Ok(normalized_logdensity(m, density, log_z));
         }
         if base_univariate_continuous && base_is_measure_combinator(m, base_resolved) {
@@ -4592,75 +4591,75 @@ pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "joint_likelihood",
 ];
 
-/// True iff `base`'s builtin head is a measure-algebra combinator (in
-/// [`MEASURE_COMBINATOR_OPS`]) rather than a leaf distribution constructor.
-/// Map `truncate(locscale(D, shift, scale), interval(lo, hi))` to the leaf `D` and
-/// the preimage interval. The §06 pushforward under `x -> scale * x + shift` gives
-/// the interval `I` the mass `P_D((I - shift) / scale)`. A negative scale swaps the
-/// endpoints. Nested locscale layers peel from the outside in.
-fn locscale_leaf_interval(
+/// The log mass of `interval(lo, hi)` under `locscale(... locscale(D, ...) ...)`
+/// for an atomless scalar leaf `D`. The §06 pushforward under
+/// `x -> scale * x + shift` gives the interval `I` the mass
+/// `P_D((I - shift) / scale)`, so a negative scale swaps the preimage bounds. A
+/// scale of unknown sign selects between the two orientations, which keeps every
+/// infinite bound a constant.
+fn locscale_log_interval_mass(
     m: &mut Module,
     base: NodeId,
-    mut lo: NodeId,
-    mut hi: NodeId,
-) -> Option<(NodeId, NodeId, NodeId)> {
-    let mut node = base;
-    let mut layers = 0;
-    while let Some(c) = expect_builtin_call(m, node, "locscale") {
-        let [inner, shift, scale] = *c.args.as_ref() else {
-            return None;
-        };
-        if [shift, scale].iter().any(|&x| {
-            !matches!(
-                m.type_of(resolve_ref(m, x).0),
-                None | Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
-            )
-        }) {
-            return None;
-        }
-        let sign = match static_real(m, scale) {
-            Some(s) if s > 0.0 => Some(1.0),
-            Some(s) if s < 0.0 => Some(-1.0),
-            Some(_) => return None,
-            None => None,
-        };
+    lo: NodeId,
+    hi: NodeId,
+) -> Option<NodeId> {
+    let [inner, shift, scale] = *expect_builtin_call(m, base, "locscale")?.args.as_ref() else {
+        return None;
+    };
+    if [shift, scale].iter().any(|&x| {
+        !matches!(
+            m.type_of(resolve_ref(m, x).0),
+            None | Some(Type::Scalar(ScalarType::Real | ScalarType::Integer))
+        )
+    }) {
+        return None;
+    }
+    let inner = resolve_ref(m, inner).0;
+    let oriented = |m: &mut Module, sign: f64| {
         let a = preimage_bound(m, lo, shift, scale, sign);
         let b = preimage_bound(m, hi, shift, scale, sign);
-        (lo, hi) = match sign {
-            Some(s) if s > 0.0 => (a, b),
-            Some(_) => (b, a),
-            None => (build_call(m, "min", &[a, b]), build_call(m, "max", &[a, b])),
-        };
-        node = resolve_ref(m, inner).0;
-        layers += 1;
+        let (lo, hi) = if sign > 0.0 { (a, b) } else { (b, a) };
+        if is_atomless_scalar_leaf(m, inner) {
+            Some(build_call(
+                m,
+                flatppl_core::LOG_INTERVAL_MASS,
+                &[inner, lo, hi],
+            ))
+        } else {
+            locscale_log_interval_mass(m, inner, lo, hi)
+        }
+    };
+    match static_real(m, scale) {
+        Some(s) if s > 0.0 => oriented(m, 1.0),
+        Some(s) if s < 0.0 => oriented(m, -1.0),
+        Some(_) => None,
+        None => {
+            let positive = oriented(m, 1.0)?;
+            let negative = oriented(m, -1.0)?;
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let is_positive = build_call(m, "gt", &[scale, zero]);
+            Some(build_call(m, "ifelse", &[is_positive, positive, negative]))
+        }
     }
-    (layers > 0 && is_atomless_scalar_leaf(m, node)).then_some((node, lo, hi))
 }
 
-/// `(bound - shift) / scale`, folded when static. An infinite bound keeps no
-/// arithmetic: `inf * 0` in reverse mode would turn finite gradients into NaN.
+/// `(bound - shift) / scale` for a scale of the given sign, folded when static.
+/// An infinite bound keeps no arithmetic: `inf * 0` in reverse mode would turn
+/// finite gradients into NaN.
 fn preimage_bound(
     m: &mut Module,
     bound: NodeId,
     shift: NodeId,
     scale: NodeId,
-    sign: Option<f64>,
+    sign: f64,
 ) -> NodeId {
     match (
         static_real(m, bound),
         static_real(m, shift),
         static_real(m, scale),
     ) {
-        (Some(b), _, _) if b.is_infinite() => match sign {
-            Some(s) => m.alloc(Node::Lit(Scalar::Real(b * s))),
-            None => {
-                let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
-                let positive = build_call(m, "gt", &[scale, zero]);
-                let same = m.alloc(Node::Lit(Scalar::Real(b)));
-                let flipped = m.alloc(Node::Lit(Scalar::Real(-b)));
-                build_call(m, "ifelse", &[positive, same, flipped])
-            }
-        },
+        (Some(b), _, _) if b.is_infinite() => m.alloc(Node::Lit(Scalar::Real(b * sign))),
+        (Some(b), Some(t), _) if b == t => m.alloc(Node::Lit(Scalar::Real(0.0))),
         (Some(b), Some(t), Some(s)) => m.alloc(Node::Lit(Scalar::Real((b - t) / s))),
         _ => {
             let offset = build_call(m, "sub", &[bound, shift]);
@@ -4669,6 +4668,8 @@ fn preimage_bound(
     }
 }
 
+/// True iff `base`'s builtin head is a measure-algebra combinator (in
+/// [`MEASURE_COMBINATOR_OPS`]) rather than a leaf distribution constructor.
 fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
     matches!(builtin_name(m, base), Some(name) if MEASURE_COMBINATOR_OPS.contains(&name))
 }
@@ -4755,11 +4756,12 @@ fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), Re
 /// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
 fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
     // Student-t symmetry gives exact normalizers for half-line restrictions
-    // without requiring a general CDF implementation from the target.
+    // without requiring a general CDF implementation from the target. F(0) = 1/2
+    // holds for every nu > 0, so a run-time nu needs no static value.
     if matches!(m.node(kernel), Node::Const(sym) if m.resolve(*sym) == "StudentT")
         && let Some(parameters) = expect_builtin_call(m, input, "record")
         && let Some(nu) = parameters.named.iter().find(|p| m.resolve(p.name) == "nu")
-        && static_real(m, nu.value).is_some_and(|nu| nu.is_finite() && nu > 0.0)
+        && static_real(m, nu.value).is_none_or(|nu| nu > 0.0)
         && let Some(x) = static_real(m, x)
     {
         let cdf = if x == 0.0 {

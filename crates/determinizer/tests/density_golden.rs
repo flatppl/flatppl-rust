@@ -810,22 +810,40 @@ fn a_negative_locscale_scale_swaps_the_preimage_bounds() {
     );
 }
 
-// A run-time scale has an unknown sign, so the bounds are ordered with min/max and
-// an infinite bound becomes a selected constant, never inf arithmetic.
+// A run-time scale has an unknown sign, so the mass selects between the two
+// orientations of the preimage. Each keeps its infinite bound a constant: no
+// `inf` reaches arithmetic, where reverse mode would form `inf * 0`.
 #[test]
-fn a_runtime_locscale_scale_orders_the_preimage_bounds() {
+fn a_runtime_locscale_scale_selects_the_preimage_orientation() {
     let out = determinize_src(
         "s = elementof(reals)\ninputs = s\n\
          lp = logdensityof(normalize(truncate(locscale(Normal(0, 1), 1, s), \
          interval(0, inf))), 0.3)",
     );
     let text = flatppl_syntax::print(&out);
-    for part in [
-        "min(-1 / s, ifelse(s > 0.0, inf, neg(inf)))",
-        "max(-1 / s, ifelse(s > 0.0, inf, neg(inf)))",
-    ] {
-        assert!(text.contains(part), "expected `{part}` in:\n{text}");
-    }
+    assert!(
+        text.contains("s > 0.0") && text.contains("isfinite(-1 / s)"),
+        "expected a sign selection over the preimage bound -1 / s:\n{text}"
+    );
+    assert!(
+        !text.contains("min(") && !text.contains("max(") && !text.contains("inf -"),
+        "an infinite bound must stay a constant:\n{text}"
+    );
+}
+
+// Student-t symmetry: F(0) = 1/2 for every nu > 0, so a half line needs no static nu.
+#[test]
+fn a_half_line_student_t_with_a_runtime_nu_uses_the_exact_mass() {
+    let law = "truncate(StudentT(nu), interval(0, inf))";
+    let source = |lp: &str| format!("nu = elementof(posreals)\ninputs = nu\nlp = {lp}");
+    let actual = determinize_src(&source(&format!("logdensityof(normalize({law}), 1.5)")));
+    let expected = determinize_src(&source(&format!(
+        "ifelse(isfinite(log(0.5)), logdensityof({law}, 1.5) - log(0.5), 0.0/0.0)"
+    )));
+    assert_eq!(
+        pir_binding(&flatppl_flatpir::write(&actual), "lp"),
+        pir_binding(&flatppl_flatpir::write(&expected), "lp")
+    );
 }
 
 #[test]
