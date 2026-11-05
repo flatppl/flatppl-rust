@@ -1791,6 +1791,9 @@ fn lower_measure_density_in_reference(
         measure_node,
         crate::kernel::Substitute::LocalOnly,
     ) {
+        // A local boundary (a lambda parameter or placeholder) is substituted
+        // before lowering, unlike a named one, so type what it rebuilt.
+        crate::kernel::annotate_rebuilt(m, app.body);
         refuse_boundary_named_query_point(m, v, &app.bound)?;
         // Reference proof uses the actual named arguments; density lowering
         // still substitutes their boundaries after scoring, as before.
@@ -5046,11 +5049,7 @@ fn lower_pushfwd(
     // scalar/vector forms on, and what §06's density convention reads to decide
     // whether a volume element applies at all ([`reference_measure`]). An unknown
     // domain defaults to `%any` — refused by both.
-    let domain = match m.type_of(m_inner) {
-        Some(Type::Measure { domain, .. }) => (**domain).clone(),
-        _ => Type::Any,
-    };
-
+    //
     // `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for `Gamma`,
     // `nonnegreals` for `Exponential`): the coarse variate type is `scalar real`
     // (natural extent `reals`), which would refuse every positive-support base for
@@ -5058,10 +5057,7 @@ fn lower_pushfwd(
     // by the domain guard (refuse-don't-mislower), NOT defaulted to positive. Read
     // for BOTH spellings: the image gate's witness comes off it too, so it cannot
     // depend on which spelling supplied the inverse.
-    let support = m
-        .valueset_of(m_inner)
-        .cloned()
-        .unwrap_or(flatppl_core::ValueSet::Unknown);
+    let (domain, support) = measure_domain_and_support(m, m_inner);
 
     // `forward` is the map itself, kept beside the change of variables for the image
     // gate ([`crate::invert::forward_image`]) — arg 0 of an explicit `bijection`, else
@@ -5326,6 +5322,34 @@ fn reference_measure(variate: &Type) -> Option<Reference> {
     }
 }
 
+/// The variate domain and support of a change-of-variables base measure.
+///
+/// Applying a callable substitutes into its body, and that rebuilds the dependent
+/// constructors without their annotations ([`crate::kernel::annotate_rebuilt`]
+/// restores types only). Infer a missing annotation locally. An unknown domain is
+/// `%any` and an unknown support is `Unknown`, and the callers refuse both.
+fn measure_domain_and_support(m: &mut Module, measure: NodeId) -> (Type, ValueSet) {
+    let mut ty = m.type_of(measure).cloned();
+    let mut support = m.valueset_of(measure).cloned();
+    if ty.is_none() || support.is_none() {
+        if let Some((inferred, inferred_support)) =
+            flatppl_infer::infer_expression_support(m, measure)
+        {
+            ty = ty.or(Some(inferred));
+            support = support.or(Some(inferred_support));
+        } else if ty.is_none() {
+            ty = flatppl_infer::infer_expression(m, measure, &[])
+                .0
+                .remove(&measure);
+        }
+    }
+    let domain = match ty {
+        Some(Type::Measure { domain, .. }) => *domain,
+        _ => Type::Any,
+    };
+    (domain, support.unwrap_or(ValueSet::Unknown))
+}
+
 /// The refusal for a base measure whose reference measure is not proven — shared
 /// by the `pushfwd` and `locscale` change-of-variables tails, which must not
 /// guess it. See [`reference_measure`].
@@ -5430,17 +5454,7 @@ fn lower_locscale(
         }
         (c.args[0], c.args[1], c.args[2])
     };
-    // Callable substitution rebuilds dependent constructors without annotations.
-    // Infer the scalar/vector domain locally; unknown domains still refuse.
-    let inner_type = m.type_of(m_inner).cloned().or_else(|| {
-        flatppl_infer::infer_expression(m, m_inner, &[])
-            .0
-            .remove(&m_inner)
-    });
-    let domain = match inner_type {
-        Some(Type::Measure { domain, .. }) => *domain,
-        _ => Type::Any,
-    };
+    let (domain, _) = measure_domain_and_support(m, m_inner);
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
     // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
