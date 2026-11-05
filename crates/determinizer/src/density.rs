@@ -5098,6 +5098,8 @@ fn lower_pushfwd(
 
     // preimage = f_inv(v)
     let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, &parameter, "f_inv")?;
+    // Applying f_inv rebuilt the point without a type, and a multi-axis base reads it.
+    crate::kernel::annotate_rebuilt(m, preimage);
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
