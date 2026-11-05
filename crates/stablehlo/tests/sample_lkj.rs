@@ -59,3 +59,46 @@ fn iid_lkj_keeps_matrix_cells_and_cholesky_rng_consumption() {
         "the Gram adds no random draws"
     );
 }
+
+#[test]
+fn lkj_cholesky_draws_every_row_in_one_rejection_loop() {
+    let source = |n: u64, law: &str| {
+        format!(
+            "eta = external(posreals)\ninputs = eta\n\
+             outputs = rand({law}, rnginit(23))",
+            law = law.replace('N', &n.to_string())
+        )
+    };
+    for law in ["LKJCholesky(N, eta)", "iid(LKJCholesky(N, eta), 7)"] {
+        let small = emit(&source(3, law));
+        let large = emit(&source(20, law));
+        for module in [&small, &large] {
+            assert_eq!(module.matches("stablehlo.while").count(), 1, "{module}");
+            // Gamma normals, Gamma uniforms, the boost uniform, the directions.
+            assert_eq!(
+                module.matches("stablehlo.rng_bit_generator").count(),
+                4,
+                "{module}"
+            );
+        }
+        assert_eq!(
+            small.lines().count(),
+            large.lines().count(),
+            "the module size must not grow with n"
+        );
+    }
+}
+
+#[test]
+fn lkj_cholesky_of_order_one_draws_nothing() {
+    let module = emit(
+        "eta = external(posreals)\ninputs = eta\n\
+         outputs = rand(iid(LKJCholesky(1, eta), 3), rnginit(23))",
+    );
+    assert_eq!(
+        module.matches("stablehlo.rng_bit_generator").count(),
+        0,
+        "{module}"
+    );
+    assert!(module.contains("tensor<3x1x1xf32>"), "{module}");
+}
