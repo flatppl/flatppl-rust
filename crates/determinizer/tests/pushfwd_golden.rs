@@ -294,18 +294,19 @@ fn pushfwd_matrix_affine_broadcast_add_lowers() {
 }
 
 #[test]
-fn pushfwd_scalar_scale_over_vector_refuses() {
+fn pushfwd_scalar_scale_over_vector_counts_every_cell() {
     // A SCALAR affine map (2.0 * x, no matrix) over a VECTOR variate: its true
     // log-volume is n*log|2| (summed over all n axes), not the scalar chain's
     // single log|2| — the module doc calls this exact danger out (§ vector-
-    // variate guard). Must refuse rather than fall through to the scalar-chain
-    // path and silently emit the wrong (too-small) log-volume.
-    let e = determinize(&parse_infer(
+    // variate guard).
+    let p = pir(
         "d = pushfwd(x -> 2.0 * x, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
          lp = logdensityof(d, [0.1, 0.2, 0.3])",
-    ))
-    .expect_err("scalar affine over a vector variate must refuse, not scalar-chain-lower");
-    assert!(e.reason.contains("vector variate"), "got: {e:?}");
+    );
+    assert!(
+        p.contains("(mul 3.0 "),
+        "the log-volume counts all 3 cells:\n{p}"
+    );
 }
 
 #[test]

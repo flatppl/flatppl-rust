@@ -228,11 +228,16 @@ pub(crate) fn derive_bijection(
     // against the whole matrix — the rank-2 analogue of the vector defect the
     // dispatch below closes, where the log-det is the SUM over all r·c cells.
     if domain_is_matrix(domain) {
+        if let Recognized::Lambda { body, ph } = recognise(m, f_resolved)
+            && let Some(bij) = derive_array_affine(m, body, ph, domain)?
+        {
+            return Ok(Some(bij));
+        }
         return Err(refuse(
             f,
             m,
             "the pushforward base variate is a matrix and §06 case 1 recognises no matrix forward \
-             map (scalar, elementwise-over-a-vector, matrix-vector affine only)",
+             map here except a scalar-scaled affine map (a * x + c)",
         ));
     }
     // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
@@ -308,11 +313,15 @@ fn derive_vector_bijection(
             if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
                 return Ok(Some(bij));
             }
+            if let Some(bij) = derive_array_affine(m, body, ph, domain)? {
+                return Ok(Some(bij));
+            }
             Err(refuse(
                 f,
                 m,
                 "forward map over a vector variate is not a recognised matrix-affine (mu + L * x), \
-                 elementwise affine (x .* a .+ b) or elementwise (broadcast(g, x)) map",
+                 scalar-scaled affine (a * x + c), elementwise affine (x .* a .+ b) or elementwise \
+                 (broadcast(g, x)) map",
             ))
         }
         Recognized::Unrecognized => Ok(None),
@@ -392,6 +401,76 @@ fn derive_broadcast_affine(
             })
         }
     };
+    Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// A scalar-scaled affine map over an array variate, such as `2.0 * x`,
+/// `(x - m) / s` or `a * x + c`. §07 defines `mul` for a scalar and an array,
+/// `divide` for an array and a scalar, and `add`/`sub` for arrays of one shape,
+/// so every scale is a scalar and every shift has the variate's shape. The
+/// Jacobian is `a·I`. `f_inv` is the scalar chain's inverse, which §07 applies
+/// cell by cell, and `logvol` is the cell count times the chain's `log|a|`.
+/// The chain walk refuses a scale it cannot prove nonzero, as on a scalar variate.
+fn derive_array_affine(
+    m: &mut Module,
+    body: NodeId,
+    ph: Symbol,
+    domain: &Type,
+) -> Result<Option<Bijection>, RefuseError> {
+    let Type::Array { shape, elem } = domain else {
+        return Ok(None);
+    };
+    let cells: Option<u64> = shape.iter().try_fold(1u64, |n, d| match d {
+        Dim::Static(k) => Some(n * u64::from(*k)),
+        Dim::Dynamic => None,
+    });
+    let (Some(cells), Type::Scalar(_)) = (cells, elem.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(ops) = flatten_chain(m, body, ph)? else {
+        return Ok(None);
+    };
+    for op in &ops {
+        let (c, is_scale) = match op {
+            ChainOp::MulBy(c) | ChainOp::DivBy(c) => (*c, true),
+            ChainOp::AddConstant(c) | ChainOp::SubConstant(c) | ChainOp::RSubConstant(c) => {
+                (*c, false)
+            }
+            // §07 defines `neg` on arrays, and its log-volume is 0.
+            ChainOp::Registry { op: "neg", .. } => continue,
+            ChainOp::Registry { .. } | ChainOp::OddPow(_) => return Ok(None),
+        };
+        match m.type_of(c) {
+            Some(Type::Scalar(_)) if is_scale => {}
+            Some(Type::Array { shape: s, .. }) if !is_scale && s == shape => {}
+            Some(_) => {
+                return Err(refuse(
+                    c,
+                    m,
+                    if is_scale {
+                        "an affine forward map over an array variate needs a scalar scale; an \
+                         elementwise scale is spelled x .* a"
+                    } else {
+                        "an affine forward map over an array variate needs a shift of the \
+                         variate's shape: §07 adds and subtracts only arrays of one shape"
+                    },
+                ));
+            }
+            None => return Ok(None),
+        }
+    }
+    let f_inv = lambda(m, |m, y| {
+        ops.iter().fold(y, |acc, op| apply_inverse(m, op, acc))
+    });
+    let logvol = lambda(m, |m, y| {
+        let terms: Vec<_> = ops.iter().filter_map(|op| local_logvol(m, op, y)).collect();
+        if terms.is_empty() {
+            return real_lit(m, 0.0);
+        }
+        let per_cell = fold_add(m, &terms);
+        let count = real_lit(m, cells as f64);
+        build_call(m, "mul", &[count, per_cell])
+    });
     Ok(Some(Bijection { f_inv, logvol }))
 }
 
@@ -2940,7 +3019,8 @@ fn is_nonzero_coefficient(m: &Module, id: NodeId, ph: Symbol) -> bool {
     if refs_placeholder(m, id, ph) {
         return false;
     }
-    literal_real(m, id).is_some_and(|c| c != 0.0)
+    // `static_real` reads a signed literal (`-3.0` is `neg(3.0)`) and a fixed binding.
+    crate::density::static_real(m, id).is_some_and(|c| c != 0.0 && c.is_finite())
         || match m.valueset_of(id) {
             Some(ValueSet::PosReals | ValueSet::PosIntegers) => true,
             Some(ValueSet::Interval(lo, hi)) => *lo > 0.0 || *hi < 0.0,
