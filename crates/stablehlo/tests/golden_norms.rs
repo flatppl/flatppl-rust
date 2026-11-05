@@ -19,6 +19,9 @@
 //! IREE 3.11 miscompiles a splat-constant-fed reduction, which a literal
 //! operand would have walked into. See
 //! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hlonorm-report.md`.
+//!
+//! The cumulative goldens took their loop form on 2026-11-05 and were executed
+//! again through Enzyme-JAX `hlo_call` against the same numpy oracles.
 
 use flatppl_core::{Dim, Module, Type, ValueSet};
 
@@ -397,7 +400,8 @@ fn prod_over_integers_stays_integer() {
 
 // ---- §07 cumulative pair -----------------------------------------------------
 
-/// The frozen `cumsum`/`cumprod` module — the EXECUTED artifact. At
+/// The frozen `cumsum`/`cumprod` module — the EXECUTED artifact, through
+/// Enzyme-JAX `hlo_call` since the loop form (2026-11-05). At
 /// `v = [1.5, -2.0, 3.25, 0.5]` it returns `[1.5, -0.5, 2.75, 3.25]` and
 /// `[1.5, -3.0, -9.75, -4.875]`, matching `np.cumsum`/`np.cumprod` exactly.
 #[test]
@@ -416,33 +420,83 @@ outputs = (o1, o2)
     );
 }
 
-/// A scan is one `stablehlo.reduce_window` whose window is the whole vector,
-/// left-padded by `n - 1`. Both numbers are load-bearing: a shorter window or a
-/// different pad would compute a sliding-window reduction rather than §07's
-/// prefix, and the padded positions must take the reduce's own identity.
-#[test]
-fn a_scan_is_a_whole_vector_window_left_padded_by_n_minus_one() {
-    let out = emit(&vec_src("cumsum", "reals", 4));
-    assert!(
-        out.contains("\"stablehlo.reduce_window\""),
-        "a scan must use reduce_window:\n{out}"
-    );
-    assert!(
-        out.contains("window_dimensions = array<i64: 4>"),
-        "the window must span the whole length-4 vector:\n{out}"
-    );
-    assert!(
-        out.contains("padding = dense<[[3, 0]]> : tensor<1x2xi64>"),
-        "the window must be left-padded by n - 1 = 3, and not right-padded:\n{out}"
-    );
-    assert!(
-        !out.contains("stablehlo.while"),
-        "the scan must not need a loop:\n{out}"
-    );
+fn emit_target(src: &str, target: flatppl_stablehlo::Target) -> String {
+    flatppl_stablehlo::emit(
+        &determinize_abi(src),
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions {
+            restrict_enzyme_compatible: false,
+            target,
+            ..Default::default()
+        },
+    )
+    .expect("must emit @logdensity")
 }
 
-/// `cumprod`'s window pads with the MULTIPLICATIVE identity, `cumsum`'s with the
-/// additive one. Padding a product with zeros would make every prefix zero.
+/// On CPU a scan is one `while` that carries the running value and writes each
+/// prefix into the result.
+#[test]
+fn a_cpu_scan_is_one_loop() {
+    let out = emit(&vec_src("cumsum", "reals", 4));
+    assert_eq!(out.matches("stablehlo.while").count(), 1, "{out}");
+    assert!(out.contains("stablehlo.dynamic_update_slice"), "{out}");
+    assert!(!out.contains("reduce_window"), "{out}");
+}
+
+/// On GPU a scan is a doubling scan with no loop: `ceil(log2 n)` levels, each
+/// one shift (a concatenate with identity cells in front) and one combine.
+#[test]
+fn a_gpu_scan_is_a_doubling_scan() {
+    let out = emit_target(
+        &vec_src("cumsum", "reals", 6),
+        flatppl_stablehlo::Target::Gpu,
+    );
+    assert!(!out.contains("stablehlo.while"), "{out}");
+    assert!(!out.contains("reduce_window"), "{out}");
+    assert_eq!(out.matches("stablehlo.concatenate").count(), 3, "{out}");
+}
+
+/// A cumulative op inside a broadcast callable scans each cell's own vector.
+/// It used to refuse its batched operand as a non-vector.
+#[test]
+fn a_cumulative_op_scans_each_broadcast_cell() {
+    for head in ["cumsum", "cumprod", "cummax", "cummin"] {
+        let src = format!(
+            "m = elementof(cartpow(reals, [3, 5]))\n\
+             rows = indicesof(zeros(3))\n\
+             row(j, x) = {head}(x[j, indicesof(zeros(5))])\n\
+             y = rowstack(row.(rows, [m]))\n\
+             inputs = (m)\noutputs = (y)\n"
+        );
+        let cpu = emit(&src);
+        assert_eq!(
+            cpu.matches("stablehlo.while").count(),
+            1,
+            "`{head}` cpu:\n{cpu}"
+        );
+        assert!(
+            cpu.contains("tensor<3x5xf32>"),
+            "`{head}` scans all rows at once:\n{cpu}"
+        );
+        let gpu = emit_target(&src, flatppl_stablehlo::Target::Gpu);
+        assert!(!gpu.contains("stablehlo.while"), "`{head}` gpu:\n{gpu}");
+        assert!(gpu.contains("tensor<3x5xf32>"), "`{head}` gpu:\n{gpu}");
+    }
+}
+
+/// The dotted spelling over a vector of vectors scans each inner vector.
+#[test]
+fn a_dotted_cumulative_op_scans_each_inner_vector() {
+    let out = emit(
+        "a = elementof(cartpow(reals, [3]))\nb = elementof(cartpow(reals, [3]))\n\
+         y = cumsum.([a, b])\ninputs = (a, b)\noutputs = (y)\n",
+    );
+    assert_eq!(out.matches("stablehlo.while").count(), 1, "{out}");
+    assert!(out.contains("-> tensor<2x3xf32>"), "{out}");
+}
+
+/// `cumprod` starts from the MULTIPLICATIVE identity, `cumsum` from the additive
+/// one. Starting a product at zero would make every prefix zero.
 #[test]
 fn each_scan_pads_with_its_own_reduce_identity() {
     let sum = emit(&vec_src("cumsum", "reals", 4));

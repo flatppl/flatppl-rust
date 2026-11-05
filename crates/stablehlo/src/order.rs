@@ -161,7 +161,11 @@ pub(crate) fn lower_cumulative_extremum(
     let [xs_id] = args_exact(id, args)?;
     require_not_table_vector(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
-    let n = require_static_vector(id, head, &xs)?;
+    let cell = Value {
+        ty: e.cell_ty(&xs),
+        ..xs.clone()
+    };
+    let n = require_static_vector(id, head, &cell)?;
     if n == 0 {
         return Ok(xs);
     }

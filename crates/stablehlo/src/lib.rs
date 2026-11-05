@@ -259,6 +259,18 @@ pub enum Target {
     Gpu,
 }
 
+impl Target {
+    /// Whether a prefix scan runs as a `stablehlo.while`: an affine `scan` and
+    /// `cumsum` and kin. Otherwise both use a log-depth doubling scan. Measured
+    /// 2026-11-05, f64, on spark (X925 cores, GB10) and an M4: on CPU the loop
+    /// beats the doubling scan at a 1000-step scan by 3-6x and ties at 24
+    /// steps; on GPU the doubling scan beats the loop by 7x at 24 steps and
+    /// over 200x at 1000.
+    pub(crate) fn serial_scans(self) -> bool {
+        self == Target::Cpu
+    }
+}
+
 /// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter
 /// never assumes/hardcodes 64-bit floats. Restrictions for known Enzyme
 /// limitations are enabled by default.

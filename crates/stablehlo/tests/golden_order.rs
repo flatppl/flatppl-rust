@@ -20,6 +20,9 @@
 //! off disk by these tests, so the pinned text and the verified numbers cannot
 //! diverge.
 //!
+//! The cumulative goldens took their loop form on 2026-11-05 and were executed
+//! again through Enzyme-JAX `hlo_call` against the same numpy oracles.
+//!
 //! Executed oracle table, `v = [1.5, -2.0, 3.25, 0.5]` and
 //! `b = [true, false, true, true]`:
 //!
@@ -50,7 +53,7 @@
 //!
 //! Two of those rows are worth naming. `cummax([-3, -7, -1, -5])` is
 //! `[-3, -3, -1, -1]` and `cummax([-1e30, …])` is `[-1e30, …]`, so the `-inf`
-//! window seed never surfaces as a value — and `cummax([1, NaN, 2, 3])` propagating
+//! seed never surfaces as a value — and `cummax([1, NaN, 2, 3])` propagating
 //! NaN is what proves it: `stablehlo.maximum` is NaN-propagating, so
 //! `maximum(-inf, NaN)` is NaN rather than `-inf`. The js engine's `>`-comparison
 //! scan SKIPS a mid-input NaN (`[1, 1, 1]` where Julia's `accumulate(max, ·)` gives
@@ -267,26 +270,24 @@ outputs = (o1, o2)
     );
 }
 
-/// The scan is the SAME `reduce_window` pass `cumsum`/`cumprod` take — only the
-/// combine and the seed differ. Pinned structurally so a future rewrite into an
-/// unrolled or `while`-based scan is a visible decision.
+/// The scan is the SAME prefix scan `cumsum`/`cumprod` take — only the combine
+/// and the seed differ. The CPU profile runs one `while` over the elements.
 #[test]
-fn the_cumulative_extrema_are_one_reduce_window_each() {
+fn the_cumulative_extrema_are_one_loop_each_on_cpu() {
     for (head, op) in [
         ("cummax", "stablehlo.maximum"),
         ("cummin", "stablehlo.minimum"),
     ] {
         let out = emit(&vec_src(head, "reals", 4));
         assert_eq!(
-            out.matches("stablehlo.reduce_window").count(),
+            out.matches("stablehlo.while").count(),
             1,
-            "`{head}` is one window pass:\n{out}"
+            "`{head}` is one loop:\n{out}"
         );
         assert!(out.contains(op), "`{head}` combines with {op}:\n{out}");
         assert!(
-            out.contains("window_dimensions = array<i64: 4>")
-                && out.contains("padding = dense<[[3, 0]]>"),
-            "`{head}`'s window must be the full length, left-padded by n - 1:\n{out}"
+            out.contains("stablehlo.dynamic_update_slice"),
+            "`{head}` writes each prefix into its result:\n{out}"
         );
     }
 }
