@@ -1939,6 +1939,10 @@ fn divide_type(a: Option<&Type>, b: Option<&Type>) -> Type {
         }
         _ => {}
     }
+    // §07 `divide` also takes array-scalar, so an unresolved dividend may be an array.
+    if matches!(a, Some(Type::Any)) && matches!(b, Some(Type::Scalar(_) | Type::Any)) {
+        return Type::Any;
+    }
     let is_complex = |t: Option<&Type>| matches!(t, Some(Type::Scalar(Complex)));
     let known_scalar = |t: Option<&Type>| {
         matches!(
@@ -1996,6 +2000,9 @@ fn mul_type(args: &[ArgInfo]) -> Type {
     // so only a KNOWN scalar scales an array: `L * x` with `x` unknown is not `L`'s type.
     let scalar = |t: &Type| matches!(t, Type::Scalar(_));
     match (a, b) {
+        // §07 `mul` also takes scalar-vector and scalar-matrix, so a scalar times an
+        // unresolved operand is unresolved too.
+        _ if scalarish(a) && scalarish(b) && (*a == Type::Any || *b == Type::Any) => Type::Any,
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
         (Type::Array { .. }, s) if scalar(s) => a.clone(),
         (s, Type::Array { .. }) if scalar(s) => b.clone(),
