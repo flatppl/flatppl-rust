@@ -261,47 +261,53 @@ fn a_member_reached_through_a_binding_hop_lowers() {
     );
 }
 
-// Refuse-don't-mislower, LOCATED: a §09 function member with no base-op form must
-// refuse naming the member, not with the generic "residual user call". These are
-// the members that need an engine primitive. The name is MODULE-qualified because
-// `determinize` keeps every binding, so the alias's `standard_module` call is still
-// there to read the module name off.
+// FlatPDL may call a standard module. A §09 function member with no base-op form
+// stays a call, with its `standard_module` binding intact so an engine can resolve
+// the member by module name and version. Each engine lowers or refuses it itself.
 #[test]
-fn a_member_without_a_base_op_form_refuses_naming_itself() {
-    for (loads, expr, member) in [
+fn a_member_without_a_base_op_form_stays_a_call() {
+    for (loads, expr, alias, member) in [
         (
             "sp = standard_module(\"special-functions\", \"0.1\")",
             "sp.erf(0.5)",
-            "special-functions.erf",
+            "sp",
+            "erf",
+        ),
+        (
+            "sp = standard_module(\"special-functions\", \"0.1\")",
+            "sp.erfc(x = 0.5)",
+            "sp",
+            "erfc",
         ),
         (
             "sp = standard_module(\"special-functions\", \"0.1\")",
             "sp.bessel_j(1.0, 2.0)",
-            "special-functions.bessel_j",
+            "sp",
+            "bessel_j",
         ),
-        (HEP, "hep.wignerd(1, 0, 0, 0.3)", "particle-physics.wignerd"),
+        (HEP, "hep.wignerd(1, 0, 0, 0.3)", "hep", "wignerd"),
         (
-            HEP,
-            "real(hep.resonance_breitwigner(1.0, 1.0, 0.1, 0.0, 0.0, 0, 1.5))",
-            "particle-physics.resonance_breitwigner",
-        ),
-        (
-            "dist = standard_module(\"distances\", \"0.1\")",
+            DIST,
             "dist.minkowski([1.0, 2.0], [0.5, 1.0], 3.0)",
-            "distances.minkowski",
+            "dist",
+            "minkowski",
         ),
     ] {
-        let src = probe_model(loads, expr);
-        let err =
-            determinize(&parse_infer(&src)).expect_err("a member with no base-op form must refuse");
-        let msg = format!("{err:?}");
+        let out = determinize(&parse_infer(&probe_model(loads, expr)))
+            .expect("a catalogued member call must determinize");
+        assert!(is_flatpdl(&out).is_ok(), "is_flatpdl: {expr}");
+        let text = flatppl_syntax::print(&out);
         assert!(
-            msg.contains(member),
-            "the refusal must name `{member}`: {msg}"
+            text.contains(&format!("{alias}.{member}(")),
+            "the call must survive: {text}"
         );
         assert!(
-            msg.contains("needs an engine primitive"),
-            "the refusal must say what is missing: {msg}"
+            text.contains(loads),
+            "the standard_module binding must survive: {text}"
+        );
+        assert!(
+            !text.contains("x = 0.5"),
+            "arguments bind positionally: {text}"
         );
     }
 }

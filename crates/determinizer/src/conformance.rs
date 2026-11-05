@@ -217,26 +217,33 @@ fn check_node(
         let retained = match c.head {
             // A box function application is a primitive query of the box.
             CallHead::User(callee) if crate::boxes::is_box_ref(m, callee) => true,
-            CallHead::User(callee) if !options.retain_standard_functions.is_empty() => {
-                crate::stdfn::standard_function(m, callee)
-                    .is_some_and(|(module, member)| options.retains(&module, &member))
+            // FlatPDL may call a §09 function member with no base-op form, and each
+            // engine lowers or refuses it. A member `crate::stdfn` expands survives
+            // only with a call shape it cannot read, unless the backend retains it.
+            CallHead::User(callee) => {
+                crate::stdfn::standard_function(m, callee).is_some_and(|(module, member)| {
+                    flatppl_infer::builtin_catalogue().is_module_function(&module, &member)
+                        && (options.retains(&module, &member)
+                            || !crate::stdfn::has_base_op_form(&module, &member))
+                })
             }
             _ => false,
         };
         if matches!(c.head, CallHead::User(_)) && !retained {
-            // A §09 standard-module FUNCTION member with no base-op form
-            // (`special-functions`, `ext-linear-algebra`, the Wigner functions, the
-            // higher-order `distances` members) reaches here as an ordinary
-            // residual user call. Name it: the generic reason gives no clue which
-            // member needs an engine primitive. `crate::stdfn` rewrites the
-            // members that do have one before the loop.
+            // Name the member: the generic reason gives no clue which call is at fault.
+            let alias_live = matches!(c.head, CallHead::User(callee)
+                if crate::stdfn::standard_function(m, callee).is_some());
             let reason = match crate::stdfn::residual_std_member(m, id) {
-                Some(name) => format!(
-                    "§09 standard-module function `{name}` has no lowering to FlatPDL base \
-                     operations — it needs an engine primitive"
+                Some(name) if alias_live => format!(
+                    "§09 standard-module call `{name}` has no FlatPDL form: the member \
+                     is not a function, or its arguments do not fit its definition"
                 ),
-                None => "residual user call — FlatPDL admits deterministic ops and the six \
-                         builtin_* primitives only"
+                Some(name) => format!(
+                    "§09 standard-module function `{name}` lost its `standard_module` \
+                     binding — FlatPDL calls a standard module only through one"
+                ),
+                None => "residual user call — FlatPDL admits deterministic ops, the six \
+                         builtin_* primitives and §09 standard-module functions only"
                     .to_string(),
             };
             bad.push(NonConformance {
