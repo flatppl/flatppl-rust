@@ -269,6 +269,15 @@ impl Target {
     pub(crate) fn serial_scans(self) -> bool {
         self == Target::Cpu
     }
+
+    /// Whether Multinomial counts its trials in a `stablehlo.while`.
+    /// Otherwise one `[n, k]` one-hot is summed over the trials. The draws are
+    /// bit-identical. Measured 2026-11-05, f64, on spark: on GB10 the one-hot
+    /// beats the loop 25x at n = 100, k = 10 and 9.7x at n = 1000, k = 100;
+    /// on X925 cores the loop wins 1.8x at n = 1000, k = 100.
+    pub(crate) fn serial_draw_counts(self) -> bool {
+        self == Target::Cpu
+    }
 }
 
 /// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter

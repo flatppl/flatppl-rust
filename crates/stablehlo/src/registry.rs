@@ -4637,6 +4637,9 @@ fn negative_binomial2_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
 /// makes the last bin catch a `U` that floating-point rounding pushes to (or
 /// past) the probability vector's imperfect sum, so every draw lands in exactly
 /// one bin and the counts always sum to `n`.
+///
+/// The profile picks the form ([`crate::Target::serial_draw_counts`]). The GPU
+/// profile one-hots all `n` trials at once and sums them, with the same draws.
 fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "Multinomial", "sample")?;
     let probs_id = p.field_id(e, "p")?;
@@ -4678,6 +4681,22 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     uppers.push(inf); // b_k = +inf
     let lower_vec = e.vector(&lowers);
     let upper_vec = e.vector(&uppers);
+
+    if !e.target().serial_draw_counts() {
+        // One [n, k] one-hot, one row per trial, summed over the trials.
+        let trials_ty = MlirTy::Ranked(vec![Some(n), Some(k)]);
+        let u = e.broadcast_in_dim(&u_batch, &[0], trials_ty.clone());
+        let lower = e.broadcast_in_dim(&lower_vec, &[1], trials_ty.clone());
+        let upper = e.broadcast_in_dim(&upper_vec, &[1], trials_ty);
+        let ge_lower = e.compare("GE", &u, &lower);
+        let lt_upper = e.compare("LT", &u, &upper);
+        let in_bin = e.and(&ge_lower, &lt_upper);
+        let one = e.scalar(1.0);
+        let zero = e.scalar(0.0);
+        let onehot = e.select(&in_bin, &one, &zero);
+        let by_category = e.transpose(&onehot, &[1, 0]);
+        return Ok(e.reduce_sum_last_axis(&by_category));
+    }
 
     let ones_k = e.constant(1.0, vec_ty.clone());
     let zeros_k = e.constant(0.0, vec_ty.clone());
