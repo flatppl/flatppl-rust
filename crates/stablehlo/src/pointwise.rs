@@ -19,6 +19,7 @@ pub(super) struct GatherDimensions {
 pub(super) enum Pointwise {
     Unary(String, Value),
     ChloUnary(String, Value),
+    ChloBinary(String, Value, Value),
     Binary(String, Value, Value),
     Compare(String, Value, Value),
     Select(Value, Value, Value),
@@ -61,6 +62,7 @@ impl Pointwise {
             | Self::Reduce(a, ..)
             | Self::Cholesky(a) => vec![a],
             Self::Binary(_, a, b)
+            | Self::ChloBinary(_, a, b)
             | Self::Compare(_, a, b)
             | Self::DynamicGather(a, b, _)
             | Self::Dot(a, b, ..)
@@ -74,7 +76,10 @@ impl Pointwise {
 
     pub(super) fn signature(&self) -> Option<(String, Vec<u64>)> {
         let name = match self {
-            Self::Unary(op, _) | Self::ChloUnary(op, _) | Self::Binary(op, ..) => op.clone(),
+            Self::Unary(op, _)
+            | Self::ChloUnary(op, _)
+            | Self::Binary(op, ..)
+            | Self::ChloBinary(op, ..) => op.clone(),
             Self::Compare(dir, ..) => format!("compare {dir}"),
             // Packets stack inputs column-wise, so predicate shapes must agree.
             Self::Select(c, a, _) if c.ty != a.ty => return None,
@@ -172,7 +177,9 @@ impl Emitter<'_> {
         let out = match op {
             // Compute parameter-only functions once per point, then broadcast
             // their values instead of repeating them along every cell axis.
-            Pointwise::Unary(..) | Pointwise::ChloUnary(..) => return None,
+            Pointwise::Unary(..) | Pointwise::ChloUnary(..) | Pointwise::ChloBinary(..) => {
+                return None;
+            }
             Pointwise::Binary(op, a, b) => {
                 let a = expand(&a);
                 let b = expand(&b);
