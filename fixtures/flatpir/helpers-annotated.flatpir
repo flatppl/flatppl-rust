@@ -17,7 +17,7 @@
       (functionof
         (%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %parametric reals)
           (Normal
-            (%kwarg mu (%meta ((%scalar real) %parametric reals)
+            (%kwarg mu (%meta (%any %parametric anything)
                          (add (%ref self center) (%ref %local _x_))))
             (%kwarg sigma (%ref self spread))))
         %specinputs

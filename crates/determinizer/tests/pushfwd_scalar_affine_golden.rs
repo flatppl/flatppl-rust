@@ -189,3 +189,33 @@ fn a_vector_scale_is_not_a_scalar_scale() {
         "{elementwise}"
     );
 }
+
+#[test]
+fn a_scaled_input_plus_a_vector_shift_lowers_in_every_spelling() {
+    // `2 x + c` with c = [1, 0, -1]: f_inv(y) = (y - c) / 2, logvol = 3 log 2. A
+    // scalar factor is not the matrix of `mu + L * x`.
+    let spell = |map: &str| {
+        lowered(&format!(
+            "c = [1.0, 0.0, -1.0]\nlp = logdensityof(pushfwd({map}, {BASE}), {POINT})"
+        ))
+    };
+    let fn_form = spell("fn(2.0 * _ + c)");
+    assert!(
+        fn_form.contains("(mul 3.0 ") && !fn_form.contains("linsolve"),
+        "{fn_form}"
+    );
+    assert_eq!(spell("x -> 2.0 * x + c"), fn_form);
+    lowered(&format!(
+        "c = [1.0, 0.0, -1.0]\nlp = logdensityof(pushfwd(fn(c + 2.0 * _), {BASE}), {POINT})"
+    ));
+    let y = [3.0, 1.0, -2.0];
+    let c = [1.0, 0.0, -1.0];
+    let value: f64 = y
+        .iter()
+        .zip(c)
+        .map(|(&v, c)| normal_logpdf((v - c) / 2.0, 1.0, 2.0))
+        .sum::<f64>()
+        - 3.0 * LN_2;
+    // scipy.stats.multivariate_normal(2 + c, 16 I).logpdf([3, 1, -2])
+    assert!((value - (-7.228_198_682_973_689)).abs() < 1e-14, "{value}");
+}

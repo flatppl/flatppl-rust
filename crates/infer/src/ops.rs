@@ -1894,8 +1894,10 @@ fn promote2(a: Option<&Type>, b: Option<&Type>) -> Type {
         _ => None,
     };
     match (rank(a), rank(b)) {
+        // An unconstrained operand may be real, complex or an array (§07 `mul`
+        // takes scalar-vector), so the result is unconstrained too.
+        (Some(-1), Some(_)) | (Some(_), Some(-1)) => Type::Any,
         (Some(x), Some(y)) => match x.max(y) {
-            -1 => Type::Any, // both unconstrained placeholders
             0 => Type::Scalar(Integer),
             1 => Type::Scalar(Real),
             _ => Type::Scalar(Complex),
@@ -1938,6 +1940,10 @@ fn divide_type(a: Option<&Type>, b: Option<&Type>) -> Type {
             };
         }
         _ => {}
+    }
+    // §07 `divide` also takes array-scalar, so an unresolved dividend may be an array.
+    if matches!(a, Some(Type::Any)) && matches!(b, Some(Type::Scalar(_) | Type::Any)) {
+        return Type::Any;
     }
     let is_complex = |t: Option<&Type>| matches!(t, Some(Type::Scalar(Complex)));
     let known_scalar = |t: Option<&Type>| {

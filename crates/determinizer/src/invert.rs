@@ -2424,6 +2424,10 @@ fn derive_matrix_affine(
     } else {
         return Ok(None);
     };
+    // A scalar `L` is a scalar-scaled affine map ([`derive_array_affine`]).
+    if matches!(m.type_of(l), Some(Type::Scalar(_))) || literal_real(m, l).is_some() {
+        return Ok(None);
+    }
     // Coupled/nonlinear guard: a fixed matrix-affine map has `mu` and `L`
     // independent of the input. If either references the placeholder, the
     // forward Jacobian is not the constant `L` — refuse rather than emit a
