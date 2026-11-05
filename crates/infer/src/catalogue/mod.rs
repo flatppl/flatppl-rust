@@ -910,6 +910,15 @@ impl Catalogue {
         sig_arity(self.module(module, binding)?.0)
     }
 
+    /// Whether a standard module declares `binding` as a deterministic function
+    /// (spec §09), as opposed to a distribution or a structural member.
+    pub fn is_module_function(&self, module: &str, binding: &str) -> bool {
+        matches!(
+            self.module(module, binding),
+            Some((Sig::Function { .. }, _))
+        )
+    }
+
     /// Ordered constructor parameter names for a built-in distribution (spec
     /// §08/§09 "Parameters" column), e.g. `Normal` → `["mu", "sigma"]`.
     /// Checks base builtins first, then every standard module's bindings.
