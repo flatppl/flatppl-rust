@@ -1969,6 +1969,32 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// One elementwise CHLO binary op, `%N = {op} %a, %b : ty, ty -> ty`, in the
+    /// same function-type form as [`Emitter::chlo_unary`]. Real-only.
+    fn chlo_binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        let a = self.convert(a, ElemKind::Real);
+        let b = self.convert(b, ElemKind::Real);
+        let (a, b) = self.broadcast_pair(&a, &b);
+        let ty_text = a.ty.render(self.dtype, a.elem);
+        let ssa = self.pure_like(
+            format!(
+                "{op} {}, {} : {ty_text}, {ty_text} -> {ty_text}",
+                a.ssa, b.ssa
+            ),
+            &a,
+        );
+        self.remember_pointwise(
+            &ssa,
+            &a,
+            Pointwise::ChloBinary(op.to_owned(), a.clone(), b.clone()),
+        );
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: ElemKind::Real,
+        }
+    }
+
     /// `chlo.lgamma` — the log-gamma function. Real-only conversion matters
     /// here: a literal-parameter `Gamma(2, 1)`'s `shape` reaches
     /// `crate::registry::gamma_logpdf`'s `lgamma(&shape)` as a bare `Int`

@@ -230,3 +230,43 @@ fn erfcx_lowers_to_differentiable_stablehlo() {
         "{out}"
     );
 }
+
+// digamma and polygamma lower to their CHLO ops. Executed against mpmath on M4 and
+// GB10: f64 value and gradient 1.3e-15 (2.2e-14 at digamma(-0.5) = 0.036, where the
+// reflection cancels), f32 1.3e-6. Enzyme differentiates polygamma in `x` only, and
+// the integer order reaches the op through a convert, which Enzyme treats as inactive.
+#[test]
+fn digamma_and_polygamma_lower_to_their_chlo_ops() {
+    for (dtype, ty, int) in [(Dtype::F32, "f32", "i32"), (Dtype::F64, "f64", "i64")] {
+        let src =
+            format!("{SF}\na = elementof(reals)\nv = sf.digamma(a)\ninputs = (a)\noutputs = (v)");
+        let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
+        assert!(
+            out.contains(&format!(
+                "chlo.digamma %arg0 : tensor<{ty}> -> tensor<{ty}>"
+            )),
+            "{out}"
+        );
+        let src = format!(
+            "{SF}\nn = elementof(integers)\na = elementof(reals)\nv = sf.polygamma(n = n, x = a)\n\
+             inputs = (n, a)\noutputs = (v)"
+        );
+        let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
+        assert!(
+            out.contains(&format!(
+                "stablehlo.convert %arg0 : (tensor<{int}>) -> tensor<{ty}>"
+            )) && out.contains(&format!(
+                "chlo.polygamma %0, %arg1 : tensor<{ty}>, tensor<{ty}> -> tensor<{ty}>"
+            )),
+            "{out}"
+        );
+    }
+    let out = emit(&format!(
+        "{SF}\na = elementof(cartpow(reals, 3))\nv = sf.polygamma.(2, a)\ninputs = (a)\noutputs = (v)"
+    ));
+    assert!(
+        out.contains("chlo.polygamma")
+            && out.contains("tensor<3xf32>, tensor<3xf32> -> tensor<3xf32>"),
+        "{out}"
+    );
+}
