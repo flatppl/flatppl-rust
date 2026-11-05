@@ -1894,8 +1894,10 @@ fn promote2(a: Option<&Type>, b: Option<&Type>) -> Type {
         _ => None,
     };
     match (rank(a), rank(b)) {
+        // An unconstrained operand may be real, complex or an array (§07 `mul`
+        // takes scalar-vector), so the result is unconstrained too.
+        (Some(-1), Some(_)) | (Some(_), Some(-1)) => Type::Any,
         (Some(x), Some(y)) => match x.max(y) {
-            -1 => Type::Any, // both unconstrained placeholders
             0 => Type::Scalar(Integer),
             1 => Type::Scalar(Real),
             _ => Type::Scalar(Complex),
@@ -2000,9 +2002,6 @@ fn mul_type(args: &[ArgInfo]) -> Type {
     // so only a KNOWN scalar scales an array: `L * x` with `x` unknown is not `L`'s type.
     let scalar = |t: &Type| matches!(t, Type::Scalar(_));
     match (a, b) {
-        // §07 `mul` also takes scalar-vector and scalar-matrix, so a scalar times an
-        // unresolved operand is unresolved too.
-        _ if scalarish(a) && scalarish(b) && (*a == Type::Any || *b == Type::Any) => Type::Any,
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
         (Type::Array { .. }, s) if scalar(s) => a.clone(),
         (s, Type::Array { .. }) if scalar(s) => b.clone(),

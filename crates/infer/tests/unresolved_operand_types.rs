@@ -1,7 +1,9 @@
-//! A scalar times or into an unresolved operand (`%any`, such as a lambda's own
-//! input) is unresolved. §07 gives `mul` a scalar-vector and a scalar-matrix
-//! domain and `divide` an array-scalar domain, so `2.0 * x` and `x / 2.0` may be
-//! arrays. A lambda body is typed before any argument is known.
+//! An unresolved operand (`%any`, such as a lambda's own input) keeps an
+//! arithmetic result unresolved. §07 gives `mul` a scalar-vector and a
+//! scalar-matrix domain and `divide` an array-scalar domain, so `2.0 * x` and
+//! `x / 2.0` may be arrays. `add`, `sub` and `pow` take real or complex
+//! scalars, so `x + 1` may be complex. A lambda body is typed before any
+//! argument is known, so none of these is a scalar of a fixed kind.
 use flatppl_core::{Node, Type};
 use flatppl_infer::{Severity, infer};
 
@@ -25,6 +27,18 @@ fn body_type(source: &str, name: &str) -> Type {
 #[test]
 fn a_scalar_times_or_into_an_unresolved_operand_is_unresolved() {
     for body in ["2.0 * x", "x * 2.0", "x / 2.0", "2 * x"] {
+        assert_eq!(
+            body_type(&format!("f = x -> {body}\n"), "f"),
+            Type::Any,
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_sum_or_power_with_an_unresolved_operand_is_unresolved() {
+    // The unresolved operand may be complex, so the result is not an integer.
+    for body in ["x + 1", "1 - x", "x ^ 2", "(x - 1) + (x * 2.0) * im"] {
         assert_eq!(
             body_type(&format!("f = x -> {body}\n"), "f"),
             Type::Any,
