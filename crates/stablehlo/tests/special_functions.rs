@@ -109,29 +109,72 @@ fn erf_feeds_a_sampled_parameter() {
     assert!(out.contains("chlo.erf %arg0"), "{out}");
 }
 
-// Constant arguments fold through libm. Oracle: mpmath erfc(10), correctly rounded.
-#[test]
-fn a_constant_argument_folds_with_the_tail_intact() {
+/// The folded value of the one constant a module returns beside its input.
+fn folded(member: &str, x: f64, dtype: Dtype) -> f64 {
     let out = emit_with(
-        &format!("{SF}\na = elementof(reals)\nv = a + sf.erfc(10.0)\ninputs = (a)\noutputs = (v)"),
+        &format!(
+            "{SF}\na = elementof(reals)\nv = sf.{member}({x:?})\ninputs = (a)\noutputs = (a, v)"
+        ),
         Mode::LogDensity,
-        Dtype::F64,
+        dtype,
     )
     .expect("must emit");
-    assert!(!out.contains("chlo.erfc"), "{out}");
-    // MLIR spells an f64 splat as its little-endian bytes in hex.
-    let hex = out
-        .split("dense<\"0x")
+    assert!(!out.contains("chlo."), "{member}({x}) must fold:\n{out}");
+    let literal = out
+        .split("stablehlo.constant dense<")
         .nth(1)
-        .and_then(|rest| rest.get(..16))
+        .and_then(|rest| rest.split('>').next())
         .expect("folded constant");
-    let bytes = u64::from_str_radix(hex, 16).expect("hex").to_be_bytes();
-    let value = f64::from_le_bytes(bytes);
-    let expected = 2.088487583762545e-45;
-    assert!(
-        ((value - expected) / expected).abs() < 1e-15,
-        "{value} vs {expected}"
-    );
+    // MLIR spells a splat as a decimal or as its little-endian bytes in hex.
+    match literal
+        .strip_prefix("\"0x")
+        .and_then(|h| h.strip_suffix('"'))
+    {
+        Some(hex) if hex.len() == 16 => {
+            f64::from_le_bytes(u64::from_str_radix(hex, 16).unwrap().to_be_bytes())
+        }
+        Some(hex) => f32::from_le_bytes(u32::from_str_radix(hex, 16).unwrap().to_be_bytes()) as f64,
+        None => literal.parse().expect("decimal literal"),
+    }
+}
+
+// Constant arguments fold through libm, and the fold agrees with scipy.special 1.18
+// (`erf`/`erfc` on float64 and on float32 inputs) as the executed module does. Below
+// the smallest normal the paths differ only in underflow: libm rounds erfc(27) to the
+// subnormal 5.2e-319 where scipy and the CPU runtime give 0, and f32 erfc(10) to
+// 2.8e-45 where scipy gives 1.4e-45 and the runtime 0. So the floor is that normal.
+#[test]
+fn a_constant_argument_folds_to_the_scipy_value() {
+    let cases: [(&str, f64, Dtype, f64); 14] = [
+        ("erfc", 10.0, Dtype::F64, 2.0884875837625446e-45),
+        ("erfc", 26.0, Dtype::F64, 5.663192408856145e-296),
+        ("erfc", 27.0, Dtype::F64, 0.0),
+        ("erfc", -1.3, Dtype::F64, 1.9340079449406524),
+        ("erfc", 0.7, Dtype::F64, 0.32219880616258156),
+        ("erf", -1.3, Dtype::F64, -0.9340079449406524),
+        ("erf", 0.7, Dtype::F64, 0.6778011938374184),
+        ("erfc", 10.0, Dtype::F32, 1.401298464324817e-45),
+        ("erfc", 26.0, Dtype::F32, 0.0),
+        ("erfc", 27.0, Dtype::F32, 0.0),
+        ("erfc", -1.3, Dtype::F32, 1.9340078830718994),
+        ("erfc", 0.7, Dtype::F32, 0.3221988081932068),
+        ("erf", -1.3, Dtype::F32, -0.9340079426765442),
+        ("erf", 0.7, Dtype::F32, 0.6778011918067932),
+    ];
+    for (member, x, dtype, scipy) in cases {
+        let (rtol, floor) = match dtype {
+            Dtype::F64 => (1e-15, f64::MIN_POSITIVE),
+            Dtype::F32 => (2.4e-7, f32::MIN_POSITIVE as f64),
+        };
+        let got = folded(member, x, dtype);
+        assert!(
+            got.is_finite() && (got - scipy).abs() <= rtol * scipy.abs() + floor,
+            "{member}({x}) at rtol {rtol:e}: folded {got:e}, scipy {scipy:e}"
+        );
+    }
+    // In the normal range the f64 tail is exact to the last bits, not hidden by the floor.
+    let tail = folded("erfc", 10.0, Dtype::F64);
+    assert!(((tail - 2.0884875837625446e-45) / 2.0884875837625446e-45).abs() < 1e-15);
 }
 
 #[test]
