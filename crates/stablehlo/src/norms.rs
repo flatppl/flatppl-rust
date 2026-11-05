@@ -395,7 +395,7 @@ pub(crate) fn lower_cumulative(
     let [xs_id] = args_exact(id, args)?;
     require_not_table_vector(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
-    let n = require_static_vector(id, head, &xs.ty)?;
+    let n = require_static_vector(id, head, &e.cell_ty(&xs))?;
 
     // §03's promotion, for [`lower_reduction`]'s reason: no `i1` combine
     // computes a cumulative sum or product.

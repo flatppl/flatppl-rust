@@ -2303,90 +2303,176 @@ impl<'m> Emitter<'m> {
         Ok(cur)
     }
 
-    /// A PREFIX SCAN over a rank-1 operand: `result[i]` is `combine_op` over
-    /// `a[0..=i]`, the shape §07 "Reductions" gives `cumsum`
-    /// ($(x_1, x_1+x_2, \dots)$) and `cumprod`.
+    /// A PREFIX SCAN along the last axis: `result[..., i]` is `combine_op` over
+    /// `a[..., 0..=i]`, the shape §07 "Cumulative operations" gives `cumsum`
+    /// ($(x_1, x_1+x_2, \dots)$) and its kin. Leading axes are broadcast cells,
+    /// each scanned independently. StableHLO has no cumulative op.
     ///
-    /// StableHLO has no cumulative op, but it does have `stablehlo.reduce_window`,
-    /// and a scan is one window pass: `window_dimensions = [n]` with the window
-    /// left-padded by `n - 1` puts `a[0..=i]` plus `n - 1 - i` padding elements in
-    /// window `i`, and the padded positions take the reduce's `init_values` — so
-    /// with `identity_lit` as the init, window `i` combines exactly the prefix.
-    /// This is the lowering XLA itself uses for a cumulative reduction, so it
-    /// needs neither a `stablehlo.while` nor an iota-masked matmul.
+    /// The profile picks the form ([`crate::Target::serial_scans`]). CPU runs a
+    /// `stablehlo.while` with one combine per element over every cell at once.
+    /// GPU runs a log-depth Hillis-Steele scan. The loop combines left to
+    /// right. The doubling form associates differently, so a floating-point
+    /// prefix can round differently. §07 defines the mathematical prefix, not an
+    /// association order.
     ///
-    /// The result is EXACT for both combines: the padding contributes only the
-    /// identity (`+0` / `*1`), both of which are exact in floating point. The
-    /// window is reduced as a tree rather than left-to-right, so a prefix's
-    /// rounding can differ from a sequential accumulation's — §07 defines the
-    /// mathematical prefix, not an association order.
-    ///
-    /// Cost is `O(n^2)` scalar combines for a length-`n` vector. That is the
-    /// same asymptotic cost as the masked-matmul alternative but with no
-    /// materialized `n`x`n` intermediate, and a log-depth associative scan would
-    /// need `stablehlo.while`.
-    ///
-    /// Emitted in the GENERIC (quoted) form with an explicit region: unlike
-    /// `stablehlo.reduce`, `reduce_window` has no `applies` pretty form.
-    ///
-    /// The operand must be a statically-shaped rank-1 tensor of length **>= 1**,
-    /// which `crate::norms::lower_cumulative` guarantees: it refuses a non-vector
-    /// and handles a length-0 vector itself (the empty scan is the empty vector,
-    /// emitted as the operand with no op). The length precondition is asserted
-    /// EXPLICITLY rather than left to `n - 1`: a length-0 operand used to
-    /// underflow that subtraction, which panicked in debug and in release emitted
-    /// `window_dimensions = 0` with `padding = 2^64 - 1` — text IREE rejects
-    /// ("expects window to have positive value for 0-th window dimension"), from
-    /// a CLI that exited 0. An arithmetic underflow is not a precondition check,
-    /// so this one is written down.
+    /// The operand must be statically shaped with a scan axis of length
+    /// **>= 1**. `crate::norms::lower_cumulative` and
+    /// `crate::order::lower_cumulative_extremum` refuse a non-vector cell and
+    /// return an empty vector themselves.
     pub(crate) fn prefix_scan(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
-        let n = match &a.ty {
-            MlirTy::Ranked(dims) if dims.len() == 1 => {
-                dims[0].expect("prefix_scan: operand axis must be statically sized")
-            }
-            other => {
-                panic!("prefix_scan expects a statically-shaped rank-1 operand, got {other:?}")
-            }
-        };
-        assert!(
-            n >= 1,
-            "prefix_scan: a window needs at least one element; a length-0 scan has \
-             no reduce_window form and is the caller's to answer"
+        let dims = batching::shape(&a.ty)
+            .iter()
+            .map(|d| d.expect("prefix_scan: operand axes must be statically sized"))
+            .collect::<Vec<_>>();
+        let n = *dims
+            .last()
+            .expect("prefix_scan expects an operand with a scan axis");
+        assert!(n >= 1, "prefix_scan: the caller answers a length-0 scan");
+        if n == 1 {
+            return a.clone();
+        }
+        if self.target.serial_scans() {
+            self.prefix_scan_loop(combine_op, identity_lit, a, &dims)
+        } else {
+            self.prefix_scan_doubling(combine_op, identity_lit, a, &dims)
+        }
+    }
+
+    /// `identity_lit` at shape `dims`, typed like `a`'s elements.
+    fn identity_fill(&mut self, identity_lit: &str, dims: &[u64], a: &Value) -> Value {
+        let ty = batching::tensor(dims.iter().map(|&d| Some(d)).collect());
+        let rhs = format!(
+            "stablehlo.constant dense<{identity_lit}> : {}",
+            ty.render(self.dtype, a.elem)
         );
-        let elem_ty = MlirTy::Scalar.render(self.dtype, a.elem);
-        let operand_ty = a.ty.render(self.dtype, a.elem);
-
-        let init_ssa = self.fresh();
-        self.push(&format!(
-            "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {elem_ty}"
-        ));
-
-        let (lhs, rhs, acc) = (self.fresh(), self.fresh(), self.fresh());
-        let ssa = self.fresh();
-        let mut text = String::new();
-        text.push_str(&format!(
-            "{ssa} = \"stablehlo.reduce_window\"({}, {init_ssa}) ({{\n",
-            a.ssa
-        ));
-        text.push_str(&format!("^bb0({lhs}: {elem_ty}, {rhs}: {elem_ty}):\n"));
-        text.push_str(&format!(
-            "  {acc} = {combine_op} {lhs}, {rhs} : {elem_ty}\n"
-        ));
-        text.push_str(&format!("  stablehlo.return {acc} : {elem_ty}\n"));
-        text.push_str("}) {\n");
-        text.push_str(&format!("  window_dimensions = array<i64: {n}>,\n"));
-        text.push_str("  window_strides = array<i64: 1>,\n");
-        text.push_str(&format!(
-            "  padding = dense<[[{}, 0]]> : tensor<1x2xi64>\n",
-            n - 1
-        ));
-        text.push_str(&format!("}} : ({operand_ty}, {elem_ty}) -> {operand_ty}"));
-        self.push(&text);
         Value {
-            ssa,
-            ty: a.ty.clone(),
+            ssa: self.pure(rhs),
+            ty,
             elem: a.elem,
         }
+    }
+
+    /// One `stablehlo.while` step per element. The carry holds the running value
+    /// of every cell, and each step writes it into the result buffer.
+    fn prefix_scan_loop(
+        &mut self,
+        combine_op: &str,
+        identity_lit: &str,
+        a: &Value,
+        dims: &[u64],
+    ) -> Value {
+        let n = *dims.last().expect("scan axis");
+        let axis = dims.len() - 1;
+        let counter = self.int_value_const(0);
+        let running = self.identity_fill(identity_lit, &dims[..axis], a);
+        let buffer = self.identity_fill(identity_lit, dims, a);
+        let inits = [counter, running, buffer];
+        let types = inits
+            .iter()
+            .map(|v| v.ty.render(self.dtype, v.elem))
+            .collect::<Vec<_>>();
+        let results = self.while_loop(
+            &inits,
+            &types,
+            |e, args| {
+                let limit = e.int_value_const(n as i64);
+                e.compare("LT", &args[0], &limit)
+            },
+            |e, args| {
+                let index = &args[0];
+                let rank = dims.len();
+                let zero = (rank > 1).then(|| e.int_value_const(0));
+                let mut starts = vec![zero.as_ref().map_or("", |z| z.ssa.as_str()); rank];
+                starts[axis] = &index.ssa;
+                let starts = starts.join(", ");
+                let indices = vec![index.ty.render(e.dtype, index.elem); rank].join(", ");
+                let mut one = dims.iter().map(|&d| Some(d)).collect::<Vec<_>>();
+                one[axis] = Some(1);
+                let one_ty = MlirTy::Ranked(one.clone());
+                let sizes = one
+                    .iter()
+                    .map(|d| d.expect("static").to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ssa = e.pure(format!(
+                    "stablehlo.dynamic_slice {}, {starts}, sizes = [{sizes}] : ({}, {indices}) -> {}",
+                    a.ssa,
+                    a.ty.render(e.dtype, a.elem),
+                    one_ty.render(e.dtype, a.elem)
+                ));
+                let item = e.reshape(
+                    &Value {
+                        ssa,
+                        ty: one_ty.clone(),
+                        elem: a.elem,
+                    },
+                    args[1].ty.clone(),
+                );
+                let running = e.binary(combine_op, &args[1], &item);
+                let update = e.reshape(&running, one_ty.clone());
+                let ssa = e.pure(format!(
+                    "stablehlo.dynamic_update_slice {}, {}, {starts} : ({}, {}, {indices}) -> {}",
+                    args[2].ssa,
+                    update.ssa,
+                    args[2].ty.render(e.dtype, a.elem),
+                    one_ty.render(e.dtype, a.elem),
+                    args[2].ty.render(e.dtype, a.elem)
+                ));
+                let step = e.int_value_const(1);
+                let next = e.add(index, &step);
+                vec![
+                    next,
+                    running,
+                    Value {
+                        ssa,
+                        ..args[2].clone()
+                    },
+                ]
+            },
+        );
+        let result = results[2].clone();
+        let axes = self.axes_of(a);
+        self.remember_axes(&result.ssa, axes);
+        result
+    }
+
+    /// Hillis-Steele prefix scan along the last axis: after the level with
+    /// shift `s`, each cell combines the last `2s` elements. The front cells of
+    /// each shifted copy hold the identity.
+    fn prefix_scan_doubling(
+        &mut self,
+        combine_op: &str,
+        identity_lit: &str,
+        a: &Value,
+        dims: &[u64],
+    ) -> Value {
+        let n = *dims.last().expect("scan axis");
+        let axis = dims.len() - 1;
+        let mut x = a.clone();
+        let mut s = 1;
+        while s < n {
+            let mut fill_dims = dims[..axis].to_vec();
+            fill_dims.push(s);
+            let fill = self.identity_fill(identity_lit, &fill_dims, a);
+            let mut limits = dims.to_vec();
+            limits[axis] -= s;
+            let kept = self.slice(&x, &vec![0; dims.len()], &limits, &vec![1; dims.len()]);
+            let rhs = format!(
+                "stablehlo.concatenate {}, {}, dim = {axis} : ({}, {}) -> {}",
+                fill.ssa,
+                kept.ssa,
+                fill.ty.render(self.dtype, a.elem),
+                kept.ty.render(self.dtype, a.elem),
+                a.ty.render(self.dtype, a.elem)
+            );
+            let shifted = Value {
+                ssa: self.pure_like(rhs, a),
+                ..a.clone()
+            };
+            x = self.binary(combine_op, &x, &shifted);
+            s *= 2;
+        }
+        x
     }
 
     /// Ascending sort of one real vector cell, preserving any callable batches.
@@ -4379,6 +4465,10 @@ impl<'m> Emitter<'m> {
                 | "conv"
                 | "crosscorr"
                 | "cross"
+                | "cumsum"
+                | "cumprod"
+                | "cummax"
+                | "cummin"
         ) {
             self.lower_broadcast_reduction(id, &fname, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {

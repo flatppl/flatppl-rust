@@ -53,7 +53,7 @@ impl Emitter<'_> {
             || state
                 .values
                 .iter()
-                .any(|v| v.elem != ElemKind::Real || self.cell_ty(v) != MlirTy::Scalar)
+                .any(|v| v.elem == ElemKind::Bool || self.cell_ty(v) != MlirTy::Scalar)
         {
             return Ok(None);
         }
@@ -90,8 +90,10 @@ impl Emitter<'_> {
 
         let ty = tensor(frame.clone());
         let mark = self.body.len();
-        let zeros = (0..state.values.len())
-            .map(|_| self.opaque_zero(&ty))
+        let zeros = state
+            .values
+            .iter()
+            .map(|v| self.opaque_zero(&ty, v.elem))
             .collect::<Vec<_>>();
         let mut carries = zeros.clone();
         let mut solved: Vec<Option<Value>> = vec![None; state.values.len()];
@@ -102,12 +104,16 @@ impl Emitter<'_> {
                 .call_components(scan.body, scan.entries, &arguments, scan.types)?
                 .align(state, scan.id)?;
             let mut outputs = Vec::with_capacity(output.values.len());
-            for value in &output.values {
+            for (value, leaf) in output.values.iter().zip(&state.values) {
                 let value = self.finish_broadcast(value, &frame, frame.len());
-                if value.ty != ty || value.elem == ElemKind::Bool {
+                // An integer carry stays exact only in integer arithmetic.
+                if value.ty != ty
+                    || value.elem == ElemKind::Bool
+                    || (leaf.elem == ElemKind::Int && value.elem != ElemKind::Int)
+                {
                     return Ok(None);
                 }
-                outputs.push(self.convert(&value, ElemKind::Real));
+                outputs.push(self.convert(&value, leaf.elem));
             }
             let unsolved = (0..solved.len())
                 .filter(|&j| solved[j].is_none())
@@ -151,10 +157,13 @@ impl Emitter<'_> {
 
     /// A zero that constant folding and CSE cannot see through, so every use
     /// stays visible in the emitted text.
-    fn opaque_zero(&mut self, ty: &MlirTy) -> Value {
+    fn opaque_zero(&mut self, ty: &MlirTy, elem: ElemKind) -> Value {
         let ssa = self.fresh();
-        let text = ty.render(self.dtype, ElemKind::Real);
-        let literal = float_literal(self.dtype, 0.0);
+        let text = ty.render(self.dtype, elem);
+        let literal = match elem {
+            ElemKind::Int => "0".to_owned(),
+            _ => float_literal(self.dtype, 0.0),
+        };
         self.push(&format!(
             "{ssa} = stablehlo.constant dense<{literal}> : {text}"
         ));
@@ -172,8 +181,20 @@ impl Emitter<'_> {
         Value {
             ssa,
             ty: ty.clone(),
-            elem: ElemKind::Real,
+            elem,
         }
+    }
+
+    /// `x` at shape `ty` and element kind `elem`.
+    fn filled(&mut self, x: i64, ty: MlirTy, elem: ElemKind) -> Value {
+        if elem != ElemKind::Int {
+            return self.constant(x as f64, ty);
+        }
+        let scalar = self.int_value_const(x);
+        if ty == MlirTy::Scalar {
+            return scalar;
+        }
+        self.broadcast_in_dim(&scalar, &[], ty)
     }
 
     /// The coefficient of `zero` in `v`, or `None` unless `v` is provably
@@ -202,24 +223,26 @@ impl Emitter<'_> {
                 match (name.as_str(), ca, cb) {
                     ("stablehlo.add" | "stablehlo.subtract", Some(c), None)
                     | ("stablehlo.add", None, Some(c)) => Some(c),
-                    ("stablehlo.subtract", None, Some(c)) => Some(self.coef_neg(c)),
+                    ("stablehlo.subtract", None, Some(c)) => Some(self.coef_neg(c, zero.elem)),
                     ("stablehlo.add", Some(x), Some(y)) => {
-                        let (x, y) = (self.coef_value(x), self.coef_value(y));
+                        let (x, y) = (self.coef_value(x, zero.elem), self.coef_value(y, zero.elem));
                         Some(Coef::Of(self.add(&x, &y)))
                     }
                     ("stablehlo.subtract", Some(x), Some(y)) => {
-                        let (x, y) = (self.coef_value(x), self.coef_value(y));
+                        let (x, y) = (self.coef_value(x, zero.elem), self.coef_value(y, zero.elem));
                         Some(Coef::Of(self.sub(&x, &y)))
                     }
                     ("stablehlo.multiply", Some(c), None) => Some(self.coef_scale(c, &b, false)),
                     ("stablehlo.multiply", None, Some(c)) => Some(self.coef_scale(c, &a, false)),
-                    ("stablehlo.divide", Some(c), None) => Some(self.coef_scale(c, &b, true)),
+                    ("stablehlo.divide", Some(c), None) if zero.elem != ElemKind::Int => {
+                        Some(self.coef_scale(c, &b, true))
+                    }
                     _ => None,
                 }
             }
             Pointwise::Unary(name, a) if name == "stablehlo.negate" => {
                 let c = part(self, &a)??;
-                Some(self.coef_neg(c))
+                Some(self.coef_neg(c, zero.elem))
             }
             Pointwise::Reshape(a) => match part(self, &a)?? {
                 Coef::Of(x) if x.ty == a.ty && x.ty != MlirTy::Scalar => {
@@ -244,16 +267,16 @@ impl Emitter<'_> {
         }
     }
 
-    fn coef_value(&mut self, c: Coef) -> Value {
+    fn coef_value(&mut self, c: Coef, elem: ElemKind) -> Value {
         match c {
-            Coef::One => self.scalar(1.0),
+            Coef::One => self.filled(1, MlirTy::Scalar, elem),
             Coef::Of(x) => x,
         }
     }
 
-    fn coef_neg(&mut self, c: Coef) -> Coef {
+    fn coef_neg(&mut self, c: Coef, elem: ElemKind) -> Coef {
         Coef::Of(match c {
-            Coef::One => self.scalar(-1.0),
+            Coef::One => self.filled(-1, MlirTy::Scalar, elem),
             Coef::Of(x) => self.neg(&x),
         })
     }
@@ -264,7 +287,7 @@ impl Emitter<'_> {
         let factor = self.scalar_source(factor);
         let c = match (c, divide) {
             (Coef::One, false) => return Coef::Of(factor),
-            (c, _) => self.coef_value(c),
+            (c, _) => self.coef_value(c, factor.elem),
         };
         Coef::Of(if divide {
             self.div(&c, &factor)
@@ -307,7 +330,7 @@ impl Emitter<'_> {
         let mut x = offset.clone();
         if !zero {
             let first = self.time_cells(init, 1, frame);
-            let rest = self.time_constant(0.0, n - 1, frame);
+            let rest = self.time_constant(0, n - 1, frame, offset.elem);
             let start = self.concat_time(&first, &rest, offset);
             let start = match &coef {
                 Some(a) => self.mul(a, &start),
@@ -315,7 +338,7 @@ impl Emitter<'_> {
             };
             x = self.add(&x, &start);
         }
-        let mut fill = self.time_constant(0.0, 1, frame);
+        let mut fill = self.time_constant(0, 1, frame, offset.elem);
         let mut s = 1;
         while s < n {
             let shifted = self.shift(&x, s, &fill);
@@ -330,13 +353,13 @@ impl Emitter<'_> {
                 let earlier = if a.ty == MlirTy::Scalar {
                     a.clone()
                 } else {
-                    let ones = self.time_constant(1.0, s, frame);
+                    let ones = self.time_constant(1, s, frame, a.elem);
                     self.shift(&a, s, &ones)
                 };
                 coef = Some(self.mul(&a, &earlier));
             }
             s *= 2;
-            fill = self.time_constant(0.0, s, frame);
+            fill = self.time_constant(0, s, frame, offset.elem);
         }
         x
     }
@@ -354,10 +377,10 @@ impl Emitter<'_> {
         self.broadcast_in_dim(&one, &map, tensor(dims))
     }
 
-    fn time_constant(&mut self, x: f64, s: u64, frame: &[Option<u64>]) -> Value {
+    fn time_constant(&mut self, x: i64, s: u64, frame: &[Option<u64>], elem: ElemKind) -> Value {
         let mut dims = frame[..frame.len() - 1].to_vec();
         dims.push(Some(s));
-        self.constant(x, tensor(dims))
+        self.filled(x, tensor(dims), elem)
     }
 
     /// `x` moved `s` cells later along the time axis, with `fill` in front.
@@ -376,7 +399,7 @@ impl Emitter<'_> {
     /// `a` then `b` along the time axis, typed and laid out like `like`.
     fn concat_time(&mut self, a: &Value, b: &Value, like: &Value) -> Value {
         let axis = shape(&like.ty).len() - 1;
-        let render = |v: &Value| v.ty.render(self.dtype, ElemKind::Real);
+        let render = |v: &Value| v.ty.render(self.dtype, v.elem);
         let rhs = format!(
             "stablehlo.concatenate {}, {}, dim = {axis} : ({}, {}) -> {}",
             a.ssa,

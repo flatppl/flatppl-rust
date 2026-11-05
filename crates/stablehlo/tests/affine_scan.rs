@@ -100,3 +100,42 @@ fn gpu_coupled_record_fields_keep_the_loop() {
     );
     assert_eq!(ir.matches("stablehlo.while").count(), 1, "{ir}");
 }
+
+/// A running count over integer data, the shape dogs_hierarchical's shock
+/// history takes inside a broadcast callable.
+fn integer_count(step: &str) -> String {
+    format!(
+        "k = elementof(cartpow(nonnegintegers, [3, 24]))\n\
+         rows = indicesof(zeros(3))\n\
+         history(j, m) = scan((t, s) -> {step}, 0, m[j, indicesof(zeros(24))])\n\
+         h = rowstack(history.(rows, [k]))\n\
+         inputs = (k)\n\
+         outputs = sum(h)\n"
+    )
+}
+
+#[test]
+fn gpu_integer_carries_use_a_doubling_scan() {
+    for step in ["t + s", "2 * t - s", "t * s"] {
+        let ir = emit(&integer_count(step), Target::Gpu);
+        assert!(!ir.contains("stablehlo.while"), "{step}: {ir}");
+        assert!(
+            ir.contains("tensor<3x24xi64>"),
+            "{step} stays integer: {ir}"
+        );
+    }
+}
+
+#[test]
+fn cpu_integer_carries_keep_the_loop() {
+    let ir = emit(&integer_count("t + s"), Target::Cpu);
+    assert_eq!(ir.matches("stablehlo.while").count(), 1, "{ir}");
+}
+
+#[test]
+fn gpu_non_affine_integer_steps_keep_the_loop() {
+    for step in ["t * t + s", "max(t, s)"] {
+        let ir = emit(&integer_count(step), Target::Gpu);
+        assert_eq!(ir.matches("stablehlo.while").count(), 1, "{step}: {ir}");
+    }
+}

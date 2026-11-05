@@ -655,9 +655,9 @@ impl Emitter<'_> {
             let frame = self.call_frame.clone();
             *value = self.finish_broadcast(value, &frame, frame.len());
         }
-        // The GPU profile replaces the serial loop when the step is affine in
-        // the carry. On CPU the loop is faster.
-        let affine = if reduce || self.target != crate::Target::Gpu {
+        // A profile without serial scans replaces the loop when the step is
+        // affine in the carry.
+        let affine = if reduce || self.target.serial_scans() {
             None
         } else {
             let mut types = vec![state_type.clone()];
