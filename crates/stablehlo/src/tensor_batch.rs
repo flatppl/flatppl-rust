@@ -144,6 +144,7 @@ impl TensorBatch<'_, '_> {
             Pointwise::Unary(op, _) => self.out.unary(op, a),
             Pointwise::ChloUnary(op, _) => self.out.chlo_unary(op, a),
             Pointwise::Binary(op, ..) => self.out.binary(op, a, &inputs[1]),
+            Pointwise::ChloBinary(op, ..) => self.out.chlo_binary(op, a, &inputs[1]),
             Pointwise::Compare(dir, ..) => self.out.compare(dir, a, &inputs[1]),
             Pointwise::Select(..) => self.out.select(a, &inputs[1], &inputs[2]),
             Pointwise::Convert(_, elem) => self.out.convert(a, *elem),

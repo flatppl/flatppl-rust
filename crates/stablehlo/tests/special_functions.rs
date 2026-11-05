@@ -145,7 +145,7 @@ fn folded(member: &str, x: f64, dtype: Dtype) -> f64 {
 // 2.8e-45 where scipy gives 1.4e-45 and the runtime 0. So the floor is that normal.
 #[test]
 fn a_constant_argument_folds_to_the_scipy_value() {
-    let cases: [(&str, f64, Dtype, f64); 14] = [
+    let cases: [(&str, f64, Dtype, f64); 22] = [
         ("erfc", 10.0, Dtype::F64, 2.0884875837625446e-45),
         ("erfc", 26.0, Dtype::F64, 5.663192408856145e-296),
         ("erfc", 27.0, Dtype::F64, 0.0),
@@ -160,6 +160,14 @@ fn a_constant_argument_folds_to_the_scipy_value() {
         ("erfc", 0.7, Dtype::F32, 0.3221988081932068),
         ("erf", -1.3, Dtype::F32, -0.9340079426765442),
         ("erf", 0.7, Dtype::F32, 0.6778011918067932),
+        ("erfcx", 10.0, Dtype::F64, 0.05614099274382259),
+        ("erfcx", -1.3, Dtype::F64, 10.481318741176324),
+        ("erfcx", 0.7, Dtype::F64, 0.525930337349441),
+        ("erfcx", 1e4, Dtype::F64, 5.641895807268084e-05),
+        ("erfcx", 10.0, Dtype::F32, 0.05614099279046059),
+        ("erfcx", -1.3, Dtype::F32, 10.481317520141602),
+        ("erfcx", 0.7, Dtype::F32, 0.5259303450584412),
+        ("erfcx", 1e4, Dtype::F32, 5.641895768349059e-05),
     ];
     for (member, x, dtype, scipy) in cases {
         let (rtol, floor) = match dtype {
@@ -190,5 +198,75 @@ fn a_member_without_a_chlo_op_refuses_naming_itself() {
     assert!(
         err.contains("special-functions.bessel_j has no StableHLO lowering"),
         "{err}"
+    );
+}
+
+// erfcx has no CHLO op. It is `exp(x²)·erfc(x)` below the split and a continued
+// fraction above, joined by select. Executed against mpmath on M4 and GB10 out to
+// x = 1e4: f64 value 4.2e-16 and gradient 1.3e-15, f32 2.1e-7 and 1.5e-6.
+#[test]
+fn erfcx_lowers_to_differentiable_stablehlo() {
+    for (dtype, ty, depth) in [(Dtype::F32, "f32", 12), (Dtype::F64, "f64", 40)] {
+        let src =
+            format!("{SF}\na = elementof(reals)\nv = sf.erfcx(x = a)\ninputs = (a)\noutputs = (v)");
+        let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
+        assert!(!out.contains("chlo.erfcx"), "{out}");
+        assert!(
+            out.contains("chlo.erfc %") && out.contains(&format!("-> tensor<{ty}>")),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("stablehlo.select").count(),
+            3,
+            "two clamps and the join:\n{out}"
+        );
+        assert_eq!(out.matches("stablehlo.divide").count(), depth + 1, "{out}");
+    }
+    let out = emit(&format!(
+        "{SF}\na = elementof(cartpow(reals, 3))\nv = sf.erfcx.(a)\ninputs = (a)\noutputs = (v)"
+    ));
+    assert!(
+        out.contains("-> tensor<3xf32>") && out.contains("chlo.erfc %"),
+        "{out}"
+    );
+}
+
+// digamma and polygamma lower to their CHLO ops. Executed against mpmath on M4 and
+// GB10: f64 value and gradient 1.3e-15 (2.2e-14 at digamma(-0.5) = 0.036, where the
+// reflection cancels), f32 1.3e-6. Enzyme differentiates polygamma in `x` only, and
+// the integer order reaches the op through a convert, which Enzyme treats as inactive.
+#[test]
+fn digamma_and_polygamma_lower_to_their_chlo_ops() {
+    for (dtype, ty, int) in [(Dtype::F32, "f32", "i32"), (Dtype::F64, "f64", "i64")] {
+        let src =
+            format!("{SF}\na = elementof(reals)\nv = sf.digamma(a)\ninputs = (a)\noutputs = (v)");
+        let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
+        assert!(
+            out.contains(&format!(
+                "chlo.digamma %arg0 : tensor<{ty}> -> tensor<{ty}>"
+            )),
+            "{out}"
+        );
+        let src = format!(
+            "{SF}\nn = elementof(integers)\na = elementof(reals)\nv = sf.polygamma(n = n, x = a)\n\
+             inputs = (n, a)\noutputs = (v)"
+        );
+        let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
+        assert!(
+            out.contains(&format!(
+                "stablehlo.convert %arg0 : (tensor<{int}>) -> tensor<{ty}>"
+            )) && out.contains(&format!(
+                "chlo.polygamma %0, %arg1 : tensor<{ty}>, tensor<{ty}> -> tensor<{ty}>"
+            )),
+            "{out}"
+        );
+    }
+    let out = emit(&format!(
+        "{SF}\na = elementof(cartpow(reals, 3))\nv = sf.polygamma.(2, a)\ninputs = (a)\noutputs = (v)"
+    ));
+    assert!(
+        out.contains("chlo.polygamma")
+            && out.contains("tensor<3xf32>, tensor<3xf32> -> tensor<3xf32>"),
+        "{out}"
     );
 }

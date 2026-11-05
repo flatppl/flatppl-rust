@@ -450,6 +450,7 @@ impl Packer<'_, '_> {
                 Pointwise::Unary(op, _) => self.out.unary(&op, &inputs[0]),
                 Pointwise::ChloUnary(op, _) => self.out.chlo_unary(&op, &inputs[0]),
                 Pointwise::Binary(op, ..) => self.out.emit_binary(&op, &inputs[0], &inputs[1]),
+                Pointwise::ChloBinary(op, ..) => self.out.chlo_binary(&op, &inputs[0], &inputs[1]),
                 Pointwise::Compare(dir, ..) => self.out.compare(&dir, &inputs[0], &inputs[1]),
                 Pointwise::Select(..) => self.out.select(&inputs[0], &inputs[1], &inputs[2]),
                 Pointwise::Convert(_, elem) => self.out.convert(&inputs[0], elem),

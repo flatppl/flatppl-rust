@@ -486,6 +486,13 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         latent_path: LatentPath::Sqrt,
         build_marginal: build_inverse_gamma_variance_marginal,
     },
+    ConjugateRow {
+        prior: "Exponential",
+        likelihood: "Normal",
+        conjugating_param: "mu",
+        latent_path: LatentPath::Direct,
+        build_marginal: build_exponential_mean_marginal,
+    },
 ];
 
 /// Try to lower a continuous-latent `kchain` as a closed-form conjugate marginal.
@@ -1125,6 +1132,133 @@ fn build_scaled_t_logpdf(m: &mut Module, params: &[NodeId], variates: &[NodeId])
 
     let total = build_call(m, "add", &[norm, tail]);
     build_call(m, "neg", &[total])
+}
+
+/// Exponential-prior-on-the-MEAN marginal builder. `y = v + σ·ε` with `v ~ Exponential(λ)`
+/// is the exponentially modified Gaussian. §08 has no constructor for it, so the row
+/// returns the log-density ([`build_exponentially_modified_normal_logpdf`]).
+fn build_exponential_mean_marginal(
+    m: &mut Module,
+    prior_kwargs: &[(Symbol, NodeId)],
+    lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<MarginalForm> {
+    let rate = find_kwarg(m, prior_kwargs, "rate")?;
+    let sigma = find_kwarg(m, lik_kwargs, "sigma")?;
+    Some(MarginalForm::LogDensity(LogDensity {
+        build: build_exponentially_modified_normal_logpdf,
+        params: vec![rate, sigma],
+    }))
+}
+
+/// The exponentially modified Gaussian log-density at `y`, from `params = [λ, σ]`,
+/// with `z = (λσ² − y)/(√2·σ)`:
+///
+/// ```text
+/// z < 0:  log λ − log 2 − λy + (λσ)²/2 + log erfc(z)
+/// z ≥ 0:  log λ − log 2 − y²/(2σ²)    + log erfcx(z)
+/// ```
+///
+/// Both are `log λ − log 2 − λy + (λσ)²/2 − z² + log erfcx(z)`, since `erfcx(z) =
+/// exp(z²)·erfc(z)`. `erfc(z)` underflows for large positive `z` and `erfcx(z)`
+/// overflows for large negative `z`, so each side uses the function that stays in
+/// range. Each side reads `z` clamped to its own half-line, so the side `ifelse`
+/// drops is finite and adds no `NaN` to a gradient. Both functions are §09
+/// `special-functions` members, reached through [`special_functions_alias`].
+fn build_exponentially_modified_normal_logpdf(
+    m: &mut Module,
+    params: &[NodeId],
+    variates: &[NodeId],
+) -> NodeId {
+    let y = sole_variate(variates);
+    let [rate, sigma] = [params[0], params[1]];
+
+    let rate_sigma = build_call(m, "mul", &[rate, sigma]);
+    let center = build_call(m, "mul", &[rate_sigma, sigma]);
+    let dev = build_call(m, "sub", &[center, y]);
+    let sqrt2 = real(m, std::f64::consts::SQRT_2);
+    let width = build_call(m, "mul", &[sqrt2, sigma]);
+    let z = build_call(m, "divide", &[dev, width]);
+    let zero = real(m, 0.0);
+    let left = build_call(m, "lt", &[z, zero]);
+    let z_left = build_call(m, "ifelse", &[left, z, zero]);
+    let z_right = build_call(m, "ifelse", &[left, zero, z]);
+    let alias = special_functions_alias(m);
+
+    let half = real(m, 0.5);
+    let square = build_call(m, "mul", &[rate_sigma, rate_sigma]);
+    let shift = build_call(m, "mul", &[half, square]);
+    let decay = build_call(m, "mul", &[rate, y]);
+    let exponent = build_call(m, "sub", &[shift, decay]);
+    let erfc = special_function_call(m, alias, "erfc", z_left);
+    let log_erfc = build_call(m, "log", &[erfc]);
+    let left_tail = build_call(m, "add", &[exponent, log_erfc]);
+
+    let y2 = build_call(m, "mul", &[y, y]);
+    let two = real(m, 2.0);
+    let var = build_call(m, "mul", &[sigma, sigma]);
+    let twice_var = build_call(m, "mul", &[two, var]);
+    let gauss = build_call(m, "divide", &[y2, twice_var]);
+    let erfcx = special_function_call(m, alias, "erfcx", z_right);
+    let log_erfcx = build_call(m, "log", &[erfcx]);
+    let right_tail = build_call(m, "sub", &[log_erfcx, gauss]);
+
+    let tail = build_call(m, "ifelse", &[left, left_tail, right_tail]);
+    let log_rate = build_call(m, "log", &[rate]);
+    let total = build_call(m, "add", &[log_rate, tail]);
+    let ln2 = real(m, std::f64::consts::LN_2);
+    build_call(m, "sub", &[total, ln2])
+}
+
+/// `alias.member(arg)` for a `special-functions` member.
+fn special_function_call(m: &mut Module, alias: Symbol, member: &str, arg: NodeId) -> NodeId {
+    let name = m.intern(member);
+    let callee = m.alloc(Node::Ref(Ref {
+        ns: RefNs::Module(alias),
+        name,
+    }));
+    crate::density::build_user_call_n(m, callee, vec![arg])
+}
+
+/// The alias of a `standard_module("special-functions", "0.1")` binding, adding one if the
+/// model has none. The name and version must match both engines' catalogues.
+fn special_functions_alias(m: &mut Module) -> Symbol {
+    const NAME: &str = "special-functions";
+    const VERSION: &str = "0.1";
+    let is_load = |m: &Module, rhs: NodeId| match m.node(rhs) {
+        Node::Call(c) => {
+            matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == "standard_module")
+                && matches!(c.args.as_ref(), [n, v]
+                    if matches!(m.node(*n), Node::Lit(Scalar::Str(s)) if s.as_ref() == NAME)
+                        && matches!(m.node(*v), Node::Lit(Scalar::Str(s)) if s.as_ref() == VERSION))
+        }
+        _ => false,
+    };
+    if let Some(name) = m
+        .bindings()
+        .find(|(_, b)| is_load(m, b.rhs))
+        .map(|(_, b)| b.name)
+    {
+        return name;
+    }
+    let mut index = 0;
+    let name = loop {
+        let name = m.intern(&format!("__special_functions_{index}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        index += 1;
+    };
+    let module = m.alloc(Node::Lit(Scalar::Str(NAME.into())));
+    let version = m.alloc(Node::Lit(Scalar::Str(VERSION.into())));
+    let rhs = build_call(m, "standard_module", &[module, version]);
+    m.add_binding(flatppl_core::Binding {
+        name,
+        rhs,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    name
 }
 
 // ---------------------------------------------------------------------------
