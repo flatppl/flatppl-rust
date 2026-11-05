@@ -2901,9 +2901,17 @@ fn categorical_batched(
     v: &Value,
     base: i64,
 ) -> Result<Value, EmitError> {
+    let field = e.resolve_ref_one(p.field_id(e, "p")?);
     let probs_id = unbatch_field_id(e, p, "p")?;
-    let probs = e.lower_node(probs_id)?;
-    categorical_score(e, p.variate_id()?, &probs, v, base)
+    if probs_id != field {
+        let probs = e.lower_node(probs_id)?;
+        return categorical_score(e, p.variate_id()?, &probs, v, base);
+    }
+    // An array of probability vectors pairs one vector with each variate cell.
+    let variate = p.variate_id()?;
+    e.lower_broadcast_cells(variate, &[field, variate], |e, values| {
+        categorical_score(e, variate, &values[0], &values[1], base)
+    })
 }
 
 fn categorical_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
