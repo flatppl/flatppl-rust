@@ -251,6 +251,52 @@ lp = logdensityof(pp, record(y = 5.0))",
     );
 }
 
+// Row 6 (Exponential prior on the MEAN): the exponentially modified Gaussian. §08 has no
+// constructor for it, and its density needs §09 `special-functions.erfc` and `erfcx`, so
+// the output calls that module. The log form never builds `exp(…)·erfc(…)`. Values are
+// checked by executing the emitted module and through the testsuite against
+// scipy.stats.exponnorm.
+#[test]
+fn exponential_mean_marginal_calls_special_functions() {
+    for (src, alias) in [
+        (
+            "v = draw(Exponential(rate = 1.0))\n\
+             kk = kernelof(record(y = draw(Normal(mu = v, sigma = 1.0))), v = v)\n\
+             pp = kchain(lawof(v), kk)\n\
+             lp = logdensityof(pp, record(y = 0.5))",
+            "__special_functions_0",
+        ),
+        // The implicit spelling, with the model's own alias reused.
+        (
+            "sf = standard_module(\"special-functions\", \"0.1\")\n\
+             v = draw(Exponential(rate = 2.0))\n\
+             y = draw(Normal(mu = v, sigma = 0.5))\n\
+             lp = logdensityof(lawof(y), 0.5)",
+            "sf",
+        ),
+    ] {
+        let out = determinize_src(src);
+        let text = flatppl_syntax::print(&out);
+        assert!(
+            text.contains(&format!(
+                "{alias} = standard_module(\"special-functions\", \"0.1\")"
+            )) && text.contains(&format!("{alias}.erfc("))
+                && text.contains(&format!("{alias}.erfcx(")),
+            "the marginal calls {alias}.erfc and {alias}.erfcx:\n{text}"
+        );
+        assert_eq!(
+            text.matches("standard_module(").count(),
+            1,
+            "one module binding:\n{text}"
+        );
+        assert!(!text.contains("exp("), "no exp(…)·erfc(…) product:\n{text}");
+        assert!(
+            flatppl_determinizer::is_flatpdl(&out).is_ok(),
+            "is_flatpdl failed:\n{text}"
+        );
+    }
+}
+
 // `normalize(logweighted(x -> logdensityof(g2, x), g1))` with `g1`, `g2` both
 // Normal is a POINTWISE PRODUCT OF TWO GAUSSIANS, which normalizes IN CLOSED
 // FORM (no quadrature): the overlap integral is itself a Gaussian
