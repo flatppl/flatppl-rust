@@ -7377,8 +7377,7 @@ fn emit_sample_generalized_normal_matches_frozen_golden() {
 /// The Task-15 Dirichlet anchor fixture: a free (`elementof`-declared)
 /// length-3 `alpha` (exactly [`DIRICHLET_DENSITY_SRC`]'s shape, minus the
 /// pinned observation — `@sample` scores no variate), so `alpha` becomes a
-/// `tensor<3xf32>` func arg and the sampler unrolls into one Gamma draw per
-/// component.
+/// `tensor<3xf32>` func arg and all components share one Gamma rejection loop.
 const DIRICHLET_SAMPLE_SRC: &str = "\
 alpha = elementof(cartpow(posreals, 3))
 s = rnginit(0)
@@ -7389,8 +7388,9 @@ outputs = (draws)
 ";
 
 /// §08 Dirichlet's `g_i ~ Gamma(alpha_i, 1)`, return `g / sum(g)`: `alpha`
-/// becomes a `tensor<3xf32>` func arg, one `stablehlo.while` PER component
-/// (three, statically unrolled), returning a normalized `tensor<3xf32>`.
+/// becomes a `tensor<3xf32>` func arg, ONE `stablehlo.while` with a
+/// `tensor<3xi1>` accept mask over the components, returning a normalized
+/// `tensor<3xf32>`.
 #[test]
 fn emit_sample_dirichlet_has_expected_structure() {
     let d = determinize_src(DIRICHLET_SAMPLE_SRC);
@@ -7408,14 +7408,14 @@ fn emit_sample_dirichlet_has_expected_structure() {
     assert!(out.contains("-> (tensor<3xf32>, tensor<2xui64>, tensor<i32>)"));
     assert_eq!(
         out.matches("stablehlo.while").count(),
-        3,
-        "expected one rejection loop per Dirichlet component, in:\n{out}"
+        1,
+        "expected one rejection loop over all components, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.rng").count(), 9);
     assert!(
-        out.contains("stablehlo.concatenate"),
-        "expected the per-component Gamma draws packed into a vector, in:\n{out}"
+        out.contains("tensor<3xi1>"),
+        "per-component accept mask, in:\n{out}"
     );
+    assert_eq!(out.matches("stablehlo.rng").count(), 3);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -8479,16 +8479,10 @@ fn emit_sample_mvnormal_iid_matches_frozen_golden() {
 
 /// A fanned Dirichlet draw: `iid(Dirichlet(alpha = [2, 3, 4]), 5)` — the OTHER
 /// vector-variate sampler (cf. MvNormal). Its per-component `g_j ~ Gamma(α_j,
-/// 1)` unroll fans out with NO rank-3 machinery: under the `[5]` fan-out shape
-/// each component's `draw_gamma` dispatches to the batched Marsaglia–Tsang
-/// `draw_gamma_batched` (an `[5]` column, one masked `while` per component),
-/// the `d = 3` columns stack on axis 0 → `[3, 5]`, ONE new `stablehlo.transpose`
-/// reorients to `[5, 3]` (rows = draws), then each row is normalized by its
-/// row-sum (`reduce_sum_last_axis` over the component axis + broadcast +
-/// divide) — `[5, 3]`, each row a simplex, the 5 rows independent. The frozen
-/// golden below is parse-validated against the real StableHLO parser (jax
-/// 0.10.2). The scalar Dirichlet path (`emit_sample_dirichlet_*`) is
-/// byte-identical to before.
+/// 1)` draws tile `alpha` to `[5, 3]` and run as 15 lanes of ONE masked
+/// Marsaglia–Tsang loop. Each row is then normalized by its row-sum
+/// (`reduce_sum_last_axis` over the component axis + broadcast + divide) —
+/// `[5, 3]`, each row a simplex, the 5 rows independent.
 const DIRICHLET_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Dirichlet(alpha = [2.0, 3.0, 4.0]), 5)
@@ -8497,11 +8491,9 @@ outputs = (draws)
 ";
 
 /// The fanned Dirichlet draw returns a `tensor<5x3xf32>` (`[m, d]`, not a bare
-/// `[d]` simplex) alongside the advanced key, via one masked `stablehlo.while`
-/// PER component (three, each carrying a `tensor<5xi1>` per-lane accept mask),
-/// the `[3, 5]` column stack reoriented by a `stablehlo.transpose dims = [1, 0]`
-/// to `[5, 3]`, then the per-row normalize (last-axis reduce + `dims = [0]`
-/// row-broadcast + divide).
+/// `[d]` simplex) alongside the advanced key, via ONE masked `stablehlo.while`
+/// with a `tensor<15xi1>` accept mask over all draws and components, then the
+/// per-row normalize (last-axis reduce + `dims = [0]` row-broadcast + divide).
 #[test]
 fn emit_sample_dirichlet_iid_has_expected_structure() {
     let d = determinize_src(DIRICHLET_IID_SAMPLE_SRC);
@@ -8517,16 +8509,12 @@ fn emit_sample_dirichlet_iid_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.while").count(),
-        3,
-        "one masked batched rejection loop per Dirichlet component, in:\n{out}"
+        1,
+        "one masked rejection loop over all draws and components, in:\n{out}"
     );
     assert!(
-        out.contains("tensor<5xi1>"),
-        "each component's per-lane accept mask must be tensor<5xi1>, in:\n{out}"
-    );
-    assert!(
-        out.contains("stablehlo.transpose") && out.contains("dims = [1, 0]"),
-        "the axis-0 [3, 5] column stack must be transposed to the [5, 3] batch, in:\n{out}"
+        out.contains("tensor<15xi1>"),
+        "the accept mask must cover all 15 lanes, in:\n{out}"
     );
     assert!(
         out.contains("applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>"),

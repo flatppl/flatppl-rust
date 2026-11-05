@@ -378,11 +378,12 @@ fn stablehlo_abi_model_refuses_non_exhaustive_inputs_with_exit_3() {
 }
 
 /// A source-controlled vector length must not allocate or emit billions of
-/// component samplers. The emitter refuses before the static unroll.
+/// component samplers. All components share one rejection loop, so the
+/// module size does not grow with the length.
 #[test]
-fn stablehlo_dirichlet_sample_caps_static_unroll() {
+fn stablehlo_dirichlet_sample_size_is_independent_of_length() {
     let input = write_model(
-        "dirichlet-static-unroll",
+        "dirichlet-large-length",
         "alpha = elementof(cartpow(posreals, 4294967295))\n\
          s = rnginit(0)\n\
          x = draw(Dirichlet(alpha = alpha))\n\
@@ -396,16 +397,14 @@ fn stablehlo_dirichlet_sample_caps_static_unroll() {
         .args(["--mode", "sample", "--restrict-enzyme-compatible=false"])
         .output()
         .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(3),
+    assert!(
+        out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Dirichlet sample"), "{stderr}");
-    assert!(stderr.contains("resource guard"), "{stderr}");
-    assert!(out.stdout.is_empty(), "refusal must emit no partial IR");
+    let module = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(module.matches("stablehlo.while").count(), 1, "{module}");
+    assert!(module.lines().count() < 200, "{module}");
 }
 
 /// Static shape products must not wrap in moment denominators. Both whole-array

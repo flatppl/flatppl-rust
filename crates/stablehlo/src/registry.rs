@@ -19,9 +19,6 @@ use crate::refuse::EmitError;
 
 mod bessel;
 
-/// Cap source-driven emit-time expansion before allocating or generating IR.
-const MAX_STATIC_UNROLL: u64 = 4096;
-
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
 /// distribution's closed-form log-density/-mass builder (§08/§09/§12/§13).
 pub type LogpdfBuilder = fn(&mut Emitter, &Params, &Value) -> Result<Value, EmitError>;
@@ -3586,8 +3583,8 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
 // — matching `jax.random.gamma`, correct for every `alpha > 0` with no
 // emit-time case split (verified distributionally, Task 15 report).
 //
-// Independence caveat: Beta/StudentT/Dirichlet draw two-or-more Gammas, each
-// with its own `Z`/`U`/`U0` `stablehlo.rng` ops, and assume those draws are
+// Independence caveat: Beta/StudentT draw two Gammas, each with its own
+// `Z`/`U`/`U0` `stablehlo.rng` ops, and assume those draws are
 // mutually independent — a cross-instruction property, unlike Task 12's
 // MvNormal, which issues exactly one `rng` call and so never faces it. The
 // assumption rests on distinct `stablehlo.rng` ops producing independent
@@ -3845,6 +3842,43 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     e.div(&g, rate)
 }
 
+/// Independent `Gamma(shape, 1)` draws, one per cell of the static tensor
+/// `shape`, in ONE masked rejection loop over all cells. The loop runs until
+/// its slowest cell accepts, which beats one loop per cell.
+fn draw_unit_gammas(e: &mut Emitter, shape: &Value) -> Value {
+    let MlirTy::Ranked(dims) = &shape.ty else {
+        panic!("draw_unit_gammas expects a ranked shape tensor");
+    };
+    let cells = dims
+        .iter()
+        .map(|d| d.expect("draw_unit_gammas needs static dims"))
+        .product();
+    let outer = e.batch_shape();
+    let flat = e.reshape(shape, MlirTy::Ranked(vec![Some(cells)]));
+    let one = e.scalar(1.0);
+    let draws = draw_gamma_batched(e, &flat, &one, cells);
+    match outer {
+        Some(dims) => e.set_batch_shape(dims),
+        None => e.clear_batch_shape(),
+    }
+    e.reshape(&draws, shape.ty.clone())
+}
+
+/// A standard `dist` draw at the full shape `dims`, whatever fan-out shape
+/// is active.
+fn draw_standard(e: &mut Emitter, dist: &str, dims: &[u64]) -> Value {
+    let outer = e.batch_shape();
+    e.clear_batch_shape();
+    let draw = e.rng(
+        dist,
+        &MlirTy::Ranked(dims.iter().map(|&d| Some(d)).collect()),
+    );
+    if let Some(dims) = outer {
+        e.set_batch_shape(dims);
+    }
+    draw
+}
+
 /// §08 Gamma's sampler: [`draw_gamma`] on the `shape`/`rate` kwargs directly.
 fn gamma_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
@@ -3879,70 +3913,114 @@ fn lkj_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     Ok(crate::ops::row_gram(e, &factor))
 }
 
-/// Onion sampling: row i has squared radius Beta(i/2, eta+(n-i-1)/2)
-/// and an independent uniform direction on the (i-1)-sphere.
+/// Onion sampling (Lewandowski, Kurowicka and Joe 2009, §3.2): row `i` has
+/// squared radius `Beta(i/2, eta + (n-i-1)/2)` and an independent uniform
+/// direction on the `(i-1)`-sphere. All `2(n-1)` Gammas share one
+/// [`draw_unit_gammas`] loop. One `[n, n]` normal draw, masked to its strictly
+/// lower triangle, gives every row direction.
 fn lkj_cholesky_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "sample")?;
-    if n > MAX_STATIC_UNROLL / n {
-        return Err(EmitError::at(
-            p.field_id(e, "n")?,
-            "LKJCholesky sample matrix exceeds the static-unroll resource guard",
-        ));
-    }
     let eta = p.get(e, "eta")?;
-    let batch = e.batch_shape().map(|shape| shape[0]);
-    let scalar_one = e.scalar(1.0);
-    let scalar_zero = e.scalar(0.0);
-    let (one, zero) = match batch {
-        Some(size) => {
-            let ty = MlirTy::Ranked(vec![Some(size)]);
-            (
-                e.broadcast_in_dim(&scalar_one, &[], ty.clone()),
-                e.broadcast_in_dim(&scalar_zero, &[], ty),
-            )
-        }
-        None => (scalar_one.clone(), scalar_zero),
-    };
-    let mut first = vec![zero.clone(); n as usize];
-    first[0] = one.clone();
-    let mut rows = vec![e.vector(&first)];
-    for i in 1..n {
-        let alpha = e.scalar(i as f64 / 2.0);
-        let offset = e.scalar((n - i - 1) as f64 / 2.0);
-        let beta = e.add(&eta, &offset);
-        let x = draw_gamma(e, &alpha, &scalar_one);
-        let y = draw_gamma(e, &beta, &scalar_one);
-        let total = e.add(&x, &y);
-        let radius_squared = e.div(&x, &total);
-        let diagonal_squared = e.div(&y, &total);
-        let radius = e.sqrt(&radius_squared);
-        let diagonal = e.sqrt(&diagonal_squared);
-        let normals: Vec<_> = (0..i).map(|_| e.rng("NORMAL", &MlirTy::Scalar)).collect();
-        let mut norm_squared = zero.clone();
-        for value in &normals {
-            let square = e.mul(value, value);
-            norm_squared = e.add(&norm_squared, &square);
-        }
-        // A zero vector has probability zero under the continuous law. Give
-        // that finite-precision case a valid direction without dividing by zero.
-        let nonzero = e.compare("GT", &norm_squared, &zero);
-        let safe_norm_squared = e.select(&nonzero, &norm_squared, &one);
-        let norm = e.sqrt(&safe_norm_squared);
-        let mut row = vec![zero.clone(); n as usize];
-        for (j, value) in normals.iter().enumerate() {
-            let direction = e.div(value, &norm);
-            let fallback = if j == 0 { &one } else { &zero };
-            let direction = e.select(&nonzero, &direction, fallback);
-            row[j] = e.mul(&radius, &direction);
-        }
-        row[i as usize] = diagonal;
-        rows.push(e.vector(&row));
+    let lanes = e.batch_shape().unwrap_or_default();
+    let lead = lanes.len() as u64;
+    let shape_of =
+        |tail: &[u64]| MlirTy::Ranked(lanes.iter().chain(tail).map(|&d| Some(d)).collect());
+    if n == 1 {
+        return Ok(e.constant(1.0, shape_of(&[1, 1])));
     }
-    let matrix = e.vector(&rows);
-    Ok(match batch {
-        Some(_) => e.transpose(&matrix, &[2, 0, 1]),
-        None => matrix,
-    })
+    let rows = n - 1;
+    let row_ty = shape_of(&[rows]);
+    let vector_ty = shape_of(&[n]);
+    let matrix_ty = shape_of(&[n, n]);
+    let lift = |e: &mut Emitter, v: &Value, dims: &[u64], ty: &MlirTy| {
+        if &v.ty == ty {
+            v.clone()
+        } else {
+            e.broadcast_in_dim(v, dims, ty.clone())
+        }
+    };
+
+    // Rows i = 1..n-1: Beta(i/2, eta + (n-1-i)/2) as X / (X + Y).
+    let index = e.index_vector(rows, false);
+    let index = e.convert(&index, ElemKind::Real);
+    let half = e.scalar(0.5);
+    let alpha = e.mul(&index, &half);
+    let top = e.scalar(rows as f64 / 2.0);
+    let offset = e.sub(&top, &alpha);
+    let alpha = lift(e, &alpha, &[lead], &row_ty);
+    let offset = lift(e, &offset, &[lead], &row_ty);
+    let eta_dims: Vec<u64> = match &eta.ty {
+        MlirTy::Ranked(dims) => (0..dims.len() as u64).collect(),
+        _ => Vec::new(),
+    };
+    let eta = lift(e, &eta, &eta_dims, &row_ty);
+    let beta = e.add(&eta, &offset);
+    let shapes = e.vector(&[alpha, beta]);
+    let gammas = draw_unit_gammas(e, &shapes);
+    let part = |e: &mut Emitter, j: u64| {
+        let mut starts = vec![0; lead as usize + 2];
+        starts[0] = j;
+        let mut limits = vec![j + 1];
+        limits.extend(&lanes);
+        limits.push(rows);
+        let strides = vec![1; starts.len()];
+        let part = e.slice(&gammas, &starts, &limits, &strides);
+        e.reshape(&part, row_ty.clone())
+    };
+    let x = part(e, 0);
+    let y = part(e, 1);
+    let total = e.add(&x, &y);
+    let radius_squared = e.div(&x, &total);
+    let diagonal_squared = e.div(&y, &total);
+    let radius = e.sqrt(&radius_squared);
+    let diagonal = e.sqrt(&diagonal_squared);
+    // Row 0 is e_0: radius 0 and diagonal 1.
+    let mut low = vec![0; lead as usize];
+    low.push(1);
+    let high = vec![0; low.len()];
+    let radius = e.pad_zeros(&radius, &low, &high);
+    let diagonal = e.pad_zeros(&diagonal, &low, &high);
+    let positions = e.index_vector(n, true);
+    let zero_index = e.int_value_const(0);
+    let first = e.compare("EQ", &positions, &zero_index);
+    let first = lift(e, &first, &[lead], &vector_ty);
+    let one = e.scalar(1.0);
+    let diagonal = e.select(&first, &one, &diagonal);
+
+    let square = MlirTy::Ranked(vec![Some(n), Some(n)]);
+    let row_index = e.broadcast_in_dim(&positions, &[0], square.clone());
+    let column_index = e.broadcast_in_dim(&positions, &[1], square);
+    let strictly_lower = e.compare("GT", &row_index, &column_index);
+    let on_diagonal = e.compare("EQ", &row_index, &column_index);
+    let first_column = e.compare("EQ", &column_index, &zero_index);
+    let cell_dims = [lead, lead + 1];
+    let strictly_lower = lift(e, &strictly_lower, &cell_dims, &matrix_ty);
+    let on_diagonal = lift(e, &on_diagonal, &cell_dims, &matrix_ty);
+    let first_column = lift(e, &first_column, &cell_dims, &matrix_ty);
+
+    let mut normal_dims = lanes.clone();
+    normal_dims.extend([n, n]);
+    let normals = draw_standard(e, "NORMAL", &normal_dims);
+    let zero = e.scalar(0.0);
+    let normals = e.select(&strictly_lower, &normals, &zero);
+    let squares = e.mul(&normals, &normals);
+    let norm_squared = e.reduce_sum_last_axis(&squares);
+    // A zero vector has probability zero under the continuous law. Give
+    // that finite-precision case a valid direction without dividing by zero.
+    // Row 0 always takes this path, and its zero radius keeps it zero.
+    let nonzero = e.compare("GT", &norm_squared, &zero);
+    let safe_norm_squared = e.select(&nonzero, &norm_squared, &one);
+    let norm = e.sqrt(&safe_norm_squared);
+    let scale = e.div(&radius, &norm);
+    let row_dims: Vec<u64> = (0..=lead).collect();
+    let scale = lift(e, &scale, &row_dims, &matrix_ty);
+    let nonzero = lift(e, &nonzero, &row_dims, &matrix_ty);
+    let radius = lift(e, &radius, &row_dims, &matrix_ty);
+    let diagonal = lift(e, &diagonal, &row_dims, &matrix_ty);
+    let directed = e.mul(&normals, &scale);
+    let fallback = e.select(&first_column, &radius, &zero);
+    let off_diagonal = e.select(&nonzero, &directed, &fallback);
+    Ok(e.select(&on_diagonal, &diagonal, &off_diagonal))
 }
 
 /// §08 ChiSquared's sampler, verbatim: `Gamma(k/2, 1/2)` (the §08
@@ -4012,31 +4090,10 @@ fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
 }
 
 /// §08 Dirichlet's sampler, verbatim: `g_i ~ Gamma(alpha_i, 1)`, return
-/// `g / sum(g)`. The vector `alpha`'s length `d` must be statically known (to
-/// unroll the per-component Gamma draws at emit time — one [`draw_gamma`] and
-/// thus one `stablehlo.while` per component); each `alpha_i` is sliced out as
-/// a `Scalar` (the same slice+reshape idiom [`vector_elem`] uses), drawn, then
-/// the `d` draws are packed back and normalized by their (broadcast) sum.
-/// Refuses (never panics) a dynamic-length `alpha` — refuse-don't-mislower,
-/// mirroring [`static_vector_len`]'s discipline for MvNormal.
-///
-/// Dispatches on the [`Emitter::batch_shape`] fan-out override (like every
-/// other batched sampler):
-/// - Scalar (`None`) — UNCHANGED (byte-identical): each [`draw_gamma`] is a
-///   scalar draw, the `d` scalars stack into a `[d]` vector via
-///   [`Emitter::vector`], normalized by their scalar sum.
-/// - Fanned iid `[m, d]` (`Some([m])`) — `m` independent simplex rows.
-///   [`draw_gamma`] then dispatches PER COMPONENT to [`draw_gamma_batched`],
-///   so each of the `d` components is an `[m]` column (one masked-lane
-///   `stablehlo.while` each, `d` in all — the same per-component unroll the
-///   scalar path uses, just batched over the `m` lanes; the columns are
-///   independent, each drawn from its own `stablehlo.rng` stream). The `d`
-///   columns stack on axis 0 via [`Emitter::vector`] → `[d, m]`, then a
-///   [`Emitter::transpose`] `[1, 0]` reorients to `[m, d]` (rows = draws,
-///   cols = components). Each row is normalized by its own row-sum:
-///   [`Emitter::reduce_sum_last_axis`] collapses the component axis to `[m]`,
-///   broadcast back to `[m, d]`, divide — so every row sums to 1 and the `m`
-///   rows are mutually independent (their Gamma entries are).
+/// `g / sum(g)`. The length `d` of `alpha` must be static, because the draw
+/// tensor has a static shape. A fan-out `[m]` tiles `alpha` to `[m, d]`, so
+/// all `m * d` Gammas share one [`draw_unit_gammas`] loop and each row
+/// normalizes by its own sum.
 fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let alpha_id = p.field_id(e, "alpha")?;
     let alpha = e.lower_node(alpha_id)?;
@@ -4055,47 +4112,21 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
         }
     };
 
-    if d > MAX_STATIC_UNROLL {
-        return Err(EmitError::at(
-            alpha_id,
-            format!(
-                "Dirichlet sample length {d} exceeds the {MAX_STATIC_UNROLL}-element static-unroll resource guard"
-            ),
-        ));
-    }
-
-    let one = e.scalar(1.0);
-    // Draw g_j ~ Gamma(alpha_j, 1) per component. `draw_gamma` reads the
-    // fan-out batch shape: scalar (None) → a scalar Gamma; fanned (Some([m])) →
-    // an `[m]` batched-Gamma column.
-    let mut gammas: Vec<Value> = Vec::with_capacity(d as usize);
-    for j in 0..d {
-        let alpha_j = vector_elem(e, &alpha, j);
-        gammas.push(draw_gamma(e, &alpha_j, &one));
-    }
-
-    match e.batch_shape() {
-        // Scalar Dirichlet — UNCHANGED (byte-identical to the pre-fan-out path):
-        // stack the `d` scalar Gammas into `[d]` and normalize by their sum.
-        None => {
-            let g_vec = e.vector(&gammas);
-            let sum = e.reduce_sum(&g_vec);
-            let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
-            Ok(e.div(&g_vec, &sum_bc))
-        }
-        // Fanned iid `[m, d]`: `Emitter::vector` stacks the `d` `[m]`-columns on
-        // axis 0 → `[d, m]`; transpose to `[m, d]` (rows = draws), then normalize
-        // each row by its row-sum.
+    let shape = match e.batch_shape() {
+        None => alpha,
         Some(batch) => {
-            let m = batch[0];
-            let stacked = e.vector(&gammas); // [d, m]
-            let g_mat = e.transpose(&stacked, &[1, 0]); // [m, d]
-            let row_sum = e.reduce_sum_last_axis(&g_mat); // [m]
-            let batch_ty = MlirTy::Ranked(vec![Some(m), Some(d)]);
-            let sum_bc = e.broadcast_in_dim(&row_sum, &[0], batch_ty);
-            Ok(e.div(&g_mat, &sum_bc))
+            let ty = MlirTy::Ranked(vec![Some(batch[0]), Some(d)]);
+            e.broadcast_in_dim(&alpha, &[1], ty)
         }
-    }
+    };
+    let gammas = draw_unit_gammas(e, &shape);
+    let total = e.reduce_sum_last_axis(&gammas);
+    let MlirTy::Ranked(dims) = &gammas.ty else {
+        unreachable!("draw_unit_gammas keeps its ranked shape")
+    };
+    let kept: Vec<u64> = (0..dims.len() as u64 - 1).collect();
+    let total = e.broadcast_in_dim(&total, &kept, gammas.ty.clone());
+    Ok(e.div(&gammas, &total))
 }
 
 // ---- §08 discrete + Multinomial `@sample` batch (Task 16) -------------------
