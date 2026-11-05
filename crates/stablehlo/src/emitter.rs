@@ -357,6 +357,11 @@ impl<'m> Emitter<'m> {
         self.batch_shape.clone()
     }
 
+    /// The lowering profile, for samplers that choose their form by target.
+    pub(crate) fn target(&self) -> crate::Target {
+        self.target
+    }
+
     /// Allocate a fresh SSA name (`%0`, `%1`, ...).
     fn fresh(&mut self) -> String {
         let name = format!("%{}", self.next);
