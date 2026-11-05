@@ -19,13 +19,12 @@
 //! the loop and the density lowering looking at base ops only, so no downstream
 //! path needs to know §09 exists.
 //!
-//! ## Refuse-don't-mislower
+//! ## Members without a base-op form
 //!
 //! A member with no base-op form (`special-functions`, `ext-linear-algebra`, the
-//! Wigner functions, the higher-order `distances` members) is left ALONE here, not
-//! refused: a call in a binding that root-based DCE drops must keep being dropped
-//! rather than refuse. `conformance::is_flatpdl` names the member in its refusal
-//! for the calls that do survive.
+//! Wigner functions, the higher-order `distances` members) is left ALONE here.
+//! FlatPDL keeps the call and its `standard_module` binding, and each engine
+//! lowers or refuses the member itself.
 //!
 //! A member this pass does implement, but whose call shape it cannot read (invalid
 //! arguments, wrong arity, a non-literal degree), is likewise left alone.
@@ -92,7 +91,7 @@ pub(crate) fn lower_std_module_functions(
         let targets = collect_member_calls(m);
         let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
         for (id, module, member) in targets {
-            if options.retains(&module, &member) {
+            if options.retains(&module, &member) || !has_base_op_form(&module, &member) {
                 if let Some(new) = normalize_member_call(m, id, &module, &member) {
                     replacements.insert(id, new);
                 }
@@ -277,12 +276,44 @@ fn lower_member_broadcast(
     Some(build_call(m, "broadcast", &mapped_args))
 }
 
+/// Whether [`lower_member_function`] expands `module.member` into base ops. Such a
+/// call that survives the pass has a shape the pass cannot read, so it refuses.
+/// Every other §09 function member stays a call in FlatPDL.
+pub(crate) fn has_base_op_form(module: &str, member: &str) -> bool {
+    matches!(
+        (module, member),
+        ("pyhf-helpers" | "splines", _)
+            | (
+                "particle-physics",
+                "interp_pwlin"
+                    | "interp_pwexp"
+                    | "interp_poly2_lin"
+                    | "interp_poly6_lin"
+                    | "interp_poly6_exp"
+                    | "kallen"
+                    | "breakup_momentum"
+                    | "blatt_weisskopf"
+            )
+            | (
+                "polynomials",
+                "legendre" | "hermite" | "laguerre" | "chebyshev"
+            )
+            | (
+                "distances",
+                "euclidean" | "squared_euclidean" | "manhattan" | "chebyshev" | "cosine"
+            )
+    )
+}
+
 fn lower_member_function(
     m: &mut Module,
     args: &[NodeId],
     module: &str,
     member: &str,
 ) -> Option<NodeId> {
+    if !has_base_op_form(module, member) {
+        return None;
+    }
     match (module, member) {
         ("pyhf-helpers", member) => pyhf::lower_function(m, args, member),
         ("splines", member) => splines::lower_function(m, args, member),

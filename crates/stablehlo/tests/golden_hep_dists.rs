@@ -78,14 +78,15 @@ fn emit_err(src: &str) -> String {
 
 // CrystalBall's density is piecewise, so the emission needs a `compare` + `select`
 // pair for the tail/core branch, and its normalizer needs `chlo.erf` for the
-// Gaussian core's integral.
+// Gaussian core's integral. A runtime `alpha` keeps erf from constant-folding.
 #[test]
 fn crystal_ball_emits_a_selected_branch_and_an_erf_normalizer() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 x = elementof(reals)
-lp = logdensityof(hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0), x)
-inputs = (x)
+a = elementof(posreals)
+lp = logdensityof(hep.CrystalBall(m0 = 5.279, sigma = 0.003, alpha = a, n = 3.0), x)
+inputs = (x, a)
 outputs = lp";
     let mlir = emit(src);
     assert!(
@@ -100,13 +101,15 @@ outputs = lp";
 
 // Argus at §09's typical `power = 0.5`: the incomplete-gamma normalizer collapses
 // to `erf`, so it emits without an igamma op (which this emitter does not carry).
+// A runtime `slope` keeps erf from constant-folding.
 #[test]
 fn argus_at_power_half_emits_an_erf_normalizer() {
     let src = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
 x = elementof(reals)
-lp = logdensityof(hep.Argus(resonance = 5.29, slope = -20.0, power = 0.5), x)
-inputs = (x)
+c = elementof(reals)
+lp = logdensityof(hep.Argus(resonance = 5.29, slope = c, power = 0.5), x)
+inputs = (x, c)
 outputs = lp";
     let mlir = emit(src);
     assert!(

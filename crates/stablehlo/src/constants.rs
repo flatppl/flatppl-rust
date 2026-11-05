@@ -577,7 +577,7 @@ fn dense_literal(values: &[Scalar], dims: &[Option<u64>]) -> Option<String> {
 fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
     // Use each target's math implementation, not f64 followed by f32 rounding.
     macro_rules! unary {
-        ($x:expr, $log:path, $exp:path, $sqrt:path, $lgamma:path, $log1p:path, $expm1:path) => {{
+        ($x:expr, $log:path, $exp:path, $sqrt:path, $lgamma:path, $log1p:path, $expm1:path, $erf:path, $erfc:path) => {{
             let x = $x;
             match op {
                 "stablehlo.negate" => -x,
@@ -588,6 +588,8 @@ fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
                 "stablehlo.log_plus_one" => $log1p(x),
                 "stablehlo.exponential_minus_one" => $expm1(x),
                 "chlo.lgamma" => $lgamma(x),
+                "chlo.erf" => $erf(x),
+                "chlo.erfc" => $erfc(x),
                 _ => return None,
             }
         }};
@@ -600,7 +602,9 @@ fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
             libm::sqrtf,
             libm::lgammaf,
             libm::log1pf,
-            libm::expm1f
+            libm::expm1f,
+            libm::erff,
+            libm::erfcf
         ) as f64,
         Dtype::F64 => unary!(
             x,
@@ -609,7 +613,9 @@ fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
             libm::sqrt,
             libm::lgamma,
             libm::log1p,
-            libm::expm1
+            libm::expm1,
+            libm::erf,
+            libm::erfc
         ),
     })
 }

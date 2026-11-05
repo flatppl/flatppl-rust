@@ -65,6 +65,8 @@ mod pyhf;
 mod records;
 #[path = "runtime_status.rs"]
 mod runtime_status;
+#[path = "special.rs"]
+mod special;
 use runtime_status::append_runtime_status;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
@@ -4370,6 +4372,9 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_special_function_call(id, f, &args[1..], true) {
+            return result;
+        }
         let fname = match self.m.node(f) {
             Node::Const(sym) => self.m.resolve(*sym).to_string(),
             _ => {
@@ -4664,9 +4669,10 @@ impl<'m> Emitter<'m> {
                     // dispatch to the distribution registry (`crate::registry`),
                     // never to `ops::lower_builtin`'s deterministic
                     // (non-distribution) map — see that module's doc comment.
-                    if let Some(result) = matches!(name.as_str(), "builtin_logdensityof" | "builtin_sample")
-                        .then(|| self.lower_box_primitive(id, &name, &call.args))
-                        .flatten()
+                    if let Some(result) =
+                        matches!(name.as_str(), "builtin_logdensityof" | "builtin_sample")
+                            .then(|| self.lower_box_primitive(id, &name, &call.args))
+                            .flatten()
                     {
                         result
                     } else if name == "builtin_logdensityof" {
@@ -4678,13 +4684,20 @@ impl<'m> Emitter<'m> {
                     } else if name == "rnginit" {
                         self.lower_rnginit(id, &call.args)
                     } else if name == "rngstate" {
-                        Err(EmitError::at(id, "rngstate byte deserialization is not supported"))
-                    } else if matches!(name.as_str(), "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal") {
+                        Err(EmitError::at(
+                            id,
+                            "rngstate byte deserialization is not supported",
+                        ))
+                    } else if matches!(
+                        name.as_str(),
+                        "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal"
+                    ) {
                         crate::registry::lower_transport(self, id, &name, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "scan" | "reduce") {
-                        self.lower_sequence(id, &call.args, name == "reduce")?.tensor(id)
+                        self.lower_sequence(id, &call.args, name == "reduce")?
+                            .tensor(id)
                     } else if name == "mul" {
                         // A BARE `mul` is the surface `*`, which spec §07 "Linear
                         // algebra" defines as the MATRIX product ("Matrix
@@ -4769,10 +4782,20 @@ impl<'m> Emitter<'m> {
                 CallHead::User(callee) => self
                     .lower_box_application(id, callee, &call.args)
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
-                    .unwrap_or_else(|| Err(EmitError::at(
-                        id,
-                        "user-callable application has no lowering (expected to be inlined by determinize)",
-                    ))),
+                    .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
+                    .unwrap_or_else(|| {
+                        Err(EmitError::at(
+                            id,
+                            match flatppl_determinizer::standard_function(self.m, callee) {
+                                Some((module, member)) => {
+                                    format!("{module}.{member} has no StableHLO lowering")
+                                }
+                                None => "user-callable application has no lowering (expected to \
+                                     be inlined by determinize)"
+                                    .to_string(),
+                            },
+                        ))
+                    }),
             },
         }
     }
