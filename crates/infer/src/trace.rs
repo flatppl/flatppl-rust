@@ -136,6 +136,8 @@ pub(crate) struct Inferencer<'m, 's> {
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
     active_bindings: HashSet<BindingId>,
+    /// Bodies of recursive callables, which a call must not substitute.
+    recursive_bodies: HashSet<NodeId>,
     /// Ops already reported as catalogue gaps (one note per op).
     noted_gaps: HashSet<Symbol>,
     /// For a cross-module callable reference (`helpers.obs_kernel`), the
@@ -228,6 +230,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             seeds: HashMap::new(),
             in_progress: Vec::new(),
             active_bindings: HashSet::new(),
+            recursive_bodies: HashSet::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_callable_interfaces: HashMap::new(),
@@ -339,6 +342,100 @@ impl<'m, 's> Inferencer<'m, 's> {
                 (Type::Failed("axis out of position".into()), Phase::Fixed),
             );
             self.diags.push(diag);
+        }
+        self.refuse_recursive_callables();
+    }
+
+    /// Spec §04: a module is a directed acyclic graph. A function or kernel whose
+    /// body reaches its own binding, directly or through other bindings, recurses.
+    /// Its body is only traced when it is called, so the binding cycle check never
+    /// sees it, and each call would substitute the body again. Fail the binding
+    /// before the trace starts.
+    fn refuse_recursive_callables(&mut self) {
+        let bindings: Vec<(BindingId, NodeId)> =
+            self.module.bindings().map(|(id, b)| (id, b.rhs)).collect();
+        let index: HashMap<BindingId, usize> = bindings
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, i))
+            .collect();
+        let mut edges = vec![Vec::new(); bindings.len()];
+        for (i, &(_, rhs)) in bindings.iter().enumerate() {
+            let mut stack = vec![rhs];
+            let mut seen = HashSet::new();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) = self.module.node(id)
+                    && let Some(b) = self.module.binding_by_name(*name)
+                {
+                    edges[i].push(index[&b]);
+                }
+                self.module.for_each_child(id, |child| stack.push(child));
+            }
+        }
+        let callable = |i: usize| matches!(self.module.node(bindings[i].1), Node::Call(c) if c.inputs.is_some());
+        let mut reported = HashSet::new();
+        for start in (0..bindings.len()).filter(|&i| callable(i)) {
+            // A path back to `start` through the reference graph.
+            let mut parent = vec![usize::MAX; bindings.len()];
+            let mut stack = edges[start].clone();
+            for &next in &edges[start] {
+                parent[next] = start;
+            }
+            let mut cycle = None;
+            while let Some(i) = stack.pop() {
+                if i == start {
+                    cycle = Some(i);
+                    break;
+                }
+                for &next in &edges[i] {
+                    if parent[next] == usize::MAX {
+                        parent[next] = i;
+                        stack.push(next);
+                    }
+                }
+            }
+            if cycle.is_none() {
+                continue;
+            }
+            // Walk the parents back from `start`, then read the cycle forwards.
+            let mut cycle = vec![start];
+            let mut at = parent[start];
+            while at != start && cycle.len() <= bindings.len() {
+                cycle.push(at);
+                at = parent[at];
+            }
+            cycle.push(start);
+            cycle.reverse();
+            if !cycle.iter().any(|i| reported.contains(i)) {
+                let name = |i: &usize| {
+                    self.module
+                        .resolve(self.module.binding(bindings[*i].0).name)
+                };
+                let message = format!(
+                    "`{}` calls itself ({}); a FlatPPL module is an acyclic graph, so functions \
+                     and kernels cannot recurse (spec §04)",
+                    name(&start),
+                    cycle.iter().map(name).collect::<Vec<_>>().join(" → ")
+                );
+                self.diags.push(Diagnostic::error(message));
+            }
+            reported.extend(cycle);
+            let rhs = bindings[start].1;
+            if let Node::Call(c) = self.module.node(rhs)
+                && let Some(&body) = c.args.first()
+            {
+                self.recursive_bodies.insert(body);
+            }
+            self.inferred.insert(
+                rhs,
+                (Type::Failed("recursive definition".into()), Phase::Fixed),
+            );
         }
     }
 
@@ -1160,6 +1257,14 @@ impl<'m, 's> Inferencer<'m, 's> {
         } else {
             Vec::new()
         };
+        let recursive = self.recursive_bodies.contains(&body);
+        if recursive {
+            // Already reported once for the definition; every call fails with it.
+            self.inferred.insert(
+                body,
+                (Type::Failed("recursive definition".into()), Phase::Fixed),
+            );
+        }
         work.push(Work::ResumeBody(Box::new(BodyFrame {
             body,
             seeds,
@@ -1167,7 +1272,9 @@ impl<'m, 's> Inferencer<'m, 's> {
             scope,
             resume,
         })));
-        work.push(Work::Enter(body));
+        if !recursive {
+            work.push(Work::Enter(body));
+        }
     }
 
     fn finish_call_type(
