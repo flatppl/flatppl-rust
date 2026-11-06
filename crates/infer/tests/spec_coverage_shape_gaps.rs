@@ -703,6 +703,11 @@ fn fill_and_array_element_kind_and_shape() {
         out.contains("(%array 1 (3) (%scalar integer))") && out.contains("(fill"),
         "fill(2, 3) should be a length-3 integer vector, got:\n{out}"
     );
+    let out = ir_at("x = fill(fill(0, 3), 2)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (2) (%array 1 (3) (%scalar integer)))"),
+        "fill(fill(0, 3), 2) should be two integer 3-vectors, got:\n{out}"
+    );
     // §07 declares `array | data, size, dimorder` with no default for
     // `dimorder`, so all three are supplied.
     let out = ir_at(
