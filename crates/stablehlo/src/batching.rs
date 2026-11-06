@@ -352,6 +352,27 @@ impl Emitter<'_> {
         self.expand_axes(v, &map, tensor(dims), axes)
     }
 
+    /// Repeat an array cell over the leading axes of `ty`, as one more nesting
+    /// layer outside its own. `None` when the cell does not end `ty`.
+    pub(crate) fn fill_array(&mut self, v: &Value, ty: &MlirTy) -> Option<Value> {
+        let cell = self.cell_ty(v);
+        let (inner, total) = (shape(&cell), shape(ty));
+        if inner.len() > total.len() || total[total.len() - inner.len()..] != *inner {
+            return None;
+        }
+        let outer = total.len() - inner.len();
+        let batch = self.batch_rank(v);
+        let mut dims = shape(&v.ty)[..batch].to_vec();
+        dims.extend_from_slice(total);
+        let map = (0..batch)
+            .chain(batch + outer..batch + total.len())
+            .map(|d| d as u64)
+            .collect::<Vec<_>>();
+        let mut layers = vec![outer];
+        layers.extend(self.axes_of(v).layers);
+        Some(self.expand_axes(v, &map, tensor(dims), Axes { batch, layers }))
+    }
+
     pub(crate) fn reshape_cell(&mut self, v: &Value, cell: MlirTy) -> Value {
         let mut dims = shape(&v.ty)[..self.batch_rank(v)].to_vec();
         dims.extend_from_slice(shape(&cell));

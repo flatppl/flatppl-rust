@@ -1,4 +1,4 @@
-//! §07 array and index operations as emitter heads: `onehot`, `reverse`, `tile`,
+//! §07 array and index operations as emitter heads: `fill`, `onehot`, `reverse`, `tile`,
 //! `splitblocks`, `joinblocks`, `partition`, `blockdiagmat`, `bandedmat`,
 //! `bincounts`, `selectbins` and `filter`. Structural only: the
 //! values and gradients are checked by executing the modules under Enzyme-JAX
@@ -48,6 +48,8 @@ fn refuses(expr: &str, needle: &str) {
 #[test]
 fn shapes_follow_the_written_sizes() {
     returns("onehot(2, 3)", "tensor<3xf32>");
+    returns("fill(v, 2)", "tensor<2x3xf32>");
+    returns("fill(A, [2, 1])", "tensor<2x1x2x4xf32>");
     returns("reverse(v)", "tensor<3xf32>");
     returns("reverse([v, w])", "tensor<2x3xf32>");
     returns("tile(v, 3)", "tensor<9xf32>");
