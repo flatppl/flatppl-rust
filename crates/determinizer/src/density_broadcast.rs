@@ -694,6 +694,29 @@ fn sum_density_with(
         Some(Type::Array { shape, .. }) => shape.len(),
         _ => 1,
     };
+    // §04: "All collection arguments ... must have the same number of axes." A
+    // matrix observed for a vector of vector-valued cells breaks it, since the
+    // matrix is iterated by element, not by row.
+    for &arg in &args {
+        let (arg_resolved, _) = resolve_ref(m, arg);
+        let axes = match known_type(m, arg).or_else(|| known_type(m, arg_resolved)) {
+            Some(Type::Array { shape, .. }) => shape.len(),
+            Some(Type::Table { .. }) => 1,
+            _ => continue,
+        };
+        if axes != rank {
+            return Err(refuse(
+                values,
+                m,
+                &format!(
+                    "density broadcast: the observation has {rank} axes but the broadcast \
+                     operands have {axes}, and §04 broadcasting needs the same number of axes. \
+                     A matrix is iterated by element, so observe an array of arrays, one per \
+                     cell (for example `pair.(u, v)` with `pair(a, b) = [a, b]`), not a matrix"
+                ),
+            ));
+        }
+    }
     let point = cell_input(m, values, &mut inputs, &mut args)?;
     let body = lower_measure_density(m, measure, point)?;
     let mapped = map_body(m, body, inputs, args, rank);

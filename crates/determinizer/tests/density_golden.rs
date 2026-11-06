@@ -567,6 +567,29 @@ splitblocks(rowstack([[true, false], [false, false]]), [1, 2]))";
     );
 }
 
+// §04: broadcast collections need the same number of axes. A matrix observed for
+// a vector of 2-vector cells would be iterated by element, so the density refuses
+// and names the array-of-arrays form. The array of pairs lowers.
+#[test]
+fn a_matrix_observation_for_vector_cells_refuses_and_names_the_array_form() {
+    let model = |observation: &str| {
+        format!(
+            "r = elementof(posreals)\n\
+             y ~ broadcast(a -> joint(Exponential(a), Exponential(2.0)), [r, 1.0])\n\
+             lp = logdensityof(lawof(y), {observation})"
+        )
+    };
+    let mut m = flatppl_syntax::parse(&model("colstack([[0.5, 1.0], [0.2, 0.4]])")).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("a matrix observation for vector cells must refuse");
+    assert!(
+        err.reason.contains("observe an array of arrays"),
+        "expected the array-of-arrays refusal, got: {}",
+        err.reason
+    );
+    determinize_src(&model("[[0.5, 0.2], [1.0, 0.4]]"));
+}
+
 // Weights need NOT sum to one — here 0.3 + 0.5 = 0.8 — the normalizer is the
 // general `log(add w₁ w₂)`. Regression for the dissimilar mixture.
 #[test]
