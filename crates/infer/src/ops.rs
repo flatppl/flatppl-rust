@@ -628,19 +628,41 @@ fn op_rule(
                 _ => Type::Deferred,
             }
         }
-        // splitblocks(A, blocksize) (spec §07) nests A into a vector of equal
-        // sub-arrays. Exact for a 1-D scalar vector → vector of sub-vectors;
-        // multi-D outer rank is value-dependent, so those defer.
+        // splitblocks(A, blocksize) (spec §07) nests A into an array of equal
+        // sub-arrays: "blocksize is ... one per axis of A ... the outer-array
+        // shape is the elementwise quotient, and every inner array has shape
+        // blocksize". Both ranks are A's.
         "splitblocks" => match arg_ty(args, 0) {
-            Some(Type::Array { shape, elem })
-                if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_)) =>
-            {
-                Type::Array {
-                    shape: Box::new([Dim::Dynamic]),
-                    elem: Box::new(Type::Array {
+            Some(Type::Array { shape, elem }) if matches!(elem.as_ref(), Type::Scalar(_)) => {
+                let blocks = args
+                    .get(1)
+                    .map(|a| count_dims(inf, a.0))
+                    .filter(|blocks| blocks.len() == shape.len());
+                match blocks {
+                    Some(blocks) => Type::Array {
+                        shape: shape
+                            .iter()
+                            .zip(blocks.iter())
+                            .map(|(n, b)| match (n, b) {
+                                (Dim::Static(n), Dim::Static(b)) if *b > 0 && n % b == 0 => {
+                                    Dim::Static(n / b)
+                                }
+                                _ => Dim::Dynamic,
+                            })
+                            .collect(),
+                        elem: Box::new(Type::Array {
+                            shape: blocks,
+                            elem: elem.clone(),
+                        }),
+                    },
+                    None if shape.len() == 1 => Type::Array {
                         shape: Box::new([Dim::Dynamic]),
-                        elem: elem.clone(),
-                    }),
+                        elem: Box::new(Type::Array {
+                            shape: Box::new([Dim::Dynamic]),
+                            elem: elem.clone(),
+                        }),
+                    },
+                    None => Type::Deferred,
                 }
             }
             _ => Type::Deferred,

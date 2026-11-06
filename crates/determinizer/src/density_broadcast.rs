@@ -562,7 +562,7 @@ fn bind_call(
     let mut args = Vec::new();
     let mut bind = |m: &mut Module, value| {
         let (resolved, _) = resolve_ref_chain(m, value);
-        match m.type_of(value).or_else(|| m.type_of(resolved)) {
+        match known_type(m, value).or_else(|| known_type(m, resolved)) {
             Some(Type::Array { .. } | Type::Table { .. }) => {
                 cell_input(m, value, &mut inputs, &mut args)
             }
@@ -630,7 +630,7 @@ pub(crate) fn cell_input(
     args: &mut Vec<NodeId>,
 ) -> Result<NodeId, RefuseError> {
     let (resolved, _) = resolve_ref(m, values);
-    let ty = m.type_of(values).or_else(|| m.type_of(resolved)).cloned();
+    let ty = known_type(m, values).or_else(|| known_type(m, resolved));
     let point = match ty {
         Some(Type::Array { elem, .. }) => {
             let (label, reference, value) = placeholder(m, *elem);
