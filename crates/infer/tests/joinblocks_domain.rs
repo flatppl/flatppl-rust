@@ -26,7 +26,7 @@ fn joinblocks_requires_nesting_and_preserves_the_inverse_shape() {
     );
     let output = flatppl_flatpir::write(&valid);
     assert!(
-        output.contains("(%array 1 (%dynamic) (%scalar integer))"),
+        output.contains("(%array 1 (4) (%scalar integer))"),
         "{output}"
     );
 

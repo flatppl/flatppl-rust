@@ -506,6 +506,67 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 // variate-independent scalar weights is a convex superposition: by §06 the total
 // mass is additive/multiplicative, Z = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ (a closed-form
 // scalar), so it lowers to the superpose density minus `log(Σ wᵢ)`, NOT a refuse.
+// §06: a product measure's density is taken against the product of its factors'
+// references. Two joints of Lebesgue factors share the Lebesgue reference on the
+// product space, so their superposition adds the two densities.
+#[test]
+fn a_superposition_of_continuous_joints_shares_the_product_reference() {
+    let src = "\
+a = elementof(posreals)
+mix = normalize(superpose(weighted(0.3, joint(Exponential(a), Exponential(2.0))), \
+weighted(0.7, joint(Exponential(3.0), Exponential(4.0)))))
+lp = logdensityof(mix, [0.5, 0.2])";
+    let text = flatppl_syntax::print(&determinize_src(src));
+    assert!(
+        text.contains("logsumexp") && text.matches("builtin_logdensityof(Exponential").count() == 4,
+        "expected one log-sum-exp over the two joint densities:\n{text}"
+    );
+}
+
+// A joint of a Lebesgue and a counting factor has a mixed product reference.
+// Two such components could share it, but no reference here names it, so the
+// superposition refuses rather than add densities against unproven references.
+#[test]
+fn a_superposition_of_mixed_reference_joints_refuses() {
+    let src = "\
+mix = superpose(weighted(0.3, joint(Exponential(1.0), Poisson(2.0))), \
+weighted(0.7, joint(Exponential(3.0), Poisson(4.0))))
+lp = logdensityof(mix, [0.5, 2])";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("a mixed product reference must refuse");
+    assert!(
+        err.reason.contains("fixed common reference"),
+        "expected the common-reference refusal, got: {}",
+        err.reason
+    );
+}
+
+// The cells of a constructor broadcast share its counting reference, and a Dirac
+// at a boolean array is counting too. Inside an applied kernel the components
+// keep their definition's deferred types, so the reference and the unit masses
+// must be read from the cells the kernel is applied to.
+#[test]
+fn a_capture_mixture_over_matrix_cells_normalizes_by_its_weights() {
+    let src = "\
+w = elementof(unitinterval)
+capture(row, omega) = normalize(superpose(weighted(omega, Bernoulli.(invlogit.(row))), \
+weighted(1 - omega, Dirac(fill(false, [1, 2])))))
+lp = logdensityof(capture.(splitblocks(rowstack([[0.2, -0.4], [1.0, 0.5]]), [1, 2]), w), \
+splitblocks(rowstack([[true, false], [false, false]]), [1, 2]))";
+    let text = flatppl_syntax::print(&determinize_src(src));
+    assert!(
+        text.contains("logsumexp") && text.contains("builtin_logdensityof(Dirac"),
+        "expected the two-component mixture per cell:\n{text}"
+    );
+    // The Bernoulli cell density is itself a sum over the 1 x 2 cell, so each
+    // mixture component is a scalar.
+    assert!(
+        text.matches("sum(").count() >= 2,
+        "the Bernoulli product inside each cell must be summed:\n{text}"
+    );
+}
+
 // Weights need NOT sum to one — here 0.3 + 0.5 = 0.8 — the normalizer is the
 // general `log(add w₁ w₂)`. Regression for the dissimilar mixture.
 #[test]
