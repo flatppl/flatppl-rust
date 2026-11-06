@@ -568,6 +568,40 @@ pub(crate) fn lower_selectbins(
     Ok(e.vector(&picked))
 }
 
+/// `filter(pred, xs)` over a vector. The result length is static only when the
+/// predicate is known for every element at emit time, as it is over fixed data.
+/// The kept elements are then read at their fixed positions.
+pub(crate) fn lower_filter(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [pred, data] = args_exact(id, args).map_err(|_| refuse_filter(id))?;
+    let xs = e.lower_node(data)?;
+    let [n] = dims(e, id, &xs, "filter").map_err(|_| refuse_filter(id))?[..] else {
+        return Err(refuse_filter(id));
+    };
+    let mask = e.lower_broadcast(id, &[pred, data])?;
+    let keep = (0..n as usize)
+        .map(|i| match e.fixed_scalar_at(&mask, i) {
+            Some(&Scalar::Bool(b)) => Some(b),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| refuse_filter(id))?;
+    let kept = (0..n)
+        .filter(|&i| keep[i as usize])
+        .map(|i| get_literal_value(e, id, xs.clone(), i))
+        .collect::<Result<Vec<_>, _>>()?;
+    if kept.is_empty() {
+        return Err(EmitError::at(
+            id,
+            "filter: no element is kept, and an empty result has no tensor form here",
+        ));
+    }
+    Ok(e.vector(&kept))
+}
+
 /// `filter`'s result length depends on the data, which StableHLO's static
 /// shapes cannot carry.
 pub(crate) fn refuse_filter(id: NodeId) -> EmitError {
