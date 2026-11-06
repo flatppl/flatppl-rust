@@ -476,15 +476,18 @@ fn op_rule(
             shape: Box::new([args.get(1).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0))]),
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
-        "fill" => Type::Array {
-            shape: args.get(1).map_or_else(
-                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
-                |a| count_dims(inf, a.0),
-            ),
-            elem: Box::new(match arg_ty(args, 0) {
-                Some(Type::Scalar(s)) => Type::Scalar(*s),
-                _ => Type::Scalar(ScalarType::Real),
-            }),
+        // §07: "an array of shape `size` filled with value `x`". Every element is
+        // `x`, so an array `x` gives an array of arrays. An `x` not yet typed leaves
+        // the element, and so the result, deferred.
+        "fill" => match arg_ty(args, 0) {
+            Some(x @ (Type::Scalar(_) | Type::Array { .. })) => Type::Array {
+                shape: args.get(1).map_or_else(
+                    || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                    |a| count_dims(inf, a.0),
+                ),
+                elem: Box::new(x.clone()),
+            },
+            _ => Type::Deferred,
         },
         // array(data, size, dimorder): n-d array of `size`, element kind from data.
         "array" => Type::Array {

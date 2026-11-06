@@ -2497,7 +2497,8 @@ fn lower_binary_extremum(
 }
 
 /// §07 `fill(x, size)` — "creates an array of shape `size` filled with value
-/// `x`", one `stablehlo.broadcast_in_dim` of the scalar `x`.
+/// `x`", one `stablehlo.broadcast_in_dim` of `x`. An array `x` gives an array of
+/// arrays.
 ///
 /// The result shape is read off `id`'s OWN inferred type, not by lowering
 /// `size`: inference has already resolved the result shape, including sizes
@@ -2528,12 +2529,6 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         }
     }
     let x = e.lower_node(x_id)?;
-    if e.cell_ty(&x) != MlirTy::Scalar {
-        return Err(EmitError::at(
-            id,
-            format!("fill: fill value must be a scalar, got {:?}", x.ty),
-        ));
-    }
     if elem_rank(x.elem) > elem_rank(kind) {
         return Err(EmitError::at(
             id,
@@ -2545,7 +2540,16 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         ));
     }
     let x = e.convert(&x, kind);
-    Ok(e.fill_cell(&x, ty))
+    let cell = e.cell_ty(&x);
+    if cell == MlirTy::Scalar {
+        return Ok(e.fill_cell(&x, ty));
+    }
+    e.fill_array(&x, &ty).ok_or_else(|| {
+        EmitError::at(
+            id,
+            format!("fill: the fill value {cell:?} does not end the result shape {ty:?}"),
+        )
+    })
 }
 
 /// §07 `linspace(from, to, n)`: `n` evenly spaced reals with both ends included,
