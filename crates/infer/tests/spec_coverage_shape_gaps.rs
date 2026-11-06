@@ -832,8 +832,8 @@ fn table_constructor_infers() {
 }
 
 /// `addaxes(A, nl, nt)` (spec §07) inserts size-1 axes around A — exact dims
-/// when the counts are fixed; `splitblocks(v, bs)` nests a 1-D vector into a
-/// vector of sub-vectors.
+/// when the counts are fixed; `splitblocks(A, bs)` nests A into an array of
+/// sub-arrays of shape `bs`, the outer shape being the elementwise quotient.
 #[test]
 fn addaxes_and_splitblocks_infer() {
     let out = ir("v = [1.0, 2.0, 3.0]\nx = addaxes(v, 1, 0)");
@@ -848,9 +848,14 @@ fn addaxes_and_splitblocks_infer() {
     );
     let out = ir("v = [1.0, 2.0, 3.0, 4.0]\nx = splitblocks(v, 2)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))")
             && out.contains("(splitblocks"),
         "splitblocks(1-D) should be a vector of real sub-vectors, got:\n{out}"
+    );
+    let out = ir("A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = splitblocks(A, [1, 2])");
+    assert!(
+        out.contains("(%array 2 (2 1) (%array 2 (1 2) (%scalar real)))"),
+        "splitblocks(matrix, [1, 2]) should be a 2x1 array of 1x2 blocks, got:\n{out}"
     );
 }
 

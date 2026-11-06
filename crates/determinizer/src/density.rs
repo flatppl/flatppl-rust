@@ -3648,7 +3648,8 @@ fn superposition_reference(
                 let value = named_or_positional(m, &call, "value")?;
                 if let Some(atom) = static_real(m, value).filter(|x| x.is_finite()) {
                     Some(SuperpositionReference::Atoms(vec![atom]))
-                } else if m.type_of(value).and_then(reference_measure) == Some(Reference::Counting)
+                } else if known_type(m, value).as_ref().and_then(reference_measure)
+                    == Some(Reference::Counting)
                 {
                     Some(SuperpositionReference::Counting)
                 } else {
@@ -3692,6 +3693,47 @@ fn superposition_reference(
                     .map(|&arg| superposition_reference(m, arg, path))
                     .collect();
                 SuperpositionReference::common(&references?)
+            }
+            // A product measure has the product of its factors' references. Only
+            // factors on one common reference give a reference this enum names.
+            "joint" => {
+                let factors = call
+                    .args
+                    .iter()
+                    .copied()
+                    .chain(call.named.iter().map(|a| a.value));
+                let mut common = None;
+                for factor in factors.collect::<Vec<_>>() {
+                    let reference = superposition_reference(m, factor, path)?;
+                    if !matches!(
+                        reference,
+                        SuperpositionReference::Lebesgue | SuperpositionReference::Counting
+                    ) || common.as_ref().is_some_and(|c| *c != reference)
+                    {
+                        return None;
+                    }
+                    common = Some(reference);
+                }
+                common
+            }
+            // A constructor broadcast is the product of its cells' laws, which share
+            // the constructor's reference. A Dirac cell has no density on it.
+            "broadcast" => {
+                let ctor = match m.node(*call.args.first()?) {
+                    Node::Const(sym) => m.resolve(*sym),
+                    _ => return None,
+                };
+                if ctor == "Dirac" || flatppl_infer::distribution_param_names(ctor).is_none() {
+                    return None;
+                }
+                let ty = known_type(m, node)?;
+                let Type::Measure { domain, .. } = ty else {
+                    return None;
+                };
+                reference_measure(&domain).map(|reference| match reference {
+                    Reference::Lebesgue => SuperpositionReference::Lebesgue,
+                    Reference::Counting => SuperpositionReference::Counting,
+                })
             }
             _ if flatppl_infer::distribution_param_names(name).is_some() => {
                 // Applying a row kernel rebuilds its constructor without the
@@ -4350,7 +4392,7 @@ fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<No
                 mass: Mass::Normalized,
                 ..
             })
-        );
+        ) || is_constructor_broadcast(m, base_resolved);
         if !base_normalized {
             return None;
         }
@@ -4363,6 +4405,58 @@ fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<No
         weights.push(weight);
     }
     Some(weights)
+}
+
+/// The type of `node`, inferred again when its annotation is missing or still
+/// deferred. An applied kernel's body keeps the annotations of its definition,
+/// where the cells were not yet known.
+fn known_type(m: &mut Module, node: NodeId) -> Option<Type> {
+    let deferred = |ty: &Type| {
+        matches!(ty, Type::Deferred)
+            || matches!(ty, Type::Measure { domain, .. } if **domain == Type::Deferred)
+    };
+    if let Some(ty) = m.type_of(node).filter(|ty| !deferred(ty)) {
+        return Some(ty.clone());
+    }
+    let locals = typed_locals(m, node);
+    flatppl_infer::infer_expression(m, node, &locals)
+        .0
+        .remove(&node)
+        .filter(|ty| !deferred(ty))
+}
+
+/// The typed local references under `root`. An applied kernel's body reads its
+/// cell through such placeholders, and inference needs their types as inputs.
+fn typed_locals(m: &Module, root: NodeId) -> Vec<(NodeId, Type)> {
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::Local, ..
+        }) = m.node(id)
+            && let Some(ty) = m.type_of(id)
+        {
+            found.push((id, ty.clone()));
+        }
+        m.for_each_child(id, |child| stack.push(child));
+    }
+    found
+}
+
+/// A broadcast of a distribution constructor is the product of its cells' laws,
+/// so it is a probability measure whatever its arguments. Inside an applied
+/// kernel the arguments are placeholders, which leave the inferred mass unknown.
+fn is_constructor_broadcast(m: &Module, node: NodeId) -> bool {
+    expect_builtin_call(m, node, "broadcast")
+        .and_then(|c| c.args.first().copied())
+        .is_some_and(|ctor| {
+            matches!(m.node(ctor), Node::Const(sym)
+                if flatppl_infer::distribution_param_names(m.resolve(*sym)).is_some())
+        })
 }
 
 /// A recognized `normalize(logweighted(…))` pointwise product of two Gaussians.
