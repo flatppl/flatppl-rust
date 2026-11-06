@@ -1,6 +1,6 @@
 //! §07 array and index operations as emitter heads: `onehot`, `reverse`, `tile`,
 //! `splitblocks`, `joinblocks`, `partition`, `blockdiagmat`, `bandedmat`,
-//! `bincounts` and `selectbins`, and the `filter` refusal. Structural only: the
+//! `bincounts`, `selectbins` and `filter`. Structural only: the
 //! values and gradients are checked by executing the modules under Enzyme-JAX
 //! against numpy in the PR.
 
@@ -69,6 +69,17 @@ fn shapes_follow_the_written_sizes() {
     returns(
         "bincounts([0.0, 1.0, 2.0], [0.5, z0, 2.0])",
         "tensor<2xi32>",
+    );
+}
+
+// A predicate known for every element at emit time keeps a static number of
+// elements; one that reads a run-time value does not (see the refusals below).
+#[test]
+fn filter_over_fixed_data_keeps_a_static_count() {
+    returns("filter(fn(_ > 1.5), [1.0, 2.0, 3.0])", "tensor<2xf32>");
+    returns(
+        "filter(k -> [1.0, 0.0, 1.0, 1.0][k] > 0.5, [1, 2, 3, 4])",
+        "tensor<3xi32>",
     );
 }
 
@@ -162,6 +173,7 @@ fn what_has_no_static_shape_refuses_with_its_reason() {
         "filter(fn(_ > 1.5), v)",
         "data-dependent number of elements",
     );
+    refuses("filter(fn(_ > 9.0), [1.0, 2.0])", "no element is kept");
     refuses(
         "onehot.([1, 2], 3)",
         "`onehot` under a broadcast has no lowering here",

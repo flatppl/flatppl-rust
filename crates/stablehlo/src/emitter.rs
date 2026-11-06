@@ -4388,7 +4388,11 @@ impl<'m> Emitter<'m> {
     /// Dist, broadcast(record, …), vec)` → `registry::lower_logdensityof` over the
     /// batched record + vector variate, yielding a rank-1 vector of
     /// log-densities (its `sum` caller reduces it to the iid log-likelihood).
-    fn lower_broadcast(&mut self, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    pub(crate) fn lower_broadcast(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+    ) -> Result<Value, EmitError> {
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;

@@ -151,18 +151,37 @@ outputs = (lp)
     );
 }
 
-/// The default-deny gate still holds for a dist with neither route:
-/// `NegativeBinomial2`'s builder uses `get0`/`reshape`, and it carries no batched
-/// builder.
+/// `NegativeBinomial2`'s density is arithmetic and `lgamma` in `mu`, `psi` and
+/// the count, so a broadcast scores every observation at once.
 #[test]
-fn a_dist_with_neither_route_still_refuses_under_broadcast() {
-    let msg = refusal(
+fn a_negative_binomial2_broadcast_scores_each_count() {
+    let out = emit(
         "\
 flatppl_compat = \"0.1\"
 obs = [1, 3, 2, 1]
 mu = elementof(posreals)
 lp = logdensityof(iid(NegativeBinomial2(mu = mu, psi = 2.0), 4), obs)
 inputs = (mu)
+outputs = (lp)
+",
+    );
+    assert!(
+        out.contains("applies stablehlo.add across dimensions = [0] : (tensor<4xf32>"),
+        "expected one sum over the four per-count terms, in:\n{out}"
+    );
+}
+
+/// The default-deny gate still holds for a dist with neither route:
+/// `Dirichlet`'s builder reduces over its simplex, and it carries no batched
+/// builder.
+#[test]
+fn a_dist_with_neither_route_still_refuses_under_broadcast() {
+    let msg = refusal(
+        "\
+flatppl_compat = \"0.1\"
+a = elementof(posreals)
+lp = logdensityof(Dirichlet.([[a, 2.0], [2.0, a]]), [[0.3, 0.7], [0.6, 0.4]])
+inputs = (a)
 outputs = (lp)
 ",
     );

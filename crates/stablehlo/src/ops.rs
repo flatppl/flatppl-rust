@@ -342,7 +342,7 @@ pub(crate) fn lower_builtin(
         "bandedmat" => crate::arrays::lower_bandedmat(e, id, args),
         "bincounts" => crate::arrays::lower_bincounts(e, id, args),
         "selectbins" => crate::arrays::lower_selectbins(e, id, args),
-        "filter" => Err(crate::arrays::refuse_filter(id)),
+        "filter" => crate::arrays::lower_filter(e, id, args),
         "linspace" => lower_linspace(e, id, args, false),
         "extlinspace" => lower_linspace(e, id, args, true),
         "zeros" | "ones" | "eye" => {

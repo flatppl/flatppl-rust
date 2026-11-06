@@ -528,7 +528,7 @@ fn check_parameters(e: &mut Emitter, ctor: &str, p: &Params) -> Result<(), EmitE
 /// for these dists. **Default-deny**: everything not listed — the structural
 /// builders (MvNormal / Wishart / InverseWishart / LKJ / LKJCholesky /
 /// Multinomial's matrix / Cholesky / static-vector ops; Dirichlet /
-/// Multinomial's simplex reductions; NegativeBinomial2's `get0`/`reshape`) AND
+/// Multinomial's simplex reductions) AND
 /// any FUTURE registry addition — refuses under broadcast rather than risk
 /// emitting shape-inconsistent StableHLO (refuse-don't-mislower). Enable a new
 /// dist here only after verifying its builder uses no shape-specific ops, or
@@ -573,6 +573,7 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "Binomial"
             | "Geometric"
             | "NegativeBinomial"
+            | "NegativeBinomial2"
             | "Uniform"
             // §09 particle-physics.
             | "CrystalBall"
@@ -4759,6 +4760,7 @@ mod tests {
             "Binomial",
             "Geometric",
             "NegativeBinomial",
+            "NegativeBinomial2",
             // Rank-agnostic because its density is masked to its support, and
             // the mask carries the variate's shape.
             "Uniform",
@@ -4773,8 +4775,8 @@ mod tests {
     #[test]
     fn batch_safe_denies_structural_multivariate_and_unknown_dists() {
         // Matrix/Cholesky (MvNormal/Wishart/LKJ), simplex reductions
-        // (Dirichlet/Multinomial), get0/reshape (NegativeBinomial2), gather/index
-        // (Categorical/Categorical0), and any future/unknown ctor are NOT
+        // (Dirichlet/Multinomial), gather/index (Categorical/Categorical0), and
+        // any future/unknown ctor are NOT
         // rank-agnostic, so none may reuse its scalar builder under broadcast.
         for d in [
             "Dirac",
@@ -4787,7 +4789,6 @@ mod tests {
             "InverseWishart",
             "LKJ",
             "LKJCholesky",
-            "NegativeBinomial2",
             "SomeFutureDistribution",
         ] {
             assert!(!is_batch_safe(d), "{d} must not be batch-safe");
