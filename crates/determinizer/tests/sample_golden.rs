@@ -903,3 +903,42 @@ draws = rand(pushfwd(f, lawof(record(y1 = y1, y2 = y2))), s)";
     );
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// §13 "Output reduction": a deterministic expression of draws passes through, so
+// `rand(lawof(z), s)` for `z = x * 2 + 1` samples `x` once and returns `z`.
+#[test]
+fn a_derived_value_samples_its_latents_once() {
+    let src = "q = elementof(interval(0.0, 1.0))\nx ~ Binomial(10, q)\nz = x * 2 + 1\n\
+               s = rnginit(0)\nd, s2 = rand(lawof(z), s)\ninputs = (s, q)\noutputs = (d, s2)\n";
+    let out = determinize(&parse_infer(src)).expect("a derived value samples");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok(), "{pir}");
+    assert_eq!(pir.matches("builtin_sample").count(), 1, "{pir}");
+    assert!(pir.contains("Binomial"), "{pir}");
+}
+
+// §06: component i of `normalize(superpose(c₁, …, c_k))` has mass wᵢ, so the sampler
+// draws a Categorical0 index with p = w / Σw, then every component in order, and
+// selects one.
+#[test]
+fn a_normalized_superpose_draws_a_component_by_mass() {
+    let src = "r = elementof(posreals)\n\
+               m = superpose(weighted(3.0, Poisson(r)), Poisson(2.0))\ns = rnginit(0)\n\
+               d, s2 = rand(normalize(m), s)\ninputs = (s, r)\noutputs = (d, s2)\n";
+    let out = determinize(&parse_infer(src)).expect("a normalized superpose samples");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok(), "{pir}");
+    assert!(pir.contains("Categorical0"), "{pir}");
+    assert!(pir.contains("Poisson"), "{pir}");
+    assert!(pir.contains("ifelse"), "{pir}");
+    // A component that is not a probability measure has no unit mass.
+    let src = "r = elementof(posreals)\n\
+               m = superpose(Lebesgue(reals), Normal(0.0, 1.0))\ns = rnginit(0)\n\
+               d, s2 = rand(normalize(m), s)\ninputs = (s, r)\noutputs = (d, s2)\n";
+    let err = determinize(&parse_infer(src)).expect_err("an improper component refuses");
+    assert!(
+        err.reason.contains("probability components"),
+        "{}",
+        err.reason
+    );
+}
