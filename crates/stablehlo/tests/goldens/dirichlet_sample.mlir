@@ -90,16 +90,25 @@ module attributes {flatppl.runtime_status = 2 : i64} {
     %88 = stablehlo.convert %87 : (tensor<3xui32>) -> tensor<3xf32>
     %89 = stablehlo.constant dense<1.1920929E-7> : tensor<3xf32>
     %90 = stablehlo.multiply %88, %89 : tensor<3xf32>
-    %91 = stablehlo.divide %9, %7 : tensor<3xf32>
-    %92 = stablehlo.power %90, %91 : tensor<3xf32>
-    %93 = stablehlo.select %10, %92, %9 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
-    %94 = stablehlo.multiply %47#2, %93 : tensor<3xf32>
-    %95 = stablehlo.divide %94, %9 : tensor<3xf32>
-    %96 = stablehlo.reshape %95 : (tensor<3xf32>) -> tensor<3xf32>
-    %97 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %98 = stablehlo.reduce(%96 init: %97) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %99 = stablehlo.broadcast_in_dim %98, dims = [] : (tensor<f32>) -> tensor<3xf32>
-    %100 = stablehlo.divide %96, %99 : tensor<3xf32>
-    return %100, %84, %6 : tensor<3xf32>, tensor<2xui64>, tensor<i32>
+    %91 = stablehlo.log %47#2 : tensor<3xf32>
+    %92 = stablehlo.log %90 : tensor<3xf32>
+    %93 = stablehlo.divide %92, %7 : tensor<3xf32>
+    %94 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<f32>) -> tensor<3xf32>
+    %95 = stablehlo.select %10, %93, %94 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
+    %96 = stablehlo.add %91, %95 : tensor<3xf32>
+    %97 = stablehlo.constant dense<"0x00000000"> : tensor<f32>
+    %98 = stablehlo.broadcast_in_dim %97, dims = [] : (tensor<f32>) -> tensor<3xf32>
+    %99 = stablehlo.subtract %96, %98 : tensor<3xf32>
+    %100 = stablehlo.reshape %99 : (tensor<3xf32>) -> tensor<3xf32>
+    %101 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %102 = stablehlo.reduce(%100 init: %101) applies stablehlo.maximum across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %103 = stablehlo.broadcast_in_dim %102, dims = [] : (tensor<f32>) -> tensor<3xf32>
+    %104 = stablehlo.subtract %100, %103 : tensor<3xf32>
+    %105 = stablehlo.exponential %104 : tensor<3xf32>
+    %106 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %107 = stablehlo.reduce(%105 init: %106) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %108 = stablehlo.broadcast_in_dim %107, dims = [] : (tensor<f32>) -> tensor<3xf32>
+    %109 = stablehlo.divide %105, %108 : tensor<3xf32>
+    return %109, %84, %6 : tensor<3xf32>, tensor<2xui64>, tensor<i32>
   }
 }
