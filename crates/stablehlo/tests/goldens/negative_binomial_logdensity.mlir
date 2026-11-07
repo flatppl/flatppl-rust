@@ -15,16 +15,15 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %15 = stablehlo.constant dense<"0x187231BF"> : tensor<f32>
     %16 = stablehlo.add %9, %11 : tensor<f32>
     %17 = stablehlo.add %16, %15 : tensor<f32>
-    %18 = stablehlo.log %arg1 : tensor<f32>
-    %19 = stablehlo.add %arg1, %12 : tensor<f32>
-    %20 = stablehlo.log %19 : tensor<f32>
-    %21 = stablehlo.negate %20 : tensor<f32>
-    %22 = stablehlo.add %18, %21 : tensor<f32>
-    %23 = stablehlo.multiply %arg0, %22 : tensor<f32>
-    %24 = stablehlo.multiply %7, %20 : tensor<f32>
-    %25 = stablehlo.negate %24 : tensor<f32>
-    %26 = stablehlo.add %17, %23 : tensor<f32>
-    %27 = stablehlo.add %26, %25 : tensor<f32>
-    return %27, %5 : tensor<f32>, tensor<i32>
+    %18 = stablehlo.divide %12, %arg1 : tensor<f32>
+    %19 = stablehlo.log_plus_one %18 : tensor<f32>
+    %20 = stablehlo.negate %19 : tensor<f32>
+    %21 = stablehlo.multiply %arg0, %20 : tensor<f32>
+    %22 = stablehlo.log_plus_one %arg1 : tensor<f32>
+    %23 = stablehlo.multiply %7, %22 : tensor<f32>
+    %24 = stablehlo.negate %23 : tensor<f32>
+    %25 = stablehlo.add %17, %21 : tensor<f32>
+    %26 = stablehlo.add %25, %24 : tensor<f32>
+    return %26, %5 : tensor<f32>, tensor<i32>
   }
 }
