@@ -87,17 +87,26 @@ module {
     %85 = stablehlo.convert %84 : (tensor<15xui32>) -> tensor<15xf32>
     %86 = stablehlo.constant dense<1.1920929E-7> : tensor<15xf32>
     %87 = stablehlo.multiply %85, %86 : tensor<15xf32>
-    %88 = stablehlo.divide %5, %2 : tensor<15xf32>
-    %89 = stablehlo.power %87, %88 : tensor<15xf32>
-    %90 = stablehlo.select %6, %89, %5 : (tensor<15xi1>, tensor<15xf32>, tensor<15xf32>) -> tensor<15xf32>
-    %91 = stablehlo.multiply %44#2, %90 : tensor<15xf32>
-    %92 = stablehlo.divide %91, %5 : tensor<15xf32>
-    %93 = stablehlo.reshape %92 : (tensor<15xf32>) -> tensor<5x3xf32>
-    %94 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %95 = stablehlo.reduce(%93 init: %94) applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>, tensor<f32>) -> tensor<5xf32>
-    %96 = stablehlo.broadcast_in_dim %95, dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>
-    %97 = stablehlo.divide %93, %96 : tensor<5x3xf32>
-    %98 = stablehlo.reshape %97 : (tensor<5x3xf32>) -> tensor<5x3xf32>
-    return %98, %81 : tensor<5x3xf32>, tensor<2xui64>
+    %88 = stablehlo.log %44#2 : tensor<15xf32>
+    %89 = stablehlo.log %87 : tensor<15xf32>
+    %90 = stablehlo.divide %89, %2 : tensor<15xf32>
+    %91 = stablehlo.broadcast_in_dim %4, dims = [] : (tensor<f32>) -> tensor<15xf32>
+    %92 = stablehlo.select %6, %90, %91 : (tensor<15xi1>, tensor<15xf32>, tensor<15xf32>) -> tensor<15xf32>
+    %93 = stablehlo.add %88, %92 : tensor<15xf32>
+    %94 = stablehlo.constant dense<"0x00000000"> : tensor<f32>
+    %95 = stablehlo.broadcast_in_dim %94, dims = [] : (tensor<f32>) -> tensor<15xf32>
+    %96 = stablehlo.subtract %93, %95 : tensor<15xf32>
+    %97 = stablehlo.reshape %96 : (tensor<15xf32>) -> tensor<5x3xf32>
+    %98 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %99 = stablehlo.reduce(%97 init: %98) applies stablehlo.maximum across dimensions = [1] : (tensor<5x3xf32>, tensor<f32>) -> tensor<5xf32>
+    %100 = stablehlo.broadcast_in_dim %99, dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>
+    %101 = stablehlo.subtract %97, %100 : tensor<5x3xf32>
+    %102 = stablehlo.exponential %101 : tensor<5x3xf32>
+    %103 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %104 = stablehlo.reduce(%102 init: %103) applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>, tensor<f32>) -> tensor<5xf32>
+    %105 = stablehlo.broadcast_in_dim %104, dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>
+    %106 = stablehlo.divide %102, %105 : tensor<5x3xf32>
+    %107 = stablehlo.reshape %106 : (tensor<5x3xf32>) -> tensor<5x3xf32>
+    return %107, %81 : tensor<5x3xf32>, tensor<2xui64>
   }
 }

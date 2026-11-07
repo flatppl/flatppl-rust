@@ -3618,9 +3618,13 @@ const MAXITER: u64 = 128;
 /// broadcast over the `[n]` batch via [`Emitter::binary`]/[`Emitter::compare`]/
 /// [`Emitter::select`]'s auto-broadcast.
 fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
+    draw_gamma_scaled(e, shape, rate, GammaScale::Value)
+}
+
+fn draw_gamma_scaled(e: &mut Emitter, shape: &Value, rate: &Value, scale: GammaScale) -> Value {
     match e.batch_shape() {
-        Some(dims) if dims.len() == 1 => draw_gamma_batched(e, shape, rate, dims[0]),
-        _ => draw_gamma_scalar(e, shape, rate),
+        Some(dims) if dims.len() == 1 => draw_gamma_batched(e, shape, rate, dims[0], scale),
+        _ => draw_gamma_scalar(e, shape, rate, scale),
     }
 }
 
@@ -3639,7 +3643,7 @@ fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
 /// candidate on success, or the last candidate on the all-reject path). The
 /// final `Gamma(shape, rate)` is `result * boost / rate`, with `boost` the
 /// shape-`< 1` correction.
-fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
+fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value, scale: GammaScale) -> Value {
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
 
@@ -3720,12 +3724,46 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     );
     let g0 = results[2].clone();
 
-    // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
+    finish_gamma(e, &g0, shape, &shape_lt_one, rate, scale)
+}
+
+/// Where a Gamma draw ends up: the variate, or its logarithm.
+#[derive(Clone, Copy, PartialEq)]
+enum GammaScale {
+    Value,
+    Log,
+}
+
+/// Apply the shape-`< 1` boost and the rate to the boosted-shape draw `g0`.
+/// The boost is `U0^(1/shape)`, which for a shape well below one falls under the
+/// smallest float32 for a visible share of draws. On the log scale it is
+/// `log(U0) / shape` and stays finite, so normalizing draws (Beta, Dirichlet) keeps
+/// cells that the value scale would round to exactly 0 or 1.
+fn finish_gamma(
+    e: &mut Emitter,
+    g0: &Value,
+    shape: &Value,
+    shape_lt_one: &Value,
+    rate: &Value,
+    scale: GammaScale,
+) -> Value {
+    let one = e.scalar(1.0);
     let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
+    if scale == GammaScale::Log {
+        let log_g0 = e.log(g0);
+        let log_u0 = e.log(&u0);
+        let log_boost = e.div(&log_u0, shape);
+        let zero = e.scalar(0.0);
+        let log_boost = e.select(shape_lt_one, &log_boost, &zero);
+        let log_g = e.add(&log_g0, &log_boost);
+        let log_rate = e.log(rate);
+        return e.sub(&log_g, &log_rate);
+    }
+    // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);
-    let boost = e.select(&shape_lt_one, &boost_raw, &one);
-    let g = e.mul(&g0, &boost);
+    let boost = e.select(shape_lt_one, &boost_raw, &one);
+    let g = e.mul(g0, &boost);
     e.div(&g, rate)
 }
 
@@ -3746,7 +3784,13 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
 /// the trailing per-lane boost uniform) — the same fixed-key-advance discipline
 /// [`draw_gamma_scalar`] uses (a `[n]` row read per iteration by
 /// [`Emitter::dynamic_slice_row`]), so the whole draw stays reproducible.
-fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> Value {
+fn draw_gamma_batched(
+    e: &mut Emitter,
+    shape: &Value,
+    rate: &Value,
+    n: u64,
+    scale: GammaScale,
+) -> Value {
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
 
@@ -3840,21 +3884,19 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     );
     let g0 = results[2].clone();
 
-    // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
     // U0 is now a [n] per-lane uniform (batch shape restored above); the scalar
     // `shape_lt_one` predicate and scalar `1` broadcast over the [n] boost.
-    let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
-    let inv_shape = e.div(&one, shape);
-    let boost_raw = e.pow(&u0, &inv_shape);
-    let boost = e.select(&shape_lt_one, &boost_raw, &one);
-    let g = e.mul(&g0, &boost);
-    e.div(&g, rate)
+    finish_gamma(e, &g0, shape, &shape_lt_one, rate, scale)
 }
 
 /// Independent `Gamma(shape, 1)` draws, one per cell of the static tensor
 /// `shape`, in ONE masked rejection loop over all cells. The loop runs until
 /// its slowest cell accepts, which beats one loop per cell.
 fn draw_unit_gammas(e: &mut Emitter, shape: &Value) -> Value {
+    draw_unit_gammas_scaled(e, shape, GammaScale::Value)
+}
+
+fn draw_unit_gammas_scaled(e: &mut Emitter, shape: &Value, scale: GammaScale) -> Value {
     let MlirTy::Ranked(dims) = &shape.ty else {
         panic!("draw_unit_gammas expects a ranked shape tensor");
     };
@@ -3865,7 +3907,7 @@ fn draw_unit_gammas(e: &mut Emitter, shape: &Value) -> Value {
     let outer = e.batch_shape();
     let flat = e.reshape(shape, MlirTy::Ranked(vec![Some(cells)]));
     let one = e.scalar(1.0);
-    let draws = draw_gamma_batched(e, &flat, &one, cells);
+    let draws = draw_gamma_batched(e, &flat, &one, cells, scale);
     match outer {
         Some(dims) => e.set_batch_shape(dims),
         None => e.clear_batch_shape(),
@@ -3902,10 +3944,14 @@ fn beta_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
     let one = e.scalar(1.0);
-    let x = draw_gamma(e, &alpha, &one);
-    let y = draw_gamma(e, &beta, &one);
-    let sum = e.add(&x, &y);
-    Ok(e.div(&x, &sum))
+    // X / (X + Y) = 1 / (1 + exp(log Y - log X)), on the log scale so that two
+    // underflowing float32 Gammas give a ratio, not 0/0.
+    let x = draw_gamma_scaled(e, &alpha, &one, GammaScale::Log);
+    let y = draw_gamma_scaled(e, &beta, &one, GammaScale::Log);
+    let gap = e.sub(&y, &x);
+    let odds = e.exp(&gap);
+    let denominator = e.add(&one, &odds);
+    Ok(e.div(&one, &denominator))
 }
 
 /// §08: `LKJ(n, eta) = pushfwd(row_gram, LKJCholesky(n, eta))`.
@@ -4128,14 +4174,20 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             e.broadcast_in_dim(&alpha, &[1], ty)
         }
     };
-    let gammas = draw_unit_gammas(e, &shape);
-    let total = e.reduce_sum_last_axis(&gammas);
-    let MlirTy::Ranked(dims) = &gammas.ty else {
+    // Normalize on the log scale (a softmax of log Gammas): cells whose float32
+    // Gamma underflows keep their share of the total instead of becoming 0.
+    let log_gammas = draw_unit_gammas_scaled(e, &shape, GammaScale::Log);
+    let MlirTy::Ranked(dims) = &log_gammas.ty else {
         unreachable!("draw_unit_gammas keeps its ranked shape")
     };
     let kept: Vec<u64> = (0..dims.len() as u64 - 1).collect();
-    let total = e.broadcast_in_dim(&total, &kept, gammas.ty.clone());
-    Ok(e.div(&gammas, &total))
+    let largest = e.reduce_max_last_axis(&log_gammas);
+    let largest = e.broadcast_in_dim(&largest, &kept, log_gammas.ty.clone());
+    let shifted = e.sub(&log_gammas, &largest);
+    let weights = e.exp(&shifted);
+    let total = e.reduce_sum_last_axis(&weights);
+    let total = e.broadcast_in_dim(&total, &kept, weights.ty.clone());
+    Ok(e.div(&weights, &total))
 }
 
 // ---- §08 discrete + Multinomial `@sample` batch (Task 16) -------------------

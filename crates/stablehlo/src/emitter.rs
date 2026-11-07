@@ -2087,6 +2087,17 @@ impl<'m> Emitter<'m> {
         self.reduce_axis("stablehlo.add", "0.000000e+00", a, rank - 1)
     }
 
+    /// [`Emitter::reduce_sum_last_axis`] with `stablehlo.maximum`: the largest
+    /// element of each innermost row.
+    pub fn reduce_max_last_axis(&mut self, a: &Value) -> Value {
+        let rank = match &a.ty {
+            MlirTy::Ranked(dims) if !dims.is_empty() => dims.len(),
+            other => panic!("reduce_max_last_axis expects a ranked operand, got {other:?}"),
+        };
+        let identity = reduce_max_identity(self.dtype);
+        self.reduce_axis("stablehlo.maximum", identity, a, rank - 1)
+    }
+
     /// Reduce cell axes only. Callable batch axes represent independent
     /// applications and must survive reductions inside the body.
     fn reduce_full(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
