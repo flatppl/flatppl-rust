@@ -111,6 +111,33 @@ func.func @logdensity(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>)
 
 The results are `m.x`, `m.y`, `first.x`, `first.y`.
 
+## Random states (`--mode sample`)
+
+`@sample` takes the random state first, as `%key: tensor<2xui64>`, then the free
+parameters. It returns the draws, then the advanced state:
+
+```
+func.func @sample(%key: tensor<2xui64>, %arg0: tensor<f32>) -> (tensor<f32>, tensor<2xui64>)
+```
+
+Pass the returned state to the next call. A state is opaque (§07): take it from
+`rnginit(seed)` or from an earlier call, and never write one by hand. Internally, a
+THREE_FRY state is `[key, counter]`, so two hand-written states that differ only in
+the counter word give overlapping streams, and their draws are correlated. `rnginit`
+hashes its seed, so distinct seeds give separate streams.
+
+To get the state for a seed, emit a query whose output is `rnginit(seed)`:
+
+```
+seed = elementof(nonnegintegers)
+state = rnginit(seed)
+inputs = (seed)
+outputs = (state)
+```
+
+Its `@logdensity` maps an integer seed to the `tensor<2xui64>` state, followed by
+the [runtime status](#runtime-status).
+
 ## Runtime status
 
 Programs with runtime checks return one trailing integer status after the
