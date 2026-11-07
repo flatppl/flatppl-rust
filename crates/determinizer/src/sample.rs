@@ -309,6 +309,16 @@ fn lower_closed_measure_sample(
                      has no generative draw for `rand` to sample",
                 ));
             }
+            // A deterministic expression of draws (`z = x * 2 + 1`) samples its latents
+            // once each and passes through, as a derived record field does (§13
+            // "Output reduction").
+            if is_derived_value_field(m, inner) {
+                let name = m.intern("value");
+                let record = build_record(m, &[(name, inner)]);
+                let (value, next) = lower_record_of_draws_sample(m, record, rng)?;
+                let key = m.alloc(Node::Lit(Scalar::Str("value".into())));
+                return Ok((build_call(m, "get", &[value, key]), next));
+            }
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
@@ -393,6 +403,9 @@ fn lower_normalized_weight_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
+    if let Some(sample) = lower_normalized_superpose_sample(m, measure, rng) {
+        return sample;
+    }
     let (base, valid) = normalized_sample_base(m, measure)?;
     let (value, next) = if sample_name.is_some() {
         let draw = build_call(m, "draw", &[base]);
@@ -406,6 +419,81 @@ fn lower_normalized_weight_sample(
         crate::density::exponential_tilt::guard(m, value, valid)
     };
     Ok((value, next))
+}
+
+/// §06 `normalize(superpose(c₁, …, c_k))` with each `cᵢ` a probability measure
+/// `Bᵢ` or `weighted(wᵢ, Bᵢ)` with a constant `wᵢ`: component `i` has mass `wᵢ`, so
+/// draw it with probability `wᵢ / Σw`, then its value. Every component is drawn,
+/// in order, so the random stream does not depend on the chosen index.
+fn lower_normalized_superpose_sample(
+    m: &mut Module,
+    measure: NodeId,
+    rng: NodeId,
+) -> Option<Result<(NodeId, NodeId), RefuseError>> {
+    let [inner] = *expect_builtin_call(m, measure, "normalize")?.args.clone() else {
+        return None;
+    };
+    let inner = resolve_ref(m, inner).0;
+    expect_builtin_call(m, inner, "superpose")?;
+    let mut components = Vec::new();
+    crate::density::collect_superposition_components(m, inner, &mut components);
+    let mut weights = Vec::with_capacity(components.len());
+    let mut bases = Vec::with_capacity(components.len());
+    for component in components {
+        let resolved = resolve_ref(m, component).0;
+        let (weight, base) = match expect_builtin_call(m, resolved, "weighted") {
+            Some(c) if c.args.len() == 2 => (c.args[0], c.args[1]),
+            _ => (m.alloc(Node::Lit(Scalar::Real(1.0))), component),
+        };
+        let probability = matches!(
+            crate::density::known_type(m, resolve_ref(m, base).0),
+            Some(Type::Measure {
+                mass: flatppl_core::Mass::Normalized,
+                ..
+            })
+        );
+        if !probability || crate::density::weight_is_variate_dependent(m, weight) {
+            return Some(Err(refuse(
+                measure,
+                m,
+                "superpose sampling requires probability components with constant weights",
+            )));
+        }
+        weights.push(weight);
+        bases.push(base);
+    }
+    let weights = build_call(m, "vector", &weights);
+    let total = build_call(m, "sum", &[weights]);
+    let probabilities = crate::density::tilt::elementwise(m, "divide", &[weights, total]);
+    let p = m.intern("p");
+    let input = build_record(m, &[(p, probabilities)]);
+    let categorical = m.intern("Categorical0");
+    let categorical = m.alloc(Node::Const(categorical));
+    let mut serial = 0;
+    let name = loop {
+        let name = m.intern(&format!("__component_{serial}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        serial += 1;
+    };
+    let (index, mut cur) = build_sample_term(m, categorical, input, rng, Some(name));
+    let mut values = Vec::with_capacity(bases.len());
+    for base in bases {
+        let (value, next) = match lower_closed_measure_sample(m, base, cur) {
+            Ok(sample) => sample,
+            Err(err) => return Some(Err(err)),
+        };
+        values.push(value);
+        cur = next;
+    }
+    let mut selected = values.pop().expect("a superpose has components");
+    for (i, value) in values.into_iter().enumerate().rev() {
+        let i = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let chosen = build_call(m, "equal", &[index, i]);
+        selected = build_call(m, "ifelse", &[chosen, value, selected]);
+    }
+    Some(Ok((selected, cur)))
 }
 
 fn normalized_sample_base(
