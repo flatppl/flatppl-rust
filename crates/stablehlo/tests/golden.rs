@@ -410,7 +410,9 @@ fn a_joint_kernel_chain_step_emits_the_direct_factorization() {
 /// operand of the outer `broadcast` (§04 "Broadcasting", "Disallowed inputs"). The emitter
 /// reads that spelling like the record-operand one it replaces, so the program is the same:
 /// fixed observations reduce to their sufficient statistics (a count, a centre and a
-/// spread) and a promoted fixed input keeps one broadcast of the parameter. Executed with
+/// spread) and a promoted fixed input keeps one broadcast of the parameter. The promoted
+/// case scores an `iid` measure: `Normal.(mu, 1.0)` with scalar arguments is a single
+/// call (§04), so its variate is a scalar, not the 2-vector point. Executed with
 /// JAX, the first program gives -5.327877044677734, -14.33787727355957 and
 /// -2.087877035140991 at mu = 0.7, -1.0 and 2.5 (closed form -5.327877066409345,
 /// -14.337877066409344, -2.0878770664093453), the second -4.33787727355957 at mu = 0.7
@@ -430,7 +432,7 @@ fn a_kernel_broadcast_with_scalar_parameters_emits_the_record_operand_program() 
     // compatible form.
     let promoted = emit_log_density_with(
         "y = [1.0, 2.0]\nmu = elementof(reals)\n\
-         m = lawof(record(a = draw(Normal.(mu, 1.0))))\n\
+         m = lawof(record(a = draw(iid(Normal(mu, 1.0), 2))))\n\
          q = logdensityof(m, record(a = y .+ mu))\ninputs = (mu, y)\noutputs = q\n",
         &flatppl_stablehlo::EmitOptions::default(),
     );
