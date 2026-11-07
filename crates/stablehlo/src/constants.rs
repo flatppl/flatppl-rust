@@ -42,6 +42,28 @@ impl Emitter<'_> {
                 }
                 self.fixed_scalar_at(input, source_index)
             }
+            // Result axis i is input axis perm[i].
+            Pointwise::Transpose(input, perm) => {
+                let out_dims = shape(&value.ty);
+                let mut coordinates = vec![0usize; out_dims.len()];
+                let mut remaining = index;
+                for (coordinate, size) in coordinates.iter_mut().zip(out_dims).rev() {
+                    let size = usize::try_from((*size)?).ok()?;
+                    *coordinate = remaining.checked_rem(size)?;
+                    remaining = remaining.checked_div(size)?;
+                }
+                let in_dims = shape(&input.ty);
+                let mut input_coordinates = vec![0usize; in_dims.len()];
+                for (coordinate, axis) in coordinates.iter().zip(perm) {
+                    *input_coordinates.get_mut(usize::try_from(*axis).ok()?)? = *coordinate;
+                }
+                let mut source_index = 0usize;
+                for (coordinate, size) in input_coordinates.iter().zip(in_dims) {
+                    let size = usize::try_from((*size)?).ok()?;
+                    source_index = source_index.checked_mul(size)?.checked_add(*coordinate)?;
+                }
+                self.fixed_scalar_at(input, source_index)
+            }
             _ => None,
         }
     }
