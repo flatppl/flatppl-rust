@@ -228,6 +228,37 @@ pub(crate) fn refuse_bad_likelihood_point(
     check_point_types(inf, name, what, at, &interface, &declared, &point_ty)
 }
 
+/// `densityof(M, x)` and `logdensityof(M, x)` evaluate the density of `M` at a
+/// point of its variate space (spec §06), and `logdensityof.(M, grid)` does so at
+/// each grid element. A point whose type no variate of `M` can have is a located
+/// static error, rather than a value broadcast up to the variate's shape.
+pub(crate) fn refuse_point_outside_variate(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    if !matches!(name, "densityof" | "logdensityof") {
+        return None;
+    }
+    let Type::Measure { domain, .. } = &args.first()?.1 else {
+        return None;
+    };
+    let (at, point) = (args.get(1)?.0, &args.get(1)?.1);
+    if !incompatible(domain, point) {
+        return None;
+    }
+    let message = format!(
+        "`{name}`: the point is {}, but the measure's variate is {}; a density is \
+         evaluated at a variate of its measure (spec §06 `densityof`)",
+        show(inf, point),
+        show(inf, domain),
+    );
+    inf.diags.push(crate::Diagnostic::error_at(at, message));
+    Some(Type::Failed(
+        format!("{name}: the point is not a variate of the measure").into(),
+    ))
+}
+
 /// The kernel of a `likelihoodof(K, obs)` binding.
 fn likelihood_kernel(inf: &Inferencer<'_, '_>, likelihood: NodeId) -> Option<NodeId> {
     let Node::Call(call) = inf.module.node(resolve_binding_refs(inf, likelihood)) else {

@@ -7144,6 +7144,18 @@ fn broadcast_type(
         });
     }
 
+    // `logdensityof.(M, grid)` holds the measure fixed (§04) and evaluates its density at
+    // each grid element (§06), so each element must be a variate of `M`.
+    if matches!(op_name.as_str(), "densityof" | "logdensityof") {
+        let cells: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, t, p)| (*n, cell_arg(t), *p))
+            .collect();
+        if let Some(ty) = crate::boundary::refuse_point_outside_variate(inf, &op_name, &cells) {
+            return Ready(ty);
+        }
+    }
+
     // A §07 collection-domain head (`sum`, `lany`, `l2norm`, `cumsum`, …). §04 applies
     // it to each ELEMENT, so the cell decides: a scalar element misses the head's
     // domain and is refused, an array element is the legal nested case. Placed ahead of
@@ -8415,6 +8427,7 @@ fn domain_check(
         .or_else(|| refuse_bad_rng_seed(inf, name, args))
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_likelihood_point(inf, name, args))
+        .or_else(|| crate::boundary::refuse_point_outside_variate(inf, name, args))
         .or_else(|| crate::boundary::refuse_bad_chain_boundary(inf, name, args, named))
 }
 
