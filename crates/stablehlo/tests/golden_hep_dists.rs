@@ -319,3 +319,35 @@ outputs = (lp)";
         "the known observations' lgamma terms fold:\n{mlir}"
     );
 }
+
+// The three elementary §09 members that had no lowering. Each density is checked
+// in the PR against §09's own formula, with the normalizer found by quadrature.
+#[test]
+fn the_elementary_hep_members_emit() {
+    for (density, ops) in [
+        // Both sides' tails and cores: four branches, two erf normalizer pieces.
+        (
+            "hep.DoubleSidedCrystalBall(5.28, 0.02, 0.03, a, 2.0, 3.0, 4.0)",
+            &["stablehlo.select", "chlo.erf"][..],
+        ),
+        // §09's closed-form M, under the `posreals` support mask.
+        (
+            "hep.RelativisticBreitWigner(91.19, a)",
+            &["stablehlo.sqrt", "stablehlo.select"][..],
+        ),
+        // One width per side of the mean.
+        (
+            "hep.BifurcatedNormal(1.0, 0.5, a)",
+            &["stablehlo.select"][..],
+        ),
+    ] {
+        let mlir = emit(&format!(
+            "hep = standard_module(\"particle-physics\", \"0.1\")\nx = elementof(reals)\n\
+             a = elementof(posreals)\nlp = logdensityof({density}, x)\ninputs = (x, a)\n\
+             outputs = lp"
+        ));
+        for op in ops {
+            assert!(mlir.contains(op), "{density} needs {op}:\n{mlir}");
+        }
+    }
+}
