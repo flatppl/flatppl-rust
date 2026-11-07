@@ -120,6 +120,8 @@ fn the_shape_clauses_of_the_arithmetic_rows() {
         "mul(transpose([1.0, 2.0]), [1.0, 2.0])",
         "mul([1.0, 2.0], transpose([1.0, 2.0]))",
         "mul(transpose([1.0, 2.0]), rowstack([[1.0, 2.0], [3.0, 4.0]]))",
+        "mul(2.0, transpose([1.0, 2.0]))",
+        "mul(transpose([1.0, 2.0]), 2.0)",
     ] {
         clean(&format!("z = {ok}\n"));
     }
@@ -133,8 +135,6 @@ fn the_shape_clauses_of_the_arithmetic_rows() {
         "mul(transpose([1.0, 2.0]), rowstack([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))",
         "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), [1.0, 2.0, 3.0])",
         "mul(rowstack([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]]), rowstack([[1.0, 2.0], [3.0, 4.0]]))",
-        "mul(2.0, transpose([1.0, 2.0]))",
-        "mul(transpose([1.0, 2.0]), 2.0)",
         "mul([1.0, 2.0], rowstack([[1.0, 2.0], [3.0, 4.0]]))",
         "mul(rowstack([[1.0, 2.0], [3.0, 4.0]]), transpose([1.0, 2.0]))",
         "mul(transpose([1.0, 2.0]), transpose([1.0, 2.0]))",
