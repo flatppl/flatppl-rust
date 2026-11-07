@@ -1390,7 +1390,13 @@ fn lower_ksuperpose_inner(
             }
             Some(Type::Table { .. }) => false,
             _ => true,
-        });
+        })
+        // The dotted form passes the point as a broadcast operand, so it holds a
+        // scalar point fixed but would iterate over a vector or matrix one (§04).
+        && !matches!(
+            m.type_of(value),
+            Some(Type::Array { .. } | Type::TVector { .. } | Type::Table { .. })
+        );
     if !simple {
         return broadcast::mixture_density(
             m,
