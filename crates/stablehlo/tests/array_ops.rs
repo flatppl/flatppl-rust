@@ -129,6 +129,27 @@ fn filter_with_helper_predicates_keeps_a_static_count() {
         row(k) = div(k - 1, 3) + 1\ncol(k) = mod(k - 1, 3) + 1\n";
     let out = emitted_with(pre, &format!("filter(k -> T[row(k), col(k)] > 0, {cells})")).unwrap();
     assert!(out.contains("-> tensor<4xi32>"), "{out}");
+    // Reversed, sliced and gathered fixed data: V reversed and V[[4, 3, 2, 1]]
+    // are [1, 0, 0, 1], N[2, :] is [0, 1] and N[:, 1] is [1, 0, 1].
+    let pre = "V = [1, 0, 0, 1]\nN = rowstack([[1, 0], [0, 1], [1, 1]])\n";
+    for (expr, ty) in [
+        (
+            "filter(k -> reverse(V)[k] > 0, [1, 2, 3, 4])",
+            "tensor<2xi32>",
+        ),
+        (
+            "filter(k -> V[[4, 3, 2, 1]][k] > 0, [1, 2, 3, 4])",
+            "tensor<2xi32>",
+        ),
+        ("filter(k -> N[2, :][k] > 0, [1, 2])", "tensor<1xi32>"),
+        ("filter(k -> N[k, 1] > 0, [1, 2, 3])", "tensor<2xi32>"),
+    ] {
+        let out = emitted_with(pre, expr).unwrap_or_else(|e| panic!("{expr} must emit: {e}"));
+        assert!(
+            out.contains(&format!("-> {ty}")),
+            "{expr} returns {ty}:\n{out}"
+        );
+    }
 }
 
 // Bins are [eᵢ, eᵢ₊₁), the last closed (§07 "Binning"). A bin that only touches a

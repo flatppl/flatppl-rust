@@ -12,65 +12,110 @@ pub(super) type Constant = Arc<[Scalar]>;
 pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
 
 impl Emitter<'_> {
-    /// Read a fixed element through layout views without expanding them.
-    pub(crate) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<&Scalar> {
+    /// Read a fixed element through pure views without expanding them:
+    /// reshape, broadcast, transpose, slice, concatenation, static gather and
+    /// exact element-kind conversion. A reverse remembers its fixed values
+    /// where it is emitted.
+    pub(crate) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<Scalar> {
         if index >= element_count(&value.ty)? {
             return None;
         }
         if let Some(data) = self.constants.get(&value.ssa) {
-            return data.get(if data.len() == 1 { 0 } else { index });
+            return data.get(if data.len() == 1 { 0 } else { index }).cloned();
         }
+        let at = |input: &Value, coordinates: &[usize]| {
+            self.fixed_scalar_at(input, flat_index(&input.ty, coordinates)?)
+        };
         match &self.pointwise.get(&value.ssa)?.op {
             Pointwise::Reshape(input) => self.fixed_scalar_at(input, index),
             Pointwise::Broadcast(input, dimensions) => {
-                let mut remaining = index;
-                let mut coordinates = vec![0; shape(&value.ty).len()];
-                for (coordinate, size) in coordinates.iter_mut().zip(shape(&value.ty)).rev() {
-                    let size = usize::try_from((*size)?).ok()?;
-                    *coordinate = remaining.checked_rem(size)?;
-                    remaining = remaining.checked_div(size)?;
-                }
-                let mut source_index = 0usize;
-                for (size, axis) in shape(&input.ty).iter().zip(dimensions) {
-                    let size = usize::try_from((*size)?).ok()?;
-                    let coordinate = if size == 1 {
-                        0
-                    } else {
-                        *coordinates.get(usize::try_from(*axis).ok()?)?
-                    };
-                    source_index = source_index.checked_mul(size)?.checked_add(coordinate)?;
-                }
-                self.fixed_scalar_at(input, source_index)
+                let out = coordinates_of(&value.ty, index)?;
+                let source = shape(&input.ty)
+                    .iter()
+                    .zip(dimensions)
+                    .map(|(size, axis)| match size {
+                        Some(1) => Some(0),
+                        _ => out.get(usize::try_from(*axis).ok()?).copied(),
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                at(input, &source)
             }
             // Result axis i is input axis perm[i].
             Pointwise::Transpose(input, perm) => {
-                let out_dims = shape(&value.ty);
-                let mut coordinates = vec![0usize; out_dims.len()];
-                let mut remaining = index;
-                for (coordinate, size) in coordinates.iter_mut().zip(out_dims).rev() {
-                    let size = usize::try_from((*size)?).ok()?;
-                    *coordinate = remaining.checked_rem(size)?;
-                    remaining = remaining.checked_div(size)?;
+                let out = coordinates_of(&value.ty, index)?;
+                let mut source = vec![0usize; out.len()];
+                for (coordinate, axis) in out.iter().zip(perm) {
+                    *source.get_mut(usize::try_from(*axis).ok()?)? = *coordinate;
                 }
-                let in_dims = shape(&input.ty);
-                let mut input_coordinates = vec![0usize; in_dims.len()];
-                for (coordinate, axis) in coordinates.iter().zip(perm) {
-                    *input_coordinates.get_mut(usize::try_from(*axis).ok()?)? = *coordinate;
+                at(input, &source)
+            }
+            Pointwise::Slice(input, starts, _, strides) => {
+                let out = coordinates_of(&value.ty, index)?;
+                let source = out
+                    .iter()
+                    .zip(starts.iter().zip(strides))
+                    .map(|(c, (start, stride))| {
+                        usize::try_from(*start)
+                            .ok()?
+                            .checked_add(c.checked_mul(usize::try_from(*stride).ok()?)?)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                at(input, &source)
+            }
+            Pointwise::Concat(parts, axis) => {
+                let mut source = coordinates_of(&value.ty, index)?;
+                let coordinate = source.get_mut(*axis)?;
+                for part in parts {
+                    let extent = usize::try_from((*shape(&part.ty).get(*axis)?)?).ok()?;
+                    if *coordinate < extent {
+                        return at(part, &source);
+                    }
+                    *coordinate -= extent;
                 }
-                let mut source_index = 0usize;
-                for (coordinate, size) in input_coordinates.iter().zip(in_dims) {
-                    let size = usize::try_from((*size)?).ok()?;
-                    source_index = source_index.checked_mul(size)?.checked_add(*coordinate)?;
-                }
-                self.fixed_scalar_at(input, source_index)
+                None
+            }
+            // Static, in-bounds, zero-based selections along one axis.
+            Pointwise::Gather(input, axis, indices) => {
+                let mut source = coordinates_of(&value.ty, index)?;
+                let coordinate = source.get_mut(*axis)?;
+                *coordinate = usize::try_from(*indices.get(*coordinate)?).ok()?;
+                at(input, &source)
+            }
+            Pointwise::Convert(input, target) => {
+                convert_scalar(self.fixed_scalar_at(input, index)?, *target, self.dtype)
             }
             _ => None,
         }
     }
 
+    /// The fixed values of `a` reversed along `dims`, bounded like other folds.
+    pub(super) fn fixed_reversed(&self, a: &Value, dims: &[u64]) -> Option<Vec<Scalar>> {
+        let count = element_count(&a.ty)?;
+        if count > MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let extents = shape(&a.ty)
+            .iter()
+            .map(|d| usize::try_from((*d)?).ok())
+            .collect::<Option<Vec<_>>>()?;
+        (0..count)
+            .map(|i| {
+                let mut source = coordinates_of(&a.ty, i)?;
+                for axis in dims {
+                    let axis = usize::try_from(*axis).ok()?;
+                    source[axis] = extents
+                        .get(axis)?
+                        .checked_sub(1)?
+                        .checked_sub(source[axis])?;
+                }
+                self.fixed_scalar_at(a, flat_index(&a.ty, &source)?)
+            })
+            .collect()
+    }
+
     fn fixed_count_at(&self, value: &Value, index: usize) -> Option<i64> {
         match self.fixed_scalar_at(value, index)? {
-            Scalar::Int(n) => Some(*n),
+            Scalar::Int(n) => Some(n),
             _ => None,
         }
     }
@@ -406,7 +451,7 @@ impl Emitter<'_> {
             return None;
         }
         (0..count)
-            .map(|i| self.fixed_scalar_at(value, i).cloned())
+            .map(|i| self.fixed_scalar_at(value, i))
             .collect::<Option<Vec<_>>>()
             .map(Into::into)
     }
@@ -442,7 +487,7 @@ impl Emitter<'_> {
                     .checked_add(index)?
                     .checked_mul(cell)?
                     .checked_add(i.checked_rem(cell)?)?;
-                self.fixed_scalar_at(operand, source).cloned()
+                self.fixed_scalar_at(operand, source)
             })
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, ty, axes)
@@ -452,15 +497,7 @@ impl Emitter<'_> {
         let data = self.constants.get(&a.ssa)?;
         let values = data
             .iter()
-            .map(|v| match (v, target) {
-                (Scalar::Int(x), ElemKind::Real) => Some(Scalar::Real(match self.dtype {
-                    Dtype::F32 => (*x as f32) as f64,
-                    Dtype::F64 => *x as f64,
-                })),
-                (Scalar::Bool(x), ElemKind::Real) => Some(Scalar::Real(f64::from(*x))),
-                (Scalar::Bool(x), ElemKind::Int) => Some(Scalar::Int(i64::from(*x))),
-                _ => None,
-            })
+            .map(|v| convert_scalar(v.clone(), target, self.dtype))
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
@@ -532,6 +569,50 @@ impl Emitter<'_> {
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
+}
+
+/// The canonical embeddings `booleans ⊂ integers ⊂ reals` (§03), with an
+/// integer rounded once to the target precision.
+fn convert_scalar(value: Scalar, target: ElemKind, dtype: Dtype) -> Option<Scalar> {
+    match (value, target) {
+        (Scalar::Int(x), ElemKind::Real) => Some(Scalar::Real(match dtype {
+            Dtype::F32 => (x as f32) as f64,
+            Dtype::F64 => x as f64,
+        })),
+        (Scalar::Bool(x), ElemKind::Real) => Some(Scalar::Real(f64::from(x))),
+        (Scalar::Bool(x), ElemKind::Int) => Some(Scalar::Int(i64::from(x))),
+        _ => None,
+    }
+}
+
+/// Row-major coordinates of a flat index in a static shape.
+fn coordinates_of(ty: &MlirTy, index: usize) -> Option<Vec<usize>> {
+    let dims = shape(ty);
+    let mut coordinates = vec![0usize; dims.len()];
+    let mut remaining = index;
+    for (coordinate, size) in coordinates.iter_mut().zip(dims).rev() {
+        let size = usize::try_from((*size)?).ok()?;
+        *coordinate = remaining.checked_rem(size)?;
+        remaining = remaining.checked_div(size)?;
+    }
+    Some(coordinates)
+}
+
+/// The flat row-major index of in-bounds coordinates in a static shape.
+fn flat_index(ty: &MlirTy, coordinates: &[usize]) -> Option<usize> {
+    let dims = shape(ty);
+    if dims.len() != coordinates.len() {
+        return None;
+    }
+    let mut index = 0usize;
+    for (coordinate, size) in coordinates.iter().zip(dims) {
+        let size = usize::try_from((*size)?).ok()?;
+        if *coordinate >= size {
+            return None;
+        }
+        index = index.checked_mul(size)?.checked_add(*coordinate)?;
+    }
+    Some(index)
 }
 
 pub(super) fn element_count(ty: &MlirTy) -> Option<usize> {

@@ -1902,11 +1902,16 @@ impl<'m> Emitter<'m> {
             "stablehlo.reverse {}, dims = [{dims_text}] : {ty}",
             a.ssa
         ));
-        Value {
+        let out = Value {
             ssa,
             ty: a.ty.clone(),
             elem: a.elem,
+        };
+        // Reverse has no view recipe, so remember its fixed values here.
+        if let Some(values) = self.fixed_reversed(a, dims) {
+            self.remember_constant(&out.ssa, values);
         }
+        out
     }
 
     /// `%N = stablehlo.pad %a, %zero, low = [...], high = [...], interior = [...]`
