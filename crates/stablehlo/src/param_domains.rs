@@ -189,9 +189,9 @@ impl Emitter<'_> {
         }
         (0..count)
             .map(|i| match self.fixed_scalar_at(value, i)? {
-                Scalar::Real(x) => Some(self.rounded(*x)),
-                Scalar::Int(n) => Some(*n as f64),
-                Scalar::Bool(b) => Some(f64::from(*b)),
+                Scalar::Real(x) => Some(self.rounded(x)),
+                Scalar::Int(n) => Some(n as f64),
+                Scalar::Bool(b) => Some(f64::from(b)),
                 _ => None,
             })
             .collect()

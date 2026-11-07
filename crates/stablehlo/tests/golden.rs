@@ -1209,22 +1209,16 @@ fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
 /// over an all-integer expression.
 #[test]
 fn int_ifelse_select_returns_int_tagged_value() {
-    let mut m = Module::new();
-    let k = int(&mut m, 5);
-    let lo = int(&mut m, 0);
-    let hi = int(&mut m, 10);
-    let interval = call(&mut m, "interval", &[lo, hi]);
-    let cond = call(&mut m, "in", &[k, interval]);
-    let a = int(&mut m, 3);
-    let b = int(&mut m, 7);
-    let ifelse_node = call(&mut m, "ifelse", &[cond, a, b]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let result = e.lower_node(ifelse_node).unwrap();
-    assert_eq!(result.ty, MlirTy::Scalar);
-    assert_eq!(result.elem, ElemKind::Int);
-    let out = e.finish("f", &[], &[&result]);
+    // A run-time `k`: a literal predicate folds the select away.
+    let out = emit_log_density(
+        "flatppl_compat = \"0.1\"\nk = elementof(integers)\n\
+         q = ifelse(in(k, interval(0, 10)), 3, 7)\ninputs = (k)\noutputs = (q)\n",
+    );
     assert!(is_delimiter_balanced(&out));
+    assert!(
+        out.contains("-> tensor<i32>"),
+        "an int ifelse returns i32:\n{out}"
+    );
 
     let select_line = out
         .lines()
@@ -1304,17 +1298,13 @@ fn compare_adds_signed_compare_type_for_int_operands_only() {
 /// op, not `div`'s).
 #[test]
 fn div_lowers_to_floor_corrected_integer_divide() {
-    let mut m = Module::new();
-    let a = int(&mut m, 7);
-    let b = int(&mut m, 2);
-    let node = call(&mut m, "div", &[a, b]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let result = e.lower_node(node).unwrap();
-    assert_eq!(result.ty, MlirTy::Scalar);
-    assert_eq!(result.elem, ElemKind::Int);
-    let out = e.finish("f", &[], &[&result]);
+    // A run-time dividend: literal operands fold (see the test below).
+    let out = emit_log_density(
+        "flatppl_compat = \"0.1\"\nk = elementof(integers)\nq = div(k, 2)\n\
+         inputs = (k)\noutputs = (q)\n",
+    );
     assert!(is_delimiter_balanced(&out));
+    assert!(out.contains("-> tensor<i32>"), "div returns i32:\n{out}");
 
     for op in [
         "stablehlo.divide",
@@ -1337,17 +1327,12 @@ fn div_lowers_to_floor_corrected_integer_divide() {
 /// `Int`.
 #[test]
 fn mod_lowers_to_floor_corrected_integer_remainder() {
-    let mut m = Module::new();
-    let a = int(&mut m, 7);
-    let b = int(&mut m, 2);
-    let node = call(&mut m, "mod", &[a, b]);
-
-    let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let result = e.lower_node(node).unwrap();
-    assert_eq!(result.ty, MlirTy::Scalar);
-    assert_eq!(result.elem, ElemKind::Int);
-    let out = e.finish("f", &[], &[&result]);
+    let out = emit_log_density(
+        "flatppl_compat = \"0.1\"\nk = elementof(integers)\nq = mod(k, 2)\n\
+         inputs = (k)\noutputs = (q)\n",
+    );
     assert!(is_delimiter_balanced(&out));
+    assert!(out.contains("-> tensor<i32>"), "mod returns i32:\n{out}");
 
     for op in [
         "stablehlo.remainder",
@@ -1356,6 +1341,37 @@ fn mod_lowers_to_floor_corrected_integer_remainder() {
         "stablehlo.select",
     ] {
         assert!(out.contains(op), "mod: missing {op} in:\n{out}");
+    }
+}
+
+/// Literal operands fold through the same floor correction: StableHLO's
+/// truncating divide and remainder fold first, then the sign fix-up.
+/// §07: `div(-7, 2) = -4` and `mod(-7, 2) = 1`.
+#[test]
+fn literal_div_and_mod_fold_to_floored_values() {
+    for (head, a, b, value) in [
+        ("div", -7, 2, -4),
+        ("mod", -7, 2, 1),
+        ("div", 7, 2, 3),
+        ("mod", 7, -2, -1),
+    ] {
+        let expr = format!("{head}({a}, {b})");
+        let value = format!("dense<{value}>");
+        let mut m = Module::new();
+        let (a, b) = (int(&mut m, a), int(&mut m, b));
+        let node = call(&mut m, head, &[a, b]);
+        let mut e = unrestricted_emitter(&m, Dtype::F32);
+        let result = e.lower_node(node).unwrap();
+        assert_eq!(result.elem, ElemKind::Int);
+        let out = e.finish("f", &[], &[&result]);
+        for op in [
+            "stablehlo.divide",
+            "stablehlo.remainder",
+            "stablehlo.select",
+        ] {
+            assert!(!out.contains(op), "{expr} folds, but emits {op}:\n{out}");
+        }
+        assert!(out.contains(&value), "{expr} folds to {value}:\n{out}");
     }
 }
 
@@ -4547,10 +4563,11 @@ fn emit_logdensity_uniform_has_expected_structure() {
         out.contains("dense<-1.3862943611198906>"),
         "expected the folded -log(4.0) literal, in:\n{out}"
     );
-    for op in ["dense<true>", "stablehlo.and", "stablehlo.select"] {
+    // The fixed point is in the support, so the mask folds away.
+    for op in ["stablehlo.and", "stablehlo.select"] {
         assert!(
-            out.contains(op),
-            "expected the folded closed-interval support mask to emit `{op}`, in:\n{out}"
+            !out.contains(op),
+            "the fixed closed-interval support mask folds away, but `{op}` remains, in:\n{out}"
         );
     }
     assert!(is_delimiter_balanced(&out));
@@ -4623,13 +4640,13 @@ fn emit_logdensity_beta_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
-        3,
-        "expected exactly three subtracts, in:\n{out}"
+        2,
+        "expected exactly two subtracts (alpha - 1, beta - 1), in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.log").count(),
-        2,
-        "expected exactly two logs, in:\n{out}"
+        0,
+        "log(x) and log(1 - x) fold at the fixed point x = 0.5, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
@@ -4643,28 +4660,24 @@ fn emit_logdensity_beta_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates (2 formula + 1 off-support -inf)"
+        2,
+        "expected exactly two negates (the formula's lgammas)"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         5,
         "expected exactly five adds, in:\n{out}"
     );
-    // Constrained support (§08 support `unitinterval`): masked to `-inf`
-    // off-support — a `compare` guards the variate into the support and two
-    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
-    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
-    // op counts above are unchanged (numerically identical in-support).
+    // §08 support `unitinterval`: the fixed point 0.5 is in the support, so
+    // the support mask folds away. Only the run-time status keeps a select.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        3,
-        "expected two selects (variate guard + off-support mask) and two for status 9, in:
-{out}"
+        1,
+        "expected only the status select, in:\n{out}"
     );
     assert!(
-        out.contains("stablehlo.constant dense<0x7F800000>"),
-        "off-support -inf floor (negated +inf) missing, in:\n{out}"
+        !out.contains("dense<0x7F800000>"),
+        "an in-support fixed point needs no -inf floor, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }

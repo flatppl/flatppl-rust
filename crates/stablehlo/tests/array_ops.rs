@@ -10,8 +10,12 @@ const PRE: &str = "v = [1.0, z0, 3.0]\nw = [4.0, 5.0, z0]\n\
     A = rowstack([[1.0, z0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])\nB = rowstack([[9.0]])\n";
 
 fn emitted(expr: &str) -> Result<String, String> {
+    emitted_with("", expr)
+}
+
+fn emitted_with(defs: &str, expr: &str) -> Result<String, String> {
     let src = format!(
-        "flatppl_compat = \"0.1\"\nz0 = elementof(reals)\n{PRE}x = {expr}\ninputs = (z0)\noutputs = (x)"
+        "flatppl_compat = \"0.1\"\nz0 = elementof(reals)\n{PRE}{defs}x = {expr}\ninputs = (z0)\noutputs = (x)"
     );
     let mut m = flatppl_syntax::parse(&src).unwrap();
     let diags = flatppl_infer::infer(&mut m);
@@ -83,6 +87,69 @@ fn filter_over_fixed_data_keeps_a_static_count() {
         "filter(k -> [1.0, 0.0, 1.0, 1.0][k] > 0.5, [1, 2, 3, 4])",
         "tensor<3xi32>",
     );
+}
+
+// Helper functions, integer `div`/`mod`, index comparisons and Boolean
+// connectives over fixed data still fix the predicate at emit time. The
+// expected counts are the kept elements, worked by hand.
+#[test]
+fn filter_with_helper_predicates_keeps_a_static_count() {
+    let cells = "indicesof(zeros(6))";
+    // Column-major cells of a 3 x 2 mask: cells 1, 2 and 6 hold 1.0.
+    let pre = "mask = rowstack([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])\n\
+        day(k) = mod(k - 1, 3) + 1\ncountry(k) = div(k - 1, 3) + 1\n\
+        keep(k) = mask[day(k), country(k)] > 0.0\n";
+    let out = emitted_with(pre, &format!("filter(keep, {cells})")).unwrap();
+    assert!(out.contains("-> tensor<3xi32>"), "{out}");
+    // Day d of country c is in the window when start[c] <= d <= stop[c]:
+    // cells 2, 3, 4 and 5.
+    let pre = "start = [2, 1]\nstop = [3, 2]\ndays = indicesof(zeros(3))\n\
+        window = ifelse.(land.(addaxes(days, 0, 1) .>= addaxes(start, 1, 0), \
+        addaxes(days, 0, 1) .<= addaxes(stop, 1, 0)), 1.0, 0.0)\n\
+        day(k) = mod(k - 1, 3) + 1\ncountry(k) = div(k - 1, 3) + 1\n\
+        keep(k) = window[day(k), country(k)] > 0.0\n";
+    let out = emitted_with(pre, &format!("filter(keep, {cells})")).unwrap();
+    assert!(out.contains("-> tensor<4xi32>"), "{out}");
+    returns(
+        &format!("filter(k -> lor(k < 2, k > 4), {cells})"),
+        "tensor<3xi32>",
+    );
+    returns(
+        &format!("filter(k -> lnot(k == 3), {cells})"),
+        "tensor<5xi32>",
+    );
+    returns(
+        &format!("filter(k -> lxor(k < 4, k > 2), {cells})"),
+        "tensor<5xi32>",
+    );
+    // A transposed fixed matrix read at two computed indices, as a column-major
+    // `load_data` table reads: transpose(M) is [[1, 0, 1], [0, 1, 1]], so cells
+    // 1, 3, 5 and 6 are kept.
+    let pre = "M = rowstack([[1, 0], [0, 1], [1, 1]])\nT = transpose(M)\n\
+        row(k) = div(k - 1, 3) + 1\ncol(k) = mod(k - 1, 3) + 1\n";
+    let out = emitted_with(pre, &format!("filter(k -> T[row(k), col(k)] > 0, {cells})")).unwrap();
+    assert!(out.contains("-> tensor<4xi32>"), "{out}");
+    // Reversed, sliced and gathered fixed data: V reversed and V[[4, 3, 2, 1]]
+    // are [1, 0, 0, 1], N[2, :] is [0, 1] and N[:, 1] is [1, 0, 1].
+    let pre = "V = [1, 0, 0, 1]\nN = rowstack([[1, 0], [0, 1], [1, 1]])\n";
+    for (expr, ty) in [
+        (
+            "filter(k -> reverse(V)[k] > 0, [1, 2, 3, 4])",
+            "tensor<2xi32>",
+        ),
+        (
+            "filter(k -> V[[4, 3, 2, 1]][k] > 0, [1, 2, 3, 4])",
+            "tensor<2xi32>",
+        ),
+        ("filter(k -> N[2, :][k] > 0, [1, 2])", "tensor<1xi32>"),
+        ("filter(k -> N[k, 1] > 0, [1, 2, 3])", "tensor<2xi32>"),
+    ] {
+        let out = emitted_with(pre, expr).unwrap_or_else(|e| panic!("{expr} must emit: {e}"));
+        assert!(
+            out.contains(&format!("-> {ty}")),
+            "{expr} returns {ty}:\n{out}"
+        );
+    }
 }
 
 // Bins are [eᵢ, eᵢ₊₁), the last closed (§07 "Binning"). A bin that only touches a
