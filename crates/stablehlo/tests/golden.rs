@@ -6604,7 +6604,16 @@ lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
 inputs = (eta, c_obs)
 outputs = (lp)
 ";
-    let d = determinize_src(src);
+    // Inference refuses the mismatched point first; the emitter's own guard is the
+    // backstop for a module handed to it directly.
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    assert!(
+        flatppl_infer::infer(&mut m)
+            .iter()
+            .any(|d| d.message.contains("a density is evaluated at a variate")),
+        "inference must refuse the mismatched point"
+    );
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
@@ -6734,7 +6743,16 @@ lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
 inputs = (eta, l_obs)
 outputs = (lp)
 ";
-    let d = determinize_src(src);
+    // Inference refuses the mismatched point first; the emitter's own guard is the
+    // backstop for a module handed to it directly.
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    assert!(
+        flatppl_infer::infer(&mut m)
+            .iter()
+            .any(|d| d.message.contains("a density is evaluated at a variate")),
+        "inference must refuse the mismatched point"
+    );
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
@@ -9198,7 +9216,7 @@ fn emit_logdensity_abi_promotes_fixed_literal_input() {
     let src = "\
 y = [1.0, 2.0]
 mu = elementof(reals)
-m = lawof(record(a = draw(Normal.(mu, 1.0))))
+m = lawof(record(a = draw(iid(Normal(mu, 1.0), 2))))
 q = logdensityof(m, record(a = y .+ mu))
 inputs = (mu, y)
 outputs = q

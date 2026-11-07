@@ -745,12 +745,12 @@ fn op_rule(
         // Domain-preserving measure-algebra ops (spec §06): the result is a
         // measure over the SAME value domain as its measure argument, with a
         // fresh (recomputed) mass — like truncate/normalize.
-        //   `restrict(M, S)`   — restrict M to S
         //   `superpose(M1, …)` — measure addition M1 + M2 + … (shared domain)
         //   `locscale(M, …)`   — affine pushforward x → scale·x + shift
         // These no longer defer: even before the engine evaluates their mass,
         // the value domain is known, so the type slot carries `(%measure …)`.
-        "restrict" | "locscale" => fresh_measure(arg_ty(args, 0)),
+        "locscale" => fresh_measure(arg_ty(args, 0)),
+        "restrict" => restrict_type(arg_ty(args, 0), arg_ty(args, 1)),
         // EVERY `superpose` argument must itself be a measure (spec §06: measure
         // addition) — `fresh_measure` otherwise passes a non-measure argument
         // straight through unchanged, so `superpose(record(m1 = n1, m2 = n2))`
@@ -1792,6 +1792,40 @@ fn integer_arithmetic_type(inf: &mut Inferencer<'_, '_>, name: &str, args: &[Arg
 /// Clone a measure type with its mass reset to `Deferred` (to be filled by
 /// the normalization-level rule for the op at hand); non-measures clone
 /// as-is, absent arguments defer.
+/// §06 `restrict(M, x)` is `bayesupdate(likelihoodof(kernel, x), marginal)` for the
+/// disintegration of `M` along the names of `x`, so it is a measure over the
+/// marginal's variate: the fields (or columns) of `M`'s variate that `x` does not
+/// name, in their order.
+fn restrict_type(measure: Option<&Type>, given: Option<&Type>) -> Type {
+    let Some(Type::Measure { domain, .. }) = measure else {
+        return fresh_measure(measure);
+    };
+    let names: Vec<Symbol> = match given {
+        Some(Type::Record(fields)) => fields.iter().map(|(n, _)| *n).collect(),
+        Some(Type::Table { columns, .. }) => columns.iter().map(|(n, _)| *n).collect(),
+        _ => return fresh_measure(measure),
+    };
+    let keep = |fields: &[(Symbol, Type)]| -> Box<[(Symbol, Type)]> {
+        fields
+            .iter()
+            .filter(|(n, _)| !names.contains(n))
+            .cloned()
+            .collect()
+    };
+    let domain = match domain.as_ref() {
+        Type::Record(fields) => Type::Record(keep(fields)),
+        Type::Table { columns, nrows } => Type::Table {
+            columns: keep(columns),
+            nrows: *nrows,
+        },
+        _ => return fresh_measure(measure),
+    };
+    Type::Measure {
+        domain: Box::new(domain),
+        mass: Mass::Deferred,
+    }
+}
+
 fn fresh_measure(t: Option<&Type>) -> Type {
     match t {
         Some(Type::Measure { domain, .. }) => Type::Measure {

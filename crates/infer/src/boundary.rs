@@ -62,6 +62,13 @@ fn is_concrete_value(ty: &Type) -> bool {
 /// ⊂ complexes`, a record's field order is part of its identity (§03), and a
 /// table's row count is part of its type. Anything undecided is compatible.
 fn incompatible(expected: &Type, actual: &Type) -> bool {
+    mismatched(expected, actual, true)
+}
+
+/// As [`incompatible`] when `strict`. Otherwise only shape and structure count:
+/// scalar kinds are not compared, and record fields and table columns match by
+/// name in any order.
+fn mismatched(expected: &Type, actual: &Type, strict: bool) -> bool {
     use Type::*;
     let rank = |kind: &flatppl_core::ScalarType| match kind {
         flatppl_core::ScalarType::Boolean => 0,
@@ -70,13 +77,22 @@ fn incompatible(expected: &Type, actual: &Type) -> bool {
         flatppl_core::ScalarType::Complex => 3,
     };
     let fields = |a: &[(Symbol, Type)], b: &[(Symbol, Type)]| {
-        a.len() != b.len()
-            || a.iter()
+        if a.len() != b.len() {
+            return true;
+        }
+        if strict {
+            return a
+                .iter()
                 .zip(b.iter())
-                .any(|((p, t), (q, u))| p != q || incompatible(t, u))
+                .any(|((p, t), (q, u))| p != q || mismatched(t, u, strict));
+        }
+        a.iter().any(|(p, t)| match b.iter().find(|(q, _)| q == p) {
+            Some((_, u)) => mismatched(t, u, strict),
+            None => true,
+        })
     };
     match (expected, actual) {
-        (Scalar(want), Scalar(have)) => rank(have) > rank(want),
+        (Scalar(want), Scalar(have)) => strict && rank(have) > rank(want),
         (Scalar(_), Array { .. } | TVector { .. } | Record(_) | Tuple(_) | Table { .. }) => true,
         (Array { .. } | TVector { .. }, Scalar(_) | Record(_) | Tuple(_) | Table { .. }) => true,
         (Record(_), Scalar(_) | Array { .. } | TVector { .. } | Tuple(_) | Table { .. }) => true,
@@ -88,10 +104,10 @@ fn incompatible(expected: &Type, actual: &Type) -> bool {
                     (Dim::Static(p), Dim::Static(q)) => p != q,
                     _ => false,
                 })
-                || incompatible(x, y)
+                || mismatched(x, y, strict)
         }
         (TVector { len: a, elem: x }, TVector { len: b, elem: y }) => {
-            matches!((a, b), (Dim::Static(p), Dim::Static(q)) if p != q) || incompatible(x, y)
+            matches!((a, b), (Dim::Static(p), Dim::Static(q)) if p != q) || mismatched(x, y, strict)
         }
         (Record(a), Record(b)) => fields(a, b),
         (
@@ -105,7 +121,10 @@ fn incompatible(expected: &Type, actual: &Type) -> bool {
             },
         ) => matches!((p, q), (Dim::Static(m), Dim::Static(n)) if m != n) || fields(a, b),
         (Tuple(a), Tuple(b)) => {
-            a.len() != b.len() || a.iter().zip(b.iter()).any(|(t, u)| incompatible(t, u))
+            a.len() != b.len()
+                || a.iter()
+                    .zip(b.iter())
+                    .any(|(t, u)| mismatched(t, u, strict))
         }
         _ => false,
     }
@@ -230,8 +249,8 @@ pub(crate) fn refuse_bad_likelihood_point(
 
 /// `densityof(M, x)` and `logdensityof(M, x)` evaluate the density of `M` at a
 /// point of its variate space (spec §06), and `logdensityof.(M, grid)` does so at
-/// each grid element. A point whose type no variate of `M` can have is a located
-/// static error, rather than a value broadcast up to the variate's shape.
+/// each grid element. A point whose shape or structure no variate of `M` has is a
+/// located static error, rather than a value broadcast up to the variate's shape.
 pub(crate) fn refuse_point_outside_variate(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
@@ -244,7 +263,10 @@ pub(crate) fn refuse_point_outside_variate(
         return None;
     };
     let (at, point) = (args.get(1)?.0, &args.get(1)?.1);
-    if !incompatible(domain, point) {
+    // Shape and structure only. A point of another scalar kind, like 2.5 for a
+    // Poisson, lies outside the support and has density zero (§08), and the
+    // engines bind a record point's fields by name.
+    if !mismatched(domain, point, false) {
         return None;
     }
     let message = format!(

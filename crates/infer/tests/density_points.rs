@@ -1,8 +1,9 @@
 //! Spec §06: `densityof(M, x)` and `logdensityof(M, x)` evaluate the density of `M`
 //! at a point of its variate space, and `logdensityof.(M, grid)` does so at each grid
 //! element (§04 holds the measure fixed). A point that no variate of `M` can be is a
-//! static error that names both types. Scalar kinds follow §03's inclusions, so an
-//! integer point fits a real variate.
+//! static error that names both types. Only shape and structure are judged: a point of
+//! another scalar kind, like 2.5 for a Poisson, lies outside the support and has
+//! density zero (§08), and record fields match by name, as the engines bind them.
 
 use flatppl_infer::{Severity, infer};
 
@@ -95,6 +96,11 @@ fn points_of_the_variate_type_stay_clean() {
         "logdensityof.(Normal(0.0, 1.0), [0.1, 0.2, 0.3])",
         "logdensityof(joint(a = Normal(0.0, 1.0), b = Poisson(2.0)), record(a = 0.3, b = 2))",
         "logdensityof(iid(Normal(0.0, 1.0), 3), [1.0, 2.0, 3.0])",
+        // The engines bind a record point's fields by name.
+        "logdensityof(joint(a = Normal(0.0, 1.0), b = Poisson(2.0)), record(b = 2, a = 0.3))",
+        // Off the lattice: density zero, not a shape error.
+        "logdensityof(Poisson(3.0), 2.5)",
+        "logdensityof(Poisson.(mu), [1.0, 7.0, 30.5])",
     ] {
         assert_clean(&format!("{MU}lp = {expr}\n"));
     }
@@ -106,4 +112,20 @@ fn an_undecided_extent_is_not_refused() {
     assert_clean(&format!(
         "{MU}xs = filter(fn(_ > 1), [1, 2, 3, 4])\nlp = logdensityof(iid(Poisson(2.0), 3), xs)\n"
     ));
+}
+
+#[test]
+fn a_restricted_measure_is_over_the_fields_not_given() {
+    // §06 `restrict(M, x)` disintegrates `M` along the names of `x`, so its variate
+    // holds the remaining fields.
+    let model = "a = draw(Normal(0.0, 1.0))\nb = draw(Normal(a, 1.0))\n\
+        c = draw(Normal(b, 1.0))\nM = lawof(record(a = a, b = b, c = c))\n\
+        R = restrict(M, record(c = 0.5))\n";
+    assert_clean(&format!(
+        "{model}lp = logdensityof(R, record(a = 0.1, b = 0.2))\n"
+    ));
+    assert_refused(
+        &format!("{model}lp = logdensityof(R, record(a = 0.1, b = 0.2, c = 0.5))\n"),
+        &["variate is record(a: real, b: real)"],
+    );
 }
