@@ -397,3 +397,45 @@ fn a_batched_integral_captures_nested_record_leaves() {
         emit(&query("s = posreals", "r.s"))
     );
 }
+
+// §03: a record lies in `cartprod(name = S, …)` when each field lies in the set of
+// the same name, so membership is the conjunction of the field memberships.
+#[test]
+fn record_set_membership_is_the_conjunction_of_field_memberships() {
+    let model = "p = elementof(cartpow(reals, 2))\nq = elementof(reals)\ninputs = (p, q)\n";
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = ifelse(record(s = p) in cartprod(s = cartpow(posreals, 2)), 1.0, 0.0)\n"
+        )),
+        emit(&format!(
+            "{model}outputs = ifelse(p in cartpow(posreals, 2), 1.0, 0.0)\n"
+        )),
+    );
+    assert_eq!(
+        emit(&format!(
+            "{model}outputs = ifelse(record(t = q, s = p) in \
+             cartprod(s = cartpow(posreals, 2), t = interval(0.0, 1.0)), 1.0, 0.0)\n"
+        )),
+        emit(&format!(
+            "{model}outputs = ifelse(land(p in cartpow(posreals, 2), \
+             q in interval(0.0, 1.0)), 1.0, 0.0)\n"
+        )),
+    );
+}
+
+// The posteriorDB state_space port truncates a record-valued Lebesgue by a record
+// set. At s = [0.5, 1.5] the closed form is -sum(s) = -2.0, executed in the PR.
+#[test]
+fn a_record_valued_lebesgue_truncates_by_a_record_set() {
+    let out = emit(
+        "log_prior(x) = -sum(x.s)\n\
+         M = logweighted(log_prior, truncate(Lebesgue(cartprod(s = ordered(2))), \
+         cartprod(s = cartpow(posreals, 2))))\n\
+         p = elementof(cartpow(reals, 2))\ninputs = (p)\n\
+         outputs = logdensityof(M, record(s = p))\n",
+    );
+    assert!(
+        signature(&out).contains("(%arg0: tensor<2xf32>) -> tensor<f32>"),
+        "{out}"
+    );
+}

@@ -410,7 +410,9 @@ fn a_joint_kernel_chain_step_emits_the_direct_factorization() {
 /// operand of the outer `broadcast` (§04 "Broadcasting", "Disallowed inputs"). The emitter
 /// reads that spelling like the record-operand one it replaces, so the program is the same:
 /// fixed observations reduce to their sufficient statistics (a count, a centre and a
-/// spread) and a promoted fixed input keeps one broadcast of the parameter. Executed with
+/// spread) and a promoted fixed input keeps one broadcast of the parameter. The promoted
+/// case scores an `iid` measure: `Normal.(mu, 1.0)` with scalar arguments is a single
+/// call (§04), so its variate is a scalar, not the 2-vector point. Executed with
 /// JAX, the first program gives -5.327877044677734, -14.33787727355957 and
 /// -2.087877035140991 at mu = 0.7, -1.0 and 2.5 (closed form -5.327877066409345,
 /// -14.337877066409344, -2.0878770664093453), the second -4.33787727355957 at mu = 0.7
@@ -430,7 +432,7 @@ fn a_kernel_broadcast_with_scalar_parameters_emits_the_record_operand_program() 
     // compatible form.
     let promoted = emit_log_density_with(
         "y = [1.0, 2.0]\nmu = elementof(reals)\n\
-         m = lawof(record(a = draw(Normal.(mu, 1.0))))\n\
+         m = lawof(record(a = draw(iid(Normal(mu, 1.0), 2))))\n\
          q = logdensityof(m, record(a = y .+ mu))\ninputs = (mu, y)\noutputs = q\n",
         &flatppl_stablehlo::EmitOptions::default(),
     );
@@ -5649,11 +5651,10 @@ fn emit_logdensity_geometric_matches_frozen_golden() {
     );
 }
 
-/// §08 NegativeBinomial, verbatim: `[lgamma(k+alpha) - lgamma(alpha) -
-/// lgamma(k+1)] + alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`. Op
-/// counts: two `log`s, two `multiply`s, four `negate`s, eight `add`s, three
-/// `chlo.lgamma`s, no `subtract` (every term is additive/negated, not
-/// subtracted).
+/// §08 NegativeBinomial: `[lgamma(k+alpha) - lgamma(alpha) - lgamma(k+1)] +
+/// alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`, with the log ratios
+/// as `-log1p(1 / beta)` and `log1p(beta)`. At the fixed point k = 2,
+/// `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
 #[test]
 fn emit_logdensity_negative_binomial_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL_DENSITY_SRC);
@@ -5676,10 +5677,12 @@ fn emit_logdensity_negative_binomial_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "alpha/beta must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.log ").count(), 0);
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
+    assert_eq!(out.matches("stablehlo.divide").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
     assert_eq!(out.matches("stablehlo.negate").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 7);
+    assert_eq!(out.matches("stablehlo.add").count(), 5);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
@@ -5701,10 +5704,10 @@ fn emit_logdensity_negative_binomial_matches_frozen_golden() {
     );
 }
 
-/// §08 NegativeBinomial2, verbatim: `[lgamma(k+psi) - lgamma(psi) -
-/// lgamma(k+1)] + k * (log(mu) - log(mu+psi)) + psi * (log(psi) -
-/// log(mu+psi))`. Op counts: three `log`s, two `multiply`s, three `negate`s,
-/// nine `add`s, three `chlo.lgamma`s, no `subtract`.
+/// §08 NegativeBinomial2: `[lgamma(k+psi) - lgamma(psi) - lgamma(k+1)] +
+/// k * (log(mu) - log(mu+psi)) + psi * (log(psi) - log(mu+psi))`, with the log
+/// ratios as `-log1p(psi / mu)` and `-log1p(mu / psi)`. At the fixed point
+/// k = 2, `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
 #[test]
 fn emit_logdensity_negative_binomial2_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL2_DENSITY_SRC);
@@ -5727,10 +5730,12 @@ fn emit_logdensity_negative_binomial2_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "mu/psi must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 3);
+    assert_eq!(out.matches("stablehlo.log ").count(), 0);
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
+    assert_eq!(out.matches("stablehlo.divide").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 2);
-    assert_eq!(out.matches("stablehlo.add").count(), 8);
+    assert_eq!(out.matches("stablehlo.negate").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 5);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
@@ -6604,7 +6609,16 @@ lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
 inputs = (eta, c_obs)
 outputs = (lp)
 ";
-    let d = determinize_src(src);
+    // Inference refuses the mismatched point first; the emitter's own guard is the
+    // backstop for a module handed to it directly.
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    assert!(
+        flatppl_infer::infer(&mut m)
+            .iter()
+            .any(|d| d.message.contains("a density is evaluated at a variate")),
+        "inference must refuse the mismatched point"
+    );
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
@@ -6734,7 +6748,16 @@ lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
 inputs = (eta, l_obs)
 outputs = (lp)
 ";
-    let d = determinize_src(src);
+    // Inference refuses the mismatched point first; the emitter's own guard is the
+    // backstop for a module handed to it directly.
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    assert!(
+        flatppl_infer::infer(&mut m)
+            .iter()
+            .any(|d| d.message.contains("a density is evaluated at a variate")),
+        "inference must refuse the mismatched point"
+    );
+    let d = determinize_ungated(src);
     let err = flatppl_stablehlo::emit(
         &d,
         flatppl_stablehlo::Mode::LogDensity,
@@ -9198,7 +9221,7 @@ fn emit_logdensity_abi_promotes_fixed_literal_input() {
     let src = "\
 y = [1.0, 2.0]
 mu = elementof(reals)
-m = lawof(record(a = draw(Normal.(mu, 1.0))))
+m = lawof(record(a = draw(iid(Normal(mu, 1.0), 2))))
 q = logdensityof(m, record(a = y .+ mu))
 inputs = (mu, y)
 outputs = q

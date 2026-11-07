@@ -1390,7 +1390,13 @@ fn lower_ksuperpose_inner(
             }
             Some(Type::Table { .. }) => false,
             _ => true,
-        });
+        })
+        // The dotted form passes the point as a broadcast operand, so it holds a
+        // scalar point fixed but would iterate over a vector or matrix one (§04).
+        && !matches!(
+            m.type_of(value),
+            Some(Type::Array { .. } | Type::TVector { .. } | Type::Table { .. })
+        );
     if !simple {
         return broadcast::mixture_density(
             m,
@@ -3167,7 +3173,7 @@ pub(crate) fn measure_stochastic_ancestors(
 ///
 /// We catch both: resolve the alias chain and test the reification head, and test
 /// the inferred type of the (original) weight node. Either positive ⇒ refuse.
-fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
+pub(crate) fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
     // Inferred type of the weight (catches the bound-by-name `(%ref self f)` form,
     // whose call head we never see): a reified callable types to Function/Kernel,
     // a constant/scalar weight does not.
@@ -3450,7 +3456,11 @@ struct CoincidentAtoms {
     components: Vec<(NodeId, NodeId)>,
 }
 
-fn collect_superposition_components(m: &mut Module, node: NodeId, components: &mut Vec<NodeId>) {
+pub(crate) fn collect_superposition_components(
+    m: &mut Module,
+    node: NodeId,
+    components: &mut Vec<NodeId>,
+) {
     let resolved = resolve_ref_chain(m, node).0;
     if let Some(parts) = expect_builtin_call(m, resolved, "superpose")
         .filter(|c| c.args.len() >= 2)
@@ -4411,7 +4421,7 @@ fn recognize_convex_superposition(m: &mut Module, node: NodeId) -> Option<Vec<No
 /// The type of `node`, inferred again when its annotation is missing or still
 /// deferred. An applied kernel's body keeps the annotations of its definition,
 /// where the cells were not yet known.
-fn known_type(m: &mut Module, node: NodeId) -> Option<Type> {
+pub(crate) fn known_type(m: &mut Module, node: NodeId) -> Option<Type> {
     let deferred = |ty: &Type| {
         matches!(ty, Type::Deferred)
             || matches!(ty, Type::Measure { domain, .. } if **domain == Type::Deferred)
