@@ -5636,11 +5636,10 @@ fn emit_logdensity_geometric_matches_frozen_golden() {
     );
 }
 
-/// §08 NegativeBinomial, verbatim: `[lgamma(k+alpha) - lgamma(alpha) -
-/// lgamma(k+1)] + alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`. Op
-/// counts: two `log`s, two `multiply`s, four `negate`s, eight `add`s, three
-/// `chlo.lgamma`s, no `subtract` (every term is additive/negated, not
-/// subtracted).
+/// §08 NegativeBinomial: `[lgamma(k+alpha) - lgamma(alpha) - lgamma(k+1)] +
+/// alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`, with the log ratios
+/// as `-log1p(1 / beta)` and `log1p(beta)`. At the fixed point k = 2,
+/// `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
 #[test]
 fn emit_logdensity_negative_binomial_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL_DENSITY_SRC);
@@ -5663,10 +5662,12 @@ fn emit_logdensity_negative_binomial_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "alpha/beta must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.log ").count(), 0);
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
+    assert_eq!(out.matches("stablehlo.divide").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
     assert_eq!(out.matches("stablehlo.negate").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 7);
+    assert_eq!(out.matches("stablehlo.add").count(), 5);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
@@ -5688,10 +5689,10 @@ fn emit_logdensity_negative_binomial_matches_frozen_golden() {
     );
 }
 
-/// §08 NegativeBinomial2, verbatim: `[lgamma(k+psi) - lgamma(psi) -
-/// lgamma(k+1)] + k * (log(mu) - log(mu+psi)) + psi * (log(psi) -
-/// log(mu+psi))`. Op counts: three `log`s, two `multiply`s, three `negate`s,
-/// nine `add`s, three `chlo.lgamma`s, no `subtract`.
+/// §08 NegativeBinomial2: `[lgamma(k+psi) - lgamma(psi) - lgamma(k+1)] +
+/// k * (log(mu) - log(mu+psi)) + psi * (log(psi) - log(mu+psi))`, with the log
+/// ratios as `-log1p(psi / mu)` and `-log1p(mu / psi)`. At the fixed point
+/// k = 2, `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
 #[test]
 fn emit_logdensity_negative_binomial2_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL2_DENSITY_SRC);
@@ -5714,10 +5715,12 @@ fn emit_logdensity_negative_binomial2_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "mu/psi must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 3);
+    assert_eq!(out.matches("stablehlo.log ").count(), 0);
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
+    assert_eq!(out.matches("stablehlo.divide").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 2);
-    assert_eq!(out.matches("stablehlo.add").count(), 8);
+    assert_eq!(out.matches("stablehlo.negate").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 5);
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert!(
         !out.contains("stablehlo.subtract"),
