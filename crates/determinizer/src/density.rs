@@ -1938,6 +1938,7 @@ fn lower_measure_density_in_reference(
         // density is the support gate, not a backend density builder. Lowering
         // it here keeps it out of FlatPDL ([`lower_lebesgue`]).
         Some("Lebesgue") => lower_lebesgue(m, measure_node, v),
+        Some("Counting") => lower_counting(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v, origin),
         Some("joint") => lower_joint(m, measure_node, v, origin),
         // A reified measure (`functionof` / `kernelof`) used AS a measure — its
@@ -7731,6 +7732,70 @@ fn numerical_bin_mass(
 /// `builtin_logdensityof(Lebesgue, …)` leaf keeps the reference measure out of
 /// FlatPDL, so no backend needs a `Lebesgue` density builder. `Counting` has the
 /// same rule over the integers and is deliberately NOT added in this change.
+/// §06 `Counting(support = S)` is the counting measure on the integers restricted
+/// to `S`, so its density with respect to itself is 1 on `S ∩ ℤ` and 0 elsewhere:
+/// the support gate of [`lower_lebesgue`], plus integrality for a point that is not
+/// integer by type.
+fn lower_counting(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let support = {
+        let c = expect_builtin_call(m, node, "Counting")
+            .ok_or_else(|| refuse(node, m, "expected Counting"))?;
+        named_or_positional(m, c, "support").ok_or_else(|| {
+            refuse(
+                node,
+                m,
+                "Counting expects a `support` set (spec §06 `Counting`)",
+            )
+        })?
+    };
+    let mut cond = reference_membership(m, v, support);
+    // A point that is integer by type lies on the lattice. A real point does when its
+    // fractional part `x - floor(x)`, which lies in [0, 1), is not positive, in every
+    // cell of a vector point. §07 `equal` is not defined on reals.
+    let whole = match m.type_of(resolve_ref_chain(m, v).0) {
+        Some(Type::Scalar(ScalarType::Integer | ScalarType::Boolean)) => None,
+        Some(Type::Array { elem, .. })
+            if matches!(
+                elem.as_ref(),
+                Type::Scalar(ScalarType::Integer | ScalarType::Boolean)
+            ) =>
+        {
+            None
+        }
+        Some(Type::Array { shape, .. }) => {
+            if shape.len() != 1 {
+                return Err(refuse(
+                    node,
+                    m,
+                    "Counting density of a real point needs a scalar or a vector",
+                ));
+            }
+            let floor = m.intern("floor");
+            let floor = m.alloc(Node::Const(floor));
+            let floored = build_call(m, "broadcast", &[floor, v]);
+            let sub = m.intern("sub");
+            let sub = m.alloc(Node::Const(sub));
+            let fraction = build_call(m, "broadcast", &[sub, v, floored]);
+            let le = m.intern("le");
+            let le = m.alloc(Node::Const(le));
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            let cells = build_call(m, "broadcast", &[le, fraction, zero]);
+            Some(build_call(m, "lall", &[cells]))
+        }
+        _ => {
+            let floored = build_call(m, "floor", &[v]);
+            let fraction = build_call(m, "sub", &[v, floored]);
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            Some(build_call(m, "le", &[fraction, zero]))
+        }
+    };
+    if let Some(whole) = whole {
+        cond = build_call(m, "land", &[cond, whole]);
+    }
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    Ok(gate_density(m, cond, zero))
+}
+
 fn lower_lebesgue(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let support = {
         let c = expect_builtin_call(m, node, "Lebesgue")
