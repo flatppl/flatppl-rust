@@ -270,8 +270,8 @@ pub(crate) fn refuse_point_outside_variate(
         return None;
     }
     let message = format!(
-        "`{name}`: the point is {}, but the measure's variate is {}; a density is \
-         evaluated at a variate of its measure (spec §06 `densityof`)",
+        "`{name}`: the point is {}, but the measure has variates of type {}; a density \
+         is evaluated at a variate of its measure (spec §06 `densityof`)",
         show(inf, point),
         show(inf, domain),
     );

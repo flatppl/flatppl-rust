@@ -65,7 +65,7 @@ fn a_point_of_another_shape_is_refused_naming_both_types() {
             &[
                 "the point is",
                 &format!("is {point}, but"),
-                &format!("variate is {variate}"),
+                &format!("variates of type {variate}"),
                 "spec §06 `densityof`",
             ],
         );
@@ -81,7 +81,7 @@ fn each_grid_element_must_be_a_variate() {
     ] {
         assert_refused(
             &format!("{MU}lp = {expr}\n"),
-            &["is integer, but", "variate is array of integer [3]"],
+            &["is integer, but", "variates of type array of integer [3]"],
         );
     }
 }
@@ -126,6 +126,6 @@ fn a_restricted_measure_is_over_the_fields_not_given() {
     ));
     assert_refused(
         &format!("{model}lp = logdensityof(R, record(a = 0.1, b = 0.2, c = 0.5))\n"),
-        &["variate is record(a: real, b: real)"],
+        &["variates of type record(a: real, b: real)"],
     );
 }
