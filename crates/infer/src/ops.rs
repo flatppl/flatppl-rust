@@ -2030,6 +2030,17 @@ fn mul_type(args: &[ArgInfo]) -> Type {
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
         (Type::Array { .. }, s) if scalar(s) => a.clone(),
         (s, Type::Array { .. }) if scalar(s) => b.clone(),
+        // Scaling a transposed vector keeps it a row (§07 lists scalar–transposed-vector
+        // and transposed-vector–scalar).
+        (Type::TVector { len, elem }, s) | (s, Type::TVector { len, elem }) if scalar(s) => {
+            match promote2(Some(elem.as_ref()), Some(s)) {
+                Type::Deferred => Type::Deferred,
+                elem => Type::TVector {
+                    len: *len,
+                    elem: Box::new(elem),
+                },
+            }
+        }
         // Matrix multiply over flat rank-2 matrices: matrix·matrix → matrix,
         // matrix·vector → vector. The left operand is a rank-2 matrix; the right
         // is a matrix (rank-2) or a vector (rank-1). The shared inner dimension
@@ -8414,8 +8425,8 @@ fn operator_domain(name: &str) -> Option<&'static str> {
         "add" | "sub" => "scalars or arrays of same shape (real or complex)",
         "mul" => {
             "scalars, matrix-matrix, matrix-vector, scalar-matrix, matrix-scalar, scalar-vector, \
-             vector-scalar, transposed-vector–vector, vector–transposed-vector, \
-             transposed-vector–matrix"
+             vector-scalar, scalar–transposed-vector, transposed-vector–scalar, \
+             transposed-vector–vector, vector–transposed-vector, transposed-vector–matrix"
         }
         "divide" => "scalars, array-scalar, transposed-vector–scalar (real or complex)",
         "neg" => "scalars or arrays (real or complex)",
@@ -8506,8 +8517,8 @@ fn shape_of(ty: &Type) -> Shape {
 /// `add`/`sub` take scalars or arrays of the same shape, `divide` scalars, an array
 /// over a scalar, or a transposed vector over a scalar, `pow` scalars only, and `mul`
 /// exactly the listed pairs (scalars, matrix-matrix, matrix-vector, scalar-matrix,
-/// scalar-vector, transposed-vector–vector, vector–transposed-vector,
-/// transposed-vector–matrix). Only a definite mismatch is refused: an operand whose
+/// scalar-vector, scalar–transposed-vector, transposed-vector–vector,
+/// vector–transposed-vector, transposed-vector–matrix). Only a definite mismatch is refused: an operand whose
 /// shape is not classified is never an accusation.
 fn operand_shapes_outside_domain(name: &str, a: &Type, b: &Type) -> bool {
     use Shape::*;
@@ -8547,6 +8558,8 @@ fn operand_shapes_outside_domain(name: &str, a: &Type, b: &Type) -> bool {
                     | (Matrix, Scalar)
                     | (Matrix, Matrix)
                     | (Matrix, Vector)
+                    | (Scalar, TVector)
+                    | (TVector, Scalar)
                     | (TVector, Vector)
                     | (Vector, TVector)
                     | (TVector, Matrix)

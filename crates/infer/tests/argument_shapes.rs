@@ -257,6 +257,18 @@ fn an_array_over_a_scalar_divides_to_its_shape() {
     assert!(binding(&src, "c").contains("(%meta ((%array 2 (2 2) (%scalar real))"));
 }
 
+/// §07 `mul` lists "scalar–transposed-vector, transposed-vector–scalar": scaling a row
+/// keeps it a row, in either order, and a real scalar promotes an integer row.
+#[test]
+fn a_scalar_scales_a_transposed_vector_in_either_order() {
+    let src =
+        format!("{V}a = transpose(v) * 0.5\nb = 2 * transpose(v)\nc = transpose([1, 2]) * 0.5");
+    assert!(binding(&src, "a").contains("(%meta ((%tvector 2 (%scalar real))"));
+    assert!(binding(&src, "b").contains("(%meta ((%tvector 2 (%scalar real))"));
+    assert!(binding(&src, "c").contains("(%meta ((%tvector 2 (%scalar real))"));
+    assert_clean(&src);
+}
+
 // ---- §09 module rows -------------------------------------------------------------
 
 /// §09 declares a member's parameters as §07 and §08 do: `erf`'s Domains cell is
