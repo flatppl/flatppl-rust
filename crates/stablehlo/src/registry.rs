@@ -2750,8 +2750,9 @@ fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     Ok(e.add(&log_p, &k_log_one_minus_p))
 }
 
-/// §08 NegativeBinomial, verbatim: `log f = logC(k + alpha - 1, alpha - 1) +
-/// alpha * (log(beta) - log(beta + 1)) - k * log(beta + 1)`, with `logC(k +
+/// §08 NegativeBinomial: `log f = logC(k + alpha - 1, alpha - 1) +
+/// alpha * (log(beta) - log(beta + 1)) - k * log(beta + 1)`, computed as
+/// `-alpha * log1p(1 / beta) - k * log1p(beta)`, with `logC(k +
 /// alpha - 1, alpha - 1) = lgamma(k + alpha) - lgamma(alpha) - lgamma(k + 1)`
 /// (the task brief's already-reduced closed form — computing the raw `(n, k)
 /// = (k+alpha-1, alpha-1)` pair first and expanding `logC` from there, as
@@ -2775,13 +2776,15 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
     let t1 = e.add(&lgamma_k_alpha, &neg_lgamma_alpha);
     let t2 = e.add(&t1, &neg_lgamma_k1);
 
-    let log_beta = e.log(&beta);
-    let beta_plus_one = e.add(&beta, &one);
-    let log_beta_plus_one = e.log(&beta_plus_one);
-    let neg_log_beta_plus_one = e.neg(&log_beta_plus_one);
-    let log_ratio = e.add(&log_beta, &neg_log_beta_plus_one);
+    // log(beta / (beta + 1)) = -log1p(1 / beta) and log(beta + 1) =
+    // log1p(beta). A difference of two logarithms cancels when beta is large,
+    // in the value and in its derivative.
+    let inv_beta = e.div(&one, &beta);
+    let log1p_inv_beta = e.log1p(&inv_beta);
+    let log_ratio = e.neg(&log1p_inv_beta);
     let alpha_log_ratio = e.mul(&alpha, &log_ratio);
 
+    let log_beta_plus_one = e.log1p(&beta);
     let k_log_beta_plus_one = e.mul(v, &log_beta_plus_one);
     let neg_k_log_beta_plus_one = e.neg(&k_log_beta_plus_one);
 
@@ -2789,14 +2792,10 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
     Ok(e.add(&t3, &neg_k_log_beta_plus_one))
 }
 
-/// §08 NegativeBinomial2, verbatim: `log f = logC(k + psi - 1, k) + k *
-/// (log(mu) - log(mu + psi)) + psi * (log(psi) - log(mu + psi))`, with
-/// `logC(k + psi - 1, k) = lgamma(k + psi) - lgamma(psi) - lgamma(k + 1)` —
-/// same already-reduced-form reasoning as [`negative_binomial_logpdf`]'s doc
-/// comment. `log(mu + psi)` is computed once and its negation reused for both
-/// the `k`- and `psi`-weighted ratio terms (the spec's `mu + psi` denominator
-/// appears in both positions verbatim — same reuse discipline as
-/// `lognormal_logpdf`'s shared `log(x)`). Its `@sample` builder is
+/// §08 NegativeBinomial2: `log f = logC(k + psi - 1, k) + k * (log(mu) -
+/// log(mu + psi)) + psi * (log(psi) - log(mu + psi))`, computed as
+/// `-k * log1p(psi / mu) - psi * log1p(mu / psi)`, with `logC(k + psi - 1, k) =
+/// lgamma(k + psi) - lgamma(psi) - lgamma(k + 1)`. Its `@sample` builder is
 /// [`negative_binomial2_sample`] (Task 16) — the Gamma–Poisson mixture.
 fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
@@ -2814,16 +2813,17 @@ fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
     let t1 = e.add(&lgamma_k_psi, &neg_lgamma_psi);
     let t2 = e.add(&t1, &neg_lgamma_k1);
 
-    let mu_plus_psi = e.add(&mu, &psi);
-    let log_mu_plus_psi = e.log(&mu_plus_psi);
-    let neg_log_mu_plus_psi = e.neg(&log_mu_plus_psi);
-
-    let log_mu = e.log(&mu);
-    let log_ratio_mu = e.add(&log_mu, &neg_log_mu_plus_psi);
+    // log(mu / (mu + psi)) = -log1p(psi / mu), and likewise for psi. The
+    // difference of two logarithms cancels when mu >> psi, in the value and
+    // in its derivative k/mu - k/(mu + psi).
+    let psi_over_mu = e.div(&psi, &mu);
+    let log1p_psi_over_mu = e.log1p(&psi_over_mu);
+    let log_ratio_mu = e.neg(&log1p_psi_over_mu);
     let k_log_ratio_mu = e.mul(v, &log_ratio_mu);
 
-    let log_psi = e.log(&psi);
-    let log_ratio_psi = e.add(&log_psi, &neg_log_mu_plus_psi);
+    let mu_over_psi = e.div(&mu, &psi);
+    let log1p_mu_over_psi = e.log1p(&mu_over_psi);
+    let log_ratio_psi = e.neg(&log1p_mu_over_psi);
     let psi_log_ratio_psi = e.mul(&psi, &log_ratio_psi);
 
     let t3 = e.add(&t2, &k_log_ratio_mu);
