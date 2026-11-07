@@ -1659,13 +1659,16 @@ impl<'a> ExprParser<'a> {
         }
 
         // A lambda argument shadows module bindings and built-ins inside its
-        // body (spec §05), lowering to the placeholder `_name_` — but only in
-        // the *innermost* reification: referencing an enclosing lambda's
-        // argument from inside a nested lambda / `fn` / `functionof` would
-        // leave the placeholder unbound there (spec §04's DISALLOWED case).
+        // body (spec §05), and §04 "Lambda notation" rewrites every free
+        // occurrence of it to the placeholder `_name_`, nested reifications
+        // included. A nested `functionof` or `kernelof` that lists the
+        // placeholder as a boundary input binds it, as in
+        // `g(mu) = functionof(Normal(mu, 1.0), mu = mu)`. One that does not,
+        // like a closure `x -> (y -> x + y)`, is refused by the reification's
+        // boundary check (§04 "Placeholders and holes").
         let lambda_arg =
             |f: &ReifyFrame| matches!(f, ReifyFrame::Lambda(args) if args.contains(&name));
-        if self.reify_frames.last().is_some_and(lambda_arg) {
+        if self.reify_frames.iter().any(lambda_arg) {
             let ph_sym = self.module.intern(&format!("_{name}_"));
             let r = Ref {
                 ns: RefNs::Local,
@@ -1676,14 +1679,6 @@ impl<'a> ExprParser<'a> {
             }
             return Ok(Primary::Ready(self.alloc_spanned(Node::Ref(r), start)));
         }
-        if self.reify_frames.iter().any(lambda_arg) {
-            return Err(self.err_prev(format!(
-                "`{name}` is an argument of an enclosing lambda and cannot be referenced \
-                     inside a nested reification (placeholders are scoped to the nearest \
-                     enclosing `functionof`)"
-            )));
-        }
-
         if matches!(self.peek(), Some(TokenKind::LParen)) {
             self.advance();
             // `fn(expr)` starts its own hole scope.
