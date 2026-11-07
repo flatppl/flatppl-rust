@@ -53,7 +53,7 @@
 //! primitives, still unimplemented until a later task adds a matching
 //! registry gate for it).
 
-use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Type};
+use flatppl_core::{CallHead, Dim, Node, NodeId, Scalar, Symbol, Type};
 
 use crate::emitter::{Axes, Emitter, IntegralKind, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -3150,8 +3150,69 @@ enum ElemSet {
 /// its own element set. Other set expressions refuse.
 fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v_id, set_id] = args_exact(id, args)?;
-    let v = e.lower_node(v_id)?;
+    lower_membership(e, id, v_id, set_id)
+}
+
+/// The fields of a record set `cartprod(name = S, …)`, by name.
+fn record_set_fields(e: &Emitter, set_id: NodeId) -> Option<Vec<(Symbol, NodeId)>> {
+    let Node::Call(c) = e.node(set_id) else {
+        return None;
+    };
+    (matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
+        && c.args.is_empty()
+        && !c.named.is_empty())
+    .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
+}
+
+/// The field values of a written `record(name = v, …)`, by name.
+fn record_fields(e: &Emitter, v_id: NodeId) -> Option<Vec<(Symbol, NodeId)>> {
+    let Node::Call(c) = e.node(e.resolve_ref_one(v_id)) else {
+        return None;
+    };
+    (matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "record") && c.args.is_empty())
+        .then(|| c.named.iter().map(|n| (n.name, n.value)).collect())
+}
+
+fn lower_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v_id: NodeId,
+    set_id: NodeId,
+) -> Result<Value, EmitError> {
     let set_id = e.resolve_ref_one(set_id);
+
+    // §03: a record lies in `cartprod(name = S, …)` when each field lies in the set
+    // of the same name, so the record needs no tensor form.
+    if let Some(sets) = record_set_fields(e, set_id) {
+        let fields = record_fields(e, v_id).ok_or_else(|| {
+            EmitError::at(id, "'in' over a record set needs a written record point")
+        })?;
+        if fields.len() != sets.len() {
+            return Err(EmitError::at(
+                id,
+                "'in' over a record set: the point and the set have different fields",
+            ));
+        }
+        let mut members = Vec::with_capacity(sets.len());
+        for (name, set) in sets {
+            let Some(&(_, field)) = fields.iter().find(|(n, _)| *n == name) else {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "'in' over a record set: the point has no field `{}`",
+                        e.resolve(name)
+                    ),
+                ));
+            };
+            members.push(lower_membership(e, id, field, set)?);
+        }
+        return members
+            .into_iter()
+            .reduce(|a, b| e.and(&a, &b))
+            .ok_or_else(|| EmitError::at(id, "'in' over an empty record set is unsupported"));
+    }
+
+    let v = e.lower_node(v_id)?;
 
     if let Node::Call(c) = e.node(set_id)
         && matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "cartprod")
