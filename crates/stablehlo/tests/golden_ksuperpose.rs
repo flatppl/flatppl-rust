@@ -196,18 +196,12 @@ fn a_singular_family_argument_emits_against_the_component_axis() {
     );
 }
 
-/// A component whose density builder is not rank-agnostic cannot be evaluated
-/// batched over the family axis. The existing `is_batch_safe` gate refuses it —
-/// refuse-don't-mislower — so the mixture inherits exactly the same restriction
-/// `iid` and value-`broadcast` already have.
-///
-/// `LKJ` is the component: its builder works on the correlation matrix, and it
-/// carries no dedicated batched builder either. This test used `Uniform` and then
-/// `NegativeBinomial2`, which both became batch-safe: `Uniform` once its density
-/// gained §08's support mask, `NegativeBinomial2` once its arithmetic builder
-/// was admitted.
+/// A component with a matrix variate scores per component, holding the point fixed:
+/// `LKJ` takes the mixture route that keeps the shared matrix out of the broadcast
+/// operands, and `n = [2, 2]` fixes the dimension because every component agrees.
+/// Values are checked against the closed form in the testsuite.
 #[test]
-fn a_non_batch_safe_component_refuses_at_the_existing_gate() {
+fn a_matrix_component_scores_each_component_at_the_shared_point() {
     let mut m = flatppl_syntax::parse(
         "flatppl_compat = \"0.1\"\n\
          w = [0.3, 1.2]\n\
@@ -218,8 +212,8 @@ fn a_non_batch_safe_component_refuses_at_the_existing_gate() {
     .unwrap();
     let _ = flatppl_infer::infer(&mut m);
     let d = flatppl_determinizer::determinize(&m).expect("determinizes");
-    let err = emit(&d, Mode::LogDensity, &Default::default()).expect_err("must refuse");
-    assert!(err.msg.contains("not rank-agnostic"), "got: {}", err.msg);
+    let out = emit(&d, Mode::LogDensity, &Default::default()).expect("must emit");
+    assert!(out.contains("func.func @logdensity"), "{out}");
 }
 
 #[test]

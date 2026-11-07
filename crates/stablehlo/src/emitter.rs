@@ -4515,10 +4515,9 @@ impl<'m> Emitter<'m> {
             // Batched density: `Params::field_id` reads the batched
             // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
             // builder auto-broadcasts over the rank-1 variate → a rank-1
-            // log-density vec, and a dist whose builder is not rank-agnostic
-            // needs a dedicated batched one. Which of the two (or a refusal) is
-            // `registry::lower_logdensityof_batched`'s call: the guard belongs
-            // with the distribution knowledge, not here.
+            // log-density vec. The route is each registry entry's
+            // `registry::Broadcast`: the knowledge belongs with the
+            // distribution, not here.
             crate::registry::lower_logdensityof_batched(self, id, rest)
         } else if matches!(
             fname.as_str(),

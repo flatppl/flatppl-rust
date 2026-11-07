@@ -48,6 +48,23 @@ pub struct DistLowering {
     pub logpdf: LogpdfBuilder,
     pub sample: Option<SampleBuilder>,
     pub touniform: Option<CdfBuilder>,
+    /// How the density scores under broadcast: `D.(args)`, `iid(D(...), n)` and
+    /// `ksuperpose(D, ...)` all reach it (§04, §06).
+    pub broadcast: Broadcast,
+}
+
+/// The broadcast route of a distribution's density.
+pub enum Broadcast {
+    /// The density builder is elementwise in its parameters and the variate, so
+    /// it scores a batch of scalar cells as it is.
+    Elementwise,
+    /// A dedicated builder scores the batch.
+    Batched(LogpdfBuilder),
+    /// One vector or matrix cell per element: the variate and the named
+    /// parameters enter a broadcast frame, and the ordinary builder reads the cells.
+    PerCell(&'static [&'static str]),
+    /// Dirac compares its atom with each cell.
+    Atom,
 }
 
 /// The ctor-name-keyed table: a linear scan over a short static list. The
@@ -61,6 +78,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: normal_logpdf,
             sample: Some(normal_sample),
             touniform: Some(normal_cdf),
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -69,6 +87,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: cauchy_logpdf,
             sample: Some(cauchy_sample),
             touniform: Some(cauchy_cdf),
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -77,6 +96,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: logistic_logpdf,
             sample: Some(logistic_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -85,6 +105,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: laplace_logpdf,
             sample: Some(laplace_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -93,6 +114,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: exponential_logpdf,
             sample: Some(exponential_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -101,6 +123,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: gamma_logpdf,
             sample: Some(gamma_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -109,6 +132,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: weibull_logpdf,
             sample: Some(weibull_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -117,6 +141,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: pareto_logpdf,
             sample: Some(pareto_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -125,6 +150,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: inverse_gamma_logpdf,
             sample: Some(inverse_gamma_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -133,6 +159,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: chi_squared_logpdf,
             sample: Some(chi_squared_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -141,6 +168,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: lognormal_logpdf,
             sample: Some(lognormal_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -149,6 +177,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: uniform_logpdf,
             sample: Some(uniform_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -157,6 +186,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: beta_logpdf,
             sample: Some(beta_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -165,6 +195,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: studentt_logpdf,
             sample: Some(studentt_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -173,6 +204,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: generalized_normal_logpdf,
             sample: Some(generalized_normal_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -181,6 +213,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: von_mises_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -189,6 +222,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: bernoulli_logpdf,
             sample: Some(bernoulli_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -197,6 +231,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: poisson_logpdf,
             sample: Some(poisson_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -205,6 +240,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: binomial_logpdf,
             sample: Some(binomial_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -213,6 +249,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: geometric_logpdf,
             sample: Some(geometric_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -221,6 +258,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: negative_binomial_logpdf,
             sample: Some(negative_binomial_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -229,6 +267,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: negative_binomial2_logpdf,
             sample: Some(negative_binomial2_sample),
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -237,6 +276,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: categorical_logpdf,
             sample: Some(categorical_sample),
             touniform: None,
+            broadcast: Broadcast::Batched(categorical_logpdf_batched),
         },
     ),
     (
@@ -245,6 +285,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: categorical0_logpdf,
             sample: Some(categorical0_sample),
             touniform: None,
+            broadcast: Broadcast::Batched(categorical0_logpdf_batched),
         },
     ),
     (
@@ -253,6 +294,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: mvnormal_logpdf,
             sample: Some(mvnormal_sample),
             touniform: None,
+            broadcast: Broadcast::Batched(mvnormal_logpdf_batched),
         },
     ),
     (
@@ -261,6 +303,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: dirichlet_logpdf,
             sample: Some(dirichlet_sample),
             touniform: None,
+            broadcast: Broadcast::PerCell(&["alpha"]),
         },
     ),
     (
@@ -269,6 +312,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: multinomial_logpdf,
             sample: Some(multinomial_sample),
             touniform: None,
+            broadcast: Broadcast::PerCell(&["n", "p"]),
         },
     ),
     (
@@ -277,6 +321,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: wishart_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::PerCell(&["nu", "scale"]),
         },
     ),
     (
@@ -285,6 +330,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: inverse_wishart_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::PerCell(&["nu", "scale"]),
         },
     ),
     (
@@ -293,6 +339,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: lkj_logpdf,
             sample: Some(lkj_sample),
             touniform: None,
+            broadcast: Broadcast::PerCell(&["n", "eta"]),
         },
     ),
     (
@@ -301,6 +348,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: lkj_cholesky_logpdf,
             sample: Some(lkj_cholesky_sample),
             touniform: None,
+            broadcast: Broadcast::PerCell(&["n", "eta"]),
         },
     ),
     (
@@ -309,6 +357,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: dirac_logpdf,
             sample: Some(dirac_sample),
             touniform: None,
+            broadcast: Broadcast::Atom,
         },
     ),
     // §09 particle-physics standard-module densities. Reached exactly like a §08
@@ -320,6 +369,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: crystal_ball_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -328,6 +378,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: argus_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
     (
@@ -336,6 +387,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             logpdf: continued_poisson_logpdf,
             sample: None,
             touniform: None,
+            broadcast: Broadcast::Elementwise,
         },
     ),
 ];
@@ -514,99 +566,48 @@ fn check_parameters(e: &mut Emitter, ctor: &str, p: &Params) -> Result<(), EmitE
     e.check_parameter_domains(ctor, &fields)
 }
 
-/// `builtin_logdensityof(kernel, kernel_input, v)` (`density.rs`'s
-/// `build_density_term`): `kernel` is a bare `Const(ctor)` distribution
-/// constructor symbol, `kernel_input` its kwargs record, `v` the scored
-/// variate. Dispatches to `lookup(ctor).logpdf`, refusing precisely for a
-/// malformed call shape or an unregistered ctor — never guessed.
-/// Whether distribution `ctor`'s `logpdf` builder is **rank-agnostic** — pure
-/// `Emitter::binary`-style per-element arithmetic over `Params::get` fields and
-/// the variate, so feeding it rank-1 (batched) inputs yields a rank-1
-/// log-density vector via auto-broadcast, with no shape-specific machinery.
-/// The gate for the broadcast-density path (`Emitter::lower_broadcast`): a
-/// dotted `builtin_logdensityof.(Dist, broadcast(record, …), vec)` is only sound
-/// for these dists. **Default-deny**: everything not listed — the structural
-/// builders (MvNormal / Wishart / InverseWishart / LKJ / LKJCholesky /
-/// Multinomial's matrix / Cholesky / static-vector ops; Dirichlet /
-/// Multinomial's simplex reductions) AND
-/// any FUTURE registry addition — refuses under broadcast rather than risk
-/// emitting shape-inconsistent StableHLO (refuse-don't-mislower). Enable a new
-/// dist here only after verifying its builder uses no shape-specific ops, or
-/// give it a dedicated batched builder in [`batched_logpdf`] instead.
-///
-/// `Uniform` qualifies because its density is masked to its support: the mask
-/// carries the variate's shape (see [`uniform_logpdf`]), so nothing in the
-/// builder is shape-specific once the batch record's size-1 `support` wrapper is
-/// stripped by [`unbatch_field_id`].
-///
-/// The three §09 entries qualify for the same reason as the §08 arithmetic ones.
-/// [`argus_logpdf`] is add/sub/mul/div/log/exp/sqrt/pow/erf only.
-/// [`crystal_ball_logpdf`] adds a `compare`/`select` pair for its piecewise
-/// branch, which broadcasts exactly like `Uniform`'s support mask — the
-/// condition carries the variate's shape, so both branches and the selection are
-/// rank-agnostic. [`continued_poisson_logpdf`] is arithmetic plus `lgamma`
-/// under the same `Uniform`-style support mask. This is what lets an
-/// `iid(hep.CrystalBall(…), n)` or a HistFactory `staterror` constraint — which
-/// the determiniser lowers to the axis-native dotted density, NOT an unroll —
-/// reach StableHLO at all; without these three they refused as "not
-/// rank-agnostic".
-pub(crate) fn is_batch_safe(ctor: &str) -> bool {
-    matches!(
-        ctor,
-        "Normal"
-            | "Cauchy"
-            | "Logistic"
-            | "Laplace"
-            | "Exponential"
-            | "Gamma"
-            | "Weibull"
-            | "Pareto"
-            | "InverseGamma"
-            | "ChiSquared"
-            | "LogNormal"
-            | "Beta"
-            | "StudentT"
-            | "GeneralizedNormal"
-            | "VonMises"
-            | "Bernoulli"
-            | "Poisson"
-            | "Binomial"
-            | "Geometric"
-            | "NegativeBinomial"
-            | "NegativeBinomial2"
-            | "Uniform"
-            // §09 particle-physics.
-            | "CrystalBall"
-            | "Argus"
-            | "ContinuedPoisson"
-    )
-}
-
-/// A distribution's dedicated BATCHED log-density builder, for the dists whose
-/// scalar builder is not rank-agnostic but whose batched form still has an exact
-/// lowering. The second half of the broadcast-density dispatch
-/// ([`lower_logdensityof_batched`]): [`is_batch_safe`] first, this next, then a
-/// refusal.
-///
-/// Kept a separate table rather than a `DistLowering` field because it is the
-/// exception: 21 of the registry's dists reuse one rank-agnostic builder for
-/// both shapes, and a per-entry `Option` would put a `None` on all of them.
-fn batched_logpdf(ctor: &str) -> Option<LogpdfBuilder> {
-    match ctor {
-        "Categorical" => Some(categorical_logpdf_batched),
-        "Categorical0" => Some(categorical0_logpdf_batched),
-        "MvNormal" => Some(mvnormal_logpdf_batched),
-        _ => None,
+/// Score each variate cell with its own parameters, in one vectorized program:
+/// the variate and every per-cell parameter enter the broadcast frame, a parameter
+/// shared by every cell (a one-element `vector` wrapper) rides along, and the
+/// distribution's own builder reads the cells through the frame.
+fn score_per_cell(
+    e: &mut Emitter,
+    id: NodeId,
+    ctor: &str,
+    params: &Params,
+    v: NodeId,
+    names: &[&str],
+) -> Result<Value, EmitError> {
+    let dist = lookup(ctor)
+        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
+    let mut fields = Vec::with_capacity(names.len());
+    let mut cells = Vec::with_capacity(names.len() + 1);
+    for &name in names {
+        let field = e.resolve_ref_one(params.field_id(e, name)?);
+        let shared = unbatch_field_id(e, params, name)?;
+        if shared == field {
+            cells.push(field);
+        }
+        fields.push((name.to_string(), shared));
     }
+    cells.push(v);
+    let cell_params = Params {
+        kernel_input: params.kernel_input,
+        variate: Some(v),
+        sample_shape: None,
+        fields: Some(fields),
+    };
+    check_parameters(e, ctor, &cell_params)?;
+    e.lower_broadcast_cells(id, &cells, |e, values| {
+        let variate = values.last().expect("the variate is a cell").clone();
+        (dist.logpdf)(e, &cell_params, &variate)
+    })
 }
 
 /// The broadcast-density entry point: `builtin_logdensityof.(Dist,
 /// broadcast(record, …), variate_vec)`, called by
-/// `Emitter::lower_broadcast`. Routes a rank-agnostic dist
-/// ([`is_batch_safe`]) to its ordinary builder, a dist with a dedicated batched
-/// builder ([`batched_logpdf`]) to that, and refuses anything else rather than
-/// drive a structural builder's shape-specific ops with batched inputs
-/// (refuse-don't-mislower).
+/// `Emitter::lower_broadcast`. Routes each distribution by the [`Broadcast`]
+/// route its registry entry declares.
 pub(crate) fn lower_logdensityof_batched(
     e: &mut Emitter,
     id: NodeId,
@@ -668,29 +669,24 @@ fn lower_logdensityof_batched_with(
     params: Params,
     v: NodeId,
 ) -> Result<Value, EmitError> {
-    if ctor == "Dirac" {
-        let atom = params.field_id(e, "value")?;
-        return e.lower_broadcast_cells(id, &[atom, v], |e, values| {
-            let eq = e.dirac_tensor_equal(id, &values[0], &values[1])?;
-            Ok(dirac_score(e, &eq))
-        });
+    let dist = lookup(ctor)
+        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
+    match dist.broadcast {
+        Broadcast::Atom => {
+            let atom = params.field_id(e, "value")?;
+            e.lower_broadcast_cells(id, &[atom, v], |e, values| {
+                let eq = e.dirac_tensor_equal(id, &values[0], &values[1])?;
+                Ok(dirac_score(e, &eq))
+            })
+        }
+        Broadcast::Elementwise => score_with(e, id, ctor, params, v),
+        Broadcast::PerCell(names) => score_per_cell(e, id, ctor, &params, v, names),
+        Broadcast::Batched(builder) => {
+            check_parameters(e, ctor, &params)?;
+            let value = e.lower_node(v)?;
+            builder(e, &params, &value)
+        }
     }
-    if is_batch_safe(ctor) {
-        return score_with(e, id, ctor, params, v);
-    }
-    let Some(builder) = batched_logpdf(ctor) else {
-        return Err(EmitError::at(
-            id,
-            format!(
-                "broadcast over builtin_logdensityof of '{ctor}' is unsupported: \
-                 its density builder is not rank-agnostic (batched density is \
-                 sound only for univariate pure-arithmetic distributions)"
-            ),
-        ));
-    };
-    check_parameters(e, ctor, &params)?;
-    let value = e.lower_node(v)?;
-    builder(e, &params, &value)
 }
 
 pub(crate) fn lower_logdensityof(
@@ -2520,7 +2516,7 @@ fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
 /// §09 also permits rate zero: its density limit is one at zero and zero
 /// elsewhere. Guard the logarithm before selecting that boundary value.
 ///
-/// Rank-agnostic, hence listed in [`is_batch_safe`]: every parameter read is a
+/// Rank-agnostic, hence [`Broadcast::Elementwise`]: every parameter read is a
 /// [`Params::get`] and the mask carries the variate's shape, exactly as
 /// [`uniform_logpdf`]'s does. That is what lets HistFactory's staterror
 /// constraint — `functionof(hepphys.ContinuedPoisson.(mcstat .* mcstat_tau))`,
@@ -3191,12 +3187,13 @@ fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 /// [`wishart_logpdf`]/[`inverse_wishart_logpdf`] to read `n` off `scale`'s own
 /// shape (spec §08: "the dimension n is the row/column count of scale").
 fn static_square_matrix_dim(
+    e: &Emitter,
     blame: NodeId,
     m: &Value,
     ctor: &str,
     param_name: &str,
 ) -> Result<u64, EmitError> {
-    match &m.ty {
+    match &e.cell_ty(m) {
         MlirTy::Ranked(dims) if dims.len() == 2 => match (dims[0], dims[1]) {
             (Some(a), Some(b)) if a == b => Ok(a),
             // Both dims ARE statically known here — just unequal (e.g.
@@ -3236,13 +3233,14 @@ fn static_square_matrix_dim(
 /// mismatch itself (see `require_square_cov`'s doc comment for the same
 /// reasoning), so every builder below must, before any matrix op runs.
 fn require_matrix_dim(
+    e: &Emitter,
     blame: NodeId,
     m: &Value,
     n: u64,
     ctor: &str,
     param_name: &str,
 ) -> Result<(), EmitError> {
-    match &m.ty {
+    match &e.cell_ty(m) {
         MlirTy::Ranked(dims) if dims.len() == 2 && dims[0] == Some(n) && dims[1] == Some(n) => {
             Ok(())
         }
@@ -3267,8 +3265,34 @@ fn require_matrix_dim(
 /// asking, so the message accurately says which lowering needs the literal
 /// — LKJ/LKJCholesky's `logdensity` callers pass `"logdensity"`; Binomial/
 /// Multinomial's `sample` callers pass `"sample"`.
+/// The positive integer every cell of the fixed value `id` holds, if they agree.
+fn fixed_common_positive_int(e: &mut Emitter, id: NodeId) -> Option<u64> {
+    let value = e.lower_node(id).ok()?;
+    if value.elem != ElemKind::Int {
+        return None;
+    }
+    let count = match &value.ty {
+        MlirTy::Scalar => 1,
+        MlirTy::Ranked(dims) => dims
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul((*d)? as usize))?,
+        _ => return None,
+    };
+    let mut common = None;
+    for i in 0..count {
+        let Some(Scalar::Int(n)) = e.fixed_scalar_at(&value, i) else {
+            return None;
+        };
+        if n <= 0 || common.is_some_and(|c| c != n) {
+            return None;
+        }
+        common = Some(n);
+    }
+    common.map(|n| n as u64)
+}
+
 fn literal_fixed_positive_int(
-    e: &Emitter,
+    e: &mut Emitter,
     p: &Params,
     field_name: &str,
     ctor: &str,
@@ -3276,15 +3300,20 @@ fn literal_fixed_positive_int(
 ) -> Result<u64, EmitError> {
     let field = p.field_id(e, field_name)?;
     let resolved = e.resolve_ref_one(field);
-    match e.node(resolved) {
-        Node::Lit(Scalar::Int(i)) if *i > 0 => Ok(*i as u64),
-        _ => Err(EmitError::at(
-            field,
-            format!(
-                "{ctor} {mode} needs a fixed-phase positive integer literal for '{field_name}'"
-            ),
-        )),
+    if let Node::Lit(Scalar::Int(i)) = e.node(resolved)
+        && *i > 0
+    {
+        return Ok(*i as u64);
     }
+    // A fixed value read once per broadcast cell, such as `ksuperpose(LKJ, w, n = [2, 2],
+    // ...)`, fixes the dimension when every cell holds the same positive integer.
+    if let Some(n) = fixed_common_positive_int(e, resolved) {
+        return Ok(n);
+    }
+    Err(EmitError::at(
+        field,
+        format!("{ctor} {mode} needs a fixed-phase positive integer literal for '{field_name}'"),
+    ))
 }
 
 /// `log|A|` for an SPD matrix `A`, from an already-computed Cholesky factor
@@ -3391,8 +3420,25 @@ fn log_cn_lkj(e: &mut Emitter, n: u64, eta: &Value) -> Value {
 /// statically-known `n` (its own caller's loop bound), never an arbitrary
 /// selector reachable from untrusted FlatPDL.
 fn vector_elem(e: &mut Emitter, vec: &Value, idx: u64) -> Value {
-    let sliced = e.slice(vec, &[idx], &[idx + 1], &[1]);
-    e.reshape(&sliced, MlirTy::Scalar)
+    let batch = e.batch_rank(vec);
+    if batch == 0 {
+        let sliced = e.slice(vec, &[idx], &[idx + 1], &[1]);
+        return e.reshape(&sliced, MlirTy::Scalar);
+    }
+    // Element `idx` of every vector cell: slice the cell axis behind the batch axes.
+    let MlirTy::Ranked(dims) = &vec.ty else {
+        unreachable!("a batched vector is ranked")
+    };
+    let dims = dims
+        .iter()
+        .map(|d| d.expect("a batched vector cell has static extents"))
+        .collect::<Vec<_>>();
+    let mut starts = vec![0; dims.len()];
+    let mut limits = dims.clone();
+    starts[batch] = idx;
+    limits[batch] = idx + 1;
+    let sliced = e.slice(vec, &starts, &limits, &vec![1; dims.len()]);
+    e.reshape_cell(&sliced, MlirTy::Scalar)
 }
 
 /// §08 Wishart, verbatim: `((nu-n-1)/2) log|X| - (1/2) tr(V^-1 X) -
@@ -3410,8 +3456,8 @@ fn vector_elem(e: &mut Emitter, vec: &Value, idx: u64) -> Value {
 fn wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let scale_id = p.field_id(e, "scale")?;
     let scale = e.lower_node(scale_id)?;
-    let n = static_square_matrix_dim(scale_id, &scale, "Wishart", "scale")?;
-    require_matrix_dim(p.variate_id()?, v, n, "Wishart", "X")?;
+    let n = static_square_matrix_dim(e, scale_id, &scale, "Wishart", "scale")?;
+    require_matrix_dim(e, p.variate_id()?, v, n, "Wishart", "X")?;
     let nu = p.get(e, "nu")?;
 
     let pd = e.positive_definite_factor(scale_id, "Wishart", "scale", &scale)?;
@@ -3464,8 +3510,8 @@ fn wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
 fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let scale_id = p.field_id(e, "scale")?;
     let psi = e.lower_node(scale_id)?;
-    let n = static_square_matrix_dim(scale_id, &psi, "InverseWishart", "scale")?;
-    require_matrix_dim(p.variate_id()?, v, n, "InverseWishart", "X")?;
+    let n = static_square_matrix_dim(e, scale_id, &psi, "InverseWishart", "scale")?;
+    require_matrix_dim(e, p.variate_id()?, v, n, "InverseWishart", "X")?;
     let nu = p.get(e, "nu")?;
 
     let pd = e.positive_definite_factor(scale_id, "InverseWishart", "scale", &psi)?;
@@ -3510,7 +3556,7 @@ fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Valu
 /// `@sample` builder (`sample: None`).
 fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "LKJ", "logdensity")?;
-    require_matrix_dim(p.variate_id()?, v, n, "LKJ", "C")?;
+    require_matrix_dim(e, p.variate_id()?, v, n, "LKJ", "C")?;
     let eta = p.get(e, "eta")?;
 
     let l_c = e.cholesky(v);
@@ -3534,7 +3580,7 @@ fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError
 /// `@sample` builder (`sample: None`).
 fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "logdensity")?;
-    require_matrix_dim(p.variate_id()?, v, n, "LKJCholesky", "L")?;
+    require_matrix_dim(e, p.variate_id()?, v, n, "LKJCholesky", "L")?;
     let eta = p.get(e, "eta")?;
 
     let diag_l = e.diag(v);
@@ -4796,10 +4842,14 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_batch_safe;
+    use super::{Broadcast, lookup};
+
+    fn route(ctor: &str) -> Option<&'static Broadcast> {
+        lookup(ctor).map(|d| &d.broadcast)
+    }
 
     #[test]
-    fn batch_safe_allows_univariate_arithmetic_dists() {
+    fn univariate_arithmetic_densities_score_elementwise() {
         for d in [
             "Normal",
             "Cauchy",
@@ -4820,30 +4870,28 @@ mod tests {
             // support mask.
             "ContinuedPoisson",
         ] {
-            assert!(is_batch_safe(d), "{d} should be batch-safe");
+            assert!(matches!(route(d), Some(Broadcast::Elementwise)), "{d}");
         }
     }
 
     #[test]
-    fn batch_safe_denies_structural_multivariate_and_unknown_dists() {
-        // Matrix/Cholesky (MvNormal/Wishart/LKJ), simplex reductions
-        // (Dirichlet/Multinomial), gather/index (Categorical/Categorical0), and
-        // any future/unknown ctor are NOT
-        // rank-agnostic, so none may reuse its scalar builder under broadcast.
+    fn structural_densities_score_through_their_own_route() {
+        // Matrix and Cholesky, simplex reductions and gathers are not elementwise,
+        // so each names its batched builder or its per-cell parameters.
+        for d in ["Categorical", "Categorical0", "MvNormal"] {
+            assert!(matches!(route(d), Some(Broadcast::Batched(_))), "{d}");
+        }
         for d in [
-            "Dirac",
-            "Categorical",
-            "Categorical0",
-            "MvNormal",
             "Dirichlet",
             "Multinomial",
             "Wishart",
             "InverseWishart",
             "LKJ",
             "LKJCholesky",
-            "SomeFutureDistribution",
         ] {
-            assert!(!is_batch_safe(d), "{d} must not be batch-safe");
+            assert!(matches!(route(d), Some(Broadcast::PerCell(_))), "{d}");
         }
+        assert!(matches!(route("Dirac"), Some(Broadcast::Atom)));
+        assert!(route("SomeFutureDistribution").is_none());
     }
 }
