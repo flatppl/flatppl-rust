@@ -317,6 +317,7 @@ impl Emitter<'_> {
                     _ => None,
                 }
                 .map(Scalar::Int),
+                Scalar::Bool(x) if op == "stablehlo.not" => Some(Scalar::Bool(!x)),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
@@ -324,8 +325,8 @@ impl Emitter<'_> {
     }
 
     pub(super) fn fold_binary(&mut self, op: &str, a: &Value, b: &Value) -> Option<Value> {
-        let (Some(aa), Some(bb)) = (self.constants.get(&a.ssa), self.constants.get(&b.ssa)) else {
-            return self.fold_fixed_indices(op, a, b);
+        let (Some(aa), Some(bb)) = (self.fixed_operand(a), self.fixed_operand(b)) else {
+            return None;
         };
         let n = aa.len().max(bb.len());
         if (aa.len() != 1 && aa.len() != n) || (bb.len() != 1 && bb.len() != n) {
@@ -343,10 +344,20 @@ impl Emitter<'_> {
                     (Scalar::Real(x), Scalar::Real(y)) => {
                         real_binary(op, *x, *y, self.dtype).map(Scalar::Real)
                     }
+                    (Scalar::Bool(x), Scalar::Bool(y)) => match op {
+                        "stablehlo.and" => Some(Scalar::Bool(*x && *y)),
+                        "stablehlo.or" => Some(Scalar::Bool(*x || *y)),
+                        "stablehlo.xor" => Some(Scalar::Bool(x != y)),
+                        _ => None,
+                    },
                     (Scalar::Int(x), Scalar::Int(y)) => match op {
                         "stablehlo.add" => x.checked_add(*y),
                         "stablehlo.subtract" => x.checked_sub(*y),
                         "stablehlo.multiply" => x.checked_mul(*y),
+                        // StableHLO integer divide and remainder truncate toward zero,
+                        // as Rust's do. A zero divisor stays a run-time op.
+                        "stablehlo.divide" => x.checked_div(*y),
+                        "stablehlo.remainder" => x.checked_rem(*y),
                         _ => None,
                     }
                     .map(Scalar::Int),
@@ -357,30 +368,25 @@ impl Emitter<'_> {
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
 
-    /// Index arithmetic can use broadcast views without materializing operands.
-    /// Real arithmetic retains its existing target-precision folding path.
-    fn fold_fixed_indices(&mut self, op: &str, a: &Value, b: &Value) -> Option<Value> {
-        if a.elem != ElemKind::Int || b.elem != ElemKind::Int {
+    /// Dense fixed data, or a bounded expansion of a broadcast or reshape
+    /// view over integer or Boolean data. Index and mask arithmetic then
+    /// folds without materializing its operands. Real data keeps the compact
+    /// rule.
+    fn fixed_operand(&self, value: &Value) -> Option<Constant> {
+        if let Some(data) = self.constants.get(&value.ssa) {
+            return Some(data.clone());
+        }
+        if value.elem == ElemKind::Real {
             return None;
         }
-        let count = element_count(&a.ty)?;
+        let count = element_count(&value.ty)?;
         if count > MAX_FOLDED_ELEMENTS {
             return None;
         }
-        let values = (0..count)
-            .map(|i| {
-                let x = self.fixed_count_at(a, i)?;
-                let y = self.fixed_count_at(b, i)?;
-                match op {
-                    "stablehlo.add" => x.checked_add(y),
-                    "stablehlo.subtract" => x.checked_sub(y),
-                    "stablehlo.multiply" => x.checked_mul(y),
-                    _ => None,
-                }
-                .map(Scalar::Int)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        self.folded_constant(values, a.ty.clone(), self.axes_of(a))
+        (0..count)
+            .map(|i| self.fixed_scalar_at(value, i).cloned())
+            .collect::<Option<Vec<_>>>()
+            .map(Into::into)
     }
 
     /// Gather outer cells from fixed data, reading broadcast sources lazily.
@@ -440,8 +446,8 @@ impl Emitter<'_> {
     pub(super) fn fold_compare(&mut self, dir: &str, a: &Value, b: &Value) -> Option<Value> {
         use std::cmp::Ordering::{Equal, Greater, Less};
 
-        let aa = self.constants.get(&a.ssa)?;
-        let bb = self.constants.get(&b.ssa)?;
+        let aa = self.fixed_operand(a)?;
+        let bb = self.fixed_operand(b)?;
         let n = aa.len().max(bb.len());
         if aa.is_empty()
             || bb.is_empty()
@@ -476,7 +482,7 @@ impl Emitter<'_> {
         if c.ty != MlirTy::Scalar && c.ty != a.ty {
             return None;
         }
-        let cc = self.constants.get(&c.ssa)?;
+        let cc = self.fixed_operand(c)?;
         let Scalar::Bool(first) = cc.first()? else {
             return None;
         };
@@ -486,8 +492,8 @@ impl Emitter<'_> {
         {
             return Some(if *first { a.clone() } else { b.clone() });
         }
-        let aa = self.constants.get(&a.ssa)?;
-        let bb = self.constants.get(&b.ssa)?;
+        let aa = self.fixed_operand(a)?;
+        let bb = self.fixed_operand(b)?;
         let n = cc.len().max(aa.len()).max(bb.len());
         if [cc.len(), aa.len(), bb.len()]
             .iter()
