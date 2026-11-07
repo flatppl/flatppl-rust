@@ -48,12 +48,15 @@ fn refusal(src: &str) -> String {
 
 const IID_UNIFORM: &str = "\
 flatppl_compat = \"0.1\"
+x = elementof(cartpow(reals, 2))
 square = iid(Uniform(interval(0.0, 1.0)), 2)
-lp = logdensityof(square, [0.5, 0.8])
+lp = logdensityof(square, x)
+inputs = (x)
 outputs = (lp)
 ";
 
-/// `iid(Uniform(S), 2)`: the mask must be rank-1 over the two-element variate,
+/// `iid(Uniform(S), 2)` at a run-time point (a fixed point folds the mask): the
+/// mask must be rank-1 over the two-element variate,
 /// so the reduce that follows sums TWO `-log(1.0)` terms. A rank-0 mask (the
 /// pre-mask builder's shape) would leave `sum` a scalar reduce and halve the
 /// log-likelihood, which no structural check on the constant alone would catch.
@@ -89,8 +92,8 @@ outputs = (lp)
         "expected a -inf off-support branch, in:\n{out}"
     );
     assert!(
-        out.contains("dense<false>"),
-        "the constant off-support comparison folds to false, in:\n{out}"
+        !out.contains("stablehlo.select"),
+        "the constant off-support mask folds to the -inf branch, in:\n{out}"
     );
 }
 

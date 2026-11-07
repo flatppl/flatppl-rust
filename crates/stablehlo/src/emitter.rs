@@ -1902,11 +1902,16 @@ impl<'m> Emitter<'m> {
             "stablehlo.reverse {}, dims = [{dims_text}] : {ty}",
             a.ssa
         ));
-        Value {
+        let out = Value {
             ssa,
             ty: a.ty.clone(),
             elem: a.elem,
+        };
+        // Reverse has no view recipe, so remember its fixed values here.
+        if let Some(values) = self.fixed_reversed(a, dims) {
+            self.remember_constant(&out.ssa, values);
         }
+        out
     }
 
     /// `%N = stablehlo.pad %a, %zero, low = [...], high = [...], interior = [...]`
@@ -3528,6 +3533,12 @@ impl<'m> Emitter<'m> {
     /// [`render_i1`], like `compare`/`select`.
     pub fn and(&mut self, a: &Value, b: &Value) -> Value {
         let (a, b) = self.broadcast_pair(a, b);
+        if a.elem == ElemKind::Bool
+            && b.elem == ElemKind::Bool
+            && let Some(value) = self.fold_binary("stablehlo.and", &a, &b)
+        {
+            return value;
+        }
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!(
@@ -3557,6 +3568,12 @@ impl<'m> Emitter<'m> {
     /// or `tensor<Nxi1>` batch).
     pub fn or(&mut self, a: &Value, b: &Value) -> Value {
         let (a, b) = self.broadcast_pair(a, b);
+        if a.elem == ElemKind::Bool
+            && b.elem == ElemKind::Bool
+            && let Some(value) = self.fold_binary("stablehlo.or", &a, &b)
+        {
+            return value;
+        }
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.or {}, {} : {ty}", a.ssa, b.ssa));
@@ -3581,6 +3598,12 @@ impl<'m> Emitter<'m> {
     /// against `iree-base-compiler` 3.11.
     pub fn xor(&mut self, a: &Value, b: &Value) -> Value {
         let (a, b) = self.broadcast_pair(a, b);
+        if a.elem == ElemKind::Bool
+            && b.elem == ElemKind::Bool
+            && let Some(value) = self.fold_binary("stablehlo.xor", &a, &b)
+        {
+            return value;
+        }
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!(
@@ -3606,6 +3629,11 @@ impl<'m> Emitter<'m> {
     /// predicate (the loop condition's `!accepted`). Rendered via
     /// [`render_i1`], like [`Emitter::and`].
     pub fn not(&mut self, a: &Value) -> Value {
+        if a.elem == ElemKind::Bool
+            && let Some(value) = self.fold_unary("stablehlo.not", a)
+        {
+            return value;
+        }
         let ssa = self.fresh();
         let ty = render_i1(&a.ty);
         self.push(&format!("{ssa} = stablehlo.not {} : {ty}", a.ssa));

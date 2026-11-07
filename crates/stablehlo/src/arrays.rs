@@ -584,7 +584,7 @@ pub(crate) fn lower_filter(
     let mask = e.lower_broadcast(id, &[pred, data])?;
     let keep = (0..n as usize)
         .map(|i| match e.fixed_scalar_at(&mask, i) {
-            Some(&Scalar::Bool(b)) => Some(b),
+            Some(Scalar::Bool(b)) => Some(b),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
