@@ -593,20 +593,23 @@ fn function_definition_errors() {
     assert!(parse("f(a, b)").is_err());
 }
 
-/// Placeholders are scoped to the nearest enclosing reification (spec §04):
-/// referencing an enclosing lambda's argument — or an enclosing `fn`'s hole —
-/// from inside a nested lambda / `fn` / `functionof` would leave the
-/// placeholder unbound there (the spec's DISALLOWED case), so the parser
-/// rejects the capture at the point it would introduce the placeholder.
+/// Spec §04 "Lambda notation" rewrites every free occurrence of a lambda
+/// argument to its placeholder, nested reifications included, so the parser
+/// accepts an enclosing argument there. Whether the nested reification binds the
+/// placeholder is the reification's boundary check, in `infer`
+/// (`crates/infer/tests/nested_reification.rs`). A `fn(…)` hole has no name to
+/// rewrite, so a hole separated from its `fn(…)` stays a parse error.
 #[test]
-fn cross_reification_capture_rejected() {
-    // Outer lambda arg inside a nested lambda.
-    assert!(parse("f = x -> broadcast(y -> x * y, v)").is_err());
-    // Outer lambda arg inside a nested `fn(…)`.
-    assert!(parse("f = x -> fn(_ + x)").is_err());
-    // Outer lambda arg inside a nested explicit reification (body or kwargs).
-    assert!(parse("a = elementof(reals)\nf = x -> functionof(a + x, p = a)").is_err());
-    assert!(parse("a = elementof(reals)\nf = x -> kernelof(a, p = x)").is_err());
+fn cross_reification_capture_rewrites_to_placeholders() {
+    let printed = print_with(
+        &parse("f = x -> broadcast(y -> x * y, v)").unwrap(),
+        Syntax::Minimal,
+    );
+    assert!(
+        printed.contains("functionof(mul(_x_, _y_), y = _y_)"),
+        "got:\n{printed}"
+    );
+    assert!(parse("f = x -> fn(_ + x)").is_ok());
     // A hole separated from its `fn(…)` by a nested lambda.
     assert!(parse("g = fn(broadcast(y -> _ * y, v))").is_err());
 

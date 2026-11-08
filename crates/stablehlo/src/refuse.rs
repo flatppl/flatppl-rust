@@ -400,20 +400,10 @@
 //!
 //! **`registry.rs`** (`registry::lower_logdensityof_batched`, the batched-density
 //! head `Emitter::lower_broadcast` routes to):
-//! - `broadcast(builtin_logdensityof, K, …)` whose `K` is neither
-//!   [`crate::registry::is_batch_safe`] nor carries a dedicated batched builder
-//!   (`registry::batched_logpdf`) — "broadcast over builtin_logdensityof
-//!   of '...' is unsupported: its density builder is not rank-agnostic (batched
-//!   density is sound only for univariate pure-arithmetic distributions)". A
-//!   structural builder (matrix / Cholesky / simplex reduction) driven by batched
-//!   inputs would emit shape-inconsistent StableHLO, so the allow-list is
-//!   default-deny.
-//!   This one gate covers every construct that reaches the batched-density path:
-//!   an `iid` fan-out, a value `broadcast`, and §06's `ksuperpose` mixture, all
-//!   of which the determiniser lowers through the same
-//!   `broadcast(builtin_logdensityof, …)` shape. Locked by
-//!   `tests/golden_ksuperpose.rs`'s
-//!   `a_non_batch_safe_component_refuses_at_the_existing_gate`.
+//! - `broadcast(builtin_logdensityof, K, …)` whose `K` has no registry entry —
+//!   "no lowering for distribution '...'". Every registered distribution declares
+//!   its broadcast route (`registry::Broadcast`), so an `iid` fan-out, a value
+//!   `broadcast` and §06's `ksuperpose` mixture score every §08 distribution.
 //! - `broadcast(builtin_logdensityof, …)` whose distribution argument is not a
 //!   bare `Const` constructor — "broadcast(builtin_logdensityof, …):
 //!   distribution must be a bare constructor"

@@ -120,8 +120,8 @@ outputs = lp";
 
 // An `iid` over a §09 member is the BATCHED (dotted) density, not an unroll: the
 // determiniser emits one `builtin_logdensityof.(D, broadcast(record, …), vec)`
-// under a `sum`. Both builders are rank-agnostic, so they are listed in
-// `is_batch_safe`; without that this refused as "not rank-agnostic".
+// under a `sum`. Both builders are rank-agnostic, so their registry entries route
+// `Broadcast::Elementwise`; without that this refused as "not rank-agnostic".
 //
 // Executed, not merely pinned. Under the suite's Enzyme-JAX executor:
 //

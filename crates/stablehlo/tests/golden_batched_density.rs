@@ -1,10 +1,9 @@
 //! Batched density (`builtin_logdensityof.(D, broadcast(record, …), vec)`) for
-//! the two distributions whose scalar builder is not rank-agnostic on its own.
+//! distributions whose scalar builder is not rank-agnostic on its own.
 //!
-//! `registry::lower_logdensityof_batched` routes an `iid` fan-out either to a
-//! rank-agnostic builder (`registry::is_batch_safe`) or to a dedicated batched
-//! one (`registry::batched_logpdf`). These tests pin both routes and the refusal
-//! that guards the third case.
+//! `registry::lower_logdensityof_batched` routes an `iid` fan-out by each
+//! distribution's `registry::Broadcast`: an elementwise builder, a dedicated batched
+//! one, or one vector or matrix cell per element. These tests pin the routes.
 //!
 //! `Uniform` takes the first route: §08's "outside the support the density is
 //! zero" mask carries the variate's shape, so `iid(Uniform(S), n)` yields the
@@ -34,16 +33,6 @@ fn emit(src: &str) -> String {
         &flatppl_stablehlo::EmitOptions::default(),
     )
     .expect("must emit @logdensity")
-}
-
-fn refusal(src: &str) -> String {
-    flatppl_stablehlo::emit(
-        &determinize_src(src),
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .expect_err("must refuse")
-    .to_string()
 }
 
 const IID_UNIFORM: &str = "\
@@ -174,12 +163,12 @@ outputs = (lp)
     );
 }
 
-/// The default-deny gate still holds for a dist with neither route:
-/// `Dirichlet`'s builder reduces over its simplex, and it carries no batched
-/// builder.
+/// A multivariate density scores one vector cell per element: `Dirichlet.(A)` pairs
+/// each row of `A` with the matching observation, in one vectorized program with no
+/// `while`. Values are checked against scipy in the testsuite.
 #[test]
-fn a_dist_with_neither_route_still_refuses_under_broadcast() {
-    let msg = refusal(
+fn a_vector_density_scores_each_cell_under_broadcast() {
+    let out = emit(
         "\
 flatppl_compat = \"0.1\"
 a = elementof(posreals)
@@ -189,8 +178,12 @@ outputs = (lp)
 ",
     );
     assert!(
-        msg.contains("is not rank-agnostic"),
-        "expected the batch-safety refusal, got: {msg}"
+        out.contains("tensor<2x2xf32>"),
+        "the cells stay one batch, in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.while"),
+        "no per-cell loop, in:\n{out}"
     );
 }
 
@@ -249,4 +242,38 @@ outputs = (lp)
         out.contains("operand_batching_dims = [0]") && out.contains("tensor<4x3xf32>"),
         "each observation must index its own probability vector, in:\n{out}"
     );
+}
+
+/// Every §08 distribution scores under broadcast. The matrix ones score one matrix
+/// cell per element through the same per-cell route, whether the parameters are
+/// shared (`iid`) or one per cell (a dotted constructor). Values are checked against
+/// scipy and closed forms in the testsuite.
+#[test]
+fn matrix_and_vector_densities_score_each_cell() {
+    let corr = "[rowstack([[1.0, 0.3], [0.3, 1.0]]), rowstack([[1.0, -0.2], [-0.2, 1.0]])]";
+    let chol = "[rowstack([[1.0, 0.0], [0.3, 0.9539392014169457]]), \
+                rowstack([[1.0, 0.0], [-0.2, 0.9797958971132712]])]";
+    let spd = "[rowstack([[1.0, 0.2], [0.2, 2.0]]), rowstack([[3.0, -0.5], [-0.5, 1.5]])]";
+    let scale = "rowstack([[2.0, 0.3], [0.3, 1.0]])";
+    for density in [
+        format!("logdensityof(iid(LKJ(2, a), 2), {corr})"),
+        format!("logdensityof(LKJ.(2, [a, 2.0 * a]), {corr})"),
+        format!("logdensityof(iid(LKJCholesky(2, a), 2), {chol})"),
+        format!("logdensityof(LKJCholesky.(2, [a, 2.0 * a]), {chol})"),
+        format!("logdensityof(iid(Wishart(a + 3.0, {scale}), 2), {spd})"),
+        format!("logdensityof(Wishart.([a + 3.0, a + 4.0], fill({scale}, 2)), {spd})"),
+        format!("logdensityof(iid(InverseWishart(a + 3.0, {scale}), 2), {spd})"),
+        format!("logdensityof(InverseWishart.([a + 3.0, a + 4.0], fill({scale}, 2)), {spd})"),
+        "logdensityof(Multinomial.(5, [[0.2, 0.3, 0.5], [0.1, 0.1, 0.8]]), [[1, 2, 2], [0, 1, 4]])"
+            .to_string(),
+    ] {
+        let out = emit(&format!(
+            "flatppl_compat = \"0.1\"\na = elementof(posreals)\nlp = {density}\n\
+             inputs = (a)\noutputs = (lp)\n"
+        ));
+        assert!(
+            !out.contains("stablehlo.while"),
+            "{density}: no per-cell loop, in:\n{out}"
+        );
+    }
 }
