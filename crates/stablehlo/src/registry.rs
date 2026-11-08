@@ -2017,8 +2017,8 @@ fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     Ok(e.add(&a, &width_u))
 }
 
-/// §08 Beta, verbatim: `log f = (alpha - 1) * log(x) + (beta - 1) *
-/// log(1 - x) - [lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta)]`. Beta
+/// §08 Beta: `log f = (alpha - 1) * log(x) + (beta - 1) * log(1 - x) -
+/// log B(alpha, beta)`, with `log B` from [`Emitter::log_beta`]. Beta
 /// is a ratio of Gammas, so its `@sample` builder ([`beta_sample`], Task 15)
 /// is `X / (X + Y)` for `X ~ Gamma(alpha, 1)`, `Y ~ Gamma(beta, 1)` on the
 /// shared [`draw_gamma`] rejection core (no closed-form inverse-CDF — the
@@ -2043,22 +2043,16 @@ fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErro
         let log_x = e.log(v);
         let t1 = e.mul(&alpha_minus_one, &log_x);
 
+        // log1p(-x), not log(1 - x): rounding 1 - x costs an ulp that (beta - 1)
+        // multiplies, and a small x loses most of its digits.
         let beta_minus_one = e.sub(&beta, &one);
-        let one_minus_x = e.sub(&one, v);
-        let log_one_minus_x = e.log(&one_minus_x);
+        let neg_x = e.neg(v);
+        let log_one_minus_x = e.log1p(&neg_x);
         let t2 = e.mul(&beta_minus_one, &log_one_minus_x);
 
-        let lgamma_alpha = e.lgamma(&alpha);
-        let neg_lgamma_alpha = e.neg(&lgamma_alpha);
-        let lgamma_beta = e.lgamma(&beta);
-        let neg_lgamma_beta = e.neg(&lgamma_beta);
-        let alpha_plus_beta = e.add(&alpha, &beta);
-        let lgamma_alpha_plus_beta = e.lgamma(&alpha_plus_beta);
-
+        let log_beta = e.log_beta(&alpha, &beta);
         let t3 = e.add(&t1, &t2);
-        let t4 = e.add(&neg_lgamma_alpha, &neg_lgamma_beta);
-        let t5 = e.add(&t4, &lgamma_alpha_plus_beta);
-        Ok(e.add(&t3, &t5))
+        Ok(e.sub(&t3, &log_beta))
     })
 }
 
@@ -2287,10 +2281,10 @@ fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     continued_poisson_logpdf(e, p, v)
 }
 
-/// §08 Binomial, verbatim: `log f = logC(n, k) + k * log(p) + (n - k) *
-/// log(1 - p)`, with `logC(n, k) = lgamma(n+1) - lgamma(k+1) -
-/// lgamma(n-k+1)` (task brief, verbatim). `n - k` is computed once and its
-/// `Value` reused for both `logC`'s `lgamma(n-k+1)` term and the trailing
+/// §08 Binomial: `log f = logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
+/// with `logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1)`, which equals
+/// `lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. `n - k` is computed once and its
+/// `Value` reused for both `logC`'s `log B` argument and the trailing
 /// `(n-k) * log(1-p)` term — the spec's `n - k` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
 /// Its `@sample` builder is [`binomial_sample`] (Task 16) — the exact sum of
@@ -2309,15 +2303,14 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let one = e.scalar(1.0);
 
     let n_minus_k = e.sub(&n, &v);
+    // logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1): no large log-gammas cancel.
     let log_choose_nk = fixed_log_choose.unwrap_or_else(|| {
-        let n_plus_one = e.add(&n, &one);
-        let lgamma_n1 = e.lgamma(&n_plus_one);
         let k_plus_one = e.add(&v, &one);
-        let lgamma_k1 = e.lgamma(&k_plus_one);
         let n_minus_k_plus_one = e.add(&n_minus_k, &one);
-        let lgamma_nmk1 = e.lgamma(&n_minus_k_plus_one);
-        let difference = e.sub(&lgamma_n1, &lgamma_k1);
-        e.sub(&difference, &lgamma_nmk1)
+        let log_beta = e.log_beta(&k_plus_one, &n_minus_k_plus_one);
+        let log1p_n = e.log1p(&n);
+        let neg_log1p_n = e.neg(&log1p_n);
+        e.sub(&neg_log1p_n, &log_beta)
     });
 
     // A zero exponent contributes log(1), even when its probability is zero.
@@ -2327,10 +2320,11 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let log_p = e.log(&safe_prob);
     let k_log_p = e.mul(&v, &log_p);
 
-    let one_minus_p = e.sub(&one, &prob);
+    // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
     let no_failures = e.compare("EQ", &n_minus_k, &zero);
-    let safe_complement = e.select(&no_failures, &one, &one_minus_p);
-    let log_one_minus_p = e.log(&safe_complement);
+    let safe_prob_complement = e.select(&no_failures, &zero, &prob);
+    let neg_prob = e.neg(&safe_prob_complement);
+    let log_one_minus_p = e.log1p(&neg_prob);
     let n_minus_k_log_one_minus_p = e.mul(&n_minus_k, &log_one_minus_p);
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
@@ -2918,39 +2912,38 @@ fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 
     let log_p = e.log(&prob);
 
-    let one = e.scalar(1.0);
-    let one_minus_p = e.sub(&one, &prob);
-    let log_one_minus_p = e.log(&one_minus_p);
+    // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
+    let neg_prob = e.neg(&prob);
+    let log_one_minus_p = e.log1p(&neg_prob);
     let k_log_one_minus_p = e.mul(v, &log_one_minus_p);
 
     Ok(e.add(&log_p, &k_log_one_minus_p))
 }
 
+/// `logC(k + r - 1, k) = lgamma(k + r) - lgamma(r) - lgamma(k + 1)`, the negative
+/// binomial count coefficient, as `-log(k + r) - log B(r, k + 1)`. The three
+/// log-gammas grow with `k + r` while their difference stays small.
+fn log_count_choose(e: &mut Emitter, k: &Value, r: &Value) -> Value {
+    let one = e.scalar(1.0);
+    let k_plus_one = e.add(k, &one);
+    let log_beta = e.log_beta(r, &k_plus_one);
+    let k_plus_r = e.add(k, r);
+    let log_k_plus_r = e.log(&k_plus_r);
+    let neg_log_k_plus_r = e.neg(&log_k_plus_r);
+    e.sub(&neg_log_k_plus_r, &log_beta)
+}
+
 /// §08 NegativeBinomial: `log f = logC(k + alpha - 1, alpha - 1) +
 /// alpha * (log(beta) - log(beta + 1)) - k * log(beta + 1)`, computed as
-/// `-alpha * log1p(1 / beta) - k * log1p(beta)`, with `logC(k +
-/// alpha - 1, alpha - 1) = lgamma(k + alpha) - lgamma(alpha) - lgamma(k + 1)`
-/// (the task brief's already-reduced closed form — computing the raw `(n, k)
-/// = (k+alpha-1, alpha-1)` pair first and expanding `logC` from there, as
-/// [`binomial_logpdf`] does for its own `(n, k)` pair, would reach the same
-/// three lgammas via one extra `sub`/`add` pair; inlining the already-reduced
-/// form here is the smaller op count). Its `@sample` builder is
+/// `-alpha * log1p(1 / beta) - k * log1p(beta)`, with the coefficient from
+/// [`log_count_choose`]. Its `@sample` builder is
 /// [`negative_binomial_sample`] (Task 16) — the Gamma–Poisson mixture.
 fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
 
-    let k_plus_alpha = e.add(v, &alpha);
-    let lgamma_k_alpha = e.lgamma(&k_plus_alpha);
-    let lgamma_alpha = e.lgamma(&alpha);
-    let neg_lgamma_alpha = e.neg(&lgamma_alpha);
     let one = e.scalar(1.0);
-    let k_plus_one = e.add(v, &one);
-    let lgamma_k1 = e.lgamma(&k_plus_one);
-    let neg_lgamma_k1 = e.neg(&lgamma_k1);
-
-    let t1 = e.add(&lgamma_k_alpha, &neg_lgamma_alpha);
-    let t2 = e.add(&t1, &neg_lgamma_k1);
+    let t2 = log_count_choose(e, v, &alpha);
 
     // log(beta / (beta + 1)) = -log1p(1 / beta) and log(beta + 1) =
     // log1p(beta). A difference of two logarithms cancels when beta is large,
@@ -2970,24 +2963,14 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
 
 /// §08 NegativeBinomial2: `log f = logC(k + psi - 1, k) + k * (log(mu) -
 /// log(mu + psi)) + psi * (log(psi) - log(mu + psi))`, computed as
-/// `-k * log1p(psi / mu) - psi * log1p(mu / psi)`, with `logC(k + psi - 1, k) =
-/// lgamma(k + psi) - lgamma(psi) - lgamma(k + 1)`. Its `@sample` builder is
+/// `-k * log1p(psi / mu) - psi * log1p(mu / psi)`, with the coefficient from
+/// [`log_count_choose`]. Its `@sample` builder is
 /// [`negative_binomial2_sample`] (Task 16) — the Gamma–Poisson mixture.
 fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let psi = p.get(e, "psi")?;
 
-    let k_plus_psi = e.add(v, &psi);
-    let lgamma_k_psi = e.lgamma(&k_plus_psi);
-    let lgamma_psi = e.lgamma(&psi);
-    let neg_lgamma_psi = e.neg(&lgamma_psi);
-    let one = e.scalar(1.0);
-    let k_plus_one = e.add(v, &one);
-    let lgamma_k1 = e.lgamma(&k_plus_one);
-    let neg_lgamma_k1 = e.neg(&lgamma_k1);
-
-    let t1 = e.add(&lgamma_k_psi, &neg_lgamma_psi);
-    let t2 = e.add(&t1, &neg_lgamma_k1);
+    let t2 = log_count_choose(e, v, &psi);
 
     // log(mu / (mu + psi)) = -log1p(psi / mu), and likewise for psi. The
     // difference of two logarithms cancels when mu >> psi, in the value and
@@ -3251,8 +3234,9 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     }
 }
 
-/// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))
-/// + sum((alpha - 1) * log(x))`. `alpha - 1` needs a vector-shaped `1`
+/// §08 Dirichlet: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha)) + sum((alpha -
+/// 1) * log(x))`, with the normalizer from [`Emitter::log_multivariate_beta`], so no
+/// large log-gammas cancel. `alpha - 1` needs a vector-shaped `1`
 /// (`Emitter::constant_like(1.0, &alpha)`, a splat — see the batch doc
 /// comment on why a bare `Emitter::scalar` cannot be subtracted from a
 /// vector directly). Its `@sample` builder ([`dirichlet_sample`], Task 15)
@@ -3260,13 +3244,7 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// rejection loop each) and returns `g / sum(g)`.
 fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
-
-    let sum_alpha = e.reduce_sum(&alpha);
-    let lgamma_sum_alpha = e.lgamma(&sum_alpha);
-
-    let lgamma_alpha = e.lgamma(&alpha);
-    let sum_lgamma_alpha = e.reduce_sum(&lgamma_alpha);
-    let neg_sum_lgamma_alpha = e.neg(&sum_lgamma_alpha);
+    let log_norm = e.log_multivariate_beta(&alpha);
 
     let one_vec = e.constant_like(1.0, &alpha);
     let alpha_minus_one = e.sub(&alpha, &one_vec);
@@ -3274,8 +3252,7 @@ fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     let term = e.mul(&alpha_minus_one, &log_x);
     let sum_term = e.reduce_sum(&term);
 
-    let t1 = e.add(&lgamma_sum_alpha, &neg_sum_lgamma_alpha);
-    Ok(e.add(&t1, &sum_term))
+    Ok(e.sub(&sum_term, &log_norm))
 }
 
 /// §08 Multinomial, verbatim: `log f = lgamma(n+1) - sum(lgamma(x+1)) +

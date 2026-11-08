@@ -51,6 +51,8 @@ pub(crate) use integration::IntegralKind;
 mod likelihood_reductions;
 #[path = "linalg.rs"]
 mod linalg;
+#[path = "log_beta.rs"]
+mod log_beta;
 #[path = "packed_gathers.rs"]
 mod packed_gathers;
 #[path = "packing.rs"]
