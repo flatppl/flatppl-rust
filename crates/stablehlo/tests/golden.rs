@@ -11836,11 +11836,12 @@ fn emit_logdensity_invlogit_pushfwd_gates_strictly_on_zero_and_one() {
     // `logit` is the inverse; `invlogit` (`stablehlo.logistic`) appears both in
     // the log-volume term and at the safe-point witness.
     assert!(out.contains("stablehlo.logistic"), "invlogit:\n{out}");
-    // Two selects: the witness substitution, then the −inf floor.
+    // Three selects: the witness substitution, the base density's guard for an
+    // infinite variate, then the −inf floor.
     assert_eq!(
         out.matches("stablehlo.select").count(),
-        2,
-        "witness + floor:\n{out}"
+        3,
+        "witness, infinite-variate guard and floor:\n{out}"
     );
     assert!(
         out.contains("dense<0x7F800000>") && out.contains("stablehlo.negate"),
@@ -11903,14 +11904,28 @@ fn emit_logdensity_expm1_pushfwd_matches_frozen_golden() {
 /// The whole-line case carries NO gate: `asinh` is onto, so §06 gives it no
 /// image, and there is nothing to compare, conjoin, sanitise or floor. The
 /// negative assertions are the substance — a spurious gate here would clamp a
-/// density that is finite everywhere.
+/// density that is finite everywhere. The one compare and select are the base
+/// density's guard for an infinite variate (§03 "Note on infinities").
 #[test]
 fn emit_logdensity_asinh_pushfwd_carries_no_image_gate() {
     let out = emit_logdensity(&determinize_src(PUSHFWD_ASINH_SRC));
     assert!(is_delimiter_balanced(&out));
-    assert!(!out.contains("stablehlo.compare"), "onto map:\n{out}");
-    assert!(!out.contains("stablehlo.select"), "onto map:\n{out}");
-    assert!(!out.contains("dense<0x7F800000>"), "no −inf floor:\n{out}");
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        1,
+        "onto map:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.compare EQ,").count(),
+        1,
+        "the infinite-variate guard:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        1,
+        "onto map:\n{out}"
+    );
+    assert!(!out.contains("stablehlo.and"), "no image gate:\n{out}");
     // `sinh` inverts `asinh`, and it is emitted ONCE — for the base density alone.
     // The log-volume reads `%arg0` directly (`−ln cosh y`, spelled
     // `−(|y| + log1p(exp(−2|y|)) − ln 2)`), where the forward-input spelling

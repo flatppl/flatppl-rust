@@ -32,7 +32,7 @@ module attributes {flatppl.runtime_status = 2 : i64} {
     %30 = stablehlo.multiply %27, %28 : tensor<128x3xf32>
     %31 = stablehlo.subtract %30, %29 : tensor<128x3xf32>
     %32 = chlo.erf_inv %31 : tensor<128x3xf32> -> tensor<128x3xf32>
-    %33 = stablehlo.constant dense<1.4142135> : tensor<128x3xf32>
+    %33 = stablehlo.constant dense<1.4142135623730951> : tensor<128x3xf32>
     %34 = stablehlo.multiply %32, %33 : tensor<128x3xf32>
     %35, %36 = stablehlo.rng_bit_generator %21, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128x3xui32>)
     %37 = stablehlo.constant dense<9> : tensor<128x3xui32>

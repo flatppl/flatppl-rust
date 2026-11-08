@@ -8,7 +8,7 @@ module {
     %7 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
     %8 = stablehlo.multiply %6, %7 : tensor<f32>
     %9 = stablehlo.constant dense<2.0> : tensor<f32>
-    %13 = stablehlo.constant dense<1.4142135> : tensor<f32>
+    %13 = stablehlo.constant dense<1.4142135623730951> : tensor<f32>
     %17, %18 = stablehlo.rng_bit_generator %2, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<ui32>)
     %19 = stablehlo.constant dense<9> : tensor<ui32>
     %20 = stablehlo.shift_right_logical %18, %19 : tensor<ui32>
@@ -18,10 +18,9 @@ module {
     %24 = stablehlo.multiply %23, %9 : tensor<f32>
     %25 = stablehlo.subtract %24, %0 : tensor<f32>
     %26 = chlo.erf_inv %25 : tensor<f32> -> tensor<f32>
-    %27 = stablehlo.constant dense<1.4142135> : tensor<f32>
-    %28 = stablehlo.multiply %26, %27 : tensor<f32>
-    %29 = stablehlo.multiply %0, %28 : tensor<f32>
-    %30 = stablehlo.add %0, %29 : tensor<f32>
-    return %30, %17 : tensor<f32>, tensor<2xui64>
+    %27 = stablehlo.multiply %26, %13 : tensor<f32>
+    %28 = stablehlo.multiply %0, %27 : tensor<f32>
+    %29 = stablehlo.add %0, %28 : tensor<f32>
+    return %29, %17 : tensor<f32>, tensor<2xui64>
   }
 }

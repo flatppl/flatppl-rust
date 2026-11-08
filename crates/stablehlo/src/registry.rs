@@ -627,8 +627,37 @@ fn score_per_cell(
     check_parameters(e, ctor, &cell_params)?;
     e.lower_broadcast_cells(id, &cells, |e, values| {
         let variate = values.last().expect("the variate is a cell").clone();
-        (dist.logpdf)(e, &cell_params, &variate)
+        let density = (dist.logpdf)(e, &cell_params, &variate)?;
+        Ok(infinite_variate_scores_zero(e, dist, &variate, density))
     })
+}
+
+/// §03 "Note on infinities": `reals` admits `±inf` as legal values, but "the
+/// reference measure is the ordinary Lebesgue measure on the finite-real part;
+/// the points ±∞ carry zero Lebesgue mass". So `±inf` lies outside the support
+/// of every elementwise density, each density tends to 0 there, and the
+/// log-density is `-inf`. A formula such as `(k - 1) log(x) - rate x` gives
+/// the IEEE artifact `inf - inf = NaN` instead. NaN stays NaN.
+fn infinite_variate_scores_zero(
+    e: &mut Emitter,
+    dist: &DistLowering,
+    variate: &Value,
+    density: Value,
+) -> Value {
+    // A known constant variate is finite (only finite reals fold), so its
+    // density already folds without a guard.
+    if !matches!(dist.broadcast, Broadcast::Elementwise)
+        || variate.elem != ElemKind::Real
+        || variate.ty != density.ty
+        || e.is_constant(variate)
+    {
+        return density;
+    }
+    let magnitude = e.abs(variate);
+    let inf = e.inf_like(variate);
+    let infinite = e.compare("EQ", &magnitude, &inf);
+    let zero = e.constant_like(f64::NEG_INFINITY, &density);
+    e.select(&infinite, &zero, &density)
 }
 
 /// The broadcast-density entry point: `builtin_logdensityof.(Dist,
@@ -765,7 +794,8 @@ fn score_with(
     }
     check_parameters(e, ctor, &params)?;
     let value = e.lower_node(v)?;
-    (dist.logpdf)(e, &params, &value)
+    let density = (dist.logpdf)(e, &params, &value)?;
+    Ok(infinite_variate_scores_zero(e, dist, &value, density))
 }
 
 /// `builtin_touniform(kernel, kernel_input, x)` (spec §07 "Measure kernel

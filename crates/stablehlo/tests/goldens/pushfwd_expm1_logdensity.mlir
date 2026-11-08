@@ -14,10 +14,14 @@ module {
     %14 = stablehlo.multiply %12, %13 : tensor<f32>
     %15 = stablehlo.constant dense<"0x8E3F6BBF"> : tensor<f32>
     %16 = stablehlo.add %15, %14 : tensor<f32>
-    %17 = stablehlo.subtract %16, %5 : tensor<f32>
+    %17 = stablehlo.abs %5 : tensor<f32>
     %18 = stablehlo.constant dense<0x7F800000> : tensor<f32>
-    %19 = stablehlo.negate %18 : tensor<f32>
-    %20 = stablehlo.select %1, %17, %19 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %20 : tensor<f32>
+    %19 = stablehlo.compare EQ, %17, %18 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %20 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %21 = stablehlo.select %19, %20, %16 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %22 = stablehlo.subtract %21, %5 : tensor<f32>
+    %23 = stablehlo.negate %18 : tensor<f32>
+    %24 = stablehlo.select %1, %22, %23 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %24 : tensor<f32>
   }
 }

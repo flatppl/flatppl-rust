@@ -61,8 +61,10 @@ fn runtime_scale_reports_status_9() {
     ));
     assert!(checked(&ir), "{ir}");
     assert!(ir.contains("stablehlo.compare LE, %arg1"), "{ir}");
-    // NaN propagates, so `mu` over `reals` has no test.
-    assert_eq!(ir.matches("stablehlo.compare").count(), 1, "{ir}");
+    // NaN propagates, so `mu` over `reals` has no test. The other compare is
+    // the density's guard for an infinite variate (§03 "Note on infinities").
+    assert_eq!(ir.matches("stablehlo.compare").count(), 2, "{ir}");
+    assert_eq!(ir.matches("stablehlo.compare EQ,").count(), 1, "{ir}");
 }
 
 #[test]
