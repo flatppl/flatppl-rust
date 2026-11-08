@@ -3287,8 +3287,7 @@ impl<'m> Emitter<'m> {
         let t = self.mul(u, &two);
         let s = self.sub(&t, &one);
         let e = self.erf_inv(&s);
-        let sqrt2 = self.const_lit("1.4142135", u.ty.clone());
-        let sqrt2 = self.axes_view(&sqrt2, self.axes_of(u));
+        let sqrt2 = self.constant_like(std::f64::consts::SQRT_2, u);
         self.mul(&e, &sqrt2)
     }
 
