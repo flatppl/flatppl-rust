@@ -280,8 +280,9 @@ fn level_shape_resolves_fixed_dims() {
     );
 }
 
-// `relabel(M, labels)` renames the variate but preserves the value domain and
-// total mass, so the call must infer to the base measure's type (not %deferred).
+// `relabel(M, labels)` relabels the variate (spec §04 "Interface adaptation": a
+// scalar becomes a one-field record) and keeps the total mass, so the call infers to
+// a measure over that record (not %deferred).
 #[test]
 fn relabel_preserves_measure_type_and_mass() {
     let mut module = flatppl_syntax::parse(
@@ -290,9 +291,11 @@ fn relabel_preserves_measure_type_and_mass() {
     .unwrap();
     flatppl_infer::infer(&mut module);
     let out = flatppl_flatpir::write(&module);
-    // relabel carries a measure type (domain real) with the base's mass preserved.
+    // relabel carries a measure over `record(x = real)` with the base's mass preserved.
     assert!(
-        out.contains("(%bind g (%meta ((%measure (%domain (%scalar real)) (%mass %normalized))"),
+        out.contains(
+            "(%bind g (%meta ((%measure (%domain (%record (x (%scalar real)))) (%mass %normalized))"
+        ),
         "relabel must preserve the measure type + normalized mass, got:\n{out}"
     );
     assert!(

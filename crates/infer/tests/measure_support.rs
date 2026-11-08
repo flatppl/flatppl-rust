@@ -104,7 +104,12 @@ fn products_and_sums_combine_their_component_supports() {
 #[test]
 fn relabel_and_dirac_keep_their_argument_sets() {
     let mut module = infer(COMBINATORS);
-    assert_eq!(support(&mut module, "labelled"), "cartpow(nonnegreals, 2)");
+    // §04 "Interface adaptation": the relabelled iid pair is a record of the two
+    // entries, each keeping its set.
+    assert_eq!(
+        support(&mut module, "labelled"),
+        "cartprod(p = nonnegreals, q = nonnegreals)"
+    );
     assert_eq!(support(&mut module, "point"), "interval(2, 2)");
 }
 
