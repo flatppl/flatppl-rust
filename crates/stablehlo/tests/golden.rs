@@ -4616,8 +4616,8 @@ fn uniform_logpdf_refuses_unbounded_support() {
     assert_eq!(err.node, Some(support));
 }
 
-/// §08 Beta, verbatim: `(alpha - 1) * log(x) + (beta - 1) * log(1 - x) -
-/// [lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta)]`.
+/// §08 Beta: `(alpha - 1) * log(x) + (beta - 1) * log1p(-x) - log B(alpha, beta)`,
+/// with `log B` split by Stirling's series where both arguments are large.
 #[test]
 fn emit_logdensity_beta_has_expected_structure() {
     let d = determinize_src(BETA_DENSITY_SRC);
@@ -4640,42 +4640,23 @@ fn emit_logdensity_beta_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "alpha/beta must become func args, in:\n{out}"
     );
-    assert_eq!(
-        out.matches("stablehlo.subtract").count(),
-        2,
-        "expected exactly two subtracts (alpha - 1, beta - 1), in:\n{out}"
+    // log B through the Stirling split: the correction series' leading
+    // coefficient 1/12, and one compare that orders the pair.
+    assert!(
+        out.contains("dense<0.0833333333333333>"),
+        "log B must use the Stirling correction series, in:\n{out}"
     );
     assert_eq!(
-        out.matches("stablehlo.log").count(),
-        0,
-        "log(x) and log(1 - x) fold at the fixed point x = 0.5, in:\n{out}"
+        out.matches("stablehlo.compare LE, %arg0, %arg1").count(),
+        1,
+        "one compare orders alpha and beta, in:\n{out}"
     );
-    assert_eq!(
-        out.matches("stablehlo.multiply").count(),
-        2,
-        "expected exactly two multiplies, in:\n{out}"
-    );
+    // The branch with both arguments below 8 keeps three lgammas; the
+    // fixed point x = 0.5 folds log(x) and log1p(-x).
     assert_eq!(
         out.matches("chlo.lgamma").count(),
         3,
-        "expected exactly three lgammas, in:\n{out}"
-    );
-    assert_eq!(
-        out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates (the formula's lgammas)"
-    );
-    assert_eq!(
-        out.matches("stablehlo.add").count(),
-        5,
-        "expected exactly five adds, in:\n{out}"
-    );
-    // §08 support `unitinterval`: the fixed point 0.5 is in the support, so
-    // the support mask folds away. Only the run-time status keeps a select.
-    assert_eq!(
-        out.matches("stablehlo.select").count(),
-        1,
-        "expected only the status select, in:\n{out}"
+        "expected the small-argument branch's three lgammas, in:\n{out}"
     );
     assert!(
         !out.contains("dense<0x7F800000>"),
@@ -5603,8 +5584,8 @@ fn emit_logdensity_poisson_matches_frozen_golden() {
     );
 }
 
-/// §08 Geometric, verbatim: `log(p) + k * log(1 - p)`. Op counts: two `log`s,
-/// one `multiply`, one `subtract` (`1-p`), one `add`. No `chlo.*`.
+/// §08 Geometric: `log(p) + k * log1p(-p)`. Op counts: one `log`, one
+/// `log_plus_one` of the negated `p`, one `multiply`, one `add`. No `chlo.*`.
 #[test]
 fn emit_logdensity_geometric_has_expected_structure() {
     let d = determinize_src(GEOMETRIC_DENSITY_SRC);
@@ -5627,9 +5608,11 @@ fn emit_logdensity_geometric_has_expected_structure() {
         out.contains("%arg0: tensor<f32>"),
         "p must become a func arg, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.log ").count(), 1);
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
     assert_eq!(out.matches("stablehlo.multiply").count(), 1);
-    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 0);
     assert_eq!(out.matches("stablehlo.add").count(), 1);
     assert!(
         !out.contains("chlo."),
@@ -5652,9 +5635,9 @@ fn emit_logdensity_geometric_matches_frozen_golden() {
 }
 
 /// §08 NegativeBinomial: `[lgamma(k+alpha) - lgamma(alpha) - lgamma(k+1)] +
-/// alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`, with the log ratios
-/// as `-log1p(1 / beta)` and `log1p(beta)`. At the fixed point k = 2,
-/// `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
+/// alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`, with the coefficient as
+/// `-log(k + alpha) - log B(alpha, k + 1)` and the log ratios as
+/// `-log1p(1 / beta)` and `log1p(beta)`.
 #[test]
 fn emit_logdensity_negative_binomial_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL_DENSITY_SRC);
@@ -5677,17 +5660,17 @@ fn emit_logdensity_negative_binomial_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "alpha/beta must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log ").count(), 0);
-    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
-    assert_eq!(out.matches("stablehlo.divide").count(), 1);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 5);
-    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    // The log ratios stay log1p forms; log B adds two log1p(x / y) of its own.
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 4);
+    // The small-argument branch of log B keeps three lgammas.
+    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    // log B through the Stirling split: the correction series' leading
+    // coefficient 1/12, and one compare that orders the pair.
     assert!(
-        !out.contains("stablehlo.subtract"),
-        "NegativeBinomial's log-form has no subtraction, in:\n{out}"
+        out.contains("dense<0.0833333333333333>"),
+        "log B must use the Stirling correction series, in:\n{out}"
     );
+
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -5705,9 +5688,9 @@ fn emit_logdensity_negative_binomial_matches_frozen_golden() {
 }
 
 /// §08 NegativeBinomial2: `[lgamma(k+psi) - lgamma(psi) - lgamma(k+1)] +
-/// k * (log(mu) - log(mu+psi)) + psi * (log(psi) - log(mu+psi))`, with the log
-/// ratios as `-log1p(psi / mu)` and `-log1p(mu / psi)`. At the fixed point
-/// k = 2, `lgamma(3)` folds, leaving two `chlo.lgamma`s and no plain `log`.
+/// k * (log(mu) - log(mu+psi)) + psi * (log(psi) - log(mu+psi))`, with the
+/// coefficient as `-log(k + psi) - log B(psi, k + 1)` and the log ratios as
+/// `-log1p(psi / mu)` and `-log1p(mu / psi)`.
 #[test]
 fn emit_logdensity_negative_binomial2_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL2_DENSITY_SRC);
@@ -5730,17 +5713,17 @@ fn emit_logdensity_negative_binomial2_has_expected_structure() {
         out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
         "mu/psi must become func args, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.log ").count(), 0);
-    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 2);
-    assert_eq!(out.matches("stablehlo.divide").count(), 2);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 5);
-    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    // The log ratios stay log1p forms; log B adds two log1p(x / y) of its own.
+    assert_eq!(out.matches("stablehlo.log_plus_one").count(), 4);
+    // The small-argument branch of log B keeps three lgammas.
+    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    // log B through the Stirling split: the correction series' leading
+    // coefficient 1/12, and one compare that orders the pair.
     assert!(
-        !out.contains("stablehlo.subtract"),
-        "NegativeBinomial2's log-form has no subtraction, in:\n{out}"
+        out.contains("dense<0.0833333333333333>"),
+        "log B must use the Stirling correction series, in:\n{out}"
     );
+
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -6176,13 +6159,10 @@ outputs = (lp)
 ";
 
 /// §08 Dirichlet, verbatim: `lgamma(sum(alpha)) - sum(lgamma(alpha)) +
-/// sum((alpha - 1) * log(x))`. Op counts: two `chlo.lgamma`s (one on the
-/// reduced sum, one elementwise on the length-3 `alpha` vector itself), three
-/// `stablehlo.reduce`s (`sum(alpha)`, `sum(lgamma(alpha))`, the final
-/// `sum((alpha-1)*log(x))`), one `subtract` (`alpha - 1`, a same-shape
-/// splat constant per the batch's doc comment in `registry.rs`), one
-/// `multiply`. No `cholesky`/`triangular_solve`/`iota` — Dirichlet needs no
-/// matrix ops, only reductions.
+/// sum((alpha - 1) * log(x))`, with the normalizer in Stirling form. Two
+/// `chlo.lgamma`s remain, elementwise on `alpha` and on its sum, each only for
+/// arguments below 8. No `cholesky`/`triangular_solve`/`iota` and no loop —
+/// Dirichlet needs no matrix ops, only reductions.
 #[test]
 fn emit_logdensity_dirichlet_has_expected_structure() {
     let d = determinize_src(DIRICHLET_DENSITY_SRC);
@@ -6206,13 +6186,17 @@ fn emit_logdensity_dirichlet_has_expected_structure() {
         "alpha must become a length-3 vector func arg, in:\n{out}"
     );
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 4);
-    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
-    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    // log B through the Stirling split: the correction series' leading
+    // coefficient 1/12, and one compare that orders the pair.
+    assert!(
+        out.contains("dense<0.0833333333333333>"),
+        "log B must use the Stirling correction series, in:\n{out}"
+    );
     assert!(
         !out.contains("stablehlo.cholesky")
             && !out.contains("triangular_solve")
-            && !out.contains("stablehlo.iota"),
+            && !out.contains("stablehlo.iota")
+            && !out.contains("stablehlo.while"),
         "Dirichlet needs no matrix ops, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
