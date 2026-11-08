@@ -596,7 +596,8 @@ enum ExprFrame {
     Level(Precedence),
     BinaryTail(Precedence, usize),
     BinaryRhs(Precedence, usize, NodeId, CmpOp),
-    Compare(usize, Vec<NodeId>, Vec<CmpOp>),
+    /// Operands so far, and each comparison operator with its token index.
+    Compare(usize, Vec<NodeId>, Vec<(CmpOp, usize)>),
     Unary(usize, CmpOp),
     Power(usize),
     PowerRhs(usize, NodeId, bool),
@@ -918,8 +919,8 @@ impl<'a> ExprParser<'a> {
                 ExprFrame::Compare(start, mut operands, mut ops) => {
                     operands.push(value.take().unwrap());
                     if let Some(op) = self.peek().and_then(cmp_op) {
+                        ops.push((op, self.pos));
                         self.advance();
-                        ops.push(op);
                         work.push(ExprFrame::Compare(start, operands, ops));
                         work.push(ExprFrame::Level(Precedence::Add));
                     } else {
@@ -1288,35 +1289,35 @@ impl<'a> ExprParser<'a> {
         Ok(self.builtin_call(op, list.elems, list.start))
     }
 
+    /// `a < b <= c` lowers to `land(a < b, b <= c)` (spec §05). Dotted operators
+    /// are broadcast sugar, so `a .< b .<= c` lowers to `land.(a .< b, b .<= c)`.
+    /// A chain that mixes dotted and plain comparisons has no such reading.
     fn lower_comparison(
         &mut self,
         start: usize,
         operands: Vec<NodeId>,
-        ops: Vec<CmpOp>,
+        ops: Vec<(CmpOp, usize)>,
     ) -> Result<NodeId> {
-        if ops.is_empty() {
+        let Some(&(first, _)) = ops.first() else {
             return Ok(operands[0]);
-        }
-        if ops.len() == 1 {
-            return Ok(self.apply_binop(
-                ops[0].func,
-                ops[0].dotted,
-                operands[0],
-                operands[1],
-                start,
+        };
+        if let Some(&(_, at)) = ops.iter().find(|(op, _)| op.dotted != first.dotted) {
+            return Err(err_at(
+                &self.toks[at],
+                "a comparison chain mixes dotted and plain comparisons; write every comparison \
+                 dotted (`a .< b .<= c`) or none (`a < b <= c`) (spec §05)",
             ));
-        }
-        if ops.iter().any(|op| op.dotted) {
-            return Err(self.err_here("chained dotted comparisons are not supported"));
         }
         let terms: Vec<_> = ops
             .iter()
             .enumerate()
-            .map(|(k, op)| self.builtin_call(op.func, vec![operands[k], operands[k + 1]], start))
+            .map(|(k, (op, _))| {
+                self.apply_binop(op.func, op.dotted, operands[k], operands[k + 1], start)
+            })
             .collect();
         let mut acc = terms[0];
         for &term in &terms[1..] {
-            acc = self.builtin_call("land", vec![acc, term], start);
+            acc = self.apply_binop("land", first.dotted, acc, term, start);
         }
         Ok(acc)
     }
@@ -1863,6 +1864,7 @@ impl<'a> ExprParser<'a> {
 }
 
 /// An operator's lowered function name and whether it is dotted.
+#[derive(Clone, Copy)]
 struct CmpOp {
     func: &'static str,
     dotted: bool,
