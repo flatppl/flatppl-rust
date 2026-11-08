@@ -281,6 +281,32 @@ pub(crate) fn refuse_point_outside_variate(
     ))
 }
 
+/// `likelihoodof(K, obs)` evaluates `K`'s measures at `obs`, so "the shape of
+/// variates of … the kernel must match the shape of the observed data" (spec §06
+/// `likelihoodof`). An observation of another shape or structure is a located
+/// static error, not a value broadcast or truncated to the variate.
+pub(crate) fn refuse_observation_outside_variate(
+    inf: &mut Inferencer<'_, '_>,
+    obstype: &Type,
+    observation: &ArgInfo,
+) -> Option<Type> {
+    let (at, observed, _) = observation;
+    if !mismatched(obstype, observed, false) {
+        return None;
+    }
+    let message = format!(
+        "`likelihoodof`: the observed data is {}, but the measures of the kernel have variates of \
+         type {}; the shape of the observed data must match the shape of the variates, and \
+         several IID observations need an explicit `iid` (spec §06 `likelihoodof`)",
+        show(inf, observed),
+        show(inf, obstype),
+    );
+    inf.diags.push(crate::Diagnostic::error_at(*at, message));
+    Some(Type::Failed(
+        "likelihoodof: the observed data is not a variate of the kernel".into(),
+    ))
+}
+
 /// The kernel of a `likelihoodof(K, obs)` binding.
 fn likelihood_kernel(inf: &Inferencer<'_, '_>, likelihood: NodeId) -> Option<NodeId> {
     let Node::Call(call) = inf.module.node(resolve_binding_refs(inf, likelihood)) else {

@@ -134,10 +134,10 @@ draws = rand(lawof(record(x = x)), s)";
         "sampled value is projected via get0(sample, 0):\n{pir}"
     );
     // The draw-binding `x` is now dead (the sampled value is a fresh inline
-    // node, not a ref to `x`) and swept by `sweep_dead_measure_bindings`.
+    // node, not a ref to `x`) and removed by `sweep_dead_measure_bindings`.
     assert!(
-        pir.contains("(%bind x 0.0)"),
-        "orphaned draw binding x is swept to a harmless literal:\n{pir}"
+        !pir.contains("(%bind x "),
+        "orphaned draw binding x is removed, not given a value:\n{pir}"
     );
 }
 

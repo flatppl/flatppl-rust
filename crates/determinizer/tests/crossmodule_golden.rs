@@ -1291,12 +1291,25 @@ l2 = logdensityof(posterior, x)";
         "the shared prior terms must lower to builtin_logdensityof; got:\n{pir}"
     );
     // Shared-dep dedup: `theta1_dist`, reached via both `prior` and `posterior`,
-    // is grafted into the host EXACTLY ONCE (a re-graft would have collided/refused).
+    // is grafted once; a re-graft would have collided and refused, so the
+    // determinize above would have failed. Once both queries are lowered the graft
+    // is a dead measure binding, and the sweep removes it rather than leaving a
+    // placeholder value.
     assert_eq!(
         pir.matches("(%bind theta1_dist ").count(),
-        1,
-        "the shared submodule dependency `theta1_dist` must be grafted exactly once \
-         (deduped across the two queries); got:\n{pir}"
+        0,
+        "the dead `theta1_dist` graft must be removed once both queries lower; got:\n{pir}"
+    );
+    let names: Vec<&str> = pir
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("(%bind "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    let unique: std::collections::HashSet<&&str> = names.iter().collect();
+    assert_eq!(
+        names.len(),
+        unique.len(),
+        "no binding name may repeat; got:\n{pir}"
     );
 }
 

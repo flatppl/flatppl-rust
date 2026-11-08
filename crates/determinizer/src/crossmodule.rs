@@ -155,16 +155,6 @@ impl GraftState {
         *self.instances.entry((parent, load)).or_insert(next)
     }
 
-    /// The measure sweep may discard a member needed by a later lazy import.
-    /// Canonical DCE is checked separately through the live name index.
-    pub(crate) fn discard(&mut self, bid: BindingId) {
-        if let Some(key) = self.owners.get(&bid)
-            && let Some(imported) = self.bindings.get_mut(key)
-        {
-            imported.state = Materialization::Reserved;
-        }
-    }
-
     fn adopt_alias(&mut self, host: &Module, resolved: &ResolvedRef<'_>, bid: BindingId) {
         // Synthetic aliases can be zeroed by canonicalization. Own a separate
         // non-synthetic slot instead, just as for an ordinary imported member.

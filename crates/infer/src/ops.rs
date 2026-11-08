@@ -875,10 +875,11 @@ fn op_rule(
         // carries the complement fields and the kernel inputs are those complement
         // (conditioning) variates. See `disintegrate_type` for the full logic.
         "disintegrate" => disintegrate_type(inf, call, args),
-        // `relabel(M, labels)` (spec §06) renames the variate; the value domain
-        // AND total mass are unchanged, so the measure type passes through whole
-        // (unlike normalize/truncate, which reset the mass slot).
-        "relabel" => arg_ty(args, 0).cloned().unwrap_or(Type::Deferred),
+        // `relabel(x, names)` (spec §04 "Interface adaptation") assigns or renames
+        // fields: an array becomes a record, a scalar a one-field record, and a
+        // record or table is renamed. On a measure it relabels the variate and
+        // keeps the mass.
+        "relabel" => relabel_type(inf, args),
         // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
         // §06): the measure is the SECOND argument.
         "weighted" | "logweighted" => fresh_measure(arg_ty(args, 1)),
@@ -3992,6 +3993,89 @@ fn selector_field_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Bo
     }
 }
 
+/// The type of `relabel(x, names)` (spec §04 "Interface adaptation"). The names
+/// must be static string literals, one per renamed field or array element; with
+/// names that are not static, or a count that does not match, the result is
+/// deferred rather than guessed.
+fn relabel_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
+    let Some(ty) = arg_ty(args, 0).cloned() else {
+        return Type::Deferred;
+    };
+    let Some(names) = args.get(1).and_then(|a| selector_field_names(inf, a.0)) else {
+        return match ty {
+            Type::Measure { mass, .. } => Type::Measure {
+                domain: Box::new(Type::Deferred),
+                mass,
+            },
+            _ => Type::Deferred,
+        };
+    };
+    let symbols: Vec<Symbol> = names.iter().map(|n| inf.module.intern(n)).collect();
+    relabel_value_type(ty, &symbols)
+}
+
+fn relabel_value_type(ty: Type, names: &[Symbol]) -> Type {
+    let rename = |fields: &[(Symbol, Type)]| -> Option<Box<[(Symbol, Type)]>> {
+        (fields.len() == names.len()).then(|| {
+            names
+                .iter()
+                .zip(fields)
+                .map(|(name, (_, t))| (*name, t.clone()))
+                .collect()
+        })
+    };
+    match ty {
+        Type::Measure { domain, mass } => Type::Measure {
+            domain: Box::new(relabel_value_type(*domain, names)),
+            mass,
+        },
+        Type::Scalar(_) if names.len() == 1 => Type::Record(vec![(names[0], ty)].into()),
+        Type::Array {
+            ref shape,
+            ref elem,
+        } if shape.len() == 1
+            && u32::try_from(names.len()).is_ok_and(|n| shape[0] == Dim::Static(n)) =>
+        {
+            Type::Record(names.iter().map(|n| (*n, (**elem).clone())).collect())
+        }
+        Type::Record(ref fields) => rename(fields).map_or(Type::Deferred, Type::Record),
+        Type::Table { ref columns, nrows } => {
+            rename(columns).map_or(Type::Deferred, |columns| Type::Table { columns, nrows })
+        }
+        _ => Type::Deferred,
+    }
+}
+
+/// The set of `relabel(x, names)`: the operand's set with its entries named. An
+/// array power or a tuple product becomes a record set, a record set is renamed,
+/// and a scalar set becomes a one-field record set. Anything else is unknown.
+fn relabel_valueset(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> ValueSet {
+    let (Some((operand, _, _)), Some((labels, _, _))) = (args.first(), args.get(1)) else {
+        return ValueSet::Unknown;
+    };
+    let Some(names) = selector_field_names(inf, *labels) else {
+        return ValueSet::Unknown;
+    };
+    let names: Vec<Symbol> = names.iter().map(|n| inf.module.intern(n)).collect();
+    let named = |sets: Vec<ValueSet>| -> ValueSet {
+        if sets.len() == names.len() {
+            ValueSet::RecordSet(names.iter().copied().zip(sets).collect())
+        } else {
+            ValueSet::Unknown
+        }
+    };
+    match inf.lookup_valueset(*operand) {
+        ValueSet::CartPow(elem, Dim::Static(n)) => named(vec![(*elem).clone(); n as usize]),
+        ValueSet::CartProd(items) => named(items.into_vec()),
+        ValueSet::RecordSet(fields) => {
+            named(fields.into_vec().into_iter().map(|(_, v)| v).collect())
+        }
+        ValueSet::Deferred => ValueSet::Deferred,
+        ValueSet::Unknown | ValueSet::CartPow(..) => ValueSet::Unknown,
+        scalar => named(vec![scalar]),
+    }
+}
+
 /// `disintegrate(selector, joint)` (spec §06) → `(kernel, marginal)`. When the
 /// joint is a record-domain measure and the selector statically names a non-empty
 /// proper subset of its fields, the marginal is the record of the COMPLEMENT
@@ -5485,9 +5569,24 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
         return Type::Deferred;
     };
     let inputs = inputs.clone();
+    let likelihood = likelihood_of_kernel(inf, *k_node, inputs);
+    if let (Type::Likelihood { obstype, .. }, Some(observation)) = (&likelihood, args.get(1))
+        && let Some(failed) =
+            crate::boundary::refuse_observation_outside_variate(inf, obstype, observation)
+    {
+        return failed;
+    }
+    likelihood
+}
+
+fn likelihood_of_kernel(
+    inf: &mut Inferencer<'_, '_>,
+    k_node: NodeId,
+    inputs: Box<[Symbol]>,
+) -> Type {
     // A `functionof`-of-measure body exposes its domain; a `kernelof` body is
     // the random *value* itself, so its type is the observation domain.
-    match reified_result_type(inf, *k_node) {
+    match reified_result_type(inf, k_node) {
         Some(Type::Measure { domain, .. }) => Type::Likelihood {
             inputs,
             obstype: domain,
@@ -5495,7 +5594,7 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
         Some(Type::Deferred) | None => {
             // Fall back: check if this kernel came from `disintegrate` and
             // recover the selected-variate obstype from the joint's record domain.
-            match disintegrate_kernel_obstype(inf, *k_node) {
+            match disintegrate_kernel_obstype(inf, k_node) {
                 Some(obstype) => Type::Likelihood {
                     inputs,
                     obstype: Box::new(obstype),
@@ -10393,10 +10492,9 @@ pub(crate) fn call_valueset(
         "lawof" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
-        // `relabel` names the variate's entries without moving any (§06).
-        "relabel" => args
-            .first()
-            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // `relabel` renames the variate's entries without moving any (§04
+        // "Interface adaptation"): the operand's set, with the new field names.
+        "relabel" => relabel_valueset(inf, args),
         // The point mass at `value` lies in `value`'s set.
         "Dirac" => named_or_positional_node(inf.module, named, args, "value", 0)
             .map_or(ValueSet::Unknown, |n| inf.lookup_valueset(n)),

@@ -43,7 +43,11 @@ pub fn read_regular_utf8(path: &Path) -> std::io::Result<String> {
 pub(crate) fn terminal_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        out.extend(ch.escape_debug());
+        match ch {
+            // Quotes are printable; `escape_debug` would show them as `\'` and `\"`.
+            '\'' | '"' => out.push(ch),
+            _ => out.extend(ch.escape_debug()),
+        }
     }
     out
 }
@@ -863,6 +867,14 @@ fn inline_allows(source: &str) -> Result<Vec<flatppl_lint::RuleId>, usize> {
 #[cfg(all(test, feature = "fmtlint"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_text_keeps_quotes_and_escapes_controls() {
+        assert_eq!(terminal_text("kernel's \"x\""), "kernel's \"x\"");
+        assert_eq!(terminal_text("a\u{1b}[2J"), "a\\u{1b}[2J");
+        assert_eq!(terminal_text("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(terminal_text("C:\\data"), "C:\\\\data");
+    }
 
     #[test]
     fn format_text_is_idempotent() {

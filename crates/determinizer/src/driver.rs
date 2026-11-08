@@ -131,6 +131,7 @@ pub fn determinize_with_options(
         crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
     crate::canon::normalize_call_wrappers(&mut work);
+    crate::free_draw::refuse_measure_roots(&work, roots)?;
     crate::free_draw::refuse_free_draws(&work, roots)?;
 
     let mut specialize_sequences = true;
@@ -144,7 +145,7 @@ pub fn determinize_with_options(
             if let Some(roots) = roots {
                 crate::canon::retain_reachable(&mut work, roots);
             } else {
-                sweep_dead_measure_bindings(&mut work, &mut imports);
+                sweep_dead_measure_bindings(&mut work);
             }
             continue;
         }
@@ -156,7 +157,7 @@ pub fn determinize_with_options(
                 if let Some(roots) = roots {
                     crate::canon::retain_reachable(&mut work, roots);
                 } else {
-                    sweep_dead_measure_bindings(&mut work, &mut imports);
+                    sweep_dead_measure_bindings(&mut work);
                 }
                 let _ = flatppl_infer::infer(&mut work);
             }
@@ -516,7 +517,7 @@ fn apply_rule(
         // general scan never reaches the bare `disintegrate` and refuses — this is
         // what makes each rewrite strictly remove a `get`/`disintegrate` node and
         // the driver terminate.
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -547,7 +548,7 @@ fn apply_rule(
         // `M = lawof(record(…))` joint binding is now unreferenced (dead
         // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
         // never reaches the bare `lawof(record(…))` and refuses.
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -568,7 +569,7 @@ fn apply_rule(
         })?;
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, root);
         m.set_binding_rhs(bid, rhs);
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -606,7 +607,7 @@ fn apply_rule(
             // The intermediate `x = m.L` self-ref binding (if any) and the
             // `helpers = load_module(…)` binding may now be dead; sweep the
             // measure-typed ones so the next scan is clean.
-            sweep_dead_measure_bindings(m, imports);
+            sweep_dead_measure_bindings(m);
             return Ok(());
         }
         let new_root = if is_logdensityof {
@@ -621,7 +622,7 @@ fn apply_rule(
         // and the combinator binding is no longer referenced.  Sweep them out now
         // so the outer scan loop does not encounter them as unhandled
         // measure-layer nodes on the next iteration.
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -635,7 +636,7 @@ fn apply_rule(
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`
         // binding referenced by nothing (the sampled value is a fresh inline
         // node, not a ref to `x`) — sweep it out before the next scan.
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -643,7 +644,7 @@ fn apply_rule(
         let mass = crate::density::integral::lower_interval_mass(m, target_node, options)?;
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, mass);
         m.set_binding_rhs(bid, rhs);
-        sweep_dead_measure_bindings(m, imports);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -913,8 +914,14 @@ const COMBINATOR_OPS: &[&str] = &[
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
 /// combinator op.  If no other binding tree references the binding by name,
-/// replace its RHS with `0.0` (a harmless Real literal) so the driver loop no
-/// longer sees it as a measure-layer node.
+/// remove the binding so the driver loop no longer sees it as a measure-layer
+/// node.
+///
+/// Removal, not a placeholder value: a determinized module is measure-free, so a
+/// measure binding or an unread draw has no value it could carry there, and any
+/// fixed value would be a wrong one. A public binding is removed too. A host that
+/// later reads it from the determinized module gets the unknown-member error at
+/// the read site, instead of a silent number.
 ///
 /// This handles the common pattern:
 /// ```text
@@ -926,13 +933,12 @@ const COMBINATOR_OPS: &[&str] = &[
 /// binding.  Without this sweep the driver would encounter `weighted` on the
 /// next iteration and refuse, since there is no standalone rule for it.
 ///
-/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) an
+/// **Soundness invariant.** A binding is removed iff it is BOTH (a) an
 /// eliminable measure binding — either a combinator op (`is_combinator_rhs`) OR a
 /// `Measure`/`Likelihood`-typed RHS (`is_measure_typed_rhs`) — AND (b) provably
 /// unreferenced: no *other* binding subtree contains a `(%ref self name)` to it
-/// (see [`referenced_binding_names`]). Zeroing a genuinely-dead measure binding is
-/// sound dead-code elimination: it has no observable effect because nothing reads
-/// it.  The guard below never touches anything that fails *either* condition, so
+/// (see [`referenced_binding_names`]). Removing such a binding is sound dead-code
+/// elimination inside the module, because no binding reads it. The guard below never touches anything that fails *either* condition, so
 /// it cannot disturb a live value, a non-measure binding, or a still-referenced
 /// measure.
 ///
@@ -946,7 +952,7 @@ const COMBINATOR_OPS: &[&str] = &[
 /// the conformance gate, and no others (a value-typed binding never matches).
 /// A query-pinned latent's PRIOR is exempt while another query is still unreduced —
 /// see [`referenced_binding_names`].
-fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule::GraftState) {
+fn sweep_dead_measure_bindings(m: &mut Module) {
     // §13 "Output reduction" reduces PER OUTPUT, so a second query over the same
     // measure re-reads the `draw(prior)` an earlier query's pin overwrote
     // (`Module::declared_binding_rhs`). Until the last query is lowered, that prior
@@ -958,8 +964,8 @@ fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule:
     // Iterate to a fixpoint so dead-binding *cascades* are fully eliminated.
     // A `kchain` marginal leaves a chain `pp = kchain(M, k)` → `k = kernelof(…)`
     // → `z = draw(…)`: only `pp` is unreferenced at first (the still-present-but-
-    // dead `k` references `z`, and `pp` references `k`). Zeroing `pp` orphans
-    // `k`; zeroing `k` orphans `z`. A `likelihoodof` query leaves an analogous
+    // dead `k` references `z`, and `pp` references `k`). Removing `pp` orphans
+    // `k`; removing `k` orphans `z`. A `likelihoodof` query leaves an analogous
     // chain `obs = likelihoodof(iid(gauss_x, 1), …)` → `gauss_x = Normal(…)`:
     // sweeping the `obs` combinator orphans the `gauss_x` constructor, caught by
     // the type arm. One pass only kills the currently-orphaned bindings; we
@@ -968,7 +974,7 @@ fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule:
         // Collect bindings whose RHS is eliminable (combinator op OR
         // Measure/Likelihood-typed) AND that no other binding references. Both
         // predicates are read-only over `m`, so we settle the full kill-set
-        // before any mutation (a later zeroing in this pass cannot make a
+        // before any mutation (a later removal in this pass cannot make a
         // previously-live binding look dead).
         let mut dead: Vec<BindingId> = m
             .bindings()
@@ -986,18 +992,15 @@ fn sweep_dead_measure_bindings(m: &mut Module, imports: &mut crate::crossmodule:
             return;
         }
 
-        for bid in dead {
-            // Zeroing can only remove references, so the sweep's reference set
-            // remains a conservative guard throughout this kill-set.
-            let binding = m.binding(bid);
-            debug_assert!(
-                is_eliminable_measure_rhs(m, binding.rhs) && !referenced.contains(&binding.name),
-                "sweep must only zero a dead measure binding"
-            );
-            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
-            m.set_binding_rhs(bid, zero);
-            imports.discard(bid);
-        }
+        // Removal can only remove references, so the sweep's reference set
+        // remains a conservative guard throughout this kill-set.
+        let dead: std::collections::HashSet<BindingId> = dead.into_iter().collect();
+        let keep: std::collections::HashSet<BindingId> = m
+            .bindings()
+            .map(|(bid, _)| bid)
+            .filter(|bid| !dead.contains(bid))
+            .collect();
+        m.retain_bindings(&keep);
     }
 }
 
@@ -1206,9 +1209,14 @@ mod tests {
             synthetic: false,
         });
 
-        sweep_dead_measure_bindings(&mut m, &mut crate::crossmodule::GraftState::default());
+        sweep_dead_measure_bindings(&mut m);
 
-        // `g` must survive: still a `Normal` call, NOT the `0.0` sweep sentinel.
+        // `g` must survive: still a live `Normal` binding, not removed by the sweep.
+        assert_eq!(
+            m.binding_by_name(g_name),
+            Some(g_bid),
+            "g was removed by the sweep"
+        );
         let g_after = m.binding(g_bid).rhs;
         assert!(
             matches!(m.node(g_after), Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "Normal")),

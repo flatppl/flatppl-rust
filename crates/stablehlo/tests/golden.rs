@@ -9709,7 +9709,7 @@ fn emit_logdensity_abi_load_data_array_column_is_rank_two() {
 alpha = elementof(reals)
 sigma = elementof(posreals)
 data = load_data(\"data.csv\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
-y ~ Normal.(alpha, sigma)
+y ~ Normal.(fill(alpha, 4), sigma)
 k = kernelof(record(y = y), alpha = alpha, sigma = sigma)
 L = likelihoodof(k, record(y = data.y))
 lp = logdensityof(L, record(alpha = alpha, sigma = sigma))
