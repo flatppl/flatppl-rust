@@ -13,7 +13,38 @@ use std::collections::HashSet;
 
 use crate::density::{builtin_name, draw_argument, refuse};
 use crate::refuse::RefuseError;
-use flatppl_core::{BindingId, Module, Node, NodeId, Ref, RefNs, Symbol};
+use flatppl_core::{BindingId, Module, Node, NodeId, Ref, RefNs, Symbol, Type};
+
+/// Refuse a requested output that is itself a measure, a likelihood or a kernel.
+/// A determinized module is measure-free, so it cannot hold that output, and
+/// leaving it out would answer a named request with nothing.
+pub(crate) fn refuse_measure_roots(
+    m: &Module,
+    roots: Option<&[Symbol]>,
+) -> Result<(), RefuseError> {
+    for &name in roots.unwrap_or_default() {
+        let Some(bid) = m.binding_by_name(name) else {
+            continue;
+        };
+        let rhs = m.binding(bid).rhs;
+        let n = m.resolve(name);
+        let (kind, example) = match m.type_of(rhs) {
+            Some(Type::Measure { .. }) => ("a measure", format!("logdensityof({n}, x)")),
+            Some(Type::Likelihood { .. }) => ("a likelihood", format!("logdensityof({n}, theta)")),
+            Some(Type::Kernel { .. }) => ("a kernel", format!("logdensityof({n}(theta), x)")),
+            _ => continue,
+        };
+        return Err(refuse(
+            rhs,
+            m,
+            &format!(
+                "`{n}` is {kind}; a determinized module holds no measures; keep a query over \
+                 it, for example `{example}`"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// Refuse when a density query reachable from the outputs reads a free draw.
 ///
