@@ -13,7 +13,7 @@ module {
     %11 = stablehlo.multiply %8, %9 : tensor<4xf32>
     %12 = stablehlo.subtract %11, %10 : tensor<4xf32>
     %13 = chlo.erf_inv %12 : tensor<4xf32> -> tensor<4xf32>
-    %14 = stablehlo.constant dense<1.4142135> : tensor<4xf32>
+    %14 = stablehlo.constant dense<1.4142135623730951> : tensor<4xf32>
     %15 = stablehlo.multiply %13, %14 : tensor<4xf32>
     %16 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
     %17 = stablehlo.multiply %16, %15 : tensor<4xf32>

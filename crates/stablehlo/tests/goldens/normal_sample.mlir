@@ -12,7 +12,7 @@ module {
     %10 = stablehlo.multiply %8, %9 : tensor<f32>
     %11 = stablehlo.subtract %10, %0 : tensor<f32>
     %12 = chlo.erf_inv %11 : tensor<f32> -> tensor<f32>
-    %13 = stablehlo.constant dense<1.4142135> : tensor<f32>
+    %13 = stablehlo.constant dense<1.4142135623730951> : tensor<f32>
     %14 = stablehlo.multiply %12, %13 : tensor<f32>
     %15 = stablehlo.multiply %0, %14 : tensor<f32>
     %16 = stablehlo.add %1, %15 : tensor<f32>

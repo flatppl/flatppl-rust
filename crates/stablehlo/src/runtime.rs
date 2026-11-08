@@ -20,7 +20,11 @@ impl Emitter<'_> {
         let upper = extent.saturating_sub(1).saturating_add(base as u64);
         if let Some(valid) = self.constant_indices_in_bounds(index, base, upper) {
             if !valid {
-                return Err(EmitError::at(id, "index out of range"));
+                let order = if base == 1 { "1-based" } else { "0-based" };
+                return Err(EmitError::at(
+                    id,
+                    format!("a selector index is out of range for length {extent} ({order})"),
+                ));
             }
             // Keep static selectors visible to the gather and segment passes.
             return Ok(index.clone());

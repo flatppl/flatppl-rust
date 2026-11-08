@@ -3287,8 +3287,7 @@ impl<'m> Emitter<'m> {
         let t = self.mul(u, &two);
         let s = self.sub(&t, &one);
         let e = self.erf_inv(&s);
-        let sqrt2 = self.const_lit("1.4142135", u.ty.clone());
-        let sqrt2 = self.axes_view(&sqrt2, self.axes_of(u));
+        let sqrt2 = self.constant_like(std::f64::consts::SQRT_2, u);
         self.mul(&e, &sqrt2)
     }
 
@@ -3727,21 +3726,14 @@ impl<'m> Emitter<'m> {
     /// `stablehlo.reduce(... init: ...) applies ... across dimensions = [0]`
     /// form, but over `i1` (rendered via [`render_i1`], since [`MlirTy`] carries
     /// no boolean element type — see [`Emitter::and`]) rather than the float
-    /// dtype. Returns a `Scalar`-shaped `i1` placeholder (like
-    /// [`Emitter::bool_const`]); panics on a non-rank-1 operand (an internal
-    /// invariant violation, mirroring the other shape-typed helpers).
+    /// dtype. Returns a `Scalar`-shaped `i1` value of [`ElemKind::Bool`]; panics
+    /// on a non-rank-1 operand (an internal invariant violation, mirroring the
+    /// other shape-typed helpers).
     pub fn reduce_all(&mut self, a: &Value) -> Value {
-        let all = self.reduce_boolean("stablehlo.and", "true", a);
-        // The rejection loop's condition consumes this through
-        // [`Emitter::not`]/[`Emitter::and`], which render `i1` from the SHAPE and
-        // ignore `elem`. Its callers were written against the `Real` placeholder
-        // every other internal predicate carries ([`Emitter::bool_const`]), so the
-        // kind is restored rather than propagated — a §07 `lall` needs `Bool`
-        // (its return type is the module's), an internal flag does not.
-        Value {
-            elem: ElemKind::Real,
-            ..all
-        }
+        // The result is an `i1` truth value, so it carries the boolean kind. Its
+        // consumers ([`Emitter::not`], [`Emitter::and`], [`Emitter::or`],
+        // [`Emitter::select`]) render `i1` from the shape either way.
+        self.reduce_boolean("stablehlo.and", "true", a)
     }
 
     /// Reduce every cell axis of a boolean (`i1`) tensor with
@@ -4213,7 +4205,7 @@ impl<'m> Emitter<'m> {
             return None;
         }
         match self.m.node(index) {
-            Node::Lit(Scalar::Int(i)) => Some(i - base),
+            Node::Lit(Scalar::Int(i)) => i.checked_sub(base),
             _ => None,
         }
     }
@@ -5184,4 +5176,24 @@ fn wide_integer(id: NodeId, i: i64) -> EmitError {
              emit with the f64 dtype for i64 integers"
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduce_all_carries_the_boolean_kind() {
+        let module = Module::new();
+        let mut e = Emitter::new(&module, Dtype::F32);
+        let lanes = Value {
+            ssa: "%lanes".into(),
+            ty: MlirTy::Ranked(vec![Some(4)]),
+            elem: ElemKind::Bool,
+        };
+        let all = e.reduce_all(&lanes);
+        assert_eq!(all.elem, ElemKind::Bool);
+        assert_eq!(all.ty, MlirTy::Scalar);
+        assert!(e.body.contains("stablehlo.and"), "{}", e.body);
+    }
 }

@@ -300,13 +300,13 @@
 //!   "vector elements must have identical shape; ragged vector-of-vectors
 //!   has no tensor form"
 //! - `get`/`get0` whose computed 0-based index is negative (a selector
-//!   below `get`'s 1-based floor) — "get/get0: index out of range"
+//!   below `get`'s 1-based floor) — "get: index 0 is out of range; indices are
+//!   1-based"
 //! - `get`/`get0` on a non-rank-1 container — "get/get0: only
 //!   single-selector indexing into a rank-1 tensor is supported, got ..."
 //! - `get`/`get0` whose computed index is `>=` a statically-known length —
-//!   "get/get0: index out of range" (same message text as the negative-index
-//!   case above, but a distinct guard reached only once the container has
-//!   already been lowered)
+//!   "get0: index 5 is out of range for length 3 (0-based)" (a distinct guard
+//!   reached only once the container has been lowered, so it names the length)
 //! - `get`/`get0` selector is not a literal integer — "get/get0: selector
 //!   must be a literal integer"
 //! - `in`'s set is none of `interval(lo, hi)`, `reals`, `posreals`,

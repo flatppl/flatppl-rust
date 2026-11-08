@@ -121,6 +121,10 @@ module {
     %122 = stablehlo.constant dense<0x7F800000> : tensor<f32>
     %123 = stablehlo.negate %122 : tensor<f32>
     %125 = stablehlo.select %2, %120, %123 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %125 : tensor<f32>
+    %126 = stablehlo.abs %arg0 : tensor<f32>
+    %127 = stablehlo.compare EQ, %126, %122 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %128 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %129 = stablehlo.select %127, %128, %125 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %129 : tensor<f32>
   }
 }
