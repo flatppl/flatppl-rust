@@ -303,7 +303,10 @@ impl<'m> Emitter<'m> {
     }
 
     pub(crate) fn require_static_shape(&self, id: NodeId, ty: &MlirTy) -> Result<(), EmitError> {
-        if self.restrict_enzyme_compatible && shape(ty).contains(&None) {
+        // Only a numeric tensor has a shape to check; an rng key (`tensor<2xui64>`)
+        // or a tuple is judged by its own rules, not here.
+        let dynamic = matches!(ty, MlirTy::Ranked(dims) if dims.contains(&None));
+        if self.restrict_enzyme_compatible && dynamic {
             return Err(EmitError::at(
                 id,
                 "Enzyme restrictions require static tensor shapes",
