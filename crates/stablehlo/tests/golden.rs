@@ -3115,10 +3115,9 @@ fn lower_get0_refuses_out_of_range_index() {
         },
     );
     let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("out of range"),
-        "unexpected message: {}",
-        err.msg
+    assert_eq!(
+        err.msg, "get0: index 5 is out of range for length 3 (0-based)",
+        "the refusal names the index, the length and the base"
     );
 }
 
@@ -5414,8 +5413,8 @@ fn lower_in_refuses_shape_mismatched_bound() {
 /// 0-based index (`0 - 1 = -1`) BEFORE the container is ever lowered or its
 /// length checked — a distinct guard from
 /// `lower_get0_refuses_out_of_range_index` (which trips the separate
-/// known-length check on an already-lowered container), even though both
-/// report the same "index out of range" text.
+/// known-length check on an already-lowered container); this one cannot name
+/// the length yet.
 #[test]
 fn lower_get_refuses_selector_below_one_based_floor() {
     let mut m = Module::new();
@@ -5433,10 +5432,9 @@ fn lower_get_refuses_selector_below_one_based_floor() {
         },
     );
     let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("out of range"),
-        "unexpected message: {}",
-        err.msg
+    assert_eq!(
+        err.msg, "get: index 0 is out of range; indices are 1-based",
+        "the refusal names the index and the base"
     );
     assert_eq!(err.node, Some(node));
 }

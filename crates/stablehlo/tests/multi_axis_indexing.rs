@@ -189,8 +189,15 @@ fn unsupported_advanced_selectors_refuse() {
          selected = get(matrix, [1, 2], all)\n\
          inputs = (matrix)\noutputs = (selected)\n",
     )
-    .expect_err("boolean tensors are not numeric indexing operands");
-    assert!(non_numeric.msg.contains("requires a numeric tensor"));
+    .expect_err("multi-axis selection from a Boolean array is not lowered");
+    assert!(
+        non_numeric
+            .msg
+            .contains("from a Boolean array is not implemented")
+            && non_numeric.msg.contains("§07 `get` allows it"),
+        "{}",
+        non_numeric.msg
+    );
 
     let nested = emit(
         "flatppl_compat = \"0.1\"\n\
