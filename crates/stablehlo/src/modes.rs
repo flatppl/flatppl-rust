@@ -608,21 +608,64 @@ fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
 /// slot with no root): [`emit_sample_abi`] then refuses rather than silently
 /// dropping the key. In a well-formed threaded chain there is exactly one
 /// source; the first found (in reachability-walk order) is returned.
+///
+/// A sample inside a scan step reads its rng state from the carry, a local.
+/// The chain's source is then the rng field of the scan's initial record.
 fn find_rng_source(m: &Module, outputs: &[NodeId]) -> Option<NodeId> {
     for &output in outputs {
-        for sample in collect_sample_calls(m, output) {
-            if let Node::Call(c) = m.node(sample)
-                && let Some(&rng_arg) = c.args.first()
-                && !derives_from_sample(m, rng_arg)
+        for call in collect_sample_calls(m, output) {
+            let Node::Call(c) = m.node(call) else {
+                continue;
+            };
+            let candidates: Vec<NodeId> = if is_builtin_call(m, call, "scan") {
+                let init = c.args.get(1).map(|&init| resolve_self_ref(m, init));
+                match init.map(|init| m.node(init)) {
+                    Some(Node::Call(record)) if is_builtin_call(m, init.unwrap(), "record") => {
+                        record
+                            .named
+                            .iter()
+                            .map(|field| field.value)
+                            .filter(|&value| {
+                                m.type_of(resolve_self_ref(m, value)) == Some(&Type::RngState)
+                                    || m.type_of(value) == Some(&Type::RngState)
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                c.args.first().copied().into_iter().collect()
+            };
+            if let Some(rng) = candidates
+                .into_iter()
+                .find(|&rng| !derives_from_sample(m, rng) && !reads_local(m, rng))
             {
-                return Some(rng_arg);
+                return Some(rng);
             }
         }
     }
     None
 }
 
-/// Collect every `builtin_sample` [`NodeId`] reachable from `root`, following
+/// Whether `id` reads a local, such as a scan step's carry.
+fn reads_local(m: &Module, id: NodeId) -> bool {
+    let mut stack = vec![id];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            m.node(node),
+            Node::Ref(Ref {
+                ns: RefNs::Local,
+                ..
+            })
+        ) {
+            return true;
+        }
+        m.for_each_child(node, |child| stack.push(child));
+    }
+    false
+}
+
+/// Collect every `builtin_sample` and `scan` [`NodeId`] reachable from `root`, following
 /// `(%ref self x)` leaves to their bound RHS (transitively) as well as
 /// [`Module::for_each_child`] — a record/hierarchical query's samples sit one
 /// or more binding-hops away on ref-resolved RHSs, so a purely structural walk
@@ -636,7 +679,7 @@ fn collect_sample_calls(m: &Module, root: NodeId) -> Vec<NodeId> {
         if !seen.insert(id) {
             continue;
         }
-        if is_builtin_call(m, id, "builtin_sample") {
+        if is_builtin_call(m, id, "builtin_sample") || is_builtin_call(m, id, "scan") {
             samples.push(id);
         }
         if let Node::Ref(Ref {

@@ -74,7 +74,7 @@ pub(crate) fn lower_rand(
     };
     let measure = instantiate_declared_draws(m, measure, bid);
     let (value, rng_out) = lower_closed_measure_sample(m, measure, rng)?;
-    let result = if preserve_tuple || rand_result_is_destructured(m, bid) {
+    let result = if preserve_tuple || rand_result_is_destructured(m, bid, rand_node) {
         // Full spec §07 (value, new_rstate) contract: retain both slots for
         // host outputs or the parser's get(_,1)/get(_,2) projections.
         build_call(m, "tuple", &[value, rng_out])
@@ -205,8 +205,18 @@ pub(crate) fn is_rand_boundary(m: &Module, node: NodeId) -> bool {
 /// tuple projection and must NOT trip this predicate: the value-terminal
 /// convention (`draws` standing in for the record `lower_rand` returns) still
 /// needs its fields readable by name.
-fn rand_result_is_destructured(m: &Module, rand_bid: BindingId) -> bool {
-    let name = m.binding(rand_bid).name;
+///
+/// A `rand` nested inside a larger expression (`get0(rand(M, c.r), 1)` in a
+/// lambda body) has no binding name of its own: it is destructured when an
+/// integer projection reads the call directly.
+fn rand_result_is_destructured(m: &Module, rand_bid: BindingId, rand_node: NodeId) -> bool {
+    let binding = m.binding(rand_bid);
+    if binding.rhs != rand_node {
+        return subtree_has(m, binding.rhs, |id| {
+            is_int_projection(m, id, |subject| subject == rand_node)
+        });
+    }
+    let name = binding.name;
     m.bindings()
         .any(|(_, binding)| subtree_has_int_projection_of(m, binding.rhs, name))
 }
@@ -217,12 +227,16 @@ fn rand_result_is_destructured(m: &Module, rand_bid: BindingId) -> bool {
 /// idiom used throughout this crate (e.g. this file's own
 /// [`referenced_draw_bindings`], `Module::collect_referenced_names`).
 fn subtree_has_int_projection_of(m: &Module, root: NodeId, name: Symbol) -> bool {
+    subtree_has(m, root, |id| is_int_projection_of(m, id, name))
+}
+
+fn subtree_has(m: &Module, root: NodeId, pred: impl Fn(NodeId) -> bool) -> bool {
     let mut queue = vec![root];
     let mut qi = 0;
     while qi < queue.len() {
         let id = queue[qi];
         qi += 1;
-        if is_int_projection_of(m, id, name) {
+        if pred(id) {
             return true;
         }
         m.for_each_child(id, |c| queue.push(c));
@@ -234,18 +248,24 @@ fn subtree_has_int_projection_of(m: &Module, root: NodeId, name: Symbol) -> bool
 /// `(%ref self name)` and `k` is an integer literal — a tuple-slot projection
 /// of the binding named `name`, as opposed to a string-selector field access.
 fn is_int_projection_of(m: &Module, id: NodeId, name: Symbol) -> bool {
+    is_int_projection(m, id, |subject| {
+        matches!(
+            m.node(subject),
+            Node::Ref(Ref { ns: RefNs::SelfMod, name: n }) if *n == name
+        )
+    })
+}
+
+/// True iff `id` is `get(subject, k)` or `get0(subject, k)` with an integer
+/// literal `k` and a subject that `is_subject` accepts.
+fn is_int_projection(m: &Module, id: NodeId, is_subject: impl Fn(NodeId) -> bool) -> bool {
     let Some(c) = expect_builtin_call(m, id, "get").or_else(|| expect_builtin_call(m, id, "get0"))
     else {
         return false;
     };
-    if c.args.len() < 2 {
-        return false;
-    }
-    let subject_is_name = matches!(
-        m.node(c.args[0]),
-        Node::Ref(Ref { ns: RefNs::SelfMod, name: n }) if *n == name
-    );
-    subject_is_name && matches!(m.node(c.args[1]), Node::Lit(Scalar::Int(_)))
+    c.args.len() >= 2
+        && is_subject(c.args[0])
+        && matches!(m.node(c.args[1]), Node::Lit(Scalar::Int(_)))
 }
 
 /// `lawof(?m)` → `?m`, resolving `(%ref self x)` alias chains first.
@@ -271,7 +291,7 @@ fn strip_lawof(m: &Module, node: NodeId) -> Option<NodeId> {
 /// dispatcher would make `lawof(record(a = Normal(…)))` sample a field the model never
 /// declared as a variate
 /// (`tests/refuse.rs::undrawn_measure_in_a_record_field_still_refuses`).
-fn lower_closed_measure_sample(
+pub(crate) fn lower_closed_measure_sample(
     m: &mut Module,
     measure: NodeId,
     rng: NodeId,
@@ -342,6 +362,10 @@ fn lower_closed_measure_sample(
         }
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
         Some("draw") => lower_draw(m, resolved, rng, None),
+        Some(op @ ("markovchain" | "kscan")) => {
+            let op = op.to_owned();
+            crate::chain::lower_chain_sample(m, resolved, rng, &op)
+        }
         _ => {
             // The intractable/deferred set first — `weighted(w, M)` and friends
             // carry positional args, so `split_constructor` would reject them
@@ -843,6 +867,10 @@ fn lower_draw(
     }
     if builtin_name(m, inner_resolved) == Some("broadcast") {
         return broadcast::lower(m, inner_resolved, rng, sample_name);
+    }
+    if let Some(op @ ("markovchain" | "kscan")) = builtin_name(m, inner_resolved) {
+        let op = op.to_owned();
+        return crate::chain::lower_chain_sample(m, inner_resolved, rng, &op);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
