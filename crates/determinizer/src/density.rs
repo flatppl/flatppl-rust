@@ -6861,6 +6861,15 @@ pub(crate) fn iid_static_shape(m: &Module, iid_node: NodeId) -> Option<Vec<usize
         .collect()
 }
 
+/// Whether an `iid`'s scalar size folds to 0 (see [`flatppl_infer::fixed_int_value`]).
+fn iid_size_folds_to_zero(m: &mut Module, iid_node: NodeId) -> bool {
+    let Some(size) = expect_builtin_call(m, iid_node, "iid").and_then(|c| c.args.get(1).copied())
+    else {
+        return false;
+    };
+    flatppl_infer::fixed_int_value(m, size) == Some(0)
+}
+
 /// One-dimensional repeat count for position-based projections and set laws.
 pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
     let shape = iid_static_shape(m, iid_node)?;
@@ -6919,6 +6928,13 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
             .remove(&node)
     {
         m.set_type(node, ty);
+    }
+    // A derived scalar size that folds to 0 types as `%dynamic` (the
+    // 2026-08-20 zero-size ruling), so read its value: an array `iid` of size
+    // 0 is the empty product measure, log-density 0 (§06 `iid`), whatever the
+    // observation. (A record-valued M at size 0 is refused in inference.)
+    if iid_static_shape(m, node).is_none() && iid_size_folds_to_zero(m, node) {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
     // Record-valued products with a scalar size are tables, whose row count
     // comes from a separate reader. Their row remains the whole inner event.

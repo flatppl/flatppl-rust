@@ -571,8 +571,25 @@ fn op_rule(
             _ => Type::Deferred,
         },
         // filter(pred, data) keeps a subset of data's elements/rows: same type
-        // and rank as data, with the filtered axis now dynamic.
-        "filter" => arg_ty(args, 1).map_or(Type::Deferred, with_dynamic_dims),
+        // and rank as data, with the filtered axis now dynamic — unless the data
+        // and the mask are fixed, when the kept count is known (a resolved 0
+        // stays `%dynamic`, per the 2026-08-20 zero-size ruling).
+        "filter" => match (
+            arg_ty(args, 1),
+            crate::consteval::fixed_filter_count(
+                inf,
+                args.first().map(|a| a.0),
+                args.get(1).map(|a| a.0),
+            ),
+        ) {
+            (Some(Type::Array { shape, elem }), Some(k)) if shape.len() == 1 && k > 0 => {
+                Type::Array {
+                    shape: Box::new([crate::consteval::static_dim(k as i64)]),
+                    elem: elem.clone(),
+                }
+            }
+            (t, _) => t.map_or(Type::Deferred, with_dynamic_dims),
+        },
         // partition(xs, spec) splits a vector into a vector of sub-vectors (spec
         // §07): an outer vector whose elements are dynamic-length copies of xs.
         "partition" => match arg_ty(args, 0) {

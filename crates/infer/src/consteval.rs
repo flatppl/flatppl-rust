@@ -44,6 +44,10 @@ use crate::{Diagnostic, Level};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FixedValue {
     Int(i64),
+    /// A real element of fixed data. Produced only by the `filter` fold below,
+    /// so `lengthof(filter(pred, data))` can count the kept elements; no other
+    /// op folds reals, and a real in a shape position stays `%dynamic`.
+    Real(f64),
     Vec(Vec<FixedValue>),
 }
 
@@ -153,7 +157,7 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
     match inf.module.resolve(op).to_string().as_str() {
         // Shape observers: read the inferred TYPE, never recurse into the value
         // (§17.1 laziness short-circuit). Inference-specific — see module docs.
-        "lengthof" => length_observer(inf, c),
+        "lengthof" => length_observer(inf, c, depth),
         "sizeof" => sizeof_observer(inf, c),
 
         // Pure value ops (the liftable core).
@@ -167,6 +171,7 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
             Err(e) => e,
         },
         "cat" => cat_value(inf, c, depth),
+        "filter" => filter_value(inf, c, depth),
 
         // Runtime-determined value sources: known `%dynamic`, never a gap
         // (`external`/`load_data` are compile-time-unknown; the
@@ -316,7 +321,7 @@ fn cat_value(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
             .into_iter()
             .flat_map(|p| match p {
                 FixedValue::Vec(v) => v,
-                FixedValue::Int(_) => Vec::new(), // unreachable (guarded above)
+                FixedValue::Int(_) | FixedValue::Real(_) => Vec::new(), // unreachable (guarded above)
             })
             .collect();
         ConstEval::Val(FixedValue::Vec(concatenated))
@@ -326,11 +331,20 @@ fn cat_value(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
 }
 
 /// `lengthof(x)` — the single dim of a rank-1 array / transposed vector, or a
-/// table's row count. Reads the inferred TYPE (never the value).
-fn length_observer(inf: &mut Inferencer<'_, '_>, c: &Call) -> ConstEval {
+/// table's row count. Reads the inferred TYPE (never the value), with one
+/// exception: a `filter` over fixed data with a fixed mask has a fixed length
+/// (spec §07 `filter`) that its type cannot carry, so it is folded.
+fn length_observer(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
     let Some(&arg) = c.args.first() else {
         return ConstEval::Dynamic;
     };
+    if let Some(filter) = fixed_filter_call(inf, arg, depth) {
+        return match filter_value(inf, &filter, depth + 1) {
+            ConstEval::Val(FixedValue::Vec(kept)) => i64::try_from(kept.len())
+                .map_or(ConstEval::Dynamic, |n| ConstEval::Val(FixedValue::Int(n))),
+            _ => ConstEval::Dynamic,
+        };
+    }
     match inf.node_annotation(arg).0 {
         Type::Array { shape, .. } if shape.len() == 1 => dim_to_ce(shape[0]),
         Type::TVector { len, .. } => dim_to_ce(len),
@@ -365,10 +379,252 @@ fn sizeof_observer(inf: &mut Inferencer<'_, '_>, c: &Call) -> ConstEval {
     }
 }
 
+/// A node's fixed integer value, or `None` when it does not fold to one.
+pub(crate) fn fixed_int(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<i64> {
+    match const_eval(inf, node, 0) {
+        ConstEval::Val(FixedValue::Int(n)) => Some(n),
+        _ => None,
+    }
+}
+
 fn dim_to_ce(d: Dim) -> ConstEval {
     match d {
         Dim::Static(n) => ConstEval::Val(FixedValue::Int(i64::from(n))),
         Dim::Dynamic => ConstEval::Dynamic,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `filter` over fixed data with a fixed mask (spec §07 `filter`). Narrow on
+// purpose: the data is a fixed vector of numbers and the predicate a
+// `functionof` of one placeholder whose body is a membership test against a
+// fixed interval, a comparison with a fixed number, or a `land`/`lor`/`lnot`
+// of those. Anything else stays `%dynamic`, as before.
+// ---------------------------------------------------------------------------
+
+/// The kept count of `filter(pred, data)` when the fold below applies (type
+/// rule entry point; only at `Level::Shape`, like every value-domain read).
+pub(crate) fn fixed_filter_count(
+    inf: &mut Inferencer<'_, '_>,
+    pred: Option<NodeId>,
+    data: Option<NodeId>,
+) -> Option<usize> {
+    if inf.level < Level::Shape {
+        return None;
+    }
+    let (pred, data) = (pred?, data?);
+    let xs = real_vector(inf, data, 1)?;
+    let (param, body) = single_input_function(inf, pred, 1)?;
+    let mut kept = 0;
+    for x in xs {
+        if predicate_holds(inf, body, param, x, 1)? {
+            kept += 1;
+        }
+    }
+    Some(kept)
+}
+
+/// The `filter` call behind `node`, through refs to fixed bindings.
+fn fixed_filter_call(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<Call> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
+            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
+            fixed_filter_call(inf, rhs, depth + 1)
+        }
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "filter") => {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+fn filter_value(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
+    let (Some(&pred), Some(&data)) = (c.args.first(), c.args.get(1)) else {
+        return ConstEval::Dynamic;
+    };
+    if c.args.len() != 2 || !c.named.is_empty() {
+        return ConstEval::Dynamic;
+    }
+    let Some(xs) = real_vector(inf, data, depth + 1) else {
+        return ConstEval::Dynamic;
+    };
+    let Some((param, body)) = single_input_function(inf, pred, depth + 1) else {
+        return ConstEval::Dynamic;
+    };
+    let mut kept = Vec::new();
+    for x in xs {
+        match predicate_holds(inf, body, param, x, depth + 1) {
+            Some(true) => kept.push(FixedValue::Real(x)),
+            Some(false) => {}
+            None => return ConstEval::Dynamic,
+        }
+    }
+    ConstEval::Val(FixedValue::Vec(kept))
+}
+
+/// A `functionof` with exactly one placeholder input, through refs: the
+/// placeholder's name and the body.
+fn single_input_function(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    depth: u32,
+) -> Option<(flatppl_core::Symbol, NodeId)> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
+            single_input_function(inf, rhs, depth + 1)
+        }
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            if inf.module.resolve(op) != "functionof" {
+                return None;
+            }
+            let Some(flatppl_core::Inputs::Spec(inputs)) = &c.inputs else {
+                return None;
+            };
+            let [(_, r)] = inputs.as_ref() else {
+                return None;
+            };
+            if r.ns != RefNs::Local {
+                return None;
+            }
+            Some((r.name, *c.args.first()?))
+        }
+        _ => None,
+    }
+}
+
+/// A fixed number: an int/real literal, `neg` of one, or a ref to a fixed
+/// binding holding one.
+fn real_number(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<f64> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Lit(Scalar::Int(n)) => Some(n as f64),
+        Node::Lit(Scalar::Real(x)) => Some(x),
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
+            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
+            real_number(inf, rhs, depth + 1)
+        }
+        Node::Call(c) if is_builtin(inf, &c, "neg") && c.args.len() == 1 => {
+            Some(-real_number(inf, c.args[0], depth + 1)?)
+        }
+        _ => None,
+    }
+}
+
+/// A fixed vector of numbers: a `vector` literal of fixed numbers, or a ref to
+/// a fixed binding holding one.
+fn real_vector(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<Vec<f64>> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
+            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
+            real_vector(inf, rhs, depth + 1)
+        }
+        Node::Call(c) if is_builtin(inf, &c, "vector") && c.named.is_empty() => c
+            .args
+            .iter()
+            .map(|&a| real_number(inf, a, depth + 1))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// A fixed closed interval (spec §03 `interval`), through refs.
+fn real_interval(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<(f64, f64)> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let rhs = inf.module.binding(inf.module.binding_by_name(r.name)?).rhs;
+            (inf.node_annotation(rhs).1 == Phase::Fixed).then_some(())?;
+            real_interval(inf, rhs, depth + 1)
+        }
+        Node::Call(c)
+            if is_builtin(inf, &c, "interval") && c.args.len() == 2 && c.named.is_empty() =>
+        {
+            Some((
+                real_number(inf, c.args[0], depth + 1)?,
+                real_number(inf, c.args[1], depth + 1)?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn is_builtin(inf: &Inferencer<'_, '_>, c: &Call, name: &str) -> bool {
+    matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == name)
+}
+
+/// The predicate body's truth at `param = x`, or `None` outside the narrow
+/// shapes this fold reads.
+fn predicate_holds(
+    inf: &mut Inferencer<'_, '_>,
+    body: NodeId,
+    param: flatppl_core::Symbol,
+    x: f64,
+    depth: u32,
+) -> Option<bool> {
+    if depth > 64 {
+        return None;
+    }
+    let Node::Call(c) = inf.module.node(body).clone() else {
+        return None;
+    };
+    let CallHead::Builtin(op) = c.head else {
+        return None;
+    };
+    if !c.named.is_empty() {
+        return None;
+    }
+    let is_param = |inf: &Inferencer<'_, '_>, n: NodeId| matches!(inf.module.node(n), Node::Ref(r) if r.ns == RefNs::Local && r.name == param);
+    let op = inf.module.resolve(op).to_string();
+    match (op.as_str(), c.args.as_ref()) {
+        ("in", [a, set]) if is_param(inf, *a) => {
+            let (lo, hi) = real_interval(inf, *set, depth + 1)?;
+            Some(lo <= x && x <= hi)
+        }
+        (cmp @ ("lt" | "le" | "gt" | "ge"), [a, b]) => {
+            let (l, r) = if is_param(inf, *a) {
+                (x, real_number(inf, *b, depth + 1)?)
+            } else if is_param(inf, *b) {
+                (real_number(inf, *a, depth + 1)?, x)
+            } else {
+                return None;
+            };
+            Some(match cmp {
+                "lt" => l < r,
+                "le" => l <= r,
+                "gt" => l > r,
+                _ => l >= r,
+            })
+        }
+        ("land", [a, b]) => Some(
+            predicate_holds(inf, *a, param, x, depth + 1)?
+                && predicate_holds(inf, *b, param, x, depth + 1)?,
+        ),
+        ("lor", [a, b]) => Some(
+            predicate_holds(inf, *a, param, x, depth + 1)?
+                || predicate_holds(inf, *b, param, x, depth + 1)?,
+        ),
+        ("lnot", [a]) => Some(!predicate_holds(inf, *a, param, x, depth + 1)?),
+        _ => None,
     }
 }
 
@@ -479,7 +735,7 @@ pub(crate) fn count_dims_with_zero(
                 return (Box::new([size_dim(inf, node, n)]), n == 0);
             }
             ConstEval::Gap(op) => emit_gap(inf, node, &op),
-            ConstEval::Dynamic => {}
+            ConstEval::Val(FixedValue::Real(_)) | ConstEval::Dynamic => {}
         }
     }
     (Box::new([Dim::Dynamic]), false)
@@ -488,7 +744,7 @@ pub(crate) fn count_dims_with_zero(
 fn fixed_to_dim(inf: &mut Inferencer<'_, '_>, node: NodeId, v: &FixedValue) -> Dim {
     match v {
         FixedValue::Int(n) => size_dim(inf, node, *n),
-        FixedValue::Vec(_) => Dim::Dynamic,
+        FixedValue::Real(_) | FixedValue::Vec(_) => Dim::Dynamic,
     }
 }
 

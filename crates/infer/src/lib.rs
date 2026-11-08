@@ -235,6 +235,17 @@ pub fn infer_expression(
     (types, diagnostics)
 }
 
+/// The fixed integer value of `root`, as the shape const-evaluator folds it
+/// (engine-concepts §17.1), without replacing module annotations. A derived
+/// size that folds to 0 types as `%dynamic` (the 2026-08-20 zero-size
+/// ruling), so a consumer that must tell an empty product from an unresolved
+/// size reads the value here.
+pub fn fixed_int_value(module: &mut Module, root: NodeId) -> Option<i64> {
+    let bundle = ModuleBundle::new();
+    let session = InferSession::new(&bundle);
+    trace::Inferencer::new(module, Level::Shape, &session).run_fixed_int(root)
+}
+
 /// Infer one expression's type and support without replacing module annotations.
 /// Used when callable substitution rebuilt a measure whose density needs a safe
 /// point inside its support. Failed inference does not provide such a proof.
