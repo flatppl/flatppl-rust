@@ -2311,6 +2311,32 @@ fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     continued_poisson_logpdf(e, p, v)
 }
 
+/// The support bounds of an integer-domain count density (§08: `nonnegintegers`, or
+/// `interval(0, n)` for Binomial): `0 <= k`, and `k <= upper` when given. Returns
+/// the in-support predicate and `k` with out-of-support lanes replaced by 0, an
+/// in-support stand-in, so neither the score nor its unused derivative sees the
+/// out-of-support point. Pair it with [`outside_count_support`].
+fn count_support(e: &mut Emitter, k: &Value, upper: Option<&Value>) -> (Value, Value) {
+    let zero = e.scalar(0.0);
+    let above = e.compare("GE", k, &zero);
+    let supported = match upper {
+        Some(upper) => {
+            let below = e.compare("LE", k, upper);
+            e.and(&above, &below)
+        }
+        None => above,
+    };
+    let safe = e.select(&supported, k, &zero);
+    (supported, safe)
+}
+
+/// `score` where `supported`, else `-inf`: the density is zero outside the support.
+fn outside_count_support(e: &mut Emitter, supported: &Value, score: &Value) -> Value {
+    let inf = e.inf_like(score);
+    let outside = e.neg(&inf);
+    e.select(supported, score, &outside)
+}
+
 /// §08 Binomial: `log f = logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
 /// with `logC(n, k) = -log1p(n) - log B(k + 1, n - k + 1)`, which equals
 /// `lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. `n - k` is computed once and its
@@ -2324,10 +2350,7 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let prob = p.get(e, "p")?;
     let fixed_log_choose = e.fold_log_choose(&n, v);
     let zero = e.scalar(0.0);
-    let above = e.compare("GE", v, &zero);
-    let below = e.compare("LE", v, &n);
-    let supported = e.and(&above, &below);
-    let v = e.select(&supported, v, &zero);
+    let (supported, v) = count_support(e, v, Some(&n));
     let half = e.scalar(0.5);
     let prob = e.select(&supported, &prob, &half);
     let one = e.scalar(1.0);
@@ -2359,9 +2382,7 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
     let score = e.add(&t2, &n_minus_k_log_one_minus_p);
-    let inf = e.inf_like(&score);
-    let outside = e.neg(&inf);
-    Ok(e.select(&supported, &score, &outside))
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// §09 `CrystalBall(m0, sigma, alpha, n)` — a Gaussian core with a power-law
@@ -2939,15 +2960,17 @@ fn dirac_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// `floor(log(U) / log(1 - p))`.
 fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
+    let (supported, v) = count_support(e, v, None);
 
     let log_p = e.log(&prob);
 
     // log1p(-p), not log(1 - p), for the reason in [`beta_logpdf`].
     let neg_prob = e.neg(&prob);
     let log_one_minus_p = e.log1p(&neg_prob);
-    let k_log_one_minus_p = e.mul(v, &log_one_minus_p);
+    let k_log_one_minus_p = e.mul(&v, &log_one_minus_p);
 
-    Ok(e.add(&log_p, &k_log_one_minus_p))
+    let score = e.add(&log_p, &k_log_one_minus_p);
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// `logC(k + r - 1, k) = lgamma(k + r) - lgamma(r) - lgamma(k + 1)`, the negative
@@ -2971,6 +2994,8 @@ fn log_count_choose(e: &mut Emitter, k: &Value, r: &Value) -> Value {
 fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
+    let (supported, v) = count_support(e, v, None);
+    let v = &v;
 
     let one = e.scalar(1.0);
     let t2 = log_count_choose(e, v, &alpha);
@@ -2988,7 +3013,8 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
     let neg_k_log_beta_plus_one = e.neg(&k_log_beta_plus_one);
 
     let t3 = e.add(&t2, &alpha_log_ratio);
-    Ok(e.add(&t3, &neg_k_log_beta_plus_one))
+    let score = e.add(&t3, &neg_k_log_beta_plus_one);
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// §08 NegativeBinomial2: `log f = logC(k + psi - 1, k) + k * (log(mu) -
@@ -2999,6 +3025,8 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
 fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let psi = p.get(e, "psi")?;
+    let (supported, v) = count_support(e, v, None);
+    let v = &v;
 
     let t2 = log_count_choose(e, v, &psi);
 
@@ -3016,7 +3044,8 @@ fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
     let psi_log_ratio_psi = e.mul(&psi, &log_ratio_psi);
 
     let t3 = e.add(&t2, &k_log_ratio_mu);
-    Ok(e.add(&t3, &psi_log_ratio_psi))
+    let score = e.add(&t3, &psi_log_ratio_psi);
+    Ok(outside_count_support(e, &supported, &score))
 }
 
 /// Category scores gather probabilities before taking logarithms, so unused zero
