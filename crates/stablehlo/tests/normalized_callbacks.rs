@@ -115,12 +115,11 @@ fn explicit_pushforward_parameters_reach_both_density_maps_and_sampling() {
 fn sequence_parameters_keep_record_fields_outside_the_iteration_axis() {
     // For p=(scale=2,shift=1), the scan is [2,7,18]; the final derivatives
     // are (11,7). The associative reduction a+x+shift is 8 at shift=1.
-    // A record or tuple is not an additional input of `scan` (spec §04 "Broadcasting",
-    // "Disallowed inputs"), so `scan` takes the fields and only `reduce` takes the record.
+    // Both operations pass the record whole (spec §04 "Explicit callback parameters").
     let source = "p = external(cartprod(scale = reals, shift = reals))\n\
-                  step(a, x, scale, shift) = scale * a + x + shift\n\
+                  step(a, x, q) = q.scale * a + x + q.shift\n\
                   fold(a, x, q) = a + x + q.shift\ninputs = p\n\
-                  outputs = (scan(step, 0.0, [1.0, 2.0, 3.0], p.scale, p.shift), \
+                  outputs = (scan(step, 0.0, [1.0, 2.0, 3.0], p), \
                              reduce(fold, [1.0, 2.0, 3.0], p))";
     emit(source, &Mode::LogDensity);
     let tuple = source
@@ -254,26 +253,15 @@ fn sequence_object_parameters_specialize_to_live_value_leaves() {
 }
 
 #[test]
-fn keyword_additional_arguments_of_a_sequence_callback_refuse() {
-    // Keyword binding is not lowered; the emitter refuses rather than reading the
-    // keyword argument as a positional one.
+fn keyword_parameters_of_a_sequence_callback_refuse() {
+    // The final parameter is positional (§04 "Explicit callback parameters").
     let source = "mu = external(reals)\nstep(a, x, w) = w * a + x\ninputs = mu\n\
-                  outputs = scan(step, 0.0, [1.0, 2.0, mu], w = [2.0])[3]";
+                  outputs = scan(step, 0.0, [1.0, 2.0, mu], w = 2.0)[3]";
     let mut model = flatppl_syntax::parse(source).unwrap();
-    assert!(flatppl_infer::infer(&mut model).is_empty());
-    let roots = [model.intern("inputs"), model.intern("outputs")];
-    let options = EmitOptions::default();
-    let model = flatppl_determinizer::determinize_with_options(
-        &model,
-        &flatppl_infer::ModuleBundle::new(),
-        Some(&roots),
-        &options.lowering_options(),
-    )
-    .unwrap();
-    let error = flatppl_stablehlo::emit(&model, Mode::LogDensity, &options).unwrap_err();
+    let errors = flatppl_infer::infer(&mut model);
     assert!(
-        error.to_string().contains("keyword additional arguments"),
-        "{error}"
+        errors.iter().any(|d| d.message.contains("positional")),
+        "{errors:?}"
     );
 }
 

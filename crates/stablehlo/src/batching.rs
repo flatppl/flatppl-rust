@@ -83,12 +83,13 @@ impl Emitter<'_> {
                         let Some(state) = type_of(id) else {
                             return false;
                         };
+                        // The step reads an element of `xs`, then `p` whole.
                         let mut arguments = vec![item(state)];
-                        for sequence in sequences {
+                        for (i, sequence) in sequences.iter().enumerate() {
                             let Some(input) = type_of(*sequence) else {
                                 return false;
                             };
-                            arguments.push(item(input));
+                            arguments.push(if i == 0 { item(input) } else { input.clone() });
                         }
                         let mut seeds = types.clone();
                         for i in 0..self.m.node_count() {

@@ -1,7 +1,8 @@
-//! Spec §04 "Additional arguments" in the lowering rules: `weighted`, `logweighted`,
-//! `pushfwd`, `markovchain` and `kscan` call their callback with the additional
+//! Spec §04 "Explicit callback parameters" in the lowering rules: `weighted`,
+//! `logweighted`, `pushfwd` and `markovchain` call their callback with the additional
 //! arguments, bound positionally or by name, a sole record or table by its fields.
-//! Each case equals the same model with the arguments written into the callback.
+//! `kscan` traverses its sequence `xs` and passes a final `p` whole. Each case equals
+//! the same model with the arguments written into the callback.
 use flatppl_determinizer::determinize;
 
 mod common;
@@ -16,10 +17,11 @@ fn pir(src: &str) -> String {
 }
 
 #[test]
-fn weighted_binds_several_positional_additional_arguments() {
+fn weighted_reads_a_record_parameter_whole() {
     // log w(0.5) = log(2.0 * 0.5 + 1.0)
     let extras = pir(
-        "W = weighted((x, a, b) -> a * x + b, Normal(0.0, 1.0), 2.0, 1.0)\nlp = logdensityof(W, 0.5)",
+        "W = weighted((x, p) -> p.a * x + p.b, Normal(0.0, 1.0), record(a = 2.0, b = 1.0))\n\
+         lp = logdensityof(W, 0.5)",
     );
     let inline =
         pir("W = weighted(x -> 2.0 * x + 1.0, Normal(0.0, 1.0))\nlp = logdensityof(W, 0.5)");
@@ -27,14 +29,11 @@ fn weighted_binds_several_positional_additional_arguments() {
 }
 
 #[test]
-fn weighted_binds_keyword_and_record_additional_arguments() {
+fn weighted_splats_a_sole_record_parameter() {
+    // The #215 auto-splat: a sole record binds the callback's inputs by field.
     let inline =
         pir("W = weighted(x -> 2.0 * x + 1.0, Normal(0.0, 1.0))\nlp = logdensityof(W, 0.5)");
-    for extras in [
-        "a = 2.0, b = 1.0",
-        "b = 1.0, a = 2.0",
-        "record(b = 1.0, a = 2.0)",
-    ] {
+    for extras in ["record(b = 1.0, a = 2.0)", "record(a = 2.0, b = 1.0)"] {
         let got = pir(&format!(
             "W = weighted((x, a, b) -> a * x + b, Normal(0.0, 1.0), {extras})\nlp = logdensityof(W, 0.5)"
         ));
@@ -43,19 +42,20 @@ fn weighted_binds_keyword_and_record_additional_arguments() {
 }
 
 #[test]
-fn logweighted_binds_keyword_additional_arguments() {
+fn logweighted_reads_a_record_parameter_whole() {
     let extras = pir(
-        "W = logweighted((x, a) -> a * x, Normal(0.0, 1.0), a = 2.0)\nlp = logdensityof(W, 0.5)",
+        "W = logweighted((x, p) -> p.a * x, Normal(0.0, 1.0), record(a = 2.0))\nlp = logdensityof(W, 0.5)",
     );
     let inline = pir("W = logweighted(x -> 2.0 * x, Normal(0.0, 1.0))\nlp = logdensityof(W, 0.5)");
     assert_eq!(extras, inline);
 }
 
 #[test]
-fn pushfwd_binds_keyword_additional_arguments() {
-    // The synthesised inverse and log-volume see the same additional arguments.
-    let extras =
-        pir("W = pushfwd((x, a) -> a * x, Normal(0.0, 1.0), a = 2.0)\nlp = logdensityof(W, 0.5)");
+fn pushfwd_reads_a_record_parameter_whole() {
+    // The synthesised inverse and log-volume see the same parameter.
+    let extras = pir(
+        "W = pushfwd((x, p) -> p.a * x, Normal(0.0, 1.0), record(a = 2.0))\nlp = logdensityof(W, 0.5)",
+    );
     let inline = pir("W = pushfwd(x -> 2.0 * x, Normal(0.0, 1.0))\nlp = logdensityof(W, 0.5)");
     assert_eq!(extras, inline);
 }
@@ -64,7 +64,7 @@ fn pushfwd_binds_keyword_additional_arguments() {
 fn pushfwd_bijection_passes_the_additional_arguments_to_inverse_and_volume() {
     let extras = pir(
         "W = pushfwd(bijection((x, a, b) -> exp(x) * a + b, (y, a, b) -> log((y - b) / a), \
-         (y, a, b) -> log(a)), Normal(0.0, 1.0), 2.0, 1.0)\nlp = logdensityof(W, 4.0)",
+         (y, a, b) -> log(a)), Normal(0.0, 1.0), record(a = 2.0, b = 1.0))\nlp = logdensityof(W, 4.0)",
     );
     // log N(log(3 / 2); 0, 1) - log(2): the preimage is f_inv(4.0, 2.0, 1.0), the volume logvol(.., 2.0, 1.0).
     assert!(extras.contains("(log 1.5)"), "{extras}");
@@ -72,78 +72,51 @@ fn pushfwd_bijection_passes_the_additional_arguments_to_inverse_and_volume() {
 }
 
 #[test]
-fn markovchain_binds_several_additional_arguments() {
+fn markovchain_binds_a_record_parameter() {
     // Step i is Normal(prev + drift, scale), prev_0 = 0.0.
     let want = pir(
         "T = markovchain(s -> Normal(s + 0.1, 0.5), 0.0, 3)\nlp = logdensityof(T, [0.1, 0.2, 0.3])",
     );
-    for extras in [
-        "0.1, 0.5",
-        "drift = 0.1, scale = 0.5",
-        "record(scale = 0.5, drift = 0.1)",
-    ] {
+    // One record parameter, splatted onto the step's inputs or read whole.
+    let got = pir(
+        "T = markovchain((state, drift, scale) -> Normal(state + drift, scale), 0.0, 3, \
+         record(scale = 0.5, drift = 0.1))\nlp = logdensityof(T, [0.1, 0.2, 0.3])",
+    );
+    assert_eq!(got, want);
+    let got = pir(
+        "T = markovchain((state, p) -> Normal(state + p.drift, p.scale), 0.0, 3, \
+         record(scale = 0.5, drift = 0.1))\nlp = logdensityof(T, [0.1, 0.2, 0.3])",
+    );
+    assert_eq!(got, want);
+}
+
+#[test]
+fn kscan_passes_a_vector_parameter_whole() {
+    // §04 "Explicit callback parameters": `w` is the whole vector at every step, also
+    // when it has the trajectory length or length one.
+    for (w, sum) in [("[0.5, 0.25]", "sum([0.5, 0.25])"), ("[0.5]", "sum([0.5])")] {
         let got = pir(&format!(
-            "T = markovchain((state, drift, scale) -> Normal(state + drift, scale), 0.0, 3, {extras})\n\
-             lp = logdensityof(T, [0.1, 0.2, 0.3])"
-        ));
-        assert_eq!(got, want, "{extras}");
-    }
-}
-
-#[test]
-fn kscan_traverses_every_additional_sequence_together() {
-    // Step i is Normal(prev + xs[i], ws[i]) with prev_0 = 0.0. The step inputs are
-    // (prev, cur, x, w), mapped over the shifted trajectory, the point, xs and ws.
-    let out = pir(
-        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], [0.5, 0.25])\n\
-         lp = logdensityof(T, [0.1, 0.2])",
-    );
-    assert!(
-        out.contains("(add (%ref %local _density_point_0_) (%ref %local _density_point_2_))"),
-        "{out}"
-    );
-    assert!(
-        out.contains("(%field sigma (%ref %local _density_point_3_))"),
-        "{out}"
-    );
-    let xs = out
-        .find("(vector 1.0 2.0))")
-        .expect("xs is a broadcast argument");
-    let ws = out
-        .find("(vector 0.5 0.25))")
-        .expect("ws is a broadcast argument");
-    assert!(xs < ws, "{out}");
-}
-
-#[test]
-fn kscan_repeats_a_length_one_sequence() {
-    let repeated = pir(
-        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], [0.5])\n\
-         lp = logdensityof(T, [0.1, 0.2])",
-    );
-    let constant = pir(
-        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], 0.5)\n\
-         lp = logdensityof(T, [0.1, 0.2])",
-    );
-    assert_eq!(repeated, constant);
-}
-
-#[test]
-fn kscan_binds_keyword_sequences_and_a_sole_table_by_name() {
-    let positional = pir(
-        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], [0.5, 0.25])\n\
-         lp = logdensityof(T, [0.1, 0.2])",
-    );
-    for extras in [
-        "w = [0.5, 0.25], x = [1.0, 2.0]",
-        "table(x = [1.0, 2.0], w = [0.5, 0.25])",
-    ] {
-        let got = pir(&format!(
-            "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, {extras})\n\
+            "T = kscan((state, x, w) -> Normal(state + x, sum(w)), 0.0, [1.0, 2.0], {w})\n\
              lp = logdensityof(T, [0.1, 0.2])"
         ));
-        assert_eq!(got, positional, "{extras}");
+        let inline = pir(&format!(
+            "T = kscan((state, x) -> Normal(state + x, {sum}), 0.0, [1.0, 2.0])\n\
+             lp = logdensityof(T, [0.1, 0.2])"
+        ));
+        assert_eq!(got, inline, "{w}");
     }
+}
+
+#[test]
+fn kscan_reads_a_table_row_whole() {
+    let out = pir(
+        "T = kscan((state, row) -> Normal(state + row.x, row.w), 0.0, \
+         table(x = [1.0, 2.0], w = [0.5, 0.25]))\nlp = logdensityof(T, [0.1, 0.2])",
+    );
+    assert!(
+        out.contains("(vector 1.0 2.0)") && out.contains("(vector 0.5 0.25)"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -174,21 +147,15 @@ fn kscan_holds_scalar_inputs_constant_at_every_step() {
         "T = kscan((state, x) -> Normal(state + x, 0.5), 0.0, [1.0, 2.0])\n\
          lp = logdensityof(T, [0.1, 0.2])",
     );
-    for extras in [
-        "[1.0, 2.0], 0.5",
-        "[1.0, 2.0], w = 0.5",
-        "x = [1.0, 2.0], w = 0.5",
-    ] {
-        let got = pir(&format!(
-            "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, {extras})\n\
-             lp = logdensityof(T, [0.1, 0.2])"
-        ));
-        assert_eq!(got, inline, "{extras}");
-    }
-    // Two constants beside one sequence bind in order.
     let got = pir(
-        "T = kscan((state, x, p, q) -> Normal(state + x + q, p), 0.0, [1.0, 2.0], \
-         0.5, 10.0)\nlp = logdensityof(T, [0.1, 0.2])",
+        "T = kscan((state, x, w) -> Normal(state + x, w), 0.0, [1.0, 2.0], 0.5)\n\
+         lp = logdensityof(T, [0.1, 0.2])",
+    );
+    assert_eq!(got, inline);
+    // A record parameter reaches the kernel whole.
+    let got = pir(
+        "T = kscan((state, x, p) -> Normal(state + x + p.q, p.s), 0.0, [1.0, 2.0], \
+         record(s = 0.5, q = 10.0))\nlp = logdensityof(T, [0.1, 0.2])",
     );
     let inline = pir(
         "T = kscan((state, x) -> Normal(state + x + 10.0, 0.5), 0.0, [1.0, 2.0])\n\
