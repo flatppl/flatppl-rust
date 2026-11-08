@@ -492,10 +492,11 @@ impl Emitter<'_> {
                 "scan/reduce: keyword additional arguments are not lowered to StableHLO",
             ));
         }
-        // `scan` traverses every sequence after `init` together (spec §04
-        // "Additional arguments"); `reduce` holds its additional arguments constant.
+        // `scan(f, init, xs, p)` traverses `xs` and passes `p` whole, held at every
+        // step as a constant input; `reduce(f, xs, p)` passes `p` as its parameter
+        // (spec §04 "Explicit callback parameters").
         let (function, init, sequences, parameters) = match (reduce, args) {
-            (false, [function, init, sequences @ ..]) if !sequences.is_empty() => {
+            (false, [function, init, sequences @ ..]) if (1..=2).contains(&sequences.len()) => {
                 (*function, Some(*init), sequences, &[][..])
             }
             (true, [function, xs, parameters @ ..]) => {
@@ -510,7 +511,16 @@ impl Emitter<'_> {
         };
         let item_types = sequences
             .iter()
-            .map(|&sequence| self.sequence_item_type(sequence))
+            .enumerate()
+            .map(|(i, &sequence)| {
+                if i == 0 {
+                    self.sequence_item_type(sequence)
+                } else {
+                    self.type_of(sequence)
+                        .cloned()
+                        .ok_or_else(|| EmitError::at(sequence, "scan: unresolved parameter type"))
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let state_type = if reduce {
             item_types[0].clone()
@@ -521,7 +531,7 @@ impl Emitter<'_> {
         if parameters.len() > 1 || entries.len() != 1 + sequences.len() + parameters.len() {
             return Err(EmitError::at(
                 id,
-                "scan: step must take state, one input per sequence and, for reduce, an optional parameter",
+                "scan: step must take the state, one element of `xs` and an optional parameter",
             ));
         }
         let parameter = parameters
@@ -538,21 +548,16 @@ impl Emitter<'_> {
             .iter()
             .map(|&sequence| self.lower_components(sequence))
             .collect::<Result<Vec<_>, _>>()?;
-        // A one-dimensional array or table is traversed; any other input is a
-        // constant held at every step (spec §04 "Additional arguments").
-        let traversed: Vec<bool> = sequences
-            .iter()
-            .map(|&sequence| {
-                matches!(
-                    self.type_of(sequence),
-                    Some(Type::Array { .. } | Type::TVector { .. } | Type::Table { .. })
-                )
-            })
-            .collect();
-        if !traversed.iter().any(|&t| t) {
+        // Only `xs` is traversed; a `p` is a constant held at every step, whatever
+        // its shape (spec §04 "Explicit callback parameters").
+        let traversed: Vec<bool> = (0..sequences.len()).map(|i| i == 0).collect();
+        if !matches!(
+            self.type_of(sequences[0]),
+            Some(Type::Array { .. } | Type::TVector { .. } | Type::Table { .. })
+        ) {
             return Err(EmitError::at(
-                id,
-                "scan: needs at least one array or table input",
+                sequences[0],
+                "scan: `xs` must be an array or table",
             ));
         }
         let mut lengths: Vec<Option<u64>> = Vec::with_capacity(seqs.len());
@@ -584,12 +589,7 @@ impl Emitter<'_> {
             }
             lengths.push(Some(len));
         }
-        // Length-one sequences repeat; every other length must agree (§04).
-        let mut others = lengths.iter().copied().flatten().filter(|&len| len != 1);
-        let n = others.next().unwrap_or(1);
-        if others.any(|len| len != n) {
-            return Err(EmitError::at(id, "scan: sequences differ in length"));
-        }
+        let n = lengths[0].expect("`xs` is traversed");
         let xs = &seqs[0];
         let mut state = if let Some(init) = init {
             self.lower_components(init)?
