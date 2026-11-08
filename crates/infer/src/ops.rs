@@ -4010,8 +4010,44 @@ fn relabel_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             _ => Type::Deferred,
         };
     };
+    // §04 gives one name per array element or record field, so a known count
+    // that differs from the names is an error, not a type to defer.
+    let variate = match &ty {
+        Type::Measure { domain, .. } => domain.as_ref(),
+        other => other,
+    };
+    if let Some(components) = relabel_components(variate)
+        && components != names.len()
+    {
+        let message = format!(
+            "relabel: {} names for {}, which has {components} components; give one name per \
+             array element or record field (spec §04 \"Interface adaptation\")",
+            names.len(),
+            crate::boundary::show(inf, variate),
+        );
+        if let Some((at, _, _)) = args.get(1) {
+            inf.diags.push(crate::Diagnostic::error_at(*at, message));
+        }
+        return Type::Failed("relabel: the name count does not match the components".into());
+    }
     let symbols: Vec<Symbol> = names.iter().map(|n| inf.module.intern(n)).collect();
     relabel_value_type(ty, &symbols)
+}
+
+/// How many names `relabel` needs for a value of type `ty`: one for a scalar, one
+/// per element of a static vector, one per record field or table column. `None`
+/// when the count is not statically known.
+fn relabel_components(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::Scalar(_) => Some(1),
+        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
+            Dim::Static(n) => usize::try_from(n).ok(),
+            Dim::Dynamic => None,
+        },
+        Type::Record(fields) => Some(fields.len()),
+        Type::Table { columns, .. } => Some(columns.len()),
+        _ => None,
+    }
 }
 
 fn relabel_value_type(ty: Type, names: &[Symbol]) -> Type {
