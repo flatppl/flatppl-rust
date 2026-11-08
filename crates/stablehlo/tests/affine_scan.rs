@@ -30,10 +30,11 @@ fn arma11(t: usize) -> String {
          phi = elementof(reals)\n\
          theta = elementof(reals)\n\
          sigma = elementof(posreals)\n\
-         prediction(state, mu, phi, theta) = mu + phi * state.previous + theta * state.error\n\
-         step(state, observation, mu, phi, theta) = record(\n    \
-             previous = observation, error = observation - prediction(state, mu, phi, theta))\n\
-         states = scan(step, record(previous = mu, error = 0.0), y, mu, phi, theta)\n\
+         prediction(state, p) = p.mu + p.phi * state.previous + p.theta * state.error\n\
+         step(state, observation, p) = record(\n    \
+             previous = observation, error = observation - prediction(state, p))\n\
+         states = scan(step, record(previous = mu, error = 0.0), y, \
+         record(mu = mu, phi = phi, theta = theta))\n\
          state_error(state) = state.error\n\
          errors = state_error.(states)\n\
          inputs = (mu, phi, theta, sigma, y)\n\

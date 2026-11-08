@@ -69,14 +69,14 @@ pub(crate) fn lower_kscan(m: &mut Module, node: NodeId, v: NodeId) -> Result<Nod
 }
 
 /// A chain call's checked arguments: `op` is `"markovchain"` (kernel, init, `n`,
-/// then additional arguments held constant) or `"kscan"` (kernel, init, then
-/// sequences traversed together, spec §04 "Additional arguments").
+/// then an optional parameter `p`) or `"kscan"` (kernel, init, the sequence `xs`,
+/// then an optional `p`). `p` is passed whole to every step (§04 "Explicit
+/// callback parameters").
 struct ChainParts {
     k_arg: NodeId,
     init: NodeId,
     extras: Vec<NodeId>,
-    /// Per extra: `Some(len)` traversed (or repeated at length one), `None`
-    /// held constant.
+    /// Per extra: `Some(len)` traversed with the steps, `None` passed whole.
     positions: Vec<Option<usize>>,
     n: usize,
     state: Type,
@@ -84,7 +84,9 @@ struct ChainParts {
 
 fn chain_parts(m: &mut Module, node: NodeId, op: &str) -> Result<ChainParts, RefuseError> {
     let per_step_input = op == "kscan";
-    let lead = if per_step_input { 2 } else { 3 };
+    // `kscan`'s `xs` is a leading argument like `markovchain`'s `n`; only `p` binds
+    // through the callback-parameter rule.
+    let lead = 3;
     let (k_arg, init) = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected a chain call"));
@@ -95,17 +97,19 @@ fn chain_parts(m: &mut Module, node: NodeId, op: &str) -> Result<ChainParts, Ref
                 m,
                 &format!(
                     "{op} expects (kernel, init, {})",
-                    if per_step_input {
-                        "sequences..."
-                    } else {
-                        "n, additional arguments..."
-                    }
+                    if per_step_input { "xs[, p]" } else { "n[, p]" }
                 ),
             ));
         }
         (c.args[0], c.args[1])
     };
-    let extras = crate::extras::bind_extras(m, node, k_arg, lead, 1)?;
+    let xs = per_step_input.then(|| match m.node(node) {
+        Node::Call(c) => c.args[2],
+        _ => unreachable!("checked above"),
+    });
+    let callback_lead = if per_step_input { 2 } else { 1 };
+    let parameters = crate::extras::bind_extras(m, node, k_arg, lead, callback_lead)?;
+    let extras: Vec<NodeId> = xs.into_iter().chain(parameters).collect();
     let expected_inputs = 1 + extras.len();
 
     // The step count. `None` covers a dynamic length AND a record-state chain
@@ -157,26 +161,23 @@ fn chain_parts(m: &mut Module, node: NodeId, op: &str) -> Result<ChainParts, Ref
         ));
     }
 
-    // §04 "Additional arguments": a one-dimensional array or table is traversed with
-    // the steps, a length-one one repeats, and anything else is held constant.
-    let positions: Vec<Option<usize>> = if per_step_input {
-        extras
-            .iter()
-            .map(|&extra| match extra_traversal(m, extra) {
-                Some(Some(1)) => Ok(Some(1)),
-                Some(Some(len)) if len == n => Ok(Some(len)),
-                Some(None) => Ok(None),
-                _ => Err(refuse(
+    // `xs` is traversed with the steps; a final `p` is passed whole, whatever its
+    // shape (§04 "Explicit callback parameters").
+    let mut positions: Vec<Option<usize>> = vec![None; extras.len()];
+    if per_step_input && let Some(&xs) = extras.first() {
+        positions[0] = match extra_traversal(m, xs) {
+            Some(Some(len)) if len == n => Some(len),
+            _ => {
+                return Err(refuse(
                     node,
                     m,
-                    "kscan additional input is not statically a constant or a sequence of the \
-                     trajectory length",
-                )),
-            })
-            .collect::<Result<_, _>>()?
-    } else {
-        vec![None; extras.len()]
-    };
+                    "kscan sequence `xs` is not statically a one-dimensional array or table of \
+                     the trajectory length",
+                ));
+            }
+        };
+    }
+
     let state = match m.type_of(node) {
         Some(Type::Measure { domain, .. }) => match domain.as_ref() {
             Type::Array { elem, .. } => (**elem).clone(),
@@ -247,9 +248,9 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
     Ok(build_call(m, "sum", &[terms]))
 }
 
-/// How an additional input of `kscan` meets the steps: `Some(Some(len))` for a
-/// one-dimensional array or table of static length `len`, `Some(None)` for a
-/// constant, and `None` when its type is not statically known.
+/// The static length of `kscan`'s sequence `xs`: `Some(Some(len))` for a
+/// one-dimensional array or table, `Some(None)` for anything else, and `None` when
+/// its type is not statically known.
 fn extra_traversal(m: &mut Module, extra: NodeId) -> Option<Option<usize>> {
     let resolved = crate::density::resolve_ref_chain(m, extra).0;
     let ty = m

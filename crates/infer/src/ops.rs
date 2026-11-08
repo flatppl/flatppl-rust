@@ -829,16 +829,11 @@ fn op_rule(
             trajectory_measure(arg_ty(args, 1), len)
         }
         "kscan" => {
-            // The sequences after `init` are traversed together (§04 "Additional
-            // arguments"), so the trajectory has as many steps as they agree on.
-            let lengths: Option<Vec<Option<Dim>>> = args[2.min(args.len())..]
-                .iter()
-                .map(|input| sequence_item(input).map(|(len, _)| len))
-                .collect();
-            let len = lengths
-                .map(|lengths| lengths.into_iter().flatten().collect::<Vec<_>>())
-                .filter(|lengths| !lengths.is_empty())
-                .map_or(Dim::Dynamic, |lengths| sequence_steps(&lengths));
+            // One step per element (row) of `xs`; a final `p` is not traversed.
+            let len = args
+                .get(2)
+                .and_then(sequence_item)
+                .map_or(Dim::Dynamic, |(len, _)| len);
             trajectory_measure(arg_ty(args, 1), len)
         }
         // `kchain(M, K1, …, Kn)` (spec §06): Kleisli bind — marginalizes the
@@ -1138,23 +1133,27 @@ struct ExtrasHead {
     lead: usize,
     /// Inputs the operation itself supplies to the callback first.
     callback_lead: usize,
-    /// Whether the additional arguments are sequences traversed together
-    /// (`filter`, `scan`, `kscan`) rather than values held constant.
-    sequences: bool,
+    /// The positional form §04 "Explicit callback parameters" gives the operation,
+    /// which takes at most one final parameter `p`.
+    form: &'static str,
 }
 
 fn extras_head(name: &str) -> Option<ExtrasHead> {
-    let (lead, callback_lead, sequences) = match name {
-        "weighted" | "logweighted" | "pushfwd" => (2, 1, false),
-        "reduce" => (2, 2, false),
-        "markovchain" => (3, 1, false),
-        "filter" | "scan" | "kscan" => (2, 1, true),
+    let (lead, callback_lead, form) = match name {
+        "weighted" => (2, 1, "weighted(f, M, p)"),
+        "logweighted" => (2, 1, "logweighted(f, M, p)"),
+        "pushfwd" => (2, 1, "pushfwd(f, M, p)"),
+        "reduce" => (2, 2, "reduce(f, xs, p)"),
+        "markovchain" => (3, 1, "markovchain(kernel, init, n, p)"),
+        "filter" => (2, 1, "filter(pred, data, p)"),
+        "scan" => (3, 2, "scan(f, init, xs, p)"),
+        "kscan" => (3, 2, "kscan(kernel, init, xs, p)"),
         _ => return None,
     };
     Some(ExtrasHead {
         lead,
         callback_lead,
-        sequences,
+        form,
     })
 }
 
@@ -1179,16 +1178,39 @@ fn bind_call_extras(
     if args.len() < head.lead {
         return ExtrasOutcome::Unchanged;
     }
+    if matches!(name, "scan" | "kscan")
+        && let Some(refusal) = check_sequence(inf, name, &args[2])
+    {
+        return ExtrasOutcome::Refused(refusal);
+    }
     let extras = &args[head.lead..];
+    if let Some((_, node, _, _)) = named.first() {
+        let form = head.form;
+        return refuse_extras(
+            inf,
+            *node,
+            name,
+            format!(
+                "the final parameter is positional: `{form}`; pass several values as one \
+                 record `p`, for example `record(a = 2.0)`, not as keyword arguments"
+            ),
+        );
+    }
+    if extras.len() > 1 {
+        let form = head.form;
+        let node = extras.get(1).map_or(id, |extra| extra.0);
+        return refuse_extras(
+            inf,
+            node,
+            name,
+            format!(
+                "takes one optional final parameter: `{form}`, with `p` passed whole to the \
+                 callback; pack several parameters into one record `p`, and several sequences \
+                 into one table"
+            ),
+        );
+    }
     if extras.is_empty() && named.is_empty() {
-        if head.sequences && name != "filter" {
-            return refuse_extras(
-                inf,
-                id,
-                name,
-                "needs at least one array or table input to traverse".to_string(),
-            );
-        }
         return ExtrasOutcome::Unchanged;
     }
     let Some(interface) = crate::callable::interface(inf, args[0].0) else {
@@ -1220,9 +1242,6 @@ fn bind_call_extras(
     };
     let mut bound: Vec<ArgInfo> = args[..head.lead].to_vec();
     bound.extend(bound_extras);
-    // `filter` traverses its additional inputs with `data`, which is a sequence
-    // too; `scan` and `kscan` traverse the additional inputs alone.
-    let traversed = if name == "filter" { 1 } else { head.lead };
     if name == "filter"
         && let Some((node, ty, _)) = bound.get(1)
         && !matches!(
@@ -1242,11 +1261,6 @@ fn bind_call_extras(
             "the data to filter must be an array or table".to_string(),
         );
     }
-    if head.sequences
-        && let Some(refusal) = check_sequences(inf, id, name, &bound[traversed..])
-    {
-        return ExtrasOutcome::Refused(refusal);
-    }
     ExtrasOutcome::Bound(bound)
 }
 
@@ -1262,7 +1276,7 @@ fn refuse_extras(
 fn extras_diagnostic(inf: &mut Inferencer<'_, '_>, node: NodeId, name: &str, what: String) -> Type {
     inf.diags.push(crate::Diagnostic::error_at(
         node,
-        format!("`{name}`: {what} (spec §04 \"Additional arguments\")"),
+        format!("`{name}`: {what} (spec §04 \"Explicit callback parameters\")"),
     ));
     Type::Failed(format!("{name}: additional arguments").into())
 }
@@ -1298,13 +1312,13 @@ fn bind_extras_to_interface(
         names: &remaining_names,
         ordered: interface.ordered,
     };
-    // Sequence callbacks receive record parameters whole; table columns retain
-    // their existing binding to the callback's remaining inputs.
+    // `scan`, `kscan` and `filter` pass their final parameter whole, whatever its
+    // shape (§04 "Explicit callback parameters"); the other operations keep the
+    // aggregate splat of a single record or table.
+    let whole = matches!(who, "scan" | "kscan" | "filter");
     let aggregate_fields = match extras {
-        [(_, Type::Record(fields), _)] if !matches!(who, "scan" | "kscan" | "filter") => {
-            Some(fields.as_ref())
-        }
-        [(_, Type::Table { columns, .. }, _)] => Some(columns.as_ref()),
+        [(_, Type::Record(fields), _)] if !whole => Some(fields.as_ref()),
+        [(_, Type::Table { columns, .. }, _)] if !whole => Some(columns.as_ref()),
         _ => None,
     }
     .filter(|_| named.is_empty());
@@ -1366,76 +1380,25 @@ fn bind_extras_to_interface(
     Ok(bound)
 }
 
-/// §04 "Additional arguments": the additional inputs of `filter`, `scan` and `kscan`
-/// traverse one-dimensional arrays and tables together. A length-one input repeats;
-/// other unequal lengths are an error. Scalars, records and other non-collection
-/// inputs are held constant. A tuple or an array of more than one dimension is an
-/// error, and `scan` and `kscan` need at least one array or table to traverse.
-fn check_sequences(
-    inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
-    name: &str,
-    inputs: &[ArgInfo],
-) -> Option<Type> {
-    let mut len: Option<u32> = None;
-    let mut traversed = false;
-    let mut unknown = false;
-    for (node, ty, _) in inputs {
-        let dim = match ty {
-            Type::Array { shape, .. } if shape.len() == 1 => shape[0],
-            Type::Table { nrows, .. } => *nrows,
-            Type::Array { .. } | Type::Tuple(_) => {
-                inf.diags.push(crate::Diagnostic::error_at(
-                    *node,
-                    format!(
-                        "`{name}` additional inputs are one-dimensional arrays or tables, or \
-                         constants; a tuple or a higher-dimensional array is not allowed \
-                         (spec §04 \"Additional arguments\")"
-                    ),
-                ));
-                return Some(Type::Failed(
-                    format!("{name}: input is not a sequence or a constant").into(),
-                ));
-            }
-            Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => {
-                unknown = true;
-                continue;
-            }
-            _ => continue,
-        };
-        traversed = true;
-        let Dim::Static(n) = dim else { continue };
-        if n == 1 {
-            continue;
-        }
-        match len {
-            Some(previous) if previous != n => {
-                inf.diags.push(crate::Diagnostic::error_at(
-                    *node,
-                    format!(
-                        "`{name}` sequence inputs have lengths {previous} and {n}: spec §04 \
-                         \"Additional arguments\" repeats only length-one inputs, and other \
-                         unequal lengths are an error"
-                    ),
-                ));
-                return Some(Type::Failed(
-                    format!("{name}: unequal sequence lengths").into(),
-                ));
-            }
-            _ => len = Some(n),
+/// The one sequence `xs` of `scan` and `kscan` (§04 "Folds and scans", §06
+/// `kscan`): a one-dimensional array or a table, traversed element by element or
+/// row by row. An input of unknown type is left for later rules.
+fn check_sequence(inf: &mut Inferencer<'_, '_>, name: &str, xs: &ArgInfo) -> Option<Type> {
+    let (node, ty, _) = xs;
+    match ty {
+        Type::Array { shape, .. } if shape.len() == 1 => None,
+        Type::Table { .. } | Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => None,
+        _ => {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`{name}` traverses one sequence `xs`, which must be a one-dimensional \
+                     array or a table (spec §04 \"Folds and scans\")"
+                ),
+            ));
+            Some(Type::Failed(format!("{name}: xs is not a sequence").into()))
         }
     }
-    if name != "filter" && !traversed && !unknown {
-        inf.diags.push(crate::Diagnostic::error_at(
-            id,
-            format!(
-                "`{name}` needs at least one array or table input to traverse; a constant is \
-                 held at every step (spec §04 \"Additional arguments\")"
-            ),
-        ));
-        return Some(Type::Failed(format!("{name}: no sequence input").into()));
-    }
-    None
 }
 
 /// Higher-order operations pass whole objects in a fixed callback signature.
@@ -1480,42 +1443,14 @@ fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
 }
 
-/// The number of steps of sequences traversed together (§04 "Additional
-/// arguments"): equal lengths, with length-one inputs repeating. An empty input
-/// combined with length-one inputs yields zero steps.
-fn sequence_steps(lengths: &[Dim]) -> Dim {
-    let mut steps = None;
-    let mut dynamic = false;
-    for length in lengths {
-        match length {
-            Dim::Static(1) => {}
-            Dim::Static(n) => steps = Some(*n),
-            Dim::Dynamic => dynamic = true,
-        }
-    }
-    match (steps, dynamic) {
-        (Some(n), _) => Dim::Static(n),
-        (None, true) => Dim::Dynamic,
-        (None, false) => Dim::Static(1),
-    }
-}
-
-/// One additional input of `scan`/`kscan`, as the step sees it: `Some(len)` with
-/// the element (row) type for a one-dimensional array or table, `None` with the
-/// whole value for a constant. A tuple, a higher-dimensional array or an input of
-/// unknown type is `None` for the whole call (inference of the step is deferred;
-/// [`check_sequences`] reports the tuple and the array).
-fn sequence_item(input: &ArgInfo) -> Option<(Option<Dim>, ArgInfo)> {
+/// The sequence `xs` of `scan`/`kscan` as the step sees it: its length and the
+/// element (row) type, or `None` when `xs` is not yet a known one-dimensional
+/// array or table ([`check_sequence`] reports a wrong kind).
+fn sequence_item(input: &ArgInfo) -> Option<(Dim, ArgInfo)> {
     let (len, item) = match &input.1 {
-        Type::Array { shape, elem } if shape.len() == 1 => (Some(shape[0]), (**elem).clone()),
-        Type::Table { columns, nrows } => (Some(*nrows), Type::Record(columns.clone())),
-        Type::Array { .. }
-        | Type::Tuple(_)
-        | Type::Deferred
-        | Type::Any
-        | Type::Var(_)
-        | Type::Failed(_) => return None,
-        other => (None, other.clone()),
+        Type::Array { shape, elem } if shape.len() == 1 => (shape[0], (**elem).clone()),
+        Type::Table { columns, nrows } => (*nrows, Type::Record(columns.clone())),
+        _ => return None,
     };
     Some((len, (input.0, item, input.2)))
 }
@@ -1523,22 +1458,17 @@ fn sequence_item(input: &ArgInfo) -> Option<(Option<Dim>, ArgInfo)> {
 /// A scan has one fixed state type, including the numeric embedding of an
 /// integer initial value into a real-valued recurrence. Infer the step with
 /// state and row types, just as broadcast infers its callable on cell types.
-/// The sequences after `init` are traversed together, and their elements are
-/// the step's inputs after the state (§04 "Additional arguments").
+/// The step reads one element (row) of `xs` after the state, then the optional
+/// final parameter `p` whole (§04 "Explicit callback parameters").
 fn scan_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> RuleStep<Type> {
-    let [function, init, sequences @ ..] = args else {
+    let [function, init, xs, parameters @ ..] = args else {
         return Ready(Type::Deferred);
     };
-    let Some(items) = sequences
-        .iter()
-        .map(sequence_item)
-        .collect::<Option<Vec<_>>>()
-        .filter(|items| items.iter().any(|(len, _)| len.is_some()))
-    else {
+    let Some((len, item)) = sequence_item(xs) else {
         return Ready(Type::Deferred);
     };
-    let len = sequence_steps(&items.iter().filter_map(|(len, _)| *len).collect::<Vec<_>>());
-    let items: Vec<ArgInfo> = items.into_iter().map(|(_, item)| item).collect();
+    let mut items = vec![item];
+    items.extend(parameters.iter().cloned());
     scan_state_type(inf, function.0, init.clone(), items).map(inf, move |_, state| match state {
         Type::Record(columns) => Type::Table {
             columns,
@@ -8073,9 +8003,8 @@ enum SpecialArity {
     /// that it "only accepts positional arguments, not keyword arguments", which
     /// is now what EVERY distinguished input does, so the carve-out folded in.
     Distinguished(usize),
-    /// `n` distinguished POSITIONAL inputs, then zero or more additional
-    /// arguments, positional or keyword, that bind the callback's remaining
-    /// inputs (§04 "Additional arguments").
+    /// `n` distinguished POSITIONAL inputs, then the callback's optional final
+    /// parameter (§04 "Explicit callback parameters").
     DistinguishedPlusTail(usize),
     /// `n` distinguished inputs plus optional variadic NAMED inputs
     /// (`load_module`'s substitutions).
@@ -8147,15 +8076,17 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
         ),
         "markovchain" => (
             DistinguishedPlusTail(3),
-            "\"`markovchain`: Three distinguished inputs, plus variadic inputs\"",
+            "\"`markovchain`, `kscan`: Three distinguished inputs\", with an optional final \
+             parameter (§04 \"Explicit callback parameters\")",
         ),
         "scan" | "kscan" => (
-            DistinguishedPlusEither(2),
-            "\"`scan`, `kscan`: Two distinguished inputs, plus one or more variadic sequence inputs\"",
+            DistinguishedPlusTail(3),
+            "\"`markovchain`, `kscan`: Three distinguished inputs\", and `scan(f, init, xs)`, each \
+             with an optional final parameter (§04 \"Explicit callback parameters\")",
         ),
         "weighted" | "logweighted" | "pushfwd" | "reduce" | "filter" => (
             DistinguishedPlusTail(2),
-            "two distinguished inputs and additional arguments for the callback (§04 \"Additional arguments\")",
+            "two distinguished inputs and an optional final parameter for the callback (§04 \"Explicit callback parameters\")",
         ),
         "load_module" => (
             DistinguishedPlusNamed(1),
