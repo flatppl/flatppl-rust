@@ -902,22 +902,18 @@ fn empty_record_is_zero() {
 // Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
 // same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed
 // measures", with an empty index set). The determiniser still lowers that to the
-// log-density literal 0 with no density term — but the shape is NO LONGER
-// REACHABLE from surface source, so this test pins the two static refusals that
-// now stand in front of it instead of the lowering.
+// log-density literal 0 with no density term.
 //
-// Both come from `flatppl-dev/empty-arrays-ruling.md` (2026-08-20): "an author
-// may not write a degenerate shape, data may turn out empty".
+// From `flatppl-dev/empty-arrays-ruling.md` (2026-08-20): "an author may not
+// write a degenerate shape, data may turn out empty".
 //   * A WRITTEN size of `0` is a static error (§06 `iid`, the positivity rule).
 //   * A DERIVED size resolving to 0 types `%dynamic`, never `Dim::Static(0)`
-//     (sub-ruling 3), and the lowering needs a static shape — so it refuses.
-//
-// Which leaves the static empty product with no legal spelling: a derived size
-// only turns out to be 0 at data-load time, and that is the js engine's job, not
-// this crate's. The empty-product lowering stays as §06 requires; it has no
-// surface witness here. Recorded in `flatppl-dev/TODO-flatppl-rust.md`.
+//     (sub-ruling 3). When the size is fixed-phase and the const-evaluator folds
+//     it to 0, the determiniser reads that value (`flatppl_infer::fixed_int_value`)
+//     and lowers the empty product (R10, which this test used to pin as a
+//     refusal; `corpora/coverage/out_of_window` is the model that needs it).
 #[test]
-fn iid_zero_size_is_refused_written_and_derived() {
+fn iid_zero_size_written_refuses_derived_is_the_empty_product() {
     let written = "\
 xs = [1.0, 2.0, 3.0]
 keep = filter(x -> x < 0.0, xs)
@@ -942,10 +938,16 @@ n = sub(lengthof(xs), lengthof(xs))
 d = iid(Normal(mu = 0.0, sigma = 1.0), n)
 lp = logdensityof(d, keep)";
     let m = parse_infer(derived);
-    let err = determinize(&m).expect_err("a %dynamic iid size must refuse");
-    assert!(
-        format!("{err:?}").contains("not a statically-resolved shape"),
-        "a derived zero size stays %dynamic and the lowering refuses it: {err:?}"
+    let out = determinize(&m).expect("a size that folds to 0 is the empty product");
+    let lp = out
+        .bindings()
+        .find(|(_, b)| out.resolve(b.name) == "lp")
+        .map(|(_, b)| b)
+        .unwrap();
+    assert_eq!(
+        out.node(lp.rhs),
+        &flatppl_core::Node::Lit(flatppl_core::Scalar::Real(0.0)),
+        "the empty product has log-density 0 (§06 `iid`)"
     );
 }
 

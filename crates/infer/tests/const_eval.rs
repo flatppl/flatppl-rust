@@ -181,3 +181,58 @@ fn dynamic_dominates_a_gap_no_error() {
         "add(dynamic, gap) should stay %dynamic, got:\n{out}"
     );
 }
+
+// ---- `lengthof(filter(...))` over fixed data with a fixed mask (§07 `filter`) ----
+
+/// A `filter` over a fixed vector with a fixed predicate has a fixed length,
+/// which its type (`%dynamic` in general) cannot carry; `lengthof` folds it.
+/// Data [1.0, 5.0, -2.0, 0.5, 1.5]: each predicate keeps a different count, so
+/// a mis-read predicate or element shows.
+#[test]
+fn lengthof_a_fixed_filter_resolves_a_shape() {
+    for (pred, kept) in [
+        ("fn(_ in interval(0.0, 2.0))", 3),
+        ("fn(_ in window)", 3),
+        ("fn(_ > 0.75)", 3),
+        ("fn(1.0 <= _)", 3),
+        ("fn(lnot(_ < 1.0))", 3),
+        ("x -> x < 0.0 || x > 4.0", 2),
+        ("x -> x >= 0.5 && x <= 1.0", 2),
+        ("fn(_ in interval(-3.0, -1.0))", 1),
+    ] {
+        let src = format!(
+            "data = [1.0, 5.0, -2.0, 0.5, 1.5]\nwindow = interval(0.0, 2.0)\n\
+             kept = filter({pred}, data)\nz = zeros(lengthof(kept))"
+        );
+        let out = ir_at(&src, Level::Shape);
+        assert!(
+            out.contains(&format!(
+                "(%bind z (%meta ((%array 1 ({kept}) (%scalar real))"
+            )),
+            "{pred}: zeros(lengthof(filter)) should have length {kept}, got:\n{out}"
+        );
+    }
+}
+
+/// A predicate outside the folded shapes, or non-fixed data, leaves the length
+/// `%dynamic` with no diagnostic — exactly as before the fold.
+#[test]
+fn lengthof_an_unfoldable_filter_stays_dynamic() {
+    for (data, pred) in [
+        ("[1.0, 5.0, -2.0]", "fn(sin(_) > 0.0)"),
+        ("load_data(\"d.csv\", cartpow(reals, 3))", "fn(_ > 0.0)"),
+    ] {
+        let src = format!("data = {data}\nkept = filter({pred}, data)\nz = zeros(lengthof(kept))");
+        let out = ir_at(&src, Level::Shape);
+        assert!(
+            out.contains("(%bind z (%meta ((%array 1 (%dynamic) (%scalar real))"),
+            "{pred}: the length should stay %dynamic, got:\n{out}"
+        );
+        assert!(
+            diags_at(&src, Level::Shape)
+                .iter()
+                .all(|d| d.severity != flatppl_infer::Severity::Error),
+            "{pred}: no error expected"
+        );
+    }
+}
