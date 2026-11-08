@@ -209,6 +209,10 @@ pub struct Emitter<'m> {
     /// [`Emitter::lower_node`]'s `get0(sample, 1)`/`get(sample, 2)` arm so a
     /// chained `rand` threads the advanced key onward without re-drawing.
     sample_keys: HashMap<NodeId, Value>,
+    /// The final carried key of each scan, by SSA name, with the scan length.
+    /// It stands for the scan's rng-state column, of which only the last row
+    /// is kept.
+    pub(crate) final_scan_keys: HashMap<String, u64>,
     /// The fan-out batch shape, set by [`crate::registry::lower_sample`] around
     /// a batched `builtin_sample(rng, ctor, input, n)` (spec §07 size dims).
     /// When `Some`, [`Emitter::rng`] OVERRIDES the per-element `out_ty` the
@@ -260,6 +264,7 @@ impl<'m> Emitter<'m> {
             body: String::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
+            final_scan_keys: HashMap::new(),
             batch_shape: None,
             columns: HashMap::new(),
         }
@@ -340,6 +345,42 @@ impl<'m> Emitter<'m> {
     /// that node has not been lowered yet.
     pub(crate) fn sample_key(&self, id: NodeId) -> Option<Value> {
         self.sample_keys.get(&id).cloned()
+    }
+
+    /// `get0(states, n - 1)` / `get(states, n)` over a scan's rng-state column.
+    /// The scan keeps only the state after its last step.
+    fn final_scan_key(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        args: &[NodeId],
+    ) -> Result<Option<Value>, EmitError> {
+        let [states, index] = args else {
+            return Ok(None);
+        };
+        if !matches!(self.type_of(*states), Some(Type::Array { elem, .. }) if **elem == Type::RngState)
+        {
+            return Ok(None);
+        }
+        let column = self.lower_node(*states)?;
+        let Some(&n) = self.final_scan_keys.get(&column.ssa) else {
+            return Err(EmitError::at(
+                id,
+                "an array of rng states has no StableHLO lowering",
+            ));
+        };
+        let last = match name {
+            "get0" => n - 1,
+            _ => n,
+        };
+        if matches!(self.m.node(*index), Node::Lit(Scalar::Int(k)) if *k == last as i64) {
+            Ok(Some(column))
+        } else {
+            Err(EmitError::at(
+                id,
+                "a scan keeps only its last rng state; read it with get0(states, n - 1)",
+            ))
+        }
     }
 
     /// Set the fan-out batch shape [`Emitter::rng`] draws at — called by
@@ -4846,7 +4887,10 @@ impl<'m> Emitter<'m> {
                                 id,
                                 "sample tuple has only slots 0 (value) and 1 (rng)",
                             )),
-                            None => crate::ops::lower_builtin(self, id, &name, &call.args),
+                            None => match self.final_scan_key(id, &name, &call.args)? {
+                                Some(last) => Ok(last),
+                                None => crate::ops::lower_builtin(self, id, &name, &call.args),
+                            },
                         }
                     } else {
                         crate::ops::lower_builtin(self, id, &name, &call.args)

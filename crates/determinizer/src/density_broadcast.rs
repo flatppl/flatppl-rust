@@ -727,11 +727,38 @@ fn sum_density_with(
 pub(crate) fn map_body(
     m: &mut Module,
     body: NodeId,
-    mut inputs: Vec<(Symbol, Ref)>,
-    mut args: Vec<NodeId>,
+    inputs: Vec<(Symbol, Ref)>,
+    args: Vec<NodeId>,
     rank: usize,
 ) -> NodeId {
+    let (function, mut args) = closed_function(m, body, inputs, args, Lift::Cells(rank));
+    args.insert(0, function);
+    build_call(m, "broadcast", &args)
+}
+
+/// How [`closed_function`] passes a captured value into the function.
+#[derive(Clone, Copy)]
+pub(crate) enum Lift {
+    /// One more input per capture, its argument a length-one array of this
+    /// rank, which a broadcast repeats at every cell.
+    Cells(usize),
+    /// One final input, a record of every capture, passed whole: the explicit
+    /// callback parameter `p` of `scan(f, init, xs, p)` (spec §04 "Explicit
+    /// callback parameters").
+    Parameter,
+}
+
+/// `functionof(body)` over `inputs`, with every captured non-fixed value lifted
+/// to an argument as `lift` says. Returns the function and the arguments.
+pub(crate) fn closed_function(
+    m: &mut Module,
+    body: NodeId,
+    mut inputs: Vec<(Symbol, Ref)>,
+    mut args: Vec<NodeId>,
+    lift: Lift,
+) -> (NodeId, Vec<NodeId>) {
     let mut replacements = Vec::new();
+    let mut parameters = Vec::new();
     for (capture, value) in captures(m, body, &inputs) {
         let (resolved, _) = resolve_ref_chain(m, value);
         // Closed support sets and other fixed module bindings remain global.
@@ -754,14 +781,18 @@ pub(crate) fn map_body(
             .or_else(|| m.type_of(resolved))
             .cloned()
             .unwrap_or(Type::Any);
-        let (label, local, replacement) = placeholder(m, ty.clone());
-        inputs.push((label, local));
-        replacements.push((capture, replacement));
         let actual = match capture {
             Capture::Reference(reference) => m.alloc(Node::Ref(reference)),
             Capture::Projection(id) => id,
         };
-        m.set_type(actual, ty);
+        m.set_type(actual, ty.clone());
+        let Lift::Cells(rank) = lift else {
+            parameters.push((capture, ty, actual));
+            continue;
+        };
+        let (label, local, replacement) = placeholder(m, ty);
+        inputs.push((label, local));
+        replacements.push((capture, replacement));
         let mut singleton = build_call(m, "vector", &[actual]);
         if rank > 1 {
             let leading = m.alloc(Node::Lit(Scalar::Int((rank - 1) as i64)));
@@ -769,6 +800,27 @@ pub(crate) fn map_body(
             singleton = build_call(m, "addaxes", &[singleton, leading, trailing]);
         }
         args.push(singleton);
+    }
+    if !parameters.is_empty() {
+        let names: Vec<Symbol> = (0..parameters.len())
+            .map(|i| m.intern(&format!("p{i}")))
+            .collect();
+        let fields: Vec<(Symbol, Type)> = names
+            .iter()
+            .zip(&parameters)
+            .map(|(&name, (_, ty, _))| (name, ty.clone()))
+            .collect();
+        let (label, local, record) = placeholder(m, Type::Record(fields.into()));
+        inputs.push((label, local));
+        let mut actuals = Vec::with_capacity(parameters.len());
+        for (&name, (capture, ty, actual)) in names.iter().zip(parameters) {
+            let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).into())));
+            let field = build_call(m, "get", &[record, key]);
+            m.set_type(field, ty);
+            replacements.push((capture, field));
+            actuals.push((name, actual));
+        }
+        args.push(build_record(m, &actuals));
     }
     let body = crate::driver::map_tree(m, body, &mut |m, id| {
         replacements
@@ -789,6 +841,5 @@ pub(crate) fn map_body(
         named: vec![].into(),
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
-    args.insert(0, function);
-    build_call(m, "broadcast", &args)
+    (function, args)
 }

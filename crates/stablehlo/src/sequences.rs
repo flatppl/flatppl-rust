@@ -641,7 +641,25 @@ impl Emitter<'_> {
             (Some(Type::Array { elem, .. }), None) => vec![(**elem).clone()],
             _ => return Err(EmitError::at(id, "scan: unresolved state type")),
         };
+        // An rng state rides in the carry with no output buffer: only the state
+        // after the last step is kept (spec §07 "Random number generation").
+        let keys: Vec<bool> = state.values.iter().map(|v| v.ty == MlirTy::Key).collect();
+        if keys.iter().any(|&k| k) && (reduce || n == 0 || !self.call_frame.is_empty()) {
+            return Err(EmitError::at(
+                id,
+                "scan: an rng state in the carry is lowered only for an unmapped, non-empty scan",
+            ));
+        }
         for (value, ty) in state.values.iter_mut().zip(carry_types) {
+            if value.ty == MlirTy::Key {
+                if ty != Type::RngState {
+                    return Err(EmitError::at(
+                        id,
+                        "scan: initial value does not fit the state type",
+                    ));
+                }
+                continue;
+            }
             let (shape, kind) = crate::types::mlir_type_of_ty(id, &ty, self.dtype)?;
             if self.cell_ty(value) != shape || elem_rank(value.elem) > elem_rank(kind) {
                 return Err(EmitError::at(
@@ -657,7 +675,7 @@ impl Emitter<'_> {
         }
         // A profile without serial scans replaces the loop when the step is
         // affine in the carry.
-        let affine = if reduce || self.target.serial_scans() {
+        let affine = if reduce || self.target.serial_scans() || keys.iter().any(|&k| k) {
             None
         } else {
             let mut types = vec![state_type.clone()];
@@ -674,7 +692,12 @@ impl Emitter<'_> {
             })
         };
         let mut buffers = Vec::with_capacity(state.values.len());
-        for value in state.values.iter().filter(|_| !reduce && affine.is_none()) {
+        for (value, _) in state
+            .values
+            .iter()
+            .zip(&keys)
+            .filter(|(_, key)| !reduce && affine.is_none() && !**key)
+        {
             let mut dims = shape(&value.ty).to_vec();
             dims.insert(self.batch_rank(value), Some(n));
             let zero = match value.elem {
@@ -743,7 +766,11 @@ impl Emitter<'_> {
                     }
                     let mut carries = Vec::with_capacity(state.values.len());
                     for (value, original) in args[start..out_start].iter().zip(&state.values) {
-                        carries.push(e.axes_view(value, e.axes_of(original)));
+                        carries.push(if original.ty == MlirTy::Key {
+                            value.clone()
+                        } else {
+                            e.axes_view(value, e.axes_of(original))
+                        });
                     }
                     let mut arguments = vec![state.with_values(&carries)];
                     arguments.extend(sequence_items);
@@ -761,6 +788,13 @@ impl Emitter<'_> {
                     next.push(e.add(&args[0], &one));
                     next.extend_from_slice(&args[1..start]);
                     for (value, expected) in output.values.iter().zip(&state.values) {
+                        if expected.ty == MlirTy::Key || value.ty == MlirTy::Key {
+                            if value.ty != expected.ty {
+                                return Err(EmitError::at(id, "scan: step changes the state type"));
+                            }
+                            next.push(value.clone());
+                            continue;
+                        }
                         let frame = e.call_frame.clone();
                         let value = e.finish_broadcast(value, &frame, frame.len());
                         if value.ty != expected.ty
@@ -770,9 +804,15 @@ impl Emitter<'_> {
                         }
                         next.push(e.convert(&value, expected.elem));
                     }
+                    let buffered = next[start..out_start]
+                        .iter()
+                        .zip(&keys)
+                        .filter(|(_, key)| !**key)
+                        .map(|(value, _)| value.clone())
+                        .collect::<Vec<_>>();
                     let updates = args[out_start..]
                         .iter()
-                        .zip(&next[start..out_start])
+                        .zip(&buffered)
                         .map(|(buffer, value)| e.scan_update(buffer, value, &args[0]))
                         .collect::<Vec<_>>();
                     next.extend(updates);
@@ -782,12 +822,33 @@ impl Emitter<'_> {
             buffers = if reduce {
                 results[start..out_start].to_vec()
             } else {
-                results[out_start..].to_vec()
+                let mut columns = results[out_start..].iter().cloned();
+                results[start..out_start]
+                    .iter()
+                    .zip(&keys)
+                    .map(|(last, &key)| {
+                        if key {
+                            last.clone()
+                        } else {
+                            columns.next().expect("one buffer per tensor leaf")
+                        }
+                    })
+                    .collect()
             };
+            for (last, &key) in buffers.iter().zip(&keys) {
+                if key {
+                    // The next draw after the scan reads its final state.
+                    self.set_cur_key(last.clone());
+                    self.final_scan_keys.insert(last.ssa.clone(), n);
+                }
+            }
         } else if reduce {
             buffers = state.values.clone();
         }
         for (buffer, value) in buffers.iter_mut().zip(&state.values) {
+            if value.ty == MlirTy::Key {
+                continue;
+            }
             let mut axes = self.axes_of(value);
             if !reduce {
                 axes.layers.insert(0, 1);
