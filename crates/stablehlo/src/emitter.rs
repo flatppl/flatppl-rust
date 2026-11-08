@@ -4206,7 +4206,7 @@ impl<'m> Emitter<'m> {
             return None;
         }
         match self.m.node(index) {
-            Node::Lit(Scalar::Int(i)) => Some(i - base),
+            Node::Lit(Scalar::Int(i)) => i.checked_sub(base),
             _ => None,
         }
     }

@@ -461,14 +461,16 @@ fn collect_sites(
                     sels.push(Sel::Axis(*ax));
                 }
                 Node::Lit(Scalar::Int(i)) => {
-                    let idx = *i - base as i64;
-                    if idx < 0 {
+                    let Some(idx) = i
+                        .checked_sub(base as i64)
+                        .and_then(|k| u64::try_from(k).ok())
+                    else {
                         return Err(EmitError::at(
                             sel,
                             format!("aggregate: index {i} is out of range"),
                         ));
-                    }
-                    sels.push(Sel::Lit(idx as u64));
+                    };
+                    sels.push(Sel::Lit(idx));
                 }
                 Node::Const(sym) if e.resolve(*sym) == "only" => sels.push(Sel::Only),
                 Node::Const(sym) if e.resolve(*sym) == "all" => {

@@ -292,12 +292,13 @@ fn index(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32, base: i64) -> Const
         const_eval(inf, container, depth + 1),
         const_eval(inf, sel, depth + 1),
     ) {
-        (ConstEval::Val(FixedValue::Vec(elems)), ConstEval::Val(FixedValue::Int(i))) => {
-            usize::try_from(i - base)
-                .ok()
-                .and_then(|k| elems.get(k).cloned())
-                .map_or(ConstEval::Dynamic, ConstEval::Val)
-        }
+        // An index whose offset from `base` overflows `i64` is out of range, like
+        // any other index outside the vector, and does not fold.
+        (ConstEval::Val(FixedValue::Vec(elems)), ConstEval::Val(FixedValue::Int(i))) => i
+            .checked_sub(base)
+            .and_then(|k| usize::try_from(k).ok())
+            .and_then(|k| elems.get(k).cloned())
+            .map_or(ConstEval::Dynamic, ConstEval::Val),
         // `Dynamic` dominates `Gap` (match order matters).
         (ConstEval::Dynamic, _) | (_, ConstEval::Dynamic) => ConstEval::Dynamic,
         (ConstEval::Gap(g), _) | (_, ConstEval::Gap(g)) => ConstEval::Gap(g),
