@@ -236,3 +236,25 @@ fn lengthof_an_unfoldable_filter_stays_dynamic() {
         );
     }
 }
+
+/// A fixed index whose offset from the `get` base overflows `i64` is out of range,
+/// like any index outside the vector: it does not fold, the dim stays `%dynamic`,
+/// and inference neither panics nor reports an op gap.
+#[test]
+fn an_extreme_index_is_out_of_range_not_an_overflow() {
+    for src in [
+        "v = [2, 5, 7]\ni = -9223372036854775807 - 1\nz = fill(0.0, get(v, i))",
+        "v = [2, 5, 7]\ni = 9223372036854775807\nz = fill(0.0, get(v, i))",
+    ] {
+        let errors: Vec<_> = diags_at(src, Level::Shape)
+            .into_iter()
+            .filter(|d| d.severity == flatppl_infer::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{src}: {errors:?}");
+        let out = ir_at(src, Level::Shape);
+        assert!(
+            out.contains("(%bind z (%meta ((%array 1 (%dynamic) (%scalar real))"),
+            "an out-of-range index must leave the dim dynamic, got:\n{out}"
+        );
+    }
+}

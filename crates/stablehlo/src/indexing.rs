@@ -52,10 +52,11 @@ pub(crate) fn lower_multi_axis(
             ));
         }
     };
-    if !matches!(operand.elem, ElemKind::Real | ElemKind::Int) {
+    if operand.elem == ElemKind::Bool {
         return Err(EmitError::at(
             id,
-            "get/get0: multi-axis selection requires a numeric tensor",
+            "get/get0: multi-axis selection from a Boolean array is not implemented in the \
+             StableHLO emitter (§07 `get` allows it); index a 0/1 real or integer array instead",
         ));
     }
     if selector_nodes.len() != cell_dims.len() {
@@ -205,10 +206,10 @@ fn lower_selectors(
         let selector = match e.node(node) {
             Node::Lit(Scalar::Int(i)) => {
                 let Some(zero) = i.checked_sub(base).filter(|zero| *zero >= 0) else {
-                    return Err(EmitError::at(id, "get/get0: index out of range"));
+                    return Err(crate::ops::index_out_of_range(id, *i, base, extent));
                 };
                 if extent.is_some_and(|n| zero as u64 >= n) {
-                    return Err(EmitError::at(id, "get/get0: index out of range"));
+                    return Err(crate::ops::index_out_of_range(id, *i, base, extent));
                 }
                 TensorSelector::Scalar(zero as u64)
             }

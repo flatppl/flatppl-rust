@@ -2933,6 +2933,23 @@ fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<
     lower_get_gather(e, id, container, index, base)
 }
 
+/// The refusal for a statically known `get`/`get0` index outside the axis, naming
+/// the index as written, the base and, when known, the axis length.
+pub(crate) fn index_out_of_range(id: NodeId, index: i64, base: i64, len: Option<u64>) -> EmitError {
+    let (head, order) = if base == 1 {
+        ("get", "1-based")
+    } else {
+        ("get0", "0-based")
+    };
+    EmitError::at(
+        id,
+        match len {
+            Some(n) => format!("{head}: index {index} is out of range for length {n} ({order})"),
+            None => format!("{head}: index {index} is out of range; indices are {order}"),
+        },
+    )
+}
+
 /// The literal-selector fast path — see [`lower_get`].
 fn lower_get_literal(
     e: &mut Emitter,
@@ -2942,7 +2959,7 @@ fn lower_get_literal(
     base: i64,
 ) -> Result<Value, EmitError> {
     let Some(idx) = selector.checked_sub(base).filter(|index| *index >= 0) else {
-        return Err(EmitError::at(id, "get/get0: index out of range"));
+        return Err(index_out_of_range(id, selector, base, None));
     };
     if let Some(result) = crate::indices::projection(e, id, container, idx as usize) {
         return result;
@@ -2950,7 +2967,7 @@ fn lower_get_literal(
 
     let v = e.lower_node(container)?;
     let v = e.with_typed_axes(container, v);
-    get_literal_value(e, id, v, idx as u64)
+    get_literal_value_at(e, id, v, idx as u64, base)
 }
 
 /// Select element `idx` (0-based) of `v`'s outer vector axis.
@@ -2959,6 +2976,18 @@ pub(crate) fn get_literal_value(
     id: NodeId,
     v: Value,
     idx: u64,
+) -> Result<Value, EmitError> {
+    get_literal_value_at(e, id, v, idx, 0)
+}
+
+/// As [`get_literal_value`], reporting an out-of-range `idx` in the caller's
+/// `base` (1 for `get`, 0 for `get0`).
+fn get_literal_value_at(
+    e: &mut Emitter,
+    id: NodeId,
+    v: Value,
+    idx: u64,
+    base: i64,
 ) -> Result<Value, EmitError> {
     let len = match &e.cell_ty(&v) {
         MlirTy::Ranked(dims) if e.axes_of(&v).layers.first() == Some(&1) => dims[0],
@@ -2974,7 +3003,8 @@ pub(crate) fn get_literal_value(
     if let Some(len) = len
         && idx >= len
     {
-        return Err(EmitError::at(id, "get/get0: index out of range"));
+        let shown = i64::try_from(idx).map_or(i64::MAX, |i| i.saturating_add(base));
+        return Err(index_out_of_range(id, shown, base, Some(len)));
     }
 
     let batch = e.batch_rank(&v);
@@ -3079,9 +3109,9 @@ pub(crate) fn get_outer(
 ) -> Result<Value, EmitError> {
     if let Ok(selector) = literal_index(e, id, index) {
         if selector < base {
-            return Err(EmitError::at(id, "get/get0: index out of range"));
+            return Err(index_out_of_range(id, selector, base, None));
         }
-        return get_literal_value(e, id, v, (selector - base) as u64);
+        return get_literal_value_at(e, id, v, (selector - base) as u64, base);
     }
     let idx = lower_selector(e, index)?;
     get_gather_value(e, id, v, idx, base)
