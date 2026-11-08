@@ -744,7 +744,9 @@ fn cat_and_tile_preserve_kind_and_rank() {
 }
 
 /// `reduce(f, xs)` folds to xs's element type (spec §07: f returns the element
-/// type); `filter(pred, data)` keeps data's type/rank with a dynamic length.
+/// type); `filter(pred, data)` keeps data's type/rank. Its length is the kept
+/// count when the data and the mask are fixed (R10: the const-evaluator folds
+/// the mask), and `%dynamic` when either depends on an input.
 #[test]
 fn reduce_and_filter_infer() {
     let out = ir("xs = [1.0, 2.0, 3.0]\nx = reduce(add, xs)");
@@ -754,9 +756,22 @@ fn reduce_and_filter_infer() {
     );
     let out = ir("d = [1.0, 2.0, 3.0]\ny = filter(fn(_ in interval(0.0, 2.0)), d)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(filter"),
-        "filter of a real vector should stay a real vector (dynamic length), got:\n{out}"
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(filter"),
+        "a fixed filter keeps 2 of [1, 2, 3] in [0, 2], got:\n{out}"
     );
+    // Data that depends on an input, or is read at run time, makes the kept
+    // count unknowable. (A predicate cannot read a module input: a reified
+    // body takes no closure, so that spelling is a static error, not a case.)
+    for src in [
+        "a = elementof(reals)\nd = [1.0, a, 3.0]\ny = filter(fn(_ in interval(0.0, 2.0)), d)",
+        "d = load_data(\"d.csv\", cartpow(reals, 3))\ny = filter(fn(_ in interval(0.0, 2.0)), d)",
+    ] {
+        let out = ir(src);
+        assert!(
+            out.contains("(%bind y (%meta ((%array 1 (%dynamic) (%scalar real))"),
+            "an input-dependent filter should stay %dynamic, got:\n{out}"
+        );
+    }
 }
 
 /// `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's element

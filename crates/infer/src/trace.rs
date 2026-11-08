@@ -303,6 +303,13 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.finish_module()
     }
 
+    /// The fixed integer value of `root` (shape const-eval, §17.1), inferring
+    /// only what `root` depends on. Leaves the module's annotations alone.
+    pub(crate) fn run_fixed_int(mut self, root: NodeId) -> Option<i64> {
+        self.drain_work(&mut vec![Work::Enter(root)]);
+        crate::consteval::fixed_int(&mut self, root)
+    }
+
     pub(crate) fn run_expression(
         mut self,
         root: NodeId,
