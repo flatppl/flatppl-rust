@@ -373,6 +373,33 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         },
     ),
     (
+        "DoubleSidedCrystalBall",
+        DistLowering {
+            logpdf: double_sided_crystal_ball_logpdf,
+            sample: None,
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
+        "RelativisticBreitWigner",
+        DistLowering {
+            logpdf: relativistic_breit_wigner_logpdf,
+            sample: None,
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
+        "BifurcatedNormal",
+        DistLowering {
+            logpdf: bifurcated_normal_logpdf,
+            sample: None,
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
         "Argus",
         DistLowering {
             logpdf: argus_logpdf,
@@ -2395,6 +2422,159 @@ fn crystal_ball_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
     let mass = e.mul(&sigma, &total_int);
     let log_mass = e.log(&mass);
     Ok(e.sub(&log_unnorm, &log_mass))
+}
+
+/// One power-law side of a Crystal Ball, at `t` in units of its width: the
+/// unnormalized log density on the tail beyond `a = |alpha|` (`tail`), the core
+/// `-t²/2` (`core`), and the side's share of `M / σ`, `(n/a)·exp(-a²/2)/(n-1)` for
+/// the tail plus `√(π/2)·erf(a/√2)` for the half core. `u` is `-t` on the left
+/// side and `t` on the right, so the tail is `u > a` on both.
+struct CrystalBallSide {
+    tail: Value,
+    core: Value,
+    in_tail: Value,
+    mass: Value,
+}
+
+fn crystal_ball_side(e: &mut Emitter, u: &Value, alpha: &Value, n: &Value) -> CrystalBallSide {
+    let a = e.abs(alpha);
+    let n_over_a = e.div(n, &a);
+    let a_sq = e.mul(&a, &a);
+    let half = e.scalar(0.5);
+    let half_a_sq = e.mul(&half, &a_sq);
+    let log_n_over_a = e.log(&n_over_a);
+    let n_log_n_over_a = e.mul(n, &log_n_over_a);
+    let log_a_coef = e.sub(&n_log_n_over_a, &half_a_sq);
+    let b = e.sub(&n_over_a, &a);
+    let b_plus_u = e.add(&b, u);
+    let log_b_plus_u = e.log(&b_plus_u);
+    let n_log_b_plus_u = e.mul(n, &log_b_plus_u);
+    let tail = e.sub(&log_a_coef, &n_log_b_plus_u);
+    let u_sq = e.mul(u, u);
+    let neg_half = e.scalar(-0.5);
+    let core = e.mul(&neg_half, &u_sq);
+    let in_tail = e.compare("GT", u, &a);
+
+    let neg_half_a_sq = e.neg(&half_a_sq);
+    let exp_term = e.exp(&neg_half_a_sq);
+    let tail_num = e.mul(&n_over_a, &exp_term);
+    let one = e.scalar(1.0);
+    let n_minus_one = e.sub(n, &one);
+    let tail_mass = e.div(&tail_num, &n_minus_one);
+    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
+    let a_over_sqrt2 = e.div(&a, &sqrt2);
+    let erf_a = e.erf(&a_over_sqrt2);
+    let sqrt_half_pi = e.scalar((std::f64::consts::PI / 2.0).sqrt());
+    let core_mass = e.mul(&sqrt_half_pi, &erf_a);
+    let mass = e.add(&tail_mass, &core_mass);
+    CrystalBallSide {
+        tail,
+        core,
+        in_tail,
+        mass,
+    }
+}
+
+/// §09 `DoubleSidedCrystalBall(m0, sigmaL, sigmaR, alphaL, alphaR, nL, nR)`,
+/// normalized. Left of `m0` the density is [`crystal_ball_logpdf`]'s with
+/// `(sigmaL, alphaL, nL)`, right of it the mirror image with `(sigmaR, alphaR, nR)`.
+/// §09 leaves `M` as "a normalizing constant"; each side contributes its tail
+/// `σ·(n/a)·exp(-a²/2)/(n-1)` and its half core `σ·√(π/2)·erf(a/√2)`.
+fn double_sided_crystal_ball_logpdf(
+    e: &mut Emitter,
+    p: &Params,
+    v: &Value,
+) -> Result<Value, EmitError> {
+    let m0 = p.get(e, "m0")?;
+    let sigma_l = p.get(e, "sigmaL")?;
+    let sigma_r = p.get(e, "sigmaR")?;
+    let alpha_l = p.get(e, "alphaL")?;
+    let alpha_r = p.get(e, "alphaR")?;
+    let n_l = p.get(e, "nL")?;
+    let n_r = p.get(e, "nR")?;
+
+    let diff = e.sub(v, &m0);
+    let t_l = e.div(&diff, &sigma_l);
+    let u_l = e.neg(&t_l);
+    let t_r = e.div(&diff, &sigma_r);
+    let left = crystal_ball_side(e, &u_l, &alpha_l, &n_l);
+    let right = crystal_ball_side(e, &t_r, &alpha_r, &n_r);
+
+    let left_branch = e.select(&left.in_tail, &left.tail, &left.core);
+    let right_branch = e.select(&right.in_tail, &right.tail, &right.core);
+    let zero = e.scalar(0.0);
+    let on_left = e.compare("LE", &diff, &zero);
+    let log_unnorm = e.select(&on_left, &left_branch, &right_branch);
+
+    let left_mass = e.mul(&sigma_l, &left.mass);
+    let right_mass = e.mul(&sigma_r, &right.mass);
+    let mass = e.add(&left_mass, &right_mass);
+    let log_mass = e.log(&mass);
+    Ok(e.sub(&log_unnorm, &log_mass))
+}
+
+/// §09 `RelativisticBreitWigner(mean, width)` on `x > 0`:
+/// `log f = -log M - log((x² - m²)² + m²Γ²)` with §09's closed form
+/// `M = π·√(m² + γ) / (2√2·m·Γ·γ)`, `γ = √(m²(m² + Γ²))`. Outside the support
+/// `posreals` the density is zero (§08's shared rule).
+fn relativistic_breit_wigner_logpdf(
+    e: &mut Emitter,
+    p: &Params,
+    v: &Value,
+) -> Result<Value, EmitError> {
+    let m = p.get(e, "mean")?;
+    let width = p.get(e, "width")?;
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let m_sq = e.mul(&m, &m);
+        let width_sq = e.mul(&width, &width);
+        let m_sq_plus_width_sq = e.add(&m_sq, &width_sq);
+        let gamma_sq = e.mul(&m_sq, &m_sq_plus_width_sq);
+        let gamma = e.sqrt(&gamma_sq);
+        let m_sq_plus_gamma = e.add(&m_sq, &gamma);
+        let root = e.sqrt(&m_sq_plus_gamma);
+        let pi = e.scalar(std::f64::consts::PI);
+        let numerator = e.mul(&pi, &root);
+        let two_sqrt2 = e.scalar(2.0 * std::f64::consts::SQRT_2);
+        let m_width = e.mul(&m, &width);
+        let m_width_gamma = e.mul(&m_width, &gamma);
+        let denominator = e.mul(&two_sqrt2, &m_width_gamma);
+        let mass = e.div(&numerator, &denominator);
+        let log_mass = e.log(&mass);
+
+        let x_sq = e.mul(v, v);
+        let gap = e.sub(&x_sq, &m_sq);
+        let gap_sq = e.mul(&gap, &gap);
+        let m_sq_width_sq = e.mul(&m_sq, &width_sq);
+        let shape = e.add(&gap_sq, &m_sq_width_sq);
+        let log_shape = e.log(&shape);
+        let total = e.add(&log_mass, &log_shape);
+        Ok(e.neg(&total))
+    })
+}
+
+/// §09 `BifurcatedNormal(mean, sigmaL, sigmaR)`:
+/// `log f = log √(2/π) - log(σL + σR) - (x - μ)² / (2σ²)`, with `σ = σL` left of
+/// the mean and `σR` from it on.
+fn bifurcated_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let mean = p.get(e, "mean")?;
+    let sigma_l = p.get(e, "sigmaL")?;
+    let sigma_r = p.get(e, "sigmaR")?;
+    let diff = e.sub(v, &mean);
+    let zero = e.scalar(0.0);
+    let on_left = e.compare("LT", &diff, &zero);
+    let sigma = e.select(&on_left, &sigma_l, &sigma_r);
+    let z = e.div(&diff, &sigma);
+    let z_sq = e.mul(&z, &z);
+    let neg_half = e.scalar(-0.5);
+    let exponent = e.mul(&neg_half, &z_sq);
+    let sigma_sum = e.add(&sigma_l, &sigma_r);
+    let log_sigma_sum = e.log(&sigma_sum);
+    let log_coef = e.scalar((2.0 / std::f64::consts::PI).sqrt().ln());
+    let normalized = e.sub(&log_coef, &log_sigma_sum);
+    Ok(e.add(&normalized, &exponent))
 }
 
 /// §09 `Argus(resonance, slope, power)`, normalized.
@@ -4869,6 +5049,11 @@ mod tests {
             // §09 particle-physics: arithmetic plus `lgamma` under that same
             // support mask.
             "ContinuedPoisson",
+            // §09: arithmetic, with compare/select branches whose condition
+            // carries the variate's shape.
+            "DoubleSidedCrystalBall",
+            "RelativisticBreitWigner",
+            "BifurcatedNormal",
         ] {
             assert!(matches!(route(d), Some(Broadcast::Elementwise)), "{d}");
         }
