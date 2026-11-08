@@ -85,12 +85,59 @@ fn the_spec_patterns_likelihood_over_a_relabelled_measure_infers_clean() {
     );
 }
 
+fn errors(source: &str) -> Vec<String> {
+    let mut module = flatppl_syntax::parse(source).unwrap();
+    infer(&mut module)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect()
+}
+
 #[test]
-fn a_count_mismatch_is_not_guessed() {
-    let types = infer_types("v1 = relabel([1.0, 2.0], [\"x\", \"y\", \"z\"])\n", &["v1"]);
-    assert!(
-        !types[0].starts_with('{'),
-        "a count mismatch must not be guessed: {}",
-        types[0]
-    );
+fn a_static_count_mismatch_is_refused() {
+    // §04: one name per array element or record field.
+    for (expr, got, base, components) in [
+        (
+            "relabel([1.0, 2.0], [\"x\", \"y\", \"z\"])",
+            3,
+            "array of real [2]",
+            2,
+        ),
+        ("relabel(record(a = 1.0, b = 2.0), [\"x\"])", 1, "record", 2),
+        ("relabel(1.0, [\"x\", \"y\"])", 2, "real", 1),
+        (
+            "relabel(iid(Normal(0.0, 1.0), 2), [\"x\", \"y\", \"z\"])",
+            3,
+            "array of real [2]",
+            2,
+        ),
+    ] {
+        let source = format!("v = {expr}\n");
+        let found = errors(&source);
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one error, got {found:?}\n{source}"
+        );
+        for needle in [
+            format!("relabel: {got} names for "),
+            base.to_string(),
+            format!("which has {components} components"),
+            "give one name per array element or record field".to_string(),
+            "spec §04 \"Interface adaptation\"".to_string(),
+        ] {
+            assert!(
+                found[0].contains(&needle),
+                "`{needle}` not in: {}",
+                found[0]
+            );
+        }
+    }
+}
+
+#[test]
+fn names_that_are_not_static_are_deferred() {
+    let source = "names = [\"x\", \"y\", \"z\"]\nv = relabel([1.0, 2.0], names)\n";
+    assert!(errors(source).is_empty(), "{source}: {:?}", errors(source));
 }
