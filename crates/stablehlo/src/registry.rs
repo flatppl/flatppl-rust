@@ -3126,11 +3126,124 @@ fn categorical_batched(
         let probs = e.lower_node(probs_id)?;
         return categorical_score(e, p.variate_id()?, &probs, v, base);
     }
-    // An array of probability vectors pairs one vector with each variate cell.
     let variate = p.variate_id()?;
+    // Rows selected by an index vector, `rows[idx]`: score each observation from its
+    // source row, without gathering a whole row per observation.
+    if let Some(gathered) = row_gather(e, field)?
+        && matches!(e.cell_ty(v), MlirTy::Ranked(dims) if dims.len() == 1)
+        && e.batch_rank(v) == 0
+    {
+        return categorical_row_score(e, variate, &gathered, v, base);
+    }
+    // An array of probability vectors pairs one vector with each variate cell.
     e.lower_broadcast_cells(variate, &[field, variate], |e, values| {
         categorical_score(e, variate, &values[0], &values[1], base)
     })
+}
+
+/// `rows[idx]` where `rows` is a static `[m, n]` matrix of vectors and `idx` an
+/// integer vector: the source rows and the checked, 0-based row indices.
+pub(crate) struct RowGather {
+    pub(crate) rows: Value,
+    pub(crate) index: Value,
+    pub(crate) n: u64,
+}
+
+/// Recognize a `get`/`get0` of whole rows by one integer index vector. `None` for
+/// any other selection, which keeps its general lowering.
+pub(crate) fn row_gather(e: &mut Emitter, id: NodeId) -> Result<Option<RowGather>, EmitError> {
+    let Node::Call(c) = e.node(id) else {
+        return Ok(None);
+    };
+    let base = match c.head {
+        CallHead::Builtin(s) if e.resolve(s) == "get" => 1,
+        CallHead::Builtin(s) if e.resolve(s) == "get0" => 0,
+        _ => return Ok(None),
+    };
+    let [rows_id, index_id] = c.args[..] else {
+        return Ok(None);
+    };
+    if !c.named.is_empty() {
+        return Ok(None);
+    }
+    let vector_rows = match e.type_of(rows_id) {
+        Some(Type::Array { shape, elem }) if shape.len() == 2 => {
+            matches!(elem.as_ref(), Type::Scalar(_))
+        }
+        Some(Type::Array { shape, elem }) if shape.len() == 1 => {
+            matches!(elem.as_ref(), Type::Array { shape, elem } if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_)))
+        }
+        _ => false,
+    };
+    let integer_vector = matches!(
+        e.type_of(index_id),
+        Some(Type::Array { shape, elem }) if shape.len() == 1
+            && matches!(elem.as_ref(), Type::Scalar(flatppl_core::ScalarType::Integer))
+    );
+    if !vector_rows || !integer_vector {
+        return Ok(None);
+    }
+    let rows = e.lower_node(rows_id)?;
+    let index = e.lower_node(index_id)?;
+    let (MlirTy::Ranked(rows_dims), MlirTy::Ranked(index_dims)) = (&rows.ty, &index.ty) else {
+        return Ok(None);
+    };
+    let (&[Some(m), Some(n)], &[Some(_)]) = (&rows_dims[..], &index_dims[..]) else {
+        return Ok(None);
+    };
+    if e.batch_rank(&rows) != 0 || e.batch_rank(&index) != 0 || index.elem != ElemKind::Int {
+        return Ok(None);
+    }
+    // The same bounds check, and status, as `get` itself.
+    let index = e.checked_index(id, &index, m, base)?;
+    let first = e.int_value_const(base);
+    let index = e.sub(&index, &first);
+    Ok(Some(RowGather { rows, index, n }))
+}
+
+/// Categorical scores of `w[i]` under row `index[i]` of `rows`: one probability
+/// per observation, gathered from the flattened rows, with the invalid-category
+/// handling of [`categorical_score`].
+fn categorical_row_score(
+    e: &mut Emitter,
+    id: NodeId,
+    gathered: &RowGather,
+    v: &Value,
+    base: i64,
+) -> Result<Value, EmitError> {
+    if v.elem != ElemKind::Int {
+        return Err(EmitError::at(
+            id,
+            "Categorical requires integer scalar or vector observations",
+        ));
+    }
+    let n = gathered.n;
+    let lower = e.int_value_const(base);
+    let upper = e.int_value_const(base + n as i64);
+    let ge = e.compare("GE", v, &lower);
+    let lt = e.compare("LT", v, &upper);
+    let valid = e.and(&ge, &lt);
+    let safe = e.select(&valid, v, &lower);
+    let category = e.sub(&safe, &lower);
+    let width = e.int_value_const(n as i64);
+    let row_start = e.mul(&gathered.index, &width);
+    let flat_index = e.add(&row_start, &category);
+    // `row_gather` admits only static [m, n] rows.
+    let MlirTy::Ranked(dims) = &gathered.rows.ty else {
+        unreachable!("row_gather admits only ranked rows");
+    };
+    let cells = dims
+        .iter()
+        .map(|d| d.expect("static rows"))
+        .product::<u64>();
+    let flat = e.reshape(&gathered.rows, MlirTy::Ranked(vec![Some(cells)]));
+    let selected = e.gather(&flat, &flat_index, 0);
+    let one = e.scalar(1.0);
+    let safe_prob = e.select(&valid, &selected, &one);
+    let score = e.log(&safe_prob);
+    let outside = e.inf(MlirTy::Scalar);
+    let outside = e.neg(&outside);
+    Ok(e.select(&valid, &score, &outside))
 }
 
 fn categorical_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {

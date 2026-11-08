@@ -215,6 +215,28 @@ fn a_runtime_simplex_checks_cells_and_total() {
 }
 
 #[test]
+fn gathered_categorical_rows_check_and_score_the_source_rows() {
+    for index in ["idx", "[3, 1, 2, 3, 1]"] {
+        let ir = emit(&format!(
+            "rows = elementof(cartpow(cartpow(reals, 3), 4))\n\
+             idx = elementof(cartpow(integers, 5))\n\
+             w = elementof(cartpow(integers, 5))\n\
+             inputs = (rows, idx, w)\n\
+             outputs = logdensityof(Categorical.(rows[{index}]), w)\n"
+        ));
+        assert!(checked(&ir), "{index}: {ir}");
+        // Each observation gathers one cell and two row statistics, never a whole row.
+        assert!(!ir.contains("tensor<5x3x"), "{index}: {ir}");
+        assert!(
+            ir.contains("(tensor<4x3xf32>, tensor<f32>) -> tensor<4xf32>"),
+            "{index}: {ir}"
+        );
+        assert!(ir.contains("tensor<12xf32>"), "{index}: {ir}");
+        assert_eq!(ir.matches("dense<9>").count(), 1, "{index}: {ir}");
+    }
+}
+
+#[test]
 fn a_runtime_covariance_reuses_its_cholesky_factor() {
     let ir = emit(&density(
         "cov = elementof(cartpow(reals, [2, 2]))",
