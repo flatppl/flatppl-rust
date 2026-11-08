@@ -28,7 +28,7 @@ module {
     %26 = stablehlo.multiply %23, %24 : tensor<128x15xf32>
     %27 = stablehlo.subtract %26, %25 : tensor<128x15xf32>
     %28 = chlo.erf_inv %27 : tensor<128x15xf32> -> tensor<128x15xf32>
-    %29 = stablehlo.constant dense<1.4142135> : tensor<128x15xf32>
+    %29 = stablehlo.constant dense<1.4142135623730951> : tensor<128x15xf32>
     %30 = stablehlo.multiply %28, %29 : tensor<128x15xf32>
     %31, %32 = stablehlo.rng_bit_generator %17, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128x15xui32>)
     %33 = stablehlo.constant dense<9> : tensor<128x15xui32>

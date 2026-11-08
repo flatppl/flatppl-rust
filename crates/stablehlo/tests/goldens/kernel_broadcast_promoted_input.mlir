@@ -17,8 +17,13 @@ module {
     %18 = stablehlo.constant dense<"0x8E3F6BBF"> : tensor<1xf32>
     %19 = stablehlo.broadcast_in_dim %18, dims = [0] : (tensor<1xf32>) -> tensor<2xf32>
     %20 = stablehlo.add %19, %16 : tensor<2xf32>
-    %21 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %22 = stablehlo.reduce(%20 init: %21) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    return %22 : tensor<f32>
+    %21 = stablehlo.abs %1 : tensor<2xf32>
+    %22 = stablehlo.constant dense<0x7F800000> : tensor<2xf32>
+    %23 = stablehlo.compare EQ, %21, %22 : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>
+    %24 = stablehlo.constant dense<0xFF800000> : tensor<2xf32>
+    %25 = stablehlo.select %23, %24, %20 : (tensor<2xi1>, tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+    %26 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %27 = stablehlo.reduce(%25 init: %26) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+    return %27 : tensor<f32>
   }
 }

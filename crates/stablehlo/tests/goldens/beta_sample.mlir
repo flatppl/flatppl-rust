@@ -16,7 +16,7 @@ module {
     %21 = stablehlo.multiply %18, %19 : tensor<128xf32>
     %22 = stablehlo.subtract %21, %20 : tensor<128xf32>
     %23 = chlo.erf_inv %22 : tensor<128xf32> -> tensor<128xf32>
-    %24 = stablehlo.constant dense<1.4142135> : tensor<128xf32>
+    %24 = stablehlo.constant dense<1.4142135623730951> : tensor<128xf32>
     %25 = stablehlo.multiply %23, %24 : tensor<128xf32>
     %26, %27 = stablehlo.rng_bit_generator %12, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128xui32>)
     %28 = stablehlo.constant dense<9> : tensor<128xui32>
@@ -80,61 +80,60 @@ module {
     %91 = stablehlo.multiply %90, %19 : tensor<128xf32>
     %92 = stablehlo.subtract %91, %20 : tensor<128xf32>
     %93 = chlo.erf_inv %92 : tensor<128xf32> -> tensor<128xf32>
-    %94 = stablehlo.constant dense<1.4142135> : tensor<128xf32>
-    %95 = stablehlo.multiply %93, %94 : tensor<128xf32>
-    %96, %97 = stablehlo.rng_bit_generator %84, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128xui32>)
-    %98 = stablehlo.constant dense<9> : tensor<128xui32>
-    %99 = stablehlo.shift_right_logical %97, %98 : tensor<128xui32>
-    %100 = stablehlo.convert %99 : (tensor<128xui32>) -> tensor<128xf32>
-    %101 = stablehlo.constant dense<1.1920929E-7> : tensor<128xf32>
-    %102 = stablehlo.multiply %100, %101 : tensor<128xf32>
-    %106:3 = stablehlo.while(%103 = %33, %104 = %4, %105 = %3) : tensor<i32>, tensor<i1>, tensor<f32>
+    %94 = stablehlo.multiply %93, %24 : tensor<128xf32>
+    %95, %96 = stablehlo.rng_bit_generator %84, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<128xui32>)
+    %97 = stablehlo.constant dense<9> : tensor<128xui32>
+    %98 = stablehlo.shift_right_logical %96, %97 : tensor<128xui32>
+    %99 = stablehlo.convert %98 : (tensor<128xui32>) -> tensor<128xf32>
+    %100 = stablehlo.constant dense<1.1920929E-7> : tensor<128xf32>
+    %101 = stablehlo.multiply %99, %100 : tensor<128xf32>
+    %105:3 = stablehlo.while(%102 = %33, %103 = %4, %104 = %3) : tensor<i32>, tensor<i1>, tensor<f32>
     cond {
-      %107 = stablehlo.constant dense<128> : tensor<i32>
-      %108 = stablehlo.compare LT, %103, %107, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
-      %109 = stablehlo.not %104 : tensor<i1>
-      %110 = stablehlo.and %109, %108 : tensor<i1>
-      stablehlo.return %110 : tensor<i1>
+      %106 = stablehlo.constant dense<128> : tensor<i32>
+      %107 = stablehlo.compare LT, %102, %106, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %108 = stablehlo.not %103 : tensor<i1>
+      %109 = stablehlo.and %108, %107 : tensor<i1>
+      stablehlo.return %109 : tensor<i1>
     } do {
-      %111 = stablehlo.dynamic_slice %95, %103, sizes = [1] : (tensor<128xf32>, tensor<i32>) -> tensor<1xf32>
-      %112 = stablehlo.reshape %111 : (tensor<1xf32>) -> tensor<f32>
-      %113 = stablehlo.dynamic_slice %102, %103, sizes = [1] : (tensor<128xf32>, tensor<i32>) -> tensor<1xf32>
-      %114 = stablehlo.reshape %113 : (tensor<1xf32>) -> tensor<f32>
-      %115 = stablehlo.multiply %83, %112 : tensor<f32>
-      %116 = stablehlo.add %2, %115 : tensor<f32>
-      %117 = stablehlo.multiply %116, %116 : tensor<f32>
-      %118 = stablehlo.multiply %117, %116 : tensor<f32>
-      %119 = stablehlo.multiply %80, %118 : tensor<f32>
-      %120 = stablehlo.constant dense<0.5> : tensor<f32>
-      %121 = stablehlo.multiply %112, %112 : tensor<f32>
-      %122 = stablehlo.multiply %120, %121 : tensor<f32>
-      %123 = stablehlo.negate %119 : tensor<f32>
-      %124 = stablehlo.log %118 : tensor<f32>
-      %125 = stablehlo.multiply %80, %124 : tensor<f32>
-      %126 = stablehlo.add %122, %80 : tensor<f32>
-      %127 = stablehlo.add %126, %123 : tensor<f32>
-      %128 = stablehlo.add %127, %125 : tensor<f32>
-      %129 = stablehlo.log %114 : tensor<f32>
-      %130 = stablehlo.compare LT, %129, %128 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-      %131 = stablehlo.compare GT, %118, %3 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-      %132 = stablehlo.and %130, %131 : tensor<i1>
-      %133 = stablehlo.constant dense<1> : tensor<i32>
-      %134 = stablehlo.add %103, %133 : tensor<i32>
-      stablehlo.return %134, %132, %119 : tensor<i32>, tensor<i1>, tensor<f32>
+      %110 = stablehlo.dynamic_slice %94, %102, sizes = [1] : (tensor<128xf32>, tensor<i32>) -> tensor<1xf32>
+      %111 = stablehlo.reshape %110 : (tensor<1xf32>) -> tensor<f32>
+      %112 = stablehlo.dynamic_slice %101, %102, sizes = [1] : (tensor<128xf32>, tensor<i32>) -> tensor<1xf32>
+      %113 = stablehlo.reshape %112 : (tensor<1xf32>) -> tensor<f32>
+      %114 = stablehlo.multiply %83, %111 : tensor<f32>
+      %115 = stablehlo.add %2, %114 : tensor<f32>
+      %116 = stablehlo.multiply %115, %115 : tensor<f32>
+      %117 = stablehlo.multiply %116, %115 : tensor<f32>
+      %118 = stablehlo.multiply %80, %117 : tensor<f32>
+      %119 = stablehlo.constant dense<0.5> : tensor<f32>
+      %120 = stablehlo.multiply %111, %111 : tensor<f32>
+      %121 = stablehlo.multiply %119, %120 : tensor<f32>
+      %122 = stablehlo.negate %118 : tensor<f32>
+      %123 = stablehlo.log %117 : tensor<f32>
+      %124 = stablehlo.multiply %80, %123 : tensor<f32>
+      %125 = stablehlo.add %121, %80 : tensor<f32>
+      %126 = stablehlo.add %125, %122 : tensor<f32>
+      %127 = stablehlo.add %126, %124 : tensor<f32>
+      %128 = stablehlo.log %113 : tensor<f32>
+      %129 = stablehlo.compare LT, %128, %127 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      %130 = stablehlo.compare GT, %117, %3 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      %131 = stablehlo.and %129, %130 : tensor<i1>
+      %132 = stablehlo.constant dense<1> : tensor<i32>
+      %133 = stablehlo.add %102, %132 : tensor<i32>
+      stablehlo.return %133, %131, %118 : tensor<i32>, tensor<i1>, tensor<f32>
     }
-    %135, %136 = stablehlo.rng_bit_generator %96, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<ui32>)
-    %137 = stablehlo.constant dense<9> : tensor<ui32>
-    %138 = stablehlo.shift_right_logical %136, %137 : tensor<ui32>
-    %139 = stablehlo.convert %138 : (tensor<ui32>) -> tensor<f32>
-    %140 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
-    %141 = stablehlo.multiply %139, %140 : tensor<f32>
-    %142 = stablehlo.log %106#2 : tensor<f32>
-    %145 = stablehlo.add %142, %3 : tensor<f32>
-    %146 = stablehlo.subtract %145, %77 : tensor<f32>
-    %147 = stablehlo.subtract %146, %78 : tensor<f32>
-    %148 = stablehlo.exponential %147 : tensor<f32>
-    %149 = stablehlo.add %2, %148 : tensor<f32>
-    %150 = stablehlo.divide %2, %149 : tensor<f32>
-    return %150, %135 : tensor<f32>, tensor<2xui64>
+    %134, %135 = stablehlo.rng_bit_generator %95, algorithm =  THREE_FRY : (tensor<2xui64>) -> (tensor<2xui64>, tensor<ui32>)
+    %136 = stablehlo.constant dense<9> : tensor<ui32>
+    %137 = stablehlo.shift_right_logical %135, %136 : tensor<ui32>
+    %138 = stablehlo.convert %137 : (tensor<ui32>) -> tensor<f32>
+    %139 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
+    %140 = stablehlo.multiply %138, %139 : tensor<f32>
+    %141 = stablehlo.log %105#2 : tensor<f32>
+    %144 = stablehlo.add %141, %3 : tensor<f32>
+    %145 = stablehlo.subtract %144, %77 : tensor<f32>
+    %146 = stablehlo.subtract %145, %78 : tensor<f32>
+    %147 = stablehlo.exponential %146 : tensor<f32>
+    %148 = stablehlo.add %2, %147 : tensor<f32>
+    %149 = stablehlo.divide %2, %148 : tensor<f32>
+    return %149, %134 : tensor<f32>, tensor<2xui64>
   }
 }

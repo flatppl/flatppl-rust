@@ -233,6 +233,11 @@ impl Emitter<'_> {
             .collect()
     }
 
+    /// Whether `value` is a fixed tensor of any shape. Only finite reals fold.
+    pub(crate) fn is_constant(&self, value: &Value) -> bool {
+        self.constants.contains_key(&value.ssa)
+    }
+
     /// The value of a fixed, unbatched real scalar at the emitted precision.
     pub(crate) fn constant_real(&self, value: &Value) -> Option<f64> {
         if value.ty != MlirTy::Scalar || self.batch_rank(value) != 0 {

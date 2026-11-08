@@ -30,7 +30,7 @@ module attributes {flatppl.runtime_status = 2 : i64} {
     %28 = stablehlo.multiply %25, %26 : tensor<2xf32>
     %29 = stablehlo.subtract %28, %27 : tensor<2xf32>
     %30 = chlo.erf_inv %29 : tensor<2xf32> -> tensor<2xf32>
-    %31 = stablehlo.constant dense<1.4142135> : tensor<2xf32>
+    %31 = stablehlo.constant dense<1.4142135623730951> : tensor<2xf32>
     %32 = stablehlo.multiply %30, %31 : tensor<2xf32>
     %33 = stablehlo.dot_general %0, %32, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<2x2xf32>, tensor<2xf32>) -> tensor<2xf32>
     %34 = stablehlo.add %arg0, %33 : tensor<2xf32>
