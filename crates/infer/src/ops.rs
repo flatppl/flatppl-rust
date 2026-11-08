@@ -5485,9 +5485,24 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
         return Type::Deferred;
     };
     let inputs = inputs.clone();
+    let likelihood = likelihood_of_kernel(inf, *k_node, inputs);
+    if let (Type::Likelihood { obstype, .. }, Some(observation)) = (&likelihood, args.get(1))
+        && let Some(failed) =
+            crate::boundary::refuse_observation_outside_variate(inf, obstype, observation)
+    {
+        return failed;
+    }
+    likelihood
+}
+
+fn likelihood_of_kernel(
+    inf: &mut Inferencer<'_, '_>,
+    k_node: NodeId,
+    inputs: Box<[Symbol]>,
+) -> Type {
     // A `functionof`-of-measure body exposes its domain; a `kernelof` body is
     // the random *value* itself, so its type is the observation domain.
-    match reified_result_type(inf, *k_node) {
+    match reified_result_type(inf, k_node) {
         Some(Type::Measure { domain, .. }) => Type::Likelihood {
             inputs,
             obstype: domain,
@@ -5495,7 +5510,7 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
         Some(Type::Deferred) | None => {
             // Fall back: check if this kernel came from `disintegrate` and
             // recover the selected-variate obstype from the joint's record domain.
-            match disintegrate_kernel_obstype(inf, *k_node) {
+            match disintegrate_kernel_obstype(inf, k_node) {
                 Some(obstype) => Type::Likelihood {
                     inputs,
                     obstype: Box::new(obstype),
