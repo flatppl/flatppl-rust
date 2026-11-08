@@ -297,10 +297,21 @@ pub(crate) fn emit_logdensity_abi(
 
     let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
     for &node in &abi.outputs {
+        let before = rets_vals.len();
         if let Some(indices) = crate::indices::outputs(&mut e, node) {
             rets_vals.extend(indices?);
         } else {
             lower_output(&mut e, node, &mut rets_vals)?;
+        }
+        // A drawn successor state is threaded by `@sample` (spec §07 rng ABI,
+        // §13 output reduction). A key computed from a seed is an ordinary value.
+        if rets_vals[before..].iter().any(|v| v.ty == MlirTy::Key) && reaches_sample(m, node) {
+            return Err(EmitError::at(
+                node,
+                "this output is an rng state, which logdensity mode does not return; \
+                 a query that threads the random state needs `--mode sample` (spec §07 \
+                 \"Random number generation\", §13 \"Output reduction\")",
+            ));
         }
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
@@ -493,6 +504,33 @@ pub(crate) fn emit_sample_abi(
     }
     let rets: Vec<&Value> = rets_vals.iter().collect();
     Ok(e.finish("sample", &args, &rets))
+}
+
+/// Whether `root` reads a `builtin_sample` draw.
+fn reaches_sample(m: &Module, root: NodeId) -> bool {
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        match m.node(node) {
+            Node::Call(c) if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "builtin_sample") =>
+            {
+                return true;
+            }
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                if let Some(binding) = m.binding_by_name(*name) {
+                    pending.push(m.binding(binding).rhs);
+                }
+            }
+            _ => m.for_each_child(node, |child| pending.push(child)),
+        }
+    }
+    false
 }
 
 /// A fixed source derived from a promoted input must be computed from that
