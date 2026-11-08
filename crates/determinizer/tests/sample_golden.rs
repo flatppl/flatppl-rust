@@ -75,6 +75,23 @@ out = v";
     );
 }
 
+// A `rand` nested in a lambda body has no binding name. Its integer
+// projections read the call itself, so it keeps the §07 `(value, new_rstate)`
+// tuple; the value shortcut would make `get0(_, 1)` index the drawn scalar.
+#[test]
+fn inline_projected_rand_keeps_the_tuple() {
+    let src = "\
+s = rnginit(0)
+dts = [0.1, 0.2]
+step = (c, dt) -> record(x = get0(rand(Normal(c.x, dt), c.r), 0), r = get0(rand(Normal(c.x, dt), c.r), 1))
+traj = scan(step, record(x = 0.0, r = s), dts)
+outputs = traj.x";
+    let out = determinize(&parse_infer(src)).expect("an inline rand lowers");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok(), "{pir}");
+    assert_eq!(pir.matches("(tuple ").count(), 2, "{pir}");
+}
+
 // rand(lawof(record(x = draw(Normal))), rng) samples the one draw via
 // builtin_sample, threads the rng, and eliminates the measure/stochastic layer.
 #[test]

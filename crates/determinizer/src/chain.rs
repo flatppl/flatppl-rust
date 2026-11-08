@@ -46,11 +46,13 @@
 //! of them, and it lets a composed step body (`logweighted(ℓ, M)`, `pushfwd`, …)
 //! lower through its own combinator rule.
 
-use crate::density::broadcast::{cell_input, map_body, placeholder};
-use crate::density::{build_call, lower_measure_density_at_point, refuse, trajectory_static_len};
+use crate::density::broadcast::{Lift, cell_input, closed_function, map_body, placeholder};
+use crate::density::{
+    build_call, build_record, lower_measure_density_at_point, refuse, trajectory_static_len,
+};
 use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
-use flatppl_core::{Dim, Module, Node, NodeId, Scalar, Type};
+use flatppl_core::{Binding, Dim, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Type};
 
 /// Lower `logdensityof(markovchain(K, init, n), v)`.
 pub(crate) fn lower_markovchain(
@@ -66,10 +68,21 @@ pub(crate) fn lower_kscan(m: &mut Module, node: NodeId, v: NodeId) -> Result<Nod
     lower_chain(m, node, v, "kscan")
 }
 
-/// The shared trajectory unroll. `op` is `"markovchain"` (kernel, init, `n`, then
-/// additional arguments held constant) or `"kscan"` (kernel, init, then sequences
-/// traversed together, spec §04 "Additional arguments").
-fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<NodeId, RefuseError> {
+/// A chain call's checked arguments: `op` is `"markovchain"` (kernel, init, `n`,
+/// then additional arguments held constant) or `"kscan"` (kernel, init, then
+/// sequences traversed together, spec §04 "Additional arguments").
+struct ChainParts {
+    k_arg: NodeId,
+    init: NodeId,
+    extras: Vec<NodeId>,
+    /// Per extra: `Some(len)` traversed (or repeated at length one), `None`
+    /// held constant.
+    positions: Vec<Option<usize>>,
+    n: usize,
+    state: Type,
+}
+
+fn chain_parts(m: &mut Module, node: NodeId, op: &str) -> Result<ChainParts, RefuseError> {
     let per_step_input = op == "kscan";
     let lead = if per_step_input { 2 } else { 3 };
     let (k_arg, init) = {
@@ -144,13 +157,6 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
         ));
     }
 
-    // Empty trajectory: the product over an empty index set is 1, so the
-    // log-density is 0 — the same empty-Σ rule §06 "Density of composed
-    // measures" states for `iid`. The map needs a non-empty step axis.
-    if n == 0 {
-        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
-    }
-
     // §04 "Additional arguments": a one-dimensional array or table is traversed with
     // the steps, a length-one one repeats, and anything else is held constant.
     let positions: Vec<Option<usize>> = if per_step_input {
@@ -171,9 +177,6 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
     } else {
         vec![None; extras.len()]
     };
-
-    // Term i reads only the observed `v[i-1]` and `v[i]`, so one body maps over
-    // `prev = cat([init], v[0..n-2])` and `cur = v`.
     let state = match m.type_of(node) {
         Some(Type::Measure { domain, .. }) => match domain.as_ref() {
             Type::Array { elem, .. } => (**elem).clone(),
@@ -181,6 +184,35 @@ fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<Node
         },
         _ => unreachable!("trajectory_static_len read a measure type"),
     };
+    Ok(ChainParts {
+        k_arg,
+        init,
+        extras,
+        positions,
+        n,
+        state,
+    })
+}
+
+/// The shared trajectory density.
+fn lower_chain(m: &mut Module, node: NodeId, v: NodeId, op: &str) -> Result<NodeId, RefuseError> {
+    let ChainParts {
+        k_arg,
+        init,
+        extras,
+        positions,
+        n,
+        state,
+    } = chain_parts(m, node, op)?;
+    // Empty trajectory: the product over an empty index set is 1, so the
+    // log-density is 0 — the same empty-Σ rule §06 "Density of composed
+    // measures" states for `iid`. The map needs a non-empty step axis.
+    if n == 0 {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+
+    // Term i reads only the observed `v[i-1]` and `v[i]`, so one body maps over
+    // `prev = cat([init], v[0..n-2])` and `cur = v`.
     let (prev_label, prev_ref, prev) = placeholder(m, state.clone());
     let (cur_label, cur_ref, cur) = placeholder(m, state);
     let mut inputs = vec![(prev_label, prev_ref), (cur_label, cur_ref)];
@@ -239,4 +271,118 @@ fn extra_traversal(m: &mut Module, extra: NodeId) -> Option<Option<usize>> {
         Dim::Static(n) => Some(Some(n as usize)),
         Dim::Dynamic => None,
     }
+}
+
+/// Sample `markovchain(K, init, n)` / `kscan(K, init, xs)` from `rng`
+/// (spec §06 "Dependent composition", §07 "Random number generation"):
+///
+/// ```text
+/// traj = scan(c, x -> record(state = v, rng = r'), record(state = init, rng = rng), xs)
+///   where v, r' = sample of K(c.state, x) from c.rng
+/// value = traj.state,   next rng = get0(traj.rng, n - 1)
+/// ```
+///
+/// Step `i` draws from the state the previous step drew, so the steps run in
+/// sequence and the rng state rides in the carry. `init` is not part of the
+/// trajectory, so the scan's output column is exactly the trajectory.
+pub(crate) fn lower_chain_sample(
+    m: &mut Module,
+    node: NodeId,
+    rng: NodeId,
+    op: &str,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let ChainParts {
+        k_arg,
+        init,
+        extras,
+        positions,
+        n,
+        state,
+    } = chain_parts(m, node, op)?;
+    if n == 0 {
+        return Err(refuse(
+            node,
+            m,
+            &format!("{op} sample: an empty trajectory is not lowered"),
+        ));
+    }
+    let state_name = m.intern("state");
+    let rng_name = m.intern("rng");
+    let carry_ty =
+        Type::Record(vec![(state_name, state.clone()), (rng_name, Type::RngState)].into());
+    let (carry_label, carry_ref, carry) = placeholder(m, carry_ty);
+    let mut inputs = vec![(carry_label, carry_ref)];
+    let mut args = Vec::new();
+    let mut step_extras = Vec::with_capacity(extras.len());
+    for (&extra, &position) in extras.iter().zip(&positions) {
+        step_extras.push(match position {
+            Some(1) => {
+                let idx = m.alloc(Node::Lit(Scalar::Int(0)));
+                build_call(m, "get0", &[extra, idx])
+            }
+            Some(_) => cell_input(m, extra, &mut inputs, &mut args)?,
+            None => extra,
+        });
+    }
+    // `scan(f, init, xs, p)` traverses one sequence and passes `p` whole
+    // (spec §04 "Explicit callback parameters"). `markovchain` has no
+    // sequence, so its steps walk a vector the step does not read.
+    if args.len() > 1 {
+        return Err(refuse(
+            node,
+            m,
+            &format!("{op} sample: more than one sequence is traversed; kscan takes one"),
+        ));
+    }
+    if args.is_empty() {
+        let (label, reference, _) = placeholder(m, Type::Scalar(ScalarType::Real));
+        inputs.push((label, reference));
+        let count = m.alloc(Node::Lit(Scalar::Int(n as i64)));
+        args.push(build_call(m, "zeros", &[count]));
+    }
+    let prev = field(m, carry, "state");
+    m.set_type(prev, state);
+    let current = field(m, carry, "rng");
+    m.set_type(current, Type::RngState);
+    let step = crate::extras::apply_callback(m, k_arg, prev, &step_extras)?;
+    let (value, next) = crate::sample::lower_closed_measure_sample(m, step, current)?;
+    let body = build_record(m, &[(state_name, value), (rng_name, next)]);
+    let (function, sequences) = closed_function(m, body, inputs, args, Lift::Parameter);
+    let start = build_record(m, &[(state_name, init), (rng_name, rng)]);
+    let mut scan_args = vec![function, start];
+    scan_args.extend(sequences);
+    let scan = build_call(m, "scan", &scan_args);
+    let traj = bind_fresh(m, scan, "chain_sample");
+    let value = field(m, traj, "state");
+    let states = field(m, traj, "rng");
+    let last = m.alloc(Node::Lit(Scalar::Int(n as i64 - 1)));
+    Ok((value, build_call(m, "get0", &[states, last])))
+}
+
+fn field(m: &mut Module, record: NodeId, name: &str) -> NodeId {
+    let key = m.alloc(Node::Lit(Scalar::Str(name.into())));
+    build_call(m, "get", &[record, key])
+}
+
+/// Bind `rhs` to a fresh synthetic name, so each reader shares one evaluation.
+fn bind_fresh(m: &mut Module, rhs: NodeId, stem: &str) -> NodeId {
+    let mut serial = m.node_count();
+    let name = loop {
+        let name = m.intern(&format!("__{stem}_{serial}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        serial += 1;
+    };
+    m.add_binding(Binding {
+        name,
+        rhs,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    m.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }))
 }
