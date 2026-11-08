@@ -31,14 +31,15 @@ fn type_of(source: &str, name: &str) -> Type {
 }
 
 #[test]
-fn callbacks_take_several_positional_keyword_and_record_additional_arguments() {
+fn callbacks_take_one_positional_or_record_parameter() {
     for source in [
-        "f(x, a, b) = a * x + b\nM = weighted(f, Normal(0, 1), 2.0, 1.0)",
-        "f(x, a, b) = a * x + b\nM = weighted(f, Normal(0, 1), b = 1.0, a = 2.0)",
+        "f(x, a) = a * x\nM = weighted(f, Normal(0, 1), 2.0)",
+        "f(x, p) = p.a * x + p.b\nM = weighted(f, Normal(0, 1), record(a = 2.0, b = 1.0))",
         "f(x, a, b) = a * x + b\nM = logweighted(f, Normal(0, 1), record(a = 2.0, b = 1.0))",
-        "f(x, a) = a * x\nM = pushfwd(f, Normal(0, 1), a = 2.0)",
+        "f(x, p) = p.a * x\nM = logweighted(f, Normal(0, 1), record(a = 2.0))",
+        "f(x, p) = p.a * x\nM = pushfwd(f, Normal(0, 1), record(a = 2.0))",
         "step(s, d, k) = Normal(s + d, k)\nM = markovchain(step, 0.0, 3, record(d = 0.1, k = 0.5))",
-        "step(s, p) = Normal(s + p.d, p.k)\nM = markovchain(step, 0.0, 3, p = record(d = 0.1, k = 0.5))",
+        "step(s, p) = Normal(s + p.d, p.k)\nM = markovchain(step, 0.0, 3, record(d = 0.1, k = 0.5))",
         "x = reduce((a, b, p) -> a + b * p.s + p.t, [1.0, 2.0], record(s = 2.0, t = 1.0))",
     ] {
         assert_eq!(errors(source), Vec::<String>::new(), "{source}");
@@ -50,8 +51,8 @@ fn additional_arguments_must_bind_every_input_exactly_once() {
     for source in [
         // Unbound.
         "f(x, a, b) = a * x + b\nM = weighted(f, Normal(0, 1), 2.0)",
-        // Unknown keyword.
-        "f(x, a) = a * x\nM = pushfwd(f, Normal(0, 1), c = 2.0)",
+        // A record field that binds no input.
+        "f(x, a) = a * x\nM = pushfwd(f, Normal(0, 1), record(c = 2.0))",
         // Bound twice.
         "f(x, a) = a * x\nM = weighted(f, Normal(0, 1), 2.0, a = 3.0)",
         // Too many.
@@ -115,6 +116,22 @@ fn a_second_value_after_the_leading_arguments_is_refused() {
             "reduce(f, xs, p)",
         ),
         (
+            "f(x, a, b) = a * x + b\nM = weighted(f, Normal(0, 1), 2.0, 1.0)",
+            "weighted(f, M, p)",
+        ),
+        (
+            "f(x, a, b) = a * x + b\nM = weighted(f, Normal(0, 1), b = 1.0, a = 2.0)",
+            "weighted(f, M, p)",
+        ),
+        (
+            "f(x, a, b) = a * x + b\nM = logweighted(f, Normal(0, 1), 2.0, b = 1.0)",
+            "logweighted(f, M, p)",
+        ),
+        (
+            "f(x, a, b) = a * x + b\nM = pushfwd(f, Normal(0, 1), 2.0, 1.0)",
+            "pushfwd(f, M, p)",
+        ),
+        (
             "k(s, x, p, q) = Normal(s + x, 1.0)\nM = kscan(k, 0.0, [1.0, 2.0], [1.0, 2.0], 0.5)",
             "kscan(kernel, init, xs, p)",
         ),
@@ -146,7 +163,6 @@ fn scalars_and_objects_are_held_constant_at_every_step() {
     assert_eq!(shape.as_ref(), [Dim::Static(2)]);
     for source in [
         "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], 2.0)",
-        "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], w = 2.0)",
         "k(s, x, w) = Normal(s + x, w)\nM = kscan(k, 0.0, [1.0, 2.0], 0.5)",
         "within(x, lo) = lo < x\nr = filter(within, [1, 4, 9], 3)",
     ] {
@@ -158,16 +174,12 @@ fn scalars_and_objects_are_held_constant_at_every_step() {
 fn sequence_callbacks_receive_record_parameters_whole() {
     // §04 "Explicit callback parameters": the final p is passed whole,
     // independently of the array or table traversed by the operation.
-    for parameter in ["record(w = 2.0)", "p = record(w = 2.0)"] {
-        for source in [
-            format!("step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], {parameter})"),
-            format!(
-                "k(s, x, p) = Normal(s + x * p.w, 1.0)\nM = kscan(k, 0.0, [1.0, 2.0], {parameter})"
-            ),
-            format!("within(x, p) = x > p.w\nr = filter(within, [1.0, 4.0, 9.0], {parameter})"),
-        ] {
-            assert_eq!(errors(&source), Vec::<String>::new(), "{source}");
-        }
+    for source in [
+        "step(a, x, p) = a + x * p.w\nr = scan(step, 0.0, [10.0, 20.0], record(w = 2.0))",
+        "k(s, x, p) = Normal(s + x * p.w, 1.0)\nM = kscan(k, 0.0, [1.0, 2.0], record(w = 2.0))",
+        "within(x, p) = x > p.w\nr = filter(within, [1.0, 4.0, 9.0], record(w = 2.0))",
+    ] {
+        assert_eq!(errors(source), Vec::<String>::new(), "{source}");
     }
     // Non-sequence operations retain the same whole-parameter rule.
     for source in [
@@ -175,6 +187,53 @@ fn sequence_callbacks_receive_record_parameters_whole() {
         "w(x, p) = p.s * x\nm = weighted(w, Normal(0.0, 1.0), record(s = 2.0))",
     ] {
         assert_eq!(errors(source), Vec::<String>::new(), "{source}");
+    }
+}
+
+#[test]
+fn a_keyword_parameter_is_refused_on_every_head() {
+    // The final parameter is positional (§04 "Explicit callback parameters").
+    for (source, form) in [
+        (
+            "f(x, a) = a * x\nM = weighted(f, Normal(0, 1), a = 2.0)",
+            "weighted(f, M, p)",
+        ),
+        (
+            "f(x, a) = a * x\nM = logweighted(f, Normal(0, 1), a = 2.0)",
+            "logweighted(f, M, p)",
+        ),
+        (
+            "f(x, a) = a * x\nM = pushfwd(f, Normal(0, 1), a = 2.0)",
+            "pushfwd(f, M, p)",
+        ),
+        (
+            "x = reduce((a, b, p) -> a + b * p, [1.0, 2.0], p = 2.0)",
+            "reduce(f, xs, p)",
+        ),
+        (
+            "step(s, d) = Normal(s + d, 1.0)\nM = markovchain(step, 0.0, 3, d = 0.1)",
+            "markovchain(kernel, init, n, p)",
+        ),
+        (
+            "step(a, x, w) = a + x * w\nr = scan(step, 0.0, [10.0, 20.0], w = 2.0)",
+            "scan(f, init, xs, p)",
+        ),
+        (
+            "k(s, x, w) = Normal(s + x, w)\nM = kscan(k, 0.0, [1.0, 2.0], w = 0.5)",
+            "kscan(kernel, init, xs, p)",
+        ),
+        (
+            "within(x, lo) = lo < x\nr = filter(within, [1, 4, 9], lo = 3)",
+            "filter(pred, data, p)",
+        ),
+    ] {
+        let errors = errors(source);
+        assert!(
+            errors.iter().any(|e| e.contains(form)
+                && e.contains("positional")
+                && e.contains("record(a = 2.0)")),
+            "{source}: {errors:?}"
+        );
     }
 }
 

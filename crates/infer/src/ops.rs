@@ -1133,19 +1133,21 @@ struct ExtrasHead {
     lead: usize,
     /// Inputs the operation itself supplies to the callback first.
     callback_lead: usize,
-    /// The positional form §04 "Explicit callback parameters" gives the sequence and
-    /// chain operations, which take at most one final parameter `p`.
-    form: Option<&'static str>,
+    /// The positional form §04 "Explicit callback parameters" gives the operation,
+    /// which takes at most one final parameter `p`.
+    form: &'static str,
 }
 
 fn extras_head(name: &str) -> Option<ExtrasHead> {
     let (lead, callback_lead, form) = match name {
-        "weighted" | "logweighted" | "pushfwd" => (2, 1, None),
-        "reduce" => (2, 2, Some("reduce(f, xs, p)")),
-        "markovchain" => (3, 1, Some("markovchain(kernel, init, n, p)")),
-        "filter" => (2, 1, Some("filter(pred, data, p)")),
-        "scan" => (3, 2, Some("scan(f, init, xs, p)")),
-        "kscan" => (3, 2, Some("kscan(kernel, init, xs, p)")),
+        "weighted" => (2, 1, "weighted(f, M, p)"),
+        "logweighted" => (2, 1, "logweighted(f, M, p)"),
+        "pushfwd" => (2, 1, "pushfwd(f, M, p)"),
+        "reduce" => (2, 2, "reduce(f, xs, p)"),
+        "markovchain" => (3, 1, "markovchain(kernel, init, n, p)"),
+        "filter" => (2, 1, "filter(pred, data, p)"),
+        "scan" => (3, 2, "scan(f, init, xs, p)"),
+        "kscan" => (3, 2, "kscan(kernel, init, xs, p)"),
         _ => return None,
     };
     Some(ExtrasHead {
@@ -1182,9 +1184,20 @@ fn bind_call_extras(
         return ExtrasOutcome::Refused(refusal);
     }
     let extras = &args[head.lead..];
-    if let Some(form) = head.form
-        && extras.len() + named.len() > 1
-    {
+    if let Some((_, node, _, _)) = named.first() {
+        let form = head.form;
+        return refuse_extras(
+            inf,
+            *node,
+            name,
+            format!(
+                "the final parameter is positional: `{form}`; pass several values as one \
+                 record `p`, for example `record(a = 2.0)`, not as keyword arguments"
+            ),
+        );
+    }
+    if extras.len() > 1 {
+        let form = head.form;
         let node = extras.get(1).map_or(id, |extra| extra.0);
         return refuse_extras(
             inf,

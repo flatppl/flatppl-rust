@@ -253,26 +253,15 @@ fn sequence_object_parameters_specialize_to_live_value_leaves() {
 }
 
 #[test]
-fn keyword_additional_arguments_of_a_sequence_callback_refuse() {
-    // Keyword binding is not lowered; the emitter refuses rather than reading the
-    // keyword argument as a positional one.
+fn keyword_parameters_of_a_sequence_callback_refuse() {
+    // The final parameter is positional (§04 "Explicit callback parameters").
     let source = "mu = external(reals)\nstep(a, x, w) = w * a + x\ninputs = mu\n\
                   outputs = scan(step, 0.0, [1.0, 2.0, mu], w = 2.0)[3]";
     let mut model = flatppl_syntax::parse(source).unwrap();
-    assert!(flatppl_infer::infer(&mut model).is_empty());
-    let roots = [model.intern("inputs"), model.intern("outputs")];
-    let options = EmitOptions::default();
-    let model = flatppl_determinizer::determinize_with_options(
-        &model,
-        &flatppl_infer::ModuleBundle::new(),
-        Some(&roots),
-        &options.lowering_options(),
-    )
-    .unwrap();
-    let error = flatppl_stablehlo::emit(&model, Mode::LogDensity, &options).unwrap_err();
+    let errors = flatppl_infer::infer(&mut model);
     assert!(
-        error.to_string().contains("keyword additional arguments"),
-        "{error}"
+        errors.iter().any(|d| d.message.contains("positional")),
+        "{errors:?}"
     );
 }
 
