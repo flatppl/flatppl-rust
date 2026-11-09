@@ -1,9 +1,8 @@
 //! pyhf model / workspace JSON → FlatPPL module assembly.
 //!
 //! Implements the lift described in §12 "pyhf uncorrelated_background" of the
-//! profiles doc: each channel → `broadcast(Poisson, expected)` obs model
-//! (`hepphys.ContinuedPoisson` where the channel's observed counts are
-//! fractional), with modifier effects generating auxiliary likelihood terms as
+//! profiles doc: each channel → `broadcast(hepphys.ContinuedPoisson, expected)`
+//! obs model, with modifier effects generating auxiliary likelihood terms as
 //! needed.
 use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
@@ -515,8 +514,6 @@ pub struct Observed {
     pub node: NodeId,
     /// Bin count, checked against the samples.
     pub n_bins: usize,
-    /// Counts are fractional or supplied later, so use `hepphys.ContinuedPoisson`.
-    pub fractional: bool,
 }
 
 /// The lumi constraint's resolved config: the Normal `sigma` and the observed
@@ -637,7 +634,6 @@ struct Observation {
     likelihood: NodeId,
     expected: NodeId,
     observed: NodeId,
-    fractional: bool,
 }
 
 /// One staterror parameter's layout across the channels that carry it.
@@ -748,7 +744,7 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
     // Keep channel order: it determines the likelihood's input label order.
     for rows in terms
         .observation
-        .chunk_by(|a, b| terms.pyhf_helpers.is_some() && a.fractional == b.fractional)
+        .chunk_by(|_, _| terms.pyhf_helpers.is_some())
     {
         if rows.len() == 1 {
             all.push(rows[0].likelihood);
@@ -762,11 +758,7 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
             "cat",
             &rows.iter().map(|row| row.observed).collect::<Vec<_>>(),
         );
-        let distribution = if rows[0].fractional {
-            b.module_call("hepphys", "ContinuedPoisson")
-        } else {
-            b.call_head("Poisson")
-        };
+        let distribution = b.module_call("hepphys", "ContinuedPoisson");
         let measures = b.call("broadcast", &[distribution, expected]);
         // A bare functionof would sort the merged inputs again. Use the full
         // original order, including earlier parameters retained by shared factors.
@@ -815,13 +807,10 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
 /// `errors` there before calling.
 ///
 /// Emits `<channel>_observed`, `<channel>_<sample>_{nominal,expected}`,
-/// `<channel>_expected`, `<channel>_model` (`functionof(broadcast(Poisson, …))` —
+/// `<channel>_expected`, `<channel>_model` (`functionof(broadcast(hepphys.ContinuedPoisson, …))` —
 /// a kernel, as `likelihoodof` requires, spec §06), `<channel>_likelihood` (the
 /// observation term), plus the auxiliary constraint terms (lumi, staterror,
 /// per-sample shapesys/normsys/histosys).
-///
-/// `observed.fractional` swaps the count distribution to
-/// `hepphys.ContinuedPoisson`, from [`validate_observed_counts`].
 pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
@@ -833,13 +822,12 @@ pub fn assemble_channel(
     let Observed {
         node: observed,
         n_bins: n_observed,
-        fractional: fractional_observed,
     } = observed;
     // ---- Pass 0: validate channel shape ----
     //
     // Every sample must have the same number of bins, and that count must match
     // the observed-data length. A degenerate (empty / ragged) channel would emit a
-    // `broadcast(Poisson, [])` or length-mismatched model that is silently wrong.
+    // `broadcast(hepphys.ContinuedPoisson, [])` or length-mismatched model that is silently wrong.
     let n_bins = samples
         .first()
         .map(|(_, nominal, _)| nominal.len())
@@ -1167,20 +1155,11 @@ pub fn assemble_channel(
     // `functionof` reifies the parameter-dependent measure into a kernel, as
     // `likelihoodof` requires (spec §06).
     //
-    // §08 gives `Poisson` support `nonnegintegers`, so it cannot score a
-    // fractional count; §09 says `ContinuedPoisson` matches the Poisson density
-    // at non-negative integers but is not a probability measure and has no
-    // `rand`. So a fractional channel (an Asimov dataset, which pyhf and RooFit
-    // score on the gamma-continued density) uses `ContinuedPoisson`, and an
-    // integer channel keeps the samplable `Poisson`.
-    let (count_dist, dist_doc) = if fractional_observed {
-        (
-            b.module_call("hepphys", "ContinuedPoisson"),
-            "Per-bin continued-Poisson observation model",
-        )
-    } else {
-        (b.call_head("Poisson"), "Per-bin Poisson observation model")
-    };
+    // §08 gives `Poisson` the domain `integers`, but pyhf and ROOT score every
+    // channel, integer or fractional (Asimov) counts alike, with the continuous
+    // lgamma extension, which §09 `ContinuedPoisson` defines. It has no `rand`.
+    let count_dist = b.module_call("hepphys", "ContinuedPoisson");
+    let dist_doc = "Per-bin continued-Poisson observation model";
     let expected_ref = b.self_ref(&expected_name);
     let obs_measure = b.call("broadcast", &[count_dist, expected_ref]);
     let obs_kernel = b.functionof(obs_measure);
@@ -1201,7 +1180,6 @@ pub fn assemble_channel(
         likelihood: b.self_ref(&obs_term_name),
         expected: expected_ref,
         observed: observed_ref,
-        fractional: fractional_observed,
     });
 
     // ---- Per-sample constraint terms (parameter-keyed, once per parameter) ----
@@ -1450,12 +1428,11 @@ fn block(b: &mut Builder, cells: Vec<NodeId>, shape: [usize; 3]) -> NodeId {
     b.call("array", &[data, size, order])
 }
 
-/// Validate a channel's observed bin contents and report whether any is fractional.
+/// Validate a channel's observed bin contents.
 ///
-/// Negative or non-finite counts are refused: no Poisson-like density is defined
-/// there. A fractional count is accepted and switches the channel's count
-/// likelihood to `ContinuedPoisson` (see [`assemble_channel`]).
-pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Result<bool> {
+/// Negative or non-finite counts are refused: `ContinuedPoisson` has no density
+/// there. Fractional counts (Asimov data) are valid.
+pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Result<()> {
     if let Some((bin, value)) = values
         .iter()
         .enumerate()
@@ -1466,7 +1443,7 @@ pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Re
              finite and nonnegative, got {value}"
         )));
     }
-    Ok(values.iter().any(|value| value.fract() != 0.0))
+    Ok(())
 }
 
 /// Emit a per-parameter constraint once (deduped via `terms.emitted_params`) and
@@ -1557,17 +1534,14 @@ fn find_obs(
         return Ok(Observed {
             node: b.call("external", &[domain]),
             n_bins,
-            // pyhf scores real-valued data, including fractional Asimov counts.
-            fractional: true,
         });
     };
     let mut build = |data: &[f64]| -> Result<Observed> {
-        let fractional = validate_observed_counts(channel_name, data)?;
+        validate_observed_counts(channel_name, data)?;
         let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
         Ok(Observed {
             node: b.array(&elems),
             n_bins: data.len(),
-            fractional,
         })
     };
     if let Some(obs) = doc.observations.iter().find(|o| o.name == channel_name) {
@@ -1677,8 +1651,10 @@ mod tests {
         let doc = make_uncorrelated_doc();
         let m = pyhf_to_module(PyhfDocument::Workspace(doc)).unwrap();
         let text = print_with(&m, Syntax::Minimal);
-        assert!(text.contains("broadcast(Poisson"), "got:\n{text}");
-        assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
+        assert!(
+            text.contains("broadcast(hepphys.ContinuedPoisson"),
+            "got:\n{text}"
+        );
         assert!(text.contains("joint_likelihood("), "got:\n{text}");
         assert!(text.contains("likelihoodof("), "got:\n{text}");
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");

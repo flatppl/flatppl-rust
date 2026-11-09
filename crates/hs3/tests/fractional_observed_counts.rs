@@ -1,12 +1,10 @@
-//! Per-channel count-likelihood selection from the observed data.
+//! The count likelihood of every channel is `hepphys.ContinuedPoisson`.
 //!
-//! §08 gives `Poisson` support `nonnegintegers`, so an integer channel keeps the
-//! samplable `Poisson`. §09 says `ContinuedPoisson` matches the Poisson density
-//! at non-negative integers but is not a probability measure and has no `rand`,
-//! so it is used only where the data forces it: a channel with a fractional
-//! observed count (an Asimov dataset). Both importers go through
-//! `pyhf::assemble_channel`, but each resolves its own observed data, so both
-//! are covered here.
+//! §08 gives `Poisson` the domain `integers`, but pyhf and ROOT score integer and
+//! fractional (Asimov) counts alike with the continuous lgamma extension, which
+//! §09 `ContinuedPoisson` defines. The family never depends on the data values.
+//! Both importers go through `pyhf::assemble_channel`, but each resolves its own
+//! observed data, so both are covered here.
 
 /// The channel's own count likelihood, isolated from the staterror and shapesys
 /// constraint terms (which emit `hepphys.ContinuedPoisson` regardless).
@@ -70,13 +68,13 @@ fn native_hs3_fractional_counts_emit_continued_poisson() {
 }
 
 #[test]
-fn native_hs3_integer_counts_keep_poisson() {
+fn native_hs3_integer_counts_emit_continued_poisson() {
     let m = flatppl_hs3::read_hs3(&hs3_document("51.0, 48.0")).unwrap();
     let text = printed(&m);
     let model = model_binding(&text);
     assert!(
-        model.contains("broadcast(Poisson") && !model.contains("ContinuedPoisson"),
-        "integer channel must keep the samplable Poisson, got:\n{model}"
+        model.contains("broadcast(hepphys.ContinuedPoisson"),
+        "integer counts use the same family as fractional ones, got:\n{model}"
     );
 }
 
@@ -96,20 +94,19 @@ fn pyhf_fractional_counts_emit_continued_poisson() {
 }
 
 #[test]
-fn pyhf_integer_counts_keep_poisson() {
+fn pyhf_integer_counts_emit_continued_poisson() {
     let m = flatppl_hs3::read_pyhf(&pyhf_workspace("51.0, 48.0")).unwrap();
     let text = printed(&m);
     let model = model_binding(&text);
     assert!(
-        model.contains("broadcast(Poisson") && !model.contains("ContinuedPoisson"),
-        "integer channel must keep the samplable Poisson, got:\n{model}"
+        model.contains("broadcast(hepphys.ContinuedPoisson"),
+        "integer counts use the same family as fractional ones, got:\n{model}"
     );
 }
 
-/// The rule is per channel, not per workspace: one Asimov channel must not drag
-/// an integer channel off `Poisson`.
+/// An integer channel and an Asimov channel in one workspace use one family.
 #[test]
-fn pyhf_fractional_channel_does_not_infect_its_sibling() {
+fn pyhf_integer_and_fractional_channels_share_one_family() {
     let json = r#"{
   "channels": [
     { "name": "ch",
@@ -132,8 +129,8 @@ fn pyhf_fractional_channel_does_not_infect_its_sibling() {
     let text = printed(&flatppl_hs3::read_pyhf(json).unwrap());
     let integer = model_binding(&text);
     assert!(
-        integer.contains("broadcast(Poisson") && !integer.contains("ContinuedPoisson"),
-        "integer channel must keep the samplable Poisson, got:\n{integer}"
+        integer.contains("broadcast(hepphys.ContinuedPoisson"),
+        "integer channel must score the continued density, got:\n{integer}"
     );
     let asimov = text
         .lines()
@@ -145,7 +142,7 @@ fn pyhf_fractional_channel_does_not_infect_its_sibling() {
     );
 }
 
-/// Negative and non-finite counts have no Poisson-like density and stay refused.
+/// Negative and non-finite counts have no `ContinuedPoisson` density and stay refused.
 #[test]
 fn pyhf_negative_counts_still_refused() {
     let err = flatppl_hs3::read_pyhf(&pyhf_workspace("-1.0, 48.0"))
