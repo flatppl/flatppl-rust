@@ -191,6 +191,7 @@ outputs = (lp)
 /// each variate cell, so the batched route must pair cell `i` of `p` with
 /// observation `i`. The fixed index vector made `p` a `[3, 2]` array of cells,
 /// which the shared-vector route read as a single rank-2 cell and refused.
+/// Each observation reads one probability of its source row, never a whole row.
 #[test]
 fn a_categorical_broadcast_over_gathered_rows_pairs_each_row_with_its_observation() {
     let out = emit(
@@ -205,17 +206,19 @@ outputs = (lp)
     );
     let scores = out
         .lines()
-        .filter(|line| line.contains("\"stablehlo.gather\"") && line.contains("-> tensor<3xf32>"))
+        .filter(|line| {
+            line.contains("\"stablehlo.gather\"")
+                && line.contains("(tensor<4xf32>, tensor<3x1xi32>) -> tensor<3xf32>")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         scores.len(),
         1,
-        "expected one gather of the three category probabilities, in:\n{out}"
+        "expected one gather of the three category probabilities from the flattened rows, in:\n{out}"
     );
     assert!(
-        scores[0].contains("operand_batching_dims = [0]")
-            && scores[0].contains("(tensor<3x2xf32>, tensor<3x1xi32>)"),
-        "each observation must index its own row, in:\n{out}"
+        !out.contains("tensor<3x2xf32>"),
+        "no row is gathered per observation, in:\n{out}"
     );
     assert_eq!(
         out.matches("stablehlo.log ").count(),

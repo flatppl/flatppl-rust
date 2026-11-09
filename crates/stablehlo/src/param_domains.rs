@@ -58,6 +58,22 @@ impl Emitter<'_> {
             {
                 continue;
             }
+            // Probability rows selected per observation, `rows[idx]`: check each
+            // source row once and gather its verdict, never a row per observation.
+            if set == ParamSet::StdSimplex
+                && self.check_parameters
+                && let Some(gathered) = crate::registry::row_gather(self, id)?
+                && self.constant_elements(&gathered.rows).is_none()
+            {
+                let key = (gathered.rows.ssa.clone(), format!("{set:?} rows"));
+                if !self.checked_parameters.contains(&key) {
+                    if self.region_depth == 0 {
+                        self.checked_parameters.insert(key);
+                    }
+                    violations.push(self.simplex_row_violations(&gathered));
+                }
+                continue;
+            }
             let value = self.lower_node(id)?;
             if let Some(values) = self.constant_elements(&value) {
                 if constant_violates(set, &values, self.cell_len(&value), self.dtype) {
@@ -427,6 +443,37 @@ impl Emitter<'_> {
         let infinite = self.compare("EQ", &largest, &infinity);
         let flag = self.either(&negative, &far);
         vec![self.either(&flag, &infinite)]
+    }
+}
+
+impl Emitter<'_> {
+    /// [`Emitter::simplex_violations`] for `rows[idx]`: each source row's least
+    /// cell and total, gathered per observation, then the same three tests over
+    /// the observations. Unused rows are never tested, as with the gathered rows.
+    fn simplex_row_violations(&mut self, gathered: &crate::registry::RowGather) -> Value {
+        let n = usize::try_from(gathered.n).expect("row length fits usize");
+        let p = self.convert(&gathered.rows, ElemKind::Real);
+        let row_least = self.reduce_axis("stablehlo.minimum", pos_inf_literal(self.dtype), &p, 1);
+        let row_total = self.reduce_sum_last_axis(&p);
+        let least = self.gather(&row_least, &gathered.index, 0);
+        let total = self.gather(&row_total, &gathered.index, 0);
+        let zero = self.scalar(0.0);
+        let least = self.per_call(&least, false);
+        let negative = self.compare("LT", &least, &zero);
+        let one = self.scalar(1.0);
+        let error = self.sub(&total, &one);
+        let error = self.abs(&error);
+        let scale = self.max(&total, &one);
+        let rounding = self.scalar(simplex_tolerance(n, self.dtype));
+        let tolerance = self.mul(&scale, &rounding);
+        let excess = self.sub(&error, &tolerance);
+        let excess = self.per_call(&excess, true);
+        let far = self.compare("GT", &excess, &zero);
+        let largest = self.per_call(&total, true);
+        let infinity = self.scalar(f64::INFINITY);
+        let infinite = self.compare("EQ", &largest, &infinity);
+        let flag = self.either(&negative, &far);
+        self.either(&flag, &infinite)
     }
 }
 
