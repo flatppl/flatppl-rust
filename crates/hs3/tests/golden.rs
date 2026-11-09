@@ -278,7 +278,7 @@ fn golden_pyhf_2bin_assembly() {
     // requires; the observation term binds it to the observed counts.
     assert!(
         text.contains(
-            "singlechannel_model = functionof(broadcast(Poisson, singlechannel_expected))"
+            "singlechannel_model = functionof(broadcast(hepphys.ContinuedPoisson, singlechannel_expected))"
         ),
         "obs model mismatch, got:\n{text}"
     );

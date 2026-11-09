@@ -32,8 +32,9 @@ fn staterror_constraint_type_gaussian_lowers_to_normal() {
         text.contains("Normal"),
         "Gaussian-constrained staterror must lower to a Normal aux, got:\n{text}"
     );
+    // The channel model is ContinuedPoisson too, so test for the Poisson aux's `tau`.
     assert!(
-        !text.contains("ContinuedPoisson"),
+        !text.contains("gamma_stat_tau"),
         "must NOT fall back to the Poisson default, got:\n{text}"
     );
 }

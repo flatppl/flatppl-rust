@@ -139,12 +139,8 @@ fn external_observations_leave_the_data_to_the_loader() {
         text.contains("a_observed = external(cartpow(nonnegreals, 1))"),
         "{text}"
     );
-    // Loaded counts need not be integers, so the observation model is the
-    // continued Poisson that bound non-integer counts also get.
-    let bound = convert(&PyhfOptions::default())
-        .replace("hepphys.ContinuedPoisson", "Poisson")
-        .replace("Per-bin Poisson", "Per-bin continued-Poisson")
-        .replace("broadcast(Poisson,", "broadcast(hepphys.ContinuedPoisson,");
+    // Loaded and bound counts get the same continued-Poisson observation model.
+    let bound = convert(&PyhfOptions::default());
     let strip = |text: &str| {
         text.lines()
             .filter(|line| !line.contains("_observed = "))

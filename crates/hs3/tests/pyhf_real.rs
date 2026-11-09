@@ -9,8 +9,8 @@ fn two_bin_one_channel_converts() {
     let m = flatppl_hs3::read(FIXTURE_2BIN).expect("2bin_1channel.json must parse and convert");
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains("broadcast(Poisson"),
-        "missing Poisson obs model, got:\n{text}"
+        text.contains("broadcast(hepphys.ContinuedPoisson"),
+        "missing the continued-Poisson obs model, got:\n{text}"
     );
     assert!(
         text.contains("ContinuedPoisson"),
@@ -61,10 +61,10 @@ fn multichan_old_converts() {
         "missing normsys helper, got:\n{text}"
     );
 
-    // broadcast(Poisson from obs model
+    // The observation model.
     assert!(
-        text.contains("broadcast(Poisson"),
-        "missing Poisson obs model, got:\n{text}"
+        text.contains("broadcast(hepphys.ContinuedPoisson"),
+        "missing the continued-Poisson obs model, got:\n{text}"
     );
 
     // point-free: no lambda/fn
@@ -85,7 +85,7 @@ fn multichan_old_converts() {
         "expected a Gaussian staterror constraint with sigma [0.05, 0.1], got:\n{text}"
     );
     assert!(
-        !text.contains("ContinuedPoisson"),
+        !text.contains("staterror_channel1_tau"),
         "a pyhf staterror must not take the ROOT Poisson form, got:\n{text}"
     );
 

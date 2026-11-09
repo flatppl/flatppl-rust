@@ -171,8 +171,8 @@ fn histfactory_channel_has_doc_comments_and_roundtrips() {
     // The observation-model docstring sits directly above the channel model.
     assert_comment_precedes_binding(&text, "observation model", "chan1_model");
     assert!(
-        text.contains("broadcast(Poisson"),
-        "missing Poisson broadcast, got:\n{text}"
+        text.contains("broadcast(hepphys.ContinuedPoisson"),
+        "missing the continued-Poisson broadcast, got:\n{text}"
     );
 
     // The observation-term docstring sits directly above the channel likelihood.

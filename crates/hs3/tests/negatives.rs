@@ -180,7 +180,7 @@ fn histosys_modifier_path_converts() {
         "histosys interpolation mismatch, got:\n{text}"
     );
     assert!(
-        text.contains("c_model = functionof(broadcast(Poisson, c_expected))"),
+        text.contains("c_model = functionof(broadcast(hepphys.ContinuedPoisson, c_expected))"),
         "histosys obs model mismatch, got:\n{text}"
     );
     // The shape parameter carries an N(alpha, 1) auxiliary constraint, reified
@@ -211,7 +211,8 @@ fn shapefactor_modifier_path_converts() {
     // shapefactor is an unconstrained per-bin multiplicative scale: no aux term.
     assert!(
         text.contains("c_factors = array(cat(sf), [1, 1, 2], [1, 2, 3])")
-            && text.contains("c_model = functionof(broadcast(Poisson, c_expected))"),
+            && text
+                .contains("c_model = functionof(broadcast(hepphys.ContinuedPoisson, c_expected))"),
         "shapefactor obs model mismatch, got:\n{text}"
     );
     assert!(

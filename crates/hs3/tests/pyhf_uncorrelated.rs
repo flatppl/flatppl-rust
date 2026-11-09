@@ -16,7 +16,10 @@ const PYHF: &str = r#"{
 fn pyhf_uncorrelated_background_assembles() {
     let m = flatppl_hs3::read(PYHF).unwrap();
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
-    assert!(text.contains("broadcast(Poisson"), "got:\n{text}");
+    assert!(
+        text.contains("broadcast(hepphys.ContinuedPoisson"),
+        "got:\n{text}"
+    );
     assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
     assert!(text.contains("joint_likelihood("), "got:\n{text}");
     assert!(text.contains("likelihoodof("), "got:\n{text}");

@@ -47,7 +47,8 @@ fn pyhf_staterror_defaults_to_gaussian() {
             && text.contains("functionof(broadcast(Normal, st, st_delta))"),
         "expected Normal(st, [0.1, 0.1]), got:\n{text}"
     );
-    assert!(!text.contains("ContinuedPoisson"), "got:\n{text}");
+    // The channel model is ContinuedPoisson too, so test for the Poisson aux itself.
+    assert!(!text.contains("st_tau"), "got:\n{text}");
 }
 
 #[test]
@@ -138,16 +139,8 @@ fn a_known_but_unlowered_staterror_constraint_type_is_refused() {
 #[test]
 fn both_known_staterror_constraint_families_still_import() {
     for (constraint, family, other) in [
-        (
-            "Gauss",
-            "broadcast(Normal, st, st_delta)",
-            "ContinuedPoisson",
-        ),
-        (
-            "Gaussian",
-            "broadcast(Normal, st, st_delta)",
-            "ContinuedPoisson",
-        ),
+        ("Gauss", "broadcast(Normal, st, st_delta)", "st_tau"),
+        ("Gaussian", "broadcast(Normal, st, st_delta)", "st_tau"),
         (
             "Poisson",
             "hepphys.ContinuedPoisson",
