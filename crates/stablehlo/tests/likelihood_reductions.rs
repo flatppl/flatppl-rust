@@ -3,7 +3,11 @@ use flatppl_stablehlo::{Dtype, EmitOptions, Mode};
 
 fn model(source: &str) -> Module {
     let mut module = flatppl_syntax::parse(source).unwrap();
-    let errors = flatppl_infer::infer(&mut module);
+    // A note (§09: ContinuedPoisson is not normalized) is not an error.
+    let errors = flatppl_infer::infer(&mut module)
+        .into_iter()
+        .filter(|d| !matches!(d.severity, flatppl_infer::Severity::Note))
+        .collect::<Vec<_>>();
     assert!(errors.is_empty(), "{errors:?}");
     let roots = [module.intern("inputs"), module.intern("outputs")];
     flatppl_determinizer::determinize_with_roots(
@@ -232,4 +236,37 @@ fn shared_runtime_parameters_reduce_to_scalar_arithmetic() {
         !ir.contains("tensor<2x3xf64>") && !ir.contains("stablehlo.reduce"),
         "{ir}"
     );
+}
+
+/// A converted one-bin HistFactory channel scores `hepphys.ContinuedPoisson` at a
+/// fixed count. §09 gives it §08 Poisson's log density, so it takes the same
+/// reduction: no per-cell reduce, and the fixed point folds to the closed form.
+#[test]
+fn continued_poisson_takes_the_poisson_reduction() {
+    let prefix = "hepphys = standard_module(\"particle-physics\", \"0.1\")\n";
+    let one_bin = format!(
+        "{prefix}mu = elementof(reals)\nexpected = [20.0 * mu]\n\
+         model = functionof(hepphys.ContinuedPoisson.(expected))\n\
+         inputs = mu\noutputs = logdensityof(likelihoodof(model, [55.0]), record(mu = mu))\n"
+    );
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let ir = emit(&one_bin, dtype);
+        assert!(!ir.contains("stablehlo.reduce"), "{ir}");
+    }
+    // Non-integer counts are in §09's domain, so they reduce too.
+    let fixed = format!(
+        "{prefix}outputs = logdensityof(iid(hepphys.ContinuedPoisson(2.0), 3), [0.0, 1.5, 2.0])\n"
+    );
+    let expected = [0.0_f64, 1.5, 2.0]
+        .iter()
+        .map(|x| x * 2.0_f64.ln() - 2.0 - libm::lgamma(x + 1.0))
+        .sum::<f64>();
+    let actual = returned_constant(&emit(&fixed, Dtype::F64), Dtype::F64);
+    assert!((actual - expected).abs() < 1e-13, "{actual} vs {expected}");
+    // The f32 cancellation bound of the Poisson reduction still applies.
+    let large = format!(
+        "{prefix}r = external(posreals)\ninputs = r\n\
+         outputs = logdensityof(iid(hepphys.ContinuedPoisson(r), 2), [64.0, 65.5])\n"
+    );
+    assert!(emit(&large, Dtype::F64).contains("stablehlo.reduce"));
 }
