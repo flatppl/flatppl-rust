@@ -195,7 +195,9 @@ impl Emitter<'_> {
             "Normal" => &["mu", "sigma"],
             "Gamma" => &["shape", "rate"],
             "Beta" => &["alpha", "beta"],
-            "Exponential" | "Poisson" => &["rate"],
+            // The determiniser resolves `hepphys.ContinuedPoisson` to its member name, as
+            // the registry keys it. §09 gives it §08 Poisson's log density, continued.
+            "Exponential" | "Poisson" | "ContinuedPoisson" => &["rate"],
             "Binomial" => &["n", "p"],
             _ => return Ok(None),
         };
@@ -253,6 +255,10 @@ impl Emitter<'_> {
                 "Beta" if !(0.0 < x && x < 1.0) => return Ok(None),
                 "Exponential" if x < 0.0 => return Ok(None),
                 "Poisson" if !(0.0..64.0).contains(&x) || x.fract() != 0.0 => return Ok(None),
+                // §09 defines the density at every real x >= 0. The bound below 64 stays: the
+                // summaries cancel to a result much smaller than each of them, and the bound
+                // limits that cancellation in f32 whether or not x is an integer.
+                "ContinuedPoisson" if !(0.0..64.0).contains(&x) => return Ok(None),
                 "Binomial" if x < 0.0 || x.fract() != 0.0 => return Ok(None),
                 _ => {}
             }
@@ -262,7 +268,7 @@ impl Emitter<'_> {
             }
             if ctor == "Beta" {
                 other_sum.add((-x).ln_1p());
-            } else if ctor == "Poisson" {
+            } else if matches!(ctor.as_str(), "Poisson" | "ContinuedPoisson") {
                 other_sum.add(libm::lgamma(x + 1.0));
             }
         }
@@ -377,7 +383,7 @@ impl Emitter<'_> {
                 let rate_sum = self.mul(&params[0], &total);
                 self.sub(&normalizer, &rate_sum)
             }
-            "Poisson" => {
+            "Poisson" | "ContinuedPoisson" => {
                 let Some(factorials) = self.summary_scalar(other_sum.total() * repetitions) else {
                     return Ok(None);
                 };
