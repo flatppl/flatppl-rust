@@ -332,7 +332,10 @@ pub(crate) fn lower_closed_measure_sample(
             // A deterministic expression of draws (`z = x * 2 + 1`) samples its latents
             // once each and passes through, as a derived record field does (§13
             // "Output reduction").
-            if is_derived_value_field(m, inner) {
+            // So does a draw whose kernel reads another latent: sampled alone, its
+            // parent would stay an unlowered draw. The record path samples the cone once.
+            let hierarchical = requires_shared_binding_rewrite(m, &[field_draw_binding(m, inner)]);
+            if hierarchical || is_derived_value_field(m, inner) {
                 let name = m.intern("value");
                 let record = build_record(m, &[(name, inner)]);
                 let (value, next) = lower_record_of_draws_sample(m, record, rng)?;

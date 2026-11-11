@@ -176,3 +176,32 @@ fn a_drawn_positional_joint_feeds_a_later_draw() {
         "{pir}"
     );
 }
+
+/// The law of one draw whose kernel reads another latent: the parent is drawn first,
+/// then the child, on one key chain, and the output is the child alone.
+#[test]
+fn the_law_of_a_hierarchical_draw_samples_its_parent_first() {
+    for (parent, read, first) in [
+        ("a ~ Gamma(2.0, 1.0)", "a", vec![gamma(2.0)]),
+        ("v ~ iid(Gamma(2.0, 1.0), 2)", "v[1]", vec![gamma(2.0)]),
+        (
+            "v ~ joint(Gamma(2.0, 1.0), Gamma(3.0, 1.0))",
+            "v[1]",
+            vec![gamma(2.0), gamma(3.0)],
+        ),
+    ] {
+        let (m, pir) = determinized(&format!(
+            "{parent}\ny ~ Normal(0.0, sqrt({read}))\n\
+             seed = rnginit(0)\n\
+             draws = rand(lawof(y), seed)\n"
+        ));
+        let chain = key_chain(&m, "draws");
+        assert_eq!(chain[..chain.len() - 1], first[..], "{parent}");
+        assert_eq!(chain.last().unwrap().0, "Normal", "{parent}");
+        // The output is y's value, not a record holding it.
+        assert!(
+            builtin(&m, resolve(&m, rhs(&m, "draws")), "record").is_none(),
+            "{parent}: {pir}"
+        );
+    }
+}
