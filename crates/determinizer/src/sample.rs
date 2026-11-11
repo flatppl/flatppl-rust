@@ -332,7 +332,10 @@ pub(crate) fn lower_closed_measure_sample(
             // A deterministic expression of draws (`z = x * 2 + 1`) samples its latents
             // once each and passes through, as a derived record field does (§13
             // "Output reduction").
-            if is_derived_value_field(m, inner) {
+            // So does a draw whose kernel reads another latent: sampled alone, its
+            // parent would stay an unlowered draw. The record path samples the cone once.
+            let hierarchical = requires_shared_binding_rewrite(m, &[field_draw_binding(m, inner)]);
+            if hierarchical || is_derived_value_field(m, inner) {
                 let name = m.intern("value");
                 let record = build_record(m, &[(name, inner)]);
                 let (value, next) = lower_record_of_draws_sample(m, record, rng)?;
@@ -342,6 +345,7 @@ pub(crate) fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
+        Some("joint") => lower_joint_sample(m, resolved, rng),
         Some("locscale") => {
             let (base, shift, scale) = scalar_locscale(m, resolved)?;
             let (value, next) = lower_closed_measure_sample(m, base, rng)?;
@@ -862,6 +866,11 @@ fn lower_draw(
     if builtin_name(m, inner_resolved) == Some("tilt") {
         return lower_tilt_sample(m, inner_resolved, rng, sample_name);
     }
+    // A joint has no single primitive tuple to name: its components are drawn by the
+    // record-of-draws fold, and a shared latent's binding is rewritten to the result.
+    if builtin_name(m, inner_resolved) == Some("joint") {
+        return lower_joint_sample(m, inner_resolved, rng);
+    }
     if builtin_name(m, inner_resolved) == Some("normalize") {
         return lower_normalized_weight_sample(m, inner_resolved, rng, sample_name);
     }
@@ -1264,6 +1273,56 @@ fn lower_record_of_draws_sample(
         cur = next;
     }
     Ok((build_record(m, &out_fields), cur))
+}
+
+/// §06 `joint(M1, M2, ...)`, an independent product: draw each component in turn,
+/// threading the rng, through the record-of-draws fold. The keyword form's variate is
+/// that record. The positional form's variate is the `cat` of the component variates
+/// (a vector of scalars, a concatenated vector, or a merged record).
+fn lower_joint_sample(
+    m: &mut Module,
+    joint_node: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let call = expect_builtin_call(m, joint_node, "joint")
+        .ok_or_else(|| refuse(joint_node, m, "expected joint"))?
+        .clone();
+    if !call.args.is_empty() && !call.named.is_empty() {
+        return Err(refuse(
+            joint_node,
+            m,
+            "joint takes either positional or keyword components, not both",
+        ));
+    }
+    if call.args.is_empty() && call.named.is_empty() {
+        return Err(refuse(joint_node, m, "joint needs at least one component"));
+    }
+    let positional = !call.args.is_empty();
+    let components: Vec<(Symbol, NodeId)> = if positional {
+        call.args
+            .iter()
+            .enumerate()
+            .map(|(i, &measure)| (m.intern(&format!("__joint_{i}")), measure))
+            .collect()
+    } else {
+        call.named.iter().map(|arg| (arg.name, arg.value)).collect()
+    };
+    let draws: Vec<(Symbol, NodeId)> = components
+        .iter()
+        .map(|&(name, measure)| (name, build_call(m, "draw", &[measure])))
+        .collect();
+    let record = build_record(m, &draws);
+    let (value, next) = lower_record_of_draws_sample(m, record, rng)?;
+    if !positional {
+        return Ok((value, next));
+    }
+    let values: Vec<NodeId> = expect_builtin_call(m, value, "record")
+        .ok_or_else(|| refuse(joint_node, m, "joint components did not sample to a record"))?
+        .named
+        .iter()
+        .map(|arg| arg.value)
+        .collect();
+    Ok((build_call(m, "cat", &values), next))
 }
 
 /// Is this record field a DETERMINISTIC value expression — §13 "Output reduction":
