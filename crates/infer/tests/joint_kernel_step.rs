@@ -67,3 +67,40 @@ fn a_joint_kernel_step_takes_the_record_by_its_inputs() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("no input for field `c`") && errors[0].contains("lacks field `a`"));
 }
+
+fn mass_of(m: &flatppl_core::Module, name: &str) -> flatppl_core::Mass {
+    let rhs = m
+        .bindings()
+        .find(|(_, b)| m.resolve(b.name) == name)
+        .unwrap()
+        .1
+        .rhs;
+    match m.type_of(rhs) {
+        Some(Type::Measure { mass, .. } | Type::Kernel { mass, .. }) => *mass,
+        other => panic!("{name} is not a measure or kernel: {other:?}"),
+    }
+}
+
+/// §04, §06: a broadcast of probability measures has mass 1 whatever its length. A step
+/// kernel broadcasting over an array field of the preceding variate cannot know that
+/// length while the field is a placeholder, but its mass is still 1, so `rand` accepts
+/// the chain.
+#[test]
+fn a_step_kernel_broadcasting_over_an_array_field_is_normalized() {
+    for body in ["Normal.(0.0, r.v)", "Normal.(0.0, sqrt.(r.v))"] {
+        let src = format!(
+            "k = r -> joint(y = {body})\n\
+             prior = jointchain(joint(v = iid(Gamma(2.0, 1.0), 2)), k)\n\
+             seed = rnginit([0])\n\
+             d = rand(prior, seed)\n"
+        );
+        let (m, errors) = infer_src(&src);
+        assert!(errors.is_empty(), "{body}: {errors:?}");
+        assert_eq!(mass_of(&m, "k"), flatppl_core::Mass::Normalized, "{body}");
+        assert_eq!(
+            mass_of(&m, "prior"),
+            flatppl_core::Mass::Normalized,
+            "{body}"
+        );
+    }
+}

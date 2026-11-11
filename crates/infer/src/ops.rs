@@ -7072,6 +7072,17 @@ fn broadcast_type(
             .iter()
             .map(|(name, node, ty, phase)| (*name, *node, cell(ty), *phase))
             .collect();
+        // A built-in distribution's own call leaves its mass for `fill_mass`, which
+        // passes a broadcast through. A broadcast of §08 distributions is an independent
+        // product of probability measures, mass 1 whatever its shape (§04, §06), exactly
+        // as the shaped arm below records it.
+        let distribution_head = match inf.module.node(head_node) {
+            Node::Const(op) => {
+                let name = inf.module.resolve(*op).to_string();
+                distribution_domain(inf, &name, &[], &[]).is_some()
+            }
+            _ => false,
+        };
         return ordinary_call_type(inf, head_node, &cell_args, &cell_named).map(
             inf,
             move |_, ty| {
@@ -7081,7 +7092,11 @@ fn broadcast_type(
                 match ty {
                     Type::Measure { mass, .. } => Type::Measure {
                         domain: Box::new(Type::Deferred),
-                        mass,
+                        mass: if distribution_head && mass == Mass::Deferred {
+                            Mass::Normalized
+                        } else {
+                            mass
+                        },
                     },
                     Type::Failed(_) => ty,
                     _ => Type::Deferred,
