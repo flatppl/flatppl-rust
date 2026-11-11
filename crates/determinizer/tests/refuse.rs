@@ -427,7 +427,7 @@ lp = logdensityof(L, record(mu = 0.0))";
 // deferred: not spec-excluded, simply unbuilt in this vertical.
 //
 // `weighted`/`logweighted`/`bayesupdate`, `truncate`, and the deferred
-// combinators (`jointchain`/`kchain`/`superpose`/`pushfwd`) all reach their
+// combinators (`kchain`/`superpose`/`pushfwd`) all reach their
 // refuse arm via `draw(<op>(...))` — the common surface shape — rather than
 // via `lower_measure_sample`'s own dispatch match (which only sees these ops
 // when they are NOT wrapped in `draw`: `lawof`'s direct argument, or an
@@ -525,7 +525,7 @@ draws = rand(lawof(record(d = d)), s)";
 // `d = draw(superpose(Normal(...), Normal(...)))`: `superpose` (measure
 // addition) is not conceptually intractable — a later vertical could thread
 // the rng through it — it is simply not built in this one (direct draws +
-// record-of-draws + shared ancestors). `jointchain`/`kchain` share the
+// record-of-draws + shared ancestors). `kchain` shares the
 // identical match arm and message (not separately tested). `pushfwd` no longer
 // shares that arm — a pushforward IS sampled in measure position (sample the
 // base, apply the map: `sample_golden.rs::
