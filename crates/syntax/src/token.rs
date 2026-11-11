@@ -868,7 +868,7 @@ impl Lexer {
             let tag_chars: Vec<char> = tag.chars().collect();
             if self.chars[self.pos..].starts_with(&tag_chars[..]) {
                 let after = self.chars.get(self.pos + tag_chars.len()).copied();
-                if matches!(after, None | Some(' ' | '\t' | '\n' | '\r')) {
+                if matches!(after, None | Some(' ' | '\t' | '\n' | '\r' | ';')) {
                     for _ in 0..tag_chars.len() {
                         self.bump();
                     }
@@ -1261,9 +1261,9 @@ x = 1"
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].lines, vec!["doc; text".to_string()]);
         assert!(!kinds("% doc; text\nx = 1").contains(&TokenKind::Name("text".into())));
-        // A tag needs a space, a line break or the end after it.
         let got = docs("%md; text\nx = 1");
-        assert_eq!(got[0].tag, None, "{got:?}");
+        assert_eq!(got[0].tag.as_deref(), Some("md"), "{got:?}");
+        assert_eq!(got[0].lines, vec!["; text".to_string()], "{got:?}");
     }
 
     #[test]
