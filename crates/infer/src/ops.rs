@@ -850,10 +850,17 @@ fn op_rule(
         // `jointchain(M, K1, …)` (spec §06): dependent joint — KEEPS ALL variates
         // (`cat` of every component's, or a named record in keyword form). Mass
         // is filled by `fill_mass`.
-        "jointchain" => Type::Measure {
-            domain: Box::new(jointchain_domain(inf, args, named)),
-            mass: Mass::Deferred,
-        },
+        "jointchain" => {
+            return jointchain_domain(inf, args, named).map(inf, move |_, domain| {
+                (
+                    Type::Measure {
+                        domain: Box::new(domain),
+                        mass: Mass::Deferred,
+                    },
+                    joined,
+                )
+            });
+        }
         "scan" => return scan_type(inf, args).map(inf, move |_, ty| (ty, joined)),
         // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
         // result is a function with `f1`'s input signature (output type is not
@@ -6700,29 +6707,99 @@ fn joint_kernel_variate(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Ty
 /// variate (positional form, as with `joint`), or a record naming each
 /// component's variate (keyword form `jointchain(n1 = …, n2 = …)`). Any
 /// component whose variate is not statically resolvable ⇒ `%deferred`.
-fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
-    if !named.is_empty() {
-        // Keyword form `jointchain(n1 = M, n2 = K, …)` (spec §06): "Each name holds its
-        // component's variate as it is, whether scalar, array or record ... A
-        // record-valued component becomes a nested record under its name", so the domain is
-        // `record{n1: variate(M), n2: variate(K), …}`.
-        let mut fields = Vec::with_capacity(named.len());
-        for (name, node, t, _) in named {
-            match component_variate(inf, *node, t) {
-                Some(v) => fields.push((*name, v)),
-                None => return Type::Deferred,
+///
+/// §06: the kernels' "inputs bind to the variates of everything to their left", so a
+/// kernel step's variate is its body typed AT the preceding variates, not its unapplied
+/// body. A body whose shape depends on an input (`r -> joint(y = Normal.(0.0, r.v))`)
+/// types only once `r` is known. Each step is applied to the record of the preceding
+/// labels (keyword form), the preceding variate itself, or their `cat` (positional
+/// form), through [`substituted_result`], as [`pushfwd_codomain`] applies `f` to `M`'s
+/// domain. A step that cannot be applied that way keeps its unapplied body's variate.
+fn jointchain_domain(
+    inf: &mut Inferencer<'_, '_>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> RuleStep<Type> {
+    let components: Vec<(Option<Symbol>, NodeId, Type, Phase)> = if named.is_empty() {
+        args.iter()
+            .map(|(node, ty, phase)| (None, *node, ty.clone(), *phase))
+            .collect()
+    } else {
+        named
+            .iter()
+            .map(|(name, node, ty, phase)| (Some(*name), *node, ty.clone(), *phase))
+            .collect()
+    };
+    jointchain_variates(inf, components, Vec::new())
+}
+
+/// The fold behind [`jointchain_domain`]: `variates` holds the components typed so far.
+fn jointchain_variates(
+    inf: &mut Inferencer<'_, '_>,
+    components: Vec<(Option<Symbol>, NodeId, Type, Phase)>,
+    mut variates: Vec<Type>,
+) -> RuleStep<Type> {
+    let i = variates.len();
+    let keyword = components
+        .first()
+        .is_some_and(|(label, ..)| label.is_some());
+    let Some((_, node, ty, _)) = components.get(i).cloned() else {
+        return Ready(if keyword {
+            Type::Record(
+                components
+                    .iter()
+                    .filter_map(|(label, ..)| *label)
+                    .zip(variates)
+                    .collect(),
+            )
+        } else {
+            cat_compose(&variates)
+        });
+    };
+    if i == 0 || !matches!(ty, Type::Kernel { .. }) {
+        let Some(variate) = component_variate(inf, node, &ty) else {
+            return Ready(Type::Deferred);
+        };
+        variates.push(variate);
+        return jointchain_variates(inf, components, variates);
+    }
+    let prior = if keyword {
+        Type::Record(
+            components
+                .iter()
+                .filter_map(|(label, ..)| *label)
+                .zip(variates.iter().cloned())
+                .collect(),
+        )
+    } else if let [single] = variates.as_slice() {
+        single.clone()
+    } else {
+        cat_compose(&variates)
+    };
+    // The prior has no node of its own. The base component's node only anchors the
+    // argument: its type is a measure, never the prior's type, so `substituted_result`
+    // gives the prior its type's natural value set rather than a borrowed one.
+    let (_, base, _, base_phase) = components[0].clone();
+    substituted_result(inf, node, &[(base, prior, base_phase)], &[], None, false).and_then(
+        inf,
+        move |inf, applied| {
+            let applied = match applied.map(|(ty, _)| ty) {
+                Some(Type::Measure { domain, .. }) => match *domain {
+                    Type::Deferred => None,
+                    domain => Some(domain),
+                },
+                Some(Type::Deferred) | None => None,
+                Some(value) => Some(value),
+            };
+            match applied.or_else(|| component_variate(inf, node, &ty)) {
+                Some(variate) => {
+                    variates.push(variate);
+                    jointchain_variates(inf, components, variates)
+                }
+                None => Ready(Type::Deferred),
             }
-        }
-        return Type::Record(fields.into());
-    }
-    let mut variates = Vec::with_capacity(args.len());
-    for (n, t, _) in args {
-        match component_variate(inf, *n, t) {
-            Some(v) => variates.push(v),
-            None => return Type::Deferred,
-        }
-    }
-    cat_compose(&variates)
+        },
+    )
 }
 
 /// Per-call result type of a **local** reified callable, computed by substituting

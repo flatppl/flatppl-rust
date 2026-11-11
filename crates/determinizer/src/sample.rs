@@ -346,6 +346,7 @@ pub(crate) fn lower_closed_measure_sample(
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
         Some("joint") => lower_joint_sample(m, resolved, rng),
+        Some("jointchain") => crate::jointchain::lower_jointchain_sample(m, resolved, rng),
         Some("locscale") => {
             let (base, shift, scale) = scalar_locscale(m, resolved)?;
             let (value, next) = lower_closed_measure_sample(m, base, rng)?;
@@ -689,11 +690,11 @@ fn lower_measure_sample(
 ///   is out of scope for this MVP's exact, deterministic lowering), and a
 ///   `truncate` whose base is CONFIRMED multivariate (no general sampling
 ///   recipe for an arbitrary multivariate truncated region either).
-/// * **Deferred** — `jointchain`/`kchain`/`superpose`, and a univariate
-///   `truncate`: none of these are spec-excluded (a later vertical could add
-///   inverse-CDF/rejection truncated sampling, or thread the rng through a
-///   Kleisli/joint chain), they are simply not built in this one
-///   (direct draws + record-of-draws + shared ancestors + pushforwards).
+/// * **Deferred** — `kchain`/`superpose`, and a univariate `truncate`: none of
+///   these are spec-excluded (a later vertical could add inverse-CDF/rejection
+///   truncated sampling, or thread the rng through a Kleisli chain), they are
+///   simply not built in this one (direct draws + record-of-draws + shared
+///   ancestors + pushforwards + `joint`/`jointchain`).
 ///
 /// `pushfwd` is deliberately NOT in either bucket: in measure position it is
 /// sampled ([`lower_pushfwd_sample`]), and in `draw` position it is refused for a
@@ -708,9 +709,7 @@ fn classify_intractable_or_deferred(m: &Module, resolved: NodeId) -> Option<Refu
             Some(refuse_weighted_family(m, resolved))
         }
         Some("truncate") => Some(refuse_truncate(m, resolved)),
-        Some("jointchain") | Some("kchain") | Some("superpose") => {
-            Some(refuse_deferred_combinator(m, resolved))
-        }
+        Some("kchain") | Some("superpose") => Some(refuse_deferred_combinator(m, resolved)),
         _ => None,
     }
 }
@@ -792,7 +791,7 @@ fn truncate_is_confirmed_multivariate(m: &Module, truncate_node: NodeId) -> bool
     )
 }
 
-/// `jointchain`/`kchain`/`superpose`, and a univariate `truncate` (via
+/// `kchain`/`superpose`, and a univariate `truncate` (via
 /// [`refuse_truncate`]): sample lowering for these is simply not built in this
 /// vertical — see [`classify_intractable_or_deferred`].
 fn refuse_deferred_combinator(m: &Module, id: NodeId) -> RefuseError {
@@ -870,6 +869,9 @@ fn lower_draw(
     // record-of-draws fold, and a shared latent's binding is rewritten to the result.
     if builtin_name(m, inner_resolved) == Some("joint") {
         return lower_joint_sample(m, inner_resolved, rng);
+    }
+    if builtin_name(m, inner_resolved) == Some("jointchain") {
+        return crate::jointchain::lower_jointchain_sample(m, inner_resolved, rng);
     }
     if builtin_name(m, inner_resolved) == Some("normalize") {
         return lower_normalized_weight_sample(m, inner_resolved, rng, sample_name);
@@ -1031,6 +1033,17 @@ fn lower_iid_sample(
     let (kernel, _) = resolve_ref(m, kernel);
     if let Some(body) = crate::kernel::reduce_kernel_application(m, kernel) {
         return lower_iid_sample(m, body, iid_node, rng, sample_name);
+    }
+    // The fan-out batches one primitive draw per lane. A chain is a composite per
+    // lane (a draw, then a kernel applied to it), which needs a lane loop or a
+    // lane-broadcast kernel, and neither exists for a composite.
+    if builtin_name(m, kernel) == Some("jointchain") {
+        return Err(refuse(
+            iid_node,
+            m,
+            "iid of a jointchain samples a composite per lane, which is not lowered; \
+             draw the chain once per element, or broadcast its kernel over an iid base",
+        ));
     }
     if m.type_of(iid_node).is_none()
         && let Some(ty) = flatppl_infer::infer_expression(m, iid_node, &[])

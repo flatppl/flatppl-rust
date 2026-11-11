@@ -517,3 +517,218 @@ fn refuse_jc(node: NodeId, reason: &str) -> RefuseError {
         reason: reason.to_string(),
     }
 }
+
+/// Sample `jointchain(C₀, K₁, …)` in measure position (spec §06): draw the base,
+/// then each kernel applied to the variates to its left, threading the rng from
+/// component to component, exactly as §06's equivalence with stochastic nodes reads
+/// (`a ~ M1; b ~ K2(a); c ~ K3([a, b])`). Every component is sampled by the ordinary
+/// closed-measure dispatcher, and each sampled variate is bound once, so later kernels
+/// and the output read one draw by name.
+///
+/// The three variate families and their refusals mirror [`lower_jointchain`]:
+///   * keyword — each kernel receives the record of the preceding labelled variates;
+///     the variate is that record.
+///   * record (positional, record variates) — each kernel receives the record of the
+///     preceding fields; the variate is the merged record (§06 `cat` of records).
+///   * scalar-cat (positional, scalar variates) — a kernel's one input is the prior
+///     scalar, or the vector of all prior scalars; the variate is their `cat`.
+pub(crate) fn lower_jointchain_sample(
+    m: &mut Module,
+    node: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    if let Some(components) = keyword_components(m, node) {
+        return sample_keyword_family(m, node, &components, rng);
+    }
+    let args: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "jointchain")
+            .ok_or_else(|| refuse_jc(node, "expected jointchain"))?;
+        if !c.named.is_empty() {
+            return Err(refuse_jc(
+                node,
+                "a jointchain with both positional and keyword components is not lowered",
+            ));
+        }
+        if c.args.len() < 2 {
+            return Err(refuse_jc(
+                node,
+                "jointchain needs a base and at least one kernel",
+            ));
+        }
+        c.args.to_vec()
+    };
+    let (base_node, _) = resolve_ref_chain(m, args[0]);
+    if matches!(m.type_of(base_node), Some(Type::Measure { .. }))
+        && record_fields(m, args[0]).is_some()
+    {
+        return sample_record_family(m, node, &args, rng);
+    }
+    sample_scalar_family(m, node, &args, rng)
+}
+
+/// `K(prior)` for a chain step, after the same kernel check the density side makes.
+fn apply_step(
+    m: &mut Module,
+    node: NodeId,
+    component: NodeId,
+    prior: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (resolved, _) = resolve_ref_chain(m, component);
+    if !matches!(m.type_of(resolved), Some(Type::Kernel { .. })) {
+        return Err(refuse_jc(
+            node,
+            "jointchain component is not a transition kernel",
+        ));
+    }
+    if resolve_reified(m, component).is_none() && joint_kernel(m, component).is_none() {
+        return Err(refuse_jc(
+            node,
+            "jointchain kernel is not a reified callable",
+        ));
+    }
+    Ok(m.alloc(Node::Call(Call {
+        head: CallHead::User(component),
+        args: Box::new([prior]),
+        named: Box::default(),
+        inputs: None,
+    })))
+}
+
+/// Sample one component and bind its variate to a fresh synthetic binding, so every
+/// later reader shares the one draw.
+fn sample_component(
+    m: &mut Module,
+    measure: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (value, next) = crate::sample::lower_closed_measure_sample(m, measure, rng)?;
+    let mut index = 0usize;
+    let name = loop {
+        let name = m.intern(&format!("__jointchain_{index}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        index += 1;
+    };
+    m.add_binding(flatppl_core::Binding {
+        name,
+        rhs: value,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    let reference = m.alloc(Node::Ref(flatppl_core::Ref {
+        ns: flatppl_core::RefNs::SelfMod,
+        name,
+    }));
+    Ok((reference, next))
+}
+
+fn sample_keyword_family(
+    m: &mut Module,
+    node: NodeId,
+    components: &[(Symbol, NodeId)],
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let mut env: Vec<(Symbol, NodeId)> = Vec::with_capacity(components.len());
+    let mut cur = rng;
+    for (i, &(label, component)) in components.iter().enumerate() {
+        if env.iter().any(|(name, _)| *name == label) {
+            return Err(refuse_jc(node, "jointchain labels are not distinct"));
+        }
+        let measure = if i == 0 {
+            component
+        } else {
+            let prior = build_record(m, &env);
+            apply_step(m, node, component, prior)?
+        };
+        let (value, next) = sample_component(m, measure, cur)?;
+        env.push((label, value));
+        cur = next;
+    }
+    Ok((build_record(m, &env), cur))
+}
+
+fn sample_record_family(
+    m: &mut Module,
+    node: NodeId,
+    args: &[NodeId],
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let mut env: Vec<(Symbol, NodeId)> = Vec::new();
+    let mut cur = rng;
+    for (i, &component) in args.iter().enumerate() {
+        let (measure, fields) = if i == 0 {
+            (component, record_fields(m, component))
+        } else {
+            let fields = match resolve_reified(m, component) {
+                Some(kernel) => record_fields(m, kernel.body),
+                None => joint_kernel_fields(m, component),
+            };
+            let prior = build_record(m, &env);
+            (apply_step(m, node, component, prior)?, fields)
+        };
+        let fields = fields.ok_or_else(|| {
+            refuse_jc(
+                node,
+                "record-form jointchain component domain is not a record",
+            )
+        })?;
+        let (value, next) = sample_component(m, measure, cur)?;
+        for field in fields {
+            if env.iter().any(|(name, _)| *name == field) {
+                return Err(refuse_jc(
+                    node,
+                    "jointchain record components have duplicate fields",
+                ));
+            }
+            let name: Box<str> = m.resolve(field).into();
+            let key = m.alloc(Node::Lit(Scalar::Str(name)));
+            env.push((field, build_call(m, "get", &[value, key])));
+        }
+        cur = next;
+    }
+    Ok((build_record(m, &env), cur))
+}
+
+fn sample_scalar_family(
+    m: &mut Module,
+    node: NodeId,
+    args: &[NodeId],
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    for &component in args {
+        if !component_is_scalar(m, component) {
+            return Err(refuse_jc(
+                node,
+                "scalar-cat component variate is not confirmed scalar",
+            ));
+        }
+    }
+    let mut env: Vec<NodeId> = Vec::with_capacity(args.len());
+    let mut cur = rng;
+    for (i, &component) in args.iter().enumerate() {
+        let measure = if i == 0 {
+            component
+        } else {
+            let kernel = resolve_reified(m, component)
+                .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a reified callable"))?;
+            if kernel.inputs.len() != 1 {
+                return Err(refuse_jc(
+                    node,
+                    "scalar-cat kernel must take exactly one input (the cat of priors)",
+                ));
+            }
+            let prior = if env.len() == 1 {
+                env[0]
+            } else {
+                build_call(m, "vector", &env)
+            };
+            apply_step(m, node, component, prior)?
+        };
+        let (value, next) = sample_component(m, measure, cur)?;
+        env.push(value);
+        cur = next;
+    }
+    Ok((build_call(m, "cat", &env), cur))
+}
