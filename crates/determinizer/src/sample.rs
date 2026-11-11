@@ -225,7 +225,7 @@ fn rand_result_is_destructured(m: &Module, rand_bid: BindingId, rand_node: NodeI
 /// `(%ref self name)` and whose selector argument is an integer literal — see
 /// [`rand_result_is_destructured`]. Mirrors the worklist-over-`for_each_child`
 /// idiom used throughout this crate (e.g. this file's own
-/// [`referenced_draw_bindings`], `Module::collect_referenced_names`).
+/// [`transitive_draw_bindings`], `Module::collect_referenced_names`).
 fn subtree_has_int_projection_of(m: &Module, root: NodeId, name: Symbol) -> bool {
     subtree_has(m, root, |id| is_int_projection_of(m, id, name))
 }
@@ -1419,12 +1419,12 @@ fn derived_field_latents(
 /// The draw-bindings reachable from `root` THROUGH deterministic bindings, in
 /// first-encounter order.
 ///
-/// [`referenced_draw_bindings`] stops at the subtree it is handed, which is enough
-/// for a draw's own kernel input — that names its latents directly. A derived
-/// field sits one indirection further out (the field value is `(%ref self d)`,
-/// and `d`'s RHS is what names `y1`/`y2`) and may chain (`e = d * 2.0`), so this
-/// version follows a non-draw binding's RHS as well. A draw binding terminates the
-/// walk: its own kernel-input latents are pulled in by [`topo_draw_cone`].
+/// A derived field sits one indirection away from its latents (the field value is
+/// `(%ref self d)`, and `d`'s RHS is what names `y1`/`y2`) and may chain
+/// (`e = d * 2.0`). A draw's kernel input can read latents the same way
+/// (`v = [a, b]; y ~ Normal(0.0, sqrt(v[1]))`), so this walk follows a non-draw
+/// binding's RHS for both. A draw binding terminates the walk: its own kernel-input
+/// latents are pulled in by [`topo_draw_cone`].
 fn transitive_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
     let mut found: Vec<BindingId> = Vec::new();
     let mut seen: Vec<BindingId> = Vec::new();
@@ -1483,7 +1483,7 @@ fn requires_shared_binding_rewrite(m: &Module, field_bids: &[Option<BindingId>])
     // A hierarchical draw whose kernel input references another draw-binding.
     seeds.iter().any(|&bid| {
         draw_argument(m, m.binding(bid).rhs)
-            .map(|measure| !referenced_draw_bindings(m, measure).is_empty())
+            .map(|measure| !transitive_draw_bindings(m, measure).is_empty())
             .unwrap_or(false)
     })
 }
@@ -1576,28 +1576,6 @@ fn fresh_latent_name(m: &mut Module, latent: BindingId, kind: &str) -> Symbol {
     }
 }
 
-/// The `draw`-bindings referenced by `(%ref self name)` anywhere in the subtree
-/// at `root` (a draw's kernel input), through any alias chain, in first-encounter
-/// order. Only bindings whose RHS is a `draw(…)` count — a reference to a
-/// deterministic binding is not a latent dependency.
-fn referenced_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
-    let mut found: Vec<BindingId> = Vec::new();
-    let mut queue = vec![root];
-    let mut qi = 0;
-    while qi < queue.len() {
-        let id = queue[qi];
-        qi += 1;
-        if let (rhs, Some(bid)) = resolve_ref(m, id)
-            && draw_argument(m, rhs).is_some()
-            && !found.contains(&bid)
-        {
-            found.push(bid);
-        }
-        m.for_each_child(id, |c| queue.push(c));
-    }
-    found
-}
-
 /// The generative cone of draw-bindings reachable from `seeds` (the fields'
 /// latents), in dependency (topological) order — each latent appears AFTER every
 /// draw-binding its kernel input references, so RNG threading and the
@@ -1626,7 +1604,7 @@ fn visit_draw_cone(
     }
     visited.push(bid);
     if let Some(measure) = draw_argument(m, m.binding(bid).rhs) {
-        for dep in referenced_draw_bindings(m, measure) {
+        for dep in transitive_draw_bindings(m, measure) {
             visit_draw_cone(m, dep, order, visited);
         }
         order.push(bid);
