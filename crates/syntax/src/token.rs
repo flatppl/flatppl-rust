@@ -10,7 +10,9 @@
 //! - **Maximal munch** for dotted operators (`.+`, `.==`, …) vs the field/axis
 //!   dot, and for the trailing-dot real literal (`1.` is `1.0`).
 //! - **Comments** (`#`, `###`) are discarded; **doc-comments** (`%`, `%%%`)
-//!   become [`TokenKind::Doc`] tokens the parser attaches to bindings.
+//!   become [`TokenKind::Doc`] tokens the parser attaches to bindings. A `#` or
+//!   `%` line runs to the end of its line: a `;` inside it is comment text, not a
+//!   statement separator.
 
 use crate::error::{Error, Result};
 
@@ -210,12 +212,13 @@ impl Lexer {
                 }
                 Some('#') => {
                     // `###` alone on a line opens a block comment; otherwise a
-                    // line comment to end-of-line or `;` (spec §05).
+                    // line comment to the end of the line (spec §05). A `;` inside
+                    // it is comment text.
                     if self.is_block_fence('#') {
                         self.skip_block_comment()?;
                     } else {
                         while let Some(c) = self.peek() {
-                            if c == '\n' || c == '\r' || c == ';' {
+                            if c == '\n' || c == '\r' {
                                 break;
                             }
                             self.bump();
@@ -803,7 +806,8 @@ impl Lexer {
             return Ok(());
         }
 
-        // Single-line `% …` (or `%md …`), running to newline or `;`.
+        // Single-line `% …` (or `%md …`), running to the end of the line; a `;` is
+        // doc text.
         let trailing = self.after_value;
         self.bump(); // %
         let tag = self.read_doc_tag();
@@ -811,7 +815,7 @@ impl Lexer {
             self.reject_unknown_doc_tag(start, line)?;
         }
         let cstart = self.pos;
-        while !matches!(self.peek(), Some('\n' | '\r' | ';') | None) {
+        while !matches!(self.peek(), Some('\n' | '\r') | None) {
             self.bump();
         }
         let raw: String = self.chars[cstart..self.pos].iter().collect();
@@ -1216,6 +1220,50 @@ mod tests {
                 (None, vec!["more".to_string()]),
             ]
         );
+    }
+
+    /// A `#` or `%` line ends only at a line break: a `;` inside it is comment text,
+    /// not a statement separator (spec §05).
+    #[test]
+    fn a_semicolon_inside_a_line_comment_is_comment_text() {
+        assert_eq!(
+            kinds("a = 1.0  # one; b = 2.0"),
+            vec![
+                TokenKind::Name("a".into()),
+                TokenKind::Assign,
+                TokenKind::Real(1.0),
+            ]
+        );
+        assert!(kinds("# one; two").is_empty());
+        assert!(
+            kinds(
+                "###
+one; two
+###
+x = 1"
+            )
+            .contains(&TokenKind::Name("x".into()))
+        );
+        assert!(
+            !kinds(
+                "###
+one; two
+###
+x = 1"
+            )
+            .contains(&TokenKind::Name("two".into()))
+        );
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_doc_line_is_doc_text() {
+        let got = docs("% doc; text\nx = 1");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lines, vec!["doc; text".to_string()]);
+        assert!(!kinds("% doc; text\nx = 1").contains(&TokenKind::Name("text".into())));
+        let got = docs("%md; text\nx = 1");
+        assert_eq!(got[0].tag.as_deref(), Some("md"), "{got:?}");
+        assert_eq!(got[0].lines, vec!["; text".to_string()], "{got:?}");
     }
 
     #[test]

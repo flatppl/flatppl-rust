@@ -12,7 +12,7 @@ pub(crate) fn skip_comment(bytes: &[u8], start: usize, end: usize) -> usize {
             .is_none_or(|b| matches!(b, b'\r' | b'\n'));
     let line_comment_end = || {
         (start..end)
-            .find(|&i| matches!(bytes[i], b';' | b'\r' | b'\n'))
+            .find(|&i| matches!(bytes[i], b'\r' | b'\n'))
             .unwrap_or(end)
     };
     if !fence_start {

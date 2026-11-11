@@ -608,8 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn signature_help_resumes_after_a_doc_comment_semicolon() {
-        let h = help("% doc; x = Normal(0, |").unwrap();
+    fn signature_help_reads_a_doc_comment_semicolon_as_text() {
+        // §05: a `%` line runs to the end of the line, so the call is doc text.
+        assert!(help("% doc; x = Normal(0, |").is_none());
+        let h = help("% doc; text\nx = Normal(0, |").unwrap();
         assert_eq!(h.signatures[0].active_parameter, Some(1));
     }
 
