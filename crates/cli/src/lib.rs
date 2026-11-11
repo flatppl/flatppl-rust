@@ -176,9 +176,8 @@ impl Format {
     /// How the leading generated-file banner is commented for this format.
     ///
     /// FlatPPL and FlatPIR both use a single line comment — `#` and `;`
-    /// respectively. (A `#` comment ends at the first `;` per spec §05, but the
-    /// banner text carries none, so a line comment is safe.) JSON has no comment
-    /// syntax, so it gets no banner.
+    /// respectively; each runs to the end of its line (spec §05). JSON has no
+    /// comment syntax, so it gets no banner.
     pub fn comment_style(self) -> CommentStyle {
         match self {
             Format::FlatPpl => CommentStyle::Line("#"),
@@ -883,6 +882,22 @@ mod tests {
         let twice = format_text(&once, flatppl_syntax::Syntax::Full).unwrap();
         assert_eq!(once, twice);
         assert!(once.contains("mu = 0.0"));
+    }
+
+    #[test]
+    fn format_text_keeps_a_doc_comment_with_a_semicolon() {
+        // §05: the whole `%` line is the doc-comment, so `;` and what follows stay
+        // doc text and survive formatting.
+        let src = "% scale; in metres\nx = 1.0\n";
+        let once = format_text(src, flatppl_syntax::Syntax::Full).unwrap();
+        assert!(once.contains("% scale; in metres"), "{once}");
+        assert_eq!(
+            format_text(&once, flatppl_syntax::Syntax::Full).unwrap(),
+            once
+        );
+        // A plain comment is dropped whole, and only `x` is bound.
+        let once = format_text("x = 1.0  # note; y = 2.0\n", flatppl_syntax::Syntax::Full).unwrap();
+        assert!(!once.contains('y'), "{once}");
     }
 
     #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]

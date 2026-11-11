@@ -15,9 +15,9 @@
 
 use crate::CommentStyle;
 
-/// The banner text (no comment prefix, no trailing newline). Contains no `;`, so
-/// it is safe as a single `#` line comment in FlatPPL (spec §05: a `#` comment
-/// ends at the first `;`).
+/// The banner text (no comment prefix, no trailing newline): one line, so it is a
+/// single `#` line comment in FlatPPL (spec §05: a `#` comment runs to the end of
+/// the line).
 const BANNER: &str = "AUTOMATICALLY GENERATED - do not edit";
 
 /// The leading generated-file banner for `style`, terminated by a blank line and
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn banner_is_a_single_prefixed_line() {
-        // FlatPPL: a `#` line comment (safe — the text carries no `;`).
+        // FlatPPL: one `#` line comment.
         let h = banner(CommentStyle::Line("#"));
         assert_eq!(h, "# AUTOMATICALLY GENERATED - do not edit\n\n");
 
