@@ -33,9 +33,7 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %31 = stablehlo.add %0, %1 : tensor<f32>
     %32 = chlo.lgamma %31 : tensor<f32> -> tensor<f32>
     %34 = stablehlo.constant dense<"0x00000040000040400000A040"> : tensor<3xf32>
-    %36 = stablehlo.constant dense<"0x1872313F6058E53F22339940"> : tensor<3xf32>
-    %37 = stablehlo.reduce(%36 init: %9) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %38 = stablehlo.negate %37 : tensor<f32>
+    %38 = stablehlo.constant dense<"0x7DB7E8C0"> : tensor<f32>
     %39 = stablehlo.log %arg1 : tensor<3xf32>
     %40 = stablehlo.multiply %34, %39 : tensor<3xf32>
     %41 = stablehlo.reduce(%40 init: %9) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>

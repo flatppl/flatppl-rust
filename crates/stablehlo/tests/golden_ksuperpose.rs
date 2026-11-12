@@ -149,7 +149,7 @@ fn the_mixture_emits_one_batched_density_reduced_by_logsumexp() {
 /// `subtract` — no `totalmass`, and the whole thing stays a closed-form scalar.
 #[test]
 fn the_normalizer_is_a_sum_reduce_over_the_weights() {
-    let normalized = emit_logdensity(NORMAL_MIXTURE_SRC);
+    let normalized = emit_logdensity(&format!("{NORMAL_MIXTURE_SRC}\ninputs = w\n"));
     let unnormalized = emit_logdensity(
         "flatppl_compat = \"0.1\"\n\
          w = [0.3, 1.2]\n\
@@ -157,6 +157,7 @@ fn the_normalizer_is_a_sum_reduce_over_the_weights() {
          sigmas = [1.0, 0.5]\n\
          mix = ksuperpose(Normal, w, mu = mus, sigma = sigmas)\n\
          lp = logdensityof(mix, 0.5)\n\
+         inputs = w\n\
          outputs = (lp)\n",
     );
     assert!(
@@ -279,8 +280,17 @@ fn empty_broadcasts_keep_zero_mass_and_empty_density_reductions() {
         // Empty sums return 0 and the empty logsumexp returns -infinity.
         assert!(hlo.contains("tensor<0xf32>"), "{hlo}");
         assert!(hlo.contains("dense<0xFF800000>"), "{hlo}");
+        let mass = hlo
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("return "))
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap();
         assert!(
-            hlo.contains("stablehlo.add across dimensions = [0]"),
+            hlo.contains(&format!(
+                "{mass} = stablehlo.constant dense<\"0x00000000\"> : tensor<f32>"
+            )),
             "{hlo}"
         );
     }

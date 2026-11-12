@@ -2280,6 +2280,11 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
+        if combine_op == "stablehlo.add"
+            && let Some(out) = self.fold_sum_axis(a, axis, result_ty.clone(), axes.clone())
+        {
+            return out;
+        }
         if self.restrict_enzyme_compatible
             && self.target == crate::Target::Cpu
             && combine_op == "stablehlo.multiply"

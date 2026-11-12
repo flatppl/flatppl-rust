@@ -395,6 +395,52 @@ impl Emitter<'_> {
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
 
+    /// Sum fixed cells in axis order, rounding each addition at target precision.
+    /// Bound reads as well as output storage; large views stay backend work.
+    pub(super) fn fold_sum_axis(
+        &mut self,
+        a: &Value,
+        axis: usize,
+        ty: MlirTy,
+        axes: Axes,
+    ) -> Option<Value> {
+        let source_count = element_count(&a.ty)?;
+        if source_count > MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        let count = element_count(&ty)?;
+        if count > MAX_FOLDED_ELEMENTS {
+            return None;
+        }
+        if source_count != 0 {
+            self.fixed_scalar_at(a, 0)?;
+        }
+        let width = usize::try_from((*shape(&a.ty).get(axis)?)?).ok()?;
+        let mut values = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut source = coordinates_of(&ty, i)?;
+            source.insert(axis, 0);
+            let mut total = match a.elem {
+                ElemKind::Real => Scalar::Real(0.),
+                ElemKind::Int => Scalar::Int(0),
+                ElemKind::Bool => return None,
+            };
+            for k in 0..width {
+                source[axis] = k;
+                let value = self.fixed_scalar_at(a, flat_index(&a.ty, &source)?)?;
+                total = self.rounded_constant(match (total, value) {
+                    (Scalar::Real(x), Scalar::Real(y)) => {
+                        Scalar::Real(real_binary("stablehlo.add", x, y, self.dtype)?)
+                    }
+                    (Scalar::Int(x), Scalar::Int(y)) => Scalar::Int(x.checked_add(y)?),
+                    _ => return None,
+                })?;
+            }
+            values.push(total);
+        }
+        self.folded_constant(values, ty, axes)
+    }
+
     pub(super) fn fold_binary(&mut self, op: &str, a: &Value, b: &Value) -> Option<Value> {
         let (Some(aa), Some(bb)) = (self.fixed_operand(a), self.fixed_operand(b)) else {
             return None;
@@ -732,13 +778,14 @@ fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {
 
 fn real_binary(op: &str, x: f64, y: f64, dtype: Dtype) -> Option<f64> {
     macro_rules! binary {
-        ($x:expr, $y:expr) => {{
+        ($x:expr, $y:expr, $pow:path) => {{
             let (x, y) = ($x, $y);
             match op {
                 "stablehlo.add" => x + y,
                 "stablehlo.subtract" => x - y,
                 "stablehlo.multiply" => x * y,
                 "stablehlo.divide" => x / y,
+                "stablehlo.power" => $pow(x, y),
                 // IEEE maximum/minimum order -0 below +0, unlike Rust's
                 // unspecified choice for equal zeros in max/min.
                 "stablehlo.maximum" if x == 0.0 && y == 0.0 => x + y,
@@ -750,14 +797,143 @@ fn real_binary(op: &str, x: f64, y: f64, dtype: Dtype) -> Option<f64> {
         }};
     }
     Some(match dtype {
-        Dtype::F32 => binary!(x as f32, y as f32) as f64,
-        Dtype::F64 => binary!(x, y),
+        Dtype::F32 => binary!(x as f32, y as f32, libm::powf) as f64,
+        Dtype::F64 => binary!(x, y, libm::pow),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_powers_and_axis_sums_preserve_cells_and_precision() {
+        let module = Module::new();
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let mut e = Emitter::new(&module, dtype);
+            let a = e
+                .folded_constant(
+                    [-1., -1., -1., 2., 2., 2.].map(Scalar::Real).to_vec(),
+                    MlirTy::Ranked(vec![Some(2), Some(3)]),
+                    Axes {
+                        batch: 1,
+                        layers: vec![1],
+                    },
+                )
+                .unwrap();
+            let b = e
+                .folded_constant(
+                    [0., 1., 2., 0., 1., 2.].map(Scalar::Real).to_vec(),
+                    a.ty.clone(),
+                    e.axes_of(&a),
+                )
+                .unwrap();
+            let powers = e.fold_binary("stablehlo.power", &a, &b).unwrap();
+            let sums = e.reduce_sum_last_axis(&powers);
+            assert_eq!(
+                e.fixed_operand(&sums).unwrap().as_ref(),
+                &[Scalar::Real(1.), Scalar::Real(7.)]
+            );
+            assert_eq!(
+                e.axes_of(&sums),
+                Axes {
+                    batch: 1,
+                    layers: vec![]
+                }
+            );
+            let a = e
+                .folded_constant(
+                    [16777216., 1., -16777216.].map(Scalar::Real).to_vec(),
+                    MlirTy::Ranked(vec![Some(3)]),
+                    Axes::default(),
+                )
+                .unwrap();
+            let sum = e.reduce_sum(&a);
+            assert_eq!(
+                e.constant_real(&sum),
+                Some(if matches!(dtype, Dtype::F32) { 0. } else { 1. })
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_sum_and_power_fallbacks_remain_runtime() {
+        let module = Module::new();
+        let mut e = Emitter::new(&module, Dtype::F32);
+        let unknown = Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Ranked(vec![Some(2)]),
+            elem: ElemKind::Real,
+        };
+        assert!(
+            e.fold_sum_axis(&unknown, 0, MlirTy::Scalar, Axes::default())
+                .is_none()
+        );
+        for values in [
+            vec![Scalar::Real(f64::from(f32::MAX)); 2],
+            vec![Scalar::Int(i64::from(i32::MAX)), Scalar::Int(1)],
+        ] {
+            let a = e
+                .folded_constant(values, unknown.ty.clone(), Axes::default())
+                .unwrap();
+            assert!(
+                e.fold_sum_axis(&a, 0, MlirTy::Scalar, Axes::default())
+                    .is_none()
+            );
+        }
+        let huge = e
+            .folded_constant(
+                vec![Scalar::Real(1.)],
+                MlirTy::Ranked(vec![Some(4097)]),
+                Axes::default(),
+            )
+            .unwrap();
+        assert!(
+            e.fold_sum_axis(&huge, 0, MlirTy::Scalar, Axes::default())
+                .is_none()
+        );
+        let a = e
+            .folded_constant(vec![Scalar::Real(-1.)], MlirTy::Scalar, Axes::default())
+            .unwrap();
+        let b = e
+            .folded_constant(vec![Scalar::Real(0.5)], MlirTy::Scalar, Axes::default())
+            .unwrap();
+        assert!(e.fold_binary("stablehlo.power", &a, &b).is_none());
+        let a = e
+            .folded_constant(vec![Scalar::Real(0.)], MlirTy::Scalar, Axes::default())
+            .unwrap();
+        let b = e
+            .folded_constant(vec![Scalar::Real(-1.)], MlirTy::Scalar, Axes::default())
+            .unwrap();
+        assert!(e.fold_binary("stablehlo.power", &a, &b).is_none());
+    }
+
+    #[test]
+    fn empty_axis_sum_bounds_output_storage() {
+        let module = Module::new();
+        let mut e = Emitter::new(&module, Dtype::F32);
+        for width in [2, 1000000000] {
+            let empty = Value {
+                ssa: "%empty".into(),
+                ty: MlirTy::Ranked(vec![Some(0), Some(width)]),
+                elem: ElemKind::Real,
+            };
+            let result = e.fold_sum_axis(
+                &empty,
+                0,
+                MlirTy::Ranked(vec![Some(width)]),
+                Axes::default(),
+            );
+            if width == 2 {
+                assert_eq!(
+                    e.fixed_operand(&result.unwrap()).unwrap().as_ref(),
+                    &[Scalar::Real(0.), Scalar::Real(0.)]
+                );
+            } else {
+                assert!(result.is_none());
+            }
+        }
+    }
 
     #[test]
     fn real_folds_read_broadcast_and_transpose_coordinates() {

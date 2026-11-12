@@ -144,9 +144,8 @@ fn iid_over_a_hep_member_emits_a_batched_density() {
         let src = format!(
             "hep = standard_module(\"particle-physics\", \"0.1\")\n\
              obs = [5.1, 5.15, 5.2, 5.22, 5.25]\n\
-             x = elementof(reals)\n\
              lp = logdensityof(iid(hep.{ctor}({args}), 5), obs)\n\
-             inputs = (x)\n\
+             inputs = (obs)\n\
              outputs = lp"
         );
         let mlir = emit(&src);
