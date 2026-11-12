@@ -743,14 +743,18 @@ fn emitter_compare_and_select_type_check() {
 fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     let m = Module::new();
     let mut e = unrestricted_emitter(&m, Dtype::F32);
-    let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
+    let v = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Ranked(vec![Some(3)]),
+        elem: ElemKind::Real,
+    };
     let s = e.reduce_sum(&v);
     assert_eq!(s.ty, MlirTy::Scalar);
 
     let mx = e.reduce_max(&v);
     assert_eq!(mx.ty, MlirTy::Scalar);
 
-    let out = e.finish("f", &[], &[&s, &mx]);
+    let out = e.finish("f", &[(v.ssa.clone(), v.ty.clone(), v.elem)], &[&s, &mx]);
     assert!(out.contains("stablehlo.reduce("));
     assert!(
         out.contains("applies stablehlo.add across dimensions"),
@@ -1131,10 +1135,22 @@ fn sum_over_int_array_reduces_with_int_init_and_result() {
     let total = call(&mut m, "sum", &[xs]);
 
     let mut e = unrestricted_emitter(&m, Dtype::F32);
+    e.bind(
+        e1,
+        Value {
+            ssa: "%arg0".into(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        },
+    );
     let result = e.lower_node(total).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
     assert_eq!(result.elem, ElemKind::Int);
-    let out = e.finish("f", &[], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".into(), MlirTy::Scalar, ElemKind::Int)],
+        &[&result],
+    );
     assert!(is_delimiter_balanced(&out));
 
     let reduce_line = out
@@ -6259,10 +6275,10 @@ fn emit_logdensity_multinomial_has_expected_structure() {
         "n (integer) / p must become scalar/vector func args, in:\n{out}"
     );
     assert_eq!(out.matches("chlo.lgamma").count(), 1);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
     assert_eq!(out.matches("= stablehlo.add ").count(), 3);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
-    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 0);
     assert!(
         !out.contains("stablehlo.cholesky")
             && !out.contains("triangular_solve")
@@ -12724,8 +12740,8 @@ fn constant_special_functions_fold_before_backend_compilation() {
     let out = emit_logdensity(&m);
     assert_eq!(
         out.matches("stablehlo.constant").count(),
-        2,
-        "only the folded vector and reduction identity remain:\n{out}"
+        1,
+        "only the folded scalar sum remains:\n{out}"
     );
     assert!(
         !out.contains("chlo.lgamma"),

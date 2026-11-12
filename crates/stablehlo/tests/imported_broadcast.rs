@@ -64,7 +64,7 @@ fn pyhf_helpers_keep_dots_only_for_bin_broadcast_products() {
     let prefix = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
                   theta = elementof(cartpow(reals, 2))\n\
                   inputs = theta\n";
-    // Per-row alphas broadcast over three bins in the three bin products.
+    // Per-row alphas broadcast over three bins; the fixed template product folds.
     let histosys = emit(
         &format!(
             "{prefix}a = addaxes([theta[1], theta[2]], 0, 1)\n\
@@ -77,7 +77,7 @@ fn pyhf_helpers_keep_dots_only_for_bin_broadcast_products() {
     );
     assert_eq!(
         histosys.matches("stablehlo.dot_general").count(),
-        3,
+        2,
         "{histosys}"
     );
     // One alpha per lane leaves no broadcast product.

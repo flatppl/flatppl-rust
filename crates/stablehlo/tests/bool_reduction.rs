@@ -138,8 +138,8 @@ fn counting_a_runtime_comparison_mask_lowers_to_an_integer_reduce() {
 #[test]
 fn real_and_integer_sums_emit_no_conversion() {
     let real = emit(
-        "v = [1.5, -0.5, 2.0]\nc = sum(v)\noutputs = (c)\n",
-        &["outputs"],
+        "v = [1.5, -0.5, 2.0]\nc = sum(v)\ninputs = v\noutputs = (c)\n",
+        &["inputs", "outputs"],
     );
     assert!(
         !real.contains("stablehlo.convert"),
@@ -151,7 +151,10 @@ fn real_and_integer_sums_emit_no_conversion() {
         "and keeps the float identity and f32 reduce:\n{real}"
     );
 
-    let int = emit("v = [1, 2, 3]\nc = sum(v)\noutputs = (c)\n", &["outputs"]);
+    let int = emit(
+        "v = [1, 2, 3]\nc = sum(v)\ninputs = v\noutputs = (c)\n",
+        &["inputs", "outputs"],
+    );
     assert!(
         !int.contains("stablehlo.convert"),
         "an integer sum was already at i32 and must not convert:\n{int}"
