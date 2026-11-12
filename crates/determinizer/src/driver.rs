@@ -730,6 +730,9 @@ pub(crate) fn substitute_in_tree(
 /// The arena is append-only: a `Call` whose children are unchanged is reused (no
 /// allocation), keeping the arena compact for simple rewrites. Only `Call` nodes
 /// carry children (see [`Node::for_each_child`]).
+/// Each original node is mapped once per invocation, preserving shared DAG
+/// structure. The predicate must return the same answer for a given node during
+/// that invocation; the cache is not shared across different substitutions.
 ///
 /// [`Inputs`](flatppl_core::Inputs) entries are `(Symbol, Ref)` leaves, NOT child
 /// sub-nodes, so this walk deliberately does not touch them — it clones them
@@ -743,22 +746,40 @@ pub(crate) fn map_tree(
     root: NodeId,
     f: &mut impl FnMut(&Module, NodeId) -> Option<NodeId>,
 ) -> NodeId {
+    map_tree_memoized(m, root, f, &mut std::collections::HashMap::new())
+}
+
+fn map_tree_memoized(
+    m: &mut Module,
+    root: NodeId,
+    f: &mut impl FnMut(&Module, NodeId) -> Option<NodeId>,
+    mapped: &mut std::collections::HashMap<NodeId, NodeId>,
+) -> NodeId {
+    if let Some(&result) = mapped.get(&root) {
+        return result;
+    }
     // Leaf replacement decided by the caller's predicate. A replaced node stands
     // in wholesale, so we do NOT descend into its (now-irrelevant) children.
     if let Some(replacement) = f(m, root) {
+        mapped.insert(root, replacement);
         return replacement;
     }
 
     // Collect children and map each; only `Call` nodes have any.
     let children: Vec<NodeId> = m.node(root).children();
-    let new_children: Vec<NodeId> = children.iter().map(|&c| map_tree(m, c, f)).collect();
+    let new_children: Vec<NodeId> = children
+        .iter()
+        .map(|&c| map_tree_memoized(m, c, f, mapped))
+        .collect();
 
     // If nothing changed, keep the original node.
-    if new_children == children {
-        return root;
-    }
-
-    rebuild_with_children(m, root, &new_children)
+    let result = if new_children == children {
+        root
+    } else {
+        rebuild_with_children(m, root, &new_children)
+    };
+    mapped.insert(root, result);
+    result
 }
 
 /// Rebuild the `Call` node at `id` with `new_children` standing in for its
@@ -1112,6 +1133,47 @@ pub(crate) fn referenced_binding_names(
 mod tests {
     use super::*;
     use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Ref, RefNs, Type};
+
+    #[test]
+    fn substitution_visits_shared_nodes_once() {
+        let mut m = Module::new();
+        let old = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        let replacement = m.alloc(Node::Lit(Scalar::Real(2.0)));
+        let add = m.intern("+");
+        let mut root = old;
+        for _ in 0..12 {
+            root = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(add),
+                args: vec![root, root].into(),
+                named: Box::new([]),
+                inputs: None,
+            }));
+        }
+        let mut visits = 0;
+        let mapped = map_tree(&mut m, root, &mut |_, id| {
+            visits += 1;
+            (id == old).then_some(replacement)
+        });
+        assert_eq!(visits, 13);
+        let mut node = mapped;
+        for _ in 0..12 {
+            let Node::Call(call) = m.node(node) else {
+                panic!("expected shared addition");
+            };
+            assert_eq!(call.args[0], call.args[1]);
+            node = call.args[0];
+        }
+        assert_eq!(node, replacement);
+        let mut unchanged_visits = 0;
+        assert_eq!(
+            map_tree(&mut m, root, &mut |_, _| {
+                unchanged_visits += 1;
+                None
+            }),
+            root
+        );
+        assert_eq!(unchanged_visits, 13);
+    }
 
     /// A `Measure`-typed constructor binding referenced ONLY through another
     /// binding's `functionof` / `kernelof` reification `Inputs` boundary entry
