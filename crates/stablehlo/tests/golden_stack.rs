@@ -293,8 +293,8 @@ outputs = (R, C)
 }
 
 /// §04 "Relationship to broadcasting"'s `B = addaxes(v, 0, 1)` feeding an
-/// elementwise product against a matrix — one `stablehlo.reshape` to `[3, 1]`,
-/// then §04's size-one axis expansion. The frozen golden is the EXECUTED
+/// elementwise product against a matrix, folded through the size-one axis
+/// expansion. The frozen golden is the EXECUTED
 /// artifact.
 #[test]
 fn addaxes_broadcast_matches_frozen_golden() {
@@ -326,6 +326,7 @@ b3 = [10.0, 100.0, 1000.0]
 b2 = [10.0, 100.0]
 np_style = A .* addaxes(b3, 1, 0)
 jl_style = A .* addaxes(b2, 0, 1)
+inputs = (A, b3, b2)
 outputs = (np_style, jl_style)
 ";
     let out = emit_logdensity(&determinize_src(src));
