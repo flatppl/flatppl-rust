@@ -3212,9 +3212,9 @@ fn lower_weighted(
         (c.args[0], c.args[1])
     };
     let parameters = crate::extras::bind_extras(m, node, w_node, 2, 1)?;
-    let inner_density =
+    let base_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
-    let (gate, inner_density, point) = split_support_gate(m, m_inner, v, inner_density);
+    let (gate, inner_density, point) = split_support_gate(m, m_inner, v, base_density);
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
     let w_scored = if !parameters.is_empty() || weight_is_variate_dependent(m, w_node) {
         let applied = build_callback_call(m, w_node, point, &parameters)?;
@@ -3225,6 +3225,8 @@ fn lower_weighted(
     // In a fixed-atom mixture, an absent component contributes zero for every
     // weight. Keep this guard within that proven reference: a density comparison
     // would introduce an implicit breakpoint in ordinary numerical normalizers.
+    // The component is absent where its whole base density is −∞, its support
+    // gate included, so the comparison reads the density before the gate is peeled.
     let positive = static_real(m, w_scored).is_some_and(|w| w > 0.0 && w.is_finite())
         || matches!(m.valueset_of(w_scored), Some(ValueSet::PosReals));
     let safe_weight = if atoms.is_empty() || positive {
@@ -3233,7 +3235,7 @@ fn lower_weighted(
         let inf = m.intern("inf");
         let inf = m.alloc(Node::Const(inf));
         let neg_inf = build_call(m, "neg", &[inf]);
-        let absent = build_call(m, "le", &[inner_density, neg_inf]);
+        let absent = build_call(m, "le", &[base_density, neg_inf]);
         let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
         build_call(m, "ifelse", &[absent, one, w_scored])
     };
