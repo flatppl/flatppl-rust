@@ -32,6 +32,19 @@ fn lower(src: &str) -> String {
     flatppl_syntax::print(&out)
 }
 
+#[test]
+fn nested_named_helpers_keep_their_own_local_boundaries() {
+    // The inner argument is 5, while the outer argument is 3: mu=2*5+3=13.
+    // The density at 12 is therefore -0.5*log(2*pi)-0.5.
+    let nested = lower(
+        "double(t) = 2.0 * t\n\
+         law(t) = Normal(double(t + 2.0) + t, 1.0)\n\
+         lp = logdensityof(law(3.0), 12.0)",
+    );
+    let direct = lower("lp = logdensityof(Normal(13.0, 1.0), 12.0)");
+    assert_eq!(nested, direct);
+}
+
 /// At s = 2 and x = [-1, 0, 1], the conditional log density is
 /// -3*log(2) - 1.5*log(2*pi) - 2/8 = -5.086257141293854,
 /// and its scale derivative is -1.25. The Exponential prior is not a factor.

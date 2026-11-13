@@ -33,6 +33,29 @@ fn emit_with_integrals(source: &str, mode: &Mode, numerical_integrals: bool) -> 
 }
 
 #[test]
+fn nested_gaussian_scale_helper_keeps_its_local_parameters() {
+    let prefix = "x = elementof(cartpow(reals, 3))\ninputs = x\n";
+    let nested = format!(
+        "{prefix}\
+         variance(dt, rate, diffusion) = diffusion^2 * (-expm1(-2 * rate * dt)) / (2 * rate)\n\
+         step(previous, dt, mean, rate, diffusion) = Normal(\
+             previous + (mean - previous) * (-expm1(-rate * dt)),\
+             sqrt(variance(dt, rate, diffusion)))\n\
+         outputs = logdensityof(step(0.3, 0.2, x[1], x[2], x[3]), 0.5)"
+    );
+    let direct = format!(
+        "{prefix}\
+         outputs = logdensityof(Normal(\
+             0.3 + (x[1] - 0.3) * (-expm1(-x[2] * 0.2)),\
+             sqrt(x[3]^2 * (-expm1(-2 * x[2] * 0.2)) / (2 * x[2]))), 0.5)"
+    );
+    assert_eq!(
+        emit(&nested, &Mode::LogDensity),
+        emit(&direct, &Mode::LogDensity)
+    );
+}
+
+#[test]
 fn scalar_density_broadcast_preserves_the_scalar_call_shape() {
     for operation in ["densityof", "logdensityof"] {
         let source = format!(
