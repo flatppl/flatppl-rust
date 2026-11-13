@@ -254,6 +254,11 @@ fn count_and_inverse_matrix_preparation_keep_the_scoring_abi()
     for source in [
         "p=elementof(stdsimplex(3))\ny=external(cartpow(cartpow(integers,3),17))\ninputs=(p,y)\noutputs=logdensityof(iid(Multinomial(10,p),17),y)",
         "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ny=external(cartpow(cartpow(interval(-100,100),[2,2]),17))\ninputs=(nu,scale,y)\noutputs=logdensityof(iid(InverseWishart(nu,scale),17),y)",
+        "a=elementof(posreals)\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),17))\ninputs=(a,b,y)\noutputs=logdensityof(iid(InverseGamma(a,b),17),y)",
+        "a=elementof(posreals)\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),17))\ninputs=(a,b,y)\noutputs=logdensityof(iid(Pareto(a,b),17),y)",
+        "a=elementof(posreals)\ny=external(cartpow(interval(0.1,10),17))\ninputs=(a,y)\noutputs=logdensityof(iid(Weibull(2.0,a),17),y)",
+        "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,17))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial(2.0,a),17),y)",
+        "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,17))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial2(a,2.0),17),y)",
     ] {
         let mut context = Context::default();
         let query = context.parse(source, None, None)?;

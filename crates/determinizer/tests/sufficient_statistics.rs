@@ -57,6 +57,13 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
         ("Normal(a,b)", "[-0.5,0.2,1.25]"),
         ("LogNormal(a,b)", "[0.1,1.0,2.0]"),
         ("Gamma(a,b)", "[0.1,1.0,2.0]"),
+        ("InverseGamma(a,b)", "[0.1,1.0,2.0]"),
+        ("Pareto(a,b)", "[0.1,1.0,2.0]"),
+        ("Weibull(2.0,b)", "[0.1,1.0,2.0]"),
+        ("NegativeBinomial(2.0,b)", "[0,1,3]"),
+        ("NegativeBinomial2(a,2.0)", "[0,1,3]"),
+        ("NegativeBinomial(1e8,b)", "[0,1,3]"),
+        ("NegativeBinomial2(a,1e8)", "[0,1,3]"),
         ("Beta(a,b)", "[0.1,0.4,0.8]"),
         ("Exponential(a)", "[0.0,0.2,3.0]"),
         ("Poisson(a)", "[0,2,3]"),
@@ -102,6 +109,48 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
 }
 
 #[test]
+fn large_dispersion_with_unbounded_counts_keeps_ordinary_scoring() {
+    for law in ["NegativeBinomial(1e6,a)", "NegativeBinomial2(a,1e6)"] {
+        let source = format!(
+            "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,3))\ninputs=(a,y)\noutputs=logdensityof(iid({law},3),y)"
+        );
+        assert_eq!(
+            flatppl_syntax::print(&lower(&source, true)),
+            flatppl_syntax::print(&lower(&source, false))
+        );
+        let raw = lower(&source, false);
+        assert!(prepare_likelihood(&raw, &["y".into()]).is_err());
+    }
+}
+
+#[test]
+fn fixed_shape_preparation_tracks_each_shape_and_keeps_live_shape_data() {
+    for (law, event) in [
+        ("Weibull(k,s)", "interval(0.1,10)"),
+        ("NegativeBinomial(k,s)", "nonnegintegers"),
+        ("NegativeBinomial2(s,k)", "nonnegintegers"),
+    ] {
+        let source = format!(
+            "k=elementof(interval(0.1,10))\ns=elementof(posreals)\ny=external(cartpow({event},4))\ninputs=(s,k,y)\noutputs=logdensityof(iid({law},4),y)"
+        );
+        let raw = lower(&source, false);
+        let prepared = prepare_likelihood(&raw, &["k".into(), "y".into()]).unwrap();
+        assert_eq!(inputs(&prepared.preparation), ["k", "y"]);
+        assert!(!inputs(&prepared.score).iter().any(|name| name == "y"));
+        let live = source.replace(
+            "outputs=",
+            "outputs=(logdensityof(iid(Normal(s,1.0),4),real.(y)),",
+        );
+        let live = format!("{live})");
+        let live = prepare_likelihood(&lower(&live, false), &["y".into()]).unwrap();
+        assert!(inputs(&live.score).iter().any(|name| name == "y"));
+    }
+    let source = "s=elementof(posreals)\ny=external(cartpow(interval(0.1,10),4))\ninputs=(s,y)\noutputs=(logdensityof(iid(Weibull(2.0,s),4),y),logdensityof(iid(Weibull(3.0,s),4),y))";
+    let two = prepare_likelihood(&lower(source, false), &["y".into()]).unwrap();
+    assert_eq!(two.summaries.len(), 9);
+}
+
+#[test]
 fn multivariate_guards_keep_unbounded_data_and_captured_scoring_inputs_live() {
     for (parameters, law, event) in [
         (
@@ -130,7 +179,7 @@ fn multivariate_guards_keep_unbounded_data_and_captured_scoring_inputs_live() {
 }
 
 #[test]
-fn runtime_qr_setup_requires_explicit_preparation() {
+fn runtime_setup_requires_explicit_preparation() {
     for (source, data) in [
         (
             "beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\nX=external(cartpow(interval(-100,100),[5,2]))\ny=external(cartpow(interval(-100,100),5))\ninputs=(beta,sigma,X,y)\noutputs=logdensityof(Normal.(X*beta,sigma),y)",
@@ -138,6 +187,26 @@ fn runtime_qr_setup_requires_explicit_preparation() {
         ),
         (
             "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ny=external(cartpow(cartpow(interval(-100,100),[2,2]),5))\ninputs=(nu,scale,y)\noutputs=logdensityof(iid(InverseWishart(nu,scale),5),y)",
+            vec!["y".into()],
+        ),
+        (
+            "a=elementof(posreals)\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),5))\ninputs=(a,b,y)\noutputs=logdensityof(iid(InverseGamma(a,b),5),y)",
+            vec!["y".into()],
+        ),
+        (
+            "a=elementof(posreals)\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),5))\ninputs=(a,b,y)\noutputs=logdensityof(iid(Pareto(a,b),5),y)",
+            vec!["y".into()],
+        ),
+        (
+            "a=elementof(posreals)\ny=external(cartpow(interval(0.1,10),5))\ninputs=(a,y)\noutputs=logdensityof(iid(Weibull(2.0,a),5),y)",
+            vec!["y".into()],
+        ),
+        (
+            "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,5))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial(2.0,a),5),y)",
+            vec!["y".into()],
+        ),
+        (
+            "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,5))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial2(a,2.0),5),y)",
             vec!["y".into()],
         ),
     ] {

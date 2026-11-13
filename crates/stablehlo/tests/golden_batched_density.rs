@@ -23,14 +23,27 @@ fn determinize_src(src: &str) -> Module {
         .filter(|d| d.severity == flatppl_infer::Severity::Error)
         .collect();
     assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
-    flatppl_determinizer::determinize(&m).expect("must determinize, not refuse")
+    flatppl_determinizer::determinize_with_options(
+        &m,
+        &Default::default(),
+        None,
+        &flatppl_determinizer::LoweringOptions {
+            disable_sufficient_statistics: true,
+            ..Default::default()
+        },
+    )
+    .expect("must determinize, not refuse")
 }
 
 fn emit(src: &str) -> String {
     flatppl_stablehlo::emit(
         &determinize_src(src),
         flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
+        &flatppl_stablehlo::EmitOptions {
+            // These tests exercise primitive batching before summary rewriting.
+            sufficient_statistics: false,
+            ..Default::default()
+        },
     )
     .expect("must emit @logdensity")
 }

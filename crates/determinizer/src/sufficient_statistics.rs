@@ -15,6 +15,7 @@ use crate::RefuseError;
 mod histogram;
 mod multivariate;
 mod regression;
+mod scalar;
 use crate::density::{build_call, build_record};
 
 const PREFIX: &str = "__likelihood_summary_";
@@ -522,6 +523,10 @@ impl Reducer {
     }
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        if let Some(result) = scalar::reduce(self, m, id) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
         if let Some(result) = regression::reduce(self, m, id) {
             self.count += 1;
             return Some(materialize(m, result));
