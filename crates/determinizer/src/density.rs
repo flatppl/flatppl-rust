@@ -618,12 +618,9 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
 /// [`graft_cross_module_target`] retains load-time assignments, collision
 /// checks and nested-ref handling.
 ///
-/// The application's arguments (`args` / `named` / reification `inputs`) are
-/// assumed host-local — only the callee is grafted — so they are carried over
-/// unchanged. That assumption is checked, not merely asserted: any `args` /
-/// `named` value that is itself (or resolves via a `(%ref self …)` alias chain to) a
-/// cross-module ref is refused (see below) rather than spliced unresolved into
-/// the rebuilt call.
+/// Direct imported arguments, including self-ref aliases, are grafted with the
+/// same import state before rebuilding the call. This keeps their load-time
+/// substitutions and instance identity intact during subsequent beta-reduction.
 ///
 /// The rebuilt call is returned to [`graft_query_target`], which wraps it in a
 /// fresh `logdensityof` for the driver to substitute for this query's target.
@@ -637,12 +634,8 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
 /// (same-module) ref — the existing same-module `reduce_kernel_application`
 /// handles that untouched (no regression).
 ///
-/// `Err` (refuse-don't-mislower): the callee is an unresolvable / colliding
-/// cross-module ref (or — downstream — grafts to a non-kernel) — the graft's own
-/// `Err` propagates; OR one of the application's `args`/`named` values is
-/// itself a cross-module ref (only the callee is grafted, so a cross-module
-/// argument would splice a dangling, unresolvable ref into the kernel body —
-/// a silent wrong density — rather than lower correctly).
+/// `Err`: a callee or imported argument cannot be grafted. Unresolved references
+/// must not be spliced into the rebuilt call.
 pub(crate) fn graft_kernel_application_callee(
     m: &mut Module,
     arg1: NodeId,
@@ -652,7 +645,7 @@ pub(crate) fn graft_kernel_application_callee(
     // The target may be inline (`logdensityof(m.k(input), pt)`) or bound by name
     // (`ka = m.k(input); logdensityof(ka, pt)`); resolve the alias chain to the call.
     let (call_node, _) = resolve_ref(m, arg1);
-    let (head, callee, mut args, named, inputs, arg_start) = {
+    let (head, callee, mut args, mut named, inputs, arg_start) = {
         let Node::Call(c) = m.node(call_node) else {
             return Ok(None);
         };
@@ -678,37 +671,6 @@ pub(crate) fn graft_kernel_application_callee(
     if !is_module_ref(m, callee) && !is_module_ref(m, callee_resolved) {
         return Ok(None);
     }
-    // Refuse-don't-mislower (CRITICAL): only the CALLEE is grafted below; the
-    // args / named values are carried over UNCHANGED into the rebuilt `%call`
-    // (see the doc comment above — they are assumed host-local). That
-    // assumption is false when an argument is itself — or resolves via one
-    // `(%ref self …)` hop to — a cross-module ref (`logdensityof(m.k(m.rec),
-    // pt)`): the raw unresolved `(%ref <alias> member)` would be spliced
-    // unchanged into the rebuilt call and, from there, into the grafted
-    // kernel body. `reduce_kernel_application` (structural) resolves only
-    // `SelfMod` refs, so it cannot see through a cross-module one — the
-    // dangling ref would survive lowering as a `Type::Failed("cross-module
-    // resolution")`-tagged node standing in for a resolved value, a SILENT
-    // WRONG DENSITY. Refuse instead; fully grafting a cross-module argument
-    // (rather than just the callee) is a richer follow-up, not required here.
-    let arg_is_cross_module =
-        |id: NodeId| is_module_ref(m, id) || is_module_ref(m, resolve_ref(m, id).0);
-    if let Some(&bad) = args[arg_start..].iter().find(|&&a| arg_is_cross_module(a)) {
-        return Err(refuse(
-            bad,
-            m,
-            "cross-module kernel application with a cross-module argument is not supported; \
-             refuse rather than mislower a dangling reference",
-        ));
-    }
-    if let Some(bad) = named.iter().find(|na| arg_is_cross_module(na.value)) {
-        return Err(refuse(
-            bad.value,
-            m,
-            "cross-module kernel application with a cross-module argument is not supported; \
-             refuse rather than mislower a dangling reference",
-        ));
-    }
     // A §09 STANDARD-module member application (`hep.CrystalBall(m0 = …, …)`) has
     // no submodule subtree in the bundle to graft: the member is a catalogue
     // entry. Decline, so the call reaches `split_kernel_constructor` as a
@@ -718,6 +680,17 @@ pub(crate) fn graft_kernel_application_callee(
         || crate::boxes::is_box_ref(m, callee)
     {
         return Ok(None);
+    }
+    // Import argument graphs before beta-reduction can substitute them into the
+    // callee's body. The shared graft state preserves separate load instances.
+    for arg in args[arg_start..]
+        .iter_mut()
+        .chain(named.iter_mut().map(|arg| &mut arg.value))
+    {
+        if is_module_ref(m, *arg) || is_module_ref(m, resolve_ref(m, *arg).0) {
+            *arg = graft_cross_module_target(m, *arg, bundle, imports)?
+                .ok_or_else(|| refuse(*arg, m, "cross-module argument could not be grafted"))?;
+        }
     }
     // Graft the cross-module callee into the host. `graft_cross_module_target`
     // returns `None` only for a same-module ref (excluded by the guard above), so

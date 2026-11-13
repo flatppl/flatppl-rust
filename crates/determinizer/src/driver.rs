@@ -115,8 +115,7 @@ pub fn determinize_with_options(
     // unused arguments may contain module refs that root-based DCE will drop.
     crate::stdfn::lower_std_module_functions(&mut work, options)?;
 
-    // Resolve root applications before measure lowering, preserving the existing
-    // callee-only graft and its cross-module argument checks.
+    // Resolve imported callees and arguments before measure lowering.
     let app_bindings: Vec<_> = work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
     let mut grafted_application = false;
     for (bid, rhs) in app_bindings {
