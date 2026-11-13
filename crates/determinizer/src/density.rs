@@ -1641,19 +1641,20 @@ fn refuse_boundary_named_query_point(
 /// because an emitted density references its parameters by name rather than inline. A
 /// reification's [`flatppl_core::Inputs`] boundary entries are inspected too — they are
 /// not `children()`, which is exactly why [`substitute_refs_by_name`] cannot rewrite
-/// them and why this check must see them. `visited` bounds the walk over shared DAG
-/// nodes and against a malformed reference cycle.
+/// them and why this check must see them. Local entries instead declare a nested
+/// callable's own placeholders: those shadow matching local targets, just as in
+/// [`crate::kernel::substitute_refs`]. Visiting by node and active scope preserves
+/// that distinction when the same helper is reached in several contexts.
 fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Option<Ref> {
     if targets.is_empty() {
         return None;
     }
-    let mut stack = vec![root];
-    let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    let mut visited_bindings: std::collections::HashSet<BindingId> =
-        std::collections::HashSet::new();
+    let mut scopes = vec![targets.to_vec()];
+    let mut stack = vec![(root, 0)];
+    let mut visited = std::collections::HashSet::new();
     let promoted = crate::canon::promoted_input_names(m);
-    while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
+    while let Some((id, scope)) = stack.pop() {
+        if !visited.insert((id, scope)) {
             continue;
         }
         // Only the selected object component contributes to the query point.
@@ -1661,21 +1662,20 @@ fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Op
         if let Some(value) = crate::canon::project_tuple(m, id, &promoted)
             .or_else(|| crate::canon::project(m, id, &promoted))
         {
-            stack.push(value);
+            stack.push((value, scope));
             continue;
         }
         match m.node(id) {
             Node::Ref(r) => {
-                if let Some(hit) = targets.iter().find(|t| t.ns == r.ns && t.name == r.name) {
+                if let Some(hit) = scopes[scope].iter().find(|t| **t == *r) {
                     return Some(*hit);
                 }
                 if r.ns == RefNs::SelfMod
                     && let Some(bid) = m.binding_by_name(r.name)
-                    && visited_bindings.insert(bid)
                 {
                     // A prior query pin must not hide a boundary dependency
                     // that reified-law substitution will recover.
-                    stack.push(m.declared_binding_rhs(bid));
+                    stack.push((m.declared_binding_rhs(bid), scope));
                 }
             }
             Node::Call(c) => {
@@ -1689,14 +1689,30 @@ fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Op
                         .collect(),
                     None => Vec::new(),
                 };
-                for e in entries {
-                    if let Some(hit) = targets.iter().find(|t| t.ns == e.ns && t.name == e.name) {
+                for e in &entries {
+                    if e.ns != RefNs::Local
+                        && let Some(hit) = scopes[scope].iter().find(|t| **t == *e)
+                    {
                         return Some(*hit);
                     }
                 }
-                m.for_each_child(id, |c| stack.push(c));
+                let active: Vec<_> = scopes[scope]
+                    .iter()
+                    .copied()
+                    .filter(|target| target.ns != RefNs::Local || !entries.contains(target))
+                    .collect();
+                if active.is_empty() {
+                    continue;
+                }
+                let child_scope = if let Some(existing) = scopes.iter().position(|s| *s == active) {
+                    existing
+                } else {
+                    scopes.push(active);
+                    scopes.len() - 1
+                };
+                m.for_each_child(id, |c| stack.push((c, child_scope)));
             }
-            _ => m.for_each_child(id, |c| stack.push(c)),
+            _ => m.for_each_child(id, |c| stack.push((c, scope))),
         }
     }
     None
