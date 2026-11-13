@@ -1,0 +1,29 @@
+%%%
+# Stiff ODE steps
+
+Dense finite-difference Jacobians are recomputed at each Newton iterate. The
+fixed iteration budget does not guarantee convergence; check residuals and
+refine the time grid for your problem.
+%%%
+flatppl_compat = "0.1"
+fd_increment(y) = 0.0001 .* max.(1.0, abs.(y))
+fd_column(unused, i, args) = (args[1](args[2], args[3] .+ args[4][i] .* eye(lengthof(args[3]))[:, i], args[5]) .- args[6]) ./ args[4][i]
+jacobian(f, t, y, p) = jacobian_from_base(f, t, y, p, f(t, y, p), fd_increment(y))
+jacobian_from_base(f, t, y, p, origin, increments) = transpose(rowstack(scan(fd_column, y .* 0.0, indicesof(y), (f, t, y, increments, p, origin))))
+time_derivative(f, t, y, p) = (f(t + 0.0001 * max(1.0, abs(t)), y, p) .- f(t, y, p)) ./ (0.0001 * max(1.0, abs(t)))
+newton_iteration(y, unused, args) = y .- linsolve(eye(lengthof(y)) .- args[4] .* jacobian(args[1], args[2], y, args[5]), y .- args[3] .- args[4] .* args[1](args[2], y, args[5]))
+newton(f, t, origin, factor, p) = scan(newton_iteration, origin, [1, 2, 3, 4, 5, 6, 7, 8], (f, t, origin, factor, p))[8]
+stage_gamma = 1 - 1 / sqrt(2)
+sdirk2_step(f, t, y, h, p) = sdirk2_second(f, t, y, h, p, newton(f, t + stage_gamma * h, y, stage_gamma * h, p))
+sdirk2_second(f, t, y, h, p, first) = newton(f, t + h, y .+ h * (1 - stage_gamma) .* f(t + stage_gamma * h, first, p), stage_gamma * h, p)
+rosenbrock23_step(f, t, y, h, p) = rosenbrock23_first(f, t, y, h, p, eye(lengthof(y)) .- h * stage_gamma .* jacobian(f, t, y, p), f(t, y, p), time_derivative(f, t, y, p))
+rosenbrock23_first(f, t, y, h, p, matrix, origin, dt) = rosenbrock23_second(f, t, y, h, p, matrix, linsolve(matrix, origin .+ h * stage_gamma .* dt))
+rosenbrock23_second(f, t, y, h, p, matrix, k1) = y .+ h .* (k1 .+ linsolve(matrix, f(t + h / 2, y .+ h / 2 .* k1, p) .- k1))
+sdirk2_residual(f, t, y, h, p, result) = sdirk2_residual_stages(f, t, y, h, p, result, newton(f, t + stage_gamma * h, y, stage_gamma * h, p))
+sdirk2_residual_stages(f, t, y, h, p, result, first) = record(first = first .- y .- stage_gamma * h .* f(t + stage_gamma * h, first, p), second = result .- y .- h * (1 - stage_gamma) .* f(t + stage_gamma * h, first, p) .- stage_gamma * h .* f(t + h, result, p))
+rate = elementof(reals)
+inputs = rate
+rhs(t, y, p) = p .* y
+advance(state, next_time, args) = record(y=args[2](args[1], state.t, state.y, next_time-state.t, args[3]), t=next_time)
+solve(step, f, initial, times, p) = scan(advance, record(y=initial, t=times[1]), times, (f, step, p)).y
+outputs = solve(sdirk2_step, rhs, [1.0], [0.0, 0.1, 0.2], rate)

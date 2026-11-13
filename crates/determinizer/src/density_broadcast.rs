@@ -70,19 +70,13 @@ enum Capture {
     Projection(NodeId),
 }
 
-/// Find the root reference of a field path through records.
-fn record_projection(m: &Module, id: NodeId) -> Option<Ref> {
+/// Find the root reference of a literal record or tuple projection path.
+fn capture_projection(m: &Module, id: NodeId) -> Option<Ref> {
     let call = expect_builtin_call(m, id, "get")?;
     let [source, field] = *call.args else {
         return None;
     };
-    let (resolved, _) = resolve_ref_chain(m, source);
-    if !matches!(m.node(field), Node::Lit(Scalar::Str(_)))
-        || !matches!(
-            m.type_of(source).or_else(|| m.type_of(resolved)),
-            Some(Type::Record(_))
-        )
-    {
+    if !matches!(m.node(field), Node::Lit(Scalar::Str(_) | Scalar::Int(_))) {
         return None;
     }
     match m.node(source) {
@@ -92,7 +86,7 @@ fn record_projection(m: &Module, id: NodeId) -> Option<Ref> {
                 ..
             },
         ) => Some(*reference),
-        _ => record_projection(m, source),
+        _ => capture_projection(m, source),
     }
 }
 
@@ -104,10 +98,9 @@ fn captures(m: &Module, root: NodeId, inputs: &[(Symbol, Ref)]) -> Vec<(Capture,
         if !seen.insert(id) {
             continue;
         }
-        // Arrays cannot contain records. Pass the used scalar/array field,
-        // rather than lifting its entire parameter record into vector(record).
-        // Fields of this density's cell inputs must still vary by cell.
-        if let Some(reference) = record_projection(m, id)
+        // Capture the used leaf rather than an enclosing record or tuple.
+        // Projections of the callback's own inputs must still vary per item.
+        if let Some(reference) = capture_projection(m, id)
             && !inputs.iter().any(|(_, r)| *r == reference)
             && !matches!(m.type_of(id), Some(Type::Record(_)))
         {
@@ -177,30 +170,53 @@ fn has_object(ty: &Type) -> bool {
     )
 }
 
+// The late fixpoint only needs callable-bearing tuples. Value-only tuples may
+// already be the packed captures produced by this pass and must not be
+// repeatedly re-specialized.
+fn has_callable(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(items) => items.iter().any(has_callable),
+        Type::Function { .. } | Type::Kernel { .. } => true,
+        _ => false,
+    }
+}
+
 /// Sequence callbacks receive objects at compile time. Specialize those objects
 /// into the body, then carry only their live value leaves through the loop.
 pub(crate) fn specialize_sequence_parameters(m: &mut Module) -> bool {
+    specialize_sequences(m, false)
+}
+
+pub(crate) fn specialize_callable_sequences(m: &mut Module) -> bool {
+    specialize_sequences(m, true)
+}
+
+fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
     fn walk(
         m: &mut Module,
         id: NodeId,
         memo: &mut std::collections::HashMap<NodeId, NodeId>,
+        callable_only: bool,
     ) -> NodeId {
         if let Some(&result) = memo.get(&id) {
             return result;
         }
         let children = m.node(id).children();
-        let mapped: Vec<_> = children.iter().map(|&child| walk(m, child, memo)).collect();
+        let mapped: Vec<_> = children
+            .iter()
+            .map(|&child| walk(m, child, memo, callable_only))
+            .collect();
         let current = if mapped == children {
             id
         } else {
             crate::driver::rebuild_with_children(m, id, &mapped)
         };
-        let result = specialize(m, current).unwrap_or(current);
+        let result = specialize(m, current, callable_only).unwrap_or(current);
         memo.insert(id, result);
         result
     }
 
-    fn specialize(m: &mut Module, id: NodeId) -> Option<NodeId> {
+    fn specialize(m: &mut Module, id: NodeId, callable_only: bool) -> Option<NodeId> {
         let Node::Call(call) = m.node(id) else {
             return None;
         };
@@ -221,7 +237,13 @@ pub(crate) fn specialize_sequence_parameters(m: &mut Module) -> bool {
         if !m
             .type_of(parameter)
             .or_else(|| m.type_of(resolved))
-            .is_some_and(has_object)
+            .is_some_and(|ty| {
+                if callable_only {
+                    has_callable(ty)
+                } else {
+                    has_object(ty)
+                }
+            })
         {
             return None;
         }
@@ -317,7 +339,7 @@ pub(crate) fn specialize_sequence_parameters(m: &mut Module) -> bool {
     let mut memo = std::collections::HashMap::new();
     let mut changed = false;
     for (bid, root) in bindings {
-        let mapped = walk(m, root, &mut memo);
+        let mapped = walk(m, root, &mut memo, callable_only);
         if mapped != root {
             m.set_binding_rhs(bid, mapped);
             changed = true;
