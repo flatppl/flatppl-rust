@@ -88,12 +88,12 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %88 = stablehlo.subtract %52, %76 : tensor<f32>
     %89 = stablehlo.add %88, %81 : tensor<f32>
     %90 = stablehlo.subtract %89, %87 : tensor<f32>
-    %91 = stablehlo.constant dense<1.0> : tensor<3xf32>
-    %92 = stablehlo.subtract %arg0, %91 : tensor<3xf32>
-    %93 = stablehlo.constant dense<"0x1002CEBFC81B9ABF187231BF"> : tensor<3xf32>
-    %94 = stablehlo.multiply %92, %93 : tensor<3xf32>
-    %95 = stablehlo.reduce(%94 init: %8) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %96 = stablehlo.subtract %95, %90 : tensor<f32>
-    return %96, %6 : tensor<f32>, tensor<i32>
+    %99 = stablehlo.constant dense<1.0> : tensor<3xf32>
+    %100 = stablehlo.subtract %arg0, %99 : tensor<3xf32>
+    %101 = stablehlo.constant dense<"0x1002CEBFC81B9ABF187231BF"> : tensor<3xf32>
+    %102 = stablehlo.multiply %100, %101 : tensor<3xf32>
+    %103 = stablehlo.reduce(%102 init: %8) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %104 = stablehlo.subtract %103, %90 : tensor<f32>
+    return %104, %6 : tensor<f32>, tensor<i32>
   }
 }

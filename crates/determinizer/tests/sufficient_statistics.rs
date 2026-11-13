@@ -102,6 +102,34 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
 }
 
 #[test]
+fn multivariate_guards_keep_unbounded_data_and_captured_scoring_inputs_live() {
+    for (parameters, law, event) in [
+        (
+            "mu=elementof(cartpow(reals,2))\ncov=elementof(cartpow(reals,[2,2]))\ninputs=(mu,cov,y)",
+            "MvNormal(mu,cov)",
+            "cartpow(reals,2)",
+        ),
+        (
+            "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ninputs=(nu,scale,y)",
+            "Wishart(nu,scale)",
+            "cartpow(reals,[2,2])",
+        ),
+    ] {
+        let source = format!(
+            "{parameters}\ny=external(cartpow({event},4))\noutputs=logdensityof(iid({law},4),y)"
+        );
+        assert_eq!(summary_count(&lower(&source, true)), 0, "{law}");
+    }
+    let source = "alpha=elementof(cartpow(posreals,2))\nshift=elementof(cartpow(reals,2))\ny=external(cartpow(cartpow(reals,2),4))\nf(v,s)=softmax(v+s)\nz=f.(y,[shift])\ninputs=(alpha,shift,y)\noutputs=logdensityof(iid(Dirichlet(alpha),4),z)";
+    assert_eq!(summary_count(&lower(source, true)), 0);
+    let pure = source.replace(
+        "f(v,s)=softmax(v+s)\nz=f.(y,[shift])",
+        "f(v)=softmax(v)\nz=f.(y)",
+    );
+    assert!(summary_count(&lower(&pure, true)) > 0);
+}
+
+#[test]
 fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_live() {
     let prefix = "a=elementof(reals)\ny=external(cartpow(reals,3))\ninputs=(a,y)\n";
     let one = lower(

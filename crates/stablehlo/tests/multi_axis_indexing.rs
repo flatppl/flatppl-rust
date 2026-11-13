@@ -49,6 +49,16 @@ fn row_index_vector_and_all_select_matrix_rows_in_order() {
 }
 
 #[test]
+fn selecting_outer_grid_axes_retains_matrix_cells() {
+    let source = "grid=external(cartpow(cartpow(reals,[2,2]),[3,2]))\nindex=external(integers)\ninputs=(grid,index)\noutputs=get(grid,all,1)";
+    let selected = emit(source).expect("outer selections preserve the event matrix");
+    assert!(selected.contains("-> tensor<3x2x2xf32>"), "{selected}");
+    let selected = emit(&source.replace("get(grid,all,1)", "get(grid,index,1)"))
+        .expect("a dynamic outer index selects one whole matrix");
+    assert!(selected.contains("tensor<2x2xf32>"), "{selected}");
+}
+
+#[test]
 fn rowstack_binding_is_indexed_as_a_flat_matrix() {
     let ir = emit(
         "flatppl_compat = \"0.1\"\n\
@@ -207,7 +217,7 @@ fn unsupported_advanced_selectors_refuse() {
          inputs = (a)\noutputs = (selected)\n",
     )
     .expect_err("nested array cells are not flat matrices");
-    assert!(nested.msg.contains("one flat numeric tensor cell"));
+    assert!(nested.msg.contains("every cell axis must be selected"));
 
     let batch_varying = emit(
         "flatppl_compat = \"0.1\"\n\

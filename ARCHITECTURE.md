@@ -208,6 +208,22 @@ Poisson moment expansions. A bounded empirical histogram also shares original
 primitive scores for repeated fixed scalar observations, including Categorical
 and StudentT. It preserves the observation array's promoted scalar type.
 
+Vector/matrix event rules cover MvNormal, Dirichlet and Wishart. MvNormal
+retains a centered, scaled residual factor computed by bounded-size QR blocks,
+plus the residual mean; no positive-definite scatter matrix is required.
+Dirichlet retains finite coordinate log sums, zero counts and the valid-row
+count. Wishart retains a matrix anchor, relative Cholesky log determinants and
+mean matrix corrections. Primitive anchors retain normalizers and parameter
+checks. Summaries may be scalars, vectors or matrices.
+
+MvNormal and Wishart require fixed finite observations or explicit finite
+runtime bounds, such as `cartpow(interval(-100, 100), d)` for a vector cell.
+Unbounded inputs retain ordinary scoring: compressed finite moments cannot
+reproduce every covariance-dependent IEEE infinity outcome. The finite bound
+must also fit both supported precisions. Near-singular covariance matrices can
+amplify float32 factorization errors; float64 or the reduction opt-out retains
+control over that tradeoff.
+
 Summary dependencies respect the explicit ABI: a promoted fixed input stays
 live. Ordinary emission preserves that ABI and computes runtime summaries on
 each call. Explicit preparation accepts selected data-input names and returns
@@ -220,8 +236,8 @@ same numeric precision.
 `LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
 `EmitOptions::sufficient_statistics` controls both shared lowering and the
 existing StableHLO fixed-data fallback. The CLI exposes
-`--sufficient-statistics=false` on both output commands. Multivariate moments,
-regression contractions, and arbitrary algebraic discovery are not yet rules
+`--sufficient-statistics=false` on both output commands. Regression contractions
+and arbitrary algebraic discovery are not yet rules
 of this pass. A future backend consumes the same reduced FlatPDL and does not
 need its own statistical discovery pass.
 

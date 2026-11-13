@@ -3362,7 +3362,12 @@ fn vector_set_membership(
     set: VectorSet,
     n_id: NodeId,
 ) -> Result<Value, EmitError> {
-    let len = match &v.ty {
+    let point_ty = if matches!(set, VectorSet::StdSimplex) {
+        e.cell_ty(v)
+    } else {
+        v.ty.clone()
+    };
+    let len = match &point_ty {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
         other => {
             return Err(EmitError::at(
@@ -3437,6 +3442,44 @@ fn vector_set_membership(
     let point_size = e.int_value_const(len as i64);
     let size_matches = e.compare("EQ", &declared_size, &point_size);
     Ok(e.and(&membership, &size_matches))
+}
+
+/// Simplex support of one vector cell, retaining independent batch axes.
+pub(crate) fn simplex_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: &Value,
+) -> Result<Value, EmitError> {
+    let MlirTy::Ranked(dims) = e.cell_ty(v) else {
+        return Err(EmitError::at(id, "simplex membership requires a vector"));
+    };
+    let [Some(n)] = dims.as_slice() else {
+        return Err(EmitError::at(
+            id,
+            "simplex membership requires a static vector",
+        ));
+    };
+    let zero = e.constant_like(0.0, v);
+    let nonnegative = e.compare("GE", v, &zero);
+    let nonnegative = e.reduce_boolean("stablehlo.and", "true", &nonnegative);
+    let total = e.reduce_sum(v);
+    let magnitude = e.abs(v);
+    let magnitude = e.reduce_sum(&magnitude);
+    let one = e.scalar(1.0);
+    let difference = e.sub(&total, &one);
+    let difference = e.abs(&difference);
+    let scale = e.max(&magnitude, &one);
+    let epsilon = match e.dtype() {
+        crate::Dtype::F32 => f64::from(f32::EPSILON),
+        crate::Dtype::F64 => f64::EPSILON,
+    };
+    let rounding = e.scalar(8.0 * *n as f64 * epsilon);
+    let tolerance = e.mul(&rounding, &scale);
+    let near = e.compare("LE", &difference, &tolerance);
+    let infinity = e.scalar(f64::INFINITY);
+    let finite = e.compare("LT", &scale, &infinity);
+    let valid = e.and(&near, &finite);
+    Ok(e.and(&valid, &nonnegative))
 }
 
 /// The membership predicate for one [`ElemSet`], elementwise at `v`'s shape.
