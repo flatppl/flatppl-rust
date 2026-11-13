@@ -1421,6 +1421,20 @@ fn callback_arity_check(
     // The operation supplies `callback_lead` inputs itself, and each additional
     // argument binds one more.
     let expected = head.callback_lead + args.len().saturating_sub(head.lead);
+    // A one-argument application such as `f(x)` is an ordinary call, so the §04
+    // calling conventions decide whether `x` binds whole or splats.
+    if expected == 1
+        && let Some(argument) = lone_callback_argument(op, args)
+    {
+        let resolved = resolve_binding_refs(inf, callback.0);
+        if let Node::Const(name) = inf.module.node(resolved) {
+            let name = inf.module.resolve(*name).to_string();
+            return arity_check(inf, id, &name, &[argument], &[]);
+        }
+        if crate::callable::interface(inf, callback.0).is_some() {
+            return user_arity_check(inf, id, callback.0, &[argument], &[]);
+        }
+    }
     let count = match &callback.1 {
         Type::Function { inputs } | Type::Kernel { inputs, .. } => Some(inputs.len()),
         _ => {
@@ -1445,6 +1459,29 @@ fn callback_arity_check(
         "`{op}` calls its callback with {expected} whole argument(s), but the callback declares {count}"
     )));
     Some(Type::Failed("callback arity mismatch".into()))
+}
+
+/// The value a one-argument callback application receives (§04 "Explicit callback
+/// parameters"): the whole variate of `weighted`, `logweighted` and `pushfwd`, each
+/// element or row of `filter`'s data, and `markovchain`'s state. The state of an
+/// undecided type defers the check.
+fn lone_callback_argument(op: &str, args: &[ArgInfo]) -> Option<ArgInfo> {
+    let (node, ty, phase) = args.get(1)?;
+    match op {
+        "weighted" | "logweighted" | "pushfwd" => {
+            let variate = match ty {
+                Type::Measure { domain, .. } => (**domain).clone(),
+                _ => Type::Deferred,
+            };
+            Some((*node, variate, *phase))
+        }
+        "filter" => {
+            let item = sequence_item(&args[1]).map_or(Type::Deferred, |(_, (_, item, _))| item);
+            Some((*node, item, *phase))
+        }
+        "markovchain" => Some((*node, ty.clone(), *phase)),
+        _ => None,
+    }
 }
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
