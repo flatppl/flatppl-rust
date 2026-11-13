@@ -47,6 +47,18 @@ fn lower_and_emit(src: &str) -> Result<String, String> {
 }
 
 #[test]
+fn rowstack_of_callable_scan_selects_a_matrix_column() {
+    let src = include_str!("fixtures/callable_newton_scan.flatppl")
+        .replace("outputs = solve(", "trajectory = solve(")
+        + "\noutputs = rowstack(trajectory)[:, 1]\n";
+    // §07 rowstack turns the nested scan vectors into one 3-by-1 matrix;
+    // selecting its only column must preserve all three trajectory entries.
+    let ir = lower_and_emit(&src).expect("select the stacked scan column");
+    assert!(ir.contains("[0:3, 0:1]"), "{ir}");
+    assert!(ir.contains("-> tensor<3xf32>"), "{ir}");
+}
+
+#[test]
 fn value_only_tuple_with_two_live_leaves_terminates() {
     let src = "x=elementof(cartpow(reals,2))\n\
         step(a,i,p)=a+i*p[1]+p[2]\n\

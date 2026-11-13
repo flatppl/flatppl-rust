@@ -1139,7 +1139,7 @@ fn lower_array(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
 /// Lower §07 "Array and table operations"'s `rowstack(vs)` / `colstack(vs)`,
 /// whose argument is "a vector of vectors, all of the same length".
 ///
-/// **`rowstack` emits nothing**, and that is the substantive point. §03
+/// **`rowstack` preserves the physical layout.** §03
 /// "Arrays" keeps a vector-of-vectors distinct from a matrix — "Vectors of
 /// vectors are not interpreted as matrices implicitly, but can be turned into
 /// matrices explicitly using `rowstack` or `colstack`" — but the distinction is
@@ -1149,9 +1149,9 @@ fn lower_array(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
 /// `[n, m]` tensor whose row `i` is `vs[i]`. The outer axis leads in both
 /// producers — `Emitter::vector` concatenates along dim 0, and
 /// `types::flatten_elem` appends the inner dims after the outer for an ABI
-/// input — so §07's row order is already the one emitted and the operand's
-/// `Value` passes straight through. Emitting a rank-2 identity
-/// `stablehlo.transpose … dims = [0, 1]` would be pure noise.
+/// input — so §07's row order is already the one emitted. A no-copy semantic
+/// view establishes one matrix cell when the operand retains nested vector
+/// layers; its identity reshape is removed by backend canonicalization.
 ///
 /// **`colstack` is that matrix transposed**, one `stablehlo.transpose … dims =
 /// [1, 0]`. §07's own worked example is the check: `colstack([[1, 2, 3], [4, 5,
@@ -1213,7 +1213,18 @@ fn lower_stack(
         ));
     }
     Ok(match kind {
-        Stack::Rows => vs,
+        Stack::Rows => {
+            // Keep the matrix boundary explicit even for folded constants or
+            // callable scans whose nested element type remains deferred.
+            let batch = e.batch_rank(&vs);
+            e.axes_view(
+                &vs,
+                Axes {
+                    batch,
+                    layers: vec![2],
+                },
+            )
+        }
         Stack::Cols => {
             let batch = e.batch_rank(&vs);
             let perm: Vec<_> = (0..batch as u64)
