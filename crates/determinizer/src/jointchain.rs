@@ -602,6 +602,11 @@ fn sample_component(
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     let (value, next) = crate::sample::lower_closed_measure_sample(m, measure, rng)?;
+    Ok((bind_draw(m, value), next))
+}
+
+/// Bind a draw to a fresh synthetic binding and return a reference to it.
+fn bind_draw(m: &mut Module, value: NodeId) -> NodeId {
     let mut index = 0usize;
     let name = loop {
         let name = m.intern(&format!("__jointchain_{index}"));
@@ -617,11 +622,10 @@ fn sample_component(
         public: false,
         synthetic: true,
     });
-    let reference = m.alloc(Node::Ref(flatppl_core::Ref {
+    m.alloc(Node::Ref(flatppl_core::Ref {
         ns: flatppl_core::RefNs::SelfMod,
         name,
-    }));
-    Ok((reference, next))
+    }))
 }
 
 fn sample_keyword_family(
@@ -731,4 +735,176 @@ fn sample_scalar_family(
         cur = next;
     }
     Ok((build_call(m, "cat", &env), cur))
+}
+
+/// `iid(jointchain(M, K₁, …), n)`: `n` independent chains, sampled one component at
+/// a time across all lanes. §06 gives `iid(J, n)` the product `J^⊗n`, and a lane's
+/// `J` integrates `K(a, ·)` over `M`, so the product is `jointchain(iid(M, n), a⃗ ->
+/// ⊗ᵢ K(aᵢ))`: the base drawn once per lane, then each kernel applied lane by lane to
+/// the variates to its left. Each component is one batched draw over the lanes, and
+/// the key advances once per component field.
+///
+/// Every component must be a scalar law per lane, or a keyword `joint` of scalar laws
+/// in the record form. The variate is an `n`-row table for the record and keyword
+/// forms, and an `n × k` matrix for `k` scalar components (§06 `iid`).
+pub(crate) fn lower_iid_jointchain_sample(
+    m: &mut Module,
+    chain: NodeId,
+    n: usize,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (components, record) = match keyword_components(m, chain) {
+        Some(components) => (
+            components
+                .into_iter()
+                .map(|(label, component)| (Some(label), component))
+                .collect::<Vec<_>>(),
+            true,
+        ),
+        None => {
+            let c = expect_builtin_call(m, chain, "jointchain")
+                .ok_or_else(|| refuse_jc(chain, "expected jointchain"))?;
+            if !c.named.is_empty() || c.args.len() < 2 {
+                return Err(refuse_jc(
+                    chain,
+                    "iid of a jointchain needs a base and kernels, all positional or all named",
+                ));
+            }
+            let args: Vec<_> = c.args.iter().map(|&arg| (None, arg)).collect();
+            let record = record_fields(m, args[0].1).is_some();
+            (args, record)
+        }
+    };
+    let mut columns: Vec<(Option<Symbol>, NodeId)> = Vec::new();
+    let mut cur = rng;
+    for (i, &(label, component)) in components.iter().enumerate() {
+        if i == 0 {
+            for (field, law) in lane_laws(m, chain, label, record, component)? {
+                let size = m.alloc(Node::Lit(Scalar::Int(n as i64)));
+                let iid = build_call(m, "iid", &[law, size]);
+                let (value, next) = crate::sample::lower_closed_measure_sample(m, iid, cur)?;
+                columns.push((field, lane_column(m, chain, law, value, n)?));
+                cur = next;
+            }
+            continue;
+        }
+        let sources: Vec<NodeId> = columns.iter().map(|&(_, column)| column).collect();
+        let lanes = crate::sample::Lanes::over(m, &sources)?;
+        let prior = if record {
+            let fields: Vec<_> = columns
+                .iter()
+                .zip(&lanes.points)
+                .map(|(&(field, _), &point)| (field.expect("a record lane names its field"), point))
+                .collect();
+            build_record(m, &fields)
+        } else if let [point] = lanes.points[..] {
+            point
+        } else {
+            build_call(m, "vector", &lanes.points)
+        };
+        let measure = apply_step(m, chain, component, prior)?;
+        for (field, law) in lane_laws(m, chain, label, record, measure)? {
+            let (value, next) = lanes.sample(m, law, cur)?;
+            columns.push((field, lane_column(m, chain, law, value, n)?));
+            cur = next;
+        }
+    }
+    let value = if record {
+        let mut fields = Vec::with_capacity(columns.len());
+        for (field, column) in columns {
+            let name = field.expect("a record lane names its field");
+            if fields
+                .iter()
+                .any(|f: &flatppl_core::NamedArg| f.name == name)
+            {
+                return Err(refuse_jc(
+                    chain,
+                    "jointchain record components have duplicate fields",
+                ));
+            }
+            fields.push(flatppl_core::NamedArg {
+                kind: NamedKind::Field,
+                name,
+                value: column,
+            });
+        }
+        let head = CallHead::Builtin(m.intern("table"));
+        m.alloc(Node::Call(Call {
+            head,
+            args: Box::default(),
+            named: fields.into(),
+            inputs: None,
+        }))
+    } else {
+        let cells: Vec<NodeId> = columns.into_iter().map(|(_, column)| column).collect();
+        let vectors = build_call(m, "vector", &cells);
+        build_call(m, "colstack", &[vectors])
+    };
+    Ok((value, cur))
+}
+
+/// The scalar lane laws of one chain component: the component itself (labelled in
+/// the keyword form), or the fields of a keyword `joint` in the record form.
+fn lane_laws(
+    m: &mut Module,
+    chain: NodeId,
+    label: Option<Symbol>,
+    record: bool,
+    measure: NodeId,
+) -> Result<Vec<(Option<Symbol>, NodeId)>, RefuseError> {
+    let mut measure = resolve_ref_chain(m, measure).0;
+    while let Some(body) = crate::kernel::reduce_kernel_application(m, measure) {
+        measure = resolve_ref_chain(m, body).0;
+    }
+    if label.is_some() || !record {
+        return Ok(vec![(label, measure)]);
+    }
+    match expect_builtin_call(m, measure, "joint") {
+        Some(c) if c.args.is_empty() && !c.named.is_empty() => {
+            Ok(c.named.iter().map(|f| (Some(f.name), f.value)).collect())
+        }
+        _ => Err(refuse_jc(
+            chain,
+            "iid of a record jointchain samples a keyword joint of scalar laws per lane",
+        )),
+    }
+}
+
+/// Bind one component's lane draws, an `n`-vector, so every later reader shares the
+/// draw, typed so the next component can broadcast over its cells.
+fn lane_column(
+    m: &mut Module,
+    chain: NodeId,
+    law: NodeId,
+    value: NodeId,
+    n: usize,
+) -> Result<NodeId, RefuseError> {
+    let law = resolve_ref_chain(m, law).0;
+    let ty = m
+        .type_of(law)
+        .cloned()
+        .or_else(|| flatppl_infer::infer_expression(m, law, &[]).0.remove(&law));
+    let Some(Type::Measure { domain, .. }) = ty else {
+        return Err(refuse_jc(
+            chain,
+            "iid of a jointchain component has no law type",
+        ));
+    };
+    if !matches!(domain.as_ref(), Type::Scalar(_)) {
+        return Err(refuse_jc(
+            chain,
+            "iid of a jointchain samples only scalar laws per lane",
+        ));
+    }
+    let n =
+        u32::try_from(n).map_err(|_| refuse_jc(chain, "iid of a jointchain has too many lanes"))?;
+    let column = bind_draw(m, value);
+    m.set_type(
+        column,
+        Type::Array {
+            shape: Box::new([flatppl_core::Dim::Static(n)]),
+            elem: domain,
+        },
+    );
+    Ok(column)
 }

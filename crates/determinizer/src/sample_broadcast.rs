@@ -89,6 +89,44 @@ struct Scope {
     rank: usize,
 }
 
+/// The lanes of equal-length columns: one cell placeholder per column, standing
+/// for that column's value in the lane. A scalar law built over the placeholders
+/// samples once per lane, independently, in one batched draw (§04 broadcasting).
+pub(crate) struct Lanes {
+    scope: Scope,
+    /// The placeholders, in column order. A table column gives a record point.
+    pub(crate) points: Vec<NodeId>,
+}
+
+impl Lanes {
+    pub(crate) fn over(m: &mut Module, columns: &[NodeId]) -> Result<Self, RefuseError> {
+        let mut inputs = Vec::new();
+        let mut actuals = Vec::new();
+        let points = columns
+            .iter()
+            .map(|&column| cell_input(m, column, &mut inputs, &mut actuals))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            scope: Scope {
+                inputs,
+                actuals,
+                rank: 1,
+            },
+            points,
+        })
+    }
+
+    /// Draw `law`, a scalar law over [`Self::points`], once per lane.
+    pub(crate) fn sample(
+        &self,
+        m: &mut Module,
+        law: NodeId,
+        rng: NodeId,
+    ) -> Result<(NodeId, NodeId), RefuseError> {
+        self.scope.sample(m, law, rng, None)
+    }
+}
+
 impl Scope {
     fn map(&self, m: &mut Module, body: NodeId) -> NodeId {
         map_body(

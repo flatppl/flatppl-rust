@@ -228,14 +228,64 @@ fn refusal(src: &str) -> String {
     determinize(&m).expect_err("must refuse").reason
 }
 
+/// The fields of the table an `iid` of a record chain samples to.
+fn table_fields(m: &Module, name: &str) -> Vec<String> {
+    let table = builtin(m, resolve(m, rhs(m, name)), "table").expect("a table variate");
+    table
+        .named
+        .iter()
+        .map(|n| m.resolve(n.name).to_string())
+        .collect()
+}
+
+/// §06 `iid(jointchain(M, K), n)` is `jointchain(iid(M, n), a -> K.(a))`: the base
+/// is drawn for every lane at once, then the kernel once per lane in one batched
+/// draw. Two draws on one key chain, whatever `n` is.
 #[test]
-fn iid_of_a_chain_refuses_accurately() {
-    let reason = refusal(&format!(
+fn iid_of_a_record_chain_draws_each_component_once_for_every_lane() {
+    let (m, pir) = determinized(&format!(
         "{SEED}prior = jointchain(joint(a = Gamma(2.0, 1.0)), r -> joint(b = Normal(0.0, sqrt(r.a))))\n\
          draws = rand(iid(prior, 3), seed)\n"
     ));
-    assert!(reason.contains("iid of a jointchain"), "{reason}");
-    assert!(!reason.contains("statically-resolved shape"), "{reason}");
+    let chain = key_chain(&m, "draws");
+    assert_eq!(chain.len(), 2, "{chain:?}");
+    assert!(
+        chain[0].0.contains("Gamma") && chain[1].0.contains("Normal"),
+        "{chain:?}"
+    );
+    assert_eq!(table_fields(&m, "draws"), ["a", "b"]);
+    assert!(!pir.contains("(jointchain "), "{pir}");
+}
+
+#[test]
+fn iid_of_a_keyword_chain_samples_to_a_table_of_its_labels() {
+    let (m, _) = determinized(&format!(
+        "{SEED}prior = jointchain(a = Gamma(2.0, 1.0), b = r -> Normal(0.0, sqrt(r.a)), \
+         c = r -> Normal(r.b, r.a))\n\
+         draws = rand(iid(prior, 4), seed)\n"
+    ));
+    assert_eq!(key_chain(&m, "draws").len(), 3);
+    assert_eq!(table_fields(&m, "draws"), ["a", "b", "c"]);
+}
+
+/// Positional scalar components give an `n × k` matrix, one row per chain.
+#[test]
+fn iid_of_a_scalar_chain_samples_to_a_matrix_of_rows() {
+    let (m, _) = determinized(&format!(
+        "{SEED}prior = jointchain(Gamma(2.0, 1.0), x -> Normal(0.0, sqrt(x)))\n\
+         draws = rand(iid(prior, 5), seed)\n"
+    ));
+    assert_eq!(key_chain(&m, "draws").len(), 2);
+    assert!(builtin(&m, resolve(&m, rhs(&m, "draws")), "colstack").is_some());
+}
+
+#[test]
+fn iid_of_a_chain_with_a_vector_lane_refuses_accurately() {
+    let reason = refusal(&format!(
+        "{SEED}prior = jointchain(joint(v = Dirichlet([2.0, 3.0, 5.0])), r -> joint(y = Normal(0.0, r.v[1])))\n\
+         draws = rand(iid(prior, 3), seed)\n"
+    ));
+    assert!(reason.contains("scalar laws per lane"), "{reason}");
 }
 
 #[test]
