@@ -400,3 +400,15 @@ d ~ Normal.(v, 1.0)
         "a distribution broadcast is unaffected"
     );
 }
+
+#[test]
+fn broadcast_get_infers_one_selected_vector_per_matrix() {
+    let line = bind_line(
+        "x = rowstack([[1, 2], [3, 4], [5, 6]])\ny = get.(fill(x, 2), all, [1, 2])",
+        "y",
+    );
+    assert!(
+        line.contains("(%array 1 (2) (%array 1 (3) (%scalar integer)))"),
+        "{line}"
+    );
+}

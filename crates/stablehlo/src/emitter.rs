@@ -4554,7 +4554,16 @@ impl<'m> Emitter<'m> {
         } else {
             &args[1..]
         };
-        if fname == "builtin_logdensityof" {
+        if matches!(fname.as_str(), "get" | "get0") && rest.len() > 2 {
+            // Multi-axis selection consumes each matrix cell, not the outer
+            // collection of matrices. `all` and `only` are selector markers.
+            let operands: Vec<_> = rest.iter().copied().filter(|&node| {
+                !matches!(self.m.node(node), Node::Const(s) if matches!(self.m.resolve(*s), "all" | "only"))
+            }).collect();
+            self.lower_broadcast_cells(id, &operands, |e, _| {
+                crate::ops::lower_builtin(e, id, &fname, rest)
+            })
+        } else if fname == "builtin_logdensityof" {
             // Batched density: `Params::field_id` reads the batched
             // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
             // builder auto-broadcasts over the rank-1 variate → a rank-1

@@ -5290,6 +5290,13 @@ fn lower_pushfwd(
     let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, &parameter, "f_inv")?;
     // Applying f_inv rebuilt the point without a type, and a multi-axis base reads it.
     crate::kernel::annotate_rebuilt(m, preimage);
+    // The inverse has the base variate's shape, even off the integer lattice;
+    // retain real leaves so an off-support point is not coerced to an integer.
+    if m.type_of(preimage).is_none()
+        && let Some(shape) = numeric_array_shape(&domain)
+    {
+        m.set_type(preimage, shape);
+    }
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
@@ -5351,22 +5358,43 @@ fn lower_pushfwd(
     }
 }
 
-/// The preimage SNAPPED to the integer lattice — `round(x)`, cell-wise over a vector
-/// variate (§07 `round`: "nearest integer, half to even").
-///
-/// A discrete base's pmf is nonzero only at integers, and the preimage of an ATOM of
-/// the pushforward need not be exactly one in floating point: `pushfwd(sqrt,
-/// Poisson(3))` at the atom `√2` has preimage `2.0000000000000004`, where the pmf is 0
-/// and the density read as −∞ instead of `logpmf(2, 3)`. The `exp` spelling agreed with
-/// the truth only by float luck (`log(e²)` is exactly `2.0`), so this is not
-/// `sqrt`-specific and must not be fixed per operator. Snapping restores the atom;
-/// [`on_lattice`] is what keeps a genuinely off-lattice query at −∞.
-///
-/// Wrapped in §07 `real` ("returns `x` for real `x`") because `round` types as
-/// `integers`, and an integer-typed operand under the forward would let a backend
-/// materialise `exp(round(x))` in integer arithmetic — truncating the atom's image and
-/// failing [`on_lattice`] for a point that IS an atom. The wrapper is value-identity.
+/// Preserve collection shape while allowing an off-lattice real preimage.
+fn numeric_array_shape(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Array { shape, elem } => Some(Type::Array {
+            shape: shape.clone(),
+            elem: Box::new(match elem.as_ref() {
+                Type::Scalar(ScalarType::Integer | ScalarType::Real) => {
+                    Type::Scalar(ScalarType::Real)
+                }
+                inner => numeric_array_shape(inner)?,
+            }),
+        }),
+        _ => None,
+    }
+}
+
+/// Snap each preimage coordinate to the integer lattice before scoring. A
+/// pushforward atom's inverse can be off by a rounding error; `on_lattice`
+/// checks the forward round trip so an actual off-lattice point still has zero
+/// mass. Convert the rounded values to real so the forward map is evaluated in
+/// real arithmetic rather than truncated integer arithmetic.
 fn snap_to_lattice(m: &mut Module, x: NodeId, domain: &Type) -> NodeId {
+    // Scalar rounding must descend through every nested collection layer.
+    if let Type::Array { elem, .. } = domain
+        && matches!(elem.as_ref(), Type::Array { .. })
+    {
+        let (label, reference, point) = broadcast::placeholder(m, *elem.clone());
+        let body = snap_to_lattice(m, point, elem);
+        let head = CallHead::Builtin(m.intern("functionof"));
+        let f = m.alloc(Node::Call(Call {
+            head,
+            args: vec![body].into(),
+            named: Box::new([]),
+            inputs: Some(Inputs::Spec(vec![(label, reference)].into())),
+        }));
+        return build_call(m, "broadcast", &[f, x]);
+    }
     // Over a vector variate `round` and `real` are scalar functions, so they apply per cell.
     if variate_is_vector(domain) {
         let round = m.intern("round");
