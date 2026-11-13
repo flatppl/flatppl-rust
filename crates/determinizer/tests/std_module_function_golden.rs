@@ -291,7 +291,6 @@ fn a_member_without_a_base_op_form_stays_a_call() {
             "sp",
             "bessel_j",
         ),
-        (HEP, "hep.wignerd(1, 0, 0, 0.3)", "hep", "wignerd"),
         (
             DIST,
             "dist.minkowski([1.0, 2.0], [0.5, 1.0], 3.0)",
@@ -371,6 +370,14 @@ fn every_lowering_round_trips_through_the_flatpir_reader() {
         (HEP, "hep.kallen(a, 1.0, 2.0)"),
         (HEP, "hep.breakup_momentum(3.0 + a, 1.0, 0.5)"),
         (HEP, "hep.blatt_weisskopf(3, 0.3 + a, 1.5)"),
+        (
+            HEP,
+            "real(hep.resonance_breitwigner(2.5 + a, 1.52, 0.09, 0.938, 0.493, 2, 1.5))",
+        ),
+        (HEP, "hep.wignerd(2, -1, 2, a)"),
+        (HEP, "hep.wignerd_doublearg(3, -1, 3, a)"),
+        (HEP, "imag(hep.wignerD(1, 1, 0, a, 0.3, 0.2))"),
+        (HEP, "real(hep.wignerD_doublearg(3, 1, -3, 0.4, a, 0.2))"),
         (POLY, "poly.legendre(5, a)"),
         (POLY, "poly.hermite(4, a)"),
         (POLY, "poly.laguerre(4, a)"),
@@ -403,4 +410,61 @@ lp = logdensityof(sig, 5.28)";
         pir.contains("builtin_logdensityof CrystalBall"),
         "the distribution member still becomes a kernel tag:\n{pir}"
     );
+}
+
+// `resonance_breitwigner` and the four Wigner functions lower at literal angular
+// momenta, the same contract as `blatt_weisskopf`: a computed momentum, or one
+// outside |m| <= j with the parity of j, is refused, naming the member.
+#[test]
+fn breit_wigner_and_wigner_functions_lower_at_literal_momenta() {
+    for expr in [
+        "real(hep.resonance_breitwigner(p, 1.52, 0.09, 0.938, 0.493, 7, 1.5))",
+        "hep.wignerd(2, 2, -2, 0.3 + p)",
+        "hep.wignerd_doublearg(5, -3, 1, 0.3 + p)",
+        "real(hep.wignerD(2, 1, -1, p, 0.3, 0.2))",
+        "imag(hep.wignerD_doublearg(1, 1, -1, p, 0.3, 0.2))",
+    ] {
+        let pir = lower(&probe_model(
+            &format!("{HEP}\np = elementof(posreals)"),
+            expr,
+        ));
+        assert!(!pir.contains("(%ref hep "), "{expr} must lower:\n{pir}");
+    }
+    for (expr, member) in [
+        ("hep.wignerd_doublearg(2, 1, 1, p)", "wignerd_doublearg"),
+        ("hep.wignerd(1, 2, 0, p)", "wignerd"),
+        ("hep.wignerd(n, 0, 0, p)", "wignerd"),
+        (
+            "real(hep.resonance_breitwigner(p, 1.52, 0.09, 0.938, 0.493, n, 1.5))",
+            "resonance_breitwigner",
+        ),
+    ] {
+        let src = probe_model(
+            &format!("{HEP}\np = elementof(interval(-1.0, 1.0))\nn = integer(p)"),
+            expr,
+        );
+        let err = determinize(&parse_infer(&src)).expect_err("must refuse, not lower");
+        assert!(format!("{err:?}").contains(member), "{expr}: {err:?}");
+    }
+}
+
+// At all-literal arguments the Wigner sums fold to constants. Each oracle value is
+// the §09 matrix element <j m1| exp(-i beta J_y) |j m2>, from a matrix exponential
+// of the spin-j J_y (scipy.linalg.expm), independent of Wigner's formula.
+#[test]
+fn wigner_d_folds_to_the_matrix_element() {
+    for (expr, oracle) in [
+        (
+            "hep.wignerd_doublearg(3, 1, -1, 0.3)",
+            -0.5620275793944638_f64,
+        ),
+        ("hep.wignerd(2, 1, -2, -0.4)", -0.6415605972938176),
+    ] {
+        let pir = lower(&probe_model(HEP, expr));
+        let folded = pir
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .filter_map(|token| token.parse::<f64>().ok())
+            .any(|value| (value - oracle.abs()).abs() < 1e-14);
+        assert!(folded, "{expr} should fold to {oracle}:\n{pir}");
+    }
 }

@@ -131,6 +131,27 @@ fn a_complex_value_refuses_and_its_projections_lower() {
     assert!(!out.contains("stablehlo.negate"), "{out}");
 }
 
+// §07 `imag` "returns `0` for real `x`".
+#[test]
+fn imag_of_a_real_is_zero() {
+    let out = emits("(imag(z0))");
+    assert!(out.contains("stablehlo.constant dense<0.0"), "{out}");
+}
+
+// §07 `exp` takes `complexes`: e^(a + ib) = e^a (cos b + i sin b), lowered as the
+// pair of real parts.
+#[test]
+fn complex_exp_lowers_as_real_parts() {
+    let out = emits("(real(exp(complex(z0, 2.0))), imag(exp(complex(1.0, z0))))");
+    for op in [
+        "stablehlo.exponential",
+        "stablehlo.cosine",
+        "stablehlo.sine",
+    ] {
+        assert!(out.contains(op), "{op}:\n{out}");
+    }
+}
+
 #[test]
 fn polynomial_is_horner_over_static_coefficients() {
     let out = emits("(polynomial([1.0, -2.0, 0.5], z0))");

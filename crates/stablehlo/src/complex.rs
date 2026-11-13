@@ -73,6 +73,14 @@ fn parts(
                         let angle = e.lower_node(*angle)?;
                         (e.cos(&angle), e.sin(&angle))
                     }
+                    // §07 `exp` over `complexes`: e^(a + ib) = e^a (cos b + i sin b).
+                    ("exp", [arg]) => {
+                        let (re, im) = parts(e, *arg, memo)?;
+                        let magnitude = e.exp(&re);
+                        let cos = e.cos(&im);
+                        let sin = e.sin(&im);
+                        (e.mul(&magnitude, &cos), e.mul(&magnitude, &sin))
+                    }
                     ("neg" | "conj", [arg]) => {
                         let (re, im) = parts(e, *arg, memo)?;
                         (if head == "neg" { e.neg(&re) } else { re }, e.neg(&im))
