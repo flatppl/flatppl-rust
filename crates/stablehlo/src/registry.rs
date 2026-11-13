@@ -3502,23 +3502,57 @@ fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let probs = p.get(e, "p")?;
+    let zero = e.constant_like(0.0, v);
+    let fixed_valid = e.constant_reals(v).and_then(|values| {
+        let valid = values
+            .iter()
+            .all(|x| x.is_finite() && *x >= 0.0 && x.fract() == 0.0);
+        (valid || e.batch_rank(v) == 0).then_some(valid)
+    });
+    let valid = if let Some(valid) = fixed_valid {
+        e.bool_value_const(valid)
+    } else {
+        let nonnegative = e.compare("GE", v, &zero);
+        let rounded = e.floor(v);
+        let integral = e.compare("EQ", v, &rounded);
+        let valid = e.and(&nonnegative, &integral);
+        e.reduce_boolean("stablehlo.and", "true", &valid)
+    };
+    let total = e.reduce_sum(v);
+    let total_matches = e.compare("EQ", &total, &n);
+    // Keep exact integer equality, and reject sums that wrapped around it.
+    // A valid nonnegative sum is n; a wrapped match is at least n + 2^bits.
+    let real_counts = e.convert(v, ElemKind::Real);
+    let real_total = e.reduce_sum(&real_counts);
+    let two = e.scalar(2.0);
+    let limit = e.mul(&n, &two);
+    let no_wrap = e.compare("LE", &real_total, &limit);
+    let valid_total = e.and(&total_matches, &no_wrap);
+    let in_support = e.and(&valid, &valid_total);
+    let safe_v = e.select(&valid, v, &zero);
 
     let one = e.scalar(1.0);
     let n_plus_one = e.add(&n, &one);
     let lgamma_n1 = e.lgamma(&n_plus_one);
 
     let one_vec = e.constant_like(1.0, v);
-    let x_plus_one = e.add(v, &one_vec);
+    let x_plus_one = e.add(&safe_v, &one_vec);
     let lgamma_x1 = e.lgamma(&x_plus_one);
     let sum_lgamma_x1 = e.reduce_sum(&lgamma_x1);
     let neg_sum_lgamma_x1 = e.neg(&sum_lgamma_x1);
 
-    let log_p = e.log(&probs);
-    let x_log_p = e.mul(v, &log_p);
+    // Invalid rows must avoid log(0) even in the inactive AD branch.
+    let active_v = e.select(&in_support, &safe_v, &zero);
+    let empty = e.compare("EQ", &active_v, &zero);
+    let safe_probs = e.select(&empty, &one_vec, &probs);
+    let log_p = e.log(&safe_probs);
+    let x_log_p = e.mul(&active_v, &log_p);
     let sum_x_log_p = e.reduce_sum(&x_log_p);
 
     let t1 = e.add(&lgamma_n1, &neg_sum_lgamma_x1);
-    Ok(e.add(&t1, &sum_x_log_p))
+    let score = e.add(&t1, &sum_x_log_p);
+    let outside = e.scalar(f64::NEG_INFINITY);
+    Ok(e.select(&in_support, &score, &outside))
 }
 
 // ---- §08 matrix distribution batch (Task 13) --------------------------------

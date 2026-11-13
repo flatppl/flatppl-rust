@@ -130,6 +130,44 @@ fn multivariate_guards_keep_unbounded_data_and_captured_scoring_inputs_live() {
 }
 
 #[test]
+fn runtime_qr_setup_requires_explicit_preparation() {
+    for (source, data) in [
+        (
+            "beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\nX=external(cartpow(interval(-100,100),[5,2]))\ny=external(cartpow(interval(-100,100),5))\ninputs=(beta,sigma,X,y)\noutputs=logdensityof(Normal.(X*beta,sigma),y)",
+            vec!["X".into(), "y".into()],
+        ),
+        (
+            "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ny=external(cartpow(cartpow(interval(-100,100),[2,2]),5))\ninputs=(nu,scale,y)\noutputs=logdensityof(iid(InverseWishart(nu,scale),5),y)",
+            vec!["y".into()],
+        ),
+    ] {
+        let ordinary = lower(source, true);
+        assert_eq!(summary_count(&ordinary), 0);
+        let prepared = prepare_likelihood(&ordinary, &data).unwrap();
+        assert!(
+            !inputs(&prepared.score)
+                .iter()
+                .any(|name| data.contains(name))
+        );
+    }
+}
+
+#[test]
+fn distinct_regression_designs_keep_distinct_preparation() {
+    let source = "a=elementof(reals)\nb=elementof(reals)\nx=external(cartpow(interval(-100,100),5))\nz=external(cartpow(interval(-100,100),5))\ny=external(cartpow(interval(-100,100),5))\ninputs=(a,b,x,z,y)\noutputs=(logdensityof(Normal.(a .* x,1.0),y),logdensityof(Normal.(b .* z,1.0),y))";
+    let prepared =
+        prepare_likelihood(&lower(source, true), &["x".into(), "z".into(), "y".into()]).unwrap();
+    assert_eq!(prepared.summaries.len(), 6);
+    assert_eq!(inputs(&prepared.score).len(), 8);
+}
+
+#[test]
+fn integer_array_arithmetic_does_not_become_real_regression() {
+    let source = "beta=elementof(integers)\nsigma=elementof(posreals)\nx=external(cartpow(integers,5))\ny=external(cartpow(interval(-100,100),5))\ninputs=(beta,sigma,x,y)\noutputs=logdensityof(Normal.(beta .* x .+ 0.0,sigma),y)";
+    assert!(prepare_likelihood(&lower(source, true), &["x".into(), "y".into()]).is_err());
+}
+
+#[test]
 fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_live() {
     let prefix = "a=elementof(reals)\ny=external(cartpow(reals,3))\ninputs=(a,y)\n";
     let one = lower(

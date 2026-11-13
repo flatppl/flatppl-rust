@@ -30,15 +30,31 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %27 = stablehlo.constant dense<0> : tensor<i32>
     %28 = stablehlo.constant dense<9> : tensor<i32>
     %29 = stablehlo.select %26, %28, %27 : (tensor<i1>, tensor<i32>, tensor<i32>) -> tensor<i32>
-    %31 = stablehlo.add %0, %1 : tensor<f32>
-    %32 = chlo.lgamma %31 : tensor<f32> -> tensor<f32>
-    %34 = stablehlo.constant dense<"0x00000040000040400000A040"> : tensor<3xf32>
-    %38 = stablehlo.constant dense<"0x7DB7E8C0"> : tensor<f32>
-    %39 = stablehlo.log %arg1 : tensor<3xf32>
-    %40 = stablehlo.multiply %34, %39 : tensor<3xf32>
-    %41 = stablehlo.reduce(%40 init: %9) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %42 = stablehlo.add %32, %38 : tensor<f32>
-    %43 = stablehlo.add %42, %41 : tensor<f32>
-    return %43, %29 : tensor<f32>, tensor<i32>
+    %31 = stablehlo.constant dense<0.0> : tensor<3xf32>
+    %32 = stablehlo.constant dense<true> : tensor<i1>
+    %33 = stablehlo.constant dense<10> : tensor<i32>
+    %34 = stablehlo.compare EQ, %33, %arg0, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+    %35 = stablehlo.constant dense<"0x00000040000040400000A040"> : tensor<3xf32>
+    %36 = stablehlo.constant dense<"0x00002041"> : tensor<f32>
+    %37 = stablehlo.constant dense<2.0> : tensor<f32>
+    %38 = stablehlo.multiply %0, %37 : tensor<f32>
+    %39 = stablehlo.compare LE, %36, %38 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %40 = stablehlo.and %34, %39 : tensor<i1>
+    %41 = stablehlo.and %32, %40 : tensor<i1>
+    %42 = stablehlo.add %0, %1 : tensor<f32>
+    %43 = chlo.lgamma %42 : tensor<f32> -> tensor<f32>
+    %44 = stablehlo.constant dense<1.0> : tensor<3xf32>
+    %48 = stablehlo.constant dense<"0x7DB7E8C0"> : tensor<f32>
+    %49 = stablehlo.select %41, %35, %31 : (tensor<i1>, tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
+    %50 = stablehlo.compare EQ, %49, %31 : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
+    %51 = stablehlo.select %50, %44, %arg1 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
+    %52 = stablehlo.log %51 : tensor<3xf32>
+    %53 = stablehlo.multiply %49, %52 : tensor<3xf32>
+    %54 = stablehlo.reduce(%53 init: %9) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %55 = stablehlo.add %43, %48 : tensor<f32>
+    %56 = stablehlo.add %55, %54 : tensor<f32>
+    %57 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %58 = stablehlo.select %41, %56, %57 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %58, %29 : tensor<f32>, tensor<i32>
   }
 }

@@ -118,6 +118,15 @@ example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.
 Unbounded observations keep ordinary scoring. Use float64 for covariance
 matrices close to singularity.
 
+InverseWishart and small fixed-trial Multinomial likelihoods also support
+summaries. Fixed-design Gaussian regression supports matrix-vector means and
+affine scalar features, intercepts and offsets with shared sigma. Prepare both
+the design and observations, for example `--data-input X --data-input y`.
+The reduced score uses a scaled QR factor and a data-derived coefficient
+reference. Runtime regression and InverseWishart data require explicit
+preparation to amortize QR setup. Parameter-dependent designs and varying sigmas retain
+ordinary scoring.
+
 Run preparation once per data binding, then append its results to the scoring
 arguments in preparation-output order. Other scoring arguments keep their
 original order. Data needed outside reduced factors remains a scoring argument.
