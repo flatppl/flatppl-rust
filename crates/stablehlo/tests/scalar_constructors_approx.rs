@@ -131,6 +131,13 @@ fn a_complex_value_refuses_and_its_projections_lower() {
     assert!(!out.contains("stablehlo.negate"), "{out}");
 }
 
+// §07 `imag` "returns `0` for real `x`".
+#[test]
+fn imag_of_a_real_is_zero() {
+    let out = emits("(imag(z0))");
+    assert!(out.contains("stablehlo.constant dense<0.0"), "{out}");
+}
+
 #[test]
 fn polynomial_is_horner_over_static_coefficients() {
     let out = emits("(polynomial([1.0, -2.0, 0.5], z0))");

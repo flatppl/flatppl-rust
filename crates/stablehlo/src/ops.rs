@@ -320,6 +320,13 @@ pub(crate) fn lower_builtin(
             let [a] = args_exact(id, args)?;
             e.lower_node(a)
         }
+        // §07 `imag` "returns `0` for real `x`".
+        "imag" if !complex_arg(e, args) => {
+            let [a] = args_exact(id, args)?;
+            let a = e.lower_node(a)?;
+            let a = e.convert(&a, ElemKind::Real);
+            Ok(e.constant_like(0.0, &a))
+        }
         "complex" | "cis" | "conj" => Err(EmitError::at(
             id,
             format!(
