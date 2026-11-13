@@ -522,10 +522,25 @@ impl Emitter<'_> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        fn real_state(ty: &Type) -> bool {
+            match ty {
+                Type::Scalar(flatppl_core::ScalarType::Real) => true,
+                Type::Array { elem, .. } => real_state(elem),
+                Type::Record(fields) => fields.iter().all(|(_, ty)| real_state(ty)),
+                _ => false,
+            }
+        }
         let state_type = if reduce {
             item_types[0].clone()
         } else {
-            self.sequence_item_type(id)?
+            let inferred = self.sequence_item_type(id)?;
+            match (&inferred, init.and_then(|node| self.type_of(node))) {
+                // A nested callback can remain deferred even though its
+                // initial real-valued state is fully typed. The loop checks
+                // the returned structure and tensor shape below.
+                (Type::Deferred, Some(ty)) if real_state(ty) => ty.clone(),
+                _ => inferred,
+            }
         };
         let (body, entries) = self.callable_parts(function)?;
         if parameters.len() > 1 || entries.len() != 1 + sequences.len() + parameters.len() {
@@ -621,7 +636,11 @@ impl Emitter<'_> {
             return Ok(state.with_values(std::slice::from_ref(value)));
         }
 
-        let carry_types = match (self.type_of(id), &state.fields) {
+        let output_type = match self.type_of(id) {
+            Some(Type::Deferred) if real_state(&state_type) => Some(&state_type),
+            ty => ty,
+        };
+        let carry_types = match (output_type, &state.fields) {
             (Some(Type::Table { columns, .. } | Type::Record(columns)), Some(fields)) => {
                 let mut leaves = Vec::with_capacity(state.values.len());
                 for name in fields {
@@ -638,6 +657,11 @@ impl Emitter<'_> {
                 leaves
             }
             (Some(ty), None) if reduce => vec![ty.clone()],
+            (Some(ty), None)
+                if matches!(self.type_of(id), Some(Type::Deferred)) && real_state(ty) =>
+            {
+                vec![ty.clone()]
+            }
             (Some(Type::Array { elem, .. }), None) => vec![(**elem).clone()],
             _ => return Err(EmitError::at(id, "scan: unresolved state type")),
         };

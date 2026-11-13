@@ -48,7 +48,10 @@ impl Emitter<'_> {
             Node::Const(sym) => self.m.resolve(*sym).to_owned(),
             _ => return None,
         };
-        let record = self.record_fields(container).is_some()
+        // A string selector is a field projection even when inference has
+        // deferred the producer's type (for example, a nested scan).
+        let record = matches!(self.m.node(selector), Node::Lit(Scalar::Str(_)))
+            || self.record_fields(container).is_some()
             || self
                 .columns
                 .contains_key(&(self.column_container(container), field.clone()))
