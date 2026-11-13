@@ -11863,7 +11863,7 @@ pub(crate) fn distribution_domain_static(
     };
     match name {
         "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "LogNormal"
-        | "Exponential" | "Gamma" | "Weibull" | "Pareto" | "InverseGamma" | "Beta"
+        | "Exponential" | "Gamma" | "Weibull" | "Rayleigh" | "Pareto" | "InverseGamma" | "Beta"
         | "ChiSquared" | "VonMises" | "Laplace" | "Uniform" => scalar(Real),
         // Bernoulli: spec §08 "Domain/Support: integers/booleans".
         // Legacy ops.rs returned Boolean — that is a legacy bug; oracle now
@@ -11905,7 +11905,7 @@ pub(crate) fn distribution_support_static(name: &str, param_dim: &dyn Fn(&str) -
         "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "VonMises"
         | "Laplace" => Reals,
         "LogNormal" | "InverseGamma" | "Pareto" => PosReals,
-        "Exponential" | "Weibull" | "Gamma" | "ChiSquared" => NonNegReals,
+        "Exponential" | "Weibull" | "Rayleigh" | "Gamma" | "ChiSquared" => NonNegReals,
         "Beta" => UnitInterval,
         "Bernoulli" => Booleans,
         "Categorical" => PosIntegers,

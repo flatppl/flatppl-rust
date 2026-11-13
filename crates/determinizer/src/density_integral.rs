@@ -789,7 +789,7 @@ fn continuous(m: &Module, measure: NodeId) -> bool {
     };
     match m.resolve(head) {
         "Lebesgue" | "Uniform" | "Normal" | "Exponential" | "Gamma" | "InverseGamma" | "Beta"
-        | "StudentT" | "Cauchy" | "Laplace" | "Logistic" | "LogNormal" | "Weibull"
+        | "StudentT" | "Cauchy" | "Laplace" | "Logistic" | "LogNormal" | "Weibull" | "Rayleigh"
         | "ChiSquared" | "GeneralizedNormal" | "Pareto" | "VonMises" => true,
         "weighted" | "logweighted" if c.args.len() >= 2 => continuous(m, c.args[1]),
         "truncate" | "normalize" => c.args.first().is_some_and(|&base| continuous(m, base)),

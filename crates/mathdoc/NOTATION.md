@@ -219,7 +219,7 @@ source gives one (`iid(M, J)`), else the static length, else a bare index.
 | `MvNormal(mu, cov)` | 𝒩(μ, cov), with the covariance unchanged |
 | `StudentT(nu)`, `ChiSquared(k)` | t_ν, χ²_k |
 | `Gamma(shape, rate)`, `Exponential(rate)` | Gamma(shape, rate), Exp(rate) |
-| `InverseGamma(shape, scale)`, `Weibull(shape, scale)` | InverseGamma(shape, scale), Weibull(shape, scale) |
+| `InverseGamma(shape, scale)`, `Weibull(shape, scale)`, `Rayleigh(scale)` | InverseGamma(shape, scale), Weibull(shape, scale), Rayleigh(σ) |
 | `Uniform(S)` | 𝒰(S) with the set |
 | `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ̄), Counting(S), δ_v |
 | `weighted(w, M)`, `logweighted(l, M)` | as the set function §06 defines: a named weight argument-free, ν(𝘈) = ∫_𝘈 w dM, ν(𝘈) = ∫_𝘈 e^{l} dM, as measure theory writes ∫ f dμ; a lambda writes its body under its own variable, ∫_𝘈 exp(−x) dM(x); a constant weight is c · M |

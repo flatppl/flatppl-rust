@@ -952,6 +952,7 @@ fn distribution_catalogue_sweep() {
         ("Exponential", "0.5"),
         ("Gamma", "0.5, 0.5"),
         ("Weibull", "0.5, 0.5"),
+        ("Rayleigh", "0.5"),
         ("Pareto", "0.5, 0.5"),
         ("InverseGamma", "0.5, 0.5"),
         ("Beta", "0.5, 0.5"),

@@ -65,6 +65,7 @@ fn same_law(m: &Module, a: NodeId, b: NodeId) -> bool {
             | "LogNormal"
             | "Logistic"
             | "Weibull"
+            | "Rayleigh"
             | "Laplace"
             | "ChiSquared"
             | "locscale"
@@ -456,6 +457,7 @@ fn alias(
         "lognormal" => ("LogNormal", 2),
         "logistic" => ("Logistic", 2),
         "weibull" => ("Weibull", 2),
+        "rayleigh" => ("Rayleigh", 1),
         "double_exponential" => ("Laplace", 2),
         "chi_square" => ("ChiSquared", 1),
         "student_t" => ("StudentT", 3),
