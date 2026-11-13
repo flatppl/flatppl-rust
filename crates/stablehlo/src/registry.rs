@@ -2361,12 +2361,34 @@ fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 
 /// §08 Poisson uses the same expression as §09 ContinuedPoisson on its
 /// integer domain, including the rate-zero limit. Share the stable arithmetic.
+/// ContinuedPoisson extends it to real counts; Poisson is zero off the integers.
 fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    continued_poisson_logpdf(e, p, v)
+    let Some(whole) = whole_count(e, v) else {
+        return continued_poisson_logpdf(e, p, v);
+    };
+    let zero = e.scalar(0.0);
+    let safe = e.select(&whole, v, &zero);
+    let score = continued_poisson_logpdf(e, p, &safe)?;
+    Ok(outside_count_support(e, &whole, &score))
 }
 
-/// The support bounds of an integer-domain count density (§08: `nonnegintegers`, or
-/// `interval(0, n)` for Binomial): `0 <= k`, and `k <= upper` when given. Returns
+/// Whether a real-typed count `k` is a whole number, or `None` for an integer
+/// variate, which is whole by type. §08 count densities have the domain
+/// `integers`, so a real point with a fractional part has density zero.
+fn whole_count(e: &mut Emitter, k: &Value) -> Option<Value> {
+    if k.elem != ElemKind::Real {
+        return None;
+    }
+    if let Some(x) = e.constant_real(k) {
+        return Some(e.bool_value_const(x.fract() == 0.0));
+    }
+    let floor = e.floor(k);
+    Some(e.compare("EQ", k, &floor))
+}
+
+/// The support of an integer-domain count density (§08: `nonnegintegers`, or
+/// `interval(0, n)` for Binomial): a whole `k` with `0 <= k`, and `k <= upper`
+/// when given. Returns
 /// the in-support predicate and `k` with out-of-support lanes replaced by 0, an
 /// in-support stand-in, so neither the score nor its unused derivative sees the
 /// out-of-support point. Pair it with [`outside_count_support`].
@@ -2379,6 +2401,10 @@ fn count_support(e: &mut Emitter, k: &Value, upper: Option<&Value>) -> (Value, V
             e.and(&above, &below)
         }
         None => above,
+    };
+    let supported = match whole_count(e, k) {
+        Some(whole) => e.and(&supported, &whole),
+        None => supported,
     };
     let safe = e.select(&supported, k, &zero);
     (supported, safe)
@@ -3160,12 +3186,33 @@ fn categorical_score(
 
 fn categorical_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let probs = p.get(e, "p")?;
-    categorical_score(e, p.variate_id()?, &probs, v, 1)
+    let variate = p.variate_id()?;
+    whole_category(e, v, 1, |e, v| categorical_score(e, variate, &probs, v, 1))
 }
 
 fn categorical0_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let probs = p.get(e, "p")?;
-    categorical_score(e, p.variate_id()?, &probs, v, 0)
+    let variate = p.variate_id()?;
+    whole_category(e, v, 0, |e, v| categorical_score(e, variate, &probs, v, 0))
+}
+
+/// A real-typed category scores like the integer it equals, and has density zero
+/// off the integers (§08 domain `integers`). Fractional lanes are scored at the
+/// in-range stand-in `base` and then masked, so the score never sees them.
+fn whole_category(
+    e: &mut Emitter,
+    v: &Value,
+    base: i64,
+    score: impl FnOnce(&mut Emitter, &Value) -> Result<Value, EmitError>,
+) -> Result<Value, EmitError> {
+    let Some(whole) = whole_count(e, v) else {
+        return score(e, v);
+    };
+    let stand_in = e.scalar(base as f64);
+    let safe = e.select(&whole, v, &stand_in);
+    let category = e.convert(&safe, ElemKind::Int);
+    let scored = score(e, &category)?;
+    Ok(outside_count_support(e, &whole, &scored))
 }
 
 fn categorical_batched(
@@ -3301,11 +3348,11 @@ fn categorical_row_score(
 }
 
 fn categorical_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    categorical_batched(e, p, v, 1)
+    whole_category(e, v, 1, |e, v| categorical_batched(e, p, v, 1))
 }
 
 fn categorical0_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    categorical_batched(e, p, v, 0)
+    whole_category(e, v, 0, |e, v| categorical_batched(e, p, v, 0))
 }
 
 // ---- §08/§09 multivariate vector batch (Task 12) ----------------------------
