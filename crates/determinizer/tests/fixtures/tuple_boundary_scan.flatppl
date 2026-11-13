@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+x = elementof(reals)
+rhs(t, y, p) = p * y
+params = (rhs, x)
+inner(a, i, q) = a + q[1](i, a, q[2])
+trajectory = scan(inner, 1.0, [1.0, 2.0], params)
+f = functionof(trajectory, p = params)
+inputs = x
+outputs = f((rhs, 2 * x))

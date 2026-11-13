@@ -192,11 +192,61 @@ pub(crate) fn specialize_callable_sequences(m: &mut Module) -> bool {
 }
 
 fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
+    // A later application may replace an entire parameter object, including
+    // its callable components. Preserve that cut until boundary substitution
+    // has copied the body; expanding it here would bake in the ambient object.
+    let mut boundaries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending: Vec<_> = m.bindings().map(|(_, binding)| binding.rhs).collect();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Node::Call(call) = m.node(id)
+            && let Some(Inputs::Spec(inputs)) = &call.inputs
+        {
+            boundaries.extend(inputs.iter().map(|(_, reference)| *reference));
+        }
+        pending.extend(m.node(id).children());
+    }
+
+    fn reaches_object_boundary(m: &Module, root: NodeId, boundaries: &[Ref]) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let (resolved, _) = resolve_ref_chain(m, id);
+            if let Node::Ref(reference) = m.node(id)
+                && m.type_of(id)
+                    .or_else(|| m.type_of(resolved))
+                    .is_some_and(has_object)
+            {
+                if boundaries.contains(reference) {
+                    return true;
+                }
+                if reference.ns == RefNs::SelfMod
+                    && let Some(binding) = m.binding_by_name(reference.name)
+                {
+                    // Follow one alias at a time: an intermediate binding may
+                    // itself be the boundary even when the final value is not.
+                    pending.push(m.binding(binding).rhs);
+                }
+            }
+            if !matches!(m.node(id), Node::Call(call) if call.inputs.is_some()) {
+                pending.extend(m.node(id).children());
+            }
+        }
+        false
+    }
+
     fn walk(
         m: &mut Module,
         id: NodeId,
         memo: &mut std::collections::HashMap<NodeId, NodeId>,
         callable_only: bool,
+        boundaries: &[Ref],
     ) -> NodeId {
         if let Some(&result) = memo.get(&id) {
             return result;
@@ -204,19 +254,24 @@ fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
         let children = m.node(id).children();
         let mapped: Vec<_> = children
             .iter()
-            .map(|&child| walk(m, child, memo, callable_only))
+            .map(|&child| walk(m, child, memo, callable_only, boundaries))
             .collect();
         let current = if mapped == children {
             id
         } else {
             crate::driver::rebuild_with_children(m, id, &mapped)
         };
-        let result = specialize(m, current, callable_only).unwrap_or(current);
+        let result = specialize(m, current, callable_only, boundaries).unwrap_or(current);
         memo.insert(id, result);
         result
     }
 
-    fn specialize(m: &mut Module, id: NodeId, callable_only: bool) -> Option<NodeId> {
+    fn specialize(
+        m: &mut Module,
+        id: NodeId,
+        callable_only: bool,
+        boundaries: &[Ref],
+    ) -> Option<NodeId> {
         let Node::Call(call) = m.node(id) else {
             return None;
         };
@@ -245,6 +300,9 @@ fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
                 }
             })
         {
+            return None;
+        }
+        if reaches_object_boundary(m, parameter, boundaries) {
             return None;
         }
         let mut function = crate::kernel::resolve_reified(m, call.args[0])?;
@@ -339,7 +397,7 @@ fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
     let mut memo = std::collections::HashMap::new();
     let mut changed = false;
     for (bid, root) in bindings {
-        let mapped = walk(m, root, &mut memo, callable_only);
+        let mapped = walk(m, root, &mut memo, callable_only, &boundaries);
         if mapped != root {
             m.set_binding_rhs(bid, mapped);
             changed = true;
