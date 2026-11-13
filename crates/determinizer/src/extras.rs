@@ -11,7 +11,7 @@ use flatppl_core::{Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Sy
 use flatppl_infer::extras::{Error, Remaining, Source, bind};
 
 use crate::density::{build_user_call_n, refuse};
-use crate::kernel::{is_splattable, record_field, resolve_reified, splat_fields};
+use crate::kernel::{bind_call_args, is_splattable, record_field, resolve_reified, splat_fields};
 use crate::refuse::RefuseError;
 
 /// A callback's input names and whether they accept positional arguments.
@@ -150,7 +150,8 @@ pub(crate) fn bind_extras(
 /// Apply `callback` to `first`, then to the bound `extras`. An ordered callback
 /// takes positional arguments. A keyword-only callback takes every argument by
 /// name, and so does a unary callback, which keeps a whole record or table
-/// variate from auto-splatting.
+/// variate from auto-splatting. Without extras, a callback of several inputs
+/// receives `first` by the §04 auto-splat, as the ordinary call `f(x)` would.
 pub(crate) fn apply_callback(
     m: &mut Module,
     callback: NodeId,
@@ -158,6 +159,20 @@ pub(crate) fn apply_callback(
     extras: &[NodeId],
 ) -> Result<NodeId, RefuseError> {
     let interface = interface(m, callback);
+    if let Some(interface) = &interface
+        && extras.is_empty()
+        && interface.names.len() > 1
+    {
+        let values = bind_call_args(m, &interface.names, &[first], &[], !interface.ordered)
+            .ok_or_else(|| {
+                refuse(
+                    callback,
+                    m,
+                    "the variate does not splat over the callback inputs (spec §04 \"Calling conventions\")",
+                )
+            })?;
+        return Ok(named_call(m, callback, &interface.names, &values));
+    }
     if let Some(interface) = &interface
         && interface.names.len() != 1 + extras.len()
     {
@@ -174,23 +189,30 @@ pub(crate) fn apply_callback(
         return Ok(build_user_call_n(m, callback, args));
     }
     if let Some(interface) = interface {
-        let named: Vec<NamedArg> = std::iter::once(first)
-            .chain(extras.iter().copied())
-            .zip(&interface.names)
-            .map(|(value, name)| NamedArg {
-                kind: NamedKind::Kwarg,
-                name: *name,
-                value,
-            })
-            .collect();
-        return Ok(m.alloc(Node::Call(Call {
-            head: CallHead::User(callback),
-            args: Box::new([]),
-            named: named.into(),
-            inputs: None,
-        })));
+        let mut values = vec![first];
+        values.extend_from_slice(extras);
+        return Ok(named_call(m, callback, &interface.names, &values));
     }
     let mut args = vec![first];
     args.extend_from_slice(extras);
     Ok(build_user_call_n(m, callback, args))
+}
+
+/// `callback(name1 = value1, ...)`, each value bound to the input of its position.
+fn named_call(m: &mut Module, callback: NodeId, names: &[Symbol], values: &[NodeId]) -> NodeId {
+    let named: Vec<NamedArg> = values
+        .iter()
+        .zip(names)
+        .map(|(value, name)| NamedArg {
+            kind: NamedKind::Kwarg,
+            name: *name,
+            value: *value,
+        })
+        .collect();
+    m.alloc(Node::Call(Call {
+        head: CallHead::User(callback),
+        args: Box::new([]),
+        named: named.into(),
+        inputs: None,
+    }))
 }
