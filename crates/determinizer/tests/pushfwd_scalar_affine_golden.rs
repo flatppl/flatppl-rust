@@ -7,9 +7,8 @@
 
 use std::f64::consts::{LN_2, PI};
 
-use flatppl_determinizer::determinize;
-
 mod common;
+use common::determinize;
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();

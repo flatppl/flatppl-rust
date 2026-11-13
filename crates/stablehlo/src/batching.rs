@@ -328,7 +328,10 @@ impl Emitter<'_> {
     }
 
     pub(crate) fn inf_like(&mut self, v: &Value) -> Value {
-        self.const_lit_like(pos_inf_literal(self.dtype), v)
+        let out = self.const_lit_like(pos_inf_literal(self.dtype), v);
+        self.constants
+            .insert(out.ssa.clone(), [Scalar::Real(f64::INFINITY)].into());
+        out
     }
 
     pub(crate) fn const_lit_like(&mut self, lit: &str, v: &Value) -> Value {

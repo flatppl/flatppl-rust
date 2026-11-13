@@ -14,7 +14,8 @@
 //! - `refuses_disintegrate_over_non_lawof_record` /
 //!   `refuses_get_disintegrate_out_of_range` — refuse-don't-mislower guards.
 
-use flatppl_determinizer::determinize;
+mod common;
+use common::determinize;
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();

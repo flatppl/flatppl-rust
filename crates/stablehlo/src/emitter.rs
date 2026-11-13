@@ -156,6 +156,7 @@ pub struct Emitter<'m> {
     dtype: Dtype,
     restrict_enzyme_compatible: bool,
     check_parameters: bool,
+    pub(crate) sufficient_statistics: bool,
     integration: Option<crate::IntegrationOptions>,
     target: crate::Target,
     /// The program is replayed over host batch axes after lowering.
@@ -238,6 +239,7 @@ impl<'m> Emitter<'m> {
             dtype,
             restrict_enzyme_compatible: crate::EmitOptions::default().restrict_enzyme_compatible,
             check_parameters: true,
+            sufficient_statistics: true,
             integration: None,
             target: crate::Target::Cpu,
             host_batch: false,
@@ -274,6 +276,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(m, opts.dtype);
         emitter.restrict_enzyme_compatible = opts.restrict_enzyme_compatible;
         emitter.check_parameters = opts.check_parameters;
+        emitter.sufficient_statistics = opts.sufficient_statistics;
         emitter.integration = opts.integration;
         emitter.target = opts.target;
         emitter
@@ -284,6 +287,7 @@ impl<'m> Emitter<'m> {
         let mut emitter = Self::new(self.m, self.dtype);
         emitter.restrict_enzyme_compatible = self.restrict_enzyme_compatible;
         emitter.check_parameters = self.check_parameters;
+        emitter.sufficient_statistics = self.sufficient_statistics;
         emitter.integration = self.integration;
         emitter.target = self.target;
         emitter.host_batch = self.host_batch;
@@ -441,6 +445,11 @@ impl<'m> Emitter<'m> {
         let lit = float_literal(self.dtype, x);
         let ssa = self.pure(format!("stablehlo.constant dense<{lit}> : {ty_text}"));
         self.remember_constant(&ssa, [Scalar::Real(x)]);
+        // Finiteness predicates compare fixed values against infinity.
+        // Arithmetic folds still reject non-finite results.
+        if x.is_infinite() {
+            self.constants.insert(ssa.clone(), [Scalar::Real(x)].into());
+        }
         Value {
             ssa,
             ty,
@@ -2278,9 +2287,14 @@ impl<'m> Emitter<'m> {
             }
             axes.layers.retain(|&rank| rank != 0);
         }
-        if combine_op == "stablehlo.add"
-            && let Some(out) = self.fold_sum_axis(a, axis, result_ty.clone(), axes.clone())
-        {
+        if let Some(out) = self.fold_reduce_axis(
+            combine_op,
+            init_lit,
+            a,
+            axis,
+            result_ty.clone(),
+            axes.clone(),
+        ) {
             return out;
         }
         if self.restrict_enzyme_compatible
@@ -3775,9 +3789,6 @@ impl<'m> Emitter<'m> {
         };
         let batch = self.batch_rank(a);
         for _ in batch..rank {
-            let init_ssa = self.pure(format!(
-                "stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
-            ));
             let operand_ty = render_i1(&cur.ty);
             let mut dims = match &cur.ty {
                 MlirTy::Ranked(dims) => dims.clone(),
@@ -3791,18 +3802,33 @@ impl<'m> Emitter<'m> {
             };
             let result_ty_text = render_i1(&result_ty);
             let cell_rank = shape(&result_ty).len() - batch;
+            let axes = Axes {
+                batch,
+                layers: if cell_rank == 0 {
+                    vec![]
+                } else {
+                    vec![cell_rank]
+                },
+            };
+            if let Some(out) = self.fold_reduce_axis(
+                combine_op,
+                identity_lit,
+                &cur,
+                batch,
+                result_ty.clone(),
+                axes.clone(),
+            ) {
+                cur = out;
+                continue;
+            }
+            let init_ssa = self.pure(format!(
+                "stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
+            ));
             let ssa = self.pure_axes(format!(
                 "stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{batch}] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
                 cur.ssa
             ),
-                Axes {
-                    batch,
-                    layers: if cell_rank == 0 {
-                        vec![]
-                    } else {
-                        vec![cell_rank]
-                    },
-                },
+                axes,
             );
             let out = Value {
                 ssa: ssa.clone(),

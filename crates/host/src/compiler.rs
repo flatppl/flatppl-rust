@@ -120,6 +120,14 @@ pub struct LoadedModule {
     data: Arc<Mutex<HashMap<String, DataSource>>>,
 }
 
+/// Data preparation and scoring queries with an explicit summary boundary.
+pub struct PreparedLikelihood {
+    pub preparation: Arc<LoadedModule>,
+    pub score: Arc<LoadedModule>,
+    /// Preparation outputs, in the order appended to the scoring inputs.
+    pub summaries: Vec<String>,
+}
+
 /// One public binding as hosts see it. Positions refer to the right-hand side
 /// in the module's source text. A value bound by [`Context::set`] has none.
 #[derive(Serialize)]
@@ -345,6 +353,9 @@ impl LoadedModule {
                 self.source(),
             )
         })?;
+        if options.sufficient_statistics {
+            flatppl_determinizer::sufficient_statistics(&mut lowered);
+        }
         emit_query(lowered, typed, options, batch).map_err(|e| {
             // Lowering appends nodes and never renumbers, so only nodes of the
             // typed root module index its source.
@@ -440,6 +451,82 @@ pub struct Context {
 impl Context {
     pub(crate) fn owns(&self, module: &LoadedModule) -> bool {
         Arc::ptr_eq(&self.owner, &module.owner)
+    }
+
+    /// Separate data-only summaries from repeated likelihood evaluation.
+    ///
+    /// `data_inputs` names declared inputs supplied to the preparation query.
+    /// Compile both returned modules normally, then pass the preparation results
+    /// to the score query in `summaries` order. Data needed by other outputs
+    /// remains an input of the score query.
+    pub fn prepare_likelihood(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+    ) -> Result<PreparedLikelihood, Diagnostic> {
+        let fail =
+            |message: String| Diagnostic::new("prepare_likelihood", module.source_name(), message);
+        if !self.owns(module) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let typed = &module.typed;
+        let roots: Vec<_> = typed
+            .public_bindings()
+            .filter(|(_, b)| matches!(typed.resolve(b.name), "inputs" | "outputs"))
+            .map(|(_, b)| b.name)
+            .collect();
+        let mut lowered = flatppl_determinizer::determinize_with_options(
+            typed,
+            &module.bundle,
+            Some(&roots),
+            &flatppl_determinizer::LoweringOptions {
+                disable_sufficient_statistics: true,
+                preserve_rand_tuple: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| fail(e.reason).at(typed, Some(e.node), module.source()))?;
+        crate::load_fixed_data(&mut lowered, |source| module.read_data(source)).map_err(|e| {
+            let node = e.node.filter(|id| id.index() < typed.node_count());
+            fail(e.to_string()).at(typed, node, module.source())
+        })?;
+        let prepared =
+            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs).map_err(|e| {
+                let node = (e.node.index() < typed.node_count()).then_some(e.node);
+                fail(e.reason).at(typed, node, module.source())
+            })?;
+        Ok(PreparedLikelihood {
+            preparation: self.prepared_query(module, prepared.preparation)?,
+            score: self.prepared_query(module, prepared.score)?,
+            summaries: prepared.summaries,
+        })
+    }
+
+    fn prepared_query(
+        &mut self,
+        original: &LoadedModule,
+        mut module: Module,
+    ) -> Result<Arc<LoadedModule>, Diagnostic> {
+        flatppl_determinizer::prepare_serialization(&mut module, None);
+        let source = flatppl_syntax::print(&module);
+        // Generated nodes have no source span. Reparse the printed query so
+        // subsequent diagnostics and binding metadata refer to its actual text.
+        let parsed = flatppl_syntax::parse(&source).map_err(|error| {
+            Diagnostic::new("prepare_likelihood", original.source_name(), error.message)
+                .spanned(error.span, &source)
+        })?;
+        let identity = format!("prepared:{}", self.next_inline);
+        self.next_inline += 1;
+        self.instantiate(Arc::new(Definition {
+            identity,
+            label: original.definition.label.clone(),
+            source,
+            origin: original.definition.origin.clone(),
+            parsed: Arc::new(parsed),
+            imports: original.definition.imports.clone(),
+            data_roots: original.definition.data_roots.clone(),
+            fingerprint: OnceLock::new(),
+        }))
     }
 
     /// Wrap a query with the canonical coordinates of its single continuous input.

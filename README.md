@@ -103,6 +103,21 @@ non-interactive use unless `FLATPPL_TRUST=1`).
 
 ## Building and testing (developers)
 
+Independent likelihood factors use shared data summaries where supported.
+Disable the reduction with `--sufficient-statistics=false`. For runtime data,
+emit a preparation query and a scoring query in either portable or StableHLO form:
+
+```sh
+flatppl determinize query.flatppl --data-input y --prepare-data prepare.flatppl -o score.flatppl
+flatppl stablehlo query.flatppl --dtype f64 --data-input y --prepare-data prepare.mlir -o score.mlir
+```
+
+Run preparation once per data binding, then append its results to the scoring
+arguments in preparation-output order. Other scoring arguments keep their
+original order. Data needed outside reduced factors remains a scoring argument.
+Both queries must use the same precision. See [the shared pass](ARCHITECTURE.md#shared-likelihood-summaries)
+for coverage and the Rust preparation API.
+
 ```sh
 git clone https://github.com/flatppl/flatppl-rust
 cd flatppl-rust

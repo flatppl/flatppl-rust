@@ -799,11 +799,11 @@ outputs = (o1, o2, o3, o4, o5)
         2,
         "`cummax([])` and `cummin([])` both return the operand unchanged: {ret}"
     );
-    // The boolean pair DO reduce; the zero-length axis returns the init.
+    // The zero-length Boolean reductions fold to their identities.
     assert_eq!(
         out.matches("stablehlo.reduce(").count(),
-        2,
-        "lany/lall still reduce, and answer their identity:\n{out}"
+        0,
+        "lany/lall over an empty array need no runtime reduction:\n{out}"
     );
 }
 

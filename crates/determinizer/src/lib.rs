@@ -19,17 +19,21 @@ mod primitives;
 mod refuse;
 mod sample;
 mod stdfn;
+mod sufficient_statistics;
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
 pub use driver::{determinize, determinize_with, determinize_with_options, determinize_with_roots};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;
+pub use sufficient_statistics::{PreparedLikelihood, prepare_likelihood, sufficient_statistics};
 
 /// Deterministic standard functions a backend lowers without portable expansion.
 /// The default keeps the backend-independent FlatPDL form.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoweringOptions<'a> {
+    /// Leave independent likelihood factors unreduced.
+    pub disable_sufficient_statistics: bool,
     pub retain_standard_functions: &'a [(&'a str, &'a str)],
     /// Keep rand's (value, state) result even without a tuple projection.
     /// False preserves the legacy value-terminal convention.

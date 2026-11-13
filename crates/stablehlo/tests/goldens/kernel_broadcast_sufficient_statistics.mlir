@@ -1,24 +1,18 @@
 module {
   func.func @logdensity(%arg0: tensor<f32>) -> tensor<f32> {
-    %1 = stablehlo.reshape %arg0 : (tensor<f32>) -> tensor<f32>
-    %2 = stablehlo.constant dense<1.0> : tensor<f32>
-    %3 = stablehlo.reshape %2 : (tensor<f32>) -> tensor<f32>
-    %4 = stablehlo.constant dense<2.0> : tensor<f32>
-    %6 = stablehlo.constant dense<2.5> : tensor<f32>
-    %9 = stablehlo.subtract %6, %1 : tensor<f32>
-    %10 = stablehlo.divide %9, %3 : tensor<f32>
-    %11 = stablehlo.multiply %10, %10 : tensor<f32>
-    %12 = stablehlo.multiply %4, %11 : tensor<f32>
-    %13 = stablehlo.constant dense<"0x00000000"> : tensor<f32>
-    %14 = stablehlo.multiply %10, %13 : tensor<f32>
-    %15 = stablehlo.multiply %4, %14 : tensor<f32>
-    %17 = stablehlo.constant dense<"0xFFFFFF3E"> : tensor<f32>
-    %18 = stablehlo.add %12, %15 : tensor<f32>
-    %19 = stablehlo.add %18, %17 : tensor<f32>
-    %20 = stablehlo.constant dense<-0.5> : tensor<f32>
-    %21 = stablehlo.multiply %20, %19 : tensor<f32>
-    %24 = stablehlo.constant dense<"0x8E3FEB3F"> : tensor<f32>
-    %25 = stablehlo.subtract %21, %24 : tensor<f32>
-    return %25 : tensor<f32>
+    %7 = stablehlo.constant dense<2.0> : tensor<f32>
+    %8 = stablehlo.constant dense<1.0> : tensor<f32>
+    %19 = stablehlo.constant dense<"0x00002040"> : tensor<f32>
+    %23 = stablehlo.subtract %19, %arg0 : tensor<f32>
+    %24 = stablehlo.divide %23, %8 : tensor<f32>
+    %25 = stablehlo.constant dense<-0.5> : tensor<f32>
+    %26 = stablehlo.multiply %24, %24 : tensor<f32>
+    %27 = stablehlo.multiply %25, %26 : tensor<f32>
+    %28 = stablehlo.constant dense<"0x8E3F6BBF"> : tensor<f32>
+    %29 = stablehlo.add %28, %27 : tensor<f32>
+    %30 = stablehlo.multiply %7, %29 : tensor<f32>
+    %45 = stablehlo.constant dense<"0xFFFF7F3E"> : tensor<f32>
+    %46 = stablehlo.subtract %30, %45 : tensor<f32>
+    return %46 : tensor<f32>
   }
 }

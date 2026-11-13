@@ -186,6 +186,9 @@ pub fn determinize_with_options(
                 // `roots` is given, drop bindings unreachable from them) before
                 // the conformance check and return.
                 crate::canon::canonicalize(&mut work, roots);
+                if !options.disable_sufficient_statistics {
+                    crate::sufficient_statistics(&mut work);
+                }
                 match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {

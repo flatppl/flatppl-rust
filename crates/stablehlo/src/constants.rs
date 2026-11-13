@@ -395,10 +395,12 @@ impl Emitter<'_> {
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
 
-    /// Sum fixed cells in axis order, rounding each addition at target precision.
+    /// Reduce fixed cells in axis order, rounding arithmetic at target precision.
     /// Bound reads as well as output storage; large views stay backend work.
-    pub(super) fn fold_sum_axis(
+    pub(super) fn fold_reduce_axis(
         &mut self,
+        op: &str,
+        init: &str,
         a: &Value,
         axis: usize,
         ty: MlirTy,
@@ -420,19 +422,42 @@ impl Emitter<'_> {
         for i in 0..count {
             let mut source = coordinates_of(&ty, i)?;
             source.insert(axis, 0);
-            let mut total = match a.elem {
-                ElemKind::Real => Scalar::Real(0.),
-                ElemKind::Int => Scalar::Int(0),
-                ElemKind::Bool => return None,
+            let mut total = match (a.elem, op) {
+                (ElemKind::Real, "stablehlo.add" | "stablehlo.minimum" | "stablehlo.maximum") => {
+                    Scalar::Real(if init == pos_inf_literal(self.dtype) {
+                        f64::INFINITY
+                    } else if init == reduce_max_identity(self.dtype) {
+                        f64::NEG_INFINITY
+                    } else {
+                        init.parse().ok()?
+                    })
+                }
+                (ElemKind::Int, "stablehlo.add" | "stablehlo.minimum" | "stablehlo.maximum") => {
+                    Scalar::Int(init.parse().ok()?)
+                }
+                (ElemKind::Bool, "stablehlo.and" | "stablehlo.or") => {
+                    Scalar::Bool(init.parse().ok()?)
+                }
+                _ => return None,
             };
             for k in 0..width {
                 source[axis] = k;
                 let value = self.fixed_scalar_at(a, flat_index(&a.ty, &source)?)?;
                 total = self.rounded_constant(match (total, value) {
                     (Scalar::Real(x), Scalar::Real(y)) => {
-                        Scalar::Real(real_binary("stablehlo.add", x, y, self.dtype)?)
+                        Scalar::Real(real_binary(op, x, y, self.dtype)?)
                     }
-                    (Scalar::Int(x), Scalar::Int(y)) => Scalar::Int(x.checked_add(y)?),
+                    (Scalar::Int(x), Scalar::Int(y)) => Scalar::Int(match op {
+                        "stablehlo.add" => x.checked_add(y)?,
+                        "stablehlo.minimum" => x.min(y),
+                        "stablehlo.maximum" => x.max(y),
+                        _ => return None,
+                    }),
+                    (Scalar::Bool(x), Scalar::Bool(y)) => Scalar::Bool(match op {
+                        "stablehlo.and" => x && y,
+                        "stablehlo.or" => x || y,
+                        _ => return None,
+                    }),
                     _ => return None,
                 })?;
             }
@@ -866,8 +891,15 @@ mod tests {
             elem: ElemKind::Real,
         };
         assert!(
-            e.fold_sum_axis(&unknown, 0, MlirTy::Scalar, Axes::default())
-                .is_none()
+            e.fold_reduce_axis(
+                "stablehlo.add",
+                "0",
+                &unknown,
+                0,
+                MlirTy::Scalar,
+                Axes::default()
+            )
+            .is_none()
         );
         for values in [
             vec![Scalar::Real(f64::from(f32::MAX)); 2],
@@ -877,7 +909,7 @@ mod tests {
                 .folded_constant(values, unknown.ty.clone(), Axes::default())
                 .unwrap();
             assert!(
-                e.fold_sum_axis(&a, 0, MlirTy::Scalar, Axes::default())
+                e.fold_reduce_axis("stablehlo.add", "0", &a, 0, MlirTy::Scalar, Axes::default())
                     .is_none()
             );
         }
@@ -889,8 +921,15 @@ mod tests {
             )
             .unwrap();
         assert!(
-            e.fold_sum_axis(&huge, 0, MlirTy::Scalar, Axes::default())
-                .is_none()
+            e.fold_reduce_axis(
+                "stablehlo.add",
+                "0",
+                &huge,
+                0,
+                MlirTy::Scalar,
+                Axes::default()
+            )
+            .is_none()
         );
         let a = e
             .folded_constant(vec![Scalar::Real(-1.)], MlirTy::Scalar, Axes::default())
@@ -918,7 +957,9 @@ mod tests {
                 ty: MlirTy::Ranked(vec![Some(0), Some(width)]),
                 elem: ElemKind::Real,
             };
-            let result = e.fold_sum_axis(
+            let result = e.fold_reduce_axis(
+                "stablehlo.add",
+                "0",
                 &empty,
                 0,
                 MlirTy::Ranked(vec![Some(width)]),
@@ -1068,5 +1109,78 @@ mod tests {
                 .iter()
                 .all(|x| *x == Scalar::Real(0.))
         );
+    }
+
+    #[test]
+    fn fixed_extrema_and_boolean_reductions_keep_cells_and_target_precision() {
+        let module = Module::new();
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let mut e = Emitter::new(&module, dtype);
+            let axes = Axes {
+                batch: 1,
+                layers: vec![1],
+            };
+            let values = e
+                .folded_constant(
+                    [0., -0., 1., 2., 16777217., 16777218.]
+                        .map(Scalar::Real)
+                        .to_vec(),
+                    MlirTy::Ranked(vec![Some(3), Some(2)]),
+                    axes.clone(),
+                )
+                .unwrap();
+            let minimum = e.reduce_min(&values);
+            let maximum = e.reduce_max(&values);
+            let magnitude = e.abs(&values);
+            let infinity = e.inf_like(&magnitude);
+            let finite = e.compare("LT", &magnitude, &infinity);
+            let finite = e.reduce_all(&finite);
+            assert_eq!(
+                e.fixed_operand(&finite).unwrap().as_ref(),
+                &[Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(true)]
+            );
+            let rounded = if matches!(dtype, Dtype::F32) {
+                16777216.
+            } else {
+                16777217.
+            };
+            for (value, expected) in [
+                (&minimum, [-0., 1., rounded]),
+                (&maximum, [0., 2., 16777218.]),
+            ] {
+                for (actual, expected) in e.fixed_operand(value).unwrap().iter().zip(expected) {
+                    let Scalar::Real(actual) = actual else {
+                        panic!("expected real extremum")
+                    };
+                    assert_eq!(actual.to_bits(), f64::to_bits(expected));
+                }
+                assert_eq!(
+                    e.axes_of(value),
+                    Axes {
+                        batch: 1,
+                        layers: vec![]
+                    }
+                );
+            }
+            let flags = e
+                .folded_constant(
+                    [true, false, true, true, false, false]
+                        .map(Scalar::Bool)
+                        .to_vec(),
+                    values.ty.clone(),
+                    axes,
+                )
+                .unwrap();
+            let all = e.reduce_all(&flags);
+            let any = e.reduce_boolean("stablehlo.or", "false", &flags);
+            assert_eq!(
+                e.fixed_operand(&all).unwrap().as_ref(),
+                &[Scalar::Bool(false), Scalar::Bool(true), Scalar::Bool(false)]
+            );
+            assert_eq!(
+                e.fixed_operand(&any).unwrap().as_ref(),
+                &[Scalar::Bool(true), Scalar::Bool(true), Scalar::Bool(false)]
+            );
+        }
     }
 }

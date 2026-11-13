@@ -1855,7 +1855,8 @@ fn lower_convolution(
 /// of per-column sums, which `Emitter::lower_field` lowers one column at a time;
 /// only a tensor position reaches the table refusal here.
 fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    if let [arg] = args
+    if e.sufficient_statistics
+        && let [arg] = args
         && let Some(value) = e.reduce_fixed_likelihood(*arg)?
     {
         return Ok(value);

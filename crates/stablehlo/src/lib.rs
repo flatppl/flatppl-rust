@@ -284,6 +284,8 @@ impl Target {
 /// never assumes/hardcodes 64-bit floats. Restrictions for known Enzyme
 /// limitations are enabled by default.
 pub struct EmitOptions {
+    /// Enable shared likelihood reductions and fixed-data emitter reductions.
+    pub sufficient_statistics: bool,
     pub dtype: Dtype,
     /// Restrict lowering to avoid known Enzyme limitations.
     /// Refuse known unsupported paths. This does not invoke Enzyme or prove AD support.
@@ -318,6 +320,7 @@ impl Default for IntegrationOptions {
 impl EmitOptions {
     pub fn lowering_options(&self) -> flatppl_determinizer::LoweringOptions<'static> {
         flatppl_determinizer::LoweringOptions {
+            disable_sufficient_statistics: !self.sufficient_statistics,
             numerical_integrals: self.integration.is_some(),
             ..LOWERING_OPTIONS
         }
@@ -327,6 +330,7 @@ impl EmitOptions {
 impl Default for EmitOptions {
     fn default() -> Self {
         Self {
+            sufficient_statistics: true,
             dtype: Dtype::F32,
             restrict_enzyme_compatible: true,
             integration: None,
@@ -340,6 +344,7 @@ impl Default for EmitOptions {
 /// The default determinizer still expands their portable reference definitions.
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
+        disable_sufficient_statistics: false,
         preserve_rand_tuple: false,
         numerical_integrals: false,
         vector_sort: true,
