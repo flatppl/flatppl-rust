@@ -653,14 +653,21 @@ fn infinite_variate_scores_zero(
     variate: &Value,
     density: Value,
 ) -> Value {
-    // A known constant variate is finite (only finite reals fold), so its
-    // density already folds without a guard.
     if !matches!(dist.broadcast, Broadcast::Elementwise)
         || variate.elem != ElemKind::Real
         || variate.ty != density.ty
-        || e.is_constant(variate)
     {
         return density;
+    }
+    // A fixed variate settles the guard at emission: finite cells keep their
+    // folded density, and an all-infinite variate scores `-inf` outright.
+    if let Some(cells) = e.fixed_finite_cells(variate) {
+        if cells.iter().all(|&finite| finite) {
+            return density;
+        }
+        if cells.iter().all(|&finite| !finite) {
+            return e.constant_like(f64::NEG_INFINITY, &density);
+        }
     }
     let magnitude = e.abs(variate);
     let inf = e.inf_like(variate);
