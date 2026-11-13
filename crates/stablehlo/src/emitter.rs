@@ -4889,7 +4889,12 @@ impl<'m> Emitter<'m> {
                             };
                         }
                         if let Some(field) = self.sequence_field(&call.args, base) {
-                            return field;
+                            return match field? {
+                                Lowered::Tensor(value) => Ok(value),
+                                Lowered::Record(_) => {
+                                    Err(records::record_in_tensor_position(id, "tuple item"))
+                                }
+                            };
                         }
                         if let Some(elem) = self.tuple_projection(&call.args, base) {
                             return self.lower_node(elem);

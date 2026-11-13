@@ -47,6 +47,33 @@ fn imported_function_broadcasts_at_root_and_inside_expression() {
 }
 
 #[test]
+fn imported_nested_scan_preserves_record_parameters() {
+    let fixture = include_str!("fixtures/callable_newton_scan.flatppl");
+    let stiff = fixture.split_once("rate = elementof(reals)").unwrap().0;
+    // The scalar after the multi-leaf record must retain its tuple position.
+    let grid = "advance(state,t,args)=record(y=args[2](args[1],state.t,state.y,t-state.t,args[3]) .+ args[4],t=t)\n\
+        solve(step,f,initial,times,p,tail)=scan(advance,record(y=initial,t=times[1]),times,(f,step,p,tail)).y";
+    let facade = "stiff=load_module(\"stiff.flatppl\")\ngrid=load_module(\"grid.flatppl\")\n\
+        sdirk2(f,initial,times,p,tail)=grid.solve(stiff.sdirk2_step,f,initial,times,p,tail)";
+    let mut bundle = ModuleBundle::new();
+    for (name, source) in [
+        ("stiff.flatppl", stiff),
+        ("grid.flatppl", grid),
+        ("ode.flatppl", facade),
+    ] {
+        bundle.insert(name, Arc::new(flatppl_syntax::parse(source).unwrap()));
+    }
+    let ir = emit(
+        "ode=load_module(\"ode.flatppl\")\nx=elementof(cartpow(reals,2))\n\
+         rhs(t,y,p)=[p.input_rate+p.rate*y[1]/(p.geometry.scale*p.geometry.factor)]\n\
+         p=record(rate=x[1],geometry=record(scale=1.0,factor=1.0),input_rate=0.0)\n\
+         inputs=x\noutputs=rowstack(ode.sdirk2(rhs,[1.0],[0.0,0.1,0.2],p,x[2]))[:,1]\n",
+        &bundle,
+    );
+    assert!(ir.contains("-> tensor<3xf32>"), "{ir}");
+}
+
+#[test]
 fn pyhf_helper_splats_an_opaque_record_by_name() {
     let prefix = "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\n\
                   pars = elementof(cartprod(alpha = reals, hi = posreals, lo = posreals))\n\

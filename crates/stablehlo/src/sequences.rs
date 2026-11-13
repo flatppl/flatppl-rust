@@ -9,8 +9,8 @@ pub(super) struct Components {
     pub(super) fields: Option<Vec<Symbol>>,
     /// The tensor leaves, depth-first in declared field order.
     pub(super) values: Vec<Value>,
-    /// One structure per record field when some field is itself a record;
-    /// `None` when every field is one leaf. Its tensors are placeholders: the
+    /// One structure per record field or tuple item when one is a record;
+    /// `None` when every member is one leaf. Its tensors are placeholders: the
     /// leaves always come from `values`.
     layout: Option<Vec<Lowered>>,
 }
@@ -26,19 +26,25 @@ impl Components {
 
     /// A record whose fields may themselves be records.
     pub(super) fn record(fields: Vec<Symbol>, parts: Vec<Lowered>) -> Self {
+        Self::from_parts(Some(fields), parts)
+    }
+
+    fn from_parts(fields: Option<Vec<Symbol>>, parts: Vec<Lowered>) -> Self {
+        // Tuple indices count whole members, including nested records, rather
+        // than positions in the tensor leaves used to carry callback arguments.
         let mut values = Vec::new();
         for part in parts.iter().cloned() {
             part.leaves(&mut values);
         }
         let nested = parts.iter().any(|part| matches!(part, Lowered::Record(_)));
         Self {
-            fields: Some(fields),
+            fields,
             values,
             layout: nested.then_some(parts),
         }
     }
 
-    /// One value per record field, rebuilt from the leaves.
+    /// One value per record field or tuple item, rebuilt from the leaves.
     pub(super) fn field_parts(&self) -> Vec<Lowered> {
         let Some(layout) = &self.layout else {
             return self.values.iter().cloned().map(Lowered::Tensor).collect();
@@ -51,7 +57,7 @@ impl Components {
     }
 
     pub(super) fn tensor(self, id: NodeId) -> Result<Value, EmitError> {
-        if self.fields.is_some() || self.values.len() != 1 {
+        if self.fields.is_some() || self.layout.is_some() || self.values.len() != 1 {
             return Err(EmitError::at(id, "structured object requires a projection"));
         }
         Ok(self.values.into_iter().next().expect("one tensor leaf"))
@@ -283,27 +289,26 @@ impl Emitter<'_> {
             resolved = next;
         }
         if let Some(Type::Tuple(items)) = self.type_of(id) {
-            let values = (0..items.len())
-                .map(|i| match self.columns.get(&(resolved, i.to_string())) {
-                    Some(Lowered::Tensor(value)) => Some(value.clone()),
-                    _ => None,
-                })
+            let parts = (0..items.len())
+                .map(|i| self.columns.get(&(resolved, i.to_string())).cloned())
                 .collect::<Option<Vec<_>>>();
-            if let Some(values) = values {
-                return Ok(Components::flat(None, values));
+            if let Some(parts) = parts {
+                return Ok(Components::from_parts(None, parts));
             }
             if let Node::Call(c) = self.m.node(resolved)
                 && matches!(c.head, CallHead::Builtin(h) if self.m.resolve(h) == "tuple")
             {
-                let values = c
+                let parts = c
                     .args
                     .iter()
                     .map(|&arg| {
-                        self.lower_node(arg)
-                            .map(|value| self.typed_axes(arg, value))
+                        self.lower_value(arg).map(|part| match part {
+                            Lowered::Tensor(value) => Lowered::Tensor(self.typed_axes(arg, value)),
+                            record => record,
+                        })
                     })
                     .collect::<Result<_, _>>()?;
-                return Ok(Components::flat(None, values));
+                return Ok(Components::from_parts(None, parts));
             }
         }
         if let Some(
@@ -387,8 +392,8 @@ impl Emitter<'_> {
                 self.memo.remove(&node);
                 let arg = &args[index];
                 if matches!(types[index], Type::Tuple(_)) {
-                    for (i, value) in arg.values.iter().enumerate() {
-                        self.bind_column(node, i.to_string(), value.clone());
+                    for (i, part) in arg.field_parts().into_iter().enumerate() {
+                        self.bind_field(node, i.to_string(), part);
                     }
                 } else if let Some(fields) = &arg.fields {
                     for (&field, part) in fields.iter().zip(arg.field_parts()) {
@@ -443,7 +448,7 @@ impl Emitter<'_> {
         &mut self,
         args: &[NodeId],
         base: i64,
-    ) -> Option<Result<Value, EmitError>> {
+    ) -> Option<Result<Lowered, EmitError>> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
         if matches!(self.type_of(container), Some(Type::Tuple(_)))
             && self
@@ -456,7 +461,7 @@ impl Emitter<'_> {
             let index = usize::try_from(index - base).ok()?;
             return Some(self.lower_components(container).and_then(|parts| {
                 parts
-                    .values
+                    .field_parts()
                     .get(index)
                     .cloned()
                     .ok_or_else(|| EmitError::at(container, "tuple index out of range"))
