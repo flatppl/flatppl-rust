@@ -39,6 +39,7 @@ use flatppl_core::{
 
 #[path = "sample_broadcast.rs"]
 mod broadcast;
+pub(crate) use broadcast::Lanes;
 #[path = "sample_ksuperpose.rs"]
 mod mixture;
 
@@ -1034,16 +1035,13 @@ fn lower_iid_sample(
     if let Some(body) = crate::kernel::reduce_kernel_application(m, kernel) {
         return lower_iid_sample(m, body, iid_node, rng, sample_name);
     }
-    // The fan-out batches one primitive draw per lane. A chain is a composite per
-    // lane (a draw, then a kernel applied to it), which needs a lane loop or a
-    // lane-broadcast kernel, and neither exists for a composite.
     if builtin_name(m, kernel) == Some("jointchain") {
-        return Err(refuse(
-            iid_node,
-            m,
-            "iid of a jointchain samples a composite per lane, which is not lowered; \
-             draw the chain once per element, or broadcast its kernel over an iid base",
-        ));
+        let size = expect_builtin_call(m, iid_node, "iid").and_then(|c| c.args.get(1).copied());
+        let n = size
+            .and_then(|size| flatppl_infer::fixed_int_value(m, size))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| refuse(iid_node, m, "iid of a jointchain needs a fixed scalar size"))?;
+        return crate::jointchain::lower_iid_jointchain_sample(m, kernel, n, rng);
     }
     if m.type_of(iid_node).is_none()
         && let Some(ty) = flatppl_infer::infer_expression(m, iid_node, &[])
