@@ -72,6 +72,12 @@ fn returned_constant(ir: &str, dtype: Dtype) -> f64 {
                 .sum(),
         };
     }
+    if let Some(hex) = literal.strip_prefix("0x") {
+        return match dtype {
+            Dtype::F32 => f32::from_bits(u32::from_str_radix(hex, 16).unwrap()) as f64,
+            Dtype::F64 => f64::from_bits(u64::from_str_radix(hex, 16).unwrap()),
+        };
+    }
     literal.parse().unwrap()
 }
 
@@ -120,6 +126,23 @@ fn fixed_iid_scores_keep_the_full_normalizing_constants() {
         3,
         (4.0 * 0.25_f64.powi(5) * 0.75_f64.powi(7)).ln(),
     );
+}
+
+#[test]
+fn dirichlet_boundary_keeps_unit_exponents_and_simplex_support() {
+    assert_fixed(
+        "Dirichlet([1.0,1.0,1.0])",
+        "[[0.0,0.25,0.75],[0.5,0.5,0.0]]",
+        2,
+        2.0 * 2.0_f64.ln(),
+    );
+    for dtype in [Dtype::F32, Dtype::F64] {
+        let source = "outputs=logdensityof(Dirichlet([2.0,3.0]),[0.2,0.2])";
+        assert_eq!(
+            returned_constant(&emit(source, dtype), dtype),
+            f64::NEG_INFINITY
+        );
+    }
 }
 
 #[test]

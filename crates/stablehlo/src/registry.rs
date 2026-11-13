@@ -3464,14 +3464,33 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let log_norm = e.log_multivariate_beta(&alpha);
+    let in_support = crate::ops::simplex_membership(e, p.variate_id()?, v)?;
+    let dimension = static_vector_len(e, p.variate_id()?, v)?;
+    let interior = e.constant_like(1.0 / dimension as f64, v);
+    let safe_v = e.select(&in_support, v, &interior);
 
     let one_vec = e.constant_like(1.0, &alpha);
     let alpha_minus_one = e.sub(&alpha, &one_vec);
-    let log_x = e.log(v);
+    // x^0 is one at a simplex boundary, where a raw 0 * log(0) is NaN.
+    let safe_x = if e
+        .constant_reals(&safe_v)
+        .is_some_and(|values| values.iter().all(|x| *x != 0.0))
+    {
+        safe_v
+    } else {
+        let zero = e.constant_like(0.0, &alpha_minus_one);
+        let zero_exponent = e.compare("EQ", &alpha_minus_one, &zero);
+        let zero_variate = e.compare("EQ", &safe_v, &zero);
+        let removable = e.and(&zero_exponent, &zero_variate);
+        e.select(&removable, &one_vec, &safe_v)
+    };
+    let log_x = e.log(&safe_x);
     let term = e.mul(&alpha_minus_one, &log_x);
     let sum_term = e.reduce_sum(&term);
 
-    Ok(e.sub(&sum_term, &log_norm))
+    let density = e.sub(&sum_term, &log_norm);
+    let outside = e.scalar(f64::NEG_INFINITY);
+    Ok(e.select(&in_support, &density, &outside))
 }
 
 /// §08 Multinomial, verbatim: `log f = lgamma(n+1) - sum(lgamma(x+1)) +

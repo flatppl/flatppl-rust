@@ -159,3 +159,91 @@ fn prepared_boolean_counts_keep_their_integer_tensor_abi() -> Result<(), Box<dyn
     check_summary_schemas(&prep, &score, &prepared.summaries)?;
     Ok(())
 }
+
+#[test]
+fn multivariate_preparation_replaces_observations_with_typed_event_summaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (parameters, law, event) in [
+        (
+            "mu=elementof(cartpow(reals,2))\ncov=elementof(cartpow(reals,[2,2]))\ninputs=(mu,cov,y)",
+            "MvNormal(mu,cov)",
+            "cartpow(interval(-100,100),2)",
+        ),
+        (
+            "alpha=elementof(cartpow(posreals,3))\ninputs=(alpha,y)",
+            "Dirichlet(alpha)",
+            "stdsimplex(3)",
+        ),
+        (
+            "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ninputs=(nu,scale,y)",
+            "Wishart(nu,scale)",
+            "cartpow(interval(-100,100),[2,2])",
+        ),
+    ] {
+        let mut context = Context::default();
+        let query = context.parse(
+            &format!(
+                "{parameters}\ny=external(cartpow({event},4))\noutputs=logdensityof(iid({law},4),y)"
+            ),
+            None,
+            None,
+        )?;
+        let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+        for dtype in [flatppl_host::Dtype::F32, flatppl_host::Dtype::F64] {
+            let options = EmitOptions {
+                dtype,
+                ..Default::default()
+            };
+            let original = query.compile(&options)?;
+            let prep = prepared.preparation.compile(&options)?;
+            let score = prepared.score.compile(&options)?;
+            check_summary_schemas(&prep, &score, &prepared.summaries)?;
+            assert_eq!(prep.inputs.len(), 1);
+            assert!(!score.inputs.iter().any(|field| field.name == "y"));
+            assert_eq!(
+                serde_json::to_value(original.output)?,
+                serde_json::to_value(score.output)?
+            );
+            // Summary dimensions depend on the event, never the observation count.
+            assert!(!score.stablehlo.contains("tensor<4x"), "{law}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gaussian_preparation_pads_partial_blocks_and_underdetermined_scatter()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (dimension, count) in [(2, 3), (3, 2)] {
+        let mut context = Context::default();
+        let source = format!(
+            "mu=elementof(cartpow(reals,{dimension}))\ncov=elementof(cartpow(reals,[{dimension},{dimension}]))\ny=external(cartpow(cartpow(interval(-100,100),{dimension}),{count}))\ninputs=(mu,cov,y)\noutputs=logdensityof(iid(MvNormal(mu,cov),{count}),y)"
+        );
+        let query = context.parse(&source, None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+        let prep = prepared.preparation.compile(&EmitOptions::default())?;
+        let score = prepared.score.compile(&EmitOptions::default())?;
+        check_summary_schemas(&prep, &score, &prepared.summaries)?;
+        assert!(!score.inputs.iter().any(|field| field.name == "y"));
+    }
+    Ok(())
+}
+
+#[test]
+fn gaussian_preparation_keeps_shared_centers_outside_row_maps()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "mu=elementof(cartpow(reals,2))\ncov=elementof(cartpow(reals,[2,2]))\ny=external(cartpow(cartpow(interval(-100,100),2),128))\ninputs=(mu,cov,y)\noutputs=logdensityof(iid(MvNormal(mu,cov),128),y)",
+        None,
+        None,
+    )?;
+    let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+    let prep = prepared.preparation.compile(&EmitOptions::default())?;
+    // Recomputing a captured center in each mapped row creates an N-by-N tensor.
+    assert!(!prep.stablehlo.contains("tensor<128x128x"));
+    assert!(!prep.stablehlo.contains("tensor<128x128>"));
+    // The QR workspace depends on the event dimension, not the row count.
+    assert!(!prep.stablehlo.contains("tensor<128x2x2x"));
+    Ok(())
+}

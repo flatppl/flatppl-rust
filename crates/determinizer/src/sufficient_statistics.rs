@@ -13,6 +13,7 @@ use flatppl_core::{
 use crate::RefuseError;
 
 mod histogram;
+mod multivariate;
 use crate::density::{build_call, build_record};
 
 const PREFIX: &str = "__likelihood_summary_";
@@ -35,6 +36,12 @@ enum Expr {
     Constant(&'static str),
     Call(&'static str, Vec<Expr>),
     Map(&'static str, Vec<Expr>),
+    Local,
+    Next,
+    Held(usize),
+    Text(&'static str),
+    Cells(Box<Expr>, Box<Expr>, Vec<Expr>),
+    Scan(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 fn op(name: &'static str, args: impl IntoIterator<Item = Expr>) -> Expr {
@@ -120,6 +127,95 @@ fn materialize(m: &mut Module, expr: Expr) -> NodeId {
             let args: Vec<_> = args.into_iter().map(|x| materialize(m, x)).collect();
             build_call(m, name, &args)
         }
+        Expr::Local => {
+            let name = m.intern("_likelihood_cell_");
+            m.alloc(Node::Ref(Ref {
+                ns: RefNs::Local,
+                name,
+            }))
+        }
+        Expr::Next => {
+            let name = m.intern("_likelihood_next_");
+            m.alloc(Node::Ref(Ref {
+                ns: RefNs::Local,
+                name,
+            }))
+        }
+        Expr::Held(index) => {
+            let name = m.intern(&format!("_likelihood_held_{index}_"));
+            m.alloc(Node::Ref(Ref {
+                ns: RefNs::Local,
+                name,
+            }))
+        }
+        Expr::Text(text) => m.alloc(Node::Lit(Scalar::Str(text.into()))),
+        Expr::Scan(body, initial, data) => {
+            let body = materialize(m, *body);
+            let inputs = [
+                ("likelihood_cell", "_likelihood_cell_"),
+                ("likelihood_next", "_likelihood_next_"),
+            ]
+            .into_iter()
+            .map(|(name, local)| {
+                let name = m.intern(name);
+                let local = m.intern(local);
+                (
+                    name,
+                    Ref {
+                        ns: RefNs::Local,
+                        name: local,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+            let head = m.intern("functionof");
+            let function = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(head),
+                args: vec![body].into(),
+                named: vec![].into(),
+                inputs: Some(Inputs::Spec(inputs.into())),
+            }));
+            let initial = materialize(m, *initial);
+            let data = materialize(m, *data);
+            build_call(m, "scan", &[function, initial, data])
+        }
+        Expr::Cells(body, data, held) => {
+            let body = materialize(m, *body);
+            let name = m.intern("likelihood_cell");
+            let local = m.intern("_likelihood_cell_");
+            let mut inputs = vec![(
+                name,
+                Ref {
+                    ns: RefNs::Local,
+                    name: local,
+                },
+            )];
+            for index in 0..held.len() {
+                let name = m.intern(&format!("likelihood_held_{index}"));
+                let local = m.intern(&format!("_likelihood_held_{index}_"));
+                inputs.push((
+                    name,
+                    Ref {
+                        ns: RefNs::Local,
+                        name: local,
+                    },
+                ));
+            }
+            let head = m.intern("functionof");
+            let function = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(head),
+                args: vec![body].into(),
+                named: vec![].into(),
+                inputs: Some(Inputs::Spec(inputs.into())),
+            }));
+            let data = materialize(m, *data);
+            let mut operands = vec![function, data];
+            for value in held {
+                let value = materialize(m, value);
+                operands.push(build_call(m, "vector", &[value]));
+            }
+            build_call(m, "broadcast", &operands)
+        }
     }
 }
 
@@ -197,10 +293,10 @@ fn data_only(
     allowed: &HashSet<Symbol>,
     boundary: &HashSet<Symbol>,
 ) -> bool {
-    let mut pending = vec![root];
+    let mut pending = vec![(root, Vec::<Symbol>::new())];
     let mut seen = HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
+    while let Some((id, locals)) = pending.pop() {
+        if !seen.insert((id, locals.clone())) {
             continue;
         }
         match m.node(id) {
@@ -213,18 +309,37 @@ fn data_only(
                         return false;
                     }
                 } else if let Some(bid) = m.binding_by_name(*name) {
-                    pending.push(m.binding(bid).rhs);
+                    pending.push((m.binding(bid).rhs, locals));
                 } else {
                     return false;
                 }
             }
+            Node::Ref(Ref {
+                ns: RefNs::Local,
+                name,
+            }) if locals.contains(name) => {}
             Node::Ref(_) | Node::Axis(_) | Node::Hole => return false,
-            Node::Call(c) if c.inputs.is_some() => return false,
+            Node::Call(c) if c.inputs.is_some() => {
+                let (CallHead::Builtin(head), Some(Inputs::Spec(inputs))) = (&c.head, &c.inputs)
+                else {
+                    return false;
+                };
+                if m.resolve(*head) != "functionof" {
+                    return false;
+                }
+                let mut bound = locals;
+                bound.extend(inputs.iter().map(|(_, r)| r.name));
+                pending.extend(c.args.iter().map(|&child| (child, bound.clone())));
+            }
             Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if matches!(m.resolve(h), "elementof" | "draw" | "builtin_sample")) =>
             {
                 return false;
             }
-            node => pending.extend(node.children()),
+            node => pending.extend(
+                node.children()
+                    .into_iter()
+                    .map(|child| (child, locals.clone())),
+            ),
         }
     }
     true
@@ -369,6 +484,10 @@ impl Reducer {
     }
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        if let Some(result) = multivariate::reduce(self, m, id) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
         if let Some(result) = self.reduce_moments(m, id) {
             return Some(result);
         }
@@ -1080,14 +1199,16 @@ pub fn prepare_likelihood(
     set_signature(&mut preparation, "outputs", &outputs);
     for &name in &summaries {
         let bid = score.binding_by_name(name).unwrap();
-        let set = match score.type_of(score.binding(bid).rhs) {
-            Some(Type::Scalar(ScalarType::Integer)) => "integers",
-            Some(Type::Scalar(ScalarType::Boolean)) => "booleans",
-            Some(Type::Scalar(ScalarType::Real)) => "reals",
-            _ => return Err(refuse("a summary has no supported scalar type")),
-        };
-        let set = score.intern(set);
-        let set = score.alloc(Node::Const(set));
+        let ty = score
+            .type_of(score.binding(bid).rhs)
+            .cloned()
+            .ok_or_else(|| refuse("a summary has no inferred type"))?;
+        let set = summary_set(&mut score, &ty).ok_or_else(|| {
+            refuse(&format!(
+                "summary {} has unsupported type {ty:?}",
+                score.resolve(name)
+            ))
+        })?;
         let rhs = build_call(&mut score, "external", &[set]);
         score.set_binding_rhs(bid, rhs);
     }
@@ -1122,6 +1243,40 @@ pub fn prepare_likelihood(
         score,
         summaries,
     })
+}
+
+fn summary_set(m: &mut Module, ty: &Type) -> Option<NodeId> {
+    match ty {
+        Type::Scalar(kind) => {
+            let name = match kind {
+                ScalarType::Integer => "integers",
+                ScalarType::Boolean => "booleans",
+                ScalarType::Real => "reals",
+                _ => return None,
+            };
+            let name = m.intern(name);
+            Some(m.alloc(Node::Const(name)))
+        }
+        Type::Array { shape, elem } => {
+            let set = summary_set(m, elem)?;
+            let dims = shape
+                .iter()
+                .map(|dim| match dim {
+                    Dim::Static(n) if *n > 0 => {
+                        Some(m.alloc(Node::Lit(Scalar::Int(i64::from(*n)))))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let size = if let [only] = dims.as_slice() {
+                *only
+            } else {
+                build_call(m, "vector", &dims)
+            };
+            Some(build_call(m, "cartpow", &[set, size]))
+        }
+        _ => None,
+    }
 }
 
 fn depends_on(m: &Module, root: NodeId, name: Symbol) -> bool {

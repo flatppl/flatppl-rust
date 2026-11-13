@@ -112,6 +112,12 @@ flatppl determinize query.flatppl --data-input y --prepare-data prepare.flatppl 
 flatppl stablehlo query.flatppl --dtype f64 --data-input y --prepare-data prepare.mlir -o score.mlir
 ```
 
+MvNormal, Dirichlet and Wishart support vector/matrix summaries. MvNormal and
+Wishart require fixed finite data or explicitly bounded runtime inputs, for
+example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.
+Unbounded observations keep ordinary scoring. Use float64 for covariance
+matrices close to singularity.
+
 Run preparation once per data binding, then append its results to the scoring
 arguments in preparation-output order. Other scoring arguments keep their
 original order. Data needed outside reduced factors remains a scoring argument.

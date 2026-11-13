@@ -41,14 +41,15 @@ pub(crate) fn lower_multi_axis(
     let operand = e.lower_node(container)?;
     let operand = e.with_typed_axes(container, operand);
     let axes = e.axes_of(&operand);
-    let cell_dims = match e.cell_ty(&operand) {
-        MlirTy::Ranked(dims) if axes.layers.len() == 1 => dims,
+    let (cell_dims, inner_dims) = match e.cell_ty(&operand) {
+        MlirTy::Ranked(dims) if !axes.layers.is_empty() => {
+            let (outer, inner) = dims.split_at(axes.layers[0]);
+            (outer.to_vec(), inner.to_vec())
+        }
         other => {
             return Err(EmitError::at(
                 id,
-                format!(
-                    "get/get0: multi-axis selection requires one flat numeric tensor cell, got {other:?}"
-                ),
+                format!("get/get0: multi-axis selection requires a numeric array, got {other:?}"),
             ));
         }
     };
@@ -74,6 +75,7 @@ pub(crate) fn lower_multi_axis(
     // Mapped point selectors choose one scalar per batch. Flatten the shared
     // tensor before gathering so successive axes do not replicate entire rows.
     if e.batch_rank(&operand) == 0
+        && inner_dims.is_empty()
         && selectors.iter().all(|selector| {
             matches!(selector,
             TensorSelector::DynamicScalar(index) if e.batch_rank(index) > 0)
@@ -145,6 +147,9 @@ pub(crate) fn lower_multi_axis(
                 (!matches!(selector, TensorSelector::Scalar(_))).then_some(dim)
             }),
     );
+    // Select only the outer array axes. Each selected element retains its
+    // complete vector/matrix payload, including nested array boundaries.
+    kept_dims.extend(inner_dims);
     let kept_ty = if kept_dims.is_empty() {
         MlirTy::Scalar
     } else {
