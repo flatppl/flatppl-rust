@@ -2,7 +2,8 @@
 //! functions in pushfwd density lowering (§06 case 1 + 3-bounded). Structural
 //! only: assert the emitted change-of-variables FlatPIR, cross-checked against
 //! the explicit-bijection form.
-use flatppl_determinizer::determinize;
+mod common;
+use common::determinize;
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);

@@ -47,7 +47,7 @@ fn returned_constant(ir: &str, dtype: Dtype) -> f64 {
     let literal = ir
         .lines()
         .find_map(|line| line.trim().strip_prefix(&prefix))
-        .expect("fixed reduced density must fold to a returned scalar");
+        .unwrap_or_else(|| panic!("fixed reduced density must fold to a returned scalar:\n{ir}"));
     let literal = literal.split('>').next().unwrap();
     if let Some(hex) = literal
         .strip_prefix("\"0x")
@@ -120,6 +120,39 @@ fn fixed_iid_scores_keep_the_full_normalizing_constants() {
         3,
         (4.0 * 0.25_f64.powi(5) * 0.75_f64.powi(7)).ln(),
     );
+}
+
+#[test]
+fn unsafe_target_rounding_retains_original_cellwise_scoring() {
+    for source in [
+        "outputs=logdensityof(iid(Gamma(1,2),2),[1e-50,2e-50])",
+        "outputs=logdensityof(iid(Beta(2,1),2),[0.99999999,0.99999998])",
+    ] {
+        let mut module = flatppl_syntax::parse(source).unwrap();
+        flatppl_infer::infer(&mut module);
+        let roots = [module.intern("inputs"), module.intern("outputs")];
+        let direct = flatppl_determinizer::determinize_with_options(
+            &module,
+            &Default::default(),
+            Some(&roots),
+            &flatppl_determinizer::LoweringOptions {
+                disable_sufficient_statistics: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let direct = flatppl_stablehlo::emit(
+            &direct,
+            Mode::LogDensity,
+            &EmitOptions {
+                dtype: Dtype::F32,
+                sufficient_statistics: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(emit(source, Dtype::F32), direct);
+    }
 }
 
 #[test]

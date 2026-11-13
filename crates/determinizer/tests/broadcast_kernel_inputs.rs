@@ -10,8 +10,11 @@
 //! - scalar kernel broadcast over data, `mu = 0.7`: -5.327877066409345 (-5.327877066409345);
 //! - scalar mixture family at x = 1: -1.643335713764618 (-1.6433357137646183);
 //! - array and scalar arguments, at (0.5, 0.25): -3.325733927529236 (-3.325733927529236).
-use flatppl_determinizer::{determinize, is_flatpdl};
+use flatppl_determinizer::is_flatpdl;
 use flatppl_infer::Severity;
+
+mod common;
+use common::determinize;
 
 fn lower(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();

@@ -14,7 +14,8 @@
 
 mod common;
 
-use flatppl_determinizer::{determinize, is_flatpdl};
+use common::determinize;
+use flatppl_determinizer::is_flatpdl;
 
 fn determinize_pir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -280,12 +281,8 @@ fn lp_pir_for_root(src: &str) -> String {
     let diags = flatppl_infer::infer(&mut m);
     assert!(diags.is_empty(), "fixture must infer: {diags:?}");
     let lp = m.intern("lp");
-    let out = flatppl_determinizer::determinize_with_roots(
-        &m,
-        &flatppl_infer::ModuleBundle::new(),
-        Some(&[lp]),
-    )
-    .expect("must lower, not refuse");
+    let out = common::determinize_with_roots(&m, &flatppl_infer::ModuleBundle::new(), Some(&[lp]))
+        .expect("must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
     alpha_normalize(&binding_pir(&pir, "lp"))

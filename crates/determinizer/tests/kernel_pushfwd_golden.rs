@@ -10,9 +10,8 @@
 
 use std::f64::consts::{LN_2, PI};
 
-use flatppl_determinizer::determinize;
-
 mod common;
+use common::determinize;
 
 fn lowered(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();

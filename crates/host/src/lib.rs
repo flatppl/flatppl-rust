@@ -18,7 +18,10 @@ mod readers;
 mod transforms;
 
 pub use boxes::{BoxSpec, bind_boxes, parse_describe};
-pub use compiler::{BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position};
+pub use compiler::{
+    BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position,
+    PreparedLikelihood,
+};
 pub use constants::Constant;
 pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};

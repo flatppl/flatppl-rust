@@ -4,6 +4,36 @@
 //! only some of them use is dead code there.
 #![allow(dead_code)]
 
+/// Structural tests inspect measure lowering before sufficient-statistic rewrites.
+pub fn determinize(
+    module: &flatppl_core::Module,
+) -> Result<flatppl_core::Module, flatppl_determinizer::RefuseError> {
+    determinize_with_roots(module, &flatppl_infer::ModuleBundle::new(), None)
+}
+
+pub fn determinize_with(
+    module: &flatppl_core::Module,
+    bundle: &flatppl_infer::ModuleBundle,
+) -> Result<flatppl_core::Module, flatppl_determinizer::RefuseError> {
+    determinize_with_roots(module, bundle, None)
+}
+
+pub fn determinize_with_roots(
+    module: &flatppl_core::Module,
+    bundle: &flatppl_infer::ModuleBundle,
+    roots: Option<&[flatppl_core::Symbol]>,
+) -> Result<flatppl_core::Module, flatppl_determinizer::RefuseError> {
+    flatppl_determinizer::determinize_with_options(
+        module,
+        bundle,
+        roots,
+        &flatppl_determinizer::LoweringOptions {
+            disable_sufficient_statistics: true,
+            ..Default::default()
+        },
+    )
+}
+
 /// The `n`th (0-based) argument of the FIRST `(<head> …)` call in `expr`, delimited by
 /// its own matching paren — so a `%meta`-wrapped argument comes back whole. Panics if
 /// there is no such call or it has too few arguments.

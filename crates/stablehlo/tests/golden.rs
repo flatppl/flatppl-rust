@@ -141,7 +141,14 @@ q = logdensityof(m, record(y = y_obs))
 inputs = (a, y_obs)
 outputs = (q)
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let d = determinize_abi_roots_with_options(
+        src,
+        &["inputs", "outputs"],
+        &flatppl_determinizer::LoweringOptions {
+            disable_sufficient_statistics: true,
+            ..Default::default()
+        },
+    );
     let mlir = emit_logdensity(&d);
     assert!(
         mlir.contains("module {") && is_delimiter_balanced(&mlir),
@@ -781,9 +788,13 @@ fn emitter_reduce_sum_and_max_reduce_to_scalar() {
 fn emitter_reduce_max_f64_identity_is_dtype_exact_neg_inf() {
     let m = Module::new();
     let mut e = unrestricted_emitter(&m, Dtype::F64);
-    let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
+    let v = Value {
+        ssa: "%arg0".into(),
+        ty: MlirTy::Ranked(vec![Some(3)]),
+        elem: ElemKind::Real,
+    };
     let mx = e.reduce_max(&v);
-    let out = e.finish("f", &[], &[&mx]);
+    let out = e.finish("f", &[(v.ssa.clone(), v.ty.clone(), v.elem)], &[&mx]);
     assert!(
         out.contains("dense<0xFFF0000000000000>"),
         "missing f64 -inf identity in:\n{out}"
@@ -9004,14 +9015,23 @@ fn infer_refusal(src: &str) -> String {
 /// which always passes `roots: None`) so DCE actually prunes bindings
 /// unreached from the ABI roots.
 fn determinize_abi_roots(src: &str, roots: &[&str]) -> Module {
+    determinize_abi_roots_with_options(src, roots, &Default::default())
+}
+
+fn determinize_abi_roots_with_options(
+    src: &str,
+    roots: &[&str],
+    options: &flatppl_determinizer::LoweringOptions<'_>,
+) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
     let diags = flatppl_infer::infer(&mut m);
     assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
     let syms: Vec<flatppl_core::Symbol> = roots.iter().map(|r| m.intern(r)).collect();
-    flatppl_determinizer::determinize_with_roots(
+    flatppl_determinizer::determinize_with_options(
         &m,
         &flatppl_infer::ModuleBundle::new(),
         Some(&syms),
+        options,
     )
     .expect("must determinize, not refuse")
 }

@@ -2,10 +2,10 @@
 //! fixed scalars or vectors, has the diagonal Jacobian `diag(a)`:
 //! `f_inv(y) = (y .- b) ./ a` and `logvol = Σᵢ log|aᵢ|`. Structural only
 //! (flatppl-rust is not a density engine). flatppl-testsuite scores the numbers.
-use flatppl_determinizer::{determinize, is_flatpdl};
+use flatppl_determinizer::is_flatpdl;
 
 mod common;
-use common::pir_binding;
+use common::{determinize, pir_binding};
 
 const IID: &str = "iid(Normal(mu = 0.0, sigma = 1.0), 3)";
 const MVN: &str = "MvNormal(mu = [0.2, -0.1, 0.4], cov = rowstack([[1.0, 0.3, 0.1], [0.3, 2.0, -0.4], [0.1, -0.4, 1.5]]))";

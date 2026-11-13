@@ -14,10 +14,10 @@
 //! Structural only (flatppl-rust is not a density engine). Each gate is asserted alongside
 //! the change of variables it wraps, and an ONTO map is asserted to carry NO gate — so
 //! neither a gate that swallowed the density nor one emitted unconditionally passes.
-use flatppl_determinizer::{determinize, is_flatpdl};
+use flatppl_determinizer::is_flatpdl;
 
 mod common;
-use common::{call_arg, pir_binding, pir_head};
+use common::{call_arg, determinize, pir_binding, pir_head};
 
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();

@@ -1,9 +1,11 @@
 //! Cross-module measure-ref lowering: a `logdensityof`/`likelihoodof` whose
 //! measure resolves through a `(%ref <loaded-module> member)` into a loaded
 //! submodule graph carried by a [`flatppl_infer::ModuleBundle`].
-use flatppl_determinizer::{determinize_with, determinize_with_roots};
 use flatppl_infer::ModuleBundle;
 use std::sync::Arc;
+
+mod common;
+use common::{determinize_with, determinize_with_roots};
 
 fn parse(src: &str) -> flatppl_core::Module {
     flatppl_syntax::parse(src).unwrap()
@@ -57,7 +59,7 @@ fn determinize_with_empty_bundle_matches_determinize() {
                lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
     let mut m = parse(src);
     let _ = flatppl_infer::infer(&mut m);
-    let a = flatppl_determinizer::determinize(&m);
+    let a = common::determinize(&m);
     let b = determinize_with(&m, &ModuleBundle::new());
     assert_eq!(
         a.map(|x| flatppl_flatpir::write(&x)).ok(),
@@ -1744,7 +1746,7 @@ L = likelihoodof(k, 2.0)
         let mut model = parse(&source);
         let _ = flatppl_infer::infer_module(&mut model, &bundle, flatppl_infer::Level::Shape);
         let roots = [model.intern("lp")];
-        let lowered = flatppl_determinizer::determinize_with_roots(&model, &bundle, Some(&roots))
+        let lowered = determinize_with_roots(&model, &bundle, Some(&roots))
             .expect("imported standard functions must lower after their graft");
         assert!(flatppl_determinizer::is_flatpdl(&lowered).is_ok());
     }

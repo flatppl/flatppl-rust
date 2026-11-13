@@ -24,28 +24,19 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %21 = stablehlo.abs %20 : tensor<f32>
     %22 = stablehlo.constant dense<0x7F800000> : tensor<f32>
     %23 = stablehlo.compare LT, %21, %22 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %24 = stablehlo.constant dense<true> : tensor<i1>
-    %25 = stablehlo.compare LE, %13, %22 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %26 = stablehlo.and %24, %25 : tensor<i1>
-    %27 = stablehlo.select %26, %13, %0 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %28 = stablehlo.log %arg1 : tensor<f32>
-    %29 = stablehlo.negate %28 : tensor<f32>
-    %30 = stablehlo.constant dense<-0.9189385332046727> : tensor<f32>
-    %31 = stablehlo.subtract %27, %arg0 : tensor<f32>
-    %32 = stablehlo.divide %31, %arg1 : tensor<f32>
-    %33 = stablehlo.constant dense<-0.5> : tensor<f32>
-    %34 = stablehlo.multiply %32, %32 : tensor<f32>
-    %35 = stablehlo.multiply %33, %34 : tensor<f32>
-    %36 = stablehlo.add %29, %30 : tensor<f32>
-    %37 = stablehlo.add %36, %35 : tensor<f32>
-    %38 = stablehlo.abs %27 : tensor<f32>
-    %39 = stablehlo.compare EQ, %38, %22 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %40 = stablehlo.select %39, %17, %37 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %41 = stablehlo.negate %22 : tensor<f32>
-    %42 = stablehlo.select %26, %40, %41 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %43 = stablehlo.subtract %42, %20 : tensor<f32>
-    %44 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
-    %45 = stablehlo.select %23, %43, %44 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %45, %5 : tensor<f32>, tensor<i32>
+    %25 = stablehlo.log %arg1 : tensor<f32>
+    %26 = stablehlo.negate %25 : tensor<f32>
+    %27 = stablehlo.constant dense<-0.9189385332046727> : tensor<f32>
+    %28 = stablehlo.subtract %13, %arg0 : tensor<f32>
+    %29 = stablehlo.divide %28, %arg1 : tensor<f32>
+    %30 = stablehlo.constant dense<-0.5> : tensor<f32>
+    %31 = stablehlo.multiply %29, %29 : tensor<f32>
+    %32 = stablehlo.multiply %30, %31 : tensor<f32>
+    %33 = stablehlo.add %26, %27 : tensor<f32>
+    %34 = stablehlo.add %33, %32 : tensor<f32>
+    %36 = stablehlo.subtract %34, %20 : tensor<f32>
+    %37 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+    %38 = stablehlo.select %23, %36, %37 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %38, %5 : tensor<f32>, tensor<i32>
   }
 }

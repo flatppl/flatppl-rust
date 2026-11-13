@@ -22,10 +22,10 @@
 //!
 //! Structural only (flatppl-rust is not a density engine): every lowering is asserted
 //! on its emitted FlatPDL and passed through `is_flatpdl`.
-use flatppl_determinizer::{determinize, is_flatpdl};
+use flatppl_determinizer::is_flatpdl;
 
 mod common;
-use common::pir_binding;
+use common::{determinize, pir_binding};
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();

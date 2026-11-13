@@ -13,11 +13,11 @@
 //! Distributions.jl plus quadrature of the same integral; nothing here computes one —
 //! flatppl-rust is not a density engine, so every assertion is on the emitted FlatPDL,
 //! passed through `is_flatpdl`.
-use flatppl_determinizer::{determinize, determinize_with_roots, is_flatpdl};
+use flatppl_determinizer::is_flatpdl;
 use flatppl_infer::ModuleBundle;
 
 mod common;
-use common::pir_binding;
+use common::{determinize, determinize_with_roots, pir_binding};
 
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();

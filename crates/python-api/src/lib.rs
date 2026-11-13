@@ -204,6 +204,26 @@ impl NativeContext {
             .map_err(error)
     }
 
+    fn prepare_likelihood(
+        &mut self,
+        module: &NativeModule,
+        data_inputs: Vec<String>,
+    ) -> PyResult<(NativeModule, NativeModule, Vec<String>)> {
+        let prepared = self
+            .inner
+            .prepare_likelihood(&module.inner, &data_inputs)
+            .map_err(error)?;
+        Ok((
+            NativeModule {
+                inner: prepared.preparation,
+            },
+            NativeModule {
+                inner: prepared.score,
+            },
+            prepared.summaries,
+        ))
+    }
+
     fn slice(&mut self, module: &NativeModule, outputs: Vec<String>) -> PyResult<NativeModule> {
         let outputs: Vec<&str> = outputs.iter().map(String::as_str).collect();
         self.inner
@@ -307,7 +327,7 @@ impl NativeModule {
         Ok(serde_json::to_string(&self.inner.math(format)).expect("rows contain only JSON values"))
     }
 
-    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", boxes=None))]
+    #[pyo3(signature = (dtype, autodiff, integration=None, batch=None, target="cpu", boxes=None, sufficient_statistics=true))]
     #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
@@ -318,6 +338,7 @@ impl NativeModule {
         batch: Option<BatchArguments>,
         target: &str,
         boxes: Option<Vec<(String, String, String)>>,
+        sufficient_statistics: bool,
     ) -> PyResult<String> {
         let dtype = match dtype {
             "float32" => Dtype::F32,
@@ -339,6 +360,7 @@ impl NativeModule {
             }),
             target,
             check_parameters: true,
+            sufficient_statistics,
         };
         let boxes = boxes
             .unwrap_or_default()

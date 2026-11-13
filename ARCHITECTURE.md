@@ -190,6 +190,41 @@ ambitious later piece. (egglog is a superset — it could do directional lowerin
 with a cost model forbidding illegal ops — but greedy is simpler, faster, and
 predictable for that path.)
 
+## Shared likelihood summaries
+
+`flatppl-determinizer::sufficient_statistics` rewrites independent likelihood
+reductions after measure lowering. It emits ordinary FlatPDL bindings for
+data-only summaries and ordinary expressions for scoring. No target-specific
+operation or execution cache enters the IR. Later backends can bake fixed
+summaries, place them in a setup block, or compile the explicit preparation and
+scoring queries returned by `prepare_likelihood`.
+
+The pass recognizes shared scalar parameters in IID and constructor-broadcast
+densities. Its moment rules cover Normal, LogNormal, Gamma, Beta, Exponential,
+Poisson, ContinuedPoisson, Binomial, Bernoulli, Geometric, and interval Uniform.
+Support and numerical guards deliberately retain ordinary scoring for
+unsupported cases, including boundary Gamma/Beta observations and large-count
+Poisson moment expansions. A bounded empirical histogram also shares original
+primitive scores for repeated fixed scalar observations, including Categorical
+and StudentT. It preserves the observation array's promoted scalar type.
+
+Summary dependencies respect the explicit ABI: a promoted fixed input stays
+live. Ordinary emission preserves that ABI and computes runtime summaries on
+each call. Explicit preparation accepts selected data-input names and returns
+two ordinary query modules with ordered summary names. Preparation runs once
+per data binding. Scoring accepts the summaries, keeps other original inputs,
+and retains raw data needed by unreduced factors or other outputs. No identity
+cache can silently retain a caller's changed arrays. Both queries must use the
+same numeric precision.
+
+`LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
+`EmitOptions::sufficient_statistics` controls both shared lowering and the
+existing StableHLO fixed-data fallback. The CLI exposes
+`--sufficient-statistics=false` on both output commands. Multivariate moments,
+regression contractions, and arbitrary algebraic discovery are not yet rules
+of this pass. A future backend consumes the same reduced FlatPDL and does not
+need its own statistical discovery pass.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +
