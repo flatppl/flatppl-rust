@@ -1385,7 +1385,7 @@ fn normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
 }
 
 /// Normal CDF (spec §07 `builtin_touniform` for a univariate continuous
-/// kernel): `F(x) = ½·(1 + erf((x − μ) / (σ·√2)))`. `erf(±inf) = ±1` yields the
+/// kernel): `F(x) = ½·erfc(-(x − μ) / (σ·√2))`. `erfc(±inf) = {0, 2}` yields the
 /// correct `F(±inf) = {1, 0}` limits, so the determiniser's `F(inf)`/`F(0)`
 /// truncation normaliser evaluates without special-casing.
 fn normal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
@@ -1393,14 +1393,8 @@ fn normal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError
     let sigma = p.get(e, "sigma")?;
 
     let diff = e.sub(x, &mu);
-    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
-    let denom = e.mul(&sigma, &sqrt2);
-    let z = e.div(&diff, &denom);
-    let erf_z = e.erf(&z);
-    let one = e.scalar(1.0);
-    let one_plus = e.add(&one, &erf_z);
-    let half = e.scalar(0.5);
-    Ok(e.mul(&half, &one_plus))
+    let z = e.div(&diff, &sigma);
+    Ok(e.invprobit(&z))
 }
 
 /// §08 Normal's sampling transform, verbatim: `mu + sigma * Z`, `Z ~

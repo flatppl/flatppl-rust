@@ -2653,14 +2653,14 @@ fn lower_probit_emits_erf_inv_of_the_rescaled_argument() {
 }
 
 /// §07 `invprobit(x)` is "$\Phi(x)$, standard-normal CDF" —
-/// $\tfrac12(1 + \mathrm{erf}(x/\sqrt{2}))$, the same identity
+/// $\tfrac12\mathrm{erfc}(-x/\sqrt{2})$, the same identity
 /// `registry::normal_cdf` uses. Reached only as the safe-point witness of an
 /// `invprobit` pushforward, never as an inverse.
 #[test]
-fn lower_invprobit_emits_the_erf_normal_cdf() {
+fn lower_invprobit_emits_the_complementary_error_function() {
     let out = lower_unary_head("invprobit");
     assert!(
-        out.contains("chlo.erf %1 : tensor<f32> -> tensor<f32>"),
+        out.contains("chlo.erfc %2 : tensor<f32> -> tensor<f32>"),
         "invprobit:\n{out}"
     );
     assert!(
@@ -2668,7 +2668,12 @@ fn lower_invprobit_emits_the_erf_normal_cdf() {
             && out.contains("stablehlo.constant dense<0.5> : tensor<f32>"),
         "invprobit:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.add").count(), 1, "invprobit:\n{out}");
+    assert_eq!(out.matches("stablehlo.add").count(), 0, "invprobit:\n{out}");
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        1,
+        "invprobit:\n{out}"
+    );
     assert!(!out.contains("chlo.erf_inv"), "invprobit:\n{out}");
     assert!(is_delimiter_balanced(&out));
 }
@@ -11436,8 +11441,8 @@ inputs = (location, scale)
 outputs = (lp)
 ";
 
-/// The Normal CDF `F(x) = ½·(1 + erf((x − μ)/(σ·√2)))` reaches the emitter via
-/// the truncation normaliser: only `F(0)` needs `chlo.erf`, since `F(inf)=1`.
+/// The Normal CDF `F(x) = ½·erfc(-(x − μ)/(σ·√2))` reaches the emitter via
+/// the truncation normaliser: only `F(0)` needs `chlo.erfc`, since `F(inf)=1`.
 #[test]
 fn emit_touniform_normal_via_truncation_has_expected_structure() {
     let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
@@ -11447,7 +11452,7 @@ fn emit_touniform_normal_via_truncation_has_expected_structure() {
     );
     let out = emit_logdensity(&d);
     assert_eq!(
-        out.matches("chlo.erf ").count(),
+        out.matches("chlo.erfc ").count(),
         1,
         "Normal CDF only evaluates the finite endpoint, in:\n{out}"
     );
