@@ -75,6 +75,17 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
             flatppl_syntax::print(&reduced)
         );
         assert_eq!(inputs(&reduced), ["a", "b"]);
+        let output = reduced
+            .bindings()
+            .find(|(_, b)| reduced.resolve(b.name) == "outputs")
+            .unwrap()
+            .1
+            .rhs;
+        assert_eq!(
+            reduced.type_of(output),
+            Some(&flatppl_core::Type::Scalar(flatppl_core::ScalarType::Real)),
+            "{law}"
+        );
         assert_eq!(summary_count(&lower(&source, false)), 0);
         assert_eq!(flatppl_determinizer::sufficient_statistics(&mut reduced), 0);
         let serialized = flatppl_flatpir::try_write(&reduced).unwrap();

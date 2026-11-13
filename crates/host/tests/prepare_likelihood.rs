@@ -1,5 +1,34 @@
 use flatppl_host::{Context, EmitOptions, Export, Schema};
 
+#[test]
+fn reduced_imported_posterior_keeps_its_scalar_score_type() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut context = Context::default();
+    let model = context.parse(
+        "lam ~ Gamma(2.0, 1.0)\ny ~ iid(Poisson(lam), 3)\nL = likelihoodof(kernelof(record(y = y), lam = lam), record(y = [3, 1, 4]))\nposterior = bayesupdate(L, lawof(record(lam = lam)))",
+        None,
+        None,
+    )?;
+    context.register("model.flatppl", &model)?;
+    let query = context.parse(
+        "model = load_module(\"model.flatppl\")\npoint = elementof(cartprod(lam = nonnegreals))\ninputs = point\noutputs = logdensityof(model.posterior, point)",
+        None,
+        None,
+    )?;
+    for sufficient_statistics in [false, true] {
+        let options = EmitOptions {
+            sufficient_statistics,
+            ..Default::default()
+        };
+        query.compile(&options)?;
+        context
+            .transform(&query, true)?
+            .unconstrained
+            .compile(&options)?;
+    }
+    Ok(())
+}
+
 fn check_summary_schemas(
     prep: &Export,
     score: &Export,
