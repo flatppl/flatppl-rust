@@ -105,6 +105,13 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
         changed |= fold::resolve_alias_refs(m);
         changed |= fold::sweep_dead_bindings(m);
         changed |= inline::inline_user_calls(m);
+        // Inlining may expose a scan's concrete callable argument only now.
+        // Refresh types before specializing it, then let the next sweep
+        // canonicalize the specialized body.
+        if changed {
+            let _ = flatppl_infer::infer(m);
+        }
+        changed |= crate::density::broadcast::specialize_callable_sequences(m);
         changed |= flatten::flatten_structural(m);
         if !changed {
             break;
