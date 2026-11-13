@@ -3887,6 +3887,14 @@ inputs = (shape, scale)
 outputs = (lp)
 ";
 
+const RAYLEIGH_DENSITY_SRC: &str = "\
+scale = elementof(posreals)
+a = draw(Rayleigh(scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (scale)
+outputs = (lp)
+";
+
 const PARETO_DENSITY_SRC: &str = "\
 shape = elementof(posreals)
 scale = elementof(posreals)
@@ -4172,6 +4180,62 @@ fn emit_logdensity_weibull_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @logdensity drifted from the frozen golden (tests/goldens/weibull_logdensity.mlir)"
+    );
+}
+
+/// §08 Rayleigh: with `u = x/scale`, `log(u) - log(scale) - u^2/2`. Op
+/// counts: two `log`s (`u`, `scale`), two `negate`s, one `divide` (`u`), two
+/// `multiply`s (`u*u`, `0.5*u^2`), two `add`s. No `power` and no `chlo.*`.
+#[test]
+fn emit_logdensity_rayleigh_has_expected_structure() {
+    let d = determinize_src(RAYLEIGH_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && !out.contains("%arg1"),
+        "scale must be the only func arg, in:\n{out}"
+    );
+    for (op, n) in [
+        ("stablehlo.log", 2),
+        ("stablehlo.negate", 2),
+        ("stablehlo.divide", 1),
+        ("stablehlo.multiply", 2),
+        ("stablehlo.add", 2),
+        ("stablehlo.power", 0),
+        ("stablehlo.subtract", 0),
+    ] {
+        assert_eq!(out.matches(op).count(), n, "folded {op} count, in:\n{out}");
+    }
+    assert!(
+        !out.contains("chlo."),
+        "Rayleigh needs no CHLO ops, in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.constant dense<0x7F800000>"),
+        "known in-support observation needs no -inf branch, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_rayleigh_matches_frozen_golden() {
+    let d = determinize_src(RAYLEIGH_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/rayleigh_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/rayleigh_logdensity.mlir)"
     );
 }
 
@@ -7092,6 +7156,41 @@ fn emit_sample_weibull_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @sample drifted from the frozen golden (tests/goldens/weibull_sample.mlir)"
+    );
+}
+
+const RAYLEIGH_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Rayleigh(scale = 2.0))
+draws = rand(lawof(x), s)
+outputs = (draws)
+";
+
+/// §08 Rayleigh's `scale * sqrt(-2 * log(U))` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`, one `log` and one `sqrt`.
+#[test]
+fn emit_sample_rayleigh_has_expected_structure() {
+    let d = determinize_src(RAYLEIGH_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("stablehlo.rng_bit_generator"));
+    assert_eq!(out.matches("stablehlo.log ").count(), 1);
+    assert_eq!(out.matches("stablehlo.sqrt").count(), 1);
+    assert_eq!(out.matches("stablehlo.power").count(), 0);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_rayleigh_matches_frozen_golden() {
+    let d = determinize_src(RAYLEIGH_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/rayleigh_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/rayleigh_sample.mlir)"
     );
 }
 

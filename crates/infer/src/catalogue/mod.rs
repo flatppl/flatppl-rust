@@ -1168,6 +1168,7 @@ mod tests {
             "ChiSquared",
             "Exponential",
             "Weibull",
+            "Rayleigh",
             "Beta",
             "Pareto",
             // Uniform is intentionally excluded from NAMES: its support is

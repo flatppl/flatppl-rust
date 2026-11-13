@@ -78,6 +78,18 @@ fn scoped_prior_expressions_use_the_parameter_graph() {
 }
 
 #[test]
+fn rayleigh_alias_maps_to_the_rayleigh_distribution() {
+    let source = |prior: &str| {
+        let spec = spec(json!([{"class": "sigma", "prior": prior}]));
+        let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+        flatppl_syntax::print(&converted.module)
+    };
+    let alias = source("rayleigh(2)");
+    assert!(alias.contains("Rayleigh(2"), "{alias}");
+    assert_eq!(alias, source("Rayleigh(2)"));
+}
+
+#[test]
 fn group_prior_selectors_follow_brms_coefficient_and_alias_precedence() {
     let mut spec = read(include_str!("fixtures/group-priors.formula.json")).unwrap();
     let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();

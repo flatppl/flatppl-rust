@@ -136,6 +136,15 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         },
     ),
     (
+        "Rayleigh",
+        DistLowering {
+            logpdf: rayleigh_logpdf,
+            sample: Some(rayleigh_sample),
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
         "Pareto",
         DistLowering {
             logpdf: pareto_logpdf,
@@ -1207,7 +1216,7 @@ pub(crate) fn lower_sample(
 ///   plus shape-preserving unary / [`Emitter::binary`] ops, and — since 10a's
 ///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] — the
 ///   `select`-on-a-`compare` idiom too): Normal/Exponential/Uniform/Cauchy/
-///   Logistic/Pareto/Weibull/LogNormal (continuous); [`laplace_sample`] (its
+///   Logistic/Pareto/Weibull/Rayleigh/LogNormal (continuous); [`laplace_sample`] (its
 ///   `sgn(U - 1/2)` composed from that same `compare`/`select` pair); and two
 ///   DISCRETE samplers that happen to be straight-line elementwise rather than
 ///   `while`/unrolled — [`bernoulli_sample`] (`select(U < p, 1, 0)`) and
@@ -1277,6 +1286,7 @@ const FANOUT_SAFE: &[&str] = &[
     "Logistic",
     "Pareto",
     "Weibull",
+    "Rayleigh",
     "LogNormal",
     "Laplace",
     // Tier 1 (elementwise discrete — straight-line, not while/unroll)
@@ -1584,7 +1594,7 @@ fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 // ---- §08 gamma-family / positive-support continuous batch -------------------
 //
-// Exponential/Gamma/Weibull/Pareto/InverseGamma/ChiSquared/LogNormal,
+// Exponential/Gamma/Weibull/Rayleigh/Pareto/InverseGamma/ChiSquared/LogNormal,
 // registered alongside Normal/Cauchy/Logistic/Laplace in `REGISTRY`.
 // Gamma/InverseGamma/ChiSquared's log-forms need the log-gamma special
 // function, `chlo.lgamma` ([`Emitter::lgamma`]); the others compose only the
@@ -1712,6 +1722,49 @@ fn weibull_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let powered = e.pow(&neg_log_u, &inv_shape);
 
     Ok(e.mul(&scale, &powered))
+}
+
+/// §08 Rayleigh: with `u = x / scale`, `log f = log(u) - log(scale) - u^2 / 2`,
+/// the log of `x / scale^2 * exp(-x^2 / (2 scale^2))`.
+fn rayleigh_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let scale = p.get(e, "scale")?;
+
+    // §08 Rayleigh support is `nonnegreals`, and the density is 0 at `x = 0`.
+    // The formula is evaluated at a guarded `x > 0`, so `x <= 0` gives `-inf`
+    // through the mask instead of `log(0)` or `nan`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let u = e.div(v, &scale);
+        let log_u = e.log(&u);
+        let log_scale = e.log(&scale);
+        let neg_log_scale = e.neg(&log_scale);
+
+        let u_sq = e.mul(&u, &u);
+        let half = e.scalar(0.5);
+        let half_u_sq = e.mul(&half, &u_sq);
+        let neg_half_u_sq = e.neg(&half_u_sq);
+
+        let t1 = e.add(&log_u, &neg_log_scale);
+        Ok(e.add(&t1, &neg_half_u_sq))
+    })
+}
+
+/// §08 Rayleigh's sampling transform: `scale * sqrt(-2 * log(U))`, `U ~
+/// Uniform(0, 1)`, the inverse CDF of `1 - exp(-x^2 / (2 scale^2))` at `1 - U`.
+/// Drawn at `scale`'s own shape (mirrors [`weibull_sample`]).
+fn rayleigh_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let scale = p.get(e, "scale")?;
+
+    let u = e.rng("UNIFORM", &scale.ty);
+
+    let log_u = e.log(&u);
+    let minus_two = e.scalar(-2.0);
+    let radicand = e.mul(&minus_two, &log_u);
+    let root = e.sqrt(&radicand);
+
+    Ok(e.mul(&scale, &root))
 }
 
 /// §08 Pareto, verbatim: `log f = log(shape) + shape * log(scale) -
