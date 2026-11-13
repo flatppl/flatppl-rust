@@ -247,3 +247,76 @@ fn gaussian_preparation_keeps_shared_centers_outside_row_maps()
     assert!(!prep.stablehlo.contains("tensor<128x2x2x"));
     Ok(())
 }
+
+#[test]
+fn count_and_inverse_matrix_preparation_keep_the_scoring_abi()
+-> Result<(), Box<dyn std::error::Error>> {
+    for source in [
+        "p=elementof(stdsimplex(3))\ny=external(cartpow(cartpow(integers,3),17))\ninputs=(p,y)\noutputs=logdensityof(iid(Multinomial(10,p),17),y)",
+        "nu=elementof(posreals)\nscale=elementof(cartpow(reals,[2,2]))\ny=external(cartpow(cartpow(interval(-100,100),[2,2]),17))\ninputs=(nu,scale,y)\noutputs=logdensityof(iid(InverseWishart(nu,scale),17),y)",
+    ] {
+        let mut context = Context::default();
+        let query = context.parse(source, None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+        for dtype in [flatppl_host::Dtype::F32, flatppl_host::Dtype::F64] {
+            let options = EmitOptions {
+                dtype,
+                ..Default::default()
+            };
+            let prep = prepared.preparation.compile(&options)?;
+            let score = prepared.score.compile(&options)?;
+            check_summary_schemas(&prep, &score, &prepared.summaries)?;
+            assert!(!score.inputs.iter().any(|field| field.name == "y"));
+            assert!(!score.stablehlo.contains("tensor<17x"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn regression_preparation_keeps_matrix_and_affine_designs_outside_scoring()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (dimension, count) in [(2, 5), (3, 2)] {
+        let mut context = Context::default();
+        let source = format!(
+            "beta=elementof(cartpow(reals,{dimension}))\nsigma=elementof(posreals)\nX=external(cartpow(interval(-100,100),[{count},{dimension}]))\ny=external(cartpow(interval(-100,100),{count}))\ninputs=(beta,sigma,X,y)\noutputs=logdensityof(Normal.(X*beta,sigma),y)"
+        );
+        let query = context.parse(&source, None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["X".into(), "y".into()])?;
+        let prep = prepared.preparation.compile(&EmitOptions::default())?;
+        let score = prepared.score.compile(&EmitOptions::default())?;
+        check_summary_schemas(&prep, &score, &prepared.summaries)?;
+        assert_eq!(prepared.summaries.len(), 3);
+        assert!(
+            !score
+                .inputs
+                .iter()
+                .any(|field| matches!(field.name.as_str(), "X" | "y"))
+        );
+        assert!(!prep.stablehlo.contains(&format!("tensor<{count}x{count}x")));
+        // A design that remains a scoring input must retain ordinary scoring.
+        assert!(context.prepare_likelihood(&query, &["y".into()]).is_err());
+    }
+    let mut context = Context::default();
+    let query = context.parse("a=elementof(reals)\nb=elementof(reals)\nsigma=elementof(posreals)\nx=external(cartpow(interval(-100,100),6))\noffset=external(cartpow(interval(-100,100),6))\ny=external(cartpow(interval(-100,100),6))\ninputs=(a,b,sigma,x,offset,y)\noutputs=logdensityof(Normal.(offset .+ a .+ b .* x,sigma),y)", None, None)?;
+    let prepared =
+        context.prepare_likelihood(&query, &["x".into(), "offset".into(), "y".into()])?;
+    let score = prepared.score.compile(&EmitOptions::default())?;
+    assert!(
+        !score
+            .inputs
+            .iter()
+            .any(|field| matches!(field.name.as_str(), "x" | "offset" | "y"))
+    );
+    let constructed = context.parse("beta=elementof(cartpow(reals,2))\nsigma=elementof(posreals)\nx=external(cartpow(interval(-100,100),5))\ny=external(cartpow(interval(-100,100),5))\nX=colstack([fill(1.0,5),x])\ninputs=(beta,sigma,x,y)\noutputs=logdensityof(Normal.(X*beta,sigma),y)", None, None)?;
+    let prepared = context.prepare_likelihood(&constructed, &["x".into(), "y".into()])?;
+    prepared.preparation.compile(&EmitOptions::default())?;
+    let score = prepared.score.compile(&EmitOptions::default())?;
+    assert!(
+        !score
+            .inputs
+            .iter()
+            .any(|field| matches!(field.name.as_str(), "x" | "y"))
+    );
+    Ok(())
+}

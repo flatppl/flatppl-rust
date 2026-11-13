@@ -14,6 +14,7 @@ use crate::RefuseError;
 
 mod histogram;
 mod multivariate;
+mod regression;
 use crate::density::{build_call, build_record};
 
 const PREFIX: &str = "__likelihood_summary_";
@@ -352,6 +353,19 @@ struct Factor {
 }
 
 fn per_cell(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<Factor> {
+    per_cell_inner(m, id, boundary, false)
+}
+
+fn per_cell_with_invariants(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<Factor> {
+    per_cell_inner(m, id, boundary, true)
+}
+
+fn per_cell_inner(
+    m: &Module,
+    id: NodeId,
+    boundary: &HashSet<Symbol>,
+    scalar_captures: bool,
+) -> Option<Factor> {
     let sum = call(m, id, "sum")?;
     let [arg] = *sum.args else { return None };
     let broadcast = call(m, resolve(m, arg, boundary), "broadcast")?;
@@ -396,7 +410,15 @@ fn per_cell(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<Factor
     let parameters = record
         .named
         .iter()
-        .map(|a| Some((a.name, operand(a.value)?)))
+        .map(|a| {
+            let value = operand(a.value).or_else(|| {
+                (scalar_captures
+                    && matches!(m.type_of(a.value), Some(Type::Scalar(_)))
+                    && data_only(m, a.value, boundary, boundary))
+                .then_some(a.value)
+            })?;
+            Some((a.name, value))
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(Factor {
         constructor: *constructor,
@@ -406,10 +428,11 @@ fn per_cell(m: &Module, id: NodeId, boundary: &HashSet<Symbol>) -> Option<Factor
 }
 
 struct Reducer {
+    preparing: bool,
     boundary: HashSet<Symbol>,
     allowed: HashSet<Symbol>,
     summaries: Vec<Symbol>,
-    cache: HashMap<(DataKey, &'static str), NodeId>,
+    cache: HashMap<(Vec<DataKey>, &'static str), NodeId>,
     count: usize,
 }
 
@@ -421,15 +444,30 @@ enum DataKey {
 
 impl Reducer {
     fn summary(&mut self, m: &mut Module, data: NodeId, kind: &'static str, expr: Expr) -> Expr {
-        let data = resolve(m, data, &self.boundary);
-        let key = match m.node(data) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) if self.boundary.contains(name) => DataKey::Input(*name),
-            _ => DataKey::Node(data),
-        };
-        if let Some(&id) = self.cache.get(&(key, kind)) {
+        self.summary_for(m, &[data], kind, expr)
+    }
+
+    fn summary_for(
+        &mut self,
+        m: &mut Module,
+        data: &[NodeId],
+        kind: &'static str,
+        expr: Expr,
+    ) -> Expr {
+        let key = data
+            .iter()
+            .map(|&data| {
+                let data = resolve(m, data, &self.boundary);
+                match m.node(data) {
+                    Node::Ref(Ref {
+                        ns: RefNs::SelfMod,
+                        name,
+                    }) if self.boundary.contains(name) => DataKey::Input(*name),
+                    _ => DataKey::Node(data),
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(&id) = self.cache.get(&(key.clone(), kind)) {
             return Expr::Node(id);
         }
         let rhs = materialize(m, expr);
@@ -484,6 +522,10 @@ impl Reducer {
     }
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        if let Some(result) = regression::reduce(self, m, id) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
         if let Some(result) = multivariate::reduce(self, m, id) {
             self.count += 1;
             return Some(materialize(m, result));
@@ -1073,9 +1115,10 @@ fn fixed_values(m: &Module, root: NodeId, boundary: &HashSet<Symbol>) -> Option<
         .collect()
 }
 
-fn reduce(m: &mut Module, allowed: HashSet<Symbol>) -> (usize, Vec<Symbol>) {
+fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, Vec<Symbol>) {
     let boundary = crate::canon::promoted_input_names(m);
     let mut reducer = Reducer {
+        preparing,
         boundary,
         allowed,
         summaries: Vec::new(),
@@ -1112,7 +1155,7 @@ pub fn sufficient_statistics(m: &mut Module) -> usize {
                 .is_some_and(|bid| m.binding_phase(bid) == Some(flatppl_core::Phase::Fixed))
         })
         .collect();
-    reduce(m, allowed).0
+    reduce(m, allowed, false).0
 }
 
 /// Split a FlatPDL query into preparation and scoring without changing ordinary
@@ -1149,7 +1192,7 @@ pub fn prepare_likelihood(
     let roots = [score.intern("inputs"), score.intern("outputs")];
     crate::canon::retain_reachable(&mut score, &roots);
     let allowed: HashSet<_> = data_inputs.iter().map(|name| score.intern(name)).collect();
-    let (_, added) = reduce(&mut score, allowed.clone());
+    let (_, added) = reduce(&mut score, allowed.clone(), true);
     let boundary = crate::canon::promoted_input_names(&score);
     let mut summaries: Vec<_> = score
         .bindings()

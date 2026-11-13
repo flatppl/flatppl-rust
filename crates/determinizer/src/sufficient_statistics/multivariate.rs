@@ -3,20 +3,20 @@
 use super::{Expr, Reducer, call, data_only, materialize, num, op, per_cell, resolve};
 use flatppl_core::{Dim, Module, Node, NodeId, RefNs, Scalar, ScalarType, Type, ValueSet};
 
-fn cells(body: Expr, data: Expr) -> Expr {
+pub(super) fn cells(body: Expr, data: Expr) -> Expr {
     held_cells(body, data, [])
 }
 
 /// Pass invariant values in singleton cells, outside the mapped function's scope.
-fn held_cells(body: Expr, data: Expr, held: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn held_cells(body: Expr, data: Expr, held: impl IntoIterator<Item = Expr>) -> Expr {
     Expr::Cells(Box::new(body), Box::new(data), held.into_iter().collect())
 }
 
-fn get(value: Expr, index: usize) -> Expr {
+pub(super) fn get(value: Expr, index: usize) -> Expr {
     op("get", [value, Expr::Integer(index as i64 + 1)])
 }
 
-fn entry(value: Expr, row: usize, col: usize) -> Expr {
+pub(super) fn entry(value: Expr, row: usize, col: usize) -> Expr {
     op(
         "get",
         [
@@ -27,21 +27,21 @@ fn entry(value: Expr, row: usize, col: usize) -> Expr {
     )
 }
 
-fn shared(m: &mut Module, expression: Expr) -> Expr {
+pub(super) fn shared(m: &mut Module, expression: Expr) -> Expr {
     Expr::Node(materialize(m, expression))
 }
 
-fn vector(values: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn vector(values: impl IntoIterator<Item = Expr>) -> Expr {
     op("vector", values)
 }
 
-fn dot(a: Expr, b: Expr) -> Expr {
+pub(super) fn dot(a: Expr, b: Expr) -> Expr {
     op("sum", [super::map("mul", [a, b])])
 }
 
 /// QR of bounded-size blocks avoids both Gram cancellation and an N-by-N Q.
 /// A scan needs no associativity assumption about the signs of QR factors.
-fn residual_factor(rows: Expr, count: usize, dimension: usize) -> Expr {
+pub(super) fn residual_factor(rows: Expr, count: usize, dimension: usize) -> Expr {
     let blocks = count.div_ceil(dimension);
     let padding = blocks * dimension - count;
     let zero_row = op("fill", [num(0.0), Expr::Integer(dimension as i64)]);
@@ -83,7 +83,7 @@ fn residual_factor(rows: Expr, count: usize, dimension: usize) -> Expr {
     )
 }
 
-fn real_shape(ty: &Type) -> Option<Vec<usize>> {
+pub(super) fn real_shape(ty: &Type) -> Option<Vec<usize>> {
     let Type::Array { shape, elem } = ty else {
         return None;
     };
@@ -101,6 +101,7 @@ fn real_shape(ty: &Type) -> Option<Vec<usize>> {
 
 fn finite_bound(set: &ValueSet) -> bool {
     match set {
+        ValueSet::Integers | ValueSet::NonNegIntegers | ValueSet::PosIntegers => true,
         ValueSet::Interval(lo, hi) => [lo, hi]
             .iter()
             .all(|x| x.is_finite() && (2.0 * **x as f32).is_finite()),
@@ -111,7 +112,7 @@ fn finite_bound(set: &ValueSet) -> bool {
 
 /// Infinities in a multivariate primitive can interact with covariance entries.
 /// A few scalar flags cannot reconstruct those IEEE outcomes after compression.
-fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
+pub(super) fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
     let id = resolve(m, root, &reducer.boundary);
     match m.node(id) {
         Node::Ref(r) if r.ns == RefNs::SelfMod && reducer.boundary.contains(&r.name) => {
@@ -126,7 +127,7 @@ fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
         }
         Node::Lit(Scalar::Real(x)) => x.is_finite() && (2.0 * *x as f32).is_finite(),
         Node::Lit(Scalar::Int(_)) => true,
-        Node::Call(c) if matches!(c.head, flatppl_core::CallHead::Builtin(h) if matches!(m.resolve(h), "vector" | "rowstack" | "fill" | "neg")) => {
+        Node::Call(c) if matches!(c.head, flatppl_core::CallHead::Builtin(h) if matches!(m.resolve(h), "vector" | "rowstack" | "colstack" | "cat" | "fill" | "neg")) => {
             c.args.iter().all(|&child| finite_data(m, child, reducer))
         }
         _ => m.valueset_of(root).is_some_and(finite_bound),
@@ -134,10 +135,15 @@ fn finite_data(m: &Module, root: NodeId, reducer: &Reducer) -> bool {
 }
 
 pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> {
-    let factor = per_cell(m, id, &reducer.boundary)?;
+    let factor = per_cell(m, id, &reducer.boundary).or_else(|| {
+        super::per_cell_with_invariants(m, id, &reducer.boundary)
+            .filter(|f| matches!(m.resolve(f.constructor), "Multinomial" | "InverseWishart"))
+    })?;
     let family = m.resolve(factor.constructor).to_string();
-    if !matches!(family.as_str(), "MvNormal" | "Dirichlet" | "Wishart")
-        || !data_only(m, factor.observed, &reducer.allowed, &reducer.boundary)
+    if !matches!(
+        family.as_str(),
+        "MvNormal" | "Dirichlet" | "Wishart" | "InverseWishart" | "Multinomial"
+    ) || !data_only(m, factor.observed, &reducer.allowed, &reducer.boundary)
     {
         return None;
     }
@@ -151,9 +157,26 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
         return None;
     }
     let count = *count as usize;
-    let event = real_shape(elem)?;
+    let event = if family == "Multinomial" {
+        let Type::Array { shape, elem } = elem.as_ref() else {
+            return None;
+        };
+        if !matches!(elem.as_ref(), Type::Scalar(ScalarType::Integer)) {
+            return None;
+        }
+        shape
+            .iter()
+            .map(|dim| match dim {
+                Dim::Static(n) if *n > 0 => Some(*n as usize),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        real_shape(elem)?
+    };
     let d = *event.first()?;
-    if (family == "Wishart" && event != [d, d]) || (family != "Wishart" && event != [d]) {
+    let matrix = matches!(family.as_str(), "Wishart" | "InverseWishart");
+    if (matrix && event != [d, d]) || (!matrix && event != [d]) {
         return None;
     }
     let names = flatppl_infer::distribution_param_names(&family)?;
@@ -195,6 +218,391 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     let data = Expr::Node(observed);
     let n = num(count as f64);
     match family.as_str() {
+        "Multinomial" => {
+            let trials_id = parameters
+                .iter()
+                .find(|(name, _)| m.resolve(*name) == "n")?
+                .1;
+            let trials = resolve(m, trials_id, &reducer.boundary);
+            // The trial count fixes the support. Large factorial differences
+            // retain primitive scoring, as in the scalar count reductions.
+            if !matches!(m.node(trials), Node::Lit(Scalar::Int(n)) if *n > 0 && *n < 64) {
+                return None;
+            }
+            let Node::Lit(Scalar::Int(trial_count)) = m.node(trials) else {
+                return None;
+            };
+            if count > (1 << 24) || count.checked_mul(*trial_count as usize)? > i32::MAX as usize {
+                return None;
+            }
+            let trials = Expr::Node(trials);
+            let probs = parameter("p")?;
+            let valid = |row: Expr| {
+                op(
+                    "land",
+                    [
+                        op("lall", [super::map("ge", [row.clone(), Expr::Integer(0)])]),
+                        op(
+                            "iszero",
+                            [op(
+                                "sub",
+                                [
+                                    op("sum", [super::map("real", [row])]),
+                                    op("real", [trials.clone()]),
+                                ],
+                            )],
+                        ),
+                    ],
+                )
+            };
+            let key = [observed, trials_id];
+            let flags = shared(m, cells(valid(Expr::Local), data.clone()));
+            let first = op(
+                "integer",
+                [op(
+                    "round",
+                    [op(
+                        "minimum",
+                        [super::map(
+                            "real",
+                            [super::map(
+                                "ifelse",
+                                [
+                                    flags.clone(),
+                                    op("indicesof", [flags.clone()]),
+                                    Expr::Integer(count as i64),
+                                ],
+                            )],
+                        )],
+                    )],
+                )],
+            );
+            let first = op("get", [data.clone(), first]);
+            let center = reducer.summary_for(
+                m,
+                &key,
+                "multinomial_center",
+                op(
+                    "ifelse",
+                    [
+                        op("lany", [flags.clone()]),
+                        first,
+                        op("fill", [Expr::Integer(0), Expr::Integer(d as i64)]),
+                    ],
+                ),
+            );
+            let valid_count = reducer.summary_for(
+                m,
+                &key,
+                "multinomial_valid_count",
+                op(
+                    "sum",
+                    [super::map(
+                        "ifelse",
+                        [flags, Expr::Integer(1), Expr::Integer(0)],
+                    )],
+                ),
+            );
+            let counts = reducer.summary_for(
+                m,
+                &key,
+                "multinomial_counts",
+                vector((0..d).map(|j| {
+                    op(
+                        "sum",
+                        [cells(
+                            op(
+                                "ifelse",
+                                [valid(Expr::Local), get(Expr::Local, j), Expr::Integer(0)],
+                            ),
+                            data.clone(),
+                        )],
+                    )
+                })),
+            );
+            let factorials = reducer.summary_for(
+                m,
+                &key,
+                "multinomial_relative_factorials",
+                op(
+                    "sum",
+                    [held_cells(
+                        op(
+                            "ifelse",
+                            [
+                                valid(Expr::Local),
+                                op(
+                                    "sum",
+                                    [super::map(
+                                        "sub",
+                                        [
+                                            super::map(
+                                                "loggamma",
+                                                [super::map("add", [Expr::Local, num(1.0)])],
+                                            ),
+                                            super::map(
+                                                "loggamma",
+                                                [super::map("add", [Expr::Held(0), num(1.0)])],
+                                            ),
+                                        ],
+                                    )],
+                                ),
+                                num(0.0),
+                            ],
+                        ),
+                        data,
+                        [center.clone()],
+                    )],
+                ),
+            );
+            let delta = super::map(
+                "sub",
+                [
+                    counts,
+                    super::map("mul", [valid_count.clone(), center.clone()]),
+                ],
+            );
+            let skip = super::map(
+                "lor",
+                [
+                    super::map("iszero", [delta.clone()]),
+                    super::map(
+                        "land",
+                        [
+                            super::map("iszero", [probs.clone()]),
+                            super::map("gt", [center.clone(), Expr::Integer(0)]),
+                        ],
+                    ),
+                ],
+            );
+            let safe_probs = super::map("ifelse", [skip, num(1.0), probs]);
+            let correction = op(
+                "sub",
+                [dot(delta, super::map("log", [safe_probs])), factorials],
+            );
+            let anchor = reducer.anchor(m, &factor, &parameters, center);
+            let normalizer = op(
+                "ifelse",
+                [
+                    op("iszero", [valid_count.clone()]),
+                    num(0.0),
+                    op("mul", [valid_count.clone(), anchor]),
+                ],
+            );
+            let penalty = op(
+                "ifelse",
+                [
+                    op("lt", [valid_count.clone(), Expr::Integer(count as i64)]),
+                    op("neg", [Expr::Constant("inf")]),
+                    num(0.0),
+                ],
+            );
+            let correction = op(
+                "ifelse",
+                [op("iszero", [valid_count]), num(0.0), correction],
+            );
+            Some(op("add", [op("add", [normalizer, correction]), penalty]))
+        }
+        "InverseWishart" => {
+            if !finite_data(m, observed, reducer)
+                || (!reducer.preparing
+                    && !data_only(m, observed, &Default::default(), &reducer.boundary))
+            {
+                return None;
+            }
+            let nu = nu?;
+            let scale = scale?;
+            let identity = op(
+                "rowstack",
+                [vector((0..d).map(|j| {
+                    vector((0..d).map(|k| num(if j == k { 1.0 } else { 0.0 })))
+                }))],
+            );
+            let valid_factor = |l: Expr| {
+                op(
+                    "land",
+                    [
+                        op("lall", [super::map("isfinite", [l.clone()])]),
+                        op(
+                            "lall",
+                            [vector(
+                                (0..d).map(|j| op("gt", [entry(l.clone(), j, j), num(0.0)])),
+                            )],
+                        ),
+                    ],
+                )
+            };
+            let raw_li = op("lower_cholesky", [Expr::Local]);
+            let all_valid = reducer.summary(
+                m,
+                observed,
+                "inverse_wishart_valid",
+                op("lall", [cells(valid_factor(raw_li.clone()), data.clone())]),
+            );
+            let first = get(data.clone(), 0);
+            let first_l = op("lower_cholesky", [first.clone()]);
+            let center = reducer.summary(
+                m,
+                observed,
+                "inverse_wishart_center",
+                op("ifelse", [valid_factor(first_l), first, identity.clone()]),
+            );
+            let lc = shared(m, op("lower_cholesky", [center]));
+            // Generic solves must not turn an observation's failed Cholesky
+            // into a new preparation error. Carry that failure into scoring.
+            let li = op("ifelse", [valid_factor(raw_li.clone()), raw_li, identity]);
+            let relative_det = op(
+                "sum",
+                [vector((0..d).map(|j| {
+                    super::relative_log(entry(li.clone(), j, j), entry(Expr::Held(0), j, j))
+                }))],
+            );
+            let log_delta = reducer.summary(
+                m,
+                observed,
+                "inverse_wishart_logdet",
+                op(
+                    "mul",
+                    [
+                        num(2.0),
+                        op(
+                            "sum",
+                            [held_cells(relative_det, data.clone(), [lc.clone()])],
+                        ),
+                    ],
+                ),
+            );
+            let inverse = op(
+                "colstack",
+                [vector((0..d).map(|j| {
+                    op(
+                        "linsolve",
+                        [
+                            li.clone(),
+                            vector((0..d).map(|k| num(if j == k { 1.0 } else { 0.0 }))),
+                        ],
+                    )
+                }))],
+            );
+            let scales = reducer.summary(
+                m,
+                observed,
+                "inverse_wishart_scales",
+                vector((0..d).map(|j| {
+                    op(
+                        "maximum",
+                        [cells(
+                            op(
+                                "maximum",
+                                [super::map(
+                                    "abs",
+                                    [vector((0..d).map(|k| entry(inverse.clone(), k, j)))],
+                                )],
+                            ),
+                            data.clone(),
+                        )],
+                    )
+                })),
+            );
+            // Stack all inverse-factor rows. Normalize columns before QR,
+            // then multiply by the scale Cholesky before any squaring.
+            let row_count = count.checked_mul(d)?;
+            let inverse_rows = op(
+                "cat",
+                (0..d).map(|j| {
+                    cells(
+                        vector((0..d).map(|k| entry(inverse.clone(), j, k))),
+                        data.clone(),
+                    )
+                }),
+            );
+            let rows = held_cells(
+                super::map(
+                    "divide",
+                    [
+                        Expr::Local,
+                        super::map("mul", [Expr::Held(0), op("sqrt", [n.clone()])]),
+                    ],
+                ),
+                inverse_rows,
+                [scales.clone()],
+            );
+            let r = reducer.summary(
+                m,
+                observed,
+                "inverse_wishart_factor",
+                residual_factor(rows, row_count, d),
+            );
+            let invalid = op("divide", [num(0.0), num(0.0)]);
+            let validity = op("ifelse", [all_valid, num(1.0), invalid]);
+            let r = super::map("mul", [r, validity.clone()]);
+            let log_delta = op("mul", [log_delta, validity]);
+            let ls = shared(m, op("lower_cholesky", [scale.clone()]));
+            let scaled_l = op(
+                "rowstack",
+                [vector((0..d).map(|j| {
+                    super::map(
+                        "mul",
+                        [
+                            get(scales.clone(), j),
+                            vector((0..d).map(|k| entry(ls.clone(), j, k))),
+                        ],
+                    )
+                }))],
+            );
+            let product = shared(m, op("mul", [r, scaled_l]));
+            let trace = op(
+                "sum",
+                [vector((0..d).flat_map(|j| {
+                    let product = product.clone();
+                    (0..d).map(move |k| {
+                        op(
+                            "mul",
+                            [entry(product.clone(), j, k), entry(product.clone(), j, k)],
+                        )
+                    })
+                }))],
+            );
+            let log_scale_delta = op(
+                "mul",
+                [
+                    num(2.0),
+                    op(
+                        "sum",
+                        [vector((0..d).map(|j| {
+                            super::relative_log(entry(ls.clone(), j, j), entry(lc.clone(), j, j))
+                        }))],
+                    ),
+                ],
+            );
+            let coefficient = op("mul", [num(0.5), op("add", [nu, num(d as f64 + 1.0)])]);
+            let anchor = reducer.anchor(m, &factor, &parameters, scale);
+            Some(op(
+                "sub",
+                [
+                    op(
+                        "sub",
+                        [
+                            op(
+                                "mul",
+                                [
+                                    n.clone(),
+                                    op(
+                                        "add",
+                                        [
+                                            op("add", [anchor, num(d as f64 / 2.0)]),
+                                            op("mul", [coefficient.clone(), log_scale_delta]),
+                                        ],
+                                    ),
+                                ],
+                            ),
+                            op("mul", [coefficient, log_delta]),
+                        ],
+                    ),
+                    op("mul", [op("mul", [num(0.5), n]), trace]),
+                ],
+            ))
+        }
         "MvNormal" => {
             if !finite_data(m, observed, reducer) {
                 return None;

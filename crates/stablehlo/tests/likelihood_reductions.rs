@@ -146,6 +146,20 @@ fn dirichlet_boundary_keeps_unit_exponents_and_simplex_support() {
 }
 
 #[test]
+fn multinomial_zero_counts_and_row_support_keep_counting_density() {
+    for dtype in [Dtype::F32, Dtype::F64] {
+        for (point, expected) in [
+            ("[0,2]", 0.0),
+            ("[0,1]", f64::NEG_INFINITY),
+            ("[-1,3]", f64::NEG_INFINITY),
+        ] {
+            let source = format!("outputs=logdensityof(Multinomial(2,[0.0,1.0]),{point})");
+            assert_eq!(returned_constant(&emit(&source, dtype), dtype), expected);
+        }
+    }
+}
+
+#[test]
 fn unsafe_target_rounding_retains_original_cellwise_scoring() {
     for source in [
         "outputs=logdensityof(iid(Gamma(1,2),2),[1e-50,2e-50])",

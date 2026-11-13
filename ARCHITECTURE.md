@@ -208,13 +208,38 @@ Poisson moment expansions. A bounded empirical histogram also shares original
 primitive scores for repeated fixed scalar observations, including Categorical
 and StudentT. It preserves the observation array's promoted scalar type.
 
-Vector/matrix event rules cover MvNormal, Dirichlet and Wishart. MvNormal
+Vector/matrix event rules cover MvNormal, Dirichlet, Wishart, InverseWishart and
+Multinomial. MvNormal
 retains a centered, scaled residual factor computed by bounded-size QR blocks,
 plus the residual mean; no positive-definite scatter matrix is required.
 Dirichlet retains finite coordinate log sums, zero counts and the valid-row
 count. Wishart retains a matrix anchor, relative Cholesky log determinants and
 mean matrix corrections. Primitive anchors retain normalizers and parameter
 checks. Summaries may be scalars, vectors or matrices.
+
+InverseWishart compresses scaled inverse Cholesky factors with bounded QR and
+evaluates its trace as a sum of squares. Runtime observations require explicit
+preparation, since repeating QR would cost more than ordinary scoring.
+Failed observation factors are sanitized before setup solves; a validity
+summary preserves NaN scores without introducing new preparation errors.
+Multinomial retains valid-row counts,
+category counts and relative factorial terms. It currently requires a literal
+trial count from 1 to 63 and aggregate counts that fit both integer precisions.
+The first-valid-row index must also be exact in float32 (at most 2^24 rows).
+Other cases retain primitive scoring.
+
+Gaussian regression recognizes fixed matrix-vector products and affine sums of
+fixed scalar features, intercepts and offsets, with a shared scalar sigma.
+Preparation chooses a guarded data-derived coefficient reference, computes its
+residual, and compresses the scaled augmented design with bounded QR. Scoring
+uses three event-sized summaries rather than the original rows. Small pivots
+change only the reference, never the model rank. Wide designs retain their
+rectangular rows without padding to a larger square. Parameter-dependent designs, nonlinear mean vectors
+and varying sigmas retain ordinary scoring. Runtime designs and observations
+require explicit preparation to amortize QR setup. Integer data are supported,
+but live integer array arithmetic retains its original rounding/wrap behavior.
+Summary cache keys include every
+data dependency, so different designs never share a response-only cache entry.
 
 MvNormal and Wishart require fixed finite observations or explicit finite
 runtime bounds, such as `cartpow(interval(-100, 100), d)` for a vector cell.
@@ -236,9 +261,8 @@ same numeric precision.
 `LoweringOptions::disable_sufficient_statistics` disables the shared rewrite.
 `EmitOptions::sufficient_statistics` controls both shared lowering and the
 existing StableHLO fixed-data fallback. The CLI exposes
-`--sufficient-statistics=false` on both output commands. Regression contractions
-and arbitrary algebraic discovery are not yet rules
-of this pass. A future backend consumes the same reduced FlatPDL and does not
+`--sufficient-statistics=false` on both output commands. Arbitrary algebraic
+discovery is not yet a rule of this pass. A future backend consumes the same reduced FlatPDL and does not
 need its own statistical discovery pass.
 
 ## Profiles — one mechanism, several uses
