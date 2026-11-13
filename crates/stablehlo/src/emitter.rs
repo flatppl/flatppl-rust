@@ -903,18 +903,16 @@ impl<'m> Emitter<'m> {
         self.mul(&e, &sqrt2)
     }
 
-    /// `invprobit(x) = Φ(x) = ½·(1 + erf(x / √2))` (spec §07's standard-normal
-    /// CDF). Same identity `crate::registry::normal_cdf` uses at
-    /// `mu = 0, sigma = 1`, spelled here for the op map because
-    /// `crate::ops` has no `Params` to read.
+    /// `invprobit(x) = Φ(x) = ½·erfc(-x / √2)` (spec §07's standard-normal
+    /// CDF). The complementary error function retains lower-tail probabilities
+    /// where adding one to `erf(x / √2)` would cancel.
     pub(crate) fn invprobit(&mut self, a: &Value) -> Value {
         let sqrt2 = self.constant_like(std::f64::consts::SQRT_2, a);
         let z = self.div(a, &sqrt2);
-        let erf_z = self.erf(&z);
-        let one = self.constant_like(1.0, a);
-        let one_plus = self.add(&one, &erf_z);
+        let neg_z = self.neg(&z);
+        let tail = self.chlo_unary("chlo.erfc", &neg_z);
         let half = self.constant_like(0.5, a);
-        self.mul(&half, &one_plus)
+        self.mul(&half, &tail)
     }
 
     /// `expm1(x) = eˣ − 1` (spec §07) — core
