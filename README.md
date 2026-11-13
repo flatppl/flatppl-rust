@@ -127,6 +127,13 @@ reference. Runtime regression and InverseWishart data require explicit
 preparation to amortize QR setup. Parameter-dependent designs and varying sigmas retain
 ordinary scoring.
 
+InverseGamma, Pareto, fixed-shape Weibull and fixed-dispersion NegativeBinomial
+likelihoods also support summaries. Real observations need positive finite
+values or explicit positive finite bounds. Count reductions require dispersion
+at most 64 or fixed counts below 64. Include runtime shape/dispersion inputs in
+preparation with another `--data-input` option. These families require explicit
+preparation for runtime data so setup is reused between scores.
+
 Run preparation once per data binding, then append its results to the scoring
 arguments in preparation-output order. Other scoring arguments keep their
 original order. Data needed outside reduced factors remains a scoring argument.

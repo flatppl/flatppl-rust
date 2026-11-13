@@ -208,6 +208,22 @@ Poisson moment expansions. A bounded empirical histogram also shares original
 primitive scores for repeated fixed scalar observations, including Categorical
 and StudentT. It preserves the observation array's promoted scalar type.
 
+InverseGamma, Pareto, fixed-shape Weibull and both fixed-dispersion
+NegativeBinomial parameterizations also have anchored scalar summaries.
+InverseGamma uses a harmonic center and dimensionless reciprocal residuals.
+Weibull uses a power-mean center with relative logarithms before exponentiation.
+Pareto retains the minimum for its live scale support check. Invalid observations
+are sanitized before preparation arithmetic and retain primitive support scores.
+Count summaries widen integers before reduction and reuse native coefficients
+at a data-derived reference, avoiding three-loggamma cancellation.
+Count rules require dispersion at most 64 or fixed counts below 64; other cases
+retain ordinary scoring to avoid amplifying float32 primitive errors.
+These new real-data rules require fixed positive finite observations or explicit
+positive finite runtime bounds. Runtime observations or shape/dispersion inputs
+require explicit preparation, since repeating setup can cost more than ordinary
+scoring. Shape/dispersion dependencies enter summary cache keys. Unsupported
+boundaries and live Weibull shape or count dispersion retain ordinary scoring.
+
 Vector/matrix event rules cover MvNormal, Dirichlet, Wishart, InverseWishart and
 Multinomial. MvNormal
 retains a centered, scaled residual factor computed by bounded-size QR blocks,
