@@ -3214,9 +3214,10 @@ fn lower_weighted(
     let parameters = crate::extras::bind_extras(m, node, w_node, 2, 1)?;
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
+    let (gate, inner_density, point) = split_support_gate(m, m_inner, v, inner_density);
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
     let w_scored = if !parameters.is_empty() || weight_is_variate_dependent(m, w_node) {
-        let applied = build_callback_call(m, w_node, v, &parameters)?;
+        let applied = build_callback_call(m, w_node, point, &parameters)?;
         crate::canon::inline_expression(m, applied)
     } else {
         w_node
@@ -3237,7 +3238,66 @@ fn lower_weighted(
         build_call(m, "ifelse", &[absent, one, w_scored])
     };
     let log_w = build_call(m, "log", &[safe_weight]);
-    Ok(build_call(m, "add", &[log_w, inner_density]))
+    let density = build_call(m, "add", &[log_w, inner_density]);
+    Ok(match gate {
+        Some(cond) => gate_density(m, cond, density),
+        None => density,
+    })
+}
+
+/// The base density's support gate, peeled so a weight applies inside it.
+///
+/// §06 gives `weighted(f, M)` the density `f(x)` times `M`'s density, and `M`'s
+/// density is zero outside its support, so the product is zero there whatever `f`
+/// is: `f` need only be defined on the support. Adding `log f(x)` to a gated −∞
+/// evaluates `f` at the excluded point, and a NaN there (a square root of a negative
+/// Källén function below threshold, say) turns `NaN + (−∞)` into NaN. So when the
+/// base density is a [`gate_density`], the weight is evaluated at the
+/// [`gate_point`] and the sum is gated by the same condition.
+///
+/// Returns the gate condition (`None` for an ungated base), the density inside the
+/// gate, and the point the weight is applied at.
+fn split_support_gate(
+    m: &mut Module,
+    base: NodeId,
+    v: NodeId,
+    density: NodeId,
+) -> (Option<NodeId>, NodeId, NodeId) {
+    let Some(c) = expect_builtin_call(m, density, "ifelse") else {
+        return (None, density, v);
+    };
+    let [cond, inside, outside] = c.args[..] else {
+        return (None, density, v);
+    };
+    let is_neg_inf = expect_builtin_call(m, outside, "neg").is_some_and(|n| {
+        matches!(n.args[..], [x] if matches!(m.node(x), Node::Const(s) if m.resolve(*s) == "inf"))
+    });
+    if !is_neg_inf {
+        return (None, density, v);
+    }
+    let witness = support_witness_point(m, base, v);
+    let point = match witness.and_then(|w| record_gate_point(m, cond, v, w)) {
+        Some(point) => point,
+        None => gate_point(m, cond, v, witness),
+    };
+    (Some(cond), inside, point)
+}
+
+/// [`gate_point`] for a record variate, field by field, so the point stays a record
+/// literal that a several-input weight splats over (§04 "Calling conventions").
+/// `None` unless `witness` is a record literal whose every field `v` has.
+fn record_gate_point(m: &mut Module, cond: NodeId, v: NodeId, witness: NodeId) -> Option<NodeId> {
+    let fields: Vec<(Symbol, NodeId)> = expect_builtin_call(m, witness, "record")?
+        .named
+        .iter()
+        .map(|field| (field.name, field.value))
+        .collect();
+    let mut gated = Vec::with_capacity(fields.len());
+    for (name, w) in fields {
+        let value = crate::kernel::record_field(m, v, name)?;
+        gated.push((name, build_call(m, "ifelse", &[cond, value, w])));
+    }
+    Some(build_record(m, &gated))
 }
 
 /// `logdensityof(logweighted(ℓ, M), v)` = `ℓ(v) + logdensityof(M, v)`, where `ℓ`
@@ -3267,13 +3327,18 @@ fn lower_logweighted(
     let parameters = crate::extras::bind_extras(m, node, lw_node, 2, 1)?;
     let inner_density =
         lower_measure_density_in_reference(m, m_inner, v, VariateOrigin::Other, atoms)?;
+    let (gate, inner_density, point) = split_support_gate(m, m_inner, v, inner_density);
     let lw_scored = if !parameters.is_empty() || weight_is_variate_dependent(m, lw_node) {
-        let applied = build_callback_call(m, lw_node, v, &parameters)?;
+        let applied = build_callback_call(m, lw_node, point, &parameters)?;
         crate::canon::inline_expression(m, applied)
     } else {
         lw_node
     };
-    Ok(build_call(m, "add", &[lw_scored, inner_density]))
+    let density = build_call(m, "add", &[lw_scored, inner_density]);
+    Ok(match gate {
+        Some(cond) => gate_density(m, cond, density),
+        None => density,
+    })
 }
 
 /// Apply a callback with its variate and the bound additional arguments intact.
@@ -5079,11 +5144,32 @@ fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
 /// variate, an unproven support): no sanitisation then.
 fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
     let (ty, support) = match (m.type_of(measure), m.valueset_of(measure)) {
-        (Some(ty), Some(support)) if crate::invert::support_witness(support).is_some() => {
+        (Some(ty), Some(support))
+            if crate::invert::support_witness(support).is_some()
+                || matches!(support, ValueSet::RecordSet(_)) =>
+        {
             (ty.clone(), support.clone())
         }
         _ => flatppl_infer::infer_expression_support(m, measure)?,
     };
+    // A record variate over a record set takes each field's point (§03 keyword
+    // `cartprod`: "produces a set of records").
+    if let (Type::Measure { domain, .. }, ValueSet::RecordSet(sets)) = (&ty, &support)
+        && let Type::Record(fields) = &**domain
+    {
+        let mut values = Vec::with_capacity(fields.len());
+        for (name, field) in fields.iter() {
+            let (_, set) = sets.iter().find(|(n, _)| n == name)?;
+            let w = crate::invert::support_witness(set)?;
+            let value = match field {
+                Type::Scalar(ScalarType::Integer) if w.fract() == 0.0 => Scalar::Int(w as i64),
+                Type::Scalar(_) => Scalar::Real(w),
+                _ => return None,
+            };
+            values.push((*name, m.alloc(Node::Lit(value))));
+        }
+        return Some(build_record(m, &values));
+    }
     let w = crate::invert::support_witness(&support)?;
     // An integer variate takes an integer witness: a kernel such as Categorical
     // accepts only integer observations.
