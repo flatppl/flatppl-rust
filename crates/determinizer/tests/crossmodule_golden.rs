@@ -928,26 +928,16 @@ lp = logdensityof(outer.combo, 0.5)";
     assert_normal_score(mmod, &bundle, 0.5, 99.0, 2.0);
 }
 
-/// GAP #194 FIX 1, refuse-don't-mislower (CRITICAL — reproduces a silent wrong
-/// density): a cross-module kernel APPLICATION whose ARGUMENT is itself a
-/// cross-module ref (`logdensityof(m.k(m.rec), pt)`, where `m.rec` is a record
-/// defined in the submodule) must refuse rather than lower. The doc comment on
-/// `graft_kernel_application_callee` claims the application's args are
-/// host-local and carries them over unchanged when rebuilding the `%call` — but
-/// `m.rec` is NOT host-local. Only the callee (`m.k`) is grafted; the raw
-/// unresolved `(%ref m rec)` argument would be spliced as-is into the rebuilt
-/// call. `reduce_kernel_application` (structural; `resolve_ref_one` follows
-/// only `SelfMod` refs) cannot see through it, so it splices the dangling ref
-/// into the kernel body — `determinize_with` must NOT return `Ok` with that
-/// dangling, `Type::Failed("cross-module resolution")`-tagged node standing in
-/// for a resolved value.
+/// Imported record arguments are grafted before the kernel's autosplatting and
+/// density lowering, so both Normal parameters resolve to their actual values.
 #[test]
-fn cross_module_kernel_application_with_module_arg_refuses() {
+fn cross_module_kernel_application_with_module_arg_lowers() {
     let helpers = "\
 flatppl_compat = \"0.1\"
 center = elementof(reals)
-k = functionof(Normal(mu = center, sigma = 1.0), center = center)
-rec = record(center = 0.0)";
+scale = elementof(posreals)
+k = functionof(Normal(mu = center, sigma = scale), center = center, scale = scale)
+rec = record(center = 1.25, scale = 2.0)";
     let model = "\
 flatppl_compat = \"0.1\"
 m = load_module(\"helpers.flatppl\")
@@ -961,16 +951,31 @@ lp = logdensityof(m.k(m.rec), 0.5)";
     let mut mmod = parse(model);
     let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
 
-    let result = determinize_with(&mmod, &bundle);
-    assert!(
-        result.is_err(),
-        "a cross-module kernel APPLICATION whose ARGUMENT is itself a cross-module ref must \
-         refuse (only the callee is grafted; the argument crosses the module boundary too) \
-         rather than splice an unresolved dangling ref into the kernel body — a silent wrong \
-         density; got:\n{}",
-        result
-            .map(|l| flatppl_flatpir::write(&l))
-            .unwrap_or_default()
+    assert_normal_score(mmod, &bundle, 0.5, 1.25, 2.0);
+}
+
+/// §04 makes imported fixed functions first-class arguments. Each function
+/// retains its load-time substitutions when the callee comes from another load.
+#[test]
+fn imported_function_arguments_keep_load_substitutions() {
+    let mut bundle = ModuleBundle::new();
+    bundle.insert(
+        "apply.flatppl",
+        Arc::new(parse(
+            "offset = external(reals)\napply(f, x) = f(x) + offset",
+        )),
+    );
+    bundle.insert(
+        "shift.flatppl",
+        Arc::new(parse("offset = external(reals)\nshift(x) = x + offset")),
+    );
+    assert_outputs(
+        "a = load_module(\"apply.flatppl\", offset = 2.0)\n\
+         b = load_module(\"shift.flatppl\", offset = 7.0)\n\
+         offset = 100.0\nchosen = b.shift\nx = elementof(reals)\ninputs = x\n\
+         outputs = [a.apply(b.shift, x), a.apply(f = b.shift, x = x), a.apply(f = chosen, x = x)]",
+        &bundle,
+        "x = elementof(reals)\ninputs = x\noutputs = [(x + 7.0) + 2.0, (x + 7.0) + 2.0, (x + 7.0) + 2.0]",
     );
 }
 
@@ -1389,8 +1394,7 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
 // parameter). Previously the module-ref callee nested in the application (not a
 // top-level alias, not a draw measure) was left dangling → a
 // `Type::Failed("cross-module resolution")` node. The driver pre-pass now grafts
-// such callees via `graft_kernel_application_callee` — which still REFUSES a
-// cross-module value ARGUMENT (`cross_module_kernel_application_with_module_arg_refuses`).
+// such callees via `graft_kernel_application_callee`.
 #[test]
 fn cross_module_function_callee_in_binding_grafts() {
     let helpers = "flatppl_compat = \"0.1\"\ng = par -> par + 1.0";
