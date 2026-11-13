@@ -202,7 +202,7 @@ fn beta_support_is_unitinterval() {
     );
 }
 
-/// Exponential and Weibull both have support `nonnegreals`.
+/// Exponential, Weibull and Rayleigh have support `nonnegreals`.
 #[test]
 fn exponential_weibull_support_nonnegreals() {
     let src_exp = "m = Exponential(1.0)";
@@ -219,6 +219,12 @@ fn exponential_weibull_support_nonnegreals() {
     assert!(
         out_wei.contains("nonnegreals"),
         "Weibull support must be nonnegreals; got:\n{out_wei}"
+    );
+
+    let out_ray = ir("m = Rayleigh(1.0)");
+    assert!(
+        out_ray.contains("nonnegreals"),
+        "Rayleigh support must be nonnegreals; got:\n{out_ray}"
     );
 }
 

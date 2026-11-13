@@ -22,6 +22,7 @@ Catalogue(
         Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["k"], param_sets: [PosReals])),
         Builtin(name: "Exponential",       sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["rate"], param_sets: [PosReals])),
         Builtin(name: "Weibull",           sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["shape", "scale"], param_sets: [PosReals, PosReals])),
+        Builtin(name: "Rayleigh",          sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["scale"], param_sets: [PosReals])),
         Builtin(name: "Beta",              sig: Distribution(domain: Scalar(Real), support: UnitInterval,  mass: Normalized, params: ["alpha", "beta"], param_sets: [PosReals, PosReals])),
         // Pareto: spec §08 — domain reals, support posreals (x >= x_m > 0).
         // Legacy ops.rs distribution_domain does not list Pareto (falls through

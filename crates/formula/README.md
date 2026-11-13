@@ -217,7 +217,7 @@ Gamma(2, 0.1) prior normalized above 1. Gamma shape has Gamma(0.01, 0.01),
 and negative-binomial shape has inverse-Gamma(0.4, 0.3).
 Prior text is a FlatPPL measure expression. The brms aliases `normal`, `student_t`,
 `cauchy`, `exponential`, `gamma`, `inv_gamma`, `beta`, `lognormal`, `logistic`,
-`weibull`, `double_exponential`, `chi_square` and `uniform` accept their usual
+`weibull`, `rayleigh`, `double_exponential`, `chi_square` and `uniform` accept their usual
 positional arguments. `lkj`, `lkj_corr` and `lkj_corr_cholesky` require a group
 correlation target.
 

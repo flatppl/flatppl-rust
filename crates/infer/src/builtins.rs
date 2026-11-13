@@ -65,6 +65,7 @@ pub const BUILTINS: &[&str] = &[
     "Pareto",
     "Poisson",
     "PoissonProcess",
+    "Rayleigh",
     "StudentT",
     "Uniform",
     "VonMises",

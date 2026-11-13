@@ -2218,6 +2218,7 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
             | "Exponential"
             | "InverseGamma"
             | "Weibull"
+            | "Rayleigh"
     ) && args
         .iter()
         .any(|a| matches!(a, Math::Relation { rel: Rel::Eq, .. }))

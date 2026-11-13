@@ -169,6 +169,7 @@ fn entry(name: &str) -> NotationEntry {
                 "Gamma" | "InverseGamma" => vec!["alpha", "beta"],
                 "Exponential" | "Poisson" => vec!["lambda"],
                 "Weibull" => vec!["k", "lambda"],
+                "Rayleigh" => vec!["sigma"],
                 "Cauchy" => vec!["x_0", "gamma"],
                 "Laplace" => vec!["x_0", "b"],
                 _ => params.iter().map(String::as_str).collect(),
@@ -280,6 +281,11 @@ fn entry(name: &str) -> NotationEntry {
                     math(param("k")),
                     text(" and scale "),
                     math(param("lambda")),
+                    text("."),
+                ],
+                "Rayleigh" => vec![
+                    text("Rayleigh distribution with scale "),
+                    math(param("sigma")),
                     text("."),
                 ],
                 "Uniform" => vec![

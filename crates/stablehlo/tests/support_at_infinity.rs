@@ -54,6 +54,7 @@ fn every_half_line_density_guards_an_infinite_variate() {
         "Gamma(shape = 2.5, rate = 1.5)",
         "InverseGamma(shape = 2.5, scale = 1.5)",
         "Weibull(shape = 2.5, scale = 1.5)",
+        "Rayleigh(scale = 1.5)",
         "ChiSquared(k = 3.0)",
         "Exponential(rate = 1.5)",
         "LogNormal(mu = 0.0, sigma = 1.0)",

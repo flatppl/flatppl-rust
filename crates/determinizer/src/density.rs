@@ -4788,6 +4788,7 @@ const ATOMLESS_REAL_LEAVES: &[&str] = &[
     "ChiSquared",
     "Exponential",
     "Weibull",
+    "Rayleigh",
     "Beta",
     "Pareto",
     "Uniform",
