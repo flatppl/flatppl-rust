@@ -7313,6 +7313,18 @@ fn broadcast_type(
         return Ready(Type::Deferred);
     };
     let op_name = inf.module.resolve(*op).to_string();
+    if matches!(op_name.as_str(), "get" | "get0") && named.is_empty() {
+        // Select from each collection cell, using the per-cell selector types.
+        let cells: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(node, ty, phase)| (*node, cell_arg(ty), *phase))
+            .collect();
+        let cell = get_type(inf, &cells, i64::from(op_name == "get"));
+        return Ready(Type::Array {
+            shape,
+            elem: Box::new(cell),
+        });
+    }
     if op_name == "record" && args.len() == 1 && !named.is_empty() {
         if shape.len() != 1 {
             inf.diags.push(crate::Diagnostic::error_at(

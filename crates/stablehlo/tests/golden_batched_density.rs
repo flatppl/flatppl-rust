@@ -35,6 +35,21 @@ fn emit(src: &str) -> String {
     .expect("must emit @logdensity")
 }
 
+#[test]
+fn multinomial_columns_through_a_counting_bijection_emit() {
+    let out = emit(
+        "flatppl_compat = \"0.1\"\n\
+         cols(x) = get.(fill(x, sizeof(x)[2]), all, indicesof(x)[2])\n\
+         b = bijection(x -> colstack(x), cols, x -> 0.0)\n\
+         f(p, n) = pushfwd(b, ((ni, pi) -> Multinomial(ni, pi)).(n, cols(p)))\n\
+         p = rowstack([[0.2, 0.1], [0.3, 0.1], [0.5, 0.8]])\n\
+         m = f(p, [5, 5])\n\
+         lp = logdensityof(m, rowstack([[1, 0], [2, 1], [2, 4]]))\n\
+         outputs = [lp]\n",
+    );
+    assert!(out.contains("func.func @logdensity"));
+}
+
 const IID_UNIFORM: &str = "\
 flatppl_compat = \"0.1\"
 x = elementof(cartpow(reals, 2))
