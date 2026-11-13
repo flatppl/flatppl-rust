@@ -233,9 +233,15 @@ impl Emitter<'_> {
             .collect()
     }
 
-    /// Whether `value` is a fixed tensor of any shape. Only finite reals fold.
-    pub(crate) fn is_constant(&self, value: &Value) -> bool {
-        self.constants.contains_key(&value.ssa)
+    /// Per-cell finiteness of a fixed tensor, or `None` for a runtime value.
+    /// Fixed data can hold `±inf` literals, which finiteness predicates fold.
+    pub(crate) fn fixed_finite_cells(&self, value: &Value) -> Option<Vec<bool>> {
+        let data = self.constants.get(&value.ssa)?;
+        Some(
+            data.iter()
+                .map(|cell| !matches!(cell, Scalar::Real(x) if !x.is_finite()))
+                .collect(),
+        )
     }
 
     /// The value of a fixed, unbatched real scalar at the emitted precision.
