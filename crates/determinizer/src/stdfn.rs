@@ -22,7 +22,7 @@
 //! ## Members without a base-op form
 //!
 //! A member with no base-op form (`special-functions`, `ext-linear-algebra`, the
-//! Wigner functions, the higher-order `distances` members) is left ALONE here.
+//! higher-order `distances` members) is left ALONE here.
 //! FlatPDL keeps the call and its `standard_module` binding, and each engine
 //! lowers or refuses the member itself.
 //!
@@ -293,6 +293,11 @@ pub(crate) fn has_base_op_form(module: &str, member: &str) -> bool {
                     | "kallen"
                     | "breakup_momentum"
                     | "blatt_weisskopf"
+                    | "resonance_breitwigner"
+                    | "wignerd"
+                    | "wignerD"
+                    | "wignerd_doublearg"
+                    | "wignerD_doublearg"
             )
             | (
                 "polynomials",
@@ -336,6 +341,30 @@ fn lower_member_function(
             let a = arity::<3>(args)?;
             blatt_weisskopf(m, a)
         }
+        ("particle-physics", "resonance_breitwigner") => {
+            let a = arity::<7>(args)?;
+            resonance_breitwigner(m, a)
+        }
+        ("particle-physics", "wignerd") => {
+            let [j, m1, m2, cosbeta] = arity::<4>(args)?;
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n).map(|n| 2 * n));
+            wignerd(m, doubled, cosbeta)
+        }
+        ("particle-physics", "wignerd_doublearg") => {
+            let [j, m1, m2, cosbeta] = arity::<4>(args)?;
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n));
+            wignerd(m, doubled, cosbeta)
+        }
+        ("particle-physics", "wignerD") => {
+            let [j, m1, m2, alpha, cosbeta, gamma] = arity::<6>(args)?;
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n).map(|n| 2 * n));
+            wigner_big_d(m, doubled, [alpha, cosbeta, gamma])
+        }
+        ("particle-physics", "wignerD_doublearg") => {
+            let [j, m1, m2, alpha, cosbeta, gamma] = arity::<6>(args)?;
+            let doubled = [j, m1, m2].map(|n| literal_int(m, n));
+            wigner_big_d(m, doubled, [alpha, cosbeta, gamma])
+        }
         ("polynomials", name @ ("legendre" | "hermite" | "laguerre" | "chebyshev")) => {
             let [n, x] = arity::<2>(args)?;
             let degree = literal_degree(m, n)?;
@@ -373,6 +402,23 @@ fn arity<const N: usize>(args: &[NodeId]) -> Option<[NodeId; N]> {
 /// `(%ref self …)` hop. §09 requires a non-negative integer; a computed degree is
 /// declined (this pass runs before constant folding, so `1 + 1` is not a literal
 /// here).
+/// A literal integer, written as a literal or as the negation of one (§11 "Literal
+/// values" spells a negative literal `neg(<magnitude>)`).
+fn literal_int(m: &Module, id: NodeId) -> Option<i64> {
+    let node = resolve_ref(m, id).0;
+    match m.node(node) {
+        Node::Lit(Scalar::Int(n)) => Some(*n),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "neg")
+                && c.args.len() == 1
+                && c.named.is_empty() =>
+        {
+            literal_int(m, c.args[0]).and_then(i64::checked_neg)
+        }
+        _ => None,
+    }
+}
+
 fn literal_degree(m: &Module, id: NodeId) -> Option<i64> {
     let node = resolve_ref(m, id).0;
     let n = match m.node(node) {
@@ -707,6 +753,142 @@ fn blatt_weisskopf(m: &mut Module, [l, p, d]: [NodeId; 3]) -> Option<NodeId> {
     }
     let ratio = divide(m, z_pow, chi);
     Some(sqrt(m, ratio))
+}
+
+// -- particle-physics: resonances and rotations ----------------------------
+
+/// §09 `resonance_breitwigner`:
+/// $\mathrm{BW}(\sigma) = 1/(m^2 - \sigma - i m \Gamma(\sigma))$ with
+/// $\Gamma(\sigma) = \Gamma \frac{m}{\sqrt\sigma} \frac{p(\sigma)}{p_0}
+/// (F_\ell(p(\sigma))/F_\ell(p_0))^2$, where $p(\sigma)$ is `breakup_momentum` at
+/// $\sqrt\sigma$, $p_0$ its on-shell value at $m$, and $F_\ell$ `blatt_weisskopf`.
+/// Only a literal $\ell$ lowers, as for `blatt_weisskopf`.
+fn resonance_breitwigner(
+    m: &mut Module,
+    [sigma, mass, width, ma, mb, l, d]: [NodeId; 7],
+) -> Option<NodeId> {
+    let root = sqrt(m, sigma);
+    let p = breakup_momentum(m, [root, ma, mb]);
+    let p0 = breakup_momentum(m, [mass, ma, mb]);
+    let f = blatt_weisskopf(m, [l, p, d])?;
+    let f0 = blatt_weisskopf(m, [l, p0, d])?;
+    let barrier = divide(m, f, f0);
+    let barrier = mul(m, barrier, barrier);
+    let momentum = divide(m, p, p0);
+    let mass_ratio = divide(m, mass, root);
+    let running = mul(m, width, mass_ratio);
+    let running = mul(m, running, momentum);
+    let running = mul(m, running, barrier);
+    let mass2 = mul(m, mass, mass);
+    let re = sub(m, mass2, sigma);
+    let im = mul(m, mass, running);
+    let im = neg(m, im);
+    let denominator = build_call(m, "complex", &[re, im]);
+    let one = lit(m, 1.0);
+    Some(divide(m, one, denominator))
+}
+
+/// Largest doubled spin $2j$ the Wigner lowerings unroll, so that the emitted sum
+/// of at most $2j + 1$ terms stays bounded. Well past any spin a model writes.
+const MAX_TWO_J: i64 = 40;
+
+/// §09 `wignerd` and `wignerd_doublearg` at literal doubled momenta $2j$, $2m_1$,
+/// $2m_2$: the matrix element $\langle j\, m_1 | e^{-i\beta J_y} | j\, m_2 \rangle$,
+/// by Wigner's formula
+///
+/// $$d^j_{m_1 m_2} = \sum_s (-1)^{m_1 - m_2 + s}
+/// \frac{\sqrt{(j+m_1)!\,(j-m_1)!\,(j+m_2)!\,(j-m_2)!}}
+/// {(j+m_2-s)!\,s!\,(m_1-m_2+s)!\,(j-m_1-s)!}
+/// \cos^{2j+m_2-m_1-2s}\tfrac\beta2 \, \sin^{m_1-m_2+2s}\tfrac\beta2.$$
+///
+/// With $c = \cos\beta$, $\cos^2\frac\beta2 = (1+c)/2$ and
+/// $\sin^2\frac\beta2 = (1-c)/2$. Each power's parity is the same in every term,
+/// so at most one square root of each is taken. Momenta that are not literal, or
+/// that break $|m_i| \le j$ or the parity of $j$, are declined.
+fn wignerd(m: &mut Module, doubled: [Option<i64>; 3], cosbeta: NodeId) -> Option<NodeId> {
+    let [two_j, two_m1, two_m2] = [doubled[0]?, doubled[1]?, doubled[2]?];
+    if !(0..=MAX_TWO_J).contains(&two_j)
+        || two_m1.abs() > two_j
+        || two_m2.abs() > two_j
+        || (two_j + two_m1) % 2 != 0
+        || (two_j + two_m2) % 2 != 0
+    {
+        return None;
+    }
+    let j_plus_m1 = (two_j + two_m1) / 2;
+    let j_minus_m1 = (two_j - two_m1) / 2;
+    let j_plus_m2 = (two_j + two_m2) / 2;
+    let j_minus_m2 = (two_j - two_m2) / 2;
+    let m1_minus_m2 = (two_m1 - two_m2) / 2;
+    let factorial = |n: i64| (1..=n).map(|k| k as f64).product::<f64>();
+    let norm = (factorial(j_plus_m1)
+        * factorial(j_minus_m1)
+        * factorial(j_plus_m2)
+        * factorial(j_minus_m2))
+    .sqrt();
+    let first = 0.max(-m1_minus_m2);
+    let last = j_plus_m2.min(j_minus_m1);
+    // Powers of cos(beta/2) and sin(beta/2) in the term with s = first.
+    let cos_power = two_j - m1_minus_m2 - 2 * first;
+    let sin_power = m1_minus_m2 + 2 * first;
+    let one = lit(m, 1.0);
+    let half = lit(m, 0.5);
+    let up = add(m, one, cosbeta);
+    let cos2 = mul(m, up, half);
+    let one = lit(m, 1.0);
+    let down = sub(m, one, cosbeta);
+    let sin2 = mul(m, down, half);
+    let mut sum = None;
+    for s in first..=last {
+        let sign = if (m1_minus_m2 + s) % 2 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        let coefficient = sign * norm
+            / (factorial(j_plus_m2 - s)
+                * factorial(s)
+                * factorial(m1_minus_m2 + s)
+                * factorial(j_minus_m1 - s));
+        let shift = 2 * (s - first);
+        let mut term = lit(m, coefficient);
+        for _ in 0..(cos_power - shift) / 2 {
+            term = mul(m, term, cos2);
+        }
+        for _ in 0..(sin_power + shift) / 2 {
+            term = mul(m, term, sin2);
+        }
+        sum = Some(match sum {
+            None => term,
+            Some(acc) => add(m, acc, term),
+        });
+    }
+    let mut d = sum?;
+    if cos_power % 2 != 0 {
+        let root = sqrt(m, cos2);
+        d = mul(m, d, root);
+    }
+    if sin_power % 2 != 0 {
+        let root = sqrt(m, sin2);
+        d = mul(m, d, root);
+    }
+    Some(d)
+}
+
+/// §09 `wignerD` and `wignerD_doublearg`:
+/// $D = \mathrm{cis}(-(m_1\alpha + m_2\gamma))\, d^j_{m_1 m_2}(\beta)$.
+fn wigner_big_d(
+    m: &mut Module,
+    doubled: [Option<i64>; 3],
+    [alpha, cosbeta, gamma]: [NodeId; 3],
+) -> Option<NodeId> {
+    let small = wignerd(m, doubled, cosbeta)?;
+    let a = scale(m, alpha, doubled[1]? as f64 / 2.0);
+    let g = scale(m, gamma, doubled[2]? as f64 / 2.0);
+    let angle = add(m, a, g);
+    let angle = neg(m, angle);
+    let phase = build_call(m, "cis", &[angle]);
+    Some(mul(m, phase, small))
 }
 
 // -- polynomials -----------------------------------------------------------
