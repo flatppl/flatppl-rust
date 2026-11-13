@@ -204,6 +204,16 @@ impl Emitter<'_> {
         base: i64,
         name: &str,
     ) -> Result<Lowered, EmitError> {
+        if let Some(part) = self.sequence_field(&[inner, selector], base) {
+            return match part? {
+                Lowered::Record(fields) => fields
+                    .into_iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| unknown_field(id, name)),
+                Lowered::Tensor(_) => Err(unknown_field(id, name)),
+            };
+        }
         match self.m.node(selector) {
             // `r.a.b`: the field of a record-valued field.
             Node::Lit(Scalar::Str(field)) => {
