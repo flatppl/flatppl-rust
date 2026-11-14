@@ -55,6 +55,81 @@ fn check_summary_schemas(
 }
 
 #[test]
+fn scalar_summary_buffers_preserve_types_and_the_prepared_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query=context.parse("a=elementof(cartpow(posreals,2))\ny=external(cartpow(nonnegintegers,4))\n__likelihood_summary_pack_0=elementof(reals)\ng=[1,2,1,2]\ninputs=(a,y,__likelihood_summary_pack_0)\noutputs=(logdensityof(NegativeBinomial.(2.0,a[g]),y),__likelihood_summary_pack_0,y)",None,None)?;
+    let packed = context.prepare_likelihood(&query, &["y".into()])?;
+    let unpacked = context.prepare_likelihood_with_options(
+        &query,
+        &["y".into()],
+        &flatppl_host::PreparationOptions {
+            pack_summaries: false,
+        },
+    )?;
+    assert_eq!(packed.summaries.len(), 3);
+    assert!(unpacked.summaries.len() > packed.summaries.len());
+    assert!(
+        !packed
+            .summaries
+            .iter()
+            .any(|name| name == "__likelihood_summary_pack_0")
+    );
+    for dtype in [flatppl_host::Dtype::F32, flatppl_host::Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            ..Default::default()
+        };
+        let preparation = packed.preparation.compile(&options)?;
+        let score = packed.score.compile(&options)?;
+        check_summary_schemas(&preparation, &score, &packed.summaries)?;
+        assert_eq!(
+            score
+                .inputs
+                .iter()
+                .take(3)
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "y", "__likelihood_summary_pack_0"]
+        );
+        let Schema::Tuple { items } = &preparation.output else {
+            panic!("three typed buffers")
+        };
+        let mut fields = items
+            .iter()
+            .map(|item| match item {
+                Schema::Tensor { dtype, shape, .. } => (*dtype, shape.clone()),
+                _ => panic!("tensor summary"),
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            if matches!(dtype, flatppl_host::Dtype::F32) {
+                vec![("bool", vec![2]), ("float32", vec![6]), ("int32", vec![2])]
+            } else {
+                vec![("bool", vec![2]), ("float64", vec![6]), ("int64", vec![2])]
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn one_scalar_pack_is_one_vector_result() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query=context.parse("a=elementof(cartpow(posreals,2))\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),4))\ng=[1,2,1,2]\ninputs=(a,b,y)\noutputs=logdensityof(Gamma.(a[g],b),y)",None,None)?;
+    let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+    let prep = prepared.preparation.compile(&EmitOptions::default())?;
+    let score = prepared.score.compile(&EmitOptions::default())?;
+    assert_eq!(prepared.summaries.len(), 1);
+    assert!(!prep.multiple_outputs);
+    assert!(matches!(prep.output,Schema::Tensor{ref shape,..} if shape==&[6]));
+    check_summary_schemas(&prep, &score, &prepared.summaries)?;
+    Ok(())
+}
+
+#[test]
 fn prepared_queries_keep_their_imports_and_compilable_summary_boundary()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();

@@ -464,6 +464,16 @@ impl Context {
         module: &LoadedModule,
         data_inputs: &[String],
     ) -> Result<PreparedLikelihood, Diagnostic> {
+        self.prepare_likelihood_with_options(module, data_inputs, &Default::default())
+    }
+
+    /// Prepare with explicit portable summary-layout controls.
+    pub fn prepare_likelihood_with_options(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        options: &flatppl_determinizer::PreparationOptions,
+    ) -> Result<PreparedLikelihood, Diagnostic> {
         let fail =
             |message: String| Diagnostic::new("prepare_likelihood", module.source_name(), message);
         if !self.owns(module) {
@@ -490,11 +500,16 @@ impl Context {
             let node = e.node.filter(|id| id.index() < typed.node_count());
             fail(e.to_string()).at(typed, node, module.source())
         })?;
-        let prepared =
-            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs).map_err(|e| {
-                let node = (e.node.index() < typed.node_count()).then_some(e.node);
-                fail(e.reason).at(typed, node, module.source())
-            })?;
+        let prepared = flatppl_determinizer::prepare_likelihood_with_options(
+            &lowered,
+            data_inputs,
+            options,
+            None,
+        )
+        .map_err(|e| {
+            let node = (e.node.index() < typed.node_count()).then_some(e.node);
+            fail(e.reason).at(typed, node, module.source())
+        })?;
         Ok(PreparedLikelihood {
             preparation: self.prepared_query(module, prepared.preparation)?,
             score: self.prepared_query(module, prepared.score)?,

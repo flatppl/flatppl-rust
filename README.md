@@ -148,7 +148,7 @@ inputs. Include each dependency with `--data-input`.
 Add `--explain-reductions` to either command to report committed rules and
 fallbacks on stderr. Reports cover recognized independent density sums and
 distinguish lowering, materialized data, and explicit preparation.
-Output files and the query ABI stay identical. Each grouped report
+Reporting leaves output files and the query ABI unchanged. Each grouped report
 counts observations, occupied parameter tuples, and singleton groups.
 
 Run preparation once per data binding, then append its results to the scoring
@@ -156,6 +156,11 @@ arguments in preparation-output order. Other scoring arguments keep their
 original order. Data needed outside reduced factors remains a scoring argument.
 Both queries must use the same precision. See [the shared pass](ARCHITECTURE.md#shared-likelihood-summaries)
 for coverage and the Rust preparation API.
+
+Preparation packs scalar summaries into vectors of matching real, integer, or
+boolean type. Other summary shapes stay unchanged. Use the exported schemas to
+bind each result as one score argument. Disable packing with
+`--pack-summaries=false` or `PreparationOptions { pack_summaries: false }`.
 
 ```sh
 git clone https://github.com/flatppl/flatppl-rust

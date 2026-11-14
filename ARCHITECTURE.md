@@ -199,6 +199,15 @@ operation or execution cache enters the IR. Later backends can bake fixed
 summaries, place them in a setup block, or compile the explicit preparation and
 scoring queries returned by `prepare_likelihood`.
 
+Explicit preparation groups same-type scalar summary fields into ordinary vector
+bindings before emission. Score bindings become indexed projections of those
+buffers. The preparation clone retains the original data expressions; the score
+replaces each buffer with an external input. Boolean and integer fields never
+cast through real buffers. Vector/matrix summaries and lone scalar types retain
+their shape. `PreparationOptions::pack_summaries` and CLI `--pack-summaries`
+control this layout independently of likelihood reduction. This reduces scalar
+query arguments across backends without adding an IR operation.
+
 The pass recognizes shared scalar parameters in IID and constructor-broadcast
 densities. Its moment rules cover Normal, LogNormal, Gamma, Beta, Exponential,
 Poisson, ContinuedPoisson, Binomial, Bernoulli, Geometric, and interval Uniform.
