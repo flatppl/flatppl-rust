@@ -34,6 +34,16 @@ impl Emitter<'_> {
             ));
         }
         let (m, n) = (*m, *n);
+        // Small matrices do not repay a second pass. On GPU, rolled QR
+        // also loses more launch time than the smaller workspace saves.
+        let compact = m >= 64
+            && m >= 8 * n
+            && (self.target == crate::Target::Cpu || n <= MATRIX_UNROLL_LIMIT);
+        let unroll_limit = match self.target {
+            // Unrolling both QR passes pays off only for tall inputs.
+            crate::Target::Cpu if m < 256 || n <= 4 => CPU_MATRIX_UNROLL_LIMIT,
+            _ => MATRIX_UNROLL_LIMIT,
+        };
         let input = self.convert(input, ElemKind::Real);
         let batch = self.batch_rank(&input);
         let batch_dims = shape(&input.ty)[..batch]
@@ -47,7 +57,7 @@ impl Emitter<'_> {
             layers: vec![2],
         };
         let mut q_dims: Vec<Option<u64>> = batch_dims.iter().copied().map(Some).collect();
-        q_dims.extend([Some(m), Some(m)]);
+        q_dims.extend([Some(m), Some(if compact { n } else { m })]);
         let zero_q = self.constant(0.0, tensor(q_dims));
         let zero_q = self.axes_view(&zero_q, q_axes.clone());
         let rows_q = self.axis_indices(&zero_q, batch);
@@ -57,9 +67,10 @@ impl Emitter<'_> {
         let cols_r = self.axis_indices(&input, batch + 1);
         let mut transpose: Vec<u64> = (0..batch as u64).collect();
         transpose.extend([batch as u64 + 1, batch as u64]);
-        let result = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &[input, q], |e, index, args| {
+        let initial = [input, if compact { zero_q } else { q.clone() }];
+        let result = self.matrix_loop_with_limit(n, unroll_limit, &initial, |e, index, args| {
             let r = e.axes_view(&args[0], r_axes.clone());
-            let q = e.axes_view(&args[1], q_axes.clone());
+            let reflectors = e.axes_view(&args[1], q_axes.clone());
             let at_col = e.compare("EQ", &cols_r, index);
             let zeros = e.constant_like(0.0, &r);
             let col = e.select(&at_col, &r, &zeros);
@@ -102,16 +113,54 @@ impl Emitter<'_> {
             let pr = e.matrix_expand(&r_projection, &r, batch + 1);
             let change_r = e.mul(&vr, &pr);
             let r = e.sub(&r, &change_r);
-            let q_projection = e.matvec(&q, &v);
-            let q_projection = e.mul(&beta, &q_projection);
-            let pq = e.matrix_expand(&q_projection, &q, batch);
-            let vq = e.matrix_expand(&v, &q, batch + 1);
-            let change_q = e.mul(&pq, &vq);
-            let q = e.sub(&q, &change_q);
-            vec![r, q]
+            let state = if compact {
+                e.select(&at_col, &vr, &reflectors)
+            } else {
+                let projection = e.matvec(&reflectors, &v);
+                let projection = e.mul(&beta, &projection);
+                let column = e.matrix_expand(&projection, &reflectors, batch);
+                let row = e.matrix_expand(&v, &reflectors, batch + 1);
+                let change = e.mul(&column, &row);
+                e.sub(&reflectors, &change)
+            };
+            vec![r, state]
         });
         let r = self.axes_view(&result[0], r_axes);
-        let q = self.axes_view(&result[1], q_axes);
+        let reflectors = self.axes_view(&result[1], q_axes.clone());
+        // Q = H0 H1 ... H(n-1) I[:, :n]. Apply saved reflectors from
+        // the left in reverse order, without ever constructing an m×m Q.
+        let q = if compact {
+            let result = self.matrix_loop_with_limit(n, unroll_limit, &[q], |e, index, args| {
+                let last = e.int_value_const(n as i64 - 1);
+                let k = e.sub(&last, index);
+                let at_col = e.compare("EQ", &cols_r, &k);
+                let zero = e.constant_like(0.0, &reflectors);
+                let v = e.select(&at_col, &reflectors, &zero);
+                let v = e.reduce_sum_last_axis(&v);
+                let v2 = e.mul(&v, &v);
+                let v2 = e.reduce_sum(&v2);
+                let zero = e.scalar(0.0);
+                let nonzero = e.compare("NE", &v2, &zero);
+                let one = e.scalar(1.0);
+                let safe_v2 = e.select(&nonzero, &v2, &one);
+                let two = e.scalar(2.0);
+                let beta = e.div(&two, &safe_v2);
+                let beta = e.select(&nonzero, &beta, &zero);
+                let q = e.axes_view(&args[0], q_axes.clone());
+                let qt = e.transpose(&q, &transpose);
+                let qt = e.axes_view(&qt, q_axes.clone());
+                let projection = e.matvec(&qt, &v);
+                let projection = e.mul(&beta, &projection);
+                let column = e.matrix_expand(&v, &q, batch);
+                let row = e.matrix_expand(&projection, &q, batch + 1);
+                let change = e.mul(&column, &row);
+                vec![e.sub(&q, &change)]
+            });
+            result[0].clone()
+        } else {
+            reflectors
+        };
+        let q = self.axes_view(&q, q_axes);
         let mut starts = vec![0; batch];
         starts.extend([0, 0]);
         let mut q_limits = batch_dims.clone();
@@ -135,7 +184,7 @@ impl Emitter<'_> {
         n: u64,
         unroll_limit: u64,
         inits: &[Value],
-        mut body: impl FnMut(&mut Self, &Value, &[Value]) -> Vec<Value>,
+        body: impl FnMut(&mut Self, &Value, &[Value]) -> Vec<Value>,
     ) -> Vec<Value> {
         // Pivoted elimination needs a tighter limit than rank-one updates:
         // larger bodies increase compilation cost and can slow GPU gradients.
@@ -143,6 +192,17 @@ impl Emitter<'_> {
             crate::Target::Cpu => unroll_limit.min(CPU_MATRIX_UNROLL_LIMIT),
             crate::Target::Gpu => unroll_limit,
         };
+        self.matrix_loop_with_limit(n, limit, inits, body)
+    }
+
+    /// Fixed matrix loop with an operation-specific unrolling threshold.
+    fn matrix_loop_with_limit(
+        &mut self,
+        n: u64,
+        limit: u64,
+        inits: &[Value],
+        mut body: impl FnMut(&mut Self, &Value, &[Value]) -> Vec<Value>,
+    ) -> Vec<Value> {
         if n <= limit {
             let mut state = inits.to_vec();
             for i in 0..n {
