@@ -1,6 +1,18 @@
 use flatppl_core::{Module, Node, RefNs};
 use flatppl_determinizer::{LoweringOptions, determinize_with_options, prepare_likelihood};
 
+fn prepare_unpacked(module: &Module, data: &[String]) -> flatppl_determinizer::PreparedLikelihood {
+    flatppl_determinizer::prepare_likelihood_with_options(
+        module,
+        data,
+        &flatppl_determinizer::PreparationOptions {
+            pack_summaries: false,
+        },
+        None,
+    )
+    .unwrap()
+}
+
 fn lower(source: &str, enabled: bool) -> Module {
     let mut module = flatppl_syntax::parse(source).unwrap();
     let errors = flatppl_infer::infer(&mut module);
@@ -350,7 +362,7 @@ fn fixed_shape_preparation_tracks_each_shape_and_keeps_live_shape_data() {
         assert!(inputs(&live.score).iter().any(|name| name == "y"));
     }
     let source = "s=elementof(posreals)\ny=external(cartpow(interval(0.1,10),4))\ninputs=(s,y)\noutputs=(logdensityof(iid(Weibull(2.0,s),4),y),logdensityof(iid(Weibull(3.0,s),4),y))";
-    let two = prepare_likelihood(&lower(source, false), &["y".into()]).unwrap();
+    let two = prepare_unpacked(&lower(source, false), &["y".into()]);
     assert_eq!(two.summaries.len(), 9);
 }
 
@@ -453,8 +465,8 @@ fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_
         ),
         false,
     );
-    let one = prepare_likelihood(&one, &["y".into()]).unwrap();
-    let two = prepare_likelihood(&two, &["y".into()]).unwrap();
+    let one = prepare_unpacked(&one, &["y".into()]);
+    let two = prepare_unpacked(&two, &["y".into()]);
     assert_eq!(one.summaries.len(), two.summaries.len());
     assert_eq!(inputs(&two.preparation), ["y"]);
     assert_eq!(inputs(&two.score)[0], "a");

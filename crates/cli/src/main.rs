@@ -195,6 +195,10 @@ enum Command {
         /// Runtime data input to summarize (repeatable).
         #[arg(long = "data-input", requires = "prepare_data")]
         data_inputs: Vec<String>,
+        /// Pack same-type scalar summaries into vector inputs.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        pack_summaries: bool,
         /// Input FlatPPL file.
         input: PathBuf,
         /// Output file (`.flatppl`, or `.flatpir` with `--emit flatpir`);
@@ -238,6 +242,10 @@ enum Command {
         /// Runtime data input to summarize (repeatable).
         #[arg(long = "data-input", requires = "prepare_data")]
         data_inputs: Vec<String>,
+        /// Pack same-type scalar summaries into vector inputs.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        pack_summaries: bool,
         /// Input FlatPPL file.
         input: PathBuf,
         /// Computation to emit: `logdensity` or `sample`.
@@ -451,6 +459,7 @@ fn main() -> ExitCode {
         Command::Determinize {
             prepare_data,
             data_inputs,
+            pack_summaries,
             input,
             output,
             keep,
@@ -470,12 +479,14 @@ fn main() -> ExitCode {
                     .as_deref()
                     .map(|path| (path, data_inputs.as_slice())),
                 explain_reductions,
+                pack_summaries,
             },
         ),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             prepare_data,
             data_inputs,
+            pack_summaries,
             input,
             mode,
             dtype,
@@ -520,6 +531,7 @@ fn main() -> ExitCode {
                     .as_deref()
                     .map(|path| (path, data_inputs.as_slice())),
                 explain_reductions,
+                pack_summaries,
             },
         ),
         Command::Completions { shell } => {
@@ -1181,6 +1193,7 @@ fn line_col(source: &str, offset: usize) -> (usize, usize) {
 struct LikelihoodOutput<'a> {
     preparation: Option<(&'a Path, &'a [String])>,
     explain_reductions: bool,
+    pack_summaries: bool,
 }
 
 #[cfg(feature = "determinize")]
@@ -1205,6 +1218,7 @@ fn determinize_cmd(
     let LikelihoodOutput {
         preparation,
         explain_reductions,
+        pack_summaries,
     } = likelihood;
     let resolver = CliResolver::cache_only();
     let (mut module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
@@ -1243,11 +1257,12 @@ fn determinize_cmd(
             ));
         }
         let mut report = flatppl_determinizer::ReductionReport::default();
-        let prepared = if explain_reductions {
-            flatppl_determinizer::prepare_likelihood_with_report(&lowered, data_inputs, &mut report)
-        } else {
-            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
-        };
+        let prepared = flatppl_determinizer::prepare_likelihood_with_options(
+            &lowered,
+            data_inputs,
+            &flatppl_determinizer::PreparationOptions { pack_summaries },
+            explain_reductions.then_some(&mut report),
+        );
         if explain_reductions {
             print_reductions("preparation", &report);
         }
@@ -1305,6 +1320,7 @@ fn stablehlo_cmd(
     let LikelihoodOutput {
         preparation,
         explain_reductions,
+        pack_summaries,
     } = likelihood;
     let resolver = CliResolver::cache_only();
     let (module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
@@ -1383,11 +1399,12 @@ fn stablehlo_cmd(
             ));
         }
         let mut report = flatppl_determinizer::ReductionReport::default();
-        let prepared = if explain_reductions {
-            flatppl_determinizer::prepare_likelihood_with_report(&lowered, data_inputs, &mut report)
-        } else {
-            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
-        };
+        let prepared = flatppl_determinizer::prepare_likelihood_with_options(
+            &lowered,
+            data_inputs,
+            &flatppl_determinizer::PreparationOptions { pack_summaries },
+            explain_reductions.then_some(&mut report),
+        );
         if explain_reductions {
             print_reductions("preparation", &report);
         }

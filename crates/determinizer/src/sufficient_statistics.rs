@@ -20,6 +20,7 @@ mod correlation;
 mod grouped;
 mod histogram;
 mod multivariate;
+mod packing;
 mod poisson;
 mod regression;
 mod report;
@@ -37,6 +38,21 @@ pub struct PreparedLikelihood {
     pub preparation: Module,
     pub score: Module,
     pub summaries: Vec<String>,
+}
+
+/// Portable data-preparation layout controls.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparationOptions {
+    /// Combine same-type scalar summaries into vector inputs. No scalar casts.
+    pub pack_summaries: bool,
+}
+
+impl Default for PreparationOptions {
+    fn default() -> Self {
+        Self {
+            pack_summaries: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1378,7 +1394,7 @@ pub fn prepare_likelihood(
     m: &Module,
     data_inputs: &[String],
 ) -> Result<PreparedLikelihood, RefuseError> {
-    prepare_likelihood_inner(m, data_inputs, None)
+    prepare_likelihood_with_options(m, data_inputs, &PreparationOptions::default(), None)
 }
 
 /// Append committed decisions, including when preparation finds no reduction.
@@ -1387,12 +1403,14 @@ pub fn prepare_likelihood_with_report(
     data_inputs: &[String],
     report: &mut ReductionReport,
 ) -> Result<PreparedLikelihood, RefuseError> {
-    prepare_likelihood_inner(m, data_inputs, Some(report))
+    prepare_likelihood_with_options(m, data_inputs, &PreparationOptions::default(), Some(report))
 }
 
-fn prepare_likelihood_inner(
+/// Prepare with an explicit layout and an optional reduction report.
+pub fn prepare_likelihood_with_options(
     m: &Module,
     data_inputs: &[String],
+    options: &PreparationOptions,
     report: Option<&mut ReductionReport>,
 ) -> Result<PreparedLikelihood, RefuseError> {
     let error_node = binding(m, "outputs").unwrap_or_else(|| NodeId::from_usize(0));
@@ -1457,6 +1475,13 @@ fn prepare_likelihood_inner(
             return Err(refuse("a summary depends on a scoring input"));
         }
     }
+    let (summaries, projections) = if options.pack_summaries {
+        let packed = packing::pack(&mut score, &summaries)
+            .ok_or_else(|| refuse("summary packing exceeds a supported static shape"))?;
+        (packed.summaries, packed.projections)
+    } else {
+        (summaries, Vec::new())
+    };
     let mut preparation = score.clone();
     let outputs: Vec<_> = summaries
         .iter()
@@ -1478,6 +1503,10 @@ fn prepare_likelihood_inner(
         set_signature(&mut preparation, "inputs", &inputs);
     }
     set_signature(&mut preparation, "outputs", &outputs);
+    for (name, rhs) in projections {
+        let bid = score.binding_by_name(name).unwrap();
+        score.set_binding_rhs(bid, rhs);
+    }
     for &name in &summaries {
         let bid = score.binding_by_name(name).unwrap();
         let ty = score

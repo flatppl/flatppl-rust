@@ -30,9 +30,9 @@ pub use driver::{
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;
 pub use sufficient_statistics::{
-    GroupPartition, PreparedLikelihood, ReductionDecision, ReductionOutcome, ReductionReport,
-    prepare_likelihood, prepare_likelihood_with_report, sufficient_statistics,
-    sufficient_statistics_with_report,
+    GroupPartition, PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome,
+    ReductionReport, prepare_likelihood, prepare_likelihood_with_options,
+    prepare_likelihood_with_report, sufficient_statistics, sufficient_statistics_with_report,
 };
 
 /// Deterministic standard functions a backend lowers without portable expansion.

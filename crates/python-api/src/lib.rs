@@ -204,14 +204,20 @@ impl NativeContext {
             .map_err(error)
     }
 
+    #[pyo3(signature = (module, data_inputs, *, pack_summaries=true))]
     fn prepare_likelihood(
         &mut self,
         module: &NativeModule,
         data_inputs: Vec<String>,
+        pack_summaries: bool,
     ) -> PyResult<(NativeModule, NativeModule, Vec<String>)> {
         let prepared = self
             .inner
-            .prepare_likelihood(&module.inner, &data_inputs)
+            .prepare_likelihood_with_options(
+                &module.inner,
+                &data_inputs,
+                &flatppl_host::PreparationOptions { pack_summaries },
+            )
             .map_err(error)?;
         Ok((
             NativeModule {

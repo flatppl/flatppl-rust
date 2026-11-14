@@ -85,6 +85,42 @@ fn cli_emits_portable_preparation_and_supports_the_reduction_switch() {
 }
 
 #[test]
+fn cli_packing_switch_selects_the_preparation_abi() {
+    let directory = std::env::temp_dir().join(format!("flatppl-pack-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("query.flatppl");
+    let prep = directory.join("prepare.mlir");
+    std::fs::write(&source,"a=elementof(cartpow(posreals,2))\nb=elementof(posreals)\ny=external(cartpow(interval(0.1,10),4))\ng=[1,2,1,2]\ninputs=(a,b,y)\noutputs=logdensityof(Gamma.(a[g],b),y)").unwrap();
+    for (flag, arguments) in [("--pack-summaries=true", 3), ("--pack-summaries=false", 8)] {
+        let score = run(&[
+            "stablehlo".as_ref(),
+            source.as_os_str(),
+            "--prepare-data".as_ref(),
+            prep.as_os_str(),
+            "--data-input".as_ref(),
+            "y".as_ref(),
+            flag.as_ref(),
+        ]);
+        let signature = score
+            .lines()
+            .find(|line| line.contains("func.func @logdensity("))
+            .unwrap();
+        assert_eq!(signature.matches("%arg").count(), arguments, "{signature}");
+        let prepared = std::fs::read_to_string(&prep).unwrap();
+        let signature = prepared
+            .lines()
+            .find(|line| line.contains("func.func @logdensity("))
+            .unwrap();
+        assert_eq!(
+            signature.contains("tensor<6xf32>"),
+            arguments == 3,
+            "{signature}"
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn explanations_cover_both_passes_and_leave_every_output_byte_unchanged() {
     let directory =
         std::env::temp_dir().join(format!("flatppl-reduction-reports-{}", std::process::id()));
