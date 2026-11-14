@@ -123,7 +123,7 @@ impl Emitter<'_> {
         let bound = max_exponent + n.next_power_of_two().ilog2() as u64;
         let zero_count = self.int_value_const(0);
         let needs_squaring = self.compare("GT", &count, &zero_count);
-        let result = self.matrix_exp_if(&needs_squaring, &initial, |e| {
+        let result = self.matrix_if(&needs_squaring, &initial, |e| {
             if e.target == crate::Target::Cpu {
                 return e.matrix_exp_squares(&initial, &identity, &count, 0, 16);
             }
@@ -133,7 +133,7 @@ impl Emitter<'_> {
             for (start, end) in [(1, 2), (2, 4), (4, 8), (8, 16)] {
                 let threshold = e.int_value_const(start as i64);
                 let active = e.compare("GT", &count, &threshold);
-                result = e.matrix_exp_if(&active, &result, |e| {
+                result = e.matrix_if(&active, &result, |e| {
                     e.matrix_exp_squares(&result, &identity, &count, start, end)
                 });
             }
@@ -141,7 +141,7 @@ impl Emitter<'_> {
         });
         let sixteen = self.int_value_const(16);
         let tail = self.compare("GT", &count, &sixteen);
-        let result = self.matrix_exp_if(&tail, &result, |e| {
+        let result = self.matrix_if(&tail, &result, |e| {
             e.matrix_exp_squares(&result, &identity, &count, 16, bound)
         });
         let nan = self.constant_like(f64::NAN, &result);
@@ -298,7 +298,7 @@ impl Emitter<'_> {
                     let index = e.add(index, &offset);
                     let active = e.compare("LT", &index, count);
                     let value = e.axes_view(&values[0], axes.clone());
-                    let square = e.matrix_exp_if(&active, &value, |e| {
+                    let square = e.matrix_if(&active, &value, |e| {
                         // A completed batch cell must not overflow in a discarded square.
                         let safe = e.select(&active, &value, identity);
                         let square = e.matmat(&safe, &safe);
@@ -311,8 +311,8 @@ impl Emitter<'_> {
         self.axes_view(&result, axes)
     }
 
-    /// Lazy branch local to squaring. Neither branch contains runtime checks.
-    fn matrix_exp_if(
+    /// Lazily apply a branch when any batch lane is active.
+    pub(super) fn matrix_if(
         &mut self,
         active: &Value,
         initial: &Value,
