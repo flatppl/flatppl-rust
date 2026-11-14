@@ -224,6 +224,28 @@ require explicit preparation, since repeating setup can cost more than ordinary
 scoring. Shape/dispersion dependencies enter summary cache keys. Unsupported
 boundaries and live Weibull shape or count dispersion retain ordinary scoring.
 
+ChiSquared reuses centered positive-data summaries. VonMises retains local sine
+and cosine residual sums, using squared half-angle sines instead of subtracting
+nearly equal cosines. Its location must be bounded within one period and its
+concentration within [0,64], preserving practical float32 argument accuracy.
+LKJ and LKJCholesky retain primitive membership flags and per-diagonal log sums.
+Their native primitives check correlation/Cholesky support before scoring.
+These families require explicit preparation for runtime observations.
+
+Fixed gather indices in Normal and Poisson parameters partition independent
+observations into occupied groups. The pass recognizes direct array indexing
+and wrapped broadcast gathers such as `get.([mu], group)`, including different
+index vectors for different parameters. It reuses scalar Normal reductions and
+keeps singleton groups as primitive scores with scalar data summaries. Poisson
+also supports a data-centered primitive reference for large runtime counts,
+with an actual observed count as anchor and widened count residuals.
+Runtime observations require preparation. Runtime/promoted group indices,
+indexed expressions inside per-cell lambdas, and derived observation arrays
+retain ordinary scoring. Literal observations and declared ABI vectors use
+partitions with total selector length equal to the observation count. No
+operation scans every observation once per possible group, and unused groups
+add no scoring terms. Preparation reuses monotonically allocated summary names.
+
 Vector/matrix event rules cover MvNormal, Dirichlet, Wishart, InverseWishart and
 Multinomial. MvNormal
 retains a centered, scaled residual factor computed by bounded-size QR blocks,

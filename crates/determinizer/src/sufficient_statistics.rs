@@ -12,8 +12,12 @@ use flatppl_core::{
 
 use crate::RefuseError;
 
+mod circular;
+mod correlation;
+mod grouped;
 mod histogram;
 mod multivariate;
+mod poisson;
 mod regression;
 mod scalar;
 use crate::density::{build_call, build_record};
@@ -428,6 +432,7 @@ fn per_cell_inner(
     })
 }
 
+#[derive(Clone)]
 struct Reducer {
     preparing: bool,
     boundary: HashSet<Symbol>,
@@ -435,6 +440,7 @@ struct Reducer {
     summaries: Vec<Symbol>,
     cache: HashMap<(Vec<DataKey>, &'static str), NodeId>,
     count: usize,
+    next_serial: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -472,13 +478,12 @@ impl Reducer {
             return Expr::Node(id);
         }
         let rhs = materialize(m, expr);
-        let mut serial = 0;
         let name = loop {
-            let name = m.intern(&format!("{PREFIX}{serial}"));
+            let name = m.intern(&format!("{PREFIX}{}", self.next_serial));
+            self.next_serial += 1;
             if m.binding_by_name(name).is_none() {
                 break name;
             }
-            serial += 1;
         };
         m.add_binding(Binding {
             name,
@@ -523,6 +528,17 @@ impl Reducer {
     }
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        if let Some(result) = grouped::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = correlation::reduce(self, m, id) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
+        if let Some(result) = circular::reduce(self, m, id) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
         if let Some(result) = scalar::reduce(self, m, id) {
             self.count += 1;
             return Some(materialize(m, result));
@@ -542,13 +558,19 @@ impl Reducer {
         if !data_only(m, factor.observed, &self.allowed, &self.boundary) {
             return None;
         }
-        let result = histogram::reduce(self, m, &factor)?;
-        self.count += 1;
-        Some(materialize(m, result))
+        if let Some(result) = histogram::reduce(self, m, &factor) {
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
+        poisson::reduce(self, m, &factor)
     }
 
     fn reduce_moments(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
         let f = per_cell(m, id, &self.boundary)?;
+        self.reduce_moment_factor(m, &f)
+    }
+
+    fn reduce_moment_factor(&mut self, m: &mut Module, f: &Factor) -> Option<NodeId> {
         if !data_only(m, f.observed, &self.allowed, &self.boundary) {
             return None;
         }
@@ -762,7 +784,7 @@ impl Reducer {
                     op(
                         "sub",
                         [
-                            op("mul", [n, self.anchor(m, &f, &parameters, center)]),
+                            op("mul", [n, self.anchor(m, f, &parameters, center)]),
                             correction,
                         ],
                     )
@@ -840,7 +862,7 @@ impl Reducer {
                         op(
                             "add",
                             [
-                                op("mul", [n, self.anchor(m, &f, &parameters, center)]),
+                                op("mul", [n, self.anchor(m, f, &parameters, center)]),
                                 op("mul", [op("sub", [shape, num(1.0)]), logs]),
                             ],
                         ),
@@ -869,7 +891,7 @@ impl Reducer {
                     "unit_complement_relative_log_sum",
                     op("sum", [complement_relative_log(x, center.clone())]),
                 );
-                let normalizer = self.anchor(m, &f, &parameters, center);
+                let normalizer = self.anchor(m, f, &parameters, center);
                 op(
                     "add",
                     [
@@ -896,7 +918,7 @@ impl Reducer {
                 let score = op(
                     "sub",
                     [
-                        op("mul", [n, self.anchor(m, &f, &parameters, num(0.0))]),
+                        op("mul", [n, self.anchor(m, f, &parameters, num(0.0))]),
                         op("mul", [rate?, total]),
                     ],
                 );
@@ -941,7 +963,7 @@ impl Reducer {
                         op(
                             "add",
                             [
-                                op("mul", [n, self.anchor(m, &f, &parameters, num(0.0))]),
+                                op("mul", [n, self.anchor(m, f, &parameters, num(0.0))]),
                                 op("mul", [total.clone(), op("log", [safe_rate])]),
                             ],
                         ),
@@ -1051,8 +1073,8 @@ impl Reducer {
                         op(
                             "add",
                             [
-                                self.anchor(m, &f, &parameters, min),
-                                self.anchor(m, &f, &parameters, max),
+                                self.anchor(m, f, &parameters, min),
+                                self.anchor(m, f, &parameters, max),
                             ],
                         ),
                     ],
@@ -1129,6 +1151,7 @@ fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, 
         summaries: Vec::new(),
         cache: HashMap::new(),
         count: 0,
+        next_serial: 0,
     };
     let bindings: Vec<_> = m
         .bindings()

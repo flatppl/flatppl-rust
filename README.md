@@ -134,6 +134,13 @@ at most 64 or fixed counts below 64. Include runtime shape/dispersion inputs in
 preparation with another `--data-input` option. These families require explicit
 preparation for runtime data so setup is reused between scores.
 
+ChiSquared, bounded VonMises, LKJ and LKJCholesky also support preparation.
+VonMises requires location bounds within `[-pi, pi]` and concentration bounds
+within `[0, 64]`. Grouped Normal and Poisson models support fixed index vectors,
+for example `Normal.(mu[group], sigma)` and `Poisson.(rate[group])`.
+Prepare observations with `--data-input y`. Group indices must stay fixed in
+the source; promoted or runtime group inputs retain ordinary scoring.
+
 Run preparation once per data binding, then append its results to the scoring
 arguments in preparation-output order. Other scoring arguments keep their
 original order. Data needed outside reduced factors remains a scoring argument.

@@ -58,6 +58,7 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
         ("LogNormal(a,b)", "[0.1,1.0,2.0]"),
         ("Gamma(a,b)", "[0.1,1.0,2.0]"),
         ("InverseGamma(a,b)", "[0.1,1.0,2.0]"),
+        ("ChiSquared(a)", "[0.1,1.0,2.0]"),
         ("Pareto(a,b)", "[0.1,1.0,2.0]"),
         ("Weibull(2.0,b)", "[0.1,1.0,2.0]"),
         ("NegativeBinomial(2.0,b)", "[0,1,3]"),
@@ -105,6 +106,50 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
         let mut surface = flatppl_syntax::parse(&flatppl_syntax::print(&reduced)).unwrap();
         flatppl_infer::infer(&mut surface);
         assert!(flatppl_determinizer::is_flatpdl(&surface).is_ok(), "{law}");
+    }
+}
+
+#[test]
+fn promoted_group_indices_and_circular_points_never_become_static_guards() {
+    for source in [
+        "mu=elementof(cartpow(reals,2))\ng=[1,2,1,2]\ny=[1.0,2.0,3.0,4.0]\ninputs=(mu,g)\noutputs=logdensityof(Normal.(mu[g],1.0),y)",
+        "mu=0.3\nk=2.0\ny=[0.1,0.2,0.4]\ninputs=(mu,k)\noutputs=logdensityof(iid(VonMises(mu,k),3),y)",
+    ] {
+        assert_eq!(
+            flatppl_flatpir::write(&lower(source, true)),
+            flatppl_flatpir::write(&lower(source, false))
+        );
+    }
+}
+
+#[test]
+fn grouped_gathers_prepare_only_occupied_partitions() {
+    for source in [
+        "mu=elementof(cartpow(reals,4))\nsigma=elementof(posreals)\ng=[1,2,1,2,3]\ny=external(cartpow(reals,5))\ninputs=(mu,sigma,y)\noutputs=logdensityof(Normal.(mu[g],sigma),y)",
+        "mu=elementof(cartpow(reals,4))\nsigma=elementof(cartpow(posreals,3))\ng=[1,2,1,2,3]\nh=[1,1,1,1,3]\ny=external(cartpow(reals,5))\ninputs=(mu,sigma,y)\noutputs=logdensityof(Normal.(get.([mu],g),sigma[h]),y)",
+        "rate=elementof(cartpow(nonnegreals,4))\ng=[1,2,1,2,3]\ny=external(cartpow(nonnegintegers,5))\ninputs=(rate,y)\noutputs=logdensityof(Poisson.(rate[g]),y)",
+    ] {
+        let raw = lower(source, false);
+        let prepared =
+            prepare_likelihood(&raw, &["y".into()]).unwrap_or_else(|e| panic!("{source}: {e:?}"));
+        assert_eq!(inputs(&prepared.preparation), ["y"]);
+        assert!(!inputs(&prepared.score).iter().any(|s| s == "y"));
+        assert!(flatppl_determinizer::is_flatpdl(&prepared.score).is_ok());
+        let serialized = flatppl_flatpir::try_write(&prepared.score).unwrap();
+        assert!(flatppl_flatpir::read(&serialized).is_ok());
+    }
+}
+
+#[test]
+fn bounded_circular_and_correlation_families_prepare() {
+    for source in [
+        "mu=elementof(interval(-3.14,3.14))\nkappa=elementof(interval(0.1,64))\ny=external(cartpow(interval(-4,4),3))\ninputs=(mu,kappa,y)\noutputs=logdensityof(iid(VonMises(mu,kappa),3),y)",
+        "eta=elementof(posreals)\ny=external(cartpow(cartpow(reals,[3,3]),4))\ninputs=(eta,y)\noutputs=logdensityof(iid(LKJ(3,eta),4),y)",
+        "eta=elementof(posreals)\ny=external(cartpow(cartpow(reals,[3,3]),4))\ninputs=(eta,y)\noutputs=logdensityof(iid(LKJCholesky(3,eta),4),y)",
+    ] {
+        let prepared = prepare_likelihood(&lower(source, false), &["y".into()]).unwrap();
+        assert!(!inputs(&prepared.score).iter().any(|name| name == "y"));
+        assert!(flatppl_determinizer::is_flatpdl(&prepared.score).is_ok());
     }
 }
 

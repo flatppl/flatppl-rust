@@ -38,7 +38,12 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     let name = m.resolve(f.constructor).to_owned();
     if !matches!(
         name.as_str(),
-        "InverseGamma" | "Pareto" | "Weibull" | "NegativeBinomial" | "NegativeBinomial2"
+        "ChiSquared"
+            | "InverseGamma"
+            | "Pareto"
+            | "Weibull"
+            | "NegativeBinomial"
+            | "NegativeBinomial2"
     ) || !data_only(m, f.observed, &reducer.allowed, &reducer.boundary)
         || (!reducer.preparing && !data_only(m, f.observed, &Default::default(), &reducer.boundary))
     {
@@ -64,7 +69,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             .find(|(name, _)| m.resolve(*name) == key)
             .map(|(_, value)| *value)
     };
-    let shape = param("shape");
+    let shape = param(if name == "ChiSquared" { "k" } else { "shape" });
     let scale = param("scale");
     let dispersion = param(if name == "NegativeBinomial" {
         "alpha"
@@ -77,12 +82,16 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
     let x = Expr::Node(observed);
     let n = num(*count as f64);
     match name.as_str() {
-        "InverseGamma" | "Pareto" | "Weibull"
+        "ChiSquared" | "InverseGamma" | "Pareto" | "Weibull"
             if matches!(*elem, Type::Scalar(ScalarType::Real))
                 && positive(m, observed, reducer) =>
         {
             let shape = shape?;
-            let scale = Expr::Node(scale?);
+            let scale = if name == "ChiSquared" {
+                num(0.5)
+            } else {
+                Expr::Node(scale?)
+            };
             if name == "Weibull"
                 && (!data_only(m, shape, &reducer.allowed, &reducer.boundary)
                     || !positive(m, shape, reducer)
@@ -91,7 +100,11 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             {
                 return None;
             }
-            let k = Expr::Node(shape);
+            let k = if name == "ChiSquared" {
+                op("divide", [Expr::Node(shape), num(2.0)])
+            } else {
+                Expr::Node(shape)
+            };
             let valid = map(
                 "land",
                 [
@@ -130,7 +143,19 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 minimum
             } else {
                 let maximum = op("maximum", [x.clone()]);
-                let value = if name == "InverseGamma" {
+                let value = if name == "ChiSquared" {
+                    let first = op("get", [x.clone(), Expr::Integer(1)]);
+                    op(
+                        "add",
+                        [
+                            first.clone(),
+                            op(
+                                "sum",
+                                [map("divide", [map("sub", [x.clone(), first]), n.clone()])],
+                            ),
+                        ],
+                    )
+                } else if name == "InverseGamma" {
                     // Every normalized reciprocal is <= 1, and their mean >= 1/n.
                     op(
                         "divide",
@@ -162,7 +187,9 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 reducer.summary_for(
                     m,
                     &keys,
-                    if name == "InverseGamma" {
+                    if name == "ChiSquared" {
+                        "chi_squared_center"
+                    } else if name == "InverseGamma" {
                         "harmonic_center"
                     } else {
                         "weibull_center"
@@ -173,7 +200,9 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             let logs = reducer.summary_for(
                 m,
                 &keys,
-                if name == "Pareto" {
+                if name == "ChiSquared" {
+                    "chi_squared_relative_logs"
+                } else if name == "Pareto" {
                     "pareto_relative_logs"
                 } else if name == "Weibull" {
                     "weibull_relative_logs"
@@ -190,7 +219,11 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 "mul",
                 [
                     op(
-                        if name == "Weibull" { "sub" } else { "add" },
+                        if matches!(name.as_str(), "Weibull" | "ChiSquared") {
+                            "sub"
+                        } else {
+                            "add"
+                        },
                         [safe_k.clone(), num(1.0)],
                     ),
                     logs,
@@ -202,14 +235,18 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 let residual = reducer.summary_for(
                     m,
                     &keys,
-                    if name == "Weibull" {
+                    if name == "ChiSquared" {
+                        "chi_squared_residual"
+                    } else if name == "Weibull" {
                         "weibull_power_residual"
                     } else {
                         "inverse_gamma_reciprocal_residual"
                     },
                     op(
                         "sum",
-                        [if name == "Weibull" {
+                        [if name == "ChiSquared" {
+                            map("sub", [x.clone(), center.clone()])
+                        } else if name == "Weibull" {
                             map(
                                 "expm1",
                                 [map("mul", [k, relative_log(x.clone(), center.clone())])],
@@ -229,7 +266,9 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                         op("lnot", [op("iszero", [residual.clone()])]),
                     ],
                 );
-                let multiplier = if name == "Weibull" {
+                let multiplier = if name == "ChiSquared" {
+                    num(0.5)
+                } else if name == "Weibull" {
                     op(
                         "pow",
                         [
@@ -253,7 +292,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                     )
                 };
                 let power_term = op("mul", [multiplier, residual]);
-                if name == "Weibull" {
+                if matches!(name.as_str(), "Weibull" | "ChiSquared") {
                     op("sub", [log_term, power_term])
                 } else {
                     op("neg", [op("add", [log_term, power_term])])
