@@ -23,10 +23,17 @@ mod sufficient_statistics;
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
-pub use driver::{determinize, determinize_with, determinize_with_options, determinize_with_roots};
+pub use driver::{
+    determinize, determinize_with, determinize_with_options, determinize_with_options_and_report,
+    determinize_with_roots,
+};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;
-pub use sufficient_statistics::{PreparedLikelihood, prepare_likelihood, sufficient_statistics};
+pub use sufficient_statistics::{
+    GroupPartition, PreparedLikelihood, ReductionDecision, ReductionOutcome, ReductionReport,
+    prepare_likelihood, prepare_likelihood_with_report, sufficient_statistics,
+    sufficient_statistics_with_report,
+};
 
 /// Deterministic standard functions a backend lowers without portable expansion.
 /// The default keeps the backend-independent FlatPDL form.

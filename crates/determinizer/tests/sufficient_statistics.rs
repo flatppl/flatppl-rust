@@ -141,6 +141,165 @@ fn grouped_gathers_prepare_only_occupied_partitions() {
 }
 
 #[test]
+fn grouped_scalar_families_reuse_their_ordinary_guards() {
+    for (law, event) in [
+        ("LogNormal.(a[g],b[g])", "interval(0.1,10)"),
+        ("Gamma.(a[g],b[g])", "interval(0.1,10)"),
+        ("Beta.(a[g],b[g])", "interval(0.1,0.9)"),
+        ("Exponential.(a[g])", "interval(0,10)"),
+        ("Bernoulli.(a[g])", "booleans"),
+        ("Geometric.(a[g])", "nonnegintegers"),
+        ("ChiSquared.(a[g])", "interval(0.1,10)"),
+        ("InverseGamma.(a[g],b[g])", "interval(0.1,10)"),
+        ("Pareto.(a[g],b[g])", "interval(0.1,10)"),
+        ("Weibull.([2.0,3.0,4.0,5.0][g],b[g])", "interval(0.1,10)"),
+        (
+            "NegativeBinomial.([2.0,3.0,4.0,5.0][g],b[g])",
+            "nonnegintegers",
+        ),
+        (
+            "NegativeBinomial2.(a[g],[2.0,3.0,4.0,5.0][g])",
+            "nonnegintegers",
+        ),
+    ] {
+        let source = format!(
+            "a=elementof(cartpow(posreals,4))\nb=elementof(cartpow(posreals,4))\ng=[1,2,1,2,3]\ny=external(cartpow({event},5))\ninputs=(a,b,y)\noutputs=logdensityof({law},y)"
+        );
+        let prepared = prepare_likelihood(&lower(&source, false), &["y".into()])
+            .unwrap_or_else(|e| panic!("{law}: {e:?}"));
+        assert!(
+            !inputs(&prepared.score).iter().any(|name| name == "y"),
+            "{law}"
+        );
+    }
+    let fixed_binomial = "p=elementof(cartpow(interval(0.01,0.99),4))\ng=[1,2,1,2,3]\ninputs=p\noutputs=logdensityof(Binomial.(6,p[g]),[0,1,2,3,4])";
+    assert!(summary_count(&lower(fixed_binomial, true)) > 0);
+}
+
+#[test]
+fn grouped_indexed_lambdas_and_derived_points_prepare() {
+    for expression in [
+        "Normal.(mu[g],1.0)",
+        "Normal.(get0.([mu],[0,1,0,1,2,0]),1.0)",
+        "f.(g,[mu])",
+        "h.([3,1,6,4,2,5],[mu])",
+    ] {
+        let source = format!(
+            "mu=elementof(cartpow(reals,4))\ng=[1,2,1,2,3,1]\nf(i,m)=Normal(m[i],1.0)\nh(i,m)=Normal(m[g[i]],1.0)\ny=external(cartpow(reals,6))\nz=external(cartpow(reals,6))\nshift(v,w)=v+w\npoint=shift.(y,z)\ninputs=(mu,y,z)\noutputs=(logdensityof({expression},point),y)"
+        );
+        let prepared = prepare_likelihood(&lower(&source, false), &["y".into(), "z".into()])
+            .unwrap_or_else(|e| panic!("{expression}: {e:?}"));
+        assert_eq!(inputs(&prepared.preparation), ["y", "z"]);
+        assert!(inputs(&prepared.score).iter().any(|name| name == "y"));
+        assert!(!inputs(&prepared.score).iter().any(|name| name == "z"));
+        let scoring = source
+            .replace("shift(v,w)=v+w", "shift(v,w,p)=v+w+p")
+            .replace("shift.(y,z)", "shift.(y,z,mu[1])");
+        assert!(prepare_likelihood(&lower(&scoring, false), &["y".into(), "z".into()]).is_err());
+    }
+    let zero = "mu=elementof(cartpow(reals,4))\ny=external(cartpow(reals,6))\nf(i,m)=Normal(get0(m,i),1.0)\ninputs=(mu,y)\noutputs=logdensityof(f.([0,1,0,1,2,0],[mu]),y)";
+    assert!(prepare_likelihood(&lower(zero, false), &["y".into()]).is_ok());
+    let source = "mu=elementof(cartpow(reals,4))\ng=[1,2,1,2,3,1]\ny=external(cartpow(reals,6))\nz=external(cartpow(reals,6))\nscore(i,m,v,w)=logdensityof(Normal(m[i],1.0),v+w)\ninputs=(mu,y,z)\noutputs=sum(score.(g,[mu],y,z))";
+    let prepared = prepare_likelihood(&lower(source, false), &["y".into(), "z".into()]).unwrap();
+    assert_eq!(inputs(&prepared.preparation), ["y", "z"]);
+    assert!(
+        !inputs(&prepared.score)
+            .iter()
+            .any(|name| name == "y" || name == "z")
+    );
+    // A promoted literal selector and a data-only dynamic selector both stay live.
+    let promoted = source.replace("inputs=(mu,y,z)", "inputs=(mu,y,z,g)");
+    for data in [
+        vec!["y".into(), "z".into()],
+        vec!["y".into(), "z".into(), "g".into()],
+    ] {
+        assert!(prepare_likelihood(&lower(&promoted, false), &data).is_err());
+    }
+}
+
+#[test]
+fn reduction_reports_trace_committed_rules_without_changing_the_module() {
+    use flatppl_determinizer::{
+        ReductionOutcome, ReductionReport, prepare_likelihood_with_report,
+        sufficient_statistics_with_report,
+    };
+    let source = "mu=elementof(cartpow(reals,4))\ng=[1,2,1,2,3]\ny=[1.0,2.0,3.0,4.0,5.0]\ninputs=mu\noutputs=logdensityof(Normal.(mu[g],1.0),y)";
+    let raw = lower(source, false);
+    let mut traced = raw.clone();
+    let mut report = ReductionReport::default();
+    assert_eq!(
+        sufficient_statistics_with_report(&mut traced, &mut report),
+        3
+    );
+    assert_eq!(report.decisions.len(), 1);
+    assert!(
+        matches!(&report.decisions[0].outcome, ReductionOutcome::Reduced { partition: Some(p), .. } if (p.observations,p.groups,p.singletons)==(5,3,1))
+    );
+    assert_eq!(
+        flatppl_flatpir::write(&traced),
+        flatppl_flatpir::write(&lower(source, true))
+    );
+    let unique = source
+        .replace("g=[1,2,1,2,3]", "g=[1,2,3,4]")
+        .replace("y=[1.0,2.0,3.0,4.0,5.0]", "y=[1.0,2.0,3.0,4.0]");
+    let mut module = lower(&unique, false);
+    let mut retained = ReductionReport::default();
+    assert_eq!(
+        sufficient_statistics_with_report(&mut module, &mut retained),
+        0
+    );
+    assert!(
+        retained.to_string().contains("occurs only once"),
+        "{retained}"
+    );
+    assert_eq!(summary_count(&module), 0);
+    let mut disabled = ReductionReport::default();
+    disabled.record_disabled(&raw);
+    assert!(matches!(
+        disabled.decisions[0].outcome,
+        ReductionOutcome::Disabled
+    ));
+
+    for (replacement, reason) in [
+        ("g=[1,2,3,4,1]", ""),
+        ("g=[1,2,1,2,9]", "in-range gather"),
+        ("g=[1,2,3,4,5]", "in-range gather"),
+    ] {
+        let changed = source.replace("g=[1,2,1,2,3]", replacement);
+        let mut module = lower(&changed, false);
+        let mut report = ReductionReport::default();
+        sufficient_statistics_with_report(&mut module, &mut report);
+        if reason.is_empty() {
+            assert!(matches!(
+                report.decisions[0].outcome,
+                ReductionOutcome::Reduced { .. }
+            ));
+        } else {
+            assert!(report.to_string().contains(reason), "{report}");
+        }
+    }
+    // A late bucket fails the NB range guard. No bucket or summary commits.
+    let source = "b=elementof(cartpow(posreals,3))\ng=[1,2,1,2,3,3]\nk=[2.0,3.0,1e6]\ny=external(cartpow(nonnegintegers,6))\ninputs=(b,y)\noutputs=logdensityof(NegativeBinomial.(k[g],b[g]),y)";
+    let raw = lower(source, false);
+    let mut report = ReductionReport::default();
+    assert!(prepare_likelihood_with_report(&raw, &["y".into()], &mut report).is_err());
+    assert_eq!(report.decisions.len(), 1);
+    assert!(
+        report
+            .to_string()
+            .contains("dispersion <= 64 or fixed counts < 64"),
+        "{report}"
+    );
+    let mut ordinary = raw.clone();
+    sufficient_statistics_with_report(&mut ordinary, &mut ReductionReport::default());
+    assert_eq!(summary_count(&ordinary), 0);
+    assert_eq!(
+        flatppl_flatpir::write(&ordinary),
+        flatppl_flatpir::write(&raw)
+    );
+}
+
+#[test]
 fn bounded_circular_and_correlation_families_prepare() {
     for source in [
         "mu=elementof(interval(-3.14,3.14))\nkappa=elementof(interval(0.1,64))\ny=external(cartpow(interval(-4,4),3))\ninputs=(mu,kappa,y)\noutputs=logdensityof(iid(VonMises(mu,kappa),3),y)",
