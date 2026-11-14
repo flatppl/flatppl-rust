@@ -33,6 +33,35 @@ fn assert_fixed_values(ir: &str, values: &[f64], dtype: Dtype) {
 }
 
 #[test]
+fn builtin_broadcast_indexes_each_held_vector_cell() {
+    for (head, indices) in [("get", "[1,2,1,2,3,1]"), ("get0", "[0,1,0,1,2,0]")] {
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let source = format!(
+                "mu=[10.0,20.0,30.0,40.0]\np=elementof(reals)\ninputs=p\noutputs={head}.([mu],{indices})"
+            );
+            assert_fixed_values(
+                &emit(&source, dtype),
+                &[10., 20., 10., 20., 30., 10.],
+                dtype,
+            );
+            let live = source.replace("inputs=p", "inputs=mu");
+            let ir = emit(&live, dtype);
+            assert!(ir.contains("stablehlo.gather"), "{ir}");
+            let ty = match dtype {
+                Dtype::F32 => "tensor<6xf32>",
+                Dtype::F64 => "tensor<6xf64>",
+            };
+            assert!(ir.contains(ty), "{ir}");
+            let paired = format!(
+                "p=elementof(reals)\ninputs=p\noutputs={head}.([[10.0,20.0],[30.0,40.0]],{})",
+                if head == "get" { "[2,1]" } else { "[1,0]" }
+            );
+            assert_fixed_values(&emit(&paired, dtype), &[20., 30.], dtype);
+        }
+    }
+}
+
+#[test]
 fn lag_matrix_is_fixed_before_backend_compilation() {
     let source = "y = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]\n\
         times = indicesof(zeros(4)) .+ 3\n\
