@@ -130,7 +130,7 @@ impl Emitter<'_> {
     }
     /// Enzyme's reverse-loop tape uses i64 slice offsets. Keep its induction
     /// variable i64 too; convert only the index consumed by tensor arithmetic.
-    fn matrix_loop(
+    pub(super) fn matrix_loop(
         &mut self,
         n: u64,
         unroll_limit: u64,
@@ -498,8 +498,9 @@ impl Emitter<'_> {
         self.select(&nonsingular, &determinant, &singular)
     }
 
-    /// Partial-pivot solve, carrying a singularity predicate with the same
-    /// elimination that transforms the right-hand side.
+    /// Partial-pivot solve for vector or matrix RHS cells, carrying a singularity
+    /// predicate through the elimination. Matrix RHSs share one factorization;
+    /// the language's `linsolve` caller still requires a vector.
     pub(crate) fn matrix_solve(
         &mut self,
         _id: NodeId,
@@ -511,7 +512,12 @@ impl Emitter<'_> {
         let (a, b) = self.broadcast_batches(&a, &b);
         let batch = self.batch_rank(&a);
         let n = shape(&a.ty)[batch].expect("static square checked by caller");
-        let b = self.reshape_cell(&b, tensor(vec![Some(n), Some(1)]));
+        let vector_rhs = matches!(self.cell_ty(&b), MlirTy::Ranked(dims) if dims.len() == 1);
+        let b = if vector_rhs {
+            self.reshape_cell(&b, tensor(vec![Some(n), Some(1)]))
+        } else {
+            b
+        };
         let a_axes = self.axes_of(&a);
         let b_axes = self.axes_of(&b);
         let scalar_axes = Axes {
@@ -614,7 +620,11 @@ impl Emitter<'_> {
         let x = self.axes_view(&solved[0], b_axes);
         let zero = self.constant_like(0.0, &x);
         let safe = self.select(&valid, &x, &zero);
-        Ok(self.reshape_cell(&safe, tensor(vec![Some(n)])))
+        Ok(if vector_rhs {
+            self.reshape_cell(&safe, tensor(vec![Some(n)]))
+        } else {
+            safe
+        })
     }
 
     /// Partial pivoting handles indefinite metrics and zero leading pivots.

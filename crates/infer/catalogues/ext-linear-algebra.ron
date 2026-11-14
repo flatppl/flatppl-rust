@@ -35,7 +35,7 @@
                     sig: Function(params: [Matrix], names: ["A"], result: Scalar(Real))),
                 // matexp(A) → matrix with the same shape as A (shape passes through).
                 Binding(name: "matexp",
-                    sig: Function(params: [Matrix], names: ["A"], result: SameAsArg(0))),
+                    sig: Function(params: [Matrix], names: ["A"], result: RealOrComplexOfArgShape(0))),
                 // kron(A, B): Kronecker product — (rows A · rows B) × (cols A · cols B),
                 // element kind preserved (spec §09).
                 Binding(name: "kron",
