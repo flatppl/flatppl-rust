@@ -549,6 +549,9 @@ pub(crate) fn lower_selectbins(
             "selectbins: `edges` must be one longer than `counts` (spec §07)",
         ));
     }
+    if n == 0 {
+        return Ok(cv);
+    }
     let last = edges.len() - 2;
     let picked = (0..=last)
         .filter(|&i| {
@@ -560,10 +563,7 @@ pub(crate) fn lower_selectbins(
         .map(|i| get_literal_value(e, id, cv.clone(), i as u64))
         .collect::<Result<Vec<_>, _>>()?;
     if picked.is_empty() {
-        return Err(EmitError::at(
-            id,
-            "selectbins: no bin meets the region, and an empty result has no tensor form here",
-        ));
+        return Ok(e.slice(&cv, &[0], &[0], &[1]));
     }
     Ok(e.vector(&picked))
 }
@@ -581,6 +581,9 @@ pub(crate) fn lower_filter(
     let [n] = dims(e, id, &xs, "filter").map_err(|_| refuse_filter(id))?[..] else {
         return Err(refuse_filter(id));
     };
+    if n == 0 {
+        return Ok(xs);
+    }
     let mask = e.lower_broadcast(id, &[pred, data])?;
     let keep = (0..n as usize)
         .map(|i| match e.fixed_scalar_at(&mask, i) {
@@ -594,10 +597,7 @@ pub(crate) fn lower_filter(
         .map(|i| get_literal_value(e, id, xs.clone(), i))
         .collect::<Result<Vec<_>, _>>()?;
     if kept.is_empty() {
-        return Err(EmitError::at(
-            id,
-            "filter: no element is kept, and an empty result has no tensor form here",
-        ));
+        return Ok(e.slice(&xs, &[0], &[0], &[1]));
     }
     Ok(e.vector(&kept))
 }

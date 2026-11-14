@@ -690,7 +690,19 @@ impl Emitter<'_> {
                 continue;
             }
             let (shape, kind) = crate::types::mlir_type_of_ty(id, &ty, self.dtype)?;
-            if self.cell_ty(value) != shape || elem_rank(value.elem) > elem_rank(kind) {
+            // A fixed selection can resolve a dynamic inferred extent at emission.
+            let actual = self.cell_ty(value);
+            let fits = match (&actual, &shape) {
+                (MlirTy::Ranked(actual), MlirTy::Ranked(expected)) => {
+                    actual.len() == expected.len()
+                        && actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(a, b)| b.is_none() || a == b)
+                }
+                _ => actual == shape,
+            };
+            if !fits || elem_rank(value.elem) > elem_rank(kind) {
                 return Err(EmitError::at(
                     id,
                     "scan: initial value does not fit the state type",
