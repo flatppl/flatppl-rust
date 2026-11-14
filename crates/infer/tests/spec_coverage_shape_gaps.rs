@@ -616,9 +616,15 @@ fn matrix_constructors_infer_matrices() {
         ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
     ] {
         let out = ir(src);
+        let shape = if op == "col_gram" {
+            "2 2"
+        } else {
+            "%dynamic %dynamic"
+        };
         assert!(
-            out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
-                && out.contains(&format!("({op}")),
+            out.contains(&format!(
+                "(%bind x (%meta ((%array 2 ({shape}) (%scalar real))"
+            )) && out.contains(&format!("({op}")),
             "{op} should infer a real matrix, got:\n{out}"
         );
     }
