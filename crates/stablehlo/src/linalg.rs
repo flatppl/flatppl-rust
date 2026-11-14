@@ -349,6 +349,28 @@ impl Emitter<'_> {
     /// Complete pivoting moves rank deficiency to the final diagonal entries.
     /// This retains the determinant's cofactor derivative at a zero column.
     pub(crate) fn matrix_determinant(&mut self, input: &Value, n: u64, logarithm: bool) -> Value {
+        if !logarithm || self.target != crate::Target::Cpu || n < 32 {
+            return self.matrix_determinant_impl(input, n, logarithm, false);
+        }
+        let magnitude = self.abs(input);
+        let infinity = self.inf_like(input);
+        let finite = self.compare("LT", &magnitude, &infinity);
+        let finite = self.reduce_all(&finite);
+        let nonfinite = self.not(&finite);
+        let fast = self.matrix_determinant_impl(input, n, true, true);
+        self.matrix_if(&nonfinite, &fast, |e| {
+            let fallback = e.matrix_determinant_impl(input, n, true, false);
+            e.select(&nonfinite, &fallback, &fast)
+        })
+    }
+
+    fn matrix_determinant_impl(
+        &mut self,
+        input: &Value,
+        n: u64,
+        logarithm: bool,
+        partial: bool,
+    ) -> Value {
         if n == 1 {
             let value = self.reduce_sum(input);
             return if logarithm {
@@ -374,7 +396,9 @@ impl Emitter<'_> {
             let a = e.axes_view(&args[0], axes.clone());
             let parity = e.axes_view(&args[1], scalar_axes.clone());
             let row_active = e.compare("GE", &rows, index);
-            let col_active = e.compare("GE", &cols, index);
+            // The determinant needs complete pivoting for its cofactor derivative;
+            // logabsdet only needs a nonzero pivot from the current column.
+            let col_active = e.compare(if partial { "EQ" } else { "GE" }, &cols, index);
             let active = e.and(&row_active, &col_active);
             let magnitude = e.abs(&a);
             let infinity = e.inf_like(&a);
@@ -393,30 +417,35 @@ impl Emitter<'_> {
             let pivot_row =
                 e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &pivot_row, batch);
             let pivot_rows = e.compare("EQ", &rows, &pivot_row);
-            let candidates = e.and(&candidates, &pivot_rows);
-            let candidate_cols = e.select(&candidates, &cols, &limit);
-            let pivot_col = e.reduce_axis_lit(
-                "stablehlo.minimum",
-                &n.to_string(),
-                &candidate_cols,
-                batch + 1,
-            );
-            let pivot_col =
-                e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &pivot_col, batch);
-            let row_changed = e.compare("NE", &pivot_row, index);
-            let col_changed = e.compare("NE", &pivot_col, index);
-            let negative = e.neg(&parity);
-            let parity = e.select(&row_changed, &negative, &parity);
-            let negative = e.neg(&parity);
-            let parity = e.select(&col_changed, &negative, &parity);
-            let at_row = e.compare("EQ", &rows, index);
-            let a = e.swap_rows(&a, &at_row, &pivot_rows);
-            let a = e.transpose(&a, &permutation);
-            let a = e.axes_view(&a, axes.clone());
-            let pivot_rows = e.compare("EQ", &rows, &pivot_col);
-            let a = e.swap_rows(&a, &at_row, &pivot_rows);
-            let a = e.transpose(&a, &permutation);
-            let a = e.axes_view(&a, axes.clone());
+            let (a, parity, at_row) = if partial {
+                let at_row = e.compare("EQ", &rows, index);
+                (e.swap_rows(&a, &at_row, &pivot_rows), parity, at_row)
+            } else {
+                let candidates = e.and(&candidates, &pivot_rows);
+                let candidate_cols = e.select(&candidates, &cols, &limit);
+                let pivot_col = e.reduce_axis_lit(
+                    "stablehlo.minimum",
+                    &n.to_string(),
+                    &candidate_cols,
+                    batch + 1,
+                );
+                let pivot_col =
+                    e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &pivot_col, batch);
+                let row_changed = e.compare("NE", &pivot_row, index);
+                let col_changed = e.compare("NE", &pivot_col, index);
+                let negative = e.neg(&parity);
+                let parity = e.select(&row_changed, &negative, &parity);
+                let negative = e.neg(&parity);
+                let parity = e.select(&col_changed, &negative, &parity);
+                let at_row = e.compare("EQ", &rows, index);
+                let a = e.swap_rows(&a, &at_row, &pivot_rows);
+                let a = e.transpose(&a, &permutation);
+                let a = e.axes_view(&a, axes.clone());
+                let pivot_rows = e.compare("EQ", &rows, &pivot_col);
+                let a = e.swap_rows(&a, &at_row, &pivot_rows);
+                let a = e.transpose(&a, &permutation);
+                (e.axes_view(&a, axes.clone()), parity, at_row)
+            };
             let zero = e.constant_like(0.0, &a);
             let at_col = e.compare("EQ", &cols, index);
             let column = e.select(&at_col, &a, &zero);
