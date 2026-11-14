@@ -406,3 +406,56 @@ fn regression_preparation_keeps_matrix_and_affine_designs_outside_scoring()
     );
     Ok(())
 }
+
+#[test]
+fn weighted_regression_prepares_row_scales_and_keeps_live_scales()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let prefix = "beta=elementof(cartpow(reals,2))\nsigma=elementof(interval(0.5,2))\nX=external(cartpow(interval(-100,100),[7,2]))\ny=external(cartpow(interval(-100,100),7))\ns=external(cartpow(interval(0.1,10),7))\ninputs=(beta,sigma,X,y,s)\n";
+    for scale in ["s", "sigma .* s", "s .* sigma"] {
+        let query = context.parse(
+            &format!("{prefix}outputs=logdensityof(Normal.(X*beta,{scale}),y)"),
+            None,
+            None,
+        )?;
+        let prepared = context.prepare_likelihood(&query, &["X".into(), "y".into(), "s".into()])?;
+        let prep = prepared.preparation.compile(&EmitOptions::default())?;
+        let score = prepared.score.compile(&EmitOptions::default())?;
+        check_summary_schemas(&prep, &score, &prepared.summaries)?;
+        assert!(
+            !score
+                .inputs
+                .iter()
+                .any(|f| matches!(f.name.as_str(), "X" | "y" | "s"))
+        );
+        assert!(
+            context
+                .prepare_likelihood(&query, &["X".into(), "y".into()])
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn weighted_and_ordinary_regressions_keep_distinct_summary_shapes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let prefix = "a=elementof(reals)\nb=elementof(reals)\nsigma=elementof(interval(0.5,2))\nx=external(cartpow(interval(-10,10),5))\ny=external(cartpow(interval(-10,10),5))\ns=external(cartpow(interval(0.5,4),5))\ninputs=(a,b,sigma,x,y,s)\n";
+    let weighted = "logdensityof(Normal.(a .* x,sigma .* s),y)";
+    let ordinary = "logdensityof(Normal.(a .* x .+ b .* s,sigma),y)";
+    for (first, second) in [(weighted, ordinary), (ordinary, weighted)] {
+        let query = context.parse(&format!("{prefix}outputs=({first},{second})"), None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["x".into(), "y".into(), "s".into()])?;
+        let preparation = prepared.preparation.compile(&EmitOptions::default())?;
+        let score = prepared.score.compile(&EmitOptions::default())?;
+        check_summary_schemas(&preparation, &score, &prepared.summaries)?;
+        assert!(
+            !score
+                .inputs
+                .iter()
+                .any(|f| matches!(f.name.as_str(), "x" | "y" | "s"))
+        );
+    }
+    Ok(())
+}
