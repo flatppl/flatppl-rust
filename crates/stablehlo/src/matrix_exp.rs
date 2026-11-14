@@ -1,5 +1,5 @@
-//! §09 `ext-linear-algebra.matexp`: scaling, Padé approximation and squaring.
-//! Uses portable matrix operations and pivoted elimination, preserving reverse AD
+//! §09 `ext-linear-algebra.matexp`: scaling, polynomial approximation and squaring.
+//! Uses portable matrix operations, preserving reverse AD
 //! at repeated eigenvalues. No eigendecomposition or external library call.
 
 use super::*;
@@ -48,7 +48,7 @@ impl Emitter<'_> {
                 "matexp requires a nonempty square matrix",
             ));
         }
-        let output = self.matrix_exp(id, &input)?;
+        let output = self.matrix_exp(&input);
         Ok(match parent {
             Some(parent) => {
                 let frame = self.broadcast_frame.clone();
@@ -60,36 +60,11 @@ impl Emitter<'_> {
         })
     }
 
-    fn matrix_exp(&mut self, id: NodeId, input: &Value) -> Result<Value, EmitError> {
-        // Higham (2005), doi:10.1137/04061101X. Single precision needs degree7;
-        // degree13 is the double-precision scaling case. Normalize by b0 so
-        // polynomial intermediates do not inherit the large integer coefficients.
-        let (coefficients, theta): (&[f64], f64) = match self.dtype {
-            Dtype::F32 => (
-                &[
-                    17297280., 8648640., 1995840., 277200., 25200., 1512., 56., 1.,
-                ],
-                3.925_724_783_138_66,
-            ),
-            Dtype::F64 => (
-                &[
-                    64764752532480000.,
-                    32382376266240000.,
-                    7771770303897600.,
-                    1187353796428800.,
-                    129060195264000.,
-                    10559470521600.,
-                    670442572800.,
-                    33522128640.,
-                    1323241920.,
-                    40840800.,
-                    960960.,
-                    16380.,
-                    182.,
-                    1.,
-                ],
-                5.371920351148152,
-            ),
+    fn matrix_exp(&mut self, input: &Value) -> Value {
+        // Conservative norm bounds for solve-free optimized Taylor polynomials.
+        let theta: f64 = match self.dtype {
+            Dtype::F32 => 3.94,
+            Dtype::F64 => 1.09,
         };
         let batch = self.batch_rank(input);
         let rows = self.axis_indices(input, batch);
@@ -105,7 +80,7 @@ impl Emitter<'_> {
         let zeros = self.constant_like(0.0, input);
         let input = self.select(&finite, input, &zeros);
         // NaN/Inf cannot become an unbounded loop count. Keep invalid cells out
-        // of the solve too, then propagate NaN in the final result.
+        // of the polynomial too, then propagate NaN in the final result.
         let maximum = self.select(&finite, &maximum, &one);
         let positive = self.compare("GT", &maximum, &zero);
         let safe_maximum = self.select(&positive, &maximum, &one);
@@ -136,51 +111,7 @@ impl Emitter<'_> {
         let second = self.pow(&two, &second);
         let a = self.mul(&input, &first);
         let a = self.mul(&a, &second);
-        let a2 = self.matmat(&a, &a);
-        let a4 = self.matmat(&a2, &a2);
-        let a6 = self.matmat(&a4, &a2);
-        let b = coefficients
-            .iter()
-            .map(|x| x / coefficients[0])
-            .collect::<Vec<_>>();
-        let combination = |e: &mut Self, terms: &[(&Value, f64)]| {
-            let mut result = e.constant_like(0.0, &identity);
-            for &(power, coefficient) in terms {
-                let coefficient = e.scalar(coefficient);
-                let term = e.mul(power, &coefficient);
-                result = e.add(&result, &term);
-            }
-            result
-        };
-        let (u, v) = if b.len() == 8 {
-            let odd = combination(
-                self,
-                &[(&a6, b[7]), (&a4, b[5]), (&a2, b[3]), (&identity, b[1])],
-            );
-            let even = combination(
-                self,
-                &[(&a6, b[6]), (&a4, b[4]), (&a2, b[2]), (&identity, b[0])],
-            );
-            (self.matmat(&a, &odd), even)
-        } else {
-            let odd = combination(self, &[(&a6, b[13]), (&a4, b[11]), (&a2, b[9])]);
-            let odd = self.matmat(&a6, &odd);
-            let tail = combination(
-                self,
-                &[(&a6, b[7]), (&a4, b[5]), (&a2, b[3]), (&identity, b[1])],
-            );
-            let odd = self.add(&odd, &tail);
-            let even = combination(self, &[(&a6, b[12]), (&a4, b[10]), (&a2, b[8])]);
-            let even = self.matmat(&a6, &even);
-            let tail = combination(
-                self,
-                &[(&a6, b[6]), (&a4, b[4]), (&a2, b[2]), (&identity, b[0])],
-            );
-            (self.matmat(&a, &odd), self.add(&even, &tail))
-        };
-        let denominator = self.sub(&v, &u);
-        let numerator = self.add(&v, &u);
-        let initial = self.matrix_solve(id, &denominator, &numerator)?;
+        let initial = self.matrix_exp_polynomial(&a, &identity);
         // Fixed trip counts permit statically shaped reverse-AD tapes. Keep
         // the common 16-square range separate from the rare large-norm tail.
         // norm1(A) <= n*maxabs(A), so this bound covers every finite input.
@@ -190,14 +121,162 @@ impl Emitter<'_> {
             Dtype::F64 => 1024,
         };
         let bound = max_exponent + n.next_power_of_two().ilog2() as u64;
-        let result = self.matrix_exp_squares(&initial, &identity, &count, 0, 16);
+        let zero_count = self.int_value_const(0);
+        let needs_squaring = self.compare("GT", &count, &zero_count);
+        let result = self.matrix_exp_if(&needs_squaring, &initial, |e| {
+            if e.target == crate::Target::Cpu {
+                return e.matrix_exp_squares(&initial, &identity, &count, 0, 16);
+            }
+            // GPU launch costs favor short guarded stages. On CPU their
+            // reverse-AD branch tapes cost more than the inactive loop slots.
+            let mut result = e.matrix_exp_squares(&initial, &identity, &count, 0, 1);
+            for (start, end) in [(1, 2), (2, 4), (4, 8), (8, 16)] {
+                let threshold = e.int_value_const(start as i64);
+                let active = e.compare("GT", &count, &threshold);
+                result = e.matrix_exp_if(&active, &result, |e| {
+                    e.matrix_exp_squares(&result, &identity, &count, start, end)
+                });
+            }
+            result
+        });
         let sixteen = self.int_value_const(16);
         let tail = self.compare("GT", &count, &sixteen);
         let result = self.matrix_exp_if(&tail, &result, |e| {
             e.matrix_exp_squares(&result, &identity, &count, 16, bound)
         });
         let nan = self.constant_like(f64::NAN, &result);
-        Ok(self.select(&finite, &result, &nan))
+        self.select(&finite, &result, &nan)
+    }
+
+    /// Solve-free t21^[24] and T18 factorizations, with five matrix products.
+    /// Blanes et al. (2025), doi:10.1137/24M1657250, and Bader et al. (2019),
+    /// doi:10.3390/math7121174. All factors are polynomials in the same matrix.
+    fn matrix_exp_polynomial(&mut self, a: &Value, identity: &Value) -> Value {
+        let a2 = self.matmat(a, a);
+        let a3 = self.matmat(&a2, a);
+        let combination = |e: &mut Self, terms: &[(&Value, f64)]| {
+            let mut result = e.constant_like(0.0, identity);
+            for &(power, coefficient) in terms {
+                let coefficient = e.scalar(coefficient);
+                let term = e.mul(power, &coefficient);
+                result = e.add(&result, &term);
+            }
+            result
+        };
+        match self.dtype {
+            Dtype::F32 => {
+                let c = [
+                    1.161_658_834_444_88e-6,
+                    4.500_852_739_573_01e-6,
+                    5.374708803114821e-5,
+                    2.005403977292901e-3,
+                    6.974348269544424e-2,
+                    9.418613214806352e-1,
+                    2.852960512714315e-3,
+                    -7.544837153586671e-3,
+                    1.829773504500424,
+                    3.151382711608315e-2,
+                    1.392249143769798e-1,
+                    -2.269101241269351e-3,
+                    -5.394098846866402e-2,
+                    3.112216227982407e-1,
+                    9.343851261938047,
+                    6.865706355662834e-1,
+                    3.233_370_163_085_38,
+                    -5.726379787260966,
+                    -1.413550099309667e-2,
+                    -1.638413114712016e-1,
+                ];
+                let inner = combination(self, &[(&a3, c[0]), (&a2, c[1]), (a, c[2])]);
+                let y03 = self.matmat(&a3, &inner);
+                let left = combination(self, &[(&y03, 1.0), (&a3, c[3]), (&a2, c[4]), (a, c[5])]);
+                let right = combination(self, &[(&y03, 1.0), (&a3, c[6]), (&a2, c[7])]);
+                let product = self.matmat(&left, &right);
+                let y13 = combination(
+                    self,
+                    &[(&product, 1.0), (&y03, c[8]), (&a3, c[9]), (&a2, c[10])],
+                );
+                let left =
+                    combination(self, &[(&y13, 1.0), (&a3, c[11]), (&a2, c[12]), (a, c[13])]);
+                let right = combination(self, &[(&y13, 1.0), (&y03, c[14]), (a, c[15])]);
+                let product = self.matmat(&left, &right);
+                combination(
+                    self,
+                    &[
+                        (&product, 1.0),
+                        (&y13, c[16]),
+                        (&y03, c[17]),
+                        (&a3, c[18]),
+                        (&a2, c[19]),
+                        (a, 1.0),
+                        (identity, 1.0),
+                    ],
+                )
+            }
+            Dtype::F64 => {
+                let a6 = self.matmat(&a3, &a3);
+                let b1 = combination(
+                    self,
+                    &[
+                        (a, -0.10036558103014462),
+                        (&a2, -0.008_029_246_482_411_57),
+                        (&a3, -0.00089213849804573),
+                    ],
+                );
+                let b5 = combination(
+                    self,
+                    &[
+                        (&a2, -0.09233646193671186),
+                        (&a3, -0.01693649390020817),
+                        (&a6, -0.00001400867981820361),
+                    ],
+                );
+                let product = self.matmat(&b1, &b5);
+                // Center the factorization at I to preserve exp(0) exactly.
+                let r = combination(
+                    self,
+                    &[
+                        (&product, 1.0),
+                        (a, -0.06764045190713819),
+                        (&a2, 0.06759613017704596),
+                        (&a3, 0.02955525704293155),
+                        (&a6, -0.00001391802575160607),
+                    ],
+                );
+                let d = combination(
+                    self,
+                    &[
+                        (a, 1.680158138789062),
+                        (&a2, 0.05717798464788655),
+                        (&a3, -0.006982101224880521),
+                        (&a6, 0.00003349750170860705),
+                    ],
+                );
+                let b2 = combination(
+                    self,
+                    &[
+                        (a, 0.3978497494996451),
+                        (&a2, 1.367837784604117),
+                        (&a3, 0.4982896225253827),
+                        (&a6, -0.0006378981945947233),
+                    ],
+                );
+                let left = self.add(&d, &r);
+                let product = self.matmat(&left, &r);
+                let c = -0.09043168323908106;
+                let d0 = -10.967639605296206;
+                combination(
+                    self,
+                    &[
+                        (identity, 1.0),
+                        (&b2, 1.0),
+                        (&d, c),
+                        (&r, d0 + 2.0 * c),
+                        (&product, 1.0),
+                    ],
+                )
+            }
+        }
     }
 
     fn matrix_exp_squares(

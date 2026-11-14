@@ -39,10 +39,7 @@ fn matrix_exponential_preserves_matrix_cells_and_named_arguments() {
                 Dtype::F32 => "f32",
                 Dtype::F64 => "f64",
             };
-            assert!(
-                plain.contains(&format!("-> (tensor<2x2x{ty}>, tensor<i")),
-                "{plain}"
-            );
+            assert!(plain.contains(&format!("-> tensor<2x2x{ty}>")), "{plain}");
             assert!(!plain.contains("custom_call"), "{plain}");
         }
     }
@@ -56,8 +53,5 @@ fn matrix_exponential_native_broadcast_preserves_batch_and_matrix_axes() {
         Dtype::F32,
         Target::Gpu,
     );
-    assert!(
-        output.contains("-> (tensor<3x2x2xf32>, tensor<i32>)"),
-        "{output}"
-    );
+    assert!(output.contains("-> tensor<3x2x2xf32>"), "{output}");
 }
