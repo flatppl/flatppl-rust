@@ -430,6 +430,8 @@ pub(crate) enum ResultSig {
     /// a real scalar for a scalar argument, a real array of the same shape for
     /// an array argument.
     RealOfArgShape(usize),
+    /// Preserve every array axis and promote non-complex elements to real.
+    RealOrComplexOfArgShape(usize),
     /// Result is the common type of args `i` and `j`: identical argument types
     /// pass through unchanged, otherwise the scalar promotion of the two
     /// (`integers ⊂ reals ⊂ complexes`). For `ifelse`'s two branches.

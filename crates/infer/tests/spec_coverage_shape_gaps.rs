@@ -918,6 +918,21 @@ fn ext_linalg_record_results_infer() {
     );
 }
 
+#[test]
+fn matrix_exponential_promotes_integer_entries_and_preserves_complex_entries() {
+    for (entry, kind) in [("1", "real"), ("complex(1.0, 0.5)", "complex")] {
+        let out = ir(&format!(
+            "e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+             A = rowstack([[{entry}, {entry}], [{entry}, {entry}]])\nx = e.matexp(A)"
+        ));
+        let result = out.lines().find(|line| line.contains("(%bind x ")).unwrap();
+        assert!(
+            result.contains(&format!("(%array 2 (2 2) (%scalar {kind}))")),
+            "{result}"
+        );
+    }
+}
+
 /// Indexing an array by an integer ARRAY is a gather (`a[group_data]`, spec §07
 /// "array of indices subset selection"): the result has the index's shape and
 /// the container's element type — so a hierarchical `eta = a[g] .+ b .* x`

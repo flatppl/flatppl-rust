@@ -339,6 +339,20 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
         ResultSig::SameAsArg(i) => (ctx.arg_type)(*i).unwrap_or(Type::Deferred),
+        ResultSig::RealOrComplexOfArgShape(i) => {
+            fn promote(ty: Type) -> Type {
+                match ty {
+                    Type::Array { shape, elem } => Type::Array {
+                        shape,
+                        elem: Box::new(promote(*elem)),
+                    },
+                    Type::Scalar(ScalarType::Complex) => Type::Scalar(ScalarType::Complex),
+                    Type::Scalar(_) => Type::Scalar(ScalarType::Real),
+                    _ => Type::Deferred,
+                }
+            }
+            (ctx.arg_type)(*i).map(promote).unwrap_or(Type::Deferred)
+        }
         ResultSig::RealOfArgShape(i) => match (ctx.arg_type)(*i) {
             Some(Type::Scalar(_)) => Type::Scalar(ScalarType::Real),
             Some(Type::Array { shape, .. }) => Type::Array {
