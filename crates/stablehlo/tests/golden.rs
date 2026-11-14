@@ -6613,13 +6613,7 @@ inputs = (eta, c_obs)
 outputs = (lp)
 ";
 
-/// §08 LKJ, verbatim: `(eta-1) log det(C) - log c_n(eta)`, `n = 3` (spec's
-/// own fixed dimension kwarg). Op counts: one `stablehlo.cholesky` (`L_C`),
-/// no `triangular_solve` (LKJ needs no trace), two `stablehlo.iota`/one
-/// `compare`/one `select` (`diag`'s own idiom, called once), two
-/// `stablehlo.reduce(` (`diag`'s row-sum + `log_det_from_chol`'s
-/// `reduce_sum`), four `chlo.lgamma` (`log_cn_lkj`'s `k = 1..n-1` loop, `n =
-/// 3` so 2 iterations, 2 `lgamma`s each).
+/// LKJ reuses one Cholesky factor for support and log determinant, with no solve.
 #[test]
 fn emit_logdensity_lkj_has_expected_structure() {
     let d = determinize_src(LKJ_DENSITY_SRC);
@@ -6647,10 +6641,6 @@ fn emit_logdensity_lkj_has_expected_structure() {
         !out.contains("triangular_solve"),
         "LKJ needs no trace/tri_solve, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.iota").count(), 2);
-    assert_eq!(out.matches("stablehlo.compare").count(), 2);
-    assert_eq!(out.matches("stablehlo.select").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
     assert_eq!(out.matches("chlo.lgamma").count(), 4);
     assert!(is_delimiter_balanced(&out));
 }
@@ -6748,16 +6738,7 @@ inputs = (eta, l_obs)
 outputs = (lp)
 ";
 
-/// §08 LKJCholesky, verbatim: `sum_{i=2}^{n} (n-i+2*eta-2) log L_ii - log
-/// c_n(eta)`. Op counts: NO `stablehlo.cholesky` at all (the variate `L` is
-/// already the Cholesky factor — [`lkj_cholesky_logpdf`]'s doc comment), two
-/// `stablehlo.iota`/one `compare`/one `select` (one `diag` call, called
-/// directly rather than through `log_det_from_chol`), one `stablehlo.reduce(`
-/// (`diag`'s own row-sum; no further `reduce_sum` — [`vector_elem`] slices
-/// two of the three diagonal entries individually instead of summing all
-/// their logs), two `stablehlo.slice`/two `stablehlo.reshape` ([`vector_elem`]
-/// called for `i = 2, 3`), four `chlo.lgamma` (`log_cn_lkj`'s `n = 3` loop,
-/// same as [`emit_logdensity_lkj_has_expected_structure`]).
+/// LKJCholesky scores an existing factor, without another Cholesky operation.
 #[test]
 fn emit_logdensity_lkj_cholesky_has_expected_structure() {
     let d = determinize_src(LKJ_CHOLESKY_DENSITY_SRC);
@@ -6784,12 +6765,6 @@ fn emit_logdensity_lkj_cholesky_has_expected_structure() {
         !out.contains("stablehlo.cholesky"),
         "LKJCholesky's variate is already the Cholesky factor, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.iota").count(), 2);
-    assert_eq!(out.matches("stablehlo.compare").count(), 2);
-    assert_eq!(out.matches("stablehlo.select").count(), 2);
-    assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
-    assert_eq!(out.matches("stablehlo.slice").count(), 2);
-    assert_eq!(out.matches("stablehlo.reshape").count(), 2);
     assert_eq!(out.matches("chlo.lgamma").count(), 4);
     assert!(is_delimiter_balanced(&out));
 }

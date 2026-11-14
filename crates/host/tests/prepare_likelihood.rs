@@ -259,6 +259,12 @@ fn count_and_inverse_matrix_preparation_keep_the_scoring_abi()
         "a=elementof(posreals)\ny=external(cartpow(interval(0.1,10),17))\ninputs=(a,y)\noutputs=logdensityof(iid(Weibull(2.0,a),17),y)",
         "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,17))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial(2.0,a),17),y)",
         "a=elementof(posreals)\ny=external(cartpow(nonnegintegers,17))\ninputs=(a,y)\noutputs=logdensityof(iid(NegativeBinomial2(a,2.0),17),y)",
+        "a=elementof(posreals)\ny=external(cartpow(interval(0.1,100),17))\ninputs=(a,y)\noutputs=logdensityof(iid(ChiSquared(a),17),y)",
+        "mu=elementof(interval(-3.14,3.14))\nk=elementof(interval(0.1,64))\ny=external(cartpow(interval(-4,4),17))\ninputs=(mu,k,y)\noutputs=logdensityof(iid(VonMises(mu,k),17),y)",
+        "eta=elementof(posreals)\ny=external(cartpow(cartpow(reals,[3,3]),17))\ninputs=(eta,y)\noutputs=logdensityof(iid(LKJ(3,eta),17),y)",
+        "eta=elementof(posreals)\ny=external(cartpow(cartpow(reals,[3,3]),17))\ninputs=(eta,y)\noutputs=logdensityof(iid(LKJCholesky(3,eta),17),y)",
+        "mu=elementof(cartpow(reals,3))\nsigma=elementof(posreals)\ng=[1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2]\ny=external(cartpow(reals,17))\ninputs=(mu,sigma,y)\noutputs=logdensityof(Normal.(mu[g],sigma),y)",
+        "rate=elementof(cartpow(nonnegreals,3))\ng=[1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2]\ny=external(cartpow(integers,17))\ninputs=(rate,y)\noutputs=logdensityof(Poisson.(rate[g]),y)",
     ] {
         let mut context = Context::default();
         let query = context.parse(source, None, None)?;

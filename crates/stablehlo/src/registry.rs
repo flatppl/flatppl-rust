@@ -4037,21 +4037,84 @@ fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Valu
 /// is read via [`literal_fixed_positive_int`], then the variate `C` is
 /// checked against it by [`require_matrix_dim`] before `cholesky` runs. No
 /// `@sample` builder (`sample: None`).
+fn correlation_masks(e: &mut Emitter, v: &Value, n: u64) -> (Value, Value) {
+    let positions = e.index_vector(n, true);
+    let square = MlirTy::Ranked(vec![Some(n), Some(n)]);
+    let rows = e.broadcast_in_dim(&positions, &[0], square.clone());
+    let cols = e.broadcast_in_dim(&positions, &[1], square);
+    let diagonal = e.compare("EQ", &rows, &cols);
+    let upper = e.compare("LT", &rows, &cols);
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let identity = e.select(&diagonal, &one, &zero);
+    let batch = e.batch_rank(v) as u64;
+    let lift = |e: &mut Emitter, value: &Value| {
+        let lifted = e.broadcast_in_dim(value, &[batch, batch + 1], v.ty.clone());
+        e.axes_view(&lifted, e.axes_of(v))
+    };
+    (lift(e, &identity), lift(e, &upper))
+}
+
+/// Match the affine/simplex membership convention: allow eight rounding errors
+/// per row entry. The tolerance scales with the emitted precision, not f64.
+fn correlation_tolerance(e: &mut Emitter, n: u64) -> Value {
+    let epsilon = match e.dtype() {
+        Dtype::F32 => f64::from(f32::EPSILON),
+        Dtype::F64 => f64::EPSILON,
+    };
+    e.scalar(8.0 * n as f64 * epsilon)
+}
+
 fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "LKJ", "logdensity")?;
     require_matrix_dim(e, p.variate_id()?, v, n, "LKJ", "C")?;
     let eta = p.get(e, "eta")?;
 
-    let l_c = e.cholesky(v);
+    let (identity, _) = correlation_masks(e, v, n);
+    let tolerance = correlation_tolerance(e, n);
+    let one = e.scalar(1.0);
+    let limit = e.add(&one, &tolerance);
+    let magnitude = e.abs(v);
+    let bounded = e.compare("LE", &magnitude, &limit);
+    let bounded = e.reduce_all(&bounded);
+    let diagonal = e.diag(v);
+    let difference = e.sub(&diagonal, &one);
+    let difference = e.abs(&difference);
+    let unit = e.compare("LE", &difference, &tolerance);
+    let unit = e.reduce_all(&unit);
+    let batch = e.batch_rank(v);
+    let mut permutation = (0..batch as u64).collect::<Vec<_>>();
+    permutation.extend([batch as u64 + 1, batch as u64]);
+    let transpose = e.transpose(v, &permutation);
+    let transpose = e.axes_view(&transpose, e.axes_of(v));
+    let difference = e.sub(v, &transpose);
+    let difference = e.abs(&difference);
+    let symmetric = e.compare("LE", &difference, &tolerance);
+    let symmetric = e.reduce_all(&symmetric);
+    let structural = e.and(&bounded, &unit);
+    let structural = e.and(&structural, &symmetric);
+    let safe = e.select(&structural, v, &identity);
+    let l_c = e.cholesky(&safe);
+    let diagonal = e.diag(&l_c);
+    let zero = e.scalar(0.0);
+    let positive = e.compare("GT", &diagonal, &zero);
+    let infinity = e.scalar(f64::INFINITY);
+    let finite = e.compare("LT", &diagonal, &infinity);
+    let positive = e.and(&positive, &finite);
+    let positive = e.reduce_all(&positive);
+    let supported = e.and(&structural, &positive);
+    let l_c = e.select(&supported, &l_c, &identity);
     let log_det_c = log_det_from_chol(e, &l_c);
 
-    let one = e.scalar(1.0);
+    let eta = e.select(&supported, &eta, &one);
     let eta_minus_one = e.sub(&eta, &one);
     let term1 = e.mul(&eta_minus_one, &log_det_c);
 
     let log_cn = log_cn_lkj(e, n, &eta);
     let neg_log_cn = e.neg(&log_cn);
-    Ok(e.add(&term1, &neg_log_cn))
+    let density = e.add(&term1, &neg_log_cn);
+    let outside = e.scalar(f64::NEG_INFINITY);
+    Ok(e.select(&supported, &density, &outside))
 }
 
 /// §08 LKJCholesky, verbatim: `log f = sum_{i=2}^{n} (n-i+2*eta-2) log L_ii -
@@ -4066,7 +4129,33 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
     require_matrix_dim(e, p.variate_id()?, v, n, "LKJCholesky", "L")?;
     let eta = p.get(e, "eta")?;
 
-    let diag_l = e.diag(v);
+    let (identity, upper) = correlation_masks(e, v, n);
+    let tolerance = correlation_tolerance(e, n);
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let limit = e.add(&one, &tolerance);
+    let magnitude = e.abs(v);
+    let bounded = e.compare("LE", &magnitude, &limit);
+    let bounded = e.reduce_all(&bounded);
+    let diagonal = e.diag(v);
+    let positive = e.compare("GT", &diagonal, &zero);
+    let positive = e.reduce_all(&positive);
+    let upper_values = e.select(&upper, v, &zero);
+    let triangular = e.compare("EQ", &upper_values, &zero);
+    let triangular = e.reduce_all(&triangular);
+    let structural = e.and(&bounded, &positive);
+    let structural = e.and(&structural, &triangular);
+    let safe = e.select(&structural, v, &identity);
+    let squares = e.mul(&safe, &safe);
+    let norms = e.reduce_sum_last_axis(&squares);
+    let difference = e.sub(&norms, &one);
+    let difference = e.abs(&difference);
+    let unit = e.compare("LE", &difference, &tolerance);
+    let unit = e.reduce_all(&unit);
+    let supported = e.and(&structural, &unit);
+    let safe = e.select(&supported, &safe, &identity);
+    let diag_l = e.diag(&safe);
+    let eta = e.select(&supported, &eta, &one);
     let two = e.scalar(2.0);
     let two_eta = e.mul(&two, &eta);
 
@@ -4086,7 +4175,9 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
 
     let log_cn = log_cn_lkj(e, n, &eta);
     let neg_log_cn = e.neg(&log_cn);
-    Ok(e.add(&sum_terms, &neg_log_cn))
+    let density = e.add(&sum_terms, &neg_log_cn);
+    let outside = e.scalar(f64::NEG_INFINITY);
+    Ok(e.select(&supported, &density, &outside))
 }
 
 // ---- §08 rejection-based continuous `@sample` batch (Task 15) ---------------
