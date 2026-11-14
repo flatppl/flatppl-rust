@@ -250,6 +250,23 @@ pub(crate) fn lower_builtin(
             };
             match length {
                 Some(Dim::Static(n)) => Ok(e.int_value_const(n.into())),
+                Some(Dim::Dynamic)
+                    if matches!(
+                        e.type_of(value),
+                        Some(Type::Array { .. } | Type::TVector { .. })
+                    ) =>
+                {
+                    let lowered = e.lower_node(value)?;
+                    match e.cell_ty(&lowered) {
+                        MlirTy::Ranked(dims) if dims.len() == 1 && dims[0].is_some() => {
+                            Ok(e.int_value_const(dims[0].expect("static extent") as i64))
+                        }
+                        _ => Err(EmitError::at(
+                            id,
+                            "lengthof requires a statically-sized vector",
+                        )),
+                    }
+                }
                 _ => Err(EmitError::at(
                     id,
                     "lengthof requires a statically-sized vector or table",

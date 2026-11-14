@@ -173,9 +173,9 @@ fn selectbins_keeps_the_bins_that_meet_the_region() {
         &format!("selectbins([-1.0, 0.0, 1.0, 2.0], posreals, {c})"),
         "tensor<2xf32>",
     );
-    refuses(
+    returns(
         "selectbins([-10.0, 10.0], interval(5.0, 3.0), [z0])",
-        "no bin meets the region",
+        "tensor<0xf32>",
     );
 }
 
@@ -222,6 +222,30 @@ fn integer_and_boolean_operands_keep_their_element_kind() {
 }
 
 #[test]
+fn fixed_empty_selections_preserve_their_element_type() {
+    returns("filter(fn(_ > 9.0), [1.0, 2.0])", "tensor<0xf32>");
+    returns("filter(value -> false, [1, 2])", "tensor<0xi32>");
+    returns(
+        "filter(value -> true, filter(value -> false, [true]))",
+        "tensor<0xi1>",
+    );
+    returns(
+        "selectbins([0.0, 1.0, 2.0], interval(3.0, 4.0), [1, 2])",
+        "tensor<0xi32>",
+    );
+    returns(
+        "selectbins([0.0], reals, filter(value -> false, [0.0]))",
+        "tensor<0xf32>",
+    );
+    returns("lengthof(filter(value -> false, [0.0]))", "tensor<i32>");
+    returns("indicesof(filter(value -> false, [0.0]))", "tensor<0xi32>");
+    returns(
+        "scan((state, x) -> state, filter(value -> false, [0.0]), [1.0, 2.0])",
+        "tensor<2x0xf32>",
+    );
+}
+
+#[test]
 fn what_has_no_static_shape_refuses_with_its_reason() {
     refuses("onehot(5, 4)", "onehot: index 5 is outside 1..4");
     refuses("onehot(0, 4)", "onehot: index 0 is outside 1..4");
@@ -242,7 +266,6 @@ fn what_has_no_static_shape_refuses_with_its_reason() {
         "filter(fn(_ > 1.5), v)",
         "data-dependent number of elements",
     );
-    refuses("filter(fn(_ > 9.0), [1.0, 2.0])", "no element is kept");
     refuses(
         "onehot.([1, 2], 3)",
         "`onehot` under a broadcast has no lowering here",

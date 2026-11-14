@@ -4,12 +4,29 @@ use flatppl_core::{CallHead, Dim, Node, NodeId, Type};
 
 use crate::{EmitError, Emitter, Value};
 
-fn dimensions(e: &Emitter, id: NodeId) -> Result<Vec<u32>, EmitError> {
-    let dims = match e.type_of(id) {
+fn dimensions(e: &mut Emitter, id: NodeId) -> Result<Vec<u32>, EmitError> {
+    let mut dims = match e.type_of(id) {
         Some(Type::Array { shape, .. }) => shape.to_vec(),
         Some(Type::TVector { len, .. } | Type::Table { nrows: len, .. }) => vec![*len],
         _ => vec![],
     };
+    if dims.contains(&Dim::Dynamic)
+        && matches!(
+            e.type_of(id),
+            Some(Type::Array { .. } | Type::TVector { .. })
+        )
+    {
+        let value = e.lower_node(id)?;
+        if let crate::mlir::MlirTy::Ranked(resolved) = e.cell_ty(&value) {
+            for (dim, extent) in dims.iter_mut().zip(resolved) {
+                if *dim == Dim::Dynamic
+                    && let Some(n) = extent.and_then(|n| u32::try_from(n).ok())
+                {
+                    *dim = Dim::Static(n);
+                }
+            }
+        }
+    }
     if dims.is_empty() || dims.contains(&Dim::Dynamic) {
         return Err(EmitError::at(
             id,
