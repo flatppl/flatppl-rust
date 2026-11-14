@@ -3,7 +3,10 @@
 //! Summary bindings are ordinary FlatPDL expressions. Backends may bake them,
 //! place them in a setup block, or compile the two modules returned here.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use flatppl_core::{
     Binding, Call, CallHead, Dim, Idx, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar,
@@ -19,8 +22,10 @@ mod histogram;
 mod multivariate;
 mod poisson;
 mod regression;
+mod report;
 mod scalar;
 use crate::density::{build_call, build_record};
+pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 
 const PREFIX: &str = "__likelihood_summary_";
 
@@ -299,56 +304,140 @@ fn data_only(
     allowed: &HashSet<Symbol>,
     boundary: &HashSet<Symbol>,
 ) -> bool {
-    let mut pending = vec![(root, Vec::<Symbol>::new())];
-    let mut seen = HashSet::new();
-    while let Some((id, locals)) = pending.pop() {
-        if !seen.insert((id, locals.clone())) {
+    data_only_cached(m, root, allowed, boundary, &mut HashMap::new())
+}
+
+type ProofKey = (NodeId, Vec<Symbol>);
+type ProofCache = HashMap<ProofKey, bool>;
+
+fn data_only_cached(
+    m: &Module,
+    root: NodeId,
+    allowed: &HashSet<Symbol>,
+    boundary: &HashSet<Symbol>,
+    cache: &mut ProofCache,
+) -> bool {
+    let root = (root, Vec::<Symbol>::new());
+    let mut pending = vec![(root.clone(), None::<Vec<ProofKey>>)];
+    let mut visiting = HashSet::new();
+    while let Some((key @ (id, _), children)) = pending.pop() {
+        if cache.contains_key(&key) {
             continue;
         }
-        match m.node(id) {
+        if let Some(children) = children {
+            cache.insert(
+                key.clone(),
+                children.iter().all(|child| cache.get(child) == Some(&true)),
+            );
+            visiting.remove(&key);
+            continue;
+        }
+        if !visiting.insert(key.clone()) {
+            cache.insert(key, false);
+            continue;
+        }
+        let locals = &key.1;
+        let children = match m.node(id) {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
             }) => {
                 if boundary.contains(name) {
                     if !allowed.contains(name) {
-                        return false;
+                        cache.insert(key, false);
+                        continue;
                     }
+                    vec![]
                 } else if let Some(bid) = m.binding_by_name(*name) {
-                    pending.push((m.binding(bid).rhs, locals));
+                    vec![(m.binding(bid).rhs, locals.clone())]
                 } else {
-                    return false;
+                    cache.insert(key, false);
+                    continue;
                 }
             }
             Node::Ref(Ref {
                 ns: RefNs::Local,
                 name,
-            }) if locals.contains(name) => {}
-            Node::Ref(_) | Node::Axis(_) | Node::Hole => return false,
+            }) if locals.contains(name) => vec![],
+            Node::Ref(_) | Node::Axis(_) | Node::Hole => {
+                cache.insert(key, false);
+                continue;
+            }
             Node::Call(c) if c.inputs.is_some() => {
                 let (CallHead::Builtin(head), Some(Inputs::Spec(inputs))) = (&c.head, &c.inputs)
                 else {
-                    return false;
+                    cache.insert(key, false);
+                    continue;
                 };
                 if m.resolve(*head) != "functionof" {
-                    return false;
+                    cache.insert(key, false);
+                    continue;
                 }
-                let mut bound = locals;
+                let mut bound = locals.clone();
                 bound.extend(inputs.iter().map(|(_, r)| r.name));
-                pending.extend(c.args.iter().map(|&child| (child, bound.clone())));
+                c.args.iter().map(|&child| (child, bound.clone())).collect()
             }
             Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if matches!(m.resolve(h), "elementof" | "draw" | "builtin_sample")) =>
             {
-                return false;
+                cache.insert(key, false);
+                continue;
             }
-            node => pending.extend(
-                node.children()
-                    .into_iter()
-                    .map(|child| (child, locals.clone())),
-            ),
-        }
+            node => node
+                .children()
+                .into_iter()
+                .map(|child| (child, locals.clone()))
+                .collect(),
+        };
+        pending.push((key, Some(children.clone())));
+        pending.extend(children.into_iter().map(|child| (child, None)));
     }
-    true
+    cache.get(&root) == Some(&true)
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn local_proofs_do_not_escape_their_reification_scope() {
+        let mut m = Module::new();
+        let name = m.intern("v");
+        let local = m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name,
+        }));
+        let head = m.intern("functionof");
+        let function = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: vec![local].into(),
+            named: vec![].into(),
+            inputs: Some(Inputs::Spec(
+                vec![(
+                    name,
+                    Ref {
+                        ns: RefNs::Local,
+                        name,
+                    },
+                )]
+                .into(),
+            )),
+        }));
+        let mut proofs = HashMap::new();
+        assert!(data_only_cached(
+            &m,
+            function,
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut proofs
+        ));
+        assert!(!data_only_cached(
+            &m,
+            local,
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut proofs
+        ));
+    }
 }
 
 struct Factor {
@@ -441,6 +530,13 @@ struct Reducer {
     cache: HashMap<(Vec<DataKey>, &'static str), NodeId>,
     count: usize,
     next_serial: usize,
+    data_proofs: RefCell<ProofCache>,
+    fixed_proofs: RefCell<ProofCache>,
+    report: Option<ReductionReport>,
+    binding: String,
+    enabled: bool,
+    rule: Option<(&'static str, Option<GroupPartition>)>,
+    fallback: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -450,6 +546,25 @@ enum DataKey {
 }
 
 impl Reducer {
+    fn data_only(&self, m: &Module, id: NodeId) -> bool {
+        data_only_cached(
+            m,
+            id,
+            &self.allowed,
+            &self.boundary,
+            &mut self.data_proofs.borrow_mut(),
+        )
+    }
+
+    fn fixed(&self, m: &Module, id: NodeId) -> bool {
+        data_only_cached(
+            m,
+            id,
+            &HashSet::new(),
+            &self.boundary,
+            &mut self.fixed_proofs.borrow_mut(),
+        )
+    }
     fn summary(&mut self, m: &mut Module, data: NodeId, kind: &'static str, expr: Expr) -> Expr {
         self.summary_for(m, &[data], kind, expr)
     }
@@ -532,37 +647,46 @@ impl Reducer {
             return Some(result);
         }
         if let Some(result) = correlation::reduce(self, m, id) {
+            self.rule = Some(("correlation statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
         if let Some(result) = circular::reduce(self, m, id) {
+            self.rule = Some(("circular statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
         if let Some(result) = scalar::reduce(self, m, id) {
+            self.rule = Some(("scalar sufficient statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
         if let Some(result) = regression::reduce(self, m, id) {
+            self.rule = Some(("regression statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
         if let Some(result) = multivariate::reduce(self, m, id) {
+            self.rule = Some(("multivariate statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
         if let Some(result) = self.reduce_moments(m, id) {
+            self.rule = Some(("scalar moments", None));
             return Some(result);
         }
         let factor = per_cell(m, id, &self.boundary)?;
-        if !data_only(m, factor.observed, &self.allowed, &self.boundary) {
+        if !self.data_only(m, factor.observed) {
             return None;
         }
         if let Some(result) = histogram::reduce(self, m, &factor) {
+            self.rule = Some(("fixed histogram", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
-        poisson::reduce(self, m, &factor)
+        let result = poisson::reduce(self, m, &factor)?;
+        self.rule = Some(("centered Poisson statistics", None));
+        Some(result)
     }
 
     fn reduce_moments(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
@@ -571,7 +695,8 @@ impl Reducer {
     }
 
     fn reduce_moment_factor(&mut self, m: &mut Module, f: &Factor) -> Option<NodeId> {
-        if !data_only(m, f.observed, &self.allowed, &self.boundary) {
+        if !self.data_only(m, f.observed) {
+            self.fallback = "observations depend on a scoring input";
             return None;
         }
         let Type::Array { shape, elem } = m.type_of(f.observed)?.clone() else {
@@ -1024,12 +1149,17 @@ impl Reducer {
                 let trials_id = resolve(m, trials, &self.boundary);
                 let trials = match m.node(trials_id) {
                     Node::Lit(Scalar::Int(n)) if *n > 0 && *n < 64 => *n as f64,
-                    _ => return None,
+                    _ => {
+                        self.fallback =
+                            "Binomial needs a fixed integer trial count between 1 and 63";
+                        return None;
+                    }
                 };
                 if !fixed.as_ref().is_some_and(|v| {
                     v.iter()
                         .all(|x| *x >= 0.0 && *x <= trials && x.fract() == 0.0)
                 }) {
+                    self.fallback = "Binomial needs fixed integer observations between zero and its trial count";
                     return None;
                 }
                 let total = self.summary(m, observed, "sum", op("sum", [x.clone()]));
@@ -1108,7 +1238,33 @@ impl Reducer {
         } else {
             crate::driver::rebuild_with_children(m, root, &replacements)
         };
-        let result = self.reduce(m, id).unwrap_or(id);
+        let family = self
+            .report
+            .as_ref()
+            .and_then(|_| report::family(m, id, &self.boundary));
+        self.rule = None;
+        self.fallback = "unsupported representation, support proof, or numerical range";
+        let reduced = self.enabled.then(|| self.reduce(m, id)).flatten();
+        if let Some(family) = family {
+            let outcome = if !self.enabled {
+                ReductionOutcome::Disabled
+            } else if reduced.is_some() {
+                let (rule, partition) = self.rule.take().expect("a committed reduction has a rule");
+                ReductionOutcome::Reduced { rule, partition }
+            } else {
+                ReductionOutcome::Retained {
+                    reason: self.fallback,
+                }
+            };
+            let decision = ReductionDecision {
+                binding: self.binding.clone(),
+                node: id,
+                family: m.resolve(family).into(),
+                outcome,
+            };
+            self.report.as_mut().unwrap().decisions.push(decision);
+        }
+        let result = reduced.unwrap_or(id);
         mapped.insert(root, result);
         result
     }
@@ -1142,7 +1298,13 @@ fn fixed_values(m: &Module, root: NodeId, boundary: &HashSet<Symbol>) -> Option<
         .collect()
 }
 
-fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, Vec<Symbol>) {
+fn reduce(
+    m: &mut Module,
+    allowed: HashSet<Symbol>,
+    preparing: bool,
+    report: Option<&mut ReductionReport>,
+    enabled: bool,
+) -> (usize, Vec<Symbol>) {
     let boundary = crate::canon::promoted_input_names(m);
     let mut reducer = Reducer {
         preparing,
@@ -1152,6 +1314,13 @@ fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, 
         cache: HashMap::new(),
         count: 0,
         next_serial: 0,
+        data_proofs: RefCell::default(),
+        fixed_proofs: RefCell::default(),
+        report: report.as_ref().map(|_| ReductionReport::default()),
+        binding: String::new(),
+        enabled,
+        rule: None,
+        fallback: "",
     };
     let bindings: Vec<_> = m
         .bindings()
@@ -1163,11 +1332,19 @@ fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, 
         .collect();
     let mut mapped = HashMap::new();
     for (bid, rhs) in bindings {
+        reducer.binding = m.resolve(m.binding(bid).name).into();
+        // Binding rewrites can change reference targets. Reuse proofs only
+        // within this transaction, including all occupied grouped buckets.
+        reducer.data_proofs.get_mut().clear();
+        reducer.fixed_proofs.get_mut().clear();
         let rhs = reducer.walk(m, rhs, &mut mapped);
         m.set_binding_rhs(bid, rhs);
     }
     if reducer.count > 0 {
         let _ = flatppl_infer::infer(m);
+    }
+    if let Some(report) = report {
+        report.decisions.extend(reducer.report.unwrap().decisions);
     }
     (reducer.count, reducer.summaries)
 }
@@ -1176,6 +1353,15 @@ fn reduce(m: &mut Module, allowed: HashSet<Symbol>, preparing: bool) -> (usize, 
 /// expressions. This does not change the query ABI or cache mutable caller data.
 /// Returns the number of reduced factors. Unsupported factors remain unchanged.
 pub fn sufficient_statistics(m: &mut Module) -> usize {
+    sufficient_statistics_inner(m, None)
+}
+
+/// Append decisions from this pass without changing its output or ABI.
+pub fn sufficient_statistics_with_report(m: &mut Module, report: &mut ReductionReport) -> usize {
+    sufficient_statistics_inner(m, Some(report))
+}
+
+fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionReport>) -> usize {
     let allowed = crate::canon::promoted_input_names(m)
         .into_iter()
         .filter(|name| {
@@ -1183,7 +1369,7 @@ pub fn sufficient_statistics(m: &mut Module) -> usize {
                 .is_some_and(|bid| m.binding_phase(bid) == Some(flatppl_core::Phase::Fixed))
         })
         .collect();
-    reduce(m, allowed, false).0
+    reduce(m, allowed, false, report, true).0
 }
 
 /// Split a FlatPDL query into preparation and scoring without changing ordinary
@@ -1191,6 +1377,23 @@ pub fn sufficient_statistics(m: &mut Module) -> usize {
 pub fn prepare_likelihood(
     m: &Module,
     data_inputs: &[String],
+) -> Result<PreparedLikelihood, RefuseError> {
+    prepare_likelihood_inner(m, data_inputs, None)
+}
+
+/// Append committed decisions, including when preparation finds no reduction.
+pub fn prepare_likelihood_with_report(
+    m: &Module,
+    data_inputs: &[String],
+    report: &mut ReductionReport,
+) -> Result<PreparedLikelihood, RefuseError> {
+    prepare_likelihood_inner(m, data_inputs, Some(report))
+}
+
+fn prepare_likelihood_inner(
+    m: &Module,
+    data_inputs: &[String],
+    report: Option<&mut ReductionReport>,
 ) -> Result<PreparedLikelihood, RefuseError> {
     let error_node = binding(m, "outputs").unwrap_or_else(|| NodeId::from_usize(0));
     let refuse = |reason: &str| RefuseError {
@@ -1220,14 +1423,15 @@ pub fn prepare_likelihood(
     let roots = [score.intern("inputs"), score.intern("outputs")];
     crate::canon::retain_reachable(&mut score, &roots);
     let allowed: HashSet<_> = data_inputs.iter().map(|name| score.intern(name)).collect();
-    let (_, added) = reduce(&mut score, allowed.clone(), true);
+    let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
     let boundary = crate::canon::promoted_input_names(&score);
+    let mut proofs = HashMap::new();
     let mut summaries: Vec<_> = score
         .bindings()
         .filter(|(_, b)| {
             b.synthetic
                 && score.resolve(b.name).starts_with(PREFIX)
-                && data_only(&score, b.rhs, &allowed, &boundary)
+                && data_only_cached(&score, b.rhs, &allowed, &boundary, &mut proofs)
         })
         .map(|(_, b)| b.name)
         .collect();
@@ -1243,7 +1447,13 @@ pub fn prepare_likelihood(
     }
     for &name in &summaries {
         let bid = score.binding_by_name(name).unwrap();
-        if !data_only(&score, score.binding(bid).rhs, &allowed, &boundary) {
+        if !data_only_cached(
+            &score,
+            score.binding(bid).rhs,
+            &allowed,
+            &boundary,
+            &mut proofs,
+        ) {
             return Err(refuse("a summary depends on a scoring input"));
         }
     }

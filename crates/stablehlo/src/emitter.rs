@@ -4583,9 +4583,9 @@ impl<'m> Emitter<'m> {
         } else {
             &args[1..]
         };
-        if matches!(fname.as_str(), "get" | "get0") && rest.len() > 2 {
-            // Multi-axis selection consumes each matrix cell, not the outer
-            // collection of matrices. `all` and `only` are selector markers.
+        if matches!(fname.as_str(), "get" | "get0") && rest.len() >= 2 {
+            // Index each collection cell, including a vector held in a singleton
+            // wrapper. `all` and `only` are multi-axis selector markers.
             let operands: Vec<_> = rest.iter().copied().filter(|&node| {
                 !matches!(self.m.node(node), Node::Const(s) if matches!(self.m.resolve(*s), "all" | "only"))
             }).collect();

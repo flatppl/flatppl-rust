@@ -96,6 +96,27 @@ pub fn determinize_with_options(
     roots: Option<&[Symbol]>,
     options: &crate::LoweringOptions<'_>,
 ) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, None)
+}
+
+/// Trace the actual lowering-time reductions without changing the result.
+pub fn determinize_with_options_and_report(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    report: &mut crate::ReductionReport,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, Some(report))
+}
+
+fn determinize_inner(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    mut report: Option<&mut crate::ReductionReport>,
+) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
     crate::boxes::refuse_unnormalized_draws(&work)?;
@@ -186,7 +207,13 @@ pub fn determinize_with_options(
                 // the conformance check and return.
                 crate::canon::canonicalize(&mut work, roots);
                 if !options.disable_sufficient_statistics {
-                    crate::sufficient_statistics(&mut work);
+                    if let Some(report) = report.as_deref_mut() {
+                        crate::sufficient_statistics_with_report(&mut work, report);
+                    } else {
+                        crate::sufficient_statistics(&mut work);
+                    }
+                } else if let Some(report) = report.as_deref_mut() {
+                    report.record_disabled(&work);
                 }
                 match crate::is_flatpdl_with_options(&work, options) {
                     Ok(()) => return Ok(work),

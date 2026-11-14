@@ -1,12 +1,12 @@
 //! A data-centered primitive anchor retains accurate large-count scoring.
 
-use super::{Expr, Factor, Reducer, data_only, map, materialize, num, op, relative_log};
+use super::{Expr, Factor, Reducer, map, materialize, num, op, relative_log};
 use flatppl_core::{Dim, Module, NodeId, ScalarType, Type};
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<NodeId> {
     if m.resolve(f.constructor) != "Poisson"
-        || (!r.preparing && !data_only(m, f.observed, &Default::default(), &r.boundary))
-        || !data_only(m, f.observed, &r.allowed, &r.boundary)
+        || (!r.preparing && !r.fixed(m, f.observed))
+        || !r.data_only(m, f.observed)
     {
         return None;
     }

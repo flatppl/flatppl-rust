@@ -220,6 +220,9 @@ enum Command {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
               num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         sufficient_statistics: bool,
+        /// Explain likelihood reductions and fallbacks on stderr.
+        #[arg(long)]
+        explain_reductions: bool,
     },
     /// Emit textual StableHLO for a FlatPPL model.
     ///
@@ -263,6 +266,9 @@ enum Command {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
               num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         sufficient_statistics: bool,
+        /// Explain likelihood reductions and fallbacks on stderr.
+        #[arg(long)]
+        explain_reductions: bool,
         /// Allow adaptive numerical scalar marginals and normalizers.
         #[arg(long)]
         numerical_integrals: bool,
@@ -451,6 +457,7 @@ fn main() -> ExitCode {
             emit,
             boxes,
             sufficient_statistics,
+            explain_reductions,
         } => determinize_cmd(
             &input,
             output.as_deref(),
@@ -458,9 +465,12 @@ fn main() -> ExitCode {
             emit,
             &boxes,
             sufficient_statistics,
-            prepare_data
-                .as_deref()
-                .map(|path| (path, data_inputs.as_slice())),
+            LikelihoodOutput {
+                preparation: prepare_data
+                    .as_deref()
+                    .map(|path| (path, data_inputs.as_slice())),
+                explain_reductions,
+            },
         ),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
@@ -473,6 +483,7 @@ fn main() -> ExitCode {
             restrict_enzyme_compatible,
             check_parameters,
             sufficient_statistics,
+            explain_reductions,
             numerical_integrals,
             integration_rtol,
             integration_atol,
@@ -504,8 +515,12 @@ fn main() -> ExitCode {
                 },
             },
             output.as_deref(),
-            prepare_data.as_deref(),
-            &data_inputs,
+            LikelihoodOutput {
+                preparation: prepare_data
+                    .as_deref()
+                    .map(|path| (path, data_inputs.as_slice())),
+                explain_reductions,
+            },
         ),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1162,14 +1177,21 @@ fn line_col(source: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// `flatppl determinize <in.flatppl> [-o out] [--keep name]… [--emit form]` —
-/// legalize a FlatPPL model to the deterministic FlatPDL profile (eliminate the
-/// measure layer), printing to `output`/stdout in `emit`'s form (canonical
-/// FlatPPL syntax by default, FlatPIR with `--emit flatpir`). With one or
-/// more `--keep <name>`, only bindings reachable from those requested-output
-/// roots survive (root-based DCE); with none, every binding is kept (unchanged
-/// behavior). Refuses (exit 3, via `Failure::Refuse`) any construct the
-/// determiniser cannot legalize.
+#[cfg(feature = "determinize")]
+struct LikelihoodOutput<'a> {
+    preparation: Option<(&'a Path, &'a [String])>,
+    explain_reductions: bool,
+}
+
+#[cfg(feature = "determinize")]
+fn print_reductions(stage: &str, report: &flatppl_determinizer::ReductionReport) {
+    if !report.decisions.is_empty() {
+        eprintln!("Likelihood reductions ({stage}):\n{report}");
+    }
+}
+
+/// Legalize a model and emit portable source or FlatPIR, with optional roots,
+/// preparation output, and reduction diagnostics.
 #[cfg(feature = "determinize")]
 fn determinize_cmd(
     input: &Path,
@@ -1178,8 +1200,12 @@ fn determinize_cmd(
     emit: EmitForm,
     boxes: &[String],
     sufficient_statistics: bool,
-    preparation: Option<(&Path, &[String])>,
+    likelihood: LikelihoodOutput<'_>,
 ) -> Result<(), Failure> {
+    let LikelihoodOutput {
+        preparation,
+        explain_reductions,
+    } = likelihood;
     let resolver = CliResolver::cache_only();
     let (mut module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
     let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
@@ -1188,16 +1214,27 @@ fn determinize_cmd(
     } else {
         Some(syms.as_slice())
     };
-    let mut lowered = flatppl_determinizer::determinize_with_options(
-        &module,
-        &bundle,
-        roots,
-        &flatppl_determinizer::LoweringOptions {
-            disable_sufficient_statistics: !sufficient_statistics || preparation.is_some(),
-            ..Default::default()
-        },
-    )
-    .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    let lowering = flatppl_determinizer::LoweringOptions {
+        disable_sufficient_statistics: !sufficient_statistics || preparation.is_some(),
+        ..Default::default()
+    };
+    let mut report = flatppl_determinizer::ReductionReport::default();
+    let lowered = if explain_reductions && preparation.is_none() {
+        flatppl_determinizer::determinize_with_options_and_report(
+            &module,
+            &bundle,
+            roots,
+            &lowering,
+            &mut report,
+        )
+    } else {
+        flatppl_determinizer::determinize_with_options(&module, &bundle, roots, &lowering)
+    };
+    if explain_reductions && preparation.is_none() {
+        print_reductions("lowering", &report);
+    }
+    let mut lowered =
+        lowered.map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
     if let Some((path, data_inputs)) = preparation {
         if !sufficient_statistics {
@@ -1205,8 +1242,16 @@ fn determinize_cmd(
                 "--prepare-data requires sufficient statistics".into(),
             ));
         }
-        let prepared = flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
-            .map_err(|e| Failure::Refuse(e.reason))?;
+        let mut report = flatppl_determinizer::ReductionReport::default();
+        let prepared = if explain_reductions {
+            flatppl_determinizer::prepare_likelihood_with_report(&lowered, data_inputs, &mut report)
+        } else {
+            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
+        };
+        if explain_reductions {
+            print_reductions("preparation", &report);
+        }
+        let prepared = prepared.map_err(|e| Failure::Refuse(e.reason))?;
         let rendered = match emit {
             EmitForm::Flatppl => flatppl_syntax::print(&prepared.preparation),
             EmitForm::Flatpir => flatppl_flatpir::try_write(&prepared.preparation)
@@ -1216,7 +1261,13 @@ fn determinize_cmd(
             .map_err(|e| Failure::Plain(format!("writing preparation: {e}")))?;
         lowered = prepared.score;
     } else if sufficient_statistics {
-        flatppl_determinizer::sufficient_statistics(&mut lowered);
+        if explain_reductions {
+            let mut report = flatppl_determinizer::ReductionReport::default();
+            flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, &mut report);
+            print_reductions("materialized data", &report);
+        } else {
+            flatppl_determinizer::sufficient_statistics(&mut lowered);
+        }
     }
     flatppl_determinizer::prepare_serialization(&mut lowered, roots);
     let rendered = match emit {
@@ -1249,9 +1300,12 @@ fn stablehlo_cmd(
     boxes: &[String],
     opts: &flatppl_stablehlo::EmitOptions,
     output: Option<&Path>,
-    prepare_data: Option<&Path>,
-    data_inputs: &[String],
+    likelihood: LikelihoodOutput<'_>,
 ) -> Result<(), Failure> {
+    let LikelihoodOutput {
+        preparation,
+        explain_reductions,
+    } = likelihood;
     let resolver = CliResolver::cache_only();
     let (module, bundle, source) = load_and_infer(input, &resolver, boxes)?;
 
@@ -1296,25 +1350,48 @@ fn stablehlo_cmd(
     let roots = Some(abi_syms);
 
     let lowering = flatppl_determinizer::LoweringOptions {
-        disable_sufficient_statistics: !opts.sufficient_statistics || prepare_data.is_some(),
+        disable_sufficient_statistics: !opts.sufficient_statistics || preparation.is_some(),
         ..opts.lowering_options()
     };
-    let mut lowered = flatppl_determinizer::determinize_with_options(
-        &module,
-        &bundle,
-        roots.as_deref(),
-        &lowering,
-    )
-    .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
+    let mut report = flatppl_determinizer::ReductionReport::default();
+    let lowered = if explain_reductions && preparation.is_none() {
+        flatppl_determinizer::determinize_with_options_and_report(
+            &module,
+            &bundle,
+            roots.as_deref(),
+            &lowering,
+            &mut report,
+        )
+    } else {
+        flatppl_determinizer::determinize_with_options(
+            &module,
+            &bundle,
+            roots.as_deref(),
+            &lowering,
+        )
+    };
+    if explain_reductions && preparation.is_none() {
+        print_reductions("lowering", &report);
+    }
+    let mut lowered =
+        lowered.map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     load_fixed_data(&mut lowered, &resolver, input, &source, &module)?;
-    if let Some(path) = prepare_data {
+    if let Some((path, data_inputs)) = preparation {
         if !opts.sufficient_statistics || !matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
             return Err(Failure::Usage(
                 "--prepare-data requires logdensity mode and sufficient statistics".into(),
             ));
         }
-        let prepared = flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
-            .map_err(|e| Failure::Refuse(e.reason))?;
+        let mut report = flatppl_determinizer::ReductionReport::default();
+        let prepared = if explain_reductions {
+            flatppl_determinizer::prepare_likelihood_with_report(&lowered, data_inputs, &mut report)
+        } else {
+            flatppl_determinizer::prepare_likelihood(&lowered, data_inputs)
+        };
+        if explain_reductions {
+            print_reductions("preparation", &report);
+        }
+        let prepared = prepared.map_err(|e| Failure::Refuse(e.reason))?;
         let rendered = flatppl_stablehlo::emit(
             &prepared.preparation,
             flatppl_stablehlo::Mode::LogDensity,
@@ -1325,7 +1402,13 @@ fn stablehlo_cmd(
             .map_err(|e| Failure::Plain(format!("writing preparation: {e}")))?;
         lowered = prepared.score;
     } else if opts.sufficient_statistics {
-        flatppl_determinizer::sufficient_statistics(&mut lowered);
+        if explain_reductions {
+            let mut report = flatppl_determinizer::ReductionReport::default();
+            flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, &mut report);
+            print_reductions("materialized data", &report);
+        } else {
+            flatppl_determinizer::sufficient_statistics(&mut lowered);
+        }
     }
     let rendered = flatppl_stablehlo::emit(&lowered, mode, opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;

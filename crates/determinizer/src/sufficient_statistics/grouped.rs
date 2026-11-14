@@ -2,8 +2,182 @@
 
 use std::collections::HashMap;
 
-use super::{Expr, Factor, Reducer, call, data_only, materialize, op, per_cell, resolve};
-use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Type, ValueSet};
+use super::{Expr, Factor, Reducer, call, materialize, op, per_cell, resolve};
+use flatppl_core::{
+    Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, Scalar, ScalarType, Type, ValueSet,
+};
+
+// A small selector evaluator. It never follows a promoted query input's RHS.
+fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
+    let id = resolve(m, id, &r.boundary);
+    if let Node::Lit(Scalar::Int(i)) = m.node(id) {
+        return Some(vec![*i]);
+    }
+    if let Some(c) = call(m, id, "vector") {
+        return c
+            .args
+            .iter()
+            .map(|&id| match m.node(resolve(m, id, &r.boundary)) {
+                Node::Lit(Scalar::Int(i)) => Some(*i),
+                _ => None,
+            })
+            .collect();
+    }
+    let (c, origin) = call(m, id, "get")
+        .map(|c| (c, 1))
+        .or_else(|| call(m, id, "get0").map(|c| (c, 0)))?;
+    let [array, selector] = *c.args else {
+        return None;
+    };
+    let array = fixed_indices(m, array, r)?;
+    fixed_indices(m, selector, r)?
+        .into_iter()
+        .map(|i| {
+            array
+                .get(usize::try_from(i.checked_sub(origin)?).ok()?)
+                .copied()
+        })
+        .collect()
+}
+
+fn uses(m: &Module, root: NodeId, local: Ref) -> bool {
+    let mut pending = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match m.node(id) {
+            Node::Ref(r) if *r == local => return true,
+            Node::Call(c) if matches!(&c.inputs, Some(Inputs::Spec(xs)) if xs.iter().any(|(_,r)| *r==local)) =>
+                {}
+            node => pending.extend(node.children()),
+        }
+    }
+    false
+}
+
+/// Lift only known indexing and reify point expressions with their used inputs.
+/// Blind vector substitution would change scalar arithmetic inside a lambda.
+fn factor(m: &mut Module, id: NodeId, r: &Reducer) -> Option<Factor> {
+    if let Some(f) = per_cell(m, id, &r.boundary) {
+        return Some(f);
+    }
+    let sum = call(m, id, "sum")?;
+    let [arg] = *sum.args else { return None };
+    let broadcast = call(m, resolve(m, arg, &r.boundary), "broadcast")?.clone();
+    let (head, operands) = broadcast.args.split_first()?;
+    let function = call(m, resolve(m, *head, &r.boundary), "functionof")?.clone();
+    let (Some(Inputs::Spec(inputs)), [body]) = (&function.inputs, function.args.as_ref()) else {
+        return None;
+    };
+    if inputs.len() != operands.len() {
+        return None;
+    }
+    let body = call(m, *body, "builtin_logdensityof")?;
+    let [kernel, record, point] = *body.args else {
+        return None;
+    };
+    let Node::Const(constructor) = *m.node(kernel) else {
+        return None;
+    };
+    let record = call(m, record, "record")?.clone();
+    let operand = |m: &Module, id| {
+        inputs
+            .iter()
+            .position(|(_, r)| matches!(m.node(id),Node::Ref(v) if v==r))
+            .map(|i| operands[i])
+    };
+    let held = |m: &Module, id| {
+        if let Some(value) = operand(m, id) {
+            let c = call(m, resolve(m, value, &r.boundary), "vector")?;
+            let [value] = *c.args else { return None };
+            Some(value)
+        } else {
+            super::data_only(m, id, &r.boundary, &r.boundary).then_some(id)
+        }
+    };
+    let mut parameters = Vec::new();
+    for a in &record.named {
+        let value = if let Some(value) = operand(m, a.value) {
+            value
+        } else if let Some((c, head)) = call(m, a.value, "get")
+            .map(|c| (c, "get"))
+            .or_else(|| call(m, a.value, "get0").map(|c| (c, "get0")))
+        {
+            let [array, selector] = *c.args else {
+                return None;
+            };
+            let array = held(m, array)?;
+            // Resolve a local selector, including fixed g[i] composition.
+            let selector = if let Some(value) = operand(m, selector) {
+                value
+            } else if let Some((c, head)) = call(m, selector, "get")
+                .map(|c| (c, "get"))
+                .or_else(|| call(m, selector, "get0").map(|c| (c, "get0")))
+            {
+                let [values, indices] = *c.args else {
+                    return None;
+                };
+                let values = held(m, values)?;
+                let indices = operand(m, indices)?;
+                materialize(m, op(head, [Expr::Node(values), Expr::Node(indices)]))
+            } else {
+                selector
+            };
+            let indices = fixed_indices(m, selector, r)?;
+            materialize(
+                m,
+                op(
+                    head,
+                    [
+                        Expr::Node(array),
+                        op("vector", indices.into_iter().map(Expr::Integer)),
+                    ],
+                ),
+            )
+        } else if matches!(m.type_of(a.value), Some(Type::Scalar(_)))
+            && super::data_only(m, a.value, &r.boundary, &r.boundary)
+        {
+            a.value
+        } else {
+            return None;
+        };
+        crate::kernel::annotate_rebuilt(m, value);
+        parameters.push((a.name, value));
+    }
+    let observed = if let Some(value) = operand(m, point) {
+        value
+    } else {
+        let used = inputs
+            .iter()
+            .zip(operands)
+            .filter(|((_, local), _)| uses(m, point, *local))
+            .collect::<Vec<_>>();
+        if used.is_empty() {
+            return None;
+        }
+        let inputs = used
+            .iter()
+            .map(|((name, local), _)| (*name, *local))
+            .collect::<Vec<_>>();
+        let args = used.iter().map(|(_, value)| **value).collect::<Vec<_>>();
+        let head = m.intern("functionof");
+        let function = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: vec![point].into(),
+            named: vec![].into(),
+            inputs: Some(Inputs::Spec(inputs.into())),
+        }));
+        crate::density::build_call(m, "broadcast", &[vec![function], args].concat())
+    };
+    crate::kernel::annotate_rebuilt(m, observed);
+    Some(Factor {
+        constructor,
+        parameters,
+        observed,
+    })
+}
 
 enum Parameter {
     Shared(NodeId),
@@ -17,22 +191,27 @@ enum Parameter {
 
 fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parameter> {
     let id = resolve(m, value, &r.boundary);
-    let (array, indices) = if let Some(c) = call(m, id, "get") {
+    let (array, indices, origin) = if let Some((c, origin)) = call(m, id, "get")
+        .map(|c| (c, 1))
+        .or_else(|| call(m, id, "get0").map(|c| (c, 0)))
+    {
         let [array, indices] = *c.args else {
             return None;
         };
-        (array, indices)
+        (array, indices, origin)
     } else {
         let c = call(m, id, "broadcast")?;
         let [head, array, indices] = *c.args else {
             return None;
         };
-        if !matches!(m.node(head),Node::Const(s) if m.resolve(*s)=="get") {
-            return None;
-        }
+        let origin = match m.node(head) {
+            Node::Const(s) if m.resolve(*s) == "get" => 1,
+            Node::Const(s) if m.resolve(*s) == "get0" => 0,
+            _ => return None,
+        };
         let wrapped = call(m, resolve(m, array, &r.boundary), "vector")?;
         let [array] = *wrapped.args else { return None };
-        (array, indices)
+        (array, indices, origin)
     };
     let Type::Array { shape, elem } = m.type_of(array)? else {
         return None;
@@ -40,21 +219,19 @@ fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parame
     let [Dim::Static(size)] = shape.as_ref() else {
         return None;
     };
-    if !matches!(elem.as_ref(), Type::Scalar(ScalarType::Real)) {
+    if !matches!(
+        elem.as_ref(),
+        Type::Scalar(ScalarType::Real | ScalarType::Integer)
+    ) {
         return None;
     }
-    let c = call(m, resolve(m, indices, &r.boundary), "vector")?;
-    if c.args.len() != count {
-        return None;
-    }
-    let indices = c
-        .args
-        .iter()
-        .map(|&id| match m.node(resolve(m, id, &r.boundary)) {
-            Node::Lit(Scalar::Int(k)) if *k >= 1 && *k <= i64::from(*size) => Some(*k),
-            _ => None,
-        })
+    let indices = fixed_indices(m, indices, r)?
+        .into_iter()
+        .map(|index| index.checked_add(1 - origin))
         .collect::<Option<Vec<_>>>()?;
+    if indices.len() != count || indices.iter().any(|&k| k < 1 || k > i64::from(*size)) {
+        return None;
+    }
     let set = match m.valueset_of(array) {
         Some(ValueSet::CartPow(set, _)) => set.as_ref().clone(),
         _ => ValueSet::Reals,
@@ -68,13 +245,7 @@ fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parame
 }
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {
-    let f = per_cell(m, id, &r.boundary)?;
-    if !matches!(m.resolve(f.constructor), "Normal" | "Poisson")
-        || !data_only(m, f.observed, &r.allowed, &r.boundary)
-        || (!r.preparing && !data_only(m, f.observed, &Default::default(), &r.boundary))
-    {
-        return None;
-    }
+    let f = factor(m, id, r)?;
     let Type::Array { shape, elem } = m.type_of(f.observed)?.clone() else {
         return None;
     };
@@ -87,10 +258,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
     }
     let root = resolve(m, f.observed, &r.boundary);
     let literal = call(m, root, "vector").map(|c| c.args.to_vec());
-    // Do not rewalk a derived observation DAG once for each occupied group.
-    if literal.is_none() && !matches!(m.node(root),Node::Ref(v) if r.boundary.contains(&v.name)) {
-        return None;
-    }
+    r.fallback = "parameters need shared scalars or fixed, in-range gather selectors";
     let parameters = f
         .parameters
         .iter()
@@ -99,6 +267,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
                 name,
                 match r.scalar(m, value) {
                     Some(value) => Parameter::Shared(value),
+                    None if m.resolve(name) == "support" => Parameter::Shared(value),
                     None => gather(m, value, r, count)?,
                 },
             ))
@@ -108,6 +277,15 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         .iter()
         .any(|(_, p)| matches!(p, Parameter::Gather { .. }))
     {
+        r.fallback = "unsupported representation, support proof, or numerical range";
+        return None;
+    }
+    if !r.data_only(m, f.observed) {
+        r.fallback = "observations depend on a scoring input";
+        return None;
+    }
+    if !r.preparing && !r.fixed(m, f.observed) {
+        r.fallback = "runtime observations require explicit preparation for grouping";
         return None;
     }
     let mut groups = Vec::<(Vec<i64>, Vec<usize>)>::new();
@@ -127,8 +305,18 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         groups[at].1.push(i);
     }
     if groups.len() == count {
+        r.fallback = "every occupied parameter tuple occurs only once";
         return None;
     }
+    let partition = super::GroupPartition {
+        observations: count,
+        groups: groups.len(),
+        singletons: groups
+            .iter()
+            .filter(|(_, positions)| positions.len() == 1)
+            .count(),
+    };
+    r.fallback = "an occupied group fails the family support or numerical guard";
     // A later bucket can fail a family-specific numerical guard. Commit the
     // whole partition only after every occupied bucket has a valid reduction.
     let mut candidate = m.clone();
@@ -144,9 +332,20 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
                     Parameter::Gather {
                         array, elem, set, ..
                     } => {
+                        let index = key.next()?;
+                        if let Some(c) = call(
+                            &candidate,
+                            resolve(&candidate, *array, &reducer.boundary),
+                            "vector",
+                        ) {
+                            let value = c.args[usize::try_from(index - 1).ok()?];
+                            if candidate.type_of(value) == Some(elem) {
+                                return Some((*name, value));
+                            }
+                        }
                         let value = materialize(
                             &mut candidate,
-                            op("get", [Expr::Node(*array), Expr::Integer(key.next()?)]),
+                            op("get", [Expr::Node(*array), Expr::Integer(index)]),
                         );
                         candidate.set_type(value, elem.clone());
                         candidate.set_valueset(value, set.clone());
@@ -216,14 +415,32 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
             reducer.count += 1;
             materialize(&mut candidate, value)
         } else {
-            reducer
-                .reduce_moment_factor(&mut candidate, &factor)
-                .or_else(|| super::poisson::reduce(&mut reducer, &mut candidate, &factor))?
+            if let Some(value) = super::scalar::reduce_factor(&mut reducer, &mut candidate, &factor)
+            {
+                reducer.count += 1;
+                materialize(&mut candidate, value)
+            } else if let Some(value) = reducer.reduce_moment_factor(&mut candidate, &factor) {
+                value
+            } else if let Some(value) =
+                super::histogram::reduce(&mut reducer, &mut candidate, &factor)
+            {
+                reducer.count += 1;
+                materialize(&mut candidate, value)
+            } else {
+                let Some(value) = super::poisson::reduce(&mut reducer, &mut candidate, &factor)
+                else {
+                    // Keep the failed guard, but discard every candidate edit.
+                    r.fallback = reducer.fallback;
+                    return None;
+                };
+                value
+            }
         };
         terms.push(Expr::Node(value));
     }
     let result = materialize(&mut candidate, op("sum", [op("vector", terms)]));
     *m = candidate;
     *r = reducer;
+    r.rule = Some(("grouped scalar summaries", Some(partition)));
     Some(result)
 }

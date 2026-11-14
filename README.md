@@ -136,10 +136,20 @@ preparation for runtime data so setup is reused between scores.
 
 ChiSquared, bounded VonMises, LKJ and LKJCholesky also support preparation.
 VonMises requires location bounds within `[-pi, pi]` and concentration bounds
-within `[0, 64]`. Grouped Normal and Poisson models support fixed index vectors,
+within `[0, 64]`. Grouped scalar families reuse the same support and numerical
+guards as their shared-parameter reductions. They support fixed index vectors,
 for example `Normal.(mu[group], sigma)` and `Poisson.(rate[group])`.
 Prepare observations with `--data-input y`. Group indices must stay fixed in
 the source; promoted or runtime group inputs retain ordinary scoring.
+Indexed lambdas such as `f(i,m)=Normal(m[i],1.0)` with `f.(group,[mu])` also
+support grouping. Deterministic derived observations can use several preparation
+inputs. Include each dependency with `--data-input`.
+
+Add `--explain-reductions` to either command to report committed rules and
+fallbacks on stderr. Reports cover recognized independent density sums and
+distinguish lowering, materialized data, and explicit preparation.
+Output files and the query ABI stay identical. Each grouped report
+counts observations, occupied parameter tuples, and singleton groups.
 
 Run preparation once per data binding, then append its results to the scoring
 arguments in preparation-output order. Other scoring arguments keep their

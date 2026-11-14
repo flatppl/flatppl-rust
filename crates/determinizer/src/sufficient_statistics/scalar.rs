@@ -1,7 +1,7 @@
 //! Anchored scalar families whose statistics also depend on fixed parameters.
 
 use super::{
-    Expr, Reducer, data_only, fixed_values, map, materialize, num, op, per_cell_with_invariants,
+    Expr, Factor, Reducer, fixed_values, map, materialize, num, op, per_cell_with_invariants,
     positive_in_both_precisions, relative_log,
 };
 use flatppl_core::{Module, NodeId, ScalarType, Type, ValueSet};
@@ -35,6 +35,10 @@ fn active_value(active: Expr, value: Expr, fallback: f64) -> Expr {
 
 pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Expr> {
     let f = per_cell_with_invariants(m, id, &reducer.boundary)?;
+    reduce_factor(reducer, m, &f)
+}
+
+pub(super) fn reduce_factor(reducer: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Expr> {
     let name = m.resolve(f.constructor).to_owned();
     if !matches!(
         name.as_str(),
@@ -44,9 +48,15 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             | "Weibull"
             | "NegativeBinomial"
             | "NegativeBinomial2"
-    ) || !data_only(m, f.observed, &reducer.allowed, &reducer.boundary)
-        || (!reducer.preparing && !data_only(m, f.observed, &Default::default(), &reducer.boundary))
-    {
+    ) {
+        return None;
+    }
+    if !reducer.data_only(m, f.observed) {
+        reducer.fallback = "observations depend on a scoring input";
+        return None;
+    }
+    if !reducer.preparing && !reducer.fixed(m, f.observed) {
+        reducer.fallback = "runtime observations require explicit preparation for this family";
         return None;
     }
     let Type::Array { shape, elem } = m.type_of(f.observed)?.clone() else {
@@ -93,11 +103,12 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 Expr::Node(scale?)
             };
             if name == "Weibull"
-                && (!data_only(m, shape, &reducer.allowed, &reducer.boundary)
+                && (!reducer.data_only(m, shape)
                     || !positive(m, shape, reducer)
-                    || (!reducer.preparing
-                        && !data_only(m, shape, &Default::default(), &reducer.boundary)))
+                    || (!reducer.preparing && !reducer.fixed(m, shape)))
             {
+                reducer.fallback =
+                    "Weibull shape needs a positive fixed value or explicit preparation input";
                 return None;
             }
             let k = if name == "ChiSquared" {
@@ -211,7 +222,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 },
                 op("sum", [relative_log(x.clone(), center.clone())]),
             );
-            let anchor = reducer.anchor(m, &f, &parameters, center.clone());
+            let anchor = reducer.anchor(m, f, &parameters, center.clone());
             let anchor = shared(m, anchor);
             let finite = op("isfinite", [anchor.clone()]);
             let safe_k = active_value(finite.clone(), k.clone(), 1.0);
@@ -306,7 +317,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             let invalid = op(
                 "add",
                 [
-                    reducer.anchor(m, &f, &parameters, maximum_valid),
+                    reducer.anchor(m, f, &parameters, maximum_valid),
                     op("neg", [Expr::Constant("inf")]),
                 ],
             );
@@ -316,11 +327,12 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             if matches!(*elem, Type::Scalar(ScalarType::Integer)) =>
         {
             let dispersion = dispersion?;
-            if !data_only(m, dispersion, &reducer.allowed, &reducer.boundary)
+            if !reducer.data_only(m, dispersion)
                 || !positive(m, dispersion, reducer)
-                || (!reducer.preparing
-                    && !data_only(m, dispersion, &Default::default(), &reducer.boundary))
+                || (!reducer.preparing && !reducer.fixed(m, dispersion))
             {
+                reducer.fallback =
+                    "dispersion needs a positive fixed value or explicit preparation input";
                 return None;
             }
             // Concentrated, large-count float32 primitives lose low bits in
@@ -330,12 +342,15 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             let small_counts = fixed_values(m, observed, &reducer.boundary)
                 .is_some_and(|xs| xs.iter().all(|x| *x >= 0.0 && *x < 64.0));
             if !small_dispersion && !small_counts {
+                reducer.fallback =
+                    "negative-binomial reduction needs dispersion <= 64 or fixed counts < 64";
                 return None;
             }
             let nonnegative = fixed_values(m, observed, &reducer.boundary)
                 .is_some_and(|xs| xs.iter().all(|x| *x >= 0.0))
                 || matches!(m.valueset_of(observed), Some(ValueSet::CartPow(set, _)) if matches!(set.as_ref(), ValueSet::NonNegIntegers | ValueSet::PosIntegers) || matches!(set.as_ref(), ValueSet::Interval(lo, hi) if *lo >= 0.0 && hi.is_finite()));
             if !nonnegative {
+                reducer.fallback = "nonnegative integer observations are not proven";
                 return None;
             }
             let a = Expr::Node(dispersion);
@@ -417,7 +432,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                     )],
                 ),
             );
-            let reference_anchor = reducer.anchor(m, &f, &reference_parameters, center.clone());
+            let reference_anchor = reducer.anchor(m, f, &reference_parameters, center.clone());
             let held_dispersion = materialize(m, Expr::Held(0));
             let held_reference = materialize(m, Expr::Held(1));
             let held_parameters = parameters
@@ -440,7 +455,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 })
                 .collect::<Vec<_>>();
             let reference_scores = super::multivariate::held_cells(
-                reducer.anchor(m, &f, &held_parameters, Expr::Local),
+                reducer.anchor(m, f, &held_parameters, Expr::Local),
                 x,
                 [Expr::Node(dispersion), Expr::Node(reference_id)],
             );
@@ -454,7 +469,7 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 },
                 op("sum", [map("sub", [reference_scores, reference_anchor])]),
             );
-            let anchor = reducer.anchor(m, &f, &parameters, center);
+            let anchor = reducer.anchor(m, f, &parameters, center);
             let anchor = shared(m, anchor);
             let finite = op("isfinite", [anchor.clone()]);
             let active = op(

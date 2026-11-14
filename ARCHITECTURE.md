@@ -232,19 +232,27 @@ LKJ and LKJCholesky retain primitive membership flags and per-diagonal log sums.
 Their native primitives check correlation/Cholesky support before scoring.
 These families require explicit preparation for runtime observations.
 
-Fixed gather indices in Normal and Poisson parameters partition independent
+Fixed gather indices in scalar-family parameters partition independent
 observations into occupied groups. The pass recognizes direct array indexing
 and wrapped broadcast gathers such as `get.([mu], group)`, including different
-index vectors for different parameters. It reuses scalar Normal reductions and
+index vectors for different parameters. Indexed lambdas normalize known gathers
+without substituting vectors through scalar arithmetic. Derived observations
+retain their shared DAG. Scoped dependency proofs reuse subgraphs separately
+for explicit preparation inputs and baked values. The cache belongs to one
+binding rewrite transaction and includes lexical local scopes.
+Grouping reuses the existing scalar-family reductions and their numerical guards and
 keeps singleton groups as primitive scores with scalar data summaries. Poisson
 also supports a data-centered primitive reference for large runtime counts,
 with an actual observed count as anchor and widened count residuals.
-Runtime observations require preparation. Runtime/promoted group indices,
-indexed expressions inside per-cell lambdas, and derived observation arrays
-retain ordinary scoring. Literal observations and declared ABI vectors use
+Runtime observations require preparation. Runtime/promoted group indices and
+unsupported parameter arithmetic inside per-cell lambdas retain ordinary scoring.
+Literal observations and derived data vectors use
 partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
 add no scoring terms. Preparation reuses monotonically allocated summary names.
+The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
+without changing the module. Reports distinguish the lowering, materialized-data,
+and preparation stages. A later stage can reduce a factor retained earlier.
 
 Vector/matrix event rules cover MvNormal, Dirichlet, Wishart, InverseWishart and
 Multinomial. MvNormal
