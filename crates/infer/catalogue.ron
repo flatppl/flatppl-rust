@@ -307,7 +307,7 @@ Catalogue(
             ("R", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
         ]))),
         // diagmat(x): vector → diagonal matrix, element kind from the vector.
-        Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], names: ["x"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], names: ["x"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 0), elem: OfArg(0)))),
         // diag(A, k=0): extract a diagonal as a vector, element kind from A.
         // §07 "Linear algebra": "when called as `diag(A)`, `k` defaults to `0`".
         Builtin(name: "diag",           sig: Function(params: [Matrix, Optional(Scalar(Integer))], names: ["A", "k"], result: Vector(len: Dyn, elem: OfArg(0)))),
@@ -329,7 +329,7 @@ Catalogue(
         Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "x"], result: ElemScalarKind(0))),
         // Gram / outer products → matrix, element kind preserved.
         Builtin(name: "row_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
-        Builtin(name: "col_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "col_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 1), cols: Axis(0, 1), elem: OfArg(0)))),
         Builtin(name: "self_outer",     sig: Function(params: [Vector(Real)], names: ["x"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // Block / banded / stacked matrix constructors → matrix, element kind
         // drilled from the (nested) argument.
