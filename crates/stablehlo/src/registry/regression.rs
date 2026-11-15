@@ -461,7 +461,7 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
                     let small_square = e.mul(&small_z, &small_z);
                     let small_ratio = e.div(&small_square, &fast_nu);
                     let small = e.log1p(&small_ratio);
-                    e.matrix_if(&overflow, &small, stable_tail)
+                    e.matrix_if_for_reverse(&overflow, &small, stable_tail)
                 };
                 let q = e.mul(&a, &q);
                 let q = e.neg(&q);

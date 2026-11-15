@@ -318,6 +318,26 @@ impl Emitter<'_> {
         initial: &Value,
         branch: impl FnOnce(&mut Self) -> Value,
     ) -> Value {
+        self.matrix_if_impl(active, initial, branch, false)
+    }
+
+    /// Retain the integer selector so reverse AD keeps the expensive branch lazy.
+    pub(crate) fn matrix_if_for_reverse(
+        &mut self,
+        active: &Value,
+        initial: &Value,
+        branch: impl FnOnce(&mut Self) -> Value,
+    ) -> Value {
+        self.matrix_if_impl(active, initial, branch, true)
+    }
+
+    fn matrix_if_impl(
+        &mut self,
+        active: &Value,
+        initial: &Value,
+        branch: impl FnOnce(&mut Self) -> Value,
+        retain_case: bool,
+    ) -> Value {
         let active = if matches!(active.ty, MlirTy::Scalar) {
             active.clone()
         } else {
@@ -334,6 +354,13 @@ impl Emitter<'_> {
             "stablehlo.convert {} : (tensor<i1>) -> tensor<i32>",
             active.ssa
         ));
+        let index = if retain_case {
+            self.pure(format!(
+                "stablehlo.optimization_barrier {index} : tensor<i32>"
+            ))
+        } else {
+            index
+        };
         let saved = std::mem::take(&mut self.body);
         let saved_pure = std::mem::take(&mut self.pure_ops);
         let saved_expanded = std::mem::take(&mut self.expanded);
