@@ -859,8 +859,8 @@ fn a_record_law_outside_the_closed_form_refuses() {
             "z ~ Normal(0.0, 1.0)\na ~ Normal(2.0 * z, 1.0)\nb ~ Normal(z, 1.0)",
         ),
         (
-            "non-Normal family",
-            "z ~ Gamma(2.0, 1.0)\na ~ Poisson(z)\nb ~ Poisson(z)",
+            "transformed shared rate",
+            "z ~ Gamma(2.0, 1.0)\na ~ Poisson(2*z)\nb ~ Poisson(z)",
         ),
         (
             "truncated component",
@@ -868,7 +868,7 @@ fn a_record_law_outside_the_closed_form_refuses() {
              a ~ normalize(truncate(Normal(z, 1.0), interval(0.0, 2.0)))\nb ~ Normal(z, 1.0)",
         ),
     ] {
-        let point = if label == "non-Normal family" {
+        let point = if label == "transformed shared rate" {
             "record(a = 1, b = 2)"
         } else {
             "record(a = 0.5, b = 0.7)"
@@ -880,6 +880,38 @@ fn a_record_law_outside_the_closed_form_refuses() {
             "{label}: {}",
             err.reason
         );
+    }
+}
+
+#[test]
+fn shared_gamma_poisson_record_uses_updated_native_predictives() {
+    for query in [
+        "outputs=logdensityof(lawof(record(a=a,b=b)),record(a=1,b=2))",
+        "outputs=logdensityof(lawof(record(b=b,a=a)),record(b=2,a=1))",
+        "first=logdensityof(lawof(z),0.3)\noutputs=logdensityof(lawof(record(a=a,b=b)),record(a=1,b=2))",
+    ] {
+        let text = pir(&format!(
+            "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\n{query}"
+        ));
+        let score = pir_binding(&text, "outputs");
+        assert_eq!(
+            score
+                .matches("builtin_logdensityof NegativeBinomial")
+                .count(),
+            2,
+            "{score}"
+        );
+        assert!(
+            score.contains("beta 3.0") && score.contains("beta 4.0"),
+            "{score}"
+        );
+        assert!(!score.contains("builtin_logdensityof Poisson"), "{score}");
+    }
+    for model in [
+        "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\nu~Gamma(2.0,3.0)\nc~Poisson(u)\noutputs=logdensityof(lawof(record(a=a,b=b,c=c)),record(a=1,b=2,c=3))",
+        "u~Gamma(2.0,3.0)\nz~Gamma(u,3.0)\na~Poisson(z)\nb~Poisson(z)\noutputs=logdensityof(lawof(record(a=a,b=b)),record(a=1,b=2))",
+    ] {
+        assert!(determinize(&parse_infer(model)).is_err());
     }
 }
 

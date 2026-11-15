@@ -347,6 +347,15 @@ existing StableHLO fixed-data fallback. The CLI exposes
 discovery is not yet a rule of this pass. A future backend consumes the same reduced FlatPDL and does not
 need its own statistical discovery pass.
 
+## Exact shared-rate elimination
+
+Shared-latent record laws also eliminate one ancestor-free Gamma rate from
+bare scalar Poisson draws. The joint uses sequential native NegativeBinomial
+predictives, updating shape by each widened count and rate by one. Negative
+or nonfinite counts do not enter later predictive parameters. Primitive support
+and parameter checks remain active. Carried latents retain the chain rule;
+transformed rates, extra ancestors and partly shared records retain refusal.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +
