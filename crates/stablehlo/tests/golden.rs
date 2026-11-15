@@ -12799,6 +12799,20 @@ fn special_function_siblings_form_one_ordered_packet() {
 }
 
 #[test]
+fn unrestricted_gpu_solve_retains_packed_view_dependencies() {
+    let out = emit_log_density_with(
+        "a = external(cartpow(reals, [64,64]))\n\
+         b = external(cartpow(reals, 64))\n\
+         inputs = (a,b)\noutputs = linsolve(a,b)\n",
+        &flatppl_stablehlo::EmitOptions {
+            target: flatppl_stablehlo::Target::Gpu,
+            ..unrestricted_options()
+        },
+    );
+    assert!(out.contains("-> (tensor<64xf32>, tensor<i32>)"), "{out}");
+}
+
+#[test]
 fn scalar_vector_outputs_reuse_their_packed_producer() {
     let names = (1..=12).map(|i| format!("x{i}")).collect::<Vec<_>>();
     let inputs = names.join(", ");
