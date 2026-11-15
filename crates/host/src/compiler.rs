@@ -449,6 +449,42 @@ pub struct Context {
 }
 
 impl Context {
+    /// Return a lowered query and read-only structural facts over its ABI.
+    /// Data classification is explicit. No coordinate map changes the query.
+    pub fn analyze_model(
+        &self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+    ) -> Result<(Module, flatppl_determinizer::ModelAnalysis), Diagnostic> {
+        let fail =
+            |message: String| Diagnostic::new("analyze_model", module.source_name(), message);
+        if !self.owns(module) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let roots = module
+            .typed
+            .public_bindings()
+            .filter(|(_, binding)| {
+                matches!(module.typed.resolve(binding.name), "inputs" | "outputs")
+            })
+            .map(|(_, binding)| binding.name)
+            .collect::<Vec<_>>();
+        let lowered = flatppl_determinizer::determinize_with_options(
+            &module.typed,
+            &module.bundle,
+            Some(&roots),
+            &flatppl_determinizer::LoweringOptions {
+                disable_sufficient_statistics: true,
+                preserve_rand_tuple: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| fail(error.reason).at(&module.typed, Some(error.node), module.source()))?;
+        let report = flatppl_determinizer::analyze_model(&lowered, data_inputs)
+            .map_err(|error| fail(error.to_string()))?;
+        Ok((lowered, report))
+    }
+
     pub(crate) fn owns(&self, module: &LoadedModule) -> bool {
         Arc::ptr_eq(&self.owner, &module.owner)
     }

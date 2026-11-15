@@ -112,6 +112,10 @@ flatppl determinize query.flatppl --data-input y --prepare-data prepare.flatppl 
 flatppl stablehlo query.flatppl --dtype f64 --data-input y --prepare-data prepare.mlir -o score.mlir
 ```
 
+`flatppl analyze query.flatppl --data-input y` reports structural parameter
+components, additive terms and advisory Normal coordinates without changing
+the query. Data classification is explicit. The report lists required map checks.
+
 MvNormal, Dirichlet and Wishart support vector/matrix summaries. MvNormal and
 Wishart require fixed finite data or explicitly bounded runtime inputs, for
 example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.

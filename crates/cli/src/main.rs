@@ -73,6 +73,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Report structural parameter components and advisory Normal coordinates.
+    #[cfg(feature = "determinize")]
+    Analyze {
+        input: PathBuf,
+        /// Declare a query input as data. Other inputs remain parameters.
+        #[arg(long = "data-input")]
+        data_inputs: Vec<String>,
+    },
     /// Write a portable ZIP containing a FlatPPL model, its imports, and its data.
     /// Remote sources must already be cached with `flatppl prepare`.
     #[cfg(any(feature = "infer", feature = "prepare"))]
@@ -418,6 +426,8 @@ fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        #[cfg(feature = "determinize")]
+        Command::Analyze { input, data_inputs } => analyze_cmd(&input, &data_inputs),
         #[cfg(any(feature = "infer", feature = "prepare"))]
         Command::Pack { input, output } => flatppl_cli::bundle::pack(&input, &output),
         #[cfg(any(feature = "infer", feature = "prepare"))]
@@ -1194,6 +1204,19 @@ struct LikelihoodOutput<'a> {
     preparation: Option<(&'a Path, &'a [String])>,
     explain_reductions: bool,
     pack_summaries: bool,
+}
+
+#[cfg(feature = "determinize")]
+fn analyze_cmd(input: &Path, data_inputs: &[String]) -> Result<(), Failure> {
+    let mut context = flatppl_host::Context::default();
+    let module = context
+        .load(&input.to_string_lossy())
+        .map_err(|error| Failure::Plain(error.to_string()))?;
+    let (_, report) = context
+        .analyze_model(&module, data_inputs)
+        .map_err(|error| Failure::Plain(error.to_string()))?;
+    print!("{report}");
+    Ok(())
 }
 
 #[cfg(feature = "determinize")]
