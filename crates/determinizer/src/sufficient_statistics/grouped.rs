@@ -8,7 +8,7 @@ use flatppl_core::{
 };
 
 // A small selector evaluator. It never follows a promoted query input's RHS.
-fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
+pub(super) fn fixed_indices(m: &Module, id: NodeId, r: &Reducer) -> Option<Vec<i64>> {
     let id = resolve(m, id, &r.boundary);
     if let Node::Lit(Scalar::Int(i)) = m.node(id) {
         return Some(vec![*i]);
@@ -59,7 +59,7 @@ fn uses(m: &Module, root: NodeId, local: Ref) -> bool {
 
 /// Lift only known indexing and reify point expressions with their used inputs.
 /// Blind vector substitution would change scalar arithmetic inside a lambda.
-fn factor(m: &mut Module, id: NodeId, r: &Reducer) -> Option<Factor> {
+pub(super) fn factor(m: &mut Module, id: NodeId, r: &Reducer) -> Option<Factor> {
     if let Some(f) = per_cell(m, id, &r.boundary) {
         return Some(f);
     }
@@ -189,7 +189,11 @@ enum Parameter {
     },
 }
 
-fn gather_parts(m: &Module, value: NodeId, r: &Reducer) -> Option<(NodeId, NodeId, i64)> {
+pub(super) fn gather_parts(
+    m: &Module,
+    value: NodeId,
+    r: &Reducer,
+) -> Option<(NodeId, NodeId, i64)> {
     let id = resolve(m, value, &r.boundary);
     if let Some((c, origin)) = call(m, id, "get")
         .map(|c| (c, 1))

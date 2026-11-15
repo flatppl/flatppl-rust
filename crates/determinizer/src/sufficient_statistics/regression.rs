@@ -68,7 +68,7 @@ fn scalar(m: &Module, id: NodeId) -> bool {
 }
 
 /// Generated design-column projections need not have set annotations yet.
-fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, f64)> {
+pub(super) fn bounds(m: &Module, id: NodeId, reducer: &Reducer) -> Option<(f64, f64)> {
     let id = resolve(m, id, &reducer.boundary);
     match m.node(id) {
         Node::Lit(Scalar::Real(x)) if x.is_finite() => return Some((*x, *x)),

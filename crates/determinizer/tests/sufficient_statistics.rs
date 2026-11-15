@@ -168,6 +168,104 @@ fn runtime_grouping_keeps_small_or_unproved_partitions_live() {
 }
 
 #[test]
+fn runtime_gaussian_grouping_retains_unproved_or_overflowing_ranges() {
+    for (mu, sigma, y, groups, count, second_index) in [
+        ("reals", "interval(0.5,4)", "interval(-20,20)", 3, 8, "g"),
+        (
+            "interval(0,0)",
+            "interval(1e10,2e10)",
+            "interval(1e24,2e24)",
+            3,
+            8,
+            "g",
+        ),
+        (
+            "interval(0,0)",
+            "interval(1e-30,2e-30)",
+            "interval(0,0)",
+            3,
+            8,
+            "g",
+        ),
+        (
+            "interval(0,0)",
+            "interval(1e20,2e20)",
+            "interval(1e20,2e20)",
+            3,
+            8,
+            "g",
+        ),
+        (
+            "interval(-1,1)",
+            "interval(1e38,3e38)",
+            "interval(-3e38,3e38)",
+            3,
+            8,
+            "g",
+        ),
+        (
+            "interval(1e20,2e20)",
+            "interval(1e-20,2e-20)",
+            "interval(1,2)",
+            3,
+            8,
+            "g",
+        ),
+        (
+            "interval(-10,10)",
+            "interval(0.5,4)",
+            "interval(-20,20)",
+            64,
+            131072,
+            "g",
+        ),
+        (
+            "interval(-10,10)",
+            "interval(0.5,4)",
+            "interval(-20,20)",
+            3,
+            8,
+            "h",
+        ),
+    ] {
+        let source = format!(
+            "mu=elementof(cartpow({mu},{groups}))\nsigma=elementof(cartpow({sigma},{groups}))\ng=external(cartpow(integers,{count}))\nh=external(cartpow(integers,{count}))\ny=external(cartpow({y},{count}))\ninputs=(mu,sigma,g,h,y)\noutputs=logdensityof(Normal.(mu[g],sigma[{second_index}]),y)"
+        );
+        let ordinary = lower(&source, false);
+        assert!(prepare_likelihood(&ordinary, &["g".into(), "h".into(), "y".into()]).is_err());
+        assert_eq!(
+            flatppl_flatpir::write(&ordinary),
+            flatppl_flatpir::write(&lower(&source, true))
+        );
+    }
+}
+
+#[test]
+fn runtime_gaussian_moment_cache_tracks_family_extent_and_origin() {
+    for (family, groups, second, buffers) in [
+        ("Normal", 3, "b[g]", 3),
+        ("Normal", 2, "b[g]", 5),
+        ("LogNormal", 3, "b[g]", 5),
+        ("Normal", 3, "get0(b,g)", 5),
+    ] {
+        let second_scale = if second.starts_with("get0") {
+            "get0(t,g)"
+        } else {
+            "t[g]"
+        };
+        let source = format!(
+            "a=elementof(cartpow(interval(-10,10),3))\ns=elementof(cartpow(interval(.5,4),3))\nb=elementof(cartpow(interval(-10,10),{groups}))\nt=elementof(cartpow(interval(.5,4),{groups}))\ng=external(cartpow(integers,8))\ny=external(cartpow(interval(.01,100),8))\ninputs=(a,s,b,t,g,y)\noutputs=(logdensityof(Normal.(a[g],s[g]),y),logdensityof({family}.({second},{second_scale}),y))"
+        );
+        let prepared = prepare_unpacked(&lower(&source, false), &["g".into(), "y".into()]);
+        assert_eq!(prepared.summaries.len(), buffers);
+        let serialized = flatppl_flatpir::try_write(&prepared.score).unwrap();
+        let mut roundtrip = flatppl_flatpir::read(&serialized).unwrap();
+        flatppl_infer::infer(&mut roundtrip);
+        assert!(flatppl_determinizer::is_flatpdl(&roundtrip).is_ok());
+    }
+}
+
+#[test]
 fn grouped_gathers_prepare_only_occupied_partitions() {
     for source in [
         "mu=elementof(cartpow(reals,4))\nsigma=elementof(posreals)\ng=[1,2,1,2,3]\ny=external(cartpow(reals,5))\ninputs=(mu,sigma,y)\noutputs=logdensityof(Normal.(mu[g],sigma),y)",
