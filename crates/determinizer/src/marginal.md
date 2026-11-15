@@ -1,5 +1,24 @@
 # The conjugate marginal table — the maths
 
+## Shared Gamma-Poisson record law
+
+For one `lambda ~ Gamma(alpha,beta)` and conditionally independent
+`y_i ~ Poisson(lambda)`, write `S = sum(y_i)`. Integrating the shared rate gives
+
+`p(y) = beta^alpha Gamma(alpha+S) / (Gamma(alpha) (beta+N)^(alpha+S) product(y_i!))`.
+
+The implementation uses the equal sequential product
+`product_i NegativeBinomial(alpha+sum_{j<i} y_j, beta+i-1)(y_i)`.
+Each term retains the native count coefficient and parameter checks. Counts
+widen before updating shape. Negative and nonfinite counts stay outside later
+predictive parameters while their primitive terms retain support failure.
+
+At `alpha=2, beta=3, y=(1,2)`, the mass is `108/3125`, with log mass
+`-3.365058335046282`. The separate-marginal product is `243/8192`, which differs.
+The joint derivatives are `d_alpha = 13/12 + log(3/5)` and `d_beta = -1/3`.
+Permuting fields preserves the joint. A carried rate uses the chain rule;
+transformed rates, extra ancestors and partly shared records do not match.
+
 Sidecar to `marginal.rs`. Every row of `CONJUGATE_TABLE` is one closed-form solution of
 the `kchain` marginal integral. This file states each integral, its closed form, the §08
 constructor that names the answer, and the test point that pins it — so a reader can
@@ -819,5 +838,5 @@ naming, each with a test:
    denies. The record path compares each field's `ImplicitMarginal::latent` and refuses on a
    repeat, so a new row inherits that — but a new *caller* that assembles a product does
    not. The one exception is the shared-latent record law, which answers the repeat with the
-   joint closed form; it recognises its own Normal-on-Normal-mean shape only, so a new row
-   inherits the refusal, never that law.
+   joint closed form; it recognises its own Normal-on-Normal-mean and Gamma-Poisson
+   shapes only, so a new row inherits the refusal, never that law.
