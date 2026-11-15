@@ -10,6 +10,7 @@ use crate::{AnalysisError, analyze_model};
 #[derive(Clone, Debug)]
 pub struct IncrementalTerm {
     pub dependencies: Vec<String>,
+    pub input_paths: Vec<crate::InputPath>,
     pub cache_input: String,
     root: NodeId,
 }
@@ -18,6 +19,7 @@ pub struct IncrementalTerm {
 /// over cached term values. This plan owns no evaluator or mutable data cache.
 pub struct IncrementalScorePlan {
     pub inputs: Vec<String>,
+    pub input_paths: Vec<crate::InputPath>,
     pub terms: Vec<IncrementalTerm>,
     pub combine: Module,
     source: Module,
@@ -263,6 +265,7 @@ pub fn prepare_incremental_score(
         terms.push(IncrementalTerm {
             root: term.node,
             dependencies,
+            input_paths: term.input_paths,
             cache_input: combine_query.resolve(name).to_owned(),
         });
     }
@@ -272,6 +275,7 @@ pub fn prepare_incremental_score(
     retain_query(&mut combine_query);
     Ok(IncrementalScorePlan {
         inputs,
+        input_paths: report.input_paths,
         terms,
         combine: combine_query,
         source: m.clone(),

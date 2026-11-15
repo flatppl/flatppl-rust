@@ -1,6 +1,18 @@
 //! Compiled companions for one explicitly selected Normal coordinate.
 
-use crate::Export;
+use std::sync::Arc;
+
+use crate::{Export, LoadedModule};
+
+/// Query modules whose validity constants use one explicit arithmetic precision.
+/// Compile every companion with that precision. Each returns `(value, valid)`.
+pub struct PreparedNormalCoordinate {
+    pub score: Arc<LoadedModule>,
+    pub forward: Arc<LoadedModule>,
+    pub inverse: Arc<LoadedModule>,
+    pub log_jacobian: Arc<LoadedModule>,
+    pub coordinate_input: String,
+}
 
 /// All queries use the requested emission precision and target. Every output is
 /// `(value, valid)` plus any separate native runtime status. Check both before

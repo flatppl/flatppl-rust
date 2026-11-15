@@ -1,5 +1,36 @@
 use flatppl_host::{Context, EmitOptions};
 
+#[test]
+fn record_field_edits_preserve_sibling_terms_and_validate_prefixes_atomically() {
+    use flatppl_host::InputPath;
+    let path = |fields: &[&str]| InputPath {
+        input: "point".into(),
+        fields: fields.iter().map(|s| (*s).into()).collect(),
+    };
+    let mut context = Context::default();
+    let module=context.parse("point=elementof(cartprod(a=reals,b=reals,nested=cartprod(a=reals,ab=reals),v=cartpow(reals,2)))\ninputs=point\noutputs=point.a*point.a+point.b*point.b+sum(point.v)+point.nested.a+point.nested.ab",None,None).unwrap();
+    let plan = context.prepare_incremental_score(&module, &[]).unwrap();
+    assert_eq!(plan.affected_paths(&[path(&["b"])]).unwrap(), [1]);
+    assert_eq!(plan.affected_paths(&[path(&["nested"])]).unwrap(), [3, 4]);
+    assert_eq!(plan.affected_paths(&[path(&["nested", "a"])]).unwrap(), [3]);
+    assert_eq!(plan.affected_paths(&[path(&["v"])]).unwrap(), [2]);
+    assert_eq!(plan.affected_paths(&[path(&[])]).unwrap(), [0, 1, 2, 3, 4]);
+    let mut revisions = plan.revisions();
+    let b = revisions.ticket(1).unwrap();
+    revisions.invalidate_paths(&[path(&["a"])]).unwrap();
+    assert!(revisions.accept(b));
+    let a = revisions.ticket(0).unwrap();
+    assert!(
+        revisions
+            .invalidate_paths(&[path(&["a"]), path(&["missing"])])
+            .is_err()
+    );
+    assert!(revisions.accept(a));
+    for term in plan.terms() {
+        term.query.compile(&EmitOptions::default()).unwrap();
+    }
+}
+
 fn prepared() -> (Context, flatppl_host::IncrementalScoreQueries) {
     let mut context = Context::default();
     let module = context.parse("a=elementof(reals)\nd=external(reals)\nb=elementof(reals)\nu=elementof(reals)\nf=logdensityof(Normal(a,1.0),d)\ng=logdensityof(Normal(b,2.0),d)\ninputs=(a,d,b,u)\noutputs=f+g-d*d/2.0", None, None).unwrap();

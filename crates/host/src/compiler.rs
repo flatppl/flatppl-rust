@@ -501,39 +501,76 @@ impl Context {
         logdensity: bool,
         options: &EmitOptions,
     ) -> Result<crate::NormalCoordinateExports, Diagnostic> {
+        let prepared = self.prepare_normal_coordinate_queries(
+            module,
+            data_inputs,
+            parameter,
+            logdensity,
+            options.dtype,
+        )?;
+        Ok(crate::NormalCoordinateExports {
+            score: prepared.score.compile(options)?,
+            forward: prepared.forward.compile(options)?,
+            inverse: prepared.inverse.compile(options)?,
+            log_jacobian: prepared.log_jacobian.compile(options)?,
+            coordinate_input: prepared.coordinate_input,
+        })
+    }
+
+    /// Prepare portable companions for hosts that compile, batch or serialize
+    /// queries separately. Use the same `dtype` for every later compilation.
+    pub fn prepare_normal_coordinate_queries(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        parameter: &str,
+        logdensity: bool,
+        dtype: flatppl_stablehlo::Dtype,
+    ) -> Result<crate::PreparedNormalCoordinate, Diagnostic> {
+        self.prepare_normal_coordinate_queries_at_path(
+            module,
+            data_inputs,
+            &flatppl_determinizer::InputPath {
+                input: parameter.into(),
+                fields: vec![],
+            },
+            logdensity,
+            dtype,
+        )
+    }
+
+    /// Prepare a conditional Normal map for one explicit record field path.
+    pub fn prepare_normal_coordinate_queries_at_path(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        path: &flatppl_determinizer::InputPath,
+        logdensity: bool,
+        dtype: flatppl_stablehlo::Dtype,
+    ) -> Result<crate::PreparedNormalCoordinate, Diagnostic> {
         let fail = |message: String| {
             Diagnostic::new("prepare_normal_coordinate", module.source_name(), message)
         };
         let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
         crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
             .map_err(|error| fail(error.to_string()))?;
-        let precision = match options.dtype {
+        let precision = match dtype {
             flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
             flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
         };
-        let plan = flatppl_determinizer::prepare_normal_coordinate(
+        let plan = flatppl_determinizer::prepare_normal_coordinate_at_path(
             &lowered,
             data_inputs,
-            parameter,
+            path,
             precision,
             logdensity,
         )
         .map_err(|error| fail(error.to_string()))?;
-        let score = self.prepared_query(module, plan.score)?.compile(options)?;
-        let forward = self
-            .prepared_query(module, plan.forward)?
-            .compile(options)?;
-        let inverse = self
-            .prepared_query(module, plan.inverse)?
-            .compile(options)?;
-        let log_jacobian = self
-            .prepared_query(module, plan.log_jacobian)?
-            .compile(options)?;
-        Ok(crate::NormalCoordinateExports {
-            score,
-            forward,
-            inverse,
-            log_jacobian,
+        Ok(crate::PreparedNormalCoordinate {
+            score: self.prepared_query(module, plan.score)?,
+            forward: self.prepared_query(module, plan.forward)?,
+            inverse: self.prepared_query(module, plan.inverse)?,
+            log_jacobian: self.prepared_query(module, plan.log_jacobian)?,
             coordinate_input: plan.coordinate_input,
         })
     }
@@ -564,6 +601,7 @@ impl Context {
             terms.push(crate::IncrementalTermQuery {
                 query: self.prepared_query(module, query)?,
                 dependencies: term.dependencies.clone(),
+                input_paths: term.input_paths.clone(),
                 cache_input: term.cache_input.clone(),
             });
         }
@@ -572,6 +610,7 @@ impl Context {
             terms,
             combine,
             plan.inputs,
+            plan.input_paths,
         ))
     }
 

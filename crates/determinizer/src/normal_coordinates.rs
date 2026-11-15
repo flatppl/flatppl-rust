@@ -6,7 +6,8 @@ use flatppl_core::{
     Binding, CallHead, Idx, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol,
 };
 
-use crate::{AnalysisError, analyze_model};
+use crate::{AnalysisError, InputPath, analyze_model};
+use flatppl_core::Type;
 
 /// Arithmetic precision used to validate a coordinate map. Emit every companion
 /// with this precision. These checks describe a point, not a global float bijection.
@@ -43,6 +44,78 @@ fn op(m: &mut Module, name: &str, args: &[NodeId]) -> NodeId {
 
 fn number(m: &mut Module, value: f64) -> NodeId {
     m.alloc(Node::Lit(Scalar::Real(value)))
+}
+
+fn project(m: &mut Module, mut root: NodeId, fields: &[String]) -> NodeId {
+    for field in fields {
+        let key = m.alloc(Node::Lit(Scalar::Str(field.clone().into())));
+        root = op(m, "get", &[root, key]);
+    }
+    root
+}
+
+fn replace_field(
+    m: &mut Module,
+    root: NodeId,
+    ty: &Type,
+    fields: &[String],
+    value: NodeId,
+) -> NodeId {
+    let Some((field, rest)) = fields.split_first() else {
+        return value;
+    };
+    let Type::Record(entries) = ty else {
+        unreachable!("analysis checked the record path")
+    };
+    let mut result = Vec::new();
+    for (name, ty) in entries.iter() {
+        let name_text = m.resolve(*name).to_owned();
+        let child = project(m, root, std::slice::from_ref(&name_text));
+        let child = if &name_text == field {
+            replace_field(m, child, ty, rest, value)
+        } else {
+            child
+        };
+        result.push((*name, child));
+    }
+    crate::density::build_record(m, &result)
+}
+
+fn matches_point(
+    m: &Module,
+    mut id: NodeId,
+    selected: Symbol,
+    fields: &[String],
+    boundary: &HashSet<Symbol>,
+) -> bool {
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(id) {
+        match m.node(id) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if boundary.contains(&r.name) {
+                    path.reverse();
+                    return m.alias_target(r.name) == m.alias_target(selected) && path == fields;
+                }
+                let Some(binding) = m.binding_by_name(r.name) else {
+                    return false;
+                };
+                id = m.binding(binding).rhs;
+            }
+            Node::Call(c) if matches!(c.head,CallHead::Builtin(h) if m.resolve(h)=="get") => {
+                let [receiver, key] = *c.args else {
+                    return false;
+                };
+                let Node::Lit(Scalar::Str(field)) = m.node(key) else {
+                    return false;
+                };
+                path.push(field.to_string());
+                id = receiver;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn set(m: &mut Module, name: &str, rhs: NodeId) {
@@ -208,11 +281,34 @@ pub fn prepare_normal_coordinate(
     precision: CoordinatePrecision,
     logdensity: bool,
 ) -> Result<NormalCoordinateQueries, AnalysisError> {
+    prepare_normal_coordinate_at_path(
+        m,
+        data_inputs,
+        &InputPath {
+            input: parameter.into(),
+            fields: vec![],
+        },
+        precision,
+        logdensity,
+    )
+}
+
+/// Select one real record field while retaining the original record ABI.
+/// The selected field contains z in score/forward/Jacobian inputs. Other fields
+/// retain their supplied values. Forward and inverse return the whole record.
+pub fn prepare_normal_coordinate_at_path(
+    m: &Module,
+    data_inputs: &[String],
+    path: &InputPath,
+    precision: CoordinatePrecision,
+    logdensity: bool,
+) -> Result<NormalCoordinateQueries, AnalysisError> {
+    let parameter = &path.input;
     let report = analyze_model(m, data_inputs)?;
     let candidate = report
         .normal_coordinates
         .iter()
-        .find(|c| c.parameter == parameter)
+        .find(|c| &c.parameter == parameter && c.fields == path.fields)
         .ok_or_else(|| {
             AnalysisError("the selected input has no scalar Normal coordinate".into())
         })?;
@@ -226,7 +322,16 @@ pub fn prepare_normal_coordinate(
     let Node::Ref(selected_ref) = *m.node(inputs[selected]) else {
         unreachable!()
     };
-    let target = m.alias_target(selected_ref.name).unwrap();
+    let input_type = m.type_of(inputs[selected]).unwrap().clone();
+    let all_boundary = inputs
+        .iter()
+        .flat_map(|id| {
+            let Node::Ref(r) = m.node(*id) else {
+                unreachable!()
+            };
+            m.alias_chain(r.name)
+        })
+        .collect();
     let mut factors = 0;
     for term in &report.terms {
         let Some(args) = call(m, term.node, "builtin_logdensityof") else {
@@ -234,7 +339,7 @@ pub fn prepare_normal_coordinate(
         };
         if let [family, _, point] = args.as_slice()
             && matches!(m.node(*family),Node::Const(name) if m.resolve(*name)=="Normal")
-            && matches!(m.node(*point),Node::Ref(r) if r.ns==RefNs::SelfMod && m.alias_target(r.name)==Some(target))
+            && matches_point(m, *point, selected_ref.name, &path.fields, &all_boundary)
         {
             factors += term.multiplicity;
         }
@@ -284,11 +389,11 @@ pub fn prepare_normal_coordinate(
             _ => {}
         }
     }
-    let coordinate = (0..)
+    let fresh_coordinate = (0..)
         .map(|i| format!("__normal_coordinate_{i}"))
         .find(|name| !used.contains(&q.intern(name)))
         .unwrap();
-    let name = q.intern(&coordinate);
+    let name = q.intern(&fresh_coordinate);
     let reals = q.intern("reals");
     let reals = q.alloc(Node::Const(reals));
     let external = op(&mut q, "external", &[reals]);
@@ -299,10 +404,18 @@ pub fn prepare_normal_coordinate(
         public: true,
         synthetic: true,
     });
-    let z = q.alloc(Node::Ref(Ref {
+    let fresh_z = q.alloc(Node::Ref(Ref {
         ns: RefNs::SelfMod,
         name,
     }));
+    let (coordinate, z) = if path.fields.is_empty() {
+        (fresh_coordinate, fresh_z)
+    } else {
+        (
+            parameter.clone(),
+            project(&mut q, inputs[selected], &path.fields),
+        )
+    };
     let (minimum, maximum, tolerance) = match precision {
         CoordinatePrecision::F32 => (
             (f64::from(f32::MIN_POSITIVE) * 16.).sqrt(),
@@ -343,6 +456,13 @@ pub fn prepare_normal_coordinate(
         &[mu_ok, sigma_ok, z_ok, theta_ok, recovered_ok, roundtrip],
     );
     let mut score = q.clone();
+    let forward_value = replace_field(
+        &mut score,
+        inputs[selected],
+        &input_type,
+        &path.fields,
+        safe_theta,
+    );
     let selected_aliases = m.alias_chain(selected_ref.name).into_iter().collect();
     let boundary = inputs
         .iter()
@@ -360,9 +480,11 @@ pub fn prepare_normal_coordinate(
         original,
         &boundary,
         &selected_aliases,
-        safe_theta,
+        forward_value,
     )?;
-    inputs[selected] = z;
+    if path.fields.is_empty() {
+        inputs[selected] = z;
+    }
     let signature = if inputs.len() == 1 {
         inputs[0]
     } else {
@@ -375,14 +497,15 @@ pub fn prepare_normal_coordinate(
     }
     let mut forward = score.clone();
     let mut log_jacobian = score.clone();
-    forward = finish(forward, safe_theta, forward_valid)?;
+    forward = finish(forward, forward_value, forward_valid)?;
     log_jacobian = finish(log_jacobian, jacobian, forward_valid)?;
     score = finish(score, output, forward_valid)?;
 
     // The inverse keeps theta in its original argument slot.
     let point = binding(m, "inputs").unwrap();
     let original_inputs = call(m, point, "tuple").unwrap_or_else(|| vec![point]);
-    let point = original_inputs[selected];
+    let original_root = original_inputs[selected];
+    let point = project(&mut q, original_root, &path.fields);
     let point_ok = op(&mut q, "isfinite", &[point]);
     let point = op(&mut q, "ifelse", &[point_ok, point, zero]);
     let delta = op(&mut q, "sub", &[point, mu]);
@@ -410,6 +533,7 @@ pub fn prepare_normal_coordinate(
             roundtrip,
         ],
     );
+    let inverse = replace_field(&mut q, original_root, &input_type, &path.fields, inverse);
     let inverse = finish(q, inverse, valid)?;
     Ok(NormalCoordinateQueries {
         score,

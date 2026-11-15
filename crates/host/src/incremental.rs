@@ -1,14 +1,16 @@
 //! Explicit dependency invalidation for host-owned scalar term caches.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{AnalysisError, LoadedModule};
+use flatppl_determinizer::InputPath;
 
 /// One ordinary query and the input names that invalidate its cached result.
 pub struct IncrementalTermQuery {
     pub query: Arc<LoadedModule>,
     pub dependencies: Vec<String>,
+    pub input_paths: Vec<InputPath>,
     pub cache_input: String,
 }
 
@@ -22,18 +24,42 @@ pub struct IncrementalScoreQueries {
 
 struct DependencyIndex {
     inputs: Vec<String>,
-    affected: HashMap<String, Vec<usize>>,
+    valid: HashSet<InputPath>,
+    own: HashMap<InputPath, Vec<usize>>,
+    descendants: HashMap<InputPath, Vec<usize>>,
 }
 
 impl DependencyIndex {
     fn affected_terms(&self, changed: &[String]) -> Result<Vec<usize>, AnalysisError> {
+        self.affected_paths(
+            &changed
+                .iter()
+                .map(|input| InputPath {
+                    input: input.clone(),
+                    fields: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn affected_paths(&self, changed: &[InputPath]) -> Result<Vec<usize>, AnalysisError> {
+        for path in changed {
+            if !self.valid.contains(path) {
+                return Err(AnalysisError(format!(
+                    "unknown incremental input path {path:?}"
+                )));
+            }
+        }
         let mut affected = BTreeSet::new();
-        for name in changed {
-            let terms = self
-                .affected
-                .get(name)
-                .ok_or_else(|| AnalysisError(format!("unknown incremental input {name:?}")))?;
-            affected.extend(terms);
+        for path in changed {
+            affected.extend(self.descendants.get(path).into_iter().flatten());
+            for count in 0..path.fields.len() {
+                let parent = InputPath {
+                    input: path.input.clone(),
+                    fields: path.fields[..count].to_vec(),
+                };
+                affected.extend(self.own.get(&parent).into_iter().flatten());
+            }
         }
         Ok(affected.into_iter().copied().collect())
     }
@@ -44,23 +70,34 @@ impl IncrementalScoreQueries {
         terms: Vec<IncrementalTermQuery>,
         combine: Arc<LoadedModule>,
         inputs: Vec<String>,
+        input_paths: Vec<InputPath>,
     ) -> Self {
-        let mut affected = inputs
-            .iter()
-            .map(|name| (name.clone(), Vec::new()))
-            .collect::<HashMap<_, _>>();
+        let valid = input_paths.into_iter().collect();
+        let mut own: HashMap<InputPath, Vec<usize>> = HashMap::new();
+        let mut descendants: HashMap<InputPath, Vec<usize>> = HashMap::new();
         for (index, term) in terms.iter().enumerate() {
-            for name in &term.dependencies {
-                affected
-                    .get_mut(name)
-                    .expect("term dependencies come from the analyzed boundary")
-                    .push(index);
+            for path in &term.input_paths {
+                own.entry(path.clone()).or_default().push(index);
+                for count in 0..=path.fields.len() {
+                    descendants
+                        .entry(InputPath {
+                            input: path.input.clone(),
+                            fields: path.fields[..count].to_vec(),
+                        })
+                        .or_default()
+                        .push(index);
+                }
             }
         }
         Self {
             terms,
             combine,
-            dependencies: Arc::new(DependencyIndex { inputs, affected }),
+            dependencies: Arc::new(DependencyIndex {
+                inputs,
+                valid,
+                own,
+                descendants,
+            }),
         }
     }
 
@@ -76,6 +113,10 @@ impl IncrementalScoreQueries {
 
     pub fn affected_terms(&self, changed: &[String]) -> Result<Vec<usize>, AnalysisError> {
         self.dependencies.affected_terms(changed)
+    }
+
+    pub fn affected_paths(&self, changed: &[InputPath]) -> Result<Vec<usize>, AnalysisError> {
+        self.dependencies.affected_paths(changed)
     }
 
     /// Create one coordinator per compiled plan, precision and target. Notify it
@@ -112,6 +153,17 @@ impl ScoreRevisions {
     /// Unknown input names and revision overflow leave every revision unchanged.
     pub fn invalidate(&mut self, changed: &[String]) -> Result<Vec<usize>, AnalysisError> {
         let affected = self.dependencies.affected_terms(changed)?;
+        self.invalidate_terms(affected)
+    }
+
+    /// Field edits invalidate overlapping prefixes and whole-record readers.
+    /// Validate every path before changing any revision.
+    pub fn invalidate_paths(&mut self, changed: &[InputPath]) -> Result<Vec<usize>, AnalysisError> {
+        let affected = self.dependencies.affected_paths(changed)?;
+        self.invalidate_terms(affected)
+    }
+
+    fn invalidate_terms(&mut self, affected: Vec<usize>) -> Result<Vec<usize>, AnalysisError> {
         if affected.iter().any(|&i| self.generations[i] == u64::MAX) {
             return Err(AnalysisError(
                 "incremental revision overflow requires a new coordinator".into(),

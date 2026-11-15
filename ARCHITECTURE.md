@@ -460,6 +460,16 @@ tree over cached values, rather than subtracting stale totals. Each compiled
 plan, precision and target needs its own coordinator. Cached scalar values do
 not provide full parameter gradients; retain term gradients or recompute them.
 
+Analysis also records structured input paths for static record projections.
+Record fields keep their declared domains. Arrays remain whole leaves. Term
+queries retain the original root input ABI. Prefix-overlapping edits and
+whole-record readers invalidate together; sibling fields remain independent.
+The host validates all paths before changing revisions. A Normal coordinate can
+select one real record field, replacing that field once in a copy of the whole
+record. Its forward/inverse companions preserve siblings and the record ABI.
+Python bindings expose the term plans, revision tickets and portable Normal
+query modules. Compilation and mutable execution state remain separate.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +

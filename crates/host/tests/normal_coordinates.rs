@@ -1,6 +1,39 @@
 use flatppl_host::{Context, Dtype, EmitOptions};
 
 #[test]
+fn a_normal_record_field_keeps_sibling_domains_and_the_whole_record_abi() {
+    use flatppl_host::InputPath;
+    let mut context = Context::default();
+    let module=context.parse("point=elementof(cartprod(group=cartprod(theta=reals,mu=reals,s=posreals),spare=reals))\ninputs=point\noutputs=logdensityof(Normal(point.group.mu,point.group.s),point.group.theta)+logdensityof(Normal(point.group.theta,3.0),point.spare)",None,None).unwrap();
+    let options = EmitOptions::default();
+    let before = module.compile(&options).unwrap().stablehlo;
+    let plan = context
+        .prepare_normal_coordinate_queries_at_path(
+            &module,
+            &[],
+            &InputPath {
+                input: "point".into(),
+                fields: vec!["group".into(), "theta".into()],
+            },
+            true,
+            Dtype::F32,
+        )
+        .unwrap();
+    assert_eq!(plan.coordinate_input, "point");
+    for query in [
+        &plan.score,
+        &plan.forward,
+        &plan.inverse,
+        &plan.log_jacobian,
+    ] {
+        let export = query.compile(&options).unwrap();
+        assert_eq!(export.inputs.len(), 1);
+        assert_eq!(export.inputs[0].name, "point");
+    }
+    assert_eq!(module.compile(&options).unwrap().stablehlo, before);
+}
+
+#[test]
 fn selected_coordinate_keeps_other_slots_and_original_query() {
     let mut context = Context::default();
     let module = context.parse("mu=elementof(reals)\ntheta=elementof(reals)\ns=elementof(posreals)\ny=external(reals)\ninputs=(mu,theta,s,y)\noutputs=logdensityof(Normal(mu,s),theta)+logdensityof(Normal(theta,3.0),y)", None, None).unwrap();
