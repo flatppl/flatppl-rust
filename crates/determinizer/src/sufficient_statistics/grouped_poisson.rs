@@ -12,10 +12,17 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         return None;
     }
     let f = factor(m, id, r)?;
+    reduce_factor(r, m, &f)
+}
+
+pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &super::Factor) -> Option<NodeId> {
+    if !r.preparing {
+        return None;
+    }
     if m.resolve(f.constructor) != "Poisson" {
         return None;
     }
-    let partition = Partition::new(m, &f, r, ScalarType::Integer)?;
+    let partition = Partition::new(m, f, r, ScalarType::Integer)?;
     let [(name, rate, gathered)] = *partition.parameters else {
         return None;
     };
@@ -151,10 +158,10 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
     let center = op("get", [Expr::Held(5), Expr::Local]);
     let values = map("ifelse", [supported.clone(), Expr::Held(0), center.clone()]);
     let reference_parameter = materialize(m, Expr::Held(0));
-    let inner_anchor = r.anchor(m, &f, &[(name, reference_parameter)], Expr::Local);
+    let inner_anchor = r.anchor(m, f, &[(name, reference_parameter)], Expr::Local);
     let scores = held_cells(inner_anchor, values.clone(), [reference.clone()]);
     let outer_reference = materialize(m, reference.clone());
-    let anchor = r.anchor(m, &f, &[(name, outer_reference)], center.clone());
+    let anchor = r.anchor(m, f, &[(name, outer_reference)], center.clone());
     let correction = op("sum", [map("sub", [scores, anchor])]);
     let residual = op(
         "sum",
@@ -194,7 +201,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
     let parameter = shared(m, op("ifelse", [op("iszero", [n]), num(1.0), parameter]));
     let parameter_id = materialize(m, parameter.clone());
     let center = op("get", [Expr::Held(2), Expr::Local]);
-    let anchor = r.anchor(m, &f, &[(name, parameter_id)], center);
+    let anchor = r.anchor(m, f, &[(name, parameter_id)], center);
     let anchor = shared(m, anchor);
     let finite = op("isfinite", [anchor.clone()]);
     let at = |column| op("get", [Expr::Held(3), Expr::Local, Expr::Integer(column)]);

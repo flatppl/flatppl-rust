@@ -317,6 +317,16 @@ primitive scores and preserves probability endpoints. Its table has at most 256
 cells. These paths share checked selectors, permit empty groups, and require at
 most 64 groups and 2^22 observation-by-group cells. Rebinding any preparation
 input requires rerunning preparation. No runtime cache infers data identity.
+Pointwise `exp`/`invlogit` predictors and real add/subtract/multiply/divide/negate
+DAGs can move before runtime gathers. Every vector leaf must use the same checked
+selector, origin and extent. Scalar captures stay live. Existing family counts
+provide occupancy, including Bernoulli/Binomial outcome buffers, so lifting adds
+no summary arguments. Each operation masks its inactive operands before evaluation,
+then the final parameter uses its family's empty-group value. Bounded source
+ranges must enclose both precisions and all score/link reverse intermediates.
+Tiny probabilities, subnormal range ambiguity and unsafe quotient products retain
+ordinary scoring. A depth/node budget bounds analysis, and a failed family guard
+discards the entire candidate. Original predictor outputs remain unchanged.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.

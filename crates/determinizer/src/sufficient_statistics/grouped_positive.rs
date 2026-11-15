@@ -11,11 +11,18 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         return None;
     }
     let f = factor(m, id, r)?;
+    reduce_factor(r, m, &f)
+}
+
+pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &super::Factor) -> Option<NodeId> {
+    if !r.preparing {
+        return None;
+    }
     let family = m.resolve(f.constructor).to_owned();
     if !matches!(family.as_str(), "Exponential" | "Gamma" | "Beta") {
         return None;
     }
-    let partition = super::runtime_partition::Partition::new(m, &f, r, ScalarType::Real)?;
+    let partition = super::runtime_partition::Partition::new(m, f, r, ScalarType::Real)?;
     let n = partition.count;
     let parameters = &partition.parameters;
     let (lo, hi) = bounds(m, f.observed, r)?;
@@ -157,7 +164,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
             [Expr::Held(stats_slot), Expr::Local, Expr::Integer(column)],
         )
     };
-    let anchor = r.anchor(m, &f, &selected, at(1));
+    let anchor = r.anchor(m, f, &selected, at(1));
     let parameter = |name: &str| {
         selected
             .iter()

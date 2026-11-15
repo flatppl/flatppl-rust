@@ -22,6 +22,7 @@ mod grouped_counts;
 mod grouped_moments;
 mod grouped_poisson;
 mod grouped_positive;
+mod grouped_predictors;
 mod histogram;
 mod multivariate;
 mod packing;
@@ -688,6 +689,9 @@ impl Reducer {
             return Some(result);
         }
         if let Some(result) = grouped_poisson::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_predictors::reduce(self, m, id) {
             return Some(result);
         }
         if let Some(result) = correlation::reduce(self, m, id) {
