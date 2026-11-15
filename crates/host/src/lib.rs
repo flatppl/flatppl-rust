@@ -15,6 +15,7 @@ mod export;
 mod formula;
 mod incremental;
 mod inspect;
+mod normal_coordinates;
 mod readers;
 mod transforms;
 
@@ -34,4 +35,5 @@ pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, T
 pub use formula::FormulaModel;
 pub use incremental::{IncrementalScoreQueries, IncrementalTermQuery, ScoreRevisions, ScoreTicket};
 pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
+pub use normal_coordinates::NormalCoordinateExports;
 pub use transforms::TransformedQueries;

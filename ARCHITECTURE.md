@@ -423,6 +423,26 @@ report never applies maps, changes the ABI or promises improved sampling.
 Proof flags describe source value sets. A target must also preserve finite
 numeric representation before applying a map.
 
+`prepare_normal_coordinate` explicitly selects one such scalar input. Its
+ordinary score, forward, inverse and log-Jacobian queries return `(value, valid)`.
+Only the selected score/forward/Jacobian input slot becomes a fresh coordinate.
+The inverse keeps the original ABI. Other promoted inputs and lexical binders
+remain boundaries. The original query is unchanged. A log-density request adds
+`log(scale)` to the substituted scalar score.
+Every map checks finite location, positive finite scale, finite coordinates and
+a precision-specific round trip. Scale bounds also protect squared-denominator
+arithmetic. Checks apply even when source ranges prove validity. Invalid maps
+require discarding the result, not assigning zero probability. Native runtime
+status remains a separate check. This validates a point, not a global floating
+bijection. Multiple direct Normal factors are ambiguous. Selecting one
+conditional map does not compose cyclic candidates into a joint map.
+The core returns portable modules with an explicit arithmetic precision. The
+host compiles every companion with the requested precision and target together.
+Companion input leaves use `external` with the same declared sets, so supplied
+values remain fixed captures inside explicit callbacks. Retained automatic
+callbacks require explicit boundaries before preparation; their keyword-only
+interfaces are never silently retraced.
+
 `Context::analyze_model` returns the lowered module beside its report, so node
 identities remain usable by future emitters. `flatppl analyze model.flatppl
 --data-input y` prints the same facts. Analysis runs only when requested and

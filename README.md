@@ -198,6 +198,12 @@ cargo fmt --all
 cargo run -p flatppl-cli -- convert model.flatppl model.flatpir
 ```
 
+Rust hosts can opt into `Context::prepare_normal_coordinate` for one scalar
+Normal parameter. It compiles a score, forward map, inverse map and log Jacobian
+at the requested precision. Every companion returns `(value, valid)` and may
+also return native runtime status. Check both. The original query stays unchanged,
+and only the selected coordinate's input slot changes in the companion score.
+
 ## Funding
 
 This work was supported by Germany's Federal Ministry of Research, Technology

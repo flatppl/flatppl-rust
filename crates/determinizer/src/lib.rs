@@ -17,6 +17,7 @@ mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
+mod normal_coordinates;
 mod primitives;
 mod refuse;
 mod sample;
@@ -31,6 +32,9 @@ pub use driver::{
     determinize_with_roots,
 };
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
+pub use normal_coordinates::{
+    CoordinatePrecision, NormalCoordinateQueries, prepare_normal_coordinate,
+};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;
 pub use sufficient_statistics::{
