@@ -453,6 +453,60 @@ fn integer_array_arithmetic_does_not_become_real_regression() {
 }
 
 #[test]
+fn weighted_regression_keeps_unproved_scale_products_and_ranges_unchanged() {
+    for (sigma, scales, data) in [
+        ("posreals", "interval(0.1,10)", "interval(-100,100)"),
+        ("interval(0.1,10)", "interval(-1,10)", "interval(-100,100)"),
+        (
+            "interval(1e30,1e31)",
+            "interval(1e10,1e11)",
+            "interval(-100,100)",
+        ),
+        (
+            "interval(1e-30,1e-29)",
+            "interval(1e-20,1e-19)",
+            "interval(-100,100)",
+        ),
+        (
+            "interval(1e20,2e20)",
+            "interval(1e-40,2e-40)",
+            "interval(-100,100)",
+        ),
+        (
+            "interval(1e29,1e30)",
+            "interval(1e-30,2e-30)",
+            "interval(-100,100)",
+        ),
+        (
+            "interval(1e-20,2e-20)",
+            "interval(1e20,2e20)",
+            "interval(-100,100)",
+        ),
+        ("interval(0.5,2)", "interval(1,3)", "interval(-2e8,2e8)"),
+        (
+            "interval(0.1,10)",
+            "interval(1e-20,1e20)",
+            "interval(-100,100)",
+        ),
+        (
+            "interval(0.1,10)",
+            "interval(1e-20,1)",
+            "interval(-1e30,1e30)",
+        ),
+    ] {
+        let source = format!(
+            "beta=elementof(cartpow(reals,2))\nsigma=elementof({sigma})\nX=external(cartpow({data},[5,2]))\ny=external(cartpow({data},5))\ns=external(cartpow({scales},5))\ninputs=(beta,sigma,X,y,s)\noutputs=logdensityof(Normal.(X*beta,sigma .* s),y)"
+        );
+        let ordinary = lower(&source, false);
+        assert!(prepare_likelihood(&ordinary, &["X".into(), "y".into(), "s".into()]).is_err());
+        assert_eq!(
+            flatppl_flatpir::write(&lower(&source, true)),
+            flatppl_flatpir::write(&ordinary)
+        );
+    }
+}
+
+#[test]
 fn repeated_factors_share_preparation_and_parameter_dependent_observations_stay_live() {
     let prefix = "a=elementof(reals)\ny=external(cartpow(reals,3))\ninputs=(a,y)\n";
     let one = lower(

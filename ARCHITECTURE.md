@@ -288,9 +288,22 @@ fixed scalar features, intercepts and offsets, with a shared scalar sigma.
 Preparation chooses a guarded data-derived coefficient reference, computes its
 residual, and compresses the scaled augmented design with bounded QR. Scoring
 uses three event-sized summaries rather than the original rows. Small pivots
-change only the reference, never the model rank. Wide designs retain their
+change only the reference, never the model rank. Weighted references also
+check cancellation bounds before use. Wide designs retain their
 rectangular rows without padding to a larger square. Parameter-dependent designs, nonlinear mean vectors
-and varying sigmas retain ordinary scoring. Runtime designs and observations
+and unproved varying sigmas retain ordinary scoring. Positive bounded data-only
+row scales can whiten the final centered residual and design before QR. They
+may multiply a shared scalar sigma when finite positive bounds prove that the
+original products stay in range in both precisions. Row scales are normalized
+by their maximum before whitening to avoid erasing tiny design columns. A
+prepared reciprocal restores the data scale during scoring, and a log-scale
+summary retains the full density normalizer. Scale dependencies enter every QR
+cache key. Unbounded common multipliers and unsafe product or whitening ranges
+retain ordinary scoring. The range proof uses float32 limits for both output
+precisions: individual row scales and the shared multiplier must stay normal
+and no larger than `sqrt(f32::MAX)`. Feature and response bounds must also keep
+float32 rounding below `sqrt(eps)` times the smallest noise scale. Unproved
+high-signal ranges retain ordinary scoring. Runtime designs, row scales and observations
 require explicit preparation to amortize QR setup. Integer data are supported,
 but live integer array arithmetic retains its original rounding/wrap behavior.
 Summary cache keys include every
