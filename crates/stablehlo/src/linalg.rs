@@ -396,6 +396,26 @@ impl Emitter<'_> {
         )
     }
 
+    /// Read an in-bounds row or column shared by all batch cells.
+    fn indexed_matrix_axis(&mut self, matrix: &Value, index: &Value, axis: usize) -> Value {
+        // Gather adjoints win on CPU, but cost more than masked reductions on GPU.
+        if self.target == crate::Target::Gpu {
+            let axis = self.batch_rank(matrix) + axis;
+            let indices = self.axis_indices(matrix, axis);
+            let selected = self.compare("EQ", &indices, index);
+            let zero = self.constant_like(0.0, matrix);
+            let selected = self.select(&selected, matrix, &zero);
+            return self.reduce_axis("stablehlo.add", "0.000000e+00", &selected, axis);
+        }
+        let MlirTy::Ranked(mut dims) = self.cell_ty(matrix) else {
+            unreachable!("matrix access requires ranked cells");
+        };
+        dims.remove(axis);
+        let index = self.reshape_cell(index, tensor(vec![Some(1)]));
+        let selected = self.gather_axis(matrix, &index, 0, axis);
+        self.reshape_cell(&selected, tensor(dims))
+    }
+
     fn swap_rows(&mut self, matrix: &Value, current: &Value, pivot: &Value) -> Value {
         let batch = self.batch_rank(matrix);
         let current_row = self.selected_row(matrix, current);
@@ -617,7 +637,6 @@ impl Emitter<'_> {
         let zero = self.axes_view(&zero, scalar_axes.clone());
         let valid = self.compare("EQ", &zero, &zero);
         let rows = self.axis_indices(&a, batch);
-        let cols = self.axis_indices(&a, batch + 1);
         let rhs_rows = self.axis_indices(&b, batch);
         let eliminated = self.matrix_loop(n, 4, &[a, b, valid], |e, index, args| {
             let a = e.axes_view(&args[0], a_axes.clone());
@@ -625,10 +644,7 @@ impl Emitter<'_> {
             let valid = e.axes_view(&args[2], scalar_axes.clone());
             let at_row = e.compare("EQ", &rows, index);
             let at_rhs_row = e.compare("EQ", &rhs_rows, index);
-            let at_col = e.compare("EQ", &cols, index);
-            let zero = e.constant_like(0.0, &a);
-            let column = e.select(&at_col, &a, &zero);
-            let column = e.reduce_sum_last_axis(&column);
+            let column = e.indexed_matrix_axis(&a, index, 1);
             let indices = e.axis_indices(&column, batch);
             let eligible = e.compare("GE", &indices, index);
             let magnitude = e.abs(&column);
@@ -645,10 +661,9 @@ impl Emitter<'_> {
             let pivot_rhs_rows = e.compare("EQ", &rhs_rows, &pivot_row);
             let a = e.swap_rows(&a, &at_row, &pivot_rows);
             let b = e.swap_rows(&b, &at_rhs_row, &pivot_rhs_rows);
-            let column = e.select(&at_col, &a, &zero);
-            let column = e.reduce_sum_last_axis(&column);
-            let row_a = e.selected_row(&a, &at_row);
-            let row_b = e.selected_row(&b, &at_rhs_row);
+            let column = e.indexed_matrix_axis(&a, index, 1);
+            let row_a = e.indexed_matrix_axis(&a, index, 0);
+            let row_b = e.indexed_matrix_axis(&b, index, 0);
             let indices = e.axis_indices(&row_a, batch);
             let at_pivot = e.compare("EQ", &indices, index);
             let row_zero = e.constant_like(0.0, &row_a);
@@ -656,8 +671,10 @@ impl Emitter<'_> {
             let pivot = e.reduce_sum_last_axis(&pivot);
             let zero = e.scalar(0.0);
             let nonzero = e.compare("NE", &pivot, &zero);
-            let not_nan = e.compare("EQ", &pivot, &pivot);
-            let step_valid = e.and(&nonzero, &not_nan);
+            let magnitude = e.abs(&pivot);
+            let infinity = e.inf_like(&pivot);
+            let finite = e.compare("LT", &magnitude, &infinity);
+            let step_valid = e.and(&nonzero, &finite);
             let valid = e.and(&valid, &step_valid);
             let one = e.scalar(1.0);
             let safe_pivot = e.select(&step_valid, &pivot, &one);
@@ -676,14 +693,30 @@ impl Emitter<'_> {
         let b = self.axes_view(&eliminated[1], b_axes.clone());
         let valid = self.axes_view(&eliminated[2], scalar_axes);
         self.record_runtime_error(&valid, 4);
+        if self.target == crate::Target::Gpu && n >= 8 {
+            // Invalid cells must not enter the native solve: masking its result
+            // alone can leave NaNs in the reverse pass.
+            let cols = self.axis_indices(&a, batch + 1);
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let identity = self.convert(&diagonal, ElemKind::Real);
+            let safe_a = self.select(&valid, &a, &identity);
+            let zero = self.constant_like(0.0, &b);
+            let safe_b = self.select(&valid, &b, &zero);
+            let x = self.native_tri_solve(&safe_a, &safe_b, false, false);
+            let x = self.select(&valid, &x, &zero);
+            return Ok(if vector_rhs {
+                self.reshape_cell(&x, tensor(vec![Some(n)]))
+            } else {
+                x
+            });
+        }
         let initial = self.constant_like(0.0, &b);
         let solved = self.matrix_loop(n, 4, &[initial], |e, index, args| {
             let last = e.int_value_const(n as i64 - 1);
             let k = e.sub(&last, index);
-            let at_row = e.compare("EQ", &rows, &k);
             let at_rhs_row = e.compare("EQ", &rhs_rows, &k);
-            let row_a = e.selected_row(&a, &at_row);
-            let row_b = e.selected_row(&b, &at_rhs_row);
+            let row_a = e.indexed_matrix_axis(&a, &k, 0);
+            let row_b = e.indexed_matrix_axis(&b, &k, 0);
             let indices = e.axis_indices(&row_a, batch);
             let at_pivot = e.compare("EQ", &indices, &k);
             let zero = e.constant_like(0.0, &row_a);
@@ -760,10 +793,7 @@ impl Emitter<'_> {
             let a = e.axes_view(&args[0], axes.clone());
             let b = e.axes_view(&args[1], axes.clone());
             let at_row = e.compare("EQ", &rows, index);
-            let at_col = e.compare("EQ", &cols, index);
-            let zero = e.constant_like(0.0, &a);
-            let column = e.select(&at_col, &a, &zero);
-            let column = e.reduce_sum_last_axis(&column);
+            let column = e.indexed_matrix_axis(&a, index, 1);
             let indices = e.axis_indices(&column, batch);
             let eligible = e.compare("GE", &indices, index);
             let magnitude = e.abs(&column);
@@ -779,10 +809,9 @@ impl Emitter<'_> {
             let pivot_rows = e.compare("EQ", &rows, &pivot);
             let a = e.swap_rows(&a, &at_row, &pivot_rows);
             let b = e.swap_rows(&b, &at_row, &pivot_rows);
-            let column = e.select(&at_col, &a, &zero);
-            let column = e.reduce_sum_last_axis(&column);
-            let row_a = e.selected_row(&a, &at_row);
-            let row_b = e.selected_row(&b, &at_row);
+            let column = e.indexed_matrix_axis(&a, index, 1);
+            let row_a = e.indexed_matrix_axis(&a, index, 0);
+            let row_b = e.indexed_matrix_axis(&b, index, 0);
             let indices = e.axis_indices(&row_a, batch);
             let at_pivot = e.compare("EQ", &indices, index);
             let row_zero = e.constant_like(0.0, &row_a);
@@ -805,8 +834,8 @@ impl Emitter<'_> {
             let last = e.int_value_const(n as i64 - 1);
             let k = e.sub(&last, index);
             let at_row = e.compare("EQ", &rows, &k);
-            let row_a = e.selected_row(&a, &at_row);
-            let row_b = e.selected_row(&b, &at_row);
+            let row_a = e.indexed_matrix_axis(&a, &k, 0);
+            let row_b = e.indexed_matrix_axis(&b, &k, 0);
             let indices = e.axis_indices(&row_a, batch);
             let at_pivot = e.compare("EQ", &indices, &k);
             let zero = e.constant_like(0.0, &row_a);

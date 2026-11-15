@@ -3018,7 +3018,7 @@ impl<'m> Emitter<'m> {
         if self.decompose_tri_solve(&l, *shape(&b.ty).last().unwrap()) {
             return self.tri_solve_decomposed(&l, &b);
         }
-        self.native_tri_solve(&l, &b, false)
+        self.native_tri_solve(&l, &b, false, true)
     }
 
     /// Solve `l @ y = b` for vector cells `[n]`. On CPU the native form solves
@@ -3034,7 +3034,7 @@ impl<'m> Emitter<'m> {
         }
         let row = self.reshape_cell(b, MlirTy::Ranked(vec![Some(1), Some(n)]));
         let (l, row) = self.broadcast_batches(l, &row);
-        let y = self.native_tri_solve(&l, &row, true);
+        let y = self.native_tri_solve(&l, &row, true, true);
         self.reshape_cell(&y, vector)
     }
 
@@ -3050,7 +3050,13 @@ impl<'m> Emitter<'m> {
 
     /// `right_side` solves `x @ l^T = b`, the transpose of `l @ x^T = b^T`.
     /// `l` and `b` share their leading batch dimensions.
-    pub(super) fn native_tri_solve(&mut self, l: &Value, b: &Value, right_side: bool) -> Value {
+    pub(super) fn native_tri_solve(
+        &mut self,
+        l: &Value,
+        b: &Value,
+        right_side: bool,
+        lower: bool,
+    ) -> Value {
         let (left_side, transpose) = if right_side {
             ("false", "TRANSPOSE")
         } else {
@@ -3062,7 +3068,7 @@ impl<'m> Emitter<'m> {
         let result_ty = b.ty.clone();
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
-            "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = {left_side}, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose {transpose}>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = {left_side}, lower = {lower}, unit_diagonal = false, transpose_a = #stablehlo<transpose {transpose}>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
             l.ssa, b.ssa
         ));
         self.remember_axes(&ssa, self.axes_of(b));
@@ -3074,7 +3080,7 @@ impl<'m> Emitter<'m> {
         self.remember_pointwise(
             &result.ssa,
             &result,
-            Pointwise::TriSolve(l.clone(), b.clone(), right_side),
+            Pointwise::TriSolve(l.clone(), b.clone(), right_side, lower),
         );
         result
     }
