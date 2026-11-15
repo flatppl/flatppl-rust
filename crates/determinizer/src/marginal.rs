@@ -383,6 +383,19 @@ pub(crate) enum MarginalForm {
     LogDensity(LogDensity),
 }
 
+impl MarginalForm {
+    pub(crate) fn map_parameters(
+        &mut self,
+        m: &mut Module,
+        mut map: impl FnMut(&mut Module, NodeId) -> NodeId,
+    ) {
+        match self {
+            Self::Measure(measure) => *measure = map(m, *measure),
+            Self::LogDensity(form) => form.map_parameters(m, map),
+        }
+    }
+}
+
 /// A row's closed-form log-density, resolved down to its parameter nodes and waiting for
 /// the variate.
 ///
@@ -394,6 +407,15 @@ pub(crate) struct LogDensity {
 }
 
 impl LogDensity {
+    pub(crate) fn map_parameters(
+        &mut self,
+        m: &mut Module,
+        mut map: impl FnMut(&mut Module, NodeId) -> NodeId,
+    ) {
+        for parameter in &mut self.params {
+            *parameter = map(m, *parameter);
+        }
+    }
     /// The log-density expression at `variates` — ONE variate for a `CONJUGATE_TABLE` row,
     /// whose law is over a single variate, and one per record field for the shared-latent
     /// record law ([`shared_latent_record_law`]), whose law is over all of them jointly.
