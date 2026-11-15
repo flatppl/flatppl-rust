@@ -269,6 +269,76 @@ impl NativeContext {
             .map_err(error)
     }
 
+    fn analyze(
+        &self,
+        module: &NativeModule,
+        data_inputs: Vec<String>,
+        preparing: bool,
+        sufficient_statistics: bool,
+    ) -> PyResult<String> {
+        use serde_json::json;
+        let report = self
+            .inner
+            .analyze_query(
+                &module.inner,
+                &data_inputs,
+                preparing,
+                sufficient_statistics,
+            )
+            .map_err(error)?;
+        let model = report.model;
+        let paths =
+            |items: &[flatppl_host::InputPath]| items.iter().map(path_parts).collect::<Vec<_>>();
+        let terms = model
+            .terms
+            .iter()
+            .map(|term| {
+                json!({
+                    "sign": term.sign, "multiplicity": term.multiplicity,
+                    "parameters": term.parameters, "data": term.data,
+                    "input_paths": paths(&term.input_paths),
+                })
+            })
+            .collect::<Vec<_>>();
+        let coordinates = model.normal_coordinates.iter().map(|coordinate| json!({
+            "path": path_parts(&flatppl_host::InputPath { input: coordinate.parameter.clone(), fields: coordinate.fields.clone() }),
+            "location_paths": paths(&coordinate.location_paths),
+            "scale_paths": paths(&coordinate.scale_paths),
+            "finite_location_proven": coordinate.finite_location_proven,
+            "positive_finite_scale_proven": coordinate.positive_finite_scale_proven,
+            "cyclic": coordinate.cyclic,
+        })).collect::<Vec<_>>();
+        let reductions = report.reductions.decisions.iter().map(|decision| {
+            let mut value = json!({"binding": decision.binding, "family": decision.family,
+                "rule": null, "reason": null, "partition": null});
+            match &decision.outcome {
+                flatppl_host::ReductionOutcome::Reduced { rule, partition } => {
+                    value["outcome"] = json!("reduced");
+                    value["rule"] = json!(rule);
+                    value["partition"] = match partition {
+                        Some(p) => json!({"observations": p.observations, "groups": p.groups, "singletons": p.singletons}),
+                        None => json!(null),
+                    };
+                }
+                flatppl_host::ReductionOutcome::Retained { reason } => {
+                    value["outcome"] = json!("retained");
+                    value["reason"] = json!(reason);
+                }
+                flatppl_host::ReductionOutcome::Disabled => value["outcome"] = json!("disabled"),
+            }
+            value
+        }).collect::<Vec<_>>();
+        Ok(json!({
+            "parameters": model.parameters, "data": model.data,
+            "components": model.components, "unused_parameters": model.unused_parameters,
+            "input_paths": paths(&model.input_paths), "terms": terms,
+            "normal_coordinates": coordinates, "reductions": reductions,
+            "summaries": report.summaries, "preparation_refusal": report.preparation_refusal,
+            "preparing": preparing, "sufficient_statistics": sufficient_statistics,
+        })
+        .to_string())
+    }
+
     fn normal_coordinate(
         &mut self,
         module: &NativeModule,
