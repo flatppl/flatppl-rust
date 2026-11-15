@@ -1077,7 +1077,7 @@ impl Emitter<'_> {
     }
 
     /// Partial pivoting handles indefinite metrics and zero leading pivots.
-    /// Two rolled loops avoid code growth and unsupported solve adjoints.
+    /// Keep a portable solve boundary for larger unbatched inverses.
     pub(crate) fn matrix_inverse(&mut self, id: NodeId, input: &Value) -> Result<Value, EmitError> {
         let MlirTy::Ranked(dims) = self.cell_ty(input) else {
             return Err(EmitError::at(id, "matrix inverse requires a square matrix"));
@@ -1116,6 +1116,11 @@ impl Emitter<'_> {
         let cols = self.axis_indices(&input, batch + 1);
         let diagonal = self.compare("EQ", &rows, &cols);
         let identity = self.convert(&diagonal, ElemKind::Real);
+        if n >= 8 && batch == 0 && !self.host_batch {
+            let (inverse, valid) = self.matrix_solve_helper(&input, &identity, n);
+            let nan = self.constant_like(f64::NAN, &inverse);
+            return Ok(self.select(&valid, &inverse, &nan));
+        }
         let reduced = self.matrix_loop(n, 4, &[input, identity], |e, index, args| {
             let a = e.axes_view(&args[0], axes.clone());
             let b = e.axes_view(&args[1], axes.clone());
