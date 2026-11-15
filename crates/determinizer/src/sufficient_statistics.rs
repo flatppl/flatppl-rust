@@ -24,6 +24,7 @@ mod multivariate;
 mod packing;
 mod poisson;
 mod regression;
+mod repeated;
 mod report;
 mod scalar;
 use crate::density::{build_call, build_record};
@@ -674,6 +675,9 @@ impl Reducer {
             self.rule = Some(("correlation statistics", None));
             self.count += 1;
             return Some(materialize(m, result));
+        }
+        if let Some(result) = repeated::reduce(self, m, id) {
+            return Some(result);
         }
         if let Some(result) = circular::reduce(self, m, id) {
             self.rule = Some(("circular statistics", None));
