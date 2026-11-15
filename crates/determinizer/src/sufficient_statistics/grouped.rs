@@ -285,6 +285,38 @@ fn runtime_bernoulli(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Node
         return None;
     }
     let size = materialize(m, Expr::Integer(i64::from(groups)));
+    let counts = runtime_bernoulli_counts(r, m, f.observed, indices, origin, groups);
+    let p = op("get", [Expr::Held(0), Expr::Local]);
+    let index = op("mul", [Expr::Integer(2), Expr::Local]);
+    let failures = op(
+        "get",
+        [Expr::Held(1), op("sub", [index.clone(), Expr::Integer(1)])],
+    );
+    let successes = op("get", [Expr::Held(1), index]);
+    let no = super::weighted_bernoulli(m, name, p.clone(), failures, false);
+    let yes = super::weighted_bernoulli(m, name, p, successes, true);
+    let terms = Expr::Cells(
+        Box::new(op("add", [no, yes])),
+        Box::new(op(
+            "indicesof",
+            [op("fill", [Expr::Integer(0), Expr::Node(size)])],
+        )),
+        vec![Expr::Node(array), counts],
+    );
+    r.count += 1;
+    r.rule = Some(("runtime grouped Bernoulli counts", None));
+    Some(materialize(m, op("sum", [terms])))
+}
+
+pub(super) fn runtime_bernoulli_counts(
+    r: &mut Reducer,
+    m: &mut Module,
+    observed: NodeId,
+    indices: NodeId,
+    origin: i64,
+    groups: u32,
+) -> Expr {
+    let size = materialize(m, Expr::Integer(i64::from(groups)));
     let base = materialize(m, Expr::Integer(origin));
     // Validate before subtracting the origin, including extreme input labels.
     let labels = op(
@@ -306,39 +338,19 @@ fn runtime_bernoulli(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Node
                 "mul",
                 [map("sub", [checked, Expr::Node(base)]), Expr::Integer(2)],
             ),
-            map("integer", [Expr::Node(f.observed)]),
+            map("integer", [Expr::Node(observed)]),
         ],
     );
     let edges = op(
         "vector",
         (0..=2 * groups).map(|i| Expr::Number(f64::from(i) - 0.5)),
     );
-    let counts = r.summary_for(
+    r.summary_for(
         m,
-        &[f.observed, indices, size, base],
+        &[observed, indices, size, base],
         "runtime_bernoulli_counts",
         op("bincounts", [edges, code]),
-    );
-    let p = op("get", [Expr::Held(0), Expr::Local]);
-    let index = op("mul", [Expr::Integer(2), Expr::Local]);
-    let failures = op(
-        "get",
-        [Expr::Held(1), op("sub", [index.clone(), Expr::Integer(1)])],
-    );
-    let successes = op("get", [Expr::Held(1), index]);
-    let no = super::weighted_bernoulli(m, name, p.clone(), failures, false);
-    let yes = super::weighted_bernoulli(m, name, p, successes, true);
-    let terms = Expr::Cells(
-        Box::new(op("add", [no, yes])),
-        Box::new(op(
-            "indicesof",
-            [op("fill", [Expr::Integer(0), Expr::Node(size)])],
-        )),
-        vec![Expr::Node(array), counts],
-    );
-    r.count += 1;
-    r.rule = Some(("runtime grouped Bernoulli counts", None));
-    Some(materialize(m, op("sum", [terms])))
+    )
 }
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {

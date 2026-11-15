@@ -157,6 +157,12 @@ Binomial groups prepare native outcome counts for fixed trials from 1 through 63
 Unsupported ranges retain ordinary scoring. Preparation must run again after
 observations or indices change.
 
+Runtime group predictors using `exp`, `invlogit` and affine real arithmetic also
+support preparation, for example `Bernoulli.(invlogit.(a[group] .+ b))`.
+The score evaluates links once per group while `a` and `b` remain live inputs.
+Bounds must prove finite forward and reverse arithmetic in both precisions.
+Unproved ranges, saturated probabilities and other links retain ordinary scoring.
+
 Add `--explain-reductions` to either command to report committed rules and
 fallbacks on stderr. Reports cover recognized independent density sums and
 distinguish lowering, materialized data, and explicit preparation.
