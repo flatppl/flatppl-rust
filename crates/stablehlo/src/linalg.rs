@@ -864,7 +864,11 @@ impl Emitter<'_> {
         };
         // Keep tiny solves available for scalar fusion. Explicit host batches
         // retain primitive replay until helper calls have a batching recipe.
-        let (x, valid) = if n >= 8 && batch == 0 && !self.host_batch {
+        let (x, valid) = if (n >= 8
+            || self.target == crate::Target::Cpu && self.restrict_enzyme_compatible && n >= 3)
+            && batch == 0
+            && !self.host_batch
+        {
             self.matrix_solve_helper(&a, &b, n)
         } else {
             self.matrix_solve_body(a, b, n)
@@ -1119,7 +1123,11 @@ impl Emitter<'_> {
         let cols = self.axis_indices(&input, batch + 1);
         let diagonal = self.compare("EQ", &rows, &cols);
         let identity = self.convert(&diagonal, ElemKind::Real);
-        if n >= 8 && batch == 0 && !self.host_batch {
+        if (n >= 8
+            || self.target == crate::Target::Cpu && self.restrict_enzyme_compatible && n >= 3)
+            && batch == 0
+            && !self.host_batch
+        {
             let (inverse, valid) = self.matrix_solve_helper(&input, &identity, n);
             let nan = self.constant_like(f64::NAN, &inverse);
             return Ok(self.select(&valid, &inverse, &nan));
@@ -1204,6 +1212,71 @@ impl Emitter<'_> {
 mod tests {
     use super::*;
     use flatppl_core::Idx;
+
+    #[test]
+    fn solve_helper_thresholds_preserve_gpu_and_batch_dispatch() {
+        use crate::Target::{Cpu, Gpu};
+        let module = Module::new();
+        let id = NodeId::from_usize(0);
+        for (target, n, restricted, host_batch, batch, expected) in [
+            (Cpu, 2, true, false, 0, 0),
+            (Cpu, 3, true, false, 0, 2),
+            (Cpu, 3, false, false, 0, 0),
+            (Cpu, 7, true, false, 0, 2),
+            (Cpu, 7, false, false, 0, 0),
+            (Cpu, 8, true, false, 0, 2),
+            (Cpu, 8, false, false, 0, 2),
+            (Gpu, 3, true, false, 0, 0),
+            (Gpu, 8, true, false, 0, 2),
+            (Cpu, 3, true, true, 0, 0),
+            (Cpu, 3, true, false, 1, 0),
+        ] {
+            let mut emitter = Emitter::with_options(
+                &module,
+                &crate::EmitOptions {
+                    target,
+                    restrict_enzyme_compatible: restricted,
+                    ..Default::default()
+                },
+            );
+            if host_batch {
+                emitter.lower_for_host_batch();
+            }
+            let mut dims = vec![Some(3); batch];
+            dims.extend([Some(n), Some(n)]);
+            let b = Value {
+                ssa: "%arg1".into(),
+                ty: tensor(dims[..dims.len() - 1].to_vec()),
+                elem: ElemKind::Real,
+            };
+            let a = Value {
+                ssa: "%arg0".into(),
+                ty: tensor(dims),
+                elem: ElemKind::Real,
+            };
+            for (value, rank) in [(&a, 2), (&b, 1)] {
+                emitter.remember_axes(
+                    &value.ssa,
+                    Axes {
+                        batch,
+                        layers: vec![rank],
+                    },
+                );
+            }
+            let x = emitter.matrix_solve(id, &a, &b).unwrap();
+            let inverse = emitter.matrix_inverse(id, &a).unwrap();
+            let args = [
+                (a.ssa.clone(), a.ty.clone(), a.elem),
+                (b.ssa.clone(), b.ty.clone(), b.elem),
+            ];
+            let ir = emitter.finish("main", &args, &[&x, &inverse]);
+            assert_eq!(
+                ir.matches("func.call @__enzyme_linalg_solve_v1_").count(),
+                expected,
+                "{target:?}, n={n}, restricted={restricted}, host_batch={host_batch}, batch={batch}:\n{ir}"
+            );
+        }
+    }
 
     #[test]
     fn solve_definitions_survive_region_and_module_assembly() {
