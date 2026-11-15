@@ -11,21 +11,95 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         return None;
     }
     let f = factor(m, id, r)?;
+    reduce_factor(r, m, &f)
+}
+
+pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &super::Factor) -> Option<NodeId> {
+    if !r.preparing {
+        return None;
+    }
     if !matches!(m.resolve(f.constructor), "Binomial" | "Geometric") {
         return None;
     }
-    let partition = Partition::new(m, &f, r, ScalarType::Integer)?;
+    let partition = Partition::new(m, f, r, ScalarType::Integer)?;
     if m.resolve(f.constructor) == "Geometric" {
-        return geometric(r, m, &f, &partition);
+        return geometric(r, m, f, &partition);
     }
-    let trials = partition
+    let (counts, outcomes, trials) = binomial_counts(r, m, f, &partition)?;
+    let bins = partition.groups * outcomes;
+    let axes = op(
+        "indicesof",
+        [op(
+            "fill",
+            [Expr::Integer(0), Expr::Integer(i64::from(bins))],
+        )],
+    );
+    let cell = op("sub", [Expr::Local, Expr::Integer(1)]);
+    let group = op(
+        "add",
+        [
+            op("div", [cell.clone(), Expr::Integer(i64::from(outcomes))]),
+            Expr::Integer(1),
+        ],
+    );
+    let outcome = op("mod", [cell, Expr::Integer(i64::from(outcomes))]);
+    let count = op("get", [Expr::Held(partition.parameters.len()), Expr::Local]);
+    let empty = op("iszero", [count.clone()]);
+    let mut selected = Vec::new();
+    for (i, &(name, _, gathered)) in partition.parameters.iter().enumerate() {
+        let value = if gathered {
+            op("get", [Expr::Held(i), group.clone()])
+        } else {
+            Expr::Held(i)
+        };
+        let fallback = if m.resolve(name) == "p" {
+            num(0.5)
+        } else {
+            Expr::Integer(trials)
+        };
+        selected.push((
+            name,
+            materialize(m, op("ifelse", [empty.clone(), fallback, value])),
+        ));
+    }
+    let point = op(
+        "ifelse",
+        [
+            op("equal", [outcome.clone(), Expr::Integer(trials + 1)]),
+            Expr::Integer(-1),
+            outcome,
+        ],
+    );
+    let point = op("ifelse", [empty, Expr::Integer(0), point]);
+    let anchor = r.anchor(m, f, &selected, point);
+    let anchor = shared(m, anchor);
+    let terms = op("mul", [count, anchor]);
+    let mut held = partition
         .parameters
         .iter()
-        .find(|(name, _, _)| m.resolve(*name) == "n")?;
-    if trials.2 || !r.data_only(m, trials.1) {
+        .map(|(_, value, _)| Expr::Node(*value))
+        .collect::<Vec<_>>();
+    held.push(counts);
+    r.count += 1;
+    r.rule = Some(("runtime grouped Binomial outcomes", None));
+    Some(materialize(m, op("sum", [held_cells(terms, axes, held)])))
+}
+
+pub(super) fn binomial_counts(
+    r: &mut Reducer,
+    m: &mut Module,
+    f: &super::Factor,
+    partition: &Partition,
+) -> Option<(Expr, u32, i64)> {
+    let trials = f
+        .parameters
+        .iter()
+        .find(|(name, _)| m.resolve(*name) == "n")?;
+    let trials = r.scalar(m, trials.1)?;
+    if !r.data_only(m, trials) {
         return None;
     }
-    let Node::Lit(Scalar::Int(trials)) = *m.node(resolve(m, trials.1, &r.boundary)) else {
+    let Node::Lit(Scalar::Int(trials)) = *m.node(resolve(m, trials, &r.boundary)) else {
         return None;
     };
     if !(1..=63).contains(&trials) {
@@ -75,62 +149,7 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
             ],
         ),
     );
-    let axes = op(
-        "indicesof",
-        [op(
-            "fill",
-            [Expr::Integer(0), Expr::Integer(i64::from(bins))],
-        )],
-    );
-    let cell = op("sub", [Expr::Local, Expr::Integer(1)]);
-    let group = op(
-        "add",
-        [
-            op("div", [cell.clone(), Expr::Integer(i64::from(outcomes))]),
-            Expr::Integer(1),
-        ],
-    );
-    let outcome = op("mod", [cell, Expr::Integer(i64::from(outcomes))]);
-    let count = op("get", [Expr::Held(partition.parameters.len()), Expr::Local]);
-    let empty = op("iszero", [count.clone()]);
-    let mut selected = Vec::new();
-    for (i, &(name, _, gathered)) in partition.parameters.iter().enumerate() {
-        let value = if gathered {
-            op("get", [Expr::Held(i), group.clone()])
-        } else {
-            Expr::Held(i)
-        };
-        let fallback = if m.resolve(name) == "p" {
-            num(0.5)
-        } else {
-            Expr::Integer(trials)
-        };
-        selected.push((
-            name,
-            materialize(m, op("ifelse", [empty.clone(), fallback, value])),
-        ));
-    }
-    let point = op(
-        "ifelse",
-        [
-            op("equal", [outcome.clone(), Expr::Integer(trials + 1)]),
-            Expr::Integer(-1),
-            outcome,
-        ],
-    );
-    let point = op("ifelse", [empty, Expr::Integer(0), point]);
-    let anchor = r.anchor(m, &f, &selected, point);
-    let anchor = shared(m, anchor);
-    let terms = op("mul", [count, anchor]);
-    let mut held = partition
-        .parameters
-        .iter()
-        .map(|(_, value, _)| Expr::Node(*value))
-        .collect::<Vec<_>>();
-    held.push(counts);
-    r.count += 1;
-    r.rule = Some(("runtime grouped Binomial outcomes", None));
-    Some(materialize(m, op("sum", [held_cells(terms, axes, held)])))
+    Some((counts, outcomes, trials))
 }
 
 fn geometric(
