@@ -217,6 +217,14 @@ Poisson moment expansions. A bounded empirical histogram also shares original
 primitive scores for repeated fixed scalar observations, including Categorical
 and StudentT. It preserves the observation array's promoted scalar type.
 
+Repeated fixed predictor rows also reuse existing scalar-family reductions.
+The pass deduplicates joint literal feature rows and fixed gather selectors,
+then evaluates the same pointwise predictor operations once per occupied row.
+Promoted inputs stay live, scalar types and signed real bits remain distinct,
+and unsupported group reductions roll back atomically. This preserves native
+link saturation and primitive normalization instead of expanding canonical GLM
+formulas. At most 64 distinct rows are admitted.
+
 InverseGamma, Pareto, fixed-shape Weibull and both fixed-dispersion
 NegativeBinomial parameterizations also have anchored scalar summaries.
 InverseGamma uses a harmonic center and dimensionless reciprocal residuals.
