@@ -126,11 +126,44 @@ fn promoted_group_indices_and_circular_points_never_become_static_guards() {
     for source in [
         "mu=elementof(cartpow(reals,2))\ng=[1,2,1,2]\ny=[1.0,2.0,3.0,4.0]\ninputs=(mu,g)\noutputs=logdensityof(Normal.(mu[g],1.0),y)",
         "mu=0.3\nk=2.0\ny=[0.1,0.2,0.4]\ninputs=(mu,k)\noutputs=logdensityof(iid(VonMises(mu,k),3),y)",
+        "p=elementof(cartpow(reals,3))\ng=external(cartpow(integers,5))\ny=external(cartpow(booleans,5))\ninputs=(p,g,y)\noutputs=logdensityof(Bernoulli.(p[g]),y)",
     ] {
         assert_eq!(
             flatppl_flatpir::write(&lower(source, true)),
             flatppl_flatpir::write(&lower(source, false))
         );
+    }
+}
+
+#[test]
+fn runtime_group_count_cache_tracks_extents_and_index_origins() {
+    for (groups, second, buffers) in [(3, "q[g]", 1), (2, "q[g]", 2), (3, "get0(q,g)", 2)] {
+        let source = format!(
+            "p=elementof(cartpow(reals,3))\nq=elementof(cartpow(reals,{groups}))\ng=external(cartpow(integers,5))\ny=external(cartpow(booleans,5))\ninputs=(p,q,g,y)\noutputs=(logdensityof(Bernoulli.(p[g]),y),logdensityof(Bernoulli.({second}),y),g,y)"
+        );
+        let prepared =
+            prepare_likelihood(&lower(&source, false), &["g".into(), "y".into()]).unwrap();
+        assert_eq!(prepared.summaries.len(), buffers);
+        assert!(inputs(&prepared.score).iter().any(|name| name == "g"));
+        assert!(inputs(&prepared.score).iter().any(|name| name == "y"));
+        let serialized = flatppl_flatpir::try_write(&prepared.score).unwrap();
+        let mut roundtrip = flatppl_flatpir::read(&serialized).unwrap();
+        flatppl_infer::infer(&mut roundtrip);
+        assert!(flatppl_determinizer::is_flatpdl(&roundtrip).is_ok());
+    }
+}
+
+#[test]
+fn runtime_grouping_keeps_small_or_unproved_partitions_live() {
+    for (groups, count, data) in [
+        (64, 2, vec!["g".into(), "y".into()]),
+        (65, 128, vec!["g".into(), "y".into()]),
+        (3, 5, vec!["y".into()]),
+    ] {
+        let source = format!(
+            "p=elementof(cartpow(reals,{groups}))\ng=external(cartpow(integers,{count}))\ny=external(cartpow(booleans,{count}))\ninputs=(p,g,y)\noutputs=logdensityof(Bernoulli.(p[g]),y)"
+        );
+        assert!(prepare_likelihood(&lower(&source, false), &data).is_err());
     }
 }
 

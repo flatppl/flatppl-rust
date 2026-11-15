@@ -253,12 +253,19 @@ Grouping reuses the existing scalar-family reductions and their numerical guards
 keeps singleton groups as primitive scores with scalar data summaries. Poisson
 also supports a data-centered primitive reference for large runtime counts,
 with an actual observed count as anchor and widened count residuals.
-Runtime observations require preparation. Runtime/promoted group indices and
-unsupported parameter arithmetic inside per-cell lambdas retain ordinary scoring.
+Runtime observations require preparation. Bernoulli factors with runtime data-only
+integer group indices prepare one native integer vector of failure/success counts.
+Checked indexing precedes index normalization, and unused groups sanitize their
+probabilities through zero-count primitive terms. Counts share preparation across
+probability arrays with the same data, extent and index origin. This path requires
+more observations than possible groups, at most 64 groups and at most i32::MAX
+observations. Other runtime/promoted group indices and unsupported parameter
+arithmetic inside per-cell lambdas retain ordinary scoring.
 Literal observations and derived data vectors use
 partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
-add no scoring terms. Preparation reuses monotonically allocated summary names.
+add no scoring terms on the fixed-partition path. Runtime Bernoulli scoring batches
+the group terms. Preparation reuses monotonically allocated summary names.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.

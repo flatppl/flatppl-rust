@@ -645,8 +645,8 @@ fn more_vector_results_infer() {
     );
     let out = ir("b = [0.0, 1.0, 2.0]\nd = [0.5, 1.5]\nx = bincounts(b, d)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(bincounts"),
-        "bincounts should infer an integer vector, got:\n{out}"
+        out.contains("(%array 1 (2) (%scalar integer))") && out.contains("(bincounts"),
+        "bincounts should infer one integer per bin, got:\n{out}"
     );
 }
 

@@ -559,6 +559,7 @@ struct Reducer {
 enum DataKey {
     Input(Symbol),
     Node(NodeId),
+    Integer(i64),
 }
 
 impl Reducer {
@@ -601,6 +602,7 @@ impl Reducer {
                         ns: RefNs::SelfMod,
                         name,
                     }) if self.boundary.contains(name) => DataKey::Input(*name),
+                    Node::Lit(Scalar::Int(value)) => DataKey::Integer(*value),
                     _ => DataKey::Node(data),
                 }
             })

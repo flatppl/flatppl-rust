@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{Expr, Factor, Reducer, call, materialize, op, per_cell, resolve};
+use super::{Expr, Factor, Reducer, call, map, materialize, op, per_cell, resolve};
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, Scalar, ScalarType, Type, ValueSet,
 };
@@ -189,16 +189,16 @@ enum Parameter {
     },
 }
 
-fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parameter> {
+fn gather_parts(m: &Module, value: NodeId, r: &Reducer) -> Option<(NodeId, NodeId, i64)> {
     let id = resolve(m, value, &r.boundary);
-    let (array, indices, origin) = if let Some((c, origin)) = call(m, id, "get")
+    if let Some((c, origin)) = call(m, id, "get")
         .map(|c| (c, 1))
         .or_else(|| call(m, id, "get0").map(|c| (c, 0)))
     {
         let [array, indices] = *c.args else {
             return None;
         };
-        (array, indices, origin)
+        Some((array, indices, origin))
     } else {
         let c = call(m, id, "broadcast")?;
         let [head, array, indices] = *c.args else {
@@ -211,8 +211,12 @@ fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parame
         };
         let wrapped = call(m, resolve(m, array, &r.boundary), "vector")?;
         let [array] = *wrapped.args else { return None };
-        (array, indices, origin)
-    };
+        Some((array, indices, origin))
+    }
+}
+
+fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parameter> {
+    let (array, indices, origin) = gather_parts(m, value, r)?;
     let Type::Array { shape, elem } = m.type_of(array)? else {
         return None;
     };
@@ -244,8 +248,100 @@ fn gather(m: &Module, value: NodeId, r: &Reducer, count: usize) -> Option<Parame
     })
 }
 
+/// Count each (group, outcome) once at the preparation boundary. The score
+/// keeps ordered Bernoulli factors, without a binomial coefficient.
+fn runtime_bernoulli(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<NodeId> {
+    if !r.preparing || m.resolve(f.constructor) != "Bernoulli" {
+        return None;
+    }
+    let [(name, probability)] = *f.parameters else {
+        return None;
+    };
+    let (array, indices, origin) = gather_parts(m, probability, r)?;
+    let vector_size = |id, kind| match m.type_of(id)? {
+        Type::Array { shape, elem } if **elem == Type::Scalar(kind) => match **shape {
+            [Dim::Static(size)] => Some(size),
+            _ => None,
+        },
+        _ => None,
+    };
+    let groups = vector_size(array, ScalarType::Real)?;
+    let count = vector_size(indices, ScalarType::Integer)?;
+    // Bound scoring code size and keep both counts and half-integer edges
+    // exact in the native integer and real types of either precision.
+    if !(1..=64).contains(&groups)
+        || count < 2
+        || groups >= count
+        || count > i32::MAX as u32
+        || vector_size(f.observed, ScalarType::Boolean)? != count
+        || !r.data_only(m, indices)
+        || !r.data_only(m, f.observed)
+        || fixed_indices(m, indices, r).is_some()
+    {
+        return None;
+    }
+    let size = materialize(m, Expr::Integer(i64::from(groups)));
+    let base = materialize(m, Expr::Integer(origin));
+    // Validate before subtracting the origin, including extreme input labels.
+    let labels = op(
+        if origin == 0 {
+            "indicesof0"
+        } else {
+            "indicesof"
+        },
+        [op("fill", [Expr::Integer(0), Expr::Node(size)])],
+    );
+    let checked = op(
+        if origin == 0 { "get0" } else { "get" },
+        [labels, Expr::Node(indices)],
+    );
+    let code = map(
+        "add",
+        [
+            map(
+                "mul",
+                [map("sub", [checked, Expr::Node(base)]), Expr::Integer(2)],
+            ),
+            map("integer", [Expr::Node(f.observed)]),
+        ],
+    );
+    let edges = op(
+        "vector",
+        (0..=2 * groups).map(|i| Expr::Number(f64::from(i) - 0.5)),
+    );
+    let counts = r.summary_for(
+        m,
+        &[f.observed, indices, size, base],
+        "runtime_bernoulli_counts",
+        op("bincounts", [edges, code]),
+    );
+    let p = op("get", [Expr::Held(0), Expr::Local]);
+    let index = op("mul", [Expr::Integer(2), Expr::Local]);
+    let failures = op(
+        "get",
+        [Expr::Held(1), op("sub", [index.clone(), Expr::Integer(1)])],
+    );
+    let successes = op("get", [Expr::Held(1), index]);
+    let no = super::weighted_bernoulli(m, name, p.clone(), failures, false);
+    let yes = super::weighted_bernoulli(m, name, p, successes, true);
+    let terms = Expr::Cells(
+        Box::new(op("add", [no, yes])),
+        Box::new(op(
+            "indicesof",
+            [op("fill", [Expr::Integer(0), Expr::Node(size)])],
+        )),
+        vec![Expr::Node(array), counts],
+    );
+    r.count += 1;
+    r.rule = Some(("runtime grouped Bernoulli counts", None));
+    Some(materialize(m, op("sum", [terms])))
+}
+
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {
     let f = factor(m, id, r)?;
+    if let Some(value) = runtime_bernoulli(r, m, &f) {
+        return Some(value);
+    }
     let Type::Array { shape, elem } = m.type_of(f.observed)?.clone() else {
         return None;
     };
