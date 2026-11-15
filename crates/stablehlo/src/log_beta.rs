@@ -93,6 +93,16 @@ impl Emitter<'_> {
     /// derivative. Each branch reads arguments clamped into its own domain, so the
     /// branches `select` discards stay finite in reverse mode.
     pub(crate) fn log_beta(&mut self, a: &Value, b: &Value) -> Value {
+        self.log_beta_with_log_gamma_sum(a, b, None)
+    }
+
+    /// Reuse `lgamma(a+b)` in the small-argument branch when its total is shared.
+    pub(crate) fn log_beta_with_log_gamma_sum(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        log_gamma_sum: Option<&Value>,
+    ) -> Value {
         let a = self.convert(a, ElemKind::Real);
         let b = self.convert(b, ElemKind::Real);
         let (a, b) = self.broadcast_pair(&a, &b);
@@ -160,8 +170,13 @@ impl Emitter<'_> {
         let both_small = {
             let lgamma_x = self.lgamma(&x);
             let lgamma_y = self.lgamma(&y);
-            let sum = self.add(&x, &y);
-            let lgamma_sum = self.lgamma(&sum);
+            let lgamma_sum = match log_gamma_sum {
+                Some(value) => value.clone(),
+                None => {
+                    let sum = self.add(&x, &y);
+                    self.lgamma(&sum)
+                }
+            };
             let t = self.add(&lgamma_x, &lgamma_y);
             self.sub(&t, &lgamma_sum)
         };
