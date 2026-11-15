@@ -174,6 +174,14 @@ boolean type. Other summary shapes stay unchanged. Use the exported schemas to
 bind each result as one score argument. Disable packing with
 `--pack-summaries=false` or `PreparationOptions { pack_summaries: false }`.
 
+Rust hosts can call `Context::prepare_incremental_score` to obtain ordinary
+term queries and an original-order combiner. `affected_terms` identifies work
+after named inputs change. `revisions` supplies explicit invalidation and
+stale-result tickets. Notify every change, including in-place array edits and
+rollbacks, and check native status before accepting a result. Each compiled
+plan, precision and target needs a separate coordinator. Cache term gradients
+too when a full gradient is required.
+
 ```sh
 git clone https://github.com/flatppl/flatppl-rust
 cd flatppl-rust

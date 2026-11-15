@@ -39,8 +39,9 @@ pub(crate) fn is_reserved_abi_binding(m: &Module, bid: BindingId) -> bool {
     m.resolve(m.binding(bid).name) == "inputs"
 }
 
-/// The binding names the reserved `inputs` declaration lists — the promoted
-/// arguments of the compiled function.
+/// Every name on the reserved inputs' bare-name alias chains. Aliases denote
+/// one object (§04), so protecting only the listed spelling can fold a promoted
+/// target's old value into consumers before the host binds its argument.
 ///
 /// §13's phase table replaces such a binding's *computed value* with a function
 /// argument, so its value must not be substituted into the consumers that read
@@ -62,6 +63,7 @@ pub(crate) fn promoted_input_names(m: &Module) -> HashSet<Symbol> {
             }) => Some(*name),
             _ => None,
         })
+        .flat_map(|name| m.alias_chain(name))
         .collect()
 }
 

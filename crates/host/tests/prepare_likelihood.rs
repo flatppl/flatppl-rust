@@ -1,6 +1,54 @@
 use flatppl_host::{Context, EmitOptions, Export, Schema};
 
 #[test]
+fn prepared_data_aliases_share_summaries_and_keep_requested_raw_values() {
+    for output in ["lp", "(lp,y)"] {
+        let mut context = Context::default();
+        let source = format!(
+            "mu=elementof(reals)\ny=external(cartpow(reals,3))\nalias=y\ninputs=(mu,alias)\nlp=logdensityof(iid(Normal(mu,1.0),3),y)+logdensityof(iid(Normal(mu,1.0),3),alias)\noutputs={output}"
+        );
+        let module = context.parse(&source, None, None).unwrap();
+        let prepared = context
+            .prepare_likelihood(&module, &["alias".into()])
+            .unwrap();
+        let prep = prepared
+            .preparation
+            .compile(&EmitOptions::default())
+            .unwrap();
+        let single = context
+            .parse(
+                &source.replace("+logdensityof(iid(Normal(mu,1.0),3),alias)", ""),
+                None,
+                None,
+            )
+            .unwrap();
+        let single = context
+            .prepare_likelihood(&single, &["alias".into()])
+            .unwrap();
+        assert_eq!(
+            prep.stablehlo,
+            single
+                .preparation
+                .compile(&EmitOptions::default())
+                .unwrap()
+                .stablehlo
+        );
+        assert_eq!(
+            prep.inputs
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alias"]
+        );
+        let score = prepared.score.compile(&EmitOptions::default()).unwrap();
+        assert_eq!(
+            score.inputs.iter().any(|field| field.name == "alias"),
+            output != "lp"
+        );
+    }
+}
+
+#[test]
 fn runtime_gaussian_groups_remove_data_and_compile_the_summary_boundary()
 -> Result<(), Box<dyn std::error::Error>> {
     for (family, support) in [
