@@ -31,6 +31,36 @@ fn emit(source: &str) -> String {
     emit_mode(source, Mode::LogDensity).expect("must emit")
 }
 
+#[test]
+fn a_table_binds_distribution_parameters_by_name_in_a_density() {
+    let source = "a = elementof(reals)\n\
+        t = table(sigma = [0.5, 2.0], mu = a .+ [3.0, 7.0])\n\
+        y ~ Normal.(t)\ninputs = a\n\
+        outputs = logdensityof(lawof(y), [4.0, 6.5])\n";
+    let out = emit(source);
+    assert!(out.contains("tensor<2xf32>"), "{out}");
+    assert!(out.contains("stablehlo.reduce"), "{out}");
+}
+
+#[test]
+fn table_row_laws_sample_vector_fields_and_named_inputs() {
+    for law in [
+        "t = table(x = [[1.0, 2.0], [3.0, 4.0]], noise = table(sigma = [0.5, 2.0]))\n\
+         K(row, offset) = Normal(offset + sum(row.x), row.noise.sigma)\nM = K.(t, a)\n",
+        "t = table(sigma = [0.5, 2.0], mu = a .+ [3.0, 7.0])\n\
+         K(mu, sigma) = Normal(mu, sigma)\nM = K.(t)\n",
+        "t = table(sigma = [0.5, 2.0], mu = a .+ [3.0, 7.0])\nM = Normal.(t)\n",
+    ] {
+        let source = format!(
+            "a = elementof(reals)\n{law}\n\
+             value, state = rand(M, rnginit(23))\ninputs = a\noutputs = (value, state)\n"
+        );
+        let out = emit_mode(&source, Mode::Sample).expect("must sample table row laws");
+        assert!(signature(&out).contains("tensor<2xf32>"), "{out}");
+        assert!(signature(&out).contains("tensor<2xui64>"), "{out}");
+    }
+}
+
 fn signature(out: &str) -> &str {
     out.lines()
         .find(|line| line.contains("func.func"))

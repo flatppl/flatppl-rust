@@ -24,7 +24,7 @@
 //! ([`render_i1`]) rather than extending `MlirTy` — [`Emitter::select`] does
 //! the same for its predicate operand.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use flatppl_core::{
     CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
@@ -199,6 +199,8 @@ pub struct Emitter<'m> {
     /// top-level operation, so the executor can bind it.
     region_depth: usize,
     body: String,
+    /// Portable private solve definitions, shared by shape-specialized calls.
+    solve_helpers: BTreeMap<String, String>,
     /// The threaded rng-state key (spec §07 rng ABI). Set by
     /// [`crate::registry::lower_sample`] from a `builtin_sample`'s rng arg
     /// before the distribution builder draws; each [`Emitter::rng`] call
@@ -266,6 +268,7 @@ impl<'m> Emitter<'m> {
             call_frame: Vec::new(),
             region_depth: 0,
             body: String::new(),
+            solve_helpers: BTreeMap::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
             final_scan_keys: HashMap::new(),
@@ -5125,7 +5128,7 @@ impl<'m> Emitter<'m> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut out = String::new();
+        let mut out = self.solve_helpers.values().cloned().collect::<String>();
         let visibility = if private { "private " } else { "" };
         out.push_str(&format!(
             "  func.func {visibility}@{func_name}({arg_list}) -> {ret_ty_text} {{\n"

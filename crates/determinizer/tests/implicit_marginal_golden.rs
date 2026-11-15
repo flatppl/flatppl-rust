@@ -830,17 +830,51 @@ fn a_record_law_carrying_its_latent_uses_the_chain_rule() {
 }
 
 #[test]
-fn a_partly_shared_record_law_refuses() {
+fn a_partly_shared_record_law_factors_independent_latent_blocks() {
     let src = "z1 ~ Normal(0.0, 1.0)\nz2 ~ Normal(0.0, 1.0)\n\
                a ~ Normal(z1, 1.0)\nb ~ Normal(z1, 1.0)\nc ~ Normal(z2, 1.0)\n\
                lp = logdensityof(lawof(record(a = a, b = b, c = c)), \
                                  record(a = 0.5, b = 0.7, c = 0.9))";
-    let err = determinize(&parse_infer(src)).expect_err("no single latent covers every field");
-    assert!(
-        err.reason.contains("SAME latent") && err.reason.contains("no closed form"),
-        "{}",
-        err.reason
-    );
+    let text = pir(src);
+    let score = pir_binding(&text, "lp");
+    assert!(score.contains("builtin_logdensityof Normal"), "{score}");
+    assert!(score.contains("3.6757541328186907"), "{score}");
+}
+
+#[test]
+fn marginal_parameters_keep_sibling_points_local_to_each_query() {
+    let model = "z~Normal(0.0,1.0)\na~Normal(z,1.0)\nb~Normal(z,a)\n";
+    let first = "lp1=logdensityof(lawof(record(a=a,b=b)),record(a=.5,b=.7))";
+    let second = "lp2=logdensityof(lawof(record(a=a,b=b)),record(a=1.5,b=1.7))";
+    let alone = pir_binding(&pir(&format!("{model}{first}")), "lp1");
+    let together = pir_binding(&pir(&format!("{model}{first}\n{second}")), "lp1");
+    assert_eq!(together, alone);
+}
+
+#[test]
+fn independent_shared_and_singleton_count_blocks_keep_their_joint_laws() {
+    let model = "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\nu~Gamma(2.0,3.0)\nc~Poisson(u)\nd~Poisson(u)\ne~Normal(0.0,1.0)\n";
+    for (record, point, predictive_count) in [
+        ("record(a=a,b=b,c=c)", "record(a=1,b=2,c=3)", 3),
+        (
+            "record(a=a,c=c,b=b,d=d,e=e)",
+            "record(e=0.0,d=2,b=2,c=1,a=1)",
+            4,
+        ),
+    ] {
+        let text = pir(&format!(
+            "{model}outputs=logdensityof(lawof({record}),{point})"
+        ));
+        let score = pir_binding(&text, "outputs");
+        assert_eq!(
+            score
+                .matches("builtin_logdensityof NegativeBinomial")
+                .count(),
+            predictive_count,
+            "{score}"
+        );
+        assert!(!score.contains("builtin_logdensityof Poisson"), "{score}");
+    }
 }
 
 #[test]
@@ -907,10 +941,8 @@ fn shared_gamma_poisson_record_uses_updated_native_predictives() {
         );
         assert!(!score.contains("builtin_logdensityof Poisson"), "{score}");
     }
-    for model in [
-        "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\nu~Gamma(2.0,3.0)\nc~Poisson(u)\noutputs=logdensityof(lawof(record(a=a,b=b,c=c)),record(a=1,b=2,c=3))",
-        "u~Gamma(2.0,3.0)\nz~Gamma(u,3.0)\na~Poisson(z)\nb~Poisson(z)\noutputs=logdensityof(lawof(record(a=a,b=b)),record(a=1,b=2))",
-    ] {
+    {
+        let model = "u~Gamma(2.0,3.0)\nz~Gamma(u,3.0)\na~Poisson(z)\nb~Poisson(z)\noutputs=logdensityof(lawof(record(a=a,b=b)),record(a=1,b=2))";
         assert!(determinize(&parse_infer(model)).is_err());
     }
 }
