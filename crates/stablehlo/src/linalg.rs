@@ -659,6 +659,186 @@ impl Emitter<'_> {
         self.select(&nonsingular, &determinant, &singular)
     }
 
+    /// Scalar-cell GEPP: packed L/U and `permutation` satisfy P A = L U.
+    /// Each panel searches all remaining rows; its permutation also reorders
+    /// earlier L columns before the trailing TRSM and Schur update.
+    fn matrix_lu_blocked(&mut self, input: &Value, n: u64) -> (Value, Value, Value) {
+        let mut a = input.clone();
+        let mut permutation = self.index_vector(n, true);
+        let mut valid = self.bool_value_const(true);
+        let panel_width = match self.target {
+            crate::Target::Cpu if n < 128 => 8,
+            crate::Target::Gpu if n < 64 => 8,
+            _ => 16,
+        };
+        for start in (0..n).step_by(panel_width as usize) {
+            let width = panel_width.min(n - start);
+            let height = n - start;
+            let end = start + width;
+            let panel = self.slice(&a, &[start, start], &[n, end], &[1, 1]);
+            let panel_axes = self.axes_of(&panel);
+            let rows = self.axis_indices(&panel, 0);
+            let cols = self.axis_indices(&panel, 1);
+            let local_permutation = self.index_vector(height, true);
+            let indices = local_permutation.clone();
+            let result = self.matrix_loop_with_limit(
+                width,
+                if self.target == crate::Target::Gpu {
+                    16
+                } else {
+                    0
+                },
+                &[panel, local_permutation, valid],
+                |e, index, args| {
+                    let panel = e.axes_view(&args[0], panel_axes.clone());
+                    let permutation = &args[1];
+                    let column = e.indexed_matrix_axis(&panel, index, 1);
+                    let eligible = e.compare("GE", &indices, index);
+                    let magnitude = e.abs(&column);
+                    let infinity = e.inf_like(&column);
+                    let minus_inf = e.neg(&infinity);
+                    let magnitude = e.select(&eligible, &magnitude, &minus_inf);
+                    let largest = e.reduce_max(&magnitude);
+                    let candidates = e.compare("EQ", &magnitude, &largest);
+                    let limit = e.int_value_const(height as i64);
+                    let candidates = e.select(&candidates, &indices, &limit);
+                    let pivot_row =
+                        e.reduce_axis_lit("stablehlo.minimum", &height.to_string(), &candidates, 0);
+                    let current = e.compare("EQ", &rows, index);
+                    let pivot = e.compare("EQ", &rows, &pivot_row);
+                    let panel = if e.target == crate::Target::Cpu && height >= 32 {
+                        e.swap_indexed_rows(&panel, index, &pivot_row)
+                    } else {
+                        e.swap_rows(&panel, &current, &pivot)
+                    };
+                    let current_index = e.reshape_cell(index, tensor(vec![Some(1)]));
+                    let pivot_index = e.reshape_cell(&pivot_row, tensor(vec![Some(1)]));
+                    let current_value = e.gather_axis(permutation, &current_index, 0, 0);
+                    let current_value = e.reshape_cell(&current_value, MlirTy::Scalar);
+                    let pivot_value = e.gather_axis(permutation, &pivot_index, 0, 0);
+                    let pivot_value = e.reshape_cell(&pivot_value, MlirTy::Scalar);
+                    let current = e.compare("EQ", &indices, index);
+                    let pivot = e.compare("EQ", &indices, &pivot_row);
+                    let permutation = e.select(&pivot, &current_value, permutation);
+                    let permutation = e.select(&current, &pivot_value, &permutation);
+
+                    let column = e.indexed_matrix_axis(&panel, index, 1);
+                    let row = e.indexed_matrix_axis(&panel, index, 0);
+                    let pivot = e.gather_axis(&row, &current_index, 0, 0);
+                    let pivot = e.reshape_cell(&pivot, MlirTy::Scalar);
+                    let zero = e.scalar(0.0);
+                    let nonzero = e.compare("NE", &pivot, &zero);
+                    let magnitude = e.abs(&pivot);
+                    let infinity = e.inf_like(&pivot);
+                    let finite = e.compare("LT", &magnitude, &infinity);
+                    let step_valid = e.and(&nonzero, &finite);
+                    let valid = e.and(&args[2], &step_valid);
+                    let one = e.scalar(1.0);
+                    let safe_pivot = e.select(&step_valid, &pivot, &one);
+                    let below = e.compare("GT", &indices, index);
+                    let zero = e.constant_like(0.0, &column);
+                    let column = e.select(&below, &column, &zero);
+                    let factors = e.div(&column, &safe_pivot);
+                    let factors = e.matrix_expand(&factors, &panel, 0);
+                    let row = e.matrix_expand(&row, &panel, 1);
+                    let change = e.mul(&factors, &row);
+                    let below = e.compare("GT", &rows, index);
+                    let after = e.compare("GT", &cols, index);
+                    let active = e.and(&below, &after);
+                    let zero = e.constant_like(0.0, &panel);
+                    let change = e.select(&active, &change, &zero);
+                    let panel = e.sub(&panel, &change);
+                    let at_col = e.compare("EQ", &cols, index);
+                    let store_factor = e.and(&below, &at_col);
+                    let panel = e.select(&store_factor, &factors, &panel);
+                    vec![panel, permutation, valid]
+                },
+            );
+            let panel = self.axes_view(&result[0], panel_axes);
+            let local_permutation = &result[1];
+            valid = result[2].clone();
+            let tail = self.slice(&permutation, &[start], &[n], &[1]);
+            let tail = self.gather_axis(&tail, local_permutation, 0, 0);
+            permutation = if start == 0 {
+                tail
+            } else {
+                let prefix = self.slice(&permutation, &[0], &[start], &[1]);
+                self.matrix_join(&[prefix, tail], 0)
+            };
+            let tail = self.slice(&a, &[start, 0], &[n, n], &[1, 1]);
+            let tail = self.gather_axis(&tail, local_permutation, 0, 0);
+            let mut columns = Vec::new();
+            if start > 0 {
+                columns.push(self.slice(&tail, &[0, 0], &[height, start], &[1, 1]));
+            }
+            // No empty blocks: the final panel needs neither TRSM nor GEMM.
+            if end < n {
+                let l11 = self.slice(&panel, &[0, 0], &[width, width], &[1, 1]);
+                let rows = self.axis_indices(&l11, 0);
+                let cols = self.axis_indices(&l11, 1);
+                let diagonal = self.compare("EQ", &rows, &cols);
+                let one = self.scalar(1.0);
+                let l11 = self.select(&diagonal, &one, &l11);
+                let identity = self.convert(&diagonal, ElemKind::Real);
+                let l11 = self.select(&valid, &l11, &identity);
+                let a12 = self.slice(&tail, &[0, end], &[width, n], &[1, 1]);
+                let zero = self.constant_like(0.0, &a12);
+                let a12 = self.select(&valid, &a12, &zero);
+                let u12 = self.native_tri_solve(&l11, &a12, false, true);
+                let l21 = self.slice(&panel, &[width, 0], &[height, width], &[1, 1]);
+                let a22 = self.slice(&tail, &[width, end], &[height, n], &[1, 1]);
+                let change = self.matmat(&l21, &u12);
+                let a22 = self.sub(&a22, &change);
+                let right = self.matrix_join(&[u12, a22], 0);
+                columns.push(panel);
+                columns.push(right);
+            } else {
+                columns.push(panel);
+            }
+            let tail = self.matrix_join(&columns, 1);
+            a = if start == 0 {
+                tail
+            } else {
+                let prefix = self.slice(&a, &[0, 0], &[start, n], &[1, 1]);
+                self.matrix_join(&[prefix, tail], 0)
+            };
+        }
+        (a, permutation, valid)
+    }
+
+    /// Join nonempty scalar-cell blocks, retaining host replay metadata.
+    fn matrix_join(&mut self, parts: &[Value], axis: usize) -> Value {
+        if parts.len() == 1 {
+            return parts[0].clone();
+        }
+        let first = &parts[0];
+        let mut dims = shape(&first.ty).to_vec();
+        dims[axis] = Some(parts.iter().map(|v| shape(&v.ty)[axis].unwrap()).sum());
+        let ty = tensor(dims);
+        let operands = parts
+            .iter()
+            .map(|v| v.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let types = parts
+            .iter()
+            .map(|v| v.ty.render(self.dtype, v.elem))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let result = ty.render(self.dtype, first.elem);
+        let ssa = self.pure_axes(
+            format!("stablehlo.concatenate {operands}, dim = {axis} : ({types}) -> {result}"),
+            self.axes_of(first),
+        );
+        let value = Value {
+            ssa,
+            ty,
+            elem: first.elem,
+        };
+        self.remember_pointwise(&value.ssa, &value, Pointwise::Concat(parts.to_vec(), axis));
+        value
+    }
+
     /// Partial-pivot solve for vector or matrix RHS cells, carrying a singularity
     /// predicate through the elimination. Matrix RHSs share one factorization;
     /// the language's `linsolve` caller still requires a vector.
@@ -679,6 +859,34 @@ impl Emitter<'_> {
         } else {
             b
         };
+        // CPU indexed elimination remains faster for medium cells. GPU panels
+        // amortize kernel launches earlier, with an unrolled panel body.
+        let blocked_min = match self.target {
+            crate::Target::Cpu => 64,
+            crate::Target::Gpu => 32,
+        };
+        if batch == 0 && n >= blocked_min {
+            let (lu, permutation, valid) = self.matrix_lu_blocked(&a, n);
+            self.record_runtime_error(&valid, 4);
+            let rows = self.axis_indices(&lu, 0);
+            let cols = self.axis_indices(&lu, 1);
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let identity = self.convert(&diagonal, ElemKind::Real);
+            let upper = self.select(&valid, &lu, &identity);
+            let one = self.scalar(1.0);
+            let lower = self.select(&diagonal, &one, &upper);
+            let b = self.gather_axis(&b, &permutation, 0, 0);
+            let zero = self.constant_like(0.0, &b);
+            let b = self.select(&valid, &b, &zero);
+            let y = self.native_tri_solve(&lower, &b, false, true);
+            let x = self.native_tri_solve(&upper, &y, false, false);
+            let x = self.select(&valid, &x, &zero);
+            return Ok(if vector_rhs {
+                self.reshape_cell(&x, tensor(vec![Some(n)]))
+            } else {
+                x
+            });
+        }
         let a_axes = self.axes_of(&a);
         let b_axes = self.axes_of(&b);
         let scalar_axes = Axes {
