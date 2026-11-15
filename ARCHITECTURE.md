@@ -196,8 +196,13 @@ Shared-latent record laws also eliminate one ancestor-free Gamma rate from
 bare scalar Poisson draws. The joint uses sequential native NegativeBinomial
 predictives, updating shape by each widened count and rate by one. Negative
 or nonfinite counts do not enter later predictive parameters. Primitive support
-and parameter checks remain active. Carried latents retain the chain rule;
-transformed rates, extra ancestors and partly shared records retain refusal.
+and parameter checks remain active. Record laws partition fields by complete
+integrated ancestry. Independent blocks can combine shared Normal or Gamma-Poisson
+joints, singleton marginals and conditional fields. Global draw-rank checks run
+before partitioning. Marginal parameters freeze sibling points separately for
+each query, then original draws are pinned after every block succeeds.
+Carried latents retain the chain rule. Unsupported connected blocks, transformed
+rates and extra ancestors retain refusal or the opt-in numerical fallback.
 
 ## Shared likelihood summaries
 

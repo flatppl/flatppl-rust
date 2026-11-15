@@ -2163,194 +2163,142 @@ fn score_marginal_form(
 /// exception. A guard in the record lowering refused
 /// `fixtures/flatppl/queries/bayesian_inference_2_posterior.flatppl`.
 ///
-/// A field the record lowering will refuse anyway (not a draw, or reaching two draws)
-/// makes the sibling set incomplete, so the check stands down entirely rather than
-/// mistake a sibling for an outsider — that refusal is the caller's.
+/// Match the full record before partitioning its marginalized fields by shared
+/// ancestry. Each independent block uses a supported singleton or joint law.
+/// Unsupported connected blocks retain the whole-record numerical fallback.
+/// Conditional fields and carried latents keep their ordinary chain-rule score.
 ///
-/// A field whose outside ancestor a conjugate row integrates out gets its own
-/// closed-form marginal MEASURE, and the whole record then goes to
-/// [`lower_record_of_draws_with`], which keeps the remaining fields, the sibling
-/// pinning, and the latent pins. Several fields may marginalize at once. `Ok(None)`
-/// means no field needed it.
-///
-/// A per-field product only if the marginalized fields integrate DIFFERENT latents.
-/// Summing per-field marginals is the density of the PRODUCT of the marginals, which is
-/// the joint only under independence: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over
-/// `z ~ Normal(0, 1)` each marginal is `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so
-/// the joint is a correlated `MvNormal`. Every per-field answer is right and the assembled
-/// product still wrong, so the check cannot live in the row.
-///
-/// A repeated latent therefore leaves the product path entirely. Where the shape is the
-/// shared-latent record law — every field a bare `Normal(mu = z, …)` draw over one
-/// ancestor-free `Normal` prior — `crate::marginal::shared_latent_record_law` supplies the
-/// joint's closed form and [`lower_shared_latent_record_law`] emits it as a single term.
-/// Any other shared-latent shape refuses (a scale latent, another family, two shared
-/// latents, a derived mean, a transformed field, a partly-shared record).
-///
-/// This dependence belongs to a single record law. `joint` and `iid` instead
-/// compose their measure values independently.
-///
-/// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
-/// marginalized: its law is the pushforward of the marginal under that map, which the
-/// row does not return.
+/// Marginal parameters freeze sibling values for this query before any binding
+/// is pinned. A later output can then score the same record at another point.
 fn marginalize_or_refuse_record_law(
     m: &mut Module,
     record_node: NodeId,
     v: NodeId,
 ) -> Result<Option<NodeId>, RefuseError> {
-    let Some(rec) = expect_builtin_call(m, record_node, "record") else {
+    if expect_builtin_call(m, record_node, "record").is_none() {
         return Ok(None);
-    };
-    let mut fields = Vec::with_capacity(rec.named.len());
-    for field in rec.named.iter() {
-        match resolve_component_draw(m, field.value) {
-            Some((measure, _, transform, draw_site)) => {
-                fields.push((field.name, measure, transform, draw_site))
-            }
-            None => return Ok(None),
-        }
     }
-    let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, _, site)| site).collect();
-    let mut marginals: Vec<(Symbol, crate::marginal::MarginalForm)> = Vec::new();
-    let mut integrated: Vec<Symbol> = Vec::new();
-    for &(name, measure, transform, _) in &fields {
-        // The transform is walked as well as the measure: for `b = y + z` the outside
-        // ancestor is in the MAP, which `build_forward_map` would read as a constant.
+    // Match the whole record once. Field-point pairing and the global rank
+    // check must precede partitioning, including aliases across separate blocks.
+    let components = match_independent_record(m, record_node, v)?;
+    let siblings: Vec<_> = components.iter().map(|comp| comp.draw_site).collect();
+    let substitutions: Vec<_> = components
+        .iter()
+        .filter_map(|comp| {
+            comp.draw_binding
+                .map(|bid| (m.binding(bid).name, comp.pinned))
+        })
+        .collect();
+    let mut marginals = Vec::with_capacity(components.len());
+    for comp in &components {
         let reaches = |node| measure_reaches_draw(m, node, &siblings);
-        if !(reaches(measure) || transform.is_some_and(reaches)) {
+        if !(reaches(comp.measure) || comp.transform.is_some_and(reaches)) {
+            marginals.push(None);
             continue;
         }
-        let marginal = if transform.is_some() {
-            None
+        let marginal = if comp.transform.is_none() {
+            crate::marginal::conjugate_marginal_measure(m, comp.measure, &siblings)
         } else {
-            crate::marginal::conjugate_marginal_measure(m, measure, &siblings)
+            None
         };
-        match marginal {
-            Some(built) => {
-                let built = built?;
-                if built
-                    .latents
-                    .iter()
-                    .any(|latent| integrated.contains(latent))
-                {
-                    // The fields are correlated through the shared ancestor, so no product of
-                    // per-field marginals is the joint. One shape has a closed form for the
-                    // joint itself; everything else refuses.
-                    //
-                    // EVERY field must be an untransformed draw, tested here over the whole
-                    // record rather than per field. The per-field `transform.is_some()` arm above
-                    // only screens fields reached BEFORE the repeat is detected — the repeat
-                    // lands on the second shared field, so a transformed field written after it
-                    // would never be screened, and the law would score the query's value of the
-                    // TRANSFORMED field as the untransformed draw: no inverse, no log-volume.
-                    let field_measures: Vec<NodeId> =
-                        fields.iter().map(|&(_, measure, _, _)| measure).collect();
-                    let all_bare = fields.iter().all(|(_, _, t, _)| t.is_none());
-                    if let Some(law) = all_bare
-                        .then(|| {
-                            crate::marginal::shared_latent_record_law(m, &field_measures, &siblings)
-                        })
-                        .flatten()
-                    {
-                        // The law requires every field to share ONE latent, so it must be the
-                        // one the repeat was detected on. A mismatch would mean the two
-                        // ancestry paths disagree.
-                        debug_assert!(
-                            built.latents.contains(&law.latent),
-                            "the record law must integrate the repeated latent"
-                        );
-                        return lower_shared_latent_record_law(m, record_node, v, &law).map(Some);
-                    }
-                    if let Some(numerical) = integral::record_marginal(m, record_node, v) {
-                        return numerical.map(Some);
-                    }
-                    return Err(refuse(
-                        measure,
-                        m,
-                        "lawof of a record whose fields marginalize over the SAME latent is a \
-                         CORRELATED joint (§04 kchain(prior, forward_kernel)), not a product of \
-                         their marginals, and no closed form covers this shape",
-                    ));
-                }
-                integrated.extend(built.latents);
-                marginals.push((name, built.form));
+        let Some(built) = marginal else {
+            if let Some(numerical) = integral::record_marginal(m, record_node, v) {
+                return numerical.map(Some);
             }
-            None => {
+            return Err(refuse(
+                comp.measure,
+                m,
+                "lawof of a record field parameterized by an uncarried draw needs a supported marginal law",
+            ));
+        };
+        marginals.push(Some(built?));
+    }
+    if marginals.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    // Connected components use complete integrated ancestry. Sharing any
+    // ancestor couples fields, even when their immediate parents differ.
+    let mut assigned = vec![false; components.len()];
+    let mut terms = (0..components.len())
+        .map(|_| RecordTerm::Conditional)
+        .collect::<Vec<_>>();
+    for first in 0..components.len() {
+        if assigned[first] || marginals[first].is_none() {
+            continue;
+        }
+        let mut block = vec![first];
+        assigned[first] = true;
+        let mut cursor = 0;
+        while cursor < block.len() {
+            let latents = &marginals[block[cursor]].as_ref().unwrap().latents;
+            for next in 0..components.len() {
+                if assigned[next] {
+                    continue;
+                }
+                if marginals[next].as_ref().is_some_and(|other| {
+                    other.latents.iter().any(|latent| latents.contains(latent))
+                }) {
+                    assigned[next] = true;
+                    block.push(next);
+                }
+            }
+            cursor += 1;
+        }
+        let term = if block.len() == 1 {
+            let mut form = marginals[first].take().unwrap().form;
+            // Freeze parameters only. Substituting the emitted density would
+            // also rewrite the caller's point expressions and leak between queries.
+            form.map_parameters(m, |m, parameter| {
+                substitute_siblings(m, parameter, &substitutions)
+            });
+            score_marginal_form(m, &form, components[first].pinned)?
+        } else {
+            let measures = block
+                .iter()
+                .map(|&i| components[i].measure)
+                .collect::<Vec<_>>();
+            let Some(mut law) = crate::marginal::shared_latent_record_law(m, &measures, &siblings)
+            else {
                 if let Some(numerical) = integral::record_marginal(m, record_node, v) {
                     return numerical.map(Some);
                 }
                 return Err(refuse(
-                    measure,
+                    components[first].measure,
                     m,
-                    "lawof of a record field parameterized by an uncarried draw is that field's \
-                     MARGINAL law (§04: lawof reifies the TOTAL law), and no conjugate row covers \
-                     it",
+                    "lawof of record fields marginalizing over the SAME latent is a CORRELATED joint, and no closed form covers this block",
+                ));
+            };
+            if law.field_count != block.len()
+                || !marginals[first]
+                    .as_ref()
+                    .unwrap()
+                    .latents
+                    .contains(&law.latent)
+            {
+                return Err(refuse(
+                    record_node,
+                    m,
+                    "shared-latent block does not match its component ancestry",
                 ));
             }
+            for &i in &block {
+                refuse_domain_kind_mismatch(m, components[i].measure, components[i].pinned)?;
+            }
+            law.form.map_parameters(m, |m, parameter| {
+                substitute_siblings(m, parameter, &substitutions)
+            });
+            let variates = block
+                .iter()
+                .map(|&i| components[i].pinned)
+                .collect::<Vec<_>>();
+            law.form.at(m, &variates)
+        };
+        terms[first] = RecordTerm::Score(term);
+        for &i in &block[1..] {
+            terms[i] = RecordTerm::Included;
         }
     }
-    if marginals.is_empty() {
-        return Ok(None);
-    }
-    lower_record_of_draws_with(m, record_node, v, &marginals).map(Some)
-}
-
-/// Emit the shared-latent record law's joint log-density: ONE term over all the record's
-/// fields, not a per-field product.
-///
-/// The fields are re-resolved through [`match_independent_record`] rather than reusing the
-/// caller's list, because that is where the variate is destructured (a value that is a
-/// `(%ref self x)` to a record literal resolves the same as an inline one) and where the
-/// rank check lives. Its `Component` order is the record's field order, the same order the
-/// law's sigmas were collected in, so the variates pair with the sigmas by position.
-///
-/// Each field's draw binding is pinned to its scored value exactly as
-/// [`lower_record_of_draws_with`] does — that is what lets the driver sweep the now-dead
-/// `draw` bindings, the shared latent's included, and what records that a QUERY put the
-/// literal there.
-///
-/// Because it re-resolves the fields, it re-checks the two properties it needs rather than
-/// trusting the caller's screening of a DIFFERENT list: that no field is transformed, and
-/// that it has exactly one variate per sigma the law carries. Both are refusals, not
-/// asserts — a release build would otherwise score a transformed field as its untransformed
-/// draw, or `zip` a length mismatch down to the shorter list and emit the law of a subset.
-/// Neither is reachable while the caller screens first, so both carry their OWN reason: if
-/// one ever fires, the message says which invariant broke rather than blaming the shape.
-fn lower_shared_latent_record_law(
-    m: &mut Module,
-    record_node: NodeId,
-    v: NodeId,
-    law: &crate::marginal::SharedLatentRecordLaw,
-) -> Result<NodeId, RefuseError> {
-    let components = match_independent_record(m, record_node, v)?;
-    if let Some(comp) = components.iter().find(|c| c.transform.is_some()) {
-        return Err(refuse(
-            comp.measure,
-            m,
-            "lawof of a record whose fields marginalize over the SAME latent has a closed-form \
-             joint only when every field is a BARE draw: a transformed field's law is the \
-             pushforward of that joint, which this law does not return",
-        ));
-    }
-    if components.len() != law.field_count {
-        return Err(refuse(
-            record_node,
-            m,
-            "the shared-latent record law needs exactly one variate per field it was built \
-             over, and the record destructured to a different count",
-        ));
-    }
-    let variates: Vec<NodeId> = components.iter().map(|c| c.pinned).collect();
-    for component in &components {
-        refuse_domain_kind_mismatch(m, component.measure, component.pinned)?;
-    }
-    let term = law.form.at(m, &variates);
-    for comp in &components {
-        if let Some(bid) = comp.draw_binding {
-            m.pin_binding_to_query_point(bid, comp.pinned);
-        }
-    }
-    Ok(term)
+    lower_record_components(m, &components, &terms).map(Some)
 }
 
 /// Is `node`'s inferred type a measure EXPRESSION's — a measure, or a reification
@@ -2376,7 +2324,7 @@ fn is_measure_expr_type(m: &Module, node: NodeId) -> bool {
 struct Component {
     /// The record field this component is, so a caller that pre-computed a
     /// closed-form marginal for it can say WHICH field
-    /// ([`lower_record_of_draws_with`]).
+    /// ([`lower_record_components`]).
     name: Symbol,
     /// The distribution-constructor (or combinator) node `mᵢ`. For a
     /// transformed field (`transform = Some(call)`), this is the INNER draw's
@@ -2411,27 +2359,26 @@ fn lower_record_of_draws(
     record_node: NodeId,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    lower_record_of_draws_with(m, record_node, v, &[])
+    let components = match_independent_record(m, record_node, v)?;
+    let terms = (0..components.len())
+        .map(|_| RecordTerm::Conditional)
+        .collect::<Vec<_>>();
+    lower_record_components(m, &components, &terms)
 }
 
-/// [`lower_record_of_draws`] where the caller has already marginalized some fields:
-/// `marginals` replaces the named field's own factor with the closed form supplied for it.
-///
-/// Only [`marginalize_or_refuse_record_law`] passes a non-empty list, and only for a
-/// field whose measure is parameterized by a draw the record does not carry (§04 makes
-/// that field's law its marginal). The substitution is by field NAME rather than by
-/// rewriting the model, because the field's `y = draw(Normal(mu = z, …))` binding is
-/// shared: a `kernelof` body elsewhere CONDITIONS on `z` as a boundary input (§04's own
-/// exception), so rewriting the binding's measure to the marginal would silently drop
-/// that dependence.
-fn lower_record_of_draws_with(
-    m: &mut Module,
-    record_node: NodeId,
-    v: NodeId,
-    marginals: &[(Symbol, crate::marginal::MarginalForm)],
-) -> Result<NodeId, RefuseError> {
-    let components = match_independent_record(m, record_node, v)?;
+enum RecordTerm {
+    Conditional,
+    Score(NodeId),
+    Included,
+}
 
+/// Score each component once, then pin the original draws only after every
+/// independent block and conditional field succeeds.
+fn lower_record_components(
+    m: &mut Module,
+    components: &[Component],
+    scores: &[RecordTerm],
+) -> Result<NodeId, RefuseError> {
     // Empty record (degenerate joint): a sum over no components. The independent-
     // product density is Σᵢ logdensityof(Mᵢ, xᵢ) (§06 "Density of composed measures"),
     // whose empty case is 0.
@@ -2447,16 +2394,14 @@ fn lower_record_of_draws_with(
     // change-of-variables (`logdensityof(Mᵢ, g⁻¹(y)) − logvol(g⁻¹(y))`),
     // reusing the recorded/derived inverse; a non-invertible `g` refuses there.
     let mut terms: Vec<NodeId> = Vec::with_capacity(components.len());
-    for comp in &components {
-        if let Some((_, form)) = marginals.iter().find(|(name, _)| *name == comp.name) {
-            // A marginalized field carries no transform: its law is the marginal
-            // itself, and a pushforward of it is refused upstream.
-            debug_assert!(
-                comp.transform.is_none(),
-                "marginalized field has a transform"
-            );
-            terms.push(score_marginal_form(m, form, comp.pinned)?);
-            continue;
+    for (comp, score) in components.iter().zip(scores) {
+        match score {
+            RecordTerm::Score(term) => {
+                terms.push(*term);
+                continue;
+            }
+            RecordTerm::Included => continue,
+            RecordTerm::Conditional => {}
         }
         // A sibling's value is substituted INTO this component's measure, not left as a
         // `(%ref self sibling)` for the binding pin below to supply. §13 "Output
@@ -2496,7 +2441,7 @@ fn lower_record_of_draws_with(
     // Pin each referenced draw binding to its scored value, recording that a QUERY
     // put the literal there — a later query must not read it as a model constant
     // (see [`measure_reaches_draw`]).
-    for comp in &components {
+    for comp in components {
         if let Some(bid) = comp.draw_binding {
             m.pin_binding_to_query_point(bid, comp.pinned);
         }
@@ -8397,10 +8342,21 @@ fn lower_broadcast_kernel(
         return broadcast::call_density(m, CallHead::Builtin(op), &pos_args, &kw_args, obs);
     }
 
-    // Tables have one axis. A matrix-valued product must therefore broadcast
-    // the scalar density directly instead of building a matrix of records.
+    // Table operands need row records (including constructor auto-splatting).
+    // Multi-axis observations likewise need the general per-cell density.
     let (resolved_obs, _) = resolve_ref_chain(m, obs);
-    if matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
+    let has_table = pos_args
+        .iter()
+        .chain(kw_args.iter().map(|(_, v)| v))
+        .any(|&arg| {
+            let (resolved, _) = resolve_ref_chain(m, arg);
+            matches!(
+                m.type_of(arg).or_else(|| m.type_of(resolved)),
+                Some(Type::Table { .. })
+            )
+        });
+    if has_table
+        || matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
         Some(Type::Array { shape, .. }) if shape.len() > 1)
     {
         let head = match *m.node(head) {

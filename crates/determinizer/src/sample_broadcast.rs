@@ -46,6 +46,15 @@ pub(super) fn lower(
                 rank = Some(shape.len());
                 cell_input(m, value, &mut inputs, &mut actuals)
             }
+            Some(Type::Table {
+                nrows: Dim::Static(_),
+                ..
+            }) if rank.is_none_or(|r| r == 1) => {
+                // §03 tables iterate one row axis. cell_input projects the
+                // columns and builds the row record, retaining vector fields.
+                rank = Some(1);
+                cell_input(m, value, &mut inputs, &mut actuals)
+            }
             Some(Type::Record(_) | Type::Table { .. } | Type::Tuple(_)) => {
                 Err(refuse(value, m, "broadcast sampling requires scalar cells"))
             }
