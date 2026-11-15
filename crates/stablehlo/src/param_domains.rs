@@ -34,6 +34,38 @@ pub(crate) struct PositiveDefiniteFactor {
 const MAX_STATIC_FACTOR: usize = 64;
 
 impl Emitter<'_> {
+    pub(crate) fn check_finite_parameter(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), EmitError> {
+        if let Some(values) = self.constant_elements(value) {
+            if values.iter().any(|v| !v.is_finite()) {
+                return Err(EmitError::at(
+                    id,
+                    format!("regression parameter '{name}' must be finite"),
+                ));
+            }
+            return Ok(());
+        }
+        if !self.check_parameters {
+            return Ok(());
+        }
+        let key = (value.ssa.clone(), "finite".to_string());
+        if self.checked_parameters.contains(&key) {
+            return Ok(());
+        }
+        if self.region_depth == 0 {
+            self.checked_parameters.insert(key);
+        }
+        let magnitude = self.abs(value);
+        let infinity = self.inf_like(value);
+        let finite = self.compare("LT", &magnitude, &infinity);
+        self.record_runtime_error(&finite, PARAMETER_DOMAIN_STATUS);
+        Ok(())
+    }
+
     /// Check each parameter `(name, node, set)` of distribution `ctor`. A
     /// `PosDefinite` set is left to [`Emitter::positive_definite_factor`], which
     /// reuses the factorization the builder needs.

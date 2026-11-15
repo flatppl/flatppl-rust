@@ -422,12 +422,21 @@ pub fn kernel_tag_node(m: &Module, call: &Call) -> Option<NodeId> {
     };
     let name = m.resolve(op);
     if let Some(i) = kernel_tag_index(name) {
-        return call
+        let tag = call
             .named
             .iter()
             .find(|na| m.resolve(na.name) == "kernel")
             .map(|na| na.value)
-            .or_else(|| call.args.get(i).copied());
+            .or_else(|| call.args.get(i).copied())?;
+        return match m.node(tag) {
+            Node::Call(wrapper)
+                if matches!(wrapper.head, CallHead::Builtin(s) if m.resolve(s) == "broadcasted")
+                    && wrapper.args.len() == 1 =>
+            {
+                Some(wrapper.args[0])
+            }
+            _ => Some(tag),
+        };
     }
     if name == "broadcast" || name == "broadcasted" {
         let head = *call.args.first()?;

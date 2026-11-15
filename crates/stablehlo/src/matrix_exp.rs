@@ -312,7 +312,7 @@ impl Emitter<'_> {
     }
 
     /// Lazily apply a branch when any batch lane is active.
-    pub(super) fn matrix_if(
+    pub(crate) fn matrix_if(
         &mut self,
         active: &Value,
         initial: &Value,

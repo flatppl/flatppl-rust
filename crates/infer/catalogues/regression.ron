@@ -1,0 +1,17 @@
+// §09 Regression: x supplies one response per matrix row.
+Module(
+    name: "regression",
+    version: "0.1",
+    bindings: [
+        Binding(name: "BernoulliLogitGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowBooleans, mass: Normalized, params: ["x", "alpha", "beta"], param_ranks: [2, 0, 1], param_sets: [Reals, Reals, Reals])),
+        Binding(name: "BinomialLogitGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowNonNegIntegers, mass: Normalized, params: ["x", "n", "alpha", "beta"], param_ranks: [2, 0, 0, 1], param_sets: [Reals, PosIntegers, Reals, Reals]), degraded: Some("The support bound is conservative when the trial count n is not fixed")),
+        Binding(name: "CategoricalLogitGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowNonNegIntegers, mass: Normalized, params: ["x", "alpha", "beta"], param_ranks: [2, 1, 2], param_sets: [Reals, Reals, Reals]), degraded: Some("The support bounds are conservative when the class count is unknown")),
+        Binding(name: "NormalGLM", sig: Distribution(domain: VectorFromParam(elem: Real, param: "x"), support: CartPowReals, mass: Normalized, params: ["x", "alpha", "beta", "sigma"], param_ranks: [2, 0, 1, 0], param_sets: [Reals, Reals, Reals, PosReals])),
+        Binding(name: "PoissonLogGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowNonNegIntegers, mass: Normalized, params: ["x", "alpha", "beta"], param_ranks: [2, 0, 1], param_sets: [Reals, Reals, Reals])),
+        Binding(name: "NegativeBinomial2LogGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowNonNegIntegers, mass: Normalized, params: ["x", "alpha", "beta", "psi"], param_ranks: [2, 0, 1, 0], param_sets: [Reals, Reals, Reals, PosReals])),
+        Binding(name: "StudentTGLM", sig: Distribution(domain: VectorFromParam(elem: Real, param: "x"), support: CartPowReals, mass: Normalized, params: ["x", "nu", "alpha", "beta", "sigma"], param_ranks: [2, 0, 0, 1, 0], param_sets: [Reals, PosReals, Reals, Reals, PosReals])),
+        Binding(name: "GammaLogGLM", sig: Distribution(domain: VectorFromParam(elem: Real, param: "x"), support: CartPowNonNegReals, mass: Normalized, params: ["x", "alpha", "beta", "shape"], param_ranks: [2, 0, 1, 0], param_sets: [Reals, Reals, Reals, PosReals])),
+        Binding(name: "OrderedLogitGLM", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "x"), support: CartPowNonNegIntegers, mass: Normalized, params: ["x", "beta", "cutpoints"], param_ranks: [2, 1, 1], param_sets: [Reals, Reals, Reals]), degraded: Some("The support bounds are conservative when the cutpoint count is unknown")),
+        Binding(name: "BetaLogitGLM", sig: Distribution(domain: VectorFromParam(elem: Real, param: "x"), support: CartPowUnitInterval, mass: Normalized, params: ["x", "alpha", "beta", "precision"], param_ranks: [2, 0, 1, 0], param_sets: [Reals, Reals, Reals, PosReals])),
+    ],
+)

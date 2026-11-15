@@ -24,7 +24,7 @@ const CORRECTION: [f64; 6] = [
 ];
 
 impl Emitter<'_> {
-    fn log_gamma_correction(&mut self, x: &Value) -> Value {
+    pub(crate) fn log_gamma_correction(&mut self, x: &Value) -> Value {
         let one = self.scalar(1.0);
         let inverse = self.div(&one, x);
         let inverse_squared = self.mul(&inverse, &inverse);
@@ -40,7 +40,7 @@ impl Emitter<'_> {
 
     /// `r(x) = lgamma(x) - [(x - 1/2) log x - x + log(2 pi) / 2]` for `x > 0`: the
     /// series for `x >= 8`, otherwise `lgamma` itself, where nothing large cancels.
-    fn stirling_remainder(&mut self, x: &Value) -> Value {
+    pub(crate) fn stirling_remainder(&mut self, x: &Value) -> Value {
         let threshold = self.constant_like(STIRLING_MIN, x);
         let large = self.compare("GE", x, &threshold);
         let x_big = self.select(&large, x, &threshold);

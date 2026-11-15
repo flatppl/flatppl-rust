@@ -72,9 +72,9 @@ pub(crate) enum Sig {
         /// [`Catalogue::distribution_param_ranks`] and ordinary constructor shape checks.
         ///
         /// **An empty list means every parameter is a scalar (rank 0).** That is
-        /// the shape of all but the seven shaped rows below, and of every §09
-        /// module row, so the default states the common case instead of leaving
-        /// it unread. `param_ranks_are_parallel_to_params` pins the length.
+        /// the common shape of univariate constructors. Shaped §08 and §09
+        /// rows declare their ranks. `param_ranks_are_parallel_to_params` pins
+        /// the length.
         #[serde(default)]
         param_ranks: Vec<usize>,
         /// Declared VALUE SET of each parameter, parallel to `params` — §08's
@@ -361,6 +361,9 @@ pub(crate) enum SupportTag {
     StdSimplex,
     /// Dimension-aware real Cartesian power: `ValueSet::CartPow(Reals, param_dim)`.
     CartPowReals,
+    CartPowBooleans,
+    CartPowNonNegReals,
+    CartPowUnitInterval,
     /// Dimension-aware non-negative integer Cartesian power: `ValueSet::CartPow(NonNegIntegers, param_dim)`.
     CartPowNonNegIntegers,
     /// Support not representable as a fixed tag (e.g. arg-dependent or matrix
@@ -528,6 +531,7 @@ pub(crate) fn builtin() -> &'static Catalogue {
 /// Per-module RON sources for the spec-§09 standard modules, embedded at build.
 const STD_MODULE_SRCS: &[&str] = &[
     include_str!("../../catalogues/particle-physics.ron"),
+    include_str!("../../catalogues/regression.ron"),
     include_str!("../../catalogues/pyhf-helpers.ron"),
     include_str!("../../catalogues/ext-linear-algebra.ron"),
     include_str!("../../catalogues/special-functions.ron"),
@@ -978,6 +982,19 @@ impl Catalogue {
         })
     }
 
+    /// A distribution tag carried by a lowered `builtin_*` kernel. Standard
+    /// module tags are bare at this internal boundary, not base constructors.
+    pub(crate) fn distribution(&self, name: &str) -> Option<&Sig> {
+        let is_distribution = |sig: &&Sig| matches!(sig, Sig::Distribution { .. });
+        self.base(name).filter(is_distribution).or_else(|| {
+            self.modules
+                .iter()
+                .flat_map(|m| &m.bindings)
+                .find(|b| b.name == name && matches!(b.sig, Sig::Distribution { .. }))
+                .map(|b| &b.sig)
+        })
+    }
+
     /// Declared parameter value sets for a built-in distribution, parallel to
     /// [`Self::distribution_param_names`]. A row that states no set reports
     /// [`ParamSet::Unconstrained`]. `None` under the same conditions as
@@ -1416,7 +1433,7 @@ mod tests {
         );
     }
 
-    /// Completeness guard for the six §09 standard modules.
+    /// Completeness guard for the §09 standard modules.
     ///
     /// Asserts that every public binding listed in §09 is present in the
     /// built-in catalogue, and that every row with a `degraded` note has a
@@ -1425,6 +1442,22 @@ mod tests {
     fn std_modules_complete() {
         // (module_name, version, [binding names])
         let modules: &[(&str, &str, &[&str])] = &[
+            (
+                "regression",
+                "0.1",
+                &[
+                    "BernoulliLogitGLM",
+                    "BinomialLogitGLM",
+                    "CategoricalLogitGLM",
+                    "NormalGLM",
+                    "PoissonLogGLM",
+                    "NegativeBinomial2LogGLM",
+                    "StudentTGLM",
+                    "GammaLogGLM",
+                    "OrderedLogitGLM",
+                    "BetaLogitGLM",
+                ],
+            ),
             (
                 "particle-physics",
                 "0.1",

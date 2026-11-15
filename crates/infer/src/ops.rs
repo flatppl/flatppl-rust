@@ -6530,12 +6530,62 @@ fn catalogue_call_type(
     {
         return ty;
     }
+    if let Some(ty) = regression_argument_shapes(inf, &sig, &names, args) {
+        return ty;
+    }
     // Both Distribution and Function sigs return the lowered type directly:
     // `catalogue_lower` already embeds the catalogue `MassTag` mass in the
     // `Measure` for distributions, and the result scalar/matrix type for
     // functions. No per-variant fixup is needed.
     let (ty, _vset) = catalogue_lower(&mut *inf.module, &sig, args);
     ty
+}
+
+/// Regression parameters share the design matrix's predictor axis. This is
+/// ordinary constructor shape checking, not a broadcasting rule.
+fn regression_argument_shapes(
+    inf: &mut Inferencer<'_, '_>,
+    sig: &crate::catalogue::Sig,
+    names: &[String],
+    args: &[ArgInfo],
+) -> Option<Type> {
+    use crate::catalogue::{DomainSig, Sig};
+    if !matches!(sig, Sig::Distribution {
+        domain: DomainSig::VectorFromParam { param, .. }, ..
+    } if param == "x")
+    {
+        return None;
+    }
+    let argument = |name: &str| {
+        names
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| args.get(i))
+    };
+    let array_shape = |name: &str| match argument(name) {
+        Some((_, Type::Array { shape, .. }, _)) => Some(shape.as_ref()),
+        _ => None,
+    };
+    let x = array_shape("x")?;
+    let beta = array_shape("beta")?;
+    if x.len() != 2 {
+        return None;
+    }
+    let different = |a, b| matches!((a, b), (Dim::Static(a), Dim::Static(b)) if a != b);
+    let reason = if beta.first().is_some_and(|&k| different(x[1], k)) {
+        Some("the design matrix columns must match the regression coefficient rows")
+    } else if beta.len() == 2
+        && array_shape("alpha").is_some_and(|a| a.len() == 1 && different(beta[1], a[0]))
+    {
+        Some("categorical coefficient columns must match the intercept vector length")
+    } else if array_shape("cutpoints").is_some_and(|s| s == [Dim::Static(0)]) {
+        Some("ordered logistic regression needs at least one cutpoint")
+    } else {
+        None
+    }?;
+    inf.diags
+        .push(crate::Diagnostic::error_at(args[0].0, reason));
+    Some(Type::Failed(reason.into()))
 }
 
 /// The value set of an applied §09 standard-module reference: a distribution's
@@ -6547,13 +6597,45 @@ fn catalogue_call_valueset(
     callee: NodeId,
     args: &[ArgInfo],
 ) -> ValueSet {
-    let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
+    let Some(catalogue) = inf.module_catalogue_ref(callee).cloned() else {
         return ValueSet::Unknown;
     };
+    let sig = catalogue.sig;
     if matches!(sig, crate::catalogue::Sig::Function { .. })
         && unresolved_shaped_argument(&sig, args).is_some()
     {
         return ValueSet::Unknown;
+    }
+    if catalogue.module == "regression" {
+        let names = crate::catalogue::sig_param_names(&sig).unwrap_or_default();
+        let arg = |name: &str| {
+            names
+                .iter()
+                .position(|n| n == name)
+                .and_then(|i| args.get(i))
+        };
+        let rows = match arg("x").map(|a| &a.1) {
+            Some(Type::Array { shape, .. }) => shape.first().copied().unwrap_or(Dim::Dynamic),
+            _ => Dim::Dynamic,
+        };
+        let upper = |name: &str, offset: f64| match arg(name).map(|a| &a.1) {
+            Some(Type::Array { shape, .. }) if shape.len() == 1 => match shape[0] {
+                Dim::Static(n) => Some(n as f64 + offset),
+                _ => None,
+            },
+            _ => None,
+        };
+        let interval = match catalogue.member.as_str() {
+            "BinomialLogitGLM" => arg("n")
+                .and_then(|a| crate::consteval::fixed_int(inf, a.0))
+                .map(|n| (0.0, n as f64)),
+            "CategoricalLogitGLM" => upper("alpha", 0.0).map(|n| (1.0, n)),
+            "OrderedLogitGLM" => upper("cutpoints", 1.0).map(|n| (1.0, n)),
+            _ => None,
+        };
+        if let Some((lo, hi)) = interval {
+            return ValueSet::CartPow(Box::new(ValueSet::Interval(lo, hi)), rows);
+        }
     }
     catalogue_lower(&mut *inf.module, &sig, args).1
 }
@@ -6569,7 +6651,7 @@ fn reference_mass(support: &ValueSet) -> Mass {
 /// Lower a §09 catalogue sig with a `LowerCtx` built from the concrete
 /// positional call args: `arg_scalar`/`arg_dim` read arg `i`'s inferred type,
 /// `param_dim` (VectorFromParam) has no named-kwarg source at a `RefNs::Module`
-/// application, so it falls back to the first positional arg's vector dim.
+/// application, so it falls back to the first positional arg's leading dim.
 /// The `LowerCtx` borrows local closures, so it is built and consumed here in
 /// one scope rather than returned.
 fn catalogue_lower(
@@ -6581,7 +6663,7 @@ fn catalogue_lower(
     use std::cell::RefCell;
 
     let first_dim = || match args.first().map(|(_, t, _)| t) {
-        Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+        Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
         _ => Dim::Dynamic,
     };
     // RefCell so the `intern` closure is a `Fn` alongside the immutable arg
@@ -10446,7 +10528,7 @@ fn kernel_variate(
         Node::Const(sym) => inf.module.resolve(*sym).to_string(),
         _ => return None,
     };
-    let sig = crate::catalogue::builtin().base(&name)?;
+    let sig = crate::catalogue::builtin().distribution(&name)?;
     let Sig::Distribution { .. } = sig else {
         return None;
     };
@@ -10486,6 +10568,7 @@ fn lkj_matrix_domain(inf: &mut Inferencer<'_, '_>, n: Option<NodeId>) -> Type {
 /// dists never call this; a not-yet-inferred field also yields `Dynamic`).
 fn record_field_dim(inf: &Inferencer<'_, '_>, rec: Option<NodeId>, kwarg: &str) -> Dim {
     let Some(rec) = rec else { return Dim::Dynamic };
+    let rec = resolve_binding_refs(inf, rec);
     let Node::Call(c) = inf.module.node(rec) else {
         return Dim::Dynamic;
     };
