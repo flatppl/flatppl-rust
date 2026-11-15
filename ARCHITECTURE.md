@@ -190,6 +190,15 @@ ambitious later piece. (egglog is a superset — it could do directional lowerin
 with a cost model forbidding illegal ops — but greedy is simpler, faster, and
 predictable for that path.)
 
+## Exact shared-rate elimination
+
+Shared-latent record laws also eliminate one ancestor-free Gamma rate from
+bare scalar Poisson draws. The joint uses sequential native NegativeBinomial
+predictives, updating shape by each widened count and rate by one. Negative
+or nonfinite counts do not enter later predictive parameters. Primitive support
+and parameter checks remain active. Carried latents retain the chain rule;
+transformed rates, extra ancestors and partly shared records retain refusal.
+
 ## Shared likelihood summaries
 
 `flatppl-determinizer::sufficient_statistics` rewrites independent likelihood

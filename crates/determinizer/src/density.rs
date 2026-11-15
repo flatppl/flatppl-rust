@@ -2341,6 +2341,9 @@ fn lower_shared_latent_record_law(
         ));
     }
     let variates: Vec<NodeId> = components.iter().map(|c| c.pinned).collect();
+    for component in &components {
+        refuse_domain_kind_mismatch(m, component.measure, component.pinned)?;
+    }
     let term = law.form.at(m, &variates);
     for comp in &components {
         if let Some(bid) = comp.draw_binding {

@@ -1310,6 +1310,9 @@ pub(crate) struct SharedLatentRecordLaw {
 ///   `sigma` latent-independent;
 /// * ONE shared latent across all fields, whose prior is a `Normal` with both parameters
 ///   and is itself ancestor-free (a two-level hierarchy is not this integral).
+/// * Alternatively, bare scalar Poisson draws can share one direct Gamma rate.
+///   Sequential native NegativeBinomial predictives update shape by each count
+///   and rate by one. The ancestor and cross-field agreement guards still apply.
 ///
 /// **The checks are deliberately over-determined, and most are not individually reachable
 /// today.** Only a shape whose every field ALREADY matched a `CONJUGATE_TABLE` row gets
@@ -1318,7 +1321,7 @@ pub(crate) struct SharedLatentRecordLaw {
 /// family, path and cross-field-agreement checks reddens nothing, and removing the mean-path
 /// and latent-agreement checks TOGETHER lets a partly-shared record mislower.
 ///
-/// **The masking mechanism is `find_kwarg`, not the family check.** `CONJUGATE_TABLE` admits
+/// In the Normal branch, the masking mechanism is `find_kwarg`, not the family check. `CONJUGATE_TABLE` admits
 /// the priors `Normal`, `Gamma`, `Beta`, `Exponential` and `InverseGamma`, and of the
 /// non-`Normal` four NONE takes both `mu` and `sigma` — so `find_kwarg(prior_kwargs, "mu")?`
 /// turns them away before `prior_sym` is ever compared. The field-family check is masked the
@@ -1353,6 +1356,31 @@ pub(crate) fn shared_latent_record_law(
     }
 
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
+    if m.resolve(prior_sym) == "Gamma" {
+        let alpha = find_kwarg(m, &prior_kwargs, "shape")?;
+        let beta = find_kwarg(m, &prior_kwargs, "rate")?;
+        for &measure in field_measures {
+            let (family, kwargs) = split_kernel_constructor(m, measure)?;
+            if m.resolve(family) != "Poisson"
+                || !matches_latent_path(
+                    m,
+                    find_kwarg(m, &kwargs, "rate")?,
+                    &LatentPath::Direct,
+                    latent,
+                )
+            {
+                return None;
+            }
+        }
+        return Some(SharedLatentRecordLaw {
+            latent,
+            field_count: field_measures.len(),
+            form: LogDensity {
+                build: build_shared_gamma_poisson_logpmf,
+                params: vec![alpha, beta],
+            },
+        });
+    }
     if m.resolve(prior_sym) != "Normal" {
         return None;
     }
@@ -1386,6 +1414,38 @@ pub(crate) fn shared_latent_record_law(
             params,
         },
     })
+}
+
+/// Sequential Gamma-Poisson predictives retain native count coefficients.
+/// Unlike a product of marginal NBs, each predictive updates both parameters.
+fn build_shared_gamma_poisson_logpmf(
+    m: &mut Module,
+    params: &[NodeId],
+    variates: &[NodeId],
+) -> NodeId {
+    let [mut alpha, mut beta] = [params[0], params[1]];
+    let zero = real(m, 0.0);
+    let one = real(m, 1.0);
+    let mut terms = Vec::with_capacity(variates.len());
+    for &value in variates {
+        let alpha_name = m.intern("alpha");
+        let beta_name = m.intern("beta");
+        let record = build_record(m, &[(alpha_name, alpha), (beta_name, beta)]);
+        let family = m.intern("NegativeBinomial");
+        let kernel = m.alloc(Node::Const(family));
+        let term = build_call(m, "builtin_logdensityof", &[kernel, record, value]);
+        terms.push(term);
+        // Widen before adding. Invalid earlier counts must not turn a later
+        // predictive's positive shape into a new parameter-domain error.
+        let count = build_call(m, "real", &[value]);
+        let nonnegative = build_call(m, "ge", &[count, zero]);
+        let finite = build_call(m, "isfinite", &[count]);
+        let valid = build_call(m, "land", &[finite, nonnegative]);
+        let safe = build_call(m, "ifelse", &[valid, count, zero]);
+        alpha = build_call(m, "add", &[alpha, safe]);
+        beta = build_call(m, "add", &[beta, one]);
+    }
+    crate::density::fold_add(m, &terms)
 }
 
 /// The shared-latent record law's log-density at `variates`, from
