@@ -223,6 +223,17 @@ fn log_sigmoid(e: &mut Emitter, z: &Value) -> Value {
     e.neg(&sp)
 }
 
+/// Use log1p near the mean and log differences when subtraction loses the tail.
+fn log_density_ratio(e: &mut Emitter, relative: &Value, log_y: &Value, log_mean: &Value) -> Value {
+    let cutoff = e.scalar(-0.5);
+    let far = e.compare("LT", relative, &cutoff);
+    let zero = e.scalar(0.0);
+    let safe = e.select(&far, &zero, relative);
+    let near = e.log1p(&safe);
+    let tail = e.sub(log_y, log_mean);
+    e.select(&far, &tail, &near)
+}
+
 fn student_normalizer(e: &mut Emitter, nu: &Value, log_sigma: &Value) -> Value {
     let half = e.scalar(0.5);
     if matches!(e.target(), crate::Target::Cpu) {
@@ -588,8 +599,8 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
                     let ratio_a = e.div(&gap, &safe_mean);
                     let negative_gap = e.neg(&gap);
                     let ratio_b = e.div(&negative_gap, &safe_complement);
-                    let log_ratio_a = e.log1p(&ratio_a);
-                    let log_ratio_b = e.log1p(&ratio_b);
+                    let log_ratio_a = log_density_ratio(e, &ratio_a, &log_y, &lm);
+                    let log_ratio_b = log_density_ratio(e, &ratio_b, &log_complement, &lc);
                     let term_a = e.mul(&safe_a, &log_ratio_a);
                     let term_b = e.mul(&safe_b, &log_ratio_b);
                     let deviance = e.add(&term_a, &term_b);
