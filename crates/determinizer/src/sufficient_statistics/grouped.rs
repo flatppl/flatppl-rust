@@ -343,7 +343,11 @@ fn runtime_bernoulli(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Node
 
 pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<NodeId> {
     let f = factor(m, id, r)?;
-    if let Some(value) = runtime_bernoulli(r, m, &f) {
+    reduce_factor(r, m, &f)
+}
+
+pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<NodeId> {
+    if let Some(value) = runtime_bernoulli(r, m, f) {
         return Some(value);
     }
     let Type::Array { shape, elem } = m.type_of(f.observed)?.clone() else {
@@ -538,7 +542,11 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         };
         terms.push(Expr::Node(value));
     }
-    let result = materialize(&mut candidate, op("sum", [op("vector", terms)]));
+    let terms = terms
+        .into_iter()
+        .map(|term| materialize(&mut candidate, term))
+        .collect::<Vec<_>>();
+    let result = crate::density::fold_add(&mut candidate, &terms);
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));
