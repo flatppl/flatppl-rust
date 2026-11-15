@@ -681,9 +681,12 @@ impl Emitter<'_> {
             let cols = self.axis_indices(&panel, 1);
             let local_permutation = self.index_vector(height, true);
             let indices = local_permutation.clone();
+            // Keep the fallback graph compact in compatibility mode.
             let result = self.matrix_loop_with_limit(
                 width,
-                if self.target == crate::Target::Gpu {
+                if self.target == crate::Target::Gpu
+                    && (!self.restrict_enzyme_compatible || self.host_batch)
+                {
                     16
                 } else {
                     0
@@ -932,7 +935,7 @@ impl Emitter<'_> {
     fn matrix_solve_body(&mut self, a: Value, b: Value, n: u64) -> (Value, Value) {
         let batch = self.batch_rank(&a);
         // CPU indexed elimination remains faster for medium cells. GPU panels
-        // amortize kernel launches earlier, with an unrolled panel body.
+        // amortize kernel launches earlier; unrestricted emission unrolls them.
         let blocked_min = match self.target {
             crate::Target::Cpu => 64,
             crate::Target::Gpu => 32,
