@@ -656,8 +656,10 @@ impl Emitter<'_> {
             let pivot = e.reduce_sum_last_axis(&pivot);
             let zero = e.scalar(0.0);
             let nonzero = e.compare("NE", &pivot, &zero);
-            let not_nan = e.compare("EQ", &pivot, &pivot);
-            let step_valid = e.and(&nonzero, &not_nan);
+            let magnitude = e.abs(&pivot);
+            let infinity = e.inf_like(&pivot);
+            let finite = e.compare("LT", &magnitude, &infinity);
+            let step_valid = e.and(&nonzero, &finite);
             let valid = e.and(&valid, &step_valid);
             let one = e.scalar(1.0);
             let safe_pivot = e.select(&step_valid, &pivot, &one);
