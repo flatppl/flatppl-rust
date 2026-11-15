@@ -14,6 +14,9 @@ pub(super) fn lower(
     let Some((&head, args)) = call.args.split_first() else {
         return Err(refuse(node, m, "broadcast sample requires a kernel"));
     };
+    let resolved_head = crate::density::resolve_ref_chain(m, head).0;
+    let vector_law = crate::crossmodule::std_module_member(m, resolved_head)
+        .is_some_and(|(module, _)| module == "regression");
     let mut inputs = Vec::new();
     let mut actuals = Vec::new();
     let mut rank = None;
@@ -33,7 +36,7 @@ pub(super) fn lower(
         }
         match ty {
             Some(Type::Array { shape, elem }) => {
-                if !matches!(*elem, Type::Scalar(_))
+                if (!vector_law && !matches!(*elem, Type::Scalar(_)))
                     || shape.iter().any(|d| !matches!(d, Dim::Static(_)))
                     || rank.is_some_and(|r| r != shape.len())
                 {
@@ -79,11 +82,18 @@ pub(super) fn lower(
         named: named.into(),
         inputs: None,
     }));
+    if vector_law
+        && let Some(Type::Measure { domain, mass }) = m.type_of(node).cloned()
+        && let Type::Array { elem, .. } = *domain
+    {
+        m.set_type(measure, Type::Measure { domain: elem, mass });
+    }
     if let Some(rank) = rank {
         Scope {
             inputs,
             actuals,
             rank,
+            vector_law,
         }
         .sample(m, measure, rng, sample_name)
     } else {
@@ -96,6 +106,7 @@ struct Scope {
     inputs: Vec<(Symbol, Ref)>,
     actuals: Vec<NodeId>,
     rank: usize,
+    vector_law: bool,
 }
 
 /// The lanes of equal-length columns: one cell placeholder per column, standing
@@ -120,6 +131,7 @@ impl Lanes {
                 inputs,
                 actuals,
                 rank: 1,
+                vector_law: false,
             },
             points,
         })
@@ -166,7 +178,9 @@ impl Scope {
             m.set_type(measure, ty);
         }
         if !matches!(m.type_of(measure), Some(Type::Measure { domain, .. })
-            if matches!(domain.as_ref(), Type::Scalar(_)))
+            if matches!(domain.as_ref(), Type::Scalar(_))
+                || self.vector_law && matches!(domain.as_ref(), Type::Array { shape, elem }
+                    if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_))))
         {
             return Err(refuse(
                 measure,

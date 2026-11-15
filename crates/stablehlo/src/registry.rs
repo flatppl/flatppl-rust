@@ -18,6 +18,8 @@ use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 mod bessel;
+mod regression;
+mod regression_broadcast;
 
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
 /// distribution's closed-form log-density/-mass builder (§08/§09/§12/§13).
@@ -72,6 +74,16 @@ pub enum Broadcast {
 /// §08/§09/§12/§13), so this beats the bookkeeping of a `HashMap`/`phf` for
 /// no measurable runtime cost.
 static REGISTRY: &[(&str, DistLowering)] = &[
+    regression::BERNOULLI,
+    regression::BINOMIAL,
+    regression::CATEGORICAL,
+    regression::NORMAL,
+    regression::POISSON,
+    regression::NEGATIVE_BINOMIAL,
+    regression::STUDENT_T,
+    regression::GAMMA,
+    regression::ORDERED,
+    regression::BETA,
     (
         "Normal",
         DistLowering {
@@ -1059,6 +1071,14 @@ pub(crate) fn lower_sample(
         }
         _ => (ctor, false),
     };
+    if broadcasted
+        && size_args.is_empty()
+        && let Node::Const(symbol) = e.node(ctor)
+        && regression_broadcast::supports(e.resolve(*symbol))
+    {
+        let name = e.resolve(*symbol).to_owned();
+        return regression_broadcast::sample(e, id, rng, &name, kernel_input);
+    }
     let mut batch_shape = size_args
         .iter()
         .map(|&dim| match e.node(dim) {
@@ -1285,6 +1305,16 @@ pub(crate) fn lower_sample(
 ///   are the discrete Tier-3 cases; Poisson and the NegativeBinomial mixtures
 ///   are the Tier-4 cases just admitted.)
 const FANOUT_SAFE: &[&str] = &[
+    "BernoulliLogitGLM",
+    "BinomialLogitGLM",
+    "CategoricalLogitGLM",
+    "NormalGLM",
+    "PoissonLogGLM",
+    "NegativeBinomial2LogGLM",
+    "StudentTGLM",
+    "GammaLogGLM",
+    "OrderedLogitGLM",
+    "BetaLogitGLM",
     // Tier 1 (elementwise continuous)
     "Normal",
     "Exponential",

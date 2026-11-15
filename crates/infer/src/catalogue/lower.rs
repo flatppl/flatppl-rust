@@ -163,6 +163,9 @@ fn support(tag: SupportTag) -> ValueSet {
         // Dim-aware tags: caller must use `support_ctx` for these.
         SupportTag::StdSimplex
         | SupportTag::CartPowReals
+        | SupportTag::CartPowBooleans
+        | SupportTag::CartPowNonNegReals
+        | SupportTag::CartPowUnitInterval
         | SupportTag::CartPowNonNegIntegers
         | SupportTag::Unknown
         // Structural: the live support is computed from call args (ops.rs
@@ -177,6 +180,15 @@ fn support_ctx(tag: SupportTag, param: &str, ctx: &LowerCtx) -> ValueSet {
         SupportTag::StdSimplex => ValueSet::StdSimplex((ctx.param_dim)(param)),
         SupportTag::CartPowReals => {
             ValueSet::CartPow(Box::new(ValueSet::Reals), (ctx.param_dim)(param))
+        }
+        SupportTag::CartPowBooleans => {
+            ValueSet::CartPow(Box::new(ValueSet::Booleans), (ctx.param_dim)(param))
+        }
+        SupportTag::CartPowNonNegReals => {
+            ValueSet::CartPow(Box::new(ValueSet::NonNegReals), (ctx.param_dim)(param))
+        }
+        SupportTag::CartPowUnitInterval => {
+            ValueSet::CartPow(Box::new(ValueSet::UnitInterval), (ctx.param_dim)(param))
         }
         SupportTag::CartPowNonNegIntegers => {
             let d = (ctx.param_dim)(param);
