@@ -8342,10 +8342,21 @@ fn lower_broadcast_kernel(
         return broadcast::call_density(m, CallHead::Builtin(op), &pos_args, &kw_args, obs);
     }
 
-    // Tables have one axis. A matrix-valued product must therefore broadcast
-    // the scalar density directly instead of building a matrix of records.
+    // Table operands need row records (including constructor auto-splatting).
+    // Multi-axis observations likewise need the general per-cell density.
     let (resolved_obs, _) = resolve_ref_chain(m, obs);
-    if matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
+    let has_table = pos_args
+        .iter()
+        .chain(kw_args.iter().map(|(_, v)| v))
+        .any(|&arg| {
+            let (resolved, _) = resolve_ref_chain(m, arg);
+            matches!(
+                m.type_of(arg).or_else(|| m.type_of(resolved)),
+                Some(Type::Table { .. })
+            )
+        });
+    if has_table
+        || matches!(m.type_of(obs).or_else(|| m.type_of(resolved_obs)),
         Some(Type::Array { shape, .. }) if shape.len() > 1)
     {
         let head = match *m.node(head) {
