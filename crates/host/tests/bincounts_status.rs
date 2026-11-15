@@ -28,6 +28,31 @@ fn input_edges_get_a_runtime_status() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
+fn histogram_workspace_does_not_form_a_bin_by_observation_grid()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (target, bins) in [
+        (flatppl_host::Target::Cpu, 256),
+        (flatppl_host::Target::Gpu, 1024),
+    ] {
+        let compiled = Context::default().parse(
+            &format!("e=external(cartpow(reals,{}))\nx=external(cartpow(reals,65536))\ninputs=(e,x)\noutputs=bincounts(e,x)\n", bins+1),
+            None,
+            None,
+        )?.compile(&EmitOptions { target, ..Default::default() })?;
+        for grid in [
+            format!("tensor<{bins}x65536x"),
+            format!("tensor<65536x{bins}x"),
+        ] {
+            assert!(
+                !compiled.stablehlo.contains(&grid),
+                "histogram workspace: {grid}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn increasing_fixed_edges_need_no_status() -> Result<(), Box<dyn std::error::Error>> {
     for edges in [
         "[0.0, 1.0, inf]",

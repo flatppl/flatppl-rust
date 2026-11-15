@@ -1,6 +1,39 @@
 use flatppl_host::{Context, EmitOptions, Export, Schema};
 
 #[test]
+fn runtime_bernoulli_groups_prepare_one_integer_buffer() -> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let query = context.parse(
+        "p=elementof(cartpow(reals,3))\ng=external(cartpow(integers,5))\ny=external(cartpow(booleans,5))\ninputs=(p,g,y)\noutputs=logdensityof(Bernoulli.(p[g]),y)",
+        None,
+        None,
+    )?;
+    let prepared = context.prepare_likelihood(&query, &["g".into(), "y".into()])?;
+    assert_eq!(prepared.summaries.len(), 1);
+    for dtype in [flatppl_host::Dtype::F32, flatppl_host::Dtype::F64] {
+        let options = EmitOptions {
+            dtype,
+            ..Default::default()
+        };
+        let preparation = prepared.preparation.compile(&options)?;
+        let score = prepared.score.compile(&options)?;
+        check_summary_schemas(&preparation, &score, &prepared.summaries)?;
+        assert_eq!(
+            score
+                .inputs
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["p", prepared.summaries[0].as_str()]
+        );
+        assert!(
+            matches!(&preparation.output, Schema::Tensor { shape, dtype: "int32" | "int64", .. } if shape == &[6])
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn reduced_imported_posterior_keeps_its_scalar_score_type() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut context = Context::default();

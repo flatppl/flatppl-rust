@@ -2147,6 +2147,34 @@ impl<'m> Emitter<'m> {
         self.reduce_axis("stablehlo.add", "0.000000e+00", a, rank - 1)
     }
 
+    /// Accumulate native integer counts at already-validated zero-based bins.
+    pub(crate) fn scatter_counts(&mut self, bins: u64, indices: &Value, updates: &Value) -> Value {
+        debug_assert_eq!(indices.elem, ElemKind::Int);
+        debug_assert_eq!(updates.elem, ElemKind::Int);
+        let zero = self.int_value_const(0);
+        let ty = MlirTy::Ranked(vec![Some(bins)]);
+        let initial = self.broadcast_in_dim(&zero, &[], ty.clone());
+        let mut dims = shape(&indices.ty).to_vec();
+        dims.push(Some(1));
+        let indices = self.reshape(indices, MlirTy::Ranked(dims));
+        let scalar_ty = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
+        let result_ty = ty.render(self.dtype, ElemKind::Int);
+        let left = self.fresh();
+        let right = self.fresh();
+        let sum = self.fresh();
+        let ssa = self.pure(format!(
+            "\"stablehlo.scatter\"({}, {}, {}) <{{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}}> ({{\n^bb0({left}: {scalar_ty}, {right}: {scalar_ty}):\n  {sum} = stablehlo.add {left}, {right} : {scalar_ty}\n  stablehlo.return {sum} : {scalar_ty}\n}}) : ({result_ty}, {}, {}) -> {result_ty}",
+            initial.ssa, indices.ssa, updates.ssa,
+            indices.ty.render(self.dtype, ElemKind::Int),
+            updates.ty.render(self.dtype, ElemKind::Int),
+        ));
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Int,
+        }
+    }
+
     /// [`Emitter::reduce_sum_last_axis`] with `stablehlo.maximum`: the largest
     /// element of each innermost row.
     pub fn reduce_max_last_axis(&mut self, a: &Value) -> Value {

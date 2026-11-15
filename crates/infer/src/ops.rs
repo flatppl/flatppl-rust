@@ -10201,6 +10201,14 @@ fn function_result(
     if let Some(ty) = unresolved_shaped_argument(sig, args) {
         return Some(ty);
     }
+    if name == "bincounts"
+        && let Some(shape) = arg_ty(args, 0).and_then(crate::catalogue::bin_count_shape)
+    {
+        return Some(Type::Array {
+            shape: shape.into(),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        });
+    }
     // `ResultSig::Record` interns field-name Symbols into the module. Behind a
     // RefCell so the `intern` closure is a `Fn` (not `FnMut`), coexisting with
     // the immutable arg accessors. This is the one live function-row lower path,

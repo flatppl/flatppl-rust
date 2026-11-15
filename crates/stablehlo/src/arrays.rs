@@ -423,6 +423,74 @@ pub(crate) fn lower_bincounts(
             e.record_runtime_error(&increasing, 8);
         }
     }
+    if n == 1 {
+        let first = e.reshape(&lo, MlirTy::Scalar);
+        let last = e.reshape(&hi, MlirTy::Scalar);
+        let above = e.compare("GE", &x, &first);
+        let below = e.compare("LE", &x, &last);
+        let valid = e.and(&above, &below);
+        let updates = e.convert(&valid, ElemKind::Int);
+        let count = e.reduce_sum_last_axis(&updates);
+        return Ok(e.reshape(&count, tensor(&[1])));
+    }
+    // Small GPU histograms fuse mask-and-reduce into one kernel. A scatter
+    // needs extra launches, so reserve it for larger bin counts there.
+    if e.int_fits(ne as i64) && (e.target() != crate::Target::Gpu || n > 256) {
+        let zero = e.int_value_const(0);
+        let one = e.int_value_const(1);
+        let two = e.int_value_const(2);
+        let end = e.int_value_const(ne as i64);
+        let last = e.int_value_const(ne as i64 - 1);
+        let mut lower = e.broadcast_in_dim(&zero, &[], tensor(&[m]));
+        let mut upper = e.broadcast_in_dim(&end, &[], tensor(&[m]));
+        // upper_bound(edges, x) needs at most bit_length(ne) rounds.
+        // Completed searches retain their bounds and use a safe gather probe.
+        for _ in 0..u64::BITS - ne.leading_zeros() {
+            let active = e.compare("LT", &lower, &upper);
+            let span = e.sub(&upper, &lower);
+            let half = e.floor_div(&span, &two);
+            let midpoint = e.add(&lower, &half);
+            let probe = e.min(&midpoint, &last);
+            let edge = e.gather_cells(&edges, &probe, 0);
+            let right = e.compare("GE", &x, &edge);
+            let left = e.not(&right);
+            let right = e.and(&active, &right);
+            let left = e.and(&active, &left);
+            let next = e.add(&midpoint, &one);
+            lower = e.select(&right, &next, &lower);
+            upper = e.select(&left, &midpoint, &upper);
+        }
+        let first = e.gather_cells(&edges, &zero, 0);
+        let final_edge = e.gather_cells(&edges, &last, 0);
+        let above = e.compare("GE", &x, &first);
+        let below = e.compare("LE", &x, &final_edge);
+        let valid = e.and(&above, &below);
+        let index = e.sub(&lower, &one);
+        let final_bin = e.int_value_const(n as i64 - 1);
+        let index = e.min(&index, &final_bin);
+        let index = e.max(&index, &zero);
+        let index = e.select(&valid, &index, &zero);
+        let updates = e.convert(&valid, ElemKind::Int);
+        // Independent partial histograms limit GPU atomic contention on skewed
+        // data. Reduce a bounded bins-by-shards buffer, never bins-by-data.
+        if e.target() == crate::Target::Gpu && m >= 4096 {
+            let shards = m.div_ceil(256).min(256);
+            if let Some(bins) = n
+                .checked_mul(shards)
+                .filter(|&bins| bins <= i32::MAX as u64)
+            {
+                let rows = e.index_vector(m, true);
+                let width = e.int_value_const(shards as i64);
+                let shard = e.floor_mod(&rows, &width);
+                let index = e.mul(&index, &width);
+                let index = e.add(&index, &shard);
+                let counts = e.scatter_counts(bins, &index, &updates);
+                let counts = e.reshape(&counts, tensor(&[n, shards]));
+                return Ok(e.reduce_sum_last_axis(&counts));
+            }
+        }
+        return Ok(e.scatter_counts(n, &index, &updates));
+    }
     let grid = tensor(&[n, m]);
     let xs = e.broadcast_in_dim(&x, &[1], grid.clone());
     let los = e.broadcast_in_dim(&lo, &[0], grid.clone());
@@ -436,7 +504,14 @@ pub(crate) fn lower_bincounts(
     let is_last = e.broadcast_in_dim(&is_last, &[0], grid);
     let below = e.select(&is_last, &below_closed, &below_open);
     let inside = e.and(&above, &below);
-    let ones = e.convert(&inside, ElemKind::Real);
+    // A sum of at most 2^24 zeros/ones is exact even in f32. Preserve the
+    // faster fused GPU reduction in that range, then use native integers.
+    let kind = if m <= 1 << 24 {
+        ElemKind::Real
+    } else {
+        ElemKind::Int
+    };
+    let ones = e.convert(&inside, kind);
     let counts = e.reduce_sum_last_axis(&ones);
     Ok(e.convert(&counts, ElemKind::Int))
 }
