@@ -23,7 +23,9 @@ mod refuse;
 mod sample;
 mod stdfn;
 mod sufficient_statistics;
-pub use analysis::{AnalysisError, ModelAnalysis, NormalCoordinate, OutputTerm, analyze_model};
+pub use analysis::{
+    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm, analyze_model,
+};
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
@@ -34,6 +36,7 @@ pub use driver::{
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
 pub use normal_coordinates::{
     CoordinatePrecision, NormalCoordinateQueries, prepare_normal_coordinate,
+    prepare_normal_coordinate_at_path,
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;

@@ -8,6 +8,21 @@ use flatppl_core::{
     ValueSet,
 };
 
+/// One declared input or a static record field within it. Arrays remain whole.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InputPath {
+    pub input: String,
+    pub fields: Vec<String>,
+}
+
+impl InputPath {
+    /// A whole-record dependency overlaps every field below that record.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.input == other.input
+            && (self.fields.starts_with(&other.fields) || other.fields.starts_with(&self.fields))
+    }
+}
+
 /// One additive output term. Node IDs refer to the module passed to analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputTerm {
@@ -16,16 +31,20 @@ pub struct OutputTerm {
     pub multiplicity: usize,
     pub parameters: Vec<String>,
     pub data: Vec<String>,
+    pub input_paths: Vec<InputPath>,
 }
 
 /// An advisory scalar Normal coordinate map, never an automatic rewrite.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalCoordinate {
     pub parameter: String,
+    pub fields: Vec<String>,
     pub location: NodeId,
     pub scale: NodeId,
     pub location_parents: Vec<String>,
     pub scale_parents: Vec<String>,
+    pub location_paths: Vec<InputPath>,
+    pub scale_paths: Vec<InputPath>,
     /// False means the map requires a finite runtime location check.
     pub finite_location_proven: bool,
     /// False means the map requires a positive finite runtime scale check.
@@ -45,6 +64,7 @@ pub struct ModelAnalysis {
     pub components: Vec<Vec<String>>,
     pub unused_parameters: Vec<String>,
     pub normal_coordinates: Vec<NormalCoordinate>,
+    pub input_paths: Vec<InputPath>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +117,8 @@ struct Dependencies<'a> {
     aliases: HashMap<Symbol, Symbol>,
     alias_names: HashSet<Symbol>,
     order: Vec<Symbol>,
-    cache: HashMap<NodeId, HashSet<Symbol>>,
+    cache: HashMap<NodeId, HashSet<InputPath>>,
+    paths: Vec<InputPath>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,7 +139,98 @@ impl From<Ref> for Reference {
 }
 
 impl Dependencies<'_> {
+    fn input_path(&self, mut id: NodeId, locals: &[Reference]) -> Option<InputPath> {
+        let m = self.module;
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        while seen.insert(id) {
+            match m.node(id) {
+                Node::Ref(r) if locals.contains(&Reference::from(*r)) => return None,
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => {
+                    if let Some(&declared) = self.aliases.get(name) {
+                        fields.reverse();
+                        let mut ty = m.type_of(m.binding(m.alias_target(declared)?).rhs)?;
+                        for field in &fields {
+                            let Type::Record(entries) = ty else {
+                                return None;
+                            };
+                            ty = &entries
+                                .iter()
+                                .find(|(name, _)| m.resolve(*name) == field)?
+                                .1;
+                        }
+                        return Some(InputPath {
+                            input: m.resolve(declared).into(),
+                            fields,
+                        });
+                    }
+                    id = m.binding(m.binding_by_name(*name)?).rhs;
+                }
+                Node::Call(c) if matches!(c.head,CallHead::Builtin(h) if m.resolve(h)=="get") => {
+                    let [receiver, key] = *c.args else {
+                        return None;
+                    };
+                    let Node::Lit(Scalar::Str(field)) = m.node(key) else {
+                        return None;
+                    };
+                    fields.push(field.to_string());
+                    id = receiver;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn all_paths(&self) -> Vec<InputPath> {
+        let m = self.module;
+        let mut result = Vec::new();
+        for &name in &self.order {
+            let Some(ty) = m
+                .alias_target(name)
+                .and_then(|b| m.type_of(m.binding(b).rhs))
+            else {
+                continue;
+            };
+            let mut stack = vec![(ty, Vec::new())];
+            while let Some((ty, fields)) = stack.pop() {
+                result.push(InputPath {
+                    input: m.resolve(name).into(),
+                    fields: fields.clone(),
+                });
+                if let Type::Record(entries) = ty {
+                    for (name, ty) in entries.iter().rev() {
+                        let mut child = fields.clone();
+                        child.push(m.resolve(*name).into());
+                        stack.push((ty, child));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn ordered_paths(&self, paths: &HashSet<InputPath>) -> Vec<InputPath> {
+        self.paths
+            .iter()
+            .filter(|p| paths.contains(p))
+            .cloned()
+            .collect()
+    }
+
     fn get(&mut self, root: NodeId) -> HashSet<Symbol> {
+        let paths = self.get_paths(root);
+        self.order
+            .iter()
+            .copied()
+            .filter(|name| paths.iter().any(|p| p.input == self.module.resolve(*name)))
+            .collect()
+    }
+
+    fn get_paths(&mut self, root: NodeId) -> HashSet<InputPath> {
         if let Some(value) = self.cache.get(&root) {
             return value.clone();
         }
@@ -134,7 +246,10 @@ impl Dependencies<'_> {
                 continue;
             }
             if active.contains(&key) {
-                found.extend(self.boundary.iter().copied());
+                found.extend(self.order.iter().map(|name| InputPath {
+                    input: m.resolve(*name).into(),
+                    fields: vec![],
+                }));
                 continue;
             }
             if !seen.insert(key.clone()) {
@@ -142,23 +257,33 @@ impl Dependencies<'_> {
             }
             active.insert(key);
             pending.push((id, locals.clone(), true));
+            if let Some(path) = self.input_path(id, &locals) {
+                found.insert(path);
+                continue;
+            }
             match m.node(id) {
                 Node::Ref(r) if locals.contains(&Reference::from(*r)) => {}
                 Node::Ref(Ref {
                     ns: RefNs::SelfMod,
                     name,
                 }) => {
-                    if let Some(&declared) = self.aliases.get(name) {
-                        found.insert(declared);
-                    } else if let Some(bid) = m.binding_by_name(*name) {
+                    if let Some(bid) = m.binding_by_name(*name) {
                         pending.push((m.binding(bid).rhs, locals, false));
                     } else {
-                        found.extend(self.boundary.iter().copied());
+                        found.extend(self.order.iter().map(|name| InputPath {
+                            input: m.resolve(*name).into(),
+                            fields: vec![],
+                        }));
                     }
                 }
                 Node::Call(c) => {
                     let mut locals = locals;
-                    if let Some(Inputs::Spec(inputs)) = &c.inputs {
+                    let inputs = match &c.inputs {
+                        Some(Inputs::Spec(inputs)) => Some(inputs.as_ref()),
+                        Some(Inputs::Auto) => m.auto_inputs_of(id),
+                        None => None,
+                    };
+                    if let Some(inputs) = inputs {
                         for (_, reference) in inputs.iter() {
                             let reference = Reference::from(*reference);
                             if !locals.contains(&reference) {
@@ -173,7 +298,10 @@ impl Dependencies<'_> {
                             .map(|child| (child, locals.clone(), false)),
                     );
                 }
-                Node::Ref(_) => found.extend(self.boundary.iter().copied()),
+                Node::Ref(_) => found.extend(self.order.iter().map(|name| InputPath {
+                    input: m.resolve(*name).into(),
+                    fields: vec![],
+                })),
                 _ => {}
             }
         }
@@ -275,19 +403,22 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     if !matches!(m.node(family),Node::Const(name) if m.resolve(*name)=="Normal") {
         return None;
     }
-    let point = resolve(m, point, &deps.alias_names);
-    let Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }) = *m.node(point)
-    else {
-        return None;
-    };
-    let name = *deps.aliases.get(&name)?;
-    if !deps.boundary.contains(&name)
-        || m.type_of(point) != Some(&Type::Scalar(ScalarType::Real))
-        || m.valueset_of(point) != Some(&ValueSet::Reals)
-    {
+    let path = deps.input_path(point, &[])?;
+    let name = *deps
+        .order
+        .iter()
+        .find(|name| m.resolve(**name) == path.input)?;
+    let mut domain = m.valueset_of(m.binding(m.alias_target(name)?).rhs)?;
+    for field in &path.fields {
+        let ValueSet::RecordSet(entries) = domain else {
+            return None;
+        };
+        domain = &entries
+            .iter()
+            .find(|(name, _)| m.resolve(*name) == field)?
+            .1;
+    }
+    if domain != &ValueSet::Reals {
         return None;
     }
     let parameters = call(m, resolve(m, parameters, &deps.alias_names), "record")?;
@@ -312,7 +443,13 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     }
     let location_deps = deps.get(location);
     let scale_deps = deps.get(scale);
-    if location_deps.contains(&name) || scale_deps.contains(&name) {
+    let location_paths = deps.get_paths(location);
+    let scale_paths = deps.get_paths(scale);
+    if location_paths
+        .iter()
+        .chain(&scale_paths)
+        .any(|parent| parent.overlaps(&path))
+    {
         return None;
     }
     let scale_value = resolve(m, scale, &deps.alias_names);
@@ -333,10 +470,13 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     };
     Some(NormalCoordinate {
         parameter: m.resolve(name).to_string(),
+        fields: path.fields,
         location,
         scale,
         location_parents: deps.names(&location_deps),
         scale_parents: deps.names(&scale_deps),
+        location_paths: deps.ordered_paths(&location_paths),
+        scale_paths: deps.ordered_paths(&scale_paths),
         finite_location_proven,
         positive_finite_scale_proven: proven,
         cyclic: false,
@@ -398,7 +538,9 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         aliases,
         order,
         cache: HashMap::new(),
+        paths: Vec::new(),
     };
+    deps.paths = deps.all_paths();
     let parameter_set = deps
         .boundary
         .difference(&data)
@@ -413,6 +555,7 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         let all = deps.get(node);
         let ps = all.intersection(&parameter_set).copied().collect();
         let ds = all.intersection(&data).copied().collect();
+        let paths = deps.get_paths(node);
         used.extend(&ps);
         terms.push(OutputTerm {
             node,
@@ -420,14 +563,15 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
             multiplicity,
             parameters: deps.names(&ps),
             data: deps.names(&ds),
+            input_paths: deps.ordered_paths(&paths),
         });
         if sign == 1
             && multiplicity == 1
             && let Some(candidate) = normal_coordinate(&mut deps, node)
             && parameters.contains(&candidate.parameter)
-            && !normal_coordinates
-                .iter()
-                .any(|c: &NormalCoordinate| c.parameter == candidate.parameter)
+            && !normal_coordinates.iter().any(|c: &NormalCoordinate| {
+                c.parameter == candidate.parameter && c.fields == candidate.fields
+            })
         {
             normal_coordinates.push(candidate)
         }
@@ -456,27 +600,41 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
     }
     let candidate_names = normal_coordinates
         .iter()
-        .map(|c| c.parameter.clone())
+        .map(|c| InputPath {
+            input: c.parameter.clone(),
+            fields: c.fields.clone(),
+        })
         .collect::<HashSet<_>>();
     let edges = normal_coordinates
         .iter()
         .map(|c| {
             (
-                c.parameter.clone(),
-                c.location_parents
+                InputPath {
+                    input: c.parameter.clone(),
+                    fields: c.fields.clone(),
+                },
+                c.location_paths
                     .iter()
-                    .chain(&c.scale_parents)
-                    .filter(|p| candidate_names.contains(*p))
+                    .chain(&c.scale_paths)
+                    .flat_map(|p| {
+                        candidate_names
+                            .iter()
+                            .filter(move |candidate| p.overlaps(candidate))
+                    })
                     .cloned()
                     .collect::<Vec<_>>(),
             )
         })
         .collect::<HashMap<_, _>>();
     for candidate in &mut normal_coordinates {
-        let mut pending = edges[&candidate.parameter].clone();
+        let path = InputPath {
+            input: candidate.parameter.clone(),
+            fields: candidate.fields.clone(),
+        };
+        let mut pending = edges[&path].clone();
         let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
-            if name == candidate.parameter {
+            if name == path {
                 candidate.cyclic = true;
                 break;
             }
@@ -493,6 +651,7 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         components,
         unused_parameters: deps.names(&unused),
         normal_coordinates,
+        input_paths: deps.paths.clone(),
     })
 }
 

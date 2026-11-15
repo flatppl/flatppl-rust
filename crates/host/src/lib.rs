@@ -28,12 +28,14 @@ pub use constants::Constant;
 pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_determinizer::PreparationOptions;
-pub use flatppl_determinizer::{AnalysisError, ModelAnalysis, NormalCoordinate, OutputTerm};
+pub use flatppl_determinizer::{
+    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+};
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
 pub use formula::FormulaModel;
 pub use incremental::{IncrementalScoreQueries, IncrementalTermQuery, ScoreRevisions, ScoreTicket};
 pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
-pub use normal_coordinates::NormalCoordinateExports;
+pub use normal_coordinates::{NormalCoordinateExports, PreparedNormalCoordinate};
 pub use transforms::TransformedQueries;

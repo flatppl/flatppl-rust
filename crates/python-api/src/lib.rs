@@ -21,6 +21,26 @@ pyo3::create_exception!(_native, Error, PyException);
 
 type BatchArguments = (Vec<u64>, Vec<Vec<Option<usize>>>);
 
+type NativeTerm = (NativeModule, Vec<String>, String, Vec<Vec<String>>);
+
+fn input_path(mut path: Vec<String>) -> PyResult<flatppl_host::InputPath> {
+    if path.is_empty() {
+        return Err(PyValueError::new_err(
+            "an input path requires a root input name",
+        ));
+    }
+    Ok(flatppl_host::InputPath {
+        input: path.remove(0),
+        fields: path,
+    })
+}
+
+fn path_parts(path: &flatppl_host::InputPath) -> Vec<String> {
+    std::iter::once(path.input.clone())
+        .chain(path.fields.iter().cloned())
+        .collect()
+}
+
 fn error(diagnostic: Diagnostic) -> PyErr {
     Error::new_err(
         serde_json::to_string(&diagnostic).expect("diagnostics contain only JSON values"),
@@ -238,6 +258,61 @@ impl NativeContext {
             .map_err(error)
     }
 
+    fn prepare_incremental_score(
+        &mut self,
+        module: &NativeModule,
+        data_inputs: Vec<String>,
+    ) -> PyResult<NativeIncrementalPlan> {
+        self.inner
+            .prepare_incremental_score(&module.inner, &data_inputs)
+            .map(|inner| NativeIncrementalPlan { inner })
+            .map_err(error)
+    }
+
+    fn normal_coordinate(
+        &mut self,
+        module: &NativeModule,
+        data_inputs: Vec<String>,
+        parameter: Vec<String>,
+        logdensity: bool,
+        dtype: &str,
+    ) -> PyResult<(
+        NativeModule,
+        NativeModule,
+        NativeModule,
+        NativeModule,
+        String,
+    )> {
+        let dtype = match dtype {
+            "float32" => Dtype::F32,
+            "float64" => Dtype::F64,
+            _ => return Err(PyValueError::new_err("dtype must be float32 or float64")),
+        };
+        let plan = self
+            .inner
+            .prepare_normal_coordinate_queries_at_path(
+                &module.inner,
+                &data_inputs,
+                &input_path(parameter)?,
+                logdensity,
+                dtype,
+            )
+            .map_err(error)?;
+        Ok((
+            NativeModule { inner: plan.score },
+            NativeModule {
+                inner: plan.forward,
+            },
+            NativeModule {
+                inner: plan.inverse,
+            },
+            NativeModule {
+                inner: plan.log_jacobian,
+            },
+            plan.coordinate_input,
+        ))
+    }
+
     fn transform(
         &mut self,
         module: &NativeModule,
@@ -258,6 +333,105 @@ impl NativeContext {
                 inner: queries.unconstrain,
             },
         ))
+    }
+}
+
+#[pyclass(name = "IncrementalPlan", module = "flatppl._native")]
+struct NativeIncrementalPlan {
+    inner: flatppl_host::IncrementalScoreQueries,
+}
+
+#[pymethods]
+impl NativeIncrementalPlan {
+    fn terms(&self) -> Vec<NativeTerm> {
+        self.inner
+            .terms()
+            .iter()
+            .map(|term| {
+                (
+                    NativeModule {
+                        inner: term.query.clone(),
+                    },
+                    term.dependencies.clone(),
+                    term.cache_input.clone(),
+                    term.input_paths.iter().map(path_parts).collect(),
+                )
+            })
+            .collect()
+    }
+    fn combine(&self) -> NativeModule {
+        NativeModule {
+            inner: self.inner.combine().clone(),
+        }
+    }
+    fn inputs(&self) -> Vec<String> {
+        self.inner.inputs().to_vec()
+    }
+    fn affected_terms(&self, changed: Vec<String>) -> PyResult<Vec<usize>> {
+        self.inner
+            .affected_terms(&changed)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn affected_paths(&self, changed: Vec<Vec<String>>) -> PyResult<Vec<usize>> {
+        let paths = changed
+            .into_iter()
+            .map(input_path)
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .affected_paths(&paths)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn revisions(&self) -> NativeScoreRevisions {
+        NativeScoreRevisions {
+            inner: self.inner.revisions(),
+        }
+    }
+}
+
+#[pyclass(name = "ScoreRevisions", module = "flatppl._native")]
+struct NativeScoreRevisions {
+    inner: flatppl_host::ScoreRevisions,
+}
+
+#[pyclass(name = "ScoreTicket", module = "flatppl._native")]
+struct NativeScoreTicket {
+    inner: Option<flatppl_host::ScoreTicket>,
+}
+
+#[pymethods]
+impl NativeScoreRevisions {
+    fn invalidate(&mut self, changed: Vec<String>) -> PyResult<Vec<usize>> {
+        self.inner
+            .invalidate(&changed)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn ticket(&self, term: usize) -> PyResult<NativeScoreTicket> {
+        self.inner
+            .ticket(term)
+            .map(|ticket| NativeScoreTicket {
+                inner: Some(ticket),
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn invalidate_paths(&mut self, changed: Vec<Vec<String>>) -> PyResult<Vec<usize>> {
+        let paths = changed
+            .into_iter()
+            .map(input_path)
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .invalidate_paths(&paths)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn accept(&mut self, ticket: &mut NativeScoreTicket) -> bool {
+        ticket
+            .inner
+            .take()
+            .is_some_and(|ticket| self.inner.accept(ticket))
+    }
+    fn is_current(&self, term: usize) -> PyResult<bool> {
+        self.inner
+            .is_current(term)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 }
 
@@ -400,6 +574,9 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeContext>()?;
     m.add_class::<NativeModule>()?;
     m.add_class::<NativeFormulaModel>()?;
+    m.add_class::<NativeIncrementalPlan>()?;
+    m.add_class::<NativeScoreRevisions>()?;
+    m.add_class::<NativeScoreTicket>()?;
     m.add("Error", m.py().get_type::<Error>())?;
     Ok(())
 }
