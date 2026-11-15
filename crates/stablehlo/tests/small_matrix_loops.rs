@@ -13,6 +13,16 @@ fn normal(n: usize, target: Target) -> String {
 }
 
 fn emit(source: &str, target: Target) -> String {
+    emit_with_options(
+        source,
+        &EmitOptions {
+            target,
+            ..Default::default()
+        },
+    )
+}
+
+fn emit_with_options(source: &str, options: &EmitOptions) -> String {
     let mut module = flatppl_syntax::parse(source).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut module);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -23,15 +33,7 @@ fn emit(source: &str, target: Target) -> String {
         Some(&roots),
     )
     .expect("determinize");
-    flatppl_stablehlo::emit(
-        &lowered,
-        Mode::LogDensity,
-        &EmitOptions {
-            target,
-            ..Default::default()
-        },
-    )
-    .expect("emit")
+    flatppl_stablehlo::emit(&lowered, Mode::LogDensity, options).expect("emit")
 }
 
 #[test]
@@ -101,6 +103,25 @@ fn pivoted_inverse_keeps_a_tighter_gpu_unroll_limit() {
         let gpu = emit(&source, Target::Gpu);
         assert_eq!(gpu.matches("stablehlo.while").count(), loops, "{gpu}");
     }
+}
+
+#[test]
+fn compatible_gpu_solves_keep_panel_graphs_compact() {
+    let source = "a = external(cartpow(reals, [64,64]))\n\
+                  b = external(cartpow(reals, 64))\n\
+                  inputs = (a,b)\noutputs = linsolve(a,b)\n";
+    let compatible = emit(source, Target::Gpu);
+    let unrestricted = emit_with_options(
+        source,
+        &EmitOptions {
+            target: Target::Gpu,
+            restrict_enzyme_compatible: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(compatible.matches("stablehlo.while").count(), 4);
+    assert!(!unrestricted.contains("stablehlo.while"));
+    assert!(compatible.len() * 4 < unrestricted.len());
 }
 
 #[test]
