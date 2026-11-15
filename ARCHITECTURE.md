@@ -428,6 +428,18 @@ identities remain usable by future emitters. `flatppl analyze model.flatppl
 --data-input y` prints the same facts. Analysis runs only when requested and
 uses no hidden incremental evaluation cache.
 
+`prepare_incremental_score` builds portable scalar term queries and a combiner
+that keeps the original arithmetic tree, scalar types and repeated terms.
+Input aliases share one dependency under the declared ABI name. Fixed file data
+loads once for the plan. The original query stays unchanged.
+The host exposes explicit dependency invalidation and revision tickets. Notify
+the coordinator before every input change, including array edits and rollbacks.
+Accept a result only after its native status succeeds and its ticket is current.
+Valid infinite scores remain cacheable. Recombination evaluates the original
+tree over cached values, rather than subtracting stale totals. Each compiled
+plan, precision and target needs its own coordinator. Cached scalar values do
+not provide full parameter gradients; retain term gradients or recompute them.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +
