@@ -613,6 +613,43 @@ impl Context {
         })
     }
 
+    /// Prepare a joint triangular Normal map over explicitly selected paths.
+    pub fn prepare_normal_coordinates_queries(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        paths: &[flatppl_determinizer::InputPath],
+        logdensity: bool,
+        dtype: flatppl_stablehlo::Dtype,
+    ) -> Result<crate::PreparedNormalCoordinates, Diagnostic> {
+        let fail = |message: String| {
+            Diagnostic::new("prepare_normal_coordinates", module.source_name(), message)
+        };
+        let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
+        crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
+            .map_err(|error| fail(error.to_string()))?;
+        let precision = match dtype {
+            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
+            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
+        };
+        let plan = flatppl_determinizer::prepare_normal_coordinates(
+            &lowered,
+            data_inputs,
+            paths,
+            precision,
+            logdensity,
+        )
+        .map_err(|error| fail(error.to_string()))?;
+        Ok(crate::PreparedNormalCoordinates {
+            score: self.prepared_query(module, plan.score)?,
+            forward: self.prepared_query(module, plan.forward)?,
+            inverse: self.prepared_query(module, plan.inverse)?,
+            log_jacobian: self.prepared_query(module, plan.log_jacobian)?,
+            coordinate_inputs: plan.coordinate_inputs,
+            paths: plan.paths,
+        })
+    }
+
     /// Export ordinary scalar term queries plus their original-tree combiner.
     /// Fixed file data loads once for the entire plan. Re-evaluate terms after
     /// explicit dependency changes and check each native status before caching.

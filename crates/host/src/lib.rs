@@ -39,5 +39,7 @@ pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, T
 pub use formula::FormulaModel;
 pub use incremental::{IncrementalScoreQueries, IncrementalTermQuery, ScoreRevisions, ScoreTicket};
 pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
-pub use normal_coordinates::{NormalCoordinateExports, PreparedNormalCoordinate};
+pub use normal_coordinates::{
+    NormalCoordinateExports, PreparedNormalCoordinate, PreparedNormalCoordinates,
+};
 pub use transforms::TransformedQueries;

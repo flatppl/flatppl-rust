@@ -14,6 +14,17 @@ pub struct PreparedNormalCoordinate {
     pub coordinate_input: String,
 }
 
+/// A joint triangular Normal map. Selected roots retain original ABI names;
+/// forward/inverse results list those roots in original argument order.
+pub struct PreparedNormalCoordinates {
+    pub score: Arc<LoadedModule>,
+    pub forward: Arc<LoadedModule>,
+    pub inverse: Arc<LoadedModule>,
+    pub log_jacobian: Arc<LoadedModule>,
+    pub coordinate_inputs: Vec<String>,
+    pub paths: Vec<crate::InputPath>,
+}
+
 /// All queries use the requested emission precision and target. Every output is
 /// `(value, valid)` plus any separate native runtime status. Check both before
 /// using a value. Invalid coordinates are not support-zero log densities.
