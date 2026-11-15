@@ -573,7 +573,22 @@ fn score(e: &mut Emitter, p: &Params, y: &Value, family: Family) -> Result<Value
                 // subtracting three large log-Gamma values.
                 let ap1 = e.add(&a, &one);
                 let bp1 = e.add(&b, &one);
-                let shifted_beta = e.log_beta(&ap1, &bp1);
+                let shared_denominator_rows = match e.dtype() {
+                    Dtype::F32 => 16384,
+                    Dtype::F64 => 8192,
+                };
+                let shifted_beta =
+                    if matches!(e.target(), crate::Target::Cpu) && n >= shared_denominator_rows {
+                        // Large CPU gradients benefit from sharing the denominator.
+                        // Both shifted shapes are below eight only when phi<14.
+                        let fourteen = e.scalar(14.0);
+                        let small_phi = e.min(&precision, &fourteen);
+                        let total = e.add(&small_phi, &two);
+                        let log_gamma_sum = e.lgamma(&total);
+                        e.log_beta_with_log_gamma_sum(&ap1, &bp1, Some(&log_gamma_sum))
+                    } else {
+                        e.log_beta(&ap1, &bp1)
+                    };
                 let norm = e.add(&la, &lb);
                 let norm = e.sub(&norm, &lp);
                 let log_phi_plus_one = e.log1p(&precision);
