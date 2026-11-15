@@ -916,6 +916,21 @@ fn shared_gamma_poisson_record_uses_updated_native_predictives() {
 }
 
 #[test]
+fn shared_gamma_rate_stays_carried_and_transformed_fields_do_not_use_the_joint_rule() {
+    let source = "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\noutputs=logdensityof(lawof(record(z=z,a=a,b=b)),record(z=.4,a=1,b=2))";
+    let score = pir_binding(&pir(source), "outputs");
+    assert!(score.contains("builtin_logdensityof Gamma"), "{score}");
+    assert_eq!(
+        score.matches("builtin_logdensityof Poisson").count(),
+        2,
+        "{score}"
+    );
+    assert!(!score.contains("NegativeBinomial"), "{score}");
+    let source = "z~Gamma(2.0,3.0)\na~Poisson(z)\nb~Poisson(z)\nc~Poisson(z)\noutputs=logdensityof(lawof(record(a=a,b=b,c=c+1)),record(a=1,b=2,c=3))";
+    assert!(determinize(&parse_infer(source)).is_err());
+}
+
+#[test]
 fn a_singular_record_law_refuses_rather_than_mislowers() {
     for second in ["a", "exp(a)"] {
         let src = format!(
