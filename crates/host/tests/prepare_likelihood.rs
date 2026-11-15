@@ -1,6 +1,39 @@
 use flatppl_host::{Context, EmitOptions, Export, Schema};
 
 #[test]
+fn runtime_gaussian_groups_remove_data_and_compile_the_summary_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (family, support) in [
+        ("Normal", "interval(-20,20)"),
+        ("LogNormal", "interval(0.01,100)"),
+    ] {
+        let mut context = Context::default();
+        let query = context.parse(&format!(
+            "mu=elementof(cartpow(interval(-10,10),3))\nsigma=elementof(cartpow(interval(0.5,4),3))\ng=external(cartpow(integers,8))\ny=external(cartpow({support},8))\ninputs=(mu,sigma,g,y)\noutputs=logdensityof({family}.(mu[g],sigma[g]),y)"
+        ),None,None)?;
+        let prepared = context.prepare_likelihood(&query, &["g".into(), "y".into()])?;
+        assert_eq!(prepared.summaries.len(), 3);
+        for dtype in [flatppl_host::Dtype::F32, flatppl_host::Dtype::F64] {
+            let options = EmitOptions {
+                dtype,
+                ..Default::default()
+            };
+            let preparation = prepared.preparation.compile(&options)?;
+            let score = prepared.score.compile(&options)?;
+            check_summary_schemas(&preparation, &score, &prepared.summaries)?;
+            assert_eq!(score.inputs.len(), 5);
+            assert!(
+                !score
+                    .inputs
+                    .iter()
+                    .any(|field| field.name == "g" || field.name == "y")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn runtime_bernoulli_groups_prepare_one_integer_buffer() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = Context::default();
     let query = context.parse(

@@ -266,6 +266,13 @@ partitions with total selector length equal to the observation count. No
 operation scans every observation once per possible group, and unused groups
 add no scoring terms on the fixed-partition path. Runtime Bernoulli scoring batches
 the group terms. Preparation reuses monotonically allocated summary names.
+Runtime Normal and LogNormal partitions also prepare guarded centered moments.
+Gathered parameters must share their selector, origin and array extent. Scalar
+parameters remain invariant. The pass bounds both forward and reverse arithmetic
+in F32 and F64, sanitizes unused groups before primitive calls, and retains the
+LogNormal Jacobian. Setup uses masked reductions in O(NG), with at most 64 groups
+and a 2^22 observation-by-group workspace budget. Scoring uses O(G) work and three
+summary buffers. Unproved ranges and partitions retain ordinary scoring.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.

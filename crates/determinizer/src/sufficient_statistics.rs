@@ -18,6 +18,7 @@ use crate::RefuseError;
 mod circular;
 mod correlation;
 mod grouped;
+mod grouped_moments;
 mod histogram;
 mod multivariate;
 mod packing;
@@ -563,6 +564,18 @@ enum DataKey {
 }
 
 impl Reducer {
+    fn data_key(&self, m: &Module, id: NodeId) -> DataKey {
+        let id = resolve(m, id, &self.boundary);
+        match m.node(id) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) if self.boundary.contains(name) => DataKey::Input(*name),
+            Node::Lit(Scalar::Int(value)) => DataKey::Integer(*value),
+            _ => DataKey::Node(id),
+        }
+    }
+
     fn data_only(&self, m: &Module, id: NodeId) -> bool {
         data_only_cached(
             m,
@@ -595,17 +608,7 @@ impl Reducer {
     ) -> Expr {
         let key = data
             .iter()
-            .map(|&data| {
-                let data = resolve(m, data, &self.boundary);
-                match m.node(data) {
-                    Node::Ref(Ref {
-                        ns: RefNs::SelfMod,
-                        name,
-                    }) if self.boundary.contains(name) => DataKey::Input(*name),
-                    Node::Lit(Scalar::Int(value)) => DataKey::Integer(*value),
-                    _ => DataKey::Node(data),
-                }
-            })
+            .map(|&data| self.data_key(m, data))
             .collect::<Vec<_>>();
         if let Some(&id) = self.cache.get(&(key.clone(), kind)) {
             return Expr::Node(id);
@@ -662,6 +665,9 @@ impl Reducer {
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
         if let Some(result) = grouped::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_moments::reduce(self, m, id) {
             return Some(result);
         }
         if let Some(result) = correlation::reduce(self, m, id) {
