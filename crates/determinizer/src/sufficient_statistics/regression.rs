@@ -282,7 +282,7 @@ fn collect(
 }
 
 /// Name preparation intermediates without making them extra scoring inputs.
-fn setup(m: &mut Module, expression: Expr) -> Expr {
+pub(super) fn setup(m: &mut Module, expression: Expr) -> Expr {
     let rhs = materialize(m, expression);
     let mut serial = 0;
     let name = loop {

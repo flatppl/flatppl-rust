@@ -27,6 +27,7 @@ mod regression;
 mod repeated;
 mod report;
 mod scalar;
+mod sorted;
 use crate::density::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 
@@ -665,6 +666,11 @@ impl Reducer {
     }
 
     fn reduce(&mut self, m: &mut Module, id: NodeId) -> Option<NodeId> {
+        if let Some(result) = sorted::reduce(self, m, id) {
+            self.rule = Some(("sorted Laplace distances", None));
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
         if let Some(result) = grouped::reduce(self, m, id) {
             return Some(result);
         }

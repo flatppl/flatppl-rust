@@ -208,6 +208,13 @@ their shape. `PreparationOptions::pack_summaries` and CLI `--pack-summaries`
 control this layout independently of likelihood reduction. This reduces scalar
 query arguments across backends without adding an IR operation.
 
+Explicit Laplace preparation can sort bounded finite scalar observations with a
+portable bitonic network. A contiguous table holds sorted values and normalized
+adjacent-gap prefix/suffix distances. Scoring uses strict binary search and
+nonnegative local distances, preserving the primitive location derivative at
+knots without large-prefix cancellation. Finite forward/reverse range proofs
+and a 16384-row bound limit setup work. Ordinary emission stays unchanged.
+
 The pass recognizes shared scalar parameters in IID and constructor-broadcast
 densities. Its moment rules cover Normal, LogNormal, Gamma, Beta, Exponential,
 Poisson, ContinuedPoisson, Binomial, Bernoulli, Geometric, and interval Uniform.
