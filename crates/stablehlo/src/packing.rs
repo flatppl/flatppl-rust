@@ -301,6 +301,13 @@ impl Packer<'_, '_> {
         };
         if !self.members.contains_key(name)
             && let Some(producer) = self.source.pointwise.get(name)
+            // Folded views can retain recipes whose source is dead or later
+            // than the reused constant. Do not revive those dependencies.
+            && producer
+                .op
+                .inputs()
+                .iter()
+                .all(|v| self.originals.contains_key(&v.ssa))
             && let Some(op) = producer.op.remap_segment(|v| Value {
                 ssa: self.originals[&v.ssa].clone(),
                 ..v.clone()
