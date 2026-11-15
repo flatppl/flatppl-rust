@@ -859,6 +859,78 @@ impl Emitter<'_> {
         } else {
             b
         };
+        // Keep tiny solves available for scalar fusion. Explicit host batches
+        // retain primitive replay until helper calls have a batching recipe.
+        let (x, valid) = if n >= 8 && batch == 0 && !self.host_batch {
+            self.matrix_solve_helper(&a, &b, n)
+        } else {
+            self.matrix_solve_body(a, b, n)
+        };
+        self.record_runtime_error(&valid, 4);
+        Ok(if vector_rhs {
+            self.reshape_cell(&x, tensor(vec![Some(n)]))
+        } else {
+            x
+        })
+    }
+
+    /// The versioned private boundary is ordinary portable IR. Consumers that
+    /// do not recognize its contract can inline and differentiate the body.
+    fn matrix_solve_helper(&mut self, a: &Value, b: &Value, n: u64) -> (Value, Value) {
+        let k = shape(&b.ty)[1].expect("static matrix RHS checked by caller");
+        let dtype = match self.dtype {
+            Dtype::F32 => "f32",
+            Dtype::F64 => "f64",
+        };
+        let target = match self.target {
+            crate::Target::Cpu => "cpu",
+            crate::Target::Gpu => "gpu",
+        };
+        let name = format!(
+            "__enzyme_linalg_solve_v1_{dtype}_{target}_n{n}_k{k}_r{}",
+            u8::from(self.restrict_enzyme_compatible),
+        );
+        if !self.solve_helpers.contains_key(&name) {
+            let mut helper = self.scratch_emitter();
+            let args = [
+                ("%a".to_owned(), a.ty.clone(), ElemKind::Real),
+                ("%b".to_owned(), b.ty.clone(), ElemKind::Real),
+            ];
+            let a = Value {
+                ssa: "%a".into(),
+                ..a.clone()
+            };
+            let b = Value {
+                ssa: "%b".into(),
+                ..b.clone()
+            };
+            let (x, valid) = helper.matrix_solve_body(a, b, n);
+            let definition = helper.finish_function(&name, &args, &[&x, &valid], true);
+            self.solve_helpers.insert(name.clone(), definition);
+        }
+        let a_ty = a.ty.render(self.dtype, ElemKind::Real);
+        let b_ty = b.ty.render(self.dtype, ElemKind::Real);
+        let result = self.fresh();
+        self.push(&format!(
+            "{result}:2 = func.call @{name}({}, {}) : ({a_ty}, {b_ty}) -> ({b_ty}, tensor<i1>)",
+            a.ssa, b.ssa,
+        ));
+        (
+            Value {
+                ssa: format!("{result}#0"),
+                ..b.clone()
+            },
+            Value {
+                ssa: format!("{result}#1"),
+                ty: MlirTy::Scalar,
+                elem: ElemKind::Bool,
+            },
+        )
+    }
+
+    /// Complete portable solve implementation, independent of caller status.
+    fn matrix_solve_body(&mut self, a: Value, b: Value, n: u64) -> (Value, Value) {
+        let batch = self.batch_rank(&a);
         // CPU indexed elimination remains faster for medium cells. GPU panels
         // amortize kernel launches earlier, with an unrolled panel body.
         let blocked_min = match self.target {
@@ -867,7 +939,6 @@ impl Emitter<'_> {
         };
         if batch == 0 && n >= blocked_min {
             let (lu, permutation, valid) = self.matrix_lu_blocked(&a, n);
-            self.record_runtime_error(&valid, 4);
             let rows = self.axis_indices(&lu, 0);
             let cols = self.axis_indices(&lu, 1);
             let diagonal = self.compare("EQ", &rows, &cols);
@@ -881,11 +952,7 @@ impl Emitter<'_> {
             let y = self.native_tri_solve(&lower, &b, false, true);
             let x = self.native_tri_solve(&upper, &y, false, false);
             let x = self.select(&valid, &x, &zero);
-            return Ok(if vector_rhs {
-                self.reshape_cell(&x, tensor(vec![Some(n)]))
-            } else {
-                x
-            });
+            return (x, valid);
         }
         let a_axes = self.axes_of(&a);
         let b_axes = self.axes_of(&b);
@@ -961,7 +1028,6 @@ impl Emitter<'_> {
         let a = self.axes_view(&eliminated[0], a_axes);
         let b = self.axes_view(&eliminated[1], b_axes.clone());
         let valid = self.axes_view(&eliminated[2], scalar_axes);
-        self.record_runtime_error(&valid, 4);
         if self.target == crate::Target::Gpu && n >= 8 {
             // Invalid cells must not enter the native solve: masking its result
             // alone can leave NaNs in the reverse pass.
@@ -973,11 +1039,7 @@ impl Emitter<'_> {
             let safe_b = self.select(&valid, &b, &zero);
             let x = self.native_tri_solve(&safe_a, &safe_b, false, false);
             let x = self.select(&valid, &x, &zero);
-            return Ok(if vector_rhs {
-                self.reshape_cell(&x, tensor(vec![Some(n)]))
-            } else {
-                x
-            });
+            return (x, valid);
         }
         let initial = self.constant_like(0.0, &b);
         let solved = self.matrix_loop(n, 4, &[initial], |e, index, args| {
@@ -1011,11 +1073,7 @@ impl Emitter<'_> {
         let x = self.axes_view(&solved[0], b_axes);
         let zero = self.constant_like(0.0, &x);
         let safe = self.select(&valid, &x, &zero);
-        Ok(if vector_rhs {
-            self.reshape_cell(&safe, tensor(vec![Some(n)]))
-        } else {
-            safe
-        })
+        (safe, valid)
     }
 
     /// Partial pivoting handles indefinite metrics and zero leading pivots.
@@ -1131,5 +1189,66 @@ impl Emitter<'_> {
             vec![e.select(&at_row, &row, &x)]
         });
         Ok(self.axes_view(&result[0], axes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flatppl_core::Idx;
+
+    #[test]
+    fn solve_definitions_survive_region_and_module_assembly() {
+        let module = Module::new();
+        let mut emitter = Emitter::new(&module, Dtype::F32);
+        let id = NodeId::from_usize(0);
+        let a = Value {
+            ssa: "%arg0".into(),
+            ty: tensor(vec![Some(8), Some(8)]),
+            elem: ElemKind::Real,
+        };
+        let b = Value {
+            ssa: "%arg1".into(),
+            ty: tensor(vec![Some(8)]),
+            elem: ElemKind::Real,
+        };
+        let x = emitter.matrix_solve(id, &a, &b).unwrap();
+        let result = emitter.matrix_loop(3, 0, &[x], |e, _, state| {
+            vec![e.matrix_solve(id, &a, &state[0]).unwrap()]
+        });
+        let args = [
+            (a.ssa.clone(), a.ty.clone(), a.elem),
+            (b.ssa.clone(), b.ty.clone(), b.elem),
+        ];
+        let plain = emitter.clone().finish("main", &args, &[&result[0]]);
+        let mapped = emitter
+            .finish_batched(
+                "main",
+                &args,
+                &[&result[0]],
+                &crate::BatchSpec {
+                    shape: vec![2],
+                    input_axes: vec![vec![None], vec![Some(0)]],
+                },
+            )
+            .unwrap();
+        for ir in [plain, mapped] {
+            assert_eq!(
+                ir.lines()
+                    .filter(
+                        |line| line.starts_with("  func.func private @__enzyme_linalg_solve_v1_")
+                    )
+                    .count(),
+                1,
+                "{ir}"
+            );
+            assert_eq!(
+                ir.matches("func.call @__enzyme_linalg_solve_v1_").count(),
+                2,
+                "{ir}"
+            );
+            assert!(ir.contains("-> (tensor<8x1xf32>, tensor<i1>)"), "{ir}");
+            assert!(ir.contains("flatppl.runtime_status"), "{ir}");
+        }
     }
 }
