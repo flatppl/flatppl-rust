@@ -136,6 +136,127 @@ fn promoted_group_indices_and_circular_points_never_become_static_guards() {
 }
 
 #[test]
+fn runtime_positive_families_prepare_portable_empty_group_statistics() {
+    for (law, event) in [
+        ("Exponential.(a[g])", "interval(0,10)"),
+        ("Gamma.(a[g],b[g])", "interval(.01,10)"),
+        ("Beta.(a[g],b[g])", "interval(.01,.99)"),
+    ] {
+        let source = format!(
+            "a=elementof(cartpow(interval(.1,8),6))\nb=elementof(cartpow(interval(.1,8),6))\ng=external(cartpow(integers,4))\ny=external(cartpow({event},4))\ninputs=(a,b,g,y)\noutputs=logdensityof({law},y)"
+        );
+        let raw = lower(&source, false);
+        let prepared = prepare_unpacked(&raw, &["g".into(), "y".into()]);
+        assert!(
+            !inputs(&prepared.score)
+                .iter()
+                .any(|name| name == "y" || name == "g")
+        );
+        for module in [&prepared.preparation, &prepared.score] {
+            let mut printed = flatppl_syntax::parse(&flatppl_syntax::print(module)).unwrap();
+            let errors = flatppl_infer::infer(&mut printed);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|d| d.severity == flatppl_infer::Severity::Error),
+                "{law}: {errors:?}"
+            );
+            assert!(flatppl_determinizer::is_flatpdl(&printed).is_ok());
+            assert!(flatppl_flatpir::read(&flatppl_flatpir::try_write(module).unwrap()).is_ok());
+        }
+        assert_eq!(
+            flatppl_flatpir::write(&raw),
+            flatppl_flatpir::write(&lower(&source, true))
+        );
+    }
+}
+
+#[test]
+fn runtime_positive_ranges_and_partition_identity_preserve_ordinary_fallbacks() {
+    for (family, parameter, event, second, groups, count) in [
+        ("Gamma", "interval(.1,65)", "interval(.01,10)", "g", 3, 4),
+        ("Beta", "interval(.1,65)", "interval(.01,.99)", "g", 3, 4),
+        ("Gamma", "interval(.1,8)", "interval(0,10)", "g", 3, 4),
+        ("Beta", "interval(.1,8)", "unitinterval", "g", 3, 4),
+        ("Gamma", "interval(.1,8)", "interval(.01,10)", "h", 3, 4),
+        ("Gamma", "reals", "interval(.01,10)", "g", 3, 4),
+        ("Gamma", "interval(.1,8)", "interval(.01,10)", "g", 65, 4),
+        (
+            "Gamma",
+            "interval(.1,8)",
+            "interval(.01,10)",
+            "g",
+            64,
+            131072,
+        ),
+    ] {
+        let source = format!(
+            "a=elementof(cartpow({parameter},{groups}))\nb=elementof(cartpow(interval(.1,8),{groups}))\ng=external(cartpow(integers,{count}))\nh=external(cartpow(integers,{count}))\ny=external(cartpow({event},{count}))\ninputs=(a,b,g,h,y)\noutputs=logdensityof({family}.(a[g],b[{second}]),y)"
+        );
+        let raw = lower(&source, false);
+        assert!(prepare_likelihood(&raw, &["g".into(), "h".into(), "y".into()]).is_err());
+        assert_eq!(
+            flatppl_flatpir::write(&raw),
+            flatppl_flatpir::write(&lower(&source, true))
+        );
+    }
+}
+
+#[test]
+fn runtime_count_moments_keep_integer_centers_and_boundary_fallbacks() {
+    for (family, parameter) in [
+        ("Poisson", "interval(.1,1e20)"),
+        ("Geometric", "interval(.01,.99)"),
+    ] {
+        let source = format!(
+            "p=elementof(cartpow({parameter},6))\ng=external(cartpow(integers,4))\ny=external(cartpow(integers,4))\ninputs=(p,g,y)\noutputs=logdensityof({family}.(p[g]),y)"
+        );
+        let prepared = prepare_unpacked(&lower(&source, false), &["g".into(), "y".into()]);
+        assert!(
+            !inputs(&prepared.score)
+                .iter()
+                .any(|name| name == "g" || name == "y")
+        );
+        for module in [&prepared.preparation, &prepared.score] {
+            let mut printed = flatppl_syntax::parse(&flatppl_syntax::print(module)).unwrap();
+            let errors = flatppl_infer::infer(&mut printed);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|d| d.severity == flatppl_infer::Severity::Error),
+                "{family}: {errors:?}"
+            );
+            assert!(flatppl_determinizer::is_flatpdl(&printed).is_ok());
+        }
+    }
+    for (family, parameter) in [("Poisson", "interval(0,10)"), ("Geometric", "unitinterval")] {
+        let source = format!(
+            "p=elementof(cartpow({parameter},3))\ng=external(cartpow(integers,4))\ny=external(cartpow(integers,4))\ninputs=(p,g,y)\noutputs=logdensityof({family}.(p[g]),y)"
+        );
+        assert!(prepare_likelihood(&lower(&source, false), &["g".into(), "y".into()]).is_err());
+    }
+}
+
+#[test]
+fn runtime_binomial_histograms_keep_endpoints_and_invalid_outcomes_native() {
+    let source = "p=elementof(cartpow(unitinterval,3))\ng=external(cartpow(integers,4))\ny=external(cartpow(integers,4))\ninputs=(p,g,y)\noutputs=logdensityof(Binomial.(6,p[g]),y)";
+    let prepared = prepare_unpacked(&lower(source, false), &["g".into(), "y".into()]);
+    assert_eq!(prepared.summaries.len(), 1);
+    assert_eq!(inputs(&prepared.score).len(), 2);
+    for module in [&prepared.preparation, &prepared.score] {
+        let mut printed = flatppl_syntax::parse(&flatppl_syntax::print(module)).unwrap();
+        let errors = flatppl_infer::infer(&mut printed);
+        assert!(
+            !errors
+                .iter()
+                .any(|d| d.severity == flatppl_infer::Severity::Error),
+            "{errors:?}"
+        );
+        assert!(flatppl_determinizer::is_flatpdl(&printed).is_ok());
+    }
+}
+
+#[test]
 fn runtime_group_count_cache_tracks_extents_and_index_origins() {
     for (groups, second, buffers) in [(3, "q[g]", 1), (2, "q[g]", 2), (3, "get0(q,g)", 2)] {
         let source = format!(

@@ -297,6 +297,21 @@ in F32 and F64, sanitizes unused groups before primitive calls, and retains the
 LogNormal Jacobian. Setup uses masked reductions in O(NG), with at most 64 groups
 and a 2^22 observation-by-group workspace budget. Scoring uses O(G) work and three
 summary buffers. Unproved ranges and partitions retain ordinary scoring.
+Runtime Exponential, Gamma and Beta partitions use masked sums and relative
+logarithms around data-derived centers. Finite support/parameter bounds prove
+forward and reverse arithmetic; Gamma/Beta concentrations above 64 retain native
+scoring because moving F32 primitive anchors can amplify cancellation.
+Runtime Poisson partitions preserve integer observed anchors and native
+coefficients at prepared reference rates. Positive rate lower bounds exclude the
+native zero-rate adjoint. Geometric partitions widen counts before summation and
+require interior probabilities, preserving the primitive's distinct p=1 behavior.
+Unsupported count rows add a separate support penalty, retaining supported-row
+gradients. Binomial partitions with fixed trials 1 through 63 prepare exact
+integer outcome counts, including an off-support bin. Scoring weights native
+primitive scores and preserves probability endpoints. Its table has at most 256
+cells. These paths share checked selectors, permit empty groups, and require at
+most 64 groups and 2^22 observation-by-group cells. Rebinding any preparation
+input requires rerunning preparation. No runtime cache infers data identity.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.
