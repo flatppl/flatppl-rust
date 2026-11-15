@@ -28,6 +28,13 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, id: NodeId) -> Option<Node
         return None;
     }
     let f = factor(m, id, r)?;
+    reduce_factor(r, m, &f)
+}
+
+pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &super::Factor) -> Option<NodeId> {
+    if !r.preparing {
+        return None;
+    }
     let logarithmic = match m.resolve(f.constructor) {
         "Normal" => false,
         "LogNormal" => true,

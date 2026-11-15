@@ -157,6 +157,12 @@ Binomial groups prepare native outcome counts for fixed trials from 1 through 63
 Unsupported ranges retain ordinary scoring. Preparation must run again after
 observations or indices change.
 
+Runtime group predictors using `exp`, `invlogit` and affine real arithmetic also
+support preparation, for example `Bernoulli.(invlogit.(a[group] .+ b))`.
+The score evaluates links once per group while `a` and `b` remain live inputs.
+Bounds must prove finite forward and reverse arithmetic in both precisions.
+Unproved ranges, saturated probabilities and other links retain ordinary scoring.
+
 Add `--explain-reductions` to either command to report committed rules and
 fallbacks on stderr. Reports cover recognized independent density sums and
 distinguish lowering, materialized data, and explicit preparation.
@@ -173,6 +179,14 @@ Preparation packs scalar summaries into vectors of matching real, integer, or
 boolean type. Other summary shapes stay unchanged. Use the exported schemas to
 bind each result as one score argument. Disable packing with
 `--pack-summaries=false` or `PreparationOptions { pack_summaries: false }`.
+
+Rust hosts can call `Context::prepare_incremental_score` to obtain ordinary
+term queries and an original-order combiner. `affected_terms` identifies work
+after named inputs change. `revisions` supplies explicit invalidation and
+stale-result tickets. Notify every change, including in-place array edits and
+rollbacks, and check native status before accepting a result. Each compiled
+plan, precision and target needs a separate coordinator. Cache term gradients
+too when a full gradient is required.
 
 ```sh
 git clone https://github.com/flatppl/flatppl-rust

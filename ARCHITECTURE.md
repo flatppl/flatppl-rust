@@ -317,6 +317,16 @@ primitive scores and preserves probability endpoints. Its table has at most 256
 cells. These paths share checked selectors, permit empty groups, and require at
 most 64 groups and 2^22 observation-by-group cells. Rebinding any preparation
 input requires rerunning preparation. No runtime cache infers data identity.
+Pointwise `exp`/`invlogit` predictors and real add/subtract/multiply/divide/negate
+DAGs can move before runtime gathers. Every vector leaf must use the same checked
+selector, origin and extent. Scalar captures stay live. Existing family counts
+provide occupancy, including Bernoulli/Binomial outcome buffers, so lifting adds
+no summary arguments. Each operation masks its inactive operands before evaluation,
+then the final parameter uses its family's empty-group value. Bounded source
+ranges must enclose both precisions and all score/link reverse intermediates.
+Tiny probabilities, subnormal range ambiguity and unsafe quotient products retain
+ordinary scoring. A depth/node budget bounds analysis, and a failed family guard
+discards the entire candidate. Original predictor outputs remain unchanged.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.
@@ -437,6 +447,18 @@ interfaces are never silently retraced.
 identities remain usable by future emitters. `flatppl analyze model.flatppl
 --data-input y` prints the same facts. Analysis runs only when requested and
 uses no hidden incremental evaluation cache.
+
+`prepare_incremental_score` builds portable scalar term queries and a combiner
+that keeps the original arithmetic tree, scalar types and repeated terms.
+Input aliases share one dependency under the declared ABI name. Fixed file data
+loads once for the plan. The original query stays unchanged.
+The host exposes explicit dependency invalidation and revision tickets. Notify
+the coordinator before every input change, including array edits and rollbacks.
+Accept a result only after its native status succeeds and its ticket is current.
+Valid infinite scores remain cacheable. Recombination evaluates the original
+tree over cached values, rather than subtracting stale totals. Each compiled
+plan, precision and target needs its own coordinator. Cached scalar values do
+not provide full parameter gradients; retain term gradients or recompute them.
 
 ## Profiles — one mechanism, several uses
 

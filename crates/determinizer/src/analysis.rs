@@ -94,6 +94,8 @@ fn resolve(m: &Module, mut id: NodeId, boundary: &HashSet<Symbol>) -> NodeId {
 struct Dependencies<'a> {
     module: &'a Module,
     boundary: HashSet<Symbol>,
+    aliases: HashMap<Symbol, Symbol>,
+    alias_names: HashSet<Symbol>,
     order: Vec<Symbol>,
     cache: HashMap<NodeId, HashSet<Symbol>>,
 }
@@ -146,8 +148,8 @@ impl Dependencies<'_> {
                     ns: RefNs::SelfMod,
                     name,
                 }) => {
-                    if self.boundary.contains(name) {
-                        found.insert(*name);
+                    if let Some(&declared) = self.aliases.get(name) {
+                        found.insert(declared);
                     } else if let Some(bid) = m.binding_by_name(*name) {
                         pending.push((m.binding(bid).rhs, locals, false));
                     } else {
@@ -273,7 +275,7 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     if !matches!(m.node(family),Node::Const(name) if m.resolve(*name)=="Normal") {
         return None;
     }
-    let point = resolve(m, point, &deps.boundary);
+    let point = resolve(m, point, &deps.alias_names);
     let Node::Ref(Ref {
         ns: RefNs::SelfMod,
         name,
@@ -281,13 +283,14 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     else {
         return None;
     };
+    let name = *deps.aliases.get(&name)?;
     if !deps.boundary.contains(&name)
         || m.type_of(point) != Some(&Type::Scalar(ScalarType::Real))
         || m.valueset_of(point) != Some(&ValueSet::Reals)
     {
         return None;
     }
-    let parameters = call(m, resolve(m, parameters, &deps.boundary), "record")?;
+    let parameters = call(m, resolve(m, parameters, &deps.alias_names), "record")?;
     let location = parameters
         .named
         .iter()
@@ -312,8 +315,8 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     if location_deps.contains(&name) || scale_deps.contains(&name) {
         return None;
     }
-    let scale_value = resolve(m, scale, &deps.boundary);
-    let location_value = resolve(m, location, &deps.boundary);
+    let scale_value = resolve(m, scale, &deps.alias_names);
+    let location_value = resolve(m, location, &deps.alias_names);
     if known_number(m, location_value, 0).is_some_and(|value| !value.is_finite())
         || known_number(m, scale_value, 0).is_some_and(|value| !value.is_finite() || value <= 0.0)
     {
@@ -377,9 +380,22 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
             return Err(AnalysisError(format!("data input {name:?} occurs twice")));
         }
     }
+    let mut aliases = HashMap::new();
+    for &declared in &order {
+        for name in m.alias_chain(declared) {
+            if aliases
+                .insert(name, declared)
+                .is_some_and(|previous| previous != declared)
+            {
+                return Err(AnalysisError("query inputs alias the same object".into()));
+            }
+        }
+    }
     let mut deps = Dependencies {
         module: m,
         boundary: order.iter().copied().collect(),
+        alias_names: aliases.keys().copied().collect(),
+        aliases,
         order,
         cache: HashMap::new(),
     };
@@ -393,7 +409,7 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
     let mut terms = Vec::new();
     let mut used = HashSet::new();
     let mut normal_coordinates = Vec::new();
-    for (node, sign, multiplicity) in additive_terms(m, outputs, &deps.boundary) {
+    for (node, sign, multiplicity) in additive_terms(m, outputs, &deps.alias_names) {
         let all = deps.get(node);
         let ps = all.intersection(&parameter_set).copied().collect();
         let ds = all.intersection(&data).copied().collect();

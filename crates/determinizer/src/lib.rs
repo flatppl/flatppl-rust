@@ -12,6 +12,7 @@ mod disintegrate;
 mod driver;
 mod extras;
 mod free_draw;
+mod incremental;
 mod invert;
 mod jointchain;
 mod kernel;
@@ -30,6 +31,7 @@ pub use driver::{
     determinize, determinize_with, determinize_with_options, determinize_with_options_and_report,
     determinize_with_roots,
 };
+pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
 pub use normal_coordinates::{
     CoordinatePrecision, NormalCoordinateQueries, prepare_normal_coordinate,
 };

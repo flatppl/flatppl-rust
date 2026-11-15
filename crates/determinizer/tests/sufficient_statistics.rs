@@ -136,6 +136,79 @@ fn promoted_group_indices_and_circular_points_never_become_static_guards() {
 }
 
 #[test]
+fn runtime_predictor_guards_keep_unsafe_adjoints_and_nonpointwise_values_ordinary() {
+    for (set, expression, extra_inputs) in [
+        ("interval(-87,-86)", "invlogit.(a[g])", ""),
+        ("interval(-100,-99)", "invlogit.(a[g])", ""),
+        ("interval(-1,1)", "invlogit.(a[g] .+ a[h])", ""),
+        ("interval(-1,1)", "invlogit.(a[g] .+ get0(a,g))", ""),
+        ("interval(-1,1)", "softmax(a[g])", ""),
+        ("interval(-1,1)", "q", ",q"),
+    ] {
+        let source = format!(
+            "a=elementof(cartpow({set},3))\ng=external(cartpow(integers,8))\nh=external(cartpow(integers,8))\ny=external(cartpow(booleans,8))\nq=invlogit.(a[g])\ninputs=(a,g,h,y{extra_inputs})\noutputs=logdensityof(Bernoulli.({expression}),y)"
+        );
+        let raw = lower(&source, false);
+        assert!(prepare_likelihood(&raw, &["g".into(), "h".into(), "y".into()]).is_err());
+        assert_eq!(
+            flatppl_flatpir::write(&raw),
+            flatppl_flatpir::write(&lower(&source, true))
+        );
+    }
+    for expression in ["1e38 .* exp.(a[g])", "1e38 .* invlogit.(a[g])"] {
+        let source = format!(
+            "a=elementof(cartpow(interval(-100,-99),3))\ng=external(cartpow(integers,8))\ny=external(cartpow(integers,8))\ninputs=(a,g,y)\noutputs=logdensityof(Poisson.({expression}),y)"
+        );
+        assert!(prepare_likelihood(&lower(&source, false), &["g".into(), "y".into()]).is_err());
+    }
+    let quotient = "a=elementof(cartpow(interval(1e37,1e37),2))\nb=elementof(interval(1e10,1e10))\ng=external(cartpow(integers,64))\ny=external(cartpow(interval(1,1),64))\ninputs=(a,b,g,y)\noutputs=logdensityof(Exponential.(a[g] ./ b),y)";
+    assert!(prepare_likelihood(&lower(quotient, false), &["g".into(), "y".into()]).is_err());
+    let mut deep = "a=elementof(cartpow(interval(-1,1),3))\ng=external(cartpow(integers,8))\ny=external(cartpow(booleans,8))\nt0=a[g]\n".to_owned();
+    for index in 1..=80 {
+        deep.push_str(&format!("t{index}=invlogit.(t{})\n", index - 1));
+    }
+    deep.push_str("inputs=(a,g,y)\noutputs=logdensityof(Bernoulli.(t80),y)");
+    assert!(prepare_likelihood(&lower(&deep, false), &["g".into(), "y".into()]).is_err());
+}
+
+#[test]
+fn runtime_predictors_reuse_family_buffers_and_keep_scoring_parameters_live() {
+    for (law, event, buffers) in [
+        ("Bernoulli.(invlogit.(a[g] .+ b))", "booleans", 1),
+        ("Binomial.(6,invlogit.(a[g] .+ b))", "integers", 1),
+        ("Poisson.(exp.(a[g] .+ b))", "integers", 4),
+        ("Geometric.(invlogit.(a[g] .+ b))", "integers", 3),
+        ("Exponential.(exp.(a[g] .+ b))", "interval(.1,10)", 2),
+        ("Gamma.(exp.(a[g]),exp.(a[g] .+ b))", "interval(.1,10)", 2),
+        ("Beta.(exp.(a[g]),exp.(a[g] .+ b))", "interval(.1,.9)", 2),
+        ("Normal.(exp.(a[g] .+ b),1.0)", "interval(-10,10)", 3),
+    ] {
+        let source = format!(
+            "a=elementof(cartpow(interval(-1,1),3))\nb=elementof(interval(-1,1))\ng=external(cartpow(integers,8))\ny=external(cartpow({event},8))\ninputs=(a,b,g,y)\noutputs=logdensityof({law},y)"
+        );
+        let prepared = prepare_unpacked(&lower(&source, false), &["g".into(), "y".into()]);
+        assert_eq!(prepared.summaries.len(), buffers, "{law}");
+        assert_eq!(&inputs(&prepared.score)[..2], ["a", "b"]);
+        assert!(
+            !inputs(&prepared.score)
+                .iter()
+                .any(|name| name == "g" || name == "y")
+        );
+        for module in [&prepared.preparation, &prepared.score] {
+            let mut surface = flatppl_syntax::parse(&flatppl_syntax::print(module)).unwrap();
+            let errors = flatppl_infer::infer(&mut surface);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|d| d.severity == flatppl_infer::Severity::Error),
+                "{law}: {errors:?}"
+            );
+            assert!(flatppl_determinizer::is_flatpdl(&surface).is_ok());
+        }
+    }
+}
+
+#[test]
 fn runtime_positive_families_prepare_portable_empty_group_statistics() {
     for (law, event) in [
         ("Exponential.(a[g])", "interval(0,10)"),
