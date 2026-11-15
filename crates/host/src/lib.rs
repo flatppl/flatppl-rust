@@ -14,6 +14,7 @@ mod data;
 mod export;
 mod formula;
 mod inspect;
+mod normal_coordinates;
 mod readers;
 mod transforms;
 
@@ -32,4 +33,5 @@ pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
 pub use formula::FormulaModel;
 pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
+pub use normal_coordinates::NormalCoordinateExports;
 pub use transforms::TransformedQueries;
