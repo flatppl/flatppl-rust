@@ -426,6 +426,58 @@ impl Emitter<'_> {
         self.select(current, &pivot_row, &swapped)
     }
 
+    fn swap_indexed_rows(&mut self, matrix: &Value, current: &Value, pivot: &Value) -> Value {
+        let dims = shape(&matrix.ty);
+        let n = dims[0].expect("static rows");
+        let width = dims[1].expect("static columns");
+        let index_zero = self.int_value_const(0);
+        let ty = matrix.ty.render(self.dtype, matrix.elem);
+        let row_ty = tensor(vec![Some(1), Some(width)]);
+        let row_type = row_ty.render(self.dtype, matrix.elem);
+        let index_ty = current.ty.render(self.dtype, current.elem);
+        let read_row = |e: &mut Self, index: &Value| {
+            let ssa = e.pure(format!(
+                "stablehlo.dynamic_slice {}, {}, {}, sizes = [1, {width}] : ({ty}, {index_ty}, {index_ty}) -> {row_type}",
+                matrix.ssa, index.ssa, index_zero.ssa,
+            ));
+            let row = Value {
+                ssa,
+                ty: row_ty.clone(),
+                elem: matrix.elem,
+            };
+            e.reshape_cell(&row, tensor(vec![Some(width)]))
+        };
+        let current_row = read_row(self, current);
+        let pivot_row = read_row(self, pivot);
+        let limit = self.int_value_const(n as i64);
+        let in_range = self.compare("LT", pivot, &limit);
+        // The pivot search uses n for a missing candidate. Match its empty mask
+        // rather than allowing dynamic_slice's clamp to choose the last row.
+        let zero = self.constant_like(0.0, &pivot_row);
+        let pivot_row = self.select(&in_range, &pivot_row, &zero);
+        let current_row = self.reshape_cell(&current_row, tensor(vec![Some(1), Some(width)]));
+        let pivot_row = self.reshape_cell(&pivot_row, tensor(vec![Some(1), Some(width)]));
+        let row_ty = current_row.ty.render(self.dtype, current_row.elem);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({ty}, {row_ty}, {index_ty}, {index_ty}) -> {ty}",
+            matrix.ssa, current_row.ssa, pivot.ssa, index_zero.ssa,
+        ));
+        let swapped = Value {
+            ssa,
+            ..matrix.clone()
+        };
+        let swapped = self.select(&in_range, &swapped, matrix);
+        let ssa = self.pure(format!(
+            "stablehlo.dynamic_update_slice {}, {}, {}, {} : ({ty}, {row_ty}, {index_ty}, {index_ty}) -> {ty}",
+            swapped.ssa, pivot_row.ssa, current.ssa, index_zero.ssa,
+        ));
+        let result = Value {
+            ssa,
+            ..matrix.clone()
+        };
+        self.axes_view(&result, self.axes_of(matrix))
+    }
+
     /// Complete pivoting moves rank deficiency to the final diagonal entries.
     /// This retains the determinant's cofactor derivative at a zero column.
     pub(crate) fn matrix_determinant(&mut self, input: &Value, n: u64, logarithm: bool) -> Value {
@@ -657,10 +709,19 @@ impl Emitter<'_> {
             let candidates = e.select(&candidates, &indices, &limit);
             let pivot_row =
                 e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &candidates, batch);
-            let pivot_rows = e.compare("EQ", &rows, &pivot_row);
-            let pivot_rhs_rows = e.compare("EQ", &rhs_rows, &pivot_row);
-            let a = e.swap_rows(&a, &at_row, &pivot_rows);
-            let b = e.swap_rows(&b, &at_rhs_row, &pivot_rhs_rows);
+            let (a, b) = if e.target == crate::Target::Cpu && batch == 0 && n >= 32 {
+                (
+                    e.swap_indexed_rows(&a, index, &pivot_row),
+                    e.swap_indexed_rows(&b, index, &pivot_row),
+                )
+            } else {
+                let pivot_rows = e.compare("EQ", &rows, &pivot_row);
+                let pivot_rhs_rows = e.compare("EQ", &rhs_rows, &pivot_row);
+                (
+                    e.swap_rows(&a, &at_row, &pivot_rows),
+                    e.swap_rows(&b, &at_rhs_row, &pivot_rhs_rows),
+                )
+            };
             let column = e.indexed_matrix_axis(&a, index, 1);
             let row_a = e.indexed_matrix_axis(&a, index, 0);
             let row_b = e.indexed_matrix_axis(&b, index, 0);
@@ -805,10 +866,19 @@ impl Emitter<'_> {
             let limit = e.int_value_const(n as i64);
             let candidates = e.select(&candidates, &indices, &limit);
             let pivot = e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &candidates, batch);
-            let pivot = e.fill_cell(&pivot, tensor(vec![Some(n), Some(n)]));
-            let pivot_rows = e.compare("EQ", &rows, &pivot);
-            let a = e.swap_rows(&a, &at_row, &pivot_rows);
-            let b = e.swap_rows(&b, &at_row, &pivot_rows);
+            let (a, b) = if e.target == crate::Target::Cpu && batch == 0 && n >= 32 {
+                (
+                    e.swap_indexed_rows(&a, index, &pivot),
+                    e.swap_indexed_rows(&b, index, &pivot),
+                )
+            } else {
+                let pivot = e.fill_cell(&pivot, tensor(vec![Some(n), Some(n)]));
+                let pivot_rows = e.compare("EQ", &rows, &pivot);
+                (
+                    e.swap_rows(&a, &at_row, &pivot_rows),
+                    e.swap_rows(&b, &at_row, &pivot_rows),
+                )
+            };
             let column = e.indexed_matrix_axis(&a, index, 1);
             let row_a = e.indexed_matrix_axis(&a, index, 0);
             let row_b = e.indexed_matrix_axis(&b, index, 0);
