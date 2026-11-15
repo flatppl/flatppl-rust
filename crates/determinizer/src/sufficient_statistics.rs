@@ -18,7 +18,10 @@ use crate::RefuseError;
 mod circular;
 mod correlation;
 mod grouped;
+mod grouped_counts;
 mod grouped_moments;
+mod grouped_poisson;
+mod grouped_positive;
 mod histogram;
 mod multivariate;
 mod packing;
@@ -26,6 +29,7 @@ mod poisson;
 mod regression;
 mod repeated;
 mod report;
+mod runtime_partition;
 mod scalar;
 mod sorted;
 use crate::density::{build_call, build_record};
@@ -675,6 +679,15 @@ impl Reducer {
             return Some(result);
         }
         if let Some(result) = grouped_moments::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_positive::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_counts::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_poisson::reduce(self, m, id) {
             return Some(result);
         }
         if let Some(result) = correlation::reduce(self, m, id) {

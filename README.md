@@ -143,11 +143,19 @@ VonMises requires location bounds within `[-pi, pi]` and concentration bounds
 within `[0, 64]`. Grouped scalar families reuse the same support and numerical
 guards as their shared-parameter reductions. They support fixed index vectors,
 for example `Normal.(mu[group], sigma)` and `Poisson.(rate[group])`.
-Prepare observations with `--data-input y`. Group indices must stay fixed in
-the source; promoted or runtime group inputs retain ordinary scoring.
+Prepare observations with `--data-input y`. Runtime groups require explicit
+preparation of their indices with `--data-input group` and a supported family.
 Indexed lambdas such as `f(i,m)=Normal(m[i],1.0)` with `f.(group,[mu])` also
 support grouping. Deterministic derived observations can use several preparation
 inputs. Include each dependency with `--data-input`.
+
+Runtime Exponential, Gamma, Beta, Poisson and Geometric groups prepare bounded
+statistics. Real families require finite support bounds and positive parameter
+bounds. Gamma/Beta concentrations stay at most 64. Poisson requires a positive
+rate lower bound; Geometric requires probabilities strictly between zero and one.
+Binomial groups prepare native outcome counts for fixed trials from 1 through 63.
+Unsupported ranges retain ordinary scoring. Preparation must run again after
+observations or indices change.
 
 Add `--explain-reductions` to either command to report committed rules and
 fallbacks on stderr. Reports cover recognized independent density sums and
