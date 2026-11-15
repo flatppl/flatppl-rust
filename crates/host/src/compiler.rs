@@ -315,6 +315,35 @@ impl LoadedModule {
             bound = self.typed_with_boxes(boxes)?;
             &bound
         };
+        let lowered = self.lower_query(typed, options, None)?;
+        emit_query(lowered, typed, options, batch).map_err(|e| {
+            let node = e.node.filter(|id| id.index() < typed.node_count());
+            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
+        })
+    }
+
+    pub(crate) fn compilation_reductions(
+        &self,
+        enabled: bool,
+    ) -> Result<flatppl_determinizer::ReductionReport, Diagnostic> {
+        let mut report = flatppl_determinizer::ReductionReport::default();
+        self.lower_query(
+            &self.typed,
+            &EmitOptions {
+                sufficient_statistics: enabled,
+                ..Default::default()
+            },
+            Some(&mut report),
+        )?;
+        Ok(report)
+    }
+
+    fn lower_query(
+        &self,
+        typed: &Module,
+        options: &EmitOptions,
+        mut report: Option<&mut flatppl_determinizer::ReductionReport>,
+    ) -> Result<Module, Diagnostic> {
         let roots: Vec<_> = typed
             .public_bindings()
             .filter(|(_, b)| matches!(typed.resolve(b.name), "inputs" | "outputs"))
@@ -327,15 +356,25 @@ impl LoadedModule {
                 "declare inputs and outputs before compiling a module",
             ));
         }
-        let mut lowered = flatppl_determinizer::determinize_with_options(
-            typed,
-            &self.bundle,
-            Some(&roots),
-            &flatppl_determinizer::LoweringOptions {
-                preserve_rand_tuple: true,
-                ..options.lowering_options()
-            },
-        )
+        let lowering = flatppl_determinizer::LoweringOptions {
+            preserve_rand_tuple: true,
+            ..options.lowering_options()
+        };
+        let mut lowered = match report.as_deref_mut() {
+            Some(report) => flatppl_determinizer::determinize_with_options_and_report(
+                typed,
+                &self.bundle,
+                Some(&roots),
+                &lowering,
+                report,
+            ),
+            None => flatppl_determinizer::determinize_with_options(
+                typed,
+                &self.bundle,
+                Some(&roots),
+                &lowering,
+            ),
+        }
         .map_err(|e| {
             Diagnostic::new("determinize", self.source_name(), e.reason).at(
                 typed,
@@ -354,17 +393,16 @@ impl LoadedModule {
             )
         })?;
         if options.sufficient_statistics {
-            flatppl_determinizer::sufficient_statistics(&mut lowered);
+            if let Some(report) = report {
+                flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, report);
+            } else {
+                flatppl_determinizer::sufficient_statistics(&mut lowered);
+            }
         }
-        emit_query(lowered, typed, options, batch).map_err(|e| {
-            // Lowering appends nodes and never renumbers, so only nodes of the
-            // typed root module index its source.
-            let node = e.node.filter(|id| id.index() < typed.node_count());
-            Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
-        })
+        Ok(lowered)
     }
 
-    fn read_data(&self, source: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn read_data(&self, source: &str) -> Result<Vec<u8>, String> {
         self.definition.read_data(&self.data, source)
     }
 }

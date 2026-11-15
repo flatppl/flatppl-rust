@@ -7,6 +7,7 @@
 //! [`LoadedModule::compile`] lowers explicit FlatPPL `inputs` and `outputs` to
 //! StableHLO plus a tensor ABI. The host chooses execution and differentiation.
 
+mod analysis;
 mod boxes;
 mod compiler;
 mod constants;
@@ -19,6 +20,7 @@ mod normal_coordinates;
 mod readers;
 mod transforms;
 
+pub use analysis::QueryAnalysis;
 pub use boxes::{BoxSpec, bind_boxes, parse_describe};
 pub use compiler::{
     BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position,
@@ -29,7 +31,7 @@ pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_determinizer::PreparationOptions;
 pub use flatppl_determinizer::{
-    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm, ReductionOutcome,
 };
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};

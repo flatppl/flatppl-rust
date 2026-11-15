@@ -38,6 +38,88 @@ fn shared_data_does_not_join_structural_components() {
 }
 
 #[test]
+fn ordinary_report_keeps_the_compilers_pre_file_reduction_order() {
+    use flatppl_host::ReductionOutcome;
+    let path =
+        std::env::temp_dir().join(format!("flatppl-report-order-{}.csv", std::process::id()));
+    std::fs::write(&path, "v\ninf\ninf\ninf\ninf\n").unwrap();
+    let mut context = Context::default();
+    let source = format!(
+        "mu=elementof(reals)\ny=load_data({:?},cartpow(reals,4))\ninputs=mu\noutputs=logdensityof(iid(Normal(mu,1.),4),y)",
+        path.to_str().unwrap()
+    );
+    let module = context.parse(&source, None, None).unwrap();
+    let before = module.compile(&EmitOptions::default()).unwrap().stablehlo;
+    let report = context.analyze_query(&module, &[], false, true).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(report.reductions.decisions.iter().any(|decision| matches!(
+        decision.outcome,
+        ReductionOutcome::Reduced {
+            rule: "scalar moments",
+            ..
+        }
+    )));
+    assert_eq!(
+        module.compile(&EmitOptions::default()).unwrap().stablehlo,
+        before
+    );
+}
+
+#[test]
+fn reduction_reports_match_preparation_and_leave_compilation_unchanged() {
+    use flatppl_host::ReductionOutcome;
+    let mut context = Context::default();
+    let module = context.parse("mu=elementof(reals)\ny=external(cartpow(reals,4))\ninputs=(mu,y)\noutputs=logdensityof(iid(Normal(mu,1.),4),y)", None, None).unwrap();
+    let before = module.compile(&EmitOptions::default()).unwrap().stablehlo;
+    let ordinary = context
+        .analyze_query(&module, &["y".into()], false, true)
+        .unwrap();
+    let report = context
+        .analyze_query(&module, &["y".into()], true, true)
+        .unwrap();
+    let prepared = context.prepare_likelihood(&module, &["y".into()]).unwrap();
+    assert_eq!(report.summaries, prepared.summaries);
+    assert!(report.preparation_refusal.is_none());
+    assert!(
+        report
+            .reductions
+            .decisions
+            .iter()
+            .any(|d| matches!(d.outcome, ReductionOutcome::Reduced { .. }))
+    );
+    assert!(
+        ordinary
+            .reductions
+            .decisions
+            .iter()
+            .any(|d| matches!(d.outcome, ReductionOutcome::Reduced { .. }))
+    );
+    assert!(ordinary.summaries.is_empty());
+    let disabled = context
+        .analyze_query(&module, &["y".into()], true, false)
+        .unwrap();
+    assert!(!disabled.reductions.decisions.is_empty());
+    assert!(
+        disabled
+            .reductions
+            .decisions
+            .iter()
+            .all(|d| d.outcome == ReductionOutcome::Disabled)
+    );
+    assert_eq!(
+        module.compile(&EmitOptions::default()).unwrap().stablehlo,
+        before
+    );
+    let opaque = context
+        .parse("a=elementof(reals)\ninputs=a\noutputs=exp(a)", None, None)
+        .unwrap();
+    let report = context.analyze_query(&opaque, &[], true, true).unwrap();
+    assert!(report.summaries.is_empty());
+    assert!(report.preparation_refusal.is_some());
+    assert!(report.reductions.decisions.is_empty());
+}
+
+#[test]
 fn opaque_operations_and_joint_normalizers_join_components() {
     for expression in ["logsumexp([a,b])", "a+b-a*b", "ifelse(a>0.0,a,b)", "a*b"] {
         let report = analyze(

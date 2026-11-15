@@ -448,6 +448,13 @@ identities remain usable by future emitters. `flatppl analyze model.flatppl
 --data-input y` prints the same facts. Analysis runs only when requested and
 uses no hidden incremental evaluation cache.
 
+`Context::analyze_query` also reports the actual default compilation reduction
+pipeline or explicit likelihood preparation. Ordinary reports share compilation's
+passes before and after fixed-file loading. Preparation reports include summary
+names or an overall refusal, which can coexist with a local reduction decision.
+Disabled reductions are visible. Reports leave the authored query and ABI intact;
+reading fixed data establishes the same cached file snapshot as compilation.
+
 `prepare_incremental_score` builds portable scalar term queries and a combiner
 that keeps the original arithmetic tree, scalar types and repeated terms.
 Input aliases share one dependency under the declared ABI name. Fixed file data
