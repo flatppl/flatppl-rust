@@ -1,5 +1,10 @@
 # The conjugate marginal table — the maths
 
+Sidecar to `marginal.rs`. Every row of `CONJUGATE_TABLE` is one closed-form solution of
+the `kchain` marginal integral. This file states each integral, its closed form, the §08
+constructor that names the answer, and the test point that pins it — so a reader can
+check the maths without reverse-engineering a `build_*_marginal`.
+
 ## Shared Gamma-Poisson record law
 
 For one `lambda ~ Gamma(alpha,beta)` and conditionally independent
@@ -18,11 +23,6 @@ At `alpha=2, beta=3, y=(1,2)`, the mass is `108/3125`, with log mass
 The joint derivatives are `d_alpha = 13/12 + log(3/5)` and `d_beta = -1/3`.
 Permuting fields preserves the joint. A carried rate uses the chain rule;
 transformed rates, extra ancestors and partly shared records do not match.
-
-Sidecar to `marginal.rs`. Every row of `CONJUGATE_TABLE` is one closed-form solution of
-the `kchain` marginal integral. This file states each integral, its closed form, the §08
-constructor that names the answer, and the test point that pins it — so a reader can
-check the maths without reverse-engineering a `build_*_marginal`.
 
 **Two families live here.** `CONJUGATE_TABLE`'s rows each marginalize ONE variate's law.
 The **shared-latent record law** below is a second family, deliberately outside the table:
