@@ -22,6 +22,14 @@ pyo3::create_exception!(_native, Error, PyException);
 type BatchArguments = (Vec<u64>, Vec<Vec<Option<usize>>>);
 
 type NativeTerm = (NativeModule, Vec<String>, String, Vec<Vec<String>>);
+type NativeNormalCoordinates = (
+    NativeModule,
+    NativeModule,
+    NativeModule,
+    NativeModule,
+    Vec<String>,
+    Vec<Vec<String>>,
+);
 
 fn input_path(mut path: Vec<String>) -> PyResult<flatppl_host::InputPath> {
     if path.is_empty() {
@@ -380,6 +388,49 @@ impl NativeContext {
                 inner: plan.log_jacobian,
             },
             plan.coordinate_input,
+        ))
+    }
+
+    fn normal_coordinates(
+        &mut self,
+        module: &NativeModule,
+        data_inputs: Vec<String>,
+        parameters: Vec<Vec<String>>,
+        logdensity: bool,
+        dtype: &str,
+    ) -> PyResult<NativeNormalCoordinates> {
+        let dtype = match dtype {
+            "float32" => Dtype::F32,
+            "float64" => Dtype::F64,
+            _ => return Err(PyValueError::new_err("dtype must be float32 or float64")),
+        };
+        let paths = parameters
+            .into_iter()
+            .map(input_path)
+            .collect::<PyResult<Vec<_>>>()?;
+        let plan = self
+            .inner
+            .prepare_normal_coordinates_queries(
+                &module.inner,
+                &data_inputs,
+                &paths,
+                logdensity,
+                dtype,
+            )
+            .map_err(error)?;
+        Ok((
+            NativeModule { inner: plan.score },
+            NativeModule {
+                inner: plan.forward,
+            },
+            NativeModule {
+                inner: plan.inverse,
+            },
+            NativeModule {
+                inner: plan.log_jacobian,
+            },
+            plan.coordinate_inputs,
+            plan.paths.iter().map(path_parts).collect(),
         ))
     }
 

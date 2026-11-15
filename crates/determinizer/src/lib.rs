@@ -35,8 +35,8 @@ pub use driver::{
 };
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
 pub use normal_coordinates::{
-    CoordinatePrecision, NormalCoordinateQueries, prepare_normal_coordinate,
-    prepare_normal_coordinate_at_path,
+    CoordinatePrecision, NormalCoordinateQueries, NormalCoordinatesQueries,
+    prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;

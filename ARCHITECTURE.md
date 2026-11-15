@@ -477,6 +477,17 @@ record. Its forward/inverse companions preserve siblings and the record ABI.
 Python bindings expose the term plans, revision tickets and portable Normal
 query modules. Compilation and mutable execution state remain separate.
 
+`prepare_normal_coordinates` explicitly composes non-overlapping real paths in
+their selected induced dependency order. Selected cycles refuse. Original
+argument names and order stay fixed; maps return selected roots in ABI order
+and preserve siblings. The score adds the triangular log Jacobian on request.
+Validity checks local maps and both complete round trips, catching amplified
+parent rounding. Narrow scales can fail these checks during tentative sampler
+proposals. Invalidity is an error, never zero target probability. Generated
+captures that cross retained callback graph cuts refuse without freezing
+authored derived inputs. Portable serialization retains shared scalar guards
+as fresh global bindings and preserves callback and aggregation scopes.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +
