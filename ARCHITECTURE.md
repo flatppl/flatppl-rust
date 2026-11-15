@@ -374,6 +374,8 @@ log Jacobian `log(scale)`. Known invalid constants refuse candidacy. Unproved
 finite locations and positive finite scales require explicit runtime checks.
 Cycles among candidate parents prevent composing a triangular joint map. The
 report never applies maps, changes the ABI or promises improved sampling.
+Proof flags describe source value sets. A target must also preserve finite
+numeric representation before applying a map.
 
 `Context::analyze_model` returns the lowered module beside its report, so node
 identities remain usable by future emitters. `flatppl analyze model.flatppl
