@@ -20,3 +20,18 @@ fn linear_solve_status_is_separate_per_host_call() -> Result<(), Box<dyn std::er
     assert_eq!(batched.runtime_status.as_ref().unwrap().shape, [3]);
     Ok(())
 }
+
+#[test]
+fn inverse_solve_boundary_keeps_the_matrix_only_output() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "A = elementof(cartpow(reals, [8,8]))\ninputs = A\noutputs = inv(A)\n",
+        None,
+        None,
+    )?;
+    let export = query.compile(&EmitOptions::default())?;
+    let output = serde_json::to_value(&export.output)?;
+    assert_eq!(output["index"], 0);
+    assert_eq!(output["shape"], serde_json::json!([8, 8]));
+    assert!(export.runtime_status.is_none());
+    Ok(())
+}
