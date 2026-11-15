@@ -1,6 +1,7 @@
 //! FlatPPL → FlatPDL determiniser: a greedy directional legalizer that eliminates
 //! the measure layer, leaving deterministic ops + the six `builtin_*` primitives.
 //! Type-level transform — flatppl-rust does not evaluate densities.
+mod analysis;
 mod boxes;
 mod canon;
 mod chain;
@@ -20,6 +21,7 @@ mod refuse;
 mod sample;
 mod stdfn;
 mod sufficient_statistics;
+pub use analysis::{AnalysisError, ModelAnalysis, NormalCoordinate, OutputTerm, analyze_model};
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};

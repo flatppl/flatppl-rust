@@ -371,6 +371,33 @@ existing StableHLO fixed-data fallback. The CLI exposes
 discovery is not yet a rule of this pass. A future backend consumes the same reduced FlatPDL and does not
 need its own statistical discovery pass.
 
+## Structural model analysis
+
+`analyze_model` reads lowered FlatPDL without changing it. Declared query inputs
+form the boundary, including promoted fixed or derived bindings. Data inputs
+are explicit; all other inputs are parameters. The report records additive
+terms with signs and multiplicities, parameter/data incidence, structural
+components and unused parameters. Shared data does not join components. Scalar
+addition/subtraction and sums of literal scalar vectors expose terms. Other
+operations, tuples and structured outputs remain opaque. Arrays and constrained
+values stay whole inputs. These are structural components, not a proof of
+posterior independence, propriety or removable normalizers.
+
+Direct scalar Normal factors can suggest advisory affine coordinates for an
+unconstrained real input. Location and scale must exclude that input. The maps
+are `theta = location + scale*z`, `z = (theta-location)/scale`, with forward
+log Jacobian `log(scale)`. Known invalid constants refuse candidacy. Unproved
+finite locations and positive finite scales require explicit runtime checks.
+Cycles among candidate parents prevent composing a triangular joint map. The
+report never applies maps, changes the ABI or promises improved sampling.
+Proof flags describe source value sets. A target must also preserve finite
+numeric representation before applying a map.
+
+`Context::analyze_model` returns the lowered module beside its report, so node
+identities remain usable by future emitters. `flatppl analyze model.flatppl
+--data-input y` prints the same facts. Analysis runs only when requested and
+uses no hidden incremental evaluation cache.
+
 ## Profiles — one mechanism, several uses
 
 A profile is the legal-construct set of a FlatPPL subset. The same mechanism +

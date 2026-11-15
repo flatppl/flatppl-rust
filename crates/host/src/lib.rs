@@ -26,6 +26,7 @@ pub use constants::Constant;
 pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_determinizer::PreparationOptions;
+pub use flatppl_determinizer::{AnalysisError, ModelAnalysis, NormalCoordinate, OutputTerm};
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};
 pub use flatppl_stablehlo::{BatchSpec, Dtype, EmitOptions, IntegrationOptions, Target};
