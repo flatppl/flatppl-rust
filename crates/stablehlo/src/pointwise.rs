@@ -36,9 +36,9 @@ pub(super) enum Pointwise {
     Dot(Value, Value, usize, usize, usize),
     Concat(Vec<Value>, usize),
     Reduce(Value, usize, String, String),
-    // Native lower factor and triangular solve. The `bool` selects the right-side form.
+    // Native factor and solve; solve flags select right-side and lower forms.
     Cholesky(Value),
-    TriSolve(Value, Value, bool),
+    TriSolve(Value, Value, bool, bool),
 }
 
 #[derive(Clone)]
@@ -66,7 +66,7 @@ impl Pointwise {
             | Self::Compare(_, a, b)
             | Self::DynamicGather(a, b, _)
             | Self::Dot(a, b, ..)
-            | Self::TriSolve(a, b, _) => {
+            | Self::TriSolve(a, b, ..) => {
                 vec![a, b]
             }
             Self::Select(c, a, b) => vec![c, a, b],

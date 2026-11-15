@@ -656,8 +656,10 @@ impl Emitter<'_> {
             let pivot = e.reduce_sum_last_axis(&pivot);
             let zero = e.scalar(0.0);
             let nonzero = e.compare("NE", &pivot, &zero);
-            let not_nan = e.compare("EQ", &pivot, &pivot);
-            let step_valid = e.and(&nonzero, &not_nan);
+            let magnitude = e.abs(&pivot);
+            let infinity = e.inf_like(&pivot);
+            let finite = e.compare("LT", &magnitude, &infinity);
+            let step_valid = e.and(&nonzero, &finite);
             let valid = e.and(&valid, &step_valid);
             let one = e.scalar(1.0);
             let safe_pivot = e.select(&step_valid, &pivot, &one);
@@ -676,6 +678,22 @@ impl Emitter<'_> {
         let b = self.axes_view(&eliminated[1], b_axes.clone());
         let valid = self.axes_view(&eliminated[2], scalar_axes);
         self.record_runtime_error(&valid, 4);
+        if self.target == crate::Target::Gpu && n >= 8 {
+            // Invalid cells must not enter the native solve: masking its result
+            // alone can leave NaNs in the reverse pass.
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let identity = self.convert(&diagonal, ElemKind::Real);
+            let safe_a = self.select(&valid, &a, &identity);
+            let zero = self.constant_like(0.0, &b);
+            let safe_b = self.select(&valid, &b, &zero);
+            let x = self.native_tri_solve(&safe_a, &safe_b, false, false);
+            let x = self.select(&valid, &x, &zero);
+            return Ok(if vector_rhs {
+                self.reshape_cell(&x, tensor(vec![Some(n)]))
+            } else {
+                x
+            });
+        }
         let initial = self.constant_like(0.0, &b);
         let solved = self.matrix_loop(n, 4, &[initial], |e, index, args| {
             let last = e.int_value_const(n as i64 - 1);

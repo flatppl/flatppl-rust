@@ -204,9 +204,9 @@ impl TensorBatch<'_, '_> {
             }
             Pointwise::Concat(_, axis) => self.concatenate(inputs, *axis)?,
             Pointwise::Cholesky(_) => self.out.native_cholesky(a),
-            Pointwise::TriSolve(.., right_side) => {
+            Pointwise::TriSolve(_, _, right_side, lower) => {
                 let (l, b) = self.out.broadcast_batches(a, &inputs[1]);
-                self.out.native_tri_solve(&l, &b, *right_side)
+                self.out.native_tri_solve(&l, &b, *right_side, *lower)
             }
         })
     }
