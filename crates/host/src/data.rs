@@ -101,6 +101,7 @@ pub fn load_fixed_data(
             Node::Ref(reference) if reference.ns == RefNs::SelfMod => Some(reference.name),
             _ => None,
         })
+        .flat_map(|name| module.alias_chain(name))
         .collect();
     let mut pending = binding(module, "outputs")
         .map(|node| vec![node])

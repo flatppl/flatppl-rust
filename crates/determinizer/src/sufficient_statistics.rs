@@ -22,6 +22,7 @@ mod grouped_counts;
 mod grouped_moments;
 mod grouped_poisson;
 mod grouped_positive;
+mod grouped_predictors;
 mod histogram;
 mod multivariate;
 mod packing;
@@ -576,7 +577,10 @@ impl Reducer {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
-            }) if self.boundary.contains(name) => DataKey::Input(*name),
+            }) if self.boundary.contains(name) => DataKey::Input(
+                m.alias_target(*name)
+                    .map_or(*name, |bid| m.binding(bid).name),
+            ),
             Node::Lit(Scalar::Int(value)) => DataKey::Integer(*value),
             _ => DataKey::Node(id),
         }
@@ -688,6 +692,9 @@ impl Reducer {
             return Some(result);
         }
         if let Some(result) = grouped_poisson::reduce(self, m, id) {
+            return Some(result);
+        }
+        if let Some(result) = grouped_predictors::reduce(self, m, id) {
             return Some(result);
         }
         if let Some(result) = correlation::reduce(self, m, id) {
@@ -1471,7 +1478,11 @@ pub fn prepare_likelihood_with_options(
     let mut score = m.clone();
     let roots = [score.intern("inputs"), score.intern("outputs")];
     crate::canon::retain_reachable(&mut score, &roots);
-    let allowed: HashSet<_> = data_inputs.iter().map(|name| score.intern(name)).collect();
+    let declared: Vec<_> = data_inputs.iter().map(|name| score.intern(name)).collect();
+    let allowed: HashSet<_> = declared
+        .into_iter()
+        .flat_map(|name| score.alias_chain(name))
+        .collect();
     let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
     let boundary = crate::canon::promoted_input_names(&score);
     let mut proofs = HashMap::new();
@@ -1621,6 +1632,8 @@ fn summary_set(m: &mut Module, ty: &Type) -> Option<NodeId> {
 }
 
 fn depends_on(m: &Module, root: NodeId, name: Symbol) -> bool {
+    let target = m.alias_target(name);
+    let boundary = crate::canon::promoted_input_names(m);
     let mut stack = vec![root];
     let mut seen = HashSet::new();
     while let Some(id) = stack.pop() {
@@ -1632,8 +1645,11 @@ fn depends_on(m: &Module, root: NodeId, name: Symbol) -> bool {
             name: found,
         }) = m.node(id)
         {
-            if *found == name {
+            if *found == name || (target.is_some() && m.alias_target(*found) == target) {
                 return true;
+            }
+            if boundary.contains(found) {
+                continue;
             }
             if let Some(bid) = m.binding_by_name(*found) {
                 stack.push(m.binding(bid).rhs);

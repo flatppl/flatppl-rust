@@ -12,10 +12,12 @@ mod disintegrate;
 mod driver;
 mod extras;
 mod free_draw;
+mod incremental;
 mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
+mod normal_coordinates;
 mod primitives;
 mod refuse;
 mod sample;
@@ -28,6 +30,10 @@ pub use conformance::{is_flatpdl, is_flatpdl_with_options};
 pub use driver::{
     determinize, determinize_with, determinize_with_options, determinize_with_options_and_report,
     determinize_with_roots,
+};
+pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
+pub use normal_coordinates::{
+    CoordinatePrecision, NormalCoordinateQueries, prepare_normal_coordinate,
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::standard_function;

@@ -317,6 +317,16 @@ primitive scores and preserves probability endpoints. Its table has at most 256
 cells. These paths share checked selectors, permit empty groups, and require at
 most 64 groups and 2^22 observation-by-group cells. Rebinding any preparation
 input requires rerunning preparation. No runtime cache infers data identity.
+Pointwise `exp`/`invlogit` predictors and real add/subtract/multiply/divide/negate
+DAGs can move before runtime gathers. Every vector leaf must use the same checked
+selector, origin and extent. Scalar captures stay live. Existing family counts
+provide occupancy, including Bernoulli/Binomial outcome buffers, so lifting adds
+no summary arguments. Each operation masks its inactive operands before evaluation,
+then the final parameter uses its family's empty-group value. Bounded source
+ranges must enclose both precisions and all score/link reverse intermediates.
+Tiny probabilities, subnormal range ambiguity and unsafe quotient products retain
+ordinary scoring. A depth/node budget bounds analysis, and a failed family guard
+discards the entire candidate. Original predictor outputs remain unchanged.
 The opt-in Rust report APIs and CLI `--explain-reductions` trace actual decisions
 without changing the module. Reports distinguish the lowering, materialized-data,
 and preparation stages. A later stage can reduce a factor retained earlier.
@@ -413,10 +423,42 @@ report never applies maps, changes the ABI or promises improved sampling.
 Proof flags describe source value sets. A target must also preserve finite
 numeric representation before applying a map.
 
+`prepare_normal_coordinate` explicitly selects one such scalar input. Its
+ordinary score, forward, inverse and log-Jacobian queries return `(value, valid)`.
+Only the selected score/forward/Jacobian input slot becomes a fresh coordinate.
+The inverse keeps the original ABI. Other promoted inputs and lexical binders
+remain boundaries. The original query is unchanged. A log-density request adds
+`log(scale)` to the substituted scalar score.
+Every map checks finite location, positive finite scale, finite coordinates and
+a precision-specific round trip. Scale bounds also protect squared-denominator
+arithmetic. Checks apply even when source ranges prove validity. Invalid maps
+require discarding the result, not assigning zero probability. Native runtime
+status remains a separate check. This validates a point, not a global floating
+bijection. Multiple direct Normal factors are ambiguous. Selecting one
+conditional map does not compose cyclic candidates into a joint map.
+The core returns portable modules with an explicit arithmetic precision. The
+host compiles every companion with the requested precision and target together.
+Companion input leaves use `external` with the same declared sets, so supplied
+values remain fixed captures inside explicit callbacks. Retained automatic
+callbacks require explicit boundaries before preparation; their keyword-only
+interfaces are never silently retraced.
+
 `Context::analyze_model` returns the lowered module beside its report, so node
 identities remain usable by future emitters. `flatppl analyze model.flatppl
 --data-input y` prints the same facts. Analysis runs only when requested and
 uses no hidden incremental evaluation cache.
+
+`prepare_incremental_score` builds portable scalar term queries and a combiner
+that keeps the original arithmetic tree, scalar types and repeated terms.
+Input aliases share one dependency under the declared ABI name. Fixed file data
+loads once for the plan. The original query stays unchanged.
+The host exposes explicit dependency invalidation and revision tickets. Notify
+the coordinator before every input change, including array edits and rollbacks.
+Accept a result only after its native status succeeds and its ticket is current.
+Valid infinite scores remain cacheable. Recombination evaluates the original
+tree over cached values, rather than subtracting stale totals. Each compiled
+plan, precision and target needs its own coordinator. Cached scalar values do
+not provide full parameter gradients; retain term gradients or recompute them.
 
 ## Profiles — one mechanism, several uses
 

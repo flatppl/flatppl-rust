@@ -489,6 +489,92 @@ impl Context {
         Arc::ptr_eq(&self.owner, &module.owner)
     }
 
+    /// Compile companions for one explicitly selected scalar Normal coordinate.
+    /// The original query and all other input slots stay unchanged. `logdensity`
+    /// adds the forward log Jacobian. Fixed file data loads once for all queries.
+    /// Check each `(value, valid)` output and the separate native runtime status.
+    pub fn prepare_normal_coordinate(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+        parameter: &str,
+        logdensity: bool,
+        options: &EmitOptions,
+    ) -> Result<crate::NormalCoordinateExports, Diagnostic> {
+        let fail = |message: String| {
+            Diagnostic::new("prepare_normal_coordinate", module.source_name(), message)
+        };
+        let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
+        crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
+            .map_err(|error| fail(error.to_string()))?;
+        let precision = match options.dtype {
+            flatppl_stablehlo::Dtype::F32 => flatppl_determinizer::CoordinatePrecision::F32,
+            flatppl_stablehlo::Dtype::F64 => flatppl_determinizer::CoordinatePrecision::F64,
+        };
+        let plan = flatppl_determinizer::prepare_normal_coordinate(
+            &lowered,
+            data_inputs,
+            parameter,
+            precision,
+            logdensity,
+        )
+        .map_err(|error| fail(error.to_string()))?;
+        let score = self.prepared_query(module, plan.score)?.compile(options)?;
+        let forward = self
+            .prepared_query(module, plan.forward)?
+            .compile(options)?;
+        let inverse = self
+            .prepared_query(module, plan.inverse)?
+            .compile(options)?;
+        let log_jacobian = self
+            .prepared_query(module, plan.log_jacobian)?
+            .compile(options)?;
+        Ok(crate::NormalCoordinateExports {
+            score,
+            forward,
+            inverse,
+            log_jacobian,
+            coordinate_input: plan.coordinate_input,
+        })
+    }
+
+    /// Export ordinary scalar term queries plus their original-tree combiner.
+    /// Fixed file data loads once for the entire plan. Re-evaluate terms after
+    /// explicit dependency changes and check each native status before caching.
+    /// Cached values alone do not supply parameter gradients; store term
+    /// gradients or evaluate every term required for the requested gradient.
+    pub fn prepare_incremental_score(
+        &mut self,
+        module: &LoadedModule,
+        data_inputs: &[String],
+    ) -> Result<crate::IncrementalScoreQueries, Diagnostic> {
+        let fail = |message: String| {
+            Diagnostic::new("prepare_incremental_score", module.source_name(), message)
+        };
+        let (mut lowered, _) = self.analyze_model(module, data_inputs)?;
+        crate::load_fixed_data(&mut lowered, |source| module.read_data(source))
+            .map_err(|error| fail(error.to_string()))?;
+        let plan = flatppl_determinizer::prepare_incremental_score(&lowered, data_inputs)
+            .map_err(|error| fail(error.to_string()))?;
+        let mut terms = Vec::with_capacity(plan.terms.len());
+        for (index, term) in plan.terms.iter().enumerate() {
+            let query = plan
+                .term_query(index)
+                .map_err(|error| fail(error.to_string()))?;
+            terms.push(crate::IncrementalTermQuery {
+                query: self.prepared_query(module, query)?,
+                dependencies: term.dependencies.clone(),
+                cache_input: term.cache_input.clone(),
+            });
+        }
+        let combine = self.prepared_query(module, plan.combine)?;
+        Ok(crate::IncrementalScoreQueries::new(
+            terms,
+            combine,
+            plan.inputs,
+        ))
+    }
+
     /// Separate data-only summaries from repeated likelihood evaluation.
     ///
     /// `data_inputs` names declared inputs supplied to the preparation query.
