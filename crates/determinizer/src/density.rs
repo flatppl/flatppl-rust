@@ -138,7 +138,7 @@
 //! desugared into `bayesupdate(likelihoodof(kernel, x), marginal)` over the
 //! disintegration on `x`'s field names, §06 "Measure restriction".)
 
-pub(crate) use flatppl_core::graph::{build_call, build_record};
+pub(crate) use flatppl_core::graph::{build_call, build_record, fold_add};
 
 use crate::crossmodule::GraftState;
 use crate::refuse::RefuseError;
@@ -9281,44 +9281,6 @@ pub(crate) fn build_user_call_n(m: &mut Module, callee: NodeId, args: Vec<NodeId
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }))
-}
-
-/// Combine density terms with `add`: a single term passes through; two or more
-/// combine PAIRWISE into a balanced tree of binary `add` calls, so the result
-/// nests ⌈log2 N⌉ deep rather than N − 1 deep.
-///
-/// The depth matters because an `iid` over N observations lowers to N density
-/// terms, and a left fold made the emitted FlatPDL as deep as the dataset is
-/// long. A 2000-point HistFactory likelihood printed a 1998-term `+` chain,
-/// which overflowed the JS engine's recursive IR walkers before it could score
-/// at all. FlatPDL is a target other tools consume, so the shape has to stay
-/// within a normal recursive walker's reach. `13-determinization.md` "Output
-/// reduction" fixes only that `iid` SUMS its component densities, not how the
-/// sum associates, so this is free to choose.
-///
-/// The terms keep their given left-to-right sequence: adjacent terms pair, then
-/// adjacent pairs pair, so no term moves past another, is dropped, or repeats.
-/// What does change is the ASSOCIATION, and float addition is not associative,
-/// so a sum of N ≥ 3 terms can differ from the left fold's in the last bits.
-/// That is a reassociation of the same addends, not a different quantity.
-pub(crate) fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
-    debug_assert!(!terms.is_empty(), "fold_add requires at least one term");
-    // Pair front-to-back into `level`, then repeat over that. An odd tail term
-    // carries forward unpaired, which keeps the sequence order and leaves
-    // N <= 2 byte-identical to the old left fold.
-    let mut level: Vec<NodeId> = terms.to_vec();
-    let mut next: Vec<NodeId> = Vec::new();
-    while level.len() > 1 {
-        next.clear();
-        next.reserve(level.len().div_ceil(2));
-        let (pairs, remainder) = level.as_chunks::<2>();
-        for pair in pairs {
-            next.push(build_call(m, "add", &[pair[0], pair[1]]));
-        }
-        next.extend_from_slice(remainder);
-        std::mem::swap(&mut level, &mut next);
-    }
-    level[0]
 }
 
 /// If `id` is `draw(mᵢ)`, return `mᵢ`; otherwise `None`.

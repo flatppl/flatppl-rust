@@ -181,7 +181,7 @@ impl Predictor {
                 materialize(m, op(name, [Expr::Node(*array), Expr::Node(indices)]))
             }
         };
-        crate::kernel::annotate_rebuilt(m, value);
+        flatppl_infer::annotate_rebuilt(m, value);
         cache[at] = Some(value);
         value
     }

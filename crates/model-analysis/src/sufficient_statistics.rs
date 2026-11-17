@@ -13,7 +13,7 @@ use flatppl_core::{
     ScalarType, Symbol, Type, ValueSet,
 };
 
-use crate::RefuseError;
+use flatppl_core::{graph, query};
 
 mod circular;
 mod correlation;
@@ -33,7 +33,7 @@ mod report;
 mod runtime_partition;
 mod scalar;
 mod sorted;
-use crate::density::{build_call, build_record};
+use flatppl_core::graph::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
 
 const PREFIX: &str = "__likelihood_summary_";
@@ -47,6 +47,21 @@ pub struct PreparedLikelihood {
     pub score: Module,
     pub summaries: Vec<String>,
 }
+
+/// A likelihood preparation failure at the output of the supplied query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparationError {
+    pub node: NodeId,
+    pub reason: String,
+}
+
+impl std::fmt::Display for PreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for PreparationError {}
 
 /// Portable data-preparation layout controls.
 #[derive(Clone, Copy, Debug)]
@@ -1290,7 +1305,7 @@ impl Reducer {
         let id = if children == replacements {
             root
         } else {
-            crate::driver::rebuild_with_children(m, root, &replacements)
+            graph::rebuild_with_children(m, root, &replacements)
         };
         let family = self
             .report
@@ -1359,7 +1374,7 @@ fn reduce(
     report: Option<&mut ReductionReport>,
     enabled: bool,
 ) -> (usize, Vec<Symbol>) {
-    let boundary = crate::canon::promoted_input_names(m);
+    let boundary = query::promoted_input_names(m);
     let mut reducer = Reducer {
         preparing,
         boundary,
@@ -1379,8 +1394,7 @@ fn reduce(
     let bindings: Vec<_> = m
         .bindings()
         .filter(|(bid, b)| {
-            !crate::canon::is_reserved_abi_binding(m, *bid)
-                && !m.resolve(b.name).starts_with(PREFIX)
+            !query::is_inputs_binding(m, *bid) && !m.resolve(b.name).starts_with(PREFIX)
         })
         .map(|(bid, b)| (bid, b.rhs))
         .collect();
@@ -1416,7 +1430,7 @@ pub fn sufficient_statistics_with_report(m: &mut Module, report: &mut ReductionR
 }
 
 fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionReport>) -> usize {
-    let allowed = crate::canon::promoted_input_names(m)
+    let allowed = query::promoted_input_names(m)
         .into_iter()
         .filter(|name| {
             m.binding_by_name(*name)
@@ -1431,7 +1445,7 @@ fn sufficient_statistics_inner(m: &mut Module, report: Option<&mut ReductionRepo
 pub fn prepare_likelihood(
     m: &Module,
     data_inputs: &[String],
-) -> Result<PreparedLikelihood, RefuseError> {
+) -> Result<PreparedLikelihood, PreparationError> {
     prepare_likelihood_with_options(m, data_inputs, &PreparationOptions::default(), None)
 }
 
@@ -1440,7 +1454,7 @@ pub fn prepare_likelihood_with_report(
     m: &Module,
     data_inputs: &[String],
     report: &mut ReductionReport,
-) -> Result<PreparedLikelihood, RefuseError> {
+) -> Result<PreparedLikelihood, PreparationError> {
     prepare_likelihood_with_options(m, data_inputs, &PreparationOptions::default(), Some(report))
 }
 
@@ -1450,11 +1464,10 @@ pub fn prepare_likelihood_with_options(
     data_inputs: &[String],
     options: &PreparationOptions,
     report: Option<&mut ReductionReport>,
-) -> Result<PreparedLikelihood, RefuseError> {
+) -> Result<PreparedLikelihood, PreparationError> {
     let error_node = binding(m, "outputs").unwrap_or_else(|| NodeId::from_usize(0));
-    let refuse = |reason: &str| RefuseError {
+    let refuse = |reason: &str| PreparationError {
         node: error_node,
-        construct: "prepare_likelihood".into(),
         reason: reason.into(),
     };
     if binding(m, "outputs").is_none() {
@@ -1477,14 +1490,14 @@ pub fn prepare_likelihood_with_options(
     }
     let mut score = m.clone();
     let roots = [score.intern("inputs"), score.intern("outputs")];
-    crate::canon::retain_reachable(&mut score, &roots);
+    graph::retain_reachable(&mut score, &roots);
     let declared: Vec<_> = data_inputs.iter().map(|name| score.intern(name)).collect();
     let allowed: HashSet<_> = declared
         .into_iter()
         .flat_map(|name| score.alias_chain(name))
         .collect();
     let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
-    let boundary = crate::canon::promoted_input_names(&score);
+    let boundary = query::promoted_input_names(&score);
     let mut proofs = HashMap::new();
     let mut summaries: Vec<_> = score
         .bindings()
@@ -1575,7 +1588,7 @@ pub fn prepare_likelihood_with_options(
     set_signature(&mut score, "inputs", &inputs);
     for module in [&mut preparation, &mut score] {
         let roots = [module.intern("inputs"), module.intern("outputs")];
-        crate::canon::retain_reachable(module, &roots);
+        graph::retain_reachable(module, &roots);
         let diagnostics = flatppl_infer::infer(module);
         if diagnostics
             .iter()
@@ -1633,7 +1646,7 @@ fn summary_set(m: &mut Module, ty: &Type) -> Option<NodeId> {
 
 fn depends_on(m: &Module, root: NodeId, name: Symbol) -> bool {
     let target = m.alias_target(name);
-    let boundary = crate::canon::promoted_input_names(m);
+    let boundary = query::promoted_input_names(m);
     let mut stack = vec![root];
     let mut seen = HashSet::new();
     while let Some(id) = stack.pop() {

@@ -143,7 +143,7 @@ pub(super) fn factor(m: &mut Module, id: NodeId, r: &Reducer) -> Option<Factor> 
         } else {
             return None;
         };
-        crate::kernel::annotate_rebuilt(m, value);
+        flatppl_infer::annotate_rebuilt(m, value);
         parameters.push((a.name, value));
     }
     let observed = if let Some(value) = operand(m, point) {
@@ -169,9 +169,9 @@ pub(super) fn factor(m: &mut Module, id: NodeId, r: &Reducer) -> Option<Factor> 
             named: vec![].into(),
             inputs: Some(Inputs::Spec(inputs.into())),
         }));
-        crate::density::build_call(m, "broadcast", &[vec![function], args].concat())
+        flatppl_core::graph::build_call(m, "broadcast", &[vec![function], args].concat())
     };
-    crate::kernel::annotate_rebuilt(m, observed);
+    flatppl_infer::annotate_rebuilt(m, observed);
     Some(Factor {
         constructor,
         parameters,
@@ -558,7 +558,7 @@ pub(super) fn reduce_factor(r: &mut Reducer, m: &mut Module, f: &Factor) -> Opti
         .into_iter()
         .map(|term| materialize(&mut candidate, term))
         .collect::<Vec<_>>();
-    let result = crate::density::fold_add(&mut candidate, &terms);
+    let result = flatppl_core::graph::fold_add(&mut candidate, &terms);
     *m = candidate;
     *r = reducer;
     r.rule = Some(("grouped scalar summaries", Some(partition)));

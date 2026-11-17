@@ -15,12 +15,12 @@ mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
+mod preparation;
 mod primitives;
 mod query_analysis;
 mod refuse;
 mod sample;
 mod stdfn;
-mod sufficient_statistics;
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
@@ -29,9 +29,15 @@ pub use driver::{
     determinize_with_roots,
 };
 pub use flatppl_model_analysis::{
-    AnalysisError, CoordinatePrecision, IncrementalScorePlan, IncrementalTerm, InputArray,
-    InputCell, InputPath, ModelAnalysis, NormalCoordinate, NormalCoordinateQueries,
-    NormalCoordinatesQueries, OutputTerm,
+    AnalysisError, CoordinatePrecision, GroupPartition, IncrementalScorePlan, IncrementalTerm,
+    InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, NormalCoordinateQueries,
+    NormalCoordinatesQueries, OutputTerm, PreparationOptions, PreparedLikelihood,
+    ReductionDecision, ReductionOutcome, ReductionReport, sufficient_statistics,
+    sufficient_statistics_with_report,
+};
+
+pub use preparation::{
+    prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,
 };
 pub use query_analysis::{
     analyze_model, prepare_incremental_score, prepare_normal_coordinate,
@@ -39,11 +45,6 @@ pub use query_analysis::{
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};
-pub use sufficient_statistics::{
-    GroupPartition, PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome,
-    ReductionReport, prepare_likelihood, prepare_likelihood_with_options,
-    prepare_likelihood_with_report, sufficient_statistics, sufficient_statistics_with_report,
-};
 
 /// Deterministic standard functions a backend lowers without portable expansion.
 /// The default keeps the backend-independent FlatPDL form.

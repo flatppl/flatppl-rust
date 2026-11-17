@@ -235,6 +235,21 @@ pub fn infer_expression(
     (types, diagnostics)
 }
 
+/// Fill missing types in a rebuilt expression. Keep existing types and apply
+/// only resolved types from expression inference.
+pub fn annotate_rebuilt(m: &mut Module, root: NodeId) {
+    if m.type_of(root).is_some() {
+        return;
+    }
+    let (types, _) = infer_expression(m, root, &[]);
+    for (node, ty) in types {
+        if m.type_of(node).is_none() && !matches!(ty, Type::Any | Type::Deferred | Type::Failed(_))
+        {
+            m.set_type(node, ty);
+        }
+    }
+}
+
 /// The fixed integer value of `root`, as the shape const-evaluator folds it
 /// (engine-concepts §17.1), without replacing module annotations. A derived
 /// size that folds to 0 types as `%dynamic` (the 2026-08-20 zero-size

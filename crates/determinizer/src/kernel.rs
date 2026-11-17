@@ -13,6 +13,7 @@ use flatppl_core::{
     Binding, BindingId, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref,
     RefNs, Scalar, Symbol, Type,
 };
+pub(crate) use flatppl_infer::annotate_rebuilt;
 
 /// A resolved kernel: its reified body and its boundary inputs as
 /// `(name, body-target-ref)` pairs. For a `%specinputs` boundary the pairs are
@@ -343,24 +344,6 @@ pub(crate) fn substitute_refs(m: &mut Module, root: NodeId, map: &[(Symbol, Node
         return root;
     }
     crate::driver::rebuild_with_children(m, root, &new_children)
-}
-
-/// Type the nodes that a substitution rebuilt, which carry no annotation.
-/// Lowerings read a measure's variate type, for example to prove its reference
-/// measure or to take the `iid` fast path. Inference runs on the applied
-/// expression, so a shape that depends on an argument takes the applied value.
-/// Annotated nodes keep their annotations.
-pub(crate) fn annotate_rebuilt(m: &mut Module, root: NodeId) {
-    if m.type_of(root).is_some() {
-        return;
-    }
-    let (types, _) = flatppl_infer::infer_expression(m, root, &[]);
-    for (node, ty) in types {
-        if m.type_of(node).is_none() && !matches!(ty, Type::Any | Type::Deferred | Type::Failed(_))
-        {
-            m.set_type(node, ty);
-        }
-    }
 }
 
 /// Substitute every admitted boundary entry simultaneously. `All` follows the

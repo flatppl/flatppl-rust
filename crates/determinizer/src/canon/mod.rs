@@ -3,9 +3,10 @@
 //! `flatpdl.flatprof` conformance AND exact semantics. Each pass
 //! is idempotent and refuse-free; the driver runs them to a combined fixpoint.
 
-use std::collections::HashSet;
-
-use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Symbol};
+pub(crate) use flatppl_core::query::{
+    is_inputs_binding as is_reserved_abi_binding, promoted_input_names,
+};
+use flatppl_core::{Module, Symbol};
 
 pub(crate) use flatppl_core::graph::retain_reachable;
 mod flatten;
@@ -17,67 +18,6 @@ pub(crate) use inline::{
 };
 mod integrals;
 mod sharing;
-
-/// Whether `bid` is the reserved `inputs` binding (spec §13
-/// `sec:determinization-signature`).
-///
-/// `inputs` is a pure declaration: every element must name a binding to
-/// promote, so rewriting one into a value can only destroy it. §13's phase
-/// table maps a *derived* fixed binding listed in `inputs` to "function
-/// argument, replacing the computed value", and folding `inputs = c` for
-/// `c = 2.0 * 3.0` down to `inputs = 6.0` erases the argument the caller must
-/// supply. Every canonicalization pass therefore leaves this binding's RHS
-/// untouched.
-///
-/// `outputs` is deliberately NOT exempt. Its elements are ordinary
-/// expressions — a model can write the whole density inline as `outputs =
-/// logdensityof(…)` — and they need folding like any other value: a
-/// statically-foldable `Uniform` bound must reach the emitter as a literal
-/// interval, or the support check refuses.
-pub(crate) fn is_reserved_abi_binding(m: &Module, bid: BindingId) -> bool {
-    m.resolve(m.binding(bid).name) == "inputs"
-}
-
-/// Every name on the reserved inputs' bare-name alias chains. Aliases denote
-/// one object (§04), so protecting only the listed spelling can fold a promoted
-/// target's old value into consumers before the host binds its argument.
-///
-/// §13's phase table replaces such a binding's *computed value* with a function
-/// argument, so its value must not be substituted into the consumers that read
-/// it: `inputs = c` for `c = 2.0 * 3.0` compiles to a one-argument function, not
-/// to a `6.0` baked at every use of `c`. [`resolve_alias_refs`] therefore never
-/// inlines a reference to one of these.
-///
-/// [`resolve_alias_refs`]: fold::resolve_alias_refs
-pub(crate) fn promoted_input_names(m: &Module) -> HashSet<Symbol> {
-    let Some((_, binding)) = m.bindings().find(|(_, b)| m.resolve(b.name) == "inputs") else {
-        return HashSet::new();
-    };
-    abi_tuple_elems(m, binding.rhs)
-        .into_iter()
-        .filter_map(|elem| match m.node(elem) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) => Some(*name),
-            _ => None,
-        })
-        .flat_map(|name| m.alias_chain(name))
-        .collect()
-}
-
-/// Normalize a reserved binding's RHS — a single value, or the `(v1, v2, …)`
-/// surface sugar's `tuple(...)` call — to its element nodes in declared order.
-/// Mirrors `flatppl_stablehlo::modes::tuple_elems`, which reads the same shape
-/// back off the determinized module.
-fn abi_tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
-    if let Node::Call(c) = m.node(rhs)
-        && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "tuple")
-    {
-        return c.args.to_vec();
-    }
-    vec![rhs]
-}
 
 /// The `FLATPPL_DETERMINIZE_NO_CANON` env escape hatch: when set (to any value),
 /// `canonicalize` is a no-op. Used to determinize a model both ways for the
