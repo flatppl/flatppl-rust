@@ -275,6 +275,7 @@ impl ColumnModel for Column {
 pub(crate) fn model_rows(
     formula: &Formula,
     predictors: &[&Formula],
+    extra_columns: &[String],
     table: &Table,
     mode: DataMode,
 ) -> Result<Vec<usize>> {
@@ -320,6 +321,7 @@ pub(crate) fn model_rows(
                 .flatten(),
         )
         .chain(se_columns)
+        .chain(extra_columns.iter().map(String::as_str))
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name).map_err(Error::from))
@@ -356,11 +358,25 @@ pub(crate) fn model_rows(
 /// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
     let predictors: Vec<_> = recipe.predictors.values().map(|p| &p.formula).collect();
-    let rows = model_rows(&recipe.formula, &predictors, table, mode)?;
+    let nonlinear_columns = recipe
+        .nonlinear
+        .as_ref()
+        .map_or(&[][..], |p| p.columns.as_slice());
+    let rows = model_rows(&recipe.formula, &predictors, nonlinear_columns, table, mode)?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
+    for (i, name) in nonlinear_columns.iter().enumerate() {
+        let values = crate::ColumnExpression::Column(name.clone()).data(table, &rows)?;
+        constants.insert(crate::nonlinear::data_name(i), values);
+    }
     for (dpar, predictor) in recipe.predictors() {
-        prepare_predictor(predictor, dpar, table, &rows, &mut constants)?;
+        prepare_predictor(
+            predictor,
+            &recipe.predictor_suffix(dpar),
+            table,
+            &rows,
+            &mut constants,
+        )?;
     }
     if mode == DataMode::Training {
         constants.insert(

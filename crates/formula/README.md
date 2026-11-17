@@ -61,6 +61,33 @@ defaults. `ModelInfo.dpars` records each formula, link and design columns.
 For example, `temp_Intercept_sigma` is the centred scale intercept and
 `b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
 
+### Nonlinear predictors
+
+For Gaussian and Bernoulli responses, supply `nlpars` to treat the right side
+of the response formula as arithmetic over named parameter predictors and
+numeric data columns. Each named predictor uses ordinary formula terms.
+
+```json
+{
+  "formula": "y ~ a * exp(b * x)",
+  "nlpars": {"a": "a ~ 1", "b": "b ~ 1"},
+  "priors": [
+    {"class": "b", "nlpar": "a", "prior": "normal(1, 2)"},
+    {"class": "b", "nlpar": "b", "prior": "normal(0, 2)"}
+  ]
+}
+```
+
+The family link applies to the whole expression. Use `y ~ exp(ld) * (theta - difficulty)`
+with the default Bernoulli logit link for a 2PL model. Arithmetic supports
+`+`, `-`, `*`, `/`, `^`, parentheses, `exp` and `log`. Each population
+coefficient needs an explicit `b` prior scoped by `nlpar`, including the
+uncentred intercept (coefficient `Intercept`). Group effects are independent
+across nonlinear predictors. The recipe saves every parameter design and
+prepares the response expression’s data columns on new rows.
+
+### Families
+
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
 `cumulative`, `categorical`, `zero_inflated_poisson`, `zero_inflated_binomial`,

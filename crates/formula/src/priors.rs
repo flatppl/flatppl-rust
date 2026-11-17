@@ -16,6 +16,8 @@ pub struct Prior {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpar: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nlpar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lb: Option<PriorBound>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ub: Option<PriorBound>,
@@ -83,9 +85,13 @@ pub(crate) fn dpar(value: Option<&str>) -> Option<&str> {
 }
 
 impl Prior {
+    fn predictor(&self) -> Option<&str> {
+        self.nlpar.as_deref().or_else(|| dpar(self.dpar.as_deref()))
+    }
+
     fn matches(&self, target: &PriorTarget<'_>) -> bool {
         canonical_class(&self.class) == target.class
-            && dpar(self.dpar.as_deref()) == target.dpar
+            && self.predictor() == target.dpar
             && [
                 (self.coef.as_deref(), target.coef),
                 (self.group.as_deref(), target.group),
@@ -98,7 +104,7 @@ impl Prior {
         (
             nonempty(self.coef.as_deref()).is_some(),
             nonempty(self.group.as_deref()).is_some(),
-            nonempty(self.dpar.as_deref()).is_some(),
+            self.predictor().is_some(),
         )
     }
 }
@@ -113,7 +119,7 @@ pub(crate) fn select(
             canonical_class(&prior.class),
             nonempty(prior.coef.as_deref()),
             nonempty(prior.group.as_deref()),
-            dpar(prior.dpar.as_deref()),
+            prior.predictor(),
         );
         if !seen.insert(selector) {
             return Err(Error(format!(
@@ -136,8 +142,11 @@ pub(crate) fn select(
         }
         if !targets.iter().any(|target| prior.matches(target)) {
             return Err(Error(format!(
-                "prior selector class `{}` coef {:?} group {:?} dpar {:?} matches no parameter",
-                prior.class, prior.coef, prior.group, prior.dpar
+                "prior selector class `{}` coef {:?} group {:?} predictor {:?} matches no parameter",
+                prior.class,
+                prior.coef,
+                prior.group,
+                prior.predictor()
             )));
         }
     }
@@ -176,6 +185,7 @@ pub(crate) struct PriorContext<'a> {
     pub link: Link,
     pub thresholds: usize,
     pub dpar: Option<&'a str>,
+    pub nonlinear: bool,
     pub response: Option<&'a [f64]>,
     pub offset_mean: f64,
     pub group_scale: f64,
@@ -193,6 +203,7 @@ pub(crate) fn resolve(
         link,
         thresholds,
         dpar,
+        nonlinear,
         response,
         offset_mean,
         group_scale,
@@ -228,8 +239,8 @@ pub(crate) fn resolve(
         }));
     } else if formula.intercept {
         targets.push(PriorTarget {
-            class: "Intercept",
-            coef: None,
+            class: if nonlinear { "b" } else { "Intercept" },
+            coef: nonlinear.then_some("Intercept"),
             group: None,
             dpar,
         });
@@ -264,13 +275,28 @@ pub(crate) fn resolve(
     let priors: Vec<_> = spec
         .priors
         .iter()
-        .filter(|prior| self::dpar(prior.dpar.as_deref()) == dpar)
+        .filter(|prior| prior.predictor() == dpar)
         .cloned()
         .collect();
-    let mut selected = select(&priors, &targets)?.into_iter();
+    let selected = select(&priors, &targets)?;
+    if nonlinear {
+        for (target, prior) in targets.iter().zip(&selected) {
+            if target.class == "b" && prior.is_none() {
+                return Err(Error(format!(
+                    "nonlinear parameter `{}` coefficient `{}` requires an explicit prior",
+                    dpar.unwrap(),
+                    target.coef.unwrap()
+                )));
+            }
+        }
+    }
+    let mut selected = selected.into_iter();
     let student = |location| ResolvedPrior::new(format!("student_t(3, {location}, {scale})"));
     let default_intercept = || {
-        if let Some(name) = dpar {
+        if nonlinear {
+            // No intercept is emitted when the nonlinear design omits it.
+            student(0.0)
+        } else if let Some(name) = dpar {
             ResolvedPrior::new(family.default_predictor_prior(name, link, scale))
         } else if family == Family::VonMises && link == Link::TanHalf {
             ResolvedPrior::new("student_t(1, 0, 1)")

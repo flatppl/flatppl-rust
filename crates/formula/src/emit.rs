@@ -32,19 +32,26 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     if recipe.formula.se.is_some() {
         external_vector(&mut b, "se_data", "nonnegreals");
     }
+    if let Some(nonlinear) = &recipe.nonlinear {
+        for i in 0..nonlinear.columns.len() {
+            external_vector(&mut b, &crate::nonlinear::data_name(i), "reals");
+        }
+    }
     let predictor_names: Vec<_> = recipe
         .predictors()
         .map(|(name, _)| name.to_owned())
         .collect();
     for name in &predictor_names {
-        predictor_data(&mut b, name, recipe.predictors.get_mut(name).unwrap());
+        let suffix = recipe.predictor_suffix(name);
+        predictor_data(&mut b, &suffix, recipe.predictors.get_mut(name).unwrap());
     }
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
     for name in &predictor_names {
+        let suffix = recipe.predictor_suffix(name);
         predictor_parameters(
             &mut b,
-            name,
+            &suffix,
             recipe.predictors.get_mut(name).unwrap(),
             recipe.family,
             if name == "mu" { thresholds } else { 0 },
@@ -91,11 +98,19 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     for (name, predictor) in recipe.predictors() {
         predictor_values(
             &mut b,
-            name,
+            &recipe.predictor_suffix(name),
             predictor,
             if name == "mu" { thresholds } else { 0 },
             recipe.family,
+            recipe.is_nonlinear_parameter(name),
         );
+    }
+    if let Some(nonlinear) = &recipe.nonlinear {
+        let eta = nonlinear.emit(&mut b);
+        b.bind("eta_mu", eta);
+        let eta = b.self_ref("eta_mu");
+        let mu = recipe.link.inverse(&mut b, eta);
+        b.bind("mu", mu);
     }
     let mu = if recipe.family == Family::Categorical {
         b.lit_real(0.0)
@@ -443,6 +458,7 @@ fn predictor_values(
     recipe: &crate::PredictorRecipe,
     thresholds: usize,
     family: Family,
+    nonlinear_parameter: bool,
 ) {
     let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
         .map(|i| predictor_name(dpar, &format!("x_{}", i + 1)))
@@ -535,13 +551,15 @@ fn predictor_values(
         eta = broadcast(b, "add", &[eta, offset]);
     }
     b.bind(&format!("eta_{dpar}"), eta);
-    let eta = b.self_ref(&format!("eta_{dpar}"));
-    let value = if thresholds > 0 || family == Family::Categorical {
-        eta
-    } else {
-        recipe.link.inverse(b, eta)
-    };
-    b.bind(dpar, value);
+    if !nonlinear_parameter {
+        let eta = b.self_ref(&format!("eta_{dpar}"));
+        let value = if thresholds > 0 || family == Family::Categorical {
+            eta
+        } else {
+            recipe.link.inverse(b, eta)
+        };
+        b.bind(dpar, value);
+    }
     if let Some(intercept) = intercept {
         b.bind(&predictor_name(dpar, "b_Intercept"), intercept);
     }
@@ -881,6 +899,7 @@ pub(crate) fn info(
         let thresholds = if dpar == "mu" { recipe.thresholds() } else { 0 };
         parameters.extend(predictor_info(
             dpar,
+            &recipe.predictor_suffix(dpar),
             predictor,
             module,
             thresholds,
@@ -913,16 +932,36 @@ pub(crate) fn info(
         .predictors
         .get("mu")
         .map_or_else(Default::default, metadata::levels);
+    let predictor_metadata = |name: &str, formula: &str| {
+        let predictor = &recipe.predictors[name];
+        let (factor_levels, group_levels) = metadata::levels(predictor);
+        crate::PredictorInfo {
+            formula: formula.into(),
+            link: predictor.link.name().into(),
+            design_columns: predictor
+                .design
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            factor_levels,
+            group_levels,
+        }
+    };
     Ok(ModelInfo {
         formula: spec.formula.clone(),
         family: spec.family.clone(),
         link: recipe.link.name().into(),
         group_collation: "C".into(),
-        default_prior_rule: format!(
-            "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; direct sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept. Predicted auxiliaries use brms's link-specific intercept defaults and the mean predictor's response scale for group priors.",
-            spec.family,
-            recipe.link.name()
-        ),
+        default_prior_rule: if recipe.nonlinear.is_some() {
+            "Nonlinear predictors use explicit population priors and uncentred intercepts. Family auxiliary and group priors use the existing formula defaults.".into()
+        } else {
+            format!(
+                "brms {}({}): numeric identity/log/inverse/sqrt responses use the linked median and MAD, rounded to one decimal (MAD constant 1.4826), with the mean offset subtracted from the intercept location; other responses use location 0 and scale 2.5. Scale is at least 2.5; direct sigma uses the identity-link response scale. Lognormal uses log responses for all these statistics. von_mises(tan_half) instead uses student_t(1, 0, 1) for the intercept. Predicted auxiliaries use brms's link-specific intercept defaults and the mean predictor's response scale for group priors.",
+                spec.family,
+                recipe.link.name()
+            )
+        },
         design_columns: recipe
             .predictors
             .get("mu")
@@ -939,30 +978,20 @@ pub(crate) fn info(
         response_levels: recipe.response_levels.clone(),
         dpars: recipe
             .predictors
-            .iter()
-            .filter(|(name, _)| name.as_str() != "mu")
-            .map(|(name, predictor)| {
-                let (factor_levels, group_levels) = metadata::levels(predictor);
-                (
-                    name.clone(),
-                    crate::PredictorInfo {
-                        formula: spec
-                            .dpars
-                            .get(name)
-                            .map_or(&spec.formula, |dpar| &dpar.formula)
-                            .clone(),
-                        link: predictor.link.name().into(),
-                        design_columns: predictor
-                            .design
-                            .columns
-                            .iter()
-                            .map(|column| column.name.clone())
-                            .collect(),
-                        factor_levels,
-                        group_levels,
-                    },
-                )
+            .keys()
+            .filter(|name| name.as_str() != "mu" && !spec.nlpars.contains_key(*name))
+            .map(|name| {
+                let formula = spec
+                    .dpars
+                    .get(name)
+                    .map_or(&spec.formula, |dpar| &dpar.formula);
+                (name.clone(), predictor_metadata(name, formula))
             })
+            .collect(),
+        nlpars: spec
+            .nlpars
+            .iter()
+            .map(|(name, formula)| (name.clone(), predictor_metadata(name, formula)))
             .collect(),
         parameters,
         prior_factors,
@@ -983,16 +1012,17 @@ pub(crate) fn info(
 }
 
 fn predictor_info(
+    name: &str,
     dpar: &str,
     recipe: &crate::PredictorRecipe,
     module: &Module,
     thresholds: usize,
     group_offset: usize,
 ) -> Result<Vec<Parameter>> {
-    let prefix = if dpar == "mu" {
+    let prefix = if name == "mu" {
         String::new()
     } else {
-        format!("{dpar}_")
+        format!("{name}_")
     };
     let mut parameters = Vec::new();
     let mut add = |name: String, binding: &str, indices: &[usize], role| {
@@ -1022,7 +1052,7 @@ fn predictor_info(
         }
     } else if recipe.formula.intercept {
         add(
-            predictor_name(dpar, "Intercept"),
+            predictor_name(name, "Intercept"),
             &predictor_name(dpar, "temp_Intercept"),
             &[],
             parameter_role(module, &predictor_name(dpar, "temp_Intercept")),
