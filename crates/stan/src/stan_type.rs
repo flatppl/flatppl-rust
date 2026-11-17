@@ -198,10 +198,8 @@ pub(crate) fn declare(
                         ValueSet::CartPow(inner, _) => Some(inner.as_ref()),
                         _ => None,
                     };
+                    // `array[n, m] int` indexes as `x[i][j]` and `x[i, j]` alike.
                     let mut t = declare(inner, inner_vs, bounded, size, node)?;
-                    if !t.array.is_empty() {
-                        return Err(Refusal::not_yet(Some(node), "an array of integer arrays"));
-                    }
                     let mut array = dims;
                     array.extend(t.array);
                     t.array = array;

@@ -15,11 +15,7 @@ transformed data {
     X_ifelse_2[i] = work[i] == 3 ? 1.0 : 0.0;
   }
   matrix[N, 3] X = append_col(append_col(ones_vector(N), X_ifelse), X_ifelse_2);
-  array[3] int W_idx;
-  for (i in 1:3) {
-    W_idx[i] = i + 1;
-  }
-  matrix[N, 3] W = Z[:, W_idx];
+  matrix[N, 3] W = Z[:, 2:4];
 }
 parameters {
   vector[3] beta;

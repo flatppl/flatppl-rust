@@ -14,12 +14,13 @@ use flatppl_core::{Node, NodeId, Phase, Symbol};
 use std::collections::HashMap;
 
 /// A body value over the lifted axes: either a scalar or the whole frame.
-struct Lifted {
-    ex: Ex,
-    full: bool,
+#[derive(Clone)]
+pub(super) struct Lifted {
+    pub ex: Ex,
+    pub full: bool,
     /// A Stan array (integer or real), which needs `to_vector`/`to_matrix`
     /// before vector arithmetic.
-    array: bool,
+    pub array: bool,
 }
 
 /// What an axis-indexed operand reads.
@@ -191,8 +192,9 @@ impl<'m> Emitter<'m> {
     }
 
     /// `body` over the axes `frame` (outermost first), with other axes bound
-    /// to the loop variables `vars`.
-    fn lift(
+    /// to the loop variables `vars`. A function parameter in `self.vlocals`
+    /// is a leaf too: `f.(x)` lifted over the whole array `x`.
+    pub(super) fn lift(
         &mut self,
         body: NodeId,
         frame: &[Symbol],
@@ -214,6 +216,11 @@ impl<'m> Emitter<'m> {
             array: false,
         };
         let node = self.m.node(body);
+        if let Node::Ref(r) = node
+            && let Some(l) = self.vlocals.as_ref().and_then(|v| v.get(&r.name))
+        {
+            return Ok(l.clone());
+        }
         let Node::Call(c) = node else {
             if self.shape(body).is_some_and(|s| s.rank == 0) {
                 return Ok(scalar(self.expr(body)?));
@@ -392,7 +399,7 @@ impl<'m> Emitter<'m> {
         })
     }
 
-    fn to_real(&self, ex: &Ex, rank: usize) -> Ex {
+    pub(super) fn to_real(&self, ex: &Ex, rank: usize) -> Ex {
         let f = if rank == 2 { "to_matrix" } else { "to_vector" };
         Ex::atom(format!("{f}({})", ex.s))
     }

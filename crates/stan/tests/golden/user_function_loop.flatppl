@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+T = 8
+K = 2
+y_obs = [0.1, 0.4, 0.3, 0.8, 0.6, 1.1, 0.9, 1.4]
+times = indicesof(zeros(T - K)) .+ K
+lagged(t) = y_obs[t .- indicesof(zeros(K))]
+X = rowstack(lagged.(times))
+alpha ~ Normal(0, 1)
+beta ~ iid(Normal(0, 1), K)
+sigma ~ Exponential(1.0)
+y ~ Normal.(alpha .+ X * beta, sigma)
+prior = lawof(record(alpha = alpha, beta = beta, sigma = sigma))
+L = likelihoodof(kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma), record(y = y_obs[times]))
+post = bayesupdate(L, prior)

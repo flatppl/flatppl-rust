@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 
 mod aggregate;
 mod elementwise;
+mod functions;
 mod pattern;
+mod ranges;
 mod structure;
 
 /// Expression precedence, loosest first, as Stan parses it.
@@ -119,6 +121,14 @@ pub(crate) struct Emitter<'m> {
     owner: Option<(String, NodeId)>,
     /// Set while a law fills its flattened arguments.
     flat: Option<Flat>,
+    /// The user function body being emitted.
+    fctx: Option<functions::FnCtx>,
+    /// A copy of the module for instantiating function bodies.
+    scratch: Option<Module>,
+    /// (function, argument types) → Stan function and its captured names.
+    fn_memo: HashMap<(NodeId, String), (String, Vec<String>)>,
+    /// Function parameters lifted over whole arrays (see `aggregate::lift`).
+    vlocals: Option<HashMap<Symbol, aggregate::Lifted>>,
     sizes: HashMap<u32, Vec<Symbol>>,
     data: Vec<String>,
     tdata: Vec<String>,
@@ -183,6 +193,10 @@ impl<'m> Emitter<'m> {
             in_progress: HashSet::new(),
             owner: None,
             flat: None,
+            fctx: None,
+            scratch: None,
+            fn_memo: HashMap::new(),
+            vlocals: None,
             sizes,
             data: vec![],
             tdata: vec![],
@@ -198,7 +212,18 @@ impl<'m> Emitter<'m> {
     }
 
     fn record_decl(&mut self, name: &str, t: StanType) {
+        if let Some(ctx) = &mut self.fctx {
+            ctx.declared.insert(name.to_string());
+        }
         self.decls.insert(name.to_string(), t);
+    }
+
+    /// The type of a node: its instantiated type inside a function body.
+    fn ty(&self, id: NodeId) -> Option<Type> {
+        self.fctx
+            .as_ref()
+            .and_then(|c| c.scoped.get(&id).cloned())
+            .or_else(|| self.m.type_of(id).cloned())
     }
 
     fn name(&self, s: Symbol) -> &'m str {
@@ -347,6 +372,15 @@ impl<'m> Emitter<'m> {
                 };
                 let s = self.fresh(&base);
                 self.data.push(format!("int<lower=0> {s};"));
+                self.decls.insert(
+                    s.clone(),
+                    StanType {
+                        array: vec![],
+                        base: "int",
+                        dims: vec![],
+                        bounds: Default::default(),
+                    },
+                );
                 self.json.insert(s.clone(), Value::from(n));
                 self.fresh_sizes.insert(key, s.clone());
                 s
@@ -363,9 +397,7 @@ impl<'m> Emitter<'m> {
         hints: &[Option<NodeId>],
     ) -> Result<StanType> {
         let ty = self
-            .m
-            .type_of(node)
-            .cloned()
+            .ty(node)
             .ok_or_else(|| Refusal::not_yet(Some(node), "an untyped value"))?;
         self.declare_ty(&ty, vs, bounded, node, owner, hints)
     }
@@ -552,7 +584,8 @@ impl<'m> Emitter<'m> {
                 format!("the cyclic binding `{}`", self.name(sym)),
             ));
         }
-        let out = self.bind_new(sym, self.m.binding(bid).rhs);
+        let rhs = self.m.binding(bid).rhs;
+        let out = self.at_module(|me| me.bind_new(sym, rhs));
         self.in_progress.remove(&sym);
         let out = out?;
         self.env.insert(sym, out.clone());
@@ -642,6 +675,15 @@ impl<'m> Emitter<'m> {
         let outer = self.owner.replace((base.to_string(), rhs));
         let out = if self.head(rhs) == Some("aggregate") {
             self.aggregate_value(base, rhs)
+        } else if self.user_broadcast(rhs) {
+            self.user_broadcast_value(base, rhs)
+        } else if self.head(rhs) == Some("rowstack")
+            && self.user_broadcast(self.call(rhs).unwrap().args[0])
+            && self
+                .vectorized_broadcast(self.call(rhs).unwrap().args[0])?
+                .is_err()
+        {
+            self.stacked_broadcast(base, rhs)
         } else {
             let attempt = self.expr(rhs);
             self.place(base, rhs, attempt)
@@ -666,10 +708,18 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `f.(…)` of a user function.
+    fn user_broadcast(&self, id: NodeId) -> bool {
+        self.head(id) == Some("broadcast")
+            && self.user_callee(self.call(id).unwrap().args[0]).is_some()
+    }
+
     /// Statements of a computed value, in `transformed data` when it is
     /// fixed, else per [`Placement`].
     fn put(&mut self, fixed: bool, lines: Vec<String>) {
-        if fixed {
+        if let Some(ctx) = &mut self.fctx {
+            ctx.lines.extend(lines);
+        } else if fixed {
             self.tdata.extend(lines);
         } else {
             match self.opts.derived {
@@ -806,7 +856,7 @@ impl<'m> Emitter<'m> {
     // ----------------------------------------------------------- expressions
 
     fn shape(&self, id: NodeId) -> Option<Shape> {
-        self.m.type_of(id).and_then(shape_of)
+        self.ty(id).as_ref().and_then(shape_of)
     }
 
     /// An expression used in real arithmetic: integer arrays become vectors.
@@ -856,6 +906,9 @@ impl<'m> Emitter<'m> {
     }
 
     fn expr(&mut self, id: NodeId) -> Result<Ex> {
+        if let Some(e) = self.fctx.as_ref().and_then(|c| c.lifted.get(&id)) {
+            return Ok(e.clone());
+        }
         match self.m.node(id) {
             Node::Lit(Scalar::Int(n)) => Ok(Ex::atom(n.to_string()).neg_prec(*n < 0)),
             Node::Lit(Scalar::Real(x)) => Ok(Ex::atom(real_literal(*x)).neg_prec(*x < 0.0)),
@@ -873,7 +926,7 @@ impl<'m> Emitter<'m> {
             },
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => Ok(Ex::atom(self.bind(r.name)?)),
-                RefNs::Local => Err(Refusal::not_yet(Some(id), "a function body")),
+                RefNs::Local => self.local_ref(id, r.name),
                 RefNs::Module(alias) => Err(Refusal::not_yet(
                     Some(id),
                     format!("a reference into module `{}`", self.name(alias)),
@@ -971,7 +1024,23 @@ impl<'m> Emitter<'m> {
             }
             ("colstack", [cols]) => self.stack(id, *cols, "append_col", false),
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
-            ("%call", _) => self.module_call(id),
+            ("%call", _) => match self.is_user_call(id) {
+                Some(fun) => self.user_call(id, fun, &args),
+                None => self.module_call(id),
+            },
+            ("scan", [f, init, xs]) => self.additive_scan(id, *f, *init, *xs),
+            ("indicesof", [_]) if let Some(r) = self.range(id) => Ok(Ex::atom(r.array())),
+            // functions.ron `transpose`: the operator `'`.
+            ("transpose", [a]) => {
+                let e = self.real(*a)?;
+                Ok(Ex::atom(format!("{}'", e.at(P_ATOM))))
+            }
+            // functions.ron `cat`: arrays append with append_array.
+            ("cat", [a, b]) if self.shape(id).is_some_and(|s| s.int && s.rank == 1) => {
+                let l = self.expr(*a)?;
+                let r = self.expr(*b)?;
+                Ok(Ex::atom(format!("append_array({}, {})", l.s, r.s)))
+            }
             ("aggregate", _) => {
                 let base = match &self.owner {
                     Some((name, _)) => format!("{name}_agg"),
@@ -997,9 +1066,12 @@ impl<'m> Emitter<'m> {
                         format!("`{head}` of a parameter (Stan needs data arguments)"),
                     ));
                 }
+                // An integer result (`sum` of an integer array) keeps its
+                // integer arguments.
+                let int = self.shape(id).is_some_and(|s| s.int);
                 let mut parts = Vec::new();
                 for a in &args {
-                    parts.push(self.real(*a)?);
+                    parts.push(if int { self.expr(*a)? } else { self.real(*a)? });
                 }
                 self.table_fn(id, head, None, parts)
             }
@@ -1169,8 +1241,11 @@ impl<'m> Emitter<'m> {
                 Some(s) => format!("{}_matrix", self.name(s)),
                 None => "stacked".to_string(),
             };
-            let refused = Err(Refusal::not_yet(Some(id), "a stacked array"));
-            return Ok(Ex::atom(self.place(&base, id, refused)?));
+            let refused = Refusal::not_yet(Some(id), "a stacked array");
+            if matches!(&self.owner, Some((_, root)) if *root == id) {
+                return Err(refused);
+            }
+            return Ok(Ex::atom(self.place(&base, id, Err(refused))?));
         }
         let items = self.call(list).unwrap().args.to_vec();
         let mut parts = Vec::new();
@@ -1218,7 +1293,8 @@ impl<'m> Emitter<'m> {
             && let Node::Lit(Scalar::Str(f)) = self.m.node(*field)
         {
             if let Some(rec) = self.data_record(x) {
-                return Ok(Ex::atom(self.leaf(rec, f, id)?));
+                let f = f.to_string();
+                return Ok(Ex::atom(self.at_module(|me| me.leaf(rec, &f, id))?));
             }
             let r = self.resolve(x);
             if self.head(r) == Some("record")
@@ -1241,19 +1317,28 @@ impl<'m> Emitter<'m> {
         for s in sel {
             match self.m.node(*s) {
                 Node::Const(c) if self.name(*c) == "all" => idx.push(":".to_string()),
-                // Stan has no integer-array arithmetic: compute the index array.
-                _ if self.head(*s) == Some("broadcast")
-                    && self.shape(*s).is_some_and(|sh| sh.int && sh.rank >= 1) =>
-                {
-                    let refused = Refusal::not_yet(Some(*s), "a computed index array");
-                    idx.push(self.hoist(*s, "idx", refused)?.s)
+                _ => {
+                    let computed = matches!(self.head(*s), Some("broadcast" | "indicesof"))
+                        && !self.user_broadcast(*s);
+                    if computed && let Some(r) = self.range(*s) {
+                        // An affine range: a slice, or linspaced_int_array.
+                        idx.push(r.index());
+                    } else if computed
+                        && self.head(*s) == Some("broadcast")
+                        && self.shape(*s).is_some_and(|sh| sh.int && sh.rank >= 1)
+                    {
+                        // Any other computed integer index array is named as one.
+                        let refused = Refusal::not_yet(Some(*s), "a computed index array");
+                        idx.push(self.hoist(*s, "idx", refused)?.s);
+                    } else {
+                        idx.push(self.expr(*s)?.s);
+                    }
                 }
-                _ => idx.push(self.expr(*s)?.s),
             }
         }
         let s = format!("{}[{}]", base.at(P_ATOM), idx.join(", "));
         // A matrix row is a Stan row_vector; a FlatPPL vector is a Stan vector.
-        let matrix = matches!(self.m.type_of(x), Some(Type::Array { shape, elem })
+        let matrix = matches!(self.ty(x), Some(Type::Array { shape, elem })
             if shape.len() == 2 && matches!(elem.as_ref(), Type::Scalar(ScalarType::Real)));
         let row = sel.len() == 2
             && self.shape(sel[0]).is_some_and(|s| s.rank == 0)
@@ -1270,9 +1355,28 @@ impl<'m> Emitter<'m> {
     /// operator. Anything else refuses here and is filled by loops instead.
     fn broadcast(&mut self, id: NodeId, f: NodeId, args: &[NodeId]) -> Result<Ex> {
         let Node::Const(fs) = self.m.node(f) else {
-            return Err(Refusal::not_yet(Some(id), "broadcast of a user function"));
+            if self.user_callee(f).is_none() {
+                return Err(Refusal::not_yet(Some(id), "broadcast of a user function"));
+            }
+            let base = match &self.owner {
+                Some((name, _)) => format!("{name}_values"),
+                None => "values".to_string(),
+            };
+            if let Ok(e) = self.vectorized_broadcast(id)? {
+                return Ok(e);
+            }
+            return Ok(Ex::atom(self.looped_broadcast(&base, id)?));
         };
         let fname = self.name(*fs);
+        // Stan has no integer-array arithmetic: an integer array is filled by
+        // loops.
+        if self.shape(id).is_some_and(|s| s.int && s.rank >= 1) {
+            if let Some(r) = self.range(id) {
+                return Ok(Ex::atom(r.array()));
+            }
+            let refused = Refusal::not_yet(Some(id), format!("{fname}.(…) of integers"));
+            return self.hoist(id, fname, refused);
+        }
         let row = tables::function(fname, None)
             .ok_or_else(|| Refusal::not_yet(Some(id), format!("{fname}.(…)")))?;
         let scalar = |me: &Self, a: NodeId| me.shape(a).is_some_and(|s| s.rank == 0);

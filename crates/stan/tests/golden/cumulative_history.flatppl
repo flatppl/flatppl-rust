@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+J = 3
+T = 5
+shocks = rowstack([[0, 1, 1, 0, 1], [1, 0, 1, 1, 0], [0, 0, 1, 1, 1]])
+previous = indicesof(zeros(T - 1))
+history(j) = cat([0], scan((total, s) -> total + s, 0, shocks[j, previous]))
+avoided(j) = (indicesof(zeros(T)) .- 1) .- history(j)
+n_shock = rowstack(history.(indicesof(zeros(J))))
+n_avoid = rowstack(avoided.(indicesof(zeros(J))))
+beta ~ iid(Normal(0, 10), 2)
+y ~ Bernoulli.(invlogit.(beta[1] .* n_avoid .+ beta[2] .* n_shock))
+prior = lawof(record(beta = beta))
+L = likelihoodof(kernelof(record(y = y), beta = beta), record(y = shocks))
+post = bayesupdate(L, prior)
