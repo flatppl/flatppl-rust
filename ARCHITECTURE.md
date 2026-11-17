@@ -404,7 +404,9 @@ need its own statistical discovery pass.
 ## Structural model analysis
 
 `flatppl-determinizer::analyze_model` checks FlatPDL conformance, then calls
-`flatppl-model-analysis::analyze_lowered_query` on the same typed module. Declared query inputs
+`flatppl-model-analysis::analyze_lowered_query` on the same typed module. Incremental score and Normal coordinate planners also live in
+this crate. They use core graph operations and infer types for generated coordinate queries.
+The determinizer validates calls through its public planning API. Declared query inputs
 form the boundary, including promoted fixed or derived bindings. Data inputs
 are explicit; all other inputs are parameters. The report records additive
 terms with signs and multiplicities, parameter/data incidence, structural

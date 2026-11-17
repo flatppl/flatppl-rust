@@ -15,6 +15,7 @@
 
 pub mod boxes;
 pub mod depth;
+pub mod graph;
 pub mod id;
 mod module;
 pub mod node;

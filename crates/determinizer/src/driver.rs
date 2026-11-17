@@ -10,6 +10,7 @@
 //! table (`apply_rule`) is the single extension point.
 
 use crate::refuse::RefuseError;
+pub(crate) use flatppl_core::graph::rebuild_with_children;
 use flatppl_core::{BindingId, CallHead, Idx, Module, Node, NodeId, Scalar, Symbol};
 use flatppl_infer::ModuleBundle;
 
@@ -809,65 +810,6 @@ fn map_tree_memoized(
     };
     mapped.insert(root, result);
     result
-}
-
-/// Rebuild the `Call` node at `id` with `new_children` standing in for its
-/// current children (callee first for a `CallHead::User` head, then positional
-/// args, then named values — the same partition `Node::for_each_child` visits
-/// in). Shared by [`map_tree`] (mapped-child rebuild) and
-/// `canon::inline::inline_walk` (bottom-up inline rebuild) so both stay
-/// byte-for-byte consistent in how a `Call`'s children slice decodes back into
-/// head/args/named. Only `Call` nodes have children (see
-/// [`Node::for_each_child`]), so callers must only invoke this for a node that
-/// is actually a `Call` with `new_children.len()` matching its child count.
-pub(crate) fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[NodeId]) -> NodeId {
-    let Node::Call(orig_call) = m.node(id) else {
-        // Non-call nodes have no children — a caller that reaches here despite
-        // that contract violates it, not this function's own invariant.
-        unreachable!("non-call node with children is impossible in this IR");
-    };
-    let head = orig_call.head;
-    let inputs = orig_call.inputs.clone();
-    let pos_count = orig_call.args.len();
-    let named_count = orig_call.named.len();
-
-    // `for_each_child` visits: callee (User head) first, then positional args,
-    // then named values — mirror that partition here.
-    let (new_head, child_slice) = match head {
-        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
-        CallHead::Builtin(s) => (CallHead::Builtin(s), new_children),
-    };
-
-    let new_args: Vec<NodeId> = child_slice[..pos_count].to_vec();
-    let new_named_values: Vec<NodeId> = child_slice[pos_count..pos_count + named_count].to_vec();
-
-    // Rebuild named args with updated values but original names/kinds.
-    let new_named: Vec<flatppl_core::NamedArg> = orig_call
-        .named
-        .iter()
-        .zip(new_named_values.iter())
-        .map(|(n, &v)| flatppl_core::NamedArg {
-            kind: n.kind,
-            name: n.name,
-            value: v,
-        })
-        .collect();
-
-    use flatppl_core::Call;
-    let auto_inputs = m.auto_inputs_of(id).map(<[_]>::to_vec);
-    let rebuilt = m.alloc(Node::Call(Call {
-        head: new_head,
-        args: new_args.into(),
-        named: new_named.into(),
-        inputs,
-    }));
-    if let Some(entries) = auto_inputs {
-        m.set_auto_inputs(rebuilt, entries.into());
-    }
-    if m.is_sample_result(id) {
-        m.mark_sample_result(rebuilt);
-    }
-    rebuilt
 }
 
 /// True iff `id` is a builtin call whose head is named `op`.

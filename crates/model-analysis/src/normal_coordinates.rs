@@ -2,11 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use flatppl_core::graph;
 use flatppl_core::{
     Binding, CallHead, Idx, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol,
 };
 
-use crate::{AnalysisError, InputPath, analyze_model};
+use crate::{AnalysisError, InputPath, analyze_lowered_query};
 use flatppl_core::Type;
 
 /// Arithmetic precision used to validate a coordinate map. Emit every companion
@@ -134,7 +135,7 @@ fn share_joint_expressions(m: &mut Module) {
             let value = if children == changed {
                 id
             } else {
-                crate::driver::rebuild_with_children(m, id, &changed)
+                graph::rebuild_with_children(m, id, &changed)
             };
             // Primitive density arguments and ABI tuples retain explicit
             // structural constructors. Share their scalar children instead.
@@ -167,7 +168,7 @@ fn call(m: &Module, id: NodeId, name: &str) -> Option<Vec<NodeId>> {
 }
 
 fn op(m: &mut Module, name: &str, args: &[NodeId]) -> NodeId {
-    crate::density::build_call(m, name, args)
+    graph::build_call(m, name, args)
 }
 
 fn number(m: &mut Module, value: f64) -> NodeId {
@@ -206,7 +207,7 @@ fn replace_field(
         };
         result.push((*name, child));
     }
-    crate::density::build_record(m, &result)
+    graph::build_record(m, &result)
 }
 
 fn matches_point(
@@ -275,7 +276,7 @@ fn finish(mut m: Module, output: NodeId, valid: NodeId) -> Result<Module, Analys
 
 fn validate(mut m: Module) -> Result<Module, AnalysisError> {
     let roots = [m.intern("inputs"), m.intern("outputs")];
-    crate::canon::retain_reachable(&mut m, &roots);
+    graph::retain_reachable(&mut m, &roots);
     let errors = flatppl_infer::infer(&mut m)
         .into_iter()
         .filter(|d| d.severity == flatppl_infer::Severity::Error)
@@ -415,7 +416,7 @@ fn substitute_inputs(
         } else if matches!(m.node(id), Node::Ref(_)) {
             changed[0]
         } else {
-            crate::driver::rebuild_with_children(m, id, &changed)
+            graph::rebuild_with_children(m, id, &changed)
         };
         memo.insert(key, result);
         active.remove(&key);
@@ -617,7 +618,7 @@ pub fn prepare_normal_coordinate_at_path(
     logdensity: bool,
 ) -> Result<NormalCoordinateQueries, AnalysisError> {
     let parameter = &path.input;
-    let report = analyze_model(m, data_inputs)?;
+    let report = analyze_lowered_query(m, data_inputs)?;
     let candidate = report
         .normal_coordinates
         .iter()
@@ -786,7 +787,7 @@ pub fn prepare_normal_coordinates(
     precision: CoordinatePrecision,
     logdensity: bool,
 ) -> Result<NormalCoordinatesQueries, AnalysisError> {
-    let report = analyze_model(m, data_inputs)?;
+    let report = analyze_lowered_query(m, data_inputs)?;
     if paths.is_empty()
         || paths
             .iter()

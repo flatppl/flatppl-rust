@@ -11,12 +11,10 @@ mod disintegrate;
 mod driver;
 mod extras;
 mod free_draw;
-mod incremental;
 mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
-mod normal_coordinates;
 mod primitives;
 mod query_analysis;
 mod refuse;
@@ -31,14 +29,14 @@ pub use driver::{
     determinize_with_roots,
 };
 pub use flatppl_model_analysis::{
-    AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+    AnalysisError, CoordinatePrecision, IncrementalScorePlan, IncrementalTerm, InputArray,
+    InputCell, InputPath, ModelAnalysis, NormalCoordinate, NormalCoordinateQueries,
+    NormalCoordinatesQueries, OutputTerm,
 };
-pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
-pub use normal_coordinates::{
-    CoordinatePrecision, NormalCoordinateQueries, NormalCoordinatesQueries,
-    prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
+pub use query_analysis::{
+    analyze_model, prepare_incremental_score, prepare_normal_coordinate,
+    prepare_normal_coordinate_at_path, prepare_normal_coordinates,
 };
-pub use query_analysis::analyze_model;
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};
 pub use sufficient_statistics::{

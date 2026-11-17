@@ -7,8 +7,7 @@ use std::collections::HashSet;
 
 use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Symbol};
 
-mod dce;
-pub(crate) use dce::retain_reachable;
+pub(crate) use flatppl_core::graph::retain_reachable;
 mod flatten;
 pub(crate) use flatten::{project, project_tuple};
 mod fold;
@@ -121,7 +120,7 @@ pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
         let _ = flatppl_infer::infer(m);
     }
     if let Some(roots) = roots {
-        dce::retain_reachable(m, roots);
+        retain_reachable(m, roots);
     }
     let integrals_changed = integrals::hoist_integrals(m);
     if sharing::share_broadcasts(m, false) || integrals_changed {
@@ -166,7 +165,7 @@ pub fn resolve_alias_chains(m: &mut Module) -> bool {
 pub fn prepare_serialization(m: &mut Module, roots: Option<&[Symbol]>) {
     if !no_canon() && sharing::share_broadcasts(m, true) {
         if let Some(roots) = roots {
-            dce::retain_reachable(m, roots);
+            retain_reachable(m, roots);
         }
         let _ = flatppl_infer::infer(m);
     }
