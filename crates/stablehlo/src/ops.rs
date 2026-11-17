@@ -1430,6 +1430,7 @@ fn lower_addaxes(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, 
         ));
     }
     let a = e.lower_node(a_id)?;
+    let a = e.typed_axes(a_id, a);
     let dims = match &a.ty {
         MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => dims.clone(),
         other => {
@@ -1443,11 +1444,20 @@ fn lower_addaxes(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, 
         return Ok(a);
     }
     let batch = e.batch_rank(&a);
+    // Only the outer array owns the added axes. An array of vectors keeps
+    // each vector's axes inside its element, after the new trailing axes.
+    let mut axes = e.axes_of(&a);
+    let outer = axes.layers.first().copied().unwrap_or(dims.len() - batch);
     let mut out = dims[..batch].to_vec();
     out.resize(out.len() + n_leading, Some(1));
-    out.extend_from_slice(&dims[batch..]);
+    out.extend_from_slice(&dims[batch..batch + outer]);
     out.resize(out.len() + n_trailing, Some(1));
-    Ok(e.reshape(&a, MlirTy::Ranked(out)))
+    out.extend_from_slice(&dims[batch + outer..]);
+    if let Some(rank) = axes.layers.first_mut() {
+        *rank += n_leading + n_trailing;
+    }
+    let result = e.reshape(&a, MlirTy::Ranked(out));
+    Ok(e.axes_view(&result, axes))
 }
 
 /// One of `addaxes`' two axis counts, which §07 requires to be a "non-negative

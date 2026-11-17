@@ -36,6 +36,7 @@ use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Sca
 use crate::density::{build_call, resolve_ref};
 use crate::refuse::RefuseError;
 
+mod distances;
 mod pyhf;
 mod splines;
 
@@ -305,7 +306,15 @@ pub(crate) fn has_base_op_form(module: &str, member: &str) -> bool {
             )
             | (
                 "distances",
-                "euclidean" | "squared_euclidean" | "manhattan" | "chebyshev" | "cosine"
+                "euclidean"
+                    | "squared_euclidean"
+                    | "manhattan"
+                    | "chebyshev"
+                    | "cosine"
+                    | "minkowski"
+                    | "jensenshannon"
+                    | "pairwise_distance"
+                    | "cross_distance"
             )
     )
 }
@@ -322,6 +331,9 @@ fn lower_member_function(
     match (module, member) {
         ("pyhf-helpers", member) => pyhf::lower_function(m, args, member),
         ("splines", member) => splines::lower_function(m, args, member),
+        ("distances", "minkowski" | "jensenshannon" | "pairwise_distance" | "cross_distance") => {
+            distances::lower_function(m, args, member)
+        }
         ("particle-physics", "interp_pwlin") => arity::<4>(args).map(|a| interp_pwlin(m, a)),
         ("particle-physics", "interp_pwexp") => arity::<4>(args).map(|a| interp_pwexp(m, a)),
         ("particle-physics", "interp_poly2_lin") => {

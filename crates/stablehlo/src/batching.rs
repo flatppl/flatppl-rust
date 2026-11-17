@@ -459,7 +459,7 @@ impl Emitter<'_> {
         out
     }
 
-    pub(super) fn typed_axes(&mut self, id: NodeId, v: Value) -> Value {
+    pub(crate) fn typed_axes(&mut self, id: NodeId, v: Value) -> Value {
         if !matches!(v.ty, MlirTy::Scalar | MlirTy::Ranked(_)) {
             return v;
         }
