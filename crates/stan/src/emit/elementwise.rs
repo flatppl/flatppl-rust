@@ -124,6 +124,11 @@ impl<'m> Emitter<'m> {
 
     /// `x[idx]` for a value `x` that prints as a name; size-one axes index 1.
     fn elem_indexed(&mut self, at: NodeId, x: NodeId, idx: &[String]) -> Result<Ex> {
+        if let [i] = idx
+            && let Some(s) = self.gather_at(x, i)?
+        {
+            return Ok(Ex::atom(s));
+        }
         let e = self.expr(x)?;
         if e.prec < P_ATOM || !e.s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(Refusal::not_yet(

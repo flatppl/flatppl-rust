@@ -227,7 +227,12 @@ impl<'m> Emitter<'m> {
                 Some(Bound::Expr(e)) => e.clone(),
                 None => panic!("template variable `{var}` unbound"),
             };
+            let gathered = match (index.filter(|_| per_element(var)), binds.get(var)) {
+                (Some(i), Some(Bound::Node(n))) => self.gather_at(*n, i)?,
+                _ => None,
+            };
             let text = match index.filter(|_| per_element(var)) {
+                Some(_) if gathered.is_some() => gathered.unwrap(),
                 Some(i) => format!("{}[{i}]", e.at(P_ATOM)),
                 None if whole => e.s,
                 None => e.at(P_ATOM),

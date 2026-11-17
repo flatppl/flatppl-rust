@@ -768,8 +768,45 @@ impl<'m> Emitter<'m> {
         let e = self.expr(id)?;
         match self.shape(id) {
             Some(Shape { rank: 1, int: true }) => Ok(Ex::atom(format!("to_vector({})", e.s))),
+            Some(Shape { rank: 2, int: true }) => Ok(Ex::atom(format!("to_matrix({})", e.s))),
             _ => Ok(e),
         }
+    }
+
+    /// Element `i` of a gather `x[idx]` (one integer-array selector) as
+    /// `x[idx[i]]`: indexing the gathered array would copy it per element.
+    pub(super) fn gather_at(&mut self, node: NodeId, i: &str) -> Result<Option<String>> {
+        if self.head(node) != Some("get") {
+            return Ok(None);
+        }
+        let c = self.call(node).unwrap();
+        let (x, sels) = (c.args[0], c.args[1..].to_vec());
+        let gathers: Vec<usize> = sels
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.shape(**s).is_some_and(|sh| sh.rank == 1 && sh.int))
+            .map(|(k, _)| k)
+            .collect();
+        let [g] = gathers.as_slice() else {
+            return Ok(None);
+        };
+        if sels
+            .iter()
+            .any(|s| matches!(self.m.node(*s), Node::Const(_) | Node::Lit(Scalar::Str(_))))
+        {
+            return Ok(None);
+        }
+        let base = self.expr(x)?;
+        let mut parts = Vec::new();
+        for (k, s) in sels.iter().enumerate() {
+            let e = self.expr(*s)?;
+            parts.push(if k == *g {
+                format!("{}[{i}]", e.at(P_ATOM))
+            } else {
+                e.s
+            });
+        }
+        Ok(Some(format!("{}[{}]", base.at(P_ATOM), parts.join(", "))))
     }
 
     fn expr(&mut self, id: NodeId) -> Result<Ex> {
@@ -1203,6 +1240,18 @@ impl<'m> Emitter<'m> {
                 self.call_expr_bin(op, P_MUL, *a, *b)
             }
             ("divide", [a, b]) if row.broadcast.contains("./") => {
+                // Stan's int / int truncates; FlatPPL divides as reals.
+                // Integer arrays already become vectors through `real`.
+                let int_scalar =
+                    |me: &Self, x: NodeId| me.shape(x) == Some(Shape { rank: 0, int: true });
+                if int_scalar(self, *a) && int_scalar(self, *b) {
+                    let l = self.real(*a)?;
+                    let r = self.real(*b)?;
+                    return Ok(Ex {
+                        s: format!("1.0 * {} / {}", l.at(P_MUL), r.at(P_MUL + 1)),
+                        prec: P_MUL,
+                    });
+                }
                 let op = if scalar(self, *b) { "/" } else { "./" };
                 self.call_expr_bin(op, P_MUL, *a, *b)
             }

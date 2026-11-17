@@ -12,6 +12,6 @@ model {
     theta[i] ~ dirichlet(ones_vector(3));
   }
   for (i in 1:N) {
-    w_obs[i] ~ categorical(theta[doc][i]);
+    w_obs[i] ~ categorical(theta[doc[i]]);
   }
 }
