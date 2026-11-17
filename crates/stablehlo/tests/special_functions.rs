@@ -283,3 +283,37 @@ fn digamma_and_polygamma_lower_to_their_chlo_ops() {
         "{out}"
     );
 }
+
+// Direct tails, logarithms and scaled Bessels must remain live arithmetic with
+// every parameter exposed, including named argument binding and cell broadcasts.
+#[test]
+fn tail_and_scaled_extensions_preserve_parameters_and_broadcasts() {
+    for expression in [
+        "sf.gammaincc(x = x, a = a)",
+        "sf.log_gammainc(a, x)",
+        "sf.log_gammaincc(a, x)",
+        "sf.betaincc(a, b, x)",
+        "sf.log_betainc(a, b, x)",
+        "sf.log_betaincc(a, b, x)",
+        "sf.beta(a, b)",
+        "sf.logbeta(a, b)",
+        "real(sf.bessel_i_scaled(v = a, z = x))",
+        "sf.bessel_k_scaled(a, x)",
+        "sf.log_bessel_i(a, x)",
+        "sf.log_bessel_k(a, x)",
+        "sf.log_ndtr(x)",
+    ] {
+        for dtype in [Dtype::F32, Dtype::F64] {
+            let source = format!(
+                "{SF}\na = external(reals)\nb = external(reals)\nx = external(reals)\ninputs = (a, b, x)\noutputs = {expression}"
+            );
+            let out = emit_with(&source, Mode::LogDensity, dtype).expect(expression);
+            assert!(out.contains("flatppl.runtime_status"), "{expression}");
+        }
+    }
+    let source = format!(
+        "{SF}\na = external(reals)\nx = external(cartpow(reals, 3))\nf = sf.bessel_i_scaled\nv = f.(a, x)\ninputs = (a, x)\noutputs = (real.(v), imag.(v))"
+    );
+    let out = emit(&source);
+    assert!(out.contains("tensor<3xf32>"));
+}

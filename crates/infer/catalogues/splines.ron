@@ -3,6 +3,27 @@ Module(
     name: "splines",
     version: "0.1",
     bindings: [
+        Binding(name: "interp_linear", sig: Function(
+            params: [Scalar(Real), Vector(Real), Vector(Real), Optional(Any)],
+            names: ["x", "knots", "values", "extrapolation"], result: Scalar(Real))),
+        Binding(name: "interp_cubic", sig: Function(
+            params: [Scalar(Real), Vector(Real), Vector(Real), Optional(Any)],
+            names: ["x", "knots", "values", "extrapolation"], result: Scalar(Real))),
+        Binding(name: "interp_pchip", sig: Function(
+            params: [Scalar(Real), Vector(Real), Vector(Real), Optional(Any)],
+            names: ["x", "knots", "values", "extrapolation"], result: Scalar(Real))),
+        Binding(name: "bspline_basis", sig: Function(
+            params: [Scalar(Real), Vector(Real), Scalar(Integer)], names: ["x", "knots", "degree"],
+            result: Vector(len: SplineCount(knots: 1, degree: 2), elem: Real))),
+        Binding(name: "bspline_derivative", sig: Function(
+            params: [Scalar(Real), Vector(Real), Scalar(Integer), Optional(Scalar(Integer))], names: ["x", "knots", "degree", "order"],
+            result: Vector(len: SplineCount(knots: 1, degree: 2), elem: Real))),
+        Binding(name: "bspline_integral", sig: Function(
+            params: [Scalar(Real), Scalar(Real), Vector(Real), Scalar(Integer)], names: ["a", "b", "knots", "degree"],
+            result: Vector(len: SplineCount(knots: 2, degree: 3), elem: Real))),
+        Binding(name: "bspline_penalty", sig: Function(
+            params: [Vector(Real), Scalar(Integer), Optional(Scalar(Integer))], names: ["knots", "degree", "order"],
+            result: Matrix(rows: SplineCount(knots: 0, degree: 1), cols: SplineCount(knots: 0, degree: 1)))),
         Binding(name: "thinplate_basis", sig: Function(
             params: [Scalar(Real), Vector(Real)], names: ["x", "centers"],
             result: Vector(len: Add(Axis(1, 0), 2), elem: Real))),

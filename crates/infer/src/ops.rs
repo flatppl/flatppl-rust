@@ -6682,6 +6682,10 @@ fn catalogue_lower(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     lower(sig, &ctx)
@@ -9654,8 +9658,12 @@ fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
         Type::Scalar(_) if shape == ParamShape::Scalar => return None,
         Type::Scalar(_) => "a scalar",
         Type::Array { shape: dims, elem } => match (dims.len(), numeric(elem)) {
-            (1, true) if shape == ParamShape::Vector => return None,
-            (2, true) if shape == ParamShape::Matrix => return None,
+            (1, true) if matches!(shape, ParamShape::Vector | ParamShape::VectorOrMatrix) => {
+                return None;
+            }
+            (2, true) if matches!(shape, ParamShape::Matrix | ParamShape::VectorOrMatrix) => {
+                return None;
+            }
             (1, true) => "a vector",
             (2, true) => "a matrix",
             (n, true) => return Some(format!("an array of {n} dimensions")),
@@ -9664,7 +9672,12 @@ fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
         },
         // §03 "Arrays": "The term vector will represent both non-transposed vectors
         // (one-dimensional arrays) and transposed vectors".
-        Type::TVector { elem, .. } if shape == ParamShape::Vector && numeric(elem) => return None,
+        Type::TVector { elem, .. }
+            if matches!(shape, ParamShape::Vector | ParamShape::VectorOrMatrix)
+                && numeric(elem) =>
+        {
+            return None;
+        }
         Type::TVector { .. } => "a transposed vector",
         Type::Record(_) => "a record",
         Type::Tuple(_) => "a tuple",
@@ -10323,6 +10336,10 @@ fn function_result(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (ty, _) = lower(sig, &ctx);
@@ -10370,6 +10387,10 @@ fn function_valueset(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (_, vset) = lower(sig, &ctx);
@@ -10409,6 +10430,7 @@ fn distribution_domain(
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|_| Dim::Dynamic,
+        written_integer: &|_| None,
         intern: &crate::catalogue::no_intern,
     };
     let (ty, _vset) = lower(sig, &ctx);
@@ -10515,6 +10537,7 @@ fn kernel_variate(
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         match lower(sig, &ctx).0 {
@@ -11315,6 +11338,7 @@ fn distribution_support(
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(declared, i).cloned(),
         written_size: &|_| Dim::Dynamic,
+        written_integer: &|_| None,
         intern: &crate::catalogue::no_intern,
     };
     let (_ty, vs) = lower(sig, &ctx);

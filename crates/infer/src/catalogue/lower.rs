@@ -31,6 +31,16 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
             _ => Dim::Dynamic,
         },
         DimExpr::WrittenSize(i) => (ctx.written_size)(*i),
+        DimExpr::SplineCount { knots, degree } => {
+            match ((ctx.arg_dim)(*knots), (ctx.written_integer)(*degree)) {
+                (Dim::Static(k), Some(p)) if p >= 0 => u32::try_from(p)
+                    .ok()
+                    .and_then(|p| p.checked_add(1))
+                    .and_then(|p| k.checked_sub(p))
+                    .map_or(Dim::Dynamic, Dim::Static),
+                _ => Dim::Dynamic,
+            }
+        }
         DimExpr::Add(a, offset) => match dim_of(a, ctx) {
             Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
@@ -106,9 +116,17 @@ fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
             }
         }
         ElemSig::RealOrComplexOfArgs(indices) => {
+            fn has_complex(t: &Type) -> bool {
+                match t {
+                    Type::Scalar(ScalarType::Complex) => true,
+                    Type::Array { elem, .. } | Type::TVector { elem, .. } => has_complex(elem),
+                    Type::Record(fields) => fields.iter().any(|(_, t)| has_complex(t)),
+                    _ => false,
+                }
+            }
             if indices
                 .iter()
-                .any(|&i| elem_scalar_kind((ctx.arg_type)(i).as_ref()) == Some(ScalarType::Complex))
+                .any(|&i| (ctx.arg_type)(i).as_ref().is_some_and(has_complex))
             {
                 ScalarType::Complex
             } else {
@@ -129,6 +147,7 @@ pub(crate) struct LowerCtx<'a> {
     /// `ElemScalarKind`. `None` when the arg is absent.
     pub(crate) arg_type: &'a dyn Fn(usize) -> Option<Type>,
     /// The positive integer literal written at positional arg `i`, else `%dynamic`.
+    pub(crate) written_integer: &'a dyn Fn(usize) -> Option<i64>,
     pub(crate) written_size: &'a dyn Fn(usize) -> Dim,
     /// Intern a record field name into a `Symbol` (for `ResultSig::Record`).
     /// Lives behind a `Fn` (interior-mutable at the call site) so it doesn't
@@ -416,6 +435,21 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
             shape: Box::new([dim_of(rows, ctx), dim_of(cols, ctx)]),
             elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
         },
+        ResultSig::RhsShape { rhs, rows, elem } => {
+            let rhs_type = (ctx.arg_type)(*rhs);
+            let mut shape = match rhs_type.as_ref() {
+                Some(Type::TVector { len, .. }) => vec![*len],
+                other => flatten_dims(other),
+            };
+            if shape.is_empty() {
+                return Type::Deferred;
+            }
+            shape[0] = dim_of(rows, ctx);
+            Type::Array {
+                shape: shape.into_boxed_slice(),
+                elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
+            }
+        }
         ResultSig::TransposeOf(i) => match (ctx.arg_type)(*i) {
             // Flat rank-2 array: swap the two dims, element preserved.
             Some(Type::Array { shape, elem }) if shape.len() == 2 => Type::Array {
@@ -490,6 +524,7 @@ mod tests {
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         let (ty, vset) = lower(&sig, &cx);
@@ -518,6 +553,7 @@ mod tests {
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         let (ty, _) = lower(&sig, &cx);

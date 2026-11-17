@@ -398,6 +398,7 @@ pub(crate) enum MassTag {
 pub(crate) enum ParamSig {
     Scalar(ScalarTag),
     Vector(ScalarTag),
+    VectorOrMatrix,
     Matrix,
     Callable,
     Any,
@@ -459,6 +460,12 @@ pub(crate) enum ResultSig {
         cols: DimExpr,
         elem: ElemSig,
     },
+    /// A vector or matrix RHS shape with its row extent replaced.
+    RhsShape {
+        rhs: usize,
+        rows: DimExpr,
+        elem: ElemSig,
+    },
     /// Transpose of arg `i`, preserving rank and element kind (`transpose`,
     /// `adjoint`): a rank-2 array's two dims are swapped; a vector's transpose
     /// is a transposed vector (spec §07: "the transpose of a vector is a
@@ -508,6 +515,8 @@ pub(crate) enum DimExpr {
     /// The positive integer literal written at positional arg `i`, as in
     /// `linspace`'s point count `n`.
     WrittenSize(usize),
+    /// Full knot count minus the fixed degree and one.
+    SplineCount { knots: usize, degree: usize },
 }
 
 /// Parse a catalogue from RON source.
@@ -586,6 +595,7 @@ pub(crate) enum ParamShape {
     Scalar,
     Vector,
     Matrix,
+    VectorOrMatrix,
 }
 
 impl ParamShape {
@@ -594,6 +604,7 @@ impl ParamShape {
             ParamShape::Scalar => "a scalar",
             ParamShape::Vector => "a vector",
             ParamShape::Matrix => "a matrix",
+            ParamShape::VectorOrMatrix => "a vector or matrix",
         }
     }
 }
@@ -618,6 +629,7 @@ pub(crate) fn sig_param_shapes(sig: &Sig, count: usize) -> Vec<Option<ParamShape
             ParamSig::Scalar(_) => Some(ParamShape::Scalar),
             ParamSig::Vector(_) => Some(ParamShape::Vector),
             ParamSig::Matrix => Some(ParamShape::Matrix),
+            ParamSig::VectorOrMatrix => Some(ParamShape::VectorOrMatrix),
             ParamSig::Optional(inner) | ParamSig::Variadic(inner) => of(inner),
             ParamSig::Callable | ParamSig::Any => None,
         }
@@ -1246,6 +1258,7 @@ mod tests {
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
                 written_size: &|_| Dim::Dynamic,
+                written_integer: &|_| None,
                 intern: &no_intern,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
@@ -1402,6 +1415,7 @@ mod tests {
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
                 written_size: &|_| Dim::Dynamic,
+                written_integer: &|_| None,
                 intern: &no_intern,
             };
             let (cat_ty, _) = lower(sig, &ctx);
@@ -1499,7 +1513,22 @@ mod tests {
                 "ext-linear-algebra",
                 "0.1",
                 &[
-                    "lu", "svd", "eigen", "eigmax", "eigmin", "matexp", "kron", "lstsq", "rank",
+                    "lu",
+                    "svd",
+                    "eigen",
+                    "eigmax",
+                    "eigmin",
+                    "matexp",
+                    "kron",
+                    "lstsq",
+                    "rank",
+                    "solve_triangular",
+                    "lu_solve",
+                    "cholesky_solve",
+                    "eigh",
+                    "eigvalsh",
+                    "pinv",
+                    "cond",
                 ],
             ),
             (
@@ -1516,6 +1545,19 @@ mod tests {
                     "digamma",
                     "polygamma",
                     "gammainc",
+                    "gammaincc",
+                    "log_gammainc",
+                    "log_gammaincc",
+                    "betaincc",
+                    "log_betainc",
+                    "log_betaincc",
+                    "beta",
+                    "logbeta",
+                    "bessel_i_scaled",
+                    "bessel_k_scaled",
+                    "log_bessel_i",
+                    "log_bessel_k",
+                    "log_ndtr",
                     "betainc",
                     "airy",
                 ],

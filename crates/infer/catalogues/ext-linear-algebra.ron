@@ -43,11 +43,26 @@
                         rows: Mul(Axis(0, 0), Axis(1, 0)),
                         cols: Mul(Axis(0, 1), Axis(1, 1)),
                         elem: PromoteArgs([0, 1])))),
-                // lstsq(A, b) → least-squares solution vector x, element kind from b.
                 Binding(name: "lstsq",
-                    sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: Vector(len: Dyn, elem: RealOrComplexOfArgs([0, 1])))),
-                // rank(A) → integer (numerical rank)
+                    sig: Function(params: [Matrix, VectorOrMatrix, Optional(Scalar(Real)), Optional(Scalar(Real))], names: ["A", "b", "rtol", "atol"], result: RhsShape(rhs: 1, rows: Axis(0, 1), elem: RealOrComplexOfArgs([0, 1])))),
                 Binding(name: "rank",
-                    sig: Function(params: [Matrix], names: ["A"], result: Scalar(Integer), result_set: NonNegIntegers)),
+                    sig: Function(params: [Matrix, Optional(Scalar(Real)), Optional(Scalar(Real))], names: ["A", "rtol", "atol"], result: Scalar(Integer), result_set: NonNegIntegers)),
+                Binding(name: "solve_triangular",
+                    sig: Function(params: [Matrix, VectorOrMatrix, Optional(Scalar(Boolean)), Optional(Scalar(Boolean))], names: ["A", "b", "lower", "unit_diagonal"], result: RhsShape(rhs: 1, rows: Axis(0, 0), elem: RealOrComplexOfArgs([0, 1])))),
+                Binding(name: "lu_solve",
+                    sig: Function(params: [Any, VectorOrMatrix], names: ["factors", "b"], result: RhsShape(rhs: 1, rows: Axis(1, 0), elem: RealOrComplexOfArgs([0, 1])))),
+                Binding(name: "cholesky_solve",
+                    sig: Function(params: [Matrix, VectorOrMatrix], names: ["L", "b"], result: RhsShape(rhs: 1, rows: Axis(0, 0), elem: RealOrComplexOfArgs([0, 1])))),
+                Binding(name: "eigh",
+                    sig: Function(params: [Matrix], names: ["A"], result: Record([
+                        ("values", Vector(len: Axis(0, 0), elem: Real)),
+                        ("vectors", MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: RealOrComplexOfArg(0))),
+                    ]))),
+                Binding(name: "eigvalsh",
+                    sig: Function(params: [Matrix], names: ["A"], result: Vector(len: Axis(0, 0), elem: Real))),
+                Binding(name: "pinv",
+                    sig: Function(params: [Matrix, Optional(Scalar(Real)), Optional(Scalar(Real))], names: ["A", "rtol", "atol"], result: MatrixElem(rows: Axis(0, 1), cols: Axis(0, 0), elem: RealOrComplexOfArg(0)))),
+                Binding(name: "cond",
+                    sig: Function(params: [Matrix], names: ["A"], result: Scalar(Real))),
             ]
 )

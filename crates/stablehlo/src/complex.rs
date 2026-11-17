@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::mlir::Lowered;
 use crate::{EmitError, Emitter, Value};
 use flatppl_core::{CallHead, Node, NodeId, ScalarType, Type};
 
@@ -74,6 +75,7 @@ pub(crate) fn parts(
                         .or_else(|| e.lower_matrix_exp_parts(id, callee, &c.args, false))
                         .or_else(|| e.lower_bessel_parts(id, callee, &c.args, false))
                         .or_else(|| e.lower_lstsq_parts(id, callee, &c.args, false))
+                        .or_else(|| e.lower_ext_linalg_parts(id, callee, &c.args, false))
                         .unwrap_or_else(|| {
                             Err(EmitError::at(
                                 id,
@@ -158,6 +160,7 @@ pub(crate) fn parts(
                     && let Some(result) = e
                         .lower_bessel_parts(id, *callee, args, true)
                         .or_else(|| e.lower_lstsq_parts(id, *callee, args, true))
+                        .or_else(|| e.lower_ext_linalg_parts(id, *callee, args, true))
                 {
                     return result;
                 }
@@ -241,7 +244,7 @@ pub(crate) fn parts(
 
 /// Record fields commute with selecting rows of their table. Keep both real
 /// coordinates through that projection instead of forcing a complex tensor ABI.
-fn field_parts(
+pub(crate) fn field_parts(
     e: &mut Emitter,
     id: NodeId,
     container: NodeId,
@@ -251,6 +254,10 @@ fn field_parts(
     let container = e.resolve_tuple_projections(container);
     if let Some(entry) = e.literal_entry(container, field) {
         return parts(e, entry, memo);
+    }
+    if let Some(Lowered::Tensor(value)) = e.bound_field(container, field) {
+        let zero = e.constant_like(0.0, &value);
+        return Ok((value, zero));
     }
     if let Node::Call(call) = e.node(container).clone()
         && let CallHead::Builtin(head) = call.head
@@ -271,7 +278,8 @@ fn field_parts(
             ));
         }
     }
-    e.lower_eigen_field_parts(container, field)
+    e.lower_eigh_field_parts(container, field)
+        .or_else(|| e.lower_eigen_field_parts(container, field))
         .or_else(|| e.lower_lu_field_parts(container, field))
         .or_else(|| e.lower_svd_field_parts(id, container, field))
         .unwrap_or_else(|| {

@@ -212,18 +212,14 @@ pub fn emit_query(
         }
         returned.push(value);
     }
-    let runtime_status = emitter.runtime_status().map(|status| {
-        let index = returned.len();
-        returned.push(status);
-        RuntimeStatus {
-            index,
-            dtype: match dtype {
-                Dtype::F32 => "int32",
-                Dtype::F64 => "int64",
-            },
-            shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
-            codes: emitter.runtime_codes(),
-        }
+    let runtime_status = emitter.runtime_status().map(|_| RuntimeStatus {
+        index: returned.len(),
+        dtype: match dtype {
+            Dtype::F32 => "int32",
+            Dtype::F64 => "int64",
+        },
+        shape: batch.map_or_else(Vec::new, |batch| batch.shape.clone()),
+        codes: emitter.runtime_codes(),
     });
     let returned = returned.iter().collect::<Vec<_>>();
     let stablehlo = if let Some(batch) = batch {

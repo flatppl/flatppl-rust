@@ -26,8 +26,9 @@ impl Emitter<'_> {
             _ => return None,
         };
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
-        (module == "ext-linear-algebra" && matches!(member.as_str(), "svd" | "rank" | "lstsq"))
-            .then_some((member, args, broadcast))
+        (module == "ext-linear-algebra"
+            && matches!(member.as_str(), "svd" | "rank" | "lstsq" | "pinv" | "cond"))
+        .then_some((member, args, broadcast))
     }
 
     fn emit_svd(&mut self, id: NodeId, arg: NodeId, broadcast: bool) -> Result<Svd, EmitError> {
@@ -129,63 +130,21 @@ impl Emitter<'_> {
         broadcast: bool,
     ) -> Option<Result<Value, EmitError>> {
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
-        if module != "ext-linear-algebra" || !matches!(member.as_str(), "rank" | "lstsq") {
+        if module != "ext-linear-algebra"
+            || !matches!(member.as_str(), "rank" | "lstsq" | "pinv" | "cond")
+        {
             return None;
         }
         Some((|| {
-            if member == "rank" {
-                let [arg] = args else {
-                    return Err(EmitError::at(id, "rank requires one matrix"));
-                };
-                let mut svd = self.emit_svd(id, *arg, broadcast)?;
-                let result_axes = self.axes_of(&svd.s);
-                if broadcast {
-                    // emit_svd restores a table column's collection axes. Rank
-                    // reduces its singular-value cell, retaining those axes.
-                    let outer = result_axes.layers[..result_axes.layers.len() - 1]
-                        .iter()
-                        .sum::<usize>();
-                    svd.s = self.axes_view(
-                        &svd.s,
-                        Axes {
-                            batch: result_axes.batch + outer,
-                            layers: vec![1],
-                        },
-                    );
-                }
-                let u_dims = shape(&svd.u.0.ty);
-                let v_dims = shape(&svd.v.0.ty);
-                let rows = u_dims[u_dims.len() - 2].expect("static SVD row count");
-                let cols = v_dims[v_dims.len() - 2].expect("static SVD column count");
-                let size = rows.max(cols);
-                let epsilon = match self.dtype {
-                    Dtype::F32 => f32::EPSILON as f64,
-                    Dtype::F64 => f64::EPSILON,
-                };
-                let threshold = self.scalar(size as f64 * epsilon);
-                let largest = self.reduce_max(&svd.s);
-                let threshold = self.mul(&threshold, &largest);
-                let retained = self.compare("GT", &svd.s, &threshold);
-                let retained = self.convert(&retained, ElemKind::Int);
-                let rank = self.reduce_sum(&retained);
-                return Ok(if broadcast {
-                    let mut axes = result_axes;
-                    axes.layers.pop();
-                    self.axes_view(&rank, axes)
-                } else {
-                    rank
-                });
-            }
-            if args
-                .iter()
-                .any(|a| crate::complex::complex_leaf(self.type_of(*a)))
+            if matches!(member.as_str(), "pinv" | "lstsq")
+                && crate::complex::complex_leaf(self.type_of(id))
             {
                 return Err(EmitError::at(
                     id,
-                    "complex lstsq requires a real or imaginary projection",
+                    "complex matrix result requires real/imaginary projections",
                 ));
             }
-            Ok(self.emit_lstsq_parts(id, args, broadcast)?.0)
+            Ok(self.emit_svd_operation(id, &member, args, broadcast)?.0)
         })())
     }
 
@@ -197,93 +156,183 @@ impl Emitter<'_> {
         broadcast: bool,
     ) -> Option<Result<Pair, EmitError>> {
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
-        if module != "ext-linear-algebra" || member != "lstsq" {
+        if module != "ext-linear-algebra" || !matches!(member.as_str(), "lstsq" | "pinv") {
             return None;
         }
-        Some(self.emit_lstsq_parts(id, args, broadcast))
+        Some(self.emit_svd_operation(id, &member, args, broadcast))
     }
 
-    fn emit_lstsq_parts(
+    fn emit_svd_operation(
         &mut self,
         id: NodeId,
+        member: &str,
         args: &[NodeId],
         broadcast: bool,
     ) -> Result<Pair, EmitError> {
-        let [a, b] = args else {
-            return Err(EmitError::at(id, "lstsq requires a matrix and a vector"));
+        let Some(&a) = args.first() else {
+            return Err(EmitError::at(id, "matrix operation requires a matrix"));
         };
         let mut memo = std::collections::HashMap::new();
-        let (ar, ai) = crate::complex::parts(self, *a, &mut memo)?;
-        let (br, bi) = crate::complex::parts(self, *b, &mut memo)?;
+        let (ar, ai) = crate::complex::parts(self, a, &mut memo)?;
         let (ar, ai) = self.broadcast_pair(&ar, &ai);
-        let (br, bi) = self.broadcast_pair(&br, &bi);
-        let mut values = [
-            self.typed_axes(*a, ar),
-            self.typed_axes(*a, ai),
-            self.typed_axes(*b, br),
-            self.typed_axes(*b, bi),
-        ];
+        let mut values = vec![self.typed_axes(a, ar), self.typed_axes(a, ai)];
+        let option_start = if member == "lstsq" {
+            let Some(&b) = args.get(1) else {
+                return Err(EmitError::at(id, "lstsq requires a RHS"));
+            };
+            let (br, bi) = crate::complex::parts(self, b, &mut memo)?;
+            let (br, bi) = self.broadcast_pair(&br, &bi);
+            values.extend([self.typed_axes(b, br), self.typed_axes(b, bi)]);
+            2
+        } else {
+            1
+        };
+        let cutoff_index = values.len();
+        if member != "cond" {
+            let rtol = if let Some(&arg) = args.get(option_start) {
+                self.lower_node(arg)?
+            } else {
+                self.scalar(-1.0)
+            };
+            let atol = if let Some(&arg) = args.get(option_start + 1) {
+                self.lower_node(arg)?
+            } else {
+                self.scalar(0.0)
+            };
+            values.extend([rtol, atol]);
+        }
         let parent = if broadcast {
             Some(self.enter_broadcast(id, &mut values)?)
         } else {
             None
         };
-        let MlirTy::Ranked(adims) = self.cell_ty(&values[0]) else {
-            return Err(EmitError::at(id, "lstsq requires a static matrix"));
+        let MlirTy::Ranked(dims) = self.cell_ty(&values[0]) else {
+            return Err(EmitError::at(id, "operation requires a static matrix"));
         };
-        let MlirTy::Ranked(bdims) = self.cell_ty(&values[2]) else {
-            return Err(EmitError::at(id, "lstsq requires a vector"));
-        };
-        let [Some(m), Some(n)] = adims.as_slice() else {
-            return Err(EmitError::at(id, "lstsq requires static matrix dimensions"));
-        };
-        if bdims.as_slice() != [Some(*m)] {
+        let [Some(m), Some(n)] = dims.as_slice() else {
             return Err(EmitError::at(
                 id,
-                "lstsq vector length must equal matrix rows",
+                "operation requires static matrix dimensions",
+            ));
+        };
+        let (m, n) = (*m, *n);
+        if member == "cond" && m.min(n) == 0 {
+            return Err(EmitError::at(
+                id,
+                "cond requires a nonempty singular spectrum",
             ));
         }
-        let svd = self.matrix_svd(id, (values[0].clone(), values[1].clone()))?;
-        let ut = (self.svd_transpose(&svd.u.0), self.svd_transpose(&svd.u.1));
-        let rr = self.matvec(&ut.0, &values[2]);
-        let ii = self.matvec(&ut.1, &values[3]);
-        let yr = self.add(&rr, &ii);
-        let ri = self.matvec(&ut.0, &values[3]);
-        let ir = self.matvec(&ut.1, &values[2]);
-        let yi = self.sub(&ri, &ir);
-        let epsilon = match self.dtype {
-            Dtype::F32 => f32::EPSILON as f64,
-            Dtype::F64 => f64::EPSILON,
+        let input_finite = if matches!(member, "pinv" | "cond") {
+            let finite = self.finite_matrix_parts(&(values[0].clone(), values[1].clone()));
+            self.record_runtime_error(&finite, 12);
+            finite
+        } else {
+            // Existing rank/lstsq retain SVD's numerical-failure status.
+            self.bool_value_const(true)
         };
-        let cutoff = self.scalar(epsilon * (*m).max(*n) as f64);
-        let maximum = self.reduce_max(&svd.s);
-        let cutoff = self.mul(&cutoff, &maximum);
-        let nonzero = self.compare("GT", &svd.s, &cutoff);
-        let one = self.scalar(1.0);
+        let zeros = self.constant_like(0.0, &values[0]);
+        let safe_input = (
+            self.select(&input_finite, &values[0], &zeros),
+            self.select(&input_finite, &values[1], &zeros),
+        );
+        let svd = self.matrix_svd_impl(id, safe_input, matches!(member, "pinv" | "lstsq"))?;
         let zero = self.scalar(0.0);
-        let safe_s = self.select(&nonzero, &svd.s, &one);
-        let yr = self.div(&yr, &safe_s);
-        let yi = self.div(&yi, &safe_s);
-        let yr = self.select(&nonzero, &yr, &zero);
-        let yi = self.select(&nonzero, &yi, &zero);
-        let rr = self.matvec(&svd.v.0, &yr);
-        let ii = self.matvec(&svd.v.1, &yi);
-        let re = self.sub(&rr, &ii);
-        let ri = self.matvec(&svd.v.0, &yi);
-        let ir = self.matvec(&svd.v.1, &yr);
-        let im = self.add(&ri, &ir);
+        let one = self.scalar(1.0);
+        let (result, valid) = if member == "cond" {
+            let maximum = self.reduce_max(&svd.s);
+            let minimum = self.reduce_min(&svd.s);
+            let nonzero = self.compare("GT", &minimum, &zero);
+            let safe = self.select(&nonzero, &minimum, &one);
+            let ratio = self.div(&maximum, &safe);
+            let infinity = self.scalar(f64::INFINITY);
+            let condition = self.select(&nonzero, &ratio, &infinity);
+            ((condition, zero.clone()), self.bool_value_const(true))
+        } else {
+            let epsilon = match self.dtype {
+                Dtype::F32 => f32::EPSILON as f64,
+                Dtype::F64 => f64::EPSILON,
+            };
+            let auto = self.scalar(epsilon * m.max(n) as f64);
+            let sentinel = self.scalar(-1.0);
+            let rtol = &values[cutoff_index];
+            let atol = &values[cutoff_index + 1];
+            let automatic = self.compare("EQ", rtol, &sentinel);
+            let nonnegative = self.compare("GE", rtol, &zero);
+            let infinity = self.scalar(f64::INFINITY);
+            let finite = self.compare("LT", rtol, &infinity);
+            let ordinary = self.and(&nonnegative, &finite);
+            let valid_rtol = self.or(&automatic, &ordinary);
+            let nonnegative = self.compare("GE", atol, &zero);
+            let finite = self.compare("LT", atol, &infinity);
+            let valid_atol = self.and(&nonnegative, &finite);
+            let valid = self.and(&valid_rtol, &valid_atol);
+            self.record_runtime_error(&valid, 12);
+            let rtol = self.select(&automatic, &auto, rtol);
+            let maximum = self.reduce_max(&svd.s);
+            let relative = self.mul(&rtol, &maximum);
+            let cutoff = self.max(atol, &relative);
+            let retained = self.compare("GT", &svd.s, &cutoff);
+            if member == "rank" {
+                let retained = self.convert(&retained, ElemKind::Int);
+                let rank = self.reduce_sum(&retained);
+                ((rank, zero.clone()), valid)
+            } else {
+                let safe_s = self.select(&retained, &svd.s, &one);
+                let reciprocal = self.div(&one, &safe_s);
+                let reciprocal = self.select(&retained, &reciprocal, &zero);
+                let u_adjoint = self.factor_adjoint(&svd.u);
+                let result = if member == "lstsq" {
+                    let MlirTy::Ranked(bdims) = self.cell_ty(&values[2]) else {
+                        return Err(EmitError::at(id, "lstsq requires a vector or matrix RHS"));
+                    };
+                    if bdims.first() != Some(&Some(m)) || !(1..=2).contains(&bdims.len()) {
+                        return Err(EmitError::at(id, "lstsq RHS rows must equal matrix rows"));
+                    }
+                    let matrix_rhs = bdims.len() == 2;
+                    let b = (values[2].clone(), values[3].clone());
+                    // Apply Uᴴ to the RHS first; forming the full pseudoinverse
+                    // would add an n×m workspace even for one RHS vector.
+                    let projected = self.factor_apply(&u_adjoint, &b);
+                    let scale = if matrix_rhs {
+                        self.svd_expand(&reciprocal, &projected.0, false)
+                    } else {
+                        reciprocal
+                    };
+                    let projected = (
+                        self.mul(&projected.0, &scale),
+                        self.mul(&projected.1, &scale),
+                    );
+                    self.factor_apply(&svd.v, &projected)
+                } else {
+                    let scale = self.svd_expand(&reciprocal, &svd.v.0, true);
+                    let v = (self.mul(&svd.v.0, &scale), self.mul(&svd.v.1, &scale));
+                    self.factor_matmul(&v, &u_adjoint)
+                };
+                (result, valid)
+            }
+        };
+        let valid = self.and(&valid, &input_finite);
+        let result = if member == "rank" {
+            result
+        } else {
+            let nan = self.scalar(f64::NAN);
+            (
+                self.select(&valid, &result.0, &nan),
+                self.select(&valid, &result.1, &nan),
+            )
+        };
         Ok(if let Some(parent) = parent {
             let frame = self.broadcast_frame.clone();
-            let re = self.finish_broadcast(&re, &frame, parent.len());
-            let im = self.finish_broadcast(&im, &frame, parent.len());
+            let re = self.finish_broadcast(&result.0, &frame, parent.len());
+            let im = self.finish_broadcast(&result.1, &frame, parent.len());
             self.broadcast_frame = parent;
             (re, im)
         } else {
-            (re, im)
+            result
         })
     }
 
-    fn svd_transpose(&mut self, a: &Value) -> Value {
+    pub(super) fn svd_transpose(&mut self, a: &Value) -> Value {
         let batch = self.batch_rank(a);
         let mut permutation: Vec<_> = (0..batch as u64).collect();
         permutation.extend([batch as u64 + 1, batch as u64]);
@@ -291,14 +340,14 @@ impl Emitter<'_> {
         self.axes_view(&value, self.axes_of(a))
     }
 
-    fn svd_expand(&mut self, vector: &Value, matrix: &Value, row: bool) -> Value {
+    pub(super) fn svd_expand(&mut self, vector: &Value, matrix: &Value, row: bool) -> Value {
         let batch = self.batch_rank(matrix);
         let axis = batch + usize::from(row);
         let map: Vec<_> = (0..batch as u64).chain([axis as u64]).collect();
         self.expand_axes(vector, &map, matrix.ty.clone(), self.axes_of(matrix))
     }
 
-    fn svd_column(&mut self, matrix: &Value, index: &Value) -> Value {
+    pub(super) fn svd_column(&mut self, matrix: &Value, index: &Value) -> Value {
         let columns = self.axis_indices(matrix, self.batch_rank(matrix) + 1);
         let mask = self.compare("EQ", &columns, index);
         let zero = self.constant_like(0.0, matrix);
@@ -306,7 +355,7 @@ impl Emitter<'_> {
         self.reduce_sum_last_axis(&column)
     }
 
-    fn svd_safe_sqrt(&mut self, x: &Value) -> Value {
+    pub(super) fn svd_safe_sqrt(&mut self, x: &Value) -> Value {
         let zero = self.scalar(0.0);
         let one = self.scalar(1.0);
         let positive = self.compare("GT", x, &zero);
@@ -333,7 +382,7 @@ impl Emitter<'_> {
     }
 
     /// Apply a unitary two-column rotation to B and its right singular basis.
-    fn svd_rotate(
+    pub(super) fn svd_rotate(
         &mut self,
         matrix: &Pair,
         p: &Value,
@@ -384,6 +433,15 @@ impl Emitter<'_> {
     }
 
     pub(super) fn matrix_svd(&mut self, id: NodeId, input: Pair) -> Result<Svd, EmitError> {
+        self.matrix_svd_impl(id, input, false)
+    }
+
+    fn matrix_svd_impl(
+        &mut self,
+        id: NodeId,
+        input: Pair,
+        preserve_small_modes: bool,
+    ) -> Result<Svd, EmitError> {
         let MlirTy::Ranked(dims) = self.cell_ty(&input.0) else {
             return Err(EmitError::at(id, "svd requires a static matrix"));
         };
@@ -471,6 +529,21 @@ impl Emitter<'_> {
                 let q = e.rem(index, &size);
                 let bp = (e.svd_column(&state[0], &p), e.svd_column(&state[1], &p));
                 let bq = (e.svd_column(&state[0], &q), e.svd_column(&state[1], &q));
+                // Global scaling does not protect a small correlated block:
+                // its inner products can underflow while the modes remain
+                // representable. A common pair scale preserves the rotation.
+                let pr = e.abs(&bp.0);
+                let pi = e.abs(&bp.1);
+                let qr = e.abs(&bq.0);
+                let qi = e.abs(&bq.1);
+                let pm = e.max(&pr, &pi);
+                let qm = e.max(&qr, &qi);
+                let magnitude = e.max(&pm, &qm);
+                let pair_scale = e.reduce_max(&magnitude);
+                let positive = e.compare("GT", &pair_scale, &zero);
+                let pair_scale = e.select(&positive, &pair_scale, &one);
+                let bp = (e.div(&bp.0, &pair_scale), e.div(&bp.1, &pair_scale));
+                let bq = (e.div(&bq.0, &pair_scale), e.div(&bq.1, &pair_scale));
                 let alpha = e.svd_norm2(&bp);
                 let beta = e.svd_norm2(&bq);
                 let gamma = e.svd_inner(&bp, &bq);
@@ -585,7 +658,19 @@ impl Emitter<'_> {
         let tolerance = self.scalar(64.0 * epsilon * n as f64);
         let converged = self.compare("LE", &error, &tolerance);
         self.record_runtime_error(&converged, 10);
-        let u = self.svd_complete_columns(&u, &nonzero, n);
+        let u = if preserve_small_modes {
+            // A caller may explicitly retain a nonzero mode below the default
+            // rank threshold. Null-basis completion would erase its phase.
+            let positive = self.compare("GT", &norm, &zero);
+            let safe_norm = self.select(&positive, &norm, &one);
+            let safe_norm = self.svd_expand(&safe_norm, &state[0], true);
+            (
+                self.div(&state[0], &safe_norm),
+                self.div(&state[1], &safe_norm),
+            )
+        } else {
+            self.svd_complete_columns(&u, &nonzero, n)
+        };
         let nan = self.scalar(f64::NAN);
         let u = (
             self.select(&converged, &u.0, &nan),
