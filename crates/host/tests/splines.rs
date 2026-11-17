@@ -83,7 +83,7 @@ fn spline_broadcast_callbacks_and_zero_degree_keep_cell_dimensions()
         knots = external(cartpow(reals, 4))
         values = external(cartpow(reals, 4))
         z = elementof(reals)
-        f = functionof(z, sp.interp_cubic(z, knots, values))
+        f = functionof(sp.interp_cubic(z, knots, values), z=z)
         inputs = (xs, knots, values)
         outputs = record(interp = broadcast(f, xs), basis = broadcast(sp.bspline_basis, xs, [knots], 0),
             derivative = sp.bspline_derivative(xs[1], knots, 0, 4))
