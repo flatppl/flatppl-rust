@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+M_obs = 10
+C_obs = 15
+R_obs = 5
+rcp_max = M_obs / (C_obs - R_obs + M_obs)
+rcp ~ Uniform(interval(0, rcp_max))
+R ~ Binomial(C_obs, rcp)
+Pi_prior = lawof(record(rcp = rcp))
+K_model = kernelof(record(R = R), rcp = rcp)
+L = likelihoodof(K_model, record(R = R_obs))
+Pi_post = bayesupdate(L, Pi_prior)

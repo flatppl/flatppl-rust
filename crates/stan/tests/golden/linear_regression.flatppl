@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+N = 5
+x = [1.0, 2.0, 3.0, 4.0, 5.0]
+y_obs = [1.2, 2.3, 2.9, 4.1, 5.2]
+alpha ~ Normal(0, 10)
+beta ~ Normal(0, 10)
+sigma ~ normalize(truncate(Normal(0, 1), interval(0, inf)))
+y ~ Normal.(alpha .+ beta .* x, sigma)
+prior = lawof(record(alpha = alpha, beta = beta, sigma = sigma))
+forward = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)
+L = likelihoodof(forward, record(y = y_obs))
+posterior = bayesupdate(L, prior)

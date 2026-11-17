@@ -1,0 +1,16 @@
+[package]
+name = "flatppl-stan"
+description = "FlatPPL → Stan program emitter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }

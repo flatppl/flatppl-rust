@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+obs_a = 1.5
+obs_b = 3.2
+mu = elementof(reals)
+model_a = functionof(Normal(mu = mu, sigma = 1.0))
+model_b = functionof(Normal(mu = 2.0 * mu, sigma = 0.5))
+L_a = likelihoodof(model_a, obs_a)
+L_b = likelihoodof(model_b, obs_b)
+L = joint_likelihood(L_a, L_b)
+prior = joint(mu = Normal(mu = 0.0, sigma = 2.0))
+posterior = bayesupdate(L, prior)
