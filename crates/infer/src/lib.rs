@@ -27,6 +27,7 @@ pub mod builtins;
 mod callable;
 mod catalogue;
 mod consteval;
+pub mod constructors;
 pub mod extras;
 mod modules;
 mod ops;

@@ -8,6 +8,52 @@
 use crate::id::Symbol;
 use std::fmt;
 
+/// Structural kind used to compare a measure domain with its variate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariateKind {
+    Scalar,
+    Vector,
+    Record,
+    Tuple,
+    Table,
+}
+
+impl VariateKind {
+    /// Plural noun, for naming what a SET's members are.
+    pub fn plural(self) -> &'static str {
+        match self {
+            VariateKind::Scalar => "scalars",
+            VariateKind::Vector => "vectors",
+            VariateKind::Record => "records",
+            VariateKind::Tuple => "tuples",
+            VariateKind::Table => "tables",
+        }
+    }
+
+    /// Singular with its article, for naming what a VARIATE is.
+    pub fn article_noun(self) -> &'static str {
+        match self {
+            VariateKind::Scalar => "a scalar",
+            VariateKind::Vector => "a vector",
+            VariateKind::Record => "a record",
+            VariateKind::Tuple => "a tuple",
+            VariateKind::Table => "a table",
+        }
+    }
+}
+
+/// Classify a known value type. Unknown and non-variate types have no kind.
+pub fn variate_kind(t: &Type) -> Option<VariateKind> {
+    match t {
+        Type::Scalar(_) => Some(VariateKind::Scalar),
+        Type::Array { .. } | Type::TVector { .. } => Some(VariateKind::Vector),
+        Type::Record(_) => Some(VariateKind::Record),
+        Type::Tuple(_) => Some(VariateKind::Tuple),
+        Type::Table { .. } => Some(VariateKind::Table),
+        _ => None,
+    }
+}
+
 /// The structural category of a value / object (the FlatPIR `%meta` type slot).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {

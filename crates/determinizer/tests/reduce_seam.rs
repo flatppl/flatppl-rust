@@ -4,9 +4,10 @@
 //! `kchain` row; rows in `src/marginal.md`). Both leave the module at the
 //! measure level.
 
-use flatppl_core::{CallHead, Module, Node, NodeId};
+use flatppl_core::{CallHead, Module, Node, NodeId, Symbol};
 use flatppl_determinizer::{
-    ConjugateRowId, desugar_restrict_and_disintegrate, match_conjugate_marginal,
+    ConjugateMatch, ConjugateRowId, RefuseError, desugar_restrict_and_disintegrate,
+    match_conjugate_marginal,
 };
 
 fn parse_infer(src: &str) -> Module {
@@ -57,12 +58,38 @@ fn heads(m: &Module) -> Vec<String> {
     out
 }
 
+fn match_both(
+    m: &mut Module,
+    prior: NodeId,
+    likelihood: NodeId,
+    latent: Symbol,
+) -> Option<Result<ConjugateMatch, RefuseError>> {
+    // Each matcher starts with identical nodes, including any splat projections it must build.
+    let shared = flatppl_model_analysis::match_conjugate_marginal(
+        &mut m.clone(),
+        prior,
+        likelihood,
+        latent,
+        &[],
+    )
+    .map(|result| {
+        result.map_err(|err| RefuseError {
+            node: prior,
+            construct: "kchain".into(),
+            reason: err.0,
+        })
+    });
+    let result = match_conjugate_marginal(m, prior, likelihood, latent);
+    assert_eq!(shared, result);
+    result
+}
+
 fn row(src: &str) -> Option<ConjugateRowId> {
     let mut m = parse_infer(src);
     let latent = m.intern("z");
     let prior = drawn(&m, "z");
     let lik = drawn(&m, "y");
-    match_conjugate_marginal(&mut m, prior, lik, latent).map(|r| r.unwrap().row)
+    match_both(&mut m, prior, lik, latent).map(|r| r.unwrap().row)
 }
 
 #[test]
@@ -121,6 +148,27 @@ fn conjugate_matches_follow_named_parameters_and_respect_callable_inputs() {
 }
 
 #[test]
+fn conjugate_matches_use_constructor_binding_and_the_declared_latent_path() {
+    let source =
+        "z = draw(Normal(0.0, sigma = 1.0))\np = record(sigma = 2.0, mu = z)\ny = draw(Normal(p))";
+    assert_eq!(row(source), Some(ConjugateRowId::NormalMean));
+    let duplicate_field = source.replace("mu = z)", "mu = z, mu = z)");
+    assert_eq!(row(&duplicate_field), None);
+    assert_eq!(row(&source.replace("Normal(p)", "Normal(z, mu = z)")), None);
+    // The rule recognizes a pair before the builder checks for a missing sigma.
+    assert_eq!(
+        row(&source.replace("Normal(p)", "Normal(z)")),
+        Some(ConjugateRowId::NormalMean)
+    );
+    let source = "z = draw(Exponential(1.3))\ns = sqrt(z)\ny = draw(Normal(0.0, s))";
+    assert_eq!(row(source), Some(ConjugateRowId::ExponentialVariance));
+    assert_eq!(
+        row("z = draw(Normal(0.0, 1.0))\na = z\ny = draw(Normal(a, 1.0))"),
+        None
+    );
+}
+
+#[test]
 fn a_previous_query_point_does_not_change_the_model_dependencies() {
     let mut m = parse_infer(
         "z = draw(Normal(0.0, 1.0))\nu = draw(Normal(z, 1.0))\nwidth = exp(u)\ny = draw(Normal(z, width))\nk = 0.2\npoint_alias = k\nother = draw(Normal(z, k))",
@@ -130,14 +178,21 @@ fn a_previous_query_point_does_not_change_the_model_dependencies() {
     let prior = drawn(&m, "z");
     let dependent = drawn(&m, "y");
     let independent = drawn(&m, "other");
+    let sibling = rhs(&m, "u");
     let point = rhs(&m, "point_alias");
     for symbol in [u, z] {
         let binding = m.binding_by_name(symbol).unwrap();
         m.pin_binding_to_query_point(binding, point);
     }
-    assert!(match_conjugate_marginal(&mut m, prior, dependent, z).is_none());
+    assert!(match_both(&mut m, prior, dependent, z).is_none());
+    let matched =
+        flatppl_model_analysis::match_conjugate_marginal(&mut m, prior, dependent, z, &[sibling])
+            .unwrap()
+            .unwrap();
+    assert_eq!(matched.row, ConjugateRowId::NormalMean);
+    assert!(match_both(&mut m, prior, dependent, z).is_none());
     assert_eq!(
-        match_conjugate_marginal(&mut m, prior, independent, z)
+        match_both(&mut m, prior, independent, z)
             .unwrap()
             .unwrap()
             .row,
@@ -153,9 +208,7 @@ fn match_keeps_the_original_parameter_nodes() {
     let prior = drawn(&m, "z");
     let lik = drawn(&m, "y");
     let before = m.node_count();
-    let matched = match_conjugate_marginal(&mut m, prior, lik, latent)
-        .unwrap()
-        .unwrap();
+    let matched = match_both(&mut m, prior, lik, latent).unwrap().unwrap();
     assert_eq!(
         m.node_count(),
         before,
@@ -197,10 +250,8 @@ fn non_scalar_parameter_refuses() {
     let latent = m.intern("z");
     let prior = drawn(&m, "z");
     let lik = drawn(&m, "y");
-    assert!(matches!(
-        match_conjugate_marginal(&mut m, prior, lik, latent),
-        Some(Err(_))
-    ));
+    let err = match_both(&mut m, prior, lik, latent).unwrap().unwrap_err();
+    assert!(err.reason.contains("the likelihood's `sigma` is a vector"));
 }
 
 const JOINT: &str = "\

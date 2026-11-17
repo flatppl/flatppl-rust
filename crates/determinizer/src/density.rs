@@ -138,7 +138,12 @@
 //! desugared into `bayesupdate(likelihoodof(kernel, x), marginal)` over the
 //! disintegration on `x`'s field names, §06 "Measure restriction".)
 
-pub(crate) use flatppl_core::graph::{build_call, build_record, fold_add};
+pub(crate) use flatppl_core::graph::{
+    build_call, build_record, confirmed_non_scalar, expect_builtin_call, fold_add, resolve_ref,
+    resolve_ref_one,
+};
+use flatppl_core::ty::{VariateKind, variate_kind};
+pub(crate) use flatppl_infer::constructors::{split_kernel_constructor, std_module_ctor_sym};
 
 use crate::crossmodule::GraftState;
 use crate::refuse::RefuseError;
@@ -8944,83 +8949,6 @@ fn lower_reified_measure(
 // Primitive distribution constructor density term (Task 3 helper)
 // ---------------------------------------------------------------------------
 
-/// Build `builtin_logdensityof(kernel, kernel_input, pinned)` for a primitive
-/// distribution constructor `measure` applied to keyword arguments.
-/// The top-level structural kind of a variate type, for a conservative
-/// domain/variate compatibility check. `None` for unknown (deferred / any /
-/// type-var) or non-variate types — those never refuse. `Array` and `TVector`
-/// share a kind, so a column-vs-row-vector annotation difference is not flagged.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VariateKind {
-    Scalar,
-    Vector,
-    Record,
-    Tuple,
-    Table,
-}
-
-impl VariateKind {
-    /// Plural noun, for naming what a SET's members are.
-    fn plural(self) -> &'static str {
-        match self {
-            VariateKind::Scalar => "scalars",
-            VariateKind::Vector => "vectors",
-            VariateKind::Record => "records",
-            VariateKind::Tuple => "tuples",
-            VariateKind::Table => "tables",
-        }
-    }
-
-    /// Singular with its article, for naming what a VARIATE is.
-    pub(crate) fn article_noun(self) -> &'static str {
-        match self {
-            VariateKind::Scalar => "a scalar",
-            VariateKind::Vector => "a vector",
-            VariateKind::Record => "a record",
-            VariateKind::Tuple => "a tuple",
-            VariateKind::Table => "a table",
-        }
-    }
-}
-
-fn variate_kind(t: &Type) -> Option<VariateKind> {
-    match t {
-        Type::Scalar(_) => Some(VariateKind::Scalar),
-        Type::Array { .. } | Type::TVector { .. } => Some(VariateKind::Vector),
-        Type::Record(_) => Some(VariateKind::Record),
-        Type::Tuple(_) => Some(VariateKind::Tuple),
-        Type::Table { .. } => Some(VariateKind::Table),
-        _ => None,
-    }
-}
-
-/// `value`'s CONFIRMED non-scalar [`VariateKind`], or `None` when its inferred type is a
-/// scalar OR is not known at all (`%deferred`, `%any`, a type-var, or absent — the cases
-/// [`variate_kind`] answers `None` for).
-///
-/// For a guard over a synthesized SCALAR expression. §07 "Operator-equivalent functions"
-/// gives `pow` the domain "scalars", and `divide` "scalars, array-scalar,
-/// transposed-vector–scalar (real or complex)" (flatppl-design#77, pending owner review;
-/// it supersedes #75's narrower "scalars, vector-scalar, matrix-scalar"). Every form #77
-/// admits still has a SCALAR divisor — it widens the DIVIDEND to any rank, not the divisor —
-/// so a determiniser row that builds `pow(p, 2)` or `divide(d, p)` on a parameter `p` needs
-/// `p` scalar either way; the elementwise forms are `broadcast(pow, …)` / `.^` (§04
-/// "Broadcasting"), a different node no row builds.
-///
-/// **Prove-it-is-wrong, not fail-closed.** A literal parameter node carries no inferred
-/// type at all (`Normal(mu = 0.0, sigma = 1.0)` — the literals are untyped), so requiring
-/// a CONFIRMED scalar would reject the very rows this guards. Answering `None` on an
-/// unknown type keeps every such shape on the path it has today and refuses only what the
-/// inferred type proves is out of domain — the same discipline as the StableHLO emitter's
-/// bare-op domain guard, which stays the backstop for the unproven cases.
-pub(crate) fn confirmed_non_scalar(m: &Module, value: NodeId) -> Option<VariateKind> {
-    let (resolved, _) = resolve_ref(m, value);
-    match variate_kind(m.type_of(resolved)?)? {
-        VariateKind::Scalar => None,
-        kind => Some(kind),
-    }
-}
-
 /// `true` only when `measure_node`'s OWN inferred type is a CONFIRMED
 /// scalar-domain measure — `Some(Type::Measure { domain, .. })` with
 /// `variate_kind(domain) == Some(VariateKind::Scalar)`. Used by [`lower_iid`]
@@ -9038,134 +8966,6 @@ fn is_scalar_domain_kernel(m: &Module, measure_node: NodeId) -> bool {
         m.type_of(measure_node),
         Some(Type::Measure { domain, .. }) if variate_kind(domain) == Some(VariateKind::Scalar)
     )
-}
-
-/// Read a primitive constructor call into its constructor symbol and the
-/// arguments as `(param_name, value)` pairs, accepting BOTH surface calling
-/// conventions (spec §04 "Calling conventions": every built-in ordinary
-/// callable has a defined input order and accepts positional and keyword
-/// arguments):
-///
-/// * keyword form `Ctor(mu = m, sigma = s)` → the named args verbatim;
-/// * positional form `Ctor(m, s)` → each positional arg bound to the
-///   constructor's ordered parameter name (§08 distribution / §06
-///   fundamental-measure parameter order, via
-///   [`flatppl_infer::constructor_param_names`]);
-/// * mixed form `Ctor(m, sigma = s)` → positional args bound by order, then the
-///   keyword args.
-///
-/// This only *reads* the call; it does not rewrite `node` — the surface form
-/// (positional preferred for term-rewriting) is left intact. The name mapping
-/// exists so the caller can build the by-name `record` kernel_input that
-/// `builtin_logdensityof` / `builtin_sample` require (a `record` takes named
-/// fields, §04).
-///
-/// A §09 standard-module member call (`hep.CrystalBall(m0 = …, …)`) is accepted
-/// too, with the BARE member name as the constructor symbol — see
-/// [`std_module_ctor_sym`].
-///
-/// `None` (⇒ the caller refuses, per refuse-don't-mislower) if `node` is not a
-/// `Call`, is neither builtin-headed nor a §09 distribution member call, has a
-/// non-kwarg named arg, or — when positional args are present — the head is not a
-/// known distribution constructor, carries more positional args than the
-/// constructor has parameters, or binds a parameter both positionally and by
-/// keyword (a §04 double-bind).
-///
-/// Shared by [`build_density_term`] (the density-side kernel/kernel_input build)
-/// and the sample-side leaf (`sample::split_constructor`) — both need exactly
-/// this constructor-symbol-plus-arguments read before building their respective
-/// `builtin_*` call. Needs `&mut` only to intern parameter-name symbols for the
-/// positional mapping; the keyword-only fast path is non-mutating.
-/// The bare constructor symbol of a §09 standard-module DISTRIBUTION member
-/// reached as a call callee: `hep.CrystalBall` → `CrystalBall`. One `(%ref self …)`
-/// hop is followed, so `sig = hep.CrystalBall; sig(m0 = …)` resolves too.
-///
-/// `None` for anything else — a `load_module` member (which grafts instead), a
-/// local callee, or a §09 member whose catalogue row is a *function* rather than a
-/// distribution. §09 "Standard modules" gives no unqualified spelling for a
-/// member, so the bare name cannot collide with a base §08 constructor: the
-/// catalogue keeps the two namespaces disjoint (`Catalogue::is_module_member`).
-pub(crate) fn std_module_ctor_sym(m: &Module, callee: NodeId) -> Option<Symbol> {
-    let ref_id = if crate::crossmodule::std_module_member(m, callee).is_some() {
-        callee
-    } else {
-        let hop = resolve_ref(m, callee).0;
-        crate::crossmodule::std_module_member(m, hop).map(|_| hop)?
-    };
-    let Node::Ref(Ref { name: member, .. }) = *m.node(ref_id) else {
-        return None;
-    };
-    flatppl_infer::distribution_param_names(m.resolve(member))?;
-    Some(member)
-}
-
-pub(crate) fn split_kernel_constructor(
-    m: &mut Module,
-    node: NodeId,
-) -> Option<(Symbol, Vec<(Symbol, NodeId)>)> {
-    let Node::Call(c) = m.node(node) else {
-        return None;
-    };
-    let sym = match c.head {
-        CallHead::Builtin(sym) => sym,
-        // A §09 standard-module member call (`hep.CrystalBall(m0 = …, …)`) parses
-        // as a USER-headed call whose callee is a `(%ref <alias> member)`. Its tag
-        // is the BARE member name — the same tag `lower_broadcast_kernel` emits for
-        // a module-qualified broadcast head, and the one the engine registry keys.
-        // Gated on the member being a §09 DISTRIBUTION row: a module *function*
-        // member is not a constructor and must not become a density term.
-        CallHead::User(callee) => std_module_ctor_sym(m, callee)?,
-    };
-    // Snapshot positional args and keyword args (NodeId/Symbol are Copy) so the
-    // `&Call` borrow ends before interning parameter names below needs `&mut`.
-    let pos_args: Vec<NodeId> = c.args.to_vec();
-    let mut kwargs = Vec::with_capacity(c.named.len());
-    for n in c.named.iter() {
-        if n.kind != NamedKind::Kwarg {
-            return None;
-        }
-        kwargs.push((n.name, n.value));
-    }
-
-    // Keyword-only form (the common case): return the named args verbatim.
-    if pos_args.is_empty() {
-        return Some((sym, kwargs));
-    }
-
-    // Positional / mixed form: bind positional args to the constructor's ordered
-    // parameter names. A head that is not a known distribution constructor, or
-    // more positional args than it has parameters, is not a well-formed
-    // positional constructor call → None.
-    let param_names = flatppl_infer::constructor_param_names(m.resolve(sym))?;
-
-    // Constructor domains do not decide whether the argument is spread.
-    if param_names.len() != 1
-        && kwargs.is_empty()
-        && pos_args.len() == 1
-        && crate::kernel::is_splattable(m, pos_args[0])
-    {
-        let names: Vec<_> = param_names.iter().map(|name| m.intern(name)).collect();
-        let values = crate::kernel::bind_call_args(m, &names, &pos_args, &[], false)?;
-        return Some((sym, names.into_iter().zip(values).collect()));
-    }
-
-    if pos_args.len() > param_names.len() {
-        return None;
-    }
-    let mut args: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kwargs.len());
-    for (i, &arg) in pos_args.iter().enumerate() {
-        args.push((m.intern(&param_names[i]), arg));
-    }
-    // A parameter bound BOTH positionally and by keyword is a §04 double-bind
-    // (static error) — refuse rather than emit a record with duplicate fields.
-    if kwargs
-        .iter()
-        .any(|(kw_name, _)| args.iter().any(|(pos_name, _)| pos_name == kw_name))
-    {
-        return None;
-    }
-    args.extend(kwargs);
-    Some((sym, args))
 }
 
 /// Refuse scoring a measure at a variate whose structural KIND clearly
@@ -9196,6 +8996,7 @@ fn refuse_domain_kind_mismatch(
     Ok(())
 }
 
+/// Score a primitive constructor at the pinned variate with `builtin_logdensityof`.
 pub(crate) fn build_density_term(
     m: &mut Module,
     measure: NodeId,
@@ -9322,21 +9123,6 @@ pub(crate) fn materialize_record_value(m: &mut Module, v: NodeId) -> NodeId {
     build_record(m, &values)
 }
 
-/// If `id` is a builtin call with head named `name`, return its [`Call`].
-pub(crate) fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a Call> {
-    let Node::Call(c) = m.node(id) else {
-        return None;
-    };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
-    };
-    if m.resolve(sym) == name {
-        Some(c)
-    } else {
-        None
-    }
-}
-
 /// Return the builtin op name for `id`, or `None` if it is not a builtin call.
 pub(crate) fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
     if let Node::Call(c) = m.node(id)
@@ -9345,39 +9131,6 @@ pub(crate) fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
         return Some(m.resolve(sym));
     }
     None
-}
-
-/// Follow `(%ref self x)` indirection through every bare-name alias: return the
-/// first right-hand side that is not itself a self-ref, with the binding that
-/// holds it, or `(id, None)` when `id` is not a self-ref.
-///
-/// §04 *Name resolution* makes `M = a` name the very expression `a` names, so a
-/// caller that stopped one hop off `M` would hold the ref node `a` and refuse a
-/// legal alias. Bounded by the binding count, so a cyclic module cannot hang.
-pub(crate) fn resolve_ref(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
-    let (mut node, mut bid) = resolve_ref_one(m, id);
-    for _ in 0..m.binding_count() {
-        match resolve_ref_one(m, node) {
-            (next, Some(next_bid)) => (node, bid) = (next, Some(next_bid)),
-            (_, None) => break,
-        }
-    }
-    (node, bid)
-}
-
-/// Follow one level of `(%ref self x)` indirection: if `id` is a self-ref,
-/// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`. Only a
-/// caller that inspects each hop wants this; the rest use [`resolve_ref`].
-pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
-    if let Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }) = m.node(id)
-        && let Some(bid) = m.binding_by_name(*name)
-    {
-        return (m.binding(bid).rhs, Some(bid));
-    }
-    (id, None)
 }
 
 /// Like [`resolve_ref`], but also folds a `get` of a record or tuple literal

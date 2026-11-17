@@ -1,8 +1,8 @@
 //! Exact shared simplex-probability integrals with native support checks.
 
 use super::{
-    LatentPath, LogDensity, MarginalForm, RefuseError, SharedLatentRecordLaw, build_constructor,
-    find_kwarg, matches_latent_path, real, references_latent, split_kernel_constructor,
+    LogDensity, MarginalForm, RefuseError, SharedLatentRecordLaw, build_constructor, find_kwarg,
+    is_input_ref, real, references_latent, split_kernel_constructor,
 };
 use crate::density::{build_call, build_record};
 use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Symbol, Type};
@@ -55,12 +55,7 @@ pub(super) fn marginal(
     exempt: &[NodeId],
 ) -> Option<Result<MarginalForm, RefuseError>> {
     if !matches!(family, "Categorical" | "Categorical0" | "Multinomial")
-        || !matches_latent_path(
-            m,
-            find_kwarg(m, likelihood, "p")?,
-            &LatentPath::Direct,
-            latent,
-        )
+        || !is_input_ref(m, find_kwarg(m, likelihood, "p")?, latent)
         || likelihood.iter().any(|(name, value)| {
             m.resolve(*name) != "p" && references_latent(m, *value, latent, exempt)
         })
@@ -130,7 +125,7 @@ pub(super) fn shared_law(
             }
             _ => return None,
         };
-        if !matches_latent_path(m, find_kwarg(m, &kwargs, "p")?, &LatentPath::Direct, latent) {
+        if !is_input_ref(m, find_kwarg(m, &kwargs, "p")?, latent) {
             return None;
         }
         params.push(m.alloc(Node::Const(family)));

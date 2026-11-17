@@ -2,7 +2,77 @@
 
 use std::collections::HashSet;
 
-use crate::{BindingId, Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Symbol};
+use crate::ty::{VariateKind, variate_kind};
+use crate::{
+    BindingId, Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
+};
+
+/// Follow `(%ref self x)` indirection through every bare-name alias: return the
+/// first right-hand side that is not itself a self-ref, with the binding that
+/// holds it, or `(id, None)` when `id` is not a self-ref.
+///
+/// §04 *Name resolution* makes `M = a` name the very expression `a` names, so a
+/// caller that stopped one hop off `M` would hold the ref node `a` and refuse a
+/// legal alias. Bounded by the binding count, so a cyclic module cannot hang.
+pub fn resolve_ref(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
+    let (mut node, mut bid) = resolve_ref_one(m, id);
+    for _ in 0..m.binding_count() {
+        match resolve_ref_one(m, node) {
+            (next, Some(next_bid)) => (node, bid) = (next, Some(next_bid)),
+            (_, None) => break,
+        }
+    }
+    (node, bid)
+}
+
+/// Follow one level of `(%ref self x)` indirection: if `id` is a self-ref,
+/// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`. Only a
+/// caller that inspects each hop wants this; the rest use [`resolve_ref`].
+pub fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
+    if let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = m.node(id)
+        && let Some(bid) = m.binding_by_name(*name)
+    {
+        return (m.binding(bid).rhs, Some(bid));
+    }
+    (id, None)
+}
+
+/// Is `node` exactly the boundary-input reference `(%ref self|%local input)` —
+/// the latent feeding a parameter directly (not a derived expression)?
+pub fn is_input_ref(m: &Module, node: NodeId, input: Symbol) -> bool {
+    matches!(
+        m.node(node),
+        Node::Ref(Ref { ns, name })
+            if matches!(ns, RefNs::SelfMod | RefNs::Local) && *name == input
+    )
+}
+
+/// The structural kind of a value known to be non-scalar, following its aliases.
+pub fn confirmed_non_scalar(m: &Module, value: NodeId) -> Option<VariateKind> {
+    let (resolved, _) = resolve_ref(m, value);
+    match variate_kind(m.type_of(resolved)?)? {
+        VariateKind::Scalar => None,
+        kind => Some(kind),
+    }
+}
+
+/// If `id` is a builtin call with head named `name`, return its [`Call`].
+pub fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a Call> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) == name {
+        Some(c)
+    } else {
+        None
+    }
+}
 
 /// Allocate a positional builtin call `head(args…)`.
 pub fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {

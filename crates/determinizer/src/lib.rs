@@ -30,14 +30,14 @@ pub use driver::{
     determinize_with_options_and_report, determinize_with_roots,
 };
 pub use flatppl_model_analysis::{
-    AnalysisError, CoordinatePrecision, GroupPartition, IncrementalScorePlan, IncrementalTerm,
-    InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, NormalCoordinateQueries,
-    NormalCoordinatesQueries, OutputTerm, PreparationOptions, PreparedLikelihood,
-    ReductionDecision, ReductionOutcome, ReductionReport, sufficient_statistics,
-    sufficient_statistics_with_report,
+    AnalysisError, ConjugateMatch, ConjugateRowId, CoordinatePrecision, GroupPartition,
+    IncrementalScorePlan, IncrementalTerm, InputArray, InputCell, InputPath, ModelAnalysis,
+    NormalCoordinate, NormalCoordinateQueries, NormalCoordinatesQueries, OutputTerm,
+    PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome, ReductionReport,
+    sufficient_statistics, sufficient_statistics_with_report,
 };
 
-pub use marginal::{ConjugateMatch, ConjugateRowId, match_conjugate_marginal};
+pub use marginal::match_conjugate_marginal;
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,
 };

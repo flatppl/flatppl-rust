@@ -14,6 +14,7 @@
 //! rationale behind these choices.
 
 pub mod boxes;
+pub mod calling;
 pub mod depth;
 pub mod graph;
 pub mod id;
