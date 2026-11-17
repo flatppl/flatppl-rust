@@ -404,6 +404,13 @@ need its own statistical discovery pass.
 
 ## Structural model analysis
 
+`flatppl-model-analysis::plan_iid_normal` accepts an inferred IID Normal measure,
+its observed operand, and the structural target's scoring and data inputs. It
+uses the same moment rule as a lowered density query. Its result owns the
+module, ordered data summaries, observation count, finite-data predicate and
+fully normalized score. Emitters can retain the original factor when planning
+fails or when their runtime data checks require it.
+
 `flatppl-determinizer::analyze_model` checks FlatPDL conformance, then calls
 `flatppl-model-analysis::analyze_lowered_query` on the same typed module. Incremental score and Normal coordinate planners also live in
 this crate. They use core graph operations and infer types for generated coordinate queries.

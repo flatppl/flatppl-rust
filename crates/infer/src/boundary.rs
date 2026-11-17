@@ -41,20 +41,9 @@ pub(crate) fn declared_input_types(inf: &Inferencer<'_, '_>, callee: NodeId) -> 
             }
             let binding = inf.module.binding_by_name(decl.name)?;
             let ty = inf.lookup_type(inf.module.binding(binding).rhs)?;
-            is_concrete_value(ty).then(|| ty.clone())
+            ty.is_concrete_value().then(|| ty.clone())
         })
         .collect()
-}
-
-fn is_concrete_value(ty: &Type) -> bool {
-    match ty {
-        Type::Scalar(_) => true,
-        Type::Array { elem, .. } | Type::TVector { elem, .. } => is_concrete_value(elem),
-        Type::Record(fields) => fields.iter().all(|(_, t)| is_concrete_value(t)),
-        Type::Tuple(parts) => parts.iter().all(is_concrete_value),
-        Type::Table { columns, .. } => columns.iter().all(|(_, t)| is_concrete_value(t)),
-        _ => false,
-    }
 }
 
 /// True only when no value of type `actual` can lie in a domain of type

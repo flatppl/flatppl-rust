@@ -33,9 +33,12 @@ mod report;
 mod runtime_partition;
 mod scalar;
 mod sorted;
+mod structural;
 use flatppl_core::graph::{build_call, build_record};
 pub use report::{GroupPartition, ReductionDecision, ReductionOutcome, ReductionReport};
+pub use structural::{IidNormalPlan, plan_iid_normal};
 
+const NORMAL_FINITE: &str = "all_finite";
 const PREFIX: &str = "__likelihood_summary_";
 
 /// Two ordinary deterministic queries. Run `preparation` once per data binding,
@@ -586,6 +589,25 @@ enum DataKey {
 }
 
 impl Reducer {
+    fn new(boundary: HashSet<Symbol>, allowed: HashSet<Symbol>) -> Self {
+        Self {
+            preparing: false,
+            boundary,
+            allowed,
+            summaries: Vec::new(),
+            cache: HashMap::new(),
+            count: 0,
+            next_serial: 0,
+            data_proofs: RefCell::default(),
+            fixed_proofs: RefCell::default(),
+            report: None,
+            binding: String::new(),
+            enabled: true,
+            rule: None,
+            fallback: "",
+        }
+    }
+
     fn data_key(&self, m: &Module, id: NodeId) -> DataKey {
         let id = resolve(m, id, &self.boundary);
         match m.node(id) {
@@ -864,7 +886,7 @@ impl Reducer {
                     m,
                     observed,
                     if name == "Normal" {
-                        "all_finite"
+                        NORMAL_FINITE
                     } else {
                         "all_positive_finite"
                     },
@@ -1375,22 +1397,10 @@ fn reduce(
     enabled: bool,
 ) -> (usize, Vec<Symbol>) {
     let boundary = query::promoted_input_names(m);
-    let mut reducer = Reducer {
-        preparing,
-        boundary,
-        allowed,
-        summaries: Vec::new(),
-        cache: HashMap::new(),
-        count: 0,
-        next_serial: 0,
-        data_proofs: RefCell::default(),
-        fixed_proofs: RefCell::default(),
-        report: report.as_ref().map(|_| ReductionReport::default()),
-        binding: String::new(),
-        enabled,
-        rule: None,
-        fallback: "",
-    };
+    let mut reducer = Reducer::new(boundary, allowed);
+    reducer.preparing = preparing;
+    reducer.enabled = enabled;
+    reducer.report = report.as_ref().map(|_| ReductionReport::default());
     let bindings: Vec<_> = m
         .bindings()
         .filter(|(bid, b)| {
