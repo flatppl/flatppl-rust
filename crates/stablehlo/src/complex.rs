@@ -87,6 +87,12 @@ pub(crate) fn parts(
                 };
                 let head = e.resolve(head).to_owned();
                 if matches!(head.as_str(), "get" | "get0")
+                    && let Some((container, field)) = e.record_projection(&c.args)
+                    && let Some(result) = e.lower_lu_field_parts(container, &field)
+                {
+                    return result;
+                }
+                if matches!(head.as_str(), "get" | "get0")
                     && let [container, selector] = c.args.as_ref()
                     && !matches!(e.node(*selector), Node::Lit(flatppl_core::Scalar::Str(_)))
                 {

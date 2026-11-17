@@ -482,6 +482,8 @@ pub(crate) enum ElemSig {
     OfArg(usize),
     /// Arithmetic promotion of the element kinds of all listed arguments.
     PromoteArgs(Vec<usize>),
+    /// Preserve complex elements, and promote all other numeric elements to real.
+    RealOrComplexOfArg(usize),
 }
 
 /// A result-shape dimension expression (for `Matrix` / `MatrixElem` / `Vector`

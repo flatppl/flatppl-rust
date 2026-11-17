@@ -41,7 +41,7 @@ impl Emitter<'_> {
     /// `get(container, "field")` as `(container, field)` when `container` is a
     /// record or table: by inferred type, by a bound field, or by a literal
     /// producer.
-    pub(super) fn record_projection(&self, args: &[NodeId]) -> Option<(NodeId, String)> {
+    pub(crate) fn record_projection(&self, args: &[NodeId]) -> Option<(NodeId, String)> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
         let field = match self.m.node(selector) {
             Node::Lit(Scalar::Str(s)) => s.to_string(),
@@ -100,6 +100,9 @@ impl Emitter<'_> {
         let Node::Call(call) = self.m.node(resolved) else {
             return Err(no_field_lowering(container, name, "this value"));
         };
+        if let Some(result) = self.lower_lu_record(resolved, name) {
+            return result;
+        }
         let CallHead::Builtin(head) = call.head else {
             return Err(no_field_lowering(container, name, "a user call"));
         };

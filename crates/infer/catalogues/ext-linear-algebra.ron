@@ -4,12 +4,12 @@
             version: "0.1",
             bindings: [
                 // lu(A) → record(P, L, U): permutation, lower-tri, upper-tri —
-                // all matrices with A's element kind (spec §09).
+                // L/U preserve complex elements and promote integer elements.
                 Binding(name: "lu",
                     sig: Function(params: [Matrix], names: ["A"], result: Record([
-                        ("P", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
-                        ("L", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
-                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("P", MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: Real)),
+                        ("L", MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: RealOrComplexOfArg(0))),
+                        ("U", MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: RealOrComplexOfArg(0))),
                     ]))),
                 // svd(A) → record(U, S, V): U/V matrices (A's element kind); S is a
                 // vector of non-negative REAL singular values (spec §09).
