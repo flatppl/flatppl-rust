@@ -138,6 +138,8 @@
 //! desugared into `bayesupdate(likelihoodof(kernel, x), marginal)` over the
 //! disintegration on `x`'s field names, §06 "Measure restriction".)
 
+pub(crate) use flatppl_core::graph::{build_call, build_record};
+
 use crate::crossmodule::GraftState;
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -9271,42 +9273,12 @@ fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<(NodeId, bool), Ref
 // Utility: IR construction helpers
 // ---------------------------------------------------------------------------
 
-/// Allocate a positional builtin call `head(args…)`.
-pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
-    let sym = m.intern(head);
-    m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(sym),
-        args: args.to_vec().into(),
-        named: Vec::<NamedArg>::new().into(),
-        inputs: None,
-    }))
-}
-
 /// Allocate a positional user-function call `(%call callee arg1 arg2 …)`.
 pub(crate) fn build_user_call_n(m: &mut Module, callee: NodeId, args: Vec<NodeId>) -> NodeId {
     m.alloc(Node::Call(Call {
         head: CallHead::User(callee),
         args: args.into(),
         named: Vec::<NamedArg>::new().into(),
-        inputs: None,
-    }))
-}
-
-/// Allocate a `record(%field name value ...)` call from `(name, value)` pairs.
-pub(crate) fn build_record(m: &mut Module, fields: &[(Symbol, NodeId)]) -> NodeId {
-    let named: Vec<NamedArg> = fields
-        .iter()
-        .map(|&(name, value)| NamedArg {
-            kind: NamedKind::Field,
-            name,
-            value,
-        })
-        .collect();
-    let record = m.intern("record");
-    m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(record),
-        args: Vec::<NodeId>::new().into(),
-        named: named.into(),
         inputs: None,
     }))
 }

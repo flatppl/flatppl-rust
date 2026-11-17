@@ -754,6 +754,7 @@ name = "flatppl-model-analysis"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
+ "flatppl-infer",
 ]
 
 [[package]]

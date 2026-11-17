@@ -31,7 +31,25 @@ fn a_draw_is_not_flatpdl() {
 #[test]
 fn model_analysis_requires_a_flatpdl_module() {
     let m = infer_module("x = elementof(reals)\ninputs = x\noutputs = x\nz ~ Normal(x, 1.)");
-    assert!(flatppl_determinizer::analyze_model(&m, &[]).is_err());
+    use flatppl_determinizer::{
+        CoordinatePrecision, InputPath, analyze_model, prepare_incremental_score,
+        prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
+    };
+    let path = InputPath {
+        input: "x".into(),
+        fields: vec![],
+    };
+    let precision = CoordinatePrecision::F64;
+    let expected = analyze_model(&m, &[]).unwrap_err().0;
+    assert!(expected.starts_with("model analysis requires FlatPDL:"));
+    for error in [
+        prepare_incremental_score(&m, &[]).err(),
+        prepare_normal_coordinate(&m, &[], "x", precision, true).err(),
+        prepare_normal_coordinate_at_path(&m, &[], &path, precision, true).err(),
+        prepare_normal_coordinates(&m, &[], &[path], precision, true).err(),
+    ] {
+        assert_eq!(error.unwrap().0, expected);
+    }
 }
 
 // --- Task 2 tests ---

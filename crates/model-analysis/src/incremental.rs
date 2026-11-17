@@ -2,9 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use flatppl_core::graph;
 use flatppl_core::{Binding, CallHead, Module, Node, NodeId, Ref, RefNs, ScalarType, Symbol, Type};
 
-use crate::{AnalysisError, analyze_model};
+use crate::{AnalysisError, analyze_lowered_query};
 
 /// One complete term, evaluated once even when the output uses it repeatedly.
 #[derive(Clone, Debug)]
@@ -73,7 +74,7 @@ fn set_inputs(m: &mut Module, inputs: &[NodeId]) {
         let rhs = if let [input] = inputs {
             *input
         } else {
-            crate::density::build_call(m, "tuple", inputs)
+            graph::build_call(m, "tuple", inputs)
         };
         set_binding(m, "inputs", rhs);
     }
@@ -81,7 +82,7 @@ fn set_inputs(m: &mut Module, inputs: &[NodeId]) {
 
 fn retain_query(m: &mut Module) {
     let roots = [m.intern("inputs"), m.intern("outputs")];
-    crate::canon::retain_reachable(m, &roots);
+    graph::retain_reachable(m, &roots);
 }
 
 fn resolve(m: &Module, mut id: NodeId, boundary: &HashSet<Symbol>) -> NodeId {
@@ -164,7 +165,7 @@ pub fn prepare_incremental_score(
     m: &Module,
     data_inputs: &[String],
 ) -> Result<IncrementalScorePlan, AnalysisError> {
-    let report = analyze_model(m, data_inputs)?;
+    let report = analyze_lowered_query(m, data_inputs)?;
     let output = binding(m, "outputs")
         .ok_or_else(|| AnalysisError("incremental scoring requires outputs".into()))?;
     if !matches!(
@@ -237,7 +238,7 @@ pub fn prepare_incremental_score(
         };
         let set = combine_query.intern(set);
         let set = combine_query.alloc(Node::Const(set));
-        let rhs = crate::density::build_call(&mut combine_query, "external", &[set]);
+        let rhs = graph::build_call(&mut combine_query, "external", &[set]);
         combine_query.add_binding(Binding {
             name,
             rhs,
