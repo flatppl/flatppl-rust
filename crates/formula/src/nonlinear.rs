@@ -108,7 +108,7 @@ fn emit_expression(
                 Arithmetic::Add => "add",
                 Arithmetic::Subtract => "sub",
                 Arithmetic::Multiply => "mul",
-                Arithmetic::Divide => "div",
+                Arithmetic::Divide => "divide",
                 Arithmetic::Power => "pow",
             };
             let x = emit_expression(b, x, binding);
