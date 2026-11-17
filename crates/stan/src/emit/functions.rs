@@ -51,7 +51,7 @@ pub(crate) fn arg_type(t: &StanType) -> String {
 }
 
 /// Identifiers of `text` that are not function names.
-fn identifiers(text: &str) -> Vec<String> {
+pub(super) fn identifiers(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let b = text.as_bytes();
     let mut i = 0;

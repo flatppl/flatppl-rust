@@ -24,6 +24,35 @@ const SHAPE_PRESERVING: &[&str] = &[
     "sort",
 ];
 
+/// Marks a size variable inside emitted text until it is named.
+const TOK: char = '\u{3}';
+
+fn token(k: usize) -> String {
+    format!("{TOK}{k}{TOK}")
+}
+
+/// The size variable a form is, when it is exactly one.
+fn as_var(l: &Lin) -> Option<usize> {
+    match (l.konst, l.terms.as_slice()) {
+        (0, [(t, 1)]) => t.strip_prefix(TOK)?.strip_suffix(TOK)?.parse().ok(),
+        _ => None,
+    }
+}
+
+fn has_token(l: &Lin) -> bool {
+    l.terms.iter().any(|(t, _)| t.contains(TOK))
+}
+
+/// One unsourced size of a data value.
+pub(crate) struct SizeVar {
+    owner: String,
+    axis: usize,
+    naxes: usize,
+    n: u32,
+    parent: usize,
+    bound: Option<Lin>,
+}
+
 /// An integer `konst + Σ coef · term`: sizes add and cancel symbolically.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Lin {
@@ -140,31 +169,188 @@ impl<'m> Emitter<'m> {
                 .filter(|l| !(data && l.as_const().is_some())),
         };
         self.data_sizes = data;
+        // A function sees no unnamed data size: its body takes the number.
+        if self.fctx.is_some() && found.as_ref().is_some_and(has_token) {
+            return Lin::konst(i64::from(n));
+        }
         if let Some(l) = found {
             return l;
         }
         if !data {
             return Lin::konst(i64::from(n));
         }
-        // A data value of its own shape: a fresh data size.
-        let base = if naxes > 1 {
-            format!("N_{owner}_{}", axis + 1)
-        } else {
-            format!("N_{owner}")
+        // A data value of its own shape: a size variable, unified with the
+        // sizes the model requires equal and named at the end.
+        let k = self.svars.len();
+        self.svars.push(SizeVar {
+            owner: owner.to_string(),
+            axis,
+            naxes,
+            n,
+            parent: k,
+            bound: None,
+        });
+        Lin::term(token(k))
+    }
+
+    fn find(&mut self, k: usize) -> usize {
+        let p = self.svars[k].parent;
+        if p == k {
+            return k;
+        }
+        let r = self.find(p);
+        self.svars[k].parent = r;
+        r
+    }
+
+    /// Record that two sizes are equal. Size variables merge, and a variable
+    /// takes a sourced size. Two different numbers never merge: that is a
+    /// model error, left as it is.
+    pub(super) fn unify(&mut self, a: &Lin, b: &Lin) {
+        match (as_var(a), as_var(b)) {
+            (Some(x), Some(y)) => {
+                let (rx, ry) = (self.find(x), self.find(y));
+                if rx == ry || self.svars[rx].n != self.svars[ry].n {
+                    return;
+                }
+                let (bx, by) = (self.svars[rx].bound.clone(), self.svars[ry].bound.clone());
+                if let (Some(p), Some(q)) = (&bx, &by)
+                    && p != q
+                {
+                    return;
+                }
+                // The earlier variable represents the class.
+                let (root, child) = if rx < ry { (rx, ry) } else { (ry, rx) };
+                self.svars[child].parent = root;
+                self.svars[root].bound = bx.or(by);
+            }
+            (Some(x), None) | (None, Some(x)) => {
+                let l = if as_var(a).is_some() { b } else { a };
+                if has_token(l) {
+                    return;
+                }
+                let r = self.find(x);
+                if l.as_const()
+                    .is_some_and(|c| c != i64::from(self.svars[r].n))
+                {
+                    return;
+                }
+                if self.svars[r].bound.is_none() {
+                    self.svars[r].bound = Some(l.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Name each size class and write the names into the program. A class
+    /// that took a sourced size prints it; any other is one `data` size, `N`
+    /// first, then `N_<first member>`.
+    pub(super) fn resolve_sizes(&mut self) {
+        let mut text: HashMap<usize, String> = HashMap::new();
+        let mut decls: Vec<(usize, String)> = Vec::new();
+        for k in 0..self.svars.len() {
+            let r = self.find(k);
+            if text.contains_key(&r) {
+                let t = text[&r].clone();
+                text.insert(k, t);
+                continue;
+            }
+            let t = match self.svars[r].bound.clone() {
+                Some(l) => l.print(),
+                _ => {
+                    let v = &self.svars[r];
+                    let base = if self.used.contains("N") {
+                        if v.naxes > 1 {
+                            format!("N_{}_{}", v.owner, v.axis + 1)
+                        } else {
+                            format!("N_{}", v.owner)
+                        }
+                    } else {
+                        "N".to_string()
+                    };
+                    let name = self.fresh(&base);
+                    decls.push((r, name.clone()));
+                    name
+                }
+            };
+            text.insert(r, t.clone());
+            text.insert(k, t);
+        }
+        let replace = |s: &str| -> String {
+            let mut out = s.to_string();
+            for (k, t) in &text {
+                let tok = token(*k);
+                if !out.contains(&tok) {
+                    continue;
+                }
+                // A whole extent prints bare; inside arithmetic, a compound
+                // size is parenthesized.
+                let compound = t.contains(' ');
+                for (before, after) in [("[", "]"), ("[", ","), (", ", "]"), (", ", ",")] {
+                    out = out.replace(
+                        &format!("{before}{tok}{after}"),
+                        &format!("{before}{t}{after}"),
+                    );
+                }
+                let wrapped = if compound {
+                    format!("({t})")
+                } else {
+                    t.clone()
+                };
+                out = out.replace(&tok, &wrapped);
+            }
+            out
         };
-        let s = self.fresh(&base);
-        self.data.push(format!("int<lower=0> {s};"));
-        self.decls.insert(
-            s.clone(),
-            crate::stan_type::StanType {
-                array: vec![],
-                base: "int",
-                dims: vec![],
-                bounds: Default::default(),
-            },
-        );
-        self.json.insert(s.clone(), serde_json::Value::from(n));
-        Lin::term(s)
+        for block in [
+            &mut self.data,
+            &mut self.tdata,
+            &mut self.params,
+            &mut self.tparams,
+            &mut self.locals,
+            &mut self.prior,
+            &mut self.lik,
+            &mut self.functions,
+        ] {
+            for line in block.iter_mut() {
+                if line.contains(TOK) {
+                    *line = replace(line);
+                }
+            }
+        }
+        // New size declarations lead the data block.
+        let mut data: Vec<String> = decls
+            .iter()
+            .map(|(_, n)| format!("int<lower=0> {n};"))
+            .collect();
+        for (r, n) in &decls {
+            self.json
+                .insert(n.clone(), serde_json::Value::from(self.svars[*r].n));
+        }
+        data.extend(std::mem::take(&mut self.data));
+        // A size a class took can be declared after a line that now reads it:
+        // move its declaration up to the first such line.
+        let mut i = 0;
+        while i < data.len() {
+            let line = &data[i];
+            let name = (line.starts_with("int") && !line.contains('[')).then(|| {
+                line.trim_end_matches(';')
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            });
+            if let Some(name) = name
+                && let Some(j) = data[..i]
+                    .iter()
+                    .position(|l| super::functions::identifiers(l).contains(&name))
+            {
+                let moved = data.remove(i);
+                data.insert(j, moved);
+            }
+            i += 1;
+        }
+        self.data = data;
     }
 
     /// A scalar integer expression as a linear form. Literals fold; a module
@@ -278,8 +464,7 @@ impl<'m> Emitter<'m> {
             "broadcast" => {
                 let operands = &args[1..];
                 if matches!(self.m.node(args[0]), Node::Const(_)) {
-                    let src = self.carrier(id, operands, axis)?;
-                    return self.sym_extent(src, axis, d);
+                    return self.carried(id, operands, axis, d);
                 }
                 let fun = self.user_callee(args[0])?;
                 let top = |me: &Self, a: NodeId| match me.ty(a) {
@@ -302,10 +487,7 @@ impl<'m> Emitter<'m> {
                 let subst = args.iter().map(|&a| (a, 0)).collect::<Vec<_>>();
                 self.body_extent(fun, &subst, axis, d)
             }
-            "add" | "sub" | "divide" | "neg" | "pow" => {
-                let src = self.carrier(id, &args, axis)?;
-                self.sym_extent(src, axis, d)
-            }
+            "add" | "sub" | "divide" | "neg" | "pow" => self.carried(id, &args, axis, d),
             "addaxes" => {
                 let lit = |me: &Self, x: NodeId| match me.m.node(x) {
                     Node::Lit(Scalar::Int(k)) => usize::try_from(*k).ok(),
@@ -321,6 +503,18 @@ impl<'m> Emitter<'m> {
             }
             "mul" => {
                 let [a, b] = args[..] else { return None };
+                // The inner axes of a product are equal.
+                let inner = match (rank(self, a), rank(self, b)) {
+                    (2, 1) | (2, 2) => Some((1, 0)),
+                    (1, 2) => Some((0, 0)),
+                    _ => None,
+                };
+                if let Some((ia, ib)) = inner
+                    && let (Some(x), Some(y)) =
+                        (self.sym_extent(a, ia, d), self.sym_extent(b, ib, d))
+                {
+                    self.unify(&x, &y);
+                }
                 match (rank(self, a), rank(self, b)) {
                     (0, _) => self.sym_extent(b, axis, d),
                     (_, 0) => self.sym_extent(a, axis, d),
@@ -352,8 +546,7 @@ impl<'m> Emitter<'m> {
             h if SHAPE_PRESERVING.contains(&h)
                 || crate::tables::function(h, None).is_some_and(|r| r.vectorized) =>
             {
-                let src = self.carrier(id, &args, axis)?;
-                self.sym_extent(src, axis, d)
+                self.carried(id, &args, axis, d)
             }
             _ => None,
         }
@@ -377,12 +570,12 @@ impl<'m> Emitter<'m> {
             "broadcast" => {
                 // The variate has the shape of the highest-rank argument.
                 let r = args[1..].iter().filter_map(|&a| self.arank(a)).max()?;
-                let src = args[1..]
+                let full: Vec<NodeId> = args[1..]
                     .iter()
                     .copied()
                     .filter(|&a| self.arank(a) == Some(r))
-                    .find(|&a| self.dim_at(a, axis) != Some(1))?;
-                self.sym_extent(src, axis, d)
+                    .collect();
+                self.unified(&full, axis, d)
             }
             "Dirichlet" | "MvNormal" | "Multinomial" | "MvNormalCholesky" if axis == 0 => {
                 let a = self.law_args(self.head(m)?, m).ok()?;
@@ -435,6 +628,78 @@ impl<'m> Emitter<'m> {
             .or_else(|| full.first().copied())
     }
 
+    /// A variate observed or drawn under `m` has the shape the law gives it:
+    /// its `iid` counts, or the array arguments of a broadcast law.
+    pub(super) fn constrain_variate(&mut self, lhs: &str, m: NodeId) {
+        let Some(axes) = self.ext_lin.get(lhs).cloned() else {
+            return;
+        };
+        let m = self.resolve(m);
+        let Some(c) = self.call(m) else {
+            return;
+        };
+        let args = c.args.to_vec();
+        match self.head(m) {
+            Some("iid") => {
+                let ns = self.extent_list(args[1]);
+                for (a, h) in ns.into_iter().enumerate() {
+                    if let (Some(h), Some(l)) = (h, axes.get(a))
+                        && let Some(x) = self.lin_int(h)
+                    {
+                        self.unify(l, &x);
+                    }
+                }
+            }
+            Some("broadcast") => {
+                for &v in &args[1..] {
+                    let Some(r) = self.arank(v) else { continue };
+                    for (a, l) in axes.iter().enumerate().take(r) {
+                        if self.dim_at(v, a) == Some(1) {
+                            continue;
+                        }
+                        if let Some(x) = self.sym_extent(v, a, 0) {
+                            self.unify(l, &x);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Axis `axis` of an elementwise result: its full-rank operands share it.
+    fn carried(&mut self, id: NodeId, operands: &[NodeId], axis: usize, d: u32) -> Option<Lin> {
+        self.carrier(id, operands, axis)?;
+        let r = self.arank(id)?;
+        let full: Vec<NodeId> = operands
+            .iter()
+            .copied()
+            .filter(|&a| self.arank(a) == Some(r))
+            .collect();
+        self.unified(&full, axis, d)
+    }
+
+    /// The common extent of axis `axis` of `values`, broadcast singletons
+    /// aside, recording that they are equal.
+    fn unified(&mut self, values: &[NodeId], axis: usize, d: u32) -> Option<Lin> {
+        let mut out: Option<Lin> = None;
+        for &v in values {
+            if self.dim_at(v, axis) == Some(1) && values.len() > 1 {
+                continue;
+            }
+            if let Some(l) = self.sym_extent(v, axis, d) {
+                match &out {
+                    Some(o) => {
+                        let o = o.clone();
+                        self.unify(&o, &l);
+                    }
+                    None => out = Some(l),
+                }
+            }
+        }
+        out
+    }
+
     /// Axis `axis` of a user function's result, its parameters standing for
     /// `args` (each with the axes a broadcast takes off it).
     fn body_extent(
@@ -482,8 +747,21 @@ impl<'m> Emitter<'m> {
     fn stack_inner(&mut self, list: NodeId, axis: usize, d: u32) -> Option<Lin> {
         let l = self.resolve(list);
         if self.head(l) == Some("vector") {
-            let first = *self.call(l)?.args.first()?;
-            return self.sym_extent(first, axis - 1, d);
+            // Stacked columns or rows share their length.
+            let items = self.call(l)?.args.to_vec();
+            let mut out: Option<Lin> = None;
+            for it in items {
+                if let Some(x) = self.sym_extent(it, axis - 1, d) {
+                    match &out {
+                        Some(o) => {
+                            let o = o.clone();
+                            self.unify(&o, &x);
+                        }
+                        None => out = Some(x),
+                    }
+                }
+            }
+            return out;
         }
         self.sym_extent(list, axis, d)
     }
@@ -540,7 +818,9 @@ impl<'m> Emitter<'m> {
             Node::Axis(a) => a.name,
             _ => return None,
         };
+        // Every operand an axis indexes has that axis's length.
         let mut stack = vec![args[2]];
+        let mut out: Option<Lin> = None;
         while let Some(n) = stack.pop() {
             if self.head(n) == Some("get") {
                 let c = self.call(n)?;
@@ -549,11 +829,20 @@ impl<'m> Emitter<'m> {
                     .position(|&s| matches!(self.m.node(s), Node::Axis(a) if a.name == target));
                 if let Some(p) = pos {
                     let x = c.args[0];
-                    return self.sym_extent(x, p, d);
+                    if let Some(l) = self.sym_extent(x, p, d) {
+                        match &out {
+                            Some(o) => {
+                                let o = o.clone();
+                                self.unify(&o, &l);
+                            }
+                            None => out = Some(l),
+                        }
+                    }
+                    continue;
                 }
             }
             self.m.for_each_child(n, |k| stack.push(k));
         }
-        None
+        out
     }
 }

@@ -12,11 +12,9 @@ functions {
   }
 }
 data {
-  int<lower=0> N_shocks_1;
-  int<lower=0> N_shocks_2;
-  array[N_shocks_1, N_shocks_2] int shocks;
   int<lower=0> T;
   int<lower=0> J;
+  array[J, T] int shocks;
 }
 transformed data {
   array[T - 1] int previous = linspaced_int_array(T - 1, 1, T - 1);

@@ -4,9 +4,9 @@ functions {
   }
 }
 data {
+  int<lower=0> N;
   int<lower=0> K;
-  int<lower=0> N_y_obs;
-  vector[N_y_obs] y_obs;
+  vector[N] y_obs;
   int<lower=0> T;
 }
 transformed data {

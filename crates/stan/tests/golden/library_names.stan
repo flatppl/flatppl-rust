@@ -10,10 +10,9 @@ functions {
   }
 }
 data {
-  int<lower=0> N_y_obs;
-  vector[N_y_obs] y_obs;
-  int<lower=0> N_x;
-  vector[N_x] x;
+  int<lower=0> N;
+  vector[N] y_obs;
+  vector[N] x;
 }
 parameters {
   real m;

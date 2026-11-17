@@ -1,7 +1,5 @@
 {
-  "N_n_success": 3,
-  "N_n_trials": 3,
-  "N_y_obs": 3,
+  "N": 3,
   "k": 7,
   "m": 2,
   "n_success": [

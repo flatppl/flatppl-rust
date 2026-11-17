@@ -698,6 +698,7 @@ impl<'m> Emitter<'m> {
 
     /// Sampling statements for `lhs ~ measure`.
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
+        self.constrain_variate(lhs, measure);
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
         let flat = self.flat_order(lhs);

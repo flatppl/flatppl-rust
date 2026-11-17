@@ -1,9 +1,7 @@
 data {
   int<lower=0> J;
   int<lower=0> I;
-  int<lower=0> N_y_obs_1;
-  int<lower=0> N_y_obs_2;
-  array[N_y_obs_1, N_y_obs_2] int y_obs;
+  array[I, J] int y_obs;
 }
 parameters {
   real<lower=0> sigma;

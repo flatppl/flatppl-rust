@@ -114,6 +114,8 @@ pub(crate) struct Emitter<'m> {
     ext_lin: HashMap<String, Vec<extents::Lin>>,
     /// Size parameter substitutions while sizing a user function's body.
     esubst: Vec<HashMap<Symbol, (NodeId, usize)>>,
+    /// Unsourced data sizes, in union-find classes.
+    svars: Vec<extents::SizeVar>,
     /// Node types of a user function's body being sized.
     sized_scope: Vec<HashMap<NodeId, Type>>,
     /// Set while declaring a `data` value: an extent with no source becomes
@@ -202,6 +204,7 @@ impl<'m> Emitter<'m> {
             ext_lin: HashMap::new(),
             esubst: vec![],
             sized_scope: vec![],
+            svars: vec![],
             data_sizes: false,
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
@@ -1569,6 +1572,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     let mut e = Emitter::new(m, opts);
     e.emit_target(target)?;
     e.query_inputs(target);
+    e.resolve_sizes();
     let mut model = e.locals.clone();
     if !model.is_empty() && !(e.prior.is_empty() && e.lik.is_empty()) {
         model.push(String::new());

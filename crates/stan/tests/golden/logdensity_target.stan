@@ -1,6 +1,5 @@
 data {
-  int<lower=0> N_x;
-  vector[N_x] x;
+  vector[3] x;
 }
 parameters {
   real mu;
