@@ -53,6 +53,31 @@ impl Emitter<'_> {
         })())
     }
 
+    pub(super) fn lower_lu_record_parts(
+        &mut self,
+        container: NodeId,
+    ) -> Option<Result<[(Value, Value); 3], EmitError>> {
+        let id = self.resolve_tuple_projections(container);
+        let (matrix, broadcast) = self.lu_argument(id)?;
+        Some((|| {
+            let factors = self.lower_lu_factors(id, matrix, broadcast)?;
+            let zero_p = self.constant_like(0.0, &factors.permutation);
+            let lower_im = factors
+                .lower
+                .1
+                .unwrap_or_else(|| self.constant_like(0.0, &factors.lower.0));
+            let upper_im = factors
+                .upper
+                .1
+                .unwrap_or_else(|| self.constant_like(0.0, &factors.upper.0));
+            Ok([
+                (factors.permutation, zero_p),
+                (factors.lower.0, lower_im),
+                (factors.upper.0, upper_im),
+            ])
+        })())
+    }
+
     pub(crate) fn lower_lu_field_parts(
         &mut self,
         container: NodeId,

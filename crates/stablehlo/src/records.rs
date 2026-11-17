@@ -100,6 +100,9 @@ impl Emitter<'_> {
         if let Some(result) = self.lower_svd_record(resolved, name) {
             return result;
         }
+        if let Some(result) = self.lower_eigh_record(resolved, name) {
+            return result;
+        }
         if let Some(result) = self.lower_eigen_record(resolved, name) {
             return result;
         }
@@ -198,7 +201,7 @@ impl Emitter<'_> {
         }
     }
 
-    fn bound_field(&self, container: NodeId, name: &str) -> Option<Lowered> {
+    pub(crate) fn bound_field(&self, container: NodeId, name: &str) -> Option<Lowered> {
         self.columns
             .get(&(self.column_container(container), name.to_owned()))
             .cloned()

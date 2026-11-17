@@ -24,6 +24,19 @@
                 Binding(name: "gammainc", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "x"], result: Scalar(Real))),
                 // betainc(a, b, x): regularized incomplete beta → real ∈ [0,1]
                 Binding(name: "betainc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["a", "b", "x"], result: Scalar(Real))),
+                Binding(name: "gammaincc", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "x"], result: Scalar(Real))),
+                Binding(name: "log_gammainc", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "x"], result: Scalar(Real))),
+                Binding(name: "log_gammaincc", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "x"], result: Scalar(Real))),
+                Binding(name: "betaincc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["a", "b", "x"], result: Scalar(Real))),
+                Binding(name: "log_betainc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["a", "b", "x"], result: Scalar(Real))),
+                Binding(name: "log_betaincc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["a", "b", "x"], result: Scalar(Real))),
+                Binding(name: "beta", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "b"], result: Scalar(Real))),
+                Binding(name: "logbeta", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["a", "b"], result: Scalar(Real))),
+                Binding(name: "bessel_i_scaled", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["v", "z"], result: Scalar(Complex))),
+                Binding(name: "bessel_k_scaled", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["v", "z"], result: Scalar(Real))),
+                Binding(name: "log_bessel_i", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["v", "z"], result: Scalar(Real))),
+                Binding(name: "log_bessel_k", sig: Function(params: [Scalar(Real), Scalar(Real)], names: ["v", "z"], result: Scalar(Real))),
+                Binding(name: "log_ndtr", sig: Function(params: [Scalar(Real)], names: ["x"], result: Scalar(Real))),
                 // airy(x) → real
                 Binding(name: "airy", sig: Function(params: [Scalar(Real)], names: ["x"], result: Scalar(Real))),
             ]

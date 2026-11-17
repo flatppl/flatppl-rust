@@ -47,6 +47,12 @@ mod enzyme;
 #[path = "integration.rs"]
 mod integration;
 pub(crate) use integration::IntegralKind;
+#[path = "ext_linalg.rs"]
+mod ext_linalg;
+#[path = "factor_solve.rs"]
+mod factor_solve;
+#[path = "hermitian.rs"]
+mod hermitian;
 #[path = "kronecker.rs"]
 mod kronecker;
 #[path = "likelihood_reductions.rs"]
@@ -81,6 +87,8 @@ mod records;
 mod runtime_status;
 #[path = "special.rs"]
 mod special;
+#[path = "splines.rs"]
+mod splines;
 use runtime_status::append_runtime_status;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
@@ -4557,10 +4565,16 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_spline_call(id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_special_function_call(id, f, &args[1..], true) {
             return result;
         }
         if let Some(result) = self.lower_svd_call(id, f, &args[1..], true) {
+            return result;
+        }
+        if let Some(result) = self.lower_ext_linalg_call(id, f, &args[1..], true) {
             return result;
         }
         if let Some(result) = self.lower_eigen_extremum(id, f, &args[1..], true) {
@@ -5003,8 +5017,10 @@ impl<'m> Emitter<'m> {
                 CallHead::User(callee) => self
                     .lower_box_application(id, callee, &call.args)
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_spline_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_ext_linalg_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_eigen_extremum(id, callee, &call.args, false))
                     .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))

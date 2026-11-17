@@ -9,13 +9,10 @@ pub(super) fn append_runtime_status<'a>(
     let Some(status) = status else {
         return String::new();
     };
-    let index = rets
-        .iter()
-        .position(|value| value.ssa == status.ssa)
-        .unwrap_or_else(|| {
-            rets.push(status);
-            rets.len() - 1
-        });
+    // Status is an ABI slot, even when constant folding shares its SSA value
+    // with an authored output (for example the rank of an empty matrix).
+    let index = rets.len();
+    rets.push(status);
     format!(" attributes {{flatppl.runtime_status = {index} : i64}}")
 }
 

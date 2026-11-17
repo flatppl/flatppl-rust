@@ -272,6 +272,51 @@ const-folds, so the row shows as `loggamma` at `11.0, 8.0, 4.0` (the coefficient
 `9.0, 6.0, 15.0` against `2.0, 3.0, 5.0` (the posterior-over-prior beta ratio). A plug-in
 would name `Binomial` and carry a `0.4`, and neither survives.
 
+## Beta–Bernoulli and shared Beta probabilities
+
+A single `p ~ Beta(alpha=a,beta=b)` followed by `y ~ Bernoulli(p)`
+has marginal `Bernoulli(a/(a+b))`. Scaling both shapes before division
+avoids overflowing their sum. Invalid prior shapes retain a native parameter
+failure rather than producing an apparently valid probability.
+
+Several Bernoulli or Binomial fields can share that probability. With successes
+`k_i`, trials `n_i` and totals `K`, `N`, their joint mass is
+
+`prod_i choose(n_i,k_i) * B(a+K,b+N-K) / B(a,b)`.
+
+Bernoulli fields contribute one trial and coefficient one. The Binomial
+coefficients remain separate. For Beta(2,3), Binomial observations `(n,k)`
+`(2,1),(3,2)` have joint mass `4/35`, whereas combining their coefficients
+incorrectly gives `4/21`. Two Bernoulli successes have mass `1/5`, rather
+than the product of their marginal masses `4/25`.
+
+The expression sums native half-probability observation scores and adds
+`logdensityof(Beta(a,b),.5)-logdensityof(Beta(a+K,b+N-K),.5)`.
+The difference is exactly the beta ratio plus `N*log(2)`, cancelling the
+anchors' powers of one half. Native stable log-beta and parameter checks
+remain active. Unsupported observations retain their zero mass. Sanitized
+counts keep inactive corrections finite. Carried latents remain conditional.
+
+## Dirichlet probabilities shared by categorical and multinomial fields
+
+For `p ~ Dirichlet(alpha)`, each categorical observation adds a one-hot count.
+Each multinomial observation adds its count vector. With total count vector `c`,
+the integrated mass is `prod_i multinomial_coefficient(x_i) * B(alpha+c)/B(alpha)`.
+Each field keeps its own coefficient. For `alpha=[2,3,5]`, multinomial fields
+`[1,1,0]` and `[0,1,2]` have joint mass `18/1001`. Replacing their coefficients
+with the coefficient of their sum incorrectly gives `90/1001`.
+
+At the uniform simplex point `q`, the expression sums native observation scores
+and adds `logdensityof(Dirichlet(alpha),q)-logdensityof(Dirichlet(alpha+c),q)`.
+The powers of `q` cancel. This uses the coordinate simplex measure from §08.
+Native anchors retain parameter and support checks. Count sanitization only
+protects posterior shapes. It does not compare floating totals, since distinct
+rounding can reject valid integer observations.
+
+A single categorical field reduces to normalized concentrations, scaled before
+their sum to avoid overflow. Both category bases are supported. A carried
+simplex latent remains conditional rather than being integrated again.
+
 ## Rows 4 and 5 — a prior on the VARIANCE, reached through `sqrt`
 
 Both are Gaussian **scale** mixtures: `y | v ~ Normal(mu = μ, sigma = sqrt(v))` with a prior

@@ -75,6 +75,8 @@ use flatppl_core::{
     Symbol, Type, ValueSet,
 };
 
+mod beta;
+mod dirichlet;
 pub(crate) mod gaussian;
 
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
@@ -491,6 +493,13 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
     },
     ConjugateRow {
         prior: "Beta",
+        likelihood: "Bernoulli",
+        conjugating_param: "p",
+        latent_path: LatentPath::Direct,
+        build_marginal: beta::bernoulli_marginal,
+    },
+    ConjugateRow {
+        prior: "Beta",
         likelihood: "Binomial",
         conjugating_param: "p",
         latent_path: LatentPath::Direct,
@@ -622,6 +631,9 @@ fn build_conjugate_marginal(
 
     if prior_name == "MvNormal" && lik_name == "MvNormal" {
         return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
+    }
+    if prior_name == "Dirichlet" {
+        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name);
     }
 
     // EVERY row whose prior + likelihood families match is tried, not just the first: two
@@ -1384,6 +1396,12 @@ pub(crate) fn shared_latent_record_law(
     }
 
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
+    if m.resolve(prior_sym) == "Dirichlet" {
+        return dirichlet::shared_law(m, latent, &prior_kwargs, field_measures);
+    }
+    if m.resolve(prior_sym) == "Beta" {
+        return beta::shared_law(m, latent, &prior_kwargs, field_measures);
+    }
     if m.resolve(prior_sym) == "Gamma" {
         let alpha = find_kwarg(m, &prior_kwargs, "shape")?;
         let beta = find_kwarg(m, &prior_kwargs, "rate")?;
