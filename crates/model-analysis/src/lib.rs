@@ -8,7 +8,7 @@ mod sufficient_statistics;
 
 pub use dependencies::{
     AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
-    analyze_lowered_query,
+    analyze_lowered_query, references_latent,
 };
 
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};

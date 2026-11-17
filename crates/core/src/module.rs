@@ -450,6 +450,15 @@ impl Module {
     /// A cyclic chain (`a = b; b = a`) is a static error. Its walk stops before
     /// the first repeated name, so `alias_chain(a)` is `[a, b]`.
     pub fn alias_chain(&self, name: Symbol) -> Vec<Symbol> {
+        self.alias_chain_with(name, |id| self.binding(id).rhs)
+    }
+
+    /// Follow the model's aliases through the declarations saved by query pins.
+    pub fn declared_alias_chain(&self, name: Symbol) -> Vec<Symbol> {
+        self.alias_chain_with(name, |id| self.declared_binding_rhs(id))
+    }
+
+    fn alias_chain_with(&self, name: Symbol, rhs: impl Fn(BindingId) -> NodeId) -> Vec<Symbol> {
         let mut chain = vec![name];
         for _ in 0..self.binding_count() {
             let Some(bid) = self.binding_by_name(chain[chain.len() - 1]) else {
@@ -458,7 +467,7 @@ impl Module {
             let Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name: next,
-            }) = &self.nodes[self.bindings[bid].rhs]
+            }) = self.node(rhs(bid))
             else {
                 break;
             };

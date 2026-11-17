@@ -2,7 +2,7 @@
 
 use super::{
     LatentPath, LogDensity, MarginalForm, SharedLatentRecordLaw, build_constructor, find_kwarg,
-    matches_latent_path, real, references_input, split_kernel_constructor,
+    matches_latent_path, real, references_latent, split_kernel_constructor,
 };
 use crate::density::{build_call, build_record};
 use flatppl_core::{Module, Node, NodeId, Scalar, Symbol};
@@ -56,6 +56,7 @@ pub(super) fn shared_law(
     latent: Symbol,
     prior: &[(Symbol, NodeId)],
     measures: &[NodeId],
+    exempt: &[NodeId],
 ) -> Option<SharedLatentRecordLaw> {
     let mut params = vec![
         find_kwarg(m, prior, "alpha")?,
@@ -67,7 +68,7 @@ pub(super) fn shared_law(
             "Bernoulli" => m.alloc(Node::Lit(Scalar::Int(1))),
             "Binomial" => {
                 let n = find_kwarg(m, &kwargs, "n")?;
-                if references_input(m, n, latent) {
+                if references_latent(m, n, latent, exempt) {
                     return None;
                 }
                 n

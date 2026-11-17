@@ -103,6 +103,49 @@ fn matches_every_conjugate_row() {
 }
 
 #[test]
+fn conjugate_matches_follow_named_parameters_and_respect_callable_inputs() {
+    let model = |width: &str| {
+        format!(
+            "z = draw(Normal(0.0, 1.0))\nscale_base = {width}\ns = exp(scale_base)\nwidth = s\ny = draw(Normal(mu = z, sigma = width))"
+        )
+    };
+    assert_eq!(row(&model("z")), None);
+    assert_eq!(row(&model("0.2")), Some(ConjugateRowId::NormalMean));
+    // The function accepts z as a formal input, then binds that input to a constant.
+    let source = "z = draw(Normal(0.0, 1.0))\nf = functionof(exp(z), x = z)\nwidth = f(0.2)\ny = draw(Normal(mu = z, sigma = width))";
+    assert_eq!(row(source), Some(ConjugateRowId::NormalMean));
+    assert_eq!(row(&source.replace("f(0.2)", "f(z)")), None);
+    let binomial =
+        "z = draw(Beta(2.0, 3.0))\nn = ifelse(z > 0.5, 7, 8)\ny = draw(Binomial(n = n, p = z))";
+    assert_eq!(row(binomial), None);
+}
+
+#[test]
+fn a_previous_query_point_does_not_change_the_model_dependencies() {
+    let mut m = parse_infer(
+        "z = draw(Normal(0.0, 1.0))\nu = draw(Normal(z, 1.0))\nwidth = exp(u)\ny = draw(Normal(z, width))\nk = 0.2\npoint_alias = k\nother = draw(Normal(z, k))",
+    );
+    let z = m.intern("z");
+    let u = m.intern("u");
+    let prior = drawn(&m, "z");
+    let dependent = drawn(&m, "y");
+    let independent = drawn(&m, "other");
+    let point = rhs(&m, "point_alias");
+    for symbol in [u, z] {
+        let binding = m.binding_by_name(symbol).unwrap();
+        m.pin_binding_to_query_point(binding, point);
+    }
+    assert!(match_conjugate_marginal(&mut m, prior, dependent, z).is_none());
+    assert_eq!(
+        match_conjugate_marginal(&mut m, prior, independent, z)
+            .unwrap()
+            .unwrap()
+            .row,
+        ConjugateRowId::NormalMean
+    );
+}
+
+#[test]
 fn match_keeps_the_original_parameter_nodes() {
     let mut m =
         parse_infer("z = draw(Gamma(shape = 2.0, rate = 3.0))\ny = draw(Poisson(rate = z))");
