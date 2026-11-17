@@ -71,6 +71,7 @@ pub(crate) fn parts(
                 if let CallHead::User(callee) = c.head {
                     return e
                         .lower_kronecker_parts(id, callee, &c.args, false)
+                        .or_else(|| e.lower_matrix_exp_parts(id, callee, &c.args, false))
                         .or_else(|| e.lower_bessel_parts(id, callee, &c.args, false))
                         .or_else(|| e.lower_lstsq_parts(id, callee, &c.args, false))
                         .unwrap_or_else(|| {
@@ -140,6 +141,9 @@ pub(crate) fn parts(
                     && let Some((callee, args)) = c.args.split_first()
                 {
                     if let Some(result) = e.lower_kronecker_parts(id, *callee, args, true) {
+                        return result;
+                    }
+                    if let Some(result) = e.lower_matrix_exp_parts(id, *callee, args, true) {
                         return result;
                     }
                     if matches!(e.node(*callee), Node::Const(s) if e.resolve(*s) == "complex")
