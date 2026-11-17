@@ -11,6 +11,7 @@ use crate::{AnalysisError, analyze_model};
 pub struct IncrementalTerm {
     pub dependencies: Vec<String>,
     pub input_paths: Vec<crate::InputPath>,
+    pub input_cells: Vec<crate::InputCell>,
     pub cache_input: String,
     root: NodeId,
 }
@@ -20,6 +21,7 @@ pub struct IncrementalTerm {
 pub struct IncrementalScorePlan {
     pub inputs: Vec<String>,
     pub input_paths: Vec<crate::InputPath>,
+    pub input_arrays: Vec<crate::InputArray>,
     pub terms: Vec<IncrementalTerm>,
     pub combine: Module,
     source: Module,
@@ -266,6 +268,7 @@ pub fn prepare_incremental_score(
             root: term.node,
             dependencies,
             input_paths: term.input_paths,
+            input_cells: term.input_cells,
             cache_input: combine_query.resolve(name).to_owned(),
         });
     }
@@ -276,6 +279,7 @@ pub fn prepare_incremental_score(
     Ok(IncrementalScorePlan {
         inputs,
         input_paths: report.input_paths,
+        input_arrays: report.input_arrays,
         terms,
         combine: combine_query,
         source: m.clone(),

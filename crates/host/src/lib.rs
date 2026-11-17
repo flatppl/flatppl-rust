@@ -31,7 +31,8 @@ pub use data::{DataError, load_fixed_data, resolve_data_sources};
 pub use export::{Export, Field, RuntimeStatus, Schema};
 pub use flatppl_determinizer::PreparationOptions;
 pub use flatppl_determinizer::{
-    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm, ReductionOutcome,
+    AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+    ReductionOutcome,
 };
 pub use flatppl_formula;
 pub use flatppl_hs3::{Auxiliary, Observations, PyhfOptions};

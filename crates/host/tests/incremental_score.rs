@@ -1,6 +1,85 @@
 use flatppl_host::{Context, EmitOptions};
 
 #[test]
+fn cell_edits_preserve_siblings_and_invalidate_whole_readers() {
+    use flatppl_host::{InputCell, InputPath};
+    let path = InputPath {
+        input: "point".into(),
+        fields: vec!["v".into()],
+    };
+    let cell = |indices: &[u64]| InputCell {
+        path: path.clone(),
+        indices: indices.into(),
+    };
+    let mut context = Context::default();
+    let module = context.parse("point=elementof(cartprod(v=cartpow(reals,[2,3]),other=reals))\ninputs=point\noutputs=get(point.v,1,1)*get0(point.v,0,0)+get(point.v,2,3)+sum(point.v)+point.other", None, None).unwrap();
+    let plan = context.prepare_incremental_score(&module, &[]).unwrap();
+    assert_eq!(plan.affected_cells(&[cell(&[0, 0])]).unwrap(), [0, 2]);
+    assert_eq!(plan.affected_cells(&[cell(&[1, 2])]).unwrap(), [1, 2]);
+    assert_eq!(plan.affected_cells(&[cell(&[1, 1])]).unwrap(), [2]);
+    assert_eq!(
+        plan.affected_paths(std::slice::from_ref(&path)).unwrap(),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        plan.affected_terms(&["point".into()]).unwrap(),
+        [0, 1, 2, 3]
+    );
+    let mut revisions = plan.revisions();
+    let sibling = revisions.ticket(1).unwrap();
+    let changed = revisions.ticket(0).unwrap();
+    let whole = revisions.ticket(2).unwrap();
+    assert_eq!(
+        revisions.invalidate_cells(&[cell(&[0, 0])]).unwrap(),
+        [0, 2]
+    );
+    assert!(revisions.accept(sibling));
+    assert!(!revisions.accept(changed));
+    assert!(!revisions.accept(whole));
+    let unchanged = revisions.ticket(0).unwrap();
+    assert!(
+        revisions
+            .invalidate_cells(&[cell(&[0, 0]), cell(&[2, 0])])
+            .is_err()
+    );
+    assert!(revisions.accept(unchanged));
+    for term in plan.terms() {
+        term.query.compile(&EmitOptions::default()).unwrap();
+    }
+}
+
+#[test]
+fn unread_cells_are_valid_and_dynamic_reads_remain_conservative() {
+    use flatppl_host::{InputCell, InputPath};
+    let mut context = Context::default();
+    let module = context.parse("v=external(cartpow(reals,4))\ni=elementof(nonnegintegers)\ninputs=(v,i)\noutputs=v[1]+get(v,i)", None, None).unwrap();
+    let plan = context
+        .prepare_incremental_score(&module, &["v".into()])
+        .unwrap();
+    let cell = |index| InputCell {
+        path: InputPath {
+            input: "v".into(),
+            fields: vec![],
+        },
+        indices: vec![index],
+    };
+    assert_eq!(plan.affected_cells(&[cell(0)]).unwrap(), [0, 1]);
+    assert_eq!(plan.affected_cells(&[cell(3)]).unwrap(), [1]);
+    assert_eq!(plan.affected_terms(&["i".into()]).unwrap(), [1]);
+    let module = context
+        .parse(
+            "v=external(cartpow(reals,4))\ninputs=v\noutputs=v[1]",
+            None,
+            None,
+        )
+        .unwrap();
+    let plan = context
+        .prepare_incremental_score(&module, &["v".into()])
+        .unwrap();
+    assert!(plan.affected_cells(&[cell(3)]).unwrap().is_empty());
+}
+
+#[test]
 fn record_field_edits_preserve_sibling_terms_and_validate_prefixes_atomically() {
     use flatppl_host::InputPath;
     let path = |fields: &[&str]| InputPath {

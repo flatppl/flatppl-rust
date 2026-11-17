@@ -245,12 +245,89 @@ fn structured_inputs_remain_whole_blocks_and_local_names_stay_scoped() {
     );
     assert_eq!(report.components, [vec!["theta"]]);
     assert!(report.normal_coordinates.is_empty());
+    assert!(report.terms.iter().all(|term| term.input_paths.is_empty()));
+    assert_eq!(report.terms[0].input_cells[0].indices, [0]);
+    assert_eq!(report.terms[1].input_cells[0].indices, [1]);
     let report = analyze(
         "a=elementof(reals)\nb=elementof(reals)\nf(a,b)=a+b\ninputs=(a,b)\noutputs=f(1.0,b)",
         &[],
     );
     assert_eq!(report.unused_parameters, ["a"]);
     assert!(report.terms.iter().any(|term| term.parameters == ["b"]));
+}
+
+#[test]
+fn array_cell_coordinates_normalize_bases_and_keep_whole_reads() {
+    let report = analyze(
+        "point=elementof(cartprod(v=cartpow(reals,[2,3]),other=reals))\ninputs=point\noutputs=get(point.v,2,3)*get0(point.v,1,2)+sum(point.v)",
+        &[],
+    );
+    assert_eq!(report.input_arrays.len(), 1);
+    assert_eq!(report.input_arrays[0].shape, [2, 3]);
+    assert_eq!(report.terms[0].input_cells.len(), 1);
+    assert_eq!(report.terms[0].input_cells[0].indices, [1, 2]);
+    assert_eq!(report.terms[0].input_cells[0].path.fields, ["v"]);
+    assert!(report.terms[0].input_paths.is_empty());
+    assert!(report.terms[1].input_cells.is_empty());
+    assert_eq!(report.terms[1].input_paths[0].fields, ["v"]);
+}
+
+#[test]
+fn promoted_selectors_and_dynamic_indices_retain_array_dependencies() {
+    for selector in ["i=1", "i=elementof(nonnegintegers)"] {
+        let report = analyze(
+            &format!(
+                "raw=external(cartpow(reals,3))\nv=raw\n{selector}\ninputs=(v,i)\noutputs=get(raw,i)"
+            ),
+            &["v"],
+        );
+        assert!(report.terms[0].input_cells.is_empty());
+        assert_eq!(report.terms[0].data, ["v"]);
+        assert_eq!(report.terms[0].parameters, ["i"]);
+        assert!(
+            report.terms[0]
+                .input_paths
+                .iter()
+                .any(|path| path.input == "v")
+        );
+    }
+}
+
+#[test]
+fn array_dependency_metadata_does_not_enumerate_unused_cells() {
+    let mut context = Context::default();
+    let module = context
+        .parse(
+            "v=external(cartpow(reals,1000000))\ninputs=v\noutputs=v[3]",
+            None,
+            None,
+        )
+        .unwrap();
+    let (_, report) = context.analyze_model(&module, &["v".into()]).unwrap();
+    assert_eq!(report.input_paths.len(), 1);
+    assert_eq!(report.input_arrays.len(), 1);
+    assert_eq!(report.input_arrays[0].shape, [1000000]);
+    assert_eq!(report.terms[0].input_cells.len(), 1);
+    assert_eq!(report.terms[0].input_cells[0].indices, [2]);
+}
+
+#[test]
+fn callback_indices_and_slices_keep_whole_arrays() {
+    for output in ["sum(f.(indices))", "sum(get(v,all))"] {
+        let report = analyze(
+            &format!(
+                "v=external(cartpow(reals,3))\ni=1\nindices=external(cartpow(nonnegintegers,2))\nf(i)=get(v,i)\ninputs=(v,indices)\noutputs={output}"
+            ),
+            &["v", "indices"],
+        );
+        assert!(report.terms[0].input_cells.is_empty());
+        assert!(
+            report.terms[0]
+                .input_paths
+                .iter()
+                .any(|path| path.input == "v")
+        );
+    }
 }
 
 #[test]

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use flatppl_core::{
-    Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Symbol, Type,
-    ValueSet,
+    Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Symbol,
+    Type, ValueSet,
 };
 
 /// One declared input or a static record field within it. Arrays remain whole.
@@ -23,6 +23,36 @@ impl InputPath {
     }
 }
 
+/// One scalar array cell. Coordinates are zero-based and include every axis.
+/// A read does not imply independent coordinates or an admissible parameter move.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InputCell {
+    pub path: InputPath,
+    pub indices: Vec<u64>,
+}
+
+/// Static scalar-array dimensions, without enumerating its cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputArray {
+    pub path: InputPath,
+    pub shape: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Read {
+    Whole(InputPath),
+    Cell(InputCell),
+}
+
+impl Read {
+    fn path(&self) -> &InputPath {
+        match self {
+            Self::Whole(path) => path,
+            Self::Cell(cell) => &cell.path,
+        }
+    }
+}
+
 /// One additive output term. Node IDs refer to the module passed to analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputTerm {
@@ -31,7 +61,9 @@ pub struct OutputTerm {
     pub multiplicity: usize,
     pub parameters: Vec<String>,
     pub data: Vec<String>,
+    /// Whole scalar/record/array reads, separate from precise cell reads.
     pub input_paths: Vec<InputPath>,
+    pub input_cells: Vec<InputCell>,
 }
 
 /// An advisory scalar Normal coordinate map, never an automatic rewrite.
@@ -65,6 +97,7 @@ pub struct ModelAnalysis {
     pub unused_parameters: Vec<String>,
     pub normal_coordinates: Vec<NormalCoordinate>,
     pub input_paths: Vec<InputPath>,
+    pub input_arrays: Vec<InputArray>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,8 +150,9 @@ struct Dependencies<'a> {
     aliases: HashMap<Symbol, Symbol>,
     alias_names: HashSet<Symbol>,
     order: Vec<Symbol>,
-    cache: HashMap<NodeId, HashSet<InputPath>>,
+    cache: HashMap<NodeId, HashSet<Read>>,
     paths: Vec<InputPath>,
+    arrays: Vec<InputArray>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,6 +173,56 @@ impl From<Ref> for Reference {
 }
 
 impl Dependencies<'_> {
+    fn input_cell(&self, id: NodeId, locals: &[Reference]) -> Option<InputCell> {
+        let m = self.module;
+        let Node::Call(c) = m.node(id) else {
+            return None;
+        };
+        if c.inputs.is_some() {
+            return None;
+        }
+        let CallHead::Builtin(head) = c.head else {
+            return None;
+        };
+        let base = match m.resolve(head) {
+            "get" => 1,
+            "get0" => 0,
+            _ => return None,
+        };
+        let (&receiver, selectors) = c.args.split_first()?;
+        let path = self.input_path(receiver, locals)?;
+        let array = self.arrays.iter().find(|a| a.path == path)?;
+        if selectors.len() != array.shape.len() {
+            return None;
+        }
+        let indices = selectors
+            .iter()
+            .zip(&array.shape)
+            .map(|(&selector, &size)| {
+                // Supplied query inputs hide their authored values, even if
+                // their RHS looks like a constant integer.
+                let mut selector = selector;
+                let mut seen = HashSet::new();
+                while let Node::Ref(reference) = m.node(selector) {
+                    if !seen.insert(selector)
+                        || locals.contains(&Reference::from(*reference))
+                        || reference.ns != RefNs::SelfMod
+                        || self.alias_names.contains(&reference.name)
+                    {
+                        return None;
+                    }
+                    selector = m.binding(m.binding_by_name(reference.name)?).rhs;
+                }
+                let Node::Lit(Scalar::Int(index)) = m.node(selector) else {
+                    return None;
+                };
+                let index = u64::try_from(index.checked_sub(base)?).ok()?;
+                (index < size).then_some(index)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(InputCell { path, indices })
+    }
+
     fn input_path(&self, mut id: NodeId, locals: &[Reference]) -> Option<InputPath> {
         let m = self.module;
         let mut fields = Vec::new();
@@ -213,6 +297,46 @@ impl Dependencies<'_> {
         result
     }
 
+    fn input_arrays(&self) -> Vec<InputArray> {
+        let m = self.module;
+        self.paths
+            .iter()
+            .filter_map(|path| {
+                let &name = self
+                    .order
+                    .iter()
+                    .find(|&&name| m.resolve(name) == path.input)?;
+                let mut ty = m.type_of(m.binding(m.alias_target(name)?).rhs)?;
+                for field in &path.fields {
+                    let Type::Record(entries) = ty else {
+                        return None;
+                    };
+                    ty = &entries
+                        .iter()
+                        .find(|(name, _)| m.resolve(*name) == field)?
+                        .1;
+                }
+                let Type::Array { shape, elem } = ty else {
+                    return None;
+                };
+                if shape.is_empty() || !matches!(elem.as_ref(), Type::Scalar(_)) {
+                    return None;
+                }
+                let shape = shape
+                    .iter()
+                    .map(|dim| match dim {
+                        Dim::Static(n) => Some(u64::from(*n)),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(InputArray {
+                    path: path.clone(),
+                    shape,
+                })
+            })
+            .collect()
+    }
+
     fn ordered_paths(&self, paths: &HashSet<InputPath>) -> Vec<InputPath> {
         self.paths
             .iter()
@@ -231,6 +355,13 @@ impl Dependencies<'_> {
     }
 
     fn get_paths(&mut self, root: NodeId) -> HashSet<InputPath> {
+        self.get_reads(root)
+            .iter()
+            .map(|read| read.path().clone())
+            .collect()
+    }
+
+    fn get_reads(&mut self, root: NodeId) -> HashSet<Read> {
         if let Some(value) = self.cache.get(&root) {
             return value.clone();
         }
@@ -246,9 +377,11 @@ impl Dependencies<'_> {
                 continue;
             }
             if active.contains(&key) {
-                found.extend(self.order.iter().map(|name| InputPath {
-                    input: m.resolve(*name).into(),
-                    fields: vec![],
+                found.extend(self.order.iter().map(|name| {
+                    Read::Whole(InputPath {
+                        input: m.resolve(*name).into(),
+                        fields: vec![],
+                    })
                 }));
                 continue;
             }
@@ -257,8 +390,12 @@ impl Dependencies<'_> {
             }
             active.insert(key);
             pending.push((id, locals.clone(), true));
+            if let Some(cell) = self.input_cell(id, &locals) {
+                found.insert(Read::Cell(cell));
+                continue;
+            }
             if let Some(path) = self.input_path(id, &locals) {
-                found.insert(path);
+                found.insert(Read::Whole(path));
                 continue;
             }
             match m.node(id) {
@@ -270,9 +407,11 @@ impl Dependencies<'_> {
                     if let Some(bid) = m.binding_by_name(*name) {
                         pending.push((m.binding(bid).rhs, locals, false));
                     } else {
-                        found.extend(self.order.iter().map(|name| InputPath {
-                            input: m.resolve(*name).into(),
-                            fields: vec![],
+                        found.extend(self.order.iter().map(|name| {
+                            Read::Whole(InputPath {
+                                input: m.resolve(*name).into(),
+                                fields: vec![],
+                            })
                         }));
                     }
                 }
@@ -298,9 +437,11 @@ impl Dependencies<'_> {
                             .map(|child| (child, locals.clone(), false)),
                     );
                 }
-                Node::Ref(_) => found.extend(self.order.iter().map(|name| InputPath {
-                    input: m.resolve(*name).into(),
-                    fields: vec![],
+                Node::Ref(_) => found.extend(self.order.iter().map(|name| {
+                    Read::Whole(InputPath {
+                        input: m.resolve(*name).into(),
+                        fields: vec![],
+                    })
                 })),
                 _ => {}
             }
@@ -539,8 +680,10 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         order,
         cache: HashMap::new(),
         paths: Vec::new(),
+        arrays: Vec::new(),
     };
     deps.paths = deps.all_paths();
+    deps.arrays = deps.input_arrays();
     let parameter_set = deps
         .boundary
         .difference(&data)
@@ -555,7 +698,28 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         let all = deps.get(node);
         let ps = all.intersection(&parameter_set).copied().collect();
         let ds = all.intersection(&data).copied().collect();
-        let paths = deps.get_paths(node);
+        let reads = deps.get_reads(node);
+        let paths = reads
+            .iter()
+            .filter_map(|read| match read {
+                Read::Whole(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut cells = reads
+            .iter()
+            .filter_map(|read| match read {
+                Read::Cell(cell) => Some(cell.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        cells.sort_by(|a, b| {
+            deps.paths
+                .iter()
+                .position(|p| p == &a.path)
+                .cmp(&deps.paths.iter().position(|p| p == &b.path))
+                .then_with(|| a.indices.cmp(&b.indices))
+        });
         used.extend(&ps);
         terms.push(OutputTerm {
             node,
@@ -564,6 +728,7 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
             parameters: deps.names(&ps),
             data: deps.names(&ds),
             input_paths: deps.ordered_paths(&paths),
+            input_cells: cells,
         });
         if sign == 1
             && multiplicity == 1
@@ -652,6 +817,7 @@ pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis
         unused_parameters: deps.names(&unused),
         normal_coordinates,
         input_paths: deps.paths.clone(),
+        input_arrays: deps.arrays.clone(),
     })
 }
 
@@ -662,8 +828,14 @@ impl fmt::Display for ModelAnalysis {
         for term in &self.terms {
             writeln!(
                 f,
-                "Term {:?}: sign {}, multiplicity {}, parameters {:?}, data {:?}",
-                term.node, term.sign, term.multiplicity, term.parameters, term.data
+                "Term {:?}: sign {}, multiplicity {}, parameters {:?}, data {:?}, paths {:?}, cells {:?}",
+                term.node,
+                term.sign,
+                term.multiplicity,
+                term.parameters,
+                term.data,
+                term.input_paths,
+                term.input_cells
             )?;
         }
         for c in &self.normal_coordinates {

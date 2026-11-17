@@ -24,7 +24,8 @@ mod sample;
 mod stdfn;
 mod sufficient_statistics;
 pub use analysis::{
-    AnalysisError, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm, analyze_model,
+    AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+    analyze_model,
 };
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};

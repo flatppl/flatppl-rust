@@ -4,13 +4,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{AnalysisError, LoadedModule};
-use flatppl_determinizer::InputPath;
+use flatppl_determinizer::{InputArray, InputCell, InputPath};
 
 /// One ordinary query and the input names that invalidate its cached result.
 pub struct IncrementalTermQuery {
     pub query: Arc<LoadedModule>,
     pub dependencies: Vec<String>,
     pub input_paths: Vec<InputPath>,
+    pub input_cells: Vec<InputCell>,
     pub cache_input: String,
 }
 
@@ -27,9 +28,41 @@ struct DependencyIndex {
     valid: HashSet<InputPath>,
     own: HashMap<InputPath, Vec<usize>>,
     descendants: HashMap<InputPath, Vec<usize>>,
+    cells: HashMap<InputCell, Vec<usize>>,
+    arrays: HashMap<InputPath, Vec<u64>>,
 }
 
 impl DependencyIndex {
+    fn affected_cells(&self, changed: &[InputCell]) -> Result<Vec<usize>, AnalysisError> {
+        for cell in changed {
+            let valid = self.arrays.get(&cell.path).is_some_and(|shape| {
+                shape.len() == cell.indices.len()
+                    && cell
+                        .indices
+                        .iter()
+                        .zip(shape)
+                        .all(|(index, size)| index < size)
+            });
+            if !valid {
+                return Err(AnalysisError(format!(
+                    "invalid incremental input cell {cell:?}"
+                )));
+            }
+        }
+        let mut affected = BTreeSet::new();
+        for cell in changed {
+            affected.extend(self.cells.get(cell).into_iter().flatten());
+            for count in 0..=cell.path.fields.len() {
+                let parent = InputPath {
+                    input: cell.path.input.clone(),
+                    fields: cell.path.fields[..count].to_vec(),
+                };
+                affected.extend(self.own.get(&parent).into_iter().flatten());
+            }
+        }
+        Ok(affected.into_iter().copied().collect())
+    }
+
     fn affected_terms(&self, changed: &[String]) -> Result<Vec<usize>, AnalysisError> {
         self.affected_paths(
             &changed
@@ -71,13 +104,24 @@ impl IncrementalScoreQueries {
         combine: Arc<LoadedModule>,
         inputs: Vec<String>,
         input_paths: Vec<InputPath>,
+        input_arrays: Vec<InputArray>,
     ) -> Self {
         let valid = input_paths.into_iter().collect();
         let mut own: HashMap<InputPath, Vec<usize>> = HashMap::new();
         let mut descendants: HashMap<InputPath, Vec<usize>> = HashMap::new();
+        let mut cells: HashMap<InputCell, Vec<usize>> = HashMap::new();
         for (index, term) in terms.iter().enumerate() {
             for path in &term.input_paths {
                 own.entry(path.clone()).or_default().push(index);
+            }
+            for cell in &term.input_cells {
+                cells.entry(cell.clone()).or_default().push(index);
+            }
+            for path in term
+                .input_paths
+                .iter()
+                .chain(term.input_cells.iter().map(|cell| &cell.path))
+            {
                 for count in 0..=path.fields.len() {
                     descendants
                         .entry(InputPath {
@@ -97,6 +141,11 @@ impl IncrementalScoreQueries {
                 valid,
                 own,
                 descendants,
+                cells,
+                arrays: input_arrays
+                    .into_iter()
+                    .map(|array| (array.path, array.shape))
+                    .collect(),
             }),
         }
     }
@@ -117,6 +166,12 @@ impl IncrementalScoreQueries {
 
     pub fn affected_paths(&self, changed: &[InputPath]) -> Result<Vec<usize>, AnalysisError> {
         self.dependencies.affected_paths(changed)
+    }
+
+    /// Scalar array edits use full-rank zero-based coordinates. Whole-array and
+    /// ancestor record readers remain affected. Unread valid cells are allowed.
+    pub fn affected_cells(&self, changed: &[InputCell]) -> Result<Vec<usize>, AnalysisError> {
+        self.dependencies.affected_cells(changed)
     }
 
     /// Create one coordinator per compiled plan, precision and target. Notify it
@@ -160,6 +215,12 @@ impl ScoreRevisions {
     /// Validate every path before changing any revision.
     pub fn invalidate_paths(&mut self, changed: &[InputPath]) -> Result<Vec<usize>, AnalysisError> {
         let affected = self.dependencies.affected_paths(changed)?;
+        self.invalidate_terms(affected)
+    }
+
+    /// Validate every cell before invalidating any result revision.
+    pub fn invalidate_cells(&mut self, changed: &[InputCell]) -> Result<Vec<usize>, AnalysisError> {
+        let affected = self.dependencies.affected_cells(changed)?;
         self.invalidate_terms(affected)
     }
 
