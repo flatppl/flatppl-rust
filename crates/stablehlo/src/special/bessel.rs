@@ -871,10 +871,16 @@ impl Emitter<'_> {
                     self.bessel_positive_i(&n, &safe_x, false, false)
                 };
                 let k = if scaled {
-                    let noninteger = self.compare("NE", &sinpi, &zero);
-                    let reflected = self.select(&noninteger, &reflected_order, &one);
-                    let logarithm = self.bessel_tail_log(&reflected, &safe_x, 0, false);
+                    let logarithm = self.bessel_tail_log(&reflected_order, &safe_x, 0, false);
                     let logarithm = self.sub(&logarithm, &safe_x);
+                    let maximum = self.scalar(match self.dtype {
+                        Dtype::F32 => (f32::MAX as f64).ln(),
+                        Dtype::F64 => f64::MAX.ln(),
+                    });
+                    let overflows = self.compare("GT", &logarithm, &maximum);
+                    let integer = self.compare("EQ", &sinpi, &zero);
+                    let zero_correction = self.and(&integer, &overflows);
+                    let logarithm = self.select(&zero_correction, &zero, &logarithm);
                     self.exp(&logarithm)
                 } else {
                     self.bessel_tail(&reflected_order, &safe_x, 0)

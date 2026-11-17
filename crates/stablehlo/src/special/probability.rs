@@ -307,7 +307,8 @@ impl Emitter<'_> {
         difference = self.add(&difference, &psi);
         let gamma = self.special_log_gamma1p_over_a(a);
         let normalization = self.sub(&gamma, &difference);
-        let largest = self.max(a, b);
+        let ordered = self.compare("LE", a, b);
+        let largest = self.select(&ordered, b, a);
         let ratio = self.div(a, &largest);
         let log_ratio_near = self.log1p(&ratio);
         let inverse = self.div(b, &largest);
@@ -316,7 +317,6 @@ impl Emitter<'_> {
         let logb = self.log(b);
         let log_ratio_far = self.sub(&loga, &logb);
         let log_ratio_far = self.add(&log_ratio_far, &correction);
-        let ordered = self.compare("LE", a, b);
         let log_ratio = self.select(&ordered, &log_ratio_near, &log_ratio_far);
         let log_ratio = self.select(&shifted, &log_ratio, &zero);
         let tolerance = self.scalar(self.ratio_tolerance());
