@@ -256,19 +256,7 @@ impl LoadedModule {
     }
 
     pub fn compile(&self, options: &EmitOptions) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None, &[])
-    }
-
-    /// Compile with `load_module` aliases bound to black boxes. Each entry
-    /// names a top-level alias and the parsed describe reply of its box.
-    /// Box queries become `stablehlo.custom_call @flatppl.box` operations
-    /// that the executor binds.
-    pub fn compile_with_boxes(
-        &self,
-        options: &EmitOptions,
-        boxes: &[(String, Arc<crate::BoxSpec>)],
-    ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, None, boxes)
+        self.compile_export(options, None)
     }
 
     /// Compile independent calls over explicit host batch axes.
@@ -277,45 +265,16 @@ impl LoadedModule {
         options: &EmitOptions,
         batch: &BatchSpec,
     ) -> Result<Export, Diagnostic> {
-        self.compile_export(options, Some(batch), &[])
-    }
-
-    /// The typed root with `boxes` bound, inferred again.
-    fn typed_with_boxes(
-        &self,
-        boxes: &[(String, Arc<crate::BoxSpec>)],
-    ) -> Result<Module, Diagnostic> {
-        let mut typed = self.parsed().clone();
-        crate::bind_boxes(&mut typed, &self.bundle, boxes)
-            .map_err(|message| Diagnostic::new("boxes", self.source_name(), message))?;
-        let diagnostics = flatppl_infer::infer_module(&mut typed, &self.bundle, Level::Shape);
-        if let Some(d) = diagnostics
-            .into_iter()
-            .find(|d| d.severity == Severity::Error)
-        {
-            return Err(Diagnostic::new("infer", self.source_name(), d.message).at(
-                &typed,
-                d.node,
-                self.source(),
-            ));
-        }
-        Ok(typed)
+        self.compile_export(options, Some(batch))
     }
 
     fn compile_export(
         &self,
         options: &EmitOptions,
         batch: Option<&BatchSpec>,
-        boxes: &[(String, Arc<crate::BoxSpec>)],
     ) -> Result<Export, Diagnostic> {
-        let bound;
-        let typed = if boxes.is_empty() {
-            &self.typed
-        } else {
-            bound = self.typed_with_boxes(boxes)?;
-            &bound
-        };
-        let lowered = self.lower_query(typed, options, None)?;
+        let typed = &self.typed;
+        let lowered = self.lower_query(options, None)?;
         emit_query(lowered, typed, options, batch).map_err(|e| {
             let node = e.node.filter(|id| id.index() < typed.node_count());
             Diagnostic::new("stablehlo", self.source_name(), e.msg).at(typed, node, self.source())
@@ -328,7 +287,6 @@ impl LoadedModule {
     ) -> Result<flatppl_determinizer::ReductionReport, Diagnostic> {
         let mut report = flatppl_determinizer::ReductionReport::default();
         self.lower_query(
-            &self.typed,
             &EmitOptions {
                 sufficient_statistics: enabled,
                 ..Default::default()
@@ -340,10 +298,10 @@ impl LoadedModule {
 
     fn lower_query(
         &self,
-        typed: &Module,
         options: &EmitOptions,
         mut report: Option<&mut flatppl_determinizer::ReductionReport>,
     ) -> Result<Module, Diagnostic> {
+        let typed = &self.typed;
         let roots: Vec<_> = typed
             .public_bindings()
             .filter(|(_, b)| matches!(typed.resolve(b.name), "inputs" | "outputs"))

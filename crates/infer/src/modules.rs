@@ -730,11 +730,6 @@ impl<'b> InferSession<'b> {
         binding_name: &str,
         subst_annos: &[(String, Resolved)],
     ) -> Result<Resolution, String> {
-        // A box binding needs no dependency: the describe reply types it.
-        if let Some(binding) = importer.box_binding(alias).cloned() {
-            return crate::boxes::resolve_box_member(importer, &binding, binding_name)
-                .map(Resolution::Ready);
-        }
         let directive = self.load_directive(importer, alias)?;
 
         // §09 standard modules resolve against the merged catalogue set

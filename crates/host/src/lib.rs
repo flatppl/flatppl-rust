@@ -8,7 +8,6 @@
 //! StableHLO plus a tensor ABI. The host chooses execution and differentiation.
 
 mod analysis;
-mod boxes;
 mod compiler;
 mod constants;
 mod data;
@@ -21,7 +20,6 @@ mod readers;
 mod transforms;
 
 pub use analysis::QueryAnalysis;
-pub use boxes::{BoxSpec, bind_boxes, parse_describe};
 pub use compiler::{
     BindingInfo, Context, Diagnostic, LoadedModule, MathFormat, MathRow, Position,
     PreparedLikelihood,

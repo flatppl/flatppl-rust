@@ -38,8 +38,6 @@ use crate::refuse::EmitError;
 mod affine_scan;
 #[path = "batching.rs"]
 mod batching;
-#[path = "boxes.rs"]
-mod boxes;
 #[path = "constants.rs"]
 mod constants;
 #[path = "enzyme.rs"]
@@ -213,8 +211,7 @@ pub struct Emitter<'m> {
     constants: HashMap<String, constants::Constant>,
     broadcast_frame: Vec<Option<u64>>,
     call_frame: Vec<Option<u64>>,
-    /// Nesting depth of region bodies being emitted. A box query must stay a
-    /// top-level operation, so the executor can bind it.
+    /// Nesting depth for region-local runtime checks.
     region_depth: usize,
     body: String,
     /// Portable private solve definitions, shared by shape-specialized calls.
@@ -4559,9 +4556,6 @@ impl<'m> Emitter<'m> {
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
-        if let Some(result) = self.lower_box_broadcast(id, args) {
-            return result;
-        }
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
@@ -4896,13 +4890,7 @@ impl<'m> Emitter<'m> {
                     // dispatch to the distribution registry (`crate::registry`),
                     // never to `ops::lower_builtin`'s deterministic
                     // (non-distribution) map — see that module's doc comment.
-                    if let Some(result) =
-                        matches!(name.as_str(), "builtin_logdensityof" | "builtin_sample")
-                            .then(|| self.lower_box_primitive(id, &name, &call.args))
-                            .flatten()
-                    {
-                        result
-                    } else if name == "builtin_logdensityof" {
+                    if name == "builtin_logdensityof" {
                         crate::registry::lower_logdensityof(self, id, &call.args)
                     } else if name == "builtin_sample" {
                         crate::registry::lower_sample(self, id, &call.args)
@@ -5015,8 +5003,7 @@ impl<'m> Emitter<'m> {
                     }
                 }
                 CallHead::User(callee) => self
-                    .lower_box_application(id, callee, &call.args)
-                    .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
+                    .lower_pyhf_call(id, callee, &call.args, false)
                     .or_else(|| self.lower_spline_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
