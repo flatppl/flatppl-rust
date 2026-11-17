@@ -27,6 +27,18 @@ impl Emitter<'_> {
         upper: &Value,
         template: &Value,
         frequency: &Value,
+        f: impl FnMut(&mut Self, &Value) -> Value,
+    ) -> Value {
+        let one = self.scalar(1.0);
+        self.special_quad_with_roundoff(upper, template, frequency, &one, f)
+    }
+
+    fn special_quad_with_roundoff(
+        &mut self,
+        upper: &Value,
+        template: &Value,
+        frequency: &Value,
+        roundoff: &Value,
         mut f: impl FnMut(&mut Self, &Value) -> Value,
     ) -> Value {
         // Resolve the oscillation before testing global
@@ -53,6 +65,7 @@ impl Emitter<'_> {
             Dtype::F32 => 32.0 * f32::EPSILON as f64,
             Dtype::F64 => 32.0 * f64::EPSILON,
         });
+        let eps = self.mul(&eps, roundoff);
         let mut previous = coarse;
         let mut fine = fine;
         let mut magnitude = magnitude;
@@ -105,7 +118,13 @@ impl Emitter<'_> {
         (sine, cosine)
     }
 
-    fn bessel_series(&mut self, order: &Value, x: &Value, modified: bool) -> Value {
+    fn bessel_series(
+        &mut self,
+        order: &Value,
+        x: &Value,
+        modified: bool,
+        logarithmic: bool,
+    ) -> Value {
         let one = self.constant_like(1.0, x);
         let zero = self.constant_like(0.0, x);
         let half = self.scalar(0.5);
@@ -175,7 +194,11 @@ impl Emitter<'_> {
         let log_sum = self.log(&magnitude);
         let log_value = self.add(&log_value, &log_sum);
         let log_value = self.add(&log_value, &state[2]);
-        let value = self.exp(&log_value);
+        let value = if logarithmic {
+            log_value
+        } else {
+            self.exp(&log_value)
+        };
         let negative = self.compare("LT", &state[1], &zero);
         let minus = self.neg(&value);
         let value = self.select(&negative, &minus, &value);
@@ -251,7 +274,7 @@ impl Emitter<'_> {
         (self.mul(&scale, &j), self.mul(&scale, &y))
     }
 
-    fn bessel_tail(&mut self, order: &Value, x: &Value, kind: u8) -> Value {
+    fn bessel_tail_log(&mut self, order: &Value, x: &Value, kind: u8, scaled: bool) -> Value {
         let zero = self.scalar(0.0);
         let one = self.scalar(1.0);
         let two = self.scalar(2.0);
@@ -271,14 +294,28 @@ impl Emitter<'_> {
         let upper = self.add(&upper, &two);
         let upper = self.max(&upper, &one);
         let frequency = self.scalar(0.0);
-        let value = self.special_quad(&upper, x, &frequency, |e, t| {
+        // Exponent normalization subtracts numbers of size |peak|. Its
+        // absolute rounding floor survives even when the normalized integrand
+        // is near one, so refinement must account for that conditioning.
+        let roundoff = self.abs(&peak);
+        let roundoff = self.max(&roundoff, &one);
+        let value = self.special_quad_with_roundoff(&upper, x, &frequency, &roundoff, |e, t| {
             let exponent = e.bessel_tail_exponent(order, x, t, kind);
             let exponent = e.sub(&exponent, &peak);
             e.exp(&exponent)
         });
         let log_value = self.log(&value);
         let log_value = self.add(&peak, &log_value);
-        self.exp(&log_value)
+        if kind == 0 && !scaled {
+            self.sub(&log_value, x)
+        } else {
+            log_value
+        }
+    }
+
+    fn bessel_tail(&mut self, order: &Value, x: &Value, kind: u8) -> Value {
+        let logarithm = self.bessel_tail_log(order, x, kind, false);
+        self.exp(&logarithm)
     }
 
     // kind 0: K, 1: growing Y correction, 2: decaying J/Y correction.
@@ -292,7 +329,15 @@ impl Emitter<'_> {
         let backward = self.exp(&backward);
         let vt = self.mul(order, t);
         if kind == 0 {
-            let decay = self.add(&forward, &backward);
+            // cosh(t)-1 = expm1(t)^2/(2 exp(t)); subtracting x*cosh(t)
+            // from the peak would erase the scaled integral at large x.
+            let difference = self.expm1(t);
+            let square = self.mul(&difference, &difference);
+            let exponential = self.exp(t);
+            let two = self.scalar(2.0);
+            let denominator = self.mul(&two, &exponential);
+            let coshm1 = self.div(&square, &denominator);
+            let decay = self.mul(x, &coshm1);
             let decay = self.neg(&decay);
             let magnitude = self.abs(&vt);
             let minus_two = self.scalar(-2.0);
@@ -321,7 +366,7 @@ impl Emitter<'_> {
         let limit = self.sqrt(&limit);
         let limit = self.max(&limit, &ten);
         let xs = self.min(x, &limit);
-        let series = self.bessel_series(order, &xs, false);
+        let series = self.bessel_series(order, &xs, false, false);
         let use_series = self.compare("LT", x, &limit);
         let pi = self.scalar(std::f64::consts::PI);
         let frequency = self.add(order, x);
@@ -456,14 +501,25 @@ impl Emitter<'_> {
         self.select(&large, &asymptotic, &value)
     }
 
-    fn bessel_positive_i(&mut self, order: &Value, x: &Value) -> Value {
+    fn bessel_positive_i(
+        &mut self,
+        order: &Value,
+        x: &Value,
+        logarithmic: bool,
+        scaled: bool,
+    ) -> Value {
         let square = self.mul(order, order);
         let two = self.scalar(2.0);
         let forty = self.scalar(40.0);
         let cutoff = self.mul(&two, &square);
         let cutoff = self.max(&cutoff, &forty);
         let safe_series = self.min(x, &cutoff);
-        let series = self.bessel_series(order, &safe_series, true);
+        let series = self.bessel_series(order, &safe_series, true, logarithmic);
+        let series = if scaled {
+            self.sub(&series, &safe_series)
+        } else {
+            series
+        };
         let safe_large = self.max(x, &cutoff);
         let one = self.constant_like(1.0, x);
         let four = self.scalar(4.0);
@@ -497,11 +553,69 @@ impl Emitter<'_> {
         let half = self.scalar(0.5);
         let log_denominator = self.mul(&half, &log_denominator);
         let log_sum = self.log(&state[1]);
-        let log_value = self.sub(&safe_large, &log_denominator);
+        let log_value = if scaled {
+            self.neg(&log_denominator)
+        } else {
+            self.sub(&safe_large, &log_denominator)
+        };
         let log_value = self.add(&log_value, &log_sum);
-        let asymptotic = self.exp(&log_value);
+        let asymptotic = if logarithmic {
+            log_value
+        } else {
+            self.exp(&log_value)
+        };
         let large = self.compare("GT", x, &cutoff);
         self.select(&large, &asymptotic, &series)
+    }
+
+    pub(super) fn bessel_modified_log(
+        &mut self,
+        order: &Value,
+        x: &Value,
+        modified_i: bool,
+        scaled: bool,
+    ) -> Value {
+        let order = self.convert(order, ElemKind::Real);
+        let x = self.convert(x, ElemKind::Real);
+        let (order, x) = self.broadcast_pair(&order, &x);
+        let zero = self.constant_like(0.0, &x);
+        let one = self.constant_like(1.0, &x);
+        let positive = self.compare("GT", &x, &zero);
+        let safe_x = self.select(&positive, &x, &one);
+        let value = if modified_i {
+            let safe_order = self.max(&order, &zero);
+            self.bessel_positive_i(&safe_order, &safe_x, true, scaled)
+        } else {
+            let order = self.abs(&order);
+            self.bessel_tail_log(&order, &safe_x, 0, scaled)
+        };
+        let value = if modified_i {
+            let order_zero = self.compare("EQ", &order, &zero);
+            let minus_infinity = self.constant_like(f64::NEG_INFINITY, &x);
+            let endpoint = self.select(&order_zero, &zero, &minus_infinity);
+            self.select(&positive, &value, &endpoint)
+        } else {
+            let infinity = self.constant_like(f64::INFINITY, &x);
+            self.select(&positive, &value, &infinity)
+        };
+        let valid = if modified_i {
+            let nonnegative_order = self.compare("GE", &order, &zero);
+            let nonnegative_x = self.compare("GE", &x, &zero);
+            self.and(&nonnegative_order, &nonnegative_x)
+        } else {
+            self.compare("GE", &x, &zero)
+        };
+        let finite_order = self.special_finite(&order);
+        let finite_x = self.special_finite(&x);
+        let finite = self.and(&finite_order, &finite_x);
+        let valid = self.and(&valid, &finite);
+        self.record_runtime_error(&valid, 12);
+        let not_nan = self.compare("EQ", &value, &value);
+        let invalid = self.not(&valid);
+        let converged = self.or(&invalid, &not_nan);
+        self.record_runtime_error(&converged, 10);
+        let nan = self.constant_like(f64::NAN, &x);
+        self.select(&valid, &value, &nan)
     }
 
     pub(super) fn bessel_real(&mut self, member: &str, order: &Value, x: &Value) -> Value {
@@ -528,9 +642,23 @@ impl Emitter<'_> {
                 let reflected = self.sub(&c, &s);
                 self.select(&negative_order, &reflected, &base)
             }
-            "bessel_i" => {
-                let base = self.bessel_positive_i(&n, &safe_x);
-                let k = self.bessel_tail(&reflected_order, &safe_x, 0);
+            "bessel_i" | "bessel_i_scaled" => {
+                let scaled = member == "bessel_i_scaled";
+                let base = if scaled {
+                    let logarithm = self.bessel_positive_i(&n, &safe_x, true, true);
+                    self.exp(&logarithm)
+                } else {
+                    self.bessel_positive_i(&n, &safe_x, false, false)
+                };
+                let k = if scaled {
+                    let noninteger = self.compare("NE", &sinpi, &zero);
+                    let reflected = self.select(&noninteger, &reflected_order, &one);
+                    let logarithm = self.bessel_tail_log(&reflected, &safe_x, 0, false);
+                    let logarithm = self.sub(&logarithm, &safe_x);
+                    self.exp(&logarithm)
+                } else {
+                    self.bessel_tail(&reflected_order, &safe_x, 0)
+                };
                 let coefficient = self.scalar(2.0 / std::f64::consts::PI);
                 let coefficient = self.mul(&coefficient, &sinpi);
                 let correction = self.mul(&coefficient, &k);
@@ -572,7 +700,21 @@ impl Emitter<'_> {
             let endpoint = self.select(&first_order, &linear, &endpoint);
             self.select(&diverges, &divergent, &endpoint)
         };
-        self.select(&is_positive, &value, &at_zero)
+        let value = self.select(&is_positive, &value, &at_zero);
+        if member == "bessel_i_scaled" {
+            let finite_order = self.special_finite(&order);
+            let finite_x = self.special_finite(&x);
+            let valid = self.and(&finite_order, &finite_x);
+            self.record_runtime_error(&valid, 12);
+            let not_nan = self.compare("EQ", &value, &value);
+            let invalid = self.not(&valid);
+            let converged = self.or(&invalid, &not_nan);
+            self.record_runtime_error(&converged, 10);
+            let nan = self.constant_like(f64::NAN, &value);
+            self.select(&valid, &value, &nan)
+        } else {
+            value
+        }
     }
 
     pub(super) fn airy_ai(&mut self, x: &Value) -> Value {

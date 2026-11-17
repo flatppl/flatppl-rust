@@ -10,7 +10,7 @@ mod bessel;
 mod probability;
 
 /// The `special-functions` members this backend lowers, with their arity.
-pub(crate) const SPECIAL_FUNCTIONS: [(&str, usize); 12] = [
+pub(crate) const SPECIAL_FUNCTIONS: [(&str, usize); 25] = [
     ("erf", 1),
     ("erfc", 1),
     ("erfcx", 1),
@@ -22,6 +22,19 @@ pub(crate) const SPECIAL_FUNCTIONS: [(&str, usize); 12] = [
     ("bessel_y", 2),
     ("bessel_i", 2),
     ("bessel_k", 2),
+    ("gammaincc", 2),
+    ("log_gammainc", 2),
+    ("log_gammaincc", 2),
+    ("betaincc", 3),
+    ("log_betainc", 3),
+    ("log_betaincc", 3),
+    ("beta", 2),
+    ("logbeta", 2),
+    ("bessel_i_scaled", 2),
+    ("bessel_k_scaled", 2),
+    ("log_bessel_i", 2),
+    ("log_bessel_k", 2),
+    ("log_ndtr", 1),
     ("airy", 1),
 ];
 
@@ -94,7 +107,9 @@ impl Emitter<'_> {
         broadcast: bool,
     ) -> Option<Result<(Value, Value), EmitError>> {
         let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
-        if module != "special-functions" || !matches!(member.as_str(), "bessel_j" | "bessel_i") {
+        if module != "special-functions"
+            || !matches!(member.as_str(), "bessel_j" | "bessel_i" | "bessel_i_scaled")
+        {
             return None;
         }
         Some((|| {
@@ -185,7 +200,53 @@ impl Emitter<'_> {
             "digamma" => self.chlo_unary("chlo.digamma", &values[0]),
             "gammainc" => self.regularized_gamma(&values[0], &values[1]),
             "betainc" => self.regularized_beta(&values[0], &values[1], &values[2]),
-            "bessel_j" | "bessel_i" => {
+            "gammaincc" | "log_gammainc" | "log_gammaincc" => self.regularized_gamma_tail(
+                &values[0],
+                &values[1],
+                member.ends_with("cc"),
+                member.starts_with("log_"),
+                true,
+            ),
+            "betaincc" | "log_betainc" | "log_betaincc" => self.regularized_beta_tail(
+                &values[0],
+                &values[1],
+                &values[2],
+                member.ends_with("cc"),
+                member.starts_with("log_"),
+                true,
+            ),
+            "beta" | "logbeta" => {
+                let a = self.convert(&values[0], ElemKind::Real);
+                let b = self.convert(&values[1], ElemKind::Real);
+                let zero = self.scalar(0.0);
+                let positive_a = self.compare("GT", &a, &zero);
+                let positive_b = self.compare("GT", &b, &zero);
+                let valid = self.and(&positive_a, &positive_b);
+                let finite_a = self.special_finite(&a);
+                let finite_b = self.special_finite(&b);
+                let finite = self.and(&finite_a, &finite_b);
+                let valid = self.and(&valid, &finite);
+                self.record_runtime_error(&valid, 12);
+                let one = self.scalar(1.0);
+                let a = self.select(&valid, &a, &one);
+                let b = self.select(&valid, &b, &one);
+                let value = self.log_beta(&a, &b);
+                let value = if member == "beta" {
+                    self.exp(&value)
+                } else {
+                    value
+                };
+                let nan = self.scalar(f64::NAN);
+                self.select(&valid, &value, &nan)
+            }
+            "bessel_k_scaled" | "log_bessel_i" | "log_bessel_k" => {
+                let modified_i = member == "log_bessel_i";
+                let scaled = member == "bessel_k_scaled";
+                let value = self.bessel_modified_log(&values[0], &values[1], modified_i, scaled);
+                if scaled { self.exp(&value) } else { value }
+            }
+            "log_ndtr" => self.normal_log_cdf(&values[0]),
+            "bessel_j" | "bessel_i" | "bessel_i_scaled" => {
                 return Err(EmitError::at(
                     id,
                     "complex Bessel J/I result requires real, imag, abs or abs2 projection",
@@ -206,6 +267,41 @@ impl Emitter<'_> {
             }
             None => result,
         })
+    }
+
+    fn special_finite(&mut self, x: &Value) -> Value {
+        let magnitude = self.abs(x);
+        let infinity = self.constant_like(f64::INFINITY, x);
+        self.compare("LT", &magnitude, &infinity)
+    }
+
+    fn normal_log_cdf(&mut self, x: &Value) -> Value {
+        let x = self.convert(x, ElemKind::Real);
+        let zero = self.constant_like(0.0, &x);
+        let negative = self.compare("LT", &x, &zero);
+        let magnitude = self.abs(&x);
+        let finite = self.special_finite(&x);
+        let one = self.constant_like(1.0, &x);
+        let magnitude = self.select(&finite, &magnitude, &one);
+        let inv_sqrt_two = self.scalar(std::f64::consts::FRAC_1_SQRT_2);
+        let argument = self.mul(&magnitude, &inv_sqrt_two);
+        let scaled_tail = self.erfcx(&argument);
+        let log_tail = self.log(&scaled_tail);
+        let log_two = self.scalar(std::f64::consts::LN_2);
+        let log_tail = self.sub(&log_tail, &log_two);
+        let square = self.mul(&argument, &argument);
+        let log_tail = self.sub(&log_tail, &square);
+        let tail = self.exp(&log_tail);
+        let minus_tail = self.neg(&tail);
+        let log_complement = self.log1p(&minus_tail);
+        let value = self.select(&negative, &log_tail, &log_complement);
+        let minus_infinity = self.constant_like(f64::NEG_INFINITY, &x);
+        let endpoint = self.select(&negative, &minus_infinity, &zero);
+        let value = self.select(&finite, &value, &endpoint);
+        let not_nan = self.compare("EQ", &x, &x);
+        self.record_runtime_error(&not_nan, 12);
+        let nan = self.constant_like(f64::NAN, &x);
+        self.select(&not_nan, &value, &nan)
     }
 
     /// `erfcx(x) = exp(x²)·erfc(x)`, the product below [`ERFCX_SPLIT`] and the
