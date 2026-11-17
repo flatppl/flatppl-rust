@@ -389,7 +389,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Voigtian",
         DistLowering {
             logpdf: hep::voigtian_logpdf,
-            sample: None,
+            sample: Some(hep::voigtian_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -398,7 +398,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Landau",
         DistLowering {
             logpdf: hep::landau_logpdf,
-            sample: None,
+            sample: Some(hep::landau_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -406,8 +406,8 @@ static REGISTRY: &[(&str, DistLowering)] = &[
     (
         "CrystalBall",
         DistLowering {
-            logpdf: crystal_ball_logpdf,
-            sample: None,
+            logpdf: hep::crystal_ball_logpdf,
+            sample: Some(hep::crystal_ball_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -415,8 +415,8 @@ static REGISTRY: &[(&str, DistLowering)] = &[
     (
         "DoubleSidedCrystalBall",
         DistLowering {
-            logpdf: double_sided_crystal_ball_logpdf,
-            sample: None,
+            logpdf: hep::double_sided_crystal_ball_logpdf,
+            sample: Some(hep::double_sided_crystal_ball_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -425,7 +425,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "RelativisticBreitWigner",
         DistLowering {
             logpdf: relativistic_breit_wigner_logpdf,
-            sample: None,
+            sample: Some(hep::relativistic_breit_wigner_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -434,7 +434,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "BifurcatedNormal",
         DistLowering {
             logpdf: bifurcated_normal_logpdf,
-            sample: None,
+            sample: Some(hep::bifurcated_normal_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -443,7 +443,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Argus",
         DistLowering {
             logpdf: hep::argus_logpdf,
-            sample: None,
+            sample: Some(hep::argus_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -1375,6 +1375,14 @@ const FANOUT_SAFE: &[&str] = &[
     "Poisson",
     "NegativeBinomial",
     "NegativeBinomial2",
+    // Scalar HEP laws: analytic transforms, bracketed inversion, or masked rejection.
+    "CrystalBall",
+    "DoubleSidedCrystalBall",
+    "Argus",
+    "RelativisticBreitWigner",
+    "Voigtian",
+    "Landau",
+    "BifurcatedNormal",
 ];
 
 // ---- constrained-support masking -------------------------------------------
@@ -2512,179 +2520,6 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let t2 = e.add(&log_choose_nk, &k_log_p);
     let score = e.add(&t2, &n_minus_k_log_one_minus_p);
     Ok(outside_count_support(e, &supported, &score))
-}
-
-/// §09 `CrystalBall(m0, sigma, alpha, n)` — a Gaussian core with a power-law
-/// tail below `-alpha` standard deviations, normalized.
-///
-/// With `t = (x − m₀)/σ` and `a = |α|`, §09's density is
-/// `(1/M)·A·(B − t)^(−n)` for `t < −a` and `(1/M)·exp(−t²/2)` otherwise, where
-/// `A = (n/a)^n·exp(−a²/2)` and `B = n/a − a`. So
-///
-/// ```text
-/// log f = select(t < −a,  log A − n·log(B − t),  −t²/2)  −  log M
-/// ```
-///
-/// §09 leaves `M` as "a normalizing constant"; its closed form follows from the
-/// two pieces. The tail integrates to `A·(n/a)^(1−n)/(n−1) = (n/a)·exp(−a²/2)/(n−1)`
-/// (substituting `u = B − t`, whose lower limit at `t = −a` is `B + a = n/a`),
-/// and the core to `√(π/2)·(1 + erf(a/√2))`, both scaled by `σ` for the `t → x`
-/// change of variables:
-///
-/// ```text
-/// M = σ·( (n/a)·exp(−a²/2)/(n−1) + √(π/2)·(1 + erf(a/√2)) )
-/// ```
-///
-/// Verified against `scipy.stats.crystalball(beta = alpha, m = n, loc = m0,
-/// scale = sigma).logpdf` at four masses of the b_mass_peak corpus model,
-/// agreeing to 0–9e-16 absolute.
-///
-/// `n ≤ 1` makes the tail integral divergent, so §09's `M` does not exist; the
-/// emitted `n − 1` then drives `log M` to `NaN` rather than a wrong finite
-/// number. Both `select` branches are computed, so the discarded
-/// `log(B − t)` of a non-positive argument on the core side is a per-element
-/// `NaN` that `select` drops — the same discipline [`Emitter::atan2`] uses.
-fn crystal_ball_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    let m0 = p.get(e, "m0")?;
-    let sigma = p.get(e, "sigma")?;
-    let alpha = p.get(e, "alpha")?;
-    let n = p.get(e, "n")?;
-
-    let diff = e.sub(v, &m0);
-    let t = e.div(&diff, &sigma);
-    let a = e.abs(&alpha);
-
-    let n_over_a = e.div(&n, &a);
-    let a_sq = e.mul(&a, &a);
-    let half = e.scalar(0.5);
-    let half_a_sq = e.mul(&half, &a_sq);
-    let log_n_over_a = e.log(&n_over_a);
-    let n_log_n_over_a = e.mul(&n, &log_n_over_a);
-    let log_a_coef = e.sub(&n_log_n_over_a, &half_a_sq);
-    let b = e.sub(&n_over_a, &a);
-
-    let b_minus_t = e.sub(&b, &t);
-    let log_b_minus_t = e.log(&b_minus_t);
-    let n_log_b_minus_t = e.mul(&n, &log_b_minus_t);
-    let tail_branch = e.sub(&log_a_coef, &n_log_b_minus_t);
-
-    let t_sq = e.mul(&t, &t);
-    let neg_half = e.scalar(-0.5);
-    let core_branch = e.mul(&neg_half, &t_sq);
-
-    let neg_a = e.neg(&a);
-    let in_tail = e.compare("LT", &t, &neg_a);
-    let log_unnorm = e.select(&in_tail, &tail_branch, &core_branch);
-
-    // M's tail piece: (n/a)·exp(−a²/2)/(n − 1).
-    let neg_half_a_sq = e.neg(&half_a_sq);
-    let exp_term = e.exp(&neg_half_a_sq);
-    let tail_num = e.mul(&n_over_a, &exp_term);
-    let one = e.scalar(1.0);
-    let n_minus_one = e.sub(&n, &one);
-    let tail_int = e.div(&tail_num, &n_minus_one);
-
-    // M's core piece: √(π/2)·(1 + erf(a/√2)).
-    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
-    let a_over_sqrt2 = e.div(&a, &sqrt2);
-    let erf_a = e.erf(&a_over_sqrt2);
-    let one_plus_erf = e.add(&one, &erf_a);
-    let sqrt_half_pi = e.scalar((std::f64::consts::PI / 2.0).sqrt());
-    let core_int = e.mul(&sqrt_half_pi, &one_plus_erf);
-
-    let total_int = e.add(&tail_int, &core_int);
-    let mass = e.mul(&sigma, &total_int);
-    let log_mass = e.log(&mass);
-    Ok(e.sub(&log_unnorm, &log_mass))
-}
-
-/// One power-law side of a Crystal Ball, at `t` in units of its width: the
-/// unnormalized log density on the tail beyond `a = |alpha|` (`tail`), the core
-/// `-t²/2` (`core`), and the side's share of `M / σ`, `(n/a)·exp(-a²/2)/(n-1)` for
-/// the tail plus `√(π/2)·erf(a/√2)` for the half core. `u` is `-t` on the left
-/// side and `t` on the right, so the tail is `u > a` on both.
-struct CrystalBallSide {
-    tail: Value,
-    core: Value,
-    in_tail: Value,
-    mass: Value,
-}
-
-fn crystal_ball_side(e: &mut Emitter, u: &Value, alpha: &Value, n: &Value) -> CrystalBallSide {
-    let a = e.abs(alpha);
-    let n_over_a = e.div(n, &a);
-    let a_sq = e.mul(&a, &a);
-    let half = e.scalar(0.5);
-    let half_a_sq = e.mul(&half, &a_sq);
-    let log_n_over_a = e.log(&n_over_a);
-    let n_log_n_over_a = e.mul(n, &log_n_over_a);
-    let log_a_coef = e.sub(&n_log_n_over_a, &half_a_sq);
-    let b = e.sub(&n_over_a, &a);
-    let b_plus_u = e.add(&b, u);
-    let log_b_plus_u = e.log(&b_plus_u);
-    let n_log_b_plus_u = e.mul(n, &log_b_plus_u);
-    let tail = e.sub(&log_a_coef, &n_log_b_plus_u);
-    let u_sq = e.mul(u, u);
-    let neg_half = e.scalar(-0.5);
-    let core = e.mul(&neg_half, &u_sq);
-    let in_tail = e.compare("GT", u, &a);
-
-    let neg_half_a_sq = e.neg(&half_a_sq);
-    let exp_term = e.exp(&neg_half_a_sq);
-    let tail_num = e.mul(&n_over_a, &exp_term);
-    let one = e.scalar(1.0);
-    let n_minus_one = e.sub(n, &one);
-    let tail_mass = e.div(&tail_num, &n_minus_one);
-    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
-    let a_over_sqrt2 = e.div(&a, &sqrt2);
-    let erf_a = e.erf(&a_over_sqrt2);
-    let sqrt_half_pi = e.scalar((std::f64::consts::PI / 2.0).sqrt());
-    let core_mass = e.mul(&sqrt_half_pi, &erf_a);
-    let mass = e.add(&tail_mass, &core_mass);
-    CrystalBallSide {
-        tail,
-        core,
-        in_tail,
-        mass,
-    }
-}
-
-/// §09 `DoubleSidedCrystalBall(m0, sigmaL, sigmaR, alphaL, alphaR, nL, nR)`,
-/// normalized. Left of `m0` the density is [`crystal_ball_logpdf`]'s with
-/// `(sigmaL, alphaL, nL)`, right of it the mirror image with `(sigmaR, alphaR, nR)`.
-/// §09 leaves `M` as "a normalizing constant"; each side contributes its tail
-/// `σ·(n/a)·exp(-a²/2)/(n-1)` and its half core `σ·√(π/2)·erf(a/√2)`.
-fn double_sided_crystal_ball_logpdf(
-    e: &mut Emitter,
-    p: &Params,
-    v: &Value,
-) -> Result<Value, EmitError> {
-    let m0 = p.get(e, "m0")?;
-    let sigma_l = p.get(e, "sigmaL")?;
-    let sigma_r = p.get(e, "sigmaR")?;
-    let alpha_l = p.get(e, "alphaL")?;
-    let alpha_r = p.get(e, "alphaR")?;
-    let n_l = p.get(e, "nL")?;
-    let n_r = p.get(e, "nR")?;
-
-    let diff = e.sub(v, &m0);
-    let t_l = e.div(&diff, &sigma_l);
-    let u_l = e.neg(&t_l);
-    let t_r = e.div(&diff, &sigma_r);
-    let left = crystal_ball_side(e, &u_l, &alpha_l, &n_l);
-    let right = crystal_ball_side(e, &t_r, &alpha_r, &n_r);
-
-    let left_branch = e.select(&left.in_tail, &left.tail, &left.core);
-    let right_branch = e.select(&right.in_tail, &right.tail, &right.core);
-    let zero = e.scalar(0.0);
-    let on_left = e.compare("LE", &diff, &zero);
-    let log_unnorm = e.select(&on_left, &left_branch, &right_branch);
-
-    let left_mass = e.mul(&sigma_l, &left.mass);
-    let right_mass = e.mul(&sigma_r, &right.mass);
-    let mass = e.add(&left_mass, &right_mass);
-    let log_mass = e.log(&mass);
-    Ok(e.sub(&log_unnorm, &log_mass))
 }
 
 /// §09 `RelativisticBreitWigner(mean, width)` on `x > 0`:

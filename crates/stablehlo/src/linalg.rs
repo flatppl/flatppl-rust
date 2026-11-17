@@ -179,7 +179,7 @@ impl Emitter<'_> {
     }
     /// Enzyme's reverse-loop tape uses i64 slice offsets. Keep its induction
     /// variable i64 too; convert only the index consumed by tensor arithmetic.
-    pub(super) fn matrix_loop(
+    pub(crate) fn matrix_loop(
         &mut self,
         n: u64,
         unroll_limit: u64,

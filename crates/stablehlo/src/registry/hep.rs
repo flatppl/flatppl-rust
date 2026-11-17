@@ -478,3 +478,100 @@ pub(super) fn argus_logpdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Val
     let outside = e.constant_like(f64::NEG_INFINITY, &value);
     Ok(e.select(&supported, &value, &outside))
 }
+
+#[derive(Clone, Copy)]
+enum ParameterDomain {
+    Real,
+    Positive,
+    TailExponent,
+}
+
+fn parameter(
+    e: &mut Emitter,
+    p: &Params,
+    name: &str,
+    domain: ParameterDomain,
+) -> Result<Value, EmitError> {
+    let value = p.get(e, name)?;
+    let value = e.convert(&value, ElemKind::Real);
+    let absolute = e.abs(&value);
+    let infinity = e.inf_like(&value);
+    let finite = e.compare("LT", &absolute, &infinity);
+    let (valid, fallback) = match domain {
+        ParameterDomain::Real => (finite, 0.0),
+        ParameterDomain::Positive | ParameterDomain::TailExponent => {
+            let boundary = e.scalar(if matches!(domain, ParameterDomain::Positive) {
+                0.0
+            } else {
+                1.0
+            });
+            let positive = e.compare("GT", &value, &boundary);
+            (
+                e.and(&finite, &positive),
+                if matches!(domain, ParameterDomain::Positive) {
+                    1.0
+                } else {
+                    2.0
+                },
+            )
+        }
+    };
+    e.record_runtime_error(&valid, 9);
+    let fallback = e.scalar(fallback);
+    Ok(e.select(&valid, &value, &fallback))
+}
+
+fn open_uniform(e: &mut Emitter, template: &Value) -> Value {
+    let u = e.rng("UNIFORM", &template.ty);
+    let half_epsilon = match e.dtype() {
+        Dtype::F32 => 0.5 * f32::EPSILON as f64,
+        Dtype::F64 => 0.5 * f64::EPSILON,
+    };
+    let lower = e.scalar(half_epsilon);
+    let upper = e.scalar(1.0 - half_epsilon);
+    let u = e.max(&u, &lower);
+    e.min(&u, &upper)
+}
+
+fn softplus(e: &mut Emitter, x: &Value) -> Value {
+    let threshold = e.scalar(30.0);
+    let large = e.compare("GT", x, &threshold);
+    let zero = e.scalar(0.0);
+    let direct_x = e.select(&large, &zero, x);
+    let exponential = e.exp(&direct_x);
+    let direct = e.log1p(&exponential);
+    let negative = e.neg(x);
+    let negative = e.select(&large, &negative, &zero);
+    let exponential = e.exp(&negative);
+    let correction = e.log1p(&exponential);
+    let upper = e.add(x, &correction);
+    e.select(&large, &upper, &direct)
+}
+
+fn logadd(e: &mut Emitter, a: &Value, b: &Value) -> Value {
+    let difference = e.sub(a, b);
+    let threshold = e.scalar(30.0);
+    let large = e.compare("GT", &difference, &threshold);
+    let zero = e.scalar(0.0);
+    let direct_x = e.select(&large, &zero, &difference);
+    let exponential = e.exp(&direct_x);
+    let direct = e.log1p(&exponential);
+    let direct = e.add(b, &direct);
+    let negative = e.neg(&difference);
+    let negative = e.select(&large, &negative, &zero);
+    let exponential = e.exp(&negative);
+    let correction = e.log1p(&exponential);
+    let upper = e.add(a, &correction);
+    e.select(&large, &upper, &direct)
+}
+
+mod crystal_ball;
+mod sampling;
+pub(super) use crystal_ball::{
+    crystal_ball_logpdf, crystal_ball_sample, double_sided_crystal_ball_logpdf,
+    double_sided_crystal_ball_sample,
+};
+pub(super) use sampling::{
+    argus_sample, bifurcated_normal_sample, landau_sample, relativistic_breit_wigner_sample,
+    voigtian_sample,
+};
