@@ -9,7 +9,7 @@ use std::{path::Path, sync::Arc};
 
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBool, PyBytes, PyInt};
 
 use flatppl_host::flatppl_formula::DataMode;
 use flatppl_host::{
@@ -21,7 +21,15 @@ pyo3::create_exception!(_native, Error, PyException);
 
 type BatchArguments = (Vec<u64>, Vec<Vec<Option<usize>>>);
 
-type NativeTerm = (NativeModule, Vec<String>, String, Vec<Vec<String>>);
+type NativeCell = (Vec<String>, Vec<u64>);
+type NativeCellArguments<'py> = Vec<(Vec<String>, Vec<Bound<'py, PyAny>>)>;
+type NativeTerm = (
+    NativeModule,
+    Vec<String>,
+    String,
+    Vec<Vec<String>>,
+    Vec<NativeCell>,
+);
 type NativeNormalCoordinates = (
     NativeModule,
     NativeModule,
@@ -46,6 +54,33 @@ fn input_path(mut path: Vec<String>) -> PyResult<flatppl_host::InputPath> {
 fn path_parts(path: &flatppl_host::InputPath) -> Vec<String> {
     std::iter::once(path.input.clone())
         .chain(path.fields.iter().cloned())
+        .collect()
+}
+
+fn cell_parts(cell: &flatppl_host::InputCell) -> NativeCell {
+    (path_parts(&cell.path), cell.indices.clone())
+}
+
+fn input_cells(changed: NativeCellArguments<'_>) -> PyResult<Vec<flatppl_host::InputCell>> {
+    changed
+        .into_iter()
+        .map(|(path, indices)| {
+            let indices = indices
+                .into_iter()
+                .map(|index| {
+                    if index.is_instance_of::<PyBool>() || !index.is_instance_of::<PyInt>() {
+                        return Err(PyValueError::new_err(
+                            "array cell indices must be nonnegative integers",
+                        ));
+                    }
+                    index.extract::<u64>()
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(flatppl_host::InputCell {
+                path: input_path(path)?,
+                indices,
+            })
+        })
         .collect()
 }
 
@@ -305,6 +340,7 @@ impl NativeContext {
                     "sign": term.sign, "multiplicity": term.multiplicity,
                     "parameters": term.parameters, "data": term.data,
                     "input_paths": paths(&term.input_paths),
+                    "input_cells": term.input_cells.iter().map(cell_parts).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
@@ -340,6 +376,9 @@ impl NativeContext {
             "parameters": model.parameters, "data": model.data,
             "components": model.components, "unused_parameters": model.unused_parameters,
             "input_paths": paths(&model.input_paths), "terms": terms,
+            "input_arrays": model.input_arrays.iter().map(|array| json!({
+                "path": path_parts(&array.path), "shape": array.shape,
+            })).collect::<Vec<_>>(),
             "normal_coordinates": coordinates, "reductions": reductions,
             "summaries": report.summaries, "preparation_refusal": report.preparation_refusal,
             "preparing": preparing, "sufficient_statistics": sufficient_statistics,
@@ -476,6 +515,7 @@ impl NativeIncrementalPlan {
                     term.dependencies.clone(),
                     term.cache_input.clone(),
                     term.input_paths.iter().map(path_parts).collect(),
+                    term.input_cells.iter().map(cell_parts).collect(),
                 )
             })
             .collect()
@@ -500,6 +540,11 @@ impl NativeIncrementalPlan {
             .collect::<PyResult<Vec<_>>>()?;
         self.inner
             .affected_paths(&paths)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn affected_cells(&self, changed: NativeCellArguments<'_>) -> PyResult<Vec<usize>> {
+        self.inner
+            .affected_cells(&input_cells(changed)?)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
     fn revisions(&self) -> NativeScoreRevisions {
@@ -541,6 +586,11 @@ impl NativeScoreRevisions {
             .collect::<PyResult<Vec<_>>>()?;
         self.inner
             .invalidate_paths(&paths)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn invalidate_cells(&mut self, changed: NativeCellArguments<'_>) -> PyResult<Vec<usize>> {
+        self.inner
+            .invalidate_cells(&input_cells(changed)?)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
     fn accept(&mut self, ticket: &mut NativeScoreTicket) -> bool {

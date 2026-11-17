@@ -677,6 +677,7 @@ impl Context {
                 query: self.prepared_query(module, query)?,
                 dependencies: term.dependencies.clone(),
                 input_paths: term.input_paths.clone(),
+                input_cells: term.input_cells.clone(),
                 cache_input: term.cache_input.clone(),
             });
         }
@@ -686,6 +687,7 @@ impl Context {
             combine,
             plan.inputs,
             plan.input_paths,
+            plan.input_arrays,
         ))
     }
 
