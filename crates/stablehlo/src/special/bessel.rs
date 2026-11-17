@@ -211,7 +211,7 @@ impl Emitter<'_> {
         let negative = self.compare("LT", &state[1], &zero);
         let minus = self.neg(&value);
         let value = self.select(&negative, &minus, &value);
-        let converged = self.compare("NE", &state[3], &zero);
+        let converged = self.compare("GT", &state[3], &zero);
         let nan = self.scalar(f64::NAN);
         self.select(&converged, &value, &nan)
     }

@@ -60,6 +60,15 @@ for dtype in ("f32", "f64"):
             np.testing.assert_allclose(
                 got, case["value"], rtol=rtol, atol=np.finfo(typ).tiny
             )
+        for case in row.get("failure_cases", []):
+            args = [jnp.asarray(a, dtype=typ) for a in case["args"]]
+            raw = jax.jit(lambda *args, source=module: hlo_call(*args, source=source))(
+                *args
+            )
+            status = re.search(r"flatppl.runtime_status\s*=\s*(\d+)", module)
+            assert status is not None
+            assert int(raw[int(status[1])]) == case["status"]
+            assert np.isnan(raw[0])
         point = [jnp.asarray(a, dtype=typ) for a in row["point"]]
         gradient = jax.jit(jax.grad(call, argnums=tuple(range(len(point)))))
         gradient_cases = [{"args": row["point"], "gradient": row["gradient"]}]

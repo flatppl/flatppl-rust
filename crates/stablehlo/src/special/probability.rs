@@ -660,7 +660,7 @@ impl Emitter<'_> {
         };
         let value = self.select(&infinite_x, &infinite_endpoint, &value);
         let converged = self.select(&use_series, &series[2], &fraction[4]);
-        let converged = self.compare("NE", &converged, &zero);
+        let converged = self.compare("GT", &converged, &zero);
         let converged = self.or(&converged, &use_temme);
         let converged = self.or(&converged, &use_small);
         let invalid = self.not(&valid);
@@ -843,7 +843,7 @@ impl Emitter<'_> {
         };
         let value = self.select(&interior, &value, &endpoint);
         let converged = self.select(&use_small, &small_done, &state[3]);
-        let converged = self.compare("NE", &converged, &zero);
+        let converged = self.compare("GT", &converged, &zero);
         let endpoint = self.not(&interior);
         let converged = self.or(&converged, &endpoint);
         let invalid = self.not(&valid);
