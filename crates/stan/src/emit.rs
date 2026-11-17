@@ -16,6 +16,7 @@ mod elementwise;
 mod functions;
 mod pattern;
 mod ranges;
+mod statistics;
 mod structure;
 
 /// Expression precedence, loosest first, as Stan parses it.
@@ -413,6 +414,13 @@ impl<'m> Emitter<'m> {
     ) -> Result<StanType> {
         // Collect the extents first, then name them, so the size closure does
         // not borrow `self` while `declare` runs.
+        if self
+            .fctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.plan_arrays.is_some())
+        {
+            return declare(ty, vs, bounded, &mut |n| n.to_string(), node);
+        }
         let mut extents = Vec::new();
         declare(
             ty,
@@ -696,6 +704,18 @@ impl<'m> Emitter<'m> {
     /// expression: its own variable, filled by loops, keeps the rest
     /// vectorized.
     fn hoist(&mut self, id: NodeId, what: &str, refused: Refusal) -> Result<Ex> {
+        if let Some((_, expr)) = self
+            .fctx
+            .as_ref()
+            .and_then(|ctx| ctx.plan_arrays.as_ref())
+            .and_then(|arrays| {
+                arrays
+                    .iter()
+                    .find(|(old, _)| self.m.structural_eq(*old, id))
+            })
+        {
+            return Ok(expr.clone());
+        }
         match &self.owner {
             Some((_, root)) if *root == id => Err(refused),
             owner => {
@@ -703,7 +723,11 @@ impl<'m> Emitter<'m> {
                     Some((name, _)) => format!("{name}_{what}"),
                     None => what.to_string(),
                 };
-                Ok(Ex::atom(self.place(&base, id, Err(refused))?))
+                let expr = Ex::atom(self.place(&base, id, Err(refused))?);
+                if let Some(arrays) = self.fctx.as_mut().and_then(|ctx| ctx.plan_arrays.as_mut()) {
+                    arrays.push((id, expr.clone()));
+                }
+                Ok(expr)
             }
         }
     }
@@ -950,6 +974,22 @@ impl<'m> Emitter<'m> {
             })
         };
         match (head, args.as_slice()) {
+            ("builtin_logdensityof", [law, parameters, point])
+                if matches!(self.m.node(*law), Node::Const(s) if self.name(*s) == "Normal")
+                    && self.head(*parameters) == Some("record") =>
+            {
+                let parameters = self.law_args("Normal", *parameters)?;
+                let &[mu, sigma] = parameters.as_slice() else {
+                    return Err(Refusal::not_yet(Some(id), "Normal density parameters"));
+                };
+                let y = self.expr(*point)?;
+                let mu = self.expr(mu)?;
+                let sigma = self.expr(sigma)?;
+                Ok(Ex::atom(format!(
+                    "normal_lpdf({} | {}, {})",
+                    y.s, mu.s, sigma.s
+                )))
+            }
             ("add", [a, b]) => bin(self, "+", P_ADD, *a, *b),
             ("sub", [a, b]) => bin(self, "-", P_ADD, *a, *b),
             ("mul", [a, b]) => bin(self, "*", P_MUL, *a, *b),
@@ -1130,6 +1170,12 @@ impl<'m> Emitter<'m> {
                 format!("`{name}` (its Stan mapping is unverified)"),
             )),
             "builtin" | "helper" => Ok(row),
+            "operator"
+                if row.status == "verified"
+                    && matches!(name, "isfinite" | "iszero" | "land" | "lall") =>
+            {
+                Ok(row)
+            }
             _ => Err(Refusal::not_yet(Some(id), name.to_string())),
         }
     }

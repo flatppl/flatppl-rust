@@ -471,6 +471,8 @@ impl<'m> Emitter<'m> {
     /// Emit the likelihood statements: each observed value becomes a data
     /// variable, and the output variate is `~` its law.
     fn observe(&mut self, obs: Vec<Observation>) -> Result<()> {
+        let mut conditioned = Vec::new();
+        let mut factors = Vec::new();
         for o in obs {
             let lhs = match self.observed_value(&o) {
                 Ok(lhs) => lhs,
@@ -489,7 +491,21 @@ impl<'m> Emitter<'m> {
                 self.env.insert(d, lhs.clone());
             }
             let lines = self.tilde(&lhs, o.law)?;
-            self.lik.extend(lines);
+            let site = self.normal_site(&lhs, o.value, o.law, conditioned.len());
+            factors.push((lines, site));
+            if let Some(draw) = o.draw
+                && (self.json.contains_key(&lhs) || self.deferred.iter().any(|d| d.stan == lhs))
+            {
+                conditioned.push(draw);
+            }
+        }
+        // Allocate ordinary data and model names before adding any summaries.
+        for (ordinary, site) in factors {
+            if let Some(score) = site.and_then(|s| self.observed_normal(s, &conditioned)) {
+                self.lik.push(score);
+            } else {
+                self.lik.extend(ordinary);
+            }
         }
         Ok(())
     }

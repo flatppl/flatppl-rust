@@ -784,6 +784,7 @@ version = "0.1.0"
 dependencies = [
  "flatppl-core",
  "flatppl-infer",
+ "flatppl-model-analysis",
  "flatppl-syntax",
  "ron",
  "serde",

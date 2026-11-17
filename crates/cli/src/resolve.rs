@@ -304,7 +304,7 @@ impl CliResolver {
     }
 
     /// The inferred source spelling stays within the language's closed file schemes.
-    #[cfg(any(feature = "determinize", feature = "stablehlo"))]
+    #[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
     fn data_identity(&self, location: &Location) -> String {
         let mounted = self.members.borrow().get(&location.display()).cloned();
         if let Some((bundle, member)) = mounted {
@@ -568,7 +568,7 @@ pub fn build_bundle(
 }
 
 /// Preserve each data source's declaring location when compilation grafts modules.
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 pub fn compilation_bundle(
     root: &mut Module,
     root_loc: &Location,

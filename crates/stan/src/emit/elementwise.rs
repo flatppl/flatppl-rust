@@ -81,6 +81,13 @@ impl<'m> Emitter<'m> {
         if rank == 0 {
             return self.expr(node);
         }
+        if self
+            .fctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.plan_arrays.is_some() && ctx.lifted.contains_key(&node))
+        {
+            return self.elem_indexed(node, node, idx);
+        }
         let c = self.call(node);
         match self.head(node) {
             Some("broadcast") => {
