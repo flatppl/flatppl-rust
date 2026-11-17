@@ -62,6 +62,22 @@ fn inputs(module: &Module) -> Vec<String> {
 }
 
 #[test]
+fn preparation_preserves_the_failing_node_and_reason() {
+    let query = lower("x=elementof(reals)\ninputs=x\noutputs=x", false);
+    let report = &mut flatppl_determinizer::ReductionReport::default();
+    let shared = flatppl_model_analysis::prepare_likelihood(&query, &[]).unwrap_err();
+    let legacy =
+        flatppl_determinizer::prepare_likelihood_with_report(&query, &[], report).unwrap_err();
+    assert_eq!(legacy.node, shared.node);
+    assert_eq!(legacy.construct, "prepare_likelihood");
+    assert_eq!(
+        legacy.reason,
+        "no supported sufficient-statistic likelihood factor"
+    );
+    assert_eq!(legacy.reason, shared.reason);
+}
+
+#[test]
 fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
     // Each distinct family rule must produce ordinary, serializable FlatPDL.
     // Values and gradients have independent execution oracles outside this crate.

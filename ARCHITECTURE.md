@@ -206,9 +206,10 @@ rates and extra ancestors retain refusal or the opt-in numerical fallback.
 
 ## Shared likelihood summaries
 
-`flatppl-determinizer::sufficient_statistics` rewrites independent likelihood
-reductions after measure lowering. It emits ordinary FlatPDL bindings for
-data-only summaries and ordinary expressions for scoring. No target-specific
+`flatppl-model-analysis::sufficient_statistics` rewrites independent likelihood
+reductions after measure lowering. The pass emits ordinary FlatPDL bindings for
+data-only summaries and ordinary expressions for scoring. The determinizer calls
+the shared pass through its existing reduction and preparation APIs. No target-specific
 operation or execution cache enters the IR. Later backends can bake fixed
 summaries, place them in a setup block, or compile the explicit preparation and
 scoring queries returned by `prepare_likelihood`.

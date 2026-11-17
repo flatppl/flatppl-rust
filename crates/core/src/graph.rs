@@ -116,3 +116,29 @@ pub fn retain_reachable(m: &mut Module, roots: &[Symbol]) {
     }
     m.retain_bindings(&keep);
 }
+
+/// Add the terms in a balanced tree. Each pair contains adjacent terms in
+/// their original order. This keeps the depth logarithmic.
+///
+/// # Panics
+///
+/// Panics if `terms` is empty.
+pub fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
+    debug_assert!(!terms.is_empty(), "fold_add requires at least one term");
+    // Pair front-to-back into `level`, then repeat over that. An odd tail term
+    // carries forward unpaired, which keeps the sequence order and leaves
+    // N <= 2 byte-identical to the old left fold.
+    let mut level: Vec<NodeId> = terms.to_vec();
+    let mut next: Vec<NodeId> = Vec::new();
+    while level.len() > 1 {
+        next.clear();
+        next.reserve(level.len().div_ceil(2));
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for pair in pairs {
+            next.push(build_call(m, "add", &[pair[0], pair[1]]));
+        }
+        next.extend_from_slice(remainder);
+        std::mem::swap(&mut level, &mut next);
+    }
+    level[0]
+}

@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-model-analysis"
-description = "Dependency and coordinate analysis for typed FlatPPL query graphs."
+description = "Dependency analysis, likelihood reductions and coordinate maps for typed FlatPPL queries."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

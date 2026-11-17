@@ -19,6 +19,7 @@ pub mod graph;
 pub mod id;
 mod module;
 pub mod node;
+pub mod query;
 pub mod text;
 pub mod ty;
 pub mod width_classes;
