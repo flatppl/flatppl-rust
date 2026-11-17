@@ -7609,9 +7609,9 @@ fn broadcast_type(
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
         ("builtin_logdensityof", [_, _, _]) => Type::Scalar(ScalarType::Real),
-        ("add" | "sub" | "mul" | "divide" | "pow" | "min" | "max", [a, b]) => {
-            promote2(Some(a), Some(b))
-        }
+        ("add" | "sub" | "mul" | "pow" | "min" | "max", [a, b]) => promote2(Some(a), Some(b)),
+        // §07 `divide` is `a / b`: integers divide as reals, cell by cell too.
+        ("divide", [a, b]) => divide_type(Some(a), Some(b)),
         ("neg", [a]) => a.clone(),
         ("loggamma" | "real" | "imag", [_]) => Type::Scalar(ScalarType::Real),
         ("complex", [_, _]) | ("cis", [_]) => Type::Scalar(ScalarType::Complex),
