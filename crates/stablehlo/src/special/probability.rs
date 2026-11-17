@@ -112,7 +112,7 @@ impl Emitter<'_> {
     }
     /// a log(x) - x - log Gamma(a), with the large-shape cancellation
     /// removed analytically near x=a.
-    fn gamma_log_prefactor(&mut self, a: &Value, x: &Value) -> Value {
+    pub(crate) fn gamma_log_prefactor(&mut self, a: &Value, x: &Value) -> Value {
         let logx = self.log(x);
         let power = self.mul(a, &logx);
         let gamma = self.lgamma(a);
@@ -139,7 +139,7 @@ impl Emitter<'_> {
         let corrected = self.sub(&corrected, &remainder);
         self.select(&stable, &corrected, &direct)
     }
-    fn special_log1pmx(&mut self, delta: &Value) -> Value {
+    pub(crate) fn special_log1pmx(&mut self, delta: &Value) -> Value {
         let magnitude = self.abs(delta);
         let threshold = self.scalar(0.125);
         let small = self.compare("LT", &magnitude, &threshold);
@@ -236,7 +236,7 @@ impl Emitter<'_> {
         self.select(&small, &signed, x)
     }
 
-    pub(super) fn regularized_gamma(&mut self, a: &Value, x: &Value) -> Value {
+    pub(crate) fn regularized_gamma(&mut self, a: &Value, x: &Value) -> Value {
         let a = self.convert(a, ElemKind::Real);
         let x = self.convert(x, ElemKind::Real);
         let (a, x) = self.broadcast_pair(&a, &x);

@@ -63,19 +63,6 @@ fn emit(src: &str) -> String {
     .expect("must emit @logdensity")
 }
 
-fn emit_err(src: &str) -> String {
-    let err = flatppl_stablehlo::emit(
-        &determinize_abi(src),
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions {
-            restrict_enzyme_compatible: false,
-            ..Default::default()
-        },
-    )
-    .expect_err("must refuse");
-    format!("{err:?}")
-}
-
 // CrystalBall's density is piecewise, so the emission needs a `compare` + `select`
 // pair for the tail/core branch, and its normalizer needs `chlo.erf` for the
 // Gaussian core's integral. A runtime `alpha` keeps erf from constant-folding.
@@ -99,22 +86,10 @@ outputs = lp";
     );
 }
 
-// Argus at §09's typical `power = 0.5`: the incomplete-gamma normalizer collapses
-// to `erf`, so it emits without an igamma op (which this emitter does not carry).
-// A runtime `slope` keeps erf from constant-folding.
 #[test]
-fn argus_at_power_half_emits_an_erf_normalizer() {
-    let src = "\
-hep = standard_module(\"particle-physics\", \"0.1\")
-x = elementof(reals)
-c = elementof(reals)
-lp = logdensityof(hep.Argus(resonance = 5.29, slope = c, power = 0.5), x)
-inputs = (x, c)
-outputs = lp";
-    let mlir = emit(src);
-    assert!(
-        mlir.contains("chlo.erf"),
-        "the power = 0.5 normalizer is erf-expressible:\n{mlir}"
+fn argus_accepts_runtime_slope_and_power() {
+    emit(
+        "hep=standard_module(\"particle-physics\",\"0.1\")\nx=external(reals)\nc=external(reals)\np=external(posreals)\ninputs=(x,c,p)\noutputs=logdensityof(hep.Argus(5.29,c,p),x)",
     );
 }
 
@@ -162,44 +137,30 @@ fn iid_over_a_hep_member_emits_a_batched_density() {
     }
 }
 
-// The batched kernel input wraps each per-batch-constant parameter in a size-1
-// `vector`. `argus_logpdf` reads `power` STRUCTURALLY (its normalizer has a
-// closed form only at 0.5), so it is the one §09 builder that notices, and it
-// strips the wrapper via `unbatch_field_id`. Without the strip, a batched Argus
-// refused as a non-literal `power` even when the literal was 0.5.
 #[test]
-fn batched_argus_still_reads_its_literal_power() {
-    let src = "\
-hep = standard_module(\"particle-physics\", \"0.1\")
-obs = [5.1, 5.15, 5.2]
-x = elementof(reals)
-lp = logdensityof(iid(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), 3), obs)
-inputs = (x)
-outputs = lp";
-    let msg = emit_err(src);
-    assert!(
-        msg.contains("lower incomplete gamma"),
-        "a batched non-0.5 power must reach the SAME refusal as the scalar case, \
-         not a spurious non-literal one: {msg}"
+fn batched_argus_accepts_a_runtime_power() {
+    let output = emit(
+        "hep=standard_module(\"particle-physics\",\"0.1\")\nobs=external(cartpow(reals,3))\np=external(posreals)\ninputs=(obs,p)\noutputs=logdensityof(iid(hep.Argus(5.29,20.0,p),3),obs)",
     );
+    assert!(output.contains("tensor<3xf32>"));
 }
 
-// Refuse-don't-mislower: at any other `power` the normalizer is a genuine lower
-// incomplete gamma, for which there is no lowering here. The refusal names the
-// missing function rather than guessing a normalizer.
 #[test]
-fn argus_at_another_power_refuses_naming_the_incomplete_gamma() {
-    let src = "\
-hep = standard_module(\"particle-physics\", \"0.1\")
-x = elementof(reals)
-lp = logdensityof(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), x)
-inputs = (x)
-outputs = lp";
-    let msg = emit_err(src);
-    assert!(
-        msg.contains("lower incomplete gamma"),
-        "the refusal must name the missing function: {msg}"
-    );
+fn landau_and_voigtian_accept_runtime_parameters() {
+    for (arguments, constructor) in [
+        (
+            "loc=external(reals)\nscale=external(posreals)\ninputs=(x,loc,scale)",
+            "Landau(loc,scale)",
+        ),
+        (
+            "mean=external(reals)\nwidth=external(posreals)\nsigma=external(posreals)\ninputs=(x,mean,width,sigma)",
+            "Voigtian(mean,width,sigma)",
+        ),
+    ] {
+        emit(&format!(
+            "hep=standard_module(\"particle-physics\",\"0.1\")\nx=external(reals)\n{arguments}\noutputs=logdensityof(hep.{constructor},x)"
+        ));
+    }
 }
 
 // ---- §09 ContinuedPoisson ---------------------------------------------------
