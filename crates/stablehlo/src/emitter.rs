@@ -47,6 +47,8 @@ mod enzyme;
 #[path = "integration.rs"]
 mod integration;
 pub(crate) use integration::IntegralKind;
+#[path = "kronecker.rs"]
+mod kronecker;
 #[path = "likelihood_reductions.rs"]
 mod likelihood_reductions;
 #[path = "linalg.rs"]
@@ -4553,6 +4555,17 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_matrix_exp_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_kronecker_call(id, f, &args[1..], true) {
+            return result;
+        }
+        if let Node::Const(symbol) = self.m.node(f)
+            && let [_, value] = args
+            && crate::complex::complex_leaf(self.type_of(*value))
+            && matches!(self.m.resolve(*symbol), "real" | "imag" | "abs" | "abs2")
+        {
+            let name = self.m.resolve(*symbol).to_owned();
+            return crate::complex::project(self, id, &name, *value);
+        }
         let fname = match self.m.node(f) {
             Node::Const(sym) => self.m.resolve(*sym).to_string(),
             _ => {
@@ -4978,6 +4991,7 @@ impl<'m> Emitter<'m> {
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
                     .unwrap_or_else(|| {
                         Err(EmitError::at(
                             id,

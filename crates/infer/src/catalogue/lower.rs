@@ -88,6 +88,16 @@ fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
         ElemSig::OfArg(i) => {
             elem_scalar_kind((ctx.arg_type)(*i).as_ref()).unwrap_or(ScalarType::Real)
         }
+        ElemSig::PromoteArgs(args) => args.iter().fold(ScalarType::Integer, |kind, &i| {
+            let actual = elem_scalar_kind((ctx.arg_type)(i).as_ref()).unwrap_or(ScalarType::Real);
+            if kind == ScalarType::Complex || actual == ScalarType::Complex {
+                ScalarType::Complex
+            } else if kind == ScalarType::Real || actual == ScalarType::Real {
+                ScalarType::Real
+            } else {
+                ScalarType::Integer
+            }
+        }),
     }
 }
 

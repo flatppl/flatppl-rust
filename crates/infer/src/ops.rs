@@ -7595,7 +7595,8 @@ fn broadcast_type(
             promote2(Some(a), Some(b))
         }
         ("neg", [a]) => a.clone(),
-        ("loggamma" | "real", [_]) => Type::Scalar(ScalarType::Real),
+        ("loggamma" | "real" | "imag", [_]) => Type::Scalar(ScalarType::Real),
+        ("complex", [_, _]) | ("cis", [_]) => Type::Scalar(ScalarType::Complex),
         (
             "exp" | "log" | "sqrt" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1" | "abs"
             | "sin" | "cos" | "tan" | "atan" | "tanh",

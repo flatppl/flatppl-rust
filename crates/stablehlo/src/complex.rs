@@ -70,7 +70,8 @@ pub(crate) fn parts(
             Node::Call(c) => {
                 if let CallHead::User(callee) = c.head {
                     return e
-                        .lower_bessel_parts(id, callee, &c.args, false)
+                        .lower_kronecker_parts(id, callee, &c.args, false)
+                        .or_else(|| e.lower_bessel_parts(id, callee, &c.args, false))
                         .unwrap_or_else(|| {
                             Err(EmitError::at(
                                 id,
@@ -85,6 +86,63 @@ pub(crate) fn parts(
                     ));
                 };
                 let head = e.resolve(head).to_owned();
+                if matches!(head.as_str(), "get" | "get0")
+                    && let [container, selector] = c.args.as_ref()
+                    && !matches!(e.node(*selector), Node::Lit(flatppl_core::Scalar::Str(_)))
+                {
+                    let (re, im) = parts(e, *container, memo)?;
+                    let base = i64::from(head == "get");
+                    return Ok((
+                        crate::ops::get_outer(e, id, re, *selector, base)?,
+                        crate::ops::get_outer(e, id, im, *selector, base)?,
+                    ));
+                }
+                if head == "vector" {
+                    let coordinates = c
+                        .args
+                        .iter()
+                        .map(|&arg| parts(e, arg, memo))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let re = coordinates
+                        .iter()
+                        .map(|(re, _)| re.clone())
+                        .collect::<Vec<_>>();
+                    let im = coordinates
+                        .into_iter()
+                        .map(|(_, im)| im)
+                        .collect::<Vec<_>>();
+                    return Ok((e.vector(&re), e.vector(&im)));
+                }
+                if matches!(head.as_str(), "rowstack" | "colstack")
+                    && let [vectors] = c.args.as_ref()
+                {
+                    let (mut re, mut im) = parts(e, *vectors, memo)?;
+                    if head == "colstack" {
+                        let crate::mlir::MlirTy::Ranked(dims) = &re.ty else {
+                            return Err(EmitError::at(id, "colstack requires vector cells"));
+                        };
+                        let rank = dims.len();
+                        let mut permutation = (0..rank as u64).collect::<Vec<_>>();
+                        permutation.swap(rank - 2, rank - 1);
+                        re = e.transpose(&re, &permutation);
+                        im = e.transpose(&im, &permutation);
+                    }
+                    return Ok((e.with_typed_axes(id, re), e.with_typed_axes(id, im)));
+                }
+                if head == "broadcast"
+                    && let Some((callee, args)) = c.args.split_first()
+                {
+                    if let Some(result) = e.lower_kronecker_parts(id, *callee, args, true) {
+                        return result;
+                    }
+                    if matches!(e.node(*callee), Node::Const(s) if e.resolve(*s) == "complex")
+                        && let [re, im] = args
+                    {
+                        let re = e.lower_node(*re)?;
+                        let im = e.lower_node(*im)?;
+                        return Ok(e.broadcast_pair(&re, &im));
+                    }
+                }
                 if head == "broadcast"
                     && let Some((callee, args)) = c.args.split_first()
                     && let Some(result) = e.lower_bessel_parts(id, *callee, args, true)
