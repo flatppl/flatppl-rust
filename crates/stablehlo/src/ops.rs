@@ -2545,7 +2545,7 @@ fn lower_binary_extremum(
 /// The result shape is read off `id`'s OWN inferred type, not by lowering
 /// `size`: inference has already resolved the result shape, including sizes
 /// spelled as `lengthof(v)` by the determiniser. An
-/// unknown scalar extent can also be recovered from a folded size expression.
+/// unknown extent can also be recovered from a folded scalar or vector size.
 /// Runtime extents refuse — `broadcast_in_dim` needs a static result shape.
 ///
 /// A fill value whose kind OUTRANKS the array's element kind is refused too:
@@ -2555,9 +2555,23 @@ fn lower_binary_extremum(
 fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [x_id, size] = args_exact(id, args)?;
     let (mut ty, kind) = e.node_ty(id)?;
-    if ty == MlirTy::Ranked(vec![None]) {
+    if let MlirTy::Ranked(dims) = &ty
+        && dims.iter().any(Option::is_none)
+    {
         let value = e.lower_node(size)?;
-        if let Some(n) = e.constant_extent(&value) {
+        if let Some(sizes) = e.constant_integer_vector(&value)
+            && sizes.len() <= dims.len()
+            && sizes.iter().all(|&n| n >= 0)
+        {
+            let mut resolved = sizes
+                .into_iter()
+                .map(|n| Some(n as u64))
+                .collect::<Vec<_>>();
+            resolved.extend_from_slice(&dims[resolved.len()..]);
+            ty = MlirTy::Ranked(resolved);
+        } else if ty == MlirTy::Ranked(vec![None])
+            && let Some(n) = e.constant_extent(&value)
+        {
             ty = MlirTy::Ranked(vec![Some(n)]);
         }
     }
