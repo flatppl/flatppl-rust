@@ -13,6 +13,7 @@ mod expression;
 mod family;
 mod formula;
 mod metadata;
+mod monotonic;
 mod nonlinear;
 mod ordinal;
 mod prior_expr;
@@ -32,6 +33,7 @@ pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
 pub use flatppl_data::{Column, ColumnValues, Table};
 pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, parse_formula};
+pub use monotonic::Monotonic;
 pub use nonlinear::NonlinearPredictor;
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 pub use splines::{Smooth, ThinPlate};
@@ -194,6 +196,8 @@ pub struct PredictorRecipe {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub smooths: Vec<Smooth>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monotonic: Vec<Monotonic>,
     pub priors: Priors,
 }
 
@@ -568,6 +572,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             .map(|offset| offset.values(table, &rows))
             .transpose()?
             .map_or(0.0, |values| values.iter().sum::<f64>() / rows.len() as f64);
+        let monotonic = formula
+            .monotonic
+            .iter()
+            .map(|column| Monotonic::fit(table.column(column)?, &rows))
+            .collect::<Result<Vec<_>>>()?;
         let groups = formula
             .groups
             .iter()
@@ -651,6 +660,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 means,
                 groups,
                 smooths,
+                monotonic,
                 priors,
             },
         );

@@ -428,6 +428,16 @@ fn prepare_predictor(
     rows: &[usize],
     constants: &mut BTreeMap<String, DataValue>,
 ) -> Result<()> {
+    for (i, (coding, column)) in recipe
+        .monotonic
+        .iter()
+        .zip(&recipe.formula.monotonic)
+        .enumerate()
+    {
+        let codes = coding.codes(table.column(column)?, rows)?;
+        let name = crate::emit::predictor_name(dpar, &format!("mo_{}", i + 1));
+        constants.insert(name, DataValue::Integers(codes));
+    }
     for (smooth, term) in recipe.smooths.iter().zip(&recipe.formula.smooths) {
         let column = table.column(&term.column)?;
         let values = smooth.basis.evaluate(&column.numeric(rows)?)?;

@@ -222,6 +222,9 @@ pub(crate) fn predictor_name(dpar: &str, name: &str) -> String {
 }
 
 fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::PredictorRecipe) {
+    for i in 1..=recipe.monotonic.len() {
+        external_vector(b, &predictor_name(dpar, &format!("mo_{i}")), "posintegers");
+    }
     for (i, smooth) in recipe.smooths.iter_mut().enumerate() {
         smooth.inputs = (0..smooth.basis.transform[0].len())
             .map(|j| {
@@ -371,6 +374,22 @@ fn predictor_parameters(
         let rank = b.lit_int(smooth.inputs.len() as i64 - 1);
         let law = b.call("iid", &[normal, rank]);
         declare_parameter(b, &smooth.z, law, parameters);
+    }
+    for (i, coding) in recipe.monotonic.iter().enumerate() {
+        let index = i + 1;
+        let name = predictor_name(dpar, &format!("bmo_{index}"));
+        parameter(b, &name, &recipe.priors.bmo[i], None, parameters, family)?;
+        let name = predictor_name(dpar, &format!("simo_{index}"));
+        let steps = coding.steps();
+        let law = crate::prior_expr::emit_simplex(b, &recipe.priors.simo[i], steps)?;
+        if steps == 1 {
+            // A two-level predictor has only one possible simplex.
+            let one = b.lit_real(1.0);
+            let singleton = b.array(&[one]);
+            b.bind(&name, singleton);
+        } else {
+            declare_parameter(b, &name, law, parameters);
+        }
     }
     for (i, group) in recipe.groups.iter_mut().enumerate() {
         group.sd = b.alloc_name(&predictor_name(dpar, &format!("sd_{}", group.column)));
@@ -523,6 +542,22 @@ fn predictor_values(
         let random = b.call("mul", &[random, coefficients]);
         let smooth = broadcast(b, "add", &[fixed, random]);
         eta = broadcast(b, "add", &[eta, smooth]);
+    }
+    for (i, coding) in recipe.monotonic.iter().enumerate() {
+        let index = i + 1;
+        let simplex = b.self_ref(&predictor_name(dpar, &format!("simo_{index}")));
+        let prefix = b.call("cumsum", &[simplex]);
+        let zero = b.lit_real(0.0);
+        let baseline = b.array(&[zero]);
+        let levels = b.call("cat", &[baseline, prefix]);
+        let codes = b.self_ref(&predictor_name(dpar, &format!("mo_{index}")));
+        let selected = b.call("get", &[levels, codes]);
+        let slope = b.self_ref(&predictor_name(dpar, &format!("bmo_{index}")));
+        // brms defines the slope per step, so the total change is steps times the slope.
+        let steps = b.lit_real(coding.steps() as f64);
+        let total = b.call("mul", &[slope, steps]);
+        let contribution = broadcast(b, "mul", &[selected, total]);
+        eta = broadcast(b, "add", &[eta, contribution]);
     }
     for (i, group) in recipe.groups.iter().enumerate() {
         let mut columns = design_columns(b, &group.design, &group.inputs);
@@ -1133,6 +1168,36 @@ fn predictor_info(
                 &smooth.z,
                 &[j],
                 ParameterRole::Sampled,
+            );
+        }
+    }
+    for (i, (coding, column)) in recipe
+        .monotonic
+        .iter()
+        .zip(&recipe.formula.monotonic)
+        .enumerate()
+    {
+        let name = crate::monotonic::coefficient(column);
+        if !names.insert(name.clone()) {
+            return Err(Error(format!(
+                "design columns have duplicate brms name `{name}`"
+            )));
+        }
+        let index = i + 1;
+        let slope = predictor_name(dpar, &format!("bmo_{index}"));
+        add(
+            format!("b_{prefix}{name}"),
+            &slope,
+            &[],
+            parameter_role(module, &slope),
+        );
+        let simplex = predictor_name(dpar, &format!("simo_{index}"));
+        for j in 1..=coding.steps() as usize {
+            add(
+                format!("simo_{prefix}{name}1[{j}]"),
+                &simplex,
+                &[j],
+                parameter_role(module, &simplex),
             );
         }
     }

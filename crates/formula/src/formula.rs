@@ -17,6 +17,8 @@ pub struct Formula {
     pub groups: Vec<GroupTerm>,
     #[serde(default)]
     pub smooths: Vec<SmoothTerm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monotonic: Vec<String>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
 }
@@ -101,6 +103,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
     let mut smooths = Vec::new();
+    let mut monotonic = Vec::new();
     // R records offset calls separately from coefficient terms, including
     // calls appearing after subtraction. Negation belongs inside offset().
     let offsets = parser
@@ -116,6 +119,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             Atom::Groups(terms) => groups.extend(terms.iter().cloned()),
             Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
             Atom::Offset(_) => {}
+            Atom::Monotonic(column) => monotonic.push(column.clone()),
             Atom::Smooth(smooth) => {
                 if smooths
                     .iter()
@@ -154,6 +158,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         fixed,
         groups,
         smooths,
+        monotonic,
         expressions,
         offsets,
     };
@@ -204,7 +209,7 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     let variable = |id| match &atoms[id] {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
-        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) => unreachable!(),
+        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
@@ -426,6 +431,7 @@ enum Atom {
     Offset(ColumnExpression),
     Groups(Vec<GroupTerm>),
     Smooth(SmoothTerm),
+    Monotonic(String),
 }
 
 struct Expr {
@@ -516,6 +522,21 @@ impl<'a> Parser<'a> {
         self.atom(Atom::Smooth(SmoothTerm { column, rank }))
     }
 
+    fn monotonic(&mut self) -> Result<Expr> {
+        let fail = || Error("monotonic terms support `mo(column)`".into());
+        self.at += 1;
+        let Token::Name(column) = self.peek() else {
+            return Err(fail());
+        };
+        let column = name(column)?;
+        self.at += 1;
+        if self.peek() != Token::Right {
+            return Err(fail());
+        }
+        self.at += 1;
+        self.atom(Atom::Monotonic(column))
+    }
+
     fn expression(&mut self, min_precedence: u8, depth: usize) -> Result<Expr> {
         if depth >= MAX_DEPTH {
             return Err(Error(format!("formula exceeds nesting limit {MAX_DEPTH}")));
@@ -526,6 +547,8 @@ impl<'a> Parser<'a> {
             Token::Name(text) => {
                 if self.peek() == Token::Left && text == "s" {
                     self.smooth()?
+                } else if self.peek() == Token::Left && text == "mo" {
+                    self.monotonic()?
                 } else if self.peek() == Token::Left {
                     if !matches!(text, "I" | "log" | "exp" | "offset") {
                         return Err(Error(format!(
@@ -717,11 +740,11 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms.iter().flatten().any(|&id| {
         matches!(
             atoms[id],
-            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
+            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_)
         )
     }) {
         return Err(Error(
-            "group terms, offsets and smooths may only be added or removed".into(),
+            "group terms, offsets, smooths and monotonic terms may only be added or removed".into(),
         ));
     }
     Ok(())
@@ -751,11 +774,11 @@ fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
         ExprKind::Atom(id)
             if matches!(
                 atoms[*id],
-                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
+                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_)
             ) =>
         {
             Err(Error(
-                "group effects cannot contain nested group terms, offsets or smooths".into(),
+                "group effects cannot contain nested group terms, offsets, smooths or monotonic terms".into(),
             ))
         }
         ExprKind::Parentheses(child) | ExprKind::Unary(_, child) => {
@@ -777,7 +800,7 @@ fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
             Atom::Expression(expression) => expression.clone(),
             _ => {
                 return Err(Error(
-                    "group effects and offsets cannot be nested in column expressions".into(),
+                    "group terms, offsets, smooths and monotonic terms cannot be nested in column expressions".into(),
                 ));
             }
         },
@@ -848,6 +871,11 @@ impl Formula {
         for smooth in &self.smooths {
             if !names.contains(&smooth.column.as_str()) {
                 names.push(&smooth.column);
+            }
+        }
+        for column in &self.monotonic {
+            if !names.contains(&column.as_str()) {
+                names.push(column);
             }
         }
         names

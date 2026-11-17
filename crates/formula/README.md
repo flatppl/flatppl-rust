@@ -86,6 +86,24 @@ uncentred intercept (coefficient `Intercept`). Group effects are independent
 across nonlinear predictors. The recipe saves every parameter design and
 prepares the response expression’s data columns on new rows.
 
+### Monotonic predictors
+
+Use an additive term such as `y ~ mo(dose) + (1 | site)` for ordered factors
+or integer scores. A real slope sets the direction and average change across
+steps. A simplex distributes that change over the steps. The lowest level
+contributes zero. For example, with three levels, slope 2 and simplex
+`[0.25, 0.75]`, the contributions are `[0, 1, 4]`.
+
+Prediction reuses the retained training order of ordered factors and the
+training range of integer scores. Unused factor levels are dropped. Gaps between integer scores retain their
+steps, and predictions can use those intermediate scores. A term supports up
+to 4,096 steps. To set priors,
+select the slope with `class = "b", coef = "modose"` and the simplex with
+`class = "simo", coef = "modose1"`. The simplex defaults to a uniform
+Dirichlet. Use `dirichlet(2)` for a symmetric prior or
+`dirichlet(c(2, 1))` to specify each concentration for a two-step term.
+With one step, the simplex is fixed at `[1]`.
+
 ### Families
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,

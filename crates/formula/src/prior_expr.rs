@@ -125,6 +125,57 @@ pub(crate) fn emit_correlation(
     )))
 }
 
+pub(crate) fn emit_simplex(
+    b: &mut Builder<'_>,
+    prior: &ResolvedPrior,
+    steps: i64,
+) -> Result<NodeId> {
+    if prior.lb.is_some() || prior.ub.is_some() {
+        return Err(Error(
+            "monotonic simplex priors do not support scalar bounds".into(),
+        ));
+    }
+    let bad_prior = || {
+        Error(format!(
+            "monotonic simplex prior requires dirichlet with positive finite concentrations for {steps} steps"
+        ))
+    };
+    let (module, root) = parse_expression(&prior.prior)?;
+    let Node::Call(call) = module.node(root) else {
+        return Err(bad_prior());
+    };
+    if !matches!(call.head, CallHead::Builtin(name) if matches!(module.resolve(name), "dirichlet" | "Dirichlet"))
+        || call.args.len() != 1
+        || !call.named.is_empty()
+    {
+        return Err(bad_prior());
+    }
+    let concentration = |node| {
+        scalar(&module, node)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(bad_prior)
+    };
+    let alpha = call.args[0];
+    let alpha = if let Node::Call(call) = module.node(alpha)
+        && matches!(call.head, CallHead::Builtin(name) if matches!(module.resolve(name), "c" | "vector"))
+    {
+        if call.args.len() as i64 != steps || !call.named.is_empty() {
+            return Err(bad_prior());
+        }
+        let values = call
+            .args
+            .iter()
+            .map(|&node| Ok(b.lit_real(concentration(node)?)))
+            .collect::<Result<Vec<_>>>()?;
+        b.array(&values)
+    } else {
+        let alpha = b.lit_real(concentration(alpha)?);
+        let count = b.lit_int(steps);
+        b.call("fill", &[alpha, count])
+    };
+    Ok(b.call("Dirichlet", &[alpha]))
+}
+
 pub(crate) fn emit(
     b: &mut Builder<'_>,
     prior: &ResolvedPrior,
