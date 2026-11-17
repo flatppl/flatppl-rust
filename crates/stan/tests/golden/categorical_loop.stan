@@ -9,7 +9,7 @@ parameters {
 }
 model {
   for (i in 1:K) {
-    theta[i] ~ dirichlet(rep_vector(1.0, 3));
+    theta[i] ~ dirichlet(ones_vector(3));
   }
   for (i in 1:N) {
     w_obs[i] ~ categorical(theta[doc][i]);

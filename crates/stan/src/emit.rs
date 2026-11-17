@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 mod elementwise;
+mod pattern;
 mod structure;
 
 /// Expression precedence, loosest first, as Stan parses it.
@@ -24,7 +25,7 @@ const P_POW: u8 = 7;
 const P_ATOM: u8 = 9;
 
 #[derive(Clone, Debug)]
-struct Ex {
+pub(crate) struct Ex {
     s: String,
     prec: u8,
 }
@@ -92,6 +93,8 @@ pub(crate) struct Emitter<'m> {
     decls: HashMap<String, StanType>,
     /// Kernel inputs inside the prior, bound by name to prior fields.
     links: Vec<(Symbol, Symbol)>,
+    /// `functions` block sources, deduplicated.
+    functions: Vec<String>,
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
@@ -151,6 +154,7 @@ impl<'m> Emitter<'m> {
             fields: HashMap::new(),
             decls: HashMap::new(),
             links: vec![],
+            functions: vec![],
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
             sizes,
@@ -646,6 +650,16 @@ impl<'m> Emitter<'m> {
             ("broadcast", [f, rest @ ..]) => self.broadcast(id, *f, rest),
             ("get", [x, sel @ ..]) => self.get(id, *x, sel),
             ("vector", elems) => self.vector(id, elems),
+            ("ones" | "zeros", [n])
+                if self.shape(id)
+                    == Some(Shape {
+                        rank: 1,
+                        int: false,
+                    }) =>
+            {
+                let size = self.expr(*n)?;
+                self.table_fn(id, head, None, vec![size])
+            }
             ("ones", [n]) => self.filled(id, "1", *n),
             ("zeros", [n]) => self.filled(id, "0", *n),
             ("fill", [x, n]) => {
@@ -656,23 +670,45 @@ impl<'m> Emitter<'m> {
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
             ("%call", _) => self.module_call(id),
             _ => {
-                if let Some((stan, _)) = tables::function(head) {
-                    let mut parts = Vec::new();
-                    for a in &args {
-                        parts.push(self.real(*a)?.s);
-                    }
-                    if !c.named.is_empty() {
-                        return Err(Refusal::not_yet(
-                            Some(id),
-                            format!("{head} with keyword arguments"),
-                        ));
-                    }
-                    Ok(Ex::atom(format!("{stan}({})", parts.join(", "))))
-                } else {
-                    Err(Refusal::not_yet(Some(id), head.to_string()))
+                if !c.named.is_empty() {
+                    return Err(Refusal::not_yet(
+                        Some(id),
+                        format!("{head} with keyword arguments"),
+                    ));
                 }
+                let mut parts = Vec::new();
+                for a in &args {
+                    parts.push(self.real(*a)?);
+                }
+                self.table_fn(id, head, None, parts)
             }
         }
+    }
+
+    /// A function from `functions.ron` applied to printed arguments.
+    fn table_fn(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        module: Option<&str>,
+        parts: Vec<Ex>,
+    ) -> Result<Ex> {
+        let row = tables::function(name, module)
+            .filter(|r| matches!(r.kind.as_str(), "builtin" | "helper"))
+            .filter(|r| r.args.len() == parts.len() && !r.args.iter().any(|a| a == "..."))
+            .ok_or_else(|| Refusal::not_yet(Some(id), name.to_string()))?;
+        if row.kind == "helper" && !self.functions.contains(&row.functions) {
+            self.functions.push(row.functions.clone());
+        }
+        let binds = row
+            .args
+            .iter()
+            .cloned()
+            .zip(parts.into_iter().map(pattern::Bound::Expr))
+            .collect();
+        let s = self.fill(&row.stan, &binds, &|_| false, None)?;
+        let prec = if is_call(&s) { P_ATOM } else { P_TERNARY };
+        Ok(Ex { s, prec })
     }
 
     /// A call into a standard module: refused until the `functions` block lands,
@@ -689,22 +725,76 @@ impl<'m> Emitter<'m> {
             },
             _ => "a callable expression".to_string(),
         };
-        if let Node::Ref(r) = self.m.node(callee)
-            && let Some((_, instead)) = tables::NO_STAN_FUNCTION
-                .iter()
-                .find(|(f, _)| *f == self.name(r.name))
-        {
-            return Err(Refusal::new(
-                RefusalKind::NoStanFunction,
+        let (Node::Ref(r), Some(module)) = (self.m.node(callee), self.standard_module(callee))
+        else {
+            return Err(Refusal::not_yet(
                 Some(id),
-                member.clone(),
-                format!("`{member}` has no Stan function; {instead}"),
+                format!("the call `{member}(…)`"),
+            ));
+        };
+        let fname = self.name(r.name);
+        if !c.named.is_empty() {
+            return Err(Refusal::not_yet(
+                Some(id),
+                format!("`{member}` with keyword arguments"),
             ));
         }
-        Err(Refusal::not_yet(
-            Some(id),
-            format!("the call `{member}(…)`"),
-        ))
+        let args = c.args.to_vec();
+        // polygamma(n, x): Stan has the orders 0 and 1 only.
+        if fname == "polygamma" && args.len() == 2 {
+            let order = match self.m.node(self.resolve(args[0])) {
+                Node::Lit(Scalar::Int(n)) => Some(*n),
+                _ => None,
+            };
+            match order {
+                Some(0) => {
+                    let x = self.real(args[1])?;
+                    return self.table_fn(id, "digamma", Some(&module), vec![x]);
+                }
+                Some(1) => {}
+                Some(_) => {
+                    return Err(Refusal::new(
+                        RefusalKind::NoStanFunction,
+                        Some(id),
+                        member.clone(),
+                        format!(
+                            "`{member}` of order 2 or more has no Stan function; Stan has \
+                             `digamma` and `trigamma` (orders 0 and 1) only"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(Refusal::not_yet(
+                        Some(id),
+                        format!("`{member}` of a computed order"),
+                    ));
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        for a in &args {
+            parts.push(self.real(*a)?);
+        }
+        self.table_fn(id, fname, Some(&module), parts)
+            .map_err(|_| Refusal::not_yet(Some(id), format!("the call `{member}(…)`")))
+    }
+
+    /// The standard-module name a callee reference resolves into.
+    fn standard_module(&self, callee: NodeId) -> Option<String> {
+        let Node::Ref(r) = self.m.node(callee) else {
+            return None;
+        };
+        let RefNs::Module(alias) = r.ns else {
+            return None;
+        };
+        let rhs = self.m.binding(self.m.binding_by_name(alias)?).rhs;
+        if self.head(rhs) != Some("standard_module") {
+            return None;
+        }
+        match self.m.node(*self.call(rhs)?.args.first()?) {
+            Node::Lit(Scalar::Str(s)) => Some(s.to_string()),
+            _ => None,
+        }
     }
 
     fn cmp(&mut self, op: &str, a: NodeId, b: NodeId) -> Result<Ex> {
@@ -883,13 +973,10 @@ impl<'m> Emitter<'m> {
                     prec: P_UNARY,
                 })
             }
-            (name, [a]) => match tables::function(name) {
-                Some((stan, true)) => {
-                    let e = self.real(*a)?;
-                    Ok(Ex::atom(format!("{stan}({})", e.s)))
-                }
-                _ => Err(Refusal::not_yet(Some(id), format!("{name}.(…)"))),
-            },
+            (name, [a]) if tables::ELEMENTWISE.contains(&name) => {
+                let e = self.real(*a)?;
+                self.table_fn(id, name, None, vec![e])
+            }
             (name, _) => Err(Refusal::not_yet(Some(id), format!("{name}.(…)"))),
         }
     }
@@ -902,6 +989,34 @@ impl<'m> Emitter<'m> {
             prec,
         })
     }
+}
+
+/// `true` when `s` is one call `f(...)` (so it needs no parentheses).
+fn is_call(s: &str) -> bool {
+    let Some(open) = s.find('(') else {
+        return false;
+    };
+    if !s[..open]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || open == 0
+    {
+        return false;
+    }
+    let mut depth = 0;
+    for (i, c) in s.char_indices().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == s.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn real_literal(x: f64) -> String {
@@ -1000,6 +1115,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     model.extend(e.prior.iter().cloned());
     model.extend(e.lik.iter().cloned());
     let mut code = String::new();
+    block(&mut code, "functions", &e.functions);
     block(&mut code, "data", &e.data);
     block(&mut code, "transformed data", &e.tdata);
     block(&mut code, "parameters", &e.params);

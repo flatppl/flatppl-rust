@@ -1,141 +1,148 @@
-//! Phase-1 mapping tables: FlatPPL laws and functions to Stan. A stopgap until
-//! the stan-profile-check RON tables land; the lookups below are the only API
-//! the emitter uses, so the swap stays local to this file.
+//! The FlatPPL → Stan mapping tables, `tables/*.ron`, parsed once.
+//!
+//! `distributions.ron` maps laws and `functions.ron` maps functions; both are
+//! checked against Stan 2.40 by the tables' own verifier. `sets.ron` documents
+//! the declaration of each set; [`crate::stan_type`] implements it.
 
-/// How a FlatPPL law's canonical arguments become Stan arguments.
-pub(crate) enum ArgMap {
-    /// The FlatPPL argument at this index.
-    Arg(usize),
-    /// A literal Stan expression.
-    Lit(&'static str),
-    /// `p / (1 - p)` of the argument at this index (`Geometric`).
-    Odds(usize),
-}
+use serde::Deserialize;
+use std::sync::OnceLock;
 
-pub(crate) struct LawMap {
-    pub stan: &'static str,
-    pub args: &'static [ArgMap],
-    /// Stan accepts vector arguments and a vector variate for this law.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct LawRow {
+    pub id: String,
+    pub flatppl: String,
+    pub module: Option<String>,
+    pub params: Vec<String>,
+    pub pattern: String,
+    pub vars: Vec<String>,
+    pub kind: String,
+    pub stan: String,
+    pub suffix: String,
+    pub lhs: String,
+    pub args: String,
+    pub variate: String,
+    pub sizes: Vec<(String, String)>,
     pub vectorized: bool,
-    /// Variate is a vector per draw (`dirichlet`, `multi_normal`, …).
-    pub multivariate: bool,
+    pub lcdf: bool,
+    pub normalized: bool,
+    pub functions: String,
+    pub status: String,
+    pub note: String,
 }
 
-use ArgMap::{Arg, Lit, Odds};
-
-macro_rules! law {
-    ($stan:literal, [$($a:expr),*], vec = $v:literal, mv = $m:literal) => {
-        LawMap { stan: $stan, args: &[$($a),*], vectorized: $v, multivariate: $m }
-    };
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct FnRow {
+    pub id: String,
+    pub flatppl: String,
+    pub module: Option<String>,
+    pub args: Vec<String>,
+    pub kind: String,
+    pub stan: String,
+    pub functions: String,
+    pub data_only: bool,
+    pub caveat: String,
+    pub status: String,
 }
 
-/// The Stan law for a FlatPPL distribution, keyed by name. Argument indices
-/// refer to the canonical order of `flatppl_infer::distribution_param_names`.
-pub(crate) fn law(name: &str) -> Option<LawMap> {
-    Some(match name {
-        "Normal" => law!("normal", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Cauchy" => law!("cauchy", [Arg(0), Arg(1)], vec = true, mv = false),
-        "StudentT" => law!(
-            "student_t",
-            [Arg(0), Lit("0"), Lit("1")],
-            vec = true,
-            mv = false
-        ),
-        "Logistic" => law!("logistic", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Laplace" => law!(
-            "double_exponential",
-            [Arg(0), Arg(1)],
-            vec = true,
-            mv = false
-        ),
-        "LogNormal" => law!("lognormal", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Exponential" => law!("exponential", [Arg(0)], vec = true, mv = false),
-        "Gamma" => law!("gamma", [Arg(0), Arg(1)], vec = true, mv = false),
-        "InverseGamma" => law!("inv_gamma", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Weibull" => law!("weibull", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Beta" => law!("beta", [Arg(0), Arg(1)], vec = true, mv = false),
-        "ChiSquared" => law!("chi_square", [Arg(0)], vec = true, mv = false),
-        "Rayleigh" => law!("rayleigh", [Arg(0)], vec = true, mv = false),
-        // Stan's pareto takes (y_min, alpha): FlatPPL's (shape, scale) swap.
-        "Pareto" => law!("pareto", [Arg(1), Arg(0)], vec = true, mv = false),
-        "VonMises" => law!("von_mises", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Bernoulli" => law!("bernoulli", [Arg(0)], vec = true, mv = false),
-        "Binomial" => law!("binomial", [Arg(0), Arg(1)], vec = true, mv = false),
-        "Poisson" => law!("poisson", [Arg(0)], vec = true, mv = false),
-        "NegativeBinomial" => law!("neg_binomial", [Arg(0), Arg(1)], vec = true, mv = false),
-        "NegativeBinomial2" => law!("neg_binomial_2", [Arg(0), Arg(1)], vec = true, mv = false),
-        // Failures before the first success: neg_binomial with alpha = 1 and
-        // beta = p / (1 - p) has the same support {0, 1, …} and pmf.
-        "Geometric" => law!("neg_binomial", [Lit("1"), Odds(0)], vec = true, mv = false),
-        "Categorical" => law!("categorical", [Arg(0)], vec = false, mv = false),
-        "Dirichlet" => law!("dirichlet", [Arg(0)], vec = false, mv = true),
-        "MvNormal" => law!("multi_normal", [Arg(0), Arg(1)], vec = false, mv = true),
-        // Stan infers the count from the variate.
-        "Multinomial" => law!("multinomial", [Arg(1)], vec = false, mv = true),
-        _ => return None,
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct SetRow {
+    pub set: String,
+    pub block: String,
+    pub decl: String,
+    pub chart: String,
+    pub status: String,
+    pub note: String,
+}
+
+fn parse<T: for<'de> Deserialize<'de>>(name: &str, text: &str) -> Vec<T> {
+    ron::from_str(text).unwrap_or_else(|e| panic!("tables/{name}: {e}"))
+}
+
+pub(crate) fn laws() -> &'static [LawRow] {
+    static T: OnceLock<Vec<LawRow>> = OnceLock::new();
+    T.get_or_init(|| {
+        parse(
+            "distributions.ron",
+            include_str!("../tables/distributions.ron"),
+        )
     })
 }
 
-/// A FlatPPL function with a same-arity Stan function. The flag says whether
-/// Stan applies it elementwise to a vector argument.
-pub(crate) fn function(name: &str) -> Option<(&'static str, bool)> {
-    Some(match name {
-        "exp" => ("exp", true),
-        "log" => ("log", true),
-        "log10" => ("log10", true),
-        "sqrt" => ("sqrt", true),
-        "abs" => ("abs", true),
-        "sin" => ("sin", true),
-        "cos" => ("cos", true),
-        "tan" => ("tan", true),
-        "asin" => ("asin", true),
-        "acos" => ("acos", true),
-        "atan" => ("atan", true),
-        "sinh" => ("sinh", true),
-        "cosh" => ("cosh", true),
-        "tanh" => ("tanh", true),
-        "asinh" => ("asinh", true),
-        "acosh" => ("acosh", true),
-        "atanh" => ("atanh", true),
-        "log1p" => ("log1p", true),
-        "expm1" => ("expm1", true),
-        "floor" => ("floor", true),
-        "ceil" => ("ceil", true),
-        "gamma" => ("tgamma", true),
-        "loggamma" => ("lgamma", true),
-        "logit" => ("logit", true),
-        "invlogit" => ("inv_logit", true),
-        "probit" => ("inv_Phi", true),
-        "invprobit" => ("Phi", true),
-        "atan2" => ("atan2", false),
-        "sum" => ("sum", false),
-        "prod" => ("prod", false),
-        "mean" => ("mean", false),
-        "var" => ("variance", false),
-        "std" => ("sd", false),
-        "maximum" => ("max", false),
-        "minimum" => ("min", false),
-        "cumsum" => ("cumulative_sum", false),
-        "logsumexp" => ("log_sum_exp", false),
-        "softmax" => ("softmax", false),
-        "det" => ("determinant", false),
-        "inv" => ("inverse", false),
-        "trace" => ("trace", false),
-        "logabsdet" => ("log_determinant", false),
-        "lower_cholesky" => ("cholesky_decompose", false),
-        "diagmat" => ("diag_matrix", false),
-        "diag" => ("diagonal", false),
-        "quadform" => ("quad_form", false),
-        "eye" => ("identity_matrix", false),
-        _ => return None,
+pub(crate) fn functions() -> &'static [FnRow] {
+    static T: OnceLock<Vec<FnRow>> = OnceLock::new();
+    T.get_or_init(|| parse("functions.ron", include_str!("../tables/functions.ron")))
+}
+
+#[cfg(test)]
+fn sets() -> &'static [SetRow] {
+    static T: OnceLock<Vec<SetRow>> = OnceLock::new();
+    T.get_or_init(|| parse("sets.ron", include_str!("../tables/sets.ron")))
+}
+
+/// The builtin-law rows whose pattern's outer call is `head`, most specific
+/// first. `locscale(StudentT(nu), mu, sigma)` is found under `locscale`.
+pub(crate) fn law_rows_by_head(head: &str) -> Vec<&'static LawRow> {
+    let mut rows: Vec<&LawRow> = laws()
+        .iter()
+        .filter(|r| r.module.is_none() && r.pattern.split('(').next() == Some(head))
+        .collect();
+    rows.sort_by_key(|r| r.kind != "composition");
+    rows
+}
+
+/// The row for a function. One `functions.ron` row may list several
+/// standard-module members (`"legendre, hermite"`).
+pub(crate) fn function(name: &str, module: Option<&str>) -> Option<&'static FnRow> {
+    functions().iter().find(|r| {
+        module_matches(r.module.as_deref(), module) && r.flatppl.split(", ").any(|n| n == name)
     })
 }
 
-/// FlatPPL functions with no Stan counterpart, with what Stan offers instead.
-pub(crate) const NO_STAN_FUNCTION: &[(&str, &str)] = &[(
-    "polygamma",
-    "Stan has `digamma` and `trigamma` for orders 0 and 1 only",
-)];
+/// A table module is `"<name> <version>"`; a call names the module only.
+fn module_matches(row: Option<&str>, call: Option<&str>) -> bool {
+    match (row, call) {
+        (None, None) => true,
+        (Some(r), Some(c)) => r.split(' ').next() == Some(c),
+        _ => false,
+    }
+}
+
+/// FlatPPL functions whose Stan form applies elementwise to a vector.
+/// `functions.ron` has no column for this.
+pub(crate) const ELEMENTWISE: &[&str] = &[
+    "exp",
+    "log",
+    "log2",
+    "log10",
+    "sqrt",
+    "abs",
+    "abs2",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "log1p",
+    "expm1",
+    "floor",
+    "ceil",
+    "gamma",
+    "loggamma",
+    "logit",
+    "invlogit",
+    "probit",
+    "invprobit",
+];
 
 /// Stan keywords and reserved names; a FlatPPL name in this list gets a
 /// trailing underscore.
@@ -200,3 +207,14 @@ pub(crate) const RESERVED: &[&str] = &[
     "lp__",
     "jacobian",
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tables_parse() {
+        assert!(super::laws().len() > 40);
+        assert!(super::functions().len() > 100);
+        assert!(super::sets().len() > 10);
+        assert_eq!(super::law_rows_by_head("Bernoulli")[0].kind, "composition");
+    }
+}

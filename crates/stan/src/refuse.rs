@@ -25,6 +25,8 @@ pub enum RefusalKind {
     NonBijectivePushfwd,
     /// A function with no Stan counterpart.
     NoStanFunction,
+    /// A law with no Stan density.
+    NoStanLaw,
     /// A construct with a Stan form this emitter does not write yet.
     NotYetSupported,
 }

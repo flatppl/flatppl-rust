@@ -1,36 +1,42 @@
 //! Target decomposition and the `~` statements.
 
-use super::{Emitter, Ex, P_ATOM, P_MUL, PriorField};
+use super::pattern;
+use super::{Emitter, Ex, P_ATOM, PriorField};
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
-use crate::tables::{self, ArgMap};
+use crate::tables;
 use crate::{ManifestParam, Truncation};
 use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Symbol, Type, ValueSet};
+use std::collections::HashMap;
+
+/// The loop index a per-element argument of a broadcast law is rendered with.
+const LOOP: &str = "\u{1}";
 
 /// A law as a Stan sampling statement right-hand side.
 struct Law {
-    stan: String,
-    args: Vec<Ex>,
+    /// `stan(args)` for one statement over the whole variate.
+    call: String,
+    /// `stan(args)` with [`LOOP`] where a broadcast loop indexes.
+    indexed: String,
+    /// A broadcast varies a vector parameter per element, which Stan does not
+    /// vectorize (`categorical` with one simplex per observation).
+    vector_per_element: bool,
+    /// The `distributions.ron` variate template (`{y}`, `{y} + 1`).
+    lhs: String,
     /// `T[lower, upper]`, either side open.
     trunc: Option<(Option<String>, Option<String>)>,
     vectorized: bool,
     multivariate: bool,
-    /// The argument expressions that vary per element of a broadcast.
-    per_element: Vec<bool>,
+    /// Stan defines `_lcdf` and `_lccdf`, so `T[L, U]` is well formed.
+    lcdf: bool,
 }
 
 impl Law {
     fn rhs(&self, index: Option<&str>) -> String {
-        let args: Vec<String> = self
-            .args
-            .iter()
-            .zip(&self.per_element)
-            .map(|(a, &per)| match (index, per) {
-                (Some(i), true) => format!("{}[{i}]", a.at(P_ATOM)),
-                _ => a.s.clone(),
-            })
-            .collect();
-        let mut s = format!("{}({})", self.stan, args.join(", "));
+        let mut s = match index {
+            Some(i) => self.indexed.replace(LOOP, i),
+            None => self.call.clone(),
+        };
         if let Some((lo, hi)) = &self.trunc {
             s.push_str(&format!(
                 " T[{}, {}]",
@@ -39,6 +45,11 @@ impl Law {
             ));
         }
         s
+    }
+
+    /// The variate side for `y`.
+    fn lhs(&self, y: &str) -> String {
+        self.lhs.replace("{y}", y)
     }
 }
 
@@ -496,69 +507,43 @@ impl<'m> Emitter<'m> {
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
-        match self.head(m) {
-            Some("Lebesgue") => Ok(vec![]),
-            Some("iid") => {
-                let c = self.call(m).unwrap();
-                let inner = c.args[0];
-                let law = self.law(inner, false)?;
-                if law.multivariate || law.trunc.is_some() || !law.vectorized {
-                    let i = self.fresh_index();
-                    let n = self.extent_of(lhs);
-                    let stmt = format!(
-                        "for ({i} in 1:{n}) {{\n  {lhs}[{i}] ~ {};\n}}",
-                        law.rhs(None)
-                    );
-                    self.used.remove(&i);
-                    return Ok(vec![stmt]);
-                }
-                let target = if lhs_rank >= 2 {
-                    format!("to_vector({lhs})")
-                } else {
-                    lhs.to_string()
-                };
-                Ok(vec![format!("{target} ~ {};", law.rhs(None))])
-            }
-            Some("broadcast") => {
-                let law = self.law(m, true)?;
-                let loops = !law.vectorized || law.trunc.is_some() || law.multivariate;
-                if loops {
-                    let i = self.fresh_index();
-                    let n = self.extent_of(lhs);
-                    let stmt = format!(
-                        "for ({i} in 1:{n}) {{\n  {lhs}[{i}] ~ {};\n}}",
-                        law.rhs(Some(&i))
-                    );
-                    self.used.remove(&i);
-                    return Ok(vec![stmt]);
-                }
-                let target = if lhs_rank >= 2 {
-                    format!("to_vector({lhs})")
-                } else {
-                    lhs.to_string()
-                };
-                Ok(vec![format!("{target} ~ {};", law.rhs(None))])
-            }
-            _ => {
-                let law = self.law(m, false)?;
-                if law.trunc.is_some() && lhs_rank > 0 {
-                    let i = self.fresh_index();
-                    let n = self.extent_of(lhs);
-                    let stmt = format!(
-                        "for ({i} in 1:{n}) {{\n  {lhs}[{i}] ~ {};\n}}",
-                        law.rhs(None)
-                    );
-                    self.used.remove(&i);
-                    return Ok(vec![stmt]);
-                }
-                let target = if lhs_rank >= 2 && !law.multivariate {
-                    format!("to_vector({lhs})")
-                } else {
-                    lhs.to_string()
-                };
-                Ok(vec![format!("{target} ~ {};", law.rhs(None))])
-            }
+        let (law, per_element) = match self.head(m) {
+            Some("Lebesgue") => return Ok(vec![]),
+            // An iid product of one law: the law's arguments are shared.
+            Some("iid") => (self.law(self.call(m).unwrap().args[0], false)?, false),
+            Some("broadcast") => (self.law(m, true)?, true),
+            _ => (self.law(m, false)?, false),
+        };
+        let elementwise = per_element || self.head(m) == Some("iid");
+        let shifted = law.lhs("{y}") != "{y}";
+        // A loop where Stan has no vectorized form: a law that does not
+        // vectorize, a truncated law, a vector law over an array of variates,
+        // or a shifted variate (`{y} + 1`) of an integer array.
+        let one_variate = !elementwise && (law.multivariate || lhs_rank == 0);
+        let loops = !one_variate
+            && (!law.vectorized
+                || law.trunc.is_some()
+                || law.multivariate
+                || law.vector_per_element
+                || (shifted && lhs_rank > 0));
+        if loops {
+            let i = self.fresh_index();
+            let n = self.extent_of(lhs);
+            let index = per_element.then_some(i.as_str());
+            let stmt = format!(
+                "for ({i} in 1:{n}) {{\n  {} ~ {};\n}}",
+                law.lhs(&format!("{lhs}[{i}]")),
+                law.rhs(index)
+            );
+            self.used.remove(&i);
+            return Ok(vec![stmt]);
         }
+        let target = if lhs_rank >= 2 && !law.multivariate {
+            format!("to_vector({lhs})")
+        } else {
+            lhs.to_string()
+        };
+        Ok(vec![format!("{} ~ {};", law.lhs(&target), law.rhs(None))])
     }
 
     fn fresh_index(&mut self) -> String {
@@ -627,60 +612,14 @@ impl<'m> Emitter<'m> {
                     return Err(Refusal::not_yet(Some(m), "a broadcast of a user law"));
                 };
                 let name = self.name(*f);
-                let args = c.args[1..].to_vec();
                 if !c.named.is_empty() {
                     return Err(Refusal::not_yet(
                         Some(m),
                         format!("{name}.(…) with keyword arguments"),
                     ));
                 }
-                let base_ranks = flatppl_infer::distribution_param_ranks(name).unwrap_or_default();
-                let per: Vec<bool> = args
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &a)| {
-                        let r = self.shape(a).map(|s| s.rank).unwrap_or(0);
-                        r > base_ranks.get(k).copied().unwrap_or(0)
-                    })
-                    .collect();
-                self.dist(m, name, &args, &per)
-            }
-            "locscale" => {
-                let c = self.call(m).unwrap();
-                let base = self.resolve(c.args[0]);
-                let (shift, scale) = (c.args[1], c.args[2]);
-                match self.head(base) {
-                    Some("StudentT") => {
-                        let nu = self.law_args("StudentT", base)?[0];
-                        let nu = self.real(nu)?;
-                        let shift = self.real(shift)?;
-                        let scale = self.real(scale)?;
-                        Ok(Law {
-                            stan: "student_t".into(),
-                            args: vec![nu, shift, scale],
-                            trunc: None,
-                            vectorized: true,
-                            multivariate: false,
-                            per_element: vec![false; 3],
-                        })
-                    }
-                    _ => Err(Refusal::not_yet(Some(m), "locscale of this law")),
-                }
-            }
-            "Uniform" => {
-                let s = self.resolve(self.law_args("Uniform", m)?[0]);
-                let (lo, hi) = self.interval(s)?;
-                match (lo, hi) {
-                    (Some(lo), Some(hi)) => Ok(Law {
-                        stan: "uniform".into(),
-                        args: vec![Ex::atom(lo), Ex::atom(hi)],
-                        trunc: None,
-                        vectorized: true,
-                        multivariate: false,
-                        per_element: vec![false; 2],
-                    }),
-                    _ => Err(Refusal::not_yet(Some(m), "a Uniform on an unbounded set")),
-                }
+                let args = c.args[1..].to_vec();
+                self.table_law(m, name, &args, true)
             }
             "kchain" => {
                 let first = self.resolve(self.call(m).unwrap().args[0]);
@@ -717,9 +656,19 @@ impl<'m> Emitter<'m> {
                 Err(Refusal::not_yet(Some(m), "pushfwd"))
             }
             name => {
-                let args = self.law_args(name, m)?;
-                let per = vec![false; args.len()];
-                self.dist(m, name, &args, &per)
+                let args = if name.starts_with(char::is_uppercase) {
+                    self.law_args(name, m)?
+                } else {
+                    let c = self.call(m).unwrap();
+                    if !c.named.is_empty() {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            format!("{name} with keyword arguments"),
+                        ));
+                    }
+                    c.args.to_vec()
+                };
+                self.table_law(m, name, &args, false)
             }
         }
     }
@@ -795,6 +744,12 @@ impl<'m> Emitter<'m> {
         if law.multivariate {
             return Err(Refusal::not_yet(Some(t), "truncate of a multivariate law"));
         }
+        if !law.lcdf {
+            return Err(Refusal::not_yet(
+                Some(t),
+                "truncate of a law with no Stan CDF",
+            ));
+        }
         let (lo, hi) = self.interval(set)?;
         law.trunc = Some((lo, hi));
         Ok(law)
@@ -825,42 +780,91 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    fn dist(&mut self, m: NodeId, name: &str, args: &[NodeId], per: &[bool]) -> Result<Law> {
-        let Some(map) = tables::law(name) else {
-            return Err(Refusal::not_yet(Some(m), name.to_string()));
+    /// A law from `distributions.ron`: the most specific row whose pattern
+    /// matches `name(args…)`. With `broadcast`, an argument whose rank exceeds
+    /// the law parameter's is indexed per element.
+    fn table_law(
+        &mut self,
+        m: NodeId,
+        name: &str,
+        args: &[NodeId],
+        broadcast: bool,
+    ) -> Result<Law> {
+        let mut found = None;
+        for row in tables::law_rows_by_head(name) {
+            let pat = pattern::parse(&row.pattern);
+            let mut binds = HashMap::new();
+            if self.match_call(&pat, args, &mut binds) {
+                found = Some((row, pat, binds));
+                break;
+            }
+        }
+        let Some((row, pat, binds)) = found else {
+            return Err(Refusal::not_yet(
+                Some(m),
+                format!("the law `{name}` in this form"),
+            ));
         };
-        let mut out = Vec::new();
-        let mut per_out = Vec::new();
-        for a in map.args {
-            match a {
-                ArgMap::Arg(k) => {
-                    let id = *args
-                        .get(*k)
-                        .ok_or_else(|| Refusal::not_yet(Some(m), format!("{name} arguments")))?;
-                    out.push(self.expr(id)?);
-                    per_out.push(per.get(*k).copied().unwrap_or(false));
-                }
-                ArgMap::Lit(s) => {
-                    out.push(Ex::atom(*s));
-                    per_out.push(false);
-                }
-                ArgMap::Odds(k) => {
-                    let p = self.expr(args[*k])?;
-                    out.push(Ex {
-                        s: format!("{} / (1 - {})", p.at(P_MUL), p.at(P_MUL + 1)),
-                        prec: P_MUL,
-                    });
-                    per_out.push(per.get(*k).copied().unwrap_or(false));
+        match row.kind.as_str() {
+            "none" if matches!(name, "PoissonProcess" | "BinnedPoissonProcess") => {
+                return Err(Refusal::not_yet(Some(m), name.to_string()));
+            }
+            "none" => {
+                return Err(Refusal::new(
+                    RefusalKind::NoStanLaw,
+                    Some(m),
+                    name.to_string(),
+                    format!("`{name}` has no Stan density: {}", row.note),
+                ));
+            }
+            "custom_lpdf" if !self.functions.contains(&row.functions) => {
+                self.functions.push(row.functions.clone());
+            }
+            _ => {}
+        }
+        if !row.normalized {
+            return Err(Refusal::not_yet(
+                Some(m),
+                format!("the unnormalized law `{name}`"),
+            ));
+        }
+        // Expected rank of each variable: the law parameter's rank when the
+        // variable is a direct argument, a scalar inside a nested call.
+        let ranks = flatppl_infer::distribution_param_ranks(name).unwrap_or_default();
+        let mut expected: HashMap<String, usize> = HashMap::new();
+        if let pattern::Pat::Call(_, pargs) = &pat {
+            for (k, p) in pargs.iter().enumerate() {
+                if let pattern::Pat::Var(v) = p {
+                    expected.insert(v.clone(), ranks.get(k).copied().unwrap_or(0));
                 }
             }
         }
+        let mut per: HashMap<String, bool> = HashMap::new();
+        for (v, b) in &binds {
+            if let pattern::Bound::Node(n) = b {
+                let rank = self.shape(*n).map(|s| s.rank).unwrap_or(0);
+                per.insert(
+                    v.clone(),
+                    broadcast && rank > expected.get(v).copied().unwrap_or(0),
+                );
+            }
+        }
+        let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
+        let args = self.fill(&row.args, &binds, &is_per, None)?;
+        let indexed = self.fill(&row.args, &binds, &is_per, Some(LOOP))?;
+        let vector_per_element = per
+            .iter()
+            .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
+        let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
         Ok(Law {
-            stan: map.stan.to_string(),
-            args: out,
+            call: format!("{}({args})", row.stan),
+            indexed: format!("{}({indexed})", row.stan),
+            vector_per_element,
+            lhs: row.lhs.clone(),
             trunc: None,
-            vectorized: map.vectorized,
-            multivariate: map.multivariate,
-            per_element: per_out,
+            vectorized: row.vectorized,
+            multivariate: !scalar_variate,
+            lcdf: row.lcdf,
         })
     }
 

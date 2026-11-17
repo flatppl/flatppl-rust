@@ -1,0 +1,47 @@
+// FlatPPL `elementof(S)` set -> Stan declaration.
+// Sources: flatppl-design docs/03-value-types.md at eed1724 (sets, standard charts);
+// Stan Reference Manual 2.40 (types.html, transforms.html); stanc 2.40.0 probes.
+//
+// Schema: a list of rows. Every field is present in every row.
+//   set:        FlatPPL set expression; lower-case words are placeholders.
+//   block:      "parameters" when the set can hold an inferred value; "data" when Stan forbids
+//               parameters of that type; "none" when no Stan form exists.
+//   decl:       Stan declaration template; {name} is the variable name, other {..} are placeholders.
+//   chart:      "same" when Stan's transform equals the §03 standard chart; "differs" otherwise; "n/a".
+//   status:     "verified" (stanc 2.40 accepts the declaration) | "unverified: <reason>" | "n/a".
+//   note:       caveats.
+//
+// A chart difference changes only the unconstrained-space density. Values in the constrained
+// space and densities evaluated with jacobian=false agree.
+[
+    (set: "reals", block: "parameters", decl: "real {name};", chart: "same", status: "verified", note: ""),
+    (set: "interval(-inf, inf)", block: "parameters", decl: "real {name};", chart: "same", status: "verified", note: ""),
+    (set: "posreals", block: "parameters", decl: "real<lower=0> {name};", chart: "same", status: "verified",
+     note: "Stan bounds admit the boundary value in floating point; §03 excludes 0."),
+    (set: "nonnegreals", block: "parameters", decl: "real<lower=0> {name};", chart: "same", status: "verified", note: ""),
+    (set: "unitinterval", block: "parameters", decl: "real<lower=0, upper=1> {name};", chart: "same", status: "verified", note: ""),
+    (set: "interval(a, b)", block: "parameters", decl: "real<lower={a}, upper={b}> {name};", chart: "same", status: "verified",
+     note: "Infinite bounds are ignored by Stan, so interval(a, inf) may emit <lower={a}> or keep upper=positive_infinity()."),
+    (set: "interval(a, inf)", block: "parameters", decl: "real<lower={a}> {name};", chart: "same", status: "verified", note: ""),
+    (set: "interval(-inf, b)", block: "parameters", decl: "real<upper={b}> {name};", chart: "same", status: "verified", note: ""),
+    (set: "ordered(n)", block: "parameters", decl: "ordered[{n}] {name};", chart: "same", status: "verified", note: ""),
+    (set: "zerosum(n)", block: "parameters", decl: "sum_to_zero_vector[{n}] {name};", chart: "differs", status: "verified",
+     note: "Stan uses an isometric (Helmert) transform; §03 uses the first n-1 coordinates."),
+    (set: "stdsimplex(n)", block: "parameters", decl: "simplex[{n}] {name};", chart: "differs", status: "verified",
+     note: "Stan 2.37+ uses softmax of a sum-to-zero vector; §03 uses centered stick-breaking."),
+    (set: "cartpow(S, n)", block: "parameters", decl: "vector<{bounds_of_S}>[{n}] {name};", chart: "same", status: "verified",
+     note: "Per-component chart of S. Use array[{n}] real when S is not a real interval set."),
+    (set: "cartpow(S, [m, n])", block: "parameters", decl: "matrix<{bounds_of_S}>[{m}, {n}] {name};", chart: "same", status: "verified", note: ""),
+    (set: "cartprod(S1, ..., Sk)", block: "parameters", decl: "vector<lower={lower_vector}, upper={upper_vector}>[{k}] {name};", chart: "same", status: "verified",
+     note: "Vector bounds, for example vector<lower=[negative_infinity(), 0]'>[2]. Only for real interval components."),
+    (set: "cartprod(a = S1, ...)", block: "parameters", decl: "one declaration per field", chart: "same", status: "verified",
+     note: "tuple(...) parameters are also accepted by stanc 2.40."),
+    (set: "complexes", block: "parameters", decl: "complex {name};", chart: "same", status: "verified", note: ""),
+    (set: "integers", block: "data", decl: "int {name};", chart: "n/a", status: "verified",
+     note: "stanc 2.40: \"Parameters cannot be integers.\" A latent integer needs marginalization; refuse."),
+    (set: "posintegers", block: "data", decl: "int<lower=1> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "nonnegintegers", block: "data", decl: "int<lower=0> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "booleans", block: "data", decl: "int<lower=0, upper=1> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "anything", block: "none", decl: "", chart: "n/a", status: "n/a", note: "No Stan form."),
+    (set: "rngstates", block: "none", decl: "", chart: "n/a", status: "n/a", note: "Stan RNG state is implicit."),
+]

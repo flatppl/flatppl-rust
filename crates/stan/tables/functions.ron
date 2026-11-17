@@ -1,0 +1,396 @@
+// FlatPPL function -> Stan expression mapping.
+// Sources: flatppl-design docs/07-functions.md and docs/09-standard-modules.md at eed1724;
+// Stan Functions Reference 2.40; CmdStan 2.40.0 stanc signature dump.
+//
+// Schema: a list of rows. Every field is present in every row.
+//   id:        unique row key (verify.py keys its test points and references on it).
+//   flatppl:   FlatPPL function name.
+//   module:    None for §07, Some("<module> <version>") for a standard-module function.
+//   args:      FlatPPL argument names in spec order.
+//   kind:      "builtin"   a Stan function call; the template states any reorder.
+//              "operator"  a Stan operator expression.
+//              "helper"    calls a function defined in the `functions` field.
+//              "construct" a structural mapping (indexing, blocks, declarations); no numeric check.
+//              "none"      no Stan form: emit a loop helper later, or refuse.
+//   stan:      Stan expression template. Each {arg} is substituted with an atomic Stan expression.
+//   functions: Stan functions-block source the template needs ("" if none).
+//   data_only: Stan requires data-only arguments (no parameters).
+//   caveat:    where Stan semantics differ from the spec, and what the template does about it.
+//   status:    "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
+[
+    // ------------------------------------------------------------ identities and generation
+    (id: "identity", flatppl: "identity", module: None, args: ["x"], kind: "operator", stan: "{x}", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "vector", flatppl: "vector", module: None, args: ["x1", "..."], kind: "construct", stan: "[{x1}, ...]'", functions: "", data_only: false,
+     caveat: "Row-vector literal, transposed. Use {...} for an int array.", status: "n/a"),
+    (id: "array", flatppl: "array", module: None, args: ["data", "size", "dimorder"], kind: "construct", stan: "to_matrix({data}, {m}, {n})", functions: "", data_only: false,
+     caveat: "Rank 2 only. to_matrix fills column-major; pass a 4th argument 0 for row-major. Rank > 2: none.", status: "n/a"),
+    (id: "fill", flatppl: "fill", module: None, args: ["x", "size"], kind: "builtin", stan: "rep_vector({x}, {size})", functions: "", data_only: false,
+     caveat: "Template is for an integer size. size [m, n]: rep_matrix({x}, m, n). Higher rank: rep_array.", status: "verified"),
+    (id: "zeros", flatppl: "zeros", module: None, args: ["size"], kind: "builtin", stan: "zeros_vector({size})", functions: "", data_only: false,
+     caveat: "Integer size. size [m, n]: rep_matrix(0, m, n).", status: "verified"),
+    (id: "ones", flatppl: "ones", module: None, args: ["size"], kind: "builtin", stan: "ones_vector({size})", functions: "", data_only: false,
+     caveat: "Integer size. size [m, n]: rep_matrix(1, m, n).", status: "verified"),
+    (id: "eye", flatppl: "eye", module: None, args: ["n"], kind: "builtin", stan: "identity_matrix({n})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "onehot", flatppl: "onehot", module: None, args: ["i", "n"], kind: "builtin", stan: "one_hot_vector({n}, {i})", functions: "", data_only: false,
+     caveat: "Argument order swaps.", status: "verified"),
+    (id: "linspace", flatppl: "linspace", module: None, args: ["from", "to", "n"], kind: "builtin", stan: "linspaced_vector({n}, {from}, {to})", functions: "", data_only: true,
+     caveat: "Argument order changes: n comes first. The bounds must be data.", status: "verified"),
+    (id: "extlinspace", flatppl: "extlinspace", module: None, args: ["from", "to", "n"], kind: "builtin",
+     stan: "append_row(negative_infinity(), append_row(linspaced_vector({n}, {from}, {to}), positive_infinity()))", functions: "", data_only: true,
+     caveat: "The bounds must be data.", status: "verified"),
+    (id: "load_data", flatppl: "load_data", module: None, args: ["source", "valueset"], kind: "construct", stan: "data block declaration", functions: "", data_only: true,
+     caveat: "The value goes to the Stan data file.", status: "n/a"),
+
+    // ------------------------------------------------------------ access and array operations
+    (id: "get", flatppl: "get", module: None, args: ["container", "selectors"], kind: "construct", stan: "{container}[{selectors}]", functions: "", data_only: false,
+     caveat: "1-based in both. Record fields become tuple slots (.1, .2) or separate variables.", status: "n/a"),
+    (id: "get0", flatppl: "get0", module: None, args: ["container", "selectors"], kind: "construct", stan: "{container}[{selectors} + 1]", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "cat", flatppl: "cat", module: None, args: ["x", "y"], kind: "builtin", stan: "append_row({x}, {y})", functions: "", data_only: false,
+     caveat: "Template is for vectors. Arrays: append_array. Records: no form.", status: "verified"),
+    (id: "rowstack", flatppl: "rowstack", module: None, args: ["vs"], kind: "builtin", stan: "to_matrix({vs})", functions: "", data_only: false,
+     caveat: "vs must be an array[] row_vector.", status: "verified"),
+    (id: "colstack", flatppl: "colstack", module: None, args: ["vs"], kind: "builtin", stan: "to_matrix({vs})'", functions: "", data_only: false,
+     caveat: "vs must be an array[] row_vector.", status: "verified"),
+    (id: "tile", flatppl: "tile", module: None, args: ["A", "size"], kind: "none", stan: "", functions: "", data_only: false, caveat: "rep_matrix covers only tiling a vector.", status: "n/a"),
+    (id: "splitblocks", flatppl: "splitblocks", module: None, args: ["A", "blocksize"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop with block().", status: "n/a"),
+    (id: "joinblocks", flatppl: "joinblocks", module: None, args: ["A"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+    (id: "partition", flatppl: "partition", module: None, args: ["xs", "spec"], kind: "none", stan: "", functions: "", data_only: false, caveat: "One segment(xs, start, len) per part.", status: "n/a"),
+    (id: "reverse", flatppl: "reverse", module: None, args: ["xs"], kind: "builtin", stan: "reverse({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "addaxes", flatppl: "addaxes", module: None, args: ["A", "n_leading", "n_trailing"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Stan has no general rank change.", status: "n/a"),
+    (id: "blockdiagmat", flatppl: "blockdiagmat", module: None, args: ["mats"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+    (id: "bandedmat", flatppl: "bandedmat", module: None, args: ["v", "rows"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+    (id: "conv", flatppl: "conv", module: None, args: ["v", "kernel"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop, or fft/inv_fft.", status: "n/a"),
+    (id: "crosscorr", flatppl: "crosscorr", module: None, args: ["v", "kernel"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+
+    // ------------------------------------------------------------ scalar restrictions
+    (id: "boolean", flatppl: "boolean", module: None, args: ["x"], kind: "construct", stan: "{x}", functions: "", data_only: true,
+     caveat: "Stan booleans are int 0/1. A non-0/1 check must be a reject in transformed data.", status: "n/a"),
+    (id: "integer", flatppl: "integer", module: None, args: ["x"], kind: "construct", stan: "to_int({x})", functions: "", data_only: true,
+     caveat: "to_int truncates; FlatPPL raises a static error on a non-integral value. Data-only.", status: "n/a"),
+    (id: "real", flatppl: "real", module: None, args: ["x"], kind: "builtin", stan: "get_real({x})", functions: "", data_only: false,
+     caveat: "Template is for complex x. For real x emit {x}.", status: "verified"),
+    (id: "complex", flatppl: "complex", module: None, args: ["re", "im"], kind: "builtin", stan: "to_complex({re}, {im})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "string", flatppl: "string", module: None, args: ["x"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Stan has no string values.", status: "n/a"),
+    (id: "imag", flatppl: "imag", module: None, args: ["x"], kind: "builtin", stan: "get_imag({x})", functions: "", data_only: false,
+     caveat: "Template is for complex x. For real x emit 0.", status: "verified"),
+
+    // ------------------------------------------------------------ elementary functions
+    (id: "exp", flatppl: "exp", module: None, args: ["x"], kind: "builtin", stan: "exp({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "log", flatppl: "log", module: None, args: ["x"], kind: "builtin", stan: "log({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "log2", flatppl: "log2", module: None, args: ["x"], kind: "builtin", stan: "log2({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "log10", flatppl: "log10", module: None, args: ["x"], kind: "builtin", stan: "log10({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "sqrt", flatppl: "sqrt", module: None, args: ["x"], kind: "builtin", stan: "sqrt({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "abs", flatppl: "abs", module: None, args: ["x"], kind: "builtin", stan: "abs({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "abs2", flatppl: "abs2", module: None, args: ["x"], kind: "builtin", stan: "square({x})", functions: "", data_only: false,
+     caveat: "Real x only. Complex x: square(abs({x})).", status: "verified"),
+    (id: "sin", flatppl: "sin", module: None, args: ["x"], kind: "builtin", stan: "sin({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "cos", flatppl: "cos", module: None, args: ["x"], kind: "builtin", stan: "cos({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "tan", flatppl: "tan", module: None, args: ["x"], kind: "builtin", stan: "tan({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "asin", flatppl: "asin", module: None, args: ["x"], kind: "builtin", stan: "asin({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "acos", flatppl: "acos", module: None, args: ["x"], kind: "builtin", stan: "acos({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "atan", flatppl: "atan", module: None, args: ["x"], kind: "builtin", stan: "atan({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "atan2", flatppl: "atan2", module: None, args: ["y", "x"], kind: "builtin", stan: "atan2({y}, {x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "sinh", flatppl: "sinh", module: None, args: ["x"], kind: "builtin", stan: "sinh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "cosh", flatppl: "cosh", module: None, args: ["x"], kind: "builtin", stan: "cosh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "tanh", flatppl: "tanh", module: None, args: ["x"], kind: "builtin", stan: "tanh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "asinh", flatppl: "asinh", module: None, args: ["x"], kind: "builtin", stan: "asinh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "acosh", flatppl: "acosh", module: None, args: ["x"], kind: "builtin", stan: "acosh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "atanh", flatppl: "atanh", module: None, args: ["x"], kind: "builtin", stan: "atanh({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "log1p", flatppl: "log1p", module: None, args: ["x"], kind: "builtin", stan: "log1p({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "expm1", flatppl: "expm1", module: None, args: ["x"], kind: "builtin", stan: "expm1({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "min", flatppl: "min", module: None, args: ["a", "b"], kind: "builtin", stan: "fmin({a}, {b})", functions: "", data_only: false,
+     caveat: "Stan min(a, b) exists only for int.", status: "verified"),
+    (id: "max", flatppl: "max", module: None, args: ["a", "b"], kind: "builtin", stan: "fmax({a}, {b})", functions: "", data_only: false,
+     caveat: "Stan max(a, b) exists only for int.", status: "verified"),
+    (id: "floor", flatppl: "floor", module: None, args: ["x"], kind: "builtin", stan: "floor({x})", functions: "", data_only: false,
+     caveat: "Returns real. An int needs to_int, which is data-only.", status: "verified"),
+    (id: "ceil", flatppl: "ceil", module: None, args: ["x"], kind: "builtin", stan: "ceil({x})", functions: "", data_only: false,
+     caveat: "Returns real. An int needs to_int, which is data-only.", status: "verified"),
+    (id: "round", flatppl: "round", module: None, args: ["x"], kind: "helper", stan: "flatppl_round({x})",
+     functions: "real flatppl_round(real x) {
+  // Stan round() breaks ties away from zero; FlatPPL breaks ties to even.
+  if (abs(x - trunc(x)) == 0.5) return 2 * round(x / 2);
+  return round(x);
+}",
+     data_only: false, caveat: "Stan round(2.5) = 3; FlatPPL round(2.5) = 2. The helper restores ties to even.", status: "verified"),
+    (id: "div", flatppl: "div", module: None, args: ["a", "b"], kind: "helper", stan: "flatppl_div({a}, {b})",
+     functions: "int flatppl_div(int a, int b) {
+  // Stan %/% truncates toward zero; FlatPPL floors.
+  int q = a %/% b;
+  if (a % b != 0 && ((a % b < 0) != (b < 0))) q -= 1;
+  return q;
+}",
+     data_only: false, caveat: "Stan -7 %/% 2 = -3; FlatPPL div(-7, 2) = -4.", status: "verified"),
+    (id: "mod", flatppl: "mod", module: None, args: ["a", "b"], kind: "helper", stan: "flatppl_mod({a}, {b})",
+     functions: "int flatppl_mod(int a, int b) {
+  // Stan % keeps the sign of a; FlatPPL mod is a - b * floor(a / b).
+  int r = a % b;
+  if (r != 0 && ((r < 0) != (b < 0))) r += b;
+  return r;
+}",
+     data_only: false, caveat: "Stan -7 % 2 = -1; FlatPPL mod(-7, 2) = 1.", status: "verified"),
+    (id: "conj", flatppl: "conj", module: None, args: ["x"], kind: "builtin", stan: "conj({x})", functions: "", data_only: false,
+     caveat: "Complex only. For real x emit {x}.", status: "verified"),
+    (id: "cis", flatppl: "cis", module: None, args: ["theta"], kind: "builtin", stan: "to_complex(cos({theta}), sin({theta}))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "gamma", flatppl: "gamma", module: None, args: ["x"], kind: "builtin", stan: "tgamma({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "loggamma", flatppl: "loggamma", module: None, args: ["x"], kind: "builtin", stan: "lgamma({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "logit", flatppl: "logit", module: None, args: ["p"], kind: "builtin", stan: "logit({p})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "invlogit", flatppl: "invlogit", module: None, args: ["x"], kind: "builtin", stan: "inv_logit({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "probit", flatppl: "probit", module: None, args: ["p"], kind: "builtin", stan: "inv_Phi({p})", functions: "", data_only: false,
+     caveat: "FR: quantiles above 0.999999999 lose accuracy.", status: "verified"),
+    (id: "invprobit", flatppl: "invprobit", module: None, args: ["x"], kind: "builtin", stan: "Phi({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+
+    // ------------------------------------------------------------ operator-equivalent functions
+    (id: "add", flatppl: "add", module: None, args: ["a", "b"], kind: "operator", stan: "({a} + {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "sub", flatppl: "sub", module: None, args: ["a", "b"], kind: "operator", stan: "({a} - {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "mul", flatppl: "mul", module: None, args: ["a", "b"], kind: "operator", stan: "({a} * {b})", functions: "", data_only: false,
+     caveat: "Matrix product for matrices, as in FlatPPL.", status: "verified"),
+    (id: "divide", flatppl: "divide", module: None, args: ["a", "b"], kind: "operator", stan: "({a} / {b})", functions: "", data_only: false,
+     caveat: "int / int truncates in Stan. If both operands are int, emit ((1.0 * {a}) / {b}).", status: "verified"),
+    (id: "neg", flatppl: "neg", module: None, args: ["x"], kind: "operator", stan: "(-{x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "pow", flatppl: "pow", module: None, args: ["base", "exponent"], kind: "operator", stan: "({base} ^ {exponent})", functions: "", data_only: false,
+     caveat: "int ^ int returns real in Stan.", status: "verified"),
+    (id: "equal", flatppl: "equal", module: None, args: ["a", "b"], kind: "operator", stan: "({a} == {b})", functions: "", data_only: false, caveat: "Returns int 0/1.", status: "verified"),
+    (id: "unequal", flatppl: "unequal", module: None, args: ["a", "b"], kind: "operator", stan: "({a} != {b})", functions: "", data_only: false, caveat: "Returns int 0/1.", status: "verified"),
+    (id: "lt", flatppl: "lt", module: None, args: ["a", "b"], kind: "operator", stan: "({a} < {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "le", flatppl: "le", module: None, args: ["a", "b"], kind: "operator", stan: "({a} <= {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "gt", flatppl: "gt", module: None, args: ["a", "b"], kind: "operator", stan: "({a} > {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "ge", flatppl: "ge", module: None, args: ["a", "b"], kind: "operator", stan: "({a} >= {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+
+    // ------------------------------------------------------------ predicates and checks
+    (id: "isfinite", flatppl: "isfinite", module: None, args: ["x"], kind: "operator", stan: "(!is_inf({x}) && !is_nan({x}))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "isinf", flatppl: "isinf", module: None, args: ["x"], kind: "builtin", stan: "is_inf({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "isnan", flatppl: "isnan", module: None, args: ["x"], kind: "builtin", stan: "is_nan({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "iszero", flatppl: "iszero", module: None, args: ["x"], kind: "operator", stan: "({x} == 0)", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "checked", flatppl: "checked", module: None, args: ["value", "condition"], kind: "construct", stan: "if (!({condition})) reject(...);", functions: "", data_only: true,
+     caveat: "Emit the check in transformed data, then use value.", status: "n/a"),
+
+    // ------------------------------------------------------------ linear algebra
+    (id: "transpose", flatppl: "transpose", module: None, args: ["A"], kind: "operator", stan: "{A}'", functions: "", data_only: false,
+     caveat: "Also correct for complex types; Stan ' does not conjugate.", status: "verified"),
+    (id: "adjoint", flatppl: "adjoint", module: None, args: ["A"], kind: "builtin", stan: "conj({A}')", functions: "", data_only: false,
+     caveat: "Template is for complex types. For real types emit {A}'.", status: "verified"),
+    (id: "det", flatppl: "det", module: None, args: ["A"], kind: "builtin", stan: "determinant({A})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "logabsdet", flatppl: "logabsdet", module: None, args: ["A"], kind: "builtin", stan: "log_determinant({A})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "inv", flatppl: "inv", module: None, args: ["A"], kind: "builtin", stan: "inverse({A})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "trace", flatppl: "trace", module: None, args: ["A"], kind: "builtin", stan: "trace({A})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "linsolve", flatppl: "linsolve", module: None, args: ["A", "b"], kind: "operator", stan: "({A} \\ {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "qr", flatppl: "qr", module: None, args: ["A"], kind: "builtin", stan: "qr_thin({A})", functions: "", data_only: false,
+     caveat: "Returns tuple(Q, R); record fields Q, R become .1, .2. Stan makes diag(R) non-negative; §07 fixes no sign.", status: "verified"),
+    (id: "lower_cholesky", flatppl: "lower_cholesky", module: None, args: ["A"], kind: "builtin", stan: "cholesky_decompose({A})", functions: "", data_only: false,
+     caveat: "Real symmetric A only.", status: "verified"),
+    (id: "row_gram", flatppl: "row_gram", module: None, args: ["A"], kind: "builtin", stan: "tcrossprod({A})", functions: "", data_only: false, caveat: "Real A only.", status: "verified"),
+    (id: "col_gram", flatppl: "col_gram", module: None, args: ["A"], kind: "builtin", stan: "crossprod({A})", functions: "", data_only: false, caveat: "Real A only.", status: "verified"),
+    (id: "self_outer", flatppl: "self_outer", module: None, args: ["x"], kind: "operator", stan: "({x} * {x}')", functions: "", data_only: false,
+     caveat: "Real x. Complex x: ({x} * conj({x}')).", status: "verified"),
+    (id: "cross", flatppl: "cross", module: None, args: ["a", "b"], kind: "helper", stan: "flatppl_cross({a}, {b})",
+     functions: "vector flatppl_cross(vector a, vector b) {
+  return [a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3], a[1] * b[2] - a[2] * b[1]]';
+}",
+     data_only: false, caveat: "Real vectors of length 3.", status: "verified"),
+    (id: "diagmat", flatppl: "diagmat", module: None, args: ["x"], kind: "builtin", stan: "diag_matrix({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "diag", flatppl: "diag", module: None, args: ["A", "k"], kind: "helper", stan: "flatppl_diag({A}, {k})",
+     functions: "vector flatppl_diag(matrix A, int k) {
+  // Stan diagonal() has no offset argument. Copy rows()/cols() to int first: stanc 2.40 emits
+  // std::min(long, int) for min(rows(A), int), which does not compile.
+  int m = rows(A);
+  int n = cols(A);
+  int len = k >= 0 ? min(m, n - k) : min(m + k, n);
+  vector[max(len, 0)] d;
+  for (i in 1:len) {
+    if (k >= 0) d[i] = A[i, i + k];
+    else d[i] = A[i - k, i];
+  }
+  return d;
+}",
+     data_only: false, caveat: "diag(A) with k = 0 may emit diagonal({A}).", status: "verified"),
+    (id: "quadform", flatppl: "quadform", module: None, args: ["A", "x"], kind: "builtin", stan: "quad_form({A}, {x})", functions: "", data_only: false,
+     caveat: "Real only.", status: "verified"),
+
+    // ------------------------------------------------------------ reductions
+    (id: "sum", flatppl: "sum", module: None, args: ["xs"], kind: "builtin", stan: "sum({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "mean", flatppl: "mean", module: None, args: ["xs"], kind: "builtin", stan: "mean({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "var", flatppl: "var", module: None, args: ["xs"], kind: "builtin", stan: "variance({xs})", functions: "", data_only: false,
+     caveat: "Stan returns 0 for one element; the §07 formula is 0/0 there.", status: "verified"),
+    (id: "std", flatppl: "std", module: None, args: ["xs"], kind: "builtin", stan: "sd({xs})", functions: "", data_only: false,
+     caveat: "As var.", status: "verified"),
+    (id: "prod", flatppl: "prod", module: None, args: ["xs"], kind: "builtin", stan: "prod({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "maximum", flatppl: "maximum", module: None, args: ["xs"], kind: "builtin", stan: "max({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "minimum", flatppl: "minimum", module: None, args: ["xs"], kind: "builtin", stan: "min({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "median", flatppl: "median", module: None, args: ["xs"], kind: "builtin", stan: "quantile({xs}, 0.5)", functions: "", data_only: true,
+     caveat: "Data-only.", status: "verified"),
+    (id: "quantile", flatppl: "quantile", module: None, args: ["xs", "p"], kind: "builtin", stan: "quantile({xs}, {p})", functions: "", data_only: true,
+     caveat: "Hyndman-Fan type 7, as §07. Data-only.", status: "verified"),
+    (id: "lengthof", flatppl: "lengthof", module: None, args: ["x"], kind: "builtin", stan: "num_elements({x})", functions: "", data_only: false,
+     caveat: "Vectors. Arrays: size. Tables: rows of the column vectors.", status: "verified"),
+    (id: "sizeof", flatppl: "sizeof", module: None, args: ["x"], kind: "builtin", stan: "dims({x})", functions: "", data_only: false,
+     caveat: "Matrices and arrays. Stan dims(vector[n]) returns {n, 1} (measured, CmdStan 2.40); for a vector emit {num_elements({x})}.", status: "verified"),
+    (id: "indicesof", flatppl: "indicesof", module: None, args: ["x"], kind: "builtin", stan: "linspaced_int_array(num_elements({x}), 1, num_elements({x}))", functions: "", data_only: false,
+     caveat: "Vectors only.", status: "verified"),
+    (id: "indicesof0", flatppl: "indicesof0", module: None, args: ["x"], kind: "builtin", stan: "linspaced_int_array(num_elements({x}), 0, num_elements({x}) - 1)", functions: "", data_only: false,
+     caveat: "Vectors only.", status: "verified"),
+
+    // ------------------------------------------------------------ cumulative
+    (id: "cumsum", flatppl: "cumsum", module: None, args: ["xs"], kind: "builtin", stan: "cumulative_sum({xs})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "cumprod", flatppl: "cumprod", module: None, args: ["xs"], kind: "helper", stan: "flatppl_cumprod({xs})",
+     functions: "vector flatppl_cumprod(vector x) {
+  vector[num_elements(x)] r;
+  real acc = 1;
+  for (i in 1:num_elements(x)) {
+    acc *= x[i];
+    r[i] = acc;
+  }
+  return r;
+}",
+     data_only: false, caveat: "", status: "verified"),
+    (id: "cummax", flatppl: "cummax", module: None, args: ["xs"], kind: "helper", stan: "flatppl_cummax({xs})",
+     functions: "vector flatppl_cummax(vector x) {
+  vector[num_elements(x)] r;
+  for (i in 1:num_elements(x)) {
+    if (i == 1) r[i] = x[i];
+    else r[i] = fmax(r[i - 1], x[i]);
+  }
+  return r;
+}",
+     data_only: false, caveat: "", status: "verified"),
+    (id: "cummin", flatppl: "cummin", module: None, args: ["xs"], kind: "helper", stan: "flatppl_cummin({xs})",
+     functions: "vector flatppl_cummin(vector x) {
+  vector[num_elements(x)] r;
+  for (i in 1:num_elements(x)) {
+    if (i == 1) r[i] = x[i];
+    else r[i] = fmin(r[i - 1], x[i]);
+  }
+  return r;
+}",
+     data_only: false, caveat: "", status: "verified"),
+
+    // ------------------------------------------------------------ norms
+    (id: "l1norm", flatppl: "l1norm", module: None, args: ["v"], kind: "builtin", stan: "norm1({v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "l2norm", flatppl: "l2norm", module: None, args: ["v"], kind: "builtin", stan: "norm2({v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "linfnorm", flatppl: "linfnorm", module: None, args: ["v"], kind: "builtin", stan: "max(abs({v}))", functions: "", data_only: false,
+     caveat: "Empty v: Stan max gives -inf; §07 gives 0.", status: "verified"),
+    (id: "l1unit", flatppl: "l1unit", module: None, args: ["v"], kind: "operator", stan: "({v} / norm1({v}))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "l2unit", flatppl: "l2unit", module: None, args: ["v"], kind: "operator", stan: "({v} / norm2({v}))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "logsumexp", flatppl: "logsumexp", module: None, args: ["v"], kind: "builtin", stan: "log_sum_exp({v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "softmax", flatppl: "softmax", module: None, args: ["v"], kind: "builtin", stan: "softmax({v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "logsoftmax", flatppl: "logsoftmax", module: None, args: ["v"], kind: "builtin", stan: "log_softmax({v})", functions: "", data_only: false, caveat: "", status: "verified"),
+
+    // ------------------------------------------------------------ logic and conditionals
+    (id: "land", flatppl: "land", module: None, args: ["a", "b"], kind: "operator", stan: "({a} && {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "lor", flatppl: "lor", module: None, args: ["a", "b"], kind: "operator", stan: "({a} || {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "lnot", flatppl: "lnot", module: None, args: ["a"], kind: "operator", stan: "(!{a})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "lxor", flatppl: "lxor", module: None, args: ["a", "b"], kind: "operator", stan: "({a} != {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "lany", flatppl: "lany", module: None, args: ["xs"], kind: "operator", stan: "(sum({xs}) > 0)", functions: "", data_only: false,
+     caveat: "xs is an array[] int of 0/1.", status: "verified"),
+    (id: "lall", flatppl: "lall", module: None, args: ["xs"], kind: "operator", stan: "(sum({xs}) == size({xs}))", functions: "", data_only: false,
+     caveat: "xs is an array[] int of 0/1. Empty gives 1 (true), as §07.", status: "verified"),
+    (id: "ifelse", flatppl: "ifelse", module: None, args: ["cond", "a", "b"], kind: "operator", stan: "({cond} ? {a} : {b})", functions: "", data_only: false, caveat: "", status: "verified"),
+
+    // ------------------------------------------------------------ membership, binning, approximation
+    (id: "in", flatppl: "in", module: None, args: ["x", "S"], kind: "construct", stan: "({lo} <= {x} && {x} <= {hi})", functions: "", data_only: false,
+     caveat: "interval(lo, hi) only.", status: "n/a"),
+    (id: "filter", flatppl: "filter", module: None, args: ["pred", "data", "p"], kind: "none", stan: "", functions: "", data_only: true, caveat: "Needs a loop; result size is data-dependent.", status: "n/a"),
+    (id: "selectbins", flatppl: "selectbins", module: None, args: ["edges", "region", "counts"], kind: "none", stan: "", functions: "", data_only: true, caveat: "Needs a loop.", status: "n/a"),
+    (id: "bincounts", flatppl: "bincounts", module: None, args: ["bins", "data"], kind: "none", stan: "", functions: "", data_only: true, caveat: "Needs a loop.", status: "n/a"),
+    (id: "polynomial", flatppl: "polynomial", module: None, args: ["coefficients", "x"], kind: "helper", stan: "flatppl_polynomial({coefficients}, {x})",
+     functions: "real flatppl_polynomial(vector c, real x) {
+  int n = num_elements(c);
+  real acc = 0;
+  for (i in 1:n) acc = acc * x + c[n + 1 - i];
+  return acc;
+}",
+     data_only: false, caveat: "Horner evaluation.", status: "verified"),
+    (id: "bernstein", flatppl: "bernstein", module: None, args: ["coefficients", "x"], kind: "helper", stan: "flatppl_bernstein({coefficients}, {x})",
+     functions: "real flatppl_bernstein(vector c, real x) {
+  int n = num_elements(c) - 1;
+  real acc = 0;
+  for (k in 0:n) acc += c[k + 1] * choose(n, k) * pow(x, k) * pow(1 - x, n - k);
+  return acc;
+}",
+     data_only: false, caveat: "", status: "verified"),
+    (id: "stepwise", flatppl: "stepwise", module: None, args: ["edges", "values", "x"], kind: "helper", stan: "flatppl_stepwise({edges}, {values}, {x})",
+     functions: "real flatppl_stepwise(vector edges, vector values, real x) {
+  int n = num_elements(values);
+  if (x < edges[1] || x > edges[n + 1]) return not_a_number();
+  for (i in 1:(n - 1)) {
+    if (x < edges[i + 1]) return values[i];
+  }
+  return values[n];
+}",
+     data_only: false, caveat: "§07 states no value outside [e_1, e_{n+1}]; the helper returns NaN there.", status: "verified"),
+
+    // ------------------------------------------------------------ random values and kernel primitives
+    (id: "rnginit", flatppl: "rnginit", module: None, args: ["rngseed"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Stan RNG state is implicit (seed argument of the run).", status: "n/a"),
+    (id: "rand", flatppl: "rand", module: None, args: ["m", "rstate"], kind: "construct", stan: "<stan>_rng(<args>)", functions: "", data_only: false,
+     caveat: "Only in transformed data or generated quantities; no explicit state.", status: "n/a"),
+    (id: "rngstate", flatppl: "rngstate", module: None, args: ["bytes"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "builtin_logdensityof", flatppl: "builtin_logdensityof", module: None, args: ["kernel", "kernel_input", "x"], kind: "construct",
+     stan: "<stan>_<suffix>(<lhs> | <args>)", functions: "", data_only: false, caveat: "Built-in laws via distributions.ron.", status: "n/a"),
+    (id: "builtin_sample", flatppl: "builtin_sample", module: None, args: ["rngstate", "kernel", "kernel_input", "n"], kind: "construct",
+     stan: "<stan>_rng(<args>)", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "builtin_touniform", flatppl: "builtin_touniform", module: None, args: ["kernel", "kernel_input", "x"], kind: "construct",
+     stan: "exp(<stan>_lcdf(<lhs> | <args>))", functions: "", data_only: false, caveat: "Univariate laws with lcdf only.", status: "n/a"),
+    (id: "builtin_fromuniform", flatppl: "builtin_fromuniform", module: None, args: ["kernel", "kernel_input", "u"], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Stan quantile functions exist only for std_normal (std_normal_qf), student_t (student_t_qf), beta (inv_inc_beta).", status: "n/a"),
+    (id: "builtin_tonormal", flatppl: "builtin_tonormal", module: None, args: ["kernel", "kernel_input", "x"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "builtin_fromnormal", flatppl: "builtin_fromnormal", module: None, args: ["kernel", "kernel_input", "z"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+
+    // ------------------------------------------------------------ module special-functions 0.1
+    (id: "erf", flatppl: "erf", module: Some("special-functions 0.1"), args: ["x"], kind: "builtin", stan: "erf({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "erfc", flatppl: "erfc", module: Some("special-functions 0.1"), args: ["x"], kind: "builtin", stan: "erfc({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "erfcx", flatppl: "erfcx", module: Some("special-functions 0.1"), args: ["x"], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "exp(square(x)) * erfc(x) overflows for large x.", status: "n/a"),
+    (id: "bessel_j", flatppl: "bessel_j", module: Some("special-functions 0.1"), args: ["v", "z"], kind: "builtin", stan: "bessel_first_kind({v}, {z})", functions: "", data_only: false,
+     caveat: "Stan order v must be int; real order: none.", status: "verified"),
+    (id: "bessel_y", flatppl: "bessel_y", module: Some("special-functions 0.1"), args: ["v", "z"], kind: "builtin", stan: "bessel_second_kind({v}, {z})", functions: "", data_only: false,
+     caveat: "Stan order v must be int.", status: "verified"),
+    (id: "bessel_i", flatppl: "bessel_i", module: Some("special-functions 0.1"), args: ["v", "z"], kind: "builtin", stan: "modified_bessel_first_kind({v}, {z})", functions: "", data_only: false,
+     caveat: "Stan order v must be int. Real order: exp(log_modified_bessel_first_kind(v, z)) for z > 0.", status: "verified"),
+    (id: "bessel_k", flatppl: "bessel_k", module: Some("special-functions 0.1"), args: ["v", "z"], kind: "builtin", stan: "modified_bessel_second_kind({v}, {z})", functions: "", data_only: false,
+     caveat: "Stan order v must be int.", status: "verified"),
+    (id: "digamma", flatppl: "digamma", module: Some("special-functions 0.1"), args: ["x"], kind: "builtin", stan: "digamma({x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "polygamma", flatppl: "polygamma", module: Some("special-functions 0.1"), args: ["n", "x"], kind: "builtin", stan: "trigamma({x})", functions: "", data_only: false,
+     caveat: "Template is for n = 1. n = 0: digamma({x}). n >= 2: none.",
+     status: "unverified: Stan trigamma misses 1e-12: trigamma(2.5) = 0.4903577556088261 vs exact 0.4903577561002349 (rel. 1.0e-9); trigamma(0.1) rel. 1.1e-11"),
+    (id: "gammainc", flatppl: "gammainc", module: Some("special-functions 0.1"), args: ["a", "x"], kind: "builtin", stan: "gamma_p({a}, {x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "betainc", flatppl: "betainc", module: Some("special-functions 0.1"), args: ["a", "b", "x"], kind: "builtin", stan: "inc_beta({a}, {b}, {x})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "airy", flatppl: "airy", module: Some("special-functions 0.1"), args: ["x"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+
+    // ------------------------------------------------------------ module ext-linear-algebra 0.1
+    (id: "lu", flatppl: "lu", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "svd", flatppl: "svd", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "builtin", stan: "svd({A})", functions: "", data_only: false,
+     caveat: "Returns tuple(U, s, V); singular values descending. Sign conventions of U, V not compared.", status: "unverified: decomposition signs are not unique; only defined up to sign"),
+    (id: "eigen", flatppl: "eigen", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "builtin", stan: "eigendecompose({A})", functions: "", data_only: false,
+     caveat: "Stan returns tuple(vectors, values) as complex types: the order is reversed from record(values, vectors).", status: "unverified: eigenvector scaling and order are not unique"),
+    (id: "eigmax", flatppl: "eigmax", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "builtin", stan: "max(eigenvalues_sym({A}))", functions: "", data_only: false,
+     caveat: "Symmetric A only. General real A: none.", status: "verified"),
+    (id: "eigmin", flatppl: "eigmin", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "builtin", stan: "min(eigenvalues_sym({A}))", functions: "", data_only: false,
+     caveat: "Symmetric A only.", status: "verified"),
+    (id: "matexp", flatppl: "matexp", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "builtin", stan: "matrix_exp({A})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "kron", flatppl: "kron", module: Some("ext-linear-algebra 0.1"), args: ["A", "B"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+    (id: "lstsq", flatppl: "lstsq", module: Some("ext-linear-algebra 0.1"), args: ["A", "b"], kind: "none", stan: "", functions: "", data_only: false, caveat: "", status: "n/a"),
+    (id: "rank", flatppl: "rank", module: Some("ext-linear-algebra 0.1"), args: ["A"], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Stan rank(v, s) is an order statistic, not a matrix rank.", status: "n/a"),
+
+    // ------------------------------------------------------------ module distances 0.1
+    (id: "euclidean", flatppl: "euclidean", module: Some("distances 0.1"), args: ["u", "v"], kind: "builtin", stan: "distance({u}, {v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "squared_euclidean", flatppl: "squared_euclidean", module: Some("distances 0.1"), args: ["u", "v"], kind: "builtin", stan: "squared_distance({u}, {v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "cosine", flatppl: "cosine", module: Some("distances 0.1"), args: ["u", "v"], kind: "operator", stan: "(1 - dot_product({u}, {v}) / (norm2({u}) * norm2({v})))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "manhattan", flatppl: "manhattan", module: Some("distances 0.1"), args: ["u", "v"], kind: "builtin", stan: "norm1({u} - {v})", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "chebyshev_distance", flatppl: "chebyshev", module: Some("distances 0.1"), args: ["u", "v"], kind: "builtin", stan: "max(abs({u} - {v}))", functions: "", data_only: false, caveat: "", status: "verified"),
+    (id: "minkowski", flatppl: "minkowski", module: Some("distances 0.1"), args: ["u", "v", "p"], kind: "builtin", stan: "pow(sum(pow(abs({u} - {v}), {p})), 1 / {p})", functions: "", data_only: false,
+     caveat: "Write 1 / {p} with a real p; int p would truncate.", status: "verified"),
+    (id: "jensenshannon", flatppl: "jensenshannon", module: Some("distances 0.1"), args: ["u", "v"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a helper with the 0 log 0 = 0 rule (lmultiply).", status: "n/a"),
+    (id: "pairwise_distance", flatppl: "pairwise_distance", module: Some("distances 0.1"), args: ["distance", "x"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+    (id: "cross_distance", flatppl: "cross_distance", module: Some("distances 0.1"), args: ["distance", "x", "y"], kind: "none", stan: "", functions: "", data_only: false, caveat: "Needs a loop.", status: "n/a"),
+
+    // ------------------------------------------------------------ modules without Stan forms in this pass
+    (id: "polynomials", flatppl: "legendre, hermite, laguerre, chebyshev", module: Some("polynomials 0.1"), args: ["n", "x"], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Needs recurrence helpers; not written.", status: "n/a"),
+    (id: "splines", flatppl: "thinplate_basis, thinplate_penalty", module: Some("splines 0.1"), args: ["x", "centers"], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Needs helpers; not written.", status: "n/a"),
+    (id: "particle_physics_functions", flatppl: "interp_*, resonance_breitwigner, kallen, breakup_momentum, blatt_weisskopf, wigner*", module: Some("particle-physics 0.1"), args: [], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Needs helpers; not written.", status: "n/a"),
+    (id: "pyhf_helpers", flatppl: "normsys_factor, histosys_shift, sample_yields, expected_counts", module: Some("pyhf-helpers 0.1"), args: [], kind: "none", stan: "", functions: "", data_only: false,
+     caveat: "Needs helpers; not written.", status: "n/a"),
+]

@@ -20,5 +20,5 @@ model {
 
   rho ~ gamma(25, 4);
   alpha ~ normal(0, 2) T[0, ];
-  y_obs ~ multi_normal(rep_vector(0.0, N), covariance);
+  y_obs ~ multi_normal(zeros_vector(N), covariance);
 }

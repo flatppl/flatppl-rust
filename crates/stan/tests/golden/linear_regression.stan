@@ -11,6 +11,6 @@ parameters {
 model {
   alpha ~ normal(0, 10);
   beta ~ normal(0, 10);
-  sigma ~ normal(0, 1) T[0, ];
+  sigma ~ std_normal() T[0, ];
   y_obs ~ normal(alpha + beta * x, sigma);
 }

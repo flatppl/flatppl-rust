@@ -5,7 +5,6 @@
 use super::{Emitter, Ex, P_ADD, P_ATOM, P_CMP, P_MUL, P_POW, P_TERNARY, P_UNARY};
 use crate::refuse::{Refusal, Result};
 use crate::stan_type::StanType;
-use crate::tables;
 use flatppl_core::{Dim, Node, NodeId, Scalar, Type};
 
 const P_OR: u8 = 1;
@@ -148,7 +147,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// A scalar function applied to per-element arguments.
-    fn apply(&self, node: NodeId, f: &str, args: &[NodeId], parts: Vec<Ex>) -> Result<Ex> {
+    fn apply(&mut self, node: NodeId, f: &str, args: &[NodeId], parts: Vec<Ex>) -> Result<Ex> {
         let int = |k: usize| self.shape(args[k]).is_some_and(|s| s.int);
         let bin = |op: &str, prec: u8| Ex {
             s: format!("{} {op} {}", parts[0].at(prec), parts[1].at(prec + 1)),
@@ -192,17 +191,7 @@ impl<'m> Emitter<'m> {
                 ),
                 prec: P_TERNARY,
             },
-            (name, _) => match tables::function(name) {
-                Some((stan, _)) => Ex::atom(format!(
-                    "{stan}({})",
-                    parts
-                        .iter()
-                        .map(|p| p.s.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-                None => return Err(Refusal::not_yet(Some(node), format!("{name}.(…)"))),
-            },
+            (name, _) => return self.table_fn(node, name, None, parts),
         })
     }
 }
