@@ -488,6 +488,8 @@ impl<'m> Emitter<'m> {
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
             self.env.insert(sym, stan.clone());
+            // A free input is a scoring input, as a kernel input is.
+            self.fields.insert(sym, stan.clone());
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(sym).to_string(),

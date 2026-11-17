@@ -95,3 +95,50 @@ fn skips_scoring_inputs_and_unsupported_laws() {
         assert_eq!(emit(&source, true).code, emit(&source, false).code);
     }
 }
+
+/// A `logdensityof` target scores its free inputs as a likelihood does: the
+/// summaries prepare the data only, and the interface does not change.
+#[test]
+fn logdensityof_target_uses_the_same_summaries() {
+    const TARGET: &str = r#"flatppl_compat = "0.1"
+N = 3
+samples = [0.25, -1.5, 2.0]
+mu = elementof(reals)
+sigma = elementof(posreals)
+lp = logdensityof(iid(Normal(mu = mu, sigma = sigma), N), samples)
+"#;
+    let emit = |enabled: bool| {
+        let mut m = flatppl_syntax::parse(TARGET).unwrap();
+        flatppl_infer::infer(&mut m);
+        let options = EmitOptions {
+            target: Some("lp".into()),
+            sufficient_statistics: enabled,
+            ..Default::default()
+        };
+        flatppl_stan::emit(&m, &options).unwrap()
+    };
+    let (on, off) = (emit(true), emit(false));
+    assert_eq!(on.data, off.data);
+    assert_eq!(on.manifest, off.manifest);
+    assert!(
+        off.code.contains("samples ~ normal(mu, sigma);"),
+        "{}",
+        off.code
+    );
+    let (setup, model) = on.code.split_once("model {").unwrap();
+    assert!(setup.contains("transformed data {"), "{}", on.code);
+    // The summaries are data: they never read a parameter.
+    let tdata = setup.split("parameters {").next().unwrap();
+    assert!(
+        !tdata
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|w| w == "mu" || w == "sigma"),
+        "{}",
+        on.code
+    );
+    assert!(
+        model.contains("target += normal_lpdf(samples | normal_mu, normal_sigma);"),
+        "{}",
+        on.code
+    );
+}
