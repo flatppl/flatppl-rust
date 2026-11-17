@@ -554,14 +554,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         let smooths = formula
             .smooths
             .iter()
-            .map(|term| {
-                Ok(Smooth {
-                    basis: ThinPlate::fit(&table.column(&term.column)?.numeric(&rows)?, term.rank)?,
-                    inputs: Vec::new(),
-                    sds: String::new(),
-                    z: String::new(),
-                })
-            })
+            .map(|term| Smooth::fit(term, table, &rows))
             .collect::<Result<Vec<_>>>()?;
         let offset_mean = formula
             .offset()
@@ -622,6 +615,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             &formula,
             &design,
             &groups,
+            &smooths,
             priors::PriorContext {
                 family,
                 link,

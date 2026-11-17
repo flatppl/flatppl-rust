@@ -233,6 +233,10 @@ fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::Predictor
                 name
             })
             .collect();
+        if let Some(by) = &mut smooth.by {
+            by.index = b.alloc_name(&predictor_name(dpar, &format!("smooth_{}_by", i + 1)));
+            external_vector(b, &by.index, "posintegers");
+        }
     }
     if !recipe.formula.offsets.is_empty() {
         external_vector(b, &predictor_name(dpar, "offset"), "reals");
@@ -345,32 +349,28 @@ fn predictor_parameters(
             b.bind(&predictor_name(dpar, name), coefficients);
         }
     }
-    for (i, (smooth, term)) in recipe
-        .smooths
-        .iter_mut()
-        .zip(&recipe.formula.smooths)
-        .enumerate()
-    {
-        smooth.sds = b.alloc_name(&predictor_name(
-            dpar,
-            &format!("sds_{}", term.coefficient()),
-        ));
-        smooth.z = b.alloc_name(&predictor_name(dpar, &format!("zs_{}", term.coefficient())));
-        let support = lower_bound(b, 0.0);
-        parameter(
-            b,
-            &smooth.sds,
-            &recipe.priors.sds[i],
-            Some(support),
-            parameters,
-            family,
-        )?;
-        let zero = b.lit_real(0.0);
-        let one = b.lit_real(1.0);
-        let normal = b.call("Normal", &[zero, one]);
+    let mut scale_priors = recipe.priors.sds.iter();
+    for (smooth, term) in recipe.smooths.iter_mut().zip(&recipe.formula.smooths) {
         let rank = b.lit_int(smooth.inputs.len() as i64 - 1);
-        let law = b.call("iid", &[normal, rank]);
-        declare_parameter(b, &smooth.z, law, parameters);
+        for (level, sds, z) in smooth.curves_mut() {
+            let name = term.coefficient(level);
+            *sds = b.alloc_name(&predictor_name(dpar, &format!("sds_{name}")));
+            *z = b.alloc_name(&predictor_name(dpar, &format!("zs_{name}")));
+            let support = lower_bound(b, 0.0);
+            parameter(
+                b,
+                sds,
+                scale_priors.next().unwrap(),
+                Some(support),
+                parameters,
+                family,
+            )?;
+            let zero = b.lit_real(0.0);
+            let one = b.lit_real(1.0);
+            let normal = b.call("Normal", &[zero, one]);
+            let law = b.call("iid", &[normal, rank]);
+            declare_parameter(b, z, law, parameters);
+        }
     }
     for (i, group) in recipe.groups.iter_mut().enumerate() {
         group.sd = b.alloc_name(&predictor_name(dpar, &format!("sd_{}", group.column)));
@@ -505,24 +505,11 @@ fn predictor_values(
         let value = b.self_ref(&predictor_name(dpar, "temp_Intercept"));
         eta = broadcast(b, "add", &[eta, value]);
     }
-    for (i, smooth) in recipe.smooths.iter().enumerate() {
-        let coefficients = b.self_ref(&predictor_name(dpar, "bs"));
-        let index = b.lit_int(i as i64 + 1);
-        let coefficient = b.call("get", &[coefficients, index]);
-        let fixed = b.self_ref(&smooth.inputs[0]);
-        let fixed = broadcast(b, "mul", &[fixed, coefficient]);
-        let columns: Vec<_> = smooth.inputs[1..]
-            .iter()
-            .map(|name| b.self_ref(name))
-            .collect();
-        let columns = b.array(&columns);
-        let random = b.call("colstack", &[columns]);
-        let scale = b.self_ref(&smooth.sds);
-        let z = b.self_ref(&smooth.z);
-        let coefficients = broadcast(b, "mul", &[scale, z]);
-        let random = b.call("mul", &[random, coefficients]);
-        let smooth = broadcast(b, "add", &[fixed, random]);
-        eta = broadcast(b, "add", &[eta, smooth]);
+    let mut smooth_offset = 0;
+    for smooth in &recipe.smooths {
+        let contribution = smooth_effect(b, dpar, smooth, smooth_offset);
+        eta = broadcast(b, "add", &[eta, contribution]);
+        smooth_offset += smooth.curve_count();
     }
     for (i, group) in recipe.groups.iter().enumerate() {
         let mut columns = design_columns(b, &group.design, &group.inputs);
@@ -563,6 +550,59 @@ fn predictor_values(
     if let Some(intercept) = intercept {
         b.bind(&predictor_name(dpar, "b_Intercept"), intercept);
     }
+}
+
+fn smooth_effect(b: &mut Builder<'_>, dpar: &str, smooth: &crate::Smooth, offset: usize) -> NodeId {
+    let slopes = b.self_ref(&predictor_name(dpar, "bs"));
+    let weights: Vec<_> = smooth
+        .curves()
+        .enumerate()
+        .map(|(i, (_, sds, z))| {
+            let index = b.lit_int((offset + i + 1) as i64);
+            let fixed = b.call("get", &[slopes, index]);
+            let scale = b.self_ref(sds);
+            let z = b.self_ref(z);
+            (fixed, broadcast(b, "mul", &[scale, z]))
+        })
+        .collect();
+    if let Some(by) = &smooth.by {
+        let index = b.self_ref(&by.index);
+        // Each row gathers the weights for its own level from the shared basis.
+        let mut terms = Vec::new();
+        for (j, input) in smooth.inputs.iter().enumerate() {
+            let mut coefficients = Vec::with_capacity(by.levels.len());
+            if by.first_curve() == 1 {
+                coefficients.push(b.lit_real(0.0));
+            }
+            for &(fixed, random) in &weights {
+                coefficients.push(if j == 0 {
+                    fixed
+                } else {
+                    let column = b.lit_int(j as i64);
+                    b.call("get", &[random, column])
+                });
+            }
+            let coefficients = b.array(&coefficients);
+            let selected = b.call("get", &[coefficients, index]);
+            let values = b.self_ref(input);
+            terms.push(broadcast(b, "mul", &[selected, values]));
+        }
+        return terms
+            .into_iter()
+            .reduce(|left, right| broadcast(b, "add", &[left, right]))
+            .unwrap();
+    }
+    let (fixed, random) = weights[0];
+    let linear = b.self_ref(&smooth.inputs[0]);
+    let linear = broadcast(b, "mul", &[linear, fixed]);
+    let columns: Vec<_> = smooth.inputs[1..]
+        .iter()
+        .map(|name| b.self_ref(name))
+        .collect();
+    let columns = b.array(&columns);
+    let basis = b.call("colstack", &[columns]);
+    let curved = b.call("mul", &[basis, random]);
+    broadcast(b, "add", &[linear, curved])
 }
 
 pub(crate) fn parameter_function(
@@ -1092,13 +1132,17 @@ fn predictor_info(
             );
         }
     }
-    for (i, (smooth, term)) in recipe
-        .smooths
-        .iter()
-        .zip(&recipe.formula.smooths)
-        .enumerate()
-    {
-        let name = term.coefficient();
+    let smooth_curves =
+        recipe
+            .smooths
+            .iter()
+            .zip(&recipe.formula.smooths)
+            .flat_map(|(smooth, term)| {
+                smooth.curves().map(move |(level, sds, z)| {
+                    (term.coefficient(level), smooth.inputs.len(), sds, z)
+                })
+            });
+    for (i, (name, inputs, sds, z)) in smooth_curves.enumerate() {
         if !names.insert(name.clone()) {
             return Err(Error(format!(
                 "design columns have duplicate brms name `{name}`"
@@ -1123,14 +1167,14 @@ fn predictor_info(
         }
         add(
             format!("sds_{prefix}{name}"),
-            &smooth.sds,
+            sds,
             &[],
-            parameter_role(module, &smooth.sds),
+            parameter_role(module, sds),
         );
-        for j in 1..smooth.inputs.len() {
+        for j in 1..inputs {
             add(
                 format!("zs_{prefix}{name}[{j}]"),
-                &smooth.z,
+                z,
                 &[j],
                 ParameterRole::Sampled,
             );

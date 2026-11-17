@@ -196,6 +196,7 @@ pub(crate) fn resolve(
     formula: &Formula,
     design: &Design,
     groups: &[Group],
+    smooths: &[crate::Smooth],
     context: PriorContext<'_>,
 ) -> Result<(Priors, BTreeMap<String, ResolvedPrior>)> {
     let PriorContext {
@@ -251,8 +252,14 @@ pub(crate) fn resolve(
         group: None,
         dpar,
     }));
-    let smooth_names: Vec<_> = formula.smooths.iter().map(|s| s.coefficient()).collect();
-    let smooth_labels: Vec<_> = formula.smooths.iter().map(|s| s.label()).collect();
+    let smooth_terms = formula
+        .smooths
+        .iter()
+        .zip(smooths)
+        .flat_map(|(term, smooth)| smooth.curves().map(move |(level, _, _)| (term, level)));
+    let (smooth_names, smooth_labels): (Vec<_>, Vec<_>) = smooth_terms
+        .map(|(term, level)| (term.coefficient(level), term.curve_label(level)))
+        .unzip();
     targets.extend(smooth_names.iter().map(|name| PriorTarget {
         class: "b",
         coef: Some(name),

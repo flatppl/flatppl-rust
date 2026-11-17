@@ -429,6 +429,18 @@ fn prepare_predictor(
     constants: &mut BTreeMap<String, DataValue>,
 ) -> Result<()> {
     for (smooth, term) in recipe.smooths.iter().zip(&recipe.formula.smooths) {
+        if let Some(by) = &smooth.by {
+            let name = term
+                .by
+                .as_deref()
+                .ok_or_else(|| Error("invalid retained smooth by term".into()))?;
+            let column = table.column(name)?;
+            if !matches!(&column.values, ColumnValues::Factor { .. }) {
+                return Err(Error(format!("smooth by column `{name}` must be a factor")));
+            }
+            let codes = column.factor_codes(&by.levels, rows)?;
+            constants.insert(by.index.clone(), DataValue::Integers(codes));
+        }
         let column = table.column(&term.column)?;
         let values = smooth.basis.evaluate(&column.numeric(rows)?)?;
         for (j, name) in smooth.inputs.iter().enumerate() {
