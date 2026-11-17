@@ -73,6 +73,11 @@ impl<'m> Emitter<'m> {
                 let (lik, prior) = (c.args[0], c.args[1]);
                 let fields = self.prior_fields(prior)?;
                 self.declare_params(rhs, &fields)?;
+                for (name, sym) in std::mem::take(&mut self.links) {
+                    if let Some(stan) = self.fields.get(&name).cloned() {
+                        self.env.insert(sym, stan);
+                    }
+                }
                 let obs = self.likelihood(lik, true)?;
                 for f in &fields {
                     if let Some(law) = f.law {
@@ -144,6 +149,50 @@ impl<'m> Emitter<'m> {
                         law: Some(na.value),
                         node: na.value,
                     });
+                }
+            }
+            Some("jointchain") => {
+                // jointchain(M, K…): M's fields, then each kernel's outputs.
+                // A kernel input binds to the earlier field of the same name.
+                let c = self.call(p).unwrap();
+                if !c.named.is_empty() {
+                    return Err(Refusal::not_yet(Some(p), "a keyword jointchain prior"));
+                }
+                let args = c.args.to_vec();
+                out.extend(self.prior_fields(args[0])?);
+                for &k in &args[1..] {
+                    let k = self.resolve(k);
+                    let kc = self.call(k).filter(|_| self.head(k) == Some("kernelof"));
+                    let Some(kc) = kc else {
+                        return Err(Refusal::not_yet(
+                            Some(k),
+                            "a jointchain step that is not a kernelof",
+                        ));
+                    };
+                    if let Some(Inputs::Spec(list)) = &kc.inputs {
+                        for (name, r) in list.iter() {
+                            if r.ns == RefNs::SelfMod {
+                                self.links
+                                    .push((*name, *self.m.alias_chain(r.name).last().unwrap()));
+                            }
+                        }
+                    }
+                    let rec = self.resolve(kc.args[0]);
+                    if self.head(rec) != Some("record") {
+                        return Err(Refusal::not_yet(
+                            Some(k),
+                            "a jointchain step over a non-record",
+                        ));
+                    }
+                    for na in self.call(rec).unwrap().named.iter() {
+                        let (draw, law) = self.output_law(na.value)?;
+                        out.push(PriorField {
+                            field: na.name,
+                            binding: draw,
+                            law: Some(law),
+                            node: na.value,
+                        });
+                    }
                 }
             }
             Some("Lebesgue") => {
@@ -398,7 +447,19 @@ impl<'m> Emitter<'m> {
     /// variable, and the output variate is `~` its law.
     fn observe(&mut self, obs: Vec<Observation>) -> Result<()> {
         for o in obs {
-            let lhs = self.observed_value(&o)?;
+            let lhs = match self.observed_value(&o) {
+                Ok(lhs) => lhs,
+                // A law Stan cannot express outranks data this emitter cannot
+                // write yet.
+                Err(e) if !e.kind.is_never() => {
+                    let probe = self.law(o.law, true);
+                    return Err(match probe {
+                        Err(never) if never.kind.is_never() => never,
+                        _ => e,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
             if let Some(d) = o.draw {
                 self.env.insert(d, lhs.clone());
             }
@@ -531,6 +592,19 @@ impl<'m> Emitter<'m> {
         match head {
             "normalize" => {
                 let inner = self.resolve(self.call(m).unwrap().args[0]);
+                if let Some(dims) = self.weighted_lebesgue_dims(inner)
+                    && dims > 1
+                {
+                    return Err(Refusal::new(
+                        RefusalKind::NumericNormalizer,
+                        Some(m),
+                        "normalize",
+                        format!(
+                            "`normalize` of a weighted Lebesgue measure on a {dims}-dimensional \
+                             support has no closed-form normalizer"
+                        ),
+                    ));
+                }
                 if self.head(inner) != Some("truncate") {
                     return Err(Refusal::not_yet(Some(m), "normalize of this measure"));
                 }
@@ -608,12 +682,93 @@ impl<'m> Emitter<'m> {
                     _ => Err(Refusal::not_yet(Some(m), "a Uniform on an unbounded set")),
                 }
             }
+            "kchain" => {
+                let first = self.resolve(self.call(m).unwrap().args[0]);
+                if self.finite_discrete(first) {
+                    return Err(Refusal::not_yet(
+                        Some(m),
+                        "kchain over a finite discrete variate",
+                    ));
+                }
+                Err(Refusal::new(
+                    RefusalKind::KchainMarginal,
+                    Some(m),
+                    "kchain",
+                    "`kchain` marginalizes its continuous intermediate variate; Stan has no \
+                     marginalization integral",
+                ))
+            }
+            "pushfwd" => {
+                let f = self.resolve(self.call(m).unwrap().args[0]);
+                let projection = self.head(f) == Some("functionof")
+                    && matches!(
+                        self.head(self.resolve(self.call(f).unwrap().args[0])),
+                        Some("get" | "record")
+                    );
+                if projection {
+                    return Err(Refusal::new(
+                        RefusalKind::NonBijectivePushfwd,
+                        Some(m),
+                        "pushfwd",
+                        "`pushfwd` through a non-bijective map (a field projection) has no density \
+                         Stan can express",
+                    ));
+                }
+                Err(Refusal::not_yet(Some(m), "pushfwd"))
+            }
             name => {
                 let args = self.law_args(name, m)?;
                 let per = vec![false; args.len()];
                 self.dist(m, name, &args, &per)
             }
         }
+    }
+
+    /// The support dimension of `weighted(f, Lebesgue(S))` or `logweighted(…)`.
+    fn weighted_lebesgue_dims(&self, m: NodeId) -> Option<usize> {
+        if !matches!(self.head(m), Some("weighted" | "logweighted")) {
+            return None;
+        }
+        let c = self.call(m)?;
+        let base = self.resolve(*c.args.get(1)?);
+        if self.head(base) != Some("Lebesgue") {
+            return None;
+        }
+        let bc = self.call(base)?;
+        let support = bc
+            .args
+            .first()
+            .copied()
+            .or_else(|| bc.named.first().map(|n| n.value))?;
+        let support = self.resolve(support);
+        Some(match self.head(support) {
+            Some("cartprod") => {
+                let s = self.call(support)?;
+                s.args.len() + s.named.len()
+            }
+            _ => 1,
+        })
+    }
+
+    /// `true` for a law with finite discrete support (`Bernoulli`, `Categorical`).
+    fn finite_discrete(&self, m: NodeId) -> bool {
+        let m = match self.head(m) {
+            Some("lawof") => self
+                .call(m)
+                .and_then(|c| self.self_ref(c.args[0]))
+                .and_then(|s| {
+                    let rhs = self.m.binding(self.m.binding_by_name(s)?).rhs;
+                    (self.head(rhs) == Some("draw"))
+                        .then(|| self.resolve(self.call(rhs).unwrap().args[0]))
+                }),
+            _ => Some(m),
+        };
+        m.is_some_and(|m| {
+            matches!(
+                self.head(m),
+                Some("Bernoulli" | "Categorical" | "Categorical0")
+            )
+        })
     }
 
     /// The interval a prior law restricts its variate to, when it names one.

@@ -32,7 +32,19 @@ pub enum RefusalKind {
 impl RefusalKind {
     /// `true` for a construct Stan cannot express at all.
     pub fn is_never(&self) -> bool {
-        !matches!(self, RefusalKind::NotYetSupported)
+        !matches!(
+            self,
+            RefusalKind::NotYetSupported | RefusalKind::NoTarget | RefusalKind::AmbiguousTarget
+        )
+    }
+
+    /// The class a message leads with.
+    pub fn class(&self) -> &'static str {
+        match self {
+            RefusalKind::NotYetSupported => "not yet supported",
+            RefusalKind::NoTarget | RefusalKind::AmbiguousTarget => "no target",
+            _ => "no Stan form",
+        }
     }
 }
 
@@ -70,12 +82,7 @@ impl Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let class = if self.kind.is_never() {
-            "no Stan form"
-        } else {
-            "not yet supported"
-        };
-        write!(f, "refuse `{}` ({class}): {}", self.construct, self.reason)
+        write!(f, "{}: {}", self.kind.class(), self.reason)
     }
 }
 

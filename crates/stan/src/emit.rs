@@ -11,6 +11,7 @@ use flatppl_core::{
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+mod elementwise;
 mod structure;
 
 /// Expression precedence, loosest first, as Stan parses it.
@@ -89,6 +90,8 @@ pub(crate) struct Emitter<'m> {
     fields: HashMap<Symbol, String>,
     /// Stan name → its declaration.
     decls: HashMap<String, StanType>,
+    /// Kernel inputs inside the prior, bound by name to prior fields.
+    links: Vec<(Symbol, Symbol)>,
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
@@ -147,6 +150,7 @@ impl<'m> Emitter<'m> {
             env: HashMap::new(),
             fields: HashMap::new(),
             decls: HashMap::new(),
+            links: vec![],
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
             sizes,
@@ -392,33 +396,59 @@ impl<'m> Emitter<'m> {
             ));
         }
         let phase = self.m.phase_of(rhs).unwrap_or(Phase::Stochastic);
-        if phase == Phase::Fixed {
-            if let Some(v) = data::const_json(self.m, rhs) {
-                let stan = self.fresh(name);
-                let mut t = self.declare(rhs, None, false)?;
-                if t.is_int() && t.rank() == 0 && self.sizes.values().any(|v| v.contains(&sym)) {
-                    t.bounds.lower = Some("0".into());
-                }
-                self.data.push(format!("{};", t.render(&stan)));
-                self.record_decl(&stan, t);
-                self.json.insert(stan.clone(), v);
-                return Ok(stan);
-            }
-            let e = self.expr(rhs)?;
+        if phase == Phase::Fixed
+            && let Some(v) = data::const_json(self.m, rhs)
+        {
             let stan = self.fresh(name);
-            let t = self.declare(rhs, None, false)?;
-            self.tdata.push(format!("{} = {};", t.render(&stan), e.s));
+            let mut t = self.declare(rhs, None, false)?;
+            if t.is_int() && t.rank() == 0 && self.sizes.values().any(|v| v.contains(&sym)) {
+                t.bounds.lower = Some("0".into());
+            }
+            self.data.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
+            self.json.insert(stan.clone(), v);
             return Ok(stan);
         }
-        let e = self.expr(rhs)?;
-        let stan = self.fresh(name);
-        let t = self.declare(rhs, None, false)?;
-        let line = format!("{} = {};", t.render(&stan), e.s);
-        self.record_decl(&stan, t);
-        match self.opts.derived {
-            Placement::ModelLocals => self.locals.push(line),
-            Placement::TransformedParameters => self.tparams.push(line),
+        self.computed(name, rhs)
+    }
+
+    /// A computed value under a fresh name: `transformed data` when it is
+    /// fixed, else a `model` local (see [`Placement`]). A value Stan has no
+    /// whole-array expression for is filled elementwise by loops.
+    fn computed(&mut self, base: &str, rhs: NodeId) -> Result<String> {
+        let attempt = self.expr(rhs);
+        self.place(base, rhs, attempt)
+    }
+
+    /// Place a value whose whole-array expression is `attempt`, falling back
+    /// to elementwise loops.
+    fn place(&mut self, base: &str, rhs: NodeId, attempt: Result<Ex>) -> Result<String> {
+        let fixed = self.m.phase_of(rhs) == Some(Phase::Fixed);
+        let lines = match attempt {
+            Ok(e) => {
+                let stan = self.fresh(base);
+                let t = self.declare(rhs, None, false)?;
+                let line = format!("{} = {};", t.render(&stan), e.s);
+                self.record_decl(&stan, t);
+                (stan, vec![line])
+            }
+            Err(r) if r.kind == RefusalKind::NotYetSupported && self.elementwise(rhs) => {
+                let stan = self.fresh(base);
+                let t = self.declare(rhs, None, false)?;
+                let lines = self.fill_loops(&stan, &t, rhs)?;
+                self.record_decl(&stan, t);
+                (stan, lines)
+            }
+            Err(r) => return Err(r),
+        };
+        let (stan, lines) = lines;
+        if fixed {
+            self.tdata.extend(lines);
+        } else {
+            match self.opts.derived {
+                Placement::ModelLocals => self.locals.extend(lines),
+                Placement::TransformedParameters => self.tparams.extend(lines),
+            }
         }
         Ok(stan)
     }
@@ -624,6 +654,7 @@ impl<'m> Emitter<'m> {
             }
             ("colstack", [cols]) => self.stack(id, *cols, "append_col", false),
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
+            ("%call", _) => self.module_call(id),
             _ => {
                 if let Some((stan, _)) = tables::function(head) {
                     let mut parts = Vec::new();
@@ -644,6 +675,38 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// A call into a standard module: refused until the `functions` block lands,
+    /// and refused for good where Stan has no counterpart.
+    fn module_call(&mut self, id: NodeId) -> Result<Ex> {
+        let c = self.call(id).unwrap();
+        let CallHead::User(callee) = c.head else {
+            unreachable!()
+        };
+        let member = match self.m.node(callee) {
+            Node::Ref(r) => match r.ns {
+                RefNs::Module(alias) => format!("{}.{}", self.name(alias), self.name(r.name)),
+                _ => self.name(r.name).to_string(),
+            },
+            _ => "a callable expression".to_string(),
+        };
+        if let Node::Ref(r) = self.m.node(callee)
+            && let Some((_, instead)) = tables::NO_STAN_FUNCTION
+                .iter()
+                .find(|(f, _)| *f == self.name(r.name))
+        {
+            return Err(Refusal::new(
+                RefusalKind::NoStanFunction,
+                Some(id),
+                member.clone(),
+                format!("`{member}` has no Stan function; {instead}"),
+            ));
+        }
+        Err(Refusal::not_yet(
+            Some(id),
+            format!("the call `{member}(…)`"),
+        ))
+    }
+
     fn cmp(&mut self, op: &str, a: NodeId, b: NodeId) -> Result<Ex> {
         let l = self.expr(a)?;
         let r = self.expr(b)?;
@@ -658,9 +721,9 @@ impl<'m> Emitter<'m> {
         let sh = self
             .shape(id)
             .ok_or_else(|| Refusal::not_yet(Some(id), "an untyped array"))?;
-        let n = self.resolve(n);
-        let extents: Vec<String> = if self.head(n) == Some("vector") {
-            let items = self.call(n).unwrap().args.to_vec();
+        let r = self.resolve(n);
+        let extents: Vec<String> = if self.head(r) == Some("vector") {
+            let items = self.call(r).unwrap().args.to_vec();
             items
                 .iter()
                 .map(|&i| self.expr(i).map(|e| e.s))
@@ -683,16 +746,16 @@ impl<'m> Emitter<'m> {
     }
 
     fn stack(&mut self, id: NodeId, list: NodeId, join: &str, transpose: bool) -> Result<Ex> {
+        let original = list;
         let list = self.resolve(list);
         if self.head(list) != Some("vector") {
-            return Err(Refusal::not_yet(
-                Some(id),
-                if transpose {
-                    "rowstack of a computed array"
-                } else {
-                    "colstack of a computed array"
-                },
-            ));
+            // An array of vectors: copy it into a matrix by loops.
+            let base = match self.self_ref(original) {
+                Some(s) => format!("{}_matrix", self.name(s)),
+                None => "stacked".to_string(),
+            };
+            let refused = Err(Refusal::not_yet(Some(id), "a stacked array"));
+            return Ok(Ex::atom(self.place(&base, id, refused)?));
         }
         let items = self.call(list).unwrap().args.to_vec();
         let mut parts = Vec::new();
@@ -766,7 +829,17 @@ impl<'m> Emitter<'m> {
                 _ => idx.push(self.expr(*s)?.s),
             }
         }
-        Ok(Ex::atom(format!("{}[{}]", base.at(P_ATOM), idx.join(", "))))
+        let s = format!("{}[{}]", base.at(P_ATOM), idx.join(", "));
+        // A matrix row is a Stan row_vector; a FlatPPL vector is a Stan vector.
+        let matrix = matches!(self.m.type_of(x), Some(Type::Array { shape, elem })
+            if shape.len() == 2 && matches!(elem.as_ref(), Type::Scalar(ScalarType::Real)));
+        let row = sel.len() == 2
+            && self.shape(sel[0]).is_some_and(|s| s.rank == 0)
+            && self.shape(id).is_some_and(|s| s.rank == 1);
+        if matrix && row {
+            return Ok(Ex::atom(format!("{s}'")));
+        }
+        Ok(Ex::atom(s))
     }
 
     fn broadcast(&mut self, id: NodeId, f: NodeId, args: &[NodeId]) -> Result<Ex> {

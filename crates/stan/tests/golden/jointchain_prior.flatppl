@@ -1,0 +1,16 @@
+flatppl_compat = "0.1"
+J = 3
+N = 6
+group = [1, 1, 2, 2, 3, 3]
+y_obs = [0.4, 0.6, 1.9, 2.2, -0.1, 0.3]
+mu = elementof(reals)
+sigma = elementof(posreals)
+tau = elementof(posreals)
+theta ~ iid(Normal(mu, tau), J)
+y ~ Normal.(theta[group], sigma)
+Pi_scales = Lebesgue(cartprod(sigma = posreals, tau = posreals, mu = reals))
+K_effects = kernelof(record(theta = theta), sigma = sigma, tau = tau, mu = mu)
+prior = jointchain(Pi_scales, K_effects)
+K_model = kernelof(record(y = y), sigma = sigma, tau = tau, mu = mu, theta = theta)
+L = likelihoodof(K_model, record(y = y_obs))
+post = bayesupdate(L, prior)

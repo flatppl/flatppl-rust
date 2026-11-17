@@ -131,6 +131,12 @@ pub(crate) fn function(name: &str) -> Option<(&'static str, bool)> {
     })
 }
 
+/// FlatPPL functions with no Stan counterpart, with what Stan offers instead.
+pub(crate) const NO_STAN_FUNCTION: &[(&str, &str)] = &[(
+    "polygamma",
+    "Stan has `digamma` and `trigamma` for orders 0 and 1 only",
+)];
+
 /// Stan keywords and reserved names; a FlatPPL name in this list gets a
 /// trailing underscore.
 pub(crate) const RESERVED: &[&str] = &[

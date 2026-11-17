@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+N = 4
+x = [0.0, 1.0, 2.0, 3.0]
+y_obs = [0.1, -0.3, 0.2, 0.5]
+distance_sq = (addaxes(x, 0, 1) .- addaxes(x, 1, 0)).^2
+rho ~ Gamma(shape = 25, rate = 4)
+alpha ~ normalize(truncate(Normal(0, 2), interval(0, inf)))
+covariance = alpha^2 .* exp.(-0.5 .* distance_sq ./ rho^2) + 0.01 * eye(N)
+y ~ MvNormal(zeros(N), covariance)
+prior = lawof(record(rho = rho, alpha = alpha))
+L = likelihoodof(kernelof(record(y = y), rho = rho, alpha = alpha), record(y = y_obs))
+post = bayesupdate(L, prior)
