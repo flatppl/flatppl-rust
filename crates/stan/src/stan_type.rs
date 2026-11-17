@@ -220,3 +220,177 @@ pub(crate) fn declare(
         _ => Err(Refusal::not_yet(Some(node), "a value of this type")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::declare;
+    use flatppl_core::{Dim, Idx, NodeId, ScalarType, Type, ValueSet};
+
+    /// Every `sets.ron` row this builder covers, filled from the row's own
+    /// template, must equal the declaration `declare` writes for that set.
+    #[test]
+    fn declarations_match_sets_ron() {
+        let real = || Type::Scalar(ScalarType::Real);
+        let int = || Type::Scalar(ScalarType::Integer);
+        let vector = |elem: Type| Type::Array {
+            shape: vec![Dim::Static(4)].into(),
+            elem: Box::new(elem),
+        };
+        let matrix = Type::Array {
+            shape: vec![Dim::Static(3), Dim::Static(4)].into(),
+            elem: Box::new(real()),
+        };
+        let inf = f64::INFINITY;
+        // (row key, type, value set, {lo}, {hi}, {bounds})
+        let cases: Vec<(&str, Type, ValueSet, &str, &str, &str)> = vec![
+            ("reals", real(), ValueSet::Reals, "", "", ""),
+            (
+                "interval(-inf, inf)",
+                real(),
+                ValueSet::Interval(-inf, inf),
+                "",
+                "",
+                "",
+            ),
+            ("posreals", real(), ValueSet::PosReals, "", "", ""),
+            ("nonnegreals", real(), ValueSet::NonNegReals, "", "", ""),
+            ("unitinterval", real(), ValueSet::UnitInterval, "", "", ""),
+            (
+                "interval(a, b)",
+                real(),
+                ValueSet::Interval(-1.5, 2.5),
+                "-1.5",
+                "2.5",
+                "",
+            ),
+            (
+                "interval(a, inf)",
+                real(),
+                ValueSet::Interval(0.5, inf),
+                "0.5",
+                "",
+                "",
+            ),
+            (
+                "interval(-inf, b)",
+                real(),
+                ValueSet::Interval(-inf, 3.0),
+                "",
+                "3",
+                "",
+            ),
+            (
+                "ordered(n)",
+                vector(real()),
+                ValueSet::Ordered(Dim::Static(4)),
+                "",
+                "",
+                "",
+            ),
+            (
+                "zerosum(n)",
+                vector(real()),
+                ValueSet::ZeroSum(Dim::Static(4)),
+                "",
+                "",
+                "",
+            ),
+            (
+                "stdsimplex(n)",
+                vector(real()),
+                ValueSet::StdSimplex(Dim::Static(4)),
+                "",
+                "",
+                "",
+            ),
+            (
+                "cartpow(S, n)",
+                vector(real()),
+                ValueSet::CartPow(Box::new(ValueSet::PosReals), Dim::Static(4)),
+                "",
+                "",
+                "<lower=0>",
+            ),
+            (
+                "cartpow(S, n), S integer",
+                vector(int()),
+                ValueSet::CartPow(Box::new(ValueSet::NonNegIntegers), Dim::Static(4)),
+                "",
+                "",
+                "<lower=0>",
+            ),
+            (
+                "cartpow(S, [m, n])",
+                matrix,
+                ValueSet::CartPow(
+                    Box::new(ValueSet::CartPow(
+                        Box::new(ValueSet::UnitInterval),
+                        Dim::Static(4),
+                    )),
+                    Dim::Static(3),
+                ),
+                "",
+                "",
+                "<lower=0, upper=1>",
+            ),
+            ("integers", int(), ValueSet::Integers, "", "", ""),
+            ("posintegers", int(), ValueSet::PosIntegers, "", "", ""),
+            (
+                "nonnegintegers",
+                int(),
+                ValueSet::NonNegIntegers,
+                "",
+                "",
+                "",
+            ),
+            (
+                "booleans",
+                Type::Scalar(ScalarType::Boolean),
+                ValueSet::Booleans,
+                "",
+                "",
+                "",
+            ),
+        ];
+        // Rows the emitter builds elsewhere or refuses: records flatten to
+        // one declaration per field, complex values and the `none` rows refuse.
+        let elsewhere = [
+            "cartprod(S1, ..., Sk)",
+            "cartprod(a = S1, ...)",
+            "complexes",
+            "anything",
+            "rngstates",
+        ];
+        for row in crate::tables::sets() {
+            if elsewhere.contains(&row.set.as_str()) {
+                continue;
+            }
+            let (_, ty, vs, lo, hi, bounds) =
+                cases.iter().find(|c| c.0 == row.set).unwrap_or_else(|| {
+                    panic!("sets.ron row `{}` is not bound to stan_type.rs", row.set)
+                });
+            let expected = row
+                .decl
+                .replace("{name}", "x")
+                .replace("{lo}", lo)
+                .replace("{hi}", hi)
+                .replace("{bounds}", bounds)
+                .replace("{m}", "m")
+                .replace("{n}", "n");
+            let size = &mut |e: u32| {
+                if e == 3 {
+                    "m".to_string()
+                } else {
+                    "n".to_string()
+                }
+            };
+            let got = declare(ty, Some(vs), true, size, NodeId::from_usize(0)).expect("declares");
+            assert_eq!(
+                format!("{};", got.render("x")),
+                expected,
+                "sets.ron row `{}`",
+                row.set
+            );
+        }
+    }
+}

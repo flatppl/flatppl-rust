@@ -42,6 +42,8 @@ pub(crate) struct FnRow {
     pub stan: String,
     pub functions: String,
     pub data_only: bool,
+    pub vectorized: bool,
+    pub broadcast: String,
     pub caveat: String,
     pub status: String,
 }
@@ -77,7 +79,7 @@ pub(crate) fn functions() -> &'static [FnRow] {
 }
 
 #[cfg(test)]
-fn sets() -> &'static [SetRow] {
+pub(crate) fn sets() -> &'static [SetRow] {
     static T: OnceLock<Vec<SetRow>> = OnceLock::new();
     T.get_or_init(|| parse("sets.ron", include_str!("../tables/sets.ron")))
 }
@@ -111,40 +113,6 @@ fn module_matches(row: Option<&str>, call: Option<&str>) -> bool {
         _ => false,
     }
 }
-
-/// FlatPPL functions whose Stan form applies elementwise to a vector.
-/// `functions.ron` has no column for this.
-pub(crate) const ELEMENTWISE: &[&str] = &[
-    "exp",
-    "log",
-    "log2",
-    "log10",
-    "sqrt",
-    "abs",
-    "abs2",
-    "sin",
-    "cos",
-    "tan",
-    "asin",
-    "acos",
-    "atan",
-    "sinh",
-    "cosh",
-    "tanh",
-    "asinh",
-    "acosh",
-    "atanh",
-    "log1p",
-    "expm1",
-    "floor",
-    "ceil",
-    "gamma",
-    "loggamma",
-    "logit",
-    "invlogit",
-    "probit",
-    "invprobit",
-];
 
 /// Stan keywords and reserved names; a FlatPPL name in this list gets a
 /// trailing underscore.

@@ -896,6 +896,17 @@ impl<'m> Emitter<'m> {
                         format!("{head} with keyword arguments"),
                     ));
                 }
+                let row = self.fn_row(id, head, None)?;
+                if row.data_only
+                    && args
+                        .iter()
+                        .any(|&a| self.m.phase_of(a) != Some(Phase::Fixed))
+                {
+                    return Err(Refusal::not_yet(
+                        Some(id),
+                        format!("`{head}` of a parameter (Stan needs data arguments)"),
+                    ));
+                }
                 let mut parts = Vec::new();
                 for a in &args {
                     parts.push(self.real(*a)?);
@@ -913,11 +924,13 @@ impl<'m> Emitter<'m> {
         module: Option<&str>,
         parts: Vec<Ex>,
     ) -> Result<Ex> {
-        let row = tables::function(name, module)
-            .filter(|r| matches!(r.kind.as_str(), "builtin" | "helper"))
-            .filter(|r| !r.status.starts_with("unverified"))
-            .filter(|r| r.args.len() == parts.len() && !r.args.iter().any(|a| a == "..."))
-            .ok_or_else(|| Refusal::not_yet(Some(id), name.to_string()))?;
+        let row = self.fn_row(id, name, module)?;
+        if row.args.len() != parts.len() || row.args.iter().any(|a| a == "...") {
+            return Err(Refusal::not_yet(
+                Some(id),
+                format!("{name} with this arity"),
+            ));
+        }
         if row.kind == "helper" && !self.functions.contains(&row.functions) {
             self.functions.push(row.functions.clone());
         }
@@ -930,6 +943,33 @@ impl<'m> Emitter<'m> {
         let s = self.fill(&row.stan, &binds, &|_| false, None)?;
         let prec = if is_call(&s) { P_ATOM } else { P_TERNARY };
         Ok(Ex { s, prec })
+    }
+
+    /// The `functions.ron` row of a call Stan can evaluate: `builtin` or
+    /// `helper`. `none` refuses for good, `todo` and unverified rows for now.
+    fn fn_row(
+        &self,
+        id: NodeId,
+        name: &str,
+        module: Option<&str>,
+    ) -> Result<&'static tables::FnRow> {
+        let Some(row) = tables::function(name, module) else {
+            return Err(Refusal::not_yet(Some(id), name.to_string()));
+        };
+        match row.kind.as_str() {
+            "none" => Err(Refusal::new(
+                RefusalKind::NoStanFunction,
+                Some(id),
+                name.to_string(),
+                format!("`{name}` has no Stan form: {}", row.caveat),
+            )),
+            "builtin" | "helper" if row.status.starts_with("unverified") => Err(Refusal::not_yet(
+                Some(id),
+                format!("`{name}` (its Stan mapping is unverified)"),
+            )),
+            "builtin" | "helper" => Ok(row),
+            _ => Err(Refusal::not_yet(Some(id), name.to_string())),
+        }
     }
 
     /// A call into a standard module: refused until the `functions` block lands,
@@ -965,8 +1005,13 @@ impl<'m> Emitter<'m> {
         for a in &args {
             parts.push(self.real(*a)?);
         }
-        self.table_fn(id, fname, Some(&module), parts)
-            .map_err(|_| Refusal::not_yet(Some(id), format!("the call `{member}(…)`")))
+        self.table_fn(id, fname, Some(&module), parts).map_err(|e| {
+            if e.kind.is_never() {
+                e
+            } else {
+                Refusal::not_yet(Some(id), format!("the call `{member}(…)`"))
+            }
+        })
     }
 
     /// The standard-module name a callee reference resolves into.
@@ -1122,16 +1167,34 @@ impl<'m> Emitter<'m> {
         Ok(Ex::atom(s))
     }
 
+    /// `f.(args…)` as one Stan expression over the whole arrays, per the
+    /// `functions.ron` row: a `vectorized` row takes the arrays themselves,
+    /// a `broadcast` template (`.*`, `./`, `.^`) gives the elementwise
+    /// operator. Anything else refuses here and is filled by loops instead.
     fn broadcast(&mut self, id: NodeId, f: NodeId, args: &[NodeId]) -> Result<Ex> {
         let Node::Const(fs) = self.m.node(f) else {
             return Err(Refusal::not_yet(Some(id), "broadcast of a user function"));
         };
         let fname = self.name(*fs);
+        let row = tables::function(fname, None)
+            .ok_or_else(|| Refusal::not_yet(Some(id), format!("{fname}.(…)")))?;
         let scalar = |me: &Self, a: NodeId| me.shape(a).is_some_and(|s| s.rank == 0);
         match (fname, args) {
-            ("add", [a, b]) => self.call_expr_bin("+", P_ADD, *a, *b),
-            ("sub", [a, b]) => self.call_expr_bin("-", P_ADD, *a, *b),
-            ("mul", [a, b]) => {
+            // The operators keep their precedence-aware printing.
+            ("add", [a, b]) if row.vectorized => self.call_expr_bin("+", P_ADD, *a, *b),
+            ("sub", [a, b]) if row.vectorized => self.call_expr_bin("-", P_ADD, *a, *b),
+            ("neg", [a]) if row.vectorized => {
+                let e = self.real(*a)?;
+                Ok(Ex {
+                    s: format!("-{}", e.at(P_UNARY)),
+                    prec: P_UNARY,
+                })
+            }
+            // The broadcast templates' `.*`, `./` and `.^`. A scalar operand
+            // takes the scalar operator where Stan's scalar-by-array form is
+            // the same elementwise product (`.*` with a scalar side, `./` with
+            // a scalar divisor); `.^` stays dotted unless both are scalar.
+            ("mul", [a, b]) if row.broadcast.contains(".*") => {
                 let op = if scalar(self, *a) || scalar(self, *b) {
                     "*"
                 } else {
@@ -1139,11 +1202,11 @@ impl<'m> Emitter<'m> {
                 };
                 self.call_expr_bin(op, P_MUL, *a, *b)
             }
-            ("divide", [a, b]) => {
+            ("divide", [a, b]) if row.broadcast.contains("./") => {
                 let op = if scalar(self, *b) { "/" } else { "./" };
                 self.call_expr_bin(op, P_MUL, *a, *b)
             }
-            ("pow", [a, b]) => {
+            ("pow", [a, b]) if row.broadcast.contains(".^") => {
                 let op = if scalar(self, *a) && scalar(self, *b) {
                     "^"
                 } else {
@@ -1156,16 +1219,12 @@ impl<'m> Emitter<'m> {
                     prec: P_POW,
                 })
             }
-            ("neg", [a]) => {
-                let e = self.real(*a)?;
-                Ok(Ex {
-                    s: format!("-{}", e.at(P_UNARY)),
-                    prec: P_UNARY,
-                })
-            }
-            (name, [a]) if tables::ELEMENTWISE.contains(&name) => {
-                let e = self.real(*a)?;
-                self.table_fn(id, name, None, vec![e])
+            (name, _) if row.vectorized && row.kind != "operator" => {
+                let mut parts = Vec::new();
+                for &a in args {
+                    parts.push(self.real(a)?);
+                }
+                self.table_fn(id, name, None, parts)
             }
             (name, _) => Err(Refusal::not_yet(Some(id), format!("{name}.(…)"))),
         }

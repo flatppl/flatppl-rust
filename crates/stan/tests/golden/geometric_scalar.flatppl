@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+k_obs = [0, 2, 1, 4, 0]
+p ~ Beta(2, 2)
+k ~ iid(Geometric(p), 5)
+prior = lawof(record(p = p))
+L = likelihoodof(kernelof(record(k = k), p = p), record(k = k_obs))
+post = bayesupdate(L, prior)

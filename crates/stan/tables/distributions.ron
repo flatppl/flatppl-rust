@@ -19,7 +19,11 @@
 //   args:       template for the Stan argument list after "|". "" means the call has no "|".
 //   variate:    Stan type of the variate. {n} and {k} are sizes, given by `sizes`.
 //   sizes:      list of (size placeholder, FlatPPL expression that gives it).
-//   vectorized: Stan accepts a container of variates in one call (signature dump).
+//   vectorized: Stan accepts a container of variates in one call, with scalar or container parameters,
+//               and returns the sum of the scalar terms. verify.py checks it numerically: a variate
+//               container with scalar parameters, and variate plus parameter containers (real scalar
+//               parameters become vectors, int parameters arrays, mean / concentration vectors arrays
+//               of vectors; matrices stay shared). Templates use ./ so they also work on vectors.
 //   lcdf:       <stan>_lcdf and <stan>_lccdf exist, so `~ ... T[L, U]` is well formed.
 //   normalized: the law is a probability measure. false: emit `target +=`, never a prior `~`.
 //   functions:  Stan functions-block source the row needs ("" if none).
@@ -138,7 +142,7 @@
      note: "n must be a Stan int (data)."),
     (id: "geometric", flatppl: "Geometric", module: None, params: ["p"],
      pattern: "Geometric(p)", vars: ["p"], kind: "builtin",
-     stan: "neg_binomial", suffix: "lpmf", lhs: "{y}", args: "1, {p} / (1 - {p})", variate: "int<lower=0>",
+     stan: "neg_binomial", suffix: "lpmf", lhs: "{y}", args: "1, {p} ./ (1 - {p})", variate: "int<lower=0>",
      sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
      note: "Stan has no geometric distribution. p = 1 gives beta = inf, which Stan rejects."),
     (id: "negative_binomial", flatppl: "NegativeBinomial", module: None, params: ["alpha", "beta"],
@@ -243,25 +247,25 @@
      pattern: "BernoulliLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
      stan: "bernoulli_logit_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0, upper=1>",
      sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
-     note: "Single observation: x (vector) becomes a 1-row matrix. iid observations: y array[N] int, x matrix[N, k] with one row per observation."),
+     note: "Single observation: x (vector) becomes a 1-row matrix. iid observations: y array[N] int, x matrix[N, k] with one row per observation. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
     (id: "binomial_logit_glm", flatppl: "BinomialLogitGLM", module: Some("regression 0.1"), params: ["x", "n", "alpha", "beta"],
      pattern: "BinomialLogitGLM(x, n, alpha, beta)", vars: ["x", "n", "alpha", "beta"], kind: "builtin",
      stan: "binomial_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{n}, to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
      sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
-     note: "Argument order: Stan puts n before x. Available since Stan 2.34."),
+     note: "Argument order: Stan puts n before x. Available since Stan 2.34. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
     (id: "categorical_logit_glm", flatppl: "CategoricalLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
      pattern: "CategoricalLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
      stan: "categorical_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{x}', {alpha}, {beta}", variate: "int<lower=1, upper={n}>",
      sizes: [("n", "lengthof(alpha)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
-     note: "beta is k x n (features x classes) in both languages."),
+     note: "beta is k x n (features x classes) in both languages. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace {x}' by {x} in args."),
     (id: "normal_glm", flatppl: "NormalGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "sigma"],
      pattern: "NormalGLM(x, alpha, beta, sigma)", vars: ["x", "alpha", "beta", "sigma"], kind: "builtin",
      stan: "normal_id_glm", suffix: "lpdf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}, {sigma}", variate: "real",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
     (id: "poisson_log_glm", flatppl: "PoissonLogGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
      pattern: "PoissonLogGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
      stan: "poisson_log_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
-     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
 
     // ---------------------------------------------------------------- module particle-physics 0.1
     (id: "continued_poisson", flatppl: "ContinuedPoisson", module: Some("particle-physics 0.1"), params: ["rate"],
@@ -331,9 +335,11 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
   real u = 1 - square(x / m0);
   // log of the integral of u^p exp(c u) over (0, 1)
   real log_int;
-  // No separate c == 0 branch: a constant there would give a zero derivative in c.
+  // The integral is 1F1(p + 1; p + 2; c) / (p + 1). For c < 0 use Kummer's transform so the
+  // series has positive terms. gamma_p is avoided: its gradient in the shape argument is off by
+  // 3e-7 relative at (1.5, 20) in Stan 2.39. No c == 0 branch: a constant would zero d/dc.
   if (c < 0) {
-    log_int = lgamma(p + 1) + log(gamma_p(p + 1, -c)) - (p + 1) * log(-c);
+    log_int = c + log(hypergeometric_pFq([1]', [p + 2]', -c)) - log1p(p);
   } else {
     log_int = log(hypergeometric_pFq([p + 1]', [p + 2]', c)) - log1p(p);
   }

@@ -890,8 +890,23 @@ impl<'m> Emitter<'m> {
             }
         }
         let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
-        let args = self.fill(&row.args, &binds, &is_per, None)?;
-        let indexed = self.fill(&row.args, &binds, &is_per, Some(LOOP))?;
+        let mut args = self.fill(&row.args, &binds, &is_per, None)?;
+        let mut indexed = self.fill(&row.args, &binds, &is_per, Some(LOOP))?;
+        // A template's elementwise operators become scalar ones when every
+        // operand they can see is a scalar (`1, p ./ (1 - p)` for one `p`).
+        let rank_of = |me: &Self, b: &pattern::Bound| match b {
+            pattern::Bound::Node(n) => me.shape(*n).map(|s| s.rank).unwrap_or(0),
+            _ => 0,
+        };
+        if binds.values().all(|b| rank_of(self, b) == 0) {
+            args = scalar_operators(&args);
+        }
+        if binds
+            .iter()
+            .all(|(v, b)| rank_of(self, b) == 0 || (is_per(v) && rank_of(self, b) == 1))
+        {
+            indexed = scalar_operators(&indexed);
+        }
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
@@ -942,6 +957,12 @@ impl<'m> Emitter<'m> {
             }
         }
     }
+}
+
+fn scalar_operators(s: &str) -> String {
+    s.replace(" .* ", " * ")
+        .replace(" ./ ", " / ")
+        .replace(" .^ ", " ^ ")
 }
 
 fn ty_is_int(ty: &Type) -> bool {
