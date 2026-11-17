@@ -40,7 +40,7 @@ pub use normal_coordinates::{
     prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
-pub use stdfn::standard_function;
+pub use stdfn::{expand_spline, standard_function};
 pub use sufficient_statistics::{
     GroupPartition, PreparationOptions, PreparedLikelihood, ReductionDecision, ReductionOutcome,
     ReductionReport, prepare_likelihood, prepare_likelihood_with_options,

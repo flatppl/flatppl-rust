@@ -87,6 +87,8 @@ mod records;
 mod runtime_status;
 #[path = "special.rs"]
 mod special;
+#[path = "splines.rs"]
+mod splines;
 use runtime_status::append_runtime_status;
 #[path = "segment_reductions.rs"]
 mod segment_reductions;
@@ -4563,6 +4565,9 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_spline_call(id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_special_function_call(id, f, &args[1..], true) {
             return result;
         }
@@ -5012,6 +5017,7 @@ impl<'m> Emitter<'m> {
                 CallHead::User(callee) => self
                     .lower_box_application(id, callee, &call.args)
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_spline_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_ext_linalg_call(id, callee, &call.args, false))

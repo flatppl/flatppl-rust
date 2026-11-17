@@ -515,6 +515,8 @@ pub(crate) enum DimExpr {
     /// The positive integer literal written at positional arg `i`, as in
     /// `linspace`'s point count `n`.
     WrittenSize(usize),
+    /// Full knot count minus the fixed degree and one.
+    SplineCount { knots: usize, degree: usize },
 }
 
 /// Parse a catalogue from RON source.
@@ -1256,6 +1258,7 @@ mod tests {
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
                 written_size: &|_| Dim::Dynamic,
+                written_integer: &|_| None,
                 intern: &no_intern,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
@@ -1412,6 +1415,7 @@ mod tests {
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
                 written_size: &|_| Dim::Dynamic,
+                written_integer: &|_| None,
                 intern: &no_intern,
             };
             let (cat_ty, _) = lower(sig, &ctx);

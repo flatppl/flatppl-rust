@@ -352,6 +352,13 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
             registry::lookup(ctor).is_some_and(|dist| dist.touniform.is_some())
         }),
         retain_standard_functions: &[
+            ("splines", "interp_linear"),
+            ("splines", "interp_cubic"),
+            ("splines", "interp_pchip"),
+            ("splines", "bspline_basis"),
+            ("splines", "bspline_derivative"),
+            ("splines", "bspline_integral"),
+            ("splines", "bspline_penalty"),
             ("pyhf-helpers", "normsys_factor"),
             ("pyhf-helpers", "histosys_shift"),
             ("pyhf-helpers", "sample_yields"),

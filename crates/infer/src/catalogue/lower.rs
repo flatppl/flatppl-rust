@@ -31,6 +31,16 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
             _ => Dim::Dynamic,
         },
         DimExpr::WrittenSize(i) => (ctx.written_size)(*i),
+        DimExpr::SplineCount { knots, degree } => {
+            match ((ctx.arg_dim)(*knots), (ctx.written_integer)(*degree)) {
+                (Dim::Static(k), Some(p)) if p >= 0 => u32::try_from(p)
+                    .ok()
+                    .and_then(|p| p.checked_add(1))
+                    .and_then(|p| k.checked_sub(p))
+                    .map_or(Dim::Dynamic, Dim::Static),
+                _ => Dim::Dynamic,
+            }
+        }
         DimExpr::Add(a, offset) => match dim_of(a, ctx) {
             Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
@@ -137,6 +147,7 @@ pub(crate) struct LowerCtx<'a> {
     /// `ElemScalarKind`. `None` when the arg is absent.
     pub(crate) arg_type: &'a dyn Fn(usize) -> Option<Type>,
     /// The positive integer literal written at positional arg `i`, else `%dynamic`.
+    pub(crate) written_integer: &'a dyn Fn(usize) -> Option<i64>,
     pub(crate) written_size: &'a dyn Fn(usize) -> Dim,
     /// Intern a record field name into a `Symbol` (for `ResultSig::Record`).
     /// Lives behind a `Fn` (interior-mutable at the call site) so it doesn't
@@ -513,6 +524,7 @@ mod tests {
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         let (ty, vset) = lower(&sig, &cx);
@@ -541,6 +553,7 @@ mod tests {
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         let (ty, _) = lower(&sig, &cx);

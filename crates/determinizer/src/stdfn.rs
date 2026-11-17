@@ -38,7 +38,20 @@ use crate::refuse::RefuseError;
 
 mod distances;
 mod pyhf;
+mod spline_basis;
+mod spline_interpolation;
 mod splines;
+
+/// Expand a spline member into its tensor expression and domain predicate.
+/// Backends retaining the call can attach their runtime error status.
+pub fn expand_spline(m: &mut Module, args: &[NodeId], member: &str) -> Option<(NodeId, NodeId)> {
+    match member {
+        "interp_linear" | "interp_cubic" | "interp_pchip" => {
+            spline_interpolation::lower(m, args, member)
+        }
+        _ => spline_basis::lower(m, args, member),
+    }
+}
 
 /// Largest `polynomials` degree this pass will unroll. The lowering emits the
 /// three-term recursion node by node, so the emitted subtree grows linearly in
@@ -283,7 +296,8 @@ fn lower_member_broadcast(
 pub(crate) fn has_base_op_form(module: &str, member: &str) -> bool {
     matches!(
         (module, member),
-        ("pyhf-helpers" | "splines", _)
+        ("pyhf-helpers", _)
+            | ("splines", "thinplate_basis" | "thinplate_penalty")
             | (
                 "particle-physics",
                 "interp_pwlin"

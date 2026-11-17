@@ -6682,6 +6682,10 @@ fn catalogue_lower(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     lower(sig, &ctx)
@@ -10332,6 +10336,10 @@ fn function_result(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (ty, _) = lower(sig, &ctx);
@@ -10379,6 +10387,10 @@ fn function_valueset(
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|i| literal_size(&module.borrow(), args, i),
+        written_integer: &|i| {
+            args.get(i)
+                .and_then(|(node, _, _)| crate::fixed_int_value(&mut module.borrow_mut(), *node))
+        },
         intern: &|s| module.borrow_mut().intern(s),
     };
     let (_, vset) = lower(sig, &ctx);
@@ -10418,6 +10430,7 @@ fn distribution_domain(
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
         written_size: &|_| Dim::Dynamic,
+        written_integer: &|_| None,
         intern: &crate::catalogue::no_intern,
     };
     let (ty, _vset) = lower(sig, &ctx);
@@ -10524,6 +10537,7 @@ fn kernel_variate(
             arg_dim: &|_| Dim::Dynamic,
             arg_type: &|_| None,
             written_size: &|_| Dim::Dynamic,
+            written_integer: &|_| None,
             intern: &no_intern,
         };
         match lower(sig, &ctx).0 {
@@ -11324,6 +11338,7 @@ fn distribution_support(
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(declared, i).cloned(),
         written_size: &|_| Dim::Dynamic,
+        written_integer: &|_| None,
         intern: &crate::catalogue::no_intern,
     };
     let (_ty, vs) = lower(sig, &ctx);
