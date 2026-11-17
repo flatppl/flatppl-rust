@@ -894,7 +894,12 @@ container selectors retain their respective shapes. Declared draw provenance
 keeps earlier queries from changing later conditionals. The current rule needs
 one selected latent, one complement observation, static dimensions, no other
 uncarried stochastic ancestor, and at most 64 latent axes for reconstruction.
-The marginal log-density form does not yet compose several affine layers.
+Affine marginalization returns a native `MvNormal` with mean `A*mu+b` and
+covariance `A*C*transpose(A)+R`. Its covariance guard preserves the source
+checks even through a later zero map. Real-array shape annotations let the
+existing marginal recursion compose several affine layers. It retains every
+integrated latent, so outputs sharing an ancestor cannot become a product of
+independent marginals. Reverse reconstruction still covers only one edge.
 
 ## Adding a row
 

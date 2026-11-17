@@ -1,6 +1,14 @@
 use flatppl_host::{Context, EmitOptions};
 
 #[test]
+fn gaussian_chain_marginals_compose_after_prior_queries() {
+    let source = "z~MvNormal([1.,-2.],rowstack([[2.,1.],[1.,3.]]))\ny~MvNormal(rowstack([[1.,2.]])*z+[.5],rowstack([[4.]]))\nx~MvNormal(rowstack([[2.],[-1.]])*y+[1.,3.],rowstack([[3.,1.],[1.,2.]]))\noutputs=(first=logdensityof(lawof(y),[1.5]),last=logdensityof(lawof(x),[4.,2.]))";
+    let mut context = Context::default();
+    let module = context.parse(source, None, None).unwrap();
+    module.compile(&EmitOptions::default()).unwrap();
+}
+
+#[test]
 fn gaussian_reverse_vector_disintegration_keeps_the_conditional() {
     for (selector, point) in [("1", "[0.]"), ("[1]", "[[0.]]")] {
         let source = format!(
