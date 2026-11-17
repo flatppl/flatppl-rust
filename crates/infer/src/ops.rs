@@ -9654,8 +9654,12 @@ fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
         Type::Scalar(_) if shape == ParamShape::Scalar => return None,
         Type::Scalar(_) => "a scalar",
         Type::Array { shape: dims, elem } => match (dims.len(), numeric(elem)) {
-            (1, true) if shape == ParamShape::Vector => return None,
-            (2, true) if shape == ParamShape::Matrix => return None,
+            (1, true) if matches!(shape, ParamShape::Vector | ParamShape::VectorOrMatrix) => {
+                return None;
+            }
+            (2, true) if matches!(shape, ParamShape::Matrix | ParamShape::VectorOrMatrix) => {
+                return None;
+            }
             (1, true) => "a vector",
             (2, true) => "a matrix",
             (n, true) => return Some(format!("an array of {n} dimensions")),
@@ -9664,7 +9668,12 @@ fn shape_mismatch(shape: ParamShape, ty: &Type) -> Option<String> {
         },
         // §03 "Arrays": "The term vector will represent both non-transposed vectors
         // (one-dimensional arrays) and transposed vectors".
-        Type::TVector { elem, .. } if shape == ParamShape::Vector && numeric(elem) => return None,
+        Type::TVector { elem, .. }
+            if matches!(shape, ParamShape::Vector | ParamShape::VectorOrMatrix)
+                && numeric(elem) =>
+        {
+            return None;
+        }
         Type::TVector { .. } => "a transposed vector",
         Type::Record(_) => "a record",
         Type::Tuple(_) => "a tuple",

@@ -398,6 +398,7 @@ pub(crate) enum MassTag {
 pub(crate) enum ParamSig {
     Scalar(ScalarTag),
     Vector(ScalarTag),
+    VectorOrMatrix,
     Matrix,
     Callable,
     Any,
@@ -457,6 +458,12 @@ pub(crate) enum ResultSig {
     MatrixElem {
         rows: DimExpr,
         cols: DimExpr,
+        elem: ElemSig,
+    },
+    /// A vector or matrix RHS shape with its row extent replaced.
+    RhsShape {
+        rhs: usize,
+        rows: DimExpr,
         elem: ElemSig,
     },
     /// Transpose of arg `i`, preserving rank and element kind (`transpose`,
@@ -586,6 +593,7 @@ pub(crate) enum ParamShape {
     Scalar,
     Vector,
     Matrix,
+    VectorOrMatrix,
 }
 
 impl ParamShape {
@@ -594,6 +602,7 @@ impl ParamShape {
             ParamShape::Scalar => "a scalar",
             ParamShape::Vector => "a vector",
             ParamShape::Matrix => "a matrix",
+            ParamShape::VectorOrMatrix => "a vector or matrix",
         }
     }
 }
@@ -618,6 +627,7 @@ pub(crate) fn sig_param_shapes(sig: &Sig, count: usize) -> Vec<Option<ParamShape
             ParamSig::Scalar(_) => Some(ParamShape::Scalar),
             ParamSig::Vector(_) => Some(ParamShape::Vector),
             ParamSig::Matrix => Some(ParamShape::Matrix),
+            ParamSig::VectorOrMatrix => Some(ParamShape::VectorOrMatrix),
             ParamSig::Optional(inner) | ParamSig::Variadic(inner) => of(inner),
             ParamSig::Callable | ParamSig::Any => None,
         }
@@ -1499,7 +1509,22 @@ mod tests {
                 "ext-linear-algebra",
                 "0.1",
                 &[
-                    "lu", "svd", "eigen", "eigmax", "eigmin", "matexp", "kron", "lstsq", "rank",
+                    "lu",
+                    "svd",
+                    "eigen",
+                    "eigmax",
+                    "eigmin",
+                    "matexp",
+                    "kron",
+                    "lstsq",
+                    "rank",
+                    "solve_triangular",
+                    "lu_solve",
+                    "cholesky_solve",
+                    "eigh",
+                    "eigvalsh",
+                    "pinv",
+                    "cond",
                 ],
             ),
             (

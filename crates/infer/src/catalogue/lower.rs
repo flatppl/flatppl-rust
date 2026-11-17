@@ -106,9 +106,17 @@ fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
             }
         }
         ElemSig::RealOrComplexOfArgs(indices) => {
+            fn has_complex(t: &Type) -> bool {
+                match t {
+                    Type::Scalar(ScalarType::Complex) => true,
+                    Type::Array { elem, .. } | Type::TVector { elem, .. } => has_complex(elem),
+                    Type::Record(fields) => fields.iter().any(|(_, t)| has_complex(t)),
+                    _ => false,
+                }
+            }
             if indices
                 .iter()
-                .any(|&i| elem_scalar_kind((ctx.arg_type)(i).as_ref()) == Some(ScalarType::Complex))
+                .any(|&i| (ctx.arg_type)(i).as_ref().is_some_and(has_complex))
             {
                 ScalarType::Complex
             } else {
@@ -416,6 +424,21 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
             shape: Box::new([dim_of(rows, ctx), dim_of(cols, ctx)]),
             elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
         },
+        ResultSig::RhsShape { rhs, rows, elem } => {
+            let rhs_type = (ctx.arg_type)(*rhs);
+            let mut shape = match rhs_type.as_ref() {
+                Some(Type::TVector { len, .. }) => vec![*len],
+                other => flatten_dims(other),
+            };
+            if shape.is_empty() {
+                return Type::Deferred;
+            }
+            shape[0] = dim_of(rows, ctx);
+            Type::Array {
+                shape: shape.into_boxed_slice(),
+                elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
+            }
+        }
         ResultSig::TransposeOf(i) => match (ctx.arg_type)(*i) {
             // Flat rank-2 array: swap the two dims, element preserved.
             Some(Type::Array { shape, elem }) if shape.len() == 2 => Type::Array {

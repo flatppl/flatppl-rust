@@ -47,6 +47,12 @@ mod enzyme;
 #[path = "integration.rs"]
 mod integration;
 pub(crate) use integration::IntegralKind;
+#[path = "ext_linalg.rs"]
+mod ext_linalg;
+#[path = "factor_solve.rs"]
+mod factor_solve;
+#[path = "hermitian.rs"]
+mod hermitian;
 #[path = "kronecker.rs"]
 mod kronecker;
 #[path = "likelihood_reductions.rs"]
@@ -4563,6 +4569,9 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_svd_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_ext_linalg_call(id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_eigen_extremum(id, f, &args[1..], true) {
             return result;
         }
@@ -5005,6 +5014,7 @@ impl<'m> Emitter<'m> {
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_ext_linalg_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_eigen_extremum(id, callee, &call.args, false))
                     .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
