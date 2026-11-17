@@ -98,6 +98,13 @@ fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
                 ScalarType::Integer
             }
         }),
+        ElemSig::RealOrComplexOfArg(i) => {
+            if elem_scalar_kind((ctx.arg_type)(*i).as_ref()) == Some(ScalarType::Complex) {
+                ScalarType::Complex
+            } else {
+                ScalarType::Real
+            }
+        }
     }
 }
 

@@ -379,7 +379,7 @@ impl Emitter<'_> {
         self.axes_view(&result, self.axes_of(&value))
     }
 
-    fn matrix_expand(&mut self, vector: &Value, matrix: &Value, axis: usize) -> Value {
+    pub(super) fn matrix_expand(&mut self, vector: &Value, matrix: &Value, axis: usize) -> Value {
         let batch = self.batch_rank(matrix);
         let map = (0..batch as u64).chain([axis as u64]).collect::<Vec<_>>();
         self.expand_axes(vector, &map, matrix.ty.clone(), self.axes_of(matrix))
@@ -397,7 +397,12 @@ impl Emitter<'_> {
     }
 
     /// Read an in-bounds row or column shared by all batch cells.
-    fn indexed_matrix_axis(&mut self, matrix: &Value, index: &Value, axis: usize) -> Value {
+    pub(super) fn indexed_matrix_axis(
+        &mut self,
+        matrix: &Value,
+        index: &Value,
+        axis: usize,
+    ) -> Value {
         // Gather adjoints win on CPU, but cost more than masked reductions on GPU.
         if self.target == crate::Target::Gpu {
             let axis = self.batch_rank(matrix) + axis;
@@ -416,7 +421,7 @@ impl Emitter<'_> {
         self.reshape_cell(&selected, tensor(dims))
     }
 
-    fn swap_rows(&mut self, matrix: &Value, current: &Value, pivot: &Value) -> Value {
+    pub(super) fn swap_rows(&mut self, matrix: &Value, current: &Value, pivot: &Value) -> Value {
         let batch = self.batch_rank(matrix);
         let current_row = self.selected_row(matrix, current);
         let pivot_row = self.selected_row(matrix, pivot);

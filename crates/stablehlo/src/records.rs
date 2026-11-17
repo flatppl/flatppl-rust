@@ -100,6 +100,9 @@ impl Emitter<'_> {
         let Node::Call(call) = self.m.node(resolved) else {
             return Err(no_field_lowering(container, name, "this value"));
         };
+        if let Some(result) = self.lower_lu_record(resolved, name) {
+            return result;
+        }
         let CallHead::Builtin(head) = call.head else {
             return Err(no_field_lowering(container, name, "a user call"));
         };

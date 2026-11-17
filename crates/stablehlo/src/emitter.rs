@@ -55,6 +55,8 @@ mod likelihood_reductions;
 mod linalg;
 #[path = "log_beta.rs"]
 mod log_beta;
+#[path = "lu.rs"]
+mod lu;
 #[path = "matrix_exp.rs"]
 mod matrix_exp;
 #[path = "packed_gathers.rs"]
