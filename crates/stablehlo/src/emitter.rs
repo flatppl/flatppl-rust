@@ -57,6 +57,8 @@ mod linalg;
 mod log_beta;
 #[path = "lu.rs"]
 mod lu;
+#[path = "matrix_eigen.rs"]
+mod matrix_eigen;
 #[path = "matrix_exp.rs"]
 mod matrix_exp;
 #[path = "matrix_svd.rs"]
@@ -4561,6 +4563,9 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_svd_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_eigen_extremum(id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_matrix_exp_call(id, f, &args[1..], true) {
             return result;
         }
@@ -5000,6 +5005,7 @@ impl<'m> Emitter<'m> {
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_eigen_extremum(id, callee, &call.args, false))
                     .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
                     .unwrap_or_else(|| {

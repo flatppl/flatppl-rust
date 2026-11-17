@@ -7416,6 +7416,20 @@ fn broadcast_type(
                 }),
                 mass: broadcast_mass(mass),
             },
+            Type::Record(columns) => {
+                if shape.len() != 1 {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        id,
+                        "record-valued broadcast requires one axis (spec §04)",
+                    ));
+                    Type::Failed("multi-axis record broadcast".into())
+                } else {
+                    Type::Table {
+                        columns,
+                        nrows: shape[0],
+                    }
+                }
+            }
             // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
             // elementwise into an array of the per-cell result, exactly as the
             // built-in deterministic-op path does.
