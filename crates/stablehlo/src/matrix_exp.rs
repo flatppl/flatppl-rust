@@ -5,6 +5,99 @@
 use super::*;
 
 impl Emitter<'_> {
+    /// The real block representation is an algebra homomorphism, so its
+    /// exponential contains the complex result without an eigendecomposition.
+    pub(crate) fn lower_matrix_exp_parts(
+        &mut self,
+        id: NodeId,
+        callee: NodeId,
+        args: &[NodeId],
+        broadcast: bool,
+    ) -> Option<Result<(Value, Value), EmitError>> {
+        let (module, member) = flatppl_determinizer::standard_function(self.m, callee)?;
+        if module != "ext-linear-algebra" || member != "matexp" {
+            return None;
+        }
+        Some((|| {
+            let [arg] = args else {
+                return Err(EmitError::at(id, "matexp requires one square matrix"));
+            };
+            let (re, im) = crate::complex::parts(self, *arg, &mut HashMap::new())?;
+            let mut values = [self.typed_axes(*arg, re), self.typed_axes(*arg, im)];
+            let parent = if broadcast {
+                Some(self.enter_broadcast(id, &mut values)?)
+            } else {
+                None
+            };
+            let MlirTy::Ranked(dims) = self.cell_ty(&values[0]) else {
+                return Err(EmitError::at(
+                    id,
+                    "matexp requires static square matrix cells",
+                ));
+            };
+            let [Some(n), Some(m)] = dims.as_slice() else {
+                return Err(EmitError::at(
+                    id,
+                    "matexp requires static square matrix cells",
+                ));
+            };
+            if n != m || *n > i32::MAX as u64 / 2 {
+                return Err(EmitError::at(
+                    id,
+                    "matexp requires a square matrix with supported dimensions",
+                ));
+            }
+            let n = *n;
+            let re = self.convert(&values[0], ElemKind::Real);
+            let im = self.convert(&values[1], ElemKind::Real);
+            let (re, im) = if n == 0 {
+                (re, im)
+            } else {
+                let negative = self.neg(&im);
+                let top = self.matrix_exp_block_row(&re, &negative, n);
+                let bottom = self.matrix_exp_block_row(&im, &re, n);
+                let block = self.vector(&[top, bottom]);
+                let block =
+                    self.reshape_cell(&block, MlirTy::Ranked(vec![Some(2 * n), Some(2 * n)]));
+                let block = self.matrix_exp(&block);
+                let batch = self.batch_rank(&block);
+                let mut limits = shape(&block.ty)
+                    .iter()
+                    .map(|v| v.unwrap())
+                    .collect::<Vec<_>>();
+                let mut starts = vec![0; limits.len()];
+                limits[batch] = n;
+                limits[batch + 1] = n;
+                let strides = vec![1; limits.len()];
+                let re = self.slice(&block, &starts, &limits, &strides);
+                starts[batch] = n;
+                limits[batch] = 2 * n;
+                let im = self.slice(&block, &starts, &limits, &strides);
+                (re, im)
+            };
+            Ok(if let Some(parent) = parent {
+                let frame = self.broadcast_frame.clone();
+                let re = self.finish_broadcast(&re, &frame, parent.len());
+                let im = self.finish_broadcast(&im, &frame, parent.len());
+                self.broadcast_frame = parent;
+                (re, im)
+            } else {
+                (re, im)
+            })
+        })())
+    }
+
+    fn matrix_exp_block_row(&mut self, left: &Value, right: &Value, n: u64) -> Value {
+        let stacked = self.vector(&[left.clone(), right.clone()]);
+        let batch = self.batch_rank(&stacked);
+        let axes = self.axes_of(&stacked);
+        let mut permutation = (0..(batch + 3) as u64).collect::<Vec<_>>();
+        permutation.swap(batch, batch + 1);
+        let stacked = self.transpose(&stacked, &permutation);
+        let stacked = self.axes_view(&stacked, axes);
+        self.reshape_cell(&stacked, MlirTy::Ranked(vec![Some(n), Some(2 * n)]))
+    }
+
     pub(super) fn lower_matrix_exp_call(
         &mut self,
         id: NodeId,
@@ -42,13 +135,17 @@ impl Emitter<'_> {
         let [Some(n), Some(m)] = dims.as_slice() else {
             return Err(EmitError::at(id, "matexp requires a static square matrix"));
         };
-        if n != m || *n == 0 || *n > i32::MAX as u64 {
+        if n != m || *n > i32::MAX as u64 {
             return Err(EmitError::at(
                 id,
-                "matexp requires a nonempty square matrix",
+                "matexp requires a square matrix with supported dimensions",
             ));
         }
-        let output = self.matrix_exp(&input);
+        let output = if *n == 0 {
+            input
+        } else {
+            self.matrix_exp(&input)
+        };
         Ok(match parent {
             Some(parent) => {
                 let frame = self.broadcast_frame.clone();
