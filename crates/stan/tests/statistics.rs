@@ -1,4 +1,4 @@
-use flatppl_stan::{EmitOptions, StanProgram};
+use flatppl_stan::{EmitOptions, Reduce, StanProgram};
 
 fn emit(source: &str, enabled: bool) -> StanProgram {
     let mut m = flatppl_syntax::parse(source).unwrap();
@@ -11,7 +11,9 @@ fn emit(source: &str, enabled: bool) -> StanProgram {
     );
     let options = EmitOptions {
         target: Some("lik".into()),
-        sufficient_statistics: enabled,
+        reduce: Reduce {
+            sufficient: enabled,
+        },
         ..Default::default()
     };
     flatppl_stan::emit(&m, &options).unwrap()
@@ -28,7 +30,7 @@ lik = likelihoodof(kernelof(record(y = y), mu = mu, sigma = sigma), record(y = s
 
 #[test]
 fn prepares_data_once_and_preserves_the_native_density_and_interface() {
-    assert!(EmitOptions::default().sufficient_statistics);
+    assert!(!EmitOptions::default().reduce.sufficient);
     let on = emit(MODEL, true);
     let off = emit(MODEL, false);
     assert_eq!(on.data, off.data);
@@ -112,7 +114,9 @@ lp = logdensityof(iid(Normal(mu = mu, sigma = sigma), N), samples)
         flatppl_infer::infer(&mut m);
         let options = EmitOptions {
             target: Some("lp".into()),
-            sufficient_statistics: enabled,
+            reduce: Reduce {
+                sufficient: enabled,
+            },
             ..Default::default()
         };
         flatppl_stan::emit(&m, &options).unwrap()
@@ -141,4 +145,21 @@ lp = logdensityof(iid(Normal(mu = mu, sigma = sigma), N), samples)
         "{}",
         on.code
     );
+}
+
+/// Without `--reduce sufficient` the emitter prints the native vectorized
+/// statement: no data summary and no `target +=` from the plan.
+#[test]
+fn default_output_has_no_summary() {
+    let mut m = flatppl_syntax::parse(MODEL).unwrap();
+    flatppl_infer::infer(&mut m);
+    let options = EmitOptions {
+        target: Some("lik".into()),
+        ..Default::default()
+    };
+    let code = flatppl_stan::emit(&m, &options).unwrap().code;
+    assert!(code.contains("samples ~ normal(mu, sigma);"), "{code}");
+    assert!(!code.contains("_summarized"), "{code}");
+    assert!(!code.contains("transformed data"), "{code}");
+    assert!(!code.contains("target +="), "{code}");
 }

@@ -23,7 +23,7 @@ impl Emitter<'_> {
         law: NodeId,
         conditioned: usize,
     ) -> Option<NormalSite> {
-        if !self.opts.sufficient_statistics {
+        if !self.opts.reduce.sufficient {
             return None;
         }
         let iid = self.resolve(law);

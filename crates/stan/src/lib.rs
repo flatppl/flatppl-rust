@@ -14,8 +14,8 @@
 //!   `transformed data`, and values that depend on parameters to `model`
 //!   locals (see [`Placement`]).
 //!
-//! Observed IID Normal factors can use data summaries and a normalized
-//! `target +=` expression. Stan keeps every constant of a `~` term when
+//! With `Reduce::sufficient`, observed IID Normal factors use data summaries
+//! and a normalized `target +=` expression. Stan keeps every constant of a `~` term when
 //! the density is evaluated with `propto=false`, so the program's log density
 //! at `propto=false, jacobian=false` equals FlatPPL's, including the
 //! normalizer of a truncated law, written `T[L, U]`.
@@ -46,24 +46,21 @@ pub enum Placement {
     TransformedParameters,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EmitOptions {
     /// The target binding; `None` picks the module's single `bayesupdate`.
     pub target: Option<String>,
     /// Where values that depend on parameters go (`--derived`).
     pub derived: Placement,
-    /// Prepare shared data summaries for supported observed IID factors (default: true).
-    pub sufficient_statistics: bool,
+    /// The opt-in reductions (`--reduce`). All are off by default.
+    pub reduce: Reduce,
 }
 
-impl Default for EmitOptions {
-    fn default() -> Self {
-        Self {
-            target: None,
-            derived: Placement::default(),
-            sufficient_statistics: true,
-        }
-    }
+/// Opt-in reductions of the emitted program, one flag per family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reduce {
+    /// Shared data summaries for observed IID Normal factors.
+    pub sufficient: bool,
 }
 
 /// One Stan parameter and the FlatPPL field it stands for.

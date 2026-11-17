@@ -328,10 +328,11 @@ enum Command {
         /// or `transformed-parameters` (written to the output on every draw).
         #[arg(long, default_value = "model", value_parser = ["model", "transformed-parameters"])]
         derived: String,
-        /// Prepare data summaries for observed IID Normal factors.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
-              num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        sufficient_statistics: bool,
+        /// Opt-in reductions, repeatable or comma-separated. `sufficient`
+        /// prepares data summaries for observed IID Normal factors. All are
+        /// off by default.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        reduce: Vec<ReduceFamily>,
         /// Write the Stan JSON data here (reads `load_data` sources).
         #[arg(long)]
         data: Option<PathBuf>,
@@ -400,6 +401,15 @@ enum EmitForm {
     Flatppl,
     /// FlatPIR S-expressions.
     Flatpir,
+}
+
+/// A reduction family for `--reduce`. It names no emitter type, so other verbs
+/// can share it.
+#[cfg(feature = "stan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReduceFamily {
+    /// Shared data summaries for observed IID Normal factors.
+    Sufficient,
 }
 
 /// Input format selector for `--from`.
@@ -584,7 +594,7 @@ fn main() -> ExitCode {
             input,
             target,
             derived,
-            sufficient_statistics,
+            reduce,
             data,
             manifest,
             output,
@@ -593,7 +603,9 @@ fn main() -> ExitCode {
             flatppl_stan::EmitOptions {
                 target,
                 derived: flatppl_stan::Placement::parse(&derived).expect("clap checks --derived"),
-                sufficient_statistics,
+                reduce: flatppl_stan::Reduce {
+                    sufficient: reduce.contains(&ReduceFamily::Sufficient),
+                },
             },
             data.as_deref(),
             manifest.as_deref(),
