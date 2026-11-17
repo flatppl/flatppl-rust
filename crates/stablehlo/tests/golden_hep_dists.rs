@@ -311,3 +311,37 @@ fn the_elementary_hep_members_emit() {
         }
     }
 }
+
+#[test]
+fn normalized_hep_members_sample_iid_without_scalar_unrolling() {
+    for density in [
+        "hep.CrystalBall(0, 1, p, 3)",
+        "hep.DoubleSidedCrystalBall(0, 1, 2, p, 2, 3, 4)",
+        "hep.Argus(p, -20, 0.5)",
+        "hep.RelativisticBreitWigner(p, 0.4)",
+        "hep.Voigtian(0, p, 1)",
+        "hep.Landau(0, p)",
+        "hep.BifurcatedNormal(0, p, 2)",
+    ] {
+        let mut sizes = Vec::new();
+        for count in [512, 4096] {
+            let module = determinize_abi(&format!(
+                "hep=standard_module(\"particle-physics\",\"0.1\")\n\
+                 p=external(posreals)\ninputs=(p)\n\
+                 outputs=rand(iid({density},{count}),rnginit(123))"
+            ));
+            let mlir = flatppl_stablehlo::emit(
+                &module,
+                flatppl_stablehlo::Mode::Sample,
+                &flatppl_stablehlo::EmitOptions {
+                    restrict_enzyme_compatible: false,
+                    ..Default::default()
+                },
+            )
+            .expect("normalized HEP member must sample");
+            assert!(mlir.contains(&format!("tensor<{count}xf32>")));
+            sizes.push(mlir.lines().count());
+        }
+        assert_eq!(sizes[0], sizes[1], "{density} must remain axis-native");
+    }
+}
