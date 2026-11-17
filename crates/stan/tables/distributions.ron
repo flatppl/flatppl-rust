@@ -1,0 +1,393 @@
+// FlatPPL law -> Stan distribution mapping.
+// Sources: flatppl-design docs/08-distributions.md and docs/09-standard-modules.md at eed1724;
+// Stan Functions Reference 2.40; CmdStan 2.40.0 stanc signature dump.
+//
+// Schema: a list of rows. Every field is present in every row.
+//   id:         unique row key (verify.py keys its test points and oracles on it).
+//   flatppl:    FlatPPL constructor name.
+//   module:     None for a builtin law, Some("<module> <version>") for a standard-module law.
+//   params:     the constructor parameter names in spec order.
+//   pattern:    the FlatPPL expression this row matches. Its free variables are the placeholders.
+//   vars:       the placeholders that the templates use, other than {y}.
+//   kind:       "builtin"     a Stan distribution; the template states any reorder or conversion.
+//               "composition" a FlatPPL composite that equals one Stan distribution.
+//               "custom_lpdf" a user _lpdf/_lpmf defined by the `functions` field.
+//               "todo"        a Stan form exists but needs structural lowering, not one row: the
+//                             emitter refuses with not-yet. `note` states the planned form.
+//               "none"        no sensible Stan form: the emitter refuses for good.
+//   stan:       Stan family name, called as <stan>_<suffix>. "" when kind is "none".
+//   suffix:     "lpdf" or "lpmf" ("" when kind is "none").
+//   lhs:        template for the Stan variate expression. {y} is the FlatPPL variate.
+//   args:       template for the Stan argument list after "|". "" means the call has no "|".
+//   variate:    Stan type of the variate. {n} and {k} are sizes, given by `sizes`.
+//   sizes:      list of (size placeholder, FlatPPL expression that gives it).
+//   vectorized: Stan accepts a container of variates in one call, with scalar or container parameters,
+//               and returns the sum of the scalar terms. verify.py checks it numerically: a variate
+//               container with scalar parameters, and variate plus parameter containers (real scalar
+//               parameters become vectors, int parameters arrays, mean / concentration vectors arrays
+//               of vectors; matrices stay shared). Templates use ./ so they also work on vectors.
+//   lcdf:       <stan>_lcdf and <stan>_lccdf exist, so `~ ... T[L, U]` is well formed.
+//   normalized: the law is a probability measure. false: emit `target +=`, never a prior `~`.
+//   functions:  Stan functions-block source the row needs ("" if none).
+//   status:     "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
+//   note:       caveats for the emitter.
+//
+// Template rules: substitute each {name} with an atomic Stan expression (identifier, literal,
+// or parenthesized expression). The emitted density term is
+//   <stan>_<suffix>(<lhs> | <args>)   or   <stan>_<suffix>(<lhs>)   when args is "".
+// For an exact normalized log-density emit `target += <term>;`. `~` drops constants unless
+// the evaluator runs with propto=false (Stan Reference Manual, "Distribution statements").
+[
+    // ---------------------------------------------------------------- §08 continuous
+    (id: "uniform_interval", flatppl: "Uniform", module: None, params: ["support"],
+     pattern: "Uniform(interval(a, b))", vars: ["a", "b"], kind: "builtin",
+     stan: "uniform", suffix: "lpdf", lhs: "{y}", args: "{a}, {b}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "Finite a < b only. cartpow(interval(a, b), n) maps to the vectorized call."),
+    (id: "uniform_simplex", flatppl: "Uniform", module: None, params: ["support"],
+     pattern: "Uniform(stdsimplex(n))", vars: ["n"], kind: "composition",
+     stan: "dirichlet", suffix: "lpdf", lhs: "{y}", args: "rep_vector(1, {n})", variate: "simplex[{n}]",
+     sizes: [("n", "n")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Density (n-1)! w.r.t. the coordinate Lebesgue measure of §03. Uniform on any other set (ordered, zerosum, cartprod of mixed sets): no Stan form."),
+    (id: "normal", flatppl: "Normal", module: None, params: ["mu", "sigma"],
+     pattern: "Normal(mu, sigma)", vars: ["mu", "sigma"], kind: "builtin",
+     stan: "normal", suffix: "lpdf", lhs: "{y}", args: "{mu}, {sigma}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "generalized_normal", flatppl: "GeneralizedNormal", module: None, params: ["mean", "alpha", "beta"],
+     pattern: "GeneralizedNormal(mean, alpha, beta)", vars: ["mean", "alpha", "beta"], kind: "custom_lpdf",
+     stan: "flatppl_generalized_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {alpha}, {beta}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_generalized_normal_lpdf(real x, real mu, real alpha, real beta) {
+  return log(beta) - log2() - log(alpha) - lgamma(1 / beta) - pow(abs(x - mu) / alpha, beta);
+}",
+     status: "verified", note: ""),
+    (id: "cauchy", flatppl: "Cauchy", module: None, params: ["location", "scale"],
+     pattern: "Cauchy(location, scale)", vars: ["location", "scale"], kind: "builtin",
+     stan: "cauchy", suffix: "lpdf", lhs: "{y}", args: "{location}, {scale}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "student_t_std", flatppl: "StudentT", module: None, params: ["nu"],
+     pattern: "StudentT(nu)", vars: ["nu"], kind: "builtin",
+     stan: "student_t", suffix: "lpdf", lhs: "{y}", args: "{nu}, 0, 1", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "FlatPPL StudentT is the standard form; Stan needs explicit location 0 and scale 1."),
+    (id: "logistic", flatppl: "Logistic", module: None, params: ["mu", "s"],
+     pattern: "Logistic(mu, s)", vars: ["mu", "s"], kind: "builtin",
+     stan: "logistic", suffix: "lpdf", lhs: "{y}", args: "{mu}, {s}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "lognormal", flatppl: "LogNormal", module: None, params: ["mu", "sigma"],
+     pattern: "LogNormal(mu, sigma)", vars: ["mu", "sigma"], kind: "builtin",
+     stan: "lognormal", suffix: "lpdf", lhs: "{y}", args: "{mu}, {sigma}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "exponential", flatppl: "Exponential", module: None, params: ["rate"],
+     pattern: "Exponential(rate)", vars: ["rate"], kind: "builtin",
+     stan: "exponential", suffix: "lpdf", lhs: "{y}", args: "{rate}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: "Stan uses the rate, as FlatPPL does."),
+    (id: "gamma", flatppl: "Gamma", module: None, params: ["shape", "rate"],
+     pattern: "Gamma(shape, rate)", vars: ["shape", "rate"], kind: "builtin",
+     stan: "gamma", suffix: "lpdf", lhs: "{y}", args: "{shape}, {rate}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "weibull", flatppl: "Weibull", module: None, params: ["shape", "scale"],
+     pattern: "Weibull(shape, scale)", vars: ["shape", "scale"], kind: "builtin",
+     stan: "weibull", suffix: "lpdf", lhs: "{y}", args: "{shape}, {scale}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "rayleigh", flatppl: "Rayleigh", module: None, params: ["scale"],
+     pattern: "Rayleigh(scale)", vars: ["scale"], kind: "builtin",
+     stan: "rayleigh", suffix: "lpdf", lhs: "{y}", args: "{scale}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "pareto", flatppl: "Pareto", module: None, params: ["shape", "scale"],
+     pattern: "Pareto(shape, scale)", vars: ["shape", "scale"], kind: "builtin",
+     stan: "pareto", suffix: "lpdf", lhs: "{y}", args: "{scale}, {shape}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "Argument order swaps: Stan pareto(y_min, alpha) = FlatPPL Pareto(shape = alpha, scale = y_min). Declare the variate real<lower=scale>."),
+    (id: "inverse_gamma", flatppl: "InverseGamma", module: None, params: ["shape", "scale"],
+     pattern: "InverseGamma(shape, scale)", vars: ["shape", "scale"], kind: "builtin",
+     stan: "inv_gamma", suffix: "lpdf", lhs: "{y}", args: "{shape}, {scale}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "beta", flatppl: "Beta", module: None, params: ["alpha", "beta"],
+     pattern: "Beta(alpha, beta)", vars: ["alpha", "beta"], kind: "builtin",
+     stan: "beta", suffix: "lpdf", lhs: "{y}", args: "{alpha}, {beta}", variate: "real<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "chi_squared", flatppl: "ChiSquared", module: None, params: ["k"],
+     pattern: "ChiSquared(k)", vars: ["k"], kind: "builtin",
+     stan: "chi_square", suffix: "lpdf", lhs: "{y}", args: "{k}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "von_mises", flatppl: "VonMises", module: None, params: ["mu", "kappa"],
+     pattern: "VonMises(mu, kappa)", vars: ["mu", "kappa"], kind: "builtin",
+     stan: "von_mises", suffix: "lpdf", lhs: "{y}", args: "{mu}, {kappa}", variate: "real<lower=-pi(), upper=pi()>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "Stan does not restrict y; the declaration must carry the (-pi, pi) bounds."),
+    (id: "laplace", flatppl: "Laplace", module: None, params: ["location", "scale"],
+     pattern: "Laplace(location, scale)", vars: ["location", "scale"], kind: "builtin",
+     stan: "double_exponential", suffix: "lpdf", lhs: "{y}", args: "{location}, {scale}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+
+    // ---------------------------------------------------------------- §08 discrete
+    (id: "bernoulli", flatppl: "Bernoulli", module: None, params: ["p"],
+     pattern: "Bernoulli(p)", vars: ["p"], kind: "builtin",
+     stan: "bernoulli", suffix: "lpmf", lhs: "{y}", args: "{p}", variate: "int<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "FlatPPL booleans become Stan int 0/1."),
+    (id: "categorical", flatppl: "Categorical", module: None, params: ["p"],
+     pattern: "Categorical(p)", vars: ["p"], kind: "builtin",
+     stan: "categorical", suffix: "lpmf", lhs: "{y}", args: "{p}", variate: "int<lower=1, upper={n}>",
+     sizes: [("n", "lengthof(p)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "1-based in both languages. p must pass Stan's simplex check."),
+    (id: "categorical0", flatppl: "Categorical0", module: None, params: ["p"],
+     pattern: "Categorical0(p)", vars: ["p"], kind: "builtin",
+     stan: "categorical", suffix: "lpmf", lhs: "{y} + 1", args: "{p}", variate: "int<lower=0, upper={n} - 1>",
+     sizes: [("n", "lengthof(p)")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Shift the variate by +1. An array variate needs a loop or an array expression for the shift."),
+    (id: "binomial", flatppl: "Binomial", module: None, params: ["n", "p"],
+     pattern: "Binomial(n, p)", vars: ["n", "p"], kind: "builtin",
+     stan: "binomial", suffix: "lpmf", lhs: "{y}", args: "{n}, {p}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "n must be a Stan int (data)."),
+    (id: "geometric", flatppl: "Geometric", module: None, params: ["p"],
+     pattern: "Geometric(p)", vars: ["p"], kind: "builtin",
+     stan: "neg_binomial", suffix: "lpmf", lhs: "{y}", args: "1, {p} ./ (1 - {p})", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "Stan has no geometric distribution. p = 1 gives beta = inf, which Stan rejects."),
+    (id: "negative_binomial", flatppl: "NegativeBinomial", module: None, params: ["alpha", "beta"],
+     pattern: "NegativeBinomial(alpha, beta)", vars: ["alpha", "beta"], kind: "builtin",
+     stan: "neg_binomial", suffix: "lpmf", lhs: "{y}", args: "{alpha}, {beta}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "negative_binomial2", flatppl: "NegativeBinomial2", module: None, params: ["mu", "psi"],
+     pattern: "NegativeBinomial2(mu, psi)", vars: ["mu", "psi"], kind: "builtin",
+     stan: "neg_binomial_2", suffix: "lpmf", lhs: "{y}", args: "{mu}, {psi}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: "psi is Stan's phi."),
+    (id: "poisson", flatppl: "Poisson", module: None, params: ["rate"],
+     pattern: "Poisson(rate)", vars: ["rate"], kind: "builtin",
+     stan: "poisson", suffix: "lpmf", lhs: "{y}", args: "{rate}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified",
+     note: "rate = 0 is accepted and gives the Dirac at 0. broadcast(Poisson, rates) maps to one vectorized call."),
+
+    // ---------------------------------------------------------------- §08 multivariate
+    (id: "mv_normal", flatppl: "MvNormal", module: None, params: ["mu", "cov"],
+     pattern: "MvNormal(mu, cov)", vars: ["mu", "cov"], kind: "builtin",
+     stan: "multi_normal", suffix: "lpdf", lhs: "{y}", args: "{mu}, {cov}", variate: "vector[{n}]",
+     sizes: [("n", "lengthof(mu)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "wishart", flatppl: "Wishart", module: None, params: ["nu", "scale"],
+     pattern: "Wishart(nu, scale)", vars: ["nu", "scale"], kind: "builtin",
+     stan: "wishart", suffix: "lpdf", lhs: "{y}", args: "{nu}, {scale}", variate: "cov_matrix[{n}]",
+     sizes: [("n", "sizeof(scale)[1]")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Stan requires nu > n - 1."),
+    (id: "inverse_wishart", flatppl: "InverseWishart", module: None, params: ["nu", "scale"],
+     pattern: "InverseWishart(nu, scale)", vars: ["nu", "scale"], kind: "builtin",
+     stan: "inv_wishart", suffix: "lpdf", lhs: "{y}", args: "{nu}, {scale}", variate: "cov_matrix[{n}]",
+     sizes: [("n", "sizeof(scale)[1]")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Stan requires nu > n - 1."),
+    (id: "lkj", flatppl: "LKJ", module: None, params: ["n", "eta"],
+     pattern: "LKJ(n, eta)", vars: ["eta"], kind: "builtin",
+     stan: "lkj_corr", suffix: "lpdf", lhs: "{y}", args: "{eta}", variate: "corr_matrix[{n}]",
+     sizes: [("n", "n")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "n is not a Stan argument; it moves to the declaration. The normalizing constant equals §08 c_n(eta)."),
+    (id: "lkj_cholesky", flatppl: "LKJCholesky", module: None, params: ["n", "eta"],
+     pattern: "LKJCholesky(n, eta)", vars: ["eta"], kind: "builtin",
+     stan: "lkj_corr_cholesky", suffix: "lpdf", lhs: "{y}", args: "{eta}", variate: "cholesky_factor_corr[{n}]",
+     sizes: [("n", "n")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "n moves to the declaration."),
+    (id: "dirichlet", flatppl: "Dirichlet", module: None, params: ["alpha"],
+     pattern: "Dirichlet(alpha)", vars: ["alpha"], kind: "builtin",
+     stan: "dirichlet", suffix: "lpdf", lhs: "{y}", args: "{alpha}", variate: "simplex[{n}]",
+     sizes: [("n", "lengthof(alpha)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "multinomial", flatppl: "Multinomial", module: None, params: ["n", "p"],
+     pattern: "Multinomial(n, p)", vars: ["p"], kind: "builtin",
+     stan: "multinomial", suffix: "lpmf", lhs: "{y}", args: "{p}", variate: "array[{k}] int<lower=0>",
+     sizes: [("k", "lengthof(p)")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Stan has no n argument; n = sum(y). Emit a data check that sum(y) == n (for example reject in transformed data)."),
+
+    // ---------------------------------------------------------------- compositions
+    (id: "std_normal", flatppl: "Normal", module: None, params: ["mu", "sigma"],
+     pattern: "Normal(0, 1)", vars: [], kind: "composition",
+     stan: "std_normal", suffix: "lpdf", lhs: "{y}", args: "", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: "Optional; normal(0, 1) is equivalent."),
+    (id: "student_t_locscale", flatppl: "StudentT", module: None, params: ["nu"],
+     pattern: "locscale(StudentT(nu), mu, sigma)", vars: ["nu", "mu", "sigma"], kind: "composition",
+     stan: "student_t", suffix: "lpdf", lhs: "{y}", args: "{nu}, {mu}, {sigma}", variate: "real",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "bernoulli_logit", flatppl: "Bernoulli", module: None, params: ["p"],
+     pattern: "Bernoulli(invlogit(a))", vars: ["a"], kind: "composition",
+     stan: "bernoulli_logit", suffix: "lpmf", lhs: "{y}", args: "{a}", variate: "int<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "binomial_logit", flatppl: "Binomial", module: None, params: ["n", "p"],
+     pattern: "Binomial(n, invlogit(a))", vars: ["n", "a"], kind: "composition",
+     stan: "binomial_logit", suffix: "lpmf", lhs: "{y}", args: "{n}, {a}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "poisson_log", flatppl: "Poisson", module: None, params: ["rate"],
+     pattern: "Poisson(exp(a))", vars: ["a"], kind: "composition",
+     stan: "poisson_log", suffix: "lpmf", lhs: "{y}", args: "{a}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "categorical_logit", flatppl: "Categorical", module: None, params: ["p"],
+     pattern: "Categorical(softmax(b))", vars: ["b"], kind: "composition",
+     stan: "categorical_logit", suffix: "lpmf", lhs: "{y}", args: "{b}", variate: "int<lower=1, upper={n}>",
+     sizes: [("n", "lengthof(b)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "multinomial_logit", flatppl: "Multinomial", module: None, params: ["n", "p"],
+     pattern: "Multinomial(n, softmax(g))", vars: ["g"], kind: "composition",
+     stan: "multinomial_logit", suffix: "lpmf", lhs: "{y}", args: "{g}", variate: "array[{k}] int<lower=0>",
+     sizes: [("k", "lengthof(g)")], vectorized: false, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "As multinomial: no n argument; n = sum(y)."),
+    (id: "neg_binomial_2_log", flatppl: "NegativeBinomial2", module: None, params: ["mu", "psi"],
+     pattern: "NegativeBinomial2(exp(eta), psi)", vars: ["eta", "psi"], kind: "composition",
+     stan: "neg_binomial_2_log", suffix: "lpmf", lhs: "{y}", args: "{eta}, {psi}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "multi_normal_cholesky", flatppl: "MvNormal", module: None, params: ["mu", "cov"],
+     pattern: "MvNormal(mu, row_gram(L))", vars: ["mu", "L"], kind: "composition",
+     stan: "multi_normal_cholesky", suffix: "lpdf", lhs: "{y}", args: "{mu}, {L}", variate: "vector[{n}]",
+     sizes: [("n", "lengthof(mu)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Also matches locscale(iid(Normal(0, 1), n), mu, L) with L lower-triangular, positive diagonal."),
+    (id: "multi_normal_prec", flatppl: "MvNormal", module: None, params: ["mu", "cov"],
+     pattern: "MvNormal(mu, inv(Omega))", vars: ["mu", "Omega"], kind: "composition",
+     stan: "multi_normal_prec", suffix: "lpdf", lhs: "{y}", args: "{mu}, {Omega}", variate: "vector[{n}]",
+     sizes: [("n", "lengthof(mu)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: ""),
+    (id: "beta_proportion", flatppl: "Beta", module: None, params: ["alpha", "beta"],
+     pattern: "Beta(m * kappa, (1 - m) * kappa)", vars: ["m", "kappa"], kind: "composition",
+     stan: "beta_proportion", suffix: "lpdf", lhs: "{y}", args: "{m}, {kappa}", variate: "real<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: true, normalized: true, functions: "", status: "verified", note: ""),
+
+    // ---------------------------------------------------------------- module regression 0.1
+    (id: "bernoulli_logit_glm", flatppl: "BernoulliLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
+     pattern: "BernoulliLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
+     stan: "bernoulli_logit_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0, upper=1>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Single observation: x (vector) becomes a 1-row matrix. iid observations: y array[N] int, x matrix[N, k] with one row per observation. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+    (id: "binomial_logit_glm", flatppl: "BinomialLogitGLM", module: Some("regression 0.1"), params: ["x", "n", "alpha", "beta"],
+     pattern: "BinomialLogitGLM(x, n, alpha, beta)", vars: ["x", "n", "alpha", "beta"], kind: "builtin",
+     stan: "binomial_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{n}, to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "Argument order: Stan puts n before x. Available since Stan 2.34. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+    (id: "categorical_logit_glm", flatppl: "CategoricalLogitGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
+     pattern: "CategoricalLogitGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
+     stan: "categorical_logit_glm", suffix: "lpmf", lhs: "{y}", args: "{x}', {alpha}, {beta}", variate: "int<lower=1, upper={n}>",
+     sizes: [("n", "lengthof(alpha)")], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified",
+     note: "beta is k x n (features x classes) in both languages. Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace {x}' by {x} in args."),
+    (id: "normal_glm", flatppl: "NormalGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta", "sigma"],
+     pattern: "NormalGLM(x, alpha, beta, sigma)", vars: ["x", "alpha", "beta", "sigma"], kind: "builtin",
+     stan: "normal_id_glm", suffix: "lpdf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}, {sigma}", variate: "real",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+    (id: "poisson_log_glm", flatppl: "PoissonLogGLM", module: Some("regression 0.1"), params: ["x", "alpha", "beta"],
+     pattern: "PoissonLogGLM(x, alpha, beta)", vars: ["x", "alpha", "beta"], kind: "builtin",
+     stan: "poisson_log_glm", suffix: "lpmf", lhs: "{y}", args: "to_matrix({x}'), {alpha}, {beta}", variate: "int<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, functions: "", status: "verified", note: "Vectorized call: y array[N], x matrix[N, k] (one row per observation); replace to_matrix({x}') by {x} in args."),
+
+    // ---------------------------------------------------------------- module particle-physics 0.1
+    (id: "continued_poisson", flatppl: "ContinuedPoisson", module: Some("particle-physics 0.1"), params: ["rate"],
+     pattern: "ContinuedPoisson(rate)", vars: ["rate"], kind: "custom_lpdf",
+     stan: "flatppl_continued_poisson", suffix: "lpdf", lhs: "{y}", args: "{rate}", variate: "real",
+     sizes: [], vectorized: true, lcdf: false, normalized: false,
+     functions: "real flatppl_continued_poisson_lpdf(real x, real rate) {
+  if (x < 0) return negative_infinity();
+  return lmultiply(x, rate) - rate - lgamma(x + 1);
+}
+real flatppl_continued_poisson_lpdf(vector x, vector rate) {
+  if (num_elements(x) > 0 && min(x) < 0) return negative_infinity();
+  return sum(lmultiply(x, rate) - rate - lgamma(x + 1));
+}
+real flatppl_continued_poisson_lpdf(vector x, real rate) {
+  if (num_elements(x) > 0 && min(x) < 0) return negative_infinity();
+  return sum(lmultiply(x, rate)) - num_elements(x) * rate - sum(lgamma(x + 1));
+}",
+     status: "verified",
+     note: "Not normalized: emit `target += flatppl_continued_poisson_lpdf(y | rate);`. lmultiply gives 0 * log(0) = 0, so rate = 0 at x = 0 gives 0. Overloads cover vector data with vector or scalar rates."),
+    (id: "crystal_ball", flatppl: "CrystalBall", module: Some("particle-physics 0.1"), params: ["m0", "sigma", "alpha", "n"],
+     pattern: "CrystalBall(m0, sigma, alpha, n)", vars: ["m0", "sigma", "alpha", "n"], kind: "custom_lpdf",
+     stan: "flatppl_crystal_ball", suffix: "lpdf", lhs: "{y}", args: "{m0}, {sigma}, {alpha}, {n}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_crystal_ball_lpdf(real x, real m0, real sigma, real alpha, real n) {
+  real a = abs(alpha);
+  real t = (x - m0) / sigma;
+  real log_tail = log(n) - log(a) - log(n - 1) - 0.5 * square(a);
+  real log_core = 0.5 * log(pi() / 2) + log1p(erf(a / sqrt2()));
+  real log_norm = log(sigma) + log_sum_exp(log_tail, log_core);
+  if (t < -a) return n * log(n / a) - 0.5 * square(a) - n * log(n / a - a - t) - log_norm;
+  return -0.5 * square(t) - log_norm;
+}",
+     status: "verified", note: "Requires n > 1, as §09 states."),
+    (id: "double_sided_crystal_ball", flatppl: "DoubleSidedCrystalBall", module: Some("particle-physics 0.1"),
+     params: ["m0", "sigmaL", "sigmaR", "alphaL", "alphaR", "nL", "nR"],
+     pattern: "DoubleSidedCrystalBall(m0, sigmaL, sigmaR, alphaL, alphaR, nL, nR)",
+     vars: ["m0", "sigmaL", "sigmaR", "alphaL", "alphaR", "nL", "nR"], kind: "custom_lpdf",
+     stan: "flatppl_double_sided_crystal_ball", suffix: "lpdf", lhs: "{y}",
+     args: "{m0}, {sigmaL}, {sigmaR}, {alphaL}, {alphaR}, {nL}, {nR}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_double_sided_crystal_ball_lpdf(real x, real m0, real sigmaL, real sigmaR,
+                                              real alphaL, real alphaR, real nL, real nR) {
+  real aL = abs(alphaL);
+  real aR = abs(alphaR);
+  real log_left = log(sigmaL) + log_sum_exp(log(nL) - log(aL) - log(nL - 1) - 0.5 * square(aL),
+                                            0.5 * log(pi() / 2) + log(erf(aL / sqrt2())));
+  real log_right = log(sigmaR) + log_sum_exp(log(nR) - log(aR) - log(nR - 1) - 0.5 * square(aR),
+                                             0.5 * log(pi() / 2) + log(erf(aR / sqrt2())));
+  real log_norm = log_sum_exp(log_left, log_right);
+  if (x <= m0) {
+    real t = (x - m0) / sigmaL;
+    if (t < -aL) return nL * log(nL / aL) - 0.5 * square(aL) - nL * log(nL / aL - aL - t) - log_norm;
+    return -0.5 * square(t) - log_norm;
+  }
+  real t = (x - m0) / sigmaR;
+  if (t > aR) return nR * log(nR / aR) - 0.5 * square(aR) - nR * log(nR / aR - aR + t) - log_norm;
+  return -0.5 * square(t) - log_norm;
+}",
+     status: "verified", note: "Requires nL, nR > 1."),
+    (id: "argus", flatppl: "Argus", module: Some("particle-physics 0.1"), params: ["resonance", "slope", "power"],
+     pattern: "Argus(resonance, slope, power)", vars: ["resonance", "slope", "power"], kind: "custom_lpdf",
+     stan: "flatppl_argus", suffix: "lpdf", lhs: "{y}", args: "{resonance}, {slope}, {power}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_argus_lpdf(real x, real m0, real c, real p) {
+  if (x <= 0 || x >= m0) return negative_infinity();
+  real u = 1 - square(x / m0);
+  // log of the integral of u^p exp(c u) over (0, 1)
+  real log_int;
+  // The integral is 1F1(p + 1; p + 2; c) / (p + 1). For c < 0 use Kummer's transform so the
+  // series has positive terms. gamma_p is avoided: its gradient in the shape argument is off by
+  // 3e-7 relative at (1.5, 20) in Stan 2.39. No c == 0 branch: a constant would zero d/dc.
+  if (c < 0) {
+    log_int = c + log(hypergeometric_pFq([1]', [p + 2]', -c)) - log1p(p);
+  } else {
+    log_int = log(hypergeometric_pFq([p + 1]', [p + 2]', c)) - log1p(p);
+  }
+  return log(x) + p * log(u) + c * u - (2 * log(m0) - log2() + log_int);
+}",
+     status: "verified", note: "The normalizer is (m0^2 / 2) * integral_0^1 u^p exp(c u) du."),
+    (id: "relativistic_breit_wigner", flatppl: "RelativisticBreitWigner", module: Some("particle-physics 0.1"), params: ["mean", "width"],
+     pattern: "RelativisticBreitWigner(mean, width)", vars: ["mean", "width"], kind: "custom_lpdf",
+     stan: "flatppl_relativistic_breit_wigner", suffix: "lpdf", lhs: "{y}", args: "{mean}, {width}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_relativistic_breit_wigner_lpdf(real x, real m, real w) {
+  if (x <= 0) return negative_infinity();
+  real g = sqrt(square(m) * (square(m) + square(w)));
+  real log_norm = log(pi()) + 0.5 * log(square(m) + g) - log(2 * sqrt2()) - log(m) - log(w) - log(g);
+  return -log(square(square(x) - square(m)) + square(m * w)) - log_norm;
+}",
+     status: "verified", note: "Uses the closed-form normalizer stated in §09."),
+    (id: "bifurcated_normal", flatppl: "BifurcatedNormal", module: Some("particle-physics 0.1"), params: ["mean", "sigmaL", "sigmaR"],
+     pattern: "BifurcatedNormal(mean, sigmaL, sigmaR)", vars: ["mean", "sigmaL", "sigmaR"], kind: "custom_lpdf",
+     stan: "flatppl_bifurcated_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {sigmaL}, {sigmaR}", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true,
+     functions: "real flatppl_bifurcated_normal_lpdf(real x, real mu, real sigmaL, real sigmaR) {
+  real s = x < mu ? sigmaL : sigmaR;
+  return 0.5 * log(2 / pi()) - log(sigmaL + sigmaR) - 0.5 * square((x - mu) / s);
+}",
+     status: "verified", note: ""),
+    (id: "voigtian", flatppl: "Voigtian", module: Some("particle-physics 0.1"), params: ["mean", "width", "sigma"],
+     pattern: "Voigtian(mean, width, sigma)", vars: [], kind: "none",
+     stan: "", suffix: "", lhs: "", args: "", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
+     note: "Needs the Faddeeva function; Stan has no complex erfc. Only integrate_1d per evaluation."),
+    (id: "landau", flatppl: "Landau", module: Some("particle-physics 0.1"), params: ["loc", "scale"],
+     pattern: "Landau(loc, scale)", vars: [], kind: "none",
+     stan: "", suffix: "", lhs: "", args: "", variate: "real",
+     sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
+     note: "The density is an integral; Stan has no Landau function. Only integrate_1d per evaluation."),
+
+    // ---------------------------------------------------------------- measure-algebra laws
+    (id: "poisson_process", flatppl: "PoissonProcess", module: None, params: ["intensity"],
+     pattern: "PoissonProcess(intensity)", vars: [], kind: "todo",
+     stan: "", suffix: "", lhs: "", args: "", variate: "",
+     sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
+     note: "Phase 3: extended likelihood, target += sum(log(intensity(x))) - (integral of the intensity), when the integral is closed form."),
+    (id: "binned_poisson_process", flatppl: "BinnedPoissonProcess", module: None, params: ["bins", "intensity"],
+     pattern: "BinnedPoissonProcess(bins, intensity)", vars: [], kind: "todo",
+     stan: "", suffix: "", lhs: "", args: "", variate: "",
+     sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
+     note: "Phase 3: per-bin expected counts from the intensity, then counts ~ poisson(expected) (the poisson row)."),
+]

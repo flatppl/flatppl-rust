@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+k = 7
+m = 2
+n_success = [3, 5, 2]
+n_trials = [10, 10, 8]
+y_obs = [0.9, 1.1, 1.4]
+half = k / m
+q = k ./ m
+rates = n_success ./ n_trials
+mu ~ Normal(0, 1)
+y ~ Normal.(rates .+ mu .+ half .- q, 1.0)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

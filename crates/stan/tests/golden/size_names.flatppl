@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+J = 3
+K = 3
+x = [0.5, 1.5, 2.5]
+y_obs = [0.4, 1.7, 2.2]
+theta ~ iid(Normal(0, 1), J)
+sigma ~ Exponential(1.0)
+y ~ Normal.(theta .* x, sigma)
+prior = lawof(record(theta = theta, sigma = sigma))
+L = likelihoodof(kernelof(record(y = y), theta = theta, sigma = sigma), record(y = y_obs))
+post = bayesupdate(L, prior)

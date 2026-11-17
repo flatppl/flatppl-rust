@@ -55,6 +55,10 @@ mathdoc = ["dep:flatppl-mathdoc", "infer"]
 # always determinizes first, so it pulls in the determiniser and (like
 # `determinize`) `infer` for cross-module bundle assembly too.
 stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "dep:flatppl-host", "infer"]
+# `stan` writes a Stan program for one target of an inferred model. It needs
+# `infer` for types and the cross-module bundle, and `flatppl-host` to read
+# `load_data` sources into the data JSON.
+stan = ["dep:flatppl-stan", "dep:flatppl-host", "infer"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
@@ -67,6 +71,7 @@ flatppl-formula = { path = "../formula", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
 flatppl-determinizer = { path = "../determinizer", optional = true }
 flatppl-stablehlo = { path = "../stablehlo", optional = true }
+flatppl-stan = { path = "../stan", optional = true }
 flatppl-host = { path = "../host", optional = true }
 flatppl-mathdoc = { path = "../mathdoc", optional = true, default-features = false, features = ["document"] }
 # Source resolution + remote cache. `net` (TLS) is enabled only via the `prepare`

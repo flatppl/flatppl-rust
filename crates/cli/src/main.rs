@@ -13,14 +13,16 @@ use std::process::ExitCode;
     feature = "convert",
     feature = "infer",
     feature = "determinize",
-    feature = "stablehlo"
+    feature = "stablehlo",
+    feature = "stan"
 ))]
 use std::fs;
 #[cfg(any(
     feature = "convert",
     feature = "infer",
     feature = "determinize",
-    feature = "stablehlo"
+    feature = "stablehlo",
+    feature = "stan"
 ))]
 use std::path::Path;
 #[cfg(any(
@@ -28,7 +30,8 @@ use std::path::Path;
     feature = "infer",
     feature = "prepare",
     feature = "determinize",
-    feature = "stablehlo"
+    feature = "stablehlo",
+    feature = "stan"
 ))]
 use std::path::PathBuf;
 
@@ -40,14 +43,16 @@ use clap::{CommandFactory, Parser, Subcommand};
     feature = "infer",
     feature = "prepare",
     feature = "determinize",
-    feature = "stablehlo"
+    feature = "stablehlo",
+    feature = "stan"
 ))]
 use flatppl_cli::Failure;
 #[cfg(any(
     feature = "convert",
     feature = "infer",
     feature = "determinize",
-    feature = "stablehlo"
+    feature = "stablehlo",
+    feature = "stan"
 ))]
 use flatppl_cli::Format;
 #[cfg(feature = "convert")]
@@ -307,6 +312,32 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Write a Stan program for one target of a FlatPPL model.
+    ///
+    /// The target is `--target NAME`, or the model's single `bayesupdate`.
+    /// Refuses (exit 3) a construct with no Stan form, or one the emitter
+    /// does not write yet; the message says which.
+    #[cfg(feature = "stan")]
+    Stan {
+        /// Input FlatPPL file.
+        input: PathBuf,
+        /// The posterior or likelihood binding to emit.
+        #[arg(long)]
+        target: Option<String>,
+        /// Where values that depend on parameters go: `model` block locals,
+        /// or `transformed-parameters` (written to the output on every draw).
+        #[arg(long, default_value = "model", value_parser = ["model", "transformed-parameters"])]
+        derived: String,
+        /// Write the Stan JSON data here (reads `load_data` sources).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Write the parameter manifest (Stan name, FlatPPL field, query input) here.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Output file (`.stan`); stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Print a shell completion script to stdout.
     ///
     /// Covers every subcommand and flag. Install, e.g.:
@@ -543,6 +574,24 @@ fn main() -> ExitCode {
                 explain_reductions,
                 pack_summaries,
             },
+        ),
+        #[cfg(feature = "stan")]
+        Command::Stan {
+            input,
+            target,
+            derived,
+            data,
+            manifest,
+            output,
+        } => stan_cmd(
+            &input,
+            flatppl_stan::EmitOptions {
+                target,
+                derived: flatppl_stan::Placement::parse(&derived).expect("clap checks --derived"),
+            },
+            data.as_deref(),
+            manifest.as_deref(),
+            output.as_deref(),
         ),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1066,7 +1115,7 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
 /// cache-only resolver, same `Level::Shape`) so `load_module` refs resolve
 /// identically across verbs; surfaces inference errors as a `Failure` so a
 /// mistyped model refuses loudly instead of being lowered blind.
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn load_and_infer(
     input: &Path,
     resolver: &CliResolver,
@@ -1126,7 +1175,7 @@ fn load_and_infer(
 }
 
 /// Read one `--box ALIAS=BOX:DESCRIBE` argument.
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn parse_box_arg(arg: &str) -> Result<(String, std::sync::Arc<flatppl_host::BoxSpec>), Failure> {
     let usage = || Failure::Usage(format!("--box `{arg}`: expected ALIAS=BOX:DESCRIBE"));
     let (alias, rest) = arg.split_once('=').ok_or_else(usage)?;
@@ -1171,7 +1220,7 @@ fn refuse_message(
 
 /// The name of the binding whose right-hand side subtree contains `node`, or `None` for
 /// a node the determiniser synthesized (in no source binding).
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) -> Option<String> {
     for (_, binding) in module.bindings() {
         let mut queue = vec![binding.rhs];
@@ -1190,7 +1239,7 @@ fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) 
 
 /// 1-based line and column of byte `offset` in `source`, counting a column in
 /// characters so a non-ASCII line still points at the right glyph.
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn line_col(source: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(source.len());
     let before = &source[..offset];
@@ -1464,10 +1513,74 @@ fn stablehlo_cmd(
     Ok(())
 }
 
+/// `flatppl stan <in.flatppl> [--target NAME] [--data out.json] [--manifest
+/// out.json] [-o out.stan]`: emit a Stan program for one target. A refusal exits
+/// 3 with the construct, its binding and its position.
+#[cfg(feature = "stan")]
+fn stan_cmd(
+    input: &Path,
+    opts: flatppl_stan::EmitOptions,
+    data: Option<&Path>,
+    manifest: Option<&Path>,
+    output: Option<&Path>,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let (module, _bundle, source) = load_and_infer(input, &resolver, &[])?;
+    let refuse = |e: flatppl_stan::Refusal| {
+        let mut site = String::new();
+        if let Some(node) = e.node {
+            if let Some(name) = enclosing_binding(&module, node) {
+                site.push_str(&format!(" in `{name}`"));
+            }
+            if let Some(span) = module.span_of(node) {
+                let (line, col) = line_col(&source, span.start as usize);
+                site.push_str(&format!(
+                    " ({}:{line}:{col})",
+                    flatppl_cli::terminal_path(input)
+                ));
+            }
+        }
+        Failure::Refuse(format!("stan: {e}{site}"))
+    };
+    let mut program = flatppl_stan::emit(&module, &opts).map_err(refuse)?;
+    let write = |path: &Path, text: String| {
+        fs::write(path, text).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })
+    };
+    if let Some(path) = data {
+        if !program.deferred_data.is_empty() {
+            let mut loaded = module.clone();
+            load_fixed_data(&mut loaded, &resolver, input, &source, &module)?;
+            flatppl_stan::complete_data(&mut program, &loaded).map_err(refuse)?;
+        }
+        let json = serde_json::Value::Object(program.data.clone());
+        write(
+            path,
+            serde_json::to_string_pretty(&json).expect("JSON") + "\n",
+        )?;
+    }
+    if let Some(path) = manifest {
+        let json = program.manifest.to_json();
+        write(
+            path,
+            serde_json::to_string_pretty(&json).expect("JSON") + "\n",
+        )?;
+    }
+    match output {
+        Some(path) => write(path, program.code)?,
+        None => print!("{}", program.code),
+    }
+    Ok(())
+}
+
 /// Bake fixed `load_data` values into `module`. A refusal names the call's binding
 /// and position in `input` when the call is one of `surface`'s own nodes (lowering
 /// appends nodes and never renumbers them).
-#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+#[cfg(any(feature = "determinize", feature = "stablehlo", feature = "stan"))]
 fn load_fixed_data(
     module: &mut flatppl_core::Module,
     resolver: &CliResolver,

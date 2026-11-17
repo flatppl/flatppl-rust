@@ -1,0 +1,64 @@
+// FlatPPL `elementof(S)` set -> Stan declaration.
+// Sources: flatppl-design docs/03-value-types.md at eed1724 (sets, standard charts);
+// Stan Reference Manual 2.40 (types.html, transforms.html); stanc 2.40.0 probes.
+//
+// Schema: a list of rows. Every field is present in every row.
+//   set:        FlatPPL set expression; the row key. Lower-case words are the set's own arguments.
+//   block:      "parameters" when the set can hold an inferred value; "data" when Stan forbids
+//               parameters of that type; "none" when no Stan form exists.
+//   decl:       Stan declaration template. It uses only these placeholders:
+//                 {name}       the Stan variable name.
+//                 {lo}, {hi}   the scalar bounds of interval(lo, hi) (Stan expressions).
+//                 {n}, {m}     sizes: vector length n; matrix rows m and columns n.
+//                 {k}          the number of components of cartprod(S1, ..., Sk).
+//                 {bounds}     the constraint text of S's own row: the "<...>" that follows the type
+//                              keyword in S's decl, or "" when S's decl has none
+//                              (reals -> "", posreals -> "<lower=0>", interval(lo, hi) -> "<lower={lo}, upper={hi}>").
+//                 {lo_vector}, {hi_vector}  per-component bounds of cartprod as a transposed row-vector
+//                              literal, negative_infinity() / positive_infinity() where a component
+//                              has no bound, for example [negative_infinity(), 0]'.
+//                 {field_decls} the decls of the fields of a record set, each filled from that field
+//                              set's row with {name} = {name}_<field>, joined by newlines.
+//               "" when block is "none".
+//   chart:      "same" when Stan's transform equals the §03 standard chart; "differs" otherwise; "n/a".
+//   status:     "verified" (verify.py fills the template and stanc 2.40 accepts it) | "unverified: <reason>" | "n/a".
+//   note:       caveats.
+//
+// A chart difference changes only the unconstrained-space density. Values in the constrained
+// space and densities evaluated with jacobian=false agree.
+[
+    (set: "reals", block: "parameters", decl: "real {name};", chart: "same", status: "verified", note: ""),
+    (set: "interval(-inf, inf)", block: "parameters", decl: "real {name};", chart: "same", status: "verified", note: "Same as reals."),
+    (set: "posreals", block: "parameters", decl: "real<lower=0> {name};", chart: "same", status: "verified",
+     note: "Stan bounds admit the boundary value in floating point; §03 excludes 0."),
+    (set: "nonnegreals", block: "parameters", decl: "real<lower=0> {name};", chart: "same", status: "verified", note: ""),
+    (set: "unitinterval", block: "parameters", decl: "real<lower=0, upper=1> {name};", chart: "same", status: "verified",
+     note: "unitinterval is interval(0, 1): the interval(lo, hi) row with lo = 0, hi = 1 gives this decl."),
+    (set: "interval(a, b)", block: "parameters", decl: "real<lower={lo}, upper={hi}> {name};", chart: "same", status: "verified",
+     note: "Finite a < b; {lo} = a, {hi} = b. Stan ignores infinite bounds, so the half-infinite rows below are equivalent but tidier."),
+    (set: "interval(a, inf)", block: "parameters", decl: "real<lower={lo}> {name};", chart: "same", status: "verified", note: "{lo} = a."),
+    (set: "interval(-inf, b)", block: "parameters", decl: "real<upper={hi}> {name};", chart: "same", status: "verified", note: "{hi} = b."),
+    (set: "ordered(n)", block: "parameters", decl: "ordered[{n}] {name};", chart: "same", status: "verified", note: ""),
+    (set: "zerosum(n)", block: "parameters", decl: "sum_to_zero_vector[{n}] {name};", chart: "differs", status: "verified",
+     note: "Stan uses an isometric (Helmert) transform; §03 uses the first n-1 coordinates."),
+    (set: "stdsimplex(n)", block: "parameters", decl: "simplex[{n}] {name};", chart: "differs", status: "verified",
+     note: "Stan 2.37+ uses softmax of a sum-to-zero vector; §03 uses centered stick-breaking."),
+    (set: "cartpow(S, n)", block: "parameters", decl: "vector{bounds}[{n}] {name};", chart: "same", status: "verified",
+     note: "S a real set with a scalar row (reals, posreals, intervals, ...). Integer S: the next row."),
+    (set: "cartpow(S, n), S integer", block: "data", decl: "array[{n}] int{bounds} {name};", chart: "n/a", status: "verified",
+     note: "S one of integers, posintegers, nonnegintegers, booleans. Data only."),
+    (set: "cartpow(S, [m, n])", block: "parameters", decl: "matrix{bounds}[{m}, {n}] {name};", chart: "same", status: "verified",
+     note: "S a real set with a scalar row."),
+    (set: "cartprod(S1, ..., Sk)", block: "parameters", decl: "vector<lower={lo_vector}, upper={hi_vector}>[{k}] {name};", chart: "same", status: "verified",
+     note: "Real interval components only. Components without a bound use negative_infinity() / positive_infinity()."),
+    (set: "cartprod(a = S1, ...)", block: "parameters", decl: "{field_decls}", chart: "same", status: "verified",
+     note: "One declaration per field. tuple(...) parameters are also accepted by stanc 2.40."),
+    (set: "complexes", block: "parameters", decl: "complex {name};", chart: "same", status: "verified", note: ""),
+    (set: "integers", block: "data", decl: "int {name};", chart: "n/a", status: "verified",
+     note: "stanc 2.40: \"Parameters cannot be integers.\" A latent integer needs marginalization; refuse."),
+    (set: "posintegers", block: "data", decl: "int<lower=1> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "nonnegintegers", block: "data", decl: "int<lower=0> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "booleans", block: "data", decl: "int<lower=0, upper=1> {name};", chart: "n/a", status: "verified", note: "Data only."),
+    (set: "anything", block: "none", decl: "", chart: "n/a", status: "n/a", note: "No Stan form."),
+    (set: "rngstates", block: "none", decl: "", chart: "n/a", status: "n/a", note: "Stan RNG state is implicit."),
+]

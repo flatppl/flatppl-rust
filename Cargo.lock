@@ -589,6 +589,7 @@ dependencies = [
  "flatppl-lint",
  "flatppl-mathdoc",
  "flatppl-stablehlo",
+ "flatppl-stan",
  "flatppl-syntax",
  "serde_json",
 ]
@@ -766,6 +767,18 @@ dependencies = [
  "flatppl-infer",
  "flatppl-syntax",
  "libm",
+]
+
+[[package]]
+name = "flatppl-stan"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-infer",
+ "flatppl-syntax",
+ "ron",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
