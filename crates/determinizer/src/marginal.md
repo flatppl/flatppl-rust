@@ -865,6 +865,37 @@ naming, each with a test:
   bare distribution constructor, and the reification wrapper is not one. A coverage gap,
   not a correctness one.
 
+## One affine Gaussian edge and its reverse conditional
+
+Let `z ~ MvNormal(mu,C)` and `y | z ~ MvNormal(A*z+b,R)`, with positive-definite
+`C` and `R`. Independent Gaussian errors give `y = A*mu+b + A*epsilon_z+epsilon_y`.
+Their covariance is `S=A*C*transpose(A)+R`, so the marginal is exactly
+`MvNormal(A*mu+b,S)`. The map `A` can be rectangular, zero, or rank deficient.
+No invertibility of `A` is required. Both original covariance checks remain live:
+a positive-definite `S` alone cannot validate `C` and `R`.
+
+For `mu=[1,-2]`, `C=[[2,1],[1,3]]`, `A=[[1,2]]`, `b=[.5]`, `R=[[4]]` and
+`y=[1.5]`, the marginal mean is `-2.5`, variance `22`, and log density
+`-.5*(log(44*pi)+8/11)`. A plug-in mean would incorrectly keep variance `4`.
+
+Reverse `disintegrate` builds the Gaussian conditional with gain
+`K=C*transpose(A)*inverse(S)` and mean `mu+K*(y-A*mu-b)`. The implementation
+never constructs that inverse. It solves one vector RHS per latent axis and
+stacks the results into `K`. With `B=I-K*A`, it uses Joseph covariance
+`B*C*transpose(B)+K*R*transpose(K)` rather than subtracting nearly equal
+covariances. Expanding this expression and using `K*S=C*transpose(A)` gives
+`C-C*transpose(A)*inverse(S)*A*C`, the Gaussian conditional covariance.
+For the point above, the conditional mean is `[19/11,-8/11]` and covariance
+`[[14/11,-3/11],[-3/11,17/22]]`.
+
+The conditional is a native `MvNormal`, supporting density and explicit-state
+sampling. Its covariance retains the original component checks. Bare and
+container selectors retain their respective shapes. Declared draw provenance
+keeps earlier queries from changing later conditionals. The current rule needs
+one selected latent, one complement observation, static dimensions, no other
+uncarried stochastic ancestor, and at most 64 latent axes for reconstruction.
+The marginal log-density form does not yet compose several affine layers.
+
 ## Adding a row
 
 1. Do the integral and state it here first, with the §08 constructor that names the answer

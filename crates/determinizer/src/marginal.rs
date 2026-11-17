@@ -77,6 +77,7 @@ use flatppl_core::{
 
 mod beta;
 mod dirichlet;
+pub(crate) mod gaussian;
 
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
 /// determiniser emits one density sub-tree per atom). A finite but large latent
@@ -628,6 +629,9 @@ fn build_conjugate_marginal(
     let prior_name = m.resolve(prior_sym).to_string();
     let lik_name = m.resolve(lik_sym).to_string();
 
+    if prior_name == "MvNormal" && lik_name == "MvNormal" {
+        return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
+    }
     if prior_name == "Dirichlet" {
         return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name);
     }
