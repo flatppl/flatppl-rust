@@ -185,20 +185,33 @@ fn a_constant_argument_folds_to_the_scipy_value() {
     assert!(((tail - 2.0884875837625446e-45) / 2.0884875837625446e-45).abs() < 1e-15);
 }
 
+// These members have no CHLO primitive. Portable loops supply their values.
+// The testsuite executes the resulting values and derivatives against SciPy.
 #[test]
-fn a_member_without_a_chlo_op_refuses_naming_itself() {
-    let err = emit_with(
-        &format!(
-            "{SF}\na = elementof(reals)\nv = sf.bessel_j(1.0, a)\ninputs = (a)\noutputs = (v)"
-        ),
-        Mode::LogDensity,
-        Dtype::F32,
-    )
-    .expect_err("bessel_j has no StableHLO lowering");
-    assert!(
-        err.contains("special-functions.bessel_j has no StableHLO lowering"),
-        "{err}"
+fn remaining_special_functions_lower_with_live_inputs() {
+    for expression in [
+        "real(sf.bessel_j(v, x))",
+        "real(sf.bessel_i(z = x, v = v))",
+        "sf.bessel_y(v, x)",
+        "sf.bessel_k(v, x)",
+        "sf.airy(x)",
+        "sf.gammainc(v, x)",
+        "sf.betainc(v, 3.0, x)",
+    ] {
+        let source = format!(
+            "{SF}\nv = external(reals)\nx = external(reals)\ninputs = (v, x)\noutputs = {expression}"
+        );
+        emit(&source);
+    }
+}
+
+#[test]
+fn complex_bessel_projections_preserve_broadcast_shape_and_aliases() {
+    let source = format!(
+        "{SF}\nx = external(cartpow(reals, 3))\norder = external(reals)\nj = sf.bessel_j\nv = j.(order, x)\ninputs = (order, x)\noutputs = (real.(v), imag.(v), abs.(v), abs2.(v))"
     );
+    let out = emit(&source);
+    assert!(out.contains("tensor<3xf32>"));
 }
 
 // erfcx has no CHLO op. It is `exp(x²)·erfc(x)` below the split and a continued

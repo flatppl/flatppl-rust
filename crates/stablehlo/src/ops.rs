@@ -123,11 +123,7 @@ pub(crate) fn lower_builtin(
         "log2" => unary(e, id, args, Emitter::log2),
         "log10" => unary(e, id, args, Emitter::log10),
         "abs2" | "abs" | "real" | "imag"
-            if args.len() == 1
-                && matches!(
-                    e.type_of(args[0]),
-                    Some(Type::Scalar(flatppl_core::ScalarType::Complex))
-                ) =>
+            if args.len() == 1 && crate::complex::complex_leaf(e.type_of(args[0])) =>
         {
             crate::complex::project(e, id, head, args[0])
         }

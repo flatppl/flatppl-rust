@@ -5,6 +5,14 @@ use std::collections::HashMap;
 use crate::{EmitError, Emitter, Value};
 use flatppl_core::{CallHead, Node, NodeId, ScalarType, Type};
 
+pub(crate) fn complex_leaf(ty: Option<&Type>) -> bool {
+    match ty {
+        Some(Type::Scalar(ScalarType::Complex)) => true,
+        Some(Type::Array { elem, .. } | Type::TVector { elem, .. }) => complex_leaf(Some(elem)),
+        _ => false,
+    }
+}
+
 pub(crate) fn project(
     e: &mut Emitter,
     id: NodeId,
@@ -43,7 +51,7 @@ pub(crate) fn project(
     }
 }
 
-fn parts(
+pub(crate) fn parts(
     e: &mut Emitter,
     id: NodeId,
     memo: &mut HashMap<NodeId, (Value, Value)>,
@@ -52,7 +60,7 @@ fn parts(
         return Ok(result.clone());
     }
     let resolved = e.resolve_ref_one(id);
-    let result = if !matches!(e.type_of(id), Some(Type::Scalar(ScalarType::Complex))) {
+    let result = if !complex_leaf(e.type_of(id)) {
         (e.lower_node(id)?, e.scalar(0.0))
     } else if resolved != id {
         parts(e, resolved, memo)?
@@ -60,6 +68,16 @@ fn parts(
         match e.node(id).clone() {
             Node::Const(s) if e.resolve(s) == "im" => (e.scalar(0.0), e.scalar(1.0)),
             Node::Call(c) => {
+                if let CallHead::User(callee) = c.head {
+                    return e
+                        .lower_bessel_parts(id, callee, &c.args, false)
+                        .unwrap_or_else(|| {
+                            Err(EmitError::at(
+                                id,
+                                "complex expression requires a supported callable",
+                            ))
+                        });
+                }
                 let CallHead::Builtin(head) = c.head else {
                     return Err(EmitError::at(
                         id,
@@ -67,6 +85,18 @@ fn parts(
                     ));
                 };
                 let head = e.resolve(head).to_owned();
+                if head == "broadcast"
+                    && let Some((callee, args)) = c.args.split_first()
+                    && let Some(result) = e.lower_bessel_parts(id, *callee, args, true)
+                {
+                    return result;
+                }
+                if !matches!(e.type_of(id), Some(Type::Scalar(ScalarType::Complex))) {
+                    return Err(EmitError::at(
+                        id,
+                        "complex array projection requires a supported tensor operation",
+                    ));
+                }
                 match (head.as_str(), c.args.as_ref()) {
                     ("complex", [re, im]) => (e.lower_node(*re)?, e.lower_node(*im)?),
                     ("cis", [angle]) => {

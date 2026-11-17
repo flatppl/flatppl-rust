@@ -2341,7 +2341,7 @@ fn log_bessel_i0(e: &mut Emitter, kappa: &Value) -> Value {
 /// invariant — both [`log_bessel_i0`] call sites pass a fixed non-empty
 /// literal array — mirroring this crate's other panic-on-bad-input helpers,
 /// e.g. `Emitter::vector`'s empty-elems assert).
-fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
+pub(crate) fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
     let (&last, init) = coeffs
         .split_last()
         .expect("horner: coeffs must be non-empty");
