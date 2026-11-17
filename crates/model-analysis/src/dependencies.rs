@@ -624,11 +624,13 @@ fn normal_coordinate(deps: &mut Dependencies<'_>, node: NodeId) -> Option<Normal
     })
 }
 
-/// Analyze a FlatPDL query without changing it. `data_inputs` must be an
-/// explicit subset of declared inputs. Every other input is a parameter.
-pub fn analyze_model(m: &Module, data_inputs: &[String]) -> Result<ModelAnalysis, AnalysisError> {
-    crate::is_flatpdl(m)
-        .map_err(|e| AnalysisError(format!("model analysis requires FlatPDL: {e:?}")))?;
+/// Analyze the dependencies of an inferred FlatPDL query. The caller establishes
+/// FlatPDL conformance. Node IDs in the report refer to this module snapshot.
+/// `data_inputs` names a subset of the declared inputs. All others are parameters.
+pub fn analyze_lowered_query(
+    m: &Module,
+    data_inputs: &[String],
+) -> Result<ModelAnalysis, AnalysisError> {
     let inputs = binding(m, "inputs")
         .ok_or_else(|| AnalysisError("model analysis requires declared inputs".into()))?;
     let outputs = binding(m, "outputs")

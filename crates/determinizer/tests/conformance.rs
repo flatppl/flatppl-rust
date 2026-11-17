@@ -28,6 +28,12 @@ fn a_draw_is_not_flatpdl() {
     );
 }
 
+#[test]
+fn model_analysis_requires_a_flatpdl_module() {
+    let m = infer_module("x = elementof(reals)\ninputs = x\noutputs = x\nz ~ Normal(x, 1.)");
+    assert!(flatppl_determinizer::analyze_model(&m, &[]).is_err());
+}
+
 // --- Task 2 tests ---
 
 #[test]

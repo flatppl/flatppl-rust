@@ -403,7 +403,8 @@ need its own statistical discovery pass.
 
 ## Structural model analysis
 
-`analyze_model` reads lowered FlatPDL without changing it. Declared query inputs
+`flatppl-determinizer::analyze_model` checks FlatPDL conformance, then calls
+`flatppl-model-analysis::analyze_lowered_query` on the same typed module. Declared query inputs
 form the boundary, including promoted fixed or derived bindings. Data inputs
 are explicit; all other inputs are parameters. The report records additive
 terms with signs and multiplicities, parameter/data incidence, structural

@@ -1,0 +1,11 @@
+[package]
+name = "flatppl-model-analysis"
+description = "Dependency and coordinate analysis for typed FlatPPL query graphs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }

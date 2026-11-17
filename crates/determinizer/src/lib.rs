@@ -1,7 +1,6 @@
 //! FlatPPL → FlatPDL determiniser: a greedy directional legalizer that eliminates
 //! the measure layer, leaving deterministic ops + the six `builtin_*` primitives.
 //! Type-level transform — flatppl-rust does not evaluate densities.
-mod analysis;
 mod boxes;
 mod canon;
 mod chain;
@@ -19,14 +18,11 @@ mod kernel;
 mod marginal;
 mod normal_coordinates;
 mod primitives;
+mod query_analysis;
 mod refuse;
 mod sample;
 mod stdfn;
 mod sufficient_statistics;
-pub use analysis::{
-    AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
-    analyze_model,
-};
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
@@ -34,11 +30,15 @@ pub use driver::{
     determinize, determinize_with, determinize_with_options, determinize_with_options_and_report,
     determinize_with_roots,
 };
+pub use flatppl_model_analysis::{
+    AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,
+};
 pub use incremental::{IncrementalScorePlan, IncrementalTerm, prepare_incremental_score};
 pub use normal_coordinates::{
     CoordinatePrecision, NormalCoordinateQueries, NormalCoordinatesQueries,
     prepare_normal_coordinate, prepare_normal_coordinate_at_path, prepare_normal_coordinates,
 };
+pub use query_analysis::analyze_model;
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};
 pub use sufficient_statistics::{
