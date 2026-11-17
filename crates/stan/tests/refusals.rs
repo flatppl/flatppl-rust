@@ -147,3 +147,29 @@ fn point_process_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("BinnedPoissonProcess"), "{r}");
 }
+
+#[test]
+fn reduction_of_a_looped_body_is_not_yet() {
+    let r = refuse(&posterior(
+        "X = rowstack([[1.0, -2.0], [0.5, 3.0]])\n\
+         positives = aggregate(sum, [.i], ifelse(X[.i, .j] > 0.0, 1.0, 0.0))\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + positives[1], 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("aggregate"), "{r}");
+}
+
+#[test]
+fn diagonal_axis_is_not_yet() {
+    let r = refuse(&posterior(
+        "X = rowstack([[1.0, -2.0], [0.5, 3.0]])\n\
+         trace = aggregate(sum, [], X[.i, .i])\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + trace, 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("repeated axis"), "{r}");
+}

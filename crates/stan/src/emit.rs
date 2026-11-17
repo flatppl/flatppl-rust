@@ -11,6 +11,7 @@ use flatppl_core::{
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+mod aggregate;
 mod elementwise;
 mod pattern;
 mod structure;
@@ -71,6 +72,16 @@ fn shape_of(ty: &Type) -> Option<Shape> {
     }
 }
 
+/// How a rank-2 variate and its rank-2 law arguments flatten for one
+/// vectorized statement: both orders must agree element by element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flat {
+    /// A matrix variate: `to_vector` is column-major.
+    Col,
+    /// A two-dimensional array variate: `to_array_1d` is row-major.
+    Row,
+}
+
 /// One prior field of a posterior target.
 struct PriorField {
     field: Symbol,
@@ -104,6 +115,10 @@ pub(crate) struct Emitter<'m> {
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
+    /// The binding whose value is being computed, and its root node.
+    owner: Option<(String, NodeId)>,
+    /// Set while a law fills its flattened arguments.
+    flat: Option<Flat>,
     sizes: HashMap<u32, Vec<Symbol>>,
     data: Vec<String>,
     tdata: Vec<String>,
@@ -166,6 +181,8 @@ impl<'m> Emitter<'m> {
             peers: vec![],
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
+            owner: None,
+            flat: None,
             sizes,
             data: vec![],
             tdata: vec![],
@@ -622,8 +639,44 @@ impl<'m> Emitter<'m> {
     /// fixed, else a `model` local (see [`Placement`]). A value Stan has no
     /// whole-array expression for is filled elementwise by loops.
     fn computed(&mut self, base: &str, rhs: NodeId) -> Result<String> {
-        let attempt = self.expr(rhs);
-        self.place(base, rhs, attempt)
+        let outer = self.owner.replace((base.to_string(), rhs));
+        let out = if self.head(rhs) == Some("aggregate") {
+            self.aggregate_value(base, rhs)
+        } else {
+            let attempt = self.expr(rhs);
+            self.place(base, rhs, attempt)
+        };
+        self.owner = outer;
+        out
+    }
+
+    /// A value without a Stan whole-array expression, nested in a larger
+    /// expression: its own variable, filled by loops, keeps the rest
+    /// vectorized.
+    fn hoist(&mut self, id: NodeId, what: &str, refused: Refusal) -> Result<Ex> {
+        match &self.owner {
+            Some((_, root)) if *root == id => Err(refused),
+            owner => {
+                let base = match owner {
+                    Some((name, _)) => format!("{name}_{what}"),
+                    None => what.to_string(),
+                };
+                Ok(Ex::atom(self.place(&base, id, Err(refused))?))
+            }
+        }
+    }
+
+    /// Statements of a computed value, in `transformed data` when it is
+    /// fixed, else per [`Placement`].
+    fn put(&mut self, fixed: bool, lines: Vec<String>) {
+        if fixed {
+            self.tdata.extend(lines);
+        } else {
+            match self.opts.derived {
+                Placement::ModelLocals => self.locals.extend(lines),
+                Placement::TransformedParameters => self.tparams.extend(lines),
+            }
+        }
     }
 
     /// Place a value whose whole-array expression is `attempt`, falling back
@@ -650,14 +703,7 @@ impl<'m> Emitter<'m> {
             Err(r) => return Err(r),
         };
         let (stan, lines) = lines;
-        if fixed {
-            self.tdata.extend(lines);
-        } else {
-            match self.opts.derived {
-                Placement::ModelLocals => self.locals.extend(lines),
-                Placement::TransformedParameters => self.tparams.extend(lines),
-            }
-        }
+        self.put(fixed, lines);
         Ok(stan)
     }
 
@@ -926,6 +972,13 @@ impl<'m> Emitter<'m> {
             ("colstack", [cols]) => self.stack(id, *cols, "append_col", false),
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
             ("%call", _) => self.module_call(id),
+            ("aggregate", _) => {
+                let base = match &self.owner {
+                    Some((name, _)) => format!("{name}_agg"),
+                    None => "agg".to_string(),
+                };
+                Ok(Ex::atom(self.aggregate_value(&base, id)?))
+            }
             _ => {
                 if !c.named.is_empty() {
                     return Err(Refusal::not_yet(
@@ -1188,6 +1241,13 @@ impl<'m> Emitter<'m> {
         for s in sel {
             match self.m.node(*s) {
                 Node::Const(c) if self.name(*c) == "all" => idx.push(":".to_string()),
+                // Stan has no integer-array arithmetic: compute the index array.
+                _ if self.head(*s) == Some("broadcast")
+                    && self.shape(*s).is_some_and(|sh| sh.int && sh.rank >= 1) =>
+                {
+                    let refused = Refusal::not_yet(Some(*s), "a computed index array");
+                    idx.push(self.hoist(*s, "idx", refused)?.s)
+                }
                 _ => idx.push(self.expr(*s)?.s),
             }
         }
@@ -1275,7 +1335,14 @@ impl<'m> Emitter<'m> {
                 }
                 self.table_fn(id, name, None, parts)
             }
-            (name, _) => Err(Refusal::not_yet(Some(id), format!("{name}.(…)"))),
+            (name, _) => {
+                let refused = Refusal::not_yet(Some(id), format!("{name}.(…)"));
+                if self.elementwise(id) {
+                    self.hoist(id, name, refused)
+                } else {
+                    Err(refused)
+                }
+            }
         }
     }
 

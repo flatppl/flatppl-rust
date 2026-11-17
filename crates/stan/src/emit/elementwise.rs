@@ -152,7 +152,13 @@ impl<'m> Emitter<'m> {
     }
 
     /// A scalar function applied to per-element arguments.
-    fn apply(&mut self, node: NodeId, f: &str, args: &[NodeId], parts: Vec<Ex>) -> Result<Ex> {
+    pub(super) fn apply(
+        &mut self,
+        node: NodeId,
+        f: &str,
+        args: &[NodeId],
+        parts: Vec<Ex>,
+    ) -> Result<Ex> {
         let int = |k: usize| self.shape(args[k]).is_some_and(|s| s.int);
         let bin = |op: &str, prec: u8| Ex {
             s: format!("{} {op} {}", parts[0].at(prec), parts[1].at(prec + 1)),

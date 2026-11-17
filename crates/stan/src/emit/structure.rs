@@ -1,7 +1,7 @@
 //! Target decomposition and the `~` statements.
 
 use super::pattern;
-use super::{Emitter, Ex, P_ATOM, PriorField};
+use super::{Emitter, Ex, Flat, P_ATOM, PriorField};
 use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
@@ -16,6 +16,8 @@ const LOOP: &str = "\u{1}";
 struct Law {
     /// `stan(args)` for one statement over the whole variate.
     call: String,
+    /// `call` with rank-2 arguments flattened, for a flattened variate.
+    flat_call: Option<String>,
     /// `stan(args)` with [`LOOP`] where a broadcast loop indexes.
     indexed: String,
     /// A broadcast varies a vector parameter per element, which Stan does not
@@ -33,10 +35,14 @@ struct Law {
 
 impl Law {
     fn rhs(&self, index: Option<&str>) -> String {
-        let mut s = match index {
+        let s = match index {
             Some(i) => self.indexed.replace(LOOP, i),
             None => self.call.clone(),
         };
+        self.truncate(s)
+    }
+
+    fn truncate(&self, mut s: String) -> String {
         if let Some((lo, hi)) = &self.trunc {
             s.push_str(&format!(
                 " T[{}, {}]",
@@ -515,11 +521,17 @@ impl<'m> Emitter<'m> {
     fn tilde(&mut self, lhs: &str, measure: NodeId) -> Result<Vec<String>> {
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
+        let flat = self.flat_order(lhs);
         let (law, per_element) = match self.head(m) {
             Some("Lebesgue") => return Ok(vec![]),
             // An iid product of one law: the law's arguments are shared.
             Some("iid") => (self.law(self.call(m).unwrap().args[0], false)?, false),
-            Some("broadcast") => (self.law(m, true)?, true),
+            Some("broadcast") => {
+                self.flat = flat;
+                let law = self.law(m, true);
+                self.flat = None;
+                (law?, true)
+            }
             _ => (self.law(m, false)?, false),
         };
         let elementwise = per_element || self.head(m) == Some("iid");
@@ -546,12 +558,17 @@ impl<'m> Emitter<'m> {
             self.used.remove(&i);
             return Ok(vec![stmt]);
         }
-        let target = if lhs_rank >= 2 && !law.multivariate {
-            format!("to_vector({lhs})")
-        } else {
-            lhs.to_string()
+        let (target, rhs) = match (flat, &law.flat_call) {
+            (Some(Flat::Row), Some(call)) if !law.multivariate => {
+                (format!("to_array_1d({lhs})"), law.truncate(call.clone()))
+            }
+            (Some(Flat::Col), Some(call)) if !law.multivariate => {
+                (format!("to_vector({lhs})"), law.truncate(call.clone()))
+            }
+            _ if lhs_rank >= 2 && !law.multivariate => (format!("to_vector({lhs})"), law.rhs(None)),
+            _ => (lhs.to_string(), law.rhs(None)),
         };
-        Ok(vec![format!("{} ~ {};", law.lhs(&target), law.rhs(None))])
+        Ok(vec![format!("{} ~ {rhs};", law.lhs(&target))])
     }
 
     fn fresh_index(&mut self) -> String {
@@ -570,6 +587,16 @@ impl<'m> Emitter<'m> {
             .get(name)
             .and_then(|t: &StanType| t.array.first().or(t.dims.first()).cloned())
             .unwrap_or_else(|| format!("size({name})"))
+    }
+
+    /// The flattening a rank-2 variate takes in one vectorized statement.
+    fn flat_order(&self, name: &str) -> Option<Flat> {
+        let t = self.decls.get(name)?;
+        match (t.array.len(), t.base, t.dims.len()) {
+            (2, _, 0) => Some(Flat::Row),
+            (0, "matrix", 2) => Some(Flat::Col),
+            _ => None,
+        }
     }
 
     fn lhs_rank(&self, name: &str) -> usize {
@@ -896,6 +923,15 @@ impl<'m> Emitter<'m> {
             }
         }
         let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
+        let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
+        let flat = self.flat.take().filter(|_| scalar_variate);
+        let mut flat_args = None;
+        if flat.is_some() {
+            self.flat = flat;
+            let filled = self.fill(&row.args, &binds, &is_per, None);
+            self.flat = None;
+            flat_args = Some(filled?);
+        }
         let mut args = self.fill(&row.args, &binds, &is_per, None)?;
         let mut indexed = self.fill(&row.args, &binds, &is_per, Some(LOOP))?;
         // A template's elementwise operators become scalar ones when every
@@ -906,6 +942,7 @@ impl<'m> Emitter<'m> {
         };
         if binds.values().all(|b| rank_of(self, b) == 0) {
             args = scalar_operators(&args);
+            flat_args = flat_args.map(|a| scalar_operators(&a));
         }
         if binds
             .iter()
@@ -916,9 +953,9 @@ impl<'m> Emitter<'m> {
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
-        let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
         Ok(Law {
             call: format!("{}({args})", row.stan),
+            flat_call: flat_args.map(|a| format!("{}({a})", row.stan)),
             indexed: format!("{}({indexed})", row.stan),
             vector_per_element,
             lhs: row.lhs.clone(),
@@ -975,7 +1012,7 @@ fn ty_is_int(ty: &Type) -> bool {
     super::shape_of(ty).is_some_and(|s| s.int)
 }
 
-fn is_identifier(s: &str) -> bool {
+pub(super) fn is_identifier(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && s.starts_with(|c: char| c.is_ascii_alphabetic())
 }

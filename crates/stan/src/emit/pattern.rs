@@ -2,7 +2,7 @@
 //! `locscale(StudentT(nu), mu, sigma)`) against FlatPPL law nodes, and filling
 //! the Stan argument templates.
 
-use super::{Emitter, Ex, P_ATOM};
+use super::{Emitter, Ex, Flat, P_ATOM};
 use crate::refuse::Result;
 use flatppl_core::{Node, NodeId, Scalar};
 use std::collections::HashMap;
@@ -230,6 +230,20 @@ impl<'m> Emitter<'m> {
             let gathered = match (index.filter(|_| per_element(var)), binds.get(var)) {
                 (Some(i), Some(Bound::Node(n))) => self.gather_at(*n, i)?,
                 _ => None,
+            };
+            let e = match (self.flat, binds.get(var), index) {
+                (Some(order), Some(Bound::Node(n)), None)
+                    if self.shape(*n).is_some_and(|s| s.rank == 2) =>
+                {
+                    let int = self.shape(*n).is_some_and(|s| s.int);
+                    Ex::atom(match (order, int) {
+                        (Flat::Col, false) => format!("to_vector({})", e.s),
+                        (Flat::Col, true) => format!("to_vector(to_matrix({}))", e.s),
+                        (Flat::Row, false) => format!("to_vector({}')", e.at(P_ATOM)),
+                        (Flat::Row, true) => format!("to_array_1d({})", e.s),
+                    })
+                }
+                _ => e,
             };
             let text = match index.filter(|_| per_element(var)) {
                 Some(_) if gathered.is_some() => gathered.unwrap(),
