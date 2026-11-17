@@ -12,7 +12,9 @@
 //   kind:       "builtin"     a Stan distribution; the template states any reorder or conversion.
 //               "composition" a FlatPPL composite that equals one Stan distribution.
 //               "custom_lpdf" a user _lpdf/_lpmf defined by the `functions` field.
-//               "none"        no sensible Stan form.
+//               "todo"        a Stan form exists but needs structural lowering, not one row: the
+//                             emitter refuses with not-yet. `note` states the planned form.
+//               "none"        no sensible Stan form: the emitter refuses for good.
 //   stan:       Stan family name, called as <stan>_<suffix>. "" when kind is "none".
 //   suffix:     "lpdf" or "lpmf" ("" when kind is "none").
 //   lhs:        template for the Stan variate expression. {y} is the FlatPPL variate.
@@ -379,13 +381,13 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
 
     // ---------------------------------------------------------------- measure-algebra laws
     (id: "poisson_process", flatppl: "PoissonProcess", module: None, params: ["intensity"],
-     pattern: "PoissonProcess(intensity)", vars: [], kind: "none",
+     pattern: "PoissonProcess(intensity)", vars: [], kind: "todo",
      stan: "", suffix: "", lhs: "", args: "", variate: "",
      sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
-     note: "No Stan point-process construct."),
+     note: "Phase 3: extended likelihood, target += sum(log(intensity(x))) - (integral of the intensity), when the integral is closed form."),
     (id: "binned_poisson_process", flatppl: "BinnedPoissonProcess", module: None, params: ["bins", "intensity"],
-     pattern: "BinnedPoissonProcess(bins, intensity)", vars: [], kind: "none",
+     pattern: "BinnedPoissonProcess(bins, intensity)", vars: [], kind: "todo",
      stan: "", suffix: "", lhs: "", args: "", variate: "",
      sizes: [], vectorized: false, lcdf: false, normalized: true, functions: "", status: "n/a",
-     note: "Lower to the per-bin expected counts first; then broadcast(Poisson, counts) maps to the poisson row."),
+     note: "Phase 3: per-bin expected counts from the intensity, then counts ~ poisson(expected) (the poisson row)."),
 ]

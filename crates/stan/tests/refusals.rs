@@ -134,3 +134,16 @@ fn no_and_ambiguous_target() {
     assert_eq!(r.kind, RefusalKind::AmbiguousTarget, "{r}");
     assert!(r.reason.contains("a, b"), "{r}");
 }
+
+#[test]
+fn point_process_is_not_yet() {
+    let r = refuse(
+        "rate ~ Gamma(shape = 2.0, rate = 1.0)\n\
+         y ~ BinnedPoissonProcess([0.0, 1.0, 2.0], weighted(rate, Lebesgue(support = interval(0.0, 2.0))))\n\
+         prior = lawof(record(rate = rate))\n\
+         L = likelihoodof(kernelof(record(y = y), rate = rate), record(y = [1, 2]))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("BinnedPoissonProcess"), "{r}");
+}

@@ -835,10 +835,16 @@ impl<'m> Emitter<'m> {
             ));
         };
         match row.kind.as_str() {
-            // Point processes lower structurally (per-bin `poisson`, an
-            // extended likelihood), not through a law row.
-            "none" if matches!(name, "PoissonProcess" | "BinnedPoissonProcess") => {
-                return Err(Refusal::not_yet(Some(m), name.to_string()));
+            "todo" => {
+                return Err(Refusal::new(
+                    RefusalKind::NotYetSupported,
+                    Some(m),
+                    name.to_string(),
+                    format!(
+                        "`{name}` is not supported by the Stan emitter yet ({})",
+                        row.note
+                    ),
+                ));
             }
             "none" => {
                 return Err(Refusal::new(
