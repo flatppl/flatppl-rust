@@ -72,6 +72,7 @@ pub(crate) fn parts(
                     return e
                         .lower_kronecker_parts(id, callee, &c.args, false)
                         .or_else(|| e.lower_bessel_parts(id, callee, &c.args, false))
+                        .or_else(|| e.lower_lstsq_parts(id, callee, &c.args, false))
                         .unwrap_or_else(|| {
                             Err(EmitError::at(
                                 id,
@@ -151,7 +152,15 @@ pub(crate) fn parts(
                 }
                 if head == "broadcast"
                     && let Some((callee, args)) = c.args.split_first()
-                    && let Some(result) = e.lower_bessel_parts(id, *callee, args, true)
+                    && let Some(result) = e
+                        .lower_bessel_parts(id, *callee, args, true)
+                        .or_else(|| e.lower_lstsq_parts(id, *callee, args, true))
+                {
+                    return result;
+                }
+                if matches!(head.as_str(), "get" | "get0")
+                    && let Some((container, field)) = e.record_projection(&c.args)
+                    && let Some(result) = e.lower_svd_field_parts(id, container, &field)
                 {
                     return result;
                 }

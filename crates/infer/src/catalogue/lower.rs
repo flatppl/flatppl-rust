@@ -105,6 +105,16 @@ fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
                 ScalarType::Real
             }
         }
+        ElemSig::RealOrComplexOfArgs(indices) => {
+            if indices
+                .iter()
+                .any(|&i| elem_scalar_kind((ctx.arg_type)(i).as_ref()) == Some(ScalarType::Complex))
+            {
+                ScalarType::Complex
+            } else {
+                ScalarType::Real
+            }
+        }
     }
 }
 

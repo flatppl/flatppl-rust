@@ -15,9 +15,9 @@
                 // vector of non-negative REAL singular values (spec §09).
                 Binding(name: "svd",
                     sig: Function(params: [Matrix], names: ["A"], result: Record([
-                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: RealOrComplexOfArg(0))),
                         ("S", Vector(len: Dyn, elem: Real)),
-                        ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: RealOrComplexOfArg(0))),
                     ]))),
                 // eigen(A) → record(values, vectors): values vector, vectors matrix.
                 // Element kind follows A (matching eigmax/eigmin, which assume real
@@ -45,7 +45,7 @@
                         elem: PromoteArgs([0, 1])))),
                 // lstsq(A, b) → least-squares solution vector x, element kind from b.
                 Binding(name: "lstsq",
-                    sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: Vector(len: Dyn, elem: OfArg(1)))),
+                    sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: Vector(len: Dyn, elem: RealOrComplexOfArgs([0, 1])))),
                 // rank(A) → integer (numerical rank)
                 Binding(name: "rank",
                     sig: Function(params: [Matrix], names: ["A"], result: Scalar(Integer), result_set: NonNegIntegers)),

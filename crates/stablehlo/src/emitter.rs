@@ -59,6 +59,8 @@ mod log_beta;
 mod lu;
 #[path = "matrix_exp.rs"]
 mod matrix_exp;
+#[path = "matrix_svd.rs"]
+mod matrix_svd;
 #[path = "packed_gathers.rs"]
 mod packed_gathers;
 #[path = "packing.rs"]
@@ -4554,6 +4556,9 @@ impl<'m> Emitter<'m> {
         if let Some(result) = self.lower_special_function_call(id, f, &args[1..], true) {
             return result;
         }
+        if let Some(result) = self.lower_svd_call(id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_matrix_exp_call(id, f, &args[1..], true) {
             return result;
         }
@@ -4992,6 +4997,7 @@ impl<'m> Emitter<'m> {
                     .lower_box_application(id, callee, &call.args)
                     .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
+                    .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
                     .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
                     .unwrap_or_else(|| {
