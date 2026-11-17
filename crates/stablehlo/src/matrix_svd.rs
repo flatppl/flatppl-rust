@@ -529,6 +529,21 @@ impl Emitter<'_> {
                 let q = e.rem(index, &size);
                 let bp = (e.svd_column(&state[0], &p), e.svd_column(&state[1], &p));
                 let bq = (e.svd_column(&state[0], &q), e.svd_column(&state[1], &q));
+                // Global scaling does not protect a small correlated block:
+                // its inner products can underflow while the modes remain
+                // representable. A common pair scale preserves the rotation.
+                let pr = e.abs(&bp.0);
+                let pi = e.abs(&bp.1);
+                let qr = e.abs(&bq.0);
+                let qi = e.abs(&bq.1);
+                let pm = e.max(&pr, &pi);
+                let qm = e.max(&qr, &qi);
+                let magnitude = e.max(&pm, &qm);
+                let pair_scale = e.reduce_max(&magnitude);
+                let positive = e.compare("GT", &pair_scale, &zero);
+                let pair_scale = e.select(&positive, &pair_scale, &one);
+                let bp = (e.div(&bp.0, &pair_scale), e.div(&bp.1, &pair_scale));
+                let bq = (e.div(&bq.0, &pair_scale), e.div(&bq.1, &pair_scale));
                 let alpha = e.svd_norm2(&bp);
                 let beta = e.svd_norm2(&bq);
                 let gamma = e.svd_inner(&bp, &bq);
