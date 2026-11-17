@@ -73,6 +73,8 @@ mod param_domains;
 mod pointwise;
 #[path = "pyhf.rs"]
 mod pyhf;
+#[path = "quadrature.rs"]
+mod quadrature;
 #[path = "records.rs"]
 mod records;
 #[path = "runtime_status.rs"]
