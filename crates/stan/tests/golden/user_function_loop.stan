@@ -1,19 +1,20 @@
 functions {
-  vector lagged(int t, vector y_obs) {
-    return y_obs[reverse(linspaced_int_array(2, t - 2, t - 1))];
+  vector lagged(int t, vector y_obs, int K) {
+    return y_obs[reverse(linspaced_int_array(K, t - K, t - 1))];
   }
 }
 data {
   int<lower=0> K;
+  int<lower=0> N_y_obs;
+  vector[N_y_obs] y_obs;
   int<lower=0> T;
-  vector[T] y_obs;
 }
 transformed data {
-  array[6] int times = linspaced_int_array(6, 3, 8);
-  vector[6] y = y_obs[times];
-  matrix[6, K] X;
-  for (i in 1:6) {
-    X[i] = lagged(times[i], y_obs)';
+  array[T - K] int times = linspaced_int_array(T - K, K + 1, T);
+  vector[T - K] y = y_obs[times];
+  matrix[T - K, K] X;
+  for (i in 1:T - K) {
+    X[i] = lagged(times[i], y_obs, K)';
   }
 }
 parameters {

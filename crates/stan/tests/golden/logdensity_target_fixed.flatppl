@@ -1,0 +1,3 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+lp = logdensityof(Normal(0.5, 2.0), 1.25)

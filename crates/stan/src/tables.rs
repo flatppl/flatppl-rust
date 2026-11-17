@@ -114,6 +114,34 @@ fn module_matches(row: Option<&str>, call: Option<&str>) -> bool {
     }
 }
 
+/// The Stan Math library function names (`tables/library.txt`).
+fn library() -> &'static std::collections::HashSet<&'static str> {
+    static L: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        include_str!("../tables/library.txt")
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    })
+}
+
+/// Suffixes Stan gives densities, distribution functions and generators.
+const SUFFIXES: &[&str] = &["_lpdf", "_lpmf", "_lcdf", "_lccdf", "_rng", "_lp"];
+
+/// `true` when a user function must not take `name`: a library function, the
+/// distribution behind one (`normal` of `normal_lpdf`), a reserved word, or a
+/// name with a Stan suffix.
+pub(crate) fn clashes_with_stan(name: &str) -> bool {
+    let lib = library();
+    lib.contains(name)
+        || RESERVED.contains(&name)
+        || SUFFIXES.iter().any(|s| name.ends_with(s))
+        || SUFFIXES
+            .iter()
+            .any(|s| lib.contains(format!("{name}{s}").as_str()))
+}
+
 /// Stan keywords and reserved names; a FlatPPL name in this list gets a
 /// trailing underscore.
 pub(crate) const RESERVED: &[&str] = &[

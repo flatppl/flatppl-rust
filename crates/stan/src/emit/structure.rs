@@ -7,7 +7,7 @@ use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
 use crate::tables;
 use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Symbol, Type, ValueSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The loop index a per-element argument of a broadcast law is rendered with.
 const LOOP: &str = "\u{1}";
@@ -31,6 +31,10 @@ struct Law {
     multivariate: bool,
     /// Stan defines `_lcdf` and `_lccdf`, so `T[L, U]` is well formed.
     lcdf: bool,
+    /// An integer variate.
+    discrete: bool,
+    /// The support an unnormalized `truncate` restricts its variate to.
+    support: Option<(Option<String>, Option<String>)>,
 }
 
 impl Law {
@@ -107,6 +111,17 @@ impl<'m> Emitter<'m> {
             }
             Some("likelihoodof" | "joint_likelihood") => {
                 let obs = self.likelihood(rhs, false)?;
+                self.observe(obs)
+            }
+            // `logdensityof(M, x)`: the likelihood of `M` at the data `x`. The
+            // free inputs `M` reads are its parameters.
+            Some("logdensityof") => {
+                let c = self.call(rhs).unwrap();
+                let [m, x] = c.args[..] else {
+                    return Err(Refusal::not_yet(Some(rhs), "logdensityof with this arity"));
+                };
+                self.free_inputs(m)?;
+                let obs = self.measure_observations(m, x)?;
                 self.observe(obs)
             }
             Some(h) => Err(Refusal::not_yet(
@@ -433,6 +448,108 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// Declare each `elementof` binding `m` reads as a flat parameter, in
+    /// module order.
+    fn free_inputs(&mut self, m: NodeId) -> Result<()> {
+        let mut found = HashSet::new();
+        let mut stack = vec![m];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Node::Ref(r) = self.m.node(id)
+                && r.ns == RefNs::SelfMod
+                && let Some(b) = self
+                    .m
+                    .binding_by_name(*self.m.alias_chain(r.name).last().unwrap())
+            {
+                let rhs = self.m.binding(b).rhs;
+                if self.head(rhs) == Some("elementof") {
+                    found.insert(self.m.binding(b).name);
+                    continue;
+                }
+                stack.push(rhs);
+            }
+            self.m.for_each_child(id, |k| stack.push(k));
+        }
+        let order: Vec<Symbol> = self
+            .m
+            .bindings()
+            .map(|(_, b)| b.name)
+            .filter(|n| found.contains(n))
+            .collect();
+        for sym in order {
+            let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
+            let stan = self.fresh(self.name(sym));
+            let vs = self.m.valueset_of(rhs).cloned();
+            let hints = self.set_hints(self.call(rhs).unwrap().args[0]);
+            let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
+            self.params.push(format!("{};", t.render(&stan)));
+            self.record_decl(&stan, t);
+            self.env.insert(sym, stan.clone());
+            self.manifest.push(ManifestParam {
+                stan,
+                field: self.name(sym).to_string(),
+                input: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// The observations of data `x` under the measure `m`: one per field of a
+    /// `lawof(record(…))`, else one.
+    fn measure_observations(&mut self, m: NodeId, x: NodeId) -> Result<Vec<Observation>> {
+        let r = self.resolve(m);
+        if self.head(r) == Some("lawof") {
+            let inner = self.resolve(self.call(r).unwrap().args[0]);
+            if self.head(inner) == Some("record") {
+                let mut out: Vec<Observation> = Vec::new();
+                for na in self.call(inner).unwrap().named.iter().copied() {
+                    let (draw, law) = self.output_law(na.value)?;
+                    if let Some(d) = draw
+                        && out.iter().any(|o| o.draw == draw)
+                    {
+                        let name = self.name(d).to_string();
+                        return Err(Refusal::new(
+                            RefusalKind::SingularJoint,
+                            Some(m),
+                            format!("the joint law of `{name}`"),
+                            format!(
+                                "the joint law holds the draw `{name}` in two fields; it is \
+                                 concentrated on a diagonal and has no density"
+                            ),
+                        ));
+                    }
+                    out.push(Observation {
+                        draw,
+                        law,
+                        value: self.obs_field(x, na.name)?,
+                        name: self.name(na.name).to_string(),
+                    });
+                }
+                return Ok(out);
+            }
+            let (draw, law) = self.output_law(inner)?;
+            return Ok(vec![Observation {
+                draw,
+                law,
+                value: x,
+                name: "y".to_string(),
+            }]);
+        }
+        let name = match self.self_ref(x) {
+            Some(s) => self.name(s).to_string(),
+            None => "y".to_string(),
+        };
+        Ok(vec![Observation {
+            draw: None,
+            law: m,
+            value: x,
+            name,
+        }])
+    }
+
     /// The draw binding and law of a kernel output.
     fn output_law(&self, value: NodeId) -> Result<(Option<Symbol>, NodeId)> {
         if let Some(sym) = self.self_ref(value) {
@@ -490,6 +607,7 @@ impl<'m> Emitter<'m> {
             if let Some(d) = o.draw {
                 self.env.insert(d, lhs.clone());
             }
+            self.bound_by_support(&lhs, o.law)?;
             let lines = self.tilde(&lhs, o.law)?;
             let site = self.normal_site(&lhs, o.value, o.law, conditioned.len());
             factors.push((lines, site));
@@ -510,7 +628,52 @@ impl<'m> Emitter<'m> {
         Ok(())
     }
 
+    /// Data observed under an unnormalized `truncate` outside its support
+    /// has zero density: its `data` declaration takes the support as bounds,
+    /// so Stan rejects such data instead of scoring it.
+    fn bound_by_support(&mut self, data: &str, law: NodeId) -> Result<()> {
+        let r = self.resolve(law);
+        let r = match self.head(r) {
+            Some("iid") => self.resolve(self.call(r).unwrap().args[0]),
+            _ => r,
+        };
+        if self.head(r) != Some("truncate") {
+            return Ok(());
+        }
+        let Some((lo, hi)) = self.law(r, false)?.support else {
+            return Ok(());
+        };
+        let Some(t) = self.decls.get(data).cloned() else {
+            return Ok(());
+        };
+        let old = format!("{};", t.render(data));
+        let Some(pos) = self.data.iter().position(|l| *l == old) else {
+            return Ok(());
+        };
+        let mut t = t;
+        if t.bounds.lower.is_none() {
+            t.bounds.lower = lo;
+        }
+        if t.bounds.upper.is_none() {
+            t.bounds.upper = hi;
+        }
+        self.data[pos] = format!("{};", t.render(data));
+        self.record_decl(data, t);
+        Ok(())
+    }
+
     fn observed_value(&mut self, o: &Observation) -> Result<String> {
+        // Stan rejects a non-finite variate, where FlatPPL scores zero density.
+        let v = self.resolve(o.value);
+        let inf =
+            |me: &Self, x: NodeId| matches!(me.m.node(x), Node::Const(c) if me.name(*c) == "inf");
+        if inf(self, v) || (self.head(v) == Some("neg") && inf(self, self.call(v).unwrap().args[0]))
+        {
+            return Err(Refusal::not_yet(
+                Some(o.value),
+                "an observed value at infinity (Stan rejects a non-finite variate)",
+            ));
+        }
         // A data path or fixed binding prints as its own data name.
         let e: Ex = self.expr(o.value)?;
         if e.prec == P_ATOM && is_identifier(&e.s) {
@@ -518,7 +681,7 @@ impl<'m> Emitter<'m> {
         }
         if let Some(v) = crate::data::const_json(self.m, o.value) {
             let stan = self.fresh(&o.name);
-            let t = self.declare(o.value, None, false, &stan, &[])?;
+            let t = self.declare_data(o.value, None, false, &stan, &[])?;
             self.data.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
             self.json.insert(stan.clone(), v);
@@ -650,7 +813,7 @@ impl<'m> Emitter<'m> {
             // carries the support.
             "truncate" => {
                 let mut law = self.truncated(m)?;
-                law.trunc = None;
+                law.support = law.trunc.take();
                 Ok(law)
             }
             "broadcast" if broadcast => {
@@ -839,7 +1002,13 @@ impl<'m> Emitter<'m> {
                 "truncate of a law with no Stan CDF",
             ));
         }
-        let (lo, hi) = self.interval(set)?;
+        let (mut lo, hi) = self.interval(set)?;
+        // `posreals` excludes 0: an integer variate starts at 1. Stan's
+        // discrete `T[L, U]` keeps `L`.
+        if law.discrete && matches!(self.m.node(set), Node::Const(c) if self.name(*c) == "posreals")
+        {
+            lo = Some("1".into());
+        }
         law.trunc = Some((lo, hi));
         Ok(law)
     }
@@ -1007,6 +1176,8 @@ impl<'m> Emitter<'m> {
             vectorized: row.vectorized,
             multivariate: !scalar_variate,
             lcdf: row.lcdf,
+            discrete: row.variate.starts_with("int"),
+            support: None,
         })
     }
 

@@ -1,24 +1,28 @@
 data {
   int<lower=0> K;
-  int<lower=0> N;
-  vector[N] y_obs;
-  matrix[N, K] X;
-  array[N, K] int counts;
+  int<lower=0> N_y_obs;
+  vector[N_y_obs] y_obs;
+  int<lower=0> N_X_1;
+  int<lower=0> N_X_2;
+  matrix[N_X_1, N_X_2] X;
+  int<lower=0> N_counts_1;
+  int<lower=0> N_counts_2;
+  array[N_counts_1, N_counts_2] int counts;
 }
 transformed data {
-  vector[K] means;
-  for (i in 1:K) {
+  vector[N_X_2] means;
+  for (i in 1:N_X_2) {
     means[i] = mean(X[:, i]);
   }
-  matrix[N, K] Xc = X - rep_matrix(means', N);
-  matrix[N, K] step;
-  for (i in 1:N) {
-    for (j in 1:K) {
+  matrix[N_X_1, N_X_2] Xc = X - rep_matrix(means', N_X_1);
+  matrix[N_X_1, N_X_2] step;
+  for (i in 1:N_X_1) {
+    for (j in 1:N_X_2) {
       step[i, j] = X[i, j] >= 1.0 ? 1.0 : 0.0;
     }
   }
-  array[N] int totals;
-  for (i in 1:N) {
+  array[N_counts_1] int totals;
+  for (i in 1:N_counts_1) {
     totals[i] = sum(counts[i, :]);
   }
 }

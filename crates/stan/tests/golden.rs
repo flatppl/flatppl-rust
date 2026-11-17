@@ -1,6 +1,6 @@
 //! Emitted Stan text for each `golden/*.flatppl`, compared with `*.stan` and
 //! `*.data.json`. Set `FLATPPL_BLESS=1` to rewrite the expected files. A first
-//! line `# emit: derived=transformed-parameters` sets an option.
+//! line `# emit: derived=transformed-parameters target=NAME` sets options.
 //!
 //! These goldens check structural translation with data summaries disabled.
 //! The statistics tests cover the optimized form. The posteriordb round trip in
@@ -24,6 +24,7 @@ fn options(source: &str) -> flatppl_stan::EmitOptions {
                 Some(("derived", v)) => {
                     opts.derived = flatppl_stan::Placement::parse(v).expect("derived value")
                 }
+                Some(("target", v)) => opts.target = Some(v.to_string()),
                 _ => panic!("unknown emit option `{kv}`"),
             }
         }
@@ -73,4 +74,16 @@ fn goldens() {
         "golden mismatch:\n{}",
         failures.join("\n")
     );
+}
+
+/// A size is named by its source, never by its value: two data sets of
+/// different shape give the same program.
+#[test]
+fn extent_names_follow_their_source() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+    let a = emit(&read("extent_source_a.flatppl"));
+    let b = emit(&read("extent_source_b.flatppl"));
+    assert_eq!(a.code, b.code);
+    assert_ne!(a.data, b.data);
 }

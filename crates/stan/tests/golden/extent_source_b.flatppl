@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+J = 2
+T = 6
+y = rowstack([[0.1, 0.2, 0.4, 0.3, 0.6, 0.5], [0.5, 0.7, 0.6, 0.8, 1.1, 0.9]])
+steps = indicesof(zeros(T - 1))
+change = y[:, steps .+ 1] .- y[:, steps]
+mu ~ Normal(0, 1)
+sigma ~ Exponential(1.0)
+d ~ iid(Normal(mu, sigma), [J, T - 1])
+prior = lawof(record(mu = mu, sigma = sigma))
+L = likelihoodof(kernelof(record(d = d), mu = mu, sigma = sigma), record(d = change))
+post = bayesupdate(L, prior)

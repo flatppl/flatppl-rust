@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 mod aggregate;
 mod elementwise;
+mod extents;
 mod functions;
 mod pattern;
 mod ranges;
@@ -109,12 +110,17 @@ pub(crate) struct Emitter<'m> {
     links: Vec<(Symbol, Symbol)>,
     /// `functions` block sources, deduplicated.
     functions: Vec<String>,
-    /// Fresh data sizes, by (variable, axis).
-    fresh_sizes: HashMap<(String, usize), String>,
+    /// Stan name → its extents as linear forms, axis by axis.
+    ext_lin: HashMap<String, Vec<extents::Lin>>,
+    /// Size parameter substitutions while sizing a user function's body.
+    esubst: Vec<HashMap<Symbol, (NodeId, usize)>>,
+    /// Node types of a user function's body being sized.
+    sized_scope: Vec<HashMap<NodeId, Type>>,
+    /// Set while declaring a `data` value: an extent with no source becomes
+    /// a fresh data size.
+    data_sizes: bool,
     /// Stan name → its extents and their size names, axis by axis.
     extents: HashMap<String, Vec<(u32, String)>>,
-    /// Operand extents for the declaration being made (see [`Self::size`]).
-    peers: Vec<Vec<(u32, String)>>,
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
@@ -122,12 +128,17 @@ pub(crate) struct Emitter<'m> {
     owner: Option<(String, NodeId)>,
     /// Set while a law fills its flattened arguments.
     flat: Option<Flat>,
+    /// Values placed under their own name, by node: a law filled twice
+    /// (whole and per element) computes each once.
+    placed: HashMap<NodeId, String>,
     /// The user function body being emitted.
     fctx: Option<functions::FnCtx>,
     /// A copy of the module for instantiating function bodies.
     scratch: Option<Module>,
     /// (function, argument types) → Stan function and its captured names.
     fn_memo: HashMap<(NodeId, String), (String, Vec<String>)>,
+    /// Function text (name left out) → its Stan name.
+    fn_texts: HashMap<String, String>,
     /// Function parameters lifted over whole arrays (see `aggregate::lift`).
     vlocals: Option<HashMap<Symbol, aggregate::Lifted>>,
     sizes: HashMap<u32, Vec<Symbol>>,
@@ -143,7 +154,7 @@ pub(crate) struct Emitter<'m> {
     manifest: Vec<ManifestParam>,
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let mut s: String = name
         .chars()
         .map(|c| {
@@ -187,16 +198,20 @@ impl<'m> Emitter<'m> {
             decls: HashMap::new(),
             links: vec![],
             functions: vec![],
-            fresh_sizes: HashMap::new(),
             extents: HashMap::new(),
-            peers: vec![],
+            ext_lin: HashMap::new(),
+            esubst: vec![],
+            sized_scope: vec![],
+            data_sizes: false,
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
             owner: None,
             flat: None,
+            placed: HashMap::new(),
             fctx: None,
             scratch: None,
             fn_memo: HashMap::new(),
+            fn_texts: HashMap::new(),
             vlocals: None,
             sizes,
             data: vec![],
@@ -221,9 +236,10 @@ impl<'m> Emitter<'m> {
 
     /// The type of a node: its instantiated type inside a function body.
     fn ty(&self, id: NodeId) -> Option<Type> {
-        self.fctx
-            .as_ref()
-            .and_then(|c| c.scoped.get(&id).cloned())
+        self.sized_scope
+            .last()
+            .and_then(|s| s.get(&id).cloned())
+            .or_else(|| self.fctx.as_ref().and_then(|c| c.scoped.get(&id).cloned()))
             .or_else(|| self.m.type_of(id).cloned())
     }
 
@@ -314,81 +330,6 @@ impl<'m> Emitter<'m> {
 
     // ---------------------------------------------------------------- sizes
 
-    /// A static extent, named by the unique fixed integer binding with that value.
-    /// The extent `n` of axis `axis` (of `naxes`) of `owner`. A binding the
-    /// model ties to that axis (`hint`) names it. Otherwise the one fixed int
-    /// binding with that value names it; when several share the value, a
-    /// fresh data size `N_<owner>` does, so no coincidence picks a name.
-    fn size(
-        &mut self,
-        n: u32,
-        hint: Option<NodeId>,
-        peers: &[Vec<(u32, String)>],
-        owner: &str,
-        axis: usize,
-        naxes: usize,
-    ) -> String {
-        if let Some(h) = hint {
-            match self.m.node(self.resolve(h)) {
-                Node::Lit(Scalar::Int(v)) if *v == i64::from(n) => match self.self_ref(h) {
-                    Some(sym) => {
-                        if let Ok(name) = self.bind(*self.m.alias_chain(sym).last().unwrap()) {
-                            return name;
-                        }
-                    }
-                    // The model wrote the number itself.
-                    None => return n.to_string(),
-                },
-                _ => {}
-            }
-        }
-        // An operand of the same shape, then any operand axis of that extent.
-        let same_axis = peers
-            .iter()
-            .filter(|p| p.len() == naxes)
-            .find_map(|p| (p[axis].0 == n).then(|| p[axis].1.clone()));
-        if let Some(s) = same_axis.or_else(|| {
-            peers
-                .iter()
-                .flatten()
-                .find_map(|(e, s)| (*e == n).then(|| s.clone()))
-        }) {
-            return s;
-        }
-        match self.sizes.get(&n).map(Vec::as_slice) {
-            None | Some([]) => n.to_string(),
-            Some([sym]) => {
-                let sym = *sym;
-                self.bind(sym).unwrap_or_else(|_| n.to_string())
-            }
-            Some(_) => {
-                let key = (owner.to_string(), axis);
-                if let Some(s) = self.fresh_sizes.get(&key) {
-                    return s.clone();
-                }
-                let base = if naxes > 1 {
-                    format!("N_{owner}_{}", axis + 1)
-                } else {
-                    format!("N_{owner}")
-                };
-                let s = self.fresh(&base);
-                self.data.push(format!("int<lower=0> {s};"));
-                self.decls.insert(
-                    s.clone(),
-                    StanType {
-                        array: vec![],
-                        base: "int",
-                        dims: vec![],
-                        bounds: Default::default(),
-                    },
-                );
-                self.json.insert(s.clone(), Value::from(n));
-                self.fresh_sizes.insert(key, s.clone());
-                s
-            }
-        }
-    }
-
     fn declare(
         &mut self,
         node: NodeId,
@@ -401,6 +342,22 @@ impl<'m> Emitter<'m> {
             .ty(node)
             .ok_or_else(|| Refusal::not_yet(Some(node), "an untyped value"))?;
         self.declare_ty(&ty, vs, bounded, node, owner, hints)
+    }
+
+    /// [`Self::declare`] for a `data` value: an extent with no symbolic
+    /// source is a data size of its own.
+    fn declare_data(
+        &mut self,
+        node: NodeId,
+        vs: Option<&ValueSet>,
+        bounded: bool,
+        owner: &str,
+        hints: &[Option<NodeId>],
+    ) -> Result<StanType> {
+        let outer = std::mem::replace(&mut self.data_sizes, true);
+        let t = self.declare(node, vs, bounded, owner, hints);
+        self.data_sizes = outer;
+        t
     }
 
     fn declare_ty(
@@ -433,12 +390,15 @@ impl<'m> Emitter<'m> {
             node,
         )?;
         let naxes = extents.len();
-        let peers = std::mem::take(&mut self.peers);
-        let names: Vec<String> = extents
+        let lins: Vec<extents::Lin> = extents
             .iter()
             .enumerate()
-            .map(|(a, &n)| self.size(n, hints.get(a).copied().flatten(), &peers, owner, a, naxes))
+            .map(|(a, &n)| {
+                self.axis_name(n, hints.get(a).copied().flatten(), node, a, naxes, owner)
+            })
             .collect();
+        let names: Vec<String> = lins.iter().map(extents::Lin::print).collect();
+        self.ext_lin.insert(owner.to_string(), lins);
         self.extents.insert(
             owner.to_string(),
             extents.iter().copied().zip(names.iter().cloned()).collect(),
@@ -454,37 +414,6 @@ impl<'m> Emitter<'m> {
             },
             node,
         )
-    }
-
-    /// The extents of the declared values an expression reads, so a computed
-    /// value takes its size names from its operands.
-    fn operand_extents(&self, root: NodeId) -> Vec<Vec<(u32, String)>> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let name = match self.m.node(id) {
-                Node::Ref(r) if r.ns == RefNs::SelfMod => {
-                    let sym = *self.m.alias_chain(r.name).last().unwrap();
-                    self.env.get(&sym).cloned()
-                }
-                Node::Call(c) if self.head(id) == Some("get") => {
-                    let field = match c.args.get(1).map(|&f| self.m.node(f)) {
-                        Some(Node::Lit(Scalar::Str(f))) => Some(f.to_string()),
-                        _ => None,
-                    };
-                    match (self.data_record(c.args[0]), field) {
-                        (Some(rec), Some(f)) => self.leaves.get(&(rec, f)).cloned(),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            match name.and_then(|n| self.extents.get(&n)) {
-                Some(e) if !e.is_empty() => out.push(e.clone()),
-                _ => self.m.for_each_child(id, |c| stack.push(c)),
-            }
-        }
-        out
     }
 
     /// The axis-size expressions a set names: `cartpow(S, [m, n])` gives
@@ -633,7 +562,7 @@ impl<'m> Emitter<'m> {
                     .load_set(rhs)
                     .map(|s| self.set_hints(s))
                     .unwrap_or_default();
-                let t = self.declare(rhs, self.m.valueset_of(rhs), true, &stan, &hints)?;
+                let t = self.declare_data(rhs, self.m.valueset_of(rhs), true, &stan, &hints)?;
                 self.data.push(format!("{};", t.render(&stan)));
                 self.record_decl(&stan, t);
                 self.deferred.push(DataSource {
@@ -664,7 +593,7 @@ impl<'m> Emitter<'m> {
             && let Some(v) = data::const_json(self.m, rhs)
         {
             let stan = self.fresh(name);
-            let mut t = self.declare(rhs, None, false, &stan, &[])?;
+            let mut t = self.declare_data(rhs, None, false, &stan, &[])?;
             if t.is_int() && t.rank() == 0 && self.sizes.values().any(|v| v.contains(&sym)) {
                 t.bounds.lower = Some("0".into());
             }
@@ -732,6 +661,21 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// The name a node's value was placed under, in this context.
+    fn recall(&self, id: NodeId) -> Option<String> {
+        match &self.fctx {
+            Some(c) => c.placed.get(&id).cloned(),
+            None => self.placed.get(&id).cloned(),
+        }
+    }
+
+    fn remember(&mut self, id: NodeId, name: &str) {
+        match &mut self.fctx {
+            Some(c) => c.placed.insert(id, name.to_string()),
+            None => self.placed.insert(id, name.to_string()),
+        };
+    }
+
     /// `f.(…)` of a user function.
     fn user_broadcast(&self, id: NodeId) -> bool {
         self.head(id) == Some("broadcast")
@@ -760,7 +704,6 @@ impl<'m> Emitter<'m> {
         let lines = match attempt {
             Ok(e) => {
                 let stan = self.fresh(base);
-                self.peers = self.operand_extents(rhs);
                 let t = self.declare(rhs, None, false, &stan, &[])?;
                 let line = format!("{} = {};", t.render(&stan), e.s);
                 self.record_decl(&stan, t);
@@ -768,7 +711,6 @@ impl<'m> Emitter<'m> {
             }
             Err(r) if r.kind == RefusalKind::NotYetSupported && self.elementwise(rhs) => {
                 let stan = self.fresh(base);
-                self.peers = self.operand_extents(rhs);
                 let t = self.declare(rhs, None, false, &stan, &[])?;
                 let lines = self.fill_loops(&stan, &t, rhs)?;
                 self.record_decl(&stan, t);
@@ -778,6 +720,7 @@ impl<'m> Emitter<'m> {
         };
         let (stan, lines) = lines;
         self.put(fixed, lines);
+        self.remember(rhs, &stan);
         Ok(stan)
     }
 
@@ -841,7 +784,7 @@ impl<'m> Emitter<'m> {
                 .unwrap_or_default(),
             _ => vec![],
         };
-        let t = self.declare(node, vs.as_ref(), true, &stan, &hints)?;
+        let t = self.declare_data(node, vs.as_ref(), true, &stan, &hints)?;
         self.data.push(format!("{};", t.render(&stan)));
         self.record_decl(&stan, t);
         match self.head(rhs) {
@@ -932,6 +875,9 @@ impl<'m> Emitter<'m> {
     fn expr(&mut self, id: NodeId) -> Result<Ex> {
         if let Some(e) = self.fctx.as_ref().and_then(|c| c.lifted.get(&id)) {
             return Ok(e.clone());
+        }
+        if let Some(n) = self.recall(id) {
+            return Ok(Ex::atom(n));
         }
         match self.m.node(id) {
             Node::Lit(Scalar::Int(n)) => Ok(Ex::atom(n.to_string()).neg_prec(*n < 0)),
