@@ -14,7 +14,8 @@
 //!   `transformed data`, and values that depend on parameters to `model`
 //!   locals (see [`Placement`]).
 //!
-//! Every term is a `~` statement. Stan keeps every constant of a `~` term when
+//! Observed IID Normal factors can use data summaries and a normalized
+//! `target +=` expression. Stan keeps every constant of a `~` term when
 //! the density is evaluated with `propto=false`, so the program's log density
 //! at `propto=false, jacobian=false` equals FlatPPL's, including the
 //! normalizer of a truncated law, written `T[L, U]`.
@@ -45,12 +46,24 @@ pub enum Placement {
     TransformedParameters,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EmitOptions {
     /// The target binding; `None` picks the module's single `bayesupdate`.
     pub target: Option<String>,
     /// Where values that depend on parameters go (`--derived`).
     pub derived: Placement,
+    /// Prepare shared data summaries for supported observed IID factors (default: true).
+    pub sufficient_statistics: bool,
+}
+
+impl Default for EmitOptions {
+    fn default() -> Self {
+        Self {
+            target: None,
+            derived: Placement::default(),
+            sufficient_statistics: true,
+        }
+    }
 }
 
 /// One Stan parameter and the FlatPPL field it stands for.

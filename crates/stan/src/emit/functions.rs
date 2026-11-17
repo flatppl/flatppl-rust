@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 /// The state of a function body being emitted.
 #[derive(Default)]
 pub(crate) struct FnCtx {
+    /// Temporaries shared by a data summary block guarded on its inferred extents.
+    pub plan_arrays: Option<Vec<(NodeId, Ex)>>,
     /// Statements before the `return`.
     pub lines: Vec<String>,
     /// Input placeholder → its Stan expression.

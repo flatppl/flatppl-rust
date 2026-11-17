@@ -2,7 +2,7 @@
 
 use super::{Factor, Reducer, call, resolve};
 use flatppl_core::{
-    Binding, BindingId, Call, Dim, Module, NamedKind, NodeId, ScalarType, Symbol, Type,
+    Binding, BindingId, Call, Dim, Module, NamedKind, Node, NodeId, ScalarType, Symbol, Type,
 };
 use std::collections::HashSet;
 
@@ -11,7 +11,7 @@ use std::collections::HashSet;
 /// returned and keep the score at the original factor's scope.
 pub struct IidNormalPlan {
     module: Module,
-    summaries: Vec<BindingId>,
+    summaries: Vec<(BindingId, &'static str)>,
     score: NodeId,
     all_finite: NodeId,
     count: u32,
@@ -25,7 +25,14 @@ impl IidNormalPlan {
 
     /// Data-only bindings in dependency order.
     pub fn summaries(&self) -> impl ExactSizeIterator<Item = &Binding> {
-        self.summaries.iter().map(|&id| self.module.binding(id))
+        self.named_summaries().map(|(_, binding)| binding)
+    }
+
+    /// Statistic names and data-only bindings, in dependency order.
+    pub fn named_summaries(&self) -> impl ExactSizeIterator<Item = (&'static str, &Binding)> {
+        self.summaries
+            .iter()
+            .map(|&(id, kind)| (kind, self.module.binding(id)))
     }
 
     /// The fully normalized score expression in this plan's module.
@@ -118,12 +125,22 @@ pub fn plan_iid_normal(
     let score = reducer.reduce_moment_factor(&mut module, &factor)?;
     let key = reducer.data_key(&module, observed);
     let all_finite = *reducer.cache.get(&(vec![key], super::NORMAL_FINITE))?;
+    let kinds: std::collections::HashMap<_, _> = reducer
+        .cache
+        .iter()
+        .filter_map(|((_, kind), id)| {
+            let Node::Ref(r) = module.node(*id) else {
+                return None;
+            };
+            Some((r.name, *kind))
+        })
+        .collect();
     let summaries = reducer
         .summaries
         .iter()
-        .map(|&name| module.binding_by_name(name))
+        .map(|&name| Some((module.binding_by_name(name)?, *kinds.get(&name)?)))
         .collect::<Option<Vec<_>>>()?;
-    for &id in &summaries {
+    for &(id, _) in &summaries {
         let rhs = module.binding(id).rhs;
         flatppl_infer::annotate_rebuilt(&mut module, rhs);
     }
