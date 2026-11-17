@@ -61,8 +61,14 @@ for dtype in ("f32", "f64"):
                 got, case["value"], rtol=rtol, atol=np.finfo(typ).tiny
             )
         point = [jnp.asarray(a, dtype=typ) for a in row["point"]]
-        gradient = jax.jit(jax.grad(call, argnums=tuple(range(len(point)))))(*point)
-        np.testing.assert_allclose(gradient, row["gradient"], rtol=rtol, atol=atol)
+        gradient = jax.jit(jax.grad(call, argnums=tuple(range(len(point)))))
+        gradient_cases = [{"args": row["point"], "gradient": row["gradient"]}]
+        gradient_cases += row.get("gradient_cases", [])
+        for case in gradient_cases:
+            args = [jnp.asarray(a, dtype=typ) for a in case["args"]]
+            np.testing.assert_allclose(
+                gradient(*args), case["gradient"], rtol=rtol, atol=atol
+            )
         batch = [jnp.stack([a, a]) for a in point]
         np.testing.assert_allclose(
             jax.jit(jax.vmap(call))(*batch), value(*point), rtol=rtol, atol=atol

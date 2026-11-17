@@ -636,6 +636,17 @@ impl Emitter<'_> {
             self.exp(&small_value)
         };
         let value = self.select(&use_small, &small_value, &value);
+        let value = if logarithmic && upper {
+            let at_zero = self.compare("EQ", &actual_x, &zero);
+            let first_shape = self.compare("EQ", &actual_a, &one);
+            let linear_endpoint = self.and(&at_zero, &first_shape);
+            let argument = self.select(&linear_endpoint, &actual_x, &zero);
+            let negative = self.neg(&argument);
+            let endpoint = self.log1p(&negative);
+            self.select(&linear_endpoint, &endpoint, &value)
+        } else {
+            value
+        };
         let infinite_endpoint = if logarithmic {
             if upper {
                 self.scalar(f64::NEG_INFINITY)
@@ -809,8 +820,8 @@ impl Emitter<'_> {
         let first_right = self.compare("EQ", &b, &one);
         let first_right = self.and(&first_right, &flip);
         let complement = self.sub(&one, &x);
-        let right_endpoint = self.mul(&a, &complement);
-        let right_endpoint = self.sub(&one, &right_endpoint);
+        let right_delta = self.mul(&a, &complement);
+        let right_endpoint = self.sub(&one, &right_delta);
         let endpoint = self.select(&first_right, &right_endpoint, &endpoint);
         let endpoint = if upper {
             self.sub(&one, &endpoint)
@@ -819,7 +830,14 @@ impl Emitter<'_> {
         };
         let endpoint = if logarithmic {
             let minus_infinity = self.scalar(f64::NEG_INFINITY);
-            self.select(&flipped, &zero, &minus_infinity)
+            let linear = if upper { &first_left } else { &first_right };
+            let at_boundary = self.not(&interior);
+            let linear = self.and(linear, &at_boundary);
+            let delta = if upper { &left_endpoint } else { &right_delta };
+            let delta = self.select(&linear, delta, &zero);
+            let negative = self.neg(&delta);
+            let finite_endpoint = self.log1p(&negative);
+            self.select(&flipped, &finite_endpoint, &minus_infinity)
         } else {
             endpoint
         };
