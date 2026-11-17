@@ -341,8 +341,8 @@ impl Emitter<'_> {
                 let converged = e.compare("LE", &magnitude, &bound);
                 let done = e.compare("NE", &state[2], &zero);
                 let keep = e.or(&converged, &done);
-                let sum = e.select(&done, &state[1], &sum);
-                let term = e.select(&keep, &zero, &term);
+                // At integer b, zero-valued terms still carry nonzero b
+                // tangents. Complete the bounded series after certification.
                 let flag = e.convert(&keep, ElemKind::Real);
                 vec![term, sum, flag]
             },
