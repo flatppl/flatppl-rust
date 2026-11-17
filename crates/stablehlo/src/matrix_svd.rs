@@ -390,8 +390,35 @@ impl Emitter<'_> {
         let [Some(m), Some(n)] = dims.as_slice() else {
             return Err(EmitError::at(id, "svd requires static matrix dimensions"));
         };
-        if *m == 0 || *n == 0 || (*m).max(*n) > i32::MAX as u64 {
-            return Err(EmitError::at(id, "svd requires a nonempty matrix"));
+        if *m == 0 || *n == 0 {
+            let batch = self.batch_rank(&input.0);
+            let prefix = shape(&input.0.ty)[..batch].to_vec();
+            let empty = |e: &mut Self, cell: &[u64]| {
+                let mut dims = prefix.clone();
+                dims.extend(cell.iter().copied().map(Some));
+                let value = e.constant(0.0, MlirTy::Ranked(dims));
+                e.axes_view(
+                    &value,
+                    Axes {
+                        batch,
+                        layers: vec![cell.len()],
+                    },
+                )
+            };
+            let u = empty(self, &[*m, 0]);
+            let v = empty(self, &[*n, 0]);
+            let s = empty(self, &[0]);
+            return Ok(Svd {
+                u: (u.clone(), u),
+                s,
+                v: (v.clone(), v),
+            });
+        }
+        if (*m).max(*n) > i32::MAX as u64 {
+            return Err(EmitError::at(
+                id,
+                "svd matrix dimensions exceed the supported index width",
+            ));
         }
         let wide = m < n;
         let input = if wide {

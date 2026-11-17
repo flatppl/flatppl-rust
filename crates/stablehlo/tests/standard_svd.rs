@@ -72,3 +72,20 @@ fn complex_projections_and_matrix_cell_broadcast_lower() {
         Target::Gpu,
     );
 }
+
+#[test]
+fn empty_matrices_keep_thin_factor_and_solution_shapes() {
+    for (m, n) in [(0, 0), (0, 3), (3, 0)] {
+        let m_expr = if m == 0 { "n" } else { "3" };
+        let n_expr = if n == 0 { "n" } else { "3" };
+        let output = emit(
+            &format!(
+                "t=external(reals)\nn=lengthof(filter(fn(_>2),[1]))\nA=fill(t,[{m_expr},{n_expr}])\nb=fill(t,[{m_expr}])\ninputs=t\nf=la.svd(A)\noutputs=(f.U,f.S,f.V,la.lstsq(A,b),la.rank(A))"
+            ),
+            Dtype::F64,
+            Target::Cpu,
+        );
+        assert!(output.contains(&format!("tensor<{m}x0xf64>")));
+        assert!(output.contains(&format!("tensor<{n}x0xf64>")));
+    }
+}
