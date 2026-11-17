@@ -297,6 +297,26 @@ anchors' powers of one half. Native stable log-beta and parameter checks
 remain active. Unsupported observations retain their zero mass. Sanitized
 counts keep inactive corrections finite. Carried latents remain conditional.
 
+## Dirichlet probabilities shared by categorical and multinomial fields
+
+For `p ~ Dirichlet(alpha)`, each categorical observation adds a one-hot count.
+Each multinomial observation adds its count vector. With total count vector `c`,
+the integrated mass is `prod_i multinomial_coefficient(x_i) * B(alpha+c)/B(alpha)`.
+Each field keeps its own coefficient. For `alpha=[2,3,5]`, multinomial fields
+`[1,1,0]` and `[0,1,2]` have joint mass `18/1001`. Replacing their coefficients
+with the coefficient of their sum incorrectly gives `90/1001`.
+
+At the uniform simplex point `q`, the expression sums native observation scores
+and adds `logdensityof(Dirichlet(alpha),q)-logdensityof(Dirichlet(alpha+c),q)`.
+The powers of `q` cancel. This uses the coordinate simplex measure from §08.
+Native anchors retain parameter and support checks. Count sanitization only
+protects posterior shapes. It does not compare floating totals, since distinct
+rounding can reject valid integer observations.
+
+A single categorical field reduces to normalized concentrations, scaled before
+their sum to avoid overflow. Both category bases are supported. A carried
+simplex latent remains conditional rather than being integrated again.
+
 ## Rows 4 and 5 — a prior on the VARIANCE, reached through `sqrt`
 
 Both are Gaussian **scale** mixtures: `y | v ~ Normal(mu = μ, sigma = sqrt(v))` with a prior
