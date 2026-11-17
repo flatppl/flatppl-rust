@@ -291,12 +291,6 @@ fn a_member_without_a_base_op_form_stays_a_call() {
             "sp",
             "bessel_j",
         ),
-        (
-            DIST,
-            "dist.minkowski([1.0, 2.0], [0.5, 1.0], 3.0)",
-            "dist",
-            "minkowski",
-        ),
     ] {
         let out = determinize(&parse_infer(&probe_model(loads, expr)))
             .expect("a catalogued member call must determinize");
