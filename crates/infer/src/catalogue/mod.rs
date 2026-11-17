@@ -480,6 +480,8 @@ pub(crate) enum ElemSig {
     /// The (array-drilled) element kind of positional arg `i`; defaults to real
     /// when that arg's kind is not statically known.
     OfArg(usize),
+    /// Arithmetic promotion of the element kinds of all listed arguments.
+    PromoteArgs(Vec<usize>),
 }
 
 /// A result-shape dimension expression (for `Matrix` / `MatrixElem` / `Vector`

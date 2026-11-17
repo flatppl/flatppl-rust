@@ -42,7 +42,7 @@
                     sig: Function(params: [Matrix, Matrix], names: ["A", "B"], result: MatrixElem(
                         rows: Mul(Axis(0, 0), Axis(1, 0)),
                         cols: Mul(Axis(0, 1), Axis(1, 1)),
-                        elem: OfArg(0)))),
+                        elem: PromoteArgs([0, 1])))),
                 // lstsq(A, b) → least-squares solution vector x, element kind from b.
                 Binding(name: "lstsq",
                     sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: Vector(len: Dyn, elem: OfArg(1)))),
