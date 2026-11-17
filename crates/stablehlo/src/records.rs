@@ -97,6 +97,9 @@ impl Emitter<'_> {
                 .ok_or_else(|| unknown_field(container, name))?;
             return self.lower_value(entry);
         }
+        if let Some(result) = self.lower_svd_record(resolved, name) {
+            return result;
+        }
         let Node::Call(call) = self.m.node(resolved) else {
             return Err(no_field_lowering(container, name, "this value"));
         };
