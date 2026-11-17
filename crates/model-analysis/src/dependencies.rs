@@ -1,4 +1,4 @@
-//! Read-only structural facts over a lowered query and its declared boundary.
+//! Read-only dependencies of structural factors and lowered queries.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -170,6 +170,55 @@ impl From<Ref> for Reference {
             RefNs::Module(module) => Self::Module(module, value.name),
         }
     }
+}
+
+/// A reified callable binds these references inside its body.
+fn callable_scope(m: &Module, id: NodeId, c: &Call, mut scope: Vec<Reference>) -> Vec<Reference> {
+    let inputs = match &c.inputs {
+        Some(Inputs::Spec(inputs)) => Some(inputs.as_ref()),
+        Some(Inputs::Auto) => m.auto_inputs_of(id),
+        None => None,
+    };
+    for (_, reference) in inputs.into_iter().flatten() {
+        let reference = Reference::from(*reference);
+        if !scope.contains(&reference) {
+            scope.push(reference);
+        }
+    }
+    scope
+}
+
+/// Whether an expression reads the given latent through a local input or module binding.
+/// Follow model declarations under the cuts of nested callables. The caller supplies
+/// the draws already observed in this factor's query.
+pub fn references_latent(m: &Module, root: NodeId, latent: Symbol, observed: &[NodeId]) -> bool {
+    let aliases = m.declared_alias_chain(latent);
+    let mut pending = vec![(root, Vec::new())];
+    let mut seen = HashSet::new();
+    while let Some((id, scope)) = pending.pop() {
+        if observed.contains(&id) || !seen.insert((id, scope.clone())) {
+            continue;
+        }
+        match m.node(id) {
+            Node::Ref(r) if scope.contains(&Reference::from(*r)) => {}
+            Node::Ref(r) => match r.ns {
+                RefNs::Local if r.name == latent => return true,
+                RefNs::SelfMod if aliases.contains(&r.name) => return true,
+                RefNs::SelfMod if !m.is_conditioned_input(r.name) => {
+                    if let Some(binding) = m.binding_by_name(r.name) {
+                        pending.push((m.declared_binding_rhs(binding), scope));
+                    }
+                }
+                _ => {}
+            },
+            Node::Call(c) => {
+                let scope = callable_scope(m, id, c, scope);
+                m.for_each_child(id, |child| pending.push((child, scope.clone())));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 impl Dependencies<'_> {
@@ -416,20 +465,7 @@ impl Dependencies<'_> {
                     }
                 }
                 Node::Call(c) => {
-                    let mut locals = locals;
-                    let inputs = match &c.inputs {
-                        Some(Inputs::Spec(inputs)) => Some(inputs.as_ref()),
-                        Some(Inputs::Auto) => m.auto_inputs_of(id),
-                        None => None,
-                    };
-                    if let Some(inputs) = inputs {
-                        for (_, reference) in inputs.iter() {
-                            let reference = Reference::from(*reference);
-                            if !locals.contains(&reference) {
-                                locals.push(reference);
-                            }
-                        }
-                    }
+                    let locals = callable_scope(m, id, c, locals);
                     pending.extend(
                         m.node(id)
                             .children()

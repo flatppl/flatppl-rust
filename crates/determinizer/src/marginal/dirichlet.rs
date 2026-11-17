@@ -2,7 +2,7 @@
 
 use super::{
     LatentPath, LogDensity, MarginalForm, RefuseError, SharedLatentRecordLaw, build_constructor,
-    find_kwarg, matches_latent_path, real, references_input, split_kernel_constructor,
+    find_kwarg, matches_latent_path, real, references_latent, split_kernel_constructor,
 };
 use crate::density::{build_call, build_record};
 use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Symbol, Type};
@@ -52,6 +52,7 @@ pub(super) fn marginal(
     prior: &[(Symbol, NodeId)],
     likelihood: &[(Symbol, NodeId)],
     family: &str,
+    exempt: &[NodeId],
 ) -> Option<Result<MarginalForm, RefuseError>> {
     if !matches!(family, "Categorical" | "Categorical0" | "Multinomial")
         || !matches_latent_path(
@@ -60,9 +61,9 @@ pub(super) fn marginal(
             &LatentPath::Direct,
             latent,
         )
-        || likelihood
-            .iter()
-            .any(|(name, value)| m.resolve(*name) != "p" && references_input(m, *value, latent))
+        || likelihood.iter().any(|(name, value)| {
+            m.resolve(*name) != "p" && references_latent(m, *value, latent, exempt)
+        })
     {
         return None;
     }
@@ -105,6 +106,7 @@ pub(super) fn shared_law(
     latent: Symbol,
     prior: &[(Symbol, NodeId)],
     measures: &[NodeId],
+    exempt: &[NodeId],
 ) -> Option<SharedLatentRecordLaw> {
     let alpha = find_kwarg(m, prior, "alpha")?;
     let d = dimension(m, alpha)?;
@@ -116,7 +118,7 @@ pub(super) fn shared_law(
             "Categorical" | "Categorical0" => m.alloc(Node::Lit(Scalar::Int(1))),
             "Multinomial" => {
                 let n = find_kwarg(m, &kwargs, "n")?;
-                if references_input(m, n, latent)
+                if references_latent(m, n, latent, exempt)
                     || !matches!(
                         m.type_of(n),
                         Some(Type::Scalar(ScalarType::Integer | ScalarType::Real))

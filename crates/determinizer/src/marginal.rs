@@ -74,6 +74,7 @@ use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
     Symbol, Type, ValueSet,
 };
+use flatppl_model_analysis::references_latent;
 
 mod beta;
 mod dirichlet;
@@ -596,7 +597,8 @@ fn try_conjugate_marginal(
     // length check, so the single kernel input here is guaranteed.
     let kernel_input_sym = kernel.inputs[0].1.name;
 
-    let marginal = match build_conjugate_marginal(m, latent_dist, lik.dist, kernel_input_sym)? {
+    let marginal = match build_conjugate_marginal(m, latent_dist, lik.dist, kernel_input_sym, &[])?
+    {
         Ok(form) => form,
         Err(e) => return Some(Err(e)),
     };
@@ -656,6 +658,7 @@ fn build_conjugate_marginal(
     latent_dist: NodeId,
     lik_dist: NodeId,
     latent_sym: Symbol,
+    exempt: &[NodeId],
 ) -> Option<Result<MarginalForm, RefuseError>> {
     // (a) The prior must be a bare distribution constructor (positional or
     // keyword arguments).
@@ -672,17 +675,17 @@ fn build_conjugate_marginal(
         return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
     }
     if prior_name == "Dirichlet" {
-        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name);
+        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name, exempt);
     }
 
     let matched = match match_table_row(
         m,
         latent_dist,
-        &prior_name,
-        &lik_name,
+        (&prior_name, &lik_name),
         prior_kwargs,
         lik_kwargs,
         latent_sym,
+        exempt,
     )? {
         Ok(matched) => matched,
         Err(err) => return Some(Err(err)),
@@ -727,11 +730,11 @@ pub fn match_conjugate_marginal(
     match_table_row(
         m,
         latent_dist,
-        &prior_name,
-        &lik_name,
+        (&prior_name, &lik_name),
         prior_kwargs,
         lik_kwargs,
         latent,
+        &[],
     )
 }
 
@@ -740,18 +743,18 @@ pub fn match_conjugate_marginal(
 fn match_table_row(
     m: &Module,
     latent_dist: NodeId,
-    prior_name: &str,
-    lik_name: &str,
+    families: (&str, &str),
     prior_kwargs: Vec<(Symbol, NodeId)>,
     lik_kwargs: Vec<(Symbol, NodeId)>,
     latent_sym: Symbol,
+    exempt: &[NodeId],
 ) -> Option<Result<ConjugateMatch, RefuseError>> {
     // EVERY row whose prior + likelihood families match is tried, not just the first: two
     // rows may share a family pair and differ only in which parameter the latent feeds, or
     // along which path it gets there (`Normal`–`Normal` on `mu` vs. on `sqrt`-of-variance).
     for row in CONJUGATE_TABLE
         .iter()
-        .filter(|r| r.prior == prior_name && r.likelihood == lik_name)
+        .filter(|r| (r.prior, r.likelihood) == families)
     {
         // (b) The conjugating parameter's value must carry the latent's ref
         // `(%ref self|%local latent_sym)` along the row's own path — bare for `Direct`,
@@ -768,7 +771,8 @@ fn match_table_row(
         // parameter that also references the latent (e.g. both `mu` and `sigma`
         // depending on the latent) is not a Normal–Normal (mean-only) conjugacy.
         if lik_kwargs.iter().any(|(psym, pval)| {
-            m.resolve(*psym) != row.conjugating_param && references_input(m, *pval, latent_sym)
+            m.resolve(*psym) != row.conjugating_param
+                && references_latent(m, *pval, latent_sym, exempt)
         }) {
             continue;
         }
@@ -938,7 +942,7 @@ pub(crate) fn conjugate_marginal_measure(
     };
     latents.push(latent);
     Some(
-        build_conjugate_marginal(m, prior, likelihood, latent)?
+        build_conjugate_marginal(m, prior, likelihood, latent, exempt)?
             .map(|form| ImplicitMarginal { form, latents }),
     )
 }
@@ -1040,19 +1044,6 @@ fn is_input_ref(m: &Module, node: NodeId, input: Symbol) -> bool {
         Node::Ref(Ref { ns, name })
             if matches!(ns, RefNs::SelfMod | RefNs::Local) && *name == input
     )
-}
-
-/// Does the subtree rooted at `node` reference the boundary input `input`
-/// anywhere (a `(%ref self|%local input)`)? Used to prove a likelihood parameter
-/// is latent-independent.
-fn references_input(m: &Module, node: NodeId, input: Symbol) -> bool {
-    if is_input_ref(m, node, input) {
-        return true;
-    }
-    m.node(node)
-        .children()
-        .into_iter()
-        .any(|child| references_input(m, child, input))
 }
 
 /// Allocate a distribution-constructor call `Ctor(param = value, …)` with only
@@ -1505,10 +1496,10 @@ pub(crate) fn shared_latent_record_law(
 
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
     if m.resolve(prior_sym) == "Dirichlet" {
-        return dirichlet::shared_law(m, latent, &prior_kwargs, field_measures);
+        return dirichlet::shared_law(m, latent, &prior_kwargs, field_measures, exempt);
     }
     if m.resolve(prior_sym) == "Beta" {
-        return beta::shared_law(m, latent, &prior_kwargs, field_measures);
+        return beta::shared_law(m, latent, &prior_kwargs, field_measures, exempt);
     }
     if m.resolve(prior_sym) == "Gamma" {
         let alpha = find_kwarg(m, &prior_kwargs, "shape")?;
@@ -1552,7 +1543,7 @@ pub(crate) fn shared_latent_record_law(
             return None;
         }
         let sigma = find_kwarg(m, &lik_kwargs, "sigma")?;
-        if references_input(m, sigma, latent) {
+        if references_latent(m, sigma, latent, exempt) {
             return None;
         }
         sigmas.push(sigma);
