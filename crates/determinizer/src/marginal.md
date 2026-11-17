@@ -1,6 +1,7 @@
 # The conjugate marginal table — the maths
 
-Sidecar to `marginal.rs`. Every row of `CONJUGATE_TABLE` is one closed-form solution of
+The scalar rules live in [model analysis](../../model-analysis/src/conjugacy.rs).
+Their closed-form builders live in [the determinizer](marginal.rs). Each row solves
 the `kchain` marginal integral. This file states each integral, its closed form, the §08
 constructor that names the answer, and the test point that pins it — so a reader can
 check the maths without reverse-engineering a `build_*_marginal`.
@@ -903,8 +904,8 @@ independent marginals. Reverse reconstruction still covers only one edge.
 
 ## Adding a row
 
-1. Do the integral and state it here first, with the §08 constructor that names the answer
-   and the parameter map.
+1. State the integral, its §08 constructor when one exists, and the parameter map here.
+   Register the latent path in model analysis and implement the closed form in the determinizer.
 2. Pick a test point by **scanning the truth-minus-wrong gap** over the variate, not by
    picking a round number. Both rows above have gaps that change sign; a point at a
    crossing proves nothing. Record what the point discriminates against.

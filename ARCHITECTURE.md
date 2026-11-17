@@ -404,6 +404,13 @@ need its own statistical discovery pass.
 
 ## Structural model analysis
 
+`flatppl-model-analysis::match_conjugate_marginal` recognizes seven scalar
+prior–likelihood pairs on the inferred graph. It returns the rule, the latent
+symbol and both constructors' bound parameter nodes. Callers pass the draws
+already observed by the query when checking other likelihood parameters for
+latent dependence. The determinizer uses the match to build the closed-form
+measure or log density for both `kchain` and `lawof`.
+
 `flatppl-model-analysis::plan_iid_normal` accepts an inferred IID Normal measure,
 its observed operand, and the structural target's scoring and data inputs. It
 uses the same moment rule as a lowered density query. Its result owns the

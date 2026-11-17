@@ -70,11 +70,13 @@ use crate::density::{
 };
 use crate::kernel::{Kernel, resolve_reified};
 use crate::refuse::RefuseError;
+use flatppl_core::graph::is_input_ref;
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
     Symbol, Type, ValueSet,
 };
-use flatppl_model_analysis::references_latent;
+use flatppl_infer::constructors::constructor_symbol;
+use flatppl_model_analysis::{ConjugateMatch, ConjugateRowId, references_latent};
 
 mod beta;
 mod dirichlet;
@@ -438,135 +440,11 @@ fn sole_variate(variates: &[NodeId]) -> NodeId {
     }
 }
 
-/// How the latent reaches the conjugating parameter.
-///
-/// The row records this because §08 parameterizes by the quantity it names, not by
-/// whatever a conjugacy is stated in: `Normal` takes `sigma`, so a prior on the VARIANCE
-/// reaches it through a `sqrt`. A row that accepted a bare ref where it wanted `sqrt`
-/// would score a LOCATION mixture as a scale mixture, and those two agree to 0.017 nats
-/// at `y = 0.5` (`marginal.md`, Rows 4 and 5).
-enum LatentPath {
-    /// The parameter's value IS the latent's ref.
-    Direct,
-    /// The parameter's value is `sqrt(<the latent's ref>)`.
-    Sqrt,
-}
-
 /// A conjugate-marginal builder: from the prior's and likelihood's keyword
 /// arguments (`(param, value)` pairs), build the closed form, or `None` if a required
 /// parameter is absent.
 type MarginalBuilder =
     fn(&mut Module, &[(Symbol, NodeId)], &[(Symbol, NodeId)]) -> Option<MarginalForm>;
-
-/// A row of the conjugate table (`marginal.md`). Each names one prior/likelihood
-/// pair and the parameter path the latent takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ConjugateRowId {
-    /// Row 1: `Normal` prior on a `Normal` mean.
-    NormalMean,
-    /// Row 2: `Gamma` prior on a `Poisson` rate.
-    GammaPoissonRate,
-    /// `Beta` prior on a `Bernoulli` probability.
-    BetaBernoulli,
-    /// Row 3: `Beta` prior on a `Binomial` probability.
-    BetaBinomial,
-    /// Row 4: `Exponential` prior on a `Normal` variance.
-    ExponentialVariance,
-    /// Row 5: `InverseGamma` prior on a `Normal` variance.
-    InverseGammaVariance,
-    /// Row 6: `Exponential` prior on a `Normal` mean.
-    ExponentialMean,
-}
-
-/// A recognised conjugate pair, before any closed form is built. The parameter
-/// lists hold the constructors' keyword arguments as nodes of the matched module.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConjugateMatch {
-    pub row: ConjugateRowId,
-    /// The symbol the likelihood references the latent by.
-    pub latent: Symbol,
-    pub prior: Vec<(Symbol, NodeId)>,
-    pub likelihood: Vec<(Symbol, NodeId)>,
-}
-
-/// One conjugate prior/likelihood pair whose `kchain` marginal is closed-form.
-struct ConjugateRow {
-    id: ConjugateRowId,
-    /// Prior distribution-constructor name (the latent's law), e.g. `"Normal"`.
-    prior: &'static str,
-    /// Likelihood distribution-constructor name (the kernel body), e.g. `"Normal"`.
-    likelihood: &'static str,
-    /// The likelihood parameter the latent feeds (the "conjugating" parameter),
-    /// e.g. `"mu"`.
-    conjugating_param: &'static str,
-    /// The transformation the latent passes through on its way to that parameter.
-    latent_path: LatentPath,
-    /// Build the closed form from the prior's keyword arguments and the likelihood's
-    /// keyword arguments. Returns `None` if a required parameter is absent (a
-    /// matched-but-malformed pair).
-    build_marginal: MarginalBuilder,
-}
-
-/// The conjugate-marginal table. Data-driven and extensible: a new conjugate
-/// pair is one more row.
-const CONJUGATE_TABLE: &[ConjugateRow] = &[
-    ConjugateRow {
-        id: ConjugateRowId::NormalMean,
-        prior: "Normal",
-        likelihood: "Normal",
-        conjugating_param: "mu",
-        latent_path: LatentPath::Direct,
-        build_marginal: build_normal_normal_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::GammaPoissonRate,
-        prior: "Gamma",
-        likelihood: "Poisson",
-        conjugating_param: "rate",
-        latent_path: LatentPath::Direct,
-        build_marginal: build_gamma_poisson_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::BetaBernoulli,
-        prior: "Beta",
-        likelihood: "Bernoulli",
-        conjugating_param: "p",
-        latent_path: LatentPath::Direct,
-        build_marginal: beta::bernoulli_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::BetaBinomial,
-        prior: "Beta",
-        likelihood: "Binomial",
-        conjugating_param: "p",
-        latent_path: LatentPath::Direct,
-        build_marginal: build_beta_binomial_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::ExponentialVariance,
-        prior: "Exponential",
-        likelihood: "Normal",
-        conjugating_param: "sigma",
-        latent_path: LatentPath::Sqrt,
-        build_marginal: build_exponential_variance_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::InverseGammaVariance,
-        prior: "InverseGamma",
-        likelihood: "Normal",
-        conjugating_param: "sigma",
-        latent_path: LatentPath::Sqrt,
-        build_marginal: build_inverse_gamma_variance_marginal,
-    },
-    ConjugateRow {
-        id: ConjugateRowId::ExponentialMean,
-        prior: "Exponential",
-        likelihood: "Normal",
-        conjugating_param: "mu",
-        latent_path: LatentPath::Direct,
-        build_marginal: build_exponential_mean_marginal,
-    },
-];
 
 /// Try to lower a continuous-latent `kchain` as a closed-form conjugate marginal.
 ///
@@ -660,42 +538,41 @@ fn build_conjugate_marginal(
     latent_sym: Symbol,
     exempt: &[NodeId],
 ) -> Option<Result<MarginalForm, RefuseError>> {
-    // (a) The prior must be a bare distribution constructor (positional or
-    // keyword arguments).
-    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
-    let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik_dist)?;
-
-    // Resolve the constructor names to owned strings (the `split_*` calls above
-    // borrow `m` mutably to intern positional-arg names, so we cannot hold a
-    // `resolve` borrow across them).
-    let prior_name = m.resolve(prior_sym).to_string();
-    let lik_name = m.resolve(lik_sym).to_string();
-
-    if prior_name == "MvNormal" && lik_name == "MvNormal" {
-        return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
-    }
-    if prior_name == "Dirichlet" {
-        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name, exempt);
+    let prior = constructor_symbol(m, latent_dist)?;
+    if matches!(m.resolve(prior), "MvNormal" | "Dirichlet") {
+        let (_, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
+        let (lik, lik_kwargs) = split_kernel_constructor(m, lik_dist)?;
+        if m.resolve(prior) == "MvNormal" {
+            if m.resolve(lik) != "MvNormal" {
+                return None;
+            }
+            return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
+        }
+        let family = m.resolve(lik).to_owned();
+        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &family, exempt);
     }
 
-    let matched = match match_table_row(
+    let matched = match flatppl_model_analysis::match_conjugate_marginal(
         m,
         latent_dist,
-        (&prior_name, &lik_name),
-        prior_kwargs,
-        lik_kwargs,
+        lik_dist,
         latent_sym,
         exempt,
     )? {
         Ok(matched) => matched,
-        Err(err) => return Some(Err(err)),
+        Err(err) => return Some(Err(refuse_kchain(latent_dist, &err.0))),
     };
-    let row = CONJUGATE_TABLE
-        .iter()
-        .find(|r| r.id == matched.row)
-        .expect("a matched row is in the table");
+    let build: MarginalBuilder = match matched.row {
+        ConjugateRowId::NormalMean => build_normal_normal_marginal,
+        ConjugateRowId::GammaPoissonRate => build_gamma_poisson_marginal,
+        ConjugateRowId::BetaBernoulli => beta::bernoulli_marginal,
+        ConjugateRowId::BetaBinomial => build_beta_binomial_marginal,
+        ConjugateRowId::ExponentialVariance => build_exponential_variance_marginal,
+        ConjugateRowId::InverseGammaVariance => build_inverse_gamma_variance_marginal,
+        ConjugateRowId::ExponentialMean => build_exponential_mean_marginal,
+    };
     Some(
-        (row.build_marginal)(m, &matched.prior, &matched.likelihood).ok_or_else(|| {
+        build(m, &matched.prior, &matched.likelihood).ok_or_else(|| {
             refuse_kchain(
                 latent_dist,
                 "conjugate pair matched but a required distribution parameter is missing",
@@ -704,173 +581,16 @@ fn build_conjugate_marginal(
     )
 }
 
-/// Recognise a `CONJUGATE_TABLE` pair without building its closed form.
-///
-/// `latent_dist` is the latent's distribution constructor, `lik_dist` the
-/// likelihood constructor, and `latent` the symbol `lik_dist` references the
-/// latent by. The module is mutable only because positional constructor
-/// arguments bind to interned parameter names.
-///
-/// * `None` — no table row matches.
-/// * `Some(Err(..))` — a row matched but a parameter is not a scalar.
-/// * `Some(Ok(..))` — the matched row and both constructors' keyword arguments.
-///
-/// The `MvNormal`–`MvNormal` and `Dirichlet` marginals are not table rows and
-/// never match here.
+/// Recognize a scalar conjugate marginal with no observed sibling draws.
+/// See [`flatppl_model_analysis::match_conjugate_marginal`] for the rule contract.
 pub fn match_conjugate_marginal(
     m: &mut Module,
     latent_dist: NodeId,
     lik_dist: NodeId,
     latent: Symbol,
 ) -> Option<Result<ConjugateMatch, RefuseError>> {
-    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
-    let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik_dist)?;
-    let prior_name = m.resolve(prior_sym).to_string();
-    let lik_name = m.resolve(lik_sym).to_string();
-    match_table_row(
-        m,
-        latent_dist,
-        (&prior_name, &lik_name),
-        prior_kwargs,
-        lik_kwargs,
-        latent,
-        &[],
-    )
-}
-
-/// The single conjugate-table recogniser: checks (b) to (d) for each row of the
-/// constructor pair, in table order.
-fn match_table_row(
-    m: &Module,
-    latent_dist: NodeId,
-    families: (&str, &str),
-    prior_kwargs: Vec<(Symbol, NodeId)>,
-    lik_kwargs: Vec<(Symbol, NodeId)>,
-    latent_sym: Symbol,
-    exempt: &[NodeId],
-) -> Option<Result<ConjugateMatch, RefuseError>> {
-    // EVERY row whose prior + likelihood families match is tried, not just the first: two
-    // rows may share a family pair and differ only in which parameter the latent feeds, or
-    // along which path it gets there (`Normal`–`Normal` on `mu` vs. on `sqrt`-of-variance).
-    for row in CONJUGATE_TABLE
-        .iter()
-        .filter(|r| (r.prior, r.likelihood) == families)
-    {
-        // (b) The conjugating parameter's value must carry the latent's ref
-        // `(%ref self|%local latent_sym)` along the row's own path — bare for `Direct`,
-        // under a `sqrt` for `Sqrt`. Anything else (a constant, some other derived
-        // expression) is not this conjugate shape.
-        let Some(conj_val) = find_kwarg(m, &lik_kwargs, row.conjugating_param) else {
-            continue;
-        };
-        if !matches_latent_path(m, conj_val, &row.latent_path, latent_sym) {
-            continue;
-        }
-
-        // (c) Every OTHER likelihood parameter must be latent-independent. A second
-        // parameter that also references the latent (e.g. both `mu` and `sigma`
-        // depending on the latent) is not a Normal–Normal (mean-only) conjugacy.
-        if lik_kwargs.iter().any(|(psym, pval)| {
-            m.resolve(*psym) != row.conjugating_param
-                && references_latent(m, *pval, latent_sym, exempt)
-        }) {
-            continue;
-        }
-
-        // (d) Every parameter of BOTH distributions must be scalar. Checked here, once,
-        // for every row rather than inside the five builders: the shared precondition is
-        // the row contract itself ([`sole_variate`] — a row's closed form is the law of
-        // ONE scalar variate), not any one builder's arithmetic.
-        if let Some(err) = non_scalar_parameter_refusal(m, latent_dist, &prior_kwargs, &lik_kwargs)
-        {
-            return Some(Err(err));
-        }
-
-        return Some(Ok(ConjugateMatch {
-            row: row.id,
-            latent: latent_sym,
-            prior: prior_kwargs,
-            likelihood: lik_kwargs,
-        }));
-    }
-    None
-}
-
-/// The refusal for a matched conjugate pair one of whose distribution parameters is a
-/// CONFIRMED non-scalar, or `None` when every parameter passes.
-///
-/// **Why every row needs this, not just the ones that do arithmetic.** Four of the five
-/// rows build a parameter map out of §07 "Operator-equivalent functions" and "Elementary
-/// functions" arithmetic — `pow`, `add`, `sqrt`, `divide`, `loggamma` — whose domains are
-/// scalars, so a vector parameter puts the synthesized expression outside them. Row 2
-/// (Gamma–Poisson) reuses its parameters unchanged and would survive that reading, yet a
-/// vector `alpha` would still emit a `NegativeBinomial` whose log-density at the row's
-/// SCALAR variate is not a scalar. The row contract is a scalar-variate law either way, so
-/// the check is on the contract.
-///
-/// **§08 makes this an ill-formed model, not a shape the row should generalize.** §08
-/// "Univariate continuous distributions" gives `Normal` the parameters `mu`, `sigma` with
-/// variate domain `reals`, and §04 "Broadcasting" gives the vector-parameter spelling as
-/// `broadcast(Normal, means, sigmas)` (`Normal.(means, sigmas)`), which "returns an
-/// **array-valued measure**" — a `broadcast` node, not the bare constructor
-/// [`split_kernel_constructor`] matched here. So a per-component conjugate marginal is a
-/// DIFFERENT lowering over a DIFFERENT variate: an n-vector one, whose parameter map needs
-/// the elementwise `broadcast(pow, σ₀, 2)` and whose answer is `broadcast(Normal, …)`. No
-/// row builds that, and building it here would score an n-vector law at the scalar variate
-/// the match required. Refuse; a broadcast conjugate row is a separate row (`marginal.md`,
-/// "Adding a row").
-///
-/// A future row over a distribution whose §08 parameters include a genuine vector
-/// (`Categorical`'s `p`, `MvNormal`'s `mu`) must move this check into the rows that need
-/// it — the current table's seven parameters are all scalar per §08.
-fn non_scalar_parameter_refusal(
-    m: &Module,
-    latent_dist: NodeId,
-    prior_kwargs: &[(Symbol, NodeId)],
-    lik_kwargs: &[(Symbol, NodeId)],
-) -> Option<RefuseError> {
-    let (which, psym, kind) = prior_kwargs
-        .iter()
-        .map(|kw| ("prior", kw))
-        .chain(lik_kwargs.iter().map(|kw| ("likelihood", kw)))
-        .find_map(|(which, (psym, pval))| {
-            crate::density::confirmed_non_scalar(m, *pval).map(|kind| (which, *psym, kind))
-        })?;
-    Some(refuse_kchain(
-        latent_dist,
-        &format!(
-            "conjugate pair matched but the {which}'s `{}` is {} — a row's closed form is the \
-             law of one SCALAR variate, and its parameter map is §07 scalar arithmetic \
-             (`pow`'s domain is \"scalars\"). The vector-parameter spelling is \
-             `broadcast(Dist, …)` (§04 \"Broadcasting\"), an array-valued measure no row \
-             covers — refuse rather than mislower",
-            m.resolve(psym),
-            kind.article_noun(),
-        ),
-    ))
-}
-
-/// Does the conjugating parameter's value `value` carry the latent along `path`?
-fn matches_latent_path(m: &Module, value: NodeId, path: &LatentPath, latent: Symbol) -> bool {
-    match path {
-        LatentPath::Direct => is_input_ref(m, value, latent),
-        // The ref resolution is DEFENSIVE, and currently unreachable: it would admit a named
-        // intermediate (`s = sqrt(v)`; `sigma = s`), but that whole shape refuses earlier, at
-        // the driver's residual-`draw` scan — `s` keeps referencing `v`, so `v = draw(…)` is
-        // never swept and survives to exit. Kept rather than dropped so the arm still matches
-        // if that upstream refusal is ever lifted; pinned as a refusal by
-        // `a_named_sqrt_intermediate_refuses_upstream_not_in_the_row`, which records that the
-        // refusal is not this row's.
-        LatentPath::Sqrt => {
-            let (resolved, _) = resolve_ref(m, value);
-            match expect_builtin_call(m, resolved, "sqrt") {
-                Some(c) if c.args.len() == 1 && c.named.is_empty() => {
-                    is_input_ref(m, c.args[0], latent)
-                }
-                _ => false,
-            }
-        }
-    }
+    flatppl_model_analysis::match_conjugate_marginal(m, latent_dist, lik_dist, latent, &[])
+        .map(|result| result.map_err(|err| refuse_kchain(latent_dist, &err.0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,16 +754,6 @@ fn find_kwarg(m: &Module, kwargs: &[(Symbol, NodeId)], name: &str) -> Option<Nod
         .iter()
         .find(|(sym, _)| m.resolve(*sym) == name)
         .map(|(_, val)| *val)
-}
-
-/// Is `node` exactly the boundary-input reference `(%ref self|%local input)` —
-/// the latent feeding a parameter directly (not a derived expression)?
-fn is_input_ref(m: &Module, node: NodeId, input: Symbol) -> bool {
-    matches!(
-        m.node(node),
-        Node::Ref(Ref { ns, name })
-            if matches!(ns, RefNs::SelfMod | RefNs::Local) && *name == input
-    )
 }
 
 /// Allocate a distribution-constructor call `Ctor(param = value, …)` with only
@@ -1445,7 +1155,7 @@ pub(crate) struct SharedLatentRecordLaw {
 /// * at least TWO fields — one field is Row 1, which already lowers, and routing it here
 ///   would change output for no gain;
 /// * every field's measure is `Normal`, its `mu` EXACTLY the shared latent's ref
-///   ([`LatentPath::Direct`] — a derived `mul(2, z)` mean has a different joint), and its
+///   (a derived `mul(2, z)` mean has a different joint), and its
 ///   `sigma` latent-independent;
 /// * ONE shared latent across all fields, whose prior is a `Normal` with both parameters
 ///   and is itself ancestor-free (a two-level hierarchy is not this integral).
@@ -1507,12 +1217,7 @@ pub(crate) fn shared_latent_record_law(
         for &measure in field_measures {
             let (family, kwargs) = split_kernel_constructor(m, measure)?;
             if m.resolve(family) != "Poisson"
-                || !matches_latent_path(
-                    m,
-                    find_kwarg(m, &kwargs, "rate")?,
-                    &LatentPath::Direct,
-                    latent,
-                )
+                || !is_input_ref(m, find_kwarg(m, &kwargs, "rate")?, latent)
             {
                 return None;
             }
@@ -1539,7 +1244,7 @@ pub(crate) fn shared_latent_record_law(
             return None;
         }
         let mu = find_kwarg(m, &lik_kwargs, "mu")?;
-        if !matches_latent_path(m, mu, &LatentPath::Direct, latent) {
+        if !is_input_ref(m, mu, latent) {
             return None;
         }
         let sigma = find_kwarg(m, &lik_kwargs, "sigma")?;

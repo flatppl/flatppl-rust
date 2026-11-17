@@ -1,8 +1,8 @@
 //! Shared Beta probability integrals, retaining ordered observation coefficients.
 
 use super::{
-    LatentPath, LogDensity, MarginalForm, SharedLatentRecordLaw, build_constructor, find_kwarg,
-    matches_latent_path, real, references_latent, split_kernel_constructor,
+    LogDensity, MarginalForm, SharedLatentRecordLaw, build_constructor, find_kwarg, is_input_ref,
+    real, references_latent, split_kernel_constructor,
 };
 use crate::density::{build_call, build_record};
 use flatppl_core::{Module, Node, NodeId, Scalar, Symbol};
@@ -75,7 +75,7 @@ pub(super) fn shared_law(
             }
             _ => return None,
         };
-        if !matches_latent_path(m, find_kwarg(m, &kwargs, "p")?, &LatentPath::Direct, latent) {
+        if !is_input_ref(m, find_kwarg(m, &kwargs, "p")?, latent) {
             return None;
         }
         params.push(m.alloc(Node::Const(family)));

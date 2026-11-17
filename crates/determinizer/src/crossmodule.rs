@@ -25,28 +25,7 @@ pub(crate) struct ResolvedRef<'a> {
     path: String,
 }
 
-/// Standard-module members are catalogue entries, not file-module graphs.
-pub(crate) fn std_module_member(host: &Module, id: NodeId) -> Option<(String, String)> {
-    let Node::Ref(Ref {
-        ns: RefNs::Module(alias),
-        name,
-    }) = *host.node(id)
-    else {
-        return None;
-    };
-    let bid = host.alias_target(alias)?;
-    let Node::Call(c) = host.node(host.binding(bid).rhs) else {
-        return None;
-    };
-    if !matches!(c.head, CallHead::Builtin(s) if host.resolve(s) == "standard_module") {
-        return None;
-    }
-    Some((
-        string_literal(host, *c.args.first()?)?,
-        host.resolve(name).to_string(),
-    ))
-}
-
+pub(crate) use flatppl_infer::constructors::std_module_member;
 pub(crate) fn resolve_module_ref<'a>(
     bundle: &'a ModuleBundle,
     host: &Module,
@@ -100,13 +79,6 @@ fn resolve_member<'a>(
         assign,
         path,
     })
-}
-
-fn string_literal(m: &Module, id: NodeId) -> Option<String> {
-    match m.node(id) {
-        Node::Lit(Scalar::Str(s)) => Some(s.to_string()),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
