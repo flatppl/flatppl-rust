@@ -24,9 +24,10 @@ mod stdfn;
 pub use boxes::box_member;
 pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
+pub use disintegrate::{rewrite_restrict, split_disintegrate};
 pub use driver::{
-    determinize, determinize_with, determinize_with_options, determinize_with_options_and_report,
-    determinize_with_roots,
+    desugar_restrict_and_disintegrate, determinize, determinize_with, determinize_with_options,
+    determinize_with_options_and_report, determinize_with_roots,
 };
 pub use flatppl_model_analysis::{
     AnalysisError, CoordinatePrecision, GroupPartition, IncrementalScorePlan, IncrementalTerm,
@@ -36,6 +37,7 @@ pub use flatppl_model_analysis::{
     sufficient_statistics_with_report,
 };
 
+pub use marginal::{ConjugateMatch, ConjugateRowId, match_conjugate_marginal};
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,
 };

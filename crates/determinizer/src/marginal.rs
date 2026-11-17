@@ -457,8 +457,40 @@ enum LatentPath {
 type MarginalBuilder =
     fn(&mut Module, &[(Symbol, NodeId)], &[(Symbol, NodeId)]) -> Option<MarginalForm>;
 
+/// A row of the conjugate table (`marginal.md`). Each names one prior/likelihood
+/// pair and the parameter path the latent takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConjugateRowId {
+    /// Row 1: `Normal` prior on a `Normal` mean.
+    NormalMean,
+    /// Row 2: `Gamma` prior on a `Poisson` rate.
+    GammaPoissonRate,
+    /// `Beta` prior on a `Bernoulli` probability.
+    BetaBernoulli,
+    /// Row 3: `Beta` prior on a `Binomial` probability.
+    BetaBinomial,
+    /// Row 4: `Exponential` prior on a `Normal` variance.
+    ExponentialVariance,
+    /// Row 5: `InverseGamma` prior on a `Normal` variance.
+    InverseGammaVariance,
+    /// Row 6: `Exponential` prior on a `Normal` mean.
+    ExponentialMean,
+}
+
+/// A recognised conjugate pair, before any closed form is built. The parameter
+/// lists hold the constructors' keyword arguments as nodes of the matched module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConjugateMatch {
+    pub row: ConjugateRowId,
+    /// The symbol the likelihood references the latent by.
+    pub latent: Symbol,
+    pub prior: Vec<(Symbol, NodeId)>,
+    pub likelihood: Vec<(Symbol, NodeId)>,
+}
+
 /// One conjugate prior/likelihood pair whose `kchain` marginal is closed-form.
 struct ConjugateRow {
+    id: ConjugateRowId,
     /// Prior distribution-constructor name (the latent's law), e.g. `"Normal"`.
     prior: &'static str,
     /// Likelihood distribution-constructor name (the kernel body), e.g. `"Normal"`.
@@ -478,6 +510,7 @@ struct ConjugateRow {
 /// pair is one more row.
 const CONJUGATE_TABLE: &[ConjugateRow] = &[
     ConjugateRow {
+        id: ConjugateRowId::NormalMean,
         prior: "Normal",
         likelihood: "Normal",
         conjugating_param: "mu",
@@ -485,6 +518,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: build_normal_normal_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::GammaPoissonRate,
         prior: "Gamma",
         likelihood: "Poisson",
         conjugating_param: "rate",
@@ -492,6 +526,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: build_gamma_poisson_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::BetaBernoulli,
         prior: "Beta",
         likelihood: "Bernoulli",
         conjugating_param: "p",
@@ -499,6 +534,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: beta::bernoulli_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::BetaBinomial,
         prior: "Beta",
         likelihood: "Binomial",
         conjugating_param: "p",
@@ -506,6 +542,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: build_beta_binomial_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::ExponentialVariance,
         prior: "Exponential",
         likelihood: "Normal",
         conjugating_param: "sigma",
@@ -513,6 +550,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: build_exponential_variance_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::InverseGammaVariance,
         prior: "InverseGamma",
         likelihood: "Normal",
         conjugating_param: "sigma",
@@ -520,6 +558,7 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         build_marginal: build_inverse_gamma_variance_marginal,
     },
     ConjugateRow {
+        id: ConjugateRowId::ExponentialMean,
         prior: "Exponential",
         likelihood: "Normal",
         conjugating_param: "mu",
@@ -636,12 +675,83 @@ fn build_conjugate_marginal(
         return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name);
     }
 
+    let matched = match match_table_row(
+        m,
+        latent_dist,
+        &prior_name,
+        &lik_name,
+        prior_kwargs,
+        lik_kwargs,
+        latent_sym,
+    )? {
+        Ok(matched) => matched,
+        Err(err) => return Some(Err(err)),
+    };
+    let row = CONJUGATE_TABLE
+        .iter()
+        .find(|r| r.id == matched.row)
+        .expect("a matched row is in the table");
+    Some(
+        (row.build_marginal)(m, &matched.prior, &matched.likelihood).ok_or_else(|| {
+            refuse_kchain(
+                latent_dist,
+                "conjugate pair matched but a required distribution parameter is missing",
+            )
+        }),
+    )
+}
+
+/// Recognise a `CONJUGATE_TABLE` pair without building its closed form.
+///
+/// `latent_dist` is the latent's distribution constructor, `lik_dist` the
+/// likelihood constructor, and `latent` the symbol `lik_dist` references the
+/// latent by. The module is mutable only because positional constructor
+/// arguments bind to interned parameter names.
+///
+/// * `None` — no table row matches.
+/// * `Some(Err(..))` — a row matched but a parameter is not a scalar.
+/// * `Some(Ok(..))` — the matched row and both constructors' keyword arguments.
+///
+/// The `MvNormal`–`MvNormal` and `Dirichlet` marginals are not table rows and
+/// never match here.
+pub fn match_conjugate_marginal(
+    m: &mut Module,
+    latent_dist: NodeId,
+    lik_dist: NodeId,
+    latent: Symbol,
+) -> Option<Result<ConjugateMatch, RefuseError>> {
+    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
+    let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik_dist)?;
+    let prior_name = m.resolve(prior_sym).to_string();
+    let lik_name = m.resolve(lik_sym).to_string();
+    match_table_row(
+        m,
+        latent_dist,
+        &prior_name,
+        &lik_name,
+        prior_kwargs,
+        lik_kwargs,
+        latent,
+    )
+}
+
+/// The single conjugate-table recogniser: checks (b) to (d) for each row of the
+/// constructor pair, in table order.
+fn match_table_row(
+    m: &Module,
+    latent_dist: NodeId,
+    prior_name: &str,
+    lik_name: &str,
+    prior_kwargs: Vec<(Symbol, NodeId)>,
+    lik_kwargs: Vec<(Symbol, NodeId)>,
+    latent_sym: Symbol,
+) -> Option<Result<ConjugateMatch, RefuseError>> {
     // EVERY row whose prior + likelihood families match is tried, not just the first: two
     // rows may share a family pair and differ only in which parameter the latent feeds, or
     // along which path it gets there (`Normal`–`Normal` on `mu` vs. on `sqrt`-of-variance).
     for row in CONJUGATE_TABLE
         .iter()
-        .filter(|r| r.prior == prior_name.as_str() && r.likelihood == lik_name.as_str())
+        .filter(|r| r.prior == prior_name && r.likelihood == lik_name)
     {
         // (b) The conjugating parameter's value must carry the latent's ref
         // `(%ref self|%local latent_sym)` along the row's own path — bare for `Direct`,
@@ -672,14 +782,12 @@ fn build_conjugate_marginal(
             return Some(Err(err));
         }
 
-        return Some(
-            (row.build_marginal)(m, &prior_kwargs, &lik_kwargs).ok_or_else(|| {
-                refuse_kchain(
-                    latent_dist,
-                    "conjugate pair matched but a required distribution parameter is missing",
-                )
-            }),
-        );
+        return Some(Ok(ConjugateMatch {
+            row: row.id,
+            latent: latent_sym,
+            prior: prior_kwargs,
+            likelihood: lik_kwargs,
+        }));
     }
     None
 }

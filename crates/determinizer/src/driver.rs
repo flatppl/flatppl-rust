@@ -198,6 +198,13 @@ fn determinize_inner(
             crate::canon::retain_reachable(&mut work, roots);
         }
 
+        // `get(disintegrate(…), i)` and `restrict` desugar first, one rewrite per
+        // pass, so a `logdensityof`/`bayesupdate` never consumes them (see
+        // `desugar_restrict_or_disintegrate_once`).
+        if desugar_restrict_or_disintegrate_once(&mut work, true)? {
+            continue;
+        }
+
         // Check for measure-layer nodes.
         let target = find_measure_node(&work);
 
@@ -322,24 +329,6 @@ fn graft_application_callees(
 /// `x = draw(...)` binding it closes over, so it must fire before the
 /// source-order scan reaches that `draw` binding on its own and refuses it.
 fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
-    // `get(disintegrate(…), i)` gets the highest priority (see
-    // `find_get_disintegrate`): the `get` must be eliminated into the structural
-    // split *before* a `logdensityof`/`bayesupdate` consumes it (and hits the
-    // primitive-constructor refuse in `lower_measure_density`) or the general scan
-    // reaches the bare `disintegrate` and refuses it.
-    if let Some(hit) = find_get_disintegrate(m) {
-        return Some(hit);
-    }
-    // `restrict(M, x)` is desugared (§06 "Measure restriction") into
-    // `bayesupdate(likelihoodof(kernel, x), marginal)` over the disintegration on
-    // `x`'s field names. Like `get(disintegrate, i)`, it must fire BEFORE a
-    // `logdensityof` consumes it: a `logdensityof(restrict(…), θ)` would otherwise
-    // reach the primitive-constructor refuse in `lower_measure_density` (which
-    // keeps a `restrict` safety-net arm). Eliminating the `restrict` first leaves
-    // a `bayesupdate` the density query lowers via the existing posterior path.
-    if let Some(hit) = find_op_node(m, &["restrict"]) {
-        return Some(hit);
-    }
     // `logdensityof` and `densityof` share the same query-first priority: a
     // `densityof(M, v)` pins latent draws exactly like `logdensityof(M, v)` does
     // (`densityof` lowers via the same core dispatch, wrapped in `exp`), so both
@@ -461,6 +450,132 @@ fn match_get_disintegrate(m: &Module, node: NodeId) -> Option<(NodeId, i64)> {
     Some((target, *i))
 }
 
+/// Desugar every `get(disintegrate(…), i)` and `restrict(M, x)` in `m` into the
+/// structural measure terms of spec §06 "Structural disintegration" and
+/// "Measure restriction": the kernel or marginal of the split, and
+/// `bayesupdate(likelihoodof(kernel, x), marginal)`. The result stays at the
+/// measure level and is re-inferred. Returns whether anything changed. A shape
+/// outside the explicit structural case refuses.
+///
+/// No binding is removed. The joint `lawof` and the `disintegrate` tuple
+/// bindings stay, unreferenced, so every binding a caller may target survives.
+pub fn desugar_restrict_and_disintegrate(m: &mut Module) -> Result<bool, RefuseError> {
+    let mut changed = false;
+    loop {
+        let _ = flatppl_infer::infer(m);
+        if !desugar_restrict_or_disintegrate_once(m, false)? {
+            return Ok(changed);
+        }
+        changed = true;
+    }
+}
+
+/// Apply the first pending desugaring: a `get(disintegrate(…), i)` before a
+/// `restrict`, each in binding source order. Returns `false` when neither occurs.
+///
+/// Both must fire before a density query: a `logdensityof` over a still-present
+/// `get` or `restrict` would reach the primitive-constructor refuse in
+/// `lower_measure_density`. The rewritten `bayesupdate` and split components lower
+/// through the existing posterior and kernel paths. With `sweep`, the dead
+/// measure scaffolding is removed after each rewrite, as the driver requires.
+pub(crate) fn desugar_restrict_or_disintegrate_once(
+    m: &mut Module,
+    sweep: bool,
+) -> Result<bool, RefuseError> {
+    if let Some((bid, node)) = find_get_disintegrate(m) {
+        desugar_get_disintegrate(m, bid, node)?;
+    } else if let Some((bid, node)) = find_op_node(m, &["restrict"]) {
+        desugar_restrict(m, bid, node)?;
+    } else {
+        return Ok(false);
+    }
+    if sweep {
+        sweep_dead_measure_bindings(m);
+    }
+    Ok(true)
+}
+
+/// Replace `get(disintegrate(sel, lawof(record …)), i)` at `target_node` with the
+/// kernel (`i = 1`) or the marginal (`i = 2`) of the structural split.
+fn desugar_get_disintegrate(
+    m: &mut Module,
+    bid: BindingId,
+    target_node: NodeId,
+) -> Result<(), RefuseError> {
+    let (disint_node, index) =
+        match_get_disintegrate(m, target_node).expect("the caller matched a get(disintegrate)");
+    // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
+    // `forward_kernel = get(D, 1)` (the KERNEL, tuple elem 1) and
+    // `prior = get(D, 2)` (the MARGINAL, tuple elem 2), 1-based per the tuple-
+    // destructuring desugar (`get(tmp, k+1)`, syntax/parser.rs:437). Replace the
+    // `get` with the matching component of the structural split so the downstream
+    // `likelihoodof(kernel, obs)` / `bayesupdate(L, marginal)` lower via the
+    // existing paths (spec §06 "Structural disintegration").
+    //
+    // Only the 1-based kernel (1) / marginal (2) projections of the pair are
+    // meaningful; any other index is out of range — refuse, don't mislower.
+    if index != 1 && index != 2 {
+        return Err(RefuseError {
+            node: target_node,
+            construct: "get".to_string(),
+            reason: format!(
+                "get index {index} out of range for a disintegrate (kernel, marginal) tuple"
+            ),
+        });
+    }
+    // Structural split; a non-explicit-DAG disintegrate (§06 permits refusing
+    // intractable / non-`lawof(record)` disintegrations) yields None → refuse.
+    let (kernel, marginal) =
+        crate::disintegrate::split_disintegrate(m, disint_node).ok_or_else(|| RefuseError {
+            node: disint_node,
+            construct: "disintegrate".to_string(),
+            reason: "disintegrate is not an explicit `lawof(record(…))` structural split"
+                .to_string(),
+        })?;
+    let replacement = if index == 1 { kernel } else { marginal };
+    let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, replacement);
+    m.set_binding_rhs(bid, new_rhs);
+    // Once BOTH gets are eliminated the `D = disintegrate(…)` binding (and the
+    // `joint_model = lawof(record(…))` it consumes) are unreferenced. The split
+    // components carry verbatim `(%ref self …)` value nodes to the draws, so the
+    // draw bindings stay referenced and survive; only the disintegrate/joint
+    // scaffold is dead. Sweep it (disintegrate is on `COMBINATOR_OPS`) so the
+    // general scan never reaches the bare `disintegrate` and refuses — this is
+    // what makes each rewrite strictly remove a `get`/`disintegrate` node and
+    // the driver terminate. The caller sweeps.
+    Ok(())
+}
+
+/// Replace `restrict(M, x)` at `target_node` with
+/// `bayesupdate(likelihoodof(kernel, x), marginal)`, where `(kernel, marginal)`
+/// is the structural disintegration of `M` on `x`'s field names (spec §06
+/// "Measure restriction"). A shape the desugaring cannot handle (`x` not a
+/// record, a field of `x` naming no variate of `M`, or a non-`lawof(record)` `M`)
+/// refuses rather than mislowers.
+fn desugar_restrict(
+    m: &mut Module,
+    bid: BindingId,
+    target_node: NodeId,
+) -> Result<(), RefuseError> {
+    let desugared =
+        crate::disintegrate::rewrite_restrict(m, target_node).ok_or_else(|| RefuseError {
+            node: target_node,
+            construct: "restrict".to_string(),
+            reason: "restrict(M, x) is not the explicit structural case: x must be a \
+                     record of observed values whose fields are all variates of a \
+                     lawof(record(…)) M"
+                .to_string(),
+        })?;
+    let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, desugared);
+    m.set_binding_rhs(bid, new_rhs);
+    // The desugared `bayesupdate` carries the split kernel/marginal, whose
+    // verbatim `(%ref self …)` value nodes reach the draws directly, so the
+    // `M = lawof(record(…))` joint binding is now unreferenced (dead
+    // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
+    // never reaches the bare `lawof(record(…))` and refuses. The caller sweeps.
+    Ok(())
+}
+
 /// A node is in the measure layer if it is a `Call` whose builtin head is in
 /// `MEASURE_VOCAB`. Distribution constructors (`Normal`, `Bernoulli`, …) produce
 /// `Measure`-typed values but are *not* measure-algebra operations — they are
@@ -503,82 +618,6 @@ fn apply_rule(
     if let Some(query) = crate::density::lower_broadcast_query(m, target_node) {
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, query);
         m.set_binding_rhs(bid, rhs);
-        return Ok(());
-    }
-
-    // --- structural disintegration: get(disintegrate(sel, lawof(record …)), i) ---
-    // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
-    // `forward_kernel = get(D, 1)` (the KERNEL, tuple elem 1) and
-    // `prior = get(D, 2)` (the MARGINAL, tuple elem 2), 1-based per the tuple-
-    // destructuring desugar (`get(tmp, k+1)`, syntax/parser.rs:437). Replace the
-    // `get` with the matching component of the structural split so the downstream
-    // `likelihoodof(kernel, obs)` / `bayesupdate(L, marginal)` lower via the
-    // existing paths (spec §06 "Structural disintegration"). This arm fires before
-    // the `logdensityof` arm because `find_measure_node` returns the `get` first.
-    if let Some((disint_node, index)) = match_get_disintegrate(m, target_node) {
-        // Only the 1-based kernel (1) / marginal (2) projections of the pair are
-        // meaningful; any other index is out of range — refuse, don't mislower.
-        if index != 1 && index != 2 {
-            return Err(RefuseError {
-                node: target_node,
-                construct: "get".to_string(),
-                reason: format!(
-                    "get index {index} out of range for a disintegrate (kernel, marginal) tuple"
-                ),
-            });
-        }
-        // Structural split; a non-explicit-DAG disintegrate (§06 permits refusing
-        // intractable / non-`lawof(record)` disintegrations) yields None → refuse.
-        let (kernel, marginal) = crate::disintegrate::split_disintegrate(m, disint_node)
-            .ok_or_else(|| RefuseError {
-                node: disint_node,
-                construct: "disintegrate".to_string(),
-                reason: "disintegrate is not an explicit `lawof(record(…))` structural split"
-                    .to_string(),
-            })?;
-        let replacement = if index == 1 { kernel } else { marginal };
-        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, replacement);
-        m.set_binding_rhs(bid, new_rhs);
-        // Once BOTH gets are eliminated the `D = disintegrate(…)` binding (and the
-        // `joint_model = lawof(record(…))` it consumes) are unreferenced. The split
-        // components carry verbatim `(%ref self …)` value nodes to the draws, so the
-        // draw bindings stay referenced and survive; only the disintegrate/joint
-        // scaffold is dead. Sweep it (disintegrate is on `COMBINATOR_OPS`) so the
-        // general scan never reaches the bare `disintegrate` and refuses — this is
-        // what makes each rewrite strictly remove a `get`/`disintegrate` node and
-        // the driver terminate.
-        sweep_dead_measure_bindings(m);
-        return Ok(());
-    }
-
-    // --- measure restriction: restrict(M, x) → bayesupdate(likelihoodof(kernel, x), marginal) ---
-    // Spec §06 "Measure restriction": the non-normalized conditional of `M` given
-    // the observed values `x` desugars — via structural disintegration on `x`'s
-    // field names — into `bayesupdate(likelihoodof(kernel, x), marginal)` where
-    // `(kernel, marginal) = disintegrate([field-names of x], M)`. This arm fires
-    // before the `logdensityof` arm (`find_measure_node` returns the `restrict`
-    // first), so the downstream `bayesupdate` lowers via the existing posterior
-    // path. A shape the desugaring cannot handle (`x` not a record, a field of `x`
-    // naming no variate of `M`, or a non-`lawof(record)` `M`) yields `None` →
-    // refuse, don't mislower.
-    if is_op(m, target_node, "restrict") {
-        let desugared =
-            crate::disintegrate::rewrite_restrict(m, target_node).ok_or_else(|| RefuseError {
-                node: target_node,
-                construct: "restrict".to_string(),
-                reason: "restrict(M, x) is not the explicit structural case: x must be a \
-                         record of observed values whose fields are all variates of a \
-                         lawof(record(…)) M"
-                    .to_string(),
-            })?;
-        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, desugared);
-        m.set_binding_rhs(bid, new_rhs);
-        // The desugared `bayesupdate` carries the split kernel/marginal, whose
-        // verbatim `(%ref self …)` value nodes reach the draws directly, so the
-        // `M = lawof(record(…))` joint binding is now unreferenced (dead
-        // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
-        // never reaches the bare `lawof(record(…))` and refuses.
-        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
