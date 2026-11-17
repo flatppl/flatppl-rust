@@ -97,6 +97,10 @@ pub(crate) struct Emitter<'m> {
     functions: Vec<String>,
     /// Fresh data sizes, by (variable, axis).
     fresh_sizes: HashMap<(String, usize), String>,
+    /// Stan name → its extents and their size names, axis by axis.
+    extents: HashMap<String, Vec<(u32, String)>>,
+    /// Operand extents for the declaration being made (see [`Self::size`]).
+    peers: Vec<Vec<(u32, String)>>,
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
@@ -158,6 +162,8 @@ impl<'m> Emitter<'m> {
             links: vec![],
             functions: vec![],
             fresh_sizes: HashMap::new(),
+            extents: HashMap::new(),
+            peers: vec![],
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
             sizes,
@@ -274,6 +280,7 @@ impl<'m> Emitter<'m> {
         &mut self,
         n: u32,
         hint: Option<NodeId>,
+        peers: &[Vec<(u32, String)>],
         owner: &str,
         axis: usize,
         naxes: usize,
@@ -291,6 +298,19 @@ impl<'m> Emitter<'m> {
                 },
                 _ => {}
             }
+        }
+        // An operand of the same shape, then any operand axis of that extent.
+        let same_axis = peers
+            .iter()
+            .filter(|p| p.len() == naxes)
+            .find_map(|p| (p[axis].0 == n).then(|| p[axis].1.clone()));
+        if let Some(s) = same_axis.or_else(|| {
+            peers
+                .iter()
+                .flatten()
+                .find_map(|(e, s)| (*e == n).then(|| s.clone()))
+        }) {
+            return s;
         }
         match self.sizes.get(&n).map(Vec::as_slice) {
             None | Some([]) => n.to_string(),
@@ -356,11 +376,16 @@ impl<'m> Emitter<'m> {
             node,
         )?;
         let naxes = extents.len();
+        let peers = std::mem::take(&mut self.peers);
         let names: Vec<String> = extents
             .iter()
             .enumerate()
-            .map(|(a, &n)| self.size(n, hints.get(a).copied().flatten(), owner, a, naxes))
+            .map(|(a, &n)| self.size(n, hints.get(a).copied().flatten(), &peers, owner, a, naxes))
             .collect();
+        self.extents.insert(
+            owner.to_string(),
+            extents.iter().copied().zip(names.iter().cloned()).collect(),
+        );
         let mut k = 0;
         declare(
             ty,
@@ -372,6 +397,37 @@ impl<'m> Emitter<'m> {
             },
             node,
         )
+    }
+
+    /// The extents of the declared values an expression reads, so a computed
+    /// value takes its size names from its operands.
+    fn operand_extents(&self, root: NodeId) -> Vec<Vec<(u32, String)>> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let name = match self.m.node(id) {
+                Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                    let sym = *self.m.alias_chain(r.name).last().unwrap();
+                    self.env.get(&sym).cloned()
+                }
+                Node::Call(c) if self.head(id) == Some("get") => {
+                    let field = match c.args.get(1).map(|&f| self.m.node(f)) {
+                        Some(Node::Lit(Scalar::Str(f))) => Some(f.to_string()),
+                        _ => None,
+                    };
+                    match (self.data_record(c.args[0]), field) {
+                        (Some(rec), Some(f)) => self.leaves.get(&(rec, f)).cloned(),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match name.and_then(|n| self.extents.get(&n)) {
+                Some(e) if !e.is_empty() => out.push(e.clone()),
+                _ => self.m.for_each_child(id, |c| stack.push(c)),
+            }
+        }
+        out
     }
 
     /// The axis-size expressions a set names: `cartpow(S, [m, n])` gives
@@ -577,6 +633,7 @@ impl<'m> Emitter<'m> {
         let lines = match attempt {
             Ok(e) => {
                 let stan = self.fresh(base);
+                self.peers = self.operand_extents(rhs);
                 let t = self.declare(rhs, None, false, &stan, &[])?;
                 let line = format!("{} = {};", t.render(&stan), e.s);
                 self.record_decl(&stan, t);
@@ -584,6 +641,7 @@ impl<'m> Emitter<'m> {
             }
             Err(r) if r.kind == RefusalKind::NotYetSupported && self.elementwise(rhs) => {
                 let stan = self.fresh(base);
+                self.peers = self.operand_extents(rhs);
                 let t = self.declare(rhs, None, false, &stan, &[])?;
                 let lines = self.fill_loops(&stan, &t, rhs)?;
                 self.record_decl(&stan, t);
