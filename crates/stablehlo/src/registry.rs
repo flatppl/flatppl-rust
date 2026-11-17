@@ -18,6 +18,7 @@ use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 mod bessel;
+mod hep;
 mod regression;
 mod regression_broadcast;
 
@@ -385,6 +386,24 @@ static REGISTRY: &[(&str, DistLowering)] = &[
     // base constructor: the determiniser emits the BARE member name as the kernel
     // tag, so the module qualification is gone by the time `lookup` runs.
     (
+        "Voigtian",
+        DistLowering {
+            logpdf: hep::voigtian_logpdf,
+            sample: None,
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
+        "Landau",
+        DistLowering {
+            logpdf: hep::landau_logpdf,
+            sample: None,
+            touniform: None,
+            broadcast: Broadcast::Elementwise,
+        },
+    ),
+    (
         "CrystalBall",
         DistLowering {
             logpdf: crystal_ball_logpdf,
@@ -423,7 +442,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
     (
         "Argus",
         DistLowering {
-            logpdf: argus_logpdf,
+            logpdf: hep::argus_logpdf,
             sample: None,
             touniform: None,
             broadcast: Broadcast::Elementwise,
@@ -2730,102 +2749,6 @@ fn bifurcated_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
     let log_coef = e.scalar((2.0 / std::f64::consts::PI).sqrt().ln());
     let normalized = e.sub(&log_coef, &log_sigma_sum);
     Ok(e.add(&normalized, &exponent))
-}
-
-/// §09 `Argus(resonance, slope, power)`, normalized.
-///
-/// With `m₀ = resonance`, `c = slope`, `p = power` and `u = 1 − (x/m₀)²`,
-/// §09's density is `(1/M)·x·u^p·exp(c·u)` on `0 < x < m₀`, so
-///
-/// ```text
-/// log f = log x + p·log u + c·u − log M
-/// ```
-///
-/// The support is NOT re-checked here: every builder in this module scores its
-/// per-observation formula and leaves `S`-membership to the measure layer's
-/// `restrict`/`truncate` (see this module's header note on `uniform_logpdf`).
-///
-/// `M = (m₀²/2)·∫₀¹ u^p·e^(cu) du`. For `c < 0` that integral is
-/// `s^(−(p+1))·γ(p+1, s)` with `s = −c`, a LOWER INCOMPLETE GAMMA, for which
-/// StableHLO/CHLO gives no op this emitter carries. At §09's stated typical
-/// `power = 0.5` it collapses to `erf`, via `γ(3/2, s) = (√π/2)·erf(√s) − √s·e^(−s)`:
-///
-/// ```text
-/// M = (m₀²/2)·s^(−3/2)·( (√π/2)·erf(√s) − √s·e^(−s) ),   s = −slope
-/// ```
-///
-/// so this builder REFUSES any other `power`, naming the missing function,
-/// rather than mislower. `power` must be a literal for that check, which the
-/// `record` the determiniser emits preserves.
-///
-/// Verified against `scipy.stats.argus(chi = √(−2·slope), scale = resonance)`
-/// (equivalently a direct quadrature of §09's own formula) at four slopes,
-/// agreeing to 9e-10 relative or better — the residual is the quadrature's, not
-/// the closed form's.
-///
-/// `slope ≥ 0` is admitted by §09's `reals` domain but leaves `√s` imaginary
-/// (`slope > 0`) or `M`'s expression a removable `0/0` (`slope = 0`); both emit
-/// `NaN` rather than a wrong finite number.
-fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    // `unbatch_field_id`, not `field_id`: this is the one STRUCTURAL read in an
-    // otherwise arithmetic builder, so it is the one that notices the size-1
-    // `vector` wrapper a batched kernel input puts around a per-batch-constant
-    // parameter. Without the strip, `iid(hep.Argus(…), n)` refused as a
-    // non-literal `power` even when the literal was 0.5.
-    let power_id = unbatch_field_id(e, p, "power")?;
-    let power = match e.node(power_id) {
-        Node::Lit(Scalar::Real(x)) if *x == 0.5 => 0.5,
-        Node::Lit(Scalar::Int(_)) | Node::Lit(Scalar::Real(_)) => {
-            return Err(EmitError::at(
-                power_id,
-                "Argus normalizer for power != 0.5 needs the lower incomplete gamma \
-                 function, which has no StableHLO/CHLO lowering here",
-            ));
-        }
-        _ => {
-            return Err(EmitError::at(
-                power_id,
-                "Argus power must be a literal: the normalizer has a closed form only \
-                 at power = 0.5 (spec §09's typical value)",
-            ));
-        }
-    };
-
-    let resonance = p.get(e, "resonance")?;
-    let slope = p.get(e, "slope")?;
-
-    let r = e.div(v, &resonance);
-    let r_sq = e.mul(&r, &r);
-    let one = e.scalar(1.0);
-    let u = e.sub(&one, &r_sq);
-
-    let log_v = e.log(v);
-    let log_u = e.log(&u);
-    let p_lit = e.scalar(power);
-    let p_log_u = e.mul(&p_lit, &log_u);
-    let c_u = e.mul(&slope, &u);
-    let sum = e.add(&log_v, &p_log_u);
-    let log_unnorm = e.add(&sum, &c_u);
-
-    let s = e.neg(&slope);
-    let sqrt_s = e.sqrt(&s);
-    let erf_sqrt_s = e.erf(&sqrt_s);
-    let half_sqrt_pi = e.scalar(std::f64::consts::PI.sqrt() / 2.0);
-    let erf_term = e.mul(&half_sqrt_pi, &erf_sqrt_s);
-    let neg_s = e.neg(&s);
-    let exp_neg_s = e.exp(&neg_s);
-    let exp_term = e.mul(&sqrt_s, &exp_neg_s);
-    let bracket = e.sub(&erf_term, &exp_term);
-
-    let neg_three_halves = e.scalar(-1.5);
-    let s_pow = e.pow(&s, &neg_three_halves);
-    let res_sq = e.mul(&resonance, &resonance);
-    let half = e.scalar(0.5);
-    let half_res_sq = e.mul(&half, &res_sq);
-    let scaled = e.mul(&half_res_sq, &s_pow);
-    let mass = e.mul(&scaled, &bracket);
-    let log_mass = e.log(&mass);
-    Ok(e.sub(&log_unnorm, &log_mass))
 }
 
 /// §09 `ContinuedPoisson(rate)` — the continuous extension of Poisson to the
