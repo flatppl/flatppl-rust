@@ -75,6 +75,31 @@ pub(crate) fn const_json(m: &Module, id: NodeId) -> Option<Value> {
                 .map(|&a| const_json(m, a))
                 .collect::<Option<Vec<_>>>()
                 .map(Value::Array),
+            // Stan JSON nests a matrix row by row.
+            "rowstack" | "colstack" if c.args.len() == 1 => {
+                let Value::Array(lines) = const_json(m, c.args[0])? else {
+                    return None;
+                };
+                let lines: Vec<Vec<Value>> = lines
+                    .into_iter()
+                    .map(|l| match l {
+                        Value::Array(v) if v.iter().all(|x| x.is_number()) => Some(v),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?;
+                let n = lines.first()?.len();
+                if lines.iter().any(|l| l.len() != n) {
+                    return None;
+                }
+                if head(m, id)? == "rowstack" {
+                    return Some(Value::Array(lines.into_iter().map(Value::Array).collect()));
+                }
+                Some(Value::Array(
+                    (0..n)
+                        .map(|j| Value::Array(lines.iter().map(|l| l[j].clone()).collect()))
+                        .collect(),
+                ))
+            }
             "array" if c.args.len() == 3 => {
                 let flat = match const_json(m, c.args[0])? {
                     Value::Array(v) => v,

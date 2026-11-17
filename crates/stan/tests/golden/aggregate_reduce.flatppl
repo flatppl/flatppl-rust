@@ -1,0 +1,16 @@
+flatppl_compat = "0.1"
+N = 4
+K = 3
+X = rowstack([[1.0, 2.0, 0.5], [0.0, 1.5, 2.5], [2.0, 0.5, 1.0], [1.0, 1.0, 1.0]])
+y_obs = [1.2, 0.4, 2.2, 1.1]
+counts = rowstack([[1, 0, 2], [0, 3, 1], [2, 2, 0], [1, 1, 1]])
+means = aggregate(mean, [.k], X[.n, .k])
+Xc = aggregate(sum, [.n, .k], X[.n, .k] - means[.k])
+totals = aggregate(sum, [.n], counts[.n, .k])
+step = aggregate(sum, [.n, .k], ifelse(X[.n, .k] >= 1.0, 1.0, 0.0))
+b ~ iid(Normal(0, 1), K)
+sigma ~ Exponential(1.0)
+y ~ Normal.(Xc * b .+ step * b .+ totals, sigma)
+prior = lawof(record(b = b, sigma = sigma))
+L = likelihoodof(kernelof(record(y = y), b = b, sigma = sigma), record(y = y_obs))
+post = bayesupdate(L, prior)
