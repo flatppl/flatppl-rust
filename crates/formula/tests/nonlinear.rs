@@ -37,6 +37,14 @@ fn nonlinear_recipe_prepares_expression_columns_on_new_rows() {
 }
 
 #[test]
+fn nonlinear_arithmetic_accepts_real_division() {
+    let mut spec = growth_spec();
+    spec.formula = "y ~ -log(a^2 + x) / exp(b)".into();
+    let data = read_json_table(r#"{"x":[0.5,1.5,3],"y":[-0.3,-0.6,-0.8]}"#).unwrap();
+    build(&spec, &data).unwrap();
+}
+
+#[test]
 fn nonlinear_coefficients_need_explicit_scoped_priors() {
     let data = read_json_table(r#"{"x":[0,1,2],"y":[2.2,3.8,8.5]}"#).unwrap();
     let mut spec = growth_spec();
