@@ -76,6 +76,7 @@ use flatppl_core::{
 };
 
 mod beta;
+mod dirichlet;
 
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
 /// determiniser emits one density sub-tree per atom). A finite but large latent
@@ -626,6 +627,10 @@ fn build_conjugate_marginal(
     // `resolve` borrow across them).
     let prior_name = m.resolve(prior_sym).to_string();
     let lik_name = m.resolve(lik_sym).to_string();
+
+    if prior_name == "Dirichlet" {
+        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &lik_name);
+    }
 
     // EVERY row whose prior + likelihood families match is tried, not just the first: two
     // rows may share a family pair and differ only in which parameter the latent feeds, or
@@ -1387,6 +1392,9 @@ pub(crate) fn shared_latent_record_law(
     }
 
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
+    if m.resolve(prior_sym) == "Dirichlet" {
+        return dirichlet::shared_law(m, latent, &prior_kwargs, field_measures);
+    }
     if m.resolve(prior_sym) == "Beta" {
         return beta::shared_law(m, latent, &prior_kwargs, field_measures);
     }
