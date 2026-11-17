@@ -100,6 +100,9 @@ impl Emitter<'_> {
         if let Some(result) = self.lower_svd_record(resolved, name) {
             return result;
         }
+        if let Some(result) = self.lower_eigen_record(resolved, name) {
+            return result;
+        }
         let Node::Call(call) = self.m.node(resolved) else {
             return Err(no_field_lowering(container, name, "this value"));
         };
@@ -246,7 +249,7 @@ impl Emitter<'_> {
     }
 
     /// The literal producer entry for field `field` of `container`, if any.
-    fn literal_entry(&self, container: NodeId, field: &str) -> Option<NodeId> {
+    pub(crate) fn literal_entry(&self, container: NodeId, field: &str) -> Option<NodeId> {
         if self.bound_field(container, field).is_some() {
             return None;
         }

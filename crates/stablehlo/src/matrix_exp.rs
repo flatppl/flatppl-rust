@@ -435,6 +435,36 @@ impl Emitter<'_> {
         branch: impl FnOnce(&mut Self) -> Value,
         retain_case: bool,
     ) -> Value {
+        self.matrix_if_values_impl(
+            active,
+            std::slice::from_ref(initial),
+            |e| vec![branch(e)],
+            retain_case,
+        )
+        .remove(0)
+    }
+
+    /// Lazily transform a heterogeneous matrix state when any lane is active.
+    pub(super) fn matrix_if_values(
+        &mut self,
+        active: &Value,
+        initial: &[Value],
+        branch: impl FnOnce(&mut Self) -> Vec<Value>,
+    ) -> Vec<Value> {
+        self.matrix_if_values_impl(active, initial, branch, false)
+    }
+
+    fn matrix_if_values_impl(
+        &mut self,
+        active: &Value,
+        initial: &[Value],
+        branch: impl FnOnce(&mut Self) -> Vec<Value>,
+        retain_case: bool,
+    ) -> Vec<Value> {
+        assert!(
+            !initial.is_empty(),
+            "matrix branch requires an initial state"
+        );
         let active = if matches!(active.ty, MlirTy::Scalar) {
             active.clone()
         } else {
@@ -463,17 +493,53 @@ impl Emitter<'_> {
         let saved_expanded = std::mem::take(&mut self.expanded);
         self.region_depth += 1;
         let result = branch(self);
+        assert_eq!(result.len(), initial.len(), "matrix branch state arity");
         self.region_depth -= 1;
         let body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure;
         self.expanded = saved_expanded;
-        let ty = initial.ty.render(self.dtype, initial.elem);
+        let types = initial
+            .iter()
+            .map(|value| value.ty.render(self.dtype, value.elem))
+            .collect::<Vec<_>>();
+        let ty_list = types.join(", ");
+        let ty = if initial.len() == 1 {
+            types[0].clone()
+        } else {
+            format!("({ty_list})")
+        };
+        let old = initial
+            .iter()
+            .map(|value| value.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let new = result
+            .iter()
+            .map(|value| value.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let ssa = self.fresh();
-        self.push(&format!("{ssa} = \"stablehlo.case\"({index}) ({{\n stablehlo.return {} : {ty}\n}}, {{\n{body}\n stablehlo.return {} : {ty}\n}}) : (tensor<i32>) -> {ty}", initial.ssa, result.ssa));
-        self.remember_axes(&ssa, self.axes_of(initial));
-        Value {
-            ssa,
-            ..initial.clone()
-        }
+        let assignment = if initial.len() == 1 {
+            ssa.clone()
+        } else {
+            format!("{ssa}:{}", initial.len())
+        };
+        self.push(&format!("{assignment} = \"stablehlo.case\"({index}) ({{\n stablehlo.return {old} : {ty_list}\n}}, {{\n{body}\n stablehlo.return {new} : {ty_list}\n}}) : (tensor<i32>) -> {ty}"));
+        initial
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let ssa = if initial.len() == 1 {
+                    ssa.clone()
+                } else {
+                    format!("{ssa}#{i}")
+                };
+                self.remember_axes(&ssa, self.axes_of(value));
+                Value {
+                    ssa,
+                    ..value.clone()
+                }
+            })
+            .collect()
     }
 }
