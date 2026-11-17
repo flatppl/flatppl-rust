@@ -93,6 +93,50 @@ fn row(src: &str) -> Option<ConjugateRowId> {
 }
 
 #[test]
+fn measure_ancestry_uses_model_draws_and_the_current_query_boundary() {
+    use flatppl_model_analysis::{
+        StochasticAncestor, measure_stochastic_ancestors, sole_named_ancestor,
+    };
+
+    let mut m = parse_infer(
+        "z = draw(Normal(0.0, 1.0))\na = z\nu = draw(Normal(0.0, 2.0))\n\
+         model = Normal(a + z, exp(draw(Normal(0.0, 1.0))))\n\
+         weighted_law = weighted(a, lawof(u))\npoint = 0.25",
+    );
+    let z = m.intern("z");
+    let draw = rhs(&m, "z");
+    let named = StochasticAncestor {
+        draw,
+        name: Some(z),
+        prior: drawn(&m, "z"),
+    };
+    let model = rhs(&m, "model");
+    let law = rhs(&m, "weighted_law");
+    let ancestors = measure_stochastic_ancestors(&m, model, &[]);
+    let [first, second, inline] = ancestors.as_slice() else {
+        panic!("expected three draw occurrences")
+    };
+    assert_eq!([*first, *second], [named, named]);
+    assert_eq!(inline.name, None);
+    assert_ne!(inline.draw, draw);
+    assert_eq!(sole_named_ancestor(&ancestors), None);
+    assert_eq!(
+        sole_named_ancestor(&ancestors[..2]),
+        Some((z, drawn(&m, "z")))
+    );
+
+    let binding = m.binding_by_name(z).unwrap();
+    let point = rhs(&m, "point");
+    m.pin_binding_to_query_point(binding, point);
+    assert_eq!(measure_stochastic_ancestors(&m, law, &[]), [named]);
+    assert!(measure_stochastic_ancestors(&m, law, &[draw]).is_empty());
+    m.push_conditioned_inputs(&[z]);
+    assert!(measure_stochastic_ancestors(&m, law, &[]).is_empty());
+    m.pop_conditioned_inputs(1);
+    assert_eq!(measure_stochastic_ancestors(&m, law, &[]), [named]);
+}
+
+#[test]
 fn matches_every_conjugate_row() {
     let cases = [
         (

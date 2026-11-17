@@ -48,17 +48,9 @@ fn marginal_with_ancestors(
     m: &mut Module,
     measure: NodeId,
     value: NodeId,
-    ancestors: &[Ancestor],
+    ancestors: &[StochasticAncestor],
 ) -> Option<Result<NodeId, RefuseError>> {
-    let Ancestor::Named { name, prior } = *ancestors.first()? else {
-        return None;
-    };
-    if ancestors
-        .iter()
-        .any(|a| !matches!(a, Ancestor::Named { name: other, .. } if *other == name))
-    {
-        return None;
-    }
+    let (name, prior) = sole_named_ancestor(ancestors)?;
     expectation(m, prior, &mut |m, coordinate| {
         let bound = [(
             Ref {

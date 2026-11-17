@@ -2,12 +2,14 @@
 //! the target's explicit input boundary. Scalar conjugacy uses the query's observed
 //! draws. Query analysis and preparation take FlatPDL.
 
+mod ancestry;
 mod conjugacy;
 mod dependencies;
 mod incremental;
 mod normal_coordinates;
 mod sufficient_statistics;
 
+pub use ancestry::{StochasticAncestor, measure_stochastic_ancestors, sole_named_ancestor};
 pub use conjugacy::{ConjugateMatch, ConjugateRowId, match_conjugate_marginal};
 pub use dependencies::{
     AnalysisError, InputArray, InputCell, InputPath, ModelAnalysis, NormalCoordinate, OutputTerm,

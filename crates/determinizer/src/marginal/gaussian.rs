@@ -1,12 +1,11 @@
 //! Exact affine Gaussian integration with the original covariance checks.
 
 use super::{MarginalForm, RefuseError, build_constructor, find_kwarg, is_input_ref, real};
-use crate::density::{
-    build_call, build_record, draw_argument, measure_stochastic_ancestors, split_kernel_constructor,
-};
+use crate::density::{build_call, build_record, draw_argument, split_kernel_constructor};
 use flatppl_core::{
     CallHead, Dim, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Symbol, Type,
 };
+use flatppl_model_analysis::{measure_stochastic_ancestors, sole_named_ancestor};
 use std::collections::HashSet;
 
 fn shape(m: &Module, node: NodeId) -> Option<Vec<u32>> {
@@ -270,7 +269,8 @@ pub(crate) fn conditional_draw(
     };
     let (latent, prior) = declared_draw(m, *latent_value)?;
     let (_, likelihood) = declared_draw(m, *observation)?;
-    let (ancestor, ancestor_prior) = super::sole_named_ancestor(m, likelihood, &[])?;
+    let (ancestor, ancestor_prior) =
+        sole_named_ancestor(&measure_stochastic_ancestors(m, likelihood, &[]))?;
     if ancestor != latent
         || ancestor_prior != prior
         || !measure_stochastic_ancestors(m, prior, &[]).is_empty()
