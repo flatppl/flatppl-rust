@@ -63,9 +63,11 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 
 ### Nonlinear predictors
 
-For Gaussian and Bernoulli responses, supply `nlpars` to treat the right side
-of the response formula as arithmetic over named parameter predictors and
-numeric data columns. Each named predictor uses ordinary formula terms.
+Supply `nlpars` to treat the right side as arithmetic over named parameter
+predictors and numeric data columns. Each named predictor uses ordinary
+formula terms. Gaussian, Student, Bernoulli, Binomial, Poisson, negative
+binomial, geometric, and the listed count hurdle and zero-inflated families
+support nonlinear predictors.
 
 ```json
 {
@@ -140,10 +142,12 @@ von Mises responses use radians in `[-pi, pi]`, a direct `kappa` with a
 Gamma(2, 0.01) prior, and inverse tan-half link `2 * atan(eta)`.
 The tan-half intercept prior is Student-t(1, 0, 1); the identity link uses the
 ordinary response-based Student-t prior.
-Binomial formulas require `y | trials(n) ~ ...`, where `n` is a nonnegative
-integer or a numeric column of counts. Trials remain required for prediction.
-Counts must be nonnegative integers, and binomial responses cannot exceed
-their trials. Gamma, exponential, lognormal and Weibull responses must be strictly positive.
+Binomial formulas require `y | trials(n) ~ ...`, where `n` is an integer or a
+numeric column of counts. Trials remain required for prediction. Use positive
+trial counts for execution. The converter accepts zero trials, but the emitted
+FlatPPL `Binomial` law requires positive trials. Counts must be nonnegative
+integers, and binomial responses cannot exceed their trials. Gamma,
+exponential, lognormal and Weibull responses must be strictly positive.
 Bernoulli responses may be numeric, logical or factors; the recipe retains
 the training event coding when preparing new data.
 
