@@ -481,14 +481,28 @@ impl Emitter<'_> {
     /// Complete pivoting moves rank deficiency to the final diagonal entries.
     /// This retains the determinant's cofactor derivative at a zero column.
     pub(crate) fn matrix_determinant(&mut self, input: &Value, n: u64, logarithm: bool) -> Value {
-        if logarithm && n >= 8 && self.batch_rank(input) == 0 && !self.host_batch {
-            return self.matrix_logabsdet_helper(input, n);
+        if n >= 8 && self.batch_rank(input) == 0 && !self.host_batch {
+            let (value, valid) = self.matrix_determinant_helper(input, n, logarithm);
+            if logarithm {
+                return value;
+            }
+            // The inverse formula cannot supply singular cofactors, or recover
+            // finite derivatives after determinant underflow/overflow.
+            let fallback = self.not(&valid);
+            return self.matrix_if_for_reverse(&fallback, &value, |e| {
+                e.matrix_determinant_body(input, n, false)
+            });
         }
         self.matrix_determinant_body(input, n, logarithm)
     }
 
     /// Expose the inverse for implicit AD, retaining a portable decomposition.
-    fn matrix_logabsdet_helper(&mut self, input: &Value, n: u64) -> Value {
+    fn matrix_determinant_helper(
+        &mut self,
+        input: &Value,
+        n: u64,
+        logarithm: bool,
+    ) -> (Value, Value) {
         let dtype = match self.dtype {
             Dtype::F32 => "f32",
             Dtype::F64 => "f64",
@@ -497,7 +511,8 @@ impl Emitter<'_> {
             crate::Target::Cpu => "cpu",
             crate::Target::Gpu => "gpu",
         };
-        let name = format!("__enzyme_linalg_logabsdet_v1_{dtype}_{target}_n{n}");
+        let operation = if logarithm { "logabsdet" } else { "det" };
+        let name = format!("__enzyme_linalg_{operation}_v1_{dtype}_{target}_n{n}");
         if !self.solve_helpers.contains_key(&name) {
             let mut helper = self.scratch_emitter();
             let args = [("%a".to_owned(), input.ty.clone(), ElemKind::Real)];
@@ -505,14 +520,25 @@ impl Emitter<'_> {
                 ssa: "%a".into(),
                 ..input.clone()
             };
-            let value = helper.matrix_determinant_body(&a, n, true);
+            let value = helper.matrix_determinant_body(&a, n, logarithm);
             let rows = helper.axis_indices(&a, 0);
             let cols = helper.axis_indices(&a, 1);
             let diagonal = helper.compare("EQ", &rows, &cols);
             let identity = helper.convert(&diagonal, ElemKind::Real);
-            let (inverse, valid) = helper.matrix_solve_body(a, identity, n);
-            let nan = helper.constant_like(f64::NAN, &inverse);
-            let inverse = helper.select(&valid, &inverse, &nan);
+            let (inverse, mut valid) = helper.matrix_solve_body(a, identity, n);
+            let invalid_inverse = if logarithm {
+                helper.constant_like(f64::NAN, &inverse)
+            } else {
+                let zero = helper.scalar(0.0);
+                let nonzero = helper.compare("NE", &value, &zero);
+                let magnitude = helper.abs(&value);
+                let infinity = helper.inf_like(&value);
+                let finite = helper.compare("LT", &magnitude, &infinity);
+                let representable = helper.and(&finite, &nonzero);
+                valid = helper.and(&valid, &representable);
+                helper.constant_like(0.0, &inverse)
+            };
+            let inverse = helper.select(&valid, &inverse, &invalid_inverse);
             let definition =
                 helper.finish_function(&name, &args, &[&value, &inverse, &valid], true);
             self.solve_helpers.insert(name.clone(), definition);
@@ -524,11 +550,18 @@ impl Emitter<'_> {
             "{result}:3 = func.call @{name}({}) : ({matrix}) -> ({scalar}, {matrix}, tensor<i1>)",
             input.ssa,
         ));
-        Value {
-            ssa: format!("{result}#0"),
-            ty: MlirTy::Scalar,
-            elem: ElemKind::Real,
-        }
+        (
+            Value {
+                ssa: format!("{result}#0"),
+                ty: MlirTy::Scalar,
+                elem: ElemKind::Real,
+            },
+            Value {
+                ssa: format!("{result}#2"),
+                ty: MlirTy::Scalar,
+                elem: ElemKind::Bool,
+            },
+        )
     }
 
     fn matrix_determinant_body(&mut self, input: &Value, n: u64, logarithm: bool) -> Value {
