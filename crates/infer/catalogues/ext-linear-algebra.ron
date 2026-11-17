@@ -20,12 +20,12 @@
                         ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: RealOrComplexOfArg(0))),
                     ]))),
                 // eigen(A) → record(values, vectors): values vector, vectors matrix.
-                // Element kind follows A (matching eigmax/eigmin, which assume real
-                // eigenvalues); a complex A yields complex values/vectors.
+                // A real matrix can have a complex spectrum, so both fields
+                // have a complex codomain even when A is real.
                 Binding(name: "eigen",
                     sig: Function(params: [Matrix], names: ["A"], result: Record([
-                        ("values", Vector(len: Dyn, elem: OfArg(0))),
-                        ("vectors", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("values", Vector(len: Axis(0, 0), elem: Complex)),
+                        ("vectors", MatrixElem(rows: Axis(0, 0), cols: Axis(0, 1), elem: Complex)),
                     ]))),
                 // eigmax(A) → real (maximal eigenvalue, real-valued when A has real eigenvalues)
                 Binding(name: "eigmax",

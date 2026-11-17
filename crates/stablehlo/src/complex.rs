@@ -90,9 +90,8 @@ pub(crate) fn parts(
                 let head = e.resolve(head).to_owned();
                 if matches!(head.as_str(), "get" | "get0")
                     && let Some((container, field)) = e.record_projection(&c.args)
-                    && let Some(result) = e.lower_lu_field_parts(container, &field)
                 {
-                    return result;
+                    return field_parts(e, id, container, &field, memo);
                 }
                 if matches!(head.as_str(), "get" | "get0")
                     && let [container, selector] = c.args.as_ref()
@@ -159,12 +158,6 @@ pub(crate) fn parts(
                     && let Some(result) = e
                         .lower_bessel_parts(id, *callee, args, true)
                         .or_else(|| e.lower_lstsq_parts(id, *callee, args, true))
-                {
-                    return result;
-                }
-                if matches!(head.as_str(), "get" | "get0")
-                    && let Some((container, field)) = e.record_projection(&c.args)
-                    && let Some(result) = e.lower_svd_field_parts(id, container, &field)
                 {
                     return result;
                 }
@@ -244,4 +237,47 @@ pub(crate) fn parts(
     };
     memo.insert(id, result.clone());
     Ok(result)
+}
+
+/// Record fields commute with selecting rows of their table. Keep both real
+/// coordinates through that projection instead of forcing a complex tensor ABI.
+fn field_parts(
+    e: &mut Emitter,
+    id: NodeId,
+    container: NodeId,
+    field: &str,
+    memo: &mut HashMap<NodeId, (Value, Value)>,
+) -> Result<(Value, Value), EmitError> {
+    let container = e.resolve_tuple_projections(container);
+    if let Some(entry) = e.literal_entry(container, field) {
+        return parts(e, entry, memo);
+    }
+    if let Node::Call(call) = e.node(container).clone()
+        && let CallHead::Builtin(head) = call.head
+        && matches!(e.resolve(head), "get" | "get0")
+        && let [inner, selector] = call.args.as_ref()
+    {
+        if let Node::Lit(flatppl_core::Scalar::Str(name)) = e.node(*selector) {
+            let name = name.to_string();
+            if let Some(entry) = e.literal_entry(*inner, &name) {
+                return field_parts(e, id, entry, field, memo);
+            }
+        } else {
+            let (re, im) = field_parts(e, id, *inner, field, memo)?;
+            let base = i64::from(e.resolve(head) == "get");
+            return Ok((
+                crate::ops::get_outer(e, id, re, *selector, base)?,
+                crate::ops::get_outer(e, id, im, *selector, base)?,
+            ));
+        }
+    }
+    e.lower_eigen_field_parts(container, field)
+        .or_else(|| e.lower_lu_field_parts(container, field))
+        .or_else(|| e.lower_svd_field_parts(id, container, field))
+        .unwrap_or_else(|| {
+            Err(EmitError::at(
+                id,
+                format!("complex field `{field}` has no pair lowering"),
+            ))
+        })
 }

@@ -45,6 +45,31 @@ fn errors(diags: &[flatppl_infer::Diagnostic]) -> Vec<&flatppl_infer::Diagnostic
         .collect()
 }
 
+#[test]
+fn matrix_record_broadcasts_form_tables_with_complex_eigen_columns() {
+    let source = "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+        A=external(cartpow(cartpow(reals,[3,3]),2))\n\
+        f=e.eigen.(A)\nw=f.values\nv=f[1].vectors\n";
+    let (module, diagnostics) = infer_src(source, Level::Shape);
+    assert!(errors(&diagnostics).is_empty(), "{diagnostics:?}");
+    assert!(matches!(
+        binding_ty(&module, "f"),
+        Some(Type::Table {
+            nrows: Dim::Static(2),
+            ..
+        })
+    ));
+    let complex = Type::Scalar(ScalarType::Complex);
+    assert!(
+        matches!(binding_ty(&module, "w"), Some(Type::Array { shape, elem })
+        if shape.as_ref() == [Dim::Static(2)] && matches!(elem.as_ref(), Type::Array { elem, .. } if **elem == complex))
+    );
+    assert!(
+        matches!(binding_ty(&module, "v"), Some(Type::Array { shape, elem })
+        if shape.as_ref() == [Dim::Static(3), Dim::Static(3)] && **elem == complex)
+    );
+}
+
 /// A standard-module distribution applied (`hepphys.CrystalBall(...)`) infers a
 /// normalized real measure with support over the reals.
 #[test]
