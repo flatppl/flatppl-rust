@@ -767,3 +767,103 @@ fn a_runtime_row_output_exports_one_result_per_column() -> Result<(), Box<dyn st
     );
     Ok(())
 }
+
+#[test]
+fn runtime_status_keeps_authored_zero_outputs_in_scalar_and_batched_exports()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (source, count, codes) in [
+        (
+            "x=external(reals)\ninputs=x\noutputs=integer(round(x))",
+            1,
+            vec![2],
+        ),
+        (
+            "x=external(reals)\ninputs=x\noutputs=(0,integer(round(x)))",
+            2,
+            vec![2],
+        ),
+        (
+            "e=standard_module(\"ext-linear-algebra\",\"0.1\")\n\
+          z=lengthof(filter(fn(_ > 2),[1]))\nx=external(reals)\n\
+          inputs=x\noutputs=e.rank(fill(x,[z,z]))",
+            1,
+            vec![12],
+        ),
+    ] {
+        let query = Context::default().parse(source, None, None)?;
+        for batched in [false, true] {
+            let exported = if batched {
+                query.compile_batched(
+                    &EmitOptions::default(),
+                    &BatchSpec {
+                        shape: vec![3],
+                        input_axes: vec![vec![Some(0)]],
+                    },
+                )?
+            } else {
+                query.compile(&EmitOptions::default())?
+            };
+            let shape = if batched { vec![3] } else { vec![] };
+            assert_eq!(
+                serde_json::to_value(&exported.runtime_status)?,
+                json!({"index":count,"dtype":"int32","shape":shape,"codes":codes})
+            );
+            let ty = if batched {
+                "tensor<3xi32>"
+            } else {
+                "tensor<i32>"
+            };
+            let types = std::iter::repeat_n(ty, count + 1)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let signature = exported
+                .stablehlo
+                .lines()
+                .find(|line| line.trim_start().starts_with("func.func @main("))
+                .unwrap();
+            assert!(
+                signature.contains(&format!("-> ({types}) {{")),
+                "{signature}"
+            );
+            assert!(
+                exported
+                    .stablehlo
+                    .contains(&format!("flatppl.runtime_status = {count} : i64")),
+                "{}",
+                exported.stablehlo
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_row_status_is_one_batched_result() -> Result<(), Box<dyn std::error::Error>> {
+    let query = Context::default().parse(
+        "data=elementof(cartpow(cartprod(x=reals,y=reals),4))\ni=elementof(posintegers)\n\
+         inputs=(data,i)\noutputs=data[i]",
+        None,
+        None,
+    )?;
+    let exported = query.compile_batched(
+        &EmitOptions::default(),
+        &BatchSpec {
+            shape: vec![3],
+            input_axes: vec![vec![None], vec![None], vec![Some(0)]],
+        },
+    )?;
+    assert_eq!(
+        serde_json::to_value(&exported.runtime_status)?,
+        json!({"index":2,"dtype":"int32","shape":[3],"codes":[1]})
+    );
+    let signature = exported
+        .stablehlo
+        .lines()
+        .find(|line| line.trim_start().starts_with("func.func @main("))
+        .unwrap();
+    assert!(
+        signature.contains("-> (tensor<3xf32>, tensor<3xf32>, tensor<3xi32>) {"),
+        "{signature}"
+    );
+    Ok(())
+}
