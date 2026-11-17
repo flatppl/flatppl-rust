@@ -1,8 +1,6 @@
 //! Exact affine Gaussian integration with the original covariance checks.
 
-use super::{
-    LogDensity, MarginalForm, RefuseError, build_constructor, find_kwarg, is_input_ref, real,
-};
+use super::{MarginalForm, RefuseError, build_constructor, find_kwarg, is_input_ref, real};
 use crate::density::{
     build_call, build_record, draw_argument, measure_stochastic_ancestors, split_kernel_constructor,
 };
@@ -141,10 +139,37 @@ pub(super) fn marginal(
     likelihood: &[(Symbol, NodeId)],
 ) -> Option<Result<MarginalForm, RefuseError>> {
     let params = parameters(m, latent, prior, likelihood)?;
-    Some(Ok(MarginalForm::LogDensity(LogDensity {
-        build: logpdf,
-        params: params.to_vec(),
-    })))
+    let rows = shape(m, params[4])?[0];
+    // The original A*z is real even when the authored arrays are integers.
+    let [mu, covariance, matrix, offset, noise] = params.map(|value| real_array(m, value));
+    let mean = build_call(m, "mul", &[matrix, mu]);
+    let mean = build_call(m, "add", &[mean, offset]);
+    let ac = build_call(m, "mul", &[matrix, covariance]);
+    let transpose = build_call(m, "transpose", &[matrix]);
+    let propagated = build_call(m, "mul", &[ac, transpose]);
+    let marginal_cov = build_call(m, "add", &[propagated, noise]);
+    // A valid propagated covariance must not hide invalid source covariances,
+    // including when another edge composes this measure through a zero map.
+    let valid = component_valid(m, mu, covariance, offset, noise);
+    let size = m.alloc(Node::Lit(Scalar::Int(i64::from(rows))));
+    let identity = build_call(m, "eye", &[size]);
+    let invalid = build_call(m, "neg", &[identity]);
+    let marginal_cov = build_call(m, "ifelse", &[valid, marginal_cov, invalid]);
+    // Recursive marginal recognition runs before the next inference pass.
+    for (node, shape) in [(mean, vec![rows]), (marginal_cov, vec![rows, rows])] {
+        m.set_type(
+            node,
+            Type::Array {
+                shape: shape.into_iter().map(Dim::Static).collect(),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            },
+        );
+    }
+    Some(Ok(MarginalForm::Measure(build_constructor(
+        m,
+        "MvNormal",
+        &[("mu", mean), ("cov", marginal_cov)],
+    ))))
 }
 
 fn parameters(
@@ -195,39 +220,18 @@ fn real_array(m: &mut Module, value: NodeId) -> NodeId {
     build_call(m, "broadcast", &[head, value])
 }
 
-fn component_checks(
+fn component_valid(
     m: &mut Module,
     mu: NodeId,
     covariance: NodeId,
     offset: NodeId,
     noise: NodeId,
-) -> (NodeId, NodeId) {
+) -> NodeId {
     let prior_check = native_score(m, mu, covariance, mu);
     let noise_check = native_score(m, offset, noise, offset);
     let valid_prior = build_call(m, "isfinite", &[prior_check]);
     let valid_noise = build_call(m, "isfinite", &[noise_check]);
-    let valid = build_call(m, "land", &[valid_prior, valid_noise]);
-    let invalid = build_call(m, "add", &[prior_check, noise_check]);
-    (valid, invalid)
-}
-
-fn logpdf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
-    let [mu, covariance, matrix, offset, noise] =
-        [params[0], params[1], params[2], params[3], params[4]];
-    // The original A*z is real because z is Gaussian. Preserve that arithmetic
-    // even when the authored means, matrices, and covariances are integers.
-    let [mu, covariance, matrix, offset, noise] =
-        [mu, covariance, matrix, offset, noise].map(|value| real_array(m, value));
-    let mean = build_call(m, "mul", &[matrix, mu]);
-    let mean = build_call(m, "add", &[mean, offset]);
-    let ac = build_call(m, "mul", &[matrix, covariance]);
-    let transpose = build_call(m, "transpose", &[matrix]);
-    let propagated = build_call(m, "mul", &[ac, transpose]);
-    let marginal_cov = build_call(m, "add", &[propagated, noise]);
-    let score = native_score(m, mean, marginal_cov, super::sole_variate(variates));
-    // Valid marginal covariance must not mask an invalid component covariance.
-    let (valid, invalid) = component_checks(m, mu, covariance, offset, noise);
-    build_call(m, "ifelse", &[valid, score, invalid])
+    build_call(m, "land", &[valid_prior, valid_noise])
 }
 
 fn declared_draw(m: &Module, mut value: NodeId) -> Option<(Symbol, NodeId)> {
@@ -320,7 +324,7 @@ pub(crate) fn conditional_draw(
     let kt = build_call(m, "transpose", &[gain]);
     let measurement = build_call(m, "mul", &[kr, kt]);
     let posterior_cov = build_call(m, "add", &[propagated, measurement]);
-    let (valid, _) = component_checks(m, mu, covariance, offset, noise);
+    let valid = component_valid(m, mu, covariance, offset, noise);
     let invalid = build_call(m, "neg", &[identity]);
     let posterior_cov = build_call(m, "ifelse", &[valid, posterior_cov, invalid]);
     let measure = build_constructor(
