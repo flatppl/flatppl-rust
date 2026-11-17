@@ -88,14 +88,26 @@ fn projection_pushforward_is_never() {
 }
 
 #[test]
-fn polygamma_has_no_stan_function() {
+fn law_with_no_stan_density_is_never() {
     let r = refuse(&posterior(
-        "sf = standard_module(\"special-functions\", \"0.1\")\n\
-         mu ~ Normal(0, 1)\ny ~ Normal(sf.polygamma(2, exp(mu)), 1)",
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         mu ~ Normal(0, 1)\ny ~ hep.Voigtian(mean = mu, width = 1.0, sigma = 0.5)",
         "lawof(record(mu = mu))",
         "kernelof(record(y = y), mu = mu)",
     ));
     assert_eq!(r.kind, RefusalKind::NoStanFunction, "{r}");
+    assert!(r.reason.contains("Voigtian"), "{r}");
+}
+
+#[test]
+fn unverified_mapping_is_not_yet() {
+    let r = refuse(&posterior(
+        "sf = standard_module(\"special-functions\", \"0.1\")\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(sf.polygamma(1, exp(mu)), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("polygamma"), "{r}");
 }
 

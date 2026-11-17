@@ -95,6 +95,8 @@ pub(crate) struct Emitter<'m> {
     links: Vec<(Symbol, Symbol)>,
     /// `functions` block sources, deduplicated.
     functions: Vec<String>,
+    /// Fresh data sizes, by (variable, axis).
+    fresh_sizes: HashMap<(String, usize), String>,
     /// (record binding, field) → data leaf name.
     leaves: HashMap<(Symbol, String), String>,
     in_progress: HashSet<Symbol>,
@@ -155,6 +157,7 @@ impl<'m> Emitter<'m> {
             decls: HashMap::new(),
             links: vec![],
             functions: vec![],
+            fresh_sizes: HashMap::new(),
             leaves: HashMap::new(),
             in_progress: HashSet::new(),
             sizes,
@@ -263,23 +266,71 @@ impl<'m> Emitter<'m> {
     // ---------------------------------------------------------------- sizes
 
     /// A static extent, named by the unique fixed integer binding with that value.
-    fn size(&mut self, n: u32) -> String {
+    /// The extent `n` of axis `axis` (of `naxes`) of `owner`. A binding the
+    /// model ties to that axis (`hint`) names it. Otherwise the one fixed int
+    /// binding with that value names it; when several share the value, a
+    /// fresh data size `N_<owner>` does, so no coincidence picks a name.
+    fn size(
+        &mut self,
+        n: u32,
+        hint: Option<NodeId>,
+        owner: &str,
+        axis: usize,
+        naxes: usize,
+    ) -> String {
+        if let Some(h) = hint {
+            match self.m.node(self.resolve(h)) {
+                Node::Lit(Scalar::Int(v)) if *v == i64::from(n) => match self.self_ref(h) {
+                    Some(sym) => {
+                        if let Ok(name) = self.bind(*self.m.alias_chain(sym).last().unwrap()) {
+                            return name;
+                        }
+                    }
+                    // The model wrote the number itself.
+                    None => return n.to_string(),
+                },
+                _ => {}
+            }
+        }
         match self.sizes.get(&n).map(Vec::as_slice) {
+            None | Some([]) => n.to_string(),
             Some([sym]) => {
                 let sym = *sym;
                 self.bind(sym).unwrap_or_else(|_| n.to_string())
             }
-            _ => n.to_string(),
+            Some(_) => {
+                let key = (owner.to_string(), axis);
+                if let Some(s) = self.fresh_sizes.get(&key) {
+                    return s.clone();
+                }
+                let base = if naxes > 1 {
+                    format!("N_{owner}_{}", axis + 1)
+                } else {
+                    format!("N_{owner}")
+                };
+                let s = self.fresh(&base);
+                self.data.push(format!("int<lower=0> {s};"));
+                self.json.insert(s.clone(), Value::from(n));
+                self.fresh_sizes.insert(key, s.clone());
+                s
+            }
         }
     }
 
-    fn declare(&mut self, node: NodeId, vs: Option<&ValueSet>, bounded: bool) -> Result<StanType> {
+    fn declare(
+        &mut self,
+        node: NodeId,
+        vs: Option<&ValueSet>,
+        bounded: bool,
+        owner: &str,
+        hints: &[Option<NodeId>],
+    ) -> Result<StanType> {
         let ty = self
             .m
             .type_of(node)
             .cloned()
             .ok_or_else(|| Refusal::not_yet(Some(node), "an untyped value"))?;
-        self.declare_ty(&ty, vs, bounded, node)
+        self.declare_ty(&ty, vs, bounded, node, owner, hints)
     }
 
     fn declare_ty(
@@ -288,9 +339,11 @@ impl<'m> Emitter<'m> {
         vs: Option<&ValueSet>,
         bounded: bool,
         node: NodeId,
+        owner: &str,
+        hints: &[Option<NodeId>],
     ) -> Result<StanType> {
-        // A two-pass size resolution: collect extents, then name them, so the
-        // size closure does not borrow `self` while `declare` runs.
+        // Collect the extents first, then name them, so the size closure does
+        // not borrow `self` while `declare` runs.
         let mut extents = Vec::new();
         declare(
             ty,
@@ -298,13 +351,18 @@ impl<'m> Emitter<'m> {
             bounded,
             &mut |n| {
                 extents.push(n);
-                format!("\u{0}{}\u{0}", extents.len() - 1)
+                String::new()
             },
             node,
         )?;
-        let names: Vec<String> = extents.iter().map(|&n| self.size(n)).collect();
+        let naxes = extents.len();
+        let names: Vec<String> = extents
+            .iter()
+            .enumerate()
+            .map(|(a, &n)| self.size(n, hints.get(a).copied().flatten(), owner, a, naxes))
+            .collect();
         let mut k = 0;
-        let t = declare(
+        declare(
             ty,
             vs,
             bounded,
@@ -313,8 +371,92 @@ impl<'m> Emitter<'m> {
                 names[k - 1].clone()
             },
             node,
-        )?;
-        Ok(t)
+        )
+    }
+
+    /// The axis-size expressions a set names: `cartpow(S, [m, n])` gives
+    /// `[m, n]` then S's own axes.
+    pub(super) fn set_hints(&self, set: NodeId) -> Vec<Option<NodeId>> {
+        let s = self.resolve(set);
+        let Some(c) = self.call(s) else {
+            return vec![];
+        };
+        match self.head(s) {
+            Some("cartpow") if c.args.len() == 2 => {
+                let n = c.args[1];
+                let mut out = self.extent_list(n);
+                out.extend(self.set_hints(c.args[0]));
+                out
+            }
+            Some("stdsimplex" | "ordered" | "zerosum") if c.args.len() == 1 => {
+                vec![Some(c.args[0])]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// `n` or `[m, n]` as per-axis size expressions.
+    fn extent_list(&self, n: NodeId) -> Vec<Option<NodeId>> {
+        let r = self.resolve(n);
+        if self.head(r) == Some("vector") {
+            self.call(r)
+                .unwrap()
+                .args
+                .iter()
+                .map(|&a| Some(a))
+                .collect()
+        } else {
+            vec![Some(n)]
+        }
+    }
+
+    /// The axis sizes a prior law names: `iid` counts, then the law's own
+    /// variate length (`Dirichlet(ones(K))`).
+    pub(super) fn law_hints(&self, law: NodeId) -> Vec<Option<NodeId>> {
+        let m = self.resolve(law);
+        let Some(c) = self.call(m) else {
+            return vec![];
+        };
+        match self.head(m) {
+            Some("iid") if c.args.len() == 2 => {
+                let mut out = self.extent_list(c.args[1]);
+                out.extend(self.law_hints(c.args[0]));
+                out
+            }
+            Some("normalize" | "truncate") => self.law_hints(c.args[0]),
+            Some(name @ ("Dirichlet" | "MvNormal")) => self
+                .law_args(name, m)
+                .ok()
+                .map(|a| vec![self.length_hint(a[0])])
+                .unwrap_or_default(),
+            Some("LKJCholesky") => self
+                .law_args("LKJCholesky", m)
+                .ok()
+                .map(|a| vec![Some(a[0]), Some(a[0])])
+                .unwrap_or_default(),
+            _ => vec![],
+        }
+    }
+
+    /// The length expression of `ones(K)`, `zeros(K)` or `fill(x, K)`.
+    fn length_hint(&self, e: NodeId) -> Option<NodeId> {
+        let r = self.resolve(e);
+        let c = self.call(r)?;
+        match (self.head(r)?, c.args.as_ref()) {
+            ("ones" | "zeros", [n]) | ("fill", [_, n]) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The declared set of a `load_data` call (its second argument).
+    fn load_set(&self, call: NodeId) -> Option<NodeId> {
+        let c = self.call(call)?;
+        c.args.get(1).copied().or_else(|| {
+            c.named
+                .iter()
+                .find(|na| self.name(na.name) == "valueset")
+                .map(|na| na.value)
+        })
     }
 
     // ------------------------------------------------------------- bindings
@@ -373,7 +515,11 @@ impl<'m> Emitter<'m> {
                     ));
                 }
                 let stan = self.fresh(name);
-                let t = self.declare(rhs, self.m.valueset_of(rhs), true)?;
+                let hints = self
+                    .load_set(rhs)
+                    .map(|s| self.set_hints(s))
+                    .unwrap_or_default();
+                let t = self.declare(rhs, self.m.valueset_of(rhs), true, &stan, &hints)?;
                 self.data.push(format!("{};", t.render(&stan)));
                 self.record_decl(&stan, t);
                 self.deferred.push(DataSource {
@@ -404,7 +550,7 @@ impl<'m> Emitter<'m> {
             && let Some(v) = data::const_json(self.m, rhs)
         {
             let stan = self.fresh(name);
-            let mut t = self.declare(rhs, None, false)?;
+            let mut t = self.declare(rhs, None, false, &stan, &[])?;
             if t.is_int() && t.rank() == 0 && self.sizes.values().any(|v| v.contains(&sym)) {
                 t.bounds.lower = Some("0".into());
             }
@@ -431,14 +577,14 @@ impl<'m> Emitter<'m> {
         let lines = match attempt {
             Ok(e) => {
                 let stan = self.fresh(base);
-                let t = self.declare(rhs, None, false)?;
+                let t = self.declare(rhs, None, false, &stan, &[])?;
                 let line = format!("{} = {};", t.render(&stan), e.s);
                 self.record_decl(&stan, t);
                 (stan, vec![line])
             }
             Err(r) if r.kind == RefusalKind::NotYetSupported && self.elementwise(rhs) => {
                 let stan = self.fresh(base);
-                let t = self.declare(rhs, None, false)?;
+                let t = self.declare(rhs, None, false, &stan, &[])?;
                 let lines = self.fill_loops(&stan, &t, rhs)?;
                 self.record_decl(&stan, t);
                 (stan, lines)
@@ -501,7 +647,23 @@ impl<'m> Emitter<'m> {
             self.fresh(fname)
         };
         let vs = self.m.valueset_of(node).cloned();
-        let t = self.declare(node, vs.as_ref(), true)?;
+        // The field's declared set names its axes.
+        let hints = match self.head(rhs) {
+            Some("load_data") => self
+                .load_set(rhs)
+                .map(|s| self.resolve(s))
+                .and_then(|s| self.call(s))
+                .and_then(|c| {
+                    c.named
+                        .iter()
+                        .find(|na| self.name(na.name) == fname)
+                        .map(|na| na.value)
+                })
+                .map(|s| self.set_hints(s))
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        let t = self.declare(node, vs.as_ref(), true, &stan, &hints)?;
         self.data.push(format!("{};", t.render(&stan)));
         self.record_decl(&stan, t);
         match self.head(rhs) {
@@ -695,6 +857,7 @@ impl<'m> Emitter<'m> {
     ) -> Result<Ex> {
         let row = tables::function(name, module)
             .filter(|r| matches!(r.kind.as_str(), "builtin" | "helper"))
+            .filter(|r| !r.status.starts_with("unverified"))
             .filter(|r| r.args.len() == parts.len() && !r.args.iter().any(|a| a == "..."))
             .ok_or_else(|| Refusal::not_yet(Some(id), name.to_string()))?;
         if row.kind == "helper" && !self.functions.contains(&row.functions) {
@@ -740,37 +903,6 @@ impl<'m> Emitter<'m> {
             ));
         }
         let args = c.args.to_vec();
-        // polygamma(n, x): Stan has the orders 0 and 1 only.
-        if fname == "polygamma" && args.len() == 2 {
-            let order = match self.m.node(self.resolve(args[0])) {
-                Node::Lit(Scalar::Int(n)) => Some(*n),
-                _ => None,
-            };
-            match order {
-                Some(0) => {
-                    let x = self.real(args[1])?;
-                    return self.table_fn(id, "digamma", Some(&module), vec![x]);
-                }
-                Some(1) => {}
-                Some(_) => {
-                    return Err(Refusal::new(
-                        RefusalKind::NoStanFunction,
-                        Some(id),
-                        member.clone(),
-                        format!(
-                            "`{member}` of order 2 or more has no Stan function; Stan has \
-                             `digamma` and `trigamma` (orders 0 and 1) only"
-                        ),
-                    ));
-                }
-                None => {
-                    return Err(Refusal::not_yet(
-                        Some(id),
-                        format!("`{member}` of a computed order"),
-                    ));
-                }
-            }
-        }
         let mut parts = Vec::new();
         for a in &args {
             parts.push(self.real(*a)?);
@@ -780,7 +912,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// The standard-module name a callee reference resolves into.
-    fn standard_module(&self, callee: NodeId) -> Option<String> {
+    pub(super) fn standard_module(&self, callee: NodeId) -> Option<String> {
         let Node::Ref(r) = self.m.node(callee) else {
             return None;
         };

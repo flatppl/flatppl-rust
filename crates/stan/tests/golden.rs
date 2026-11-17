@@ -1,10 +1,31 @@
 //! Emitted Stan text for each `golden/*.flatppl`, compared with `*.stan` and
-//! `*.data.json`. Set `FLATPPL_BLESS=1` to rewrite the expected files.
+//! `*.data.json`. Set `FLATPPL_BLESS=1` to rewrite the expected files. A first
+//! line `# emit: derived=transformed-parameters` sets an option.
 //!
 //! These goldens check structure only. The posteriordb round trip in
 //! flatppl-testsuite checks the numbers.
 
 use std::path::Path;
+
+/// Options from a leading `# emit: derived=transformed-parameters` line.
+fn options(source: &str) -> flatppl_stan::EmitOptions {
+    let mut opts = flatppl_stan::EmitOptions::default();
+    if let Some(rest) = source
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("# emit: "))
+    {
+        for kv in rest.split_whitespace() {
+            match kv.split_once('=') {
+                Some(("derived", v)) => {
+                    opts.derived = flatppl_stan::Placement::parse(v).expect("derived value")
+                }
+                _ => panic!("unknown emit option `{kv}`"),
+            }
+        }
+    }
+    opts
+}
 
 fn emit(source: &str) -> flatppl_stan::StanProgram {
     let mut module = flatppl_syntax::parse(source).expect("parse");
@@ -15,7 +36,7 @@ fn emit(source: &str) -> flatppl_stan::StanProgram {
             .all(|d| d.severity != flatppl_infer::Severity::Error),
         "{diagnostics:?}"
     );
-    flatppl_stan::emit(&module, &flatppl_stan::EmitOptions::default()).expect("emit")
+    flatppl_stan::emit(&module, &options(source)).expect("emit")
 }
 
 #[test]

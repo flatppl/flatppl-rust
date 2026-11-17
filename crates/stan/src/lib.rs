@@ -17,7 +17,7 @@
 //! Every term is a `~` statement. Stan keeps every constant of a `~` term when
 //! the density is evaluated with `propto=false`, so the program's log density
 //! at `propto=false, jacobian=false` equals FlatPPL's, including the
-//! normalizer of a truncated law (`T[L, U]`, see [`Truncation`]).
+//! normalizer of a truncated law, written `T[L, U]`.
 //!
 //! A construct with no sensible Stan form refuses with a never-kind
 //! [`RefusalKind`]; one this emitter does not write yet refuses with
@@ -45,23 +45,12 @@ pub enum Placement {
     TransformedParameters,
 }
 
-/// How a normalized truncation (`normalize(truncate(D, S))`) is written.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Truncation {
-    /// `x ~ D(...) T[L, U]`: exact, matches FlatPPL's log density.
-    #[default]
-    Explicit,
-    /// The declaration bound only: the common idiom, off by the log mass of
-    /// the truncation when the density is evaluated with `propto=false`.
-    BoundOnly,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct EmitOptions {
     /// The target binding; `None` picks the module's single `bayesupdate`.
     pub target: Option<String>,
+    /// Where values that depend on parameters go (`--derived`).
     pub derived: Placement,
-    pub truncation: Truncation,
 }
 
 /// One Stan parameter and the FlatPPL field it stands for.
@@ -80,6 +69,17 @@ pub struct Manifest {
     pub target: String,
     /// Parameters in declaration order.
     pub parameters: Vec<ManifestParam>,
+}
+
+impl Placement {
+    /// The `--derived` spelling.
+    pub fn parse(s: &str) -> Option<Placement> {
+        match s {
+            "model" => Some(Placement::ModelLocals),
+            "transformed-parameters" => Some(Placement::TransformedParameters),
+            _ => None,
+        }
+    }
 }
 
 impl Manifest {

@@ -2,10 +2,10 @@
 
 use super::pattern;
 use super::{Emitter, Ex, P_ATOM, PriorField};
+use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
 use crate::tables;
-use crate::{ManifestParam, Truncation};
 use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Symbol, Type, ValueSet};
 use std::collections::HashMap;
 
@@ -272,7 +272,11 @@ impl<'m> Emitter<'m> {
                 ));
             }
             let stan = self.fresh(self.name(f.field));
-            let mut t = self.declare_ty(&ty, vs.as_ref(), true, f.node)?;
+            let hints = match f.law {
+                Some(law) => self.law_hints(law),
+                None => self.set_hints(f.node),
+            };
+            let mut t = self.declare_ty(&ty, vs.as_ref(), true, f.node, &stan, &hints)?;
             // A support the value set cannot state (a computed bound) comes from
             // the law itself.
             if let Some(law) = f.law
@@ -364,7 +368,11 @@ impl<'m> Emitter<'m> {
             let rhs = self.m.binding(self.m.binding_by_name(sym).unwrap()).rhs;
             let stan = self.fresh(self.name(name));
             let vs = self.m.valueset_of(rhs).cloned();
-            let t = self.declare(rhs, vs.as_ref(), true)?;
+            let hints = match self.call(rhs) {
+                Some(c) if self.head(rhs) == Some("elementof") => self.set_hints(c.args[0]),
+                _ => vec![],
+            };
+            let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
             self.env.insert(sym, stan.clone());
@@ -488,14 +496,14 @@ impl<'m> Emitter<'m> {
         }
         if let Some(v) = crate::data::const_json(self.m, o.value) {
             let stan = self.fresh(&o.name);
-            let t = self.declare(o.value, None, false)?;
+            let t = self.declare(o.value, None, false, &stan, &[])?;
             self.data.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
             self.json.insert(stan.clone(), v);
             return Ok(stan);
         }
         let stan = self.fresh(&o.name);
-        let t = self.declare(o.value, None, false)?;
+        let t = self.declare(o.value, None, false, &stan, &[])?;
         self.tdata.push(format!("{} = {};", t.render(&stan), e.s));
         self.record_decl(&stan, t);
         Ok(stan)
@@ -593,11 +601,7 @@ impl<'m> Emitter<'m> {
                 if self.head(inner) != Some("truncate") {
                     return Err(Refusal::not_yet(Some(m), "normalize of this measure"));
                 }
-                let mut law = self.truncated(inner)?;
-                if self.opts.truncation == Truncation::BoundOnly {
-                    law.trunc = None;
-                }
-                Ok(law)
+                self.truncated(inner)
             }
             // An unnormalized restriction keeps the density; the declaration bound
             // carries the support.
@@ -654,6 +658,20 @@ impl<'m> Emitter<'m> {
                     ));
                 }
                 Err(Refusal::not_yet(Some(m), "pushfwd"))
+            }
+            "%call" => {
+                let c = self.call(m).unwrap();
+                let flatppl_core::CallHead::User(callee) = c.head else {
+                    unreachable!()
+                };
+                let (Node::Ref(r), Some(module)) =
+                    (self.m.node(callee), self.standard_module(callee))
+                else {
+                    return Err(Refusal::not_yet(Some(m), "a law from a user callable"));
+                };
+                let member = self.name(r.name);
+                let args = self.law_args(member, m)?;
+                self.table_law_in(m, member, Some(&module), &args, false)
             }
             name => {
                 let args = if name.starts_with(char::is_uppercase) {
@@ -790,8 +808,19 @@ impl<'m> Emitter<'m> {
         args: &[NodeId],
         broadcast: bool,
     ) -> Result<Law> {
+        self.table_law_in(m, name, None, args, broadcast)
+    }
+
+    fn table_law_in(
+        &mut self,
+        m: NodeId,
+        name: &str,
+        module: Option<&str>,
+        args: &[NodeId],
+        broadcast: bool,
+    ) -> Result<Law> {
         let mut found = None;
-        for row in tables::law_rows_by_head(name) {
+        for row in tables::law_rows_by_head(name, module) {
             let pat = pattern::parse(&row.pattern);
             let mut binds = HashMap::new();
             if self.match_call(&pat, args, &mut binds) {
@@ -806,21 +835,32 @@ impl<'m> Emitter<'m> {
             ));
         };
         match row.kind.as_str() {
+            // Point processes lower structurally (per-bin `poisson`, an
+            // extended likelihood), not through a law row.
             "none" if matches!(name, "PoissonProcess" | "BinnedPoissonProcess") => {
                 return Err(Refusal::not_yet(Some(m), name.to_string()));
             }
             "none" => {
                 return Err(Refusal::new(
-                    RefusalKind::NoStanLaw,
+                    RefusalKind::NoStanFunction,
                     Some(m),
                     name.to_string(),
                     format!("`{name}` has no Stan density: {}", row.note),
                 ));
             }
-            "custom_lpdf" if !self.functions.contains(&row.functions) => {
-                self.functions.push(row.functions.clone());
+            "custom_lpdf" => {
+                return Err(Refusal::not_yet(
+                    Some(m),
+                    format!("the law `{name}` (a user-defined Stan density)"),
+                ));
             }
             _ => {}
+        }
+        if row.status.starts_with("unverified") {
+            return Err(Refusal::not_yet(
+                Some(m),
+                format!("the law `{name}` (its Stan mapping is unverified)"),
+            ));
         }
         if !row.normalized {
             return Err(Refusal::not_yet(

@@ -1,0 +1,13 @@
+# emit: derived=transformed-parameters
+flatppl_compat = "0.1"
+N = 4
+x = [1.0, 2.0, 3.0, 4.0]
+y_obs = [1.9, 2.8, 4.2, 4.9]
+alpha ~ Normal(0, 10)
+beta ~ Normal(0, 10)
+tau ~ Gamma(shape = 2.0, rate = 1.0)
+sigma = 1 / sqrt(tau)
+y ~ Normal.(alpha .+ beta .* x, sigma)
+prior = lawof(record(alpha = alpha, beta = beta, tau = tau))
+L = likelihoodof(kernelof(record(y = y), alpha = alpha, beta = beta, tau = tau), record(y = y_obs))
+post = bayesupdate(L, prior)

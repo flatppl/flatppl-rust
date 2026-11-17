@@ -23,10 +23,9 @@ pub enum RefusalKind {
     NumericNormalizer,
     /// `pushfwd` through a map that is not a bijection.
     NonBijectivePushfwd,
-    /// A function with no Stan counterpart.
+    /// A law or function with no Stan counterpart (`kind: "none"` in the
+    /// mapping tables).
     NoStanFunction,
-    /// A law with no Stan density.
-    NoStanLaw,
     /// A construct with a Stan form this emitter does not write yet.
     NotYetSupported,
 }

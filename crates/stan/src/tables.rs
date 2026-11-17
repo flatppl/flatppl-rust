@@ -82,12 +82,14 @@ fn sets() -> &'static [SetRow] {
     T.get_or_init(|| parse("sets.ron", include_str!("../tables/sets.ron")))
 }
 
-/// The builtin-law rows whose pattern's outer call is `head`, most specific
+/// The law rows whose pattern's outer call is `head`, most specific
 /// first. `locscale(StudentT(nu), mu, sigma)` is found under `locscale`.
-pub(crate) fn law_rows_by_head(head: &str) -> Vec<&'static LawRow> {
+pub(crate) fn law_rows_by_head(head: &str, module: Option<&str>) -> Vec<&'static LawRow> {
     let mut rows: Vec<&LawRow> = laws()
         .iter()
-        .filter(|r| r.module.is_none() && r.pattern.split('(').next() == Some(head))
+        .filter(|r| {
+            module_matches(r.module.as_deref(), module) && r.pattern.split('(').next() == Some(head)
+        })
         .collect();
     rows.sort_by_key(|r| r.kind != "composition");
     rows
@@ -215,6 +217,9 @@ mod tests {
         assert!(super::laws().len() > 40);
         assert!(super::functions().len() > 100);
         assert!(super::sets().len() > 10);
-        assert_eq!(super::law_rows_by_head("Bernoulli")[0].kind, "composition");
+        assert_eq!(
+            super::law_rows_by_head("Bernoulli", None)[0].kind,
+            "composition"
+        );
     }
 }

@@ -324,6 +324,10 @@ enum Command {
         /// The posterior or likelihood binding to emit.
         #[arg(long)]
         target: Option<String>,
+        /// Where values that depend on parameters go: `model` block locals,
+        /// or `transformed-parameters` (written to the output on every draw).
+        #[arg(long, default_value = "model", value_parser = ["model", "transformed-parameters"])]
+        derived: String,
         /// Write the Stan JSON data here (reads `load_data` sources).
         #[arg(long)]
         data: Option<PathBuf>,
@@ -575,12 +579,16 @@ fn main() -> ExitCode {
         Command::Stan {
             input,
             target,
+            derived,
             data,
             manifest,
             output,
         } => stan_cmd(
             &input,
-            target,
+            flatppl_stan::EmitOptions {
+                target,
+                derived: flatppl_stan::Placement::parse(&derived).expect("clap checks --derived"),
+            },
             data.as_deref(),
             manifest.as_deref(),
             output.as_deref(),
@@ -1511,17 +1519,13 @@ fn stablehlo_cmd(
 #[cfg(feature = "stan")]
 fn stan_cmd(
     input: &Path,
-    target: Option<String>,
+    opts: flatppl_stan::EmitOptions,
     data: Option<&Path>,
     manifest: Option<&Path>,
     output: Option<&Path>,
 ) -> Result<(), Failure> {
     let resolver = CliResolver::cache_only();
     let (module, _bundle, source) = load_and_infer(input, &resolver, &[])?;
-    let opts = flatppl_stan::EmitOptions {
-        target,
-        ..Default::default()
-    };
     let refuse = |e: flatppl_stan::Refusal| {
         let mut site = String::new();
         if let Some(node) = e.node {
