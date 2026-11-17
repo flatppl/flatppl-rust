@@ -75,6 +75,8 @@ use flatppl_core::{
     Symbol, Type, ValueSet,
 };
 
+mod beta;
+
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
 /// determiniser emits one density sub-tree per atom). A finite but large latent
 /// is treated as non-enumerable.
@@ -486,6 +488,13 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         conjugating_param: "rate",
         latent_path: LatentPath::Direct,
         build_marginal: build_gamma_poisson_marginal,
+    },
+    ConjugateRow {
+        prior: "Beta",
+        likelihood: "Bernoulli",
+        conjugating_param: "p",
+        latent_path: LatentPath::Direct,
+        build_marginal: beta::bernoulli_marginal,
     },
     ConjugateRow {
         prior: "Beta",
@@ -1378,6 +1387,9 @@ pub(crate) fn shared_latent_record_law(
     }
 
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
+    if m.resolve(prior_sym) == "Beta" {
+        return beta::shared_law(m, latent, &prior_kwargs, field_measures);
+    }
     if m.resolve(prior_sym) == "Gamma" {
         let alpha = find_kwarg(m, &prior_kwargs, "shape")?;
         let beta = find_kwarg(m, &prior_kwargs, "rate")?;
