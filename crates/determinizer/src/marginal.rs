@@ -75,6 +75,8 @@ use flatppl_core::{
     Symbol, Type, ValueSet,
 };
 
+pub(crate) mod gaussian;
+
 /// Above this many atoms, refuse: an enumerated logsumexp must stay small (the
 /// determiniser emits one density sub-tree per atom). A finite but large latent
 /// is treated as non-enumerable.
@@ -617,6 +619,10 @@ fn build_conjugate_marginal(
     // `resolve` borrow across them).
     let prior_name = m.resolve(prior_sym).to_string();
     let lik_name = m.resolve(lik_sym).to_string();
+
+    if prior_name == "MvNormal" && lik_name == "MvNormal" {
+        return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
+    }
 
     // EVERY row whose prior + likelihood families match is tried, not just the first: two
     // rows may share a family pair and differ only in which parameter the latent feeds, or

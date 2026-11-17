@@ -9818,6 +9818,8 @@ fn refuse_nonboolean_domain(
 ///   and `compat` "a compatibility version string".
 /// - `get`, `get0` — §03 "Records": "`r.name1` (lowers to `get(r, "name1")`)", so
 ///   every SELECTOR position is textual. Position 0 is the container and is not.
+/// - `disintegrate` — §06 "Structural disintegration" uses the `get` selector
+///   convention: a string selects the bare field, a string vector its record.
 /// - `equal`, `unequal` — §07 "Operator-equivalent functions" gives this pair the
 ///   domains "`integers`, `booleans`, strings", the only §07 row that names
 ///   strings.
@@ -9835,6 +9837,7 @@ fn string_domain_positions(name: &str) -> Option<&'static [usize]> {
         "load_data" | "load_module" => Some(&[0]),
         "standard_module" => Some(&[0, 1]),
         "get" | "get0" => Some(&[1, usize::MAX]),
+        "disintegrate" => Some(&[0]),
         "equal" | "unequal" => Some(&[0, 1]),
         "vector" | "cat" => Some(&[0, usize::MAX]),
         _ => None,

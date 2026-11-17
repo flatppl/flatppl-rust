@@ -4,7 +4,8 @@
 //! A literal record split exposes its complement fields as keyword-only inputs.
 //! A literal vector split exposes one ordered input, `complement`, containing the
 //! non-selected values in source order. Both preserve the selected value DAG and
-//! refuse empty or causally reversed partitions, and repeated vector selectors.
+//! refuse empty partitions and repeated vector selectors. A reversed record
+//! partition additionally supports one affine Gaussian edge.
 
 use crate::density::{expect_builtin_call, resolve_ref};
 use flatppl_core::{
@@ -33,7 +34,7 @@ use std::collections::HashSet;
 /// - the selected or the non-selected set is empty (a vacuous split);
 /// - a NON-selected field's value is not a bare `%ref` (its boundary-input
 ///   `Ref` cannot be formed — outside the explicit-DAG shape);
-/// - the NON-selected marginal is not closed: some non-selected field
+/// - outside the affine Gaussian case, the NON-selected marginal is not closed: some non-selected field
 ///   transitively DEPENDS on a selected field (a causally REVERSED selector), so
 ///   `jointchain(marginal, kernel) ≢ joint` (§06 "Structural disintegration").
 pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
@@ -175,8 +176,8 @@ fn split_law_record(
     // intersection is exact. If it is non-empty, a non-selected field
     // (transitively) depends on a selected variate → the marginal is not closed
     // and the selector is causally REVERSED → refuse (fail-closed,
-    // refuse-don't-mislower). The reverse-direction disintegrate (§06 "two
-    // formulations") is a separate follow-up, out of scope here.
+    // refuse-don't-mislower). One affine Gaussian edge instead has an exact
+    // reverse conditional. Its complement still uses the ordinary marginalizer.
     let mut selected_bindings: HashSet<Symbol> = HashSet::new();
     for &(_, value) in &selected_fields {
         collect_selected_bindings(m, value, &mut selected_bindings);
@@ -189,7 +190,9 @@ fn split_law_record(
         .iter()
         .any(|name| selected_bindings.contains(name))
     {
-        return None;
+        let draw =
+            crate::marginal::gaussian::conditional_draw(m, &selected_fields, &nonselected_fields)?;
+        selected_fields[0].1 = draw;
     }
 
     // Build the kernel: `kernelof(record(<selected fields>), %specinputs(…))`.
@@ -284,7 +287,17 @@ fn split_law_vector(m: &mut Module, selector: NodeId, measure: NodeId) -> Option
     let record_law = crate::density::build_call(m, "lawof", &[record]);
     let (named_kernel, _) = split_law_record(m, &selected, record_law)?;
     let boundary = m.auto_inputs_of(named_kernel)?.to_vec();
-    let selected_values: Vec<_> = indices.iter().map(|i| values[*i as usize - 1]).collect();
+    let named_body = expect_builtin_call(m, named_kernel, "kernelof")?.args[0];
+    let named_fields = &expect_builtin_call(m, named_body, "record")?.named;
+    let selected_values: Vec<_> = selected
+        .iter()
+        .map(|label| {
+            named_fields
+                .iter()
+                .find(|field| m.resolve(field.name) == label.as_ref())
+                .map(|field| field.value)
+        })
+        .collect::<Option<_>>()?;
     let body = if scalar {
         selected_values[0]
     } else {
@@ -363,7 +376,7 @@ fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbo
             if out.insert(name)
                 && let Some(bid) = m.binding_by_name(name)
             {
-                stack.push(m.binding(bid).rhs);
+                stack.push(m.declared_binding_rhs(bid));
             }
             continue;
         }
@@ -377,7 +390,7 @@ fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbo
                     && out.insert(r.name)
                     && let Some(bid) = m.binding_by_name(r.name)
                 {
-                    stack.push(m.binding(bid).rhs);
+                    stack.push(m.declared_binding_rhs(bid));
                 }
             }
         }
