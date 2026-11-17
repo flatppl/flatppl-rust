@@ -76,7 +76,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// The element of `node` at the loop indices `idx` (one per axis).
-    fn elem(&mut self, node: NodeId, idx: &[String]) -> Result<Ex> {
+    pub(super) fn elem(&mut self, node: NodeId, idx: &[String]) -> Result<Ex> {
         let rank = self.shape(node).map(|s| s.rank).unwrap_or(0);
         if rank == 0 {
             return self.expr(node);
@@ -86,6 +86,9 @@ impl<'m> Emitter<'m> {
             Some("broadcast") => {
                 let c = c.unwrap();
                 let Node::Const(f) = self.m.node(c.args[0]) else {
+                    if self.user_callee(c.args[0]).is_some() {
+                        return self.elem_indexed(node, node, idx);
+                    }
                     return Err(Refusal::not_yet(Some(node), "broadcast of a user function"));
                 };
                 let f = self.name(*f);
@@ -130,13 +133,27 @@ impl<'m> Emitter<'m> {
             return Ok(Ex::atom(s));
         }
         let e = self.expr(x)?;
-        if e.prec < P_ATOM || !e.s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(Refusal::not_yet(
-                Some(at),
-                "an elementwise use of this expression",
-            ));
+        // A short literal indexes in place: `([a, b]')[i]`.
+        if self.head(x) == Some("vector") {
+            return Ok(Ex::atom(format!("({})[{}]", e.s, idx.join(", "))));
         }
-        let dims = self.m.type_of(x).map(dims_of).unwrap_or_default();
+        // Any other value is computed once, then indexed.
+        let e = if e.prec < P_ATOM || !e.s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if self.shape(x).is_none_or(|s| s.rank == 0) {
+                return Err(Refusal::not_yet(
+                    Some(at),
+                    "an elementwise use of this expression",
+                ));
+            }
+            let base = match &self.owner {
+                Some((name, _)) => format!("{name}_part"),
+                None => "part".to_string(),
+            };
+            Ex::atom(self.place(&base, x, Ok(e))?)
+        } else {
+            e
+        };
+        let dims = self.ty(x).as_ref().map(dims_of).unwrap_or_default();
         let parts: Vec<String> = idx
             .iter()
             .enumerate()

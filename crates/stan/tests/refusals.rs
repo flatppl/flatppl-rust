@@ -173,3 +173,29 @@ fn diagonal_axis_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("repeated axis"), "{r}");
 }
+
+#[test]
+fn user_broadcast_over_a_table_is_not_yet() {
+    let r = refuse(&posterior(
+        "rows = table(a = [1.0, 2.0], b = [3.0, 4.0])\n\
+         total(row) = row.a + row.b\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + sum(total.(rows)), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("table"), "{r}");
+}
+
+#[test]
+fn general_scan_is_not_yet() {
+    let r = refuse(&posterior(
+        "xs = [1.0, 2.0, 3.0]\n\
+         run = scan((acc, x) -> 0.5 * acc + x, 0.0, xs)\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + run[3], 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("scan"), "{r}");
+}

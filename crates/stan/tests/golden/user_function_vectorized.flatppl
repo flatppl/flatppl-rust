@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+x = [0.5, 1.0, 1.5, 2.0]
+y_obs = [1.1, 2.0, 3.2, 4.1]
+growth(t, a) = exp(a * t) + t
+centre(m, k) = Normal(2.0 * m - k, 0.5)
+a ~ Normal(0, 1)
+k ~ Normal(0, 1)
+y ~ centre.(growth.(x, a), k)
+prior = lawof(record(a = a, k = k))
+L = likelihoodof(kernelof(record(y = y), a = a, k = k), record(y = y_obs))
+post = bayesupdate(L, prior)

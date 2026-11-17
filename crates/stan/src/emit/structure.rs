@@ -640,7 +640,35 @@ impl<'m> Emitter<'m> {
             "broadcast" if broadcast => {
                 let c = self.call(m).unwrap();
                 let Node::Const(f) = self.m.node(c.args[0]) else {
-                    return Err(Refusal::not_yet(Some(m), "a broadcast of a user law"));
+                    // A user law: one vectorized statement when it can be,
+                    // else its body per element, in a loop.
+                    if let Some((body, ctx, nfull)) = self.vectorized_user_law(m)? {
+                        let outer = self.fctx.replace(ctx);
+                        let law = self.law(body, false);
+                        self.fctx = outer;
+                        // A template operator between two whole arrays would
+                        // not be elementwise.
+                        if let Ok(law) = law
+                            && law.vectorized
+                            && !law.multivariate
+                            && (nfull < 2 || !law.call.contains(['*', '/', '^']))
+                        {
+                            return Ok(law);
+                        }
+                    }
+                    let (body, ctx) = self.user_law_body(m, LOOP)?;
+                    let outer = self.fctx.replace(ctx);
+                    let law = self.law(body, false);
+                    let ctx = std::mem::replace(&mut self.fctx, outer);
+                    if ctx.is_some_and(|c| !c.lines.is_empty()) {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            "a user law whose arguments need statements",
+                        ));
+                    }
+                    let mut law = law?;
+                    law.vectorized = false;
+                    return Ok(law);
                 };
                 let name = self.name(*f);
                 if !c.named.is_empty() {
