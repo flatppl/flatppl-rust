@@ -182,7 +182,7 @@ impl Emitter<'_> {
     }
 
     /// DLMF 5.7.3, retaining log Gamma(1+a)/a when 1+a rounds to one.
-    fn special_log_gamma1p_over_a(&mut self, a: &Value) -> Value {
+    pub(super) fn special_log_gamma1p_over_a(&mut self, a: &Value) -> Value {
         let threshold = self.scalar(0.125);
         let small = self.compare("LT", a, &threshold);
         let safe = self.max(a, &threshold);
@@ -272,6 +272,10 @@ impl Emitter<'_> {
         let correction = self.mul(a, &sum);
         let correction = self.log1p(&correction);
         let log_p = self.add(&logarithm, &correction);
+        let split = self.scalar(-std::f64::consts::LN_2);
+        let small_p = self.compare("LT", &log_p, &split);
+        let complement = self.special_log1mexp(&log_p);
+        let log_q = self.select(&small_p, &complement, &log_q);
         (log_p, log_q)
     }
 
