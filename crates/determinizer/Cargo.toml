@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 flatppl-core = { path = "../core" }
 flatppl-infer = { path = "../infer" }
+flatppl-model-analysis = { path = "../model-analysis" }
 
 [dev-dependencies]
 flatppl-syntax = { path = "../syntax" }

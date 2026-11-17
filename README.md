@@ -15,6 +15,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-syntax`](crates/syntax) — canonical FlatPPL surface syntax: parse + print
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
+* [`flatppl-model-analysis`](crates/model-analysis) — dependency and coordinate facts for lowered queries
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-formula`](crates/formula) — Gaussian regression formulas → FlatPPL, with reusable data recipes
 * [`flatppl-convert`](crates/convert) — shared IR construction helpers for converters

@@ -626,6 +626,7 @@ dependencies = [
  "flatppl-core",
  "flatppl-flatpir",
  "flatppl-infer",
+ "flatppl-model-analysis",
  "flatppl-syntax",
 ]
 
@@ -746,6 +747,13 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "flatppl-model-analysis"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
 ]
 
 [[package]]
