@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+x = [0.5, 1.0, 1.5]
+y_obs = [1.1, 2.0, 3.2]
+z = [0.2, 0.4, 0.9]
+mu ~ Normal(mean(z), 1.0)
+beta ~ Normal(0, 1)
+y ~ Normal.(mu .+ beta .* x, 1.0)
+prior = lawof(record(mu = mu, beta = beta))
+L = likelihoodof(kernelof(record(y = y), mu = mu, beta = beta), record(y = y_obs))
+post = bayesupdate(L, prior)

@@ -1,6 +1,6 @@
 data {
-  int<lower=0> J;
   int<lower=0> N;
+  int<lower=0> J;
   vector[N] y_obs;
   array[N] int group;
 }

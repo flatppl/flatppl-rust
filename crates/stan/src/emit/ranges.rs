@@ -1,85 +1,37 @@
 //! Affine integer ranges: `indicesof(v)` and its integer shifts and scalings.
 //! Element `i` is `start + step * (i - 1)`. A unit-step range indexes as a
-//! slice `a:b`; any other prints as `linspaced_int_array`, never a loop.
+//! slice `a:b`; any other prints as `linspaced_int_array`, never a loop. The
+//! length and ends are symbolic, so the range follows the data's shape.
 
-use super::{Emitter, Ex, P_ADD, P_MUL, P_UNARY};
-use flatppl_core::{Node, NodeId, Scalar};
-
-/// `konst + extra`, an integer expression.
-#[derive(Clone, Debug)]
-struct Offset {
-    konst: i64,
-    extra: Option<Ex>,
-}
-
-impl Offset {
-    fn add(&self, c: i64, e: Option<&Ex>) -> Offset {
-        let extra = match (&self.extra, e) {
-            (None, None) => None,
-            (Some(a), None) => Some(a.clone()),
-            (None, Some(b)) => Some(b.clone()),
-            (Some(a), Some(b)) => Some(Ex {
-                s: format!("{} + {}", a.at(P_ADD), b.at(P_ADD + 1)),
-                prec: P_ADD,
-            }),
-        };
-        Offset {
-            konst: self.konst + c,
-            extra,
-        }
-    }
-
-    fn neg(&self) -> Offset {
-        Offset {
-            konst: -self.konst,
-            extra: self.extra.as_ref().map(|e| Ex {
-                s: format!("-{}", e.at(P_UNARY)),
-                prec: P_UNARY,
-            }),
-        }
-    }
-
-    fn scale(&self, k: i64) -> Offset {
-        Offset {
-            konst: self.konst * k,
-            extra: self.extra.as_ref().map(|e| Ex {
-                s: format!("{k} * {}", e.at(P_MUL + 1)),
-                prec: P_MUL,
-            }),
-        }
-    }
-
-    fn print(&self) -> String {
-        match &self.extra {
-            None => self.konst.to_string(),
-            Some(e) if self.konst == 0 => e.s.clone(),
-            Some(e) if self.konst > 0 => format!("{} + {}", e.at(P_ADD), self.konst),
-            Some(e) => format!("{} - {}", e.at(P_ADD), -self.konst),
-        }
-    }
-}
+use super::Emitter;
+use super::extents::Lin;
+use flatppl_core::{Dim, Node, NodeId, Scalar, Type};
 
 /// An affine range of `n` integers.
 pub(super) struct Range {
-    n: u32,
-    /// The length as the model writes it, for a plain `indicesof`.
-    written: Option<Ex>,
-    start: Offset,
+    n: Lin,
+    start: Lin,
     step: i64,
 }
 
+/// A bound of a slice: parenthesized unless it is one atom.
+fn bound(l: &Lin) -> String {
+    if l.atomic() {
+        l.print()
+    } else {
+        format!("({})", l.print())
+    }
+}
+
 impl Range {
-    fn last(&self) -> Offset {
-        self.start.add(self.step * (i64::from(self.n) - 1), None)
+    fn last(&self) -> Lin {
+        self.start.plus(&self.n.scale(self.step)).add(-self.step)
     }
 
     /// The range as an index: a slice when the step is one.
     pub(super) fn index(&self) -> String {
-        if let Some(n) = &self.written {
-            return format!("1:{}", n.at(super::P_ATOM));
-        }
         if self.step == 1 {
-            format!("{}:{}", self.start.print(), self.last().print())
+            format!("{}:{}", bound(&self.start), bound(&self.last()))
         } else {
             self.array()
         }
@@ -87,11 +39,8 @@ impl Range {
 
     /// The range as an integer array.
     pub(super) fn array(&self) -> String {
-        if let Some(n) = &self.written {
-            return format!("linspaced_int_array({0}, 1, {0})", n.s);
-        }
-        let n = self.n;
-        if self.step >= 0 || n == 1 {
+        let n = self.n.print();
+        if self.step >= 0 || self.n.as_const() == Some(1) {
             format!(
                 "linspaced_int_array({n}, {}, {})",
                 self.start.print(),
@@ -115,30 +64,23 @@ impl<'m> Emitter<'m> {
         if !(sh.int && sh.rank == 1) {
             return None;
         }
-        let n = match self.ty(id)? {
-            flatppl_core::Type::Array { shape, .. } => match shape.as_ref() {
-                [flatppl_core::Dim::Static(n)] => *n,
-                _ => return None,
-            },
-            _ => return None,
-        };
         let r = self.resolve(id);
         let c = self.call(r)?;
         let (f, args): (&str, Vec<NodeId>) = match self.head(r)? {
             "indicesof" => {
-                let v = self.resolve(c.args[0]);
-                let written = match (self.head(v), self.call(v).map(|c| c.args.to_vec())) {
-                    (Some("ones" | "zeros"), Some(a)) if a.len() == 1 => self.expr(a[0]).ok(),
-                    (Some("fill"), Some(a)) if a.len() == 2 => self.expr(a[1]).ok(),
-                    _ => None,
+                let n = match self.sym_extent(r, 0, 0) {
+                    Some(n) => n,
+                    None => match self.ty(id)? {
+                        Type::Array { shape, .. } => match shape.as_ref() {
+                            [Dim::Static(n)] => Lin::konst(i64::from(*n)),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    },
                 };
                 return Some(Range {
                     n,
-                    written,
-                    start: Offset {
-                        konst: 1,
-                        extra: None,
-                    },
+                    start: Lin::konst(1),
                     step: 1,
                 });
             }
@@ -154,43 +96,29 @@ impl<'m> Emitter<'m> {
             Node::Lit(Scalar::Int(k)) => Some(*k),
             _ => None,
         };
-        // A scalar operand: a literal folds, anything else stays symbolic.
-        let operand = |me: &mut Self, a: NodeId| -> Option<(i64, Option<Ex>)> {
-            match lit(me, a) {
-                Some(k) => Some((k, None)),
-                None => me.expr(a).ok().map(|e| (0, Some(e))),
-            }
-        };
         match (f, args.as_slice()) {
             ("add", [a, b]) | ("add", [b, a]) if scalar(self, *b) && !scalar(self, *a) => {
                 let x = self.range(*a)?;
-                let (k, e) = operand(self, *b)?;
+                let k = self.lin_int(*b)?;
                 Some(Range {
-                    start: x.start.add(k, e.as_ref()),
-                    written: None,
+                    start: x.start.plus(&k),
                     ..x
                 })
             }
             ("sub", [a, b]) if scalar(self, *b) => {
                 let x = self.range(*a)?;
-                let (k, e) = operand(self, *b)?;
-                let neg = e.map(|e| Ex {
-                    s: format!("-{}", e.at(P_UNARY)),
-                    prec: P_UNARY,
-                });
+                let k = self.lin_int(*b)?;
                 Some(Range {
-                    start: x.start.add(-k, neg.as_ref()),
-                    written: None,
+                    start: x.start.plus(&k.scale(-1)),
                     ..x
                 })
             }
             ("sub", [b, a]) if scalar(self, *b) => {
                 let x = self.range(*a)?;
-                let (k, e) = operand(self, *b)?;
+                let k = self.lin_int(*b)?;
                 Some(Range {
                     n: x.n,
-                    written: None,
-                    start: x.start.neg().add(k, e.as_ref()),
+                    start: x.start.scale(-1).plus(&k),
                     step: -x.step,
                 })
             }
@@ -199,7 +127,6 @@ impl<'m> Emitter<'m> {
                 let k = lit(self, *b)?;
                 Some(Range {
                     n: x.n,
-                    written: None,
                     start: x.start.scale(k),
                     step: x.step * k,
                 })
@@ -208,8 +135,7 @@ impl<'m> Emitter<'m> {
                 let x = self.range(*a)?;
                 Some(Range {
                     n: x.n,
-                    written: None,
-                    start: x.start.neg(),
+                    start: x.start.scale(-1),
                     step: -x.step,
                 })
             }

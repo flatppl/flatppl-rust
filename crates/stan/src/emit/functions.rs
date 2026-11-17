@@ -30,6 +30,8 @@ pub(crate) struct FnCtx {
     pub declared: HashSet<String>,
     /// Law arguments lifted over whole arrays, printed as is.
     pub lifted: HashMap<NodeId, Ex>,
+    /// Values placed in this body, by node.
+    pub placed: HashMap<NodeId, String>,
 }
 
 /// The unsized Stan type of a function argument or result.
@@ -49,7 +51,7 @@ pub(crate) fn arg_type(t: &StanType) -> String {
 }
 
 /// Identifiers of `text` that are not function names.
-fn identifiers(text: &str) -> Vec<String> {
+pub(super) fn identifiers(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let b = text.as_bytes();
     let mut i = 0;
@@ -112,7 +114,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// The types of `body` with its input placeholders at `arg_tys`.
-    fn instantiate(
+    pub(super) fn instantiate(
         &mut self,
         at: NodeId,
         body: NodeId,
@@ -242,9 +244,28 @@ impl<'m> Emitter<'m> {
         for c in &caps {
             params.push(format!("{} {c}", arg_type(&self.decls[c])));
         }
-        let name = self.fresh(base);
-        let mut text = format!("{} {name}({}) {{\n", arg_type(&ret_t), params.join(", "));
-        for l in &text_body {
+        let name =
+            self.finish_function(base, &arg_type(&ret_t), &params, &text_body, &ctx.declared);
+        self.fctx = Some(ctx);
+        Ok((name, caps))
+    }
+
+    /// Add a function to the `functions` block, or reuse an identical one,
+    /// and name it. Its own names are released, so another instance of the
+    /// same function prints the same text.
+    fn finish_function(
+        &mut self,
+        base: &str,
+        ret: &str,
+        params: &[String],
+        body: &[String],
+        local: &HashSet<String>,
+    ) -> String {
+        for n in local {
+            self.used.remove(n);
+        }
+        let mut text = format!("{ret} \u{2}({}) {{\n", params.join(", "));
+        for l in body {
             for part in l.lines() {
                 text.push_str("  ");
                 text.push_str(part);
@@ -252,9 +273,23 @@ impl<'m> Emitter<'m> {
             }
         }
         text.push('}');
-        self.functions.push(text);
-        self.fctx = Some(ctx);
-        Ok((name, caps))
+        if let Some(name) = self.fn_texts.get(&text) {
+            return name.clone();
+        }
+        let name = self.function_stan_name(base);
+        self.functions.push(text.replace('\u{2}', &name));
+        self.fn_texts.insert(text, name.clone());
+        name
+    }
+
+    /// A Stan name for a user function: never a Stan library function, a
+    /// reserved word, or a name with a Stan density or generator suffix.
+    fn function_stan_name(&mut self, base: &str) -> String {
+        let mut name = super::sanitize(base);
+        while crate::tables::clashes_with_stan(&name) {
+            name.push_str("_fn");
+        }
+        self.fresh(&name)
     }
 
     /// `name(args…, captures…)`.
@@ -442,13 +477,8 @@ impl<'m> Emitter<'m> {
             params.push(format!("{} {c}", arg_type(&self.decls[c])));
         }
         let base = self.function_name(fun);
-        let name = self.fresh(&base);
-        self.functions.push(format!(
-            "{} {name}({}) {{\n  return {};\n}}",
-            arg_type(&ret_t),
-            params.join(", "),
-            ex.s
-        ));
+        let body = [format!("return {};", ex.s)];
+        let name = self.finish_function(&base, &arg_type(&ret_t), &params, &body, &ctx.declared);
         self.fctx = Some(ctx);
         Ok(Ok((name, caps)))
     }
@@ -510,7 +540,6 @@ impl<'m> Emitter<'m> {
         let (name, caps) = self.user_function(id, fun, &elem_tys)?;
 
         let stan = self.fresh(base);
-        self.peers = self.operand_extents(decl);
         let t = self.declare(decl, None, false, &stan, &[])?;
         let extents: Vec<String> = t.array.iter().chain(&t.dims).take(brank).cloned().collect();
         // A matrix row takes the call's vector as a row_vector.
@@ -555,6 +584,7 @@ impl<'m> Emitter<'m> {
         self.record_decl(&stan, t);
         let fixed = self.m.phase_of(decl) == Some(Phase::Fixed);
         self.put(fixed, lines);
+        self.remember(decl, &stan);
         Ok(stan)
     }
 

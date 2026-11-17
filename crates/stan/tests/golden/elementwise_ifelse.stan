@@ -1,10 +1,11 @@
 data {
-  vector[4] y_obs;
-  vector[4] x;
+  int<lower=0> N;
+  vector[N] y_obs;
+  vector[N] x;
 }
 transformed data {
-  vector[4] weights;
-  for (i in 1:4) {
+  vector[N] weights;
+  for (i in 1:N) {
     weights[i] = x[i] > 1.5 ? 2.0 : 1.0;
   }
 }

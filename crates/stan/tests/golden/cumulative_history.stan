@@ -12,12 +12,12 @@ functions {
   }
 }
 data {
-  int<lower=0> J;
   int<lower=0> T;
+  int<lower=0> J;
   array[J, T] int shocks;
 }
 transformed data {
-  array[4] int previous = linspaced_int_array(T - 1, 1, T - 1);
+  array[T - 1] int previous = linspaced_int_array(T - 1, 1, T - 1);
   array[J, T] int n_avoid;
   for (i in 1:J) {
     n_avoid[i] = avoided(i, T, shocks, previous);

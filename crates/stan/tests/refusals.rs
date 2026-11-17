@@ -199,3 +199,24 @@ fn general_scan_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("scan"), "{r}");
 }
+
+#[test]
+fn joint_of_one_draw_twice_is_never() {
+    let r = refuse_with(
+        "y = draw(Normal(0.0, 1.0))\nlp = logdensityof(lawof(record(a = y, b = y)), record(a = 0.5, b = 0.5))\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::SingularJoint, "{r}");
+    assert!(r.kind.is_never());
+    assert!(r.reason.contains("`y`"), "{r}");
+}
+
+#[test]
+fn observation_at_infinity_is_not_yet() {
+    let r = refuse_with(
+        "s = elementof(posreals)\nlp = logdensityof(Normal(0.0, s), inf)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("infinity"), "{r}");
+}

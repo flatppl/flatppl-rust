@@ -23,6 +23,8 @@ pub enum RefusalKind {
     NumericNormalizer,
     /// `pushfwd` through a map that is not a bijection.
     NonBijectivePushfwd,
+    /// A joint law that holds one variate twice: it has no density.
+    SingularJoint,
     /// A law or function with no Stan counterpart (`kind: "none"` in the
     /// mapping tables).
     NoStanFunction,

@@ -75,7 +75,6 @@ impl<'m> Emitter<'m> {
         }
 
         let stan = self.fresh(base);
-        self.peers = self.operand_extents(id);
         let t = self.declare(id, None, false, &stan, &[])?;
         let extents: Vec<String> = t.array.iter().chain(&t.dims).cloned().collect();
         if extents.len() != outs.len() {
@@ -118,6 +117,7 @@ impl<'m> Emitter<'m> {
         self.record_decl(&stan, t);
         let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
         self.put(fixed, lines);
+        self.remember(id, &stan);
         Ok(stan)
     }
 

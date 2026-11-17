@@ -1,9 +1,10 @@
 data {
-  int<lower=0> K;
   int<lower=0> N;
+  int<lower=0> N_counts_2;
+  int<lower=0> K;
   vector[N] y_obs;
   matrix[N, K] X;
-  array[N, K] int counts;
+  array[N, N_counts_2] int counts;
 }
 transformed data {
   vector[K] means;

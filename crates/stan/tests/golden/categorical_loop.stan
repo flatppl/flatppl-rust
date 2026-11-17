@@ -1,6 +1,6 @@
 data {
-  int<lower=0> K;
   int<lower=0> N;
+  int<lower=0> K;
   array[N] int w_obs;
   array[N] int doc;
 }

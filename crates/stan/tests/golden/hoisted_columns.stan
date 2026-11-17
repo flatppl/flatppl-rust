@@ -1,9 +1,10 @@
 data {
+  int<lower=0> N_Z_2;
   int<lower=0> N;
   vector[N] y_obs;
   array[N] int work;
+  matrix[N, N_Z_2] Z;
   int<lower=0> K;
-  matrix[N, K] Z;
 }
 transformed data {
   vector[N] X_ifelse;
@@ -15,7 +16,7 @@ transformed data {
     X_ifelse_2[i] = work[i] == 3 ? 1.0 : 0.0;
   }
   matrix[N, 3] X = append_col(append_col(ones_vector(N), X_ifelse), X_ifelse_2);
-  matrix[N, 3] W = Z[:, 2:4];
+  matrix[N, K - 1] W = Z[:, 2:K];
 }
 parameters {
   vector[3] beta;

@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+x = [0.5, 1.0, 1.5]
+y_obs = [1.1, 2.0, 3.2]
+normal_lpdf(z, m) = -0.5 * (z - m)^2
+inv(z) = 1.0 / (1.0 + z)
+mean_rng(z) = z + 1.0
+m ~ Normal(0, 1)
+y ~ Normal.(normal_lpdf.(x, m) .+ inv.(x) .+ mean_rng.(x), 1.0)
+prior = lawof(record(m = m))
+L = likelihoodof(kernelof(record(y = y), m = m), record(y = y_obs))
+post = bayesupdate(L, prior)

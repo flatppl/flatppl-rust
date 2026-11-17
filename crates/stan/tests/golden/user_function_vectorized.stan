@@ -4,8 +4,9 @@ functions {
   }
 }
 data {
-  vector[4] y_obs;
-  vector[4] x;
+  int<lower=0> N;
+  vector[N] y_obs;
+  vector[N] x;
 }
 parameters {
   real a;
