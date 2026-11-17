@@ -13,6 +13,7 @@ mod expression;
 mod family;
 mod formula;
 mod metadata;
+mod nonlinear;
 mod ordinal;
 mod prior_expr;
 mod prior_model;
@@ -31,6 +32,7 @@ pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
 pub use flatppl_data::{Column, ColumnValues, Table};
 pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, parse_formula};
+pub use nonlinear::NonlinearPredictor;
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
 pub use splines::{Smooth, ThinPlate};
 pub use text::{read_csv_table, read_json_table};
@@ -70,6 +72,9 @@ pub struct Spec {
     pub link: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dpars: BTreeMap<String, DistributionalFormula>,
+    /// Named formulas for parameters used in a nonlinear response expression.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nlpars: BTreeMap<String, String>,
     #[serde(default)]
     pub priors: Vec<Prior>,
     #[serde(default)]
@@ -171,6 +176,8 @@ pub struct Recipe {
     /// Predictor names in nonreference response-category order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub category_predictors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonlinear: Option<NonlinearPredictor>,
     pub predictors: BTreeMap<String, PredictorRecipe>,
     pub auxiliary_priors: BTreeMap<String, ResolvedPrior>,
 }
@@ -191,10 +198,29 @@ pub struct PredictorRecipe {
 }
 
 impl Recipe {
+    pub(crate) fn is_nonlinear_parameter(&self, name: &str) -> bool {
+        self.nonlinear
+            .as_ref()
+            .is_some_and(|p| p.parameters.iter().any(|parameter| parameter == name))
+    }
+
+    pub(crate) fn predictor_suffix<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.is_nonlinear_parameter(name) {
+            crate::nonlinear::parameter_suffix(name).into()
+        } else {
+            name.into()
+        }
+    }
+
     pub(crate) fn predictors(&self) -> impl Iterator<Item = (&str, &PredictorRecipe)> {
         std::iter::once("mu")
             .chain(self.family.auxiliaries().iter().copied())
             .chain(self.category_predictors.iter().map(String::as_str))
+            .chain(
+                self.nonlinear
+                    .iter()
+                    .flat_map(|p| p.parameters.iter().map(String::as_str)),
+            )
             .filter_map(|name| self.predictors.get(name).map(|predictor| (name, predictor)))
     }
 
@@ -266,6 +292,8 @@ pub struct ModelInfo {
     pub response_levels: Option<Vec<GroupLevel>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dpars: BTreeMap<String, PredictorInfo>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nlpars: BTreeMap<String, PredictorInfo>,
     pub parameters: Vec<Parameter>,
     pub has_improper_prior: bool,
     pub prior_factors: BTreeMap<String, PriorFactor>,
@@ -345,7 +373,7 @@ pub fn read(json: &str) -> Result<Spec> {
 /// Build a model and an immutable training recipe without I/O.
 pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let (family, link) = Family::resolve(&spec.family, spec.link.as_deref())?;
-    let formula = parse_formula(&spec.formula)?;
+    let (formula, nonlinear) = nonlinear::parse(spec, family)?;
     if family == Family::Cumulative && !formula.intercept {
         return Err(Error(
             "cumulative models require threshold intercepts".into(),
@@ -365,7 +393,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let initial_levels = if family == Family::Categorical {
         let mut response_only = formula.clone();
         response_only.weights = None;
-        let rows = data::model_rows(&response_only, &[], table, DataMode::Training)?;
+        let rows = data::model_rows(&response_only, &[], &[], table, DataMode::Training)?;
         data::response_levels(family, table.column(&formula.response)?, &rows)?
     } else {
         None
@@ -416,8 +444,37 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "sigma cannot be predicted with se(sigma=FALSE)".into(),
         ));
     }
+    for (name, text) in &spec.nlpars {
+        let formula = parse_formula(text)?;
+        if formula.response != *name
+            || formula.trials.is_some()
+            || formula.weights.is_some()
+            || formula.se.is_some()
+        {
+            return Err(Error(format!(
+                "nonlinear parameter formula must be `{name} ~ terms` without response additions"
+            )));
+        }
+        if formula
+            .predictor_columns()
+            .iter()
+            .any(|column| spec.nlpars.contains_key(*column))
+        {
+            return Err(Error(format!(
+                "nonlinear parameter formula `{name}` must use data columns"
+            )));
+        }
+        formulas.push((name, formula, Link::Identity));
+    }
     for prior in &spec.priors {
         let dpar = priors::dpar(prior.dpar.as_deref());
+        if let Some(name) = &prior.nlpar {
+            if prior.dpar.is_some() || !spec.nlpars.contains_key(name) {
+                return Err(Error(format!("invalid nonlinear prior selector `{name}`")));
+            }
+        } else if dpar.is_some_and(|name| spec.nlpars.contains_key(name)) {
+            return Err(Error("use `nlpar` to select a nonlinear parameter".into()));
+        }
         let correlation = matches!(prior.class.as_str(), "cor" | "L");
         if family == Family::Categorical && dpar.is_none() && !correlation {
             return Err(Error(
@@ -437,7 +494,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             )));
         }
     }
-    for (_, predictor, _) in &formulas {
+    for (name, predictor, _) in &formulas {
         if predictor
             .predictor_columns()
             .contains(&formula.response.as_str())
@@ -446,12 +503,19 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 "the response cannot also be a predictor in this subset".into(),
             ));
         }
-        if predictor.intercept && !spec.options.center {
+        if predictor.intercept && !spec.options.center && !spec.nlpars.contains_key(*name) {
             return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
         }
     }
     let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
-    let rows = data::model_rows(&formula, &predictor_formulas, table, DataMode::Training)?;
+    let nonlinear_columns = nonlinear.as_ref().map_or(&[][..], |p| p.columns.as_slice());
+    let rows = data::model_rows(
+        &formula,
+        &predictor_formulas,
+        nonlinear_columns,
+        table,
+        DataMode::Training,
+    )?;
     for name in spec.options.contrasts.keys() {
         if !formulas.iter().any(|(_, formula, _)| {
             formula.variables.contains(name)
@@ -484,6 +548,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let mut predictors = BTreeMap::new();
     let mut auxiliary_priors = BTreeMap::new();
     for (name, formula, link) in formulas {
+        let is_nonlinear = spec.nlpars.contains_key(name);
         let (design, means) =
             design::build((&formula).into(), table, &rows, &spec.options.contrasts)?;
         let smooths = formula
@@ -562,16 +627,24 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 link,
                 thresholds: if name == "mu" { thresholds } else { 0 },
                 dpar: (name != "mu").then_some(name),
-                response: response.as_deref(),
+                nonlinear: is_nonlinear,
+                response: if is_nonlinear {
+                    None
+                } else {
+                    response.as_deref()
+                },
                 offset_mean,
                 group_scale,
             },
         )?;
         auxiliary_priors.extend(aux);
+        if name == "mu" && nonlinear.is_some() {
+            continue;
+        }
         predictors.insert(
             name.to_owned(),
             PredictorRecipe {
-                center: spec.options.center && formula.intercept,
+                center: !is_nonlinear && spec.options.center && formula.intercept,
                 formula,
                 link,
                 design,
@@ -591,6 +664,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         link,
         response_levels,
         category_predictors,
+        nonlinear,
         predictors,
         auxiliary_priors,
     };

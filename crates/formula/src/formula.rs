@@ -176,6 +176,19 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     Ok(formula)
 }
 
+pub(crate) fn parse_numeric_expression(text: &str) -> Result<ColumnExpression> {
+    let mut parser = Parser {
+        tokens: tokenize(text)?,
+        at: 0,
+        atoms: Vec::new(),
+    };
+    let expression = parser.expression(0, 0)?;
+    if parser.peek() != Token::End {
+        return Err(Error("unexpected token in nonlinear expression".into()));
+    }
+    column_expression(&expression, &parser.atoms)
+}
+
 type FixedTerms = (Vec<String>, Vec<Term>, BTreeMap<String, ColumnExpression>);
 
 fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
@@ -514,7 +527,7 @@ impl<'a> Parser<'a> {
                 if self.peek() == Token::Left && text == "s" {
                     self.smooth()?
                 } else if self.peek() == Token::Left {
-                    if !matches!(text, "I" | "log" | "offset") {
+                    if !matches!(text, "I" | "log" | "exp" | "offset") {
                         return Err(Error(format!(
                             "formula call `{text}(...)` is not supported"
                         )));
@@ -531,6 +544,7 @@ impl<'a> Parser<'a> {
                     self.atom(match text {
                         "I" => Atom::Expression(ColumnExpression::Identity(Box::new(expression))),
                         "log" => Atom::Expression(ColumnExpression::Log(Box::new(expression))),
+                        "exp" => Atom::Expression(ColumnExpression::Exp(Box::new(expression))),
                         "offset" => Atom::Offset(expression),
                         _ => unreachable!(),
                     })?

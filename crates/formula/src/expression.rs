@@ -12,6 +12,7 @@ pub enum ColumnExpression {
     Number(f64),
     Identity(Box<Self>),
     Log(Box<Self>),
+    Exp(Box<Self>),
     Positive(Box<Self>),
     Negate(Box<Self>),
     Parentheses(Box<Self>),
@@ -39,6 +40,7 @@ impl ColumnExpression {
             Self::Number(_) | Self::Intercept => {}
             Self::Identity(x)
             | Self::Log(x)
+            | Self::Exp(x)
             | Self::Positive(x)
             | Self::Negate(x)
             | Self::Parentheses(x) => {
@@ -57,6 +59,7 @@ impl ColumnExpression {
             Self::Column(_) | Self::Number(_) => false,
             Self::Identity(x)
             | Self::Log(x)
+            | Self::Exp(x)
             | Self::Positive(x)
             | Self::Negate(x)
             | Self::Parentheses(x) => x.uses_intercept(),
@@ -73,6 +76,7 @@ impl ColumnExpression {
                 x.values(table, rows)?
             }
             Self::Log(x) => x.values(table, rows)?.into_iter().map(f64::ln).collect(),
+            Self::Exp(x) => x.values(table, rows)?.into_iter().map(f64::exp).collect(),
             Self::Negate(x) => x.values(table, rows)?.into_iter().map(|v| -v).collect(),
             Self::Binary(op, x, y) => x
                 .values(table, rows)?
@@ -126,6 +130,7 @@ impl fmt::Display for ColumnExpression {
             Self::Number(value) => write!(f, "{value}"),
             Self::Identity(x) => write!(f, "I({x})"),
             Self::Log(x) => write!(f, "log({x})"),
+            Self::Exp(x) => write!(f, "exp({x})"),
             Self::Positive(x) => write!(f, "+{x}"),
             Self::Negate(x) => write!(f, "-{x}"),
             Self::Parentheses(x) => write!(f, "({x})"),
