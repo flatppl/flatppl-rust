@@ -61,6 +61,20 @@ pub enum Type {
     Var(u32),
 }
 
+impl Type {
+    /// Whether this is an ordinary scalar or an aggregate of ordinary values.
+    pub fn is_concrete_value(&self) -> bool {
+        match self {
+            Type::Scalar(_) => true,
+            Type::Array { elem, .. } | Type::TVector { elem, .. } => elem.is_concrete_value(),
+            Type::Record(fields) => fields.iter().all(|(_, t)| t.is_concrete_value()),
+            Type::Tuple(parts) => parts.iter().all(Type::is_concrete_value),
+            Type::Table { columns, .. } => columns.iter().all(|(_, t)| t.is_concrete_value()),
+            _ => false,
+        }
+    }
+}
+
 /// The four scalar value types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarType {

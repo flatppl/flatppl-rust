@@ -1,5 +1,5 @@
-//! Statistical analysis of typed FlatPDL queries. Callers establish FlatPDL
-//! conformance before analyzing dependencies or building companion queries.
+//! Statistical analysis of typed FlatPPL modules. Structural factor planning uses
+//! the target's explicit input boundary. Query analysis and preparation take FlatPDL.
 
 mod dependencies;
 mod incremental;
@@ -18,7 +18,8 @@ pub use normal_coordinates::{
 };
 
 pub use sufficient_statistics::{
-    GroupPartition, PreparationError, PreparationOptions, PreparedLikelihood, ReductionDecision,
-    ReductionOutcome, ReductionReport, prepare_likelihood, prepare_likelihood_with_options,
-    prepare_likelihood_with_report, sufficient_statistics, sufficient_statistics_with_report,
+    GroupPartition, IidNormalPlan, PreparationError, PreparationOptions, PreparedLikelihood,
+    ReductionDecision, ReductionOutcome, ReductionReport, plan_iid_normal, prepare_likelihood,
+    prepare_likelihood_with_options, prepare_likelihood_with_report, sufficient_statistics,
+    sufficient_statistics_with_report,
 };
