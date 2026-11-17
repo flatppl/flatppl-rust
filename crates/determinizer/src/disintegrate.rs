@@ -37,7 +37,7 @@ use std::collections::HashSet;
 /// - outside the affine Gaussian case, the NON-selected marginal is not closed: some non-selected field
 ///   transitively DEPENDS on a selected field (a causally REVERSED selector), so
 ///   `jointchain(marginal, kernel) ≢ joint` (§06 "Structural disintegration").
-pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
+pub fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
     // 1. Recognize `disintegrate(selector, M)` with exactly two arguments.
     let c = expect_builtin_call(m, disint_node, "disintegrate")?;
     if c.args.len() != 2 {
@@ -484,7 +484,7 @@ fn collect_selected_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol
 /// - the disintegration on `x`'s field names does not split
 ///   ([`split_law_record`] returns `None`) — `M` is not a `lawof(record(…))`, or
 ///   a field of `x` names no variate of `M`.
-pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<NodeId> {
+pub fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<NodeId> {
     /// The observed argument `x`, before normalization: either the explicit
     /// positional node, or the keyword-splat's `(name, value)` pairs (owned,
     /// copied out of the `restrict` call's `named` entries).
