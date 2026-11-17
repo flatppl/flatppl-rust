@@ -3,7 +3,7 @@
 use crate::{AnalysisError, references_latent};
 use flatppl_core::graph::{confirmed_non_scalar, expect_builtin_call, is_input_ref, resolve_ref};
 use flatppl_core::{Module, NodeId, Symbol};
-use flatppl_infer::constructors::split_kernel_constructor;
+use flatppl_infer::constructors::{find_parameter, split_kernel_constructor};
 
 /// How the latent reaches the conjugating parameter. Normal takes a standard
 /// deviation, so a prior on its variance must reach `sigma` through `sqrt`.
@@ -127,17 +127,36 @@ pub fn match_conjugate_marginal(
 ) -> Option<Result<ConjugateMatch, AnalysisError>> {
     let (prior_sym, prior) = split_kernel_constructor(m, latent_dist)?;
     let (lik_sym, likelihood) = split_kernel_constructor(m, lik_dist)?;
-    let families = (m.resolve(prior_sym), m.resolve(lik_sym));
+    let row = match_scalar_row(
+        m,
+        (prior_sym, &prior),
+        (lik_sym, &likelihood),
+        latent,
+        observed,
+    )?;
+    Some(row.map(|row| ConjugateMatch {
+        row,
+        latent,
+        prior,
+        likelihood,
+    }))
+}
+
+pub(super) fn match_scalar_row(
+    m: &Module,
+    (prior_family, prior): (Symbol, &[(Symbol, NodeId)]),
+    (family, likelihood): (Symbol, &[(Symbol, NodeId)]),
+    latent: Symbol,
+    observed: &[NodeId],
+) -> Option<Result<ConjugateRowId, AnalysisError>> {
+    let families = (m.resolve(prior_family), m.resolve(family));
 
     // Two rows can share the family pair but place the latent on different parameters.
     for row in CONJUGATE_TABLE
         .iter()
         .filter(|r| (r.prior, r.likelihood) == families)
     {
-        let Some(&(_, value)) = likelihood
-            .iter()
-            .find(|(p, _)| m.resolve(*p) == row.conjugating_param)
-        else {
+        let Some(value) = find_parameter(m, likelihood, row.conjugating_param) else {
             continue;
         };
         if !matches_latent_path(m, value, &row.latent_path, latent) {
@@ -149,15 +168,10 @@ pub fn match_conjugate_marginal(
             continue;
         }
         // Each row describes a scalar law, including rows that reuse parameters verbatim.
-        if let Some(error) = non_scalar_parameter(m, &prior, &likelihood) {
+        if let Some(error) = non_scalar_parameter(m, prior, likelihood) {
             return Some(Err(error));
         }
-        return Some(Ok(ConjugateMatch {
-            row: row.id,
-            latent,
-            prior,
-            likelihood,
-        }));
+        return Some(Ok(row.id));
     }
     None
 }

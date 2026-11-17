@@ -408,6 +408,12 @@ need its own statistical discovery pass.
 parameters to named or inline draws. It uses the original declarations under
 query pins and stops at observed draws, conditioned inputs and reified laws.
 
+`flatppl_model_analysis::record_marginals::plan_record_marginals` groups
+fields that share a draw anywhere in their ancestry. The groups retain field
+order and the bound parameters for supported Normal, Gamma, Beta and Dirichlet
+joint marginals. The determinizer pairs fields with points and builds one
+score for each matched group.
+
 `flatppl-model-analysis::match_conjugate_marginal` recognizes seven scalar
 prior–likelihood pairs on the inferred graph. It returns the rule, the latent
 symbol and both constructors' bound parameter nodes. Callers pass the draws

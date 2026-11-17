@@ -93,18 +93,22 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
 /// parameter lists, not just the prior's.
 #[test]
 fn a_vector_likelihood_sigma_refuses_in_the_conjugate_row() {
-    let err = refusal(
-        "\
+    let draws = "\
 sv = elementof(cartpow(posreals, 3))
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(Normal(mu = a, sigma = sv))
-lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
-    );
-    assert!(
-        err.reason
-            .contains("conjugate pair matched but the likelihood's `sigma` is a vector"),
-        "the refusal attributes the vector to the likelihood: {err:?}"
-    );
+y = draw(Normal(mu = a, sigma = sv))";
+    for query in [
+        "lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
+        "x = draw(Normal(mu = a, sigma = 1.0))\n\
+         lp = logdensityof(lawof(record(x = x, y = y)), record(x = 0.0, y = 1.0))",
+    ] {
+        let err = refusal(&format!("{draws}\n{query}"));
+        assert!(
+            err.reason
+                .contains("conjugate pair matched but the likelihood's `sigma` is a vector"),
+            "the refusal attributes the vector to the likelihood: {err:?}"
+        );
+    }
 }
 
 /// Row 5 (InverseGamma prior on the variance → scaled Student t) is the third synthesized

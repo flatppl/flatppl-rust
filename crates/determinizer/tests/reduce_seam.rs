@@ -9,6 +9,9 @@ use flatppl_determinizer::{
     ConjugateMatch, ConjugateRowId, RefuseError, desugar_restrict_and_disintegrate,
     match_conjugate_marginal,
 };
+use flatppl_model_analysis::record_marginals::{
+    RecordField, RecordMarginalBlock, SharedRecordLaw, plan_record_marginals,
+};
 
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -90,6 +93,112 @@ fn row(src: &str) -> Option<ConjugateRowId> {
     let prior = drawn(&m, "z");
     let lik = drawn(&m, "y");
     match_both(&mut m, prior, lik, latent).map(|r| r.unwrap().row)
+}
+
+fn record_plan(m: &mut Module, names: &[&str]) -> Vec<RecordMarginalBlock> {
+    let fields: Vec<_> = names
+        .iter()
+        .map(|name| RecordField {
+            measure: drawn(m, name),
+            transform: None,
+        })
+        .collect();
+    let sites: Vec<_> = names.iter().map(|name| rhs(m, name)).collect();
+    plan_record_marginals(m, &fields, &sites)
+}
+
+#[test]
+fn joint_plans_keep_draw_identity_field_order_and_bound_count_parameters() {
+    let mut m = parse_infer(
+        "p ~ Beta(1.0, 1.0)\ng ~ Gamma(2.0, 1.0)\na ~ Bernoulli(p)\n\
+        b ~ Poisson(g)\nc ~ Normal(0.0, 1.0)\nd ~ Binomial(7, p)\ne ~ Poisson(g)",
+    );
+    let before = m.node_count();
+    let blocks = record_plan(&mut m, &["a", "b", "c", "d", "e"]);
+    assert_eq!(
+        m.node_count(),
+        before,
+        "the result describes the joint score before building it"
+    );
+    let [beta, gamma] = blocks.as_slice() else {
+        panic!("expected two blocks")
+    };
+    assert_eq!(beta.fields, [0, 3]);
+    assert_eq!(gamma.fields, [1, 4]);
+    let beta = beta.shared.as_ref().unwrap();
+    assert_eq!(beta.ancestor.draw, rhs(&m, "p"));
+    let SharedRecordLaw::Beta { counts, .. } = &beta.law else {
+        panic!("expected Beta")
+    };
+    let Node::Call(binomial) = m.node(drawn(&m, "d")) else {
+        unreachable!()
+    };
+    assert_eq!(
+        (m.resolve(counts[0].family), counts[0].trials),
+        ("Bernoulli", None)
+    );
+    assert_eq!(
+        (m.resolve(counts[1].family), counts[1].trials),
+        ("Binomial", Some(binomial.args[0]))
+    );
+    assert!(matches!(
+        gamma.shared.as_ref().unwrap().law,
+        SharedRecordLaw::GammaPoisson { .. }
+    ));
+
+    let mut m =
+        parse_infer("p ~ Beta(1.0, 1.0)\nq ~ Beta(1.0, 1.0)\na ~ Bernoulli(p)\nb ~ Bernoulli(q)");
+    let blocks = record_plan(&mut m, &["a", "b"]);
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|b| b.fields.as_slice())
+            .collect::<Vec<_>>(),
+        [&[0][..], &[1][..]]
+    );
+    assert!(blocks.iter().all(|b| b.shared.is_none()));
+}
+
+#[test]
+fn unsupported_fields_connect_all_their_unobserved_ancestors() {
+    let mut m = parse_infer(
+        "u ~ Normal(0.0, 1.0)\nv ~ Normal(0.0, 1.0)\nw ~ Normal(v, 1.0)\n\
+        a ~ Normal(u, 1.0)\nb ~ Normal(v, 1.0)\nc ~ Normal(u, 2.0)\nd ~ Normal(w, 2.0)\ne ~ Normal(u + v, 1.0)",
+    );
+    let blocks = record_plan(&mut m, &["a", "b", "c", "d"]);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].fields, [0, 2]);
+    assert!(matches!(
+        blocks[0].shared.as_ref().unwrap().law,
+        SharedRecordLaw::NormalMean { .. }
+    ));
+    assert_eq!(
+        blocks[1],
+        RecordMarginalBlock {
+            fields: vec![1, 3],
+            shared: None
+        }
+    );
+
+    let blocks = record_plan(&mut m, &["a", "b", "c", "d", "e"]);
+    assert_eq!(
+        blocks,
+        [RecordMarginalBlock {
+            fields: vec![0, 1, 2, 3, 4],
+            shared: None
+        }]
+    );
+
+    let mut m = parse_infer(
+        "scale = exp(draw(Normal(0.0, 1.0)))\na ~ Normal(scale, 1.0)\nb ~ Normal(scale, 2.0)",
+    );
+    assert_eq!(
+        record_plan(&mut m, &["a", "b"]),
+        [RecordMarginalBlock {
+            fields: vec![0, 1],
+            shared: None
+        }]
+    );
 }
 
 #[test]

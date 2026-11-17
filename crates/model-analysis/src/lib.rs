@@ -7,6 +7,7 @@ mod conjugacy;
 mod dependencies;
 mod incremental;
 mod normal_coordinates;
+pub mod record_marginals;
 mod sufficient_statistics;
 
 pub use ancestry::{StochasticAncestor, measure_stochastic_ancestors, sole_named_ancestor};

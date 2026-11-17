@@ -4,6 +4,13 @@ use flatppl_core::calling::{bind_call_args, is_splattable};
 use flatppl_core::graph::resolve_ref;
 use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol};
 
+/// The value bound to a named constructor parameter.
+pub fn find_parameter(m: &Module, args: &[(Symbol, NodeId)], name: &str) -> Option<NodeId> {
+    args.iter()
+        .find(|(symbol, _)| m.resolve(*symbol) == name)
+        .map(|(_, value)| *value)
+}
+
 /// Standard-module members are catalogue entries, not file-module graphs.
 pub fn std_module_member(host: &Module, id: NodeId) -> Option<(String, String)> {
     let Node::Ref(Ref {

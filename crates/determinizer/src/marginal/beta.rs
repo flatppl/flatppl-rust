@@ -1,11 +1,8 @@
 //! Shared Beta probability integrals, retaining ordered observation coefficients.
 
-use super::{
-    LogDensity, MarginalForm, SharedLatentRecordLaw, build_constructor, find_kwarg, is_input_ref,
-    real, references_latent, split_kernel_constructor,
-};
+use super::{MarginalForm, build_constructor, find_kwarg, real};
 use crate::density::{build_call, build_record};
-use flatppl_core::{Module, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{Module, Node, NodeId, Symbol};
 
 fn positive_finite(m: &mut Module, x: NodeId) -> NodeId {
     let zero = real(m, 0.0);
@@ -51,49 +48,9 @@ pub(super) fn bernoulli_marginal(
     )))
 }
 
-pub(super) fn shared_law(
-    m: &mut Module,
-    latent: Symbol,
-    prior: &[(Symbol, NodeId)],
-    measures: &[NodeId],
-    exempt: &[NodeId],
-) -> Option<SharedLatentRecordLaw> {
-    let mut params = vec![
-        find_kwarg(m, prior, "alpha")?,
-        find_kwarg(m, prior, "beta")?,
-    ];
-    for &measure in measures {
-        let (family, kwargs) = split_kernel_constructor(m, measure)?;
-        let n = match m.resolve(family) {
-            "Bernoulli" => m.alloc(Node::Lit(Scalar::Int(1))),
-            "Binomial" => {
-                let n = find_kwarg(m, &kwargs, "n")?;
-                if references_latent(m, n, latent, exempt) {
-                    return None;
-                }
-                n
-            }
-            _ => return None,
-        };
-        if !is_input_ref(m, find_kwarg(m, &kwargs, "p")?, latent) {
-            return None;
-        }
-        params.push(m.alloc(Node::Const(family)));
-        params.push(n);
-    }
-    Some(SharedLatentRecordLaw {
-        latent,
-        field_count: measures.len(),
-        form: LogDensity {
-            build: shared_logpmf,
-            params,
-        },
-    })
-}
-
 /// Each native half-probability anchor retains its own support and coefficient.
 /// The one beta ratio integrates the shared probability jointly, not per field.
-fn shared_logpmf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
+pub(super) fn shared_logpmf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
     debug_assert_eq!(params.len(), 2 + 2 * variates.len());
     let [alpha, beta] = [params[0], params[1]];
     let valid = valid_shapes(m, alpha, beta);

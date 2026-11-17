@@ -75,10 +75,10 @@ use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
     Symbol, Type, ValueSet,
 };
-use flatppl_infer::constructors::constructor_symbol;
+use flatppl_infer::constructors::{constructor_symbol, find_parameter as find_kwarg};
+use flatppl_model_analysis::record_marginals::{CountObservation, SharedRecordLaw};
 use flatppl_model_analysis::{
-    ConjugateMatch, ConjugateRowId, measure_stochastic_ancestors, references_latent,
-    sole_named_ancestor,
+    ConjugateMatch, ConjugateRowId, measure_stochastic_ancestors, sole_named_ancestor,
 };
 
 mod beta;
@@ -428,7 +428,7 @@ impl LogDensity {
     }
     /// The log-density expression at `variates` — ONE variate for a `CONJUGATE_TABLE` row,
     /// whose law is over a single variate, and one per record field for the shared-latent
-    /// record law ([`shared_latent_record_law`]), whose law is over all of them jointly.
+    /// record law ([`shared_record_density`]), whose law is over all of them jointly.
     pub(crate) fn at(&self, m: &mut Module, variates: &[NodeId]) -> NodeId {
         (self.build)(m, &self.params, variates)
     }
@@ -551,8 +551,7 @@ fn build_conjugate_marginal(
             }
             return gaussian::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs);
         }
-        let family = m.resolve(lik).to_owned();
-        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, &family, exempt);
+        return dirichlet::marginal(m, latent_sym, &prior_kwargs, &lik_kwargs, lik, exempt);
     }
 
     let matched = match flatppl_model_analysis::match_conjugate_marginal(
@@ -600,75 +599,30 @@ pub fn match_conjugate_marginal(
 // The implicit `lawof` spelling
 // ---------------------------------------------------------------------------
 
-/// A marginal this module built for the implicit spelling: the closed form, and every
-/// latent it integrated out.
-///
-/// The `latents` are not diagnostics. A caller building a PRODUCT of several marginals must
-/// know which latents each one integrated: two marginals over a SHARED latent are not
-/// independent, and adding their log-densities is a wrong number
-/// ([`crate::density::marginalize_or_refuse_record_law`]). A chained marginal integrates
-/// its direct latent and each latent above it, so all of them are listed.
-pub(crate) struct ImplicitMarginal {
-    pub form: MarginalForm,
-    pub latents: Vec<Symbol>,
-}
-
-/// The closed-form conjugate marginal of `likelihood` — a distribution constructor one
-/// of whose parameters is a latent of the model — as a distribution-constructor node plus
-/// the latent it integrated out.
-///
-/// The implicit spelling of the integral [`lower_kchain_marginal`] does for an explicit
-/// `kchain`. §04 "Reification to measures" makes `lawof(y)` y's TOTAL law — internal
-/// stochastic nodes are "not boundary inputs, so `lawof` integrates them out" — so
-/// `y ~ Normal(mu = z, sigma = 1)` over a latent `z` asks for the Normal–Normal row
-/// without the user writing the `kchain`. `None` means no row applies, never that the
-/// conditional may be scored instead.
-///
-/// `exempt` passes the caller's own accounted-for draw sites through to
-/// [`measure_stochastic_ancestors`] — the sibling fields of a record product, whose
-/// dependence is the chain rule, not a marginal.
-///
-/// **One direct latent.** Two latents feeding two parameters is not a single conjugate
-/// integral and returns `None`. A latent whose prior has latents of its own
-/// (`z ~ Normal(mu = w, …)` with `w` latent) is a chain: `y` reaches `w` only through
-/// `z`, so `lawof(y)` is the row applied to `lawof(z)`. The prior's own marginal is built
-/// first and used as the row's prior. Without a closed-form constructor for it, or with a
-/// prior that reaches an `exempt` site, this returns `None` rather than a marginal that
-/// silently conditions on an ancestor it did not integrate.
-///
-/// **A marginal is correct only for the ONE variate it is the law of.** This returns a
-/// marginal, never a licence to multiply marginals together: the returned [`ImplicitMarginal`]
-/// carries its latents so a caller assembling a product can refuse when two of them share one.
+/// Integrate the sole named latent, recursively composing measure-valued marginals.
+/// The caller supplies observed draws at which the ancestry walk stops.
 pub(crate) fn conjugate_marginal_measure(
     m: &mut Module,
     likelihood: NodeId,
     exempt: &[NodeId],
-) -> Option<Result<ImplicitMarginal, RefuseError>> {
+) -> Option<Result<MarginalForm, RefuseError>> {
     let (latent, prior) =
         sole_named_ancestor(&measure_stochastic_ancestors(m, likelihood, exempt))?;
     let above = measure_stochastic_ancestors(m, prior, &[]);
-    let (prior, mut latents) = if above.is_empty() {
-        (prior, Vec::new())
+    let prior = if above.is_empty() {
+        prior
     } else {
-        // A carried sibling above the latent makes the law conditional on it, which is
-        // not the integral this composes.
+        // A carried draw above the latent makes the prior conditional on the query.
         if measure_stochastic_ancestors(m, prior, exempt).len() != above.len() {
             return None;
         }
         match conjugate_marginal_measure(m, prior, exempt)? {
-            Ok(ImplicitMarginal {
-                form: MarginalForm::Measure(marginal),
-                latents,
-            }) => (marginal, latents),
-            Ok(_) => return None,
+            Ok(MarginalForm::Measure(marginal)) => marginal,
+            Ok(MarginalForm::LogDensity(_)) => return None,
             Err(err) => return Some(Err(err)),
         }
     };
-    latents.push(latent);
-    Some(
-        build_conjugate_marginal(m, prior, likelihood, latent, exempt)?
-            .map(|form| ImplicitMarginal { form, latents }),
-    )
+    build_conjugate_marginal(m, prior, likelihood, latent, exempt)
 }
 
 /// The likelihood constructor resolved out of a kernel body, plus any
@@ -725,14 +679,6 @@ fn wrap_like_kernel(m: &mut Module, marginal: NodeId, record_field: Option<Symbo
         }
         None => marginal,
     }
-}
-
-/// The value of the keyword argument `name` among `kwargs`, if present.
-fn find_kwarg(m: &Module, kwargs: &[(Symbol, NodeId)], name: &str) -> Option<NodeId> {
-    kwargs
-        .iter()
-        .find(|(sym, _)| m.resolve(*sym) == name)
-        .map(|(_, val)| *val)
 }
 
 /// Allocate a distribution-constructor call `Ctor(param = value, …)` with only
@@ -1099,152 +1045,61 @@ fn special_functions_alias(m: &mut Module) -> Symbol {
 /// `log_2pi_matches_the_computed_constant` pins it against `(2·π).ln()`.
 const LOG_2PI: f64 = 1.8378770664093453;
 
-/// The joint law of a record whose fields all draw `Normal(mu = z, sigma = σᵢ)` over ONE
-/// shared latent `z ~ Normal(μ₀, s₀)`.
-///
-/// Not a `CONJUGATE_TABLE` row: a row's closed form is the law of ONE variate, and this law
-/// is over all N of them jointly. That is the whole point — each field's own Row 1 marginal
-/// is correct, and their product is a different measure, because
-/// `Cov(yᵢ, yⱼ) = Var(z) = s₀²`. `marginal.md`'s *The shared-latent record law* has the
-/// derivation, the emitted expression and the pinned points.
-pub(crate) struct SharedLatentRecordLaw {
-    /// The shared latent this law integrated out, so the caller can report it.
-    pub latent: Symbol,
-    /// How many fields the law was built over, so the emitter can prove it has one variate
-    /// per sigma rather than `zip` a mismatch down to the shorter list.
-    pub field_count: usize,
-    /// The joint log-density, awaiting one variate per field in the SAME order the field
-    /// measures were supplied in. §08 names no constructor for it, and a §08 `MvNormal`
-    /// would force the record variate into a vector, so the form is an expression (§13
-    /// admits "any other **deterministic expression** over the inputs").
-    pub form: LogDensity,
-}
-
-/// Recognise the shared-latent record law over `field_measures` — the record's per-field
-/// distribution-constructor nodes, in field order — or `None`.
-///
-/// `exempt` is the caller's own accounted-for draw sites (the record's sibling fields),
-/// threaded to [`measure_stochastic_ancestors`] exactly as
-/// [`conjugate_marginal_measure`] threads it: a latent the record CARRIES is scored by the
-/// chain rule, not integrated, so only an uncarried ancestor reaches this law.
-///
-/// The shape is narrow on purpose, and every rejection here keeps the caller's
-/// shared-latent refusal (refuse-don't-mislower):
-///
-/// * at least TWO fields — one field is Row 1, which already lowers, and routing it here
-///   would change output for no gain;
-/// * every field's measure is `Normal`, its `mu` EXACTLY the shared latent's ref
-///   (a derived `mul(2, z)` mean has a different joint), and its
-///   `sigma` latent-independent;
-/// * ONE shared latent across all fields, whose prior is a `Normal` with both parameters
-///   and is itself ancestor-free (a two-level hierarchy is not this integral).
-/// * Alternatively, bare scalar Poisson draws can share one direct Gamma rate.
-///   Sequential native NegativeBinomial predictives update shape by each count
-///   and rate by one. The ancestor and cross-field agreement guards still apply.
-///
-/// **The checks are deliberately over-determined, and most are not individually reachable
-/// today.** Only a shape whose every field ALREADY matched a `CONJUGATE_TABLE` row gets
-/// here — the caller detects the repeated latent from those rows — so the caller's upstream
-/// filtering happens to imply several of them. Verified by mutation: removing any ONE of the
-/// family, path and cross-field-agreement checks reddens nothing, and removing the mean-path
-/// and latent-agreement checks TOGETHER lets a partly-shared record mislower.
-///
-/// In the Normal branch, the masking mechanism is `find_kwarg`, not the family check. `CONJUGATE_TABLE` admits
-/// the priors `Normal`, `Gamma`, `Beta`, `Exponential` and `InverseGamma`, and of the
-/// non-`Normal` four NONE takes both `mu` and `sigma` — so `find_kwarg(prior_kwargs, "mu")?`
-/// turns them away before `prior_sym` is ever compared. The field-family check is masked the
-/// same way (`Poisson` takes `rate`, `Binomial` takes `n`/`p`). The one shape that does reach
-/// here with a non-`Normal` prior is Rows 4 and 5's shared VARIANCE, and it is turned away
-/// twice — by `find_kwarg("mu")` on the prior and, independently, by the `Direct` mean path.
-///
-/// That masking is an accident of the current table, not a guarantee, which is why the
-/// explicit checks stay. Two changes would make them live, and each needs a probe that
-/// isolates the guard it turns on: a §08 prior taking both `mu` and `sigma` (`LogNormal` is
-/// the candidate), or a second Normal-mean row.
-pub(crate) fn shared_latent_record_law(
-    m: &mut Module,
-    field_measures: &[NodeId],
-    exempt: &[NodeId],
-) -> Option<SharedLatentRecordLaw> {
-    if field_measures.len() < 2 {
-        return None;
-    }
-
-    // One shared latent across every field. `sole_named_ancestor` already rejects a field
-    // reaching two DISTINCT latents, so this only has to check the fields agree.
-    let (latent, prior) =
-        sole_named_ancestor(&measure_stochastic_ancestors(m, field_measures[0], exempt))?;
-    for &measure in &field_measures[1..] {
-        let (other, other_prior) =
-            sole_named_ancestor(&measure_stochastic_ancestors(m, measure, exempt))?;
-        if other != latent || other_prior != prior {
-            return None;
-        }
-    }
-    if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
-        return None;
-    }
-
-    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
-    if m.resolve(prior_sym) == "Dirichlet" {
-        return dirichlet::shared_law(m, latent, &prior_kwargs, field_measures, exempt);
-    }
-    if m.resolve(prior_sym) == "Beta" {
-        return beta::shared_law(m, latent, &prior_kwargs, field_measures, exempt);
-    }
-    if m.resolve(prior_sym) == "Gamma" {
-        let alpha = find_kwarg(m, &prior_kwargs, "shape")?;
-        let beta = find_kwarg(m, &prior_kwargs, "rate")?;
-        for &measure in field_measures {
-            let (family, kwargs) = split_kernel_constructor(m, measure)?;
-            if m.resolve(family) != "Poisson"
-                || !is_input_ref(m, find_kwarg(m, &kwargs, "rate")?, latent)
-            {
-                return None;
+/// Build the joint score chosen by structural model analysis.
+pub(crate) fn shared_record_density(m: &mut Module, law: SharedRecordLaw) -> LogDensity {
+    match law {
+        SharedRecordLaw::NormalMean {
+            mean,
+            sigma,
+            field_sigmas,
+        } => {
+            let mut params = vec![mean, sigma];
+            params.extend(field_sigmas);
+            LogDensity {
+                build: build_shared_latent_normal_logpdf,
+                params,
             }
         }
-        return Some(SharedLatentRecordLaw {
-            latent,
-            field_count: field_measures.len(),
-            form: LogDensity {
-                build: build_shared_gamma_poisson_logpmf,
-                params: vec![alpha, beta],
-            },
-        });
-    }
-    if m.resolve(prior_sym) != "Normal" {
-        return None;
-    }
-    let mu0 = find_kwarg(m, &prior_kwargs, "mu")?;
-    let s0 = find_kwarg(m, &prior_kwargs, "sigma")?;
-
-    let mut sigmas = Vec::with_capacity(field_measures.len());
-    for &measure in field_measures {
-        let (lik_sym, lik_kwargs) = split_kernel_constructor(m, measure)?;
-        if m.resolve(lik_sym) != "Normal" {
-            return None;
-        }
-        let mu = find_kwarg(m, &lik_kwargs, "mu")?;
-        if !is_input_ref(m, mu, latent) {
-            return None;
-        }
-        let sigma = find_kwarg(m, &lik_kwargs, "sigma")?;
-        if references_latent(m, sigma, latent, exempt) {
-            return None;
-        }
-        sigmas.push(sigma);
-    }
-
-    let mut params = vec![mu0, s0];
-    params.extend(sigmas);
-    Some(SharedLatentRecordLaw {
-        latent,
-        field_count: field_measures.len(),
-        form: LogDensity {
-            build: build_shared_latent_normal_logpdf,
-            params,
+        SharedRecordLaw::GammaPoisson { shape, rate } => LogDensity {
+            build: build_shared_gamma_poisson_logpmf,
+            params: vec![shape, rate],
         },
-    })
+        SharedRecordLaw::Beta {
+            alpha,
+            beta,
+            counts,
+        } => LogDensity {
+            build: beta::shared_logpmf,
+            params: count_parameters(m, vec![alpha, beta], counts),
+        },
+        SharedRecordLaw::Dirichlet {
+            alpha,
+            categories,
+            counts,
+        } => {
+            let size = m.alloc(Node::Lit(Scalar::Int(i64::from(categories))));
+            LogDensity {
+                build: dirichlet::shared_logpmf,
+                params: count_parameters(m, vec![alpha, size], counts),
+            }
+        }
+    }
+}
+
+fn count_parameters(
+    m: &mut Module,
+    mut params: Vec<NodeId>,
+    counts: Vec<CountObservation>,
+) -> Vec<NodeId> {
+    params.reserve(2 * counts.len());
+    for count in counts {
+        let n = count
+            .trials
+            .unwrap_or_else(|| m.alloc(Node::Lit(Scalar::Int(1))));
+        params.push(m.alloc(Node::Const(count.family)));
+        params.push(n);
+    }
+    params
 }
 
 /// Sequential Gamma-Poisson predictives retain native count coefficients.
@@ -1303,9 +1158,7 @@ fn build_shared_latent_normal_logpdf(
 ) -> NodeId {
     let [mu0, s0] = [params[0], params[1]];
     let sigmas = &params[2..];
-    // The emitter refuses a count mismatch before reaching here
-    // ([`crate::density::lower_shared_latent_record_law`]), so the `zip`s below cannot
-    // truncate. Restated as an assert because this builder's own correctness needs it.
+    // The plan supplies one scale and one variate per field in the same order.
     debug_assert_eq!(
         sigmas.len(),
         variates.len(),
