@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+I = 4
+k_obs = [1, 0, 1, 1]
+b_free = elementof(cartpow(reals, I - 1))
+b = cat(b_free, [-sum(b_free)])
+difficulty(p) = sum(logdensityof.(Normal(0, 3), cat(p.b_free, [-sum(p.b_free)])))
+prior = logweighted(difficulty, Lebesgue(cartprod(b_free = cartpow(reals, I - 1))))
+y ~ Bernoulli.(invlogit.(-b))
+L = likelihoodof(kernelof(record(y = y), b_free = b_free), record(y = k_obs))
+post = bayesupdate(L, prior)

@@ -220,3 +220,65 @@ fn observation_at_infinity_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("infinity"), "{r}");
 }
+
+#[test]
+fn logweighted_callback_parameter_is_not_yet() {
+    let r = refuse(&posterior(
+        "mu = elementof(reals)\ny ~ Normal(mu, 1)\nw(x, s) = -0.5 * (x.mu / s)^2",
+        "logweighted(w, Lebesgue(cartprod(mu = reals)), 2.0)",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("callback parameter"), "{r}");
+}
+
+#[test]
+fn logdensityof_of_none_row_is_never() {
+    let r = refuse(&posterior(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         mu = elementof(reals)\ny ~ Normal(mu, 1)\n\
+         w(x) = logdensityof(hep.Voigtian(mean = x.mu, width = 1.0, sigma = 0.5), 0.2)",
+        "logweighted(w, Lebesgue(cartprod(mu = reals)))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NoStanFunction, "{r}");
+    assert!(r.reason.contains("Voigtian"), "{r}");
+}
+
+#[test]
+fn bare_logdensityof_broadcast_is_not_yet() {
+    let r = refuse(&posterior(
+        "b = elementof(cartpow(reals, 3))\ny ~ Normal(b[1], 1)\n\
+         w(x) = sum(exp.(logdensityof.(Normal(0, 1), x.b)))",
+        "logweighted(w, Lebesgue(cartprod(b = cartpow(reals, 3))))",
+        "kernelof(record(y = y), b = b)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("logdensityof"), "{r}");
+}
+
+#[test]
+fn ordered_with_interval_bound_is_not_yet() {
+    let r = refuse(&posterior(
+        "s = elementof(ordered(2))\ny ~ Normal(s[1], s[2])",
+        "truncate(Lebesgue(cartprod(s = ordered(2))), cartprod(s = cartpow(interval(0.0, 5.0), 2)))",
+        "kernelof(record(y = y), s = s)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("ordered"), "{r}");
+}
+
+#[test]
+fn positive_set_with_interval_lower_bound_is_not_yet() {
+    let r = refuse(&posterior(
+        "s = elementof(reals)\ny ~ Normal(s, 1)",
+        "truncate(Lebesgue(cartprod(s = interval(-1.0, 5.0))), cartprod(s = posreals))",
+        "kernelof(record(y = y), s = s)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("positive set with an interval lower bound"),
+        "{r}"
+    );
+}

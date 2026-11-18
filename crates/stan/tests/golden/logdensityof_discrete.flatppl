@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+y_obs = [1.2, 0.7]
+counts = [2, 4, 3]
+rate = elementof(posreals)
+count_weight(p) = sum(logdensityof.(Poisson(p.rate), counts)) + logdensityof(Poisson(p.rate), 3)
+prior = logweighted(count_weight, Lebesgue(cartprod(rate = posreals)))
+y ~ iid(Normal(rate, 1.0), 2)
+L = likelihoodof(kernelof(record(y = y), rate = rate), record(y = y_obs))
+post = bayesupdate(L, prior)

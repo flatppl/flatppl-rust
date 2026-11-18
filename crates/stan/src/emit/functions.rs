@@ -32,6 +32,9 @@ pub(crate) struct FnCtx {
     pub lifted: HashMap<NodeId, Ex>,
     /// Values placed in this body, by node.
     pub placed: HashMap<NodeId, String>,
+    /// A log weight's record argument: `get(x, "f")` reads the parameter of
+    /// field `f`.
+    pub record_local: Option<Symbol>,
 }
 
 /// The unsized Stan type of a function argument or result.
@@ -78,6 +81,17 @@ pub(super) fn identifiers(text: &str) -> Vec<String> {
     out
 }
 
+/// A type with no unresolved part.
+fn concrete(t: &Type) -> bool {
+    match t {
+        Type::Any | Type::Deferred | Type::Failed(_) => false,
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => concrete(elem),
+        Type::Record(fs) => fs.iter().all(|(_, t)| concrete(t)),
+        Type::Tuple(ts) => ts.iter().all(concrete),
+        _ => true,
+    }
+}
+
 /// The outer array rank of a type (`cartpow(cartpow(reals, m), n)` is 1).
 fn top_rank(ty: Option<&Type>) -> usize {
     match ty {
@@ -98,7 +112,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// The body and input entries of a `functionof`.
-    fn callable_parts(&self, fun: NodeId) -> Result<(NodeId, Vec<(Symbol, Ref)>)> {
+    pub(super) fn callable_parts(&self, fun: NodeId) -> Result<(NodeId, Vec<(Symbol, Ref)>)> {
         let c = self.call(fun).unwrap();
         let body = c.args[0];
         let entries = match &c.inputs {
@@ -313,6 +327,61 @@ impl<'m> Emitter<'m> {
         Ok(Ex::atom(Self::apply_user(&name, parts, &caps)))
     }
 
+    /// The type of `f.(args…)` inside an instantiated body, where inference
+    /// leaves a user broadcast untyped: the traversed argument's outer shape
+    /// around the callee's result at the element types.
+    pub(super) fn ensure_broadcast_type(&mut self, id: NodeId) {
+        if self.fctx.is_none() || self.ty(id).as_ref().is_some_and(concrete) {
+            return;
+        }
+        let Some(c) = self.call(id) else { return };
+        let Some(fun) = self.user_callee(c.args[0]) else {
+            return;
+        };
+        let args = c.args[1..].to_vec();
+        let Some(tys) = args.iter().map(|&a| self.ty(a)).collect::<Option<Vec<_>>>() else {
+            return;
+        };
+        let brank = tys.iter().map(|t| top_rank(Some(t))).max().unwrap_or(0);
+        if brank == 0 {
+            return;
+        }
+        let mut shape = None;
+        let mut elem_tys = Vec::new();
+        for t in tys {
+            match (top_rank(Some(&t)), t) {
+                (r, Type::Array { shape: s, elem }) if r == brank => {
+                    shape.get_or_insert(s);
+                    elem_tys.push(*elem);
+                }
+                (0, t) => elem_tys.push(t),
+                _ => return,
+            }
+        }
+        let Ok((body, entries)) = self.callable_parts(fun) else {
+            return;
+        };
+        if entries.len() != elem_tys.len() {
+            return;
+        }
+        let Ok(types) = self.instantiate(id, body, &entries, &elem_tys) else {
+            return;
+        };
+        let (Some(shape), Some(elem)) = (shape, types.get(&body).cloned()) else {
+            return;
+        };
+        if !concrete(&elem) {
+            return;
+        }
+        let ty = Type::Array {
+            shape,
+            elem: Box::new(elem),
+        };
+        if let Some(ctx) = self.fctx.as_mut() {
+            ctx.scoped.insert(id, ty);
+        }
+    }
+
     /// `f.(args…)` as one call of a vectorized Stan function: the body at
     /// whole-array arguments, each operation in its elementwise form. `Err`
     /// gives the reason it loops instead.
@@ -320,6 +389,7 @@ impl<'m> Emitter<'m> {
         &mut self,
         id: NodeId,
     ) -> Result<std::result::Result<Ex, String>> {
+        self.ensure_broadcast_type(id);
         let c = self.call(id).unwrap();
         if !c.named.is_empty() {
             return Ok(Err("keyword arguments".into()));
@@ -374,13 +444,17 @@ impl<'m> Emitter<'m> {
                     ));
                 }
                 let types = self.instantiate(id, body, &entries, &elem_tys)?;
+                // The broadcast's type in the caller's scope, read before the
+                // callee's context replaces it.
+                let ret_ty = self.ty(id);
                 let outer_ctx = self.fctx.replace(FnCtx {
                     scoped: types,
                     ..Default::default()
                 });
                 let outer_owner = self.owner.take();
                 let outer_v = self.vlocals.take();
-                let out = self.vectorized_body(id, fun, body, &entries, &args, &tys, &full, brank);
+                let out = self
+                    .vectorized_body(id, fun, body, &entries, &args, &tys, &full, brank, ret_ty);
                 self.fctx = outer_ctx;
                 self.owner = outer_owner;
                 self.vlocals = outer_v;
@@ -411,6 +485,7 @@ impl<'m> Emitter<'m> {
         tys: &[Option<Type>],
         full: &[bool],
         brank: usize,
+        ret_ty: Option<Type>,
     ) -> Result<std::result::Result<(String, Vec<String>), String>> {
         let mut params = Vec::new();
         let mut leaves = HashMap::new();
@@ -461,11 +536,7 @@ impl<'m> Emitter<'m> {
         } else {
             l.ex
         };
-        let ret_ty = self
-            .m
-            .type_of(at)
-            .cloned()
-            .ok_or_else(|| Refusal::not_yet(Some(at), "an untyped broadcast"))?;
+        let ret_ty = ret_ty.ok_or_else(|| Refusal::not_yet(Some(at), "an untyped broadcast"))?;
         let ret_t = declare(&ret_ty, None, false, &mut |_| String::new(), at)?;
         let mut caps = Vec::new();
         for id in identifiers(&ex.s) {
@@ -506,6 +577,7 @@ impl<'m> Emitter<'m> {
     /// `f.(args…)` declared as the value `decl` (itself, or the `rowstack`
     /// of it) and filled by loops over the broadcast axes.
     fn looped_broadcast_into(&mut self, base: &str, id: NodeId, decl: NodeId) -> Result<String> {
+        self.ensure_broadcast_type(id);
         let c = self.call(id).unwrap();
         if !c.named.is_empty() {
             return Err(Refusal::not_yet(

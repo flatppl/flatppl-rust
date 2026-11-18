@@ -1,0 +1,8 @@
+# emit: target=post
+flatppl_compat = "0.1"
+y_obs = [0.4, 1.3, 0.8, 2.2]
+mu ~ Normal(0, 2)
+sigma ~ Exponential(1.0)
+prior = lawof(record(mu = mu, sigma = sigma))
+log_target(x) = sum(logdensityof.(Normal(x.mu, x.sigma), y_obs))
+post = logweighted(log_target, prior)

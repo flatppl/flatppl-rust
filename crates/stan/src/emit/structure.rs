@@ -100,14 +100,20 @@ impl<'m> Emitter<'m> {
                     }
                 }
                 let obs = self.likelihood(lik, true)?;
-                for f in &fields {
-                    if let Some(law) = f.law {
-                        let lhs = self.fields[&f.field].clone();
-                        let lines = self.tilde(&lhs, law)?;
-                        self.prior.extend(lines);
+                self.prior_statements(&fields)?;
+                self.observe(obs)
+            }
+            // `logweighted(lw, prior)` as the target: a posterior (§06
+            // "Posterior construction") with no separate likelihood.
+            Some("logweighted") => {
+                let fields = self.prior_fields(rhs)?;
+                self.declare_params(rhs, &fields)?;
+                for (name, sym) in std::mem::take(&mut self.links) {
+                    if let Some(stan) = self.fields.get(&name).cloned() {
+                        self.env.insert(sym, stan);
                     }
                 }
-                self.observe(obs)
+                self.prior_statements(&fields)
             }
             Some("likelihoodof" | "joint_likelihood") => {
                 let obs = self.likelihood(rhs, false)?;
@@ -136,6 +142,18 @@ impl<'m> Emitter<'m> {
     }
 
     // ---------------------------------------------------------------- prior
+
+    /// The prior's `~` lines, then one `target +=` per log weight.
+    fn prior_statements(&mut self, fields: &[PriorField]) -> Result<()> {
+        for f in fields {
+            if let Some(law) = f.law {
+                let lhs = self.fields[&f.field].clone();
+                let lines = self.tilde(&lhs, law)?;
+                self.prior.extend(lines);
+            }
+        }
+        self.emit_weights()
+    }
 
     fn prior_fields(&mut self, prior: NodeId) -> Result<Vec<PriorField>> {
         let p = self.resolve(prior);
@@ -166,6 +184,7 @@ impl<'m> Emitter<'m> {
                         binding: Some(sym),
                         law: Some(self.call(rhs).unwrap().args[0]),
                         node: na.value,
+                        sets: vec![],
                     });
                 }
             }
@@ -180,6 +199,7 @@ impl<'m> Emitter<'m> {
                         binding: None,
                         law: Some(na.value),
                         node: na.value,
+                        sets: vec![],
                     });
                 }
             }
@@ -223,6 +243,7 @@ impl<'m> Emitter<'m> {
                             binding: draw,
                             law: Some(law),
                             node: na.value,
+                            sets: vec![],
                         });
                     }
                 }
@@ -244,8 +265,58 @@ impl<'m> Emitter<'m> {
                         binding: None,
                         law: None,
                         node: na.value,
+                        sets: vec![],
                     });
                 }
+            }
+            Some("logweighted") => {
+                let c = self.call(p).unwrap();
+                let [lw, base] = c.args[..] else {
+                    // `logweighted(lw, M, p)`: no model uses the callback form.
+                    return Err(Refusal::not_yet(
+                        Some(p),
+                        "a `logweighted` prior with a callback parameter",
+                    ));
+                };
+                if !c.named.is_empty() {
+                    return Err(Refusal::not_yet(
+                        Some(p),
+                        "a `logweighted` prior with keyword arguments",
+                    ));
+                }
+                out.extend(self.prior_fields(base)?);
+                self.weights.push((lw, base));
+            }
+            // A record-level restriction of Lebesgue measure: each field keeps
+            // its own and its restricting set, which declare it.
+            Some("truncate") => {
+                let c = self.call(p).unwrap();
+                let (inner, set) = (self.resolve(c.args[0]), self.resolve(c.args[1]));
+                if self.head(inner) != Some("Lebesgue") || self.head(set) != Some("cartprod") {
+                    return Err(Refusal::not_yet(Some(p), "a `truncate` prior of this form"));
+                }
+                let support = self.call(inner).unwrap();
+                let support = support
+                    .args
+                    .first()
+                    .copied()
+                    .or_else(|| support.named.first().map(|n| n.value))
+                    .map(|s| self.resolve(s));
+                let mut fs = self.prior_fields(inner)?;
+                for f in &mut fs {
+                    for s in [support, Some(set)].into_iter().flatten() {
+                        if let Some(na) = self
+                            .call(s)
+                            .unwrap()
+                            .named
+                            .iter()
+                            .find(|na| na.name == f.field)
+                        {
+                            f.sets.push(na.value);
+                        }
+                    }
+                }
+                out.extend(fs);
             }
             Some(h) => return Err(Refusal::not_yet(Some(p), format!("a `{h}` prior"))),
             None => return Err(Refusal::not_yet(Some(p), "this prior")),
@@ -297,7 +368,12 @@ impl<'m> Emitter<'m> {
                 Some(law) => self.law_hints(law),
                 None => self.set_hints(f.node),
             };
-            let mut t = self.declare_ty(&ty, vs.as_ref(), true, f.node, &stan, &hints)?;
+            let mut t = if f.sets.is_empty() {
+                self.declare_ty(&ty, vs.as_ref(), true, f.node, &stan, &hints)?
+            } else {
+                let hints = self.set_hints(f.sets[0]);
+                self.declare_from_sets(&ty, f, &stan, &hints)?
+            };
             // A support the value set cannot state (a computed bound) comes from
             // the law itself.
             if let Some(law) = f.law
@@ -769,6 +845,127 @@ impl<'m> Emitter<'m> {
             .get(name)
             .and_then(|t: &StanType| t.array.first().or(t.dims.first()).cloned())
             .unwrap_or_else(|| format!("size({name})"))
+    }
+
+    /// `D_lpdf(x | args)` (`_lpmf` for a discrete law) from the law's
+    /// `distributions.ron` row, the same text `~` uses.
+    pub(super) fn density_call(&mut self, id: NodeId, m: NodeId, x: NodeId) -> Result<String> {
+        let law = self.law(m, false)?;
+        if law.trunc.is_some() || law.support.is_some() {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "logdensityof of a truncated law",
+            ));
+        }
+        // Over an array, `D_lpdf(x | …)` is the sum only where Stan
+        // vectorizes the law.
+        if self.shape(x).is_some_and(|s| s.rank >= 1) && !law.vectorized && !law.multivariate {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "logdensityof over an array under a law Stan does not vectorize",
+            ));
+        }
+        let x = if law.discrete {
+            self.expr(x)?
+        } else {
+            self.real(x)?
+        };
+        let open = law
+            .call
+            .find('(')
+            .ok_or_else(|| Refusal::not_yet(Some(id), "logdensityof of this law"))?;
+        let (name, args) = (&law.call[..open], &law.call[open + 1..law.call.len() - 1]);
+        let suffix = if law.discrete { "_lpmf" } else { "_lpdf" };
+        // A shifted variate (`{y} + 1`, Categorical0) is exact on the
+        // integers: a bijection under counting measure, with no Jacobian.
+        let y = if law.lhs("{y}") == "{y}" {
+            x.s.clone()
+        } else {
+            law.lhs(&x.at(P_ATOM))
+        };
+        Ok(if args.is_empty() {
+            format!("{name}{suffix}({y})")
+        } else {
+            format!("{name}{suffix}({y} | {args})")
+        })
+    }
+
+    /// A parameter declared by the sets a record-level `truncate` gives it:
+    /// `ordered(K)` → `ordered[K]`, with a positive set → `positive_ordered[K]`,
+    /// interval sets → bounds. They take precedence over the inferred value
+    /// set, which cannot state a positive ordered set.
+    fn declare_from_sets(
+        &mut self,
+        ty: &Type,
+        f: &PriorField,
+        stan: &str,
+        hints: &[Option<NodeId>],
+    ) -> Result<StanType> {
+        let mut t = self.declare_ty(ty, None, true, f.node, stan, hints)?;
+        let (mut ordered, mut positive) = (false, false);
+        let mut lowers: Vec<String> = Vec::new();
+        let mut uppers: Vec<String> = Vec::new();
+        for &s in &f.sets {
+            let mut e = self.resolve(s);
+            while self.head(e) == Some("cartpow") {
+                e = self.resolve(self.call(e).unwrap().args[0]);
+            }
+            match (self.head(e), self.m.node(e)) {
+                (Some("ordered"), _) => ordered = true,
+                (Some("interval"), _) => {
+                    let (lo, hi) = self.interval(e)?;
+                    lowers.extend(lo);
+                    uppers.extend(hi);
+                }
+                (_, Node::Const(c)) if matches!(self.name(*c), "posreals" | "nonnegreals") => {
+                    positive = true;
+                }
+                (_, Node::Const(c)) if self.name(*c) == "reals" => {}
+                _ => {
+                    return Err(Refusal::not_yet(
+                        Some(s),
+                        "a truncation of a Lebesgue prior to this set",
+                    ));
+                }
+            }
+        }
+        lowers.dedup();
+        uppers.dedup();
+        if ordered {
+            // Stan has no bounded ordered type.
+            if !lowers.is_empty() || !uppers.is_empty() {
+                return Err(Refusal::not_yet(
+                    Some(f.node),
+                    "an ordered parameter with interval bounds",
+                ));
+            }
+            t.base = if positive {
+                "positive_ordered"
+            } else {
+                "ordered"
+            };
+            t.bounds = Default::default();
+            return Ok(t);
+        }
+        if lowers.len() > 1 || uppers.len() > 1 {
+            return Err(Refusal::not_yet(
+                Some(f.node),
+                "the intersection of different bounds",
+            ));
+        }
+        // The lower bound would be max(0, lo), which this emitter does not write.
+        if positive && !lowers.is_empty() {
+            return Err(Refusal::not_yet(
+                Some(f.node),
+                "a positive set with an interval lower bound",
+            ));
+        }
+        if positive {
+            lowers.push("0".into());
+        }
+        t.bounds.lower = lowers.pop();
+        t.bounds.upper = uppers.pop();
+        Ok(t)
     }
 
     /// The flattening a rank-2 variate takes in one vectorized statement.
