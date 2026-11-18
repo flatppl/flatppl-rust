@@ -14,7 +14,8 @@ use pyo3::types::{PyBool, PyBytes, PyInt};
 use flatppl_host::flatppl_formula::DataMode;
 use flatppl_host::{
     Auxiliary, BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, FormulaModel,
-    IntegrationOptions, LoadedModule, MathFormat, Observations, PyhfOptions, Target,
+    IntegrationOptions, LoadedModule, MathFormat, Observations, PreparedFormulaPrediction,
+    PyhfOptions, Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -90,12 +91,28 @@ fn error(diagnostic: Diagnostic) -> PyErr {
     )
 }
 
-fn formula_mode(mode: &str) -> PyResult<DataMode> {
+fn formula_mode(mode: &str, allow_new_levels: bool) -> PyResult<DataMode> {
     match mode {
         "prediction" => Ok(DataMode::Prediction),
+        "training" if allow_new_levels => Err(PyValueError::new_err(
+            "allow_new_levels is only supported in prediction mode",
+        )),
         "training" => Ok(DataMode::Training),
         _ => Err(PyValueError::new_err("mode must be prediction or training")),
     }
+}
+
+fn formula_prediction(snapshot: PreparedFormulaPrediction) -> (NativeModule, String) {
+    let metadata = serde_json::json!({
+        "rows": snapshot.rows,
+        "new_group_shapes": snapshot.new_group_shapes,
+    });
+    (
+        NativeModule {
+            inner: snapshot.module,
+        },
+        metadata.to_string(),
+    )
 }
 
 #[pyclass(name = "Context", module = "flatppl._native")]
@@ -191,14 +208,22 @@ impl NativeContext {
             .map_err(error)
     }
 
-    #[pyo3(signature = (model, data_ipc, mode="prediction"))]
+    #[pyo3(signature = (model, data_ipc, mode="prediction", *, allow_new_levels=false))]
     fn prepare_formula(
         &mut self,
         model: &NativeFormulaModel,
         data_ipc: &[u8],
         mode: &str,
+        allow_new_levels: bool,
     ) -> PyResult<(NativeModule, String)> {
-        let mode = formula_mode(mode)?;
+        let mode = formula_mode(mode, allow_new_levels)?;
+        if allow_new_levels {
+            return model
+                .inner
+                .prepare_arrow_with_new_groups(&mut self.inner, data_ipc)
+                .map(formula_prediction)
+                .map_err(error);
+        }
         let (inner, rows) = model
             .inner
             .prepare_arrow(&mut self.inner, data_ipc, mode)
@@ -209,16 +234,25 @@ impl NativeContext {
         ))
     }
 
-    #[pyo3(signature = (model, path, mode="prediction"))]
+    #[pyo3(signature = (model, path, mode="prediction", *, allow_new_levels=false))]
     fn prepare_formula_path(
         &mut self,
         model: &NativeFormulaModel,
         path: &str,
         mode: &str,
+        allow_new_levels: bool,
     ) -> PyResult<(NativeModule, String)> {
+        let mode = formula_mode(mode, allow_new_levels)?;
+        if allow_new_levels {
+            return model
+                .inner
+                .prepare_path_with_new_groups(&mut self.inner, Path::new(path))
+                .map(formula_prediction)
+                .map_err(error);
+        }
         let (inner, rows) = model
             .inner
-            .prepare_path(&mut self.inner, Path::new(path), formula_mode(mode)?)
+            .prepare_path(&mut self.inner, Path::new(path), mode)
             .map_err(error)?;
         Ok((
             NativeModule { inner },

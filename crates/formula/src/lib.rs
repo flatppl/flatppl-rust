@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
 use data::ColumnModel;
-pub use data::{DataDocument, DataMode, DataValue, prepare_data};
+pub use data::{
+    DataDocument, DataMode, DataValue, NewGroupShapes, prepare_data, prepare_data_with_new_groups,
+};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
@@ -204,6 +206,12 @@ pub struct PredictorRecipe {
 }
 
 impl Recipe {
+    /// Expand noncentered group draws in this recipe's prediction template.
+    /// `shapes` comes from [`prepare_data_with_new_groups`].
+    pub fn extend_group_draws(&self, template: Module, shapes: &NewGroupShapes) -> Result<Module> {
+        emit::extend_group_draws(self, template, shapes)
+    }
+
     pub(crate) fn is_nonlinear_parameter(&self, name: &str) -> bool {
         self.nonlinear
             .as_ref()

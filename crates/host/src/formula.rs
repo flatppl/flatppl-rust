@@ -1,6 +1,8 @@
 use crate::{Constant, Context, Diagnostic, LoadedModule};
 use flatppl_fileaccess::Cache;
-use flatppl_formula::{DataDocument, DataMode, DataValue, ModelInfo, Recipe, Spec, Table};
+use flatppl_formula::{
+    DataDocument, DataMode, DataValue, ModelInfo, NewGroupShapes, Recipe, Spec, Table,
+};
 use std::{path::Path, sync::Arc};
 
 /// The training snapshot and the unbound template retained for new data.
@@ -9,6 +11,13 @@ pub struct FormulaModel {
     pub template: Arc<LoadedModule>,
     pub recipe: Recipe,
     pub info: ModelInfo,
+}
+
+/// A prediction snapshot that accepts fitted and newly sampled group effects.
+pub struct PreparedFormulaPrediction {
+    pub module: Arc<LoadedModule>,
+    pub rows: Vec<usize>,
+    pub new_group_shapes: NewGroupShapes,
 }
 
 impl Context {
@@ -183,6 +192,71 @@ impl FormulaModel {
         let rows = std::mem::take(&mut prepared.rows);
         let module = context.set(&self.template, &constants(prepared))?;
         Ok((module, rows))
+    }
+
+    /// Prepare prediction data, allowing unseen grouping labels.
+    pub fn prepare_with_new_groups(
+        &self,
+        context: &mut Context,
+        data: &Table,
+    ) -> Result<PreparedFormulaPrediction, Diagnostic> {
+        self.prediction_snapshot(context, data, false)
+    }
+
+    /// Prepare Arrow IPC prediction data, allowing unseen grouping labels.
+    pub fn prepare_arrow_with_new_groups(
+        &self,
+        context: &mut Context,
+        data_ipc: &[u8],
+    ) -> Result<PreparedFormulaPrediction, Diagnostic> {
+        let data = Table::from_arrow_ipc(data_ipc)
+            .map_err(|error| Diagnostic::new("formula", self.template.source_name(), error))?;
+        self.prepare_with_new_groups(context, &data)
+    }
+
+    /// Prepare a file-backed prediction snapshot, allowing unseen grouping labels.
+    pub fn prepare_path_with_new_groups(
+        &self,
+        context: &mut Context,
+        path: &Path,
+    ) -> Result<PreparedFormulaPrediction, Diagnostic> {
+        self.prediction_snapshot(context, &read_table(path)?, true)
+    }
+
+    fn prediction_snapshot(
+        &self,
+        context: &mut Context,
+        data: &Table,
+        file_backed: bool,
+    ) -> Result<PreparedFormulaPrediction, Diagnostic> {
+        let fail =
+            |message: String| Diagnostic::new("formula", self.template.source_name(), message);
+        if !context.owns(&self.template) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let (mut prepared, new_group_shapes) =
+            flatppl_formula::prepare_data_with_new_groups(&self.recipe, data)
+                .map_err(|error| fail(error.to_string()))?;
+        let template = if new_group_shapes.is_empty() {
+            self.template.clone()
+        } else {
+            let template = self
+                .recipe
+                .extend_group_draws(self.template.parsed().clone(), &new_group_shapes)
+                .map_err(|error| fail(error.to_string()))?;
+            context.parse(&flatppl_syntax::print(&template), None, None)?
+        };
+        let rows = std::mem::take(&mut prepared.rows);
+        let module = if file_backed {
+            context.formula_source(&template, &prepared, None, None)?
+        } else {
+            context.set(&template, &constants(prepared))?
+        };
+        Ok(PreparedFormulaPrediction {
+            module,
+            rows,
+            new_group_shapes,
+        })
     }
 }
 

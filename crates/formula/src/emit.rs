@@ -440,16 +440,7 @@ fn predictor_parameters(
             b.bind(&group.sd, value);
         }
         group.z = b.alloc_name(&predictor_name(dpar, &format!("z_{}", group.column)));
-        let zero = b.lit_real(0.0);
-        let one = b.lit_real(1.0);
-        let standard = b.call("Normal", &[zero, one]);
-        let count = b.lit_int(group.levels.len() as i64);
-        let size = if dimensions == 1 {
-            count
-        } else {
-            b.array(&[dimension, count])
-        };
-        let iid = b.call("iid", &[standard, size]);
+        let iid = group_innovations(b, dimensions, group.levels.len());
         declare_parameter(b, &group.z, iid, parameters);
         group.r = b.alloc_name(&predictor_name(dpar, &format!("r_{}", group.column)));
         let sd = b.self_ref(&group.sd);
@@ -479,6 +470,55 @@ fn predictor_parameters(
         b.bind(&group.r, effect);
     }
     Ok(())
+}
+
+fn group_innovations(b: &mut Builder<'_>, coefficients: usize, levels: usize) -> NodeId {
+    let zero = b.lit_real(0.0);
+    let one = b.lit_real(1.0);
+    let standard = b.call("Normal", &[zero, one]);
+    let count = b.lit_int(levels as i64);
+    let size = if coefficients == 1 {
+        count
+    } else {
+        let dimension = b.lit_int(coefficients as i64);
+        b.array(&[dimension, count])
+    };
+    b.call("iid", &[standard, size])
+}
+
+pub(crate) fn extend_group_draws(
+    recipe: &Recipe,
+    mut template: Module,
+    shapes: &crate::NewGroupShapes,
+) -> Result<Module> {
+    let mut b = Builder::new(&mut template);
+    for (name, shape) in shapes {
+        let group = recipe
+            .predictors()
+            .flat_map(|(_, predictor)| &predictor.groups)
+            .find(|group| group.z == *name)
+            .ok_or_else(|| Error(format!("unknown group parameter `{name}`")))?;
+        let coefficients = group.coefficients.len();
+        let new_count = match shape.as_slice() {
+            [count] if coefficients == 1 => *count,
+            [rows, count] if coefficients > 1 && *rows == coefficients => *count,
+            _ => return Err(Error(format!("invalid innovation shape for `{name}`"))),
+        };
+        let levels = group
+            .levels
+            .len()
+            .checked_add(new_count)
+            .filter(|count| u32::try_from(*count).is_ok())
+            .ok_or_else(|| Error(format!("too many levels in group `{}`", group.column)))?;
+        let symbol = b.sym(name);
+        let binding =
+            b.m.binding_by_name(symbol)
+                .ok_or_else(|| Error(format!("missing group parameter `{name}`")))?;
+        let iid = group_innovations(&mut b, coefficients, levels);
+        let draw = b.call("draw", &[iid]);
+        b.m.set_binding_rhs(binding, draw);
+    }
+    Ok(template)
 }
 
 fn predictor_values(
