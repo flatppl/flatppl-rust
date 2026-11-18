@@ -196,9 +196,7 @@ pub(crate) fn lower_builtin(
         "inv" => {
             let [arg] = args_exact(id, args)?;
             let a = e.lower_node(arg)?;
-            if a.elem != ElemKind::Complex {
-                require_real_matrix(id, &a, "inv")?;
-            }
+            require_inexact_matrix(id, &a, "inv")?;
             e.matrix_inverse(id, &a)
         }
         "det" | "logabsdet" => {
@@ -211,10 +209,10 @@ pub(crate) fn lower_builtin(
                     "determinant requires a nonempty static matrix",
                 ));
             }
+            require_inexact_matrix(id, &a, head)?;
             if a.elem == ElemKind::Complex {
                 return e.complex_determinant(id, &a, n, head == "logabsdet");
             }
-            require_real_matrix(id, &a, head)?;
             Ok(e.matrix_determinant(&a, n, head == "logabsdet"))
         }
         "diag" => lower_diag(e, id, args),
@@ -837,23 +835,15 @@ fn square_dim(id: NodeId, ty: &MlirTy, head: &str) -> Result<u64, EmitError> {
     Ok(m)
 }
 
-/// Refuse a non-`Real` operand for the two helpers that hardcode a real element
-/// type. [`Emitter::cholesky`] renders `stablehlo.cholesky` at the operand's own
-/// kind (an integer operand emits an op IREE rejects) and [`Emitter::diag`]
-/// renders its iota/mask matrices and its reduction identity as floats
-/// unconditionally — so an `Int` or `Bool` operand would mis-emit rather than
-/// lower. §07's domains here (positive definite / matrices used through a
-/// Cholesky or a diagonal) are real anyway; §03's `booleans ⊂ integers ⊂ reals`
-/// means the caller can convert first.
-fn require_real_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitError> {
-    if v.elem == ElemKind::Real {
+/// Require a matrix that lowers through floating-point arithmetic.
+fn require_inexact_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitError> {
+    if matches!(v.elem, ElemKind::Real | ElemKind::Complex) {
         return Ok(());
     }
     Err(EmitError::at(
         id,
         format!(
-            "`{head}`: only a real matrix is supported, got {:?} — the underlying lowering \
-             emits float-typed index and identity constants. Convert to reals first",
+            "`{head}`: expected a real or complex matrix, got {:?}. Convert to reals first",
             v.elem
         ),
     ))
@@ -872,10 +862,10 @@ fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<V
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
+    require_inexact_matrix(id, &a, "lower_cholesky")?;
     if a.elem == ElemKind::Complex {
         return Ok(e.complex_cholesky(&a));
     }
-    require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
 }
 
@@ -975,6 +965,7 @@ fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
     }
     let a = e.lower_node(a_id)?;
     square_dim(id, &e.cell_ty(&a), "diag")?;
+    require_inexact_matrix(id, &a, "diag")?;
     Ok(e.diag(&a))
 }
 
@@ -1004,12 +995,12 @@ fn lower_diagmat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, 
 }
 
 /// §07 `trace(A)` — $\mathrm{tr}(\mathbf{A})$ over "square matrices", the sum
-/// of [`Emitter::diag`]'s extraction. Same square/real limits as
-/// [`lower_diag`], and for the same reasons.
+/// of [`Emitter::diag`]'s extraction.
 fn lower_trace(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     square_dim(id, &e.cell_ty(&a), "trace")?;
+    require_inexact_matrix(id, &a, "trace")?;
     let d = e.diag(&a);
     Ok(e.reduce_sum(&d))
 }

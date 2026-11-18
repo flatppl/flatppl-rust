@@ -265,20 +265,10 @@
 //! - a dynamic (`?`) axis on any of the above — "`<head>`: a dynamic matrix axis
 //!   has no lowering, got ...". Not test-locked: `cartpow` over a fixed size
 //!   always resolves statically.
-//! - `diag`/`trace`/`lower_cholesky` on a non-`Real` matrix — "`<head>`: only a
-//!   real matrix is supported, got ... — the underlying lowering emits
-//!   float-typed index and identity constants ...". This is the Real-hardcode
-//!   family (`ops::require_real_matrix`): `Emitter::diag` renders its
-//!   iota/mask matrices and its reduction identity as floats unconditionally,
-//!   and `Emitter::cholesky` renders `stablehlo.cholesky` at the operand's own
-//!   kind while tagging the result `Real`, so an integer operand emits a
-//!   self-contradictory module IREE rejects outright. The head refuses rather
-//!   than reaching the helper. `row_gram`/`col_gram`/`quadform`/`self_outer` are
-//!   NOT in this family — they run through `Emitter::dot_contract`, which widens
-//!   to the operands' common §03 kind, so an integer Gram stays integer.
-//!   (The same hardcode is still reachable through `registry.rs`'s
-//!   `MvNormal`/`Wishart`/`LKJ` builders, which call `Emitter::cholesky`
-//!   directly — carded separately, not closed here.)
+//! - `diag`/`trace`/`lower_cholesky`/`inv`/`det`/`logabsdet` on an integer
+//!   or boolean matrix — "`<head>`: expected a real or complex matrix, got ..."
+//!   (`ops::require_inexact_matrix`). These lowerings use floating-point
+//!   arithmetic. A caller can explicitly widen its matrix to reals.
 //! - `quadform` whose vector length disagrees with `A`'s order — "`quadform`:
 //!   `x` must have length N to match the NxN `A`, got ...".
 //!   `Emitter::matvec` panics on a contracting-dim mismatch.
