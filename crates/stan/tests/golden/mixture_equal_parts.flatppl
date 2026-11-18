@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+N = 3
+y_obs = [-0.5, 1.4, 3.2]
+mu ~ Normal(0, 5)
+y ~ iid(normalize(superpose(Normal(mu, 1), Normal(mu + 3, 1))), N)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

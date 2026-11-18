@@ -25,6 +25,9 @@ pub enum RefusalKind {
     NonBijectivePushfwd,
     /// A joint law that holds one variate twice: it has no density.
     SingularJoint,
+    /// A mixture of components with different reference measures (a `Dirac`
+    /// atom beside a continuous law).
+    MixedReference,
     /// A law or function with no Stan counterpart (`kind: "none"` in the
     /// mapping tables).
     NoStanFunction,
