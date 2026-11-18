@@ -6,7 +6,7 @@ use crate::ManifestParam;
 use crate::refuse::{Refusal, RefusalKind, Result};
 use crate::stan_type::StanType;
 use crate::tables;
-use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Symbol, Type, ValueSet};
+use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Scalar, Symbol, Type, ValueSet};
 use std::collections::{HashMap, HashSet};
 
 /// The loop index a per-element argument of a broadcast law is rendered with.
@@ -406,10 +406,12 @@ impl<'m> Emitter<'m> {
                 self.env.insert(b, stan.clone());
             }
             self.fields.insert(f.field, stan.clone());
+            self.manifest_bindings.push(f.binding);
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(f.field).to_string(),
                 input: None,
+                index: None,
             });
         }
         Ok(())
@@ -488,10 +490,12 @@ impl<'m> Emitter<'m> {
             self.record_decl(&stan, t);
             self.env.insert(sym, stan.clone());
             self.fields.insert(name, stan.clone());
+            self.manifest_bindings.push(Some(sym));
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(name).to_string(),
                 input: None,
+                index: None,
             });
         }
         let body = c.args[0];
@@ -580,10 +584,12 @@ impl<'m> Emitter<'m> {
             self.env.insert(sym, stan.clone());
             // A free input is a scoring input, as a kernel input is.
             self.fields.insert(sym, stan.clone());
+            self.manifest_bindings.push(Some(sym));
             self.manifest.push(ManifestParam {
                 stan,
                 field: self.name(sym).to_string(),
                 input: None,
+                index: None,
             });
         }
         Ok(())
@@ -816,6 +822,11 @@ impl<'m> Emitter<'m> {
         }
         if self.head(m) == Some("pushfwd") {
             return self.pushfwd_statement(lhs, m, lhs_rank);
+        }
+        // `iid(Lebesgue(S), n)` is `Lebesgue(S^n)` (§06 "Fundamental
+        // measures"): density 1, no statement; the declaration carries S.
+        if self.lebesgue_product(m) {
+            return Ok(vec![]);
         }
         let flat = self.flat_order(lhs);
         let (law, per_element) = match self.head(m) {
@@ -1318,6 +1329,27 @@ impl<'m> Emitter<'m> {
                 let args = self.law_args(member, m)?;
                 self.table_law_in(m, member, Some(&module), &args, false)
             }
+            // `locscale(normalize(truncate(D, I)), m, s)` with s > 0 is
+            // `normalize(truncate(locscale(D, m, s), m + s·I))`: D's
+            // `locscale` row truncated to the mapped interval.
+            "locscale" if let Some((args, lo, hi)) = self.locscale_truncation(m)? => {
+                let mut law = self.locscale_law(m, args)?;
+                if law.multivariate || !law.lcdf {
+                    return Err(Refusal::not_yet(
+                        Some(m),
+                        "locscale of a truncated law with no Stan CDF",
+                    ));
+                }
+                law.trunc = Some((lo, hi));
+                Ok(law)
+            }
+            "locscale" => {
+                let c = self.call(m).unwrap();
+                match c.args[..] {
+                    [d, loc, scale] if c.named.is_empty() => self.locscale_law(m, [d, loc, scale]),
+                    _ => Err(Refusal::not_yet(Some(m), "locscale in this form")),
+                }
+            }
             name => {
                 let args = if name.starts_with(char::is_uppercase) {
                     self.law_args(name, m)?
@@ -1421,6 +1453,25 @@ impl<'m> Emitter<'m> {
                 self.interval(s).map(Some)
             }
             Some("pushfwd") => self.pushfwd_support(m),
+            Some("locscale") => Ok(self.locscale_truncation(m)?.map(|(_, lo, hi)| (lo, hi))),
+            // `Lebesgue(S)`: its variate ranges over S.
+            Some("Lebesgue") => {
+                let c = self.call(m).unwrap();
+                match c
+                    .args
+                    .first()
+                    .copied()
+                    .or_else(|| c.named.first().map(|n| n.value))
+                {
+                    // A set with no interval form (`cartpow`, `ordered`) is
+                    // the declaration's own, from the value set.
+                    Some(set) => {
+                        let set = self.resolve(set);
+                        Ok(self.interval(set).ok())
+                    }
+                    None => Ok(None),
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -1619,6 +1670,206 @@ impl<'m> Emitter<'m> {
         Ok(law)
     }
 
+    /// The law of `locscale(D, m, s)`: D's `locscale` row where it has one
+    /// (`StudentT`), else, for a location-scale family `D(a, b)`, the law
+    /// `D(m + s·a, s·b)` (the pushforward of x ↦ m + s·x), with s > 0 provable.
+    fn locscale_law(&mut self, m: NodeId, [d, loc, scale]: [NodeId; 3]) -> Result<Law> {
+        let row = self.table_law(m, "locscale", &[d, loc, scale], false);
+        let dr = self.resolve(d);
+        let family = self
+            .head(dr)
+            .filter(|h| matches!(*h, "Normal" | "Cauchy" | "Logistic" | "Laplace"));
+        let (Err(no_row), Some(family)) = (&row, family) else {
+            return row;
+        };
+        if no_row.kind.is_never() {
+            return row;
+        }
+        if !self.positive_value(scale) {
+            return Err(Refusal::not_yet(
+                Some(m),
+                "locscale with a scale of unknown sign",
+            ));
+        }
+        let scalar = |me: &Self, x: NodeId| me.shape(x).is_some_and(|s| s.rank == 0);
+        if !scalar(self, loc) || !scalar(self, scale) {
+            return Err(Refusal::not_yet(
+                Some(m),
+                "locscale with an array location or scale",
+            ));
+        }
+        let params = self.law_args(family, dr)?;
+        let [a, b] = params[..] else {
+            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+        };
+        let (mv, sv, av, bv) = (
+            self.folded(loc)?,
+            self.folded(scale)?,
+            self.folded(a)?,
+            self.folded(b)?,
+        );
+        let location = fold_add(&mv, &fold_mul(&sv, &av));
+        let spread = fold_mul(&sv, &bv);
+        let names = flatppl_infer::distribution_param_names(family).unwrap_or_default();
+        let general = format!("{family}({})", names.join(", "));
+        let Some(row) = tables::law_rows_by_head(family, None)
+            .into_iter()
+            .find(|r| r.pattern == general)
+        else {
+            return Err(Refusal::not_yet(Some(m), "locscale of this law"));
+        };
+        let pat = pattern::parse(&row.pattern);
+        let mut binds = HashMap::new();
+        for (n, v) in names.iter().zip([location, spread]) {
+            binds.insert(n.to_string(), pattern::Bound::Expr(v.1));
+        }
+        self.law_from_row(m, family, row, pat, binds, false)
+    }
+
+    /// A positive literal, or a value of a positive set.
+    fn positive_value(&self, x: NodeId) -> bool {
+        match self.literal_number(x) {
+            Some(v) => v > 0.0,
+            None => matches!(
+                self.m.valueset_of(self.resolve(x)),
+                Some(ValueSet::PosReals)
+            ),
+        }
+    }
+
+    /// A scalar's number when it is a literal, and its Stan text.
+    fn folded(&mut self, x: NodeId) -> Result<(Option<f64>, Ex)> {
+        match self.literal_number(x) {
+            Some(n) => Ok(number_ex(n)),
+            None => Ok((None, self.real(x)?)),
+        }
+    }
+
+    /// The number of a literal arithmetic expression (`-1`, `1 / 2`).
+    fn literal_number(&self, x: NodeId) -> Option<f64> {
+        let r = self.resolve(x);
+        match self.m.node(r) {
+            Node::Lit(Scalar::Int(k)) => return Some(*k as f64),
+            Node::Lit(Scalar::Real(v)) => return Some(*v),
+            _ => {}
+        }
+        let args = self.call(r)?.args.to_vec();
+        match (self.head(r)?, args.as_slice()) {
+            ("neg", [u]) => Some(-self.literal_number(*u)?),
+            ("add", [u, v]) => Some(self.literal_number(*u)? + self.literal_number(*v)?),
+            ("sub", [u, v]) => Some(self.literal_number(*u)? - self.literal_number(*v)?),
+            ("mul", [u, v]) => Some(self.literal_number(*u)? * self.literal_number(*v)?),
+            ("divide", [u, v]) => Some(self.literal_number(*u)? / self.literal_number(*v)?),
+            _ => None,
+        }
+    }
+
+    /// `Lebesgue(S)`, or an `iid` product of it.
+    fn lebesgue_product(&self, m: NodeId) -> bool {
+        let r = self.resolve(m);
+        match self.head(r) {
+            Some("Lebesgue") => true,
+            Some("iid") => self.lebesgue_product(self.call(r).unwrap().args[0]),
+            _ => false,
+        }
+    }
+
+    /// `locscale(normalize(truncate(D, I)), m, s)`: the arguments `[D, m, s]`
+    /// of D's `locscale` row and the ends of `m + s·I`. `None` for another
+    /// form. The scale must be positive: a positive literal or a value of a
+    /// positive set.
+    #[allow(clippy::type_complexity)]
+    fn locscale_truncation(
+        &mut self,
+        m: NodeId,
+    ) -> Result<Option<([NodeId; 3], Option<String>, Option<String>)>> {
+        let c = self.call(m).unwrap();
+        let [base, loc, scale] = c.args[..] else {
+            return Ok(None);
+        };
+        if !c.named.is_empty() {
+            return Ok(None);
+        }
+        let norm = self.resolve(base);
+        if self.head(norm) != Some("normalize") {
+            return Ok(None);
+        }
+        let t = self.resolve(self.call(norm).unwrap().args[0]);
+        if self.head(t) != Some("truncate") {
+            return Ok(None);
+        }
+        let tc = self.call(t).unwrap();
+        let (d, set) = (tc.args[0], self.resolve(tc.args[1]));
+        let num = |me: &Self, x: NodeId| match me.m.node(me.resolve(x)) {
+            Node::Lit(Scalar::Int(k)) => Some(*k as f64),
+            Node::Lit(Scalar::Real(r)) => Some(*r),
+            _ => None,
+        };
+        if !self.positive_value(scale) {
+            return Err(Refusal::not_yet(
+                Some(m),
+                "locscale of a truncated law with a scale of unknown sign",
+            ));
+        }
+        let (lo, hi) = self.interval(set)?;
+        let (lt, st) = (self.real(loc)?, self.real(scale)?);
+        let (ln, sn) = (num(self, loc), num(self, scale));
+        let image = |e: String| -> String {
+            match (ln, sn, e.parse::<f64>()) {
+                (Some(a), Some(b), Ok(x)) => crate::stan_type::number(a + b * x),
+                _ => format!(
+                    "{} + {} * {}",
+                    lt.at(super::P_ADD),
+                    st.at(super::P_MUL),
+                    if is_identifier(&e) || e.parse::<f64>().is_ok() {
+                        e
+                    } else {
+                        format!("({e})")
+                    }
+                ),
+            }
+        };
+        // An end written as `(c - m) / s`, with m and s the location and
+        // scale, maps back to c exactly.
+        let ends: Vec<Option<NodeId>> = match (self.head(set), self.call(set)) {
+            (Some("interval"), Some(c)) => c.args.iter().map(|&e| Some(e)).collect(),
+            _ => vec![None, None],
+        };
+        let mut mapped = [lo.map(image), hi.map(image)];
+        for (k, end) in ends.into_iter().enumerate().take(2) {
+            if let Some(e) = end
+                && mapped[k].is_some()
+                && let Some(c) = self.inverse_end(e, loc, scale)
+            {
+                mapped[k] = Some(self.real(c)?.s);
+            }
+        }
+        let [lo, hi] = mapped;
+        Ok(Some(([d, loc, scale], lo, hi)))
+    }
+
+    /// `c` when `e` is `(c - m) / s`, with `m` and `s` the same nodes (or
+    /// equal literals) as `loc` and `scale`.
+    fn inverse_end(&self, e: NodeId, loc: NodeId, scale: NodeId) -> Option<NodeId> {
+        let same = |me: &Self, a: NodeId, b: NodeId| {
+            me.m.structural_eq(me.resolve(a), me.resolve(b))
+                || matches!((me.literal_number(a), me.literal_number(b)), (Some(x), Some(y)) if x == y)
+        };
+        let d = self.resolve(e);
+        let [num, s] = self
+            .call(d)
+            .filter(|_| self.head(d) == Some("divide"))?
+            .args[..]
+        else {
+            return None;
+        };
+        let n = self.resolve(num);
+        let [c, m] = self.call(n).filter(|_| self.head(n) == Some("sub"))?.args[..] else {
+            return None;
+        };
+        (same(self, m, loc) && same(self, s, scale)).then_some(c)
+    }
+
     /// The finite ends of an interval set; `None` for an open side.
     fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
         match self.m.node(s) {
@@ -1690,6 +1941,20 @@ impl<'m> Emitter<'m> {
                 format!("the law `{name}` in this form"),
             ));
         };
+        self.law_from_row(m, name, row, pat, binds, broadcast)
+    }
+
+    /// The law of a matched `distributions.ron` row with its pattern
+    /// variables bound.
+    fn law_from_row(
+        &mut self,
+        m: NodeId,
+        name: &str,
+        row: &'static tables::LawRow,
+        pat: pattern::Pat,
+        binds: HashMap<String, pattern::Bound>,
+        broadcast: bool,
+    ) -> Result<Law> {
         match row.kind.as_str() {
             "todo" => {
                 return Err(Refusal::new(
@@ -1841,12 +2106,145 @@ impl<'m> Emitter<'m> {
         }
         for na in self.call(point).unwrap().named.iter() {
             let field = self.name(na.name);
-            if let Some(input) = self.self_ref(na.value)
+            let (input, index) = match self.self_ref(na.value) {
+                Some(input) => (Some(input), None),
+                None => match self.point_index(na.value) {
+                    Some((input, index)) => (Some(input), Some(index)),
+                    None => (None, None),
+                },
+            };
+            let input = input.map(|i| self.abi_name(i));
+            if let Some(input) = input
                 && let Some(p) = self.manifest.iter_mut().find(|p| p.field == field)
             {
-                p.input = Some(self.m.resolve(input).to_string());
+                p.input = Some(input);
+                p.index = index;
             }
         }
+    }
+
+    /// `theta[k]` or `theta[[k, …]]` with literal indices: the input and the
+    /// index.
+    fn point_index(&self, v: NodeId) -> Option<(Symbol, crate::ManifestIndex)> {
+        let g = self.resolve(v);
+        if self.head(g) != Some("get") {
+            return None;
+        }
+        let c = self.call(g)?;
+        let [x, sel] = c.args[..] else {
+            return None;
+        };
+        let input = self.self_ref(x)?;
+        let int = |me: &Self, n: NodeId| match me.m.node(n) {
+            Node::Lit(Scalar::Int(k)) => Some(*k),
+            _ => None,
+        };
+        if let Some(k) = int(self, sel) {
+            return Some((input, crate::ManifestIndex::Scalar(k)));
+        }
+        let list = self.resolve(sel);
+        if self.head(list) != Some("vector") {
+            return None;
+        }
+        let ks: Option<Vec<i64>> = self
+            .call(list)?
+            .args
+            .iter()
+            .map(|&a| int(self, a))
+            .collect();
+        Some((input, crate::ManifestIndex::Slice(ks?)))
+    }
+
+    /// A parameter whose own binding is a module input (`inputs = (…)`,
+    /// matched by alias end) is bound by that ABI name. A query point that
+    /// binds the same field to another input is a contradiction: refuse.
+    pub(crate) fn abi_parameters(&mut self) -> Result<()> {
+        let abi: Vec<(Symbol, Symbol)> = self
+            .abi_inputs()
+            .into_iter()
+            .map(|a| (a, *self.m.alias_chain(a).last().unwrap()))
+            .collect();
+        for (p, b) in self.manifest.iter_mut().zip(&self.manifest_bindings) {
+            let Some(b) = b else { continue };
+            let end = *self.m.alias_chain(*b).last().unwrap();
+            let Some((written, _)) = abi.iter().find(|(_, e)| *e == end) else {
+                continue;
+            };
+            let name = self.m.resolve(*written).to_string();
+            match &p.input {
+                None => p.input = Some(name),
+                Some(other) if *other != name || p.index.is_some() => {
+                    return Err(Refusal::not_yet(
+                        None,
+                        format!(
+                            "a query point that binds `{}` to `{other}` while it is the input `{name}`",
+                            p.field
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The names written in the module's `inputs = (…)`, the ABI names.
+    fn abi_inputs(&self) -> Vec<Symbol> {
+        let Some(rhs) = self
+            .m
+            .bindings()
+            .find(|(_, b)| self.m.resolve(b.name) == "inputs")
+            .map(|(_, b)| b.rhs)
+        else {
+            return vec![];
+        };
+        let items: Vec<NodeId> = match self.call(rhs) {
+            Some(c) if self.self_ref(rhs).is_none() => c.args.to_vec(),
+            _ => vec![rhs],
+        };
+        items
+            .into_iter()
+            .filter_map(|it| self.self_ref(it))
+            .collect()
+    }
+
+    /// The ABI name of an input the query point reads: the `inputs` entry
+    /// with the same alias end, else the name as written.
+    fn abi_name(&self, written: Symbol) -> String {
+        let end = self.m.alias_chain(written).last().copied();
+        let abi = self
+            .abi_inputs()
+            .into_iter()
+            .find(|&a| self.m.alias_chain(a).last().copied() == end)
+            .unwrap_or(written);
+        self.m.resolve(abi).to_string()
+    }
+
+    /// The module inputs (`inputs = (…)`) the program declares as data.
+    pub(crate) fn data_inputs(&self) -> Vec<crate::ManifestData> {
+        let mut out = Vec::new();
+        for written in self.abi_inputs() {
+            // The ABI name is the one written in `inputs`; its alias end is
+            // the binding the program declared.
+            let sym = *self.m.alias_chain(written).last().unwrap();
+            let Some(stan) = self.env.get(&sym) else {
+                continue;
+            };
+            let Some(line) = self.data.iter().find(|l| {
+                l.strip_suffix(';')
+                    .and_then(|l| l.rsplit_once(' '))
+                    .is_some_and(|(_, n)| n == stan)
+            }) else {
+                continue;
+            };
+            let ty = line.strip_suffix(';').unwrap().rsplit_once(' ').unwrap().0;
+            out.push(crate::ManifestData {
+                input: self.name(written).to_string(),
+                stan: stan.clone(),
+                ty: ty.to_string(),
+            });
+        }
+        out
     }
 }
 
@@ -1882,4 +2280,50 @@ fn variate_bounds(variate: &str) -> (Option<String>, Option<String>) {
         }
     }
     out
+}
+
+fn number_ex(x: f64) -> (Option<f64>, Ex) {
+    let s = crate::stan_type::number(x);
+    let ex = if x < 0.0 {
+        Ex {
+            s,
+            prec: super::P_UNARY,
+        }
+    } else {
+        Ex::atom(s)
+    };
+    (Some(x), ex)
+}
+
+/// `x + y`, folded for literals and 0.
+fn fold_add(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+    match (x.0, y.0) {
+        (Some(a), Some(b)) => number_ex(a + b),
+        (Some(0.0), _) => y.clone(),
+        (_, Some(0.0)) => x.clone(),
+        _ => (
+            None,
+            Ex {
+                s: format!("{} + {}", x.1.at(super::P_ADD), y.1.at(super::P_ADD + 1)),
+                prec: super::P_ADD,
+            },
+        ),
+    }
+}
+
+/// `x * y`, folded for literals, 0 and 1.
+fn fold_mul(x: &(Option<f64>, Ex), y: &(Option<f64>, Ex)) -> (Option<f64>, Ex) {
+    match (x.0, y.0) {
+        (Some(a), Some(b)) => number_ex(a * b),
+        (Some(0.0), _) | (_, Some(0.0)) => number_ex(0.0),
+        (Some(1.0), _) => y.clone(),
+        (_, Some(1.0)) => x.clone(),
+        _ => (
+            None,
+            Ex {
+                s: format!("{} * {}", x.1.at(super::P_MUL), y.1.at(super::P_MUL + 1)),
+                prec: super::P_MUL,
+            },
+        ),
+    }
 }

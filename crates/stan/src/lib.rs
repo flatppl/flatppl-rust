@@ -72,6 +72,29 @@ pub struct ManifestParam {
     /// The query input bound to this field by `outputs = logdensityof(target,
     /// record(field = input, …))`, when the module declares one.
     pub input: Option<String>,
+    /// The index of `input` the query binds this field to (FlatPPL
+    /// 1-based): `theta[k]` or `theta[[k, …]]`.
+    pub index: Option<ManifestIndex>,
+}
+
+/// A query point's index into a query input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManifestIndex {
+    /// `theta[k]`: one element, a scalar field.
+    Scalar(i64),
+    /// `theta[[k, …]]`: these elements, a vector field.
+    Slice(Vec<i64>),
+}
+
+/// A module input (`inputs = (…)`) that the program declares as data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestData {
+    /// The FlatPPL binding name.
+    pub input: String,
+    /// The Stan data name.
+    pub stan: String,
+    /// The Stan declaration without the name (`vector[N]`, `real<lower=0>`).
+    pub ty: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +102,8 @@ pub struct Manifest {
     pub target: String,
     /// Parameters in declaration order.
     pub parameters: Vec<ManifestParam>,
+    /// Module inputs declared as data, in `inputs` order.
+    pub data: Vec<ManifestData>,
 }
 
 impl Placement {
@@ -104,12 +129,35 @@ impl Manifest {
                 if let Some(i) = &p.input {
                     o.insert("input".into(), Value::from(i.clone()));
                 }
+                match &p.index {
+                    Some(ManifestIndex::Scalar(k)) => {
+                        o.insert("index".into(), Value::from(*k));
+                    }
+                    Some(ManifestIndex::Slice(ks)) => {
+                        o.insert("index".into(), Value::from(ks.clone()));
+                    }
+                    None => {}
+                }
                 Value::Object(o)
             })
             .collect();
         let mut o = Map::new();
         o.insert("target".into(), Value::from(self.target.clone()));
         o.insert("parameters".into(), Value::Array(params));
+        if !self.data.is_empty() {
+            let data = self
+                .data
+                .iter()
+                .map(|d| {
+                    let mut o = Map::new();
+                    o.insert("input".into(), Value::from(d.input.clone()));
+                    o.insert("stan".into(), Value::from(d.stan.clone()));
+                    o.insert("type".into(), Value::from(d.ty.clone()));
+                    Value::Object(o)
+                })
+                .collect();
+            o.insert("data".into(), Value::Array(data));
+        }
         Value::Object(o)
     }
 }

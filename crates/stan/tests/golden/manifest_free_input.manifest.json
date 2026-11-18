@@ -1,0 +1,10 @@
+{
+  "parameters": [
+    {
+      "field": "rate",
+      "input": "rate",
+      "stan": "rate"
+    }
+  ],
+  "target": "outputs"
+}

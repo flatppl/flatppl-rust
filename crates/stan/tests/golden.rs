@@ -57,7 +57,13 @@ fn goldens() {
         let program = emit(&std::fs::read_to_string(&path).unwrap());
         let data =
             serde_json::to_string_pretty(&serde_json::Value::Object(program.data)).unwrap() + "\n";
-        for (ext, got) in [("stan", &program.code), ("data.json", &data)] {
+        // A golden with a `.manifest.json` beside it checks the manifest too.
+        let manifest = serde_json::to_string_pretty(&program.manifest.to_json()).unwrap() + "\n";
+        let mut outputs = vec![("stan", &program.code), ("data.json", &data)];
+        if path.with_extension("manifest.json").exists() {
+            outputs.push(("manifest.json", &manifest));
+        }
+        for (ext, got) in outputs {
             let expected = path.with_extension(ext);
             if bless {
                 std::fs::write(&expected, got).unwrap();

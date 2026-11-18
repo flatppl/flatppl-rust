@@ -190,6 +190,8 @@ pub(crate) struct Emitter<'m> {
     json: Map<String, Value>,
     deferred: Vec<DataSource>,
     manifest: Vec<ManifestParam>,
+    /// The module binding each manifest parameter stands for, when it has one.
+    manifest_bindings: Vec<Option<Symbol>>,
 }
 
 /// Every binding name and record field name of `m`, as Stan names.
@@ -297,6 +299,7 @@ impl<'m> Emitter<'m> {
             json: Map::new(),
             deferred: vec![],
             manifest: vec![],
+            manifest_bindings: vec![],
         }
     }
 
@@ -2123,6 +2126,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     let mut e = Emitter::new(m, opts);
     e.emit_target(target)?;
     e.query_inputs(target);
+    e.abi_parameters()?;
     e.resolve_sizes();
     let mut model = e.locals.clone();
     if !model.is_empty() && !(e.prior.is_empty() && e.lik.is_empty()) {
@@ -2130,6 +2134,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     }
     model.extend(e.prior.iter().cloned());
     model.extend(e.lik.iter().cloned());
+    let data_inputs = e.data_inputs();
     let mut code = String::new();
     block(&mut code, "functions", &e.functions);
     block(&mut code, "data", &e.data);
@@ -2143,6 +2148,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
         deferred_data: e.deferred,
         manifest: crate::Manifest {
             target: m.resolve(target).to_string(),
+            data: data_inputs,
             parameters: e.manifest,
         },
     })
