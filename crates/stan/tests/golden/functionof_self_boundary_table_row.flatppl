@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+y_obs = [0.1, 2.9, 3.2]
+q ~ Beta(2, 2)
+step(state, x, p) = record(current = state.next, next = p.q * state.next + (1 - p.q) * x)
+states = scan(step, record(current = 0.5, next = 0.5), y_obs, record(q = q))
+rw = elementof(cartprod(current = reals, next = reals))
+cur = 2 * rw.current
+row_fn = functionof(cur, r = rw)
+y ~ Normal.(row_fn.(states), 1)
+prior = lawof(record(q = q))
+L = likelihoodof(kernelof(record(y = y), q = q), record(y = y_obs))
+post = bayesupdate(L, prior)

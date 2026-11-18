@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+a0 = elementof(reals)
+mid = 0.5 * a0 + 1
+k = functionof(Normal(mid, 1), acc = a0)
+w ~ Dirichlet([1.0, 1.0])
+y ~ iid(normalize(ksuperpose(k, w, [3.0, 4.0])), 3)
+prior = lawof(record(w = w))
+L = likelihoodof(kernelof(record(y = y), w = w), record(y = [0.5, 2.5, 3.1]))
+post = bayesupdate(L, prior)

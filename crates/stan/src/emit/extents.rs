@@ -9,7 +9,7 @@
 
 use super::Emitter;
 use flatppl_core::{Node, NodeId, Phase, RefNs, Scalar, Symbol, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Builtins whose result has the shape of an argument of its rank.
 const SHAPE_PRESERVING: &[&str] = &[
@@ -392,6 +392,39 @@ impl<'m> Emitter<'m> {
         Some(Lin::term(e.at(super::P_ATOM)))
     }
 
+    /// `true` when the module binding `name` reads a module-binding input of
+    /// the body being sized, through self references (not through a draw).
+    fn reads_substituted(&self, name: Symbol) -> bool {
+        match self.esubst_self.last() {
+            Some(targets) if !targets.is_empty() => self.binding_reads(name, targets, 0),
+            _ => false,
+        }
+    }
+
+    fn binding_reads(&self, name: Symbol, targets: &HashSet<Symbol>, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let Some(b) = self.m.binding_by_name(name) else {
+            return false;
+        };
+        let rhs = self.m.binding(b).rhs;
+        if self.head(rhs) == Some("draw") {
+            return false;
+        }
+        let mut stack = vec![rhs];
+        while let Some(id) = stack.pop() {
+            if let Node::Ref(r) = self.m.node(id)
+                && r.ns == RefNs::SelfMod
+                && (targets.contains(&r.name) || self.binding_reads(r.name, targets, depth + 1))
+            {
+                return true;
+            }
+            self.m.for_each_child(id, |c| stack.push(c));
+        }
+        false
+    }
+
     /// The symbolic extent of axis `axis` of the value `id`.
     pub(super) fn sym_extent(&mut self, id: NodeId, axis: usize, depth: u32) -> Option<Lin> {
         if depth > 48 {
@@ -402,6 +435,38 @@ impl<'m> Emitter<'m> {
         let rank = |me: &Self, x: NodeId| me.arank(x).unwrap_or(usize::MAX);
         if let Node::Ref(r) = self.m.node(id) {
             match r.ns {
+                // A module-binding input of a body being sized: its argument.
+                RefNs::SelfMod if self.esubst_self.last().is_some_and(|s| s.contains(&r.name)) => {
+                    let (arg, offset) = *self.esubst.last()?.get(&r.name)?;
+                    let top = self.esubst.pop();
+                    let out = self.sym_extent(arg, axis + offset, d);
+                    self.esubst.extend(top);
+                    return out;
+                }
+                // Inside a body, a module-binding input has its argument's
+                // extents (the body's types), not the module binding's.
+                RefNs::SelfMod
+                    if self
+                        .fctx
+                        .as_ref()
+                        .is_some_and(|c| c.self_inputs.contains(&r.name)) =>
+                {
+                    return None;
+                }
+                RefNs::SelfMod
+                    if self
+                        .fctx
+                        .as_ref()
+                        .is_some_and(|c| c.through.contains(&r.name)) =>
+                {
+                    let rhs = self.m.binding(self.m.binding_by_name(r.name)?).rhs;
+                    return self.sym_extent(rhs, axis, d);
+                }
+                // A binding that reads such an input: sized through its value.
+                RefNs::SelfMod if self.reads_substituted(r.name) => {
+                    let rhs = self.m.binding(self.m.binding_by_name(r.name)?).rhs;
+                    return self.sym_extent(rhs, axis, d);
+                }
                 RefNs::SelfMod => {}
                 RefNs::Local => {
                     // A parameter of a body being sized: its argument.
@@ -735,12 +800,19 @@ impl<'m> Emitter<'m> {
             _ => return None,
         };
         let types = self.instantiate(fun, body, &spec, &tys).ok()?;
+        let selfs: HashSet<Symbol> = spec
+            .iter()
+            .filter(|(_, r)| r.ns == RefNs::SelfMod)
+            .map(|(_, r)| r.name)
+            .collect();
         let map: HashMap<Symbol, (NodeId, usize)> =
             entries.into_iter().zip(args.iter().copied()).collect();
         self.esubst.push(map);
+        self.esubst_self.push(selfs);
         self.sized_scope.push(types);
         let out = self.sym_extent(body, axis, d);
         self.sized_scope.pop();
+        self.esubst_self.pop();
         self.esubst.pop();
         out
     }

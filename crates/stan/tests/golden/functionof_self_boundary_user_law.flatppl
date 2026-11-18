@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+a0 = elementof(reals)
+xv = elementof(reals)
+mid = 0.5 * a0 + xv
+law = functionof(Normal(mid, 1), acc = a0, x = xv)
+mu ~ Normal(0, 1)
+y ~ law.([3.0, 4.0], mu)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.5, 0.7]))
+post = bayesupdate(L, prior)

@@ -120,6 +120,8 @@ pub(crate) struct Emitter<'m> {
     ext_lin: HashMap<String, Vec<extents::Lin>>,
     /// Size parameter substitutions while sizing a user function's body.
     esubst: Vec<HashMap<Symbol, (NodeId, usize)>>,
+    /// The module-binding inputs among each `esubst` frame's keys.
+    esubst_self: Vec<HashSet<Symbol>>,
     /// Unsourced data sizes, in union-find classes.
     svars: Vec<extents::SizeVar>,
     /// Node types of a user function's body being sized.
@@ -218,6 +220,7 @@ impl<'m> Emitter<'m> {
             extents: HashMap::new(),
             ext_lin: HashMap::new(),
             esubst: vec![],
+            esubst_self: vec![],
             sized_scope: vec![],
             svars: vec![],
             data_sizes: false,
@@ -943,7 +946,10 @@ impl<'m> Emitter<'m> {
                 )),
             },
             Node::Ref(r) => match r.ns {
-                RefNs::SelfMod => Ok(Ex::atom(self.bind(r.name)?)),
+                RefNs::SelfMod => match self.boundary_ref(id, r.name)? {
+                    Some(e) => Ok(e),
+                    None => Ok(Ex::atom(self.bind(r.name)?)),
+                },
                 RefNs::Local => self.local_ref(id, r.name),
                 RefNs::Module(alias) => Err(Refusal::not_yet(
                     Some(id),
@@ -1342,8 +1348,15 @@ impl<'m> Emitter<'m> {
                 return Ok(Ex::atom(self.at_module(|me| me.leaf(rec, &f, id))?));
             }
             // A field of a log weight's record argument: its parameter.
+            let input = |me: &Self, rf: &flatppl_core::Ref| {
+                rf.ns == RefNs::Local
+                    || me
+                        .fctx
+                        .as_ref()
+                        .is_some_and(|c| c.self_inputs.contains(&rf.name))
+            };
             if let Node::Ref(rf) = self.m.node(x)
-                && rf.ns == RefNs::Local
+                && input(self, rf)
                 && self.fctx.as_ref().and_then(|c| c.record_local) == Some(rf.name)
             {
                 let f = f.to_string();
@@ -1352,7 +1365,7 @@ impl<'m> Emitter<'m> {
             // A field of a record argument bound by name (a scan accumulator,
             // a scan parameter, an inlined call's record parameter).
             if let Node::Ref(rf) = self.m.node(x)
-                && rf.ns == RefNs::Local
+                && input(self, rf)
                 && let Some(m) = self.fctx.as_ref().and_then(|c| c.records.get(&rf.name))
             {
                 return m

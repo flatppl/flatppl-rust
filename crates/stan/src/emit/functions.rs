@@ -39,6 +39,13 @@ pub(crate) struct FnCtx {
     pub records: HashMap<Symbol, HashMap<String, String>>,
     /// Scans emitted in this body, by node.
     pub scans: HashMap<NodeId, super::scan::ScanOut>,
+    /// Boundary inputs that name module bindings (`functionof(e, a = a0)`):
+    /// a reference to one is the input, bound in `locals` or `records`.
+    pub self_inputs: HashSet<Symbol>,
+    /// Module bindings between the body and those inputs (spec §04
+    /// "Reification to functions and kernels"): their values change with the
+    /// inputs, so the body computes them. Every other binding is captured.
+    pub through: HashSet<Symbol>,
 }
 
 /// The unsized Stan type of a function argument or result.
@@ -153,6 +160,16 @@ impl<'m> Emitter<'m> {
             }
             self.m.for_each_child(id, |c| stack.push(c));
         }
+        // A module-binding input is seeded at its right-hand side, as infer
+        // seeds a call's body: the bindings that read it are typed at the
+        // argument too.
+        for ((_, r), ty) in entries.iter().zip(arg_tys) {
+            if r.ns == RefNs::SelfMod
+                && let Some(b) = self.m.binding_by_name(r.name)
+            {
+                seeds.push((self.m.binding(b).rhs, ty.clone()));
+            }
+        }
         let module = self.scratch.get_or_insert_with(|| self.m.clone());
         let (types, diags) = flatppl_infer::infer_expression(module, body, &seeds);
         if let Some(d) = diags
@@ -170,6 +187,167 @@ impl<'m> Emitter<'m> {
             ));
         }
         Ok(types)
+    }
+
+    /// Mark the module-binding inputs of a callable body and the bindings
+    /// between them and the body (see [`FnCtx::through`]).
+    pub(super) fn mark_boundary(
+        &self,
+        ctx: &mut FnCtx,
+        at: NodeId,
+        body: NodeId,
+        entries: &[(Symbol, Ref)],
+    ) -> Result<()> {
+        let targets: HashSet<Symbol> = entries
+            .iter()
+            .filter(|(_, r)| r.ns == RefNs::SelfMod)
+            .map(|(_, r)| r.name)
+            .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        ctx.through = self.boundary_reach(at, body, &targets)?;
+        ctx.self_inputs = targets;
+        Ok(())
+    }
+
+    /// The module bindings from which `body` reaches one of `targets` through
+    /// self references. A draw binding is not entered: a captured draw keeps
+    /// its one realization. A path through a nested reification or a module
+    /// reference refuses.
+    pub(super) fn boundary_reach(
+        &self,
+        at: NodeId,
+        body: NodeId,
+        targets: &HashSet<Symbol>,
+    ) -> Result<HashSet<Symbol>> {
+        let mut memo = HashMap::new();
+        let mut through = HashSet::new();
+        self.reach_walk(at, body, targets, false, &mut memo, &mut through)?;
+        Ok(through)
+    }
+
+    /// `absorbed`: inside a `lawof` or `kernelof`, where a draw is part of
+    /// the reified law and not a captured realization.
+    fn reach_walk(
+        &self,
+        at: NodeId,
+        node: NodeId,
+        targets: &HashSet<Symbol>,
+        absorbed: bool,
+        memo: &mut HashMap<(Symbol, bool), bool>,
+        through: &mut HashSet<Symbol>,
+    ) -> Result<bool> {
+        match self.m.node(node) {
+            Node::Ref(r) => match r.ns {
+                RefNs::SelfMod => {
+                    if targets.contains(&r.name) {
+                        return Ok(true);
+                    }
+                    if let Some(&v) = memo.get(&(r.name, absorbed)) {
+                        return Ok(v);
+                    }
+                    memo.insert((r.name, absorbed), false);
+                    let Some(b) = self.m.binding_by_name(r.name) else {
+                        return Ok(false);
+                    };
+                    let rhs = self.m.binding(b).rhs;
+                    if !absorbed && self.head(rhs) == Some("draw") {
+                        return Ok(false);
+                    }
+                    let v = self.reach_walk(at, rhs, targets, absorbed, memo, through)?;
+                    memo.insert((r.name, absorbed), v);
+                    if v {
+                        through.insert(r.name);
+                    }
+                    Ok(v)
+                }
+                RefNs::Module(alias) => {
+                    let load = self.m.binding_by_name(alias).map(|b| self.m.binding(b).rhs);
+                    if let Some(load) = load
+                        && self.reach_walk(at, load, targets, absorbed, memo, through)?
+                    {
+                        return Err(Refusal::not_yet(
+                            Some(at),
+                            "a boundary input reached through a module reference",
+                        ));
+                    }
+                    Ok(false)
+                }
+                RefNs::Local => Ok(false),
+            },
+            Node::Call(c) => {
+                let head = self.head(node);
+                let nested = matches!(head, Some("functionof" | "kernelof" | "lawof"));
+                // A nested reification that declares a name rebinds it.
+                let inner: HashSet<Symbol> = match (&c.inputs, nested) {
+                    (Some(Inputs::Spec(e)), true) => targets
+                        .iter()
+                        .filter(|t| !e.iter().any(|(_, r)| r.name == **t))
+                        .copied()
+                        .collect(),
+                    _ => targets.clone(),
+                };
+                let inner_absorbed = absorbed || matches!(head, Some("lawof" | "kernelof"));
+                let mut kids = Vec::new();
+                self.m.for_each_child(node, |k| kids.push(k));
+                let mut any = false;
+                for k in kids {
+                    any |= self.reach_walk(at, k, &inner, inner_absorbed, memo, through)?;
+                }
+                if nested && any {
+                    return Err(Refusal::not_yet(
+                        Some(at),
+                        format!(
+                            "a boundary input reached inside a nested `{}`",
+                            head.unwrap_or("reification")
+                        ),
+                    ));
+                }
+                Ok(any)
+            }
+            _ => {
+                let mut kids = Vec::new();
+                self.m.for_each_child(node, |k| kids.push(k));
+                let mut any = false;
+                for k in kids {
+                    any |= self.reach_walk(at, k, targets, absorbed, memo, through)?;
+                }
+                Ok(any)
+            }
+        }
+    }
+
+    /// A module-binding reference inside a callable body: the input itself,
+    /// a binding between the body and an input (computed in the body, an
+    /// array once as a local), or `None` for a captured value.
+    pub(super) fn boundary_ref(&mut self, id: NodeId, name: Symbol) -> Result<Option<Ex>> {
+        let Some(ctx) = &self.fctx else {
+            return Ok(None);
+        };
+        if ctx.self_inputs.contains(&name) {
+            return match ctx.locals.get(&name) {
+                Some(s) => Ok(Some(Ex::atom(s.clone()))),
+                None => Err(Refusal::not_yet(
+                    Some(id),
+                    "a record boundary input used whole",
+                )),
+            };
+        }
+        if !ctx.through.contains(&name) {
+            return Ok(None);
+        }
+        let b = self.m.binding_by_name(name).unwrap();
+        let rhs = self.m.binding(b).rhs;
+        if let Some(n) = self.recall(rhs) {
+            return Ok(Some(Ex::atom(n)));
+        }
+        let e = self.expr(rhs)?;
+        if self.shape(rhs).is_none_or(|s| s.rank == 0) {
+            return Ok(Some(e));
+        }
+        let placed = self.place(self.name(name), rhs, Ok(e))?;
+        Ok(Some(Ex::atom(placed)))
     }
 
     /// The Stan function for `fun` at `arg_tys`, and the module names it
@@ -193,11 +371,12 @@ impl<'m> Emitter<'m> {
         }
         let types = self.instantiate(at, body, &entries, arg_tys)?;
         let base = self.function_name(fun);
-
-        let outer_ctx = self.fctx.replace(FnCtx {
+        let mut ctx = FnCtx {
             scoped: types,
             ..Default::default()
-        });
+        };
+        self.mark_boundary(&mut ctx, at, body, &entries)?;
+        let outer_ctx = self.fctx.replace(ctx);
         let outer_owner = self.owner.take();
         let out = self.function_body(at, fun, &base, body, &entries, arg_tys);
         self.fctx = outer_ctx;
@@ -481,10 +660,12 @@ impl<'m> Emitter<'m> {
             ));
         }
         let types = self.instantiate(id, body, &entries, elem_tys)?;
-        let outer_ctx = self.fctx.replace(FnCtx {
+        let mut ctx = FnCtx {
             scoped: types,
             ..Default::default()
-        });
+        };
+        self.mark_boundary(&mut ctx, id, body, &entries)?;
+        let outer_ctx = self.fctx.replace(ctx);
         let outer_owner = self.owner.take();
         let outer_v = self.vlocals.take();
         let out = self.vectorized_body(id, fun, body, &entries, args, tys, full, brank, ret_ty);
@@ -749,14 +930,13 @@ impl<'m> Emitter<'m> {
             locals.insert(r.name, s);
         }
         let scoped = self.instantiate(m, body, &entries, &elem_tys)?;
-        Ok((
-            body,
-            FnCtx {
-                locals,
-                scoped,
-                ..Default::default()
-            },
-        ))
+        let mut ctx = FnCtx {
+            locals,
+            scoped,
+            ..Default::default()
+        };
+        self.mark_boundary(&mut ctx, m, body, &entries)?;
+        Ok((body, ctx))
     }
 
     /// A broadcast user law as one vectorized law over whole arrays, when
@@ -779,11 +959,18 @@ impl<'m> Emitter<'m> {
         let Some(bc) = self.call(body_r) else {
             return Ok(None);
         };
+        let mut marks = FnCtx::default();
+        self.mark_boundary(&mut marks, m, body, &entries)?;
+        let through = marks.through.clone();
         let mentions = |me: &Self, root: NodeId| {
             let mut stack = vec![root];
             while let Some(id) = stack.pop() {
-                if matches!(me.m.node(id), Node::Ref(r) if refs.contains(r)) {
-                    return true;
+                match me.m.node(id) {
+                    Node::Ref(r) if refs.contains(r) => return true,
+                    Node::Ref(r) if r.ns == RefNs::SelfMod && through.contains(&r.name) => {
+                        return true;
+                    }
+                    _ => {}
                 }
                 me.m.for_each_child(id, |k| stack.push(k));
             }
@@ -823,6 +1010,8 @@ impl<'m> Emitter<'m> {
         let scoped = self.instantiate(m, body, &entries, &elem_tys)?;
         // Each law argument that reads a parameter lifts over whole arrays.
         let outer_ctx = self.fctx.replace(FnCtx {
+            self_inputs: marks.self_inputs,
+            through: marks.through,
             scoped,
             ..Default::default()
         });

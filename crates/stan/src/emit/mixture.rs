@@ -11,9 +11,9 @@
 //! `transformed data` into the values at the atom and the rest (User's Guide
 //! "Zero-inflated and hurdle models").
 
+use super::Emitter;
 use super::functions::FnCtx;
 use super::structure::Law;
-use super::{Emitter, P_ATOM};
 use crate::refuse::{Refusal, RefusalKind, Result};
 use flatppl_core::{Node, NodeId, Type};
 use std::collections::HashMap;
@@ -401,7 +401,13 @@ impl<'m> Emitter<'m> {
         let per = |me: &mut Self, a: NodeId| -> Result<String> {
             let e = me.expr(a)?;
             Ok(if me.shape(a).is_some_and(|s| s.rank >= 1) {
-                format!("{}[{COMP}]", e.at(P_ATOM))
+                // Stan indexes a name or a parenthesized expression, not a
+                // literal (`[3.0, 4.0]'[k]` is a syntax error).
+                if super::structure::is_identifier(&e.s) {
+                    format!("{}[{COMP}]", e.s)
+                } else {
+                    format!("({})[{COMP}]", e.s)
+                }
             } else {
                 e.s
             })
@@ -459,11 +465,13 @@ impl<'m> Emitter<'m> {
             locals.insert(r.name, per(self, a)?);
         }
         let scoped = self.instantiate(at, body, &entries, &tys)?;
-        let outer = self.fctx.replace(FnCtx {
+        let mut ctx = FnCtx {
             locals,
             scoped,
             ..Default::default()
-        });
+        };
+        self.mark_boundary(&mut ctx, at, body, &entries)?;
+        let outer = self.fctx.replace(ctx);
         // An iid body over the whole variate: the component's density is the
         // vectorized density, the sum over its elements.
         let mut law_node = self.resolve(body);
