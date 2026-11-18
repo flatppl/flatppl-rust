@@ -60,6 +60,8 @@ pub struct LoweringOptions<'a> {
     pub numerical_integrals: bool,
     /// Admit the compiler-only ascending vector sort used by ordered sampling.
     pub vector_sort: bool,
+    /// Admit compiler-only samplers for normalized restrictions and hurdle laws.
+    pub restricted_sampling: bool,
     /// Target CDF support for scalar continuous constructors. None keeps the
     /// portable CDF rule. Missing CDFs use quadrature only with numerical_integrals.
     pub supports_cdf: Option<fn(&str) -> bool>,

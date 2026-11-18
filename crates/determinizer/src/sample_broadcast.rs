@@ -197,6 +197,9 @@ impl Scope {
                 });
             }
             Some("normalize") => {
+                if let Some((tag, parameters)) = restricted::parameters(m, measure) {
+                    return Ok(self.sample_constructor(m, tag, parameters, rng, sample_name));
+                }
                 let (base, valid) = normalized_sample_base(m, measure)?;
                 return self.sample_map(m, base, rng, sample_name, |m, point| {
                     crate::density::exponential_tilt::guard(m, point, valid)
@@ -211,6 +214,17 @@ impl Scope {
                 "broadcast sample requires a supported scalar constructor",
             )
         })?;
+        Ok(self.sample_constructor(m, ctor, parameters, rng, sample_name))
+    }
+
+    fn sample_constructor(
+        &self,
+        m: &mut Module,
+        ctor: Symbol,
+        parameters: Vec<(Symbol, NodeId)>,
+        rng: NodeId,
+        sample_name: Option<Symbol>,
+    ) -> (NodeId, NodeId) {
         let parameters = parameters
             .into_iter()
             .map(|(name, value)| (name, self.map(m, value)))
@@ -218,7 +232,7 @@ impl Scope {
         let input = build_record(m, &parameters);
         let ctor = m.alloc(Node::Const(ctor));
         let kernel = build_call(m, "broadcasted", &[ctor]);
-        Ok(build_sample_term(m, kernel, input, rng, sample_name))
+        build_sample_term(m, kernel, input, rng, sample_name)
     }
 
     fn sample_map(

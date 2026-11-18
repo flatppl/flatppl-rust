@@ -42,6 +42,8 @@ mod broadcast;
 pub(crate) use broadcast::Lanes;
 #[path = "sample_ksuperpose.rs"]
 mod mixture;
+#[path = "sample_restricted.rs"]
+mod restricted;
 
 /// `rand(m, rng)` → a deterministic sample of the closed measure `m`.
 ///
@@ -430,6 +432,11 @@ fn lower_normalized_weight_sample(
     rng: NodeId,
     sample_name: Option<Symbol>,
 ) -> Result<(NodeId, NodeId), RefuseError> {
+    if let Some((tag, params)) = restricted::parameters(m, measure) {
+        let ctor = m.alloc(Node::Const(tag));
+        let input = build_record(m, &params);
+        return Ok(build_sample_term(m, ctor, input, rng, sample_name));
+    }
     if let Some(sample) = lower_normalized_superpose_sample(m, measure, rng) {
         return sample;
     }
@@ -1073,6 +1080,18 @@ fn lower_iid_sample(
         ));
     }
     if builtin_name(m, kernel) == Some("normalize") {
+        if let Some((tag, params)) = restricted::parameters(m, kernel) {
+            let ctor = m.alloc(Node::Const(tag));
+            let input = build_record(m, &params);
+            return Ok(build_iid_sample_term(
+                m,
+                ctor,
+                input,
+                &shape,
+                rng,
+                sample_name,
+            ));
+        }
         let (base, valid) = normalized_sample_base(m, kernel)?;
         let (value, next) = lower_iid_sample(m, base, iid_node, rng, sample_name)?;
         let value = if matches!(m.node(valid), Node::Lit(Scalar::Bool(true))) {

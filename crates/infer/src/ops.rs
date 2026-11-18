@@ -10569,11 +10569,13 @@ fn kernel_variate(
         Node::Const(sym) => inf.module.resolve(*sym).to_string(),
         _ => return None,
     };
-    let sig = crate::catalogue::builtin().distribution(&name)?;
+    let name = flatppl_core::RestrictedSample::from_tag(&name)
+        .map_or(name.as_str(), |sample| sample.constructor());
+    let sig = crate::catalogue::builtin().distribution(name)?;
     let Sig::Distribution { .. } = sig else {
         return None;
     };
-    if matches!(name.as_str(), "LKJ" | "LKJCholesky") {
+    if matches!(name, "LKJ" | "LKJCholesky") {
         let input = kernel_input_node.map(|node| resolve_binding_refs(inf, node));
         let n = input.and_then(|node| match inf.module.node(node) {
             Node::Call(call)
