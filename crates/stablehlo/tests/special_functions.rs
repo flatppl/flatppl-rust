@@ -331,7 +331,10 @@ fn normal_log_cdf_compacts_only_fixed_infinite_lanes() {
     let source =
         format!("{SF}\nx = external(cartpow(reals, 64))\nkeep = [{mask}]\ninputs = x\n{pointwise}");
     let out = emit_with(&source, Mode::LogDensity, Dtype::F64).unwrap();
-    let tail = out.lines().find(|line| line.contains("chlo.erfc")).unwrap();
+    let tail = out
+        .lines()
+        .find(|line| line.contains("stablehlo.composite \"enzyme.math.log_ndtr\""))
+        .unwrap();
     assert!(tail.contains("tensor<16xf64>"), "{tail}");
 
     let source = format!(
@@ -339,7 +342,10 @@ fn normal_log_cdf_compacts_only_fixed_infinite_lanes() {
          inputs = (x, keep)\n{pointwise}"
     );
     let out = emit_with(&source, Mode::LogDensity, Dtype::F64).unwrap();
-    let tail = out.lines().find(|line| line.contains("chlo.erfc")).unwrap();
+    let tail = out
+        .lines()
+        .find(|line| line.contains("stablehlo.composite \"enzyme.math.log_ndtr\""))
+        .unwrap();
     assert!(tail.contains("tensor<64xf64>"), "{tail}");
 }
 
@@ -353,7 +359,13 @@ hi = elementof(reals)
 inputs = (mu, sigma, lo, hi)
 outputs = log(totalmass(truncate(Normal(mu, sigma), interval(lo, hi))))";
     let out = emit_with(source, Mode::LogDensity, Dtype::F64).unwrap();
-    assert_eq!(out.matches("chlo.erfc ").count(), 2, "{out}");
+    assert_eq!(out.matches("chlo.erfc ").count(), 0, "{out}");
+    assert_eq!(
+        out.matches("stablehlo.composite \"enzyme.math.log_ndtr\"")
+            .count(),
+        2,
+        "{out}"
+    );
 }
 
 // Direct tails, logarithms and scaled Bessels must remain live arithmetic with

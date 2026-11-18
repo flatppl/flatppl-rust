@@ -476,6 +476,7 @@ impl Packer<'_, '_> {
                     self.out.broadcast_in_dim(&inputs[0], &dims, ty.clone())
                 }
                 Pointwise::Bitcast(..)
+                | Pointwise::LogNdtr(_)
                 | Pointwise::Reshape(_)
                 | Pointwise::Slice(..)
                 | Pointwise::Transpose(..)

@@ -135,6 +135,7 @@ impl TensorBatch<'_, '_> {
         let target = || batching::tensor(prefix.iter().chain(shape(&value.ty)).copied().collect());
         Some(match op {
             Pointwise::Unary(op, _) => self.out.unary(op, a),
+            Pointwise::LogNdtr(_) => self.out.normal_log_cdf_with_slope(a),
             Pointwise::ChloUnary(op, _) => self.out.chlo_unary(op, a),
             Pointwise::Binary(op, ..) => self.out.binary(op, a, &inputs[1]),
             Pointwise::ChloBinary(op, ..) => self.out.chlo_binary(op, a, &inputs[1]),

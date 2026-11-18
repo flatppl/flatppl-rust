@@ -302,32 +302,14 @@ impl Emitter<'_> {
 
     fn normal_log_cdf(&mut self, x: &Value, masks_nan: bool) -> Value {
         let x = self.convert(x, ElemKind::Real);
-        let zero = self.constant_like(0.0, &x);
-        let negative = self.compare("LT", &x, &zero);
-        let magnitude = self.abs(&x);
-        let finite = self.special_finite(&x);
-        let one = self.constant_like(1.0, &x);
-        let magnitude = self.select(&finite, &magnitude, &one);
-
-        let inv_sqrt_two = self.scalar(std::f64::consts::FRAC_1_SQRT_2);
-        let argument = self.mul(&magnitude, &inv_sqrt_two);
-        // Keep XLA from fusing the double-precision erfc expansion with the
-        // rest of the interval score and its adjoint into one GPU kernel.
-        let split_erfc_fusion =
-            self.target == crate::Target::Gpu && matches!(self.dtype, Dtype::F64);
-        let scaled_tail = self.erfcx(&argument, split_erfc_fusion);
-        let log_tail = self.log(&scaled_tail);
-        let log_two = self.scalar(std::f64::consts::LN_2);
-        let log_tail = self.sub(&log_tail, &log_two);
-        let square = self.mul(&argument, &argument);
-        let log_tail = self.sub(&log_tail, &square);
-        let tail = self.exp(&log_tail);
-        let minus_tail = self.neg(&tail);
-        let log_complement = self.log1p(&minus_tail);
-        let value = self.select(&negative, &log_tail, &log_complement);
-        let minus_infinity = self.constant_like(f64::NEG_INFINITY, &x);
-        let endpoint = self.select(&negative, &minus_infinity, &zero);
-        let value = self.select(&finite, &value, &endpoint);
+        let value = if self.restrict_enzyme_compatible
+            && self.target == crate::Target::Cpu
+            && shape(&x.ty).iter().all(Option::is_some)
+        {
+            self.normal_log_cdf_with_slope(&x)
+        } else {
+            self.normal_log_cdf_body(&x, false).0
+        };
         if masks_nan {
             return value;
         }
@@ -340,6 +322,172 @@ impl Emitter<'_> {
         self.record_runtime_error(&not_nan, 12);
         let nan = self.constant_like(f64::NAN, &x);
         self.select(&not_nan, &value, &nan)
+    }
+
+    pub(super) fn normal_log_cdf_with_slope(&mut self, x: &Value) -> Value {
+        let ty = x.ty.render(self.dtype, ElemKind::Real);
+        let name = format!("__enzyme_log_ndtr_v1_{}", &ty[7..ty.len() - 1]);
+        if !self.solve_helpers.contains_key(&name) {
+            let mut helper = self.scratch_emitter();
+            let arg = Value {
+                ssa: "%x".into(),
+                ..x.clone()
+            };
+            let (value, slope) = helper.normal_log_cdf_body(&arg, true);
+            let args = [(arg.ssa, arg.ty, arg.elem)];
+            let definition = helper.finish_function(
+                &name,
+                &args,
+                &[&value, &slope.expect("slope requested")],
+                true,
+            );
+            self.solve_helpers.insert(name.clone(), definition);
+        }
+        let result = self.fresh();
+        self.push(&format!(
+            "{result}:2 = stablehlo.composite \"enzyme.math.log_ndtr\" {} {{decomposition = @{name}, version = 1 : i32}} : ({ty}) -> ({ty}, {ty})",
+            x.ssa,
+        ));
+        let value = Value {
+            ssa: format!("{result}#0"),
+            ..x.clone()
+        };
+        self.remember_axes(&value.ssa, self.axes_of(x));
+        self.remember_pointwise(&value.ssa, x, Pointwise::LogNdtr(x.clone()));
+        value
+    }
+
+    fn normal_log_cdf_body(&mut self, x: &Value, with_slope: bool) -> (Value, Option<Value>) {
+        let zero = self.constant_like(0.0, x);
+        let negative = self.compare("LT", x, &zero);
+        let magnitude = self.abs(x);
+        let finite = self.special_finite(x);
+        let one = self.constant_like(1.0, x);
+        let magnitude = self.select(&finite, &magnitude, &one);
+
+        let inv_sqrt_two = self.scalar(std::f64::consts::FRAC_1_SQRT_2);
+        let argument = self.mul(&magnitude, &inv_sqrt_two);
+        // Keep XLA from fusing the double-precision erfc expansion with the
+        // rest of the interval score and its adjoint into one GPU kernel.
+        let split_erfc_fusion =
+            self.target == crate::Target::Gpu && matches!(self.dtype, Dtype::F64);
+        let (scaled_tail, hazard) = if with_slope {
+            let (scaled, hazard) = self.normal_log_cdf_scaled_tail(&argument, &magnitude);
+            (scaled, Some(hazard))
+        } else {
+            (self.erfcx(&argument, split_erfc_fusion), None)
+        };
+        let log_tail = self.log(&scaled_tail);
+        let log_two = self.scalar(std::f64::consts::LN_2);
+        let log_tail = self.sub(&log_tail, &log_two);
+        let square = self.mul(&argument, &argument);
+        let log_tail = self.sub(&log_tail, &square);
+        let tail = self.exp(&log_tail);
+        let minus_tail = self.neg(&tail);
+        let log_complement = self.log1p(&minus_tail);
+        let value = self.select(&negative, &log_tail, &log_complement);
+        let minus_infinity = self.constant_like(f64::NEG_INFINITY, x);
+        let endpoint = self.select(&negative, &minus_infinity, &zero);
+        let value = self.select(&finite, &value, &endpoint);
+        let slope = hazard.map(|hazard| {
+            // Convert the survival hazard to the CDF slope by reusing the
+            // tail probability, which is already available from the value.
+            let probability = self.sub(&one, &tail);
+            let ratio = self.div(&tail, &probability);
+            let ratio = self.select(&negative, &one, &ratio);
+            let slope = self.mul(&hazard, &ratio);
+            self.select(&finite, &slope, &zero)
+        });
+        (value, slope)
+    }
+
+    fn normal_log_cdf_scaled_tail(&mut self, x: &Value, abs_z: &Value) -> (Value, Value) {
+        // Fit (x + 1/2) * erfcx(x) on the positive half-line using the
+        // Shepherd–Laframboise map t = (x - 3.75)/(x + 3.75). Project
+        // 2048 Chebyshev nodes to degrees 11 and 22, then use monomial
+        // coefficients for parallel polynomial evaluation.
+        // The bounded polynomial needs neither an exponential nor a tail split.
+        const F32: [f64; 12] = [
+            6.187_563_096_338_5e-1,
+            -7.012_032_916_069_327e-2,
+            1.793_135_197_012_158e-3,
+            4.113_920_999_173_533e-2,
+            -5.440_713_507_452_408e-2,
+            4.614_538_479_565_338e-2,
+            -2.932_342_936_777_644e-2,
+            1.420_462_618_205_788e-2,
+            -4.922_247_429_833_534e-3,
+            8.379_561_089_974_229e-4,
+            1.981_538_064_929_362e-4,
+            -1.120_583_733_746_959e-4,
+        ];
+        const F64: [f64; 23] = [
+            6.187_563_154_189_137e-1,
+            -7.012_029_929_277_282e-2,
+            1.792_707_742_735_378e-3,
+            4.113_836_924_500_378e-2,
+            -5.440_196_507_112e-2,
+            4.615_216_058_203_803e-2,
+            -2.934_669_928_934_497e-2,
+            1.418_113_868_696_314e-2,
+            -4.873_289_836_317_03e-3,
+            8.778_130_778_583_207e-4,
+            1.468_571_728_115_197e-4,
+            -1.450_776_608_023_793e-4,
+            2.582_329_512_300_962e-5,
+            1.119_375_084_495_728e-5,
+            -5.719_058_075_668_331e-6,
+            -4.895_890_700_778_886e-7,
+            8.710_116_694_690_917e-7,
+            -2.545_649_480_101_187e-8,
+            -1.242_888_959_379_924e-7,
+            9.410_866_809_416_574e-9,
+            1.598_670_336_777_831e-8,
+            -9.805_568_197_344_875e-10,
+            -1.310_324_828_046_744e-9,
+        ];
+        let coefficients = match self.dtype {
+            Dtype::F32 => &F32[..],
+            Dtype::F64 => &F64[..],
+        };
+        let shift = self.scalar(3.75);
+        let numerator = self.sub(x, &shift);
+        let denominator = self.add(x, &shift);
+        let mut power = self.div(&numerator, &denominator);
+        let mut terms: Vec<_> = coefficients.iter().map(|&c| self.scalar(c)).collect();
+        while terms.len() > 1 {
+            terms = terms
+                .chunks(2)
+                .map(|pair| match pair {
+                    [a, b] => {
+                        let weighted = self.mul(b, &power);
+                        self.add(a, &weighted)
+                    }
+                    [a] => a.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            if terms.len() > 1 {
+                power = self.mul(&power, &power);
+            }
+        }
+        let normalized = &terms[0];
+        let half = self.scalar(0.5);
+        let scale = self.add(x, &half);
+        let scaled = self.div(normalized, &scale);
+
+        let shift = self.scalar(std::f64::consts::FRAC_1_SQRT_2);
+        let scale = self.add(abs_z, &shift);
+        let inverse_sqrt_pi = self.scalar(FRAC_1_SQRT_PI);
+        let ratio = self.div(&inverse_sqrt_pi, normalized);
+        let hazard = self.mul(&scale, &ratio);
+        // Beyond this point, the hazard correction is below half an ulp.
+        let cutoff = self.scalar(match self.dtype {
+            Dtype::F32 => 4096.0,
+            Dtype::F64 => 134_217_728.0,
+        });
+        let far = self.compare("GE", abs_z, &cutoff);
+        (scaled, self.select(&far, abs_z, &hazard))
     }
 
     /// Keep fixed infinite endpoints out of the CDF and its adjoint.
@@ -476,8 +624,8 @@ impl Emitter<'_> {
         let p = self.mul(&t, &p);
         let correction = self.div(&p, &q);
         let leading = self.scalar(FRAC_1_SQRT_PI);
-        let tail = self.sub(&leading, &correction);
-        let tail = self.mul(&inverse, &tail);
+        let rational = self.sub(&leading, &correction);
+        let tail = self.mul(&inverse, &rational);
         self.select(&small, &product, &tail)
     }
 }
