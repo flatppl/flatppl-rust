@@ -12,9 +12,8 @@ use crate::density::{draw_argument, resolve_ref, resolve_ref_chain};
 pub(crate) use flatppl_core::calling::{
     bind_call_args, bind_optional_call_args, is_splattable, record_field, splat_fields,
 };
-use flatppl_core::{
-    Binding, BindingId, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Symbol,
-};
+pub(crate) use flatppl_core::graph::declared_binding;
+use flatppl_core::{Binding, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Symbol};
 pub(crate) use flatppl_infer::annotate_rebuilt;
 
 /// A resolved kernel: its reified body and its boundary inputs as
@@ -44,19 +43,9 @@ fn boundary_inputs(
     reif_id: NodeId,
     inputs: &Option<Inputs>,
 ) -> Option<(Vec<(Symbol, Ref)>, bool)> {
-    match inputs.as_ref()? {
-        Inputs::Spec(entries) if !entries.is_empty() => {
-            Some((entries.iter().map(|(nm, r)| (*nm, *r)).collect(), false))
-        }
-        Inputs::Spec(_) => None,
-        Inputs::Auto => {
-            let entries = m.auto_inputs_of(reif_id)?;
-            if entries.is_empty() {
-                return None;
-            }
-            Some((entries.iter().map(|(nm, r)| (*nm, *r)).collect(), true))
-        }
-    }
+    let inputs = inputs.as_ref()?;
+    let entries = flatppl_core::calling::reified_inputs(m, reif_id, inputs)?;
+    (!entries.is_empty()).then(|| (entries.to_vec(), matches!(inputs, Inputs::Auto)))
 }
 
 /// Resolve `k_arg` to a `kernelof(body, <boundary>)`. `None` for any
@@ -628,26 +617,6 @@ pub(crate) fn reduce_kernel_application_bound(
 /// declared law, not the value supplied to that earlier query.
 pub(crate) fn declared_body(m: &Module, node: NodeId) -> NodeId {
     declared_binding(m, node).0
-}
-
-/// [`declared_body`], with the binding that holds it: the last binding of a
-/// bare-name alias chain, which is the one a query must pin.
-pub(crate) fn declared_binding(m: &Module, mut node: NodeId) -> (NodeId, Option<BindingId>) {
-    let mut holder = None;
-    for _ in 0..m.binding_count() {
-        let Node::Ref(reference) = m.node(node) else {
-            break;
-        };
-        if reference.ns != RefNs::SelfMod {
-            break;
-        }
-        let Some(binding) = m.binding_by_name(reference.name) else {
-            break;
-        };
-        node = m.declared_binding_rhs(binding);
-        holder = Some(binding);
-    }
-    (node, holder)
 }
 
 #[cfg(test)]

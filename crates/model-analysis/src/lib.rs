@@ -7,6 +7,7 @@ mod conjugacy;
 mod dependencies;
 mod incremental;
 mod normal_coordinates;
+pub mod posterior;
 pub mod record_marginals;
 mod sufficient_statistics;
 

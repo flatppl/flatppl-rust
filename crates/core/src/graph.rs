@@ -25,6 +25,26 @@ pub fn resolve_ref(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
     (node, bid)
 }
 
+/// Follow aliases to the model declaration, even after a query pinned a draw.
+/// The last binding in the chain owns the declaration.
+pub fn declared_binding(m: &Module, mut node: NodeId) -> (NodeId, Option<BindingId>) {
+    let mut holder = None;
+    for _ in 0..m.binding_count() {
+        let Node::Ref(reference) = m.node(node) else {
+            break;
+        };
+        if reference.ns != RefNs::SelfMod {
+            break;
+        }
+        let Some(binding) = m.binding_by_name(reference.name) else {
+            break;
+        };
+        node = m.declared_binding_rhs(binding);
+        holder = Some(binding);
+    }
+    (node, holder)
+}
+
 /// Follow one level of `(%ref self x)` indirection: if `id` is a self-ref,
 /// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`. Only a
 /// caller that inspects each hop wants this; the rest use [`resolve_ref`].
