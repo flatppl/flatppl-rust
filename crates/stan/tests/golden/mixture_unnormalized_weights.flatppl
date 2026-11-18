@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+k_obs = [3, 5, 4]
+theta ~ Beta(1, 1)
+counts(n, t) = iid(Binomial(n, t), 3)
+sizes = indicesof(zeros(10))
+weights = ones(10)
+y ~ normalize(ksuperpose(counts, weights, sizes, theta))
+prior = lawof(record(theta = theta))
+L = likelihoodof(kernelof(record(y = y), theta = theta), record(y = k_obs))
+post = bayesupdate(L, prior)

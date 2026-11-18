@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+N = 4
+y_obs = [-1.2, 0.3, 2.9, 3.4]
+theta ~ Beta(2, 2)
+mu ~ iid(Normal(0, 5), 2)
+component = normalize(superpose(weighted(theta, Normal(mu[1], 1)), weighted(1 - theta, Normal(mu[2], 1))))
+y ~ iid(component, N)
+prior = lawof(record(theta = theta, mu = mu))
+L = likelihoodof(kernelof(record(y = y), theta = theta, mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

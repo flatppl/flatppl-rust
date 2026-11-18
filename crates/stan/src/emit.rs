@@ -15,6 +15,7 @@ mod aggregate;
 mod elementwise;
 mod extents;
 mod functions;
+mod mixture;
 mod pattern;
 mod ranges;
 mod statistics;
@@ -134,6 +135,11 @@ pub(crate) struct Emitter<'m> {
     owner: Option<(String, NodeId)>,
     /// Set while a law fills its flattened arguments.
     flat: Option<Flat>,
+    /// Restrict law rows to each law's general pattern (a `joint`'s parts).
+    general_rows: bool,
+    /// Parameters declared from their law's sets (`ordered[K]`): only these
+    /// may take a law whose restriction the declaration carries.
+    set_declared: HashSet<String>,
     /// `logweighted` log weights of the prior, with their base measures.
     weights: Vec<(NodeId, NodeId)>,
     /// Values placed under their own name, by node: a law filled twice
@@ -216,6 +222,8 @@ impl<'m> Emitter<'m> {
             in_progress: HashSet::new(),
             owner: None,
             flat: None,
+            general_rows: false,
+            set_declared: HashSet::new(),
             weights: vec![],
             placed: HashMap::new(),
             fctx: None,

@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+y_obs = [0.2, 2.8, 3.1]
+mu = elementof(cartpow(reals, 2))
+mu_prior = truncate(joint(Normal(0, 1), Normal(3, 1)), ordered(2))
+y ~ iid(Normal(mu[2] - mu[1], 1), 3)
+prior = joint(mu = mu_prior)
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

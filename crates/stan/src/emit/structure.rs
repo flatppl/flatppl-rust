@@ -10,31 +10,39 @@ use flatppl_core::{Inputs, NamedKind, Node, NodeId, RefNs, Symbol, Type, ValueSe
 use std::collections::{HashMap, HashSet};
 
 /// The loop index a per-element argument of a broadcast law is rendered with.
-const LOOP: &str = "\u{1}";
+pub(super) const LOOP: &str = "\u{1}";
 
 /// A law as a Stan sampling statement right-hand side.
-struct Law {
+pub(super) struct Law {
     /// `stan(args)` for one statement over the whole variate.
-    call: String,
+    pub call: String,
     /// `call` with rank-2 arguments flattened, for a flattened variate.
     flat_call: Option<String>,
     /// `stan(args)` with [`LOOP`] where a broadcast loop indexes.
-    indexed: String,
+    pub indexed: String,
     /// A broadcast varies a vector parameter per element, which Stan does not
     /// vectorize (`categorical` with one simplex per observation).
     vector_per_element: bool,
     /// The `distributions.ron` variate template (`{y}`, `{y} + 1`).
     lhs: String,
     /// `T[lower, upper]`, either side open.
-    trunc: Option<(Option<String>, Option<String>)>,
-    vectorized: bool,
-    multivariate: bool,
+    pub trunc: Option<(Option<String>, Option<String>)>,
+    pub vectorized: bool,
+    pub multivariate: bool,
     /// Stan defines `_lcdf` and `_lccdf`, so `T[L, U]` is well formed.
     lcdf: bool,
     /// An integer variate.
-    discrete: bool,
+    pub discrete: bool,
     /// The support an unnormalized `truncate` restricts its variate to.
-    support: Option<(Option<String>, Option<String>)>,
+    pub support: Option<(Option<String>, Option<String>)>,
+    /// The `distributions.ron` guard with its arguments filled: `{y}` stays.
+    /// The second form indexes per element ([`LOOP`]).
+    pub guard: Option<(String, String)>,
+    /// Statements the law adds after its `~` line (`target += lgamma(K + 1);`).
+    pub extra: Vec<String>,
+    /// The restriction lives in the variate's declaration (`ordered[K]`):
+    /// the law is exact only on a parameter declared from its sets.
+    pub declared: bool,
 }
 
 impl Law {
@@ -179,12 +187,13 @@ impl<'m> Emitter<'m> {
                             format!("the derived prior field `{}`", self.name(na.name)),
                         ));
                     }
+                    let law = self.call(rhs).unwrap().args[0];
                     out.push(PriorField {
                         field: na.name,
                         binding: Some(sym),
-                        law: Some(self.call(rhs).unwrap().args[0]),
+                        law: Some(law),
                         node: na.value,
-                        sets: vec![],
+                        sets: self.law_sets(law),
                     });
                 }
             }
@@ -199,7 +208,7 @@ impl<'m> Emitter<'m> {
                         binding: None,
                         law: Some(na.value),
                         node: na.value,
-                        sets: vec![],
+                        sets: self.law_sets(na.value),
                     });
                 }
             }
@@ -372,6 +381,7 @@ impl<'m> Emitter<'m> {
                 self.declare_ty(&ty, vs.as_ref(), true, f.node, &stan, &hints)?
             } else {
                 let hints = self.set_hints(f.sets[0]);
+                self.set_declared.insert(stan.clone());
                 self.declare_from_sets(&ty, f, &stan, &hints)?
             };
             // A support the value set cannot state (a computed bound) comes from
@@ -779,6 +789,11 @@ impl<'m> Emitter<'m> {
         self.constrain_variate(lhs, measure);
         let lhs_rank = self.lhs_rank(lhs);
         let m = self.resolve(measure);
+        // A mixture is `target +=` of its log density, per element of an iid
+        // variate: Stan has no observation-level vectorized mixture.
+        if let Some(lines) = self.mixture_statements(lhs, m)? {
+            return Ok(lines);
+        }
         let flat = self.flat_order(lhs);
         let (law, per_element) = match self.head(m) {
             Some("Lebesgue") => return Ok(vec![]),
@@ -790,17 +805,41 @@ impl<'m> Emitter<'m> {
                 self.flat = None;
                 (law?, true)
             }
+            // A joint of different laws: one statement per component.
+            Some("joint") if self.call(m).unwrap().named.is_empty() => match self.law(m, false) {
+                Ok(law) => (law, false),
+                Err(e) if e.kind.is_never() => return Err(e),
+                Err(_) => {
+                    let mut out = Vec::new();
+                    for (k, a) in self.call(m).unwrap().args.iter().copied().enumerate() {
+                        let law = self.law(a, false)?;
+                        if law.multivariate {
+                            return Err(Refusal::not_yet(Some(m), "a joint of vector laws"));
+                        }
+                        self.declared_variate(lhs, &law, m)?;
+                        out.push(format!(
+                            "{} ~ {};",
+                            law.lhs(&format!("{lhs}[{}]", k + 1)),
+                            law.rhs(None)
+                        ));
+                        out.extend(law.extra);
+                    }
+                    return Ok(out);
+                }
+            },
             _ => (self.law(m, false)?, false),
         };
+        self.declared_variate(lhs, &law, m)?;
         let elementwise = per_element || self.head(m) == Some("iid");
         let shifted = law.lhs("{y}") != "{y}";
         // A loop where Stan has no vectorized form: a law that does not
         // vectorize, a truncated law, a vector law over an array of variates,
         // or a shifted variate (`{y} + 1`) of an integer array.
         let one_variate = !elementwise && (law.multivariate || lhs_rank == 0);
+        // Stan vectorizes `T[L, U]` where the law has `_lcdf` and `_lccdf`,
+        // which `truncated` requires, so truncation alone never loops.
         let loops = !one_variate
             && (!law.vectorized
-                || law.trunc.is_some()
                 || law.multivariate
                 || law.vector_per_element
                 || (shifted && lhs_rank > 0));
@@ -814,7 +853,9 @@ impl<'m> Emitter<'m> {
                 law.rhs(index)
             );
             self.used.remove(&i);
-            return Ok(vec![stmt]);
+            let mut out = vec![stmt];
+            out.extend(law.extra);
+            return Ok(out);
         }
         let (target, rhs) = match (flat, &law.flat_call) {
             (Some(Flat::Row), Some(call)) if !law.multivariate => {
@@ -826,7 +867,21 @@ impl<'m> Emitter<'m> {
             _ if lhs_rank >= 2 && !law.multivariate => (format!("to_vector({lhs})"), law.rhs(None)),
             _ => (lhs.to_string(), law.rhs(None)),
         };
-        Ok(vec![format!("{} ~ {rhs};", law.lhs(&target))])
+        let mut out = vec![format!("{} ~ {rhs};", law.lhs(&target))];
+        out.extend(law.extra);
+        Ok(out)
+    }
+
+    /// A law whose restriction the declaration carries is exact only on a
+    /// parameter declared from its sets: elsewhere the restriction is lost.
+    fn declared_variate(&self, lhs: &str, law: &Law, at: NodeId) -> Result<()> {
+        if law.declared && !self.set_declared.contains(lhs) {
+            return Err(Refusal::not_yet(
+                Some(at),
+                "an ordered restriction of a variate that is not a parameter",
+            ));
+        }
+        Ok(())
     }
 
     fn fresh_index(&mut self) -> String {
@@ -849,12 +904,55 @@ impl<'m> Emitter<'m> {
 
     /// `D_lpdf(x | args)` (`_lpmf` for a discrete law) from the law's
     /// `distributions.ron` row, the same text `~` uses.
+    /// The law of a measure, outside a broadcast.
+    pub(super) fn law_any(&mut self, m: NodeId) -> Result<Law> {
+        let broadcast = self.head(self.resolve(m)) == Some("broadcast");
+        self.law(m, broadcast)
+    }
+
+    /// A table law whose array arguments vary per element ([`LOOP`]).
+    pub(super) fn table_law_per(&mut self, at: NodeId, name: &str, args: &[NodeId]) -> Result<Law> {
+        self.table_law(at, name, args, true)
+    }
+
+    /// `D_lpdf(y | args)` (`_lpmf` for a discrete law) for a variate already
+    /// printed, per element at `index` when given.
+    pub(super) fn law_density(
+        &mut self,
+        at: NodeId,
+        law: &Law,
+        y: &str,
+        index: Option<&str>,
+    ) -> Result<String> {
+        let call = match index {
+            Some(i) => law.indexed.replace(LOOP, i),
+            None => law.call.clone(),
+        };
+        let open = call
+            .find('(')
+            .ok_or_else(|| Refusal::not_yet(Some(at), "the log density of this law"))?;
+        let (name, args) = (&call[..open], &call[open + 1..call.len() - 1]);
+        let suffix = if law.discrete { "_lpmf" } else { "_lpdf" };
+        let y = law.lhs(y);
+        Ok(if args.is_empty() {
+            format!("{name}{suffix}({y})")
+        } else {
+            format!("{name}{suffix}({y} | {args})")
+        })
+    }
+
     pub(super) fn density_call(&mut self, id: NodeId, m: NodeId, x: NodeId) -> Result<String> {
         let law = self.law(m, false)?;
         if law.trunc.is_some() || law.support.is_some() {
             return Err(Refusal::not_yet(
                 Some(id),
                 "logdensityof of a truncated law",
+            ));
+        }
+        if law.declared {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "logdensityof of an ordered restriction",
             ));
         }
         // Over an array, `D_lpdf(x | …)` is the sum only where Stan
@@ -870,24 +968,14 @@ impl<'m> Emitter<'m> {
         } else {
             self.real(x)?
         };
-        let open = law
-            .call
-            .find('(')
-            .ok_or_else(|| Refusal::not_yet(Some(id), "logdensityof of this law"))?;
-        let (name, args) = (&law.call[..open], &law.call[open + 1..law.call.len() - 1]);
-        let suffix = if law.discrete { "_lpmf" } else { "_lpdf" };
         // A shifted variate (`{y} + 1`, Categorical0) is exact on the
         // integers: a bijection under counting measure, with no Jacobian.
         let y = if law.lhs("{y}") == "{y}" {
             x.s.clone()
         } else {
-            law.lhs(&x.at(P_ATOM))
+            x.at(P_ATOM)
         };
-        Ok(if args.is_empty() {
-            format!("{name}{suffix}({y})")
-        } else {
-            format!("{name}{suffix}({y} | {args})")
-        })
+        self.law_density(id, &law, &y, None)
     }
 
     /// A parameter declared by the sets a record-level `truncate` gives it:
@@ -1007,15 +1095,64 @@ impl<'m> Emitter<'m> {
                 if self.head(inner) != Some("truncate") {
                     return Err(Refusal::not_yet(Some(m), "normalize of this measure"));
                 }
+                let c = self.call(inner).unwrap();
+                if let Some(law) = self.ordered_iid(m, c.args[0], c.args[1])? {
+                    return Ok(law);
+                }
+                // The mass of the ordered cone is 1/K! only for exchangeable
+                // components; P(X1 < … < XK) has no closed form otherwise.
+                if self.head(self.resolve(c.args[1])) == Some("ordered") {
+                    return Err(Refusal::new(
+                        RefusalKind::NumericNormalizer,
+                        Some(m),
+                        "normalize",
+                        "`normalize` of an ordered restriction of non-identical components has no \
+                         closed-form normalizer",
+                    ));
+                }
                 self.truncated(inner)
             }
-            // An unnormalized restriction keeps the density; the declaration bound
-            // carries the support.
+            // `tilt(iid(D, K), Lebesgue(ordered(K)))`: D's density on the ordered
+            // cone, normalized (§06 "Normalization and mass").
+            "tilt" => {
+                let c = self.call(m).unwrap();
+                let base = self.resolve(c.args[1]);
+                let set = (self.head(base) == Some("Lebesgue"))
+                    .then(|| self.call(base).unwrap())
+                    .and_then(|b| {
+                        b.args
+                            .first()
+                            .copied()
+                            .or_else(|| b.named.first().map(|n| n.value))
+                    });
+                match set {
+                    Some(set) => match self.ordered_iid(m, c.args[0], set)? {
+                        Some(law) => Ok(law),
+                        None => Err(Refusal::not_yet(Some(m), "the law `tilt` in this form")),
+                    },
+                    None => Err(Refusal::not_yet(Some(m), "the law `tilt` in this form")),
+                }
+            }
+            // An unnormalized restriction keeps the density; the declaration
+            // carries the support. A chain with an `ordered` set declares the
+            // parameter's type (`ordered`, `positive_ordered`, see `law_sets`).
             "truncate" => {
+                if !self.law_sets(m).is_empty() {
+                    let mut inner = m;
+                    while self.head(inner) == Some("truncate")
+                        && self.declarable_set(self.call(inner).unwrap().args[1])
+                    {
+                        inner = self.resolve(self.call(inner).unwrap().args[0]);
+                    }
+                    let mut law = self.law(inner, false)?;
+                    law.declared = true;
+                    return Ok(law);
+                }
                 let mut law = self.truncated(m)?;
                 law.support = law.trunc.take();
                 Ok(law)
             }
+            "joint" => self.joint_law(m),
             "broadcast" if broadcast => {
                 let c = self.call(m).unwrap();
                 let Node::Const(f) = self.m.node(c.args[0]) else {
@@ -1176,6 +1313,27 @@ impl<'m> Emitter<'m> {
     fn support(&mut self, law: NodeId) -> Result<Option<(Option<String>, Option<String>)>> {
         let m = self.resolve(law);
         match self.head(m) {
+            // A positional joint: vector bounds, one end per component.
+            Some("joint") if self.call(m).unwrap().named.is_empty() => {
+                let mut los = Vec::new();
+                let mut his = Vec::new();
+                for a in self.call(m).unwrap().args.iter().copied() {
+                    match self.support(a)? {
+                        Some((lo, hi)) => {
+                            los.push(lo);
+                            his.push(hi);
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                let side = |v: Vec<Option<String>>| -> Option<String> {
+                    let v: Option<Vec<String>> = v.into_iter().collect();
+                    v.map(|v| format!("[{}]'", v.join(", ")))
+                };
+                Ok(Some((side(los), side(his))))
+            }
+            // A declared set is the declaration's own (see `declare_from_sets`).
+            Some("truncate") if !self.law_sets(m).is_empty() => Ok(None),
             Some("iid" | "normalize") => self.support(self.call(m).unwrap().args[0]),
             Some("truncate") => {
                 let set = self.resolve(self.call(m).unwrap().args[1]);
@@ -1187,6 +1345,176 @@ impl<'m> Emitter<'m> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `iid(D, K)` restricted to `ordered(K)` and normalized: D's own
+    /// statement on an `ordered[K]` parameter plus `target += lgamma(K + 1);`.
+    /// K iid continuous draws are exchangeable and tie with probability 0, so
+    /// the ordered cone has mass 1/K! and the density gains log K!.
+    fn ordered_iid(&mut self, at: NodeId, measure: NodeId, set: NodeId) -> Result<Option<Law>> {
+        let (iid, set) = (self.resolve(measure), self.resolve(set));
+        if self.head(iid) != Some("iid") || self.head(set) != Some("ordered") {
+            return Ok(None);
+        }
+        let ic = self.call(iid).unwrap();
+        let (d, k) = (ic.args[0], ic.args[1]);
+        let k_set = self.call(set).unwrap().args[0];
+        let (Some(kl), Some(ks)) = (self.lin_int(k), self.lin_int(k_set)) else {
+            return Ok(None);
+        };
+        if kl != ks {
+            return Ok(None);
+        }
+        let mut law = self.law(d, false)?;
+        if law.multivariate
+            || law.discrete
+            || law.trunc.is_some()
+            || law.support.is_some()
+            || law.declared
+        {
+            return Err(Refusal::not_yet(
+                Some(at),
+                "an ordered restriction of this law",
+            ));
+        }
+        law.extra
+            .push(format!("target += lgamma({});", kl.add(1).print()));
+        law.declared = true;
+        Ok(Some(law))
+    }
+
+    /// `ordered(K)`, `posreals`, `nonnegreals` or `cartpow` of a positive set:
+    /// a set the parameter's declared type carries (see `declare_from_sets`).
+    fn declarable_set(&self, s: NodeId) -> bool {
+        let mut e = self.resolve(s);
+        while self.head(e) == Some("cartpow") {
+            e = self.resolve(self.call(e).unwrap().args[0]);
+        }
+        self.head(e) == Some("ordered")
+            || matches!(self.m.node(e), Node::Const(c) if matches!(self.name(*c), "posreals" | "nonnegreals"))
+    }
+
+    /// The sets a prior law's truncation chain restricts its variate to, when
+    /// one is `ordered`: they declare the parameter.
+    pub(super) fn law_sets(&self, law: NodeId) -> Vec<NodeId> {
+        let mut sets = Vec::new();
+        let mut m = self.resolve(law);
+        loop {
+            match self.head(m) {
+                Some("truncate") if self.declarable_set(self.call(m).unwrap().args[1]) => {
+                    sets.push(self.call(m).unwrap().args[1]);
+                    m = self.resolve(self.call(m).unwrap().args[0]);
+                }
+                Some("normalize") => m = self.resolve(self.call(m).unwrap().args[0]),
+                Some("tilt") => {
+                    let base = self.resolve(self.call(m).unwrap().args[1]);
+                    if self.head(base) == Some("Lebesgue")
+                        && let Some(s) = self.call(base).unwrap().args.first()
+                    {
+                        sets.push(*s);
+                    }
+                    m = self.resolve(self.call(m).unwrap().args[0]);
+                }
+                _ => break,
+            }
+        }
+        let ordered = sets
+            .iter()
+            .any(|&s| self.head(self.resolve(s)) == Some("ordered"));
+        if ordered { sets } else { vec![] }
+    }
+
+    /// A positional `joint` of scalar laws over a vector variate (§06
+    /// "Independent composition"): one vectorized statement when every
+    /// component is the same Stan law, with the arguments that differ as
+    /// vectors.
+    fn joint_law(&mut self, m: NodeId) -> Result<Law> {
+        let c = self.call(m).unwrap();
+        if !c.named.is_empty() || c.args.is_empty() {
+            return Err(Refusal::not_yet(Some(m), "the law `joint` in this form"));
+        }
+        let mut laws = Vec::new();
+        for a in c.args.iter().copied() {
+            laws.push(self.law(a, false)?);
+        }
+        // Components that resolve to different rows of one law
+        // (`std_normal()` beside `normal(3, 1)`) share its general row.
+        let stan = |l: &Law| l.call.split('(').next().unwrap_or("").to_string();
+        if laws.iter().any(|l| stan(l) != stan(&laws[0])) {
+            let outer = std::mem::replace(&mut self.general_rows, true);
+            let mut general = Vec::new();
+            let mut ok = true;
+            for a in c.args.iter().copied() {
+                match self.law(a, false) {
+                    Ok(l) => general.push(l),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            self.general_rows = outer;
+            if ok {
+                laws = general;
+            }
+        }
+        let split = |call: &str| -> Option<(String, Vec<String>)> {
+            let open = call.find('(')?;
+            let inner = &call[open + 1..call.len() - 1];
+            let mut parts = Vec::new();
+            let (mut depth, mut start) = (0i32, 0);
+            for (i, ch) in inner.char_indices() {
+                match ch {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(inner[start..i].trim().to_string());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if !inner.trim().is_empty() {
+                parts.push(inner[start..].trim().to_string());
+            }
+            Some((call[..open].to_string(), parts))
+        };
+        let parts: Vec<_> = laws
+            .iter()
+            .map(|l| split(&l.call))
+            .collect::<Option<_>>()
+            .ok_or_else(|| Refusal::not_yet(Some(m), "the law `joint` in this form"))?;
+        let same = parts
+            .iter()
+            .all(|(n, a)| *n == parts[0].0 && a.len() == parts[0].1.len())
+            && laws.iter().all(|l| {
+                l.vectorized
+                    && !l.multivariate
+                    && l.trunc.is_none()
+                    && l.support.is_none()
+                    && l.extra.is_empty()
+                    && !l.declared
+                    && l.lhs == "{y}"
+            });
+        if !same {
+            return Err(Refusal::not_yet(Some(m), "a joint of different laws"));
+        }
+        let args: Vec<String> = (0..parts[0].1.len())
+            .map(|j| {
+                let col: Vec<&String> = parts.iter().map(|(_, a)| &a[j]).collect();
+                if col.iter().all(|x| *x == col[0]) {
+                    col[0].clone()
+                } else {
+                    let items: Vec<&str> = col.iter().map(|x| x.as_str()).collect();
+                    format!("[{}]'", items.join(", "))
+                }
+            })
+            .collect();
+        let mut law = laws.into_iter().next().unwrap();
+        law.call = format!("{}({})", parts[0].0, args.join(", "));
+        law.indexed = law.call.clone();
+        law.flat_call = None;
+        Ok(law)
     }
 
     fn truncated(&mut self, t: NodeId) -> Result<Law> {
@@ -1260,7 +1588,17 @@ impl<'m> Emitter<'m> {
         broadcast: bool,
     ) -> Result<Law> {
         let mut found = None;
+        let general = format!(
+            "{name}({})",
+            flatppl_infer::distribution_param_names(name)
+                .unwrap_or_default()
+                .join(", ")
+        );
         for row in tables::law_rows_by_head(name, module) {
+            // A joint's components share one row: the general one.
+            if self.general_rows && row.pattern != general {
+                continue;
+            }
             let pat = pattern::parse(&row.pattern);
             let mut binds = HashMap::new();
             if self.match_call(&pat, args, &mut binds) {
@@ -1337,6 +1675,19 @@ impl<'m> Emitter<'m> {
         }
         let is_per = |v: &str| per.get(v).copied().unwrap_or(false);
         let scalar_variate = row.variate.starts_with("real") || row.variate.starts_with("int");
+        // `{y}` is the variate, not a template variable: keep it through `fill`.
+        let guard = if row.guard.is_empty() {
+            None
+        } else {
+            let t = row.guard.replace("{y}", "\u{2}");
+            let whole = self
+                .fill(&t, &binds, &is_per, None)?
+                .replace('\u{2}', "{y}");
+            let each = self
+                .fill(&t, &binds, &is_per, Some(LOOP))?
+                .replace('\u{2}', "{y}");
+            Some((whole, each))
+        };
         let flat = self.flat.take().filter(|_| scalar_variate);
         let mut flat_args = None;
         if flat.is_some() {
@@ -1378,6 +1729,9 @@ impl<'m> Emitter<'m> {
             lcdf: row.lcdf,
             discrete: row.variate.starts_with("int"),
             support: None,
+            guard,
+            extra: vec![],
+            declared: false,
         })
     }
 

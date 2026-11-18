@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+T = 4
+counts = [0, 2, 0, 3, 1]
+omega ~ Beta(1, 1)
+p ~ Beta(1, 1)
+total = normalize(superpose(weighted(omega, Binomial(T, p)), weighted(1 - omega, Dirac(0))))
+y ~ iid(total, 5)
+prior = lawof(record(omega = omega, p = p))
+L = likelihoodof(kernelof(record(y = y), omega = omega, p = p), record(y = counts))
+post = bayesupdate(L, prior)

@@ -112,14 +112,38 @@ fn unverified_mapping_is_not_yet() {
 }
 
 #[test]
-fn mixture_is_not_yet() {
+fn ordered_nonidentical_normalize_is_never() {
     let r = refuse(&posterior(
-        "w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, Normal(0, 1)), weighted(1 - w, Normal(3, 1))))",
+        "mu ~ normalize(truncate(joint(Normal(0, 1), Normal(3, 1)), ordered(2)))\ny ~ Normal(mu[1], 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
+    assert!(r.reason.contains("ordered"), "{r}");
+}
+
+#[test]
+fn dirac_with_continuous_component_is_never() {
+    let r = refuse_with(
+        "w ~ Beta(2, 2)\nm = normalize(superpose(weighted(w, Normal(0, 1)), weighted(1 - w, Dirac(0.0))))\n\
+         y ~ iid(m, 3)\nprior = lawof(record(w = w))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w), record(y = [0.0, 0.5, 1.0]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::MixedReference, "{r}");
+    assert!(r.kind.is_never());
+}
+
+#[test]
+fn unnormalized_mixture_component_is_never() {
+    let r = refuse(&posterior(
+        "w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, truncate(Normal(0, 1), interval(0.0, 2.0))), weighted(1 - w, Normal(3, 1))))",
         "lawof(record(w = w))",
         "kernelof(record(y = y), w = w)",
     ));
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(!r.kind.is_never());
+    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
+    assert!(r.reason.contains("mixture component"), "{r}");
 }
 
 #[test]
@@ -281,4 +305,52 @@ fn positive_set_with_interval_lower_bound_is_not_yet() {
             .contains("positive set with an interval lower bound"),
         "{r}"
     );
+}
+
+#[test]
+fn logdensityof_of_positive_truncation_is_not_yet() {
+    let r = refuse(&posterior(
+        "mu = elementof(reals)\ny ~ Normal(mu, 1)\n\
+         w(x) = logdensityof(truncate(Normal(0, 1), posreals), x.mu)",
+        "logweighted(w, Lebesgue(cartprod(mu = reals)))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("truncated"), "{r}");
+}
+
+#[test]
+fn positive_truncation_mixture_component_is_never() {
+    let r = refuse(&posterior(
+        "w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, truncate(Normal(0, 1), posreals)), weighted(1 - w, Normal(3, 1))))",
+        "lawof(record(w = w))",
+        "kernelof(record(y = y), w = w)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
+    assert!(r.reason.contains("mixture component"), "{r}");
+}
+
+#[test]
+fn ordered_restriction_of_data_is_not_yet() {
+    let r = refuse_with(
+        "mu ~ Normal(0, 1)\ny ~ normalize(truncate(iid(Normal(mu, 1), 2), ordered(2)))\n\
+         prior = lawof(record(mu = mu))\n\
+         L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.1, 2.5]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("ordered restriction"), "{r}");
+}
+
+#[test]
+fn logdensityof_of_ordered_restriction_is_not_yet() {
+    let r = refuse(&posterior(
+        "b = elementof(cartpow(reals, 2))\ny ~ Normal(b[1], 1)\n\
+         w(x) = logdensityof(normalize(truncate(iid(Normal(0, 1), 2), ordered(2))), x.b)",
+        "logweighted(w, Lebesgue(cartprod(b = cartpow(reals, 2))))",
+        "kernelof(record(y = y), b = b)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("ordered restriction"), "{r}");
 }

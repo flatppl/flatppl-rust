@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+K = 3
+N = 4
+y_obs = [-1.2, 0.3, 2.9, 3.4]
+theta ~ Dirichlet(ones(K))
+mu ~ iid(Normal(0, 5), K)
+sigma ~ iid(Exponential(1.0), K)
+component = normalize(ksuperpose(Normal, theta, mu = mu, sigma = sigma))
+y ~ iid(component, N)
+prior = lawof(record(theta = theta, mu = mu, sigma = sigma))
+L = likelihoodof(kernelof(record(y = y), theta = theta, mu = mu, sigma = sigma), record(y = y_obs))
+post = bayesupdate(L, prior)

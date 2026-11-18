@@ -26,6 +26,7 @@ pub(crate) struct LawRow {
     pub vectorized: bool,
     pub lcdf: bool,
     pub normalized: bool,
+    pub guard: String,
     pub functions: String,
     pub status: String,
     pub note: String,
