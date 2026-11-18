@@ -48,6 +48,8 @@ pub(crate) struct FnCtx {
     /// Boundary inputs that name module bindings (`functionof(e, a = a0)`):
     /// a reference to one is the input, bound in `locals` or `records`.
     pub self_inputs: HashSet<Symbol>,
+    /// The argument node a broadcast user law binds each local to.
+    pub args: HashMap<Symbol, NodeId>,
     /// Module bindings between the body and those inputs (spec §04
     /// "Reification to functions and kernels"): their values change with the
     /// inputs, so the body computes them. Every other binding is captured.
@@ -1014,6 +1016,11 @@ impl<'m> Emitter<'m> {
         }
         let mut elem_tys = Vec::new();
         let mut locals = HashMap::new();
+        let arg_nodes: HashMap<Symbol, NodeId> = entries
+            .iter()
+            .zip(&args)
+            .map(|((_, r), &a)| (r.name, a))
+            .collect();
         for ((pname, r), &a) in entries.iter().zip(&args) {
             // `splitblocks(A, [1, n])`: element i is row i of A, typed as a
             // row (a 1×n block and its row hold the same entries).
@@ -1062,6 +1069,7 @@ impl<'m> Emitter<'m> {
             locals,
             scoped,
             inline_only: true,
+            args: arg_nodes,
             ..Default::default()
         };
         self.mark_boundary(&mut ctx, m, body, &entries)?;
@@ -1085,9 +1093,9 @@ impl<'m> Emitter<'m> {
         }
         let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
         let body_r = self.resolve(body);
-        let Some(bc) = self.call(body_r) else {
+        if self.call(body_r).is_none() {
             return Ok(None);
-        };
+        }
         let mut marks = FnCtx::default();
         self.mark_boundary(&mut marks, m, body, &entries)?;
         let through = marks.through.clone();
@@ -1105,12 +1113,9 @@ impl<'m> Emitter<'m> {
             }
             false
         };
-        let law_args: Vec<NodeId> = bc
-            .args
-            .iter()
-            .chain(bc.named.iter().map(|n| &n.value))
-            .copied()
-            .collect();
+        // The value arguments of the law the body prints, and the R1
+        // conditions that select an `ifelse` branch among them.
+        let (law_args, conds) = self.vector_law_args(body_r);
         let mut elem_tys = Vec::new();
         let mut leaves = HashMap::new();
         let mut nfull = 0;
@@ -1136,13 +1141,37 @@ impl<'m> Emitter<'m> {
                 (*name, super::aggregate::Lifted { ex: e, full, array }),
             );
         }
+        // Beside another whole array, a computed one with an operator is
+        // placed once under its parameter's name: the law then reads two
+        // names, and its call holds no operator between whole arrays.
+        if nfull >= 2 && self.fctx.is_none() {
+            for ((pname, r), &a) in entries.iter().zip(&args) {
+                let Some((_, leaf)) = leaves.get(&r.name) else {
+                    continue;
+                };
+                if !leaf.full || !leaf.ex.s.contains(['*', '/', '^']) {
+                    continue;
+                }
+                let ex = leaf.ex.clone();
+                let placed = self.place(self.name(*pname), a, Ok(ex))?;
+                if let Some((_, leaf)) = leaves.get_mut(&r.name) {
+                    leaf.ex = super::Ex::atom(placed);
+                }
+            }
+        }
         let scoped = self.instantiate(m, body, &entries, &elem_tys)?;
         // Each law argument that reads a parameter lifts over whole arrays.
+        let arg_nodes = entries
+            .iter()
+            .zip(&args)
+            .map(|((_, r), &a)| (r.name, a))
+            .collect();
         let outer_ctx = self.fctx.replace(FnCtx {
             self_inputs: marks.self_inputs,
             through: marks.through,
             scoped,
             inline_only: true,
+            args: arg_nodes,
             ..Default::default()
         });
         let outer_v = self
@@ -1155,7 +1184,18 @@ impl<'m> Emitter<'m> {
             if !mentions(self, a) {
                 continue;
             }
-            match self.lift(a, &frame, &HashMap::new(), &HashMap::new()) {
+            // `ifelse(cond, s, …)` on an R1 condition is `s`.
+            let ar = self.resolve(a);
+            let target = match self.call(ar).map(|c| &c.args[..]) {
+                Some([c0, s, _])
+                    if self.head(ar) == Some("ifelse")
+                        && conds.iter().any(|&t| self.m.structural_eq(t, *c0)) =>
+                {
+                    *s
+                }
+                _ => a,
+            };
+            match self.lift(target, &frame, &HashMap::new(), &HashMap::new()) {
                 Ok(l) if l.array => {
                     lifted.insert(a, self.to_real(&l.ex, 1));
                 }
@@ -1175,6 +1215,48 @@ impl<'m> Emitter<'m> {
         }
         ctx.lifted = lifted;
         Ok(Some((body, ctx, nfull)))
+    }
+
+    /// The value arguments of the law that `body` prints: a `locscale`
+    /// family takes its base law's arguments with the location and scale (an
+    /// addition and a multiply, elementwise), and the R1 form
+    /// `normalize(weighted(c, M))` is M, with its condition.
+    fn vector_law_args(&self, body: NodeId) -> (Vec<NodeId>, Vec<NodeId>) {
+        let b = self.resolve(body);
+        let call_args = |me: &Self, x: NodeId| -> Vec<NodeId> {
+            me.call(x)
+                .map(|c| {
+                    c.args
+                        .iter()
+                        .chain(c.named.iter().map(|n| &n.value))
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match self.head(b) {
+            Some("normalize") => {
+                let inner = self.resolve(self.call(b).unwrap().args[0]);
+                if self.head(inner) == Some("weighted") {
+                    let wc = self.call(inner).unwrap();
+                    if let Some((cond, _)) = self.positive_finite_indicator(wc.args[0]) {
+                        let (args, mut conds) = self.vector_law_args(wc.args[1]);
+                        conds.push(cond);
+                        return (args, conds);
+                    }
+                }
+                (call_args(self, b), vec![])
+            }
+            Some("locscale") => match &self.call(b).unwrap().args[..] {
+                [d, loc, scale] => {
+                    let mut args = call_args(self, self.resolve(*d));
+                    args.extend([*loc, *scale]);
+                    (args, vec![])
+                }
+                _ => (call_args(self, b), vec![]),
+            },
+            _ => (call_args(self, b), vec![]),
+        }
     }
 
     /// The local or bound Stan expression of a `%local` reference.

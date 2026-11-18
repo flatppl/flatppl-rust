@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+x = [0.5, -1.0, 2.0]
+se = [0.5, 1.2, 0.8]
+y_obs = [0.4, -1.2, 2.5]
+mu ~ Normal(0, 1)
+nu ~ Gamma(2, 0.1)
+f = (m, s, n) -> normalize(weighted(ifelse(isfinite(s) && s > 0.0, 1.0, 0.0), locscale(StudentT(n), m, ifelse(isfinite(s) && s > 0.0, s, 1.0))))
+y ~ f.(mu .+ x, se, nu)
+prior = lawof(record(mu = mu, nu = nu))
+L = likelihoodof(kernelof(record(y = y), mu = mu, nu = nu), record(y = y_obs))
+post = bayesupdate(L, prior)

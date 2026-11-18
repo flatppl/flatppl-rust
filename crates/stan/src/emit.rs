@@ -160,6 +160,9 @@ pub(crate) struct Emitter<'m> {
     set_declared: HashSet<String>,
     /// `logweighted` log weights of the prior, with their base measures.
     weights: Vec<(NodeId, NodeId)>,
+    /// Conditions known to hold while `normalize(weighted(c, M))` builds M
+    /// (ruling R1): an `ifelse` on one of them prints its first branch.
+    true_conds: Vec<NodeId>,
     /// Values placed under their own name, by node: a law filled twice
     /// (whole and per element) computes each once.
     placed: HashMap<NodeId, String>,
@@ -280,6 +283,7 @@ impl<'m> Emitter<'m> {
             filter_counts: HashMap::new(),
             set_declared: HashSet::new(),
             weights: vec![],
+            true_conds: vec![],
             placed: HashMap::new(),
             inlined: Vec::new(),
             function_depth: 0,
@@ -1171,6 +1175,14 @@ impl<'m> Emitter<'m> {
             ("le", [a, b]) => self.cmp("<=", *a, *b),
             ("gt", [a, b]) => self.cmp(">", *a, *b),
             ("ge", [a, b]) => self.cmp(">=", *a, *b),
+            ("ifelse", [c0, a, _])
+                if self
+                    .true_conds
+                    .iter()
+                    .any(|&t| self.m.structural_eq(t, *c0)) =>
+            {
+                self.expr(*a)
+            }
             ("ifelse", [c0, a, b]) => {
                 let c0 = self.expr(*c0)?;
                 let a = self.expr(*a)?;

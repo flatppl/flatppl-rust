@@ -1,0 +1,11 @@
+# emit: target=post
+flatppl_compat = "0.1"
+x = [0.2, -0.5, 1.0, 0.0, 0.7]
+y_data = [0, 2, 0, 1, 5]
+w_data = [1.0, 0.5, 2.0, 0.0, 1.5]
+b ~ Normal(0, 1)
+zi ~ Beta(2, 2)
+mu = exp.(b .* x)
+prior = lawof(record(b = b, zi = zi))
+log_lik = functionof(((m, v, z) -> logdensityof(normalize(superpose(weighted(z, Dirac(0)), weighted(1.0 - z, Poisson(m)))), v)).(mu, y_data, zi), b = b, zi = zi)
+post = logweighted(point -> sum(w_data .* log_lik(b = point.b, zi = point.zi)), prior)

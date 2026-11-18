@@ -20,6 +20,14 @@ use std::collections::HashMap;
 
 mod nested;
 
+/// One element's log density in a weighted log likelihood (Ruling 4).
+pub(super) enum ElementLp {
+    One(String),
+    /// A `Dirac(c)` atom beside a law: the test `y == c`, the term at the
+    /// atom, the term elsewhere.
+    Split(String, String, String),
+}
+
 /// The loop index a per-component argument is rendered with.
 const COMP: &str = "\u{4}";
 
@@ -480,7 +488,7 @@ impl<'m> Emitter<'m> {
         })
     }
 
-    fn fresh_loop(&mut self) -> String {
+    pub(super) fn fresh_loop(&mut self) -> String {
         for c in ["i", "j", "n", "k"] {
             if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
@@ -548,6 +556,68 @@ impl<'m> Emitter<'m> {
             Node::Lit(flatppl_core::Scalar::Int(1))
         ) || matches!(self.m.node(self.resolve(bc.args[0])), Node::Lit(flatppl_core::Scalar::Real(x)) if *x == 1.0);
         one && self.m.structural_eq(bc.args[1], a)
+    }
+
+    /// The log density of the scalar `y` under `law`, for one element of a
+    /// weighted log likelihood. A `Dirac(c)` atom beside a law splits on
+    /// `y == c`, from the same terms as the Dirac split: at the atom the
+    /// mixture's mass there, elsewhere the law's weight and density.
+    pub(super) fn element_lp(&mut self, law: NodeId, y: &str) -> Result<ElementLp> {
+        if let Some((norm, mix)) = self.mixture(law) {
+            if self.head(mix) == Some("superpose") {
+                let parts = self.parts(mix)?;
+                let split = match parts.as_slice() {
+                    [Part::Dirac(wd, c), Part::Law(wl, l)] => Some((true, (*wd, *c), (*wl, *l))),
+                    [Part::Law(wl, l), Part::Dirac(wd, c)] => Some((false, (*wd, *c), (*wl, *l))),
+                    _ => None,
+                };
+                if let Some((dirac_first, (wd, atom), (wl, inner))) = split {
+                    if !(norm && (self.complement(wl, wd) || self.complement(wd, wl))) {
+                        return Err(Refusal::not_yet(
+                            Some(mix),
+                            "a `Dirac` mixture with these weights",
+                        ));
+                    }
+                    if self.shape(atom).is_none_or(|s| s.rank != 0) || !self.fixed_value(atom) {
+                        return Err(Refusal::not_yet(
+                            Some(mix),
+                            "a `Dirac` atom of this form in a weighted log likelihood",
+                        ));
+                    }
+                    let l = self.law_any(inner)?;
+                    let c = self.at_module(|me| me.expr(atom))?.s;
+                    // Beside a continuous law the atom's mass is its weight
+                    // alone (Ruling 2).
+                    let at = if !l.discrete {
+                        self.log_weight(wd.unwrap())?
+                    } else {
+                        match self.atom_lp(mix, inner, &l, &c)? {
+                            None => self.log_weight(wd.unwrap())?,
+                            Some(lp) if dirac_first => {
+                                format!("log_mix({}, 0, {lp})", self.real(wd.unwrap())?.s)
+                            }
+                            Some(lp) => format!("log_mix({}, {lp}, 0)", self.real(wl.unwrap())?.s),
+                        }
+                    };
+                    let rest = format!(
+                        "{} + {}",
+                        self.log_weight(wl.unwrap())?,
+                        self.law_lp(inner, &l, y, None)?
+                    );
+                    return Ok(ElementLp::Split(format!("{y} == {c}"), at, rest));
+                }
+            }
+            let (pre, lp) = self.mixture_lp(mix, norm, y)?;
+            if !pre.is_empty() {
+                return Err(Refusal::not_yet(
+                    Some(mix),
+                    "a mixture that needs statements in a weighted log likelihood",
+                ));
+            }
+            return Ok(ElementLp::One(lp));
+        }
+        let l = self.law_any(law)?;
+        Ok(ElementLp::One(self.law_lp(law, &l, y, None)?))
     }
 
     /// The log density of `y` under the mixture `mix`, after `pre` statements.
@@ -816,8 +886,19 @@ impl<'m> Emitter<'m> {
         if self.head(r) != Some("truncate") {
             return Ok(());
         }
-        let inner = self.call(r).unwrap().args[0];
-        if self.law_any(inner)?.lcdf {
+        let (inner, set) = {
+            let c = self.call(r).unwrap();
+            (c.args[0], c.args[1])
+        };
+        let base = self.law_any(inner)?;
+        // Stan's integer CDFs take integer ends (the F3 refusal, ruling R4).
+        if base.discrete && !self.integer_ends(set) {
+            return Err(Refusal::not_yet(
+                Some(law),
+                "a discrete law truncated at a non-integer end",
+            ));
+        }
+        if base.lcdf {
             return Ok(());
         }
         Err(Refusal::not_yet(
