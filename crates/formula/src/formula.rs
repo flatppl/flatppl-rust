@@ -22,6 +22,8 @@ pub struct Formula {
     #[serde(default)]
     pub smooths: Vec<SmoothTerm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tensor_smooths: Vec<crate::tensor::TensorTerm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monotonic: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) monotonic_terms: Option<crate::monotonic::MonotonicTerms>,
@@ -129,6 +131,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
     let mut smooths = Vec::new();
+    let mut tensor_smooths = Vec::new();
     let mut monotonic_terms = Vec::new();
     // R records offset calls separately from coefficient terms, including
     // calls appearing after subtraction. Negation belongs inside offset().
@@ -164,6 +167,18 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
                     )));
                 }
                 smooths.push(smooth.clone());
+            }
+            Atom::Tensor(smooth) => {
+                if tensor_smooths
+                    .iter()
+                    .any(|other: &crate::tensor::TensorTerm| other.columns == smooth.columns)
+                {
+                    return Err(Error(format!(
+                        "repeated tensor smooth `{}`",
+                        smooth.label()
+                    )));
+                }
+                tensor_smooths.push(smooth.clone());
             }
         }
     }
@@ -209,6 +224,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         fixed,
         groups,
         smooths,
+        tensor_smooths,
         monotonic,
         monotonic_terms,
         expressions,
@@ -262,7 +278,7 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
         Atom::Monotonic(call) => call.label(),
-        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) => unreachable!(),
+        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
@@ -508,6 +524,7 @@ enum Atom {
     Offset(ColumnExpression),
     Groups(Vec<GroupTerm>),
     Smooth(SmoothTerm),
+    Tensor(crate::tensor::TensorTerm),
     Monotonic(crate::monotonic::MonotonicCall),
 }
 
@@ -646,6 +663,82 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    fn tensor_smooth(&mut self) -> Result<Expr> {
+        let fail = || {
+            Error(
+                "tensor smooths support `t2(x, z)` with optional `k=integer` or `k=c(kx, kz)`"
+                    .into(),
+            )
+        };
+        self.at += 1;
+        let Token::Name(first) = self.peek() else {
+            return Err(fail());
+        };
+        self.at += 1;
+        if self.peek() != Token::Comma {
+            return Err(fail());
+        }
+        self.at += 1;
+        let Token::Name(second) = self.peek() else {
+            return Err(fail());
+        };
+        self.at += 1;
+        let columns = [name(first)?, name(second)?];
+        if columns[0] == columns[1] {
+            return Err(Error("tensor smooth needs two distinct columns".into()));
+        }
+        let ranks = if self.peek() == Token::Comma {
+            self.at += 1;
+            if self.peek() != Token::Name("k") {
+                return Err(fail());
+            }
+            self.at += 1;
+            if self.peek() != Token::Equals {
+                return Err(fail());
+            }
+            self.at += 1;
+            if self.peek() == Token::Name("c") {
+                self.at += 1;
+                if self.peek() != Token::Left {
+                    return Err(fail());
+                }
+                self.at += 1;
+                let first = self.tensor_rank()?;
+                if self.peek() != Token::Comma {
+                    return Err(fail());
+                }
+                self.at += 1;
+                let second = self.tensor_rank()?;
+                if self.peek() != Token::Right {
+                    return Err(fail());
+                }
+                self.at += 1;
+                Some([first, second])
+            } else {
+                Some([self.tensor_rank()?; 2])
+            }
+        } else {
+            None
+        };
+        if self.peek() != Token::Right {
+            return Err(fail());
+        }
+        self.at += 1;
+        self.atom(Atom::Tensor(crate::tensor::TensorTerm { columns, ranks }))
+    }
+
+    fn tensor_rank(&mut self) -> Result<usize> {
+        match self.peek() {
+            Token::Number(n) if n.fract() == 0.0 && (3.0..=2000.0).contains(&n) => {
+                self.at += 1;
+                Ok(n as usize)
+            }
+            _ => Err(Error(
+                "tensor marginal ranks must be integers between 3 and 2000".into(),
+            )),
+        }
+    }
+
     fn expression(&mut self, min_precedence: u8, depth: usize) -> Result<Expr> {
         if depth >= MAX_DEPTH {
             return Err(Error(format!("formula exceeds nesting limit {MAX_DEPTH}")));
@@ -656,6 +749,8 @@ impl<'a> Parser<'a> {
             Token::Name(text) => {
                 if self.peek() == Token::Left && text == "s" {
                     self.smooth()?
+                } else if self.peek() == Token::Left && text == "t2" {
+                    self.tensor_smooth()?
                 } else if self.peek() == Token::Left && text == "mo" {
                     self.monotonic()?
                 } else if self.peek() == Token::Left {
@@ -849,7 +944,7 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms.iter().flatten().any(|&id| {
         matches!(
             atoms[id],
-            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
+            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_)
         )
     }) {
         return Err(Error(
@@ -883,7 +978,7 @@ fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
         ExprKind::Atom(id)
             if matches!(
                 atoms[*id],
-                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_)
+                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_) | Atom::Monotonic(_)
             ) =>
         {
             Err(Error(
@@ -998,6 +1093,11 @@ impl Formula {
                 && !names.contains(&by)
             {
                 names.push(by);
+            }
+        }
+        for column in self.tensor_smooths.iter().flat_map(|term| &term.columns) {
+            if !names.contains(&column.as_str()) {
+                names.push(column);
             }
         }
         for column in &self.monotonic {

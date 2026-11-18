@@ -20,8 +20,8 @@ thin-plate basis. `x` must name a numeric column. The default rank is 10;
 the requested rank must be at least 3 and no greater than the number of
 distinct retained training values. This first implementation supports at most
 2,000 distinct values; mgcv's larger-data knot subsampling is not implemented.
-Tensor products, other bases, custom knots and smooth interactions need
-separate support.
+Other bases for `s`, custom knots and smooth interactions need separate
+support.
 
 Each smooth is centred over the retained training rows. Its unpenalized slope
 uses class `b` (coefficient `sx_1` for `s(x)`); its scale uses class `sds`,
@@ -43,6 +43,23 @@ For level `A`, select the slope prior with class `b` and coefficient
 `sx:fA_1`. Select the scale prior with class `sds` and coefficient
 `s(x, k = 6, by = f):fA`. The basis and original level order persist in the
 recipe. New data needs `x` and `f` with levels from the training data.
+
+`t2(x, z)` makes a surface from two numeric columns using natural cubic
+regression spline margins. Each margin defaults to rank 5. Set `k=4` for
+equal ranks or `k=c(4, 6)` for separate ranks. The product of the ranks
+can be at most 4,096. The surface has three centred unpenalized columns
+and disjoint rough-by-rough, affine-by-rough and rough-by-affine blocks.
+Each penalized block has its own scale. A term-specific `sds` prior
+such as `coef = "t2(x, z)"` applies separately to all three scales.
+The unpenalized columns use class `b` and coefficients `t2xz_1` through
+`t2xz_3`.
+
+The knots, spline spaces, and block penalties follow mgcv's cubic `t2`
+construction. The affine margins use a constant and a centred, unit-RMS
+linear column. This fixes the basis in the two-dimensional penalty
+nullspace. Coefficient scales can differ from mgcv's eigensolver-dependent
+basis. Prediction reuses the training basis and extends each margin
+linearly past its boundary knots.
 
 Distributional formulas use the same terms for a family parameter:
 

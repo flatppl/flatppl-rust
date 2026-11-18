@@ -262,9 +262,15 @@ pub(crate) fn resolve(
         .iter()
         .zip(smooths)
         .flat_map(|(term, smooth)| smooth.curves().map(move |(level, _, _)| (term, level)));
-    let (smooth_names, smooth_labels): (Vec<_>, Vec<_>) = smooth_terms
+    let (mut smooth_names, mut smooth_labels): (Vec<_>, Vec<_>) = smooth_terms
         .map(|(term, level)| (term.coefficient(level), term.curve_label(level)))
         .unzip();
+    for term in &formula.tensor_smooths {
+        let name = term.name();
+        smooth_names.extend((1..=crate::tensor::FIXED_COLS).map(|i| format!("{name}_{i}")));
+        let label = term.label();
+        smooth_labels.extend(crate::tensor::BLOCKS.iter().map(|_| label.clone()));
+    }
     targets.extend(smooth_names.iter().map(|name| PriorTarget {
         class: "b",
         coef: Some(name),
@@ -385,7 +391,7 @@ pub(crate) fn resolve(
                 .unwrap_or_else(|| ResolvedPrior::new("Lebesgue(reals)"))
         })
         .collect();
-    let sds = smooth_names
+    let sds = smooth_labels
         .iter()
         .map(|_| {
             selected
