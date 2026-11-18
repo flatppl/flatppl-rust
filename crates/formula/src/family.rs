@@ -476,10 +476,10 @@ impl Family {
             }
             Self::Cumulative => unreachable!("ordinal observations use explicit cut inputs"),
             Self::Categorical => {
-                let mut logits = vec![b.lit_real(0.0)];
-                logits.extend(observation.auxiliary.iter().map(|(_, value)| *value));
-                let logits = b.array(&logits);
-                let probabilities = b.call("softmax", &[logits]);
+                let probabilities = crate::categorical::row_probabilities(
+                    b,
+                    observation.auxiliary.iter().map(|(_, value)| *value),
+                );
                 b.call("Categorical", &[probabilities])
             }
         }

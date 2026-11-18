@@ -8,6 +8,22 @@ pub(crate) fn observation(
     cuts: &[NodeId],
     scalar: bool,
 ) -> NodeId {
+    emit_rows(b, eta, cuts, scalar, |b, probabilities| {
+        b.call("Categorical", &[probabilities])
+    })
+}
+
+pub(crate) fn probabilities(b: &mut Builder<'_>, eta: NodeId, cuts: &[NodeId]) -> NodeId {
+    emit_rows(b, eta, cuts, false, |_, probabilities| probabilities)
+}
+
+fn emit_rows(
+    b: &mut Builder<'_>,
+    eta: NodeId,
+    cuts: &[NodeId],
+    scalar: bool,
+    finish: impl FnOnce(&mut Builder<'_>, NodeId) -> NodeId,
+) -> NodeId {
     let name = b.sym("eta");
     let input = Ref {
         ns: RefNs::Local,
@@ -55,14 +71,14 @@ pub(crate) fn observation(
     // The complementary logistic form retains the upper tail near one.
     probabilities.push(b.call("invlogit", &[tail]));
     let probabilities = b.array(&probabilities);
-    let law = b.call("Categorical", &[probabilities]);
+    let result = finish(b, probabilities);
     if scalar {
-        return law;
+        return result;
     }
     let head = CallHead::Builtin(b.sym("functionof"));
     let kernel = b.m.alloc(Node::Call(Call {
         head,
-        args: Box::new([law]),
+        args: Box::new([result]),
         named: Box::default(),
         inputs: Some(Inputs::Spec(inputs.into())),
     }));

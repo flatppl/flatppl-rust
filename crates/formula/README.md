@@ -263,6 +263,13 @@ bound for one-sided truncation. `K_model` conditions the response law on this
 range. If `cens` and `trunc` both appear, censored rows score the event's
 intersection with the range, divided by the range's probability.
 `L` and `log_lik` score the observations before any `weights` apply.
+
+`expected_response` takes the same parameter arguments as `K_model`. It
+emits the conditional mean for each new row and response probabilities in
+training order for categorical and ordinal models. Binomial means count
+successes. Censoring predicts the latent response and truncation conditions
+on the supplied bounds. Student models with one degree of freedom return
+`nan`. Von Mises models use circular summaries and omit this function.
 Prediction requires truncation bound columns and omits censoring inputs.
 The StableHLO sampler currently refuses truncated Normal draws.
 

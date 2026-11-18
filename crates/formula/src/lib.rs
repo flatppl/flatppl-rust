@@ -9,6 +9,7 @@ mod contrasts;
 mod data;
 mod design;
 mod emit;
+mod expectation;
 mod expression;
 mod family;
 mod formula;
