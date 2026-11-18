@@ -1,5 +1,6 @@
 use flatppl_formula::{DataMode, DataValue, Recipe, ThinPlate, build, prepare_data, read};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
@@ -141,4 +142,127 @@ fn prediction_validates_retained_numeric_state() {
             .iter()
             .all(|v| v.is_finite())
     );
+}
+
+#[derive(Deserialize)]
+struct FactorOracle {
+    x: Vec<f64>,
+    levels: Vec<String>,
+    groups: Vec<String>,
+    new_x: Vec<f64>,
+    new_groups: Vec<String>,
+    cases: Vec<FactorCase>,
+}
+
+#[derive(Deserialize)]
+struct FactorCase {
+    ordered: bool,
+    curves: Vec<FactorCurve>,
+}
+
+#[derive(Deserialize)]
+struct FactorCurve {
+    level: String,
+    basis: Vec<Vec<f64>>,
+}
+
+fn factor_column(groups: &[String], levels: &[String], ordered: bool) -> Value {
+    let codes: Vec<_> = groups
+        .iter()
+        .map(|group| levels.iter().position(|level| level == group).unwrap())
+        .collect();
+    json!({"name":"f","values":{"kind":"factor","values":{"codes":codes,"levels":levels,"ordered":ordered}}})
+}
+
+#[test]
+fn factor_smooths_preserve_mgcv_curve_covariance_and_prediction() {
+    let oracle: FactorOracle =
+        serde_json::from_str(include_str!("fixtures/factor-smooths.json")).unwrap();
+    for case in oracle.cases {
+        let spec = read(
+            &json!({
+                "formula": "y ~ s(x, by=f, k=4)",
+                "priors": [
+                    {"class":"sds", "coef":"s(x, k = 4, by = f):fA", "prior":"exponential(2)"}
+                ],
+                "data": {"nrows": oracle.x.len(), "columns": [
+                    {"name":"x", "values":{"kind":"real64", "values":oracle.x}},
+                    {"name":"y", "values":{"kind":"real64", "values":oracle.x}},
+                    factor_column(&oracle.groups, &oracle.levels, case.ordered)
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let model = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+        let factor = &model.info.factor_levels["f"];
+        assert_eq!(factor.levels, oracle.levels);
+        assert_eq!(factor.ordered, case.ordered);
+        let exported = serde_json::to_value(&model.recipe).unwrap();
+        let recipe: Recipe = serde_json::from_value(exported).unwrap();
+        let predictor = &recipe.predictors["mu"];
+        let slopes: Vec<_> = model
+            .info
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.binding == "bs")
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        let expected_slopes: Vec<_> = case
+            .curves
+            .iter()
+            .map(|curve| format!("b_sx:f{}_1", curve.level))
+            .collect();
+        assert_eq!(slopes, expected_slopes);
+        assert_eq!(predictor.priors.sds.last().unwrap().prior, "exponential(2)");
+
+        let mut levels = oracle.levels.clone();
+        levels.reverse();
+        let new_data = serde_json::from_value(json!({"nrows": oracle.new_x.len(), "columns": [
+            {"name":"x", "values":{"kind":"real64", "values":oracle.new_x}},
+            factor_column(&oracle.new_groups, &levels, case.ordered)
+        ]}))
+        .unwrap();
+        let prediction = prepare_data(&recipe, &new_data, DataMode::Prediction).unwrap();
+        for curve in case.curves {
+            let level = oracle
+                .levels
+                .iter()
+                .position(|x| x == &curve.level)
+                .unwrap()
+                + 1;
+            let actual: Vec<_> = [&model.data, &prediction]
+                .into_iter()
+                .flat_map(|data| {
+                    let DataValue::Integers(codes) = &data.constants["smooth_1_by"] else {
+                        panic!("expected retained level codes")
+                    };
+                    let inputs = &predictor.smooths[0].inputs;
+                    codes.iter().enumerate().map(move |(i, &code)| {
+                        inputs
+                            .iter()
+                            .map(|name| match &data.constants[name] {
+                                DataValue::Real64(x) if code as usize == level => x[i],
+                                DataValue::Real64(_) => 0.0,
+                                _ => panic!("expected numeric spline data"),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for (i, row) in actual.iter().enumerate() {
+                close(row[0], curve.basis[i][0]);
+                for j in 0..actual.len() {
+                    let dot = |basis: &[Vec<f64>]| {
+                        basis[i][1..]
+                            .iter()
+                            .zip(&basis[j][1..])
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    };
+                    close(dot(&actual), dot(&curve.basis));
+                }
+            }
+        }
+    }
 }

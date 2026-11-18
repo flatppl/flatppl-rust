@@ -20,8 +20,8 @@ thin-plate basis. `x` must name a numeric column. The default rank is 10;
 the requested rank must be at least 3 and no greater than the number of
 distinct retained training values. This first implementation supports at most
 2,000 distinct values; mgcv's larger-data knot subsampling is not implemented.
-`by` smooths, tensor products, other bases, custom knots and smooth interactions
-are not yet supported.
+Tensor products, other bases, custom knots and smooth interactions need
+separate support.
 
 Each smooth is centred over the retained training rows. Its unpenalized slope
 uses class `b` (coefficient `sx_1` for `s(x)`); its scale uses class `sds`,
@@ -31,6 +31,18 @@ are independent standard Normals. The fitted recipe stores the basis and
 penalty transform, so prediction needs only predictor columns and never refits
 or recentres the smooth. This also applies within distributional formulas.
 Numerical setup runs in Rust; emitted models use ordinary matrix operations.
+
+`s(x, k=6, by=f)` fits one curve per retained level of the factor `f`, with
+its own slope and scale. An ordered factor with multiple retained levels
+omits its first level. Add `s(x)` to give the first level a reference curve
+and model departures at other levels.
+Add `f` as a main effect for separate intercepts. This main effect uses its
+ordinary contrasts. Smooths select curves by factor level.
+
+For level `A`, select the slope prior with class `b` and coefficient
+`sx:fA_1`. Select the scale prior with class `sds` and coefficient
+`s(x, k = 6, by = f):fA`. The basis and original level order persist in the
+recipe. New data needs `x` and `f` with levels from the training data.
 
 Distributional formulas use the same terms for a family parameter:
 

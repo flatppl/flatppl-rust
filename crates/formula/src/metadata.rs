@@ -25,6 +25,24 @@ pub(crate) fn levels(
                 )
             })
         })
+        .chain(
+            recipe
+                .smooths
+                .iter()
+                .zip(&recipe.formula.smooths)
+                .filter_map(|(smooth, term)| {
+                    let name = term.by.as_ref()?;
+                    let by = smooth.by.as_ref()?;
+                    Some((
+                        name.clone(),
+                        FactorInfo {
+                            name: name.clone(),
+                            levels: by.levels.clone(),
+                            ordered: by.ordered,
+                        },
+                    ))
+                }),
+        )
         .collect();
     for (coding, column) in recipe.monotonic.iter().zip(&recipe.formula.monotonic) {
         if let crate::Monotonic::Ordered { levels } = coding {

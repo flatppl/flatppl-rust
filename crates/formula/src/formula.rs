@@ -40,18 +40,38 @@ pub struct StandardError {
 pub struct SmoothTerm {
     pub column: String,
     pub rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 impl SmoothTerm {
     pub fn label(&self) -> String {
-        match self.rank {
-            Some(rank) => format!("s({}, k = {rank})", self.column),
-            None => format!("s({})", self.column),
+        let mut args = self.column.clone();
+        if let Some(rank) = self.rank {
+            args.push_str(&format!(", k = {rank}"));
+        }
+        if let Some(by) = &self.by {
+            args.push_str(&format!(", by = {by}"));
+        }
+        format!("s({args})")
+    }
+
+    pub(crate) fn curve_label(&self, level: Option<&str>) -> String {
+        let label = self.label();
+        match level {
+            Some(level) => format!("{label}:{}{level}", self.by.as_deref().unwrap()),
+            None => label,
         }
     }
 
-    pub(crate) fn coefficient(&self) -> String {
-        format!("s{}_1", crate::emit::coefficient_name(&self.column))
+    pub(crate) fn coefficient(&self, level: Option<&str>) -> String {
+        let by = level.map_or_else(String::new, |level| {
+            format!(":{}{level}", self.by.as_deref().unwrap())
+        });
+        format!(
+            "s{}_1",
+            crate::emit::coefficient_name(&format!("{}{by}", self.column))
+        )
     }
 }
 
@@ -123,7 +143,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             Atom::Smooth(smooth) => {
                 if smooths
                     .iter()
-                    .any(|s: &SmoothTerm| s.column == smooth.column)
+                    .any(|s: &SmoothTerm| s.column == smooth.column && s.by == smooth.by)
                 {
                     return Err(Error(format!(
                         "repeated smooths of `{}` are not supported",
@@ -486,7 +506,7 @@ impl<'a> Parser<'a> {
 
     fn smooth(&mut self) -> Result<Expr> {
         let fail = || {
-            Error("smooths support `s(column)` and `s(column, k=integer)` with the default thin-plate basis".into())
+            Error("smooths support `s(column)` with optional `k=integer` and `by=factor`".into())
         };
         self.at += 1;
         let Token::Name(column) = self.peek() else {
@@ -494,32 +514,36 @@ impl<'a> Parser<'a> {
         };
         let column = name(column)?;
         self.at += 1;
-        let rank = if self.peek() == Token::Comma {
+        let mut rank = None;
+        let mut by = None;
+        while self.peek() == Token::Comma {
             self.at += 1;
-            if self.peek() != Token::Name("k") {
+            let Token::Name(arg) = self.peek() else {
                 return Err(fail());
-            }
+            };
             self.at += 1;
             if self.peek() != Token::Equals {
                 return Err(fail());
             }
             self.at += 1;
-            let Token::Number(rank) = self.peek() else {
-                return Err(fail());
-            };
-            if !(3.0..=2000.0).contains(&rank) || rank.fract() != 0.0 {
-                return Err(fail());
+            match (arg, self.peek()) {
+                ("k", Token::Number(value))
+                    if rank.is_none()
+                        && (3.0..=2000.0).contains(&value)
+                        && value.fract() == 0.0 =>
+                {
+                    rank = Some(value as usize);
+                }
+                ("by", Token::Name(value)) if by.is_none() => by = Some(name(value)?),
+                _ => return Err(fail()),
             }
             self.at += 1;
-            Some(rank as usize)
-        } else {
-            None
-        };
+        }
         if self.peek() != Token::Right {
             return Err(fail());
         }
         self.at += 1;
-        self.atom(Atom::Smooth(SmoothTerm { column, rank }))
+        self.atom(Atom::Smooth(SmoothTerm { column, rank, by }))
     }
 
     fn monotonic(&mut self) -> Result<Expr> {
@@ -871,6 +895,11 @@ impl Formula {
         for smooth in &self.smooths {
             if !names.contains(&smooth.column.as_str()) {
                 names.push(&smooth.column);
+            }
+            if let Some(by) = smooth.by.as_deref()
+                && !names.contains(&by)
+            {
+                names.push(by);
             }
         }
         for column in &self.monotonic {
