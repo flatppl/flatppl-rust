@@ -404,6 +404,10 @@ need its own statistical discovery pass.
 
 ## Structural model analysis
 
+`flatppl-model-analysis::measure_stochastic_ancestors` traces a measure's
+parameters to named or inline draws. It uses the original declarations under
+query pins and stops at observed draws, conditioned inputs and reified laws.
+
 `flatppl-model-analysis::match_conjugate_marginal` recognizes seven scalar
 prior–likelihood pairs on the inferred graph. It returns the rule, the latent
 symbol and both constructors' bound parameter nodes. Callers pass the draws

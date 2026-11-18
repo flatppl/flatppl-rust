@@ -74,6 +74,15 @@ pub fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<
     }
 }
 
+/// If `id` is `draw(mᵢ)`, return `mᵢ`; otherwise `None`.
+pub fn draw_argument(m: &Module, id: NodeId) -> Option<NodeId> {
+    let c = expect_builtin_call(m, id, "draw")?;
+    if c.args.len() != 1 {
+        return None;
+    }
+    Some(c.args[0])
+}
+
 /// Allocate a positional builtin call `head(args…)`.
 pub fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
     let sym = m.intern(head);

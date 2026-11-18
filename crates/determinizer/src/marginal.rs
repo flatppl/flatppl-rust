@@ -65,8 +65,8 @@
 //! continuous distribution are **not** enumerable → refused.
 
 use crate::density::{
-    Ancestor, build_call, build_record, draw_argument, expect_builtin_call, lower_measure_density,
-    measure_stochastic_ancestors, refuse, resolve_ref, split_kernel_constructor,
+    build_call, build_record, draw_argument, expect_builtin_call, lower_measure_density, refuse,
+    resolve_ref, split_kernel_constructor,
 };
 use crate::kernel::{Kernel, resolve_reified};
 use crate::refuse::RefuseError;
@@ -76,7 +76,10 @@ use flatppl_core::{
     Symbol, Type, ValueSet,
 };
 use flatppl_infer::constructors::constructor_symbol;
-use flatppl_model_analysis::{ConjugateMatch, ConjugateRowId, references_latent};
+use flatppl_model_analysis::{
+    ConjugateMatch, ConjugateRowId, measure_stochastic_ancestors, references_latent,
+    sole_named_ancestor,
+};
 
 mod beta;
 mod dirichlet;
@@ -641,7 +644,8 @@ pub(crate) fn conjugate_marginal_measure(
     likelihood: NodeId,
     exempt: &[NodeId],
 ) -> Option<Result<ImplicitMarginal, RefuseError>> {
-    let (latent, prior) = sole_named_ancestor(m, likelihood, exempt)?;
+    let (latent, prior) =
+        sole_named_ancestor(&measure_stochastic_ancestors(m, likelihood, exempt))?;
     let above = measure_stochastic_ancestors(m, prior, &[]);
     let (prior, mut latents) = if above.is_empty() {
         (prior, Vec::new())
@@ -665,31 +669,6 @@ pub(crate) fn conjugate_marginal_measure(
         build_conjugate_marginal(m, prior, likelihood, latent, exempt)?
             .map(|form| ImplicitMarginal { form, latents }),
     )
-}
-
-/// The single named stochastic ancestor of `likelihood`, as `(symbol, prior)`. `None`
-/// when there is none, when two DISTINCT latents are reached, or when any ancestor has
-/// no recoverable `(name, prior)` pair ([`Ancestor::Opaque`]) — each of which is outside
-/// the table's one-prior integral.
-fn sole_named_ancestor(
-    m: &Module,
-    likelihood: NodeId,
-    exempt: &[NodeId],
-) -> Option<(Symbol, NodeId)> {
-    let mut found: Option<(Symbol, NodeId)> = None;
-    for ancestor in measure_stochastic_ancestors(m, likelihood, exempt) {
-        let Ancestor::Named { name, prior } = ancestor else {
-            return None;
-        };
-        match found {
-            None => found = Some((name, prior)),
-            // The same latent feeding two parameters is still one ancestor; check (c)
-            // in `build_conjugate_marginal` is what rejects that shape.
-            Some((seen, _)) if seen == name => {}
-            Some(_) => return None,
-        }
-    }
-    found
 }
 
 /// The likelihood constructor resolved out of a kernel body, plus any
@@ -1193,9 +1172,11 @@ pub(crate) fn shared_latent_record_law(
 
     // One shared latent across every field. `sole_named_ancestor` already rejects a field
     // reaching two DISTINCT latents, so this only has to check the fields agree.
-    let (latent, prior) = sole_named_ancestor(m, field_measures[0], exempt)?;
+    let (latent, prior) =
+        sole_named_ancestor(&measure_stochastic_ancestors(m, field_measures[0], exempt))?;
     for &measure in &field_measures[1..] {
-        let (other, other_prior) = sole_named_ancestor(m, measure, exempt)?;
+        let (other, other_prior) =
+            sole_named_ancestor(&measure_stochastic_ancestors(m, measure, exempt))?;
         if other != latent || other_prior != prior {
             return None;
         }

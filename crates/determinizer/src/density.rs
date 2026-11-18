@@ -139,8 +139,8 @@
 //! disintegration on `x`'s field names, §06 "Measure restriction".)
 
 pub(crate) use flatppl_core::graph::{
-    build_call, build_record, confirmed_non_scalar, expect_builtin_call, fold_add, resolve_ref,
-    resolve_ref_one,
+    build_call, build_record, confirmed_non_scalar, draw_argument, expect_builtin_call, fold_add,
+    resolve_ref, resolve_ref_one,
 };
 use flatppl_core::ty::{VariateKind, variate_kind};
 pub(crate) use flatppl_infer::constructors::{split_kernel_constructor, std_module_ctor_sym};
@@ -152,6 +152,9 @@ use flatppl_core::{
     RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
 };
 use flatppl_infer::ModuleBundle;
+use flatppl_model_analysis::{
+    StochasticAncestor, measure_stochastic_ancestors, sole_named_ancestor,
+};
 
 #[path = "density_broadcast.rs"]
 pub(crate) mod broadcast;
@@ -2976,112 +2979,6 @@ fn lower_value_law(
 /// reachable draw genuinely does randomize the resulting law.
 fn measure_reaches_draw(m: &Module, node: NodeId, exempt: &[NodeId]) -> bool {
     !measure_stochastic_ancestors(m, node, exempt).is_empty()
-}
-
-/// One stochastic ancestor of a measure expression, as reported by
-/// [`measure_stochastic_ancestors`].
-pub(crate) enum Ancestor {
-    /// A latent reached through a `(%ref self name)`: the binding symbol the measure
-    /// references it by, and its PRIOR measure (the `draw`'s argument).
-    Named { name: Symbol, prior: NodeId },
-    /// An ancestor with no `(name, prior)` pair to marginalize over — an inline
-    /// `draw(…)`, or a binding whose (pre-pin) right-hand side is not a bare `draw`.
-    Opaque,
-}
-
-/// Every stochastic ancestor [`measure_reaches_draw`] finds, described well enough to
-/// marginalize over: `crate::marginal` needs the latent's own symbol (to prove the
-/// likelihood feeds it to exactly the conjugating parameter) and its prior measure.
-///
-/// One walk serves both consumers so the guard and the marginal router cannot drift on
-/// what counts as an ancestor. See [`measure_reaches_draw`] for the walk's rules — the
-/// `lawof` stop, the pinned-binding provenance, and `exempt`.
-///
-/// A latent an earlier query pinned reports the prior the pin replaced
-/// ([`Module::query_pinned_rhs`]): the pin overwrote the binding with a literal, so the
-/// `draw(prior)` is reachable only through that provenance.
-pub(crate) fn measure_stochastic_ancestors(
-    m: &Module,
-    node: NodeId,
-    exempt: &[NodeId],
-) -> Vec<Ancestor> {
-    fn describe(via: Option<Symbol>, prior: Option<NodeId>) -> Ancestor {
-        match (via, prior) {
-            (Some(name), Some(prior)) => Ancestor::Named { name, prior },
-            _ => Ancestor::Opaque,
-        }
-    }
-    // `via` is the binding symbol of the ref hop taken IMMEDIATELY above `node`, and
-    // only that one: a draw reached through an intervening call (`mu = 2 * z`) is
-    // attributed to its own ref hop, never to the outer binding.
-    fn walk(
-        m: &Module,
-        node: NodeId,
-        via: Option<Symbol>,
-        exempt: &[NodeId],
-        path: &mut Vec<BindingId>,
-        out: &mut Vec<Ancestor>,
-    ) {
-        match m.node(node) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) => {
-                // An input the enclosing reification declares is a GIVEN, not a
-                // stochastic ancestor: §04 "Reification to measures" makes it the
-                // callable's argument, and §06 `likelihoodof` fixes
-                // `densityof(likelihoodof(K, obs), theta)` as `pdf(K(theta), obs)` —
-                // conditional on θ. Marginalizing it would score the obs against the
-                // model's prior predictive instead.
-                if m.is_conditioned_input(*name) {
-                    return;
-                }
-                let Some(bid) = m.binding_by_name(*name) else {
-                    return;
-                };
-                if path.contains(&bid) {
-                    return; // cyclic definition — stop rather than recurse forever
-                }
-                path.push(bid);
-                // `declared_binding_rhs`, so a latent an earlier query pinned walks as
-                // the `draw(prior)` the pin overwrote. One arm for both, rather than a
-                // pinned special case: the special case pushed its ancestor without
-                // consulting `exempt`, so a SIBLING field's latent counted as an
-                // outside ancestor once pinned, and the record law refused.
-                walk(
-                    m,
-                    m.declared_binding_rhs(bid),
-                    Some(*name),
-                    exempt,
-                    path,
-                    out,
-                );
-                path.pop();
-            }
-            Node::Call(c) => {
-                // A `draw` IS the stochastic ancestor; no need to look inside it.
-                if let Some(prior) = draw_argument(m, node) {
-                    if !exempt.contains(&node) {
-                        out.push(describe(via, Some(prior)));
-                    }
-                    return;
-                }
-                if matches!(builtin_name(m, node), Some("lawof")) {
-                    return;
-                }
-                for &arg in c.args.iter() {
-                    walk(m, arg, None, exempt, path, out);
-                }
-                for n in c.named.iter() {
-                    walk(m, n.value, None, exempt, path, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(m, node, None, exempt, &mut Vec::new(), &mut out);
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -9072,15 +8969,6 @@ pub(crate) fn build_user_call_n(m: &mut Module, callee: NodeId, args: Vec<NodeId
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }))
-}
-
-/// If `id` is `draw(mᵢ)`, return `mᵢ`; otherwise `None`.
-pub(crate) fn draw_argument(m: &Module, id: NodeId) -> Option<NodeId> {
-    let c = expect_builtin_call(m, id, "draw")?;
-    if c.args.len() != 1 {
-        return None;
-    }
-    Some(c.args[0])
 }
 
 /// The value of the `%field`-named entry `name` in `named`, if present.
