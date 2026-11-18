@@ -17,6 +17,7 @@ pub(crate) use inline::{
     expand_composed_call, inline_expression, inline_user_calls, normalize_call_wrappers,
 };
 mod integrals;
+pub(crate) use integrals::{is_closed as integral_is_closed, is_integral};
 mod sharing;
 
 /// The `FLATPPL_DETERMINIZE_NO_CANON` env escape hatch: when set (to any value),

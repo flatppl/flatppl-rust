@@ -304,7 +304,8 @@ fn check_integrals(
     bad: &mut Vec<NonConformance>,
 ) {
     let mut seen = HashSet::new();
-    let mut pending = m.bindings().map(|(_, b)| (b.rhs, None)).collect::<Vec<_>>();
+    let free = [None; 2];
+    let mut pending = m.bindings().map(|(_, b)| (b.rhs, free)).collect::<Vec<_>>();
     while let Some((id, bound)) = pending.pop() {
         if !seen.insert((id, bound)) {
             continue;
@@ -313,7 +314,7 @@ fn check_integrals(
             && r.ns == RefNs::SelfMod
             && let Some(binding) = m.binding_by_name(r.name)
         {
-            pending.push((m.binding(binding).rhs, None));
+            pending.push((m.binding(binding).rhs, free));
             continue;
         }
         if let Node::Call(c) = m.node(id)
@@ -326,33 +327,36 @@ fn check_integrals(
                             reason: "no closed form covers this marginal or normalizer; numerical integration requires explicit opt-in".into() });
                         continue;
                     }
-                    if c.args.len() != 4 || !c.named.is_empty() || bound.is_some() {
+                    if !matches!(c.args.len(), 4 | 7) || !c.named.is_empty() || bound != free {
                         bad.push(NonConformance {
                             node: id,
                             kind: NonConformKind::NumericalIntegral,
-                            reason: "numerical integration requires a nonnested scalar integral"
-                                .into(),
+                            reason: "numerical integration requires a nonnested scalar or rectangular integral".into(),
                         });
                         continue;
                     }
-                    let point = c.args[1];
-                    let valid = matches!(m.node(point), Node::Call(p)
-                        if matches!(p.head, CallHead::Builtin(h) if m.resolve(h) == flatppl_core::INTEGRATION_POINT));
-                    if !valid {
+                    let points = [Some(c.args[1]), c.args.get(4).copied()];
+                    let valid_point = |point| {
+                        matches!(m.node(point), Node::Call(p)
+                            if matches!(p.head, CallHead::Builtin(h) if m.resolve(h) == flatppl_core::INTEGRATION_POINT))
+                    };
+                    if points[0] == points[1] || !points.into_iter().flatten().all(valid_point) {
                         bad.push(NonConformance {
                             node: id,
                             kind: NonConformKind::NumericalIntegral,
-                            reason: "numerical integral has no bound coordinate".into(),
+                            reason: "numerical integral needs distinct bound coordinates".into(),
                         });
                         continue;
                     }
-                    pending.push((c.args[0], Some(point)));
-                    pending.push((point, Some(point)));
-                    pending.extend(c.args[2..].iter().map(|&node| (node, None)));
+                    pending.push((c.args[0], points));
+                    for axis in c.args[1..].as_chunks::<3>().0 {
+                        pending.push((axis[0], points));
+                        pending.extend(axis[1..].iter().map(|&node| (node, free)));
+                    }
                     continue;
                 }
                 flatppl_core::INTEGRATION_POINT
-                    if bound != Some(id)
+                    if !bound.contains(&Some(id))
                         || c.args.len() != 1
                         || !c.named.is_empty()
                         || !matches!(

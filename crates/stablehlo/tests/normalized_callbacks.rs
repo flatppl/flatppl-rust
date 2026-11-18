@@ -372,3 +372,18 @@ fn applied_vector_prior_retains_its_static_shape_and_mass_guard() {
         assert_eq!(emit(&source, &Mode::Sample), emit(&expected, &Mode::Sample));
     }
 }
+
+#[test]
+fn rectangle_normalization_shares_the_mesh_across_iid_observations() {
+    let source = "
+        a = external(posreals)
+        observations = external(cartpow(cartpow(reals, 2), 3))
+        w(v, a) = 1.0 + a * v[1] * v[2]
+        S = cartprod(interval(0, 1), interval(0, a))
+        M = normalize(weighted(w, Lebesgue(S), a))
+        inputs = (a, observations)
+        outputs = logdensityof(iid(M, 3), observations)
+    ";
+    let hlo = emit_with_integrals(source, &Mode::LogDensity, true);
+    assert_eq!(hlo.matches("stablehlo.while").count(), 1);
+}

@@ -4972,6 +4972,17 @@ fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
 /// `None` where the support or the variate names no such point (a record or table
 /// variate, an unproven support): no sanitisation then.
 fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
+    if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_bounds(m, measure) {
+        let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+        let midpoint = |m: &mut Module, lo, hi| {
+            let a = build_call(m, "mul", &[half, lo]);
+            let b = build_call(m, "mul", &[half, hi]);
+            build_call(m, "add", &[a, b])
+        };
+        let x = midpoint(m, xlo, xhi);
+        let y = midpoint(m, ylo, yhi);
+        return Some(build_call(m, "vector", &[x, y]));
+    }
     let (ty, support) = match (m.type_of(measure), m.valueset_of(measure)) {
         (Some(ty), Some(support))
             if crate::invert::support_witness(support).is_some()
@@ -7754,7 +7765,17 @@ fn lower_lebesgue(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
             )
         })?
     };
-    let cond = reference_membership(m, v, support);
+    let cond = if let Some([xlo, xhi, ylo, yhi]) = integral::rectangular_support_bounds(m, support)
+    {
+        // A broadcast can bind numeric endpoints, but its cells cannot take
+        // the set itself as an argument. Keep the membership structure here.
+        let x = build_call(m, "interval", &[xlo, xhi]);
+        let y = build_call(m, "interval", &[ylo, yhi]);
+        let rectangle = build_call(m, "cartprod", &[x, y]);
+        build_call(m, "in", &[v, rectangle])
+    } else {
+        reference_membership(m, v, support)
+    };
     let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
     Ok(gate_density(m, cond, zero))
 }

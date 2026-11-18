@@ -1,4 +1,4 @@
-//! Positive one-dimensional integrals in the compiler's internal IR.
+//! Positive integrals in the compiler's internal IR.
 //! Exact rules run first. Ordinary FlatPDL conformance rejects this extension.
 
 use super::*;
@@ -264,9 +264,105 @@ fn expectation(
 }
 
 pub(super) fn mass(m: &mut Module, measure: NodeId) -> Option<Result<NodeId, RefuseError>> {
+    if let Some(integral) = rectangular_mass(m, measure) {
+        return Some(integral.map(|(mass, logarithmic)| {
+            if logarithmic {
+                mass
+            } else {
+                log_nonnegative_mass(m, mass)
+            }
+        }));
+    }
     expectation(m, measure, &mut |m, _| {
         Ok(m.alloc(Node::Lit(Scalar::Real(0.0))))
     })
+}
+
+pub(crate) fn rectangular_totalmass(
+    m: &mut Module,
+    measure: NodeId,
+) -> Option<Result<NodeId, RefuseError>> {
+    Some(rectangular_mass(m, measure)?.map(|(mass, logarithmic)| {
+        if logarithmic {
+            build_call(m, "exp", &[mass])
+        } else {
+            mass
+        }
+    }))
+}
+
+// Direct Lebesgue reweighting gives unit reference density throughout the
+// rectangle. Integrate the callback alone, preserving raw derivatives at zero.
+fn rectangular_mass(
+    m: &mut Module,
+    measure: NodeId,
+) -> Option<Result<(NodeId, bool), RefuseError>> {
+    let (node, _) = resolve_ref_chain(m, measure);
+    let logarithmic = match builtin_name(m, node)? {
+        "weighted" => false,
+        "logweighted" => true,
+        _ => return None,
+    };
+    let Node::Call(call) = m.node(node) else {
+        return None;
+    };
+    let [weight, base, ..] = *call.args else {
+        return None;
+    };
+    let [xlo, xhi, ylo, yhi] = rectangular_bounds(m, base)?;
+    if measure_reaches_draw(m, measure, &[]) {
+        return None;
+    }
+    Some((|| {
+        let parameters = crate::extras::bind_extras(m, node, weight, 2, 1)?;
+        let x = point(m);
+        let y = point(m);
+        let body = if !parameters.is_empty() || weight_is_variate_dependent(m, weight) {
+            let coordinates = build_call(m, "vector", &[x, y]);
+            let body = build_callback_call(m, weight, coordinates, &parameters)?;
+            crate::canon::inline_expression(m, body)
+        } else {
+            weight
+        };
+        let op = if logarithmic {
+            flatppl_core::LOG_INTEGRAL
+        } else {
+            flatppl_core::MASS_INTEGRAL
+        };
+        let mass = build_call(m, op, &[body, x, xlo, xhi, y, ylo, yhi]);
+        m.set_type(mass, Type::Scalar(ScalarType::Real));
+        Ok((mass, logarithmic))
+    })())
+}
+
+/// Preserve live bounds so quadrature can differentiate through their limits.
+pub(super) fn rectangular_bounds(m: &Module, measure: NodeId) -> Option<[NodeId; 4]> {
+    let (measure, _) = resolve_ref_chain(m, measure);
+    let base = expect_builtin_call(m, measure, "Lebesgue")?;
+    let support = named_or_positional(m, base, "support")?;
+    rectangular_support_bounds(m, support)
+}
+
+pub(super) fn rectangular_support_bounds(m: &Module, support: NodeId) -> Option<[NodeId; 4]> {
+    let (support, _) = resolve_ref_chain(m, support);
+    let product = expect_builtin_call(m, support, "cartprod")?;
+    let (&[x, y], true) = (product.args.as_ref(), product.named.is_empty()) else {
+        return None;
+    };
+    let interval = |node| {
+        let (node, _) = resolve_ref_chain(m, node);
+        let bounds = expect_builtin_call(m, node, "interval")?;
+        let (&[lo, hi], true) = (bounds.args.as_ref(), bounds.named.is_empty()) else {
+            return None;
+        };
+        [lo, hi]
+            .into_iter()
+            .all(|bound| static_real(m, bound).is_none_or(f64::is_finite))
+            .then_some([lo, hi])
+    };
+    let [xlo, xhi] = interval(x)?;
+    let [ylo, yhi] = interval(y)?;
+    Some([xlo, xhi, ylo, yhi])
 }
 
 /// Integrate the raw callback of a weighted scalar reference. Unlike a log

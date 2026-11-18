@@ -1,4 +1,4 @@
-//! Name closed scalar integrals before entering broadcast or quadrature scopes.
+//! Name closed integrals before entering broadcast or quadrature scopes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -80,7 +80,7 @@ pub(super) fn hoist_integrals(m: &mut Module) -> bool {
     changed
 }
 
-fn is_integral(m: &Module, id: NodeId) -> bool {
+pub(crate) fn is_integral(m: &Module, id: NodeId) -> bool {
     matches!(m.node(id), Node::Call(c)
         if matches!(c.head, CallHead::Builtin(h) if matches!(m.resolve(h), flatppl_core::LOG_INTEGRAL | flatppl_core::MASS_INTEGRAL)))
 }
@@ -126,10 +126,11 @@ fn scoped_integrals(m: &Module, roots: impl Iterator<Item = NodeId>) -> HashSet<
     scoped
 }
 
-// Only the integrand binds its coordinate. Module references have module scope.
+// Only the integrand binds its coordinates. Module references have module scope.
 // A free local or aggregate axis conservatively keeps the integral in place.
-fn is_closed(m: &Module, root: NodeId, inputs: &[Ref]) -> bool {
-    let mut pending = vec![(root, None)];
+pub(crate) fn is_closed(m: &Module, root: NodeId, inputs: &[Ref]) -> bool {
+    let free = [None; 2];
+    let mut pending = vec![(root, free)];
     let mut seen = HashSet::new();
     while let Some((id, bound)) = pending.pop() {
         if !seen.insert((id, bound)) {
@@ -146,7 +147,7 @@ fn is_closed(m: &Module, root: NodeId, inputs: &[Ref]) -> bool {
                 name,
             }) => {
                 if let Some(binding) = m.binding_by_name(*name) {
-                    pending.push((m.binding(binding).rhs, None));
+                    pending.push((m.binding(binding).rhs, free));
                 }
                 continue;
             }
@@ -154,14 +155,17 @@ fn is_closed(m: &Module, root: NodeId, inputs: &[Ref]) -> bool {
                 if matches!(c.head, CallHead::Builtin(h)
                 if m.resolve(h) == flatppl_core::INTEGRATION_POINT) =>
             {
-                if bound != Some(id) {
+                if !bound.contains(&Some(id)) {
                     return false;
                 }
                 continue;
             }
-            Node::Call(c) if is_integral(m, id) && c.args.len() == 4 => {
-                pending.push((c.args[0], Some(c.args[1])));
-                pending.extend(c.args[2..].iter().map(|&node| (node, bound)));
+            Node::Call(c) if is_integral(m, id) && matches!(c.args.len(), 4 | 7) => {
+                let points = [Some(c.args[1]), c.args.get(4).copied()];
+                pending.push((c.args[0], points));
+                for axis in c.args[1..].as_chunks::<3>().0 {
+                    pending.extend(axis[1..].iter().map(|&node| (node, bound)));
+                }
                 continue;
             }
             _ => (),
