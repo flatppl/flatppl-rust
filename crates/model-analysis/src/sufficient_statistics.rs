@@ -41,6 +41,25 @@ pub use structural::{IidNormalPlan, plan_iid_normal};
 const NORMAL_FINITE: &str = "all_finite";
 const PREFIX: &str = "__likelihood_summary_";
 
+/// Give a portable statistic a collision-free binding for explicit data preparation.
+pub(crate) fn bind_summary(m: &mut Module, rhs: NodeId, serial: &mut usize) -> (Symbol, NodeId) {
+    let name = loop {
+        let name = m.intern(&format!("{PREFIX}{serial}"));
+        *serial += 1;
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+    };
+    m.add_binding(Binding {
+        name,
+        rhs,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    (name, local_ref(m, name))
+}
+
 /// Two ordinary deterministic queries. Run `preparation` once per data binding,
 /// then pass its results to the appended `score` inputs in `summaries` order.
 /// Raw data used outside reduced factors remains an input of `score`.
@@ -340,7 +359,7 @@ fn set_signature(m: &mut Module, name: &str, values: &[NodeId]) {
 
 /// Does this graph depend only on the allowed ABI inputs and fixed values?
 /// ABI boundaries override the source RHS, even for promoted fixed bindings.
-fn data_only(
+pub(crate) fn data_only(
     m: &Module,
     root: NodeId,
     allowed: &HashSet<Symbol>,
@@ -661,22 +680,8 @@ impl Reducer {
             return Expr::Node(id);
         }
         let rhs = materialize(m, expr);
-        let name = loop {
-            let name = m.intern(&format!("{PREFIX}{}", self.next_serial));
-            self.next_serial += 1;
-            if m.binding_by_name(name).is_none() {
-                break name;
-            }
-        };
-        m.add_binding(Binding {
-            name,
-            rhs,
-            doc: None,
-            public: false,
-            synthetic: true,
-        });
+        let (name, id) = bind_summary(m, rhs, &mut self.next_serial);
         self.summaries.push(name);
-        let id = local_ref(m, name);
         self.cache.insert((key, kind), id);
         Expr::Node(id)
     }

@@ -1,30 +1,107 @@
-//! Log evidence for Beta priors with ordered Bernoulli or Binomial observations.
+//! Predictive log mass of each conjugate likelihood factor under its incoming prior.
 
-use super::{Data, Update, UpdatedLaw, match_update, op, real};
+use super::{Data, MatchedUpdate, Update, UpdatedLaw, match_update, op, real};
 use flatppl_core::graph::{build_record, special_functions_alias};
-use flatppl_core::{Call, CallHead, Module, Node, NodeId, Ref, RefNs};
+use flatppl_core::{Call, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
+
+mod counts;
+mod gaussian;
 
 /// Log mass of an unnormalized Beta update. An impossible observation has zero mass.
 pub fn beta_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
-    let mut sum = None;
-    let mut logbeta = None;
-    let matched = match_update(m, posterior, |m, prior, _, row, data, validity| {
-        let (UpdatedLaw::Beta(a, b), Update::Binomial(trials)) = (prior, row) else {
-            return None;
+    let update = match_update(m, posterior)?;
+    if !matches!(update.prior, UpdatedLaw::Beta(..)) {
+        return None;
+    }
+    log_evidence(m, update)
+}
+
+/// Exact log evidence of a recognized one-field update, relative to the observation measure.
+pub fn conjugate_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
+    let update = match_update(m, posterior)?;
+    log_evidence(m, update)
+}
+
+#[derive(Default)]
+struct Evidence {
+    serial: usize,
+    prepare: bool,
+    logbeta: Option<NodeId>,
+}
+
+impl Evidence {
+    fn summary(&mut self, m: &mut Module, rhs: NodeId) -> NodeId {
+        if self.prepare {
+            crate::sufficient_statistics::bind_summary(m, rhs, &mut self.serial).1
+        } else {
+            rhs
+        }
+    }
+    fn logbeta(&mut self, m: &mut Module) -> NodeId {
+        *self.logbeta.get_or_insert_with(|| special_logbeta(m))
+    }
+}
+
+fn log_evidence(m: &mut Module, matched: MatchedUpdate) -> Option<NodeId> {
+    let mut evidence = Evidence::default();
+    let boundary = flatppl_core::query::promoted_input_names(m);
+    let mut law = matched.prior;
+    let mut supported = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let mut terms = Vec::with_capacity(matched.factors.len());
+    for factor in matched.factors {
+        let data = factor.data;
+        if data.count == Some(0) {
+            continue;
+        }
+        // Only module-scoped observations can move to a top-level preparation binding.
+        evidence.prepare = data.count.is_some()
+            && crate::sufficient_statistics::data_only(m, data.value, &boundary, &boundary);
+        let valid = op(m, "land", &[matched.model_valid, supported]);
+        let (score, observed) = match (law, factor.row) {
+            (UpdatedLaw::Beta(a, b), Update::Binomial(trials)) => {
+                let observed = law.update(m, factor.row, data)?;
+                let valid = op(m, "land", &[valid, observed]);
+                let a = safe(m, valid, a, 1.0);
+                let b = safe(m, valid, b, 1.0);
+                (
+                    factor_log_mass(m, &mut evidence.logbeta, [a, b], trials, data, valid),
+                    observed,
+                )
+            }
+            (UpdatedLaw::Gamma(a, b), Update::Poisson) => {
+                counts::poisson(m, &mut evidence, &mut law, [a, b], data, valid)
+            }
+            (
+                UpdatedLaw::Dirichlet(alpha),
+                Update::Categories {
+                    dimensions,
+                    trials,
+                    one_based,
+                },
+            ) => counts::categories(
+                m,
+                &mut evidence,
+                &mut law,
+                alpha,
+                data,
+                (dimensions, trials, one_based),
+                valid,
+            ),
+            (UpdatedLaw::Normal(..) | UpdatedLaw::InverseGamma(..), _) => {
+                gaussian::factor(m, &mut evidence, &mut law, factor.row, data, valid)?
+            }
+            _ => return None,
         };
-        let valid = op(m, "land", &validity);
-        let one = real(m, 1.0);
-        let a = op(m, "ifelse", &[valid, a, one]);
-        let b = op(m, "ifelse", &[valid, b, one]);
-        let factor = factor_log_mass(m, &mut logbeta, [a, b], trials, data, valid);
-        sum = Some(match sum {
-            Some(previous) => op(m, "add", &[previous, factor]),
-            None => factor,
-        });
-        Some(())
-    })?;
+        supported = op(m, "land", &[supported, observed]);
+        terms.push(score);
+    }
+    let sum = if terms.is_empty() {
+        real(m, 0.0)
+    } else {
+        flatppl_core::graph::fold_add(m, &terms)
+    };
     let minus_inf = real(m, f64::NEG_INFINITY);
-    let log_mass = op(m, "ifelse", &[matched.supported, sum?, minus_inf]);
+    let log_mass = op(m, "ifelse", &[supported, sum, minus_inf]);
     // A unit-probability event adds zero on every valid model. Its native
     // probability check preserves the source parameter error on invalid models.
     let one = real(m, 1.0);
@@ -36,6 +113,20 @@ pub fn beta_log_evidence(m: &mut Module, posterior: NodeId) -> Option<NodeId> {
     let kernel = m.alloc(Node::Const(name));
     let anchor = op(m, "builtin_logdensityof", &[kernel, parameters, one]);
     Some(op(m, "add", &[log_mass, anchor]))
+}
+
+fn safe(m: &mut Module, valid: NodeId, value: NodeId, fallback: f64) -> NodeId {
+    let fallback = real(m, fallback);
+    op(m, "ifelse", &[valid, value, fallback])
+}
+
+fn special_logbeta(m: &mut Module) -> NodeId {
+    let alias = special_functions_alias(m);
+    let name = m.intern("logbeta");
+    m.alloc(Node::Ref(Ref {
+        ns: RefNs::Module(alias),
+        name,
+    }))
 }
 
 fn log_beta(m: &mut Module, function: NodeId, x: NodeId, y: NodeId, array: bool) -> NodeId {
@@ -110,14 +201,7 @@ fn factor_log_mass(
         let relative = op(m, "ifelse", &[at_max, zero, log_fraction]);
         return op(m, "sub", &[relative, correction]);
     }
-    let function = *logbeta.get_or_insert_with(|| {
-        let alias = special_functions_alias(m);
-        let name = m.intern("logbeta");
-        m.alloc(Node::Ref(Ref {
-            ns: RefNs::Module(alias),
-            name,
-        }))
-    });
+    let function = *logbeta.get_or_insert_with(|| special_logbeta(m));
     let n = trials.unwrap_or_else(|| m.alloc(Node::Lit(flatppl_core::Scalar::Int(1))));
     let failures = data.apply(m, "sub", &[n, data.value]);
     let failures = data.apply(m, "real", &[failures]);

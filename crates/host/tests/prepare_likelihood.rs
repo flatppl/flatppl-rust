@@ -573,3 +573,52 @@ fn weighted_and_ordinary_regressions_keep_distinct_summary_shapes()
     }
     Ok(())
 }
+
+#[test]
+fn conjugate_evidence_prepares_bounded_data_for_each_new_family()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (prior, kernel, cell, latent) in [
+        ("Gamma(h,3)", "Poisson(t)", "integers", "posreals"),
+        ("Normal(0,h)", "Normal(t,h)", "reals", "reals"),
+        (
+            "InverseGamma(h,3)",
+            "Normal(h,sqrt(t))",
+            "reals",
+            "posreals",
+        ),
+        (
+            "Dirichlet([h,3.])",
+            "Categorical(t)",
+            "integers",
+            "stdsimplex(2)",
+        ),
+        (
+            "Dirichlet([h,3.])",
+            "Categorical0(t)",
+            "integers",
+            "stdsimplex(2)",
+        ),
+        (
+            "Dirichlet([h,3.])",
+            "Multinomial(h,t)",
+            "cartpow(integers,2)",
+            "stdsimplex(2)",
+        ),
+    ] {
+        let mut context = Context::default();
+        let source = format!(
+            "h=external(posintegers)\nt=elementof({latent})\ny=external(cartpow({cell},31))\nL=likelihoodof(functionof(iid({kernel},31),t=t),y)\nP=bayesupdate(L,joint(t={prior}))\ninputs=(h,y)\noutputs=log(totalmass(P))"
+        );
+        let query = context.parse(&source, None, None)?;
+        let prepared = context.prepare_likelihood(&query, &["y".into()])?;
+        let prep = prepared.preparation.compile(&EmitOptions::default())?;
+        let score = prepared.score.compile(&EmitOptions::default())?;
+        assert_eq!(prep.inputs.len(), 1);
+        assert_eq!(prep.inputs[0].name, "y");
+        assert_eq!(score.inputs.len(), 1 + prepared.summaries.len());
+        assert_eq!(score.inputs[0].name, "h");
+        check_summary_schemas(&prep, &score, &prepared.summaries)?;
+        assert!(!score.stablehlo.contains("tensor<31x"), "{kernel}");
+    }
+    Ok(())
+}

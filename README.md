@@ -127,8 +127,9 @@ For example, a `Beta(1, 1)` prior and one observed Bernoulli success give
 families and identifies the exact IID draw selected by Rust StableHLO lowering.
 `logdensityof(normalize(P), point)` scores the matched posterior law.
 `totalmass(P)` and `log(totalmass(P))` give the evidence and log evidence for
-Beta priors with Bernoulli or Binomial observations. Each Binomial observation
-retains its own count coefficient.
+each matched update. Count evidence retains each observation’s count coefficient.
+Prepared Gamma, Dirichlet and Gaussian evidence scores can reuse summaries
+when only the prior or a fixed likelihood parameter changes.
 
 This optional Rust capability covers one named parameter with Beta–Bernoulli,
 Beta–Binomial, Gamma–Poisson, Normal–Normal (mean), InverseGamma–Normal
