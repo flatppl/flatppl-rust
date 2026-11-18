@@ -15,21 +15,7 @@ pub(crate) fn parse(spec: &Spec, family: Family) -> Result<(Formula, Option<Nonl
     if spec.nlpars.is_empty() {
         return Ok((crate::parse_formula(&spec.formula)?, None));
     }
-    if !matches!(
-        family,
-        Family::Gaussian
-            | Family::Student
-            | Family::Bernoulli
-            | Family::Binomial
-            | Family::ZeroInflatedBinomial
-            | Family::Poisson
-            | Family::ZeroInflatedPoisson
-            | Family::HurdlePoisson
-            | Family::Negbinomial
-            | Family::ZeroInflatedNegbinomial
-            | Family::HurdleNegbinomial
-            | Family::Geometric
-    ) {
+    if matches!(family, Family::Cumulative | Family::Categorical) {
         return Err(Error(format!(
             "nonlinear predictors do not support family `{}`",
             spec.family

@@ -64,6 +64,25 @@ fn nonlinear_binomial_prepares_new_trials_and_predictor_values() {
 }
 
 #[test]
+fn nonlinear_beta_also_prepares_a_precision_predictor() {
+    let mut spec = growth_spec();
+    spec.family = "beta".into();
+    spec.dpars.insert(
+        "phi".into(),
+        serde_json::from_value(json!({"formula": "phi ~ z", "link": "log"})).unwrap(),
+    );
+    let data = read_json_table(r#"{"x":[0.5,1,2],"z":[1,2,3],"y":[0.2,0.4,0.8]}"#).unwrap();
+    let model = build(&spec, &data).unwrap();
+    let held = read_json_table(r#"{"x":[3,2],"z":[1,4]}"#).unwrap();
+    let fitted = prepare_data(&model.recipe, &held, DataMode::Prediction).unwrap();
+    assert_eq!(
+        fitted.constants["nl_data_1"],
+        DataValue::Real64(vec![3.0, 2.0])
+    );
+    assert_eq!(fitted.constants["x_1_phi"], DataValue::Integers(vec![1, 4]));
+}
+
+#[test]
 fn nonlinear_coefficients_need_explicit_scoped_priors() {
     let data = read_json_table(r#"{"x":[0,1,2],"y":[2.2,3.8,8.5]}"#).unwrap();
     let mut spec = growth_spec();

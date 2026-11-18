@@ -77,9 +77,9 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 
 Supply `nlpars` to treat the right side as arithmetic over named parameter
 predictors and numeric data columns. Each named predictor uses ordinary
-formula terms. Gaussian, Student, Bernoulli, Binomial, Poisson, negative
-binomial, geometric, and the listed count hurdle and zero-inflated families
-support nonlinear predictors.
+formula terms. All listed families with a scalar location or mean
+predictor support nonlinear expressions. Cumulative and categorical
+models use separate predictor forms.
 
 ```json
 {
