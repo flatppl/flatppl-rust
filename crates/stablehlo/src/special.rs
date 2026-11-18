@@ -535,8 +535,9 @@ impl Emitter<'_> {
         let rows = self.axes_view(x, vector_axes.clone());
         let mut parts = Vec::with_capacity(3);
         if n != 0 {
-            let keep = self.fixed_lane_indices(active)?;
-            let rows = self.gather_axis(&rows, &keep, 0, 0);
+            let keep = self.fixed_lane_indices(active.clone())?;
+            let rows =
+                self.gather_cdf_inputs(&rows, &keep, &active, &vector_axes, &mut HashMap::new());
             parts.push(self.normal_log_cdf(&rows, masks_nan));
         }
         let mut tail_shape = prefix.to_vec();
@@ -561,6 +562,96 @@ impl Emitter<'_> {
         let restore = self.fixed_lane_indices(layout)?;
         let restored = self.gather_axis(&merged, &restore, 0, 0);
         Some(self.axes_view(&restored, original))
+    }
+
+    /// Evaluate the endpoint arithmetic only on the rows used by the CDF.
+    /// Leave shared scalar work and side channels such as status checks in
+    /// place. Unknown producers are gathered without replaying their ops.
+    fn gather_cdf_inputs(
+        &mut self,
+        value: &Value,
+        keep: &Value,
+        selected: &[i64],
+        axes: &Axes,
+        cache: &mut HashMap<String, Value>,
+    ) -> Value {
+        if value.ty == MlirTy::Scalar {
+            return value.clone();
+        }
+        if let Some(compact) = cache.get(&value.ssa) {
+            return compact.clone();
+        }
+        let axis = axes.batch;
+        let mut dims = shape(&value.ty).to_vec();
+        let width = dims[axis].unwrap() as usize;
+        dims[axis] = Some(selected.len() as u64);
+        let compact_ty = MlirTy::Ranked(dims);
+        // Bound replay for unusual user expressions feeding the CDF.
+        // Each entry reserves one slot even before walking the operands.
+        let mut op = None;
+        if cache.len() < 64 {
+            cache.insert(value.ssa.clone(), value.clone());
+            op = self
+                .pointwise
+                .get(&value.ssa)
+                .map(|recipe| recipe.op.clone());
+        }
+        let mut gather =
+            |operand: &Value| self.gather_cdf_inputs(operand, keep, selected, axes, cache);
+        let result = match op {
+            Some(Pointwise::Reshape(input)) if input.ty == value.ty => gather(&input),
+            Some(Pointwise::Broadcast(input, dims))
+                if dims
+                    .iter()
+                    .position(|&d| d == axis as u64)
+                    .is_none_or(|d| shape(&input.ty)[d] == Some(1)) =>
+            {
+                self.broadcast_in_dim(&input, &dims, compact_ty)
+            }
+            Some(Pointwise::Unary(op, input))
+                if matches!(op.as_str(), "stablehlo.abs" | "stablehlo.negate") =>
+            {
+                let input = gather(&input);
+                self.unary(&op, &input)
+            }
+            Some(Pointwise::Binary(op, left, right))
+                if matches!(
+                    op.as_str(),
+                    "stablehlo.subtract" | "stablehlo.divide" | "stablehlo.and"
+                ) =>
+            {
+                let (left, right) = (gather(&left), gather(&right));
+                self.binary(&op, &left, &right)
+            }
+            Some(Pointwise::Compare(dir, left, right)) => {
+                let (left, right) = (gather(&left), gather(&right));
+                self.compare(&dir, &left, &right)
+            }
+            Some(Pointwise::Select(test, yes, no)) => {
+                let (test, yes, no) = (gather(&test), gather(&yes), gather(&no));
+                self.select(&test, &yes, &no)
+            }
+            _ => {
+                let fixed = self.constants.get(&value.ssa).and_then(|data| {
+                    (data.len() != 1
+                        && data.len() / width * selected.len() <= constants::MAX_FOLDED_ELEMENTS)
+                        .then(|| {
+                            data.chunks_exact(width)
+                                .flat_map(|row| selected.iter().map(|&i| row[i as usize].clone()))
+                                .collect()
+                        })
+                });
+                fixed
+                    .and_then(|values| self.folded_constant(values, compact_ty, axes.clone()))
+                    .unwrap_or_else(|| {
+                        let rows = self.axes_view(value, axes.clone());
+                        self.gather_axis(&rows, keep, 0, 0)
+                    })
+            }
+        };
+        let result = self.axes_view(&result, axes.clone());
+        cache.insert(value.ssa.clone(), result.clone());
+        result
     }
 
     fn fixed_lane_indices(&mut self, values: Vec<i64>) -> Option<Value> {
