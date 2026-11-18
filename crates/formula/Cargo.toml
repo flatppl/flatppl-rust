@@ -13,6 +13,7 @@ arrow = ["flatppl-data/arrow"]
 [dependencies]
 flatppl-core = { path = "../core" }
 flatppl-data = { path = "../data" }
+flatppl-determinizer = { path = "../determinizer" }
 flatppl-convert = { path = "../convert" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-infer = { path = "../infer" }

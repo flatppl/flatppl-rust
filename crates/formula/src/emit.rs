@@ -128,7 +128,7 @@ pub(crate) fn model_with_forecast(
             b.bind(name, zero);
             continue;
         }
-        let support = if matches!(name, "zi" | "hu" | "rescor") {
+        let support = if matches!(name, "zi" | "hu" | "rescor" | "bias") {
             let lower = b.lit_real(if name == "rescor" { -1.0 } else { 0.0 });
             let one = b.lit_real(1.0);
             b.call("interval", &[lower, one])
@@ -241,10 +241,20 @@ pub(crate) fn model_with_forecast(
         auxiliary: &auxiliary,
         cuts: &cuts,
     };
-    let response = if is_paired {
+    let response = if recipe.family == Family::Wiener {
+        crate::wiener_sample::law(
+            &mut b,
+            mu,
+            observation.parameter("bs"),
+            observation.parameter("ndt"),
+            observation.parameter("bias"),
+        )
+    } else if is_paired {
         paired::draw(&mut b)?
     } else {
-        let law = if recipe.formula.ar.is_some() {
+        let law = if recipe.family == Family::Exgaussian {
+            crate::exgaussian::conditional_observation(&mut b, observation, predictor_n)
+        } else if recipe.formula.ar.is_some() {
             autoregression::law(&mut b, mu, forecast)
         } else if let Some(truncation) = &recipe.formula.truncation {
             let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
@@ -257,7 +267,12 @@ pub(crate) fn model_with_forecast(
         let y = b.self_ref("y");
         b.call_fields("record", &[("y", y)])
     };
-    let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
+    let constructor = if recipe.family == Family::Wiener {
+        "functionof"
+    } else {
+        "kernelof"
+    };
+    let kernel = parameter_function(&mut b, constructor, response, &parameters);
     b.bind("K_model", kernel);
     let expected = if is_paired {
         Some(paired::expected(&mut b))
@@ -283,8 +298,10 @@ pub(crate) fn model_with_forecast(
     };
     let likelihood = if recipe.formula.censoring.is_some()
         || recipe.formula.ar.is_some()
-        || recipe.family == Family::Acat
-    {
+        || matches!(
+            recipe.family,
+            Family::Acat | Family::Exgaussian | Family::Wiener
+        ) {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
     } else {
         let observation = if is_paired {
@@ -561,12 +578,17 @@ fn predictor_parameters(
         if priors.is_empty() {
             continue;
         }
+        let binding = if name == "bs" {
+            smooth_coefficient_binding(dpar, family)
+        } else {
+            predictor_name(dpar, name)
+        };
         if priors.iter().all(|p| *p == priors[0]) {
             let scope = scope(b, family);
             let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
             let prior = priors::emit(b, &priors[0], None, None, &bindings)?;
             let count = b.lit_int(priors.len() as i64);
-            repeated_parameter(b, &predictor_name(dpar, name), prior, count, parameters);
+            repeated_parameter(b, &binding, prior, count, parameters);
         } else {
             let mut values = Vec::new();
             for (i, prior) in priors.iter().enumerate() {
@@ -575,7 +597,7 @@ fn predictor_parameters(
                 values.push(b.self_ref(&name));
             }
             let coefficients = b.array(&values);
-            b.bind(&predictor_name(dpar, name), coefficients);
+            b.bind(&binding, coefficients);
         }
     }
     let mut scale_priors = recipe.priors.sds.iter();
@@ -941,12 +963,13 @@ fn predictor_values(
     }
     let mut smooth_offset = 0;
     for smooth in &recipe.smooths {
-        let contribution = smooth_effect(b, dpar, smooth, smooth_offset);
+        let slopes = b.self_ref(&smooth_coefficient_binding(dpar, family));
+        let contribution = smooth_effect(b, slopes, smooth, smooth_offset);
         eta = broadcast(b, "add", &[eta, contribution]);
         smooth_offset += smooth.curve_count();
     }
     for smooth in &recipe.tensor_smooths {
-        let bs = b.self_ref(&predictor_name(dpar, "bs"));
+        let bs = b.self_ref(&smooth_coefficient_binding(dpar, family));
         for (i, input) in smooth.fixed.iter().enumerate() {
             let index = b.lit_int((smooth_offset + i + 1) as i64);
             let coefficient = b.call("get", &[bs, index]);
@@ -1046,8 +1069,22 @@ fn monotonic_values(b: &mut Builder<'_>, dpar: &str, column: usize, simplex: usi
     b.call("get", &[levels, codes])
 }
 
-fn smooth_effect(b: &mut Builder<'_>, dpar: &str, smooth: &crate::Smooth, offset: usize) -> NodeId {
-    let slopes = b.self_ref(&predictor_name(dpar, "bs"));
+fn smooth_coefficient_binding(dpar: &str, family: Family) -> String {
+    // The Wiener boundary separation uses the name `bs`.
+    let name = if family == Family::Wiener && dpar == "mu" {
+        "bs_smooth"
+    } else {
+        "bs"
+    };
+    predictor_name(dpar, name)
+}
+
+fn smooth_effect(
+    b: &mut Builder<'_>,
+    slopes: NodeId,
+    smooth: &crate::Smooth,
+    offset: usize,
+) -> NodeId {
     let weights: Vec<_> = smooth
         .curves()
         .enumerate()
@@ -1160,20 +1197,34 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     let score_inputs: Vec<_> = crate::response::score_columns(&recipe.formula)
         .map(|(name, _)| (name, argument(b, name)))
         .collect();
-    let score = if recipe.family == Family::Acat {
+    let observation = crate::family::Observation {
+        mu,
+        trials,
+        scale: row_scale,
+        auxiliary: &auxiliary,
+        cuts: &cuts,
+    };
+    let score = if recipe.family == Family::Exgaussian {
+        crate::exgaussian::log_density(b, observation, value)
+    } else if recipe.family == Family::Acat {
         crate::adjacent::log_prob(b, mu, &cuts, value)
-    } else {
-        let law = recipe.family.observation(
+    } else if recipe.family == Family::Wiener {
+        let decision = score_inputs
+            .iter()
+            .find(|(name, _)| *name == crate::response::DECISION)
+            .expect("Wiener response has a decision")
+            .1;
+        crate::wiener::score(
             b,
-            crate::family::Observation {
-                mu,
-                trials,
-                scale: row_scale,
-                auxiliary: &auxiliary,
-                cuts: &cuts,
-            },
-            true,
-        );
+            value,
+            decision,
+            mu,
+            observation.parameter("bs"),
+            observation.parameter("ndt"),
+            observation.parameter("bias"),
+        )
+    } else {
+        let law = recipe.family.observation(b, observation, true);
         crate::response::score(b, &recipe.formula, law, value, &score_inputs)
     };
     let head = b.sym("functionof");
@@ -1364,6 +1415,19 @@ fn parameter(
                         .into(),
                 ));
             }
+            if family == Family::Wiener
+                && let Some(value) = crate::prior_expr::scalar(b.m, value)
+                && match name {
+                    "bs" => value <= 0.0,
+                    "ndt" => value < 0.0,
+                    "bias" => value <= 0.0 || value >= 1.0,
+                    _ => false,
+                }
+            {
+                return Err(Error(format!(
+                    "Wiener parameter `{name}` lies outside its support"
+                )));
+            }
             b.bind(name, value);
         }
     }
@@ -1510,7 +1574,7 @@ pub(crate) fn info(
             .collect();
         parameters.extend(predictor_info(
             dpar,
-            &recipe.predictor_suffix(dpar),
+            recipe,
             predictor,
             module,
             thresholds,
@@ -1609,6 +1673,7 @@ pub(crate) fn info(
             .paired_response
             .as_ref()
             .map(|second| [recipe.formula.response.clone(), second.clone()]),
+        decision_column: recipe.formula.decision.clone(),
         family: spec.family.clone(),
         link: recipe.link.name().into(),
         group_collation: "C".into(),
@@ -1686,13 +1751,15 @@ pub(crate) fn info(
 
 fn predictor_info(
     name: &str,
-    dpar: &str,
+    model: &Recipe,
     recipe: &crate::PredictorRecipe,
     module: &Module,
     thresholds: usize,
     threshold_groups: Option<&GroupInfo>,
     group_numbers: &[usize],
 ) -> Result<Vec<Parameter>> {
+    let suffix = model.predictor_suffix(name);
+    let dpar = suffix.as_ref();
     let prefix = if name == "mu" {
         String::new()
     } else {
@@ -1803,7 +1870,7 @@ fn predictor_info(
             )));
         }
         let component = predictor_name(dpar, &format!("bs_{}", i + 1));
-        let binding = predictor_name(dpar, "bs");
+        let binding = smooth_coefficient_binding(dpar, model.family);
         if sampled(module, &component) {
             add(
                 format!("b_{prefix}{name}"),
@@ -1858,7 +1925,7 @@ fn predictor_info(
                     ParameterRole::Sampled,
                 );
             } else {
-                let binding = predictor_name(dpar, "bs");
+                let binding = smooth_coefficient_binding(dpar, model.family);
                 add(
                     format!("b_{prefix}{coefficient}"),
                     &binding,

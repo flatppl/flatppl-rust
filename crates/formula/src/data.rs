@@ -372,6 +372,11 @@ fn observation_rows(
         .chain(formula.censoring.iter().filter_map(|censoring| {
             (mode == DataMode::Training).then_some(censoring.code.as_str())
         }))
+        .chain(
+            (mode == DataMode::Training)
+                .then_some(formula.decision.as_deref())
+                .flatten(),
+        )
         .chain(extra_columns.iter().map(String::as_str))
         .chain((mode == DataMode::Training || history).then_some(formula.response.as_str()));
     let columns = names
@@ -1123,6 +1128,11 @@ pub(crate) fn response(
             }
         }
         return Ok(DataValue::Integers(values));
+    }
+    if family == Family::Wiener && column.numeric(rows)?.iter().any(|&time| time <= 0.0) {
+        return Err(Error(
+            "Wiener response times must be strictly positive".into(),
+        ));
     }
     if matches!(family, Family::Exponential | Family::Weibull) && formula.censoring.is_some() {
         if column.numeric(rows)?.iter().any(|&value| value < 0.0) {

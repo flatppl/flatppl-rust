@@ -74,7 +74,153 @@ fn record_fields(domain: &Domain) -> Option<Vec<DomainField>> {
     }
 }
 
+fn record_chart(
+    fields: &[DomainField],
+    point: &str,
+    correlations: &[String],
+) -> Result<Chart, String> {
+    for name in correlations {
+        if !fields.iter().any(|field| &field.name == name) {
+            return Err(format!(
+                "no correlation factor named `{name}` in the input record"
+            ));
+        }
+    }
+    let fields = fields
+        .iter()
+        .map(|field| {
+            let access = format!("{point}.{}", field.name);
+            let chart = if correlations.contains(&field.name) {
+                correlation_chart(&field.set, &access)?
+            } else {
+                field.set.chart(&access)?
+            };
+            Ok((&field.name, chart))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let join = |value: fn(&Chart) -> &String| {
+        fields
+            .iter()
+            .map(|(name, chart)| format!("{name} = {}", value(chart)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok(Chart {
+        domain: format!("cartprod({})", join(|c| &c.domain)),
+        free: format!("cartprod({})", join(|c| &c.free)),
+        constrain: format!("record({})", join(|c| &c.constrain)),
+        unconstrain: format!("record({})", join(|c| &c.unconstrain)),
+        log_det: sum(fields.iter().map(|(_, c)| c.log_det.clone())),
+        // Record products concatenate fields, never tensor slices.
+        size: 0,
+        free_size: 0,
+        scalar: false,
+    })
+}
+
+// Formula correlation factors use LKJCholesky, whose reference measure is
+// Lebesgue measure on the independent strictly lower-triangular coordinates.
+fn correlation_chart(domain: &Domain, point: &str) -> Result<Chart, String> {
+    let Domain::CartPow { of, shape } = domain else {
+        return Err(format!(
+            "correlation factor `{point}` must be a square real matrix"
+        ));
+    };
+    let [Some(n), Some(m)] = shape.as_slice() else {
+        return Err(format!(
+            "correlation factor `{point}` must have a known matrix shape"
+        ));
+    };
+    let n = *n;
+    if n != *m || n < 2 || !matches!(of.as_ref(), Domain::Reals) {
+        return Err(format!(
+            "correlation factor `{point}` must be a square real matrix of size at least two"
+        ));
+    }
+    let size = n
+        .checked_mul(n)
+        .ok_or("correlation matrix size overflows")?;
+    let free_size = (size - n) / 2;
+
+    let mut rows = vec![format!("cat([1.0], zeros({}))", n - 1)];
+    let mut inverse = Vec::new();
+    let mut determinants = Vec::new();
+    let mut offset = 1;
+    for row in 2..=n {
+        let u = vector_range(point, offset, offset + row - 2);
+        offset += row - 1;
+        // tanh(u) gives a partial correlation and exp(log_sech) the
+        // remaining row norm. Compute log_sech without squaring rounded tanh.
+        let magnitude = format!("abs.({u})");
+        let log_sech = format!(
+            "({} .- {magnitude} .- log1p.(exp.(-2.0 .* {magnitude})))",
+            std::f64::consts::LN_2
+        );
+        let prefix = format!("(cumsum({log_sech}))");
+        let before = if row == 2 {
+            "[1.0]".into()
+        } else {
+            format!("cat([1.0], exp.({}))", vector_range(&prefix, 1, row - 2))
+        };
+        let zeros = if row < n {
+            format!(", zeros({})", n - row)
+        } else {
+            String::new()
+        };
+        rows.push(format!(
+            "cat(tanh.({u}) .* {before}, [exp({prefix}[{}])]{zeros})",
+            row - 1
+        ));
+
+        // Each coordinate contributes its tanh derivative (sech^2), plus
+        // one sech factor to every later strict-lower entry in its row.
+        let powers = (2..=row).rev().map(|p| p.to_string()).collect::<Vec<_>>();
+        determinants.push(format!("sum([{}] .* {log_sech})", powers.join(", ")));
+
+        for col in 1..row {
+            // asinh(entry / remaining_norm) avoids subtracting a prefix of
+            // squares from one. Scale the tail before taking its norm.
+            let tail = (col + 1..=row)
+                .map(|i| format!("{point}[{row}, {i}]"))
+                .collect::<Vec<_>>();
+            let remaining = if col + 1 == row {
+                tail[0].clone()
+            } else {
+                let tail = format!("[{}]", tail.join(", "));
+                let scale = format!("linfnorm({tail})");
+                format!("({scale} * l2norm({tail} ./ {scale}))")
+            };
+            inverse.push(format!("asinh({point}[{row}, {col}] / {remaining})"));
+        }
+    }
+    Ok(Chart {
+        domain: format!("cartpow(reals, [{n}, {n}])"),
+        free: format!("cartpow(reals, {free_size})"),
+        constrain: format!("rowstack([{}])", rows.join(", ")),
+        unconstrain: format!(
+            "ifelse(isfinite(logdensityof(LKJCholesky({n}, 1.0), {point})), [{}], fill(-inf, {free_size}))",
+            inverse.join(", ")
+        ),
+        log_det: sum(determinants.into_iter()),
+        size,
+        free_size,
+        scalar: false,
+    })
+}
+
 impl Domain {
+    pub(crate) fn chart_with_correlation_factors(
+        &self,
+        point: &str,
+        correlations: &[String],
+    ) -> Result<Chart, String> {
+        if correlations.is_empty() {
+            return self.chart(point);
+        }
+        let fields = record_fields(self).ok_or("correlation factors require a record input")?;
+        record_chart(&fields, point, correlations)
+    }
+
     pub(crate) fn chart(&self, point: &str) -> Result<Chart, String> {
         let scalar =
             |domain: String, constrain: String, unconstrain: String, log_det: String| Chart {
@@ -190,35 +336,7 @@ impl Domain {
                     scalar: false,
                 })
             }
-            Self::Record { fields } => {
-                let fields = fields
-                    .iter()
-                    .map(|field| {
-                        Ok((
-                            &field.name,
-                            field.set.chart(&format!("{point}.{}", field.name))?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let join = |value: fn(&Chart) -> &String| {
-                    fields
-                        .iter()
-                        .map(|(name, chart)| format!("{name} = {}", value(chart)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                Ok(Chart {
-                    domain: format!("cartprod({})", join(|c| &c.domain)),
-                    free: format!("cartprod({})", join(|c| &c.free)),
-                    constrain: format!("record({})", join(|c| &c.constrain)),
-                    unconstrain: format!("record({})", join(|c| &c.unconstrain)),
-                    log_det: sum(fields.iter().map(|(_, c)| c.log_det.clone())),
-                    // Record products concatenate fields, never tensor slices.
-                    size: 0,
-                    free_size: 0,
-                    scalar: false,
-                })
-            }
+            Self::Record { fields } => record_chart(fields, point, &[]),
             Self::Ordered { n: Some(n) } if *n > 0 => {
                 let (forward, inverse, log_det) = if *n == 1 {
                     (point.into(), point.into(), "0.0".into())

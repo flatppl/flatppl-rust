@@ -661,6 +661,7 @@ dependencies = [
  "flatppl-convert",
  "flatppl-core",
  "flatppl-data",
+ "flatppl-determinizer",
  "flatppl-infer",
  "flatppl-syntax",
  "nalgebra",

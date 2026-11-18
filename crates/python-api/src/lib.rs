@@ -540,14 +540,20 @@ impl NativeContext {
         ))
     }
 
+    #[pyo3(signature = (module, logdensity, correlation_factors=None))]
     fn transform(
         &mut self,
         module: &NativeModule,
         logdensity: bool,
+        correlation_factors: Option<Vec<String>>,
     ) -> PyResult<(NativeModule, NativeModule, NativeModule)> {
         let queries = self
             .inner
-            .transform(&module.inner, logdensity)
+            .transform_with_correlation_factors(
+                &module.inner,
+                logdensity,
+                correlation_factors.as_deref().unwrap_or_default(),
+            )
             .map_err(error)?;
         Ok((
             NativeModule {

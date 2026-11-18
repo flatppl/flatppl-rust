@@ -90,6 +90,14 @@ defaults. `ModelInfo.dpars` records each formula, link and design columns.
 For example, `temp_Intercept_sigma` is the centred scale intercept and
 `b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
 
+Wiener formulas use `time | dec(choice) ~ predictors`. The main predictor
+controls drift. Boundary separation `bs` and nondecision time `ndt` support
+distributional formulas with log links. The starting fraction `bias` defaults
+to a fixed 0.5 and uses a logit link when predicted. Training binds positive
+response times to `y_data` and lower/upper codes (0/1) to `dec_data`. The row
+score is the joint first-passage density. `K_model` draws a record of matching
+time and decision vectors, and `expected_response` returns mean times.
+
 Use the same group ID in `y ~ (1 + x | subject | g)` and
 `sigma ~ (1 | subject | g)` to fit one covariance across the mean and log-scale
 group effects. The ID `subject` is a formula label. Every term in that block
@@ -155,9 +163,9 @@ number of steps in every occurrence.
 
 ### Families
 
-Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,
+Set `family` to `gaussian`, `student`, `lognormal`, `exgaussian`, `bernoulli`, `binomial`, `poisson`,
 `negbinomial`, `geometric`, `Gamma`, `exponential`, `weibull`, `beta`, `von_mises`,
-`cumulative`, `categorical`, `zero_inflated_poisson`, `zero_inflated_binomial`,
+`cumulative`, `acat`, `categorical`, `wiener`, `zero_inflated_poisson`, `zero_inflated_binomial`,
 `zero_inflated_negbinomial`, `zero_inflated_beta`, `hurdle_poisson`,
 `hurdle_negbinomial`, `hurdle_gamma` or `hurdle_lognormal`.
 `link` is optional:
@@ -166,14 +174,18 @@ Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `po
 | --- | --- | --- |
 | Gaussian, Student | identity | log, inverse, softplus, squareplus, logit, probit, probit_approx, cloglog, cauchit, softit |
 | Lognormal | identity | inverse |
+| Ex-Gaussian | identity | log, inverse, softplus, squareplus |
 | Bernoulli, binomial, beta | logit | probit, probit_approx, cloglog, cauchit, softit, identity, log |
 | Poisson, negative binomial, geometric | log | identity, sqrt, softplus, squareplus |
 | Gamma, exponential, Weibull | log | identity, inverse, softplus, squareplus |
 | von Mises | tan_half | identity |
-| Cumulative ordinal | logit | — |
+| Cumulative and adjacent-category ordinal | logit | — |
 | Categorical | logit | — |
+| Wiener | identity | log |
 
 Student models use direct `sigma` and `nu` parameters, with `nu >= 1`.
+Ex-Gaussian models add a Normal with location `mu - beta` and scale `sigma`
+to an Exponential with mean `beta`. Both scales can use distributional predictors.
 Gamma and negative-binomial models use direct `shape`. Their mean is `mu`;
 the emitted FlatPPL rate is `shape / mu`. Exponential models use rate `1 / mu`.
 Geometric models count failures before the first success and use
