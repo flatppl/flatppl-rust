@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+J = 3
+counts = [[-1, -1, -1], [2, -1, 1], [0, 3, -1]]
+w ~ Beta(2, 2)
+q ~ Beta(1, 3)
+lam ~ Exponential(1)
+site(q, lam) = normalize(superpose(weighted(q, Poisson(lam)), weighted(1 - q, Dirac(-1))))
+y ~ iid(normalize(superpose(weighted(w, iid(site(q, lam), J)), weighted(1 - w, Dirac(fill(-1, J))))), 3)
+prior = lawof(record(w = w, q = q, lam = lam))
+L = likelihoodof(kernelof(record(y = y), w = w, q = q, lam = lam), record(y = counts))
+post = bayesupdate(L, prior)

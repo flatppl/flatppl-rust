@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+w ~ Beta(2, 2)
+lam ~ Exponential(1)
+y ~ iid(normalize(superpose(weighted(w, Poisson(lam)), weighted(1 - w, Dirac(-1)))), 5)
+prior = lawof(record(w = w, lam = lam))
+L = likelihoodof(kernelof(record(y = y), w = w, lam = lam), record(y = [-1, 2, 0, -1, 4]))
+post = bayesupdate(L, prior)

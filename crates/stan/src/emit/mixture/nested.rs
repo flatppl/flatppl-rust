@@ -331,12 +331,13 @@ impl<'m> Emitter<'m> {
         if !l.vectorized || l.multivariate || l.lhs("{y}") != "{y}" {
             return Err(Refusal::not_yet(Some(mix), "an iid mixture with this law"));
         }
-        let lp_c = self.law_lp(law, &l, c, None)?;
         let wlx = self.real(wl.unwrap())?.s;
-        let at_atom = if dirac_first {
-            format!("log_mix({}, 0, {lp_c})", self.real(wd.unwrap())?.s)
-        } else {
-            format!("log_mix({wlx}, {lp_c}, 0)")
+        let at_atom = match self.atom_lp(mix, law, &l, c)? {
+            None => format!("log({})", self.real(wd.unwrap())?.s),
+            Some(lp_c) if dirac_first => {
+                format!("log_mix({}, 0, {lp_c})", self.real(wd.unwrap())?.s)
+            }
+            Some(lp_c) => format!("log_mix({wlx}, {lp_c}, 0)"),
         };
         let lp_slice = self.law_density(law, &l, SLICE, None)?;
         Ok(Inner {

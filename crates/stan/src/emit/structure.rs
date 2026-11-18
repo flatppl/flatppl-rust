@@ -38,6 +38,10 @@ pub(super) struct Law {
     /// The `distributions.ron` guard with its arguments filled: `{y}` stays.
     /// The second form indexes per element ([`LOOP`]).
     pub guard: Option<(String, String)>,
+    /// The `distributions.ron` variate bounds as written (`0`, `{n} - 1`):
+    /// with `guard`, the support a Dirac atom beside this law is tested
+    /// against.
+    pub bounds: (Option<String>, Option<String>),
     /// Statements the law adds after its `~` line (`target += lgamma(K + 1);`).
     pub extra: Vec<String>,
     /// The restriction lives in the variate's declaration (`ordered[K]`):
@@ -1804,6 +1808,7 @@ impl<'m> Emitter<'m> {
             discrete: row.variate.starts_with("int"),
             support: None,
             guard,
+            bounds: variate_bounds(&row.variate),
             extra: vec![],
             declared: false,
         })
@@ -1858,4 +1863,23 @@ fn ty_is_int(ty: &Type) -> bool {
 pub(super) fn is_identifier(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && s.starts_with(|c: char| c.is_ascii_alphabetic())
+}
+
+/// `lower` and `upper` of a `distributions.ron` variate type
+/// (`int<lower=0, upper=1>`).
+fn variate_bounds(variate: &str) -> (Option<String>, Option<String>) {
+    let inner = variate
+        .split_once('<')
+        .and_then(|(_, r)| r.rsplit_once('>'))
+        .map(|(b, _)| b)
+        .unwrap_or("");
+    let mut out = (None, None);
+    for part in inner.split(", ") {
+        match part.split_once('=') {
+            Some(("lower", v)) => out.0 = Some(v.trim().to_string()),
+            Some(("upper", v)) => out.1 = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    out
 }

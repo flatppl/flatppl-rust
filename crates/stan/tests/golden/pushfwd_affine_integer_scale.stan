@@ -3,6 +3,11 @@ data {
   array[N] int ks;
   real z;
 }
+transformed data {
+  if (1.0 * ks[2] / 2 == 0) {
+    reject("pushfwd of rho: the scale 1.0 * ks[2] / 2 is 0, so the map is no bijection");
+  }
+}
 parameters {
   real rho;
 }

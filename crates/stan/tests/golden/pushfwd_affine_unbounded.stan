@@ -3,6 +3,11 @@ data {
   vector[N] cs;
   real z;
 }
+transformed data {
+  if (cs[2] == 0) {
+    reject("pushfwd of rho: the scale cs[2] is 0, so the map is no bijection");
+  }
+}
 parameters {
   real rho;
 }
