@@ -256,9 +256,7 @@ impl<'m> Emitter<'m> {
     ) -> Result<Vec<String>> {
         let fill = self.resolve(atom);
         let row_law = self.resolve(law);
-        let data = self.json.contains_key(lhs)
-            || self.deferred.iter().any(|d| d.stan == lhs)
-            || self.tdata.iter().any(|t| t.contains(&format!(" {lhs}")));
+        let data = self.is_data(lhs);
         let shaped = self
             .decls
             .get(lhs)
@@ -911,9 +909,7 @@ impl<'m> Emitter<'m> {
             return Err(Refusal::not_yet(Some(mix), "a `Dirac` atom of this shape"));
         }
         // Observed data only: the positions are found once.
-        let data = self.json.contains_key(lhs)
-            || self.deferred.iter().any(|d| d.stan == lhs)
-            || self.tdata.iter().any(|t| t.contains(&format!(" {lhs}")));
+        let data = self.is_data(lhs);
         if !data
             || self
                 .decls

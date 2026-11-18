@@ -16,6 +16,7 @@ mod elementwise;
 mod extents;
 mod filter;
 mod functions;
+mod interval;
 mod markovchain;
 mod mixture;
 mod pattern;
@@ -321,6 +322,25 @@ impl<'m> Emitter<'m> {
 
     fn name(&self, s: Symbol) -> &'m str {
         self.m.resolve(s)
+    }
+
+    /// `true` when the Stan name `name` holds data: a `data` entry (literal or
+    /// loaded) or a value declared in `transformed data`, such as a computed
+    /// observation.
+    fn is_data(&self, name: &str) -> bool {
+        let declares = |line: &str| {
+            let first = line.lines().next().unwrap_or("");
+            let head = first
+                .split(" = ")
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(';');
+            !first.starts_with(['{', ' ']) && head.rsplit(' ').next() == Some(name)
+        };
+        self.json.contains_key(name)
+            || self.deferred.iter().any(|d| d.stan == name)
+            || self.data.iter().any(|l| declares(l))
+            || self.tdata.iter().any(|l| declares(l))
     }
 
     /// A loop variable or block local: a fresh name that is no module
@@ -1334,6 +1354,13 @@ impl<'m> Emitter<'m> {
                 format!("{name} with this arity"),
             ));
         }
+        // `fmax`/`fmin` return real; `max`/`min` of two integers is an integer.
+        if matches!(name, "max" | "min")
+            && module.is_none()
+            && self.shape(id).is_some_and(|s| s.int)
+        {
+            return Ok(Ex::atom(format!("{name}({}, {})", parts[0].s, parts[1].s)));
+        }
         if row.kind == "helper" && !self.functions.contains(&row.functions) {
             self.functions.push(row.functions.clone());
         }
@@ -1580,7 +1607,11 @@ impl<'m> Emitter<'m> {
             parts.push(self.expr(*e)?.s);
         }
         if sh.rank == 1 && !sh.int {
-            Ok(Ex::atom(format!("[{}]'", parts.join(", "))))
+            // Postfix `'` binds looser than an index: `([a, b]')[i]`.
+            Ok(Ex {
+                s: format!("[{}]'", parts.join(", ")),
+                prec: P_POW,
+            })
         } else {
             Ok(Ex::atom(format!("{{{}}}", parts.join(", "))))
         }

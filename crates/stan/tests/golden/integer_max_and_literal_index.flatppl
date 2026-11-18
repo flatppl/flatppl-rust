@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+trials = [3, 0, 5]
+x = [2, 1, 3]
+n = max.(trials, 1)
+ind = [1.0, 0.0, 0.5][x]
+p ~ Beta(2, 2)
+b ~ Normal(0, 1)
+y ~ Binomial.(n, p)
+z ~ Normal.(b .* ind, 1)
+prior = lawof(record(p = p, b = b))
+L = likelihoodof(kernelof(record(y = y, z = z), p = p, b = b), record(y = [1, 0, 2], z = [0.3, -0.2, 0.5]))
+post = bayesupdate(L, prior)

@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+mu ~ Normal(0, 1)
+lam ~ Exponential(1)
+y ~ iid(normalize(truncate(Normal(mu, 1), interval(-1.0, 2.0))), 3)
+k ~ normalize(truncate(Poisson(lam), interval(1, 5)))
+prior = lawof(record(mu = mu, lam = lam))
+L = likelihoodof(kernelof(record(y = y, k = k), mu = mu, lam = lam), record(y = [0.1, 0.4, 1.9], k = 2))
+post = bayesupdate(L, prior)

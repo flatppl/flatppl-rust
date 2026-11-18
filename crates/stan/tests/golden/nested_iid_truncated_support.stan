@@ -1,11 +1,21 @@
 data {
-  array[2] vector<lower=0>[2] x_obs;
+  array[2] vector[2] x_obs;
 }
 parameters {
   real mu;
 }
 model {
-  for (i in 1:2) {
-    x_obs[i] ~ normal(mu, 1);
+  {
+    int outside = 0;
+    for (i in 1:2) {
+      outside = outside || min(x_obs[i]) < 0;
+    }
+    if (outside) {
+      target += negative_infinity();
+    } else {
+      for (i in 1:2) {
+        x_obs[i] ~ normal(mu, 1);
+      }
+    }
   }
 }

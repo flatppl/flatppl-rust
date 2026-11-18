@@ -1,0 +1,26 @@
+{
+  "data": [
+    {
+      "input": "rate",
+      "stan": "rate",
+      "type": "real"
+    },
+    {
+      "input": "lo",
+      "stan": "lo",
+      "type": "real"
+    },
+    {
+      "input": "hi",
+      "stan": "hi",
+      "type": "real"
+    },
+    {
+      "input": "point",
+      "stan": "point",
+      "type": "real"
+    }
+  ],
+  "parameters": [],
+  "target": "outputs"
+}
