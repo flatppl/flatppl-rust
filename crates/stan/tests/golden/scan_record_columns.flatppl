@@ -1,0 +1,17 @@
+flatppl_compat = "0.1"
+T = 4
+y_obs = [0.4, -0.1, 0.7, 0.2]
+mu ~ Normal(0, 1)
+phi ~ Normal(0, 1)
+theta ~ Normal(0, 1)
+prediction(state, mu, phi, theta) = mu + phi * state.previous + theta * state.error
+step(state, observation, p) = record(
+    previous = observation, error = observation - prediction(state, p.mu, p.phi, p.theta),
+    mean = prediction(state, p.mu, p.phi, p.theta))
+states = scan(step, record(previous = mu, error = 0.0, mean = 0.0), y_obs,
+    record(mu = mu, phi = phi, theta = theta))
+state_mean(state) = state.mean
+y ~ Normal.(state_mean.(states), 1)
+prior = lawof(record(mu = mu, phi = phi, theta = theta))
+L = likelihoodof(kernelof(record(y = y), mu = mu, phi = phi, theta = theta), record(y = y_obs))
+post = bayesupdate(L, prior)

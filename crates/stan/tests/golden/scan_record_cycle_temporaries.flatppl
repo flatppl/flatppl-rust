@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+T = 3
+x_obs = [0.2, 0.4, -0.3]
+r ~ Normal(0, 1)
+step(s, t, p) = record(u = s.u + p.r * s.v + x_obs[t], v = 0.5 * s.u - s.v)
+history = scan(step, record(u = 1.0, v = 0.0), indicesof(zeros(T)), record(r = r))
+final(s) = s.u + s.v
+z ~ Normal(final(history[T]), 1)
+prior = lawof(record(r = r))
+L = likelihoodof(kernelof(record(z = z), r = r), record(z = 0.7))
+post = bayesupdate(L, prior)

@@ -35,6 +35,10 @@ pub(crate) struct FnCtx {
     /// A log weight's record argument: `get(x, "f")` reads the parameter of
     /// field `f`.
     pub record_local: Option<Symbol>,
+    /// Record parameters bound field by field: `get(r, "f")` is the name.
+    pub records: HashMap<Symbol, HashMap<String, String>>,
+    /// Scans emitted in this body, by node.
+    pub scans: HashMap<NodeId, super::scan::ScanOut>,
 }
 
 /// The unsized Stan type of a function argument or result.
@@ -307,13 +311,16 @@ impl<'m> Emitter<'m> {
     }
 
     /// `name(args…, captures…)`.
-    fn apply_user(name: &str, args: Vec<String>, caps: &[String]) -> String {
+    pub(super) fn apply_user(name: &str, args: Vec<String>, caps: &[String]) -> String {
         let all: Vec<String> = args.into_iter().chain(caps.iter().cloned()).collect();
         format!("{name}({})", all.join(", "))
     }
 
     /// A user call `f(args…)`.
     pub(super) fn user_call(&mut self, id: NodeId, fun: NodeId, args: &[NodeId]) -> Result<Ex> {
+        if self.has_record_argument(args) {
+            return self.inline_call(id, fun, args);
+        }
         let mut tys = Vec::new();
         let mut parts = Vec::new();
         for &a in args {
@@ -432,46 +439,71 @@ impl<'m> Emitter<'m> {
                 _ => return Ok(Err("arguments of mixed ranks".into())),
             }
         }
-        let key = (fun, format!("vectorized {tys:?}"));
-        let (name, caps) = match self.fn_memo.get(&key) {
-            Some(v) => v.clone(),
-            None => {
-                let (body, entries) = self.callable_parts(fun)?;
-                if entries.len() != args.len() {
-                    return Err(Refusal::not_yet(
-                        Some(id),
-                        "a user function called with another arity",
-                    ));
-                }
-                let types = self.instantiate(id, body, &entries, &elem_tys)?;
-                // The broadcast's type in the caller's scope, read before the
-                // callee's context replaces it.
-                let ret_ty = self.ty(id);
-                let outer_ctx = self.fctx.replace(FnCtx {
-                    scoped: types,
-                    ..Default::default()
-                });
-                let outer_owner = self.owner.take();
-                let outer_v = self.vlocals.take();
-                let out = self
-                    .vectorized_body(id, fun, body, &entries, &args, &tys, &full, brank, ret_ty);
-                self.fctx = outer_ctx;
-                self.owner = outer_owner;
-                self.vlocals = outer_v;
-                match out? {
-                    Ok(v) => {
-                        self.fn_memo.insert(key, v.clone());
-                        v
-                    }
-                    Err(reason) => return Ok(Err(reason)),
-                }
-            }
+        // The broadcast's type in the caller's scope.
+        let ret_ty = self.ty(id);
+        let (name, caps) = match self
+            .vectorized_function(id, fun, &args, &tys, &elem_tys, &full, brank, ret_ty)?
+        {
+            Ok(v) => v,
+            Err(reason) => return Ok(Err(reason)),
         };
         let mut parts = Vec::new();
         for &a in &args {
             parts.push(self.expr(a)?.s);
         }
         Ok(Ok(Ex::atom(Self::apply_user(&name, parts, &caps))))
+    }
+
+    /// The vectorized Stan function for `fun` with the arguments marked
+    /// `full` passed as whole arrays of rank `brank` and the others held.
+    /// `Err` gives the reason the body does not lift.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn vectorized_function(
+        &mut self,
+        id: NodeId,
+        fun: NodeId,
+        args: &[NodeId],
+        tys: &[Option<Type>],
+        elem_tys: &[Type],
+        full: &[bool],
+        brank: usize,
+        ret_ty: Option<Type>,
+    ) -> Result<std::result::Result<(String, Vec<String>), String>> {
+        let key = (fun, format!("vectorized {tys:?}"));
+        if let Some(v) = self.fn_memo.get(&key) {
+            return Ok(Ok(v.clone()));
+        }
+        let (body, entries) = self.callable_parts(fun)?;
+        if entries.len() != args.len() {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "a user function called with another arity",
+            ));
+        }
+        let types = self.instantiate(id, body, &entries, elem_tys)?;
+        let outer_ctx = self.fctx.replace(FnCtx {
+            scoped: types,
+            ..Default::default()
+        });
+        let outer_owner = self.owner.take();
+        let outer_v = self.vlocals.take();
+        let out = self.vectorized_body(id, fun, body, &entries, args, tys, full, brank, ret_ty);
+        let inner = std::mem::replace(&mut self.fctx, outer_ctx);
+        self.owner = outer_owner;
+        self.vlocals = outer_v;
+        let out = out?;
+        match &out {
+            Ok(v) => {
+                self.fn_memo.insert(key, v.clone());
+            }
+            // A body that does not lift leaves no names behind.
+            Err(_) => {
+                for n in inner.iter().flat_map(|c| c.declared.iter()) {
+                    self.used.remove(n);
+                }
+            }
+        }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -590,13 +622,10 @@ impl<'m> Emitter<'m> {
         let tys: Vec<Option<Type>> = args.iter().map(|&a| self.ty(a)).collect();
         let brank = tys.iter().map(|t| top_rank(t.as_ref())).max().unwrap_or(0);
         if brank == 0 {
-            let table = tys.iter().any(|t| matches!(t, Some(Type::Table { .. })));
-            let what = if table {
-                "a broadcast over a table"
-            } else {
-                "a broadcast over no array"
-            };
-            return Err(Refusal::not_yet(Some(id), what));
+            if tys.iter().any(|t| matches!(t, Some(Type::Table { .. }))) && decl == id {
+                return self.table_broadcast(base, id);
+            }
+            return Err(Refusal::not_yet(Some(id), "a broadcast over no array"));
         }
         let mut elem_tys = Vec::new();
         for (a, t) in args.iter().zip(&tys) {
@@ -835,47 +864,6 @@ impl<'m> Emitter<'m> {
             Some(s) => Ok(Ex::atom(s.clone())),
             None => Err(Refusal::not_yet(Some(id), "a function body")),
         }
-    }
-
-    /// A `scan` whose step adds: `cumulative_sum`, from `init = 0`.
-    pub(super) fn additive_scan(
-        &mut self,
-        id: NodeId,
-        f: NodeId,
-        init: NodeId,
-        xs: NodeId,
-    ) -> Result<Ex> {
-        let zero = matches!(
-            self.m.node(self.resolve(init)),
-            Node::Lit(flatppl_core::Scalar::Int(0))
-        ) || matches!(self.m.node(self.resolve(init)), Node::Lit(flatppl_core::Scalar::Real(x)) if *x == 0.0);
-        let adds = match self.m.node(f) {
-            Node::Const(c) => self.name(*c) == "add",
-            _ => {
-                match self.user_callee(f) {
-                    Some(fun) => {
-                        let (body, entries) = self.callable_parts(fun)?;
-                        let refs: Vec<Ref> = entries.iter().map(|(_, r)| *r).collect();
-                        self.head(body) == Some("add")
-                            && refs.len() == 2
-                            && self.call(body).unwrap().args.iter().all(
-                                |&a| matches!(self.m.node(a), Node::Ref(r) if refs.contains(r)),
-                            )
-                            && self.call(body).unwrap().args.len() == 2
-                            && !matches!(
-                                (self.m.node(self.call(body).unwrap().args[0]), self.m.node(self.call(body).unwrap().args[1])),
-                                (Node::Ref(a), Node::Ref(b)) if a == b
-                            )
-                    }
-                    None => false,
-                }
-            }
-        };
-        if !(zero && adds) {
-            return Err(Refusal::not_yet(Some(id), "scan"));
-        }
-        let x = self.expr(xs)?;
-        self.table_fn(id, "cumsum", None, vec![x])
     }
 
     /// `true` when `c` calls a user function (not a standard module member).

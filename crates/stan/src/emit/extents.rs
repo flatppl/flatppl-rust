@@ -540,6 +540,8 @@ impl<'m> Emitter<'m> {
                 Some(a.plus(&b))
             }
             "scan" if axis == 0 => self.sym_extent(*args.get(2)?, 0, d),
+            // A scalar or vector accumulator: each entry has the init's shape.
+            "scan" if !self.record_scan(id) => self.sym_extent(*args.get(1)?, axis - 1, d),
             "get" => self.get_extent(&args, axis, d),
             "aggregate" => self.aggregate_extent(&args, axis, d),
             // A shape-preserving function: the argument of its rank.
@@ -785,6 +787,21 @@ impl<'m> Emitter<'m> {
                     .value;
                 let h = self.set_hints(fset).get(axis).copied().flatten()?;
                 return self.lin_int(h);
+            }
+            // A field of a record argument: the extent of its Stan name.
+            if let Node::Ref(rf) = self.m.node(x)
+                && rf.ns == RefNs::Local
+            {
+                let ctx = self.fctx.as_ref()?;
+                let name = if ctx.record_local == Some(rf.name) {
+                    self.fields
+                        .iter()
+                        .find(|(k, _)| self.name(**k) == f)
+                        .map(|(_, v)| v.clone())?
+                } else {
+                    ctx.records.get(&rf.name)?.get(&f)?.clone()
+                };
+                return self.ext_lin.get(&name)?.get(axis).cloned();
             }
             // A literal record field already declared as data.
             let sym = *self.m.alias_chain(self.self_ref(x)?).last()?;

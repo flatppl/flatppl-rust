@@ -1,0 +1,16 @@
+flatppl_compat = "0.1"
+N = 4
+y_obs = [0.1, 2.9, 3.2, -0.4]
+q ~ Beta(2, 2)
+mu = elementof(ordered(2))
+mu_prior = truncate(joint(Normal(0, 1), Normal(3, 1)), ordered(2))
+predict(prev, x, p) = p.q + (1 - 2 * p.q) * invlogit(logit(prev) + x)
+step(state, x, p) = record(current = state.next, next = predict(state.next, x, p))
+states = scan(step, record(current = 0.5, next = 0.5), y_obs, record(q = q))
+state_weight(state) = state.current
+weight = state_weight.(states)
+emission(w, m1, m2) = normalize(superpose(weighted(w, Normal(m1, 1)), weighted(1 - w, Normal(m2, 1))))
+y ~ emission.(weight, mu[1], mu[2])
+prior = joint(lawof(record(q = q)), joint(mu = mu_prior))
+L = likelihoodof(kernelof(record(y = y), q = q, mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

@@ -80,6 +80,20 @@ impl<'m> Emitter<'m> {
         if extents.len() != outs.len() {
             return Err(Refusal::not_yet(Some(id), "aggregate of this shape"));
         }
+        // A user function that vectorizes over one output axis: a loop over
+        // the other axis fills whole rows or columns.
+        if reduced.is_empty()
+            && outs.len() == 2
+            && t.base == "matrix"
+            && let Some(line) = self.axis_vectorized_call(id, body, &outs, &ext, &stan, &extents)?
+        {
+            let lines = vec![format!("{};", t.render(&stan)), line];
+            self.record_decl(&stan, t);
+            let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
+            self.put(fixed, lines);
+            self.remember(id, &stan);
+            return Ok(stan);
+        }
         let mut vars = HashMap::new();
         let mut order = Vec::new();
         for a in &outs {
@@ -119,6 +133,131 @@ impl<'m> Emitter<'m> {
         self.put(fixed, lines);
         self.remember(id, &stan);
         Ok(stan)
+    }
+
+    /// `stan[i] = f(…)'` or `stan[:, k] = f(…)` in one loop, when the body is
+    /// a user call that slice B vectorizes over one of the two output axes.
+    /// The loop runs over the shorter axis when both lift.
+    fn axis_vectorized_call(
+        &mut self,
+        id: NodeId,
+        body: NodeId,
+        outs: &[Symbol],
+        ext: &HashMap<Symbol, String>,
+        stan: &str,
+        extents: &[String],
+    ) -> Result<Option<String>> {
+        let Some(fun) = self.is_user_call(body) else {
+            return Ok(None);
+        };
+        let c = self.call(body).unwrap();
+        if !c.named.is_empty() {
+            return Ok(None);
+        }
+        let args = c.args.to_vec();
+        let lens: Vec<u32> = match self.ty(id) {
+            Some(flatppl_core::Type::Array { shape, .. }) => shape
+                .iter()
+                .map(|d| match d {
+                    flatppl_core::Dim::Static(n) => *n,
+                    flatppl_core::Dim::Dynamic => u32::MAX,
+                })
+                .collect(),
+            _ => return Ok(None),
+        };
+        // The vectorized axis first: the longer one, so the loop is shorter.
+        let order: [usize; 2] = if lens.get(1) >= lens.first() {
+            [1, 0]
+        } else {
+            [0, 1]
+        };
+        for inner in order {
+            let outer = 1 - inner;
+            let v = self.loop_var();
+            let attempt = self.axis_call(
+                body,
+                fun,
+                &args,
+                outs[inner],
+                outs[outer],
+                &v,
+                ext,
+                lens[inner],
+            );
+            self.used.remove(&v);
+            let Some(call) = attempt? else {
+                continue;
+            };
+            let line = if inner == 1 {
+                format!("{stan}[{v}] = {}';", Ex::atom(call).at(P_ATOM))
+            } else {
+                format!("{stan}[:, {v}] = {call};")
+            };
+            let n = &extents[outer];
+            let inner_text: String = line.lines().map(|l| format!("  {l}\n")).collect();
+            return Ok(Some(format!("for ({v} in 1:{n}) {{\n{inner_text}}}")));
+        }
+        Ok(None)
+    }
+
+    /// `f(…)` with the arguments over axis `inner` as whole vectors and the
+    /// axis `outer` at the loop variable `v`; `None` when the body does not
+    /// lift.
+    #[allow(clippy::too_many_arguments)]
+    fn axis_call(
+        &mut self,
+        body: NodeId,
+        fun: NodeId,
+        args: &[NodeId],
+        inner: Symbol,
+        outer: Symbol,
+        v: &str,
+        ext: &HashMap<Symbol, String>,
+        n: u32,
+    ) -> Result<Option<String>> {
+        use flatppl_core::{Dim, ScalarType, Type};
+        let vars = HashMap::from([(outer, v.to_string())]);
+        let mut parts = Vec::new();
+        let mut tys = Vec::new();
+        let mut elem_tys = Vec::new();
+        let mut full = Vec::new();
+        for &a in args {
+            let Ok(l) = self.lift(a, &[inner], &vars, ext) else {
+                return Ok(None);
+            };
+            let Some(et) = self.ty(a) else {
+                return Ok(None);
+            };
+            if l.full {
+                let ex = if l.array {
+                    self.to_real(&l.ex, 1)
+                } else {
+                    l.ex
+                };
+                parts.push(ex.s);
+                tys.push(Some(Type::Array {
+                    shape: vec![Dim::Static(n)].into(),
+                    elem: Box::new(Type::Scalar(ScalarType::Real)),
+                }));
+                full.push(true);
+            } else {
+                parts.push(l.ex.s);
+                tys.push(Some(et.clone()));
+                full.push(false);
+            }
+            elem_tys.push(et);
+        }
+        if !full.iter().any(|f| *f) {
+            return Ok(None);
+        }
+        let ret = Type::Array {
+            shape: vec![Dim::Static(n)].into(),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        };
+        match self.vectorized_function(body, fun, args, &tys, &elem_tys, &full, 1, Some(ret))? {
+            Ok((name, caps)) => Ok(Some(Self::apply_user(&name, parts, &caps))),
+            Err(_) => Ok(None),
+        }
     }
 
     /// The axis names of an `[.i, .k]` list.
@@ -230,6 +369,39 @@ impl<'m> Emitter<'m> {
                 "an array inside an aggregate body",
             ));
         };
+        // A scalar field of a record argument (`p.a`).
+        if self.head(body) == Some("get")
+            && c.args.len() == 2
+            && matches!(
+                self.m.node(c.args[1]),
+                Node::Lit(flatppl_core::Scalar::Str(_))
+            )
+            && self.shape(body).is_some_and(|s| s.rank == 0)
+        {
+            return Ok(scalar(self.expr(body)?));
+        }
+        // A user function of scalars, per element: its Stan function.
+        if let Some(fun) = self.is_user_call(body) {
+            let args = c.args.to_vec();
+            let mut parts = Vec::new();
+            let mut tys = Vec::new();
+            for &a in &args {
+                let p = self.lift(a, frame, vars, ext)?;
+                if p.full {
+                    return Err(Refusal::not_yet(
+                        Some(body),
+                        "a user function over an aggregate frame",
+                    ));
+                }
+                parts.push(p.ex.s);
+                tys.push(
+                    self.ty(a)
+                        .ok_or_else(|| Refusal::not_yet(Some(a), "an untyped argument"))?,
+                );
+            }
+            let (name, caps) = self.user_function(body, fun, &tys)?;
+            return Ok(scalar(Ex::atom(Self::apply_user(&name, parts, &caps))));
+        }
         let (f, args): (&str, Vec<NodeId>) = match self.head(body) {
             Some("broadcast") => match self.m.node(c.args[0]) {
                 Node::Const(f) => (self.name(*f), c.args[1..].to_vec()),

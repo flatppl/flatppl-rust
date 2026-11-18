@@ -212,19 +212,6 @@ fn user_broadcast_over_a_table_is_not_yet() {
 }
 
 #[test]
-fn general_scan_is_not_yet() {
-    let r = refuse(&posterior(
-        "xs = [1.0, 2.0, 3.0]\n\
-         run = scan((acc, x) -> 0.5 * acc + x, 0.0, xs)\n\
-         mu ~ Normal(0, 1)\ny ~ Normal(mu + run[3], 1)",
-        "lawof(record(mu = mu))",
-        "kernelof(record(y = y), mu = mu)",
-    ));
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("scan"), "{r}");
-}
-
-#[test]
 fn joint_of_one_draw_twice_is_never() {
     let r = refuse_with(
         "y = draw(Normal(0.0, 1.0))\nlp = logdensityof(lawof(record(a = y, b = y)), record(a = 0.5, b = 0.5))\n",
@@ -353,4 +340,74 @@ fn logdensityof_of_ordered_restriction_is_not_yet() {
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("ordered restriction"), "{r}");
+}
+
+#[test]
+fn scan_over_table_is_not_yet() {
+    let r = refuse(
+        "xs = [0.1, 0.2, 0.3]\nmu ~ Normal(0, 1)\n\
+         step(s, x, p) = record(a = s.a + x * p.mu, b = s.a)\n\
+         states = scan(step, record(a = 0.0, b = 0.0), xs, record(mu = mu))\n\
+         step2(acc, row) = acc + row.a\ntotal = scan(step2, 0.0, states)\n\
+         y ~ Normal.(total, 1)\nprior = lawof(record(mu = mu))\n\
+         L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.1, 0.2, 0.3]))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("scan over a table"), "{r}");
+}
+
+#[test]
+fn record_scan_used_whole_is_not_yet() {
+    let r = refuse(
+        "xs = [0.1, 0.2, 0.3]\nmu ~ Normal(0, 1)\n\
+         step(s, x, p) = record(a = s.a + x * p.mu, b = s.a)\n\
+         states = scan(step, record(a = 0.0, b = 0.0), xs, record(mu = mu))\n\
+         first(t) = t[1].a\ny ~ Normal(first(states), 1)\nprior = lawof(record(mu = mu))\n\
+         L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = 0.5))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a record scan used whole"), "{r}");
+}
+
+#[test]
+fn user_function_over_aggregate_frame_is_not_yet() {
+    let r = refuse(&posterior(
+        "x_obs = [1.0, 2.0, 3.0]\nb ~ iid(Normal(0, 1), 2)\ng(x, c) = c * x + 1\n\
+         m = aggregate(sum, [.i], g(x_obs[.i], b[.k]))\ny ~ Normal(m[1], 1)",
+        "lawof(record(b = b))",
+        "kernelof(record(y = y), b = b)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("aggregate reducing over this body"),
+        "{r}"
+    );
+}
+
+#[test]
+fn scan_step_with_module_inputs_is_not_yet() {
+    let r = refuse(&posterior(
+        "x_obs = [0.1, 0.2, 0.3]\na0 = 2.0\nxv = 0.0\nmid = 0.5 * a0 + 1\n\
+         f = functionof(mid, acc = a0, x = xv)\nrun = scan(f, 0.0, x_obs)\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + run[1], 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("inputs are module values"), "{r}");
+}
+
+#[test]
+fn vector_scan_read_whole_is_not_yet() {
+    let r = refuse(&posterior(
+        "K = 2\nx_obs = [0.5, -1.0, 2.0]\nw ~ iid(Normal(0, 1), K)\n\
+         step(acc, x, p) = 0.5 .* acc .+ p.w .* x\n\
+         run = scan(step, zeros(K), x_obs, record(w = w))\ny ~ Normal(sum(sum(run)), 1)",
+        "lawof(record(w = w))",
+        "kernelof(record(y = y), w = w)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("a scan of vectors read whole"), "{r}");
 }

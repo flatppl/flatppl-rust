@@ -18,6 +18,7 @@ mod functions;
 mod mixture;
 mod pattern;
 mod ranges;
+mod scan;
 mod statistics;
 mod structure;
 mod weight;
@@ -147,6 +148,8 @@ pub(crate) struct Emitter<'m> {
     placed: HashMap<NodeId, String>,
     /// The user function body being emitted.
     fctx: Option<functions::FnCtx>,
+    /// Scans emitted at module scope, by node.
+    scans: HashMap<NodeId, scan::ScanOut>,
     /// A copy of the module for instantiating function bodies.
     scratch: Option<Module>,
     /// (function, argument types) → Stan function and its captured names.
@@ -227,6 +230,7 @@ impl<'m> Emitter<'m> {
             weights: vec![],
             placed: HashMap::new(),
             fctx: None,
+            scans: HashMap::new(),
             scratch: None,
             fn_memo: HashMap::new(),
             fn_texts: HashMap::new(),
@@ -628,6 +632,32 @@ impl<'m> Emitter<'m> {
     /// whole-array expression for is filled elementwise by loops.
     fn computed(&mut self, base: &str, rhs: NodeId) -> Result<String> {
         let outer = self.owner.replace((base.to_string(), rhs));
+        // `base = scan(…)[n]` read only there: the running state is `base`.
+        if self.head(rhs) == Some("get")
+            && let [x, s] = self.call(rhs).unwrap().args[..]
+        {
+            let last = self.scan_last_value(x, s);
+            if !matches!(last, Ok(None)) {
+                self.owner = outer;
+                let e = last?.unwrap();
+                self.remember(rhs, &e.s);
+                return Ok(e.s);
+            }
+        }
+        // A scan bound whole: its column is the binding.
+        if self.head(rhs) == Some("scan") {
+            let e = self.expr(rhs);
+            self.owner = outer;
+            let e = e?;
+            if structure::is_identifier(&e.s) {
+                self.remember(rhs, &e.s);
+                return Ok(e.s);
+            }
+            let outer = self.owner.replace((base.to_string(), rhs));
+            let out = self.place(base, rhs, Ok(e));
+            self.owner = outer;
+            return out;
+        }
         let out = if self.head(rhs) == Some("aggregate") {
             self.aggregate_value(base, rhs)
         } else if self.user_broadcast(rhs) {
@@ -1032,7 +1062,7 @@ impl<'m> Emitter<'m> {
                 Some(fun) => self.user_call(id, fun, &args),
                 None => self.module_call(id),
             },
-            ("scan", [f, init, xs]) => self.additive_scan(id, *f, *init, *xs),
+            ("scan", _) => self.scan_expr(id, &args),
             ("logdensityof", [m, x]) => self.log_density(id, *m, *x),
             ("sum", [a]) if self.density_broadcast(*a).is_some() => {
                 let (m, x) = self.density_broadcast(*a).unwrap();
@@ -1319,6 +1349,28 @@ impl<'m> Emitter<'m> {
                 let f = f.to_string();
                 return self.record_field(id, &f);
             }
+            // A field of a record argument bound by name (a scan accumulator,
+            // a scan parameter, an inlined call's record parameter).
+            if let Node::Ref(rf) = self.m.node(x)
+                && rf.ns == RefNs::Local
+                && let Some(m) = self.fctx.as_ref().and_then(|c| c.records.get(&rf.name))
+            {
+                return m
+                    .get(&**f)
+                    .map(|s| Ex::atom(s.clone()))
+                    .ok_or_else(|| Refusal::not_yet(Some(id), format!("the field access `.{f}`")));
+            }
+            // A column of the table a record scan returns.
+            if let Some(scan) = self.scan_of(x)
+                && self.record_scan(scan)
+            {
+                let f = f.to_string();
+                let cols = self.scan_table(scan)?;
+                return cols
+                    .get(&f)
+                    .map(|s| Ex::atom(s.clone()))
+                    .ok_or_else(|| Refusal::not_yet(Some(id), format!("the field access `.{f}`")));
+            }
             let r = self.resolve(x);
             if self.head(r) == Some("record")
                 && let Some(na) = self
@@ -1334,6 +1386,12 @@ impl<'m> Emitter<'m> {
                 Some(id),
                 format!("the field access `.{f}`"),
             ));
+        }
+        // The last entry of a scan read only there: its running state.
+        if let [s] = sel
+            && let Some(e) = self.scan_last_value(x, *s)?
+        {
+            return Ok(e);
         }
         let base = self.expr(x)?;
         let mut idx = Vec::new();
