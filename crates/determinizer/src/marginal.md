@@ -485,7 +485,7 @@ normalizer does not: the emitted `log1p` argument goes from `4.166666666666666` 
 | latent | `z`, feeding every field's `mu`, and carried by NO field of the record |
 | answer | `MvNormal(μ₀·1, Σ)` with `Σ = s₀²·J + diag(σ₁²…σ_N²)`, `J` all-ones |
 | builder | `build_shared_latent_normal_logpdf` |
-| recogniser | `shared_latent_record_law` |
+| recogniser | `flatppl_model_analysis::record_marginals::plan_record_marginals` |
 
 This is the shape the record path used to refuse. Every per-field marginal is right
 (`Normal(μ₀, sqrt(s₀² + σᵢ²))`, Row 1) and their product is still the wrong measure,
@@ -836,15 +836,9 @@ naming, each with a test:
 
 - **Two record fields marginalizing the SAME latent.** This one is different in kind from
   the rest: it is the only place where every per-row answer is right and the assembled
-  result is still wrong, so the row cannot catch it. `conjugate_marginal_measure` therefore
-  returns the latent it integrated (`ImplicitMarginal::latent`), and the record path
-  compares them across fields. Two fields over DIFFERENT latents is a genuine product and
-  lowers.
-
-  Where the shape is the shared-latent record law above — every field a bare
-  `Normal(mu = z, …)` draw over one ancestor-free `Normal` prior — the record path now emits
-  that law's closed form instead of refusing. Any other shared-latent shape still refuses;
-  the list is in that section's *What keeps refusing*.
+  result is still wrong, so the row cannot catch it. Model analysis groups fields by
+  all unobserved draw sites in their ancestry, including those above immediate parents.
+  Each recognized group receives one joint score. Independent groups factor.
 
 - **The latent feeds a scale, not the mean.** `z ~ Normal(0, 2)`; `y ~ Normal(mu = 1, sigma = z)`
   is a Normal prior on a standard deviation. That is not the Normal–Normal (mean)
@@ -917,8 +911,6 @@ independent marginals. Reverse reconstruction still covers only one edge.
    silently.
 5. **Check what happens when two variates share the row's latent.** A correct marginal is
    correct for ONE variate; summing two of them asserts independence the shared ancestor
-   denies. The record path compares each field's `ImplicitMarginal::latent` and refuses on a
-   repeat, so a new row inherits that — but a new *caller* that assembles a product does
-   not. The one exception is the shared-latent record law, which answers the repeat with the
-   joint closed form; it recognises its own Normal-on-Normal-mean and Gamma-Poisson
-   shapes only, so a new row inherits the refusal, never that law.
+   denies. Record analysis groups fields by shared ancestry. A shared block needs its
+   own joint rule or the whole-record fallback. The current joint rules cover a common
+   Normal mean, Gamma rate, Beta probability or Dirichlet probability vector.

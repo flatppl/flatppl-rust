@@ -1,29 +1,9 @@
 //! Exact shared simplex-probability integrals with native support checks.
 
-use super::{
-    LogDensity, MarginalForm, RefuseError, SharedLatentRecordLaw, build_constructor, find_kwarg,
-    is_input_ref, real, references_latent, split_kernel_constructor,
-};
+use super::{LogDensity, MarginalForm, RefuseError, build_constructor, real};
 use crate::density::{build_call, build_record};
-use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Symbol, Type};
-
-// Category labels must stay exact in both supported real precisions.
-const MAX_CATEGORIES: u32 = 1 << 24;
-
-fn dimension(m: &Module, alpha: NodeId) -> Option<u32> {
-    let Type::Array { shape, elem } = m.type_of(alpha)? else {
-        return None;
-    };
-    let [Dim::Static(n)] = shape.as_ref() else {
-        return None;
-    };
-    (matches!(
-        elem.as_ref(),
-        Type::Scalar(ScalarType::Real | ScalarType::Integer)
-    ) && *n > 0
-        && *n <= MAX_CATEGORIES)
-        .then_some(*n)
-}
+use flatppl_core::{Module, Node, NodeId, Scalar, Symbol};
+use flatppl_model_analysis::record_marginals::match_dirichlet_observation;
 
 fn map(m: &mut Module, name: &str, args: &[NodeId]) -> NodeId {
     let head = m.intern(name);
@@ -51,30 +31,14 @@ pub(super) fn marginal(
     latent: Symbol,
     prior: &[(Symbol, NodeId)],
     likelihood: &[(Symbol, NodeId)],
-    family: &str,
+    family: Symbol,
     exempt: &[NodeId],
 ) -> Option<Result<MarginalForm, RefuseError>> {
-    if !matches!(family, "Categorical" | "Categorical0" | "Multinomial")
-        || !is_input_ref(m, find_kwarg(m, likelihood, "p")?, latent)
-        || likelihood.iter().any(|(name, value)| {
-            m.resolve(*name) != "p" && references_latent(m, *value, latent, exempt)
-        })
-    {
-        return None;
-    }
-    let alpha = find_kwarg(m, prior, "alpha")?;
-    let d = dimension(m, alpha)?;
-    let size = m.alloc(Node::Lit(Scalar::Int(i64::from(d))));
-    if family == "Multinomial" {
-        let n = find_kwarg(m, likelihood, "n")?;
-        if !matches!(
-            m.type_of(n),
-            Some(Type::Scalar(ScalarType::Integer | ScalarType::Real))
-        ) {
-            return None;
-        }
-        let head = m.intern(family);
-        let head = m.alloc(Node::Const(head));
+    let (alpha, categories, count) =
+        match_dirichlet_observation(m, latent, prior, (family, likelihood), exempt)?;
+    let size = m.alloc(Node::Lit(Scalar::Int(i64::from(categories))));
+    if let Some(n) = count.trials {
+        let head = m.alloc(Node::Const(family));
         return Some(Ok(MarginalForm::LogDensity(LogDensity {
             build: shared_logpmf,
             params: vec![alpha, size, head, n],
@@ -89,59 +53,15 @@ pub(super) fn marginal(
     let probability = map(m, "divide", &[scaled, total]);
     let invalid = filled(m, -1.0, size);
     let probability = build_call(m, "ifelse", &[valid, probability, invalid]);
+    let name = m.resolve(family).to_owned();
     Some(Ok(MarginalForm::Measure(build_constructor(
         m,
-        family,
+        &name,
         &[("p", probability)],
     ))))
 }
 
-pub(super) fn shared_law(
-    m: &mut Module,
-    latent: Symbol,
-    prior: &[(Symbol, NodeId)],
-    measures: &[NodeId],
-    exempt: &[NodeId],
-) -> Option<SharedLatentRecordLaw> {
-    let alpha = find_kwarg(m, prior, "alpha")?;
-    let d = dimension(m, alpha)?;
-    let size = m.alloc(Node::Lit(Scalar::Int(i64::from(d))));
-    let mut params = vec![alpha, size];
-    for &measure in measures {
-        let (family, kwargs) = split_kernel_constructor(m, measure)?;
-        let n = match m.resolve(family) {
-            "Categorical" | "Categorical0" => m.alloc(Node::Lit(Scalar::Int(1))),
-            "Multinomial" => {
-                let n = find_kwarg(m, &kwargs, "n")?;
-                if references_latent(m, n, latent, exempt)
-                    || !matches!(
-                        m.type_of(n),
-                        Some(Type::Scalar(ScalarType::Integer | ScalarType::Real))
-                    )
-                {
-                    return None;
-                }
-                n
-            }
-            _ => return None,
-        };
-        if !is_input_ref(m, find_kwarg(m, &kwargs, "p")?, latent) {
-            return None;
-        }
-        params.push(m.alloc(Node::Const(family)));
-        params.push(n);
-    }
-    Some(SharedLatentRecordLaw {
-        latent,
-        field_count: measures.len(),
-        form: LogDensity {
-            build: shared_logpmf,
-            params,
-        },
-    })
-}
-
-fn shared_logpmf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
+pub(super) fn shared_logpmf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
     debug_assert_eq!(params.len(), 2 + 2 * variates.len());
     let [alpha, size] = [params[0], params[1]];
     let Node::Lit(Scalar::Int(d)) = m.node(size) else {

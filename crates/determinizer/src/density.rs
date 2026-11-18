@@ -152,6 +152,7 @@ use flatppl_core::{
     RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
 };
 use flatppl_infer::ModuleBundle;
+use flatppl_model_analysis::record_marginals::{RecordField, plan_record_marginals};
 use flatppl_model_analysis::{
     StochasticAncestor, measure_stochastic_ancestors, sole_named_ancestor,
 };
@@ -2055,7 +2056,7 @@ fn marginalize_or_refuse_stochastic_law(
     }
     if is_measure_expr_type(m, resolved) && measure_reaches_draw(m, resolved, &[]) {
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
-            return score_marginal_form(m, &marginal?.form, v).map(Some);
+            return score_marginal_form(m, &marginal?, v).map(Some);
         }
         if let Some(numerical) = integral::marginal(m, resolved, v) {
             return numerical.map(Some);
@@ -2185,6 +2186,17 @@ fn marginalize_or_refuse_record_law(
     // check must precede partitioning, including aliases across separate blocks.
     let components = match_independent_record(m, record_node, v)?;
     let siblings: Vec<_> = components.iter().map(|comp| comp.draw_site).collect();
+    let fields: Vec<_> = components
+        .iter()
+        .map(|comp| RecordField {
+            measure: comp.measure,
+            transform: comp.transform,
+        })
+        .collect();
+    let blocks = plan_record_marginals(m, &fields, &siblings);
+    if blocks.is_empty() {
+        return Ok(None);
+    }
     let substitutions: Vec<_> = components
         .iter()
         .filter_map(|comp| {
@@ -2192,112 +2204,70 @@ fn marginalize_or_refuse_record_law(
                 .map(|bid| (m.binding(bid).name, comp.pinned))
         })
         .collect();
-    let mut marginals = Vec::with_capacity(components.len());
-    for comp in &components {
-        let reaches = |node| measure_reaches_draw(m, node, &siblings);
-        if !(reaches(comp.measure) || comp.transform.is_some_and(reaches)) {
-            marginals.push(None);
+    let fallback =
+        |m: &mut Module, node, reason: &str| match integral::record_marginal(m, record_node, v) {
+            Some(result) => result.map(Some),
+            None => Err(refuse(node, m, reason)),
+        };
+
+    // A matched block can build its joint score directly. Other fields still take
+    // the scalar path in source order, including its malformed-parameter diagnostics.
+    let mut needs_scalar = vec![false; components.len()];
+    for block in &blocks {
+        if block.shared.is_none() {
+            for &i in &block.fields {
+                needs_scalar[i] = true;
+            }
+        }
+    }
+    let mut marginals: Vec<_> = (0..components.len()).map(|_| None).collect();
+    for (i, comp) in components.iter().enumerate() {
+        if !needs_scalar[i] {
             continue;
         }
-        let marginal = if comp.transform.is_none() {
+        let form = if comp.transform.is_none() {
             crate::marginal::conjugate_marginal_measure(m, comp.measure, &siblings)
         } else {
             None
         };
-        let Some(built) = marginal else {
-            if let Some(numerical) = integral::record_marginal(m, record_node, v) {
-                return numerical.map(Some);
-            }
-            return Err(refuse(
-                comp.measure,
+        let Some(form) = form else {
+            return fallback(
                 m,
+                comp.measure,
                 "lawof of a record field parameterized by an uncarried draw needs a supported marginal law",
-            ));
+            );
         };
-        marginals.push(Some(built?));
+        marginals[i] = Some(form?);
     }
-    if marginals.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    // Connected components use complete integrated ancestry. Sharing any
-    // ancestor couples fields, even when their immediate parents differ.
-    let mut assigned = vec![false; components.len()];
-    let mut terms = (0..components.len())
+
+    let mut terms: Vec<_> = (0..components.len())
         .map(|_| RecordTerm::Conditional)
-        .collect::<Vec<_>>();
-    for first in 0..components.len() {
-        if assigned[first] || marginals[first].is_none() {
-            continue;
-        }
-        let mut block = vec![first];
-        assigned[first] = true;
-        let mut cursor = 0;
-        while cursor < block.len() {
-            let latents = &marginals[block[cursor]].as_ref().unwrap().latents;
-            for next in 0..components.len() {
-                if assigned[next] {
-                    continue;
-                }
-                if marginals[next].as_ref().is_some_and(|other| {
-                    other.latents.iter().any(|latent| latents.contains(latent))
-                }) {
-                    assigned[next] = true;
-                    block.push(next);
-                }
+        .collect();
+    for block in blocks {
+        let first = block.fields[0];
+        let term = if let Some(shared) = block.shared {
+            let mut law = crate::marginal::shared_record_density(m, shared.law);
+            let mut variates = Vec::with_capacity(block.fields.len());
+            for &i in &block.fields {
+                let comp = &components[i];
+                refuse_domain_kind_mismatch(m, comp.measure, comp.pinned)?;
+                variates.push(comp.pinned);
             }
-            cursor += 1;
-        }
-        let term = if block.len() == 1 {
-            let mut form = marginals[first].take().unwrap().form;
-            // Freeze parameters only. Substituting the emitted density would
-            // also rewrite the caller's point expressions and leak between queries.
-            form.map_parameters(m, |m, parameter| {
-                substitute_siblings(m, parameter, &substitutions)
-            });
+            law.map_parameters(m, |m, p| substitute_siblings(m, p, &substitutions));
+            law.at(m, &variates)
+        } else if block.fields.len() == 1 {
+            let mut form = marginals[first].take().expect("singleton marginal");
+            form.map_parameters(m, |m, p| substitute_siblings(m, p, &substitutions));
             score_marginal_form(m, &form, components[first].pinned)?
         } else {
-            let measures = block
-                .iter()
-                .map(|&i| components[i].measure)
-                .collect::<Vec<_>>();
-            let Some(mut law) = crate::marginal::shared_latent_record_law(m, &measures, &siblings)
-            else {
-                if let Some(numerical) = integral::record_marginal(m, record_node, v) {
-                    return numerical.map(Some);
-                }
-                return Err(refuse(
-                    components[first].measure,
-                    m,
-                    "lawof of record fields marginalizing over the SAME latent is a CORRELATED joint, and no closed form covers this block",
-                ));
-            };
-            if law.field_count != block.len()
-                || !marginals[first]
-                    .as_ref()
-                    .unwrap()
-                    .latents
-                    .contains(&law.latent)
-            {
-                return Err(refuse(
-                    record_node,
-                    m,
-                    "shared-latent block does not match its component ancestry",
-                ));
-            }
-            for &i in &block {
-                refuse_domain_kind_mismatch(m, components[i].measure, components[i].pinned)?;
-            }
-            law.form.map_parameters(m, |m, parameter| {
-                substitute_siblings(m, parameter, &substitutions)
-            });
-            let variates = block
-                .iter()
-                .map(|&i| components[i].pinned)
-                .collect::<Vec<_>>();
-            law.form.at(m, &variates)
+            return fallback(
+                m,
+                components[first].measure,
+                "lawof of record fields marginalizing over the SAME latent is a CORRELATED joint, and no closed form covers this block",
+            );
         };
         terms[first] = RecordTerm::Score(term);
-        for &i in &block[1..] {
+        for &i in &block.fields[1..] {
             terms[i] = RecordTerm::Included;
         }
     }
@@ -2880,10 +2850,7 @@ fn lower_value_law(
             crate::marginal::conjugate_marginal_measure(m, measure, &[])
         };
         if let Some(built) = marginal {
-            // One variate, so no product to get wrong: the marginal's own latent is not
-            // needed. A caller that SUMS several marginals does need it — see
-            // [`marginalize_or_refuse_record_law`]'s shared-latent refusal.
-            let scored = built.and_then(|mg| score_marginal_form(m, &mg.form, v));
+            let scored = built.and_then(|form| score_marginal_form(m, &form, v));
             // Pin as the ancestor-free path does: the marginal consumed this value's
             // `draw`, so the binding must not survive into the conformance check.
             if scored.is_ok()
