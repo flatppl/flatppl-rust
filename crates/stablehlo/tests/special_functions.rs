@@ -7,7 +7,7 @@
 //! 2.088487583762545e-45 needs its own op: `1 - erf(10)` is 0.
 
 use flatppl_core::Module;
-use flatppl_stablehlo::{Dtype, EmitOptions, Mode};
+use flatppl_stablehlo::{Dtype, EmitOptions, Mode, Target};
 
 const SF: &str = "sf = standard_module(\"special-functions\", \"0.1\")";
 
@@ -214,12 +214,11 @@ fn complex_bessel_projections_preserve_broadcast_shape_and_aliases() {
     assert!(out.contains("tensor<3xf32>"));
 }
 
-// erfcx has no CHLO op. It is `exp(x²)·erfc(x)` below the split and a continued
-// fraction above, joined by select. Executed against mpmath on M4 and GB10 out to
-// x = 1e4: f64 value 4.2e-16 and gradient 1.3e-15, f32 2.1e-7 and 1.5e-6.
+// Keep the reciprocal and rational correction as the only divisions. The old
+// continued fraction made derivatives of batched Gaussian scores slow to compile.
 #[test]
 fn erfcx_lowers_to_differentiable_stablehlo() {
-    for (dtype, ty, depth) in [(Dtype::F32, "f32", 12), (Dtype::F64, "f64", 40)] {
+    for (dtype, ty) in [(Dtype::F32, "f32"), (Dtype::F64, "f64")] {
         let src =
             format!("{SF}\na = elementof(reals)\nv = sf.erfcx(x = a)\ninputs = (a)\noutputs = (v)");
         let out = emit_with(&src, Mode::LogDensity, dtype).expect("must emit");
@@ -233,7 +232,7 @@ fn erfcx_lowers_to_differentiable_stablehlo() {
             3,
             "two clamps and the join:\n{out}"
         );
-        assert_eq!(out.matches("stablehlo.divide").count(), depth + 1, "{out}");
+        assert_eq!(out.matches("stablehlo.divide").count(), 2, "{out}");
     }
     let out = emit(&format!(
         "{SF}\na = elementof(cartpow(reals, 3))\nv = sf.erfcx.(a)\ninputs = (a)\noutputs = (v)"
@@ -298,6 +297,63 @@ outputs = logdensityof(P, x)";
         let out = emit_with(source, Mode::LogDensity, Dtype::F64).unwrap();
         assert!(!out.contains("flatppl.runtime_status"), "{out}");
     }
+}
+
+#[test]
+fn normal_log_cdf_splits_double_precision_gpu_fusion() {
+    let source = format!("{SF}\nx = external(reals)\ninputs = x\noutputs = sf.log_ndtr(x)");
+    let program = determinize_abi(&source);
+    for (target, dtype, barriers) in [
+        (Target::Cpu, Dtype::F64, 0),
+        (Target::Gpu, Dtype::F32, 0),
+        (Target::Gpu, Dtype::F64, 1),
+    ] {
+        let options = EmitOptions {
+            target,
+            dtype,
+            ..Default::default()
+        };
+        let out = flatppl_stablehlo::emit(&program, Mode::LogDensity, &options).unwrap();
+        assert_eq!(
+            out.matches("stablehlo.optimization_barrier").count(),
+            barriers
+        );
+    }
+}
+
+#[test]
+fn normal_log_cdf_compacts_only_fixed_infinite_lanes() {
+    let mask = (0..64)
+        .map(|i| if i % 4 == 0 { "true" } else { "false" })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pointwise = "f(x, keep) = sf.log_ndtr(ifelse(keep, x, -inf))\noutputs = f.(x, keep)";
+    let source =
+        format!("{SF}\nx = external(cartpow(reals, 64))\nkeep = [{mask}]\ninputs = x\n{pointwise}");
+    let out = emit_with(&source, Mode::LogDensity, Dtype::F64).unwrap();
+    let tail = out.lines().find(|line| line.contains("chlo.erfc")).unwrap();
+    assert!(tail.contains("tensor<16xf64>"), "{tail}");
+
+    let source = format!(
+        "{SF}\nx = external(cartpow(reals, 64))\nkeep = external(cartpow(booleans, 64))\n\
+         inputs = (x, keep)\n{pointwise}"
+    );
+    let out = emit_with(&source, Mode::LogDensity, Dtype::F64).unwrap();
+    let tail = out.lines().find(|line| line.contains("chlo.erfc")).unwrap();
+    assert!(tail.contains("tensor<64xf64>"), "{tail}");
+}
+
+#[test]
+fn normal_interval_mass_uses_only_endpoint_cdfs() {
+    let source = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+lo = elementof(reals)
+hi = elementof(reals)
+inputs = (mu, sigma, lo, hi)
+outputs = log(totalmass(truncate(Normal(mu, sigma), interval(lo, hi))))";
+    let out = emit_with(source, Mode::LogDensity, Dtype::F64).unwrap();
+    assert_eq!(out.matches("chlo.erfc ").count(), 2, "{out}");
 }
 
 // Direct tails, logarithms and scaled Bessels must remain live arithmetic with

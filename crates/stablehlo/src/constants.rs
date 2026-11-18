@@ -12,10 +12,8 @@ pub(super) type Constant = Arc<[Scalar]>;
 pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
 
 impl Emitter<'_> {
-    /// Read a fixed element through pure views without expanding them:
-    /// reshape, broadcast, transpose, slice, concatenation, static gather and
-    /// exact element-kind conversion. A reverse remembers its fixed values
-    /// where it is emitted.
+    /// Read a fixed element without expanding its views. Also follow fixed
+    /// conditions, comparisons, conversions, and sign operations.
     pub(crate) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<Scalar> {
         if index >= element_count(&value.ty)? {
             return None;
@@ -83,6 +81,28 @@ impl Emitter<'_> {
             }
             Pointwise::Convert(input, target) => {
                 convert_scalar(self.fixed_scalar_at(input, index)?, *target, self.dtype)
+            }
+            Pointwise::Select(pred, yes, no) => {
+                let p = if pred.ty == MlirTy::Scalar { 0 } else { index };
+                let Scalar::Bool(choose) = self.fixed_scalar_at(pred, p)? else {
+                    return None;
+                };
+                self.fixed_scalar_at(if choose { yes } else { no }, index)
+            }
+            Pointwise::Compare(dir, lhs, rhs) => {
+                let (lhs, rhs) = (
+                    self.fixed_scalar_at(lhs, index)?,
+                    self.fixed_scalar_at(rhs, index)?,
+                );
+                compare_scalars(dir, &lhs, &rhs)
+            }
+            Pointwise::Unary(op, input)
+                if matches!(op.as_str(), "stablehlo.abs" | "stablehlo.negate") =>
+            {
+                let Scalar::Real(x) = self.fixed_scalar_at(input, index)? else {
+                    return None;
+                };
+                real_unary(op, x, self.dtype).map(Scalar::Real)
             }
             _ => None,
         }
@@ -581,8 +601,6 @@ impl Emitter<'_> {
     }
 
     pub(super) fn fold_compare(&mut self, dir: &str, a: &Value, b: &Value) -> Option<Value> {
-        use std::cmp::Ordering::{Equal, Greater, Less};
-
         let aa = self.fixed_operand(a)?;
         let bb = self.fixed_operand(b)?;
         let n = aa.len().max(bb.len());
@@ -594,23 +612,7 @@ impl Emitter<'_> {
             return None;
         }
         let values = (0..n)
-            .map(|i| {
-                let order = match (&aa[i % aa.len()], &bb[i % bb.len()]) {
-                    (Scalar::Real(x), Scalar::Real(y)) => x.partial_cmp(y)?,
-                    (Scalar::Int(x), Scalar::Int(y)) => x.cmp(y),
-                    (Scalar::Bool(x), Scalar::Bool(y)) => x.cmp(y),
-                    _ => return None,
-                };
-                Some(Scalar::Bool(match dir {
-                    "EQ" => order == Equal,
-                    "NE" => order != Equal,
-                    "LT" => order == Less,
-                    "LE" => order != Greater,
-                    "GT" => order == Greater,
-                    "GE" => order != Less,
-                    _ => return None,
-                }))
-            })
+            .map(|i| compare_scalars(dir, &aa[i % aa.len()], &bb[i % bb.len()]))
             .collect::<Option<Vec<_>>>()?;
         self.folded_constant(values, a.ty.clone(), self.axes_of(a))
     }
@@ -759,6 +761,25 @@ fn dense_literal(values: &[Scalar], dims: &[Option<u64>]) -> Option<String> {
     let mut out = String::new();
     append(&mut out, values, dims)?;
     Some(out)
+}
+
+fn compare_scalars(dir: &str, lhs: &Scalar, rhs: &Scalar) -> Option<Scalar> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let order = match (lhs, rhs) {
+        (Scalar::Real(x), Scalar::Real(y)) => x.partial_cmp(y)?,
+        (Scalar::Int(x), Scalar::Int(y)) => x.cmp(y),
+        (Scalar::Bool(x), Scalar::Bool(y)) => x.cmp(y),
+        _ => return None,
+    };
+    Some(Scalar::Bool(match dir {
+        "EQ" => order == Equal,
+        "NE" => order != Equal,
+        "LT" => order == Less,
+        "LE" => order != Greater,
+        "GT" => order == Greater,
+        "GE" => order != Less,
+        _ => return None,
+    }))
 }
 
 fn real_unary(op: &str, x: f64, dtype: Dtype) -> Option<f64> {

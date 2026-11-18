@@ -95,7 +95,7 @@ impl Emitter<'_> {
         let root = self.sqrt(&half_a);
         let argument = self.mul(&eta, &root);
         let magnitude = self.abs(&argument);
-        let leading = self.erfcx(&magnitude);
+        let leading = self.erfcx(&magnitude, false);
         let leading = self.mul(&leading, &half);
         let log_scale = self.neg(&log_scale);
         let scale = self.exp(&log_scale);

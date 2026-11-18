@@ -1471,6 +1471,21 @@ fn normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
 fn normal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
+    if x.ssa == mu.ssa {
+        // The interval normalizer evaluates the CDF at its own mean to
+        // validate the parameters. Its finite result is always one half.
+        let mu_abs = e.abs(&mu);
+        let infinity = e.inf_like(&mu_abs);
+        let finite_mean = e.compare("LT", &mu_abs, &infinity);
+        let zero = e.scalar(0.0);
+        let nonzero_scale = e.compare("NE", &sigma, &zero);
+        let real_scale = e.compare("EQ", &sigma, &sigma);
+        let valid_scale = e.and(&nonzero_scale, &real_scale);
+        let valid = e.and(&finite_mean, &valid_scale);
+        let half = e.scalar(0.5);
+        let nan = e.scalar(f64::NAN);
+        return Ok(e.select(&valid, &half, &nan));
+    }
 
     let diff = e.sub(x, &mu);
     let z = e.div(&diff, &sigma);
