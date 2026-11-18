@@ -158,6 +158,11 @@ pub(crate) struct Emitter<'m> {
     /// Values placed under their own name, by node: a law filled twice
     /// (whole and per element) computes each once.
     placed: HashMap<NodeId, String>,
+    /// Non-scalar inlined calls placed at module level (see [`FnCtx::inlined`]).
+    inlined: Vec<(NodeId, Vec<NodeId>, String)>,
+    /// Stan function bodies being emitted: inside one, a data size has no
+    /// name. An inlined body at model scope is not one.
+    function_depth: usize,
     /// The user function body being emitted.
     fctx: Option<functions::FnCtx>,
     /// Scans emitted at module scope, by node.
@@ -245,6 +250,8 @@ impl<'m> Emitter<'m> {
             set_declared: HashSet::new(),
             weights: vec![],
             placed: HashMap::new(),
+            inlined: Vec::new(),
+            function_depth: 0,
             fctx: None,
             scans: HashMap::new(),
             scratch: None,
@@ -1438,6 +1445,33 @@ impl<'m> Emitter<'m> {
             let refused = Refusal::not_yet(Some(id), "a stacked array");
             if matches!(&self.owner, Some((_, root)) if *root == id) {
                 return Err(refused);
+            }
+            // A declared `array[K] vector[M]`: one row (column) per step.
+            if let Ok(e) = self.expr(original)
+                && let Some(t) = self.decls.get(&e.s).cloned()
+                && (t.array.len(), t.base, t.dims.len()) == (1, "vector", 1)
+            {
+                let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
+                let stan = self.fresh(&base);
+                let decl = self.declare(id, None, false, &stan, &[])?;
+                let i = self.loop_var();
+                let step = if transpose {
+                    format!("{stan}[{i}] = {}[{i}]';", e.s)
+                } else {
+                    format!("{stan}[:, {i}] = {}[{i}];", e.s)
+                };
+                let k = &t.array[0];
+                self.put(
+                    fixed,
+                    vec![
+                        format!("{};", decl.render(&stan)),
+                        format!("for ({i} in 1:{k}) {{\n  {step}\n}}"),
+                    ],
+                );
+                self.used.remove(&i);
+                self.record_decl(&stan, decl);
+                self.remember(id, &stan);
+                return Ok(Ex::atom(stan));
             }
             return Ok(Ex::atom(self.place(&base, id, Err(refused))?));
         }

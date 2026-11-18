@@ -97,6 +97,7 @@ impl<'m> Emitter<'m> {
         let scoped = self.instantiate(mc, body, &entries, &tys)?;
         let mut ctx = FnCtx {
             scoped,
+            inline_only: true,
             ..Default::default()
         };
         ctx.locals.insert(state.name, PREV.to_string());

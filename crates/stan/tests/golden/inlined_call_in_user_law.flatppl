@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+vs = [0.5, -1.0, 2.0]
+h(r) = r.v .* r.s
+g(m) = Normal(sum(h(record(v = vs, s = m))), 1)
+mus ~ iid(Normal(0, 1), 2)
+y ~ g.(mus)
+prior = lawof(record(mus = mus))
+L = likelihoodof(kernelof(record(y = y), mus = mus), record(y = [0.3, -0.2]))
+post = bayesupdate(L, prior)

@@ -32,6 +32,12 @@ pub(crate) struct FnCtx {
     pub lifted: HashMap<NodeId, Ex>,
     /// Values placed in this body, by node.
     pub placed: HashMap<NodeId, String>,
+    /// Non-scalar inlined calls placed in this body: callee, arguments, name.
+    pub inlined: Vec<(NodeId, Vec<NodeId>, String)>,
+    /// The body must stay one expression, with no statements: a law
+    /// argument, a broadcast user law, a lifted map. An inlined call keeps
+    /// its text here, unmemoised.
+    pub inline_only: bool,
     /// A log weight's record argument: `get(x, "f")` reads the parameter of
     /// field `f`.
     pub record_local: Option<Symbol>,
@@ -378,7 +384,9 @@ impl<'m> Emitter<'m> {
         self.mark_boundary(&mut ctx, at, body, &entries)?;
         let outer_ctx = self.fctx.replace(ctx);
         let outer_owner = self.owner.take();
+        self.function_depth += 1;
         let out = self.function_body(at, fun, &base, body, &entries, arg_tys);
+        self.function_depth -= 1;
         self.fctx = outer_ctx;
         self.owner = outer_owner;
         let (name, caps) = out?;
@@ -668,13 +676,16 @@ impl<'m> Emitter<'m> {
         let types = self.instantiate(id, body, &entries, elem_tys)?;
         let mut ctx = FnCtx {
             scoped: types,
+            inline_only: true,
             ..Default::default()
         };
         self.mark_boundary(&mut ctx, id, body, &entries)?;
         let outer_ctx = self.fctx.replace(ctx);
         let outer_owner = self.owner.take();
         let outer_v = self.vlocals.take();
+        self.function_depth += 1;
         let out = self.vectorized_body(id, fun, body, &entries, args, tys, full, brank, ret_ty);
+        self.function_depth -= 1;
         let inner = std::mem::replace(&mut self.fctx, outer_ctx);
         self.owner = outer_owner;
         self.vlocals = outer_v;
@@ -978,7 +989,9 @@ impl<'m> Emitter<'m> {
     pub(super) fn at_module<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let ctx = self.fctx.take();
         let owner = self.owner.take();
+        let depth = std::mem::take(&mut self.function_depth);
         let out = f(self);
+        self.function_depth = depth;
         self.fctx = ctx;
         self.owner = owner;
         out
@@ -1048,6 +1061,7 @@ impl<'m> Emitter<'m> {
         let mut ctx = FnCtx {
             locals,
             scoped,
+            inline_only: true,
             ..Default::default()
         };
         self.mark_boundary(&mut ctx, m, body, &entries)?;
@@ -1128,6 +1142,7 @@ impl<'m> Emitter<'m> {
             self_inputs: marks.self_inputs,
             through: marks.through,
             scoped,
+            inline_only: true,
             ..Default::default()
         });
         let outer_v = self

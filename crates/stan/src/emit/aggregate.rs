@@ -300,12 +300,14 @@ impl<'m> Emitter<'m> {
             }
             let c = self.call(id).unwrap();
             let (x, sels) = (c.args[0], c.args[1..].to_vec());
-            let base = self.expr(x)?;
+            let mut base = self.expr(x)?;
+            // A computed array is placed once and indexed by name.
             if base.prec < P_ATOM || !super::structure::is_identifier(&base.s) {
-                return Err(Refusal::not_yet(
-                    Some(id),
-                    "axis indexing of a computed expression",
-                ));
+                let name = match &self.owner {
+                    Some((n, _)) => format!("{n}_site"),
+                    None => "site".to_string(),
+                };
+                base = Ex::atom(self.place(&name, x, Ok(base))?);
             }
             let mut axes = Vec::new();
             for s in sels {

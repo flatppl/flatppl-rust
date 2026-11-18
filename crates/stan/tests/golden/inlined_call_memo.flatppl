@@ -1,0 +1,10 @@
+# emit: target=post
+flatppl_compat = "0.1"
+K = 2
+X = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])
+p ~ iid(Normal(0, 1), K)
+prior = lawof(record(p = p))
+f(x) = X * x.p
+g(x) = sum(x.p)
+lw(x) = sum(f(x)) + f(x)[1] * f(x)[3] + g(x) + g(x) + sum(f(record(p = 2.0 .* x.p)))
+post = logweighted(lw, prior)

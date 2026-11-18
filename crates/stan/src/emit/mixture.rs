@@ -729,6 +729,7 @@ impl<'m> Emitter<'m> {
         let mut ctx = FnCtx {
             locals,
             scoped,
+            inline_only: true,
             ..Default::default()
         };
         self.mark_boundary(&mut ctx, at, body, &entries)?;

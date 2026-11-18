@@ -1,0 +1,7 @@
+# emit: target=post
+flatppl_compat = "0.1"
+A = rowstack([[1.0, 2.0], [0.5, -1.0], [0.3, 0.3]])
+w ~ iid(iid(Normal(0, 1), 2), 2)
+prior = lawof(record(w = w))
+lw(x) = sum(aggregate(sum, [.t], (A * transpose(rowstack(x.w)))[.t, .k]^2))
+post = logweighted(lw, prior)

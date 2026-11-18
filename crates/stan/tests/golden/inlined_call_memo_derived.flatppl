@@ -1,0 +1,11 @@
+# emit: derived=transformed-parameters
+flatppl_compat = "0.1"
+K = 2
+X = rowstack([[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]])
+p ~ iid(Normal(0, 1), K)
+f(x) = X * x.p
+v = f(record(p = p))
+z ~ Normal(sum(f(record(p = p))) + v[2], 1)
+prior = lawof(record(p = p))
+L = likelihoodof(kernelof(record(z = z), p = p), record(z = 0.4))
+post = bayesupdate(L, prior)
