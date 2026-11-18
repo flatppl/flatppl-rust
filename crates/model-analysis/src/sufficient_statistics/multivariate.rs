@@ -1,6 +1,8 @@
 //! Vector and matrix event summaries. The outer axis is the observation axis.
 
 use super::{Expr, Reducer, call, data_only, materialize, num, op, per_cell, resolve};
+
+mod fixed_multinomial;
 use flatppl_core::{Dim, Module, Node, NodeId, RefNs, Scalar, ScalarType, Type, ValueSet};
 
 pub(super) fn cells(body: Expr, data: Expr) -> Expr {
@@ -235,6 +237,15 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             if count > (1 << 24) || count.checked_mul(*trial_count as usize)? > i32::MAX as usize {
                 return None;
             }
+            // Defer file-backed tables to the existing materialized-data pass.
+            let source = resolve(m, observed, &reducer.boundary);
+            let source = call(m, source, "splitblocks")
+                .and_then(|c| c.args.first().copied())
+                .map_or(source, |data| resolve(m, data, &reducer.boundary));
+            if !reducer.preparing && call(m, source, "load_data").is_some() {
+                return None;
+            }
+            let fixed = fixed_multinomial::summaries(reducer, m, observed, count, d, *trial_count);
             let trials = Expr::Node(trials);
             let probs = parameter("p")?;
             let valid = |row: Expr| {
@@ -282,78 +293,86 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
                 m,
                 &key,
                 "multinomial_center",
-                op(
-                    "ifelse",
-                    [
-                        op("lany", [flags.clone()]),
-                        first,
-                        op("fill", [Expr::Integer(0), Expr::Integer(d as i64)]),
-                    ],
-                ),
+                fixed.as_ref().map(|s| s.center()).unwrap_or_else(|| {
+                    op(
+                        "ifelse",
+                        [
+                            op("lany", [flags.clone()]),
+                            first,
+                            op("fill", [Expr::Integer(0), Expr::Integer(d as i64)]),
+                        ],
+                    )
+                }),
             );
             let valid_count = reducer.summary_for(
                 m,
                 &key,
                 "multinomial_valid_count",
-                op(
-                    "sum",
-                    [super::map(
-                        "ifelse",
-                        [flags, Expr::Integer(1), Expr::Integer(0)],
-                    )],
-                ),
+                fixed.as_ref().map(|s| s.valid()).unwrap_or_else(|| {
+                    op(
+                        "sum",
+                        [super::map(
+                            "ifelse",
+                            [flags, Expr::Integer(1), Expr::Integer(0)],
+                        )],
+                    )
+                }),
             );
             let counts = reducer.summary_for(
                 m,
                 &key,
                 "multinomial_counts",
-                vector((0..d).map(|j| {
-                    op(
-                        "sum",
-                        [cells(
-                            op(
-                                "ifelse",
-                                [valid(Expr::Local), get(Expr::Local, j), Expr::Integer(0)],
-                            ),
-                            data.clone(),
-                        )],
-                    )
-                })),
+                fixed.as_ref().map(|s| s.counts()).unwrap_or_else(|| {
+                    vector((0..d).map(|j| {
+                        op(
+                            "sum",
+                            [cells(
+                                op(
+                                    "ifelse",
+                                    [valid(Expr::Local), get(Expr::Local, j), Expr::Integer(0)],
+                                ),
+                                data.clone(),
+                            )],
+                        )
+                    }))
+                }),
             );
             let factorials = reducer.summary_for(
                 m,
                 &key,
                 "multinomial_relative_factorials",
-                op(
-                    "sum",
-                    [held_cells(
-                        op(
-                            "ifelse",
-                            [
-                                valid(Expr::Local),
-                                op(
-                                    "sum",
-                                    [super::map(
-                                        "sub",
-                                        [
-                                            super::map(
-                                                "loggamma",
-                                                [super::map("add", [Expr::Local, num(1.0)])],
-                                            ),
-                                            super::map(
-                                                "loggamma",
-                                                [super::map("add", [Expr::Held(0), num(1.0)])],
-                                            ),
-                                        ],
-                                    )],
-                                ),
-                                num(0.0),
-                            ],
-                        ),
-                        data,
-                        [center.clone()],
-                    )],
-                ),
+                fixed.as_ref().map(|s| s.factorials()).unwrap_or_else(|| {
+                    op(
+                        "sum",
+                        [held_cells(
+                            op(
+                                "ifelse",
+                                [
+                                    valid(Expr::Local),
+                                    op(
+                                        "sum",
+                                        [super::map(
+                                            "sub",
+                                            [
+                                                super::map(
+                                                    "loggamma",
+                                                    [super::map("add", [Expr::Local, num(1.0)])],
+                                                ),
+                                                super::map(
+                                                    "loggamma",
+                                                    [super::map("add", [Expr::Held(0), num(1.0)])],
+                                                ),
+                                            ],
+                                        )],
+                                    ),
+                                    num(0.0),
+                                ],
+                            ),
+                            data,
+                            [center.clone()],
+                        )],
+                    )
+                }),
             );
             let delta = super::map(
                 "sub",

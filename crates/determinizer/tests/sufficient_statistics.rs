@@ -98,6 +98,9 @@ fn family_reductions_are_portable_and_the_switch_preserves_the_query_abi() {
         ("Poisson(a)", "[0,2,3]"),
         ("Binomial(6,a)", "[0,2,6]"),
         ("Bernoulli(a)", "[true,false,true]"),
+        ("Bernoulli(a)", "[0.0,0.5,1.0]"),
+        ("Categorical([a,1.0-a])", "[1,1,2]"),
+        ("Categorical0([a,1.0-a])", "[0.0,0.5,1.0]"),
         ("Geometric(a)", "[0,1,3]"),
         ("Uniform(interval(a,b))", "[0.1,0.2,0.3]"),
     ] {
