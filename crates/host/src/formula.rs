@@ -20,6 +20,12 @@ pub struct PreparedFormulaPrediction {
     pub new_group_shapes: NewGroupShapes,
 }
 
+/// A table supplied to the formula host as Arrow IPC or a local file.
+pub enum FormulaTableSource<'a> {
+    Arrow(&'a [u8]),
+    Path(&'a Path),
+}
+
 impl Context {
     /// Import a JSON specification with an optional Arrow IPC table override.
     /// With no IPC bytes, the specification must contain its typed data table.
@@ -142,6 +148,48 @@ impl Context {
 }
 
 impl FormulaModel {
+    /// Prepare an AR forecast against explicit historical observations.
+    pub fn prepare_forecast(
+        &self,
+        context: &mut Context,
+        future: FormulaTableSource<'_>,
+        history: FormulaTableSource<'_>,
+        allow_new_levels: bool,
+    ) -> Result<PreparedFormulaPrediction, Diagnostic> {
+        let fail = |error: String| Diagnostic::new("formula", self.template.source_name(), error);
+        if !context.owns(&self.template) {
+            return Err(fail("the module belongs to a different context".into()));
+        }
+        let file_backed = matches!(future, FormulaTableSource::Path(_));
+        let load = |source| match source {
+            FormulaTableSource::Arrow(bytes) => {
+                Table::from_arrow_ipc(bytes).map_err(|error| fail(error.to_string()))
+            }
+            FormulaTableSource::Path(path) => read_table(path),
+        };
+        let future = load(future)?;
+        let history = load(history)?;
+        let mut forecast =
+            flatppl_formula::prepare_forecast(&self.recipe, &future, &history, allow_new_levels)
+                .map_err(|error| fail(error.to_string()))?;
+        forecast
+            .attach_model_info(&self.info)
+            .map_err(|error| fail(error.to_string()))?;
+        let template = context.parse(&flatppl_syntax::print(&forecast.module), None, None)?;
+        let mut data = forecast.data;
+        let rows = std::mem::take(&mut data.rows);
+        let module = if file_backed {
+            context.formula_source(&template, &data, None, None)?
+        } else {
+            context.set(&template, &constants(data))?
+        };
+        Ok(PreparedFormulaPrediction {
+            module,
+            rows,
+            new_group_shapes: forecast.new_group_shapes,
+        })
+    }
+
     /// Bind a fresh snapshot in the same context. Prediction needs no response.
     pub fn prepare(
         &self,

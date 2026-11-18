@@ -1,4 +1,4 @@
-use crate::{Error, Family, Formula, GroupLevel, Recipe, Result, Trials};
+use crate::{Error, Family, Formula, GroupLevel, Recipe, Result, Trials, autoregression};
 use flatppl_data::{Column, ColumnValues, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -20,6 +20,20 @@ pub struct DataDocument {
 /// affected group parameter. The fitted labels remain the leading entries.
 pub type NewGroupShapes = BTreeMap<String, Vec<usize>>;
 
+/// A prediction template and its prepared future rows and history anchors.
+pub struct PreparedForecast {
+    pub module: flatppl_core::Module,
+    pub data: DataDocument,
+    pub new_group_shapes: NewGroupShapes,
+}
+
+impl PreparedForecast {
+    /// Attach the fitted model's parameter names and training metadata.
+    pub fn attach_model_info(&mut self, info: &crate::ModelInfo) -> Result<()> {
+        crate::metadata::emit(&mut self.module, info)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DataValue {
@@ -35,7 +49,9 @@ impl DataDocument {
         let mut columns = serde_json::Map::new();
         for (name, value) in &self.constants {
             let value = match value {
-                DataValue::Integer(_) if name == "N" => continue,
+                DataValue::Integer(_) if name == "N" || name == autoregression::DESIGN_N => {
+                    continue;
+                }
                 DataValue::Integer(_) => {
                     return Err(Error(format!("unexpected scalar data binding `{name}`")));
                 }
@@ -283,6 +299,17 @@ pub(crate) fn model_rows(
     table: &Table,
     mode: DataMode,
 ) -> Result<Vec<usize>> {
+    observation_rows(formula, predictors, extra_columns, table, mode, false)
+}
+
+fn observation_rows(
+    formula: &Formula,
+    predictors: &[&Formula],
+    extra_columns: &[String],
+    table: &Table,
+    mode: DataMode,
+    history: bool,
+) -> Result<Vec<usize>> {
     table.validate()?;
     if predictors
         .iter()
@@ -335,7 +362,7 @@ pub(crate) fn model_rows(
             (mode == DataMode::Training).then_some(censoring.code.as_str())
         }))
         .chain(extra_columns.iter().map(String::as_str))
-        .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
+        .chain((mode == DataMode::Training || history).then_some(formula.response.as_str()));
     let columns = names
         .map(|name| table.column(name).map_err(Error::from))
         .collect::<Result<Vec<_>>>()?;
@@ -372,6 +399,9 @@ pub(crate) fn model_rows(
             .collect();
     }
     if rows.is_empty() {
+        if history {
+            return Ok(rows);
+        }
         return Err(Error("no complete model rows remain".into()));
     }
     if let Some(ar) = &formula.ar {
@@ -430,10 +460,7 @@ fn prepare_ar(
         let group = groups.level(row)?;
         let time = ar_time(times, row)?;
         if group == previous_group {
-            let gap = time
-                .checked_sub(previous_time)
-                .filter(|&gap| gap <= i32::MAX as i64)
-                .ok_or_else(|| Error("ar() time gap exceeds the supported integer range".into()))?;
+            let gap = ar_gap(time, previous_time)?;
             if gap == 0 {
                 return Err(Error("ar() times must be unique within a group".into()));
             }
@@ -454,6 +481,12 @@ fn prepare_ar(
     Ok(())
 }
 
+fn ar_gap(time: i64, previous: i64) -> Result<i64> {
+    time.checked_sub(previous)
+        .filter(|&gap| gap <= i32::MAX as i64)
+        .ok_or_else(|| Error("ar() time gap exceeds the supported integer range".into()))
+}
+
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
 /// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
@@ -471,34 +504,189 @@ pub fn prepare_data_with_new_groups(
     Ok((data, shapes))
 }
 
+/// Prepare strictly future AR(1) rows conditional on the supplied history.
+/// The history is encoded with the fitted recipe. Groups absent from the
+/// history keep stationary initial residuals.
+pub fn prepare_forecast(
+    recipe: &Recipe,
+    future: &Table,
+    history: &Table,
+    allow_new_levels: bool,
+) -> Result<PreparedForecast> {
+    let mut recipe = recipe.clone();
+    if recipe.formula.ar.is_none() {
+        return Err(Error("history requires a Gaussian ar() formula".into()));
+    }
+    let shared = recipe.shared_groups.clone();
+    let mut module = crate::emit::model_with_forecast(&mut recipe, &shared, true)?;
+    let mut shapes = NewGroupShapes::new();
+    let groups = allow_new_levels.then_some(&mut shapes);
+    let mut data = prepare_data_inner(&recipe, future, DataMode::Prediction, groups)?;
+    add_history(&recipe, future, history, &mut data)?;
+    if !shapes.is_empty() {
+        module = recipe.extend_group_draws(module, &shapes)?;
+    }
+    Ok(PreparedForecast {
+        module,
+        data,
+        new_group_shapes: shapes,
+    })
+}
+
+fn add_history(
+    recipe: &Recipe,
+    future: &Table,
+    history: &Table,
+    data: &mut DataDocument,
+) -> Result<()> {
+    let ar = recipe.formula.ar.as_ref().expect("validated AR formula");
+    let predictors: Vec<_> = recipe.predictors.values().map(|p| &p.formula).collect();
+    let nonlinear = recipe
+        .nonlinear
+        .as_ref()
+        .map_or(&[][..], |p| p.columns.as_slice());
+    let history_rows = observation_rows(
+        &recipe.formula,
+        &predictors,
+        nonlinear,
+        history,
+        DataMode::Prediction,
+        true,
+    )?;
+    let history_groups = history.column(&ar.group)?;
+    let history_times = history.column(&ar.time)?;
+    let response = history.column(&recipe.formula.response)?;
+    let levels = history_rows
+        .iter()
+        .map(|&row| history_groups.level(row))
+        .collect::<Result<Vec<_>>>()?;
+    let mut last = HashMap::new();
+    for (&row, level) in history_rows.iter().zip(&levels) {
+        let time = ar_time(history_times, row)?;
+        if let Some((previous, _)) = last.insert(level_key(level), (time, row))
+            && time == previous
+        {
+            return Err(Error(
+                "ar() history times must be unique within a group".into(),
+            ));
+        }
+    }
+
+    let groups = future.column(&ar.group)?;
+    let times = future.column(&ar.time)?;
+    let mut anchors = Vec::with_capacity(data.rows.len());
+    let mut elapsed = Vec::with_capacity(data.rows.len());
+    let mut observed = Vec::with_capacity(data.rows.len());
+    let mut anchor_rows = Vec::new();
+    let DataValue::Integers(mut previous) =
+        data.constants.remove(autoregression::PREVIOUS).unwrap()
+    else {
+        unreachable!("AR preparation produces integer predecessors");
+    };
+    let DataValue::Integers(gaps) = data.constants.get_mut(autoregression::GAP).unwrap() else {
+        unreachable!("AR preparation produces integer gaps");
+    };
+    let n = data.rows.len() as i64;
+    for (i, &row) in data.rows.iter().enumerate() {
+        let group = groups.level(row)?;
+        let time = ar_time(times, row)?;
+        if let Some(&(last_time, anchor_row)) = last.get(&level_key(&group)) {
+            if time <= last_time {
+                return Err(Error(format!(
+                    "ar() forecast time {time} must follow the latest history time {last_time} in group `{group}`"
+                )));
+            }
+            let gap = ar_gap(time, last_time)?;
+            let (index, value) = if gaps[i] == 0 {
+                let index = n + anchor_rows.len() as i64 + 1;
+                let value = response.numeric(&[anchor_row])?[0];
+                anchor_rows.push(anchor_row);
+                gaps[i] = gap;
+                previous[i] = index;
+                (index, value)
+            } else {
+                (anchors[i - 1], observed[i - 1])
+            };
+            anchors.push(index);
+            elapsed.push(gap);
+            observed.push(value);
+        } else {
+            anchors.push(i as i64 + 1);
+            elapsed.push(0);
+            observed.push(0.0);
+        }
+    }
+    if !anchor_rows.is_empty() {
+        let mut design = BTreeMap::new();
+        // Known history effects use exactly the fitted coordinates. Forecast
+        // extensions append their innovations after all the fitted levels.
+        prepare_design(recipe, history, &anchor_rows, nonlinear, &mut design, None)?;
+        for (name, history) in design {
+            append_history(data.constants.get_mut(&name).unwrap(), history);
+        }
+    }
+    data.constants.extend([
+        (
+            autoregression::DESIGN_N.into(),
+            DataValue::Integer(n + anchor_rows.len() as i64),
+        ),
+        (
+            autoregression::PREVIOUS.into(),
+            DataValue::Integers(previous),
+        ),
+        (autoregression::ANCHOR.into(), DataValue::Integers(anchors)),
+        (autoregression::ELAPSED.into(), DataValue::Integers(elapsed)),
+        (autoregression::OBSERVED.into(), DataValue::Real64(observed)),
+    ]);
+    Ok(())
+}
+
+fn append_history(future: &mut DataValue, history: DataValue) {
+    match (future, history) {
+        (DataValue::Real32(a), DataValue::Real32(b)) => a.extend(b),
+        (DataValue::Real64(a), DataValue::Real64(b)) => a.extend(b),
+        (DataValue::Integers(a), DataValue::Integers(b)) => a.extend(b),
+        (future, history) => {
+            let reals = |data| match data {
+                DataValue::Real32(v) => v.into_iter().map(f64::from).collect(),
+                DataValue::Integers(v) => v.into_iter().map(|value| value as f64).collect(),
+                DataValue::Real64(v) => v,
+                DataValue::Integer(_) => unreachable!("predictor inputs are vectors"),
+            };
+            let mut values = reals(std::mem::replace(future, DataValue::Real64(Vec::new())));
+            values.extend(reals(history));
+            *future = DataValue::Real64(values);
+        }
+    }
+}
+
 fn prepare_data_inner(
     recipe: &Recipe,
     table: &Table,
     mode: DataMode,
-    mut new_groups: Option<&mut NewGroupShapes>,
+    new_groups: Option<&mut NewGroupShapes>,
 ) -> Result<DataDocument> {
     let predictors: Vec<_> = recipe.predictors.values().map(|p| &p.formula).collect();
     let nonlinear_columns = recipe
         .nonlinear
         .as_ref()
         .map_or(&[][..], |p| p.columns.as_slice());
-    let rows = model_rows(&recipe.formula, &predictors, nonlinear_columns, table, mode)?;
+    let required_columns = if mode == DataMode::Training && recipe.paired_response.is_some() {
+        recipe.paired_response.as_slice()
+    } else {
+        nonlinear_columns
+    };
+    let rows = model_rows(&recipe.formula, &predictors, required_columns, table, mode)?;
     let mut constants = BTreeMap::new();
     constants.insert("N".into(), DataValue::Integer(rows.len() as i64));
-    for (i, name) in nonlinear_columns.iter().enumerate() {
-        let values = crate::ColumnExpression::Column(name.clone()).data(table, &rows)?;
-        constants.insert(crate::nonlinear::data_name(i), values);
-    }
-    for (dpar, predictor) in recipe.predictors() {
-        prepare_predictor(
-            predictor,
-            &recipe.predictor_suffix(dpar),
-            table,
-            &rows,
-            &mut constants,
-            new_groups.as_deref_mut(),
-        )?;
-    }
+    prepare_design(
+        recipe,
+        table,
+        &rows,
+        nonlinear_columns,
+        &mut constants,
+        new_groups,
+    )?;
     if mode == DataMode::Training {
         constants.insert(
             "y_data".into(),
@@ -510,6 +698,10 @@ fn prepare_data_inner(
                 &rows,
             )?,
         );
+        if let Some(second) = &recipe.paired_response {
+            let second = table.column(second)?;
+            constants.insert(crate::paired::SECOND_DATA.into(), second.data(&rows)?);
+        }
         if let Some(name) = &recipe.formula.weights {
             let weights = table.column(name)?;
             if weights.numeric(&rows)?.iter().any(|&value| value < 0.0) {
@@ -551,6 +743,31 @@ fn prepare_data_inner(
         prepare_ar(ar, table, &rows, &mut constants)?;
     }
     Ok(DataDocument { constants, rows })
+}
+
+fn prepare_design(
+    recipe: &Recipe,
+    table: &Table,
+    rows: &[usize],
+    nonlinear_columns: &[String],
+    constants: &mut BTreeMap<String, DataValue>,
+    mut new_groups: Option<&mut NewGroupShapes>,
+) -> Result<()> {
+    for (i, name) in nonlinear_columns.iter().enumerate() {
+        let values = crate::ColumnExpression::Column(name.clone()).data(table, rows)?;
+        constants.insert(crate::nonlinear::data_name(i), values);
+    }
+    for (dpar, predictor) in recipe.predictors() {
+        prepare_predictor(
+            predictor,
+            &recipe.predictor_suffix(dpar),
+            table,
+            rows,
+            constants,
+            new_groups.as_deref_mut(),
+        )?;
+    }
+    Ok(())
 }
 
 fn prepare_predictor(
@@ -660,6 +877,9 @@ fn prepare_predictor(
             };
             constants.insert(name.clone(), values);
         }
+        if constants.contains_key(&group.index) {
+            continue;
+        }
         let mut levels: HashMap<_, _> = group
             .levels
             .iter()
@@ -681,7 +901,7 @@ fn prepare_predictor(
                 .collect();
             let new_count = levels.len() - fitted_count;
             if new_count > 0 {
-                let coefficients = group.coefficients.len();
+                let coefficients = group.innovation_width();
                 let shape = if coefficients == 1 {
                     vec![new_count]
                 } else {

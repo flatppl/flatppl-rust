@@ -90,6 +90,14 @@ defaults. `ModelInfo.dpars` records each formula, link and design columns.
 For example, `temp_Intercept_sigma` is the centred scale intercept and
 `b_Intercept_sigma` reports `b_sigma_Intercept` on the original design scale.
 
+Use the same group ID in `y ~ (1 + x | subject | g)` and
+`sigma ~ (1 | subject | g)` to fit one covariance across the mean and log-scale
+group effects. The ID `subject` is a formula label. Every term in that block
+uses the same grouping factor `g`. An unscoped `cor` or `L` prior with
+`group = "g"` selects the joint correlation. Group standard deviations
+retain their predictor-specific `sd` selectors. Prediction draws one joint
+effect per unseen level. Ordinary `|` and `||` terms keep their own blocks.
+
 ### Nonlinear predictors
 
 Supply `nlpars` to treat the right side as arithmetic over named parameter
@@ -311,8 +319,24 @@ mean `ar^d` times the last residual and innovation variance
 `sigma^2 * (1 + ar^2 + ... + ar^(2*d-2))`. The `ar` prior defaults to uniform
 on `(-1, 1)`, and `sigma` is a scalar innovation standard deviation.
 `log_lik` reports each conditional log density in model row order.
-Prediction requires both columns and starts a fresh stationary trajectory
-in each group, including groups that appeared in training.
+Prediction requires both columns and starts a stationary trajectory by default.
+With `prepare_forecast`, each group can instead start at its latest complete
+observation from a supplied history table. Future times must follow that
+anchor. The same fitted predictor recipe and parameter point determine the
+anchor residual and the future means. Groups absent from history start from
+the stationary law. Prepared row indices refer to the future table.
+
+For paired Gaussian responses, set `formula` and `paired_formula` to the
+two mean formulas. Training selects complete rows across both responses
+and their predictors. `K_model` returns outcome columns `y` and `y2`, in
+formula order. `expected_response` returns both means in a matrix, and
+`log_lik` gives the joint score per row. `info.response_columns` names the
+two response columns in order.
+
+Prior class `sigma` applies to the first residual scale and `sigma2` to
+the second. Both use their own fitted response scale for defaults. Class
+`rescor` applies to the residual correlation and defaults to uniform on
+`(-1, 1)`. Use `dpar = "mu2"` to select second-mean predictor priors.
 
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example

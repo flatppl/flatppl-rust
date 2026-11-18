@@ -2,13 +2,15 @@
 use crate::{Error, Result};
 use flatppl_convert::Builder;
 use flatppl_core::{
-    Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, Node, NodeId, Ref, RefNs, Type,
+    Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, Node, NodeId, Ref, RefNs, ScalarType,
+    Type, ValueSet,
 };
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct ParameterPrior {
     pub name: String,
     pub measure: NodeId,
+    pub coordinate_set: Option<NodeId>,
 }
 
 struct Factor<'a> {
@@ -292,6 +294,166 @@ pub(crate) fn parameter_support(b: &mut Builder<'_>, measure: NodeId) -> NodeId 
         _ => &Type::Deferred,
     };
     natural_set(b, domain)
+}
+
+/// Keep static prior restrictions for sampler coordinates even when the
+/// published measure's inferred support has widened through composition.
+pub(crate) fn coordinate_set(
+    b: &mut Builder<'_>,
+    law: NodeId,
+    restriction: Option<NodeId>,
+    fallback: NodeId,
+) -> Option<NodeId> {
+    let (Type::Measure { domain, .. }, inferred) =
+        flatppl_infer::infer_expression_support(b.m, law)?
+    else {
+        return None;
+    };
+    match domain.as_ref() {
+        Type::Scalar(ScalarType::Real) => {}
+        Type::Array { elem, .. } if elem.as_ref() == &Type::Scalar(ScalarType::Real) => {}
+        _ => return None,
+    }
+    if let Some(restriction) = restriction {
+        let explicit = set_support(b, restriction)?;
+        let domain = intersect_coordinates(explicit, inferred)?;
+        return coordinate_node(b, &domain);
+    }
+    // Keep dense matrix shapes rather than rebuilding the nested ValueSet as
+    // nested array types. The correlation chart is handled by the query host.
+    if let Type::Array { shape, .. } = domain.as_ref()
+        && shape.len() != 1
+    {
+        return Some(fallback);
+    }
+    let support = composed_support(b, law, inferred)?;
+    coordinate_node(b, &support)
+}
+
+fn set_support(b: &mut Builder<'_>, set: NodeId) -> Option<ValueSet> {
+    let probe = b.call("elementof", &[set]);
+    flatppl_infer::infer_expression_support(b.m, probe).map(|(_, support)| support)
+}
+
+/// Affine and normalized measure composition can hide a static interval in
+/// the general inferencer. Recover it from the fitted prior without changing
+/// the measure or its density. Dynamic or singular supports have no chart here.
+fn composed_support(b: &mut Builder<'_>, law: NodeId, inferred: ValueSet) -> Option<ValueSet> {
+    let Node::Call(call) = b.m.node(law).clone() else {
+        return Some(inferred);
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return Some(inferred);
+    };
+    let inner = |b: &mut Builder<'_>, law| {
+        let (_, support) = flatppl_infer::infer_expression_support(b.m, law)?;
+        composed_support(b, law, support)
+    };
+    match (b.m.resolve(head), call.args.as_ref()) {
+        ("Dirac", _) => None,
+        ("normalize", [law]) => inner(b, *law),
+        ("weighted" | "logweighted", [_, law]) => inner(b, *law),
+        ("truncate" | "restrict", [law, set]) => {
+            let restriction = set_support(b, *set)?;
+            intersect_coordinates(restriction, inner(b, *law)?)
+        }
+        ("iid", [law, n]) => {
+            let n = u32::try_from(flatppl_infer::fixed_int_value(b.m, *n)?).ok()?;
+            Some(ValueSet::CartPow(Box::new(inner(b, *law)?), Dim::Static(n)))
+        }
+        ("locscale", _) => {
+            let names = ["m", "shift", "scale"].map(|name| b.sym(name));
+            let args =
+                flatppl_core::calling::bind_call_args(b.m, &names, &call.args, &call.named, false)?;
+            let [law, shift, scale] = args.as_slice() else {
+                return None;
+            };
+            let support = inner(b, *law)?;
+            if support == ValueSet::Reals {
+                return Some(support);
+            }
+            let (lo, hi) = interval_bounds(support)?;
+            let shift = crate::prior_expr::scalar(b.m, *shift)?;
+            let scale = crate::prior_expr::scalar(b.m, *scale)?;
+            let (a, c) = (shift + scale * lo, shift + scale * hi);
+            if a.is_nan() || c.is_nan() || scale == 0.0 || !scale.is_finite() {
+                return None;
+            }
+            Some(ValueSet::Interval(a.min(c), a.max(c)))
+        }
+        ("Uniform", _) if !matches!(inferred, ValueSet::Interval(_, _)) => {
+            let support = b.sym("support");
+            let args = flatppl_core::calling::bind_call_args(
+                b.m,
+                &[support],
+                &call.args,
+                &call.named,
+                false,
+            )?;
+            set_support(b, args[0])
+        }
+        _ => Some(inferred),
+    }
+}
+
+fn interval_bounds(set: ValueSet) -> Option<(f64, f64)> {
+    use ValueSet::*;
+    match set {
+        Reals => Some((f64::NEG_INFINITY, f64::INFINITY)),
+        PosReals | NonNegReals => Some((0.0, f64::INFINITY)),
+        UnitInterval => Some((0.0, 1.0)),
+        Interval(lo, hi) => Some((lo, hi)),
+        _ => None,
+    }
+}
+
+fn intersect_coordinates(left: ValueSet, right: ValueSet) -> Option<ValueSet> {
+    use ValueSet::*;
+    if matches!(right, Unknown | Deferred) || left.subset_of(&right) {
+        return Some(left);
+    }
+    if right.subset_of(&left) {
+        return Some(right);
+    }
+    match (left, right) {
+        (CartPow(a, n), CartPow(b, m)) if n == m => {
+            Some(CartPow(Box::new(intersect_coordinates(*a, *b)?), n))
+        }
+        (a, b) => {
+            let (a, b) = (interval_bounds(a)?, interval_bounds(b)?);
+            Some(Interval(a.0.max(b.0), a.1.min(b.1)))
+        }
+    }
+}
+
+fn coordinate_node(b: &mut Builder<'_>, set: &ValueSet) -> Option<NodeId> {
+    use ValueSet::*;
+    Some(match set {
+        Reals => b.call_head("reals"),
+        PosReals => b.call_head("posreals"),
+        NonNegReals => b.call_head("nonnegreals"),
+        UnitInterval => b.call_head("unitinterval"),
+        Interval(lo, hi) if lo < hi => {
+            let lo = b.lit_real(*lo);
+            let hi = b.lit_real(*hi);
+            b.call("interval", &[lo, hi])
+        }
+        CartPow(of, Dim::Static(n)) => {
+            let of = coordinate_node(b, of)?;
+            let n = b.lit_int(i64::from(*n));
+            b.call("cartpow", &[of, n])
+        }
+        StdSimplex(Dim::Static(n)) | Ordered(Dim::Static(n)) | ZeroSum(Dim::Static(n)) => {
+            let name = match set {
+                StdSimplex(_) => "stdsimplex",
+                Ordered(_) => "ordered",
+                _ => "zerosum",
+            };
+            let n = b.lit_int(i64::from(*n));
+            b.call(name, &[n])
+        }
+        _ => return None,
+    })
 }
 
 fn natural_set(b: &mut Builder<'_>, domain: &Type) -> NodeId {

@@ -98,6 +98,8 @@ pub struct GroupTerm {
     pub fixed: Vec<Term>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub correlated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 impl GroupTerm {
@@ -797,6 +799,21 @@ impl<'a> Parser<'a> {
                 let child = self.expression(0, depth + 1)?;
                 let inner = if let Token::Bar(independent) = self.peek() {
                     self.at += 1;
+                    let id = match (self.peek(), self.tokens.get(self.at + 1)) {
+                        (Token::Name(label) | Token::String(label), Some(Token::Bar(false)))
+                            if !independent && !label.is_empty() =>
+                        {
+                            self.at += 2;
+                            Some(label.to_owned())
+                        }
+                        (Token::Number(label), Some(Token::Bar(false)))
+                            if !independent && label.is_finite() =>
+                        {
+                            self.at += 2;
+                            Some(label.to_string())
+                        }
+                        _ => None,
+                    };
                     let grouping = self.expression(0, depth + 1)?;
                     let mut group_order = Vec::new();
                     grouping_columns(&grouping, &self.atoms, &mut group_order)?;
@@ -831,6 +848,7 @@ impl<'a> Parser<'a> {
                                 fixed: fixed.clone(),
                                 expressions: expressions.clone(),
                                 correlated: !independent,
+                                id: id.clone(),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;

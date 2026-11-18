@@ -11,7 +11,7 @@ pub(super) fn sample(
         return normal(e, params);
     }
 
-    let ty = lane_type(e);
+    let ty = sample_lane_type(e);
     let zero = e.constant(0.0, ty.clone());
     let one = e.scalar(1.0);
     let infinity = e.scalar(f64::INFINITY);
@@ -22,8 +22,8 @@ pub(super) fn sample(
         law,
         RestrictedSample::HurdlePoisson | RestrictedSample::HurdleNegativeBinomial
     ) {
-        let zero_weight = param(e, params, "zero_weight", &ty)?;
-        let positive_weight = param(e, params, "positive_weight", &ty)?;
+        let zero_weight = sample_param(e, params, "zero_weight", ElemKind::Real, &ty)?;
+        let positive_weight = sample_param(e, params, "positive_weight", ElemKind::Real, &ty)?;
         let zero_valid = e.compare("GE", &zero_weight, &zero);
         let positive_valid = e.compare("GE", &positive_weight, &zero);
         let scale = e.max(&zero_weight, &positive_weight);
@@ -45,7 +45,7 @@ pub(super) fn sample(
 
     let (draw, valid) = match law {
         RestrictedSample::PositivePoisson | RestrictedSample::HurdlePoisson => {
-            let rate = param(e, params, "rate", &ty)?;
+            let rate = sample_param(e, params, "rate", ElemKind::Real, &ty)?;
             let positive = e.compare("GT", &rate, &zero);
             let finite = e.compare("LT", &rate, &infinity);
             let valid = e.and(&positive, &finite);
@@ -54,8 +54,8 @@ pub(super) fn sample(
             (positive_poisson(e, &rate), valid)
         }
         RestrictedSample::PositiveNegativeBinomial | RestrictedSample::HurdleNegativeBinomial => {
-            let alpha = param(e, params, "alpha", &ty)?;
-            let beta = param(e, params, "beta", &ty)?;
+            let alpha = sample_param(e, params, "alpha", ElemKind::Real, &ty)?;
+            let beta = sample_param(e, params, "beta", ElemKind::Real, &ty)?;
             let alpha_positive = e.compare("GT", &alpha, &zero);
             let beta_positive = e.compare("GT", &beta, &zero);
             let alpha_finite = e.compare("LT", &alpha, &infinity);
@@ -86,22 +86,6 @@ pub(super) fn sample(
     e.record_parameter_validity(&valid);
     let invalid = e.scalar(-1.0);
     Ok(e.select(&valid, &draw, &invalid))
-}
-
-fn lane_type(e: &Emitter) -> MlirTy {
-    e.batch_shape().map_or(MlirTy::Scalar, |dims| {
-        MlirTy::Ranked(dims.into_iter().map(Some).collect())
-    })
-}
-
-fn param(e: &mut Emitter, params: &Params, name: &str, ty: &MlirTy) -> Result<Value, EmitError> {
-    let value = params.get(e, name)?;
-    let value = e.convert(&value, ElemKind::Real);
-    if value.ty == MlirTy::Scalar && *ty != MlirTy::Scalar {
-        Ok(e.broadcast_in_dim(&value, &[], ty.clone()))
-    } else {
-        Ok(value)
-    }
 }
 
 /// The quantile of an exponential of rate one, cut off at `end`.
@@ -241,11 +225,11 @@ fn logarithmic(e: &mut Emitter, log_success: &Value) -> Value {
 }
 
 fn normal(e: &mut Emitter, params: &Params) -> Result<Value, EmitError> {
-    let ty = lane_type(e);
-    let mu = param(e, params, "mu", &ty)?;
-    let sigma = param(e, params, "sigma", &ty)?;
-    let lo = param(e, params, "lower", &ty)?;
-    let hi = param(e, params, "upper", &ty)?;
+    let ty = sample_lane_type(e);
+    let mu = sample_param(e, params, "mu", ElemKind::Real, &ty)?;
+    let sigma = sample_param(e, params, "sigma", ElemKind::Real, &ty)?;
+    let lo = sample_param(e, params, "lower", ElemKind::Real, &ty)?;
+    let hi = sample_param(e, params, "upper", ElemKind::Real, &ty)?;
     let zero = e.constant(0.0, ty.clone());
     let one = e.scalar(1.0);
     let infinity = e.scalar(f64::INFINITY);
@@ -342,32 +326,4 @@ fn normal(e: &mut Emitter, params: &Params) -> Result<Value, EmitError> {
     let drawn = e.min(&hi, &drawn);
     let undefined = e.scalar(f64::NAN);
     Ok(e.select(&valid, &drawn, &undefined))
-}
-
-fn rejection_draw(
-    e: &mut Emitter,
-    done: Value,
-    initial: Value,
-    proposal: impl FnOnce(&mut Emitter, &Value) -> (Value, Value),
-) -> Value {
-    let types = [
-        done.ty.render(e.dtype(), ElemKind::Bool),
-        initial.ty.render(e.dtype(), ElemKind::Real),
-        MlirTy::Key.render(e.dtype(), ElemKind::Real),
-    ];
-    let results = e.while_loop(
-        &[done, initial, e.cur_key()],
-        &types,
-        |e, args| poisson_pending(e, &args[0]),
-        |e, args| {
-            e.set_cur_key(args[2].clone());
-            let (draw, accepted) = proposal(e, &args[0]);
-            let accepted_draw = e.select(&accepted, &draw, &args[1]);
-            let draw = e.select(&args[0], &args[1], &accepted_draw);
-            let done = e.or(&args[0], &accepted);
-            vec![done, draw, e.cur_key()]
-        },
-    );
-    e.set_cur_key(results[2].clone());
-    results[1].clone()
 }

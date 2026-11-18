@@ -1,6 +1,6 @@
 use crate::{Error, Result, emit::broadcast};
 use flatppl_convert::Builder;
-use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
+use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs, Scalar};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -391,7 +391,18 @@ impl Family {
             Self::Bernoulli => apply(b, "Bernoulli", &[mu]),
             Self::Binomial => {
                 let n = trials.expect("binomial trials were validated");
-                apply(b, "Binomial", &[n, mu])
+                if matches!(b.m.node(n), Node::Lit(Scalar::Int(n)) if *n > 0) {
+                    return apply(b, "Binomial", &[n, mu]);
+                }
+                // Formula trials may be zero. Binomial(1, 0) is the zero
+                // atom and keeps the primitive's trial count positive.
+                let one = b.lit_int(1);
+                let zero = b.lit_int(0);
+                let no_trials = apply(b, "equal", &[n, zero]);
+                let trials = apply(b, "max", &[n, one]);
+                let zero = b.lit_real(0.0);
+                let probability = apply(b, "ifelse", &[no_trials, zero, mu]);
+                apply(b, "Binomial", &[trials, probability])
             }
             Self::Poisson => apply(b, "Poisson", &[mu]),
             Self::HurdlePoisson

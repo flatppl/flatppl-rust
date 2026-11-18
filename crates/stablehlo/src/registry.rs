@@ -18,6 +18,7 @@ use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 mod bessel;
+mod circular;
 mod hep;
 mod regression;
 mod regression_broadcast;
@@ -234,7 +235,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "VonMises",
         DistLowering {
             logpdf: von_mises_logpdf,
-            sample: None,
+            sample: Some(circular::von_mises_sample),
             touniform: None,
             broadcast: Broadcast::Elementwise,
         },
@@ -1167,12 +1168,10 @@ pub(crate) fn lower_sample(
     let restricted = RestrictedSample::from_tag(&ctor_name);
     let base = restricted.map_or(ctor_name.as_str(), |sample| sample.constructor());
     if broadcasted
-        && (ctor_name == "Binomial"
-            || !flatppl_infer::distribution_param_ranks(base)
-                .is_some_and(|ranks| ranks.iter().all(|&rank| rank == 0)))
+        && !flatppl_infer::distribution_param_ranks(base)
+            .is_some_and(|ranks| ranks.iter().all(|&rank| rank == 0))
     {
-        // Vector parameters own event axes; Binomial owns an inner trial axis.
-        // Neither is an elementwise scalar-parameter sampler.
+        // Vector parameters own event axes and need a dedicated lowering.
         return Err(EmitError::at(
             id,
             format!("broadcast sampling for '{ctor_name}' is not yet supported"),
@@ -1240,9 +1239,8 @@ pub(crate) fn lower_sample(
         shape.extend_from_slice(&dims[1..]);
         value = e.reshape(&value, MlirTy::Ranked(shape));
     }
-    // §08 gives every discrete distribution the domain `integers`, so the drawn
-    // value is integer-typed. The samplers count in reals, which hold these
-    // integers exactly.
+    // §08 gives discrete distributions the domain `integers`. Some samplers
+    // count in reals, so convert the result to the inferred outcome kind.
     if let Some(Type::Tuple(parts)) = e.type_of(id)
         && let Some(variate) = parts.first()
         && let Ok((_, elem)) = crate::types::mlir_type_of_ty(id, variate, e.dtype())
@@ -1381,6 +1379,8 @@ const FANOUT_SAFE: &[&str] = &[
     "Poisson",
     "NegativeBinomial",
     "NegativeBinomial2",
+    // Batched circular rejection.
+    "VonMises",
     // Scalar HEP laws: analytic transforms, bracketed inversion, or masked rejection.
     "CrystalBall",
     "DoubleSidedCrystalBall",
@@ -2038,9 +2038,8 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // limitation as Gamma/InverseGamma/ChiSquared above; GeneralizedNormal needs
 // rejection sampling), so Task 15 gives all three a rejection-based `@sample`
 // builder on the shared Marsaglia–Tsang [`draw_gamma`] core (see the Task-15
-// batch at the end of this file). VonMises also needs rejection sampling
-// (e.g. Best & Fisher) but is not part of Task 15's batch — it stays
-// `sample: None` for a later task.
+// batch at the end of this file). The VonMises sampler uses bounded-period
+// rejection with a wrapped Cauchy envelope at higher concentrations.
 
 /// The `(lo, hi)` bounds of a support `S`, when `S` is a closed-form
 /// measurable interval: a plain `ValueSet::Interval(lo, hi)` with finite,
@@ -2280,8 +2279,7 @@ fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
 /// §08 VonMises, verbatim: `log f = kappa * cos(x - mu) - log(2 * pi) -
 /// log(I_0(kappa))`. `log(I_0(kappa))` is [`log_bessel_i0`]'s inlined
 /// approximation (no `chlo.bessel_i0e` op exists — see the batch doc
-/// comment). No `@sample` builder yet (`sample: None`) — needs rejection
-/// sampling (e.g. Best & Fisher's algorithm); a later task lands its sampler.
+/// comment).
 fn von_mises_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let kappa = p.get(e, "kappa")?;
@@ -4796,7 +4794,9 @@ fn categorical0_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> 
     draw_categorical(e, p, 0.0)
 }
 
-/// §08 Binomial's sampler, verbatim: `sum of n Bernoulli(p)` —
+/// Binomial draws sum independent Bernoulli trials. The broadcast lowering
+/// keeps row-specific trial counts out of the tensor shape. For scalar and
+/// IID draws with fixed `n`, use a single uniform tensor and
 /// `reduce_sum(select(U < p, 1, 0))` over a length-`n` uniform batch, exact
 /// (not an approximation). `n` must be a FIXED-phase positive-integer literal
 /// (read via [`literal_fixed_positive_int`], the same helper LKJ's `n` uses):
@@ -4820,6 +4820,9 @@ fn categorical0_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> 
 /// restored to the `[m]` `lower_sample` set (so the recorded advanced key sees
 /// the fan-out shape). The scalar path (`batch_shape = None`) is unchanged.
 fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    if p.sample_shape.is_some() {
+        return binomial_row_sample(e, p);
+    }
     let n = literal_fixed_positive_int(e, p, "n", "Binomial", "sample")?;
     let prob = p.get(e, "p")?;
 
@@ -4862,6 +4865,61 @@ fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     }
 }
 
+/// Take one Bernoulli trial in every unfinished row per iteration. Integer
+/// loop values preserve both the trial count and the answer at ABI precision.
+fn binomial_row_sample(e: &mut Emitter, params: &Params) -> Result<Value, EmitError> {
+    let ty = sample_lane_type(e);
+    let n = sample_param(e, params, "n", ElemKind::Int, &ty)?;
+    let p = sample_param(e, params, "p", ElemKind::Real, &ty)?;
+    let zero = e.int_value_const(0);
+    let one = e.int_value_const(1);
+    let real_zero = e.scalar(0.0);
+    let real_one = e.scalar(1.0);
+    let count_valid = e.compare("GT", &n, &zero);
+    let nonnegative = e.compare("GE", &p, &real_zero);
+    let at_most_one = e.compare("LE", &p, &real_one);
+    let probability_valid = e.and(&nonnegative, &at_most_one);
+    let valid = e.and(&count_valid, &probability_valid);
+    e.record_parameter_validity(&valid);
+
+    let certain = e.compare("EQ", &p, &real_one);
+    let impossible = e.compare("EQ", &p, &real_zero);
+    let deterministic = e.or(&certain, &impossible);
+    let random = e.not(&deterministic);
+    let active = e.and(&valid, &random);
+    let remaining = e.select(&active, &n, &zero);
+    let certain = e.and(&valid, &certain);
+    let successes = e.select(&certain, &n, &zero);
+    let int_ty = ty.render(e.dtype(), ElemKind::Int);
+    let result = e.while_loop(
+        &[remaining, successes, e.cur_key()],
+        &[
+            int_ty.clone(),
+            int_ty,
+            MlirTy::Key.render(e.dtype(), ElemKind::Real),
+        ],
+        |e, args| {
+            let done = e.compare("EQ", &args[0], &zero);
+            poisson_pending(e, &done)
+        },
+        |e, args| {
+            e.set_cur_key(args[2].clone());
+            let active = e.compare("GT", &args[0], &zero);
+            let u = e.rng("UNIFORM", &ty);
+            let success = e.compare("LT", &u, &p);
+            let success = e.and(&active, &success);
+            let increment = e.convert(&success, ElemKind::Int);
+            let successes = e.add(&args[1], &increment);
+            let remaining = e.sub(&args[0], &one);
+            let remaining = e.max(&remaining, &zero);
+            vec![remaining, successes, e.cur_key()]
+        },
+    );
+    e.set_cur_key(result[2].clone());
+    let invalid = e.int_value_const(-1);
+    Ok(e.select(&valid, &result[1], &invalid))
+}
+
 /// Knuth's waiting-time sampler below rate 10, Hörmann's PTRS above it.
 /// Both are exact sampling algorithms; neither truncates the count or retries.
 /// The key is a loop-carried value, so rejected proposals consume fresh bits.
@@ -4890,6 +4948,56 @@ fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
     let result = e.select(&small, &small_draw, &large_draw);
     let invalid = e.scalar(-1.0);
     e.select(&valid, &result, &invalid)
+}
+
+fn sample_lane_type(e: &Emitter) -> MlirTy {
+    e.batch_shape().map_or(MlirTy::Scalar, |dims| {
+        MlirTy::Ranked(dims.into_iter().map(Some).collect())
+    })
+}
+
+fn sample_param(
+    e: &mut Emitter,
+    params: &Params,
+    name: &str,
+    kind: ElemKind,
+    ty: &MlirTy,
+) -> Result<Value, EmitError> {
+    let value = params.get(e, name)?;
+    let value = e.convert(&value, kind);
+    if value.ty == MlirTy::Scalar && *ty != MlirTy::Scalar {
+        Ok(e.broadcast_in_dim(&value, &[], ty.clone()))
+    } else {
+        Ok(value)
+    }
+}
+
+fn rejection_draw(
+    e: &mut Emitter,
+    done: Value,
+    initial: Value,
+    proposal: impl FnOnce(&mut Emitter, &Value) -> (Value, Value),
+) -> Value {
+    let types = [
+        done.ty.render(e.dtype(), ElemKind::Bool),
+        initial.ty.render(e.dtype(), ElemKind::Real),
+        MlirTy::Key.render(e.dtype(), ElemKind::Real),
+    ];
+    let results = e.while_loop(
+        &[done, initial, e.cur_key()],
+        &types,
+        |e, args| poisson_pending(e, &args[0]),
+        |e, args| {
+            e.set_cur_key(args[2].clone());
+            let (draw, accepted) = proposal(e, &args[0]);
+            let accepted_draw = e.select(&accepted, &draw, &args[1]);
+            let draw = e.select(&args[0], &args[1], &accepted_draw);
+            let done = e.or(&args[0], &accepted);
+            vec![done, draw, e.cur_key()]
+        },
+    );
+    e.set_cur_key(results[2].clone());
+    results[1].clone()
 }
 
 fn poisson_pending(e: &mut Emitter, done: &Value) -> Value {

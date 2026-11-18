@@ -14,8 +14,8 @@ use pyo3::types::{PyBool, PyBytes, PyInt};
 use flatppl_host::flatppl_formula::DataMode;
 use flatppl_host::{
     Auxiliary, BatchSpec, Constant, Context, Diagnostic, Dtype, EmitOptions, FormulaModel,
-    IntegrationOptions, LoadedModule, MathFormat, Observations, PreparedFormulaPrediction,
-    PyhfOptions, Target,
+    FormulaTableSource, IntegrationOptions, LoadedModule, MathFormat, Observations,
+    PreparedFormulaPrediction, PyhfOptions, Target,
 };
 
 pyo3::create_exception!(_native, Error, PyException);
@@ -113,6 +113,19 @@ fn formula_prediction(snapshot: PreparedFormulaPrediction) -> (NativeModule, Str
         },
         metadata.to_string(),
     )
+}
+
+fn formula_table_source<'a>(
+    bytes: Option<&'a [u8]>,
+    path: Option<&'a str>,
+) -> PyResult<FormulaTableSource<'a>> {
+    match (bytes, path) {
+        (Some(bytes), None) => Ok(FormulaTableSource::Arrow(bytes)),
+        (None, Some(path)) => Ok(FormulaTableSource::Path(Path::new(path))),
+        _ => Err(PyValueError::new_err(
+            "expected either Arrow IPC bytes or a table path",
+        )),
+    }
 }
 
 #[pyclass(name = "Context", module = "flatppl._native")]
@@ -258,6 +271,25 @@ impl NativeContext {
             NativeModule { inner },
             serde_json::to_string(&rows).expect("row indices are JSON integers"),
         ))
+    }
+
+    #[pyo3(signature = (model, data_ipc, path, history_ipc, history_path, *, allow_new_levels=false))]
+    fn prepare_formula_forecast(
+        &mut self,
+        model: &NativeFormulaModel,
+        data_ipc: Option<&[u8]>,
+        path: Option<&str>,
+        history_ipc: Option<&[u8]>,
+        history_path: Option<&str>,
+        allow_new_levels: bool,
+    ) -> PyResult<(NativeModule, String)> {
+        let data = formula_table_source(data_ipc, path)?;
+        let history = formula_table_source(history_ipc, history_path)?;
+        model
+            .inner
+            .prepare_forecast(&mut self.inner, data, history, allow_new_levels)
+            .map(formula_prediction)
+            .map_err(error)
     }
 
     fn load(&mut self, path: &str) -> PyResult<NativeModule> {

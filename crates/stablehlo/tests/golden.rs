@@ -5186,35 +5186,76 @@ fn builtin_sample_refuses_unregistered_ctor() {
     assert_eq!(err.node, Some(node));
 }
 
-/// `builtin_sample(rng, VonMises, kernel_input)` — `VonMises` IS registered
-/// (Task 10's `@logdensity` builder) but has no `@sample` builder yet
-/// (`sample: None`: VonMises needs a dedicated rejection sampler, e.g. Best &
-/// Fisher — Task 15's rejection batch covers Gamma/Beta/ChiSquared/StudentT/
-/// InverseGamma/GeneralizedNormal + Dirichlet, but not VonMises) — must refuse
-/// with `lower_sample`'s OWN sample-specific message, `"no @sample lowering
-/// for '{ctor}'"` (`dist.sample.ok_or_else`), distinct from the
-/// unregistered-ctor message above. This arm stays reachable via any of the
-/// registry's still-`sample: None` entries (originally exercised via `Cauchy`,
-/// before Task 14 gave Cauchy a sampler; then `Gamma`, before Task 15 gave the
-/// rejection batch theirs).
+/// A registered density without a sampler gets the sample-specific diagnostic.
 #[test]
 fn builtin_sample_refuses_registered_ctor_without_sample_builder() {
     let mut m = Module::new();
     let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
-    let ctor = const_node(&mut m, "VonMises");
-    let mu = real(&mut m, 0.0);
-    let kappa = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("mu", mu), ("kappa", kappa)]);
+    let ctor = const_node(&mut m, "Wishart");
+    let kernel_input = record_node(&mut m, &[]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
     let mut e = unrestricted_emitter(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
-        err.msg.contains("no @sample lowering for 'VonMises'"),
+        err.msg.contains("no @sample lowering for 'Wishart'"),
         "unexpected message: {}",
         err.msg
     );
     assert_eq!(err.node, Some(node));
+}
+
+#[test]
+fn von_mises_sample_fans_out_and_threads_rng() {
+    let src = "\
+mu = external(reals)
+kappa = external(posreals)
+angles, next = rand(iid(VonMises(mu, kappa), [2, 3]), rnginit(89))
+follow, _ = rand(VonMises(mu, kappa), next)
+inputs = (mu, kappa)
+outputs = (angles, follow)";
+    let d = determinize_ungated(src);
+    let result = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &unrestricted_options(),
+    )
+    .unwrap();
+    assert!(
+        result.contains("-> (tensor<2x3xf32>, tensor<f32>"),
+        "{result}"
+    );
+    assert_eq!(result.matches("stablehlo.while").count(), 2);
+}
+
+#[test]
+fn zero_inflated_binomial_sample_accepts_row_counts_and_probabilities() {
+    let src = "\
+n = external(cartpow(posintegers, [2, 3]))
+p = external(cartpow(unitinterval, [2, 3]))
+zi = external(unitinterval)
+law(n, p, zi) = normalize(superpose(weighted(zi, Dirac(0)), weighted(1 - zi, Binomial(n, p))))
+counts, next = rand(law.(n, p, zi), rnginit(29))
+follow, _ = rand(Normal(0, 1), next)
+inputs = (n, p, zi)
+outputs = (counts, follow)";
+    let d = determinize_ungated(src);
+    for (dtype, bits) in [(Dtype::F32, 32), (Dtype::F64, 64)] {
+        let result = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions {
+                dtype,
+                ..unrestricted_options()
+            },
+        )
+        .unwrap();
+        assert!(
+            result.contains(&format!("-> (tensor<2x3xi{bits}>, tensor<f{bits}>")),
+            "{result}"
+        );
+        assert_eq!(result.matches("stablehlo.while").count(), 1);
+    }
 }
 
 /// `builtin_sample`'s ctor must be a bare `Const` distribution constructor
@@ -6825,8 +6866,8 @@ outputs = (lp)
 // `registry.rs`'s "gamma-family"/"location-scale"/"remaining univariate"
 // batches a straight-line inverse-CDF or reparameterization `@sample`
 // builder (Gamma/InverseGamma/ChiSquared/Beta/StudentT/GeneralizedNormal/
-// VonMises stay `sample: None` — no closed-form inverse-CDF, or need
-// rejection sampling — see each batch's own doc comment); MvNormal gets
+// VonMises use rejection sampling — see each batch's own doc comment);
+// MvNormal gets
 // `mu + cholesky(cov) @ z`. Same anchor-fixture shape as `NORMAL_SAMPLE_SRC`
 // above: FIXED (literal, not `elementof`) hyperparameters via `s =
 // rnginit(0)`/`draw(...)`/`rand(lawof(x), s)`, so every `func.func @sample`

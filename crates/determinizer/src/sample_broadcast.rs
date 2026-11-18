@@ -327,7 +327,7 @@ fn zero_atom_mixture(m: &mut Module, measure: NodeId) -> Option<ZeroAtomMixture>
         else {
             return None;
         };
-        Some((resolve_ref(m, weight).0, resolve_ref(m, law).0))
+        Some((weight, resolve_ref(m, law).0))
     };
     let (weight, dirac) = component(first)?;
     if crate::density::weight_is_variate_dependent(m, weight) {
@@ -341,15 +341,17 @@ fn zero_atom_mixture(m: &mut Module, measure: NodeId) -> Option<ZeroAtomMixture>
     if !matches!(m.node(atom), Node::Lit(Scalar::Int(0) | Scalar::Real(0.0))) {
         return None;
     }
-    let [one, probability] = *expect_builtin_call(m, complement, "sub")?.args else {
+    let [one, probability] = *expect_builtin_call(m, resolve_ref(m, complement).0, "sub")?.args
+    else {
         return None;
     };
+    let resolved_weight = resolve_ref(m, weight).0;
     let probability = resolve_ref(m, probability).0;
     // A reference can be duplicated by inlining without duplicating its value.
     // Separate but identical stochastic expressions need not be the same draw.
-    let same_weight = weight == probability
-        || matches!(m.node(weight), Node::Ref(_) | Node::Lit(_))
-            && m.structural_eq(weight, probability);
+    let same_weight = resolved_weight == probability
+        || matches!(m.node(resolved_weight), Node::Ref(_) | Node::Lit(_))
+            && m.structural_eq(resolved_weight, probability);
     if crate::density::static_real(m, one) != Some(1.0) || !same_weight {
         return None;
     }
