@@ -598,14 +598,17 @@ fn negative_binomial_success(
     build_call(m, "ifelse", &[large, scaled, ordinary])
 }
 
-fn log1mexp(m: &mut Module, x: NodeId) -> NodeId {
+pub(super) fn log1mexp(m: &mut Module, x: NodeId) -> NodeId {
     let cutoff = real(m, -std::f64::consts::LN_2);
     let near_zero = build_call(m, "gt", &[x, cutoff]);
-    let near_x = build_call(m, "ifelse", &[near_zero, x, cutoff]);
+    // Using the cutoff as the inactive input turns the select into min or
+    // max, which can drop the chosen input's derivative at the exact tie.
+    let inactive = real(m, -1.0);
+    let near_x = build_call(m, "ifelse", &[near_zero, x, inactive]);
     let expm1 = build_call(m, "expm1", &[near_x]);
     let negative = build_call(m, "neg", &[expm1]);
     let near = build_call(m, "log", &[negative]);
-    let far_x = build_call(m, "ifelse", &[near_zero, cutoff, x]);
+    let far_x = build_call(m, "ifelse", &[near_zero, inactive, x]);
     let exp = build_call(m, "exp", &[far_x]);
     let negative = build_call(m, "neg", &[exp]);
     let far = build_call(m, "log1p", &[negative]);

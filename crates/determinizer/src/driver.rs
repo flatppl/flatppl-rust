@@ -370,6 +370,8 @@ fn find_op_node_in_scope(
             || (density_queries
                 && crate::density::broadcast_query_head(m, id)
                     .is_some_and(|head| ops.contains(&m.resolve(head))))
+            || (ops.contains(&"totalmass")
+                && crate::density::integral::log_normal_interval_query(m, id).is_some())
     })
 }
 
@@ -617,6 +619,14 @@ fn apply_rule(
     if let Some(query) = crate::density::lower_broadcast_query(m, target_node) {
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, query);
         m.set_binding_rhs(bid, rhs);
+        return Ok(());
+    }
+
+    if let Some(interval) = crate::density::integral::log_normal_interval_query(m, target_node) {
+        let root = crate::density::build_call(m, flatppl_core::LOG_INTERVAL_MASS, &interval);
+        let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, root);
+        m.set_binding_rhs(bid, rhs);
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 

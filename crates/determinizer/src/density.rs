@@ -8062,6 +8062,11 @@ pub(crate) fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<N
         return Some(mass);
     }
 
+    if let Some(interval) = integral::normal_interval(m, node) {
+        let log_mass = build_call(m, flatppl_core::LOG_INTERVAL_MASS, &interval);
+        return Some(build_call(m, "exp", &[log_mass]));
+    }
+
     if let Some((w, base)) = expect_builtin_call(m, node, "weighted")
         .filter(|c| c.args.len() == 2)
         .map(|c| (c.args[0], c.args[1]))

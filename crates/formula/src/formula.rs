@@ -1,4 +1,4 @@
-use crate::{Arithmetic, ColumnExpression, Error, Result};
+use crate::{Arithmetic, Censoring, ColumnExpression, Error, Result, Truncation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -11,6 +11,10 @@ pub struct Formula {
     pub weights: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub se: Option<StandardError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censoring: Option<Censoring>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Truncation>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
@@ -108,7 +112,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let (response, rhs) = text
         .split_once('~')
         .ok_or_else(|| Error("formula must contain `response ~ terms`".into()))?;
-    let (response, trials, weights, se) = response_additions(response)?;
+    let (response, additions) = response_additions(response)?;
     let mut parser = Parser {
         tokens: tokenize(rhs)?,
         at: 0,
@@ -170,9 +174,11 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     }
     let formula = Formula {
         response,
-        trials,
-        weights,
-        se,
+        trials: additions.trials,
+        weights: additions.weights,
+        se: additions.se,
+        censoring: additions.censoring,
+        truncation: additions.truncation,
         intercept,
         variables,
         fixed,
@@ -251,23 +257,23 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     (variables, fixed, expressions)
 }
 
-type ResponseAdditions = (
-    String,
-    Option<Trials>,
-    Option<String>,
-    Option<StandardError>,
-);
+#[derive(Default)]
+struct ResponseAdditions {
+    trials: Option<Trials>,
+    weights: Option<String>,
+    se: Option<StandardError>,
+    censoring: Option<Censoring>,
+    truncation: Option<Truncation>,
+}
 
-fn response_additions(text: &str) -> Result<ResponseAdditions> {
+fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
+    let mut additions = ResponseAdditions::default();
     let Some((response, addition)) = text.split_once('|') else {
-        return Ok((name(text.trim())?, None, None, None));
+        return Ok((name(text.trim())?, additions));
     };
     let fail = || {
-        Error("response additions support `trials(...)`, `weights(column)` and `se(..., sigma=FALSE)`".into())
+        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)` and `trunc(...)`".into())
     };
-    let mut trials = None;
-    let mut weights = None;
-    let mut se = None;
     let mut depth = 0i32;
     for addition in addition.split(|c| {
         match c {
@@ -289,29 +295,43 @@ fn response_additions(text: &str) -> Result<ResponseAdditions> {
                 } else {
                     Trials::Column(name(argument).map_err(|_| fail())?)
                 };
-                if trials.as_ref().is_some_and(|previous| previous != &value) {
+                if additions
+                    .trials
+                    .as_ref()
+                    .is_some_and(|previous| previous != &value)
+                {
                     return Err(Error("conflicting trials additions".into()));
                 }
-                trials = Some(value);
+                additions.trials = Some(value);
             }
             "weights" => {
                 let value = name(argument).map_err(|_| fail())?;
-                if weights.as_ref().is_some_and(|previous| previous != &value) {
+                if additions
+                    .weights
+                    .as_ref()
+                    .is_some_and(|previous| previous != &value)
+                {
                     return Err(Error("conflicting weights additions".into()));
                 }
-                weights = Some(value);
+                additions.weights = Some(value);
             }
             "se" => {
                 let value = standard_error(argument)?;
-                if se.as_ref().is_some_and(|old| *old != value) {
+                if additions.se.as_ref().is_some_and(|old| *old != value) {
                     return Err(Error("conflicting se additions".into()));
                 }
-                se = Some(value);
+                additions.se = Some(value);
+            }
+            "cens" if additions.censoring.is_none() => {
+                additions.censoring = Some(Censoring::parse(argument)?);
+            }
+            "trunc" if additions.truncation.is_none() => {
+                additions.truncation = Some(Truncation::parse(argument)?);
             }
             _ => return Err(fail()),
         }
     }
-    Ok((name(response.trim())?, trials, weights, se))
+    Ok((name(response.trim())?, additions))
 }
 
 fn standard_error(text: &str) -> Result<StandardError> {
@@ -861,6 +881,14 @@ fn column_expression(expr: &Expr, atoms: &[Atom]) -> Result<ColumnExpression> {
 }
 
 impl Formula {
+    pub(crate) fn has_response_additions(&self) -> bool {
+        self.trials.is_some()
+            || self.weights.is_some()
+            || self.se.is_some()
+            || self.censoring.is_some()
+            || self.truncation.is_some()
+    }
+
     pub(crate) fn uses_intercept_column(&self) -> bool {
         self.expressions
             .values()
@@ -955,7 +983,7 @@ fn union_all(terms: &Terms) -> Vec<usize> {
     out
 }
 
-fn name(text: &str) -> Result<String> {
+pub(crate) fn name(text: &str) -> Result<String> {
     let valid = text.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && text
             .chars()

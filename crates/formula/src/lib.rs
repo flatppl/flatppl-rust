@@ -19,6 +19,7 @@ mod ordinal;
 mod prior_expr;
 mod prior_model;
 mod priors;
+mod response;
 mod splines;
 mod text;
 
@@ -36,6 +37,7 @@ pub use formula::{Formula, GroupTerm, SmoothTerm, StandardError, Term, Trials, p
 pub use monotonic::Monotonic;
 pub use nonlinear::NonlinearPredictor;
 pub use priors::{Prior, PriorBound, Priors, ResolvedPrior};
+pub use response::{Censoring, Truncation, TruncationBound};
 pub use splines::{Smooth, ThinPlate};
 pub use text::{read_csv_table, read_json_table};
 
@@ -388,6 +390,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "`se(...)` is available for Gaussian and Student families".into(),
         ));
     }
+    if (formula.censoring.is_some() || formula.truncation.is_some()) && family != Family::Gaussian {
+        return Err(Error(
+            "`cens(...)` and `trunc(...)` are available for Gaussian responses".into(),
+        ));
+    }
     if family.uses_trials() != formula.trials.is_some() {
         return Err(Error(
             "`trials(...)` is required for binomial families and is unavailable for other families"
@@ -417,11 +424,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     for (name, spec) in &spec.dpars {
         let formula = parse_formula(&spec.formula)?;
-        if formula.response != *name
-            || formula.trials.is_some()
-            || formula.weights.is_some()
-            || formula.se.is_some()
-        {
+        if formula.response != *name || formula.has_response_additions() {
             return Err(Error(format!(
                 "distributional formula must be `{name} ~ terms` without response additions"
             )));
@@ -450,11 +453,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     }
     for (name, text) in &spec.nlpars {
         let formula = parse_formula(text)?;
-        if formula.response != *name
-            || formula.trials.is_some()
-            || formula.weights.is_some()
-            || formula.se.is_some()
-        {
+        if formula.response != *name || formula.has_response_additions() {
             return Err(Error(format!(
                 "nonlinear parameter formula must be `{name} ~ terms` without response additions"
             )));

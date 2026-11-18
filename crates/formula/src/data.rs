@@ -321,6 +321,15 @@ pub(crate) fn model_rows(
                 .flatten(),
         )
         .chain(se_columns)
+        .chain(
+            formula
+                .truncation
+                .iter()
+                .flat_map(crate::Truncation::columns),
+        )
+        .chain(formula.censoring.iter().filter_map(|censoring| {
+            (mode == DataMode::Training).then_some(censoring.code.as_str())
+        }))
         .chain(extra_columns.iter().map(String::as_str))
         .chain((mode == DataMode::Training).then_some(formula.response.as_str()));
     let columns = names
@@ -418,6 +427,7 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
         }
         constants.insert("se_data".into(), values);
     }
+    crate::response::prepare(&recipe.formula, table, &rows, mode, &mut constants)?;
     Ok(DataDocument { constants, rows })
 }
 

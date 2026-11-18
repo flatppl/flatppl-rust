@@ -3,6 +3,31 @@
 
 use super::*;
 
+pub(crate) fn normal_interval(m: &Module, measure: NodeId) -> Option<[NodeId; 3]> {
+    let (measure, _) = resolve_ref(m, measure);
+    let truncate = expect_builtin_call(m, measure, "truncate")?;
+    let [base, set] = *truncate.args else {
+        return None;
+    };
+    let (base, _) = resolve_ref(m, base);
+    expect_builtin_call(m, base, "Normal")?;
+    let (set, _) = resolve_ref(m, set);
+    let [lo, hi] = *expect_builtin_call(m, set, "interval")?.args else {
+        return None;
+    };
+    Some([base, lo, hi])
+}
+
+pub(crate) fn log_normal_interval_query(m: &Module, node: NodeId) -> Option<[NodeId; 3]> {
+    let [mass] = *expect_builtin_call(m, node, "log")?.args else {
+        return None;
+    };
+    let [measure] = *expect_builtin_call(m, mass, "totalmass")?.args else {
+        return None;
+    };
+    normal_interval(m, measure)
+}
+
 fn point(m: &mut Module) -> NodeId {
     let token = m.alloc(Node::Lit(Scalar::Int(m.node_count() as i64)));
     let point = build_call(m, flatppl_core::INTEGRATION_POINT, &[token]);
@@ -480,6 +505,16 @@ pub(crate) fn lower_interval_mass(
         unreachable!("kernel_and_input returns a constructor tag");
     };
     let ctor = *ctor;
+    if m.resolve(ctor) == "Normal" && options.retains("special-functions", "log_ndtr") {
+        let (mu, sigma) = (find_field(m, input, "mu"), find_field(m, input, "sigma"));
+        if let (Some(mu), Some(sigma)) = (mu, sigma) {
+            // Keep the distribution's parameter checks before replacing its
+            // CDF difference with a log-space calculation.
+            let witness = build_touniform(m, kernel, input, mu);
+            let valid = build_call(m, "isfinite", &[witness]);
+            return Ok(normal_log_mass(m, mu, sigma, lo, hi, valid));
+        }
+    }
     if m.resolve(ctor) == "Gamma"
         && static_real(m, hi) == Some(f64::INFINITY)
         && let Some(log_mass) = erlang_log_survival(m, input, lo)
@@ -552,6 +587,131 @@ pub(crate) fn lower_interval_mass(
     // An empty intersection has exactly zero mass. Keep log's argument valid
     // before AD so its unused derivative cannot introduce 0/0 into a zero bin.
     Ok(log_nonnegative_mass(m, z))
+}
+
+fn normal_log_mass(
+    m: &mut Module,
+    mu: NodeId,
+    sigma: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+    valid: NodeId,
+) -> NodeId {
+    let real = |m: &mut Module, value| m.alloc(Node::Lit(Scalar::Real(value)));
+    let zero = real(m, 0.0);
+    let one = real(m, 1.0);
+    let positive_scale = build_call(m, "gt", &[sigma, zero]);
+    let finite_scale = build_call(m, "isfinite", &[sigma]);
+    let positive_scale = build_call(m, "land", &[positive_scale, finite_scale]);
+    let valid = build_call(m, "land", &[valid, positive_scale]);
+    let mu = build_call(m, "ifelse", &[valid, mu, zero]);
+    let sigma = build_call(m, "ifelse", &[valid, sigma, one]);
+    let log_ndtr = normal_log_cdf_member(m);
+    let apply = |m: &mut Module, x| {
+        let nan = build_call(m, "isnan", &[x]);
+        let safe = build_call(m, "ifelse", &[nan, zero, x]);
+        m.alloc(Node::Call(Call {
+            head: CallHead::User(log_ndtr),
+            args: Box::new([safe]),
+            named: Box::default(),
+            inputs: None,
+        }))
+    };
+    let (bound_lo, bound_hi) = (lo, hi);
+    let lo = standardized_normal_bound(m, mu, sigma, lo);
+    let hi = standardized_normal_bound(m, mu, sigma, hi);
+    let log_mass = if static_real(m, bound_lo) == Some(f64::NEG_INFINITY) {
+        apply(m, hi)
+    } else if static_real(m, bound_hi) == Some(f64::INFINITY) {
+        let reflected = build_call(m, "neg", &[lo]);
+        apply(m, reflected)
+    } else {
+        normal_log_mass_difference(m, lo, hi, apply)
+    };
+    let nan_lo = build_call(m, "isnan", &[bound_lo]);
+    let nan_hi = build_call(m, "isnan", &[bound_hi]);
+    let nan_bound = build_call(m, "lor", &[nan_lo, nan_hi]);
+    let valid_bounds = build_call(m, "lnot", &[nan_bound]);
+    let valid = build_call(m, "land", &[valid, valid_bounds]);
+    let nan = real(m, f64::NAN);
+    build_call(m, "ifelse", &[valid, log_mass, nan])
+}
+
+fn standardized_normal_bound(m: &mut Module, mu: NodeId, sigma: NodeId, bound: NodeId) -> NodeId {
+    if static_real(m, bound).is_some_and(f64::is_infinite) {
+        return bound;
+    }
+    // Keep infinite endpoints out of location and scale arithmetic. A NaN
+    // endpoint is masked here and restored by the caller after the CDF call.
+    let finite = build_call(m, "isfinite", &[bound]);
+    let safe = build_call(m, "ifelse", &[finite, bound, mu]);
+    let difference = build_call(m, "sub", &[safe, mu]);
+    let finite_z = build_call(m, "divide", &[difference, sigma]);
+    let nan = build_call(m, "isnan", &[bound]);
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let endpoint = build_call(m, "ifelse", &[nan, zero, bound]);
+    build_call(m, "ifelse", &[finite, finite_z, endpoint])
+}
+
+fn normal_log_mass_difference(
+    m: &mut Module,
+    lo: NodeId,
+    hi: NodeId,
+    log_cdf: impl Fn(&mut Module, NodeId) -> NodeId,
+) -> NodeId {
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    let reflected = build_call(m, "gt", &[lo, zero]);
+    let neg_lo = build_call(m, "neg", &[lo]);
+    let neg_hi = build_call(m, "neg", &[hi]);
+    // Reflect positive intervals before subtraction to keep two small tails
+    // instead of two probabilities rounded to one.
+    let x = build_call(m, "ifelse", &[reflected, neg_lo, hi]);
+    let y = build_call(m, "ifelse", &[reflected, neg_hi, lo]);
+    let log_x = log_cdf(m, x);
+    let log_y = log_cdf(m, y);
+    let difference = build_call(m, "sub", &[log_y, log_x]);
+    let nonempty = build_call(m, "lt", &[difference, zero]);
+    let minus_one = m.alloc(Node::Lit(Scalar::Real(-1.0)));
+    let safe = build_call(m, "ifelse", &[nonempty, difference, minus_one]);
+    let log_ratio_complement = exponential_tilt::log1mexp(m, safe);
+    let log_mass = build_call(m, "add", &[log_x, log_ratio_complement]);
+    let neg_inf = m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)));
+    build_call(m, "ifelse", &[nonempty, log_mass, neg_inf])
+}
+
+fn normal_log_cdf_member(m: &mut Module) -> NodeId {
+    let is_special_functions = |id| {
+        expect_builtin_call(m, id, "standard_module")
+            .and_then(|call| call.args.first())
+            .is_some_and(|&arg| matches!(m.node(arg), Node::Lit(Scalar::Str(name)) if name.as_ref() == "special-functions"))
+    };
+    let alias = m
+        .bindings()
+        .find_map(|(_, binding)| is_special_functions(binding.rhs).then_some(binding.name));
+    let alias = alias.unwrap_or_else(|| {
+        let alias = (0..)
+            .find_map(|index| {
+                let name = m.intern(&format!("_normal_special_{index}"));
+                m.binding_by_name(name).is_none().then_some(name)
+            })
+            .unwrap();
+        let module = m.alloc(Node::Lit(Scalar::Str("special-functions".into())));
+        let version = m.alloc(Node::Lit(Scalar::Str("0.1".into())));
+        let rhs = build_call(m, "standard_module", &[module, version]);
+        m.add_binding(flatppl_core::Binding {
+            name: alias,
+            rhs,
+            doc: None,
+            public: false,
+            synthetic: true,
+        });
+        alias
+    });
+    let name = m.intern("log_ndtr");
+    m.alloc(Node::Ref(Ref {
+        ns: RefNs::Module(alias),
+        name,
+    }))
 }
 
 /// A finite point inside the support of `base`. A CDF's derivatives can be
