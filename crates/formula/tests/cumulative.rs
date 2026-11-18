@@ -1,4 +1,4 @@
-use flatppl_formula::{ColumnValues, DataMode, DataValue, build, prepare_data, read};
+use flatppl_formula::{ColumnValues, DataMode, DataValue, GroupLevel, build, prepare_data, read};
 use serde_json::json;
 
 #[test]
@@ -75,4 +75,47 @@ fn threshold_selectors_share_alias_resolved_laws_and_refuse_unequal_priors() {
     assert_eq!(converted.info.score_offset, 2.0_f64.ln());
     spec.priors.last_mut().unwrap().prior = "Normal(1, 2)".into();
     assert!(build(&spec, spec.data.as_ref().unwrap()).is_err());
+}
+
+#[test]
+fn grouped_thresholds_use_the_fitted_group_order_after_recipe_reload() {
+    let spec = read(
+        r#"{
+          "formula": "y | thres(gr=item) ~ 1",
+          "family": "cumulative",
+          "data": {"nrows": 5, "columns": [
+            {"name": "y", "values": {"kind": "int", "values": [1, 2, 1, 2, 1]}},
+            {"name": "item", "valid": [true, true, true, true, false],
+             "values": {"kind": "factor", "values": {
+                "levels": ["z", "a", "unused"], "codes": [1, 1, 0, 0, 0], "ordered": false
+             }}}
+          ]}
+        }"#,
+    )
+    .unwrap();
+    let converted = build(&spec, spec.data.as_ref().unwrap()).unwrap();
+    assert_eq!(converted.data.rows, [0, 1, 2, 3]);
+    assert_eq!(
+        converted.info.threshold_groups.as_ref().unwrap().levels,
+        [GroupLevel::Text("z".into()), GroupLevel::Text("a".into())]
+    );
+    assert_eq!(
+        converted.data.constants["threshold_group_index_data"],
+        DataValue::Integers(vec![2, 2, 1, 1])
+    );
+    let saved = serde_json::to_string(&converted.recipe).unwrap();
+    let recipe = serde_json::from_str(&saved).unwrap();
+    let mut table = spec.data.unwrap();
+    table.columns.remove(0);
+    table.columns[0].values = ColumnValues::Factor {
+        levels: vec!["a".into(), "z".into()],
+        codes: vec![0, 1, 0, 1, 0],
+        ordered: false,
+    };
+    assert_eq!(
+        prepare_data(&recipe, &table, DataMode::Prediction)
+            .unwrap()
+            .constants["threshold_group_index_data"],
+        DataValue::Integers(vec![2, 1, 2, 1])
+    );
 }

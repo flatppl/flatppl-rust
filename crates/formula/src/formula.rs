@@ -17,6 +17,8 @@ pub struct Formula {
     pub truncation: Option<Truncation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ar: Option<Ar1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) threshold_group: Option<ThresholdGroup>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
@@ -29,6 +31,8 @@ pub struct Formula {
     pub monotonic: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) monotonic_terms: Option<crate::monotonic::MonotonicTerms>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) category_specific: Vec<String>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
 }
@@ -38,6 +42,12 @@ pub struct Formula {
 pub enum Trials {
     Constant(i64),
     Column(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ThresholdGroup {
+    pub(crate) column: String,
+    pub(crate) count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -137,6 +147,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let mut smooths = Vec::new();
     let mut tensor_smooths = Vec::new();
     let mut monotonic_terms = Vec::new();
+    let mut category_specific = Vec::new();
     // R records offset calls separately from coefficient terms, including
     // calls appearing after subtraction. Negation belongs inside offset().
     let offsets = parser
@@ -160,6 +171,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
             Atom::Offset(_) => {}
             Atom::Monotonic(_) => unreachable!(),
+            Atom::CategorySpecific(column) => category_specific.push(column.clone()),
             Atom::Smooth(smooth) => {
                 if smooths
                     .iter()
@@ -224,6 +236,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         censoring: additions.censoring,
         truncation: additions.truncation,
         ar: additions.ar,
+        threshold_group: additions.threshold_group,
         intercept,
         variables,
         fixed,
@@ -232,6 +245,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         tensor_smooths,
         monotonic,
         monotonic_terms,
+        category_specific,
         expressions,
         offsets,
     };
@@ -283,7 +297,11 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
         Atom::Monotonic(call) => call.label(),
-        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_) => unreachable!(),
+        Atom::Groups(_)
+        | Atom::Offset(_)
+        | Atom::Smooth(_)
+        | Atom::Tensor(_)
+        | Atom::CategorySpecific(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
@@ -313,6 +331,7 @@ struct ResponseAdditions {
     censoring: Option<Censoring>,
     truncation: Option<Truncation>,
     ar: Option<Ar1>,
+    threshold_group: Option<ThresholdGroup>,
 }
 
 fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
@@ -321,7 +340,7 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
         return Ok((name(text.trim())?, additions));
     };
     let fail = || {
-        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)` and `ar(...)`".into())
+        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)`, `ar(...)` and `thres(...)`".into())
     };
     let mut depth = 0i32;
     for addition in addition.split(|c| {
@@ -380,10 +399,37 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
             "ar" if additions.ar.is_none() => {
                 additions.ar = Some(Ar1::parse(argument)?);
             }
+            "thres" if additions.threshold_group.is_none() => {
+                additions.threshold_group = Some(threshold_group(argument)?);
+            }
             _ => return Err(fail()),
         }
     }
     Ok((name(response.trim())?, additions))
+}
+
+fn threshold_group(text: &str) -> Result<ThresholdGroup> {
+    let (count, group) = match text.split_once(',') {
+        Some((count, group)) => {
+            let count = count
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| Error("thres() expects a positive integer cut count".into()))?;
+            (Some(count), group)
+        }
+        None => (None, text),
+    };
+    let column = group
+        .split_once('=')
+        .filter(|(key, _)| key.trim() == "gr")
+        .ok_or_else(|| Error("thres() expects gr = column".into()))?
+        .1;
+    Ok(ThresholdGroup {
+        column: name(column.trim())?,
+        count,
+    })
 }
 
 fn standard_error(text: &str) -> Result<StandardError> {
@@ -535,6 +581,7 @@ enum Atom {
     Smooth(SmoothTerm),
     Tensor(crate::tensor::TensorTerm),
     Monotonic(crate::monotonic::MonotonicCall),
+    CategorySpecific(String),
 }
 
 struct Expr {
@@ -762,6 +809,17 @@ impl<'a> Parser<'a> {
                     self.tensor_smooth()?
                 } else if self.peek() == Token::Left && text == "mo" {
                     self.monotonic()?
+                } else if self.peek() == Token::Left && text == "cs" {
+                    self.at += 1;
+                    let Token::Name(column) = self.peek() else {
+                        return Err(Error("cs() requires one numeric predictor column".into()));
+                    };
+                    self.at += 1;
+                    if self.peek() != Token::Right {
+                        return Err(Error("cs() requires one numeric predictor column".into()));
+                    }
+                    self.at += 1;
+                    self.atom(Atom::CategorySpecific(name(column)?))?
                 } else if self.peek() == Token::Left {
                     if !matches!(
                         text,
@@ -975,11 +1033,15 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms.iter().flatten().any(|&id| {
         matches!(
             atoms[id],
-            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_)
+            Atom::Groups(_)
+                | Atom::Offset(_)
+                | Atom::Smooth(_)
+                | Atom::Tensor(_)
+                | Atom::CategorySpecific(_)
         )
     }) {
         return Err(Error(
-            "group terms, offsets and smooths may only be added or removed".into(),
+            "group terms, offsets, smooths and cs() terms may only be added or removed".into(),
         ));
     }
     Ok(())
@@ -1009,11 +1071,11 @@ fn group_effect_terms(expr: &Expr, atoms: &[Atom]) -> Result<()> {
         ExprKind::Atom(id)
             if matches!(
                 atoms[*id],
-                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_) | Atom::Monotonic(_)
+                Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Tensor(_) | Atom::Monotonic(_) | Atom::CategorySpecific(_)
             ) =>
         {
             Err(Error(
-                "group effects cannot contain nested group terms, offsets, smooths or monotonic terms".into(),
+                "group effects cannot contain nested group terms, offsets, smooths, monotonic terms or cs() terms".into(),
             ))
         }
         ExprKind::Parentheses(child) | ExprKind::Unary(_, child) => {
@@ -1079,6 +1141,7 @@ impl Formula {
             || self.censoring.is_some()
             || self.truncation.is_some()
             || self.ar.is_some()
+            || self.threshold_group.is_some()
     }
 
     pub(crate) fn uses_intercept_column(&self) -> bool {
@@ -1116,6 +1179,11 @@ impl Formula {
         }
         for expression in &self.offsets {
             expression.columns(&mut names);
+        }
+        for column in &self.category_specific {
+            if !names.contains(&column.as_str()) {
+                names.push(column);
+            }
         }
         for smooth in &self.smooths {
             if !names.contains(&smooth.column.as_str()) {

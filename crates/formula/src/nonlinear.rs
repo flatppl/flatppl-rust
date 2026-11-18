@@ -26,7 +26,7 @@ pub(crate) fn parse(spec: &Spec, family: Family) -> Result<(Formula, Option<Nonl
         .split_once('~')
         .ok_or_else(|| Error("nonlinear formula must contain `response ~ expression`".into()))?;
     // Ordinal threshold intercepts remain part of the response model.
-    let intercept = u8::from(family == Family::Cumulative);
+    let intercept = u8::from(family.ordinal());
     let formula = crate::parse_formula(&format!("{lhs} ~ {intercept}"))?;
     let expression = crate::formula::parse_numeric_expression(rhs)?;
     let mut names = Vec::new();

@@ -1,6 +1,7 @@
 use crate::{
-    DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter,
-    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, metadata, paired,
+    DataDocument, DataValue, Design, DesignComponent, Error, Family, GroupInfo, ModelInfo,
+    Parameter, ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, data,
+    metadata, paired,
     prior_model::ParameterPrior,
     priors::{self, PriorNode},
     shared_groups::{Block, Coefficients},
@@ -39,6 +40,9 @@ pub(crate) fn model_with_forecast(
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
     }
+    if recipe.threshold_groups.is_some() {
+        external_vector(&mut b, data::THRESHOLD_GROUP_INDEX, "posintegers");
+    }
     if recipe.formula.weights.is_some() {
         external_vector(&mut b, "weights_data", "nonnegreals");
     }
@@ -63,6 +67,9 @@ pub(crate) fn model_with_forecast(
                 predictor_n,
             );
         }
+    }
+    for i in 0..recipe.formula.category_specific.len() {
+        external_vector_sized(&mut b, &crate::adjacent::data_name(i), "reals", predictor_n);
     }
     let predictor_names: Vec<_> = recipe
         .predictors()
@@ -93,6 +100,10 @@ pub(crate) fn model_with_forecast(
     }
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
+    let threshold_groups = recipe
+        .threshold_groups
+        .as_ref()
+        .map_or(0, |group| group.levels.len());
     for name in &predictor_names {
         let suffix = recipe.predictor_suffix(name);
         predictor_parameters(
@@ -101,6 +112,7 @@ pub(crate) fn model_with_forecast(
             recipe.predictors.get_mut(name).unwrap(),
             recipe.family,
             if name == "mu" { thresholds } else { 0 },
+            if name == "mu" { threshold_groups } else { 0 },
             &mut parameters,
         )?;
     }
@@ -221,6 +233,7 @@ pub(crate) fn model_with_forecast(
         .map(|name| (name, b.self_ref(name)))
         .collect();
     let cuts = threshold_inputs(&mut b, recipe);
+    let cuts = crate::adjacent::adjust_cuts(&mut b, recipe, cuts);
     let observation = crate::family::Observation {
         mu,
         trials,
@@ -268,7 +281,10 @@ pub(crate) fn model_with_forecast(
     } else {
         pointwise_log_likelihood(&mut b, recipe, scale)
     };
-    let likelihood = if recipe.formula.censoring.is_some() || recipe.formula.ar.is_some() {
+    let likelihood = if recipe.formula.censoring.is_some()
+        || recipe.formula.ar.is_some()
+        || recipe.family == Family::Acat
+    {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
     } else {
         let observation = if is_paired {
@@ -482,24 +498,55 @@ fn predictor_parameters(
     recipe: &mut crate::PredictorRecipe,
     family: Family,
     thresholds: usize,
+    threshold_groups: usize,
     parameters: &mut Vec<ParameterPrior>,
 ) -> Result<()> {
     if thresholds > 0 {
         let names = scope(b, family);
         let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-        let PriorNode::Measure { law: prior, .. } =
-            priors::emit(b, &recipe.priors.intercept, None, None, &bindings)?
+        let PriorNode::Measure {
+            law: prior,
+            restriction,
+        } = priors::emit(b, &recipe.priors.intercept, None, None, &bindings)?
         else {
             return Err(Error(
-                "cumulative thresholds require a shared continuous prior".into(),
+                "ordinal thresholds require a shared continuous prior".into(),
             ));
         };
         let count = b.lit_int(thresholds as i64);
         let prior = b.call("iid", &[prior, count]);
-        let domain = b.call("ordered", &[count]);
-        let reference = b.call("Lebesgue", &[domain]);
-        let prior = b.call("tilt", &[prior, reference]);
-        declare_parameter(b, "cuts", prior, Some(domain), parameters);
+        if family == Family::Acat {
+            let restriction = restriction.map(|set| b.call("cartpow", &[set, count]));
+            declare_parameter(b, "cuts", prior, restriction, parameters);
+            for (index, prior) in recipe.priors.bcs.iter().enumerate() {
+                let prior = priors::emit(b, prior, None, None, &bindings)?;
+                repeated_parameter(
+                    b,
+                    &crate::adjacent::coefficient_name(index),
+                    prior,
+                    count,
+                    parameters,
+                );
+            }
+        } else {
+            let domain = b.call("ordered", &[count]);
+            let reference = b.call("Lebesgue", &[domain]);
+            let prior = b.call("tilt", &[prior, reference]);
+            if threshold_groups == 0 {
+                declare_parameter(b, "cuts", prior, Some(domain), parameters);
+            } else {
+                let mut vectors = Vec::with_capacity(threshold_groups);
+                for group in 1..=threshold_groups {
+                    let name = format!("cuts_{group}");
+                    declare_parameter(b, &name, prior, Some(domain), parameters);
+                    vectors.push(b.self_ref(&name));
+                }
+                let columns = b.array(&vectors);
+                let stack = b.call("colstack", &[columns]);
+                let cuts = b.call("transpose", &[stack]);
+                b.bind("cuts", cuts);
+            }
+        }
     } else if recipe.formula.intercept {
         parameter(
             b,
@@ -519,20 +566,7 @@ fn predictor_parameters(
             let bindings: Vec<_> = scope.iter().map(String::as_str).collect();
             let prior = priors::emit(b, &priors[0], None, None, &bindings)?;
             let count = b.lit_int(priors.len() as i64);
-            match prior {
-                PriorNode::Measure {
-                    law: prior,
-                    restriction,
-                } => {
-                    let iid = b.call("iid", &[prior, count]);
-                    let restriction = restriction.map(|set| b.call("cartpow", &[set, count]));
-                    declare_parameter(b, &predictor_name(dpar, name), iid, restriction, parameters);
-                }
-                PriorNode::Constant(value) => {
-                    let values = b.call("fill", &[value, count]);
-                    b.bind(&predictor_name(dpar, name), values);
-                }
-            }
+            repeated_parameter(b, &predictor_name(dpar, name), prior, count, parameters);
         } else {
             let mut values = Vec::new();
             for (i, prior) in priors.iter().enumerate() {
@@ -681,6 +715,26 @@ fn predictor_parameters(
         b.bind(&group.r, effect);
     }
     Ok(())
+}
+
+fn repeated_parameter(
+    b: &mut Builder<'_>,
+    name: &str,
+    prior: PriorNode,
+    count: NodeId,
+    parameters: &mut Vec<ParameterPrior>,
+) {
+    match prior {
+        PriorNode::Measure { law, restriction } => {
+            let iid = b.call("iid", &[law, count]);
+            let restriction = restriction.map(|set| b.call("cartpow", &[set, count]));
+            declare_parameter(b, name, iid, restriction, parameters);
+        }
+        PriorNode::Constant(value) => {
+            let values = b.call("fill", &[value, count]);
+            b.bind(name, values);
+        }
+    }
 }
 
 fn shared_group_parameters(
@@ -1106,18 +1160,22 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     let score_inputs: Vec<_> = crate::response::score_columns(&recipe.formula)
         .map(|(name, _)| (name, argument(b, name)))
         .collect();
-    let law = recipe.family.observation(
-        b,
-        crate::family::Observation {
-            mu,
-            trials,
-            scale: row_scale,
-            auxiliary: &auxiliary,
-            cuts: &cuts,
-        },
-        true,
-    );
-    let score = crate::response::score(b, &recipe.formula, law, value, &score_inputs);
+    let score = if recipe.family == Family::Acat {
+        crate::adjacent::log_prob(b, mu, &cuts, value)
+    } else {
+        let law = recipe.family.observation(
+            b,
+            crate::family::Observation {
+                mu,
+                trials,
+                scale: row_scale,
+                auxiliary: &auxiliary,
+                cuts: &cuts,
+            },
+            true,
+        );
+        crate::response::score(b, &recipe.formula, law, value, &score_inputs)
+    };
     let head = b.sym("functionof");
     let row_score = b.m.alloc(Node::Call(Call {
         head: CallHead::Builtin(head),
@@ -1142,7 +1200,8 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
             .filter(|name| !(*name == "sigma" && scale.is_some()))
             .map(|name| b.self_ref(name)),
     );
-    args.extend(threshold_inputs(b, recipe));
+    let cuts = threshold_inputs(b, recipe);
+    args.extend(crate::adjacent::adjust_cuts(b, recipe, cuts));
     args.extend(score_inputs.iter().map(|(name, _)| b.self_ref(name)));
     b.call("broadcast", &args)
 }
@@ -1170,7 +1229,12 @@ fn threshold_inputs(b: &mut Builder<'_>, recipe: &Recipe) -> Vec<NodeId> {
         .map(|i| {
             let cuts = b.self_ref("cuts");
             let index = b.lit_int(i as i64);
-            b.call("get", &[cuts, index])
+            if recipe.threshold_groups.is_some() {
+                let groups = b.self_ref(data::THRESHOLD_GROUP_INDEX);
+                b.call("get", &[cuts, groups, index])
+            } else {
+                b.call("get", &[cuts, index])
+            }
         })
         .collect()
 }
@@ -1431,6 +1495,11 @@ pub(crate) fn info(
     let mut group_numbers = std::collections::HashMap::new();
     for (dpar, predictor) in recipe.predictors() {
         let thresholds = if dpar == "mu" { recipe.thresholds() } else { 0 };
+        let threshold_groups = if dpar == "mu" {
+            recipe.threshold_groups.as_ref()
+        } else {
+            None
+        };
         let numbers: Vec<_> = predictor
             .groups
             .iter()
@@ -1445,6 +1514,7 @@ pub(crate) fn info(
             predictor,
             module,
             thresholds,
+            threshold_groups,
             &numbers,
         )?);
     }
@@ -1565,6 +1635,7 @@ pub(crate) fn info(
         factor_levels,
         group_levels,
         response_levels: recipe.response_levels.clone(),
+        threshold_groups: recipe.threshold_groups.clone(),
         dpars: recipe
             .predictors
             .keys()
@@ -1599,7 +1670,17 @@ pub(crate) fn info(
                 )
         }),
         training_rows: data.rows.clone(),
-        score_offset: (1..=recipe.thresholds()).map(|i| (i as f64).ln()).sum(),
+        score_offset: if recipe.family == Family::Cumulative {
+            (1..=recipe.thresholds())
+                .map(|i| (i as f64).ln())
+                .sum::<f64>()
+                * recipe
+                    .threshold_groups
+                    .as_ref()
+                    .map_or(1, |group| group.levels.len()) as f64
+        } else {
+            0.0
+        },
     })
 }
 
@@ -1609,6 +1690,7 @@ fn predictor_info(
     recipe: &crate::PredictorRecipe,
     module: &Module,
     thresholds: usize,
+    threshold_groups: Option<&GroupInfo>,
     group_numbers: &[usize],
 ) -> Result<Vec<Parameter>> {
     let prefix = if name == "mu" {
@@ -1620,7 +1702,26 @@ fn predictor_info(
     let mut add = |name: String, binding: &str, indices: &[usize], role| {
         parameters.push(parameter_info(name, binding, indices, role))
     };
-    if thresholds > 0 {
+    if let Some(groups) = threshold_groups {
+        for (group, level) in groups.levels.iter().enumerate() {
+            let group = group + 1;
+            let binding = format!("cuts_{group}");
+            for i in 1..=thresholds {
+                add(
+                    format!("Intercept[{level},{i}]"),
+                    &binding,
+                    &[i],
+                    ParameterRole::Sampled,
+                );
+                add(
+                    format!("b_Intercept[{level},{i}]"),
+                    "b_Intercept",
+                    &[group, i],
+                    ParameterRole::Derived,
+                );
+            }
+        }
+    } else if thresholds > 0 {
         for i in 1..=thresholds {
             add(
                 format!("Intercept[{i}]"),
@@ -1634,6 +1735,14 @@ fn predictor_info(
                 &[i],
                 ParameterRole::Derived,
             );
+        }
+        for (index, column) in recipe.formula.category_specific.iter().enumerate() {
+            let binding = crate::adjacent::coefficient_name(index);
+            let column = coefficient_name(column);
+            let role = parameter_role(module, &binding);
+            for step in 1..=thresholds {
+                add(format!("bcs_{column}[{step}]"), &binding, &[step], role);
+            }
         }
     } else if recipe.formula.intercept {
         add(

@@ -57,6 +57,8 @@ pub struct Priors {
     pub sigma_scale: f64,
     pub intercept: ResolvedPrior,
     pub b: Vec<ResolvedPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bcs: Vec<ResolvedPrior>,
     #[serde(default)]
     pub bs: Vec<ResolvedPrior>,
     #[serde(default)]
@@ -269,6 +271,12 @@ pub(crate) fn resolve(
         group: None,
         dpar,
     }));
+    targets.extend(formula.category_specific.iter().map(|name| PriorTarget {
+        class: "b",
+        coef: Some(name),
+        group: None,
+        dpar,
+    }));
     let smooth_terms = formula
         .smooths
         .iter()
@@ -376,7 +384,7 @@ pub(crate) fn resolve(
         let first = priors.next().unwrap();
         for prior in priors {
             if !crate::prior_expr::equivalent(&first, &prior)? {
-                return Err(Error("cumulative thresholds require one shared continuous prior; unequal threshold priors are not supported".into()));
+                return Err(Error("ordinal thresholds require one shared continuous prior; unequal threshold priors are not supported".into()));
             }
         }
         first
@@ -395,6 +403,16 @@ pub(crate) fn resolve(
         })
         .collect();
     let mut sd = Vec::new();
+    let bcs = formula
+        .category_specific
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("Lebesgue(reals)"))
+        })
+        .collect();
     let bs = smooth_names
         .iter()
         .map(|_| {
@@ -473,6 +491,7 @@ pub(crate) fn resolve(
             sigma_scale,
             intercept,
             b,
+            bcs,
             bs,
             sds,
             bmo,
