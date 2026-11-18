@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+ks = cat(1, 2, 3)
+mu ~ Normal(0, 1)
+v = cat(0.5, mu, 2.5)
+ys ~ Normal.(v .* ks, 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(ys = ys), mu = mu), record(ys = [0.2, 1.1, -0.4]))
+post = bayesupdate(L, prior)

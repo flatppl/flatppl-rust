@@ -1182,11 +1182,27 @@ impl<'m> Emitter<'m> {
                 let e = self.real(*a)?;
                 Ok(Ex::atom(format!("{}'", e.at(P_ATOM))))
             }
-            // functions.ron `cat`: arrays append with append_array.
-            ("cat", [a, b]) if self.shape(id).is_some_and(|s| s.int && s.rank == 1) => {
-                let l = self.expr(*a)?;
-                let r = self.expr(*b)?;
-                Ok(Ex::atom(format!("append_array({}, {})", l.s, r.s)))
+            // `cat(1, 2, 3)` of scalars is `vector(1, 2, 3)` (spec §07).
+            ("cat", elems)
+                if elems.len() >= 2
+                    && elems
+                        .iter()
+                        .all(|&a| self.shape(a).is_some_and(|s| s.rank == 0)) =>
+            {
+                self.vector(id, elems)
+            }
+            // functions.ron `cat`: integer arrays of any rank append with
+            // append_array (append_row takes vectors and matrices only),
+            // left to right.
+            ("cat", [first, rest @ ..])
+                if !rest.is_empty() && self.shape(id).is_some_and(|s| s.int && s.rank >= 1) =>
+            {
+                let mut out = self.expr(*first)?.s;
+                for a in rest {
+                    let r = self.expr(*a)?;
+                    out = format!("append_array({out}, {})", r.s);
+                }
+                Ok(Ex::atom(out))
             }
             ("aggregate", _) => {
                 let base = match &self.owner {

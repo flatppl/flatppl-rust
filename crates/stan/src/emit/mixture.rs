@@ -18,6 +18,8 @@ use crate::refuse::{Refusal, RefusalKind, Result};
 use flatppl_core::{Node, NodeId, Type};
 use std::collections::HashMap;
 
+mod nested;
+
 /// The loop index a per-component argument is rendered with.
 const COMP: &str = "\u{4}";
 
@@ -830,6 +832,12 @@ impl<'m> Emitter<'m> {
             return self
                 .dirac_split_rows(lhs, mix, norm, dirac_first, (wd, atom), (wl, law))
                 .map(Some);
+        }
+        // An iid mixture per site beside a whole-row atom.
+        if let Some(lines) =
+            self.dirac_split_nested(lhs, mix, norm, dirac_first, (wd, atom), (wl, law))?
+        {
+            return Ok(Some(lines));
         }
         let l = self.law_any(law)?;
         if l.declared {

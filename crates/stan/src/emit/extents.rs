@@ -650,11 +650,20 @@ impl<'m> Emitter<'m> {
                 0 => self.stack_inner(args[0], 1, d),
                 _ => self.sym_extent(args[0], 0, d),
             },
+            // `cat(x, y, ...)`: the outer lengths add (a scalar counts one),
+            // and the inner axes are the operands' common extent.
             "cat" if axis == 0 => {
-                let a = self.sym_extent(args[0], 0, d)?;
-                let b = self.sym_extent(args[1], 0, d)?;
-                Some(a.plus(&b))
+                let mut n = Lin::konst(0);
+                for &a in &args {
+                    let l = match self.arank(a) {
+                        Some(0) => Lin::konst(1),
+                        _ => self.sym_extent(a, 0, d)?,
+                    };
+                    n = n.plus(&l);
+                }
+                Some(n)
             }
+            "cat" => self.unified(&args, axis, d),
             "scan" if axis == 0 => self.sym_extent(*args.get(2)?, 0, d),
             // A `filter` result: its count, computed in `transformed data`.
             "filter" if axis == 0 => self.filter_counts.get(&id).map(|c| Lin::term(c.clone())),

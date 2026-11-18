@@ -1001,7 +1001,7 @@ impl<'m> Emitter<'m> {
         }
         let mut elem_tys = Vec::new();
         let mut locals = HashMap::new();
-        for ((_, r), &a) in entries.iter().zip(&args) {
+        for ((pname, r), &a) in entries.iter().zip(&args) {
             // `splitblocks(A, [1, n])`: element i is row i of A, typed as a
             // row (a 1×n block and its row hold the same entries).
             if let Some(m_) = self.row_blocks(a)
@@ -1022,6 +1022,15 @@ impl<'m> Emitter<'m> {
             let e = self.expr(a)?;
             let (et, s) = match t {
                 Type::Array { shape, elem } if shape.len() == 1 => {
+                    // A computed array is computed once, under the parameter's
+                    // name, not once per element.
+                    let plain = e.s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let e = if plain || self.fctx.is_some() {
+                        e
+                    } else {
+                        let base = self.name(*pname).to_string();
+                        super::Ex::atom(self.place(&base, a, Ok(e))?)
+                    };
                     (*elem, format!("{}[{index}]", e.at(P_ATOM)))
                 }
                 Type::Array { .. } => {

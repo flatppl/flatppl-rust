@@ -1,0 +1,16 @@
+flatppl_compat = "0.1"
+J = 3
+counts1 = [[0, 0, 0], [2, 0, 1], [0, 3, 0]]
+counts2 = [[1, 1, 0], [0, 0, 0], [0, 2, 4]]
+w ~ Beta(2, 2)
+q ~ Beta(1, 3)
+lam ~ Exponential(1)
+u ~ iid(Normal(0, 1), 3)
+site(q, lam) = normalize(superpose(weighted(q, Poisson(lam)), weighted(1 - q, Dirac(0))))
+y1 ~ iid(normalize(superpose(weighted(w, iid(site(q, lam), J)), weighted(1 - w, Dirac(fill(0, J))))), 3)
+site2(p, lam) = normalize(superpose(weighted(p, Dirac(0)), weighted(1 - p, Poisson(lam))))
+rowlaw(p, lam, w) = normalize(superpose(weighted(w, Dirac(fill(0, J))), weighted(1 - w, iid(site2(p, lam), J))))
+y2 ~ rowlaw.(invlogit.(u), lam, w)
+prior = lawof(record(w = w, q = q, lam = lam, u = u))
+L = likelihoodof(kernelof(record(y1 = y1, y2 = y2), w = w, q = q, lam = lam, u = u), record(y1 = counts1, y2 = counts2))
+post = bayesupdate(L, prior)
