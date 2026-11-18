@@ -123,11 +123,13 @@ fn ordered_nonidentical_normalize_is_never() {
 }
 
 #[test]
-fn dirac_with_continuous_component_is_never() {
+fn dirac_with_continuous_component_parameter_is_never() {
+    // Over data the hurdle split scores it (Ruling 2); a parameter has no
+    // density with respect to Lebesgue measure.
     let r = refuse_with(
         "w ~ Beta(2, 2)\nm = normalize(superpose(weighted(w, Normal(0, 1)), weighted(1 - w, Dirac(0.0))))\n\
-         y ~ iid(m, 3)\nprior = lawof(record(w = w))\n\
-         L = likelihoodof(kernelof(record(y = y), w = w), record(y = [0.0, 0.5, 1.0]))\n\
+         z ~ iid(m, 3)\ny ~ Normal(sum(z), 1)\nprior = lawof(record(w = w, z = z))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w, z = z), record(y = 0.5))\n\
          post = bayesupdate(L, prior)\n",
         None,
     );
@@ -136,14 +138,44 @@ fn dirac_with_continuous_component_is_never() {
 }
 
 #[test]
-fn unnormalized_mixture_component_is_never() {
+fn dirac_with_continuous_component_other_weights_is_not_yet() {
+    let r = refuse_with(
+        "w ~ Beta(2, 2)\nm = normalize(superpose(weighted(w, Normal(0, 1)), weighted(0.5, Dirac(0.0))))\n\
+         y ~ iid(m, 3)\nprior = lawof(record(w = w))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w), record(y = [0.0, 0.5, 1.0]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("these weights"), "{r}");
+}
+
+#[test]
+fn truncated_component_without_cdf_is_not_yet() {
+    // `Poisson(exp(a))` is Stan's `poisson_log`, which has no CDF; its mass
+    // has a closed form all the same, so the refusal is not a never.
     let r = refuse(&posterior(
-        "w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, truncate(Normal(0, 1), interval(0.0, 2.0))), weighted(1 - w, Normal(3, 1))))",
-        "lawof(record(w = w))",
-        "kernelof(record(y = y), w = w)",
+        "w ~ Beta(2, 2)\na ~ Normal(0, 1)\n\
+         y ~ normalize(superpose(weighted(w, truncate(Poisson(exp(a)), interval(1, 4))), weighted(1 - w, Poisson(2.0))))",
+        "lawof(record(w = w, a = a))",
+        "kernelof(record(y = y), w = w, a = a)",
     ));
-    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
-    assert!(r.reason.contains("mixture component"), "{r}");
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("no Stan CDF"), "{r}");
+}
+
+#[test]
+fn two_sided_truncation_beside_dirac_per_element_is_not_yet() {
+    let r = refuse_with(
+        "x = [0.2, -0.5, 1.0]\nhu ~ Beta(2, 2)\nb ~ Normal(0, 1)\n\
+         f = (mu, hu) -> normalize(superpose(weighted(hu, Dirac(0)), weighted(1.0 - hu, normalize(truncate(Poisson(mu), interval(1, 6))))))\n\
+         y ~ f.(exp.(b .* x), hu)\nprior = lawof(record(hu = hu, b = b))\n\
+         L = likelihoodof(kernelof(record(y = y), hu = hu, b = b), record(y = [0, 2, 1]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("two-sided truncation"), "{r}");
 }
 
 #[test]
@@ -292,29 +324,6 @@ fn positive_set_with_interval_lower_bound_is_not_yet() {
             .contains("positive set with an interval lower bound"),
         "{r}"
     );
-}
-
-#[test]
-fn logdensityof_of_positive_truncation_is_not_yet() {
-    let r = refuse(&posterior(
-        "mu = elementof(reals)\ny ~ Normal(mu, 1)\n\
-         w(x) = logdensityof(truncate(Normal(0, 1), posreals), x.mu)",
-        "logweighted(w, Lebesgue(cartprod(mu = reals)))",
-        "kernelof(record(y = y), mu = mu)",
-    ));
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("truncated"), "{r}");
-}
-
-#[test]
-fn positive_truncation_mixture_component_is_never() {
-    let r = refuse(&posterior(
-        "w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, truncate(Normal(0, 1), posreals)), weighted(1 - w, Normal(3, 1))))",
-        "lawof(record(w = w))",
-        "kernelof(record(y = y), w = w)",
-    ));
-    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
-    assert!(r.reason.contains("mixture component"), "{r}");
 }
 
 #[test]
@@ -722,12 +731,13 @@ fn nested_dirac_split_other_weights_is_not_yet() {
 }
 
 #[test]
-fn nested_dirac_split_continuous_site_is_never() {
+fn nested_dirac_split_continuous_site_is_not_yet() {
     let r = refuse(&nested_rows(
         "normalize(superpose(weighted(q, Normal(lam, 1)), weighted(1 - q, Dirac(0))))",
         "J",
     ));
-    assert_eq!(r.kind, RefusalKind::MixedReference, "{r}");
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("continuous law"), "{r}");
 }
 
 #[test]
@@ -742,13 +752,14 @@ fn nested_dirac_split_truncated_site_is_not_yet() {
 }
 
 #[test]
-fn nested_dirac_split_unnormalized_site_is_never() {
+fn nested_dirac_split_unnormalized_site_is_not_yet() {
     let r = refuse(&nested_rows(
         "normalize(superpose(weighted(q, truncate(Poisson(lam), interval(0, 5))), \
          weighted(1 - q, Dirac(0))))",
         "J",
     ));
-    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("truncated mixture component"), "{r}");
 }
 
 #[test]
@@ -828,4 +839,28 @@ fn discrete_truncation_at_a_real_end_is_not_yet() {
             "{set}: {r}"
         );
     }
+}
+
+#[test]
+fn normalized_continuous_truncation_to_integers_is_never() {
+    let r = refuse(&posterior(
+        "mu ~ Normal(0, 1)\ny ~ normalize(truncate(Normal(mu, 1), posintegers))",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::ZeroMass, "{r}");
+    assert!(r.kind.is_never());
+    assert!(r.reason.contains("total mass 0"), "{r}");
+}
+
+#[test]
+fn continuous_truncation_to_integers_is_not_yet() {
+    let r = refuse(&posterior(
+        "mu = elementof(reals)\ny ~ Normal(mu, 1)\n\
+         w(x) = logdensityof(truncate(Normal(0, 1), nonnegintegers), x.mu)",
+        "logweighted(w, Lebesgue(cartprod(mu = reals)))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("zero measure"), "{r}");
 }

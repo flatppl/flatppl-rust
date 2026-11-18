@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+x = [0.2, -0.5, 1.0, 0.0, 0.7]
+y_obs = [0, 2, 0, 1, 5]
+hu ~ Beta(2, 2)
+b ~ Normal(0, 1)
+response_law = (mu, hu) -> normalize(superpose(weighted(hu, Dirac(0)), weighted(1.0 - hu, normalize(truncate(Poisson(mu), interval(1, inf))))))
+y ~ response_law.(exp.(b .* x), hu)
+prior = lawof(record(hu = hu, b = b))
+L = likelihoodof(kernelof(record(y = y), hu = hu, b = b), record(y = y_obs))
+post = bayesupdate(L, prior)

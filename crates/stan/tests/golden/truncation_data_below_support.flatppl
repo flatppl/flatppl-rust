@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+y_obs = [0.3, 1.2]
+rate ~ Gamma(2, 1)
+y ~ iid(normalize(truncate(Exponential(rate), interval(-1.0, inf))), 2)
+prior = lawof(record(rate = rate))
+L = likelihoodof(kernelof(record(y = y), rate = rate), record(y = y_obs))
+post = bayesupdate(L, prior)

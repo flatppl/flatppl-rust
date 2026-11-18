@@ -58,10 +58,84 @@ impl<'m> Emitter<'m> {
             // A parameter's declared bounds keep it in [lo, hi].
             return Ok(Some(vec![statement, minus]));
         }
-        // Data outside [lo, hi] has zero density; inside, the mass is finite.
+        // Data outside [lo, hi] and the support has zero density; inside, the
+        // mass is finite.
+        let (lo, hi) = law.within(Some(lo), Some(hi));
         Ok(self
-            .guarded(lhs, Some(lo), Some(hi), vec![statement, minus])
+            .guarded(lhs, lo.as_deref(), hi.as_deref(), vec![statement, minus])
             .map(|g| vec![g]))
+    }
+
+    /// The log mass of `[lo, hi]` under `law` (its `call`, [`LOOP`] kept),
+    /// either end open: the helper for a two-sided mass of a `tail` row, the
+    /// `lccdf` for a lower end alone, the `lcdf` for an upper end alone, the
+    /// `lcdf` pair otherwise. A discrete law's mass counts `lo`, so its
+    /// lower end is `lo - 1`, as in Stan's own `T[lo, hi]`.
+    pub(super) fn interval_lmass(
+        &mut self,
+        law: &Law,
+        lo: Option<&str>,
+        hi: Option<&str>,
+    ) -> String {
+        let open = law.call.find('(').unwrap_or(law.call.len());
+        let stan = law.call[..open].to_string();
+        let args = law.call[open..]
+            .strip_prefix('(')
+            .and_then(|x| x.strip_suffix(')'))
+            .map(split_args)
+            .unwrap_or_default();
+        let at = |x: &str| {
+            let y = law.lhs(x);
+            if args.is_empty() {
+                y
+            } else {
+                format!("{y} | {}", args.join(", "))
+            }
+        };
+        let below = |lo: &str| match (law.discrete, lo.parse::<i64>()) {
+            (false, _) => lo.to_string(),
+            (true, Ok(v)) => (v - 1).to_string(),
+            (true, Err(_)) => format!("{lo} - 1"),
+        };
+        let (lo_c, hi_c) = (lo.map(|x| law.clamp(x)), hi.map(|x| law.clamp(x)));
+        match (lo, hi) {
+            (Some(lo), Some(hi)) if !law.tail.is_empty() && law.lhs("{y}") == "{y}" => {
+                let helper = self.interval_helper(&stan, law, args.len());
+                let mut all = vec![lo.to_string(), hi.to_string()];
+                all.extend(args.iter().cloned());
+                format!("{helper}({})", all.join(", "))
+            }
+            (Some(_), Some(_)) => format!(
+                "log_diff_exp({stan}_lcdf({}), {stan}_lcdf({}))",
+                at(hi_c.as_deref().unwrap()),
+                at(&below(lo_c.as_deref().unwrap()))
+            ),
+            (Some(_), None) => format!("{stan}_lccdf({})", at(&below(lo_c.as_deref().unwrap()))),
+            (None, Some(_)) => format!("{stan}_lcdf({})", at(hi_c.as_deref().unwrap())),
+            (None, None) => "0".to_string(),
+        }
+    }
+
+    /// `y < lo || y > hi` (`min(y)`/`max(y)` for an array), either end open.
+    pub(super) fn outside_test(
+        y: &str,
+        array: bool,
+        lo: Option<&str>,
+        hi: Option<&str>,
+    ) -> Option<String> {
+        let (small, large) = if array {
+            (format!("min({y})"), format!("max({y})"))
+        } else {
+            (y.to_string(), y.to_string())
+        };
+        let mut parts = Vec::new();
+        if let Some(lo) = lo {
+            parts.push(format!("{small} < {lo}"));
+        }
+        if let Some(hi) = hi {
+            parts.push(format!("{large} > {hi}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" || "))
     }
 
     /// The name of the helper for the Stan law `stan`, emitted once.

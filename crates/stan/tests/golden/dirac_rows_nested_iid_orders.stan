@@ -96,6 +96,6 @@ model {
   for (j in 1:(3 - counts2_n_atom)) {
     int i = counts2_rest[j];
     int m = J - counts2_row_n_atom[i];
-    target += log(1 - w) + counts2_row_n_atom[i] * log_mix(p[i], 0, poisson_lpmf(0 | lam)) + m * log(1 - p[i]) + poisson_lpmf(counts2_other[counts2_other_start[i]:(counts2_other_start[i] + m - 1)] | lam);
+    target += log1m(w) + counts2_row_n_atom[i] * log_mix(p[i], 0, poisson_lpmf(0 | lam)) + m * log1m(p[i]) + poisson_lpmf(counts2_other[counts2_other_start[i]:(counts2_other_start[i] + m - 1)] | lam);
   }
 }

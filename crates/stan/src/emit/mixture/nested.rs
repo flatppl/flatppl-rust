@@ -13,7 +13,7 @@
 use super::super::Emitter;
 use super::super::functions::FnCtx;
 use super::Part;
-use crate::refuse::{Refusal, RefusalKind, Result};
+use crate::refuse::{Refusal, Result};
 use flatppl_core::{NodeId, Type};
 use std::collections::HashMap;
 
@@ -149,10 +149,11 @@ impl<'m> Emitter<'m> {
                 format!("log_mix({wlx}, {rows}, 0)")
             };
             let lp = inner.lp_slice.replace(SLICE, &other);
+            let log_l = self.log_weight(wl.unwrap())?;
             return Ok(Some(vec![
                 format!("target += {count} * {at};"),
                 format!(
-                    "target += ({n} - {count}) * log({wlx}) + {rest_n} * {} + {n_other} * {} + {lp};",
+                    "target += ({n} - {count}) * {log_l} + {rest_n} * {} + {n_other} * {} + {lp};",
                     inner.at_atom, inner.log_w
                 ),
             ]));
@@ -200,8 +201,8 @@ impl<'m> Emitter<'m> {
         };
         let slice = format!("{other}[{start}[{row}]:({start}[{row}] + {m} - 1)]");
         let rest_lp = format!(
-            "log({}) + {row_n}[{row}] * {} + {m} * {} + {}",
-            wlx,
+            "{} + {row_n}[{row}] * {} + {m} * {} + {}",
+            self.log_weight(wl.unwrap())?,
             inner.at_atom,
             inner.log_w,
             inner.lp_slice.replace(SLICE, &slice)
@@ -315,12 +316,16 @@ impl<'m> Emitter<'m> {
             ));
         }
         let l = self.law_any(law)?;
+        // The other values score in one call with no per-value mass.
+        if l.trunc.is_some() || l.support.is_some() {
+            return Err(Refusal::not_yet(Some(mix), "a truncated mixture component"));
+        }
+        // Over data the mixture has a density with respect to the atom plus
+        // Lebesgue measure (Ruling 2); the row form does not split it yet.
         if !l.discrete {
-            return Err(Refusal::new(
-                RefusalKind::MixedReference,
+            return Err(Refusal::not_yet(
                 Some(mix),
-                "superpose",
-                "a `Dirac` atom beside a continuous law mixes two reference measures (§06)",
+                "a `Dirac` row atom beside an iid mixture of a continuous law",
             ));
         }
         // A shifted variate (`{y} + 1`) would add to the integer slice,
@@ -331,7 +336,7 @@ impl<'m> Emitter<'m> {
         }
         let wlx = self.real(wl.unwrap())?.s;
         let at_atom = match self.atom_lp(mix, law, &l, c)? {
-            None => format!("log({})", self.real(wd.unwrap())?.s),
+            None => self.log_weight(wd.unwrap())?,
             Some(lp_c) if dirac_first => {
                 format!("log_mix({}, 0, {lp_c})", self.real(wd.unwrap())?.s)
             }
@@ -340,7 +345,7 @@ impl<'m> Emitter<'m> {
         let lp_slice = self.law_density(law, &l, SLICE, None)?;
         Ok(Inner {
             at_atom,
-            log_w: format!("log({wlx})"),
+            log_w: self.log_weight(wl.unwrap())?,
             lp_slice,
         })
     }
