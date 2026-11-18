@@ -752,7 +752,7 @@ fn normal_log_mass(
         let reflected = build_call(m, "neg", &[lo]);
         apply(m, reflected)
     } else {
-        normal_log_mass_difference(m, lo, hi, apply)
+        normal_log_mass_difference(m, lo, hi, bound_hi, apply)
     };
     let nan_lo = build_call(m, "isnan", &[bound_lo]);
     let nan_hi = build_call(m, "isnan", &[bound_hi]);
@@ -783,6 +783,7 @@ fn normal_log_mass_difference(
     m: &mut Module,
     lo: NodeId,
     hi: NodeId,
+    bound_hi: NodeId,
     log_cdf: impl Fn(&mut Module, NodeId) -> NodeId,
 ) -> NodeId {
     let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
@@ -793,6 +794,15 @@ fn normal_log_mass_difference(
     // instead of two probabilities rounded to one.
     let x = build_call(m, "ifelse", &[reflected, neg_lo, hi]);
     let y = build_call(m, "ifelse", &[reflected, neg_hi, lo]);
+    // With an unbounded upper endpoint, the mass is a single reflected tail
+    // regardless of the sign of the lower endpoint.
+    let lower_inf = m.alloc(Node::Lit(Scalar::Real(f64::NEG_INFINITY)));
+    let positive = build_call(m, "gt", &[bound_hi, zero]);
+    let infinite = build_call(m, "isinf", &[bound_hi]);
+    let no = m.alloc(Node::Lit(Scalar::Bool(false)));
+    let right = build_call(m, "ifelse", &[infinite, positive, no]);
+    let x = build_call(m, "ifelse", &[right, neg_lo, x]);
+    let y = build_call(m, "ifelse", &[right, lower_inf, y]);
     let log_x = log_cdf(m, x);
     let log_y = log_cdf(m, y);
     let difference = build_call(m, "sub", &[log_y, log_x]);

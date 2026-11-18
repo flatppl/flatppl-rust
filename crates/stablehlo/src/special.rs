@@ -38,11 +38,7 @@ pub(crate) const SPECIAL_FUNCTIONS: [(&str, usize); 25] = [
     ("airy", 1),
 ];
 
-/// Below this `erfcx(x) = exp(x²)·erfc(x)`. From here up the continued fraction
-/// converges to rounding in [`ERFCX_DEPTH_F64`] terms (mpmath, x up to 1e4).
-const ERFCX_SPLIT: f64 = 2.5;
-const ERFCX_DEPTH_F64: usize = 40;
-const ERFCX_DEPTH_F32: usize = 12;
+const ERFCX_SPLIT: f64 = 4.0;
 const FRAC_1_SQRT_PI: f64 = 0.5641895835477563;
 
 impl Emitter<'_> {
@@ -196,7 +192,7 @@ impl Emitter<'_> {
             "erf" => self.chlo_unary("chlo.erf", &values[0]),
             // `1 - erf(x)` cancels to zero in the upper tail.
             "erfc" => self.chlo_unary("chlo.erfc", &values[0]),
-            "erfcx" => self.erfcx(&values[0]),
+            "erfcx" => self.erfcx(&values[0], false),
             "digamma" => self.chlo_unary("chlo.digamma", &values[0]),
             "gammainc" => self.regularized_gamma(&values[0], &values[1]),
             "betainc" => self.regularized_beta(&values[0], &values[1], &values[2]),
@@ -245,7 +241,11 @@ impl Emitter<'_> {
                 let value = self.bessel_modified_log(&values[0], &values[1], modified_i, scaled);
                 if scaled { self.exp(&value) } else { value }
             }
-            "log_ndtr" => self.normal_log_cdf(&values[0], self.masks_nan(args[0])),
+            "log_ndtr" => {
+                let masks_nan = self.masks_nan(args[0]);
+                self.compact_normal_log_cdf(id, &values[0], masks_nan)
+                    .unwrap_or_else(|| self.normal_log_cdf(&values[0], masks_nan))
+            }
             "bessel_j" | "bessel_i" | "bessel_i_scaled" => {
                 return Err(EmitError::at(
                     id,
@@ -308,9 +308,14 @@ impl Emitter<'_> {
         let finite = self.special_finite(&x);
         let one = self.constant_like(1.0, &x);
         let magnitude = self.select(&finite, &magnitude, &one);
+
         let inv_sqrt_two = self.scalar(std::f64::consts::FRAC_1_SQRT_2);
         let argument = self.mul(&magnitude, &inv_sqrt_two);
-        let scaled_tail = self.erfcx(&argument);
+        // Keep XLA from fusing the double-precision erfc expansion with the
+        // rest of the interval score and its adjoint into one GPU kernel.
+        let split_erfc_fusion =
+            self.target == crate::Target::Gpu && matches!(self.dtype, Dtype::F64);
+        let scaled_tail = self.erfcx(&argument, split_erfc_fusion);
         let log_tail = self.log(&scaled_tail);
         let log_two = self.scalar(std::f64::consts::LN_2);
         let log_tail = self.sub(&log_tail, &log_two);
@@ -337,11 +342,87 @@ impl Emitter<'_> {
         self.select(&not_nan, &value, &nan)
     }
 
-    /// `erfcx(x) = exp(x²)·erfc(x)`, the product below [`ERFCX_SPLIT`] and the
-    /// Laplace continued fraction `1/(√π·(x + ½/(x + 1/(x + (3/2)/(x + …)))))`
-    /// from there up, where `erfc` underflows. Each branch reads a clamped input,
-    /// so the branch `select` drops never feeds `inf` or `NaN` into a gradient.
-    fn erfcx(&mut self, x: &Value) -> Value {
+    /// Keep fixed infinite endpoints out of the CDF and its adjoint.
+    /// Restore the original lane order by indexing the compact result and
+    /// the two constant endpoint values. Only compact rows common to the
+    /// whole batch, so rebinding or batching dynamic inputs stays valid.
+    fn compact_normal_log_cdf(&mut self, id: NodeId, x: &Value, masks_nan: bool) -> Option<Value> {
+        if self.target != crate::Target::Cpu {
+            return None;
+        }
+        let (width, prefix) = shape(&x.ty).split_last()?;
+        let width = usize::try_from((*width)?).ok()?;
+        let batch = prefix.iter().try_fold(1usize, |count, n| {
+            count.checked_mul(usize::try_from((*n)?).ok()?)
+        })?;
+        if !(64..=constants::MAX_FOLDED_ELEMENTS).contains(&width) || !(1..=32).contains(&batch) {
+            return None;
+        }
+        let endpoint = |e: &Self, i| match e.fixed_scalar_at(x, i) {
+            Some(Scalar::Real(v)) if v.is_infinite() => Some(v.is_sign_negative()),
+            _ => None,
+        };
+        let mut active = Vec::new();
+        let mut layout = Vec::with_capacity(width);
+        for i in 0..width {
+            let fixed = endpoint(self, i)
+                .filter(|sign| (1..batch).all(|b| endpoint(self, b * width + i) == Some(*sign)));
+            layout.push(fixed);
+            if fixed.is_none() {
+                active.push(i as i64);
+            }
+        }
+        if active.len() > width * 3 / 4 {
+            return None;
+        }
+        let n = active.len() as i64;
+        let indices = |e: &mut Self, values: Vec<i64>| {
+            let ty = MlirTy::Ranked(vec![Some(values.len() as u64)]);
+            e.folded_constant(
+                values.into_iter().map(Scalar::Int).collect(),
+                ty,
+                Axes::default(),
+            )
+        };
+        let original = self.axes_of(x);
+        let vector_axes = Axes {
+            batch: prefix.len(),
+            layers: vec![1],
+        };
+        let rows = self.axes_view(x, vector_axes.clone());
+        let mut parts = Vec::with_capacity(3);
+        if n != 0 {
+            let keep = indices(self, active)?;
+            let rows = self.gather_axis(&rows, &keep, 0, 0);
+            parts.push(self.normal_log_cdf(&rows, masks_nan));
+        }
+        let mut tail_shape = prefix.to_vec();
+        tail_shape.push(Some(1));
+        for value in [0.0, f64::NEG_INFINITY] {
+            let tail = self.constant(value, MlirTy::Ranked(tail_shape.clone()));
+            parts.push(self.axes_view(&tail, vector_axes.clone()));
+        }
+        let merged = self.concatenate(id, &parts).ok()?;
+        let mut active_slot = 0;
+        let layout = layout
+            .into_iter()
+            .map(|endpoint| match endpoint {
+                Some(negative) => n + i64::from(negative),
+                None => {
+                    let slot = active_slot;
+                    active_slot += 1;
+                    slot
+                }
+            })
+            .collect();
+        let restore = indices(self, layout)?;
+        let restored = self.gather_axis(&merged, &restore, 0, 0);
+        Some(self.axes_view(&restored, original))
+    }
+
+    /// Use the direct product near zero and Cody's rational tail beyond 4.
+    /// Clamp inactive inputs so they cannot overflow in the derivative.
+    fn erfcx(&mut self, x: &Value, split_erfc_fusion: bool) -> Value {
         let x = &self.convert(x, ElemKind::Real);
         let split = self.constant_like(ERFCX_SPLIT, x);
         let small = self.compare("LT", x, &split);
@@ -351,22 +432,52 @@ impl Emitter<'_> {
         let square = self.mul(&near, &near);
         let scale = self.exp(&square);
         let tail = self.chlo_unary("chlo.erfc", &near);
+        let tail = if split_erfc_fusion {
+            self.unary("stablehlo.optimization_barrier", &tail)
+        } else {
+            tail
+        };
         let product = self.mul(&scale, &tail);
 
-        let far = self.select(&small, &split, x);
-        let depth = match self.dtype {
-            Dtype::F32 => ERFCX_DEPTH_F32,
-            Dtype::F64 => ERFCX_DEPTH_F64,
-        };
-        let mut fraction = far.clone();
-        for n in (1..=depth).rev() {
-            let a = self.constant_like(n as f64 / 2.0, x);
-            let step = self.div(&a, &fraction);
-            fraction = self.add(&far, &step);
-        }
-        let c = self.constant_like(FRAC_1_SQRT_PI, x);
-        let asymptotic = self.div(&c, &fraction);
-
-        self.select(&small, &product, &asymptotic)
+        // Cody (1969), Math. Comp. 23, 631–638. The coefficients are the
+        // large-argument P and Q from https://netlib.org/specfun/erf, in
+        // ascending powers of 1/x². Form 1/x first to avoid squaring a large x.
+        // A distinct placeholder avoids folding this select to max(x, 4),
+        // which can send the tangent at the split to the constant.
+        let far_placeholder = self.scalar(5.0);
+        let far = self.select(&small, &far_placeholder, x);
+        let one = self.scalar(1.0);
+        let inverse = self.div(&one, &far);
+        let t = self.mul(&inverse, &inverse);
+        let p = crate::registry::horner(
+            self,
+            &t,
+            &[
+                6.587_491_615_298_378e-4,
+                1.608_378_514_874_228e-2,
+                1.257_817_261_112_292_5e-1,
+                3.603_448_999_498_044_4e-1,
+                3.053_266_349_612_323_4e-1,
+                1.631_538_713_730_209_8e-2,
+            ],
+        );
+        let q = crate::registry::horner(
+            self,
+            &t,
+            &[
+                2.335_204_976_268_691_8e-3,
+                6.051_834_131_244_132e-2,
+                5.279_051_029_514_284e-1,
+                1.872_952_849_923_460_5,
+                2.568_520_192_289_822,
+                1.0,
+            ],
+        );
+        let p = self.mul(&t, &p);
+        let correction = self.div(&p, &q);
+        let leading = self.scalar(FRAC_1_SQRT_PI);
+        let tail = self.sub(&leading, &correction);
+        let tail = self.mul(&inverse, &tail);
+        self.select(&small, &product, &tail)
     }
 }
