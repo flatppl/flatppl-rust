@@ -937,7 +937,7 @@ fn build_exponential_mean_marginal(
 /// overflows for large negative `z`, so each side uses the function that stays in
 /// range. Each side reads `z` clamped to its own half-line, so the side `ifelse`
 /// drops is finite and adds no `NaN` to a gradient. Both functions are §09
-/// `special-functions` members, reached through [`special_functions_alias`].
+/// `special-functions` members, reached through [`flatppl_core::graph::special_functions_alias`].
 fn build_exponentially_modified_normal_logpdf(
     m: &mut Module,
     params: &[NodeId],
@@ -956,7 +956,7 @@ fn build_exponentially_modified_normal_logpdf(
     let left = build_call(m, "lt", &[z, zero]);
     let z_left = build_call(m, "ifelse", &[left, z, zero]);
     let z_right = build_call(m, "ifelse", &[left, zero, z]);
-    let alias = special_functions_alias(m);
+    let alias = flatppl_core::graph::special_functions_alias(m);
 
     let half = real(m, 0.5);
     let square = build_call(m, "mul", &[rate_sigma, rate_sigma]);
@@ -991,48 +991,6 @@ fn special_function_call(m: &mut Module, alias: Symbol, member: &str, arg: NodeI
         name,
     }));
     crate::density::build_user_call_n(m, callee, vec![arg])
-}
-
-/// The alias of a `standard_module("special-functions", "0.1")` binding, adding one if the
-/// model has none. The name and version must match both engines' catalogues.
-fn special_functions_alias(m: &mut Module) -> Symbol {
-    const NAME: &str = "special-functions";
-    const VERSION: &str = "0.1";
-    let is_load = |m: &Module, rhs: NodeId| match m.node(rhs) {
-        Node::Call(c) => {
-            matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == "standard_module")
-                && matches!(c.args.as_ref(), [n, v]
-                    if matches!(m.node(*n), Node::Lit(Scalar::Str(s)) if s.as_ref() == NAME)
-                        && matches!(m.node(*v), Node::Lit(Scalar::Str(s)) if s.as_ref() == VERSION))
-        }
-        _ => false,
-    };
-    if let Some(name) = m
-        .bindings()
-        .find(|(_, b)| is_load(m, b.rhs))
-        .map(|(_, b)| b.name)
-    {
-        return name;
-    }
-    let mut index = 0;
-    let name = loop {
-        let name = m.intern(&format!("__special_functions_{index}"));
-        if m.binding_by_name(name).is_none() {
-            break name;
-        }
-        index += 1;
-    };
-    let module = m.alloc(Node::Lit(Scalar::Str(NAME.into())));
-    let version = m.alloc(Node::Lit(Scalar::Str(VERSION.into())));
-    let rhs = build_call(m, "standard_module", &[module, version]);
-    m.add_binding(flatppl_core::Binding {
-        name,
-        rhs,
-        doc: None,
-        public: false,
-        synthetic: true,
-    });
-    name
 }
 
 // ---------------------------------------------------------------------------

@@ -91,6 +91,11 @@ fn posterior_reports_follow_imports_restrictions_and_specialized_likelihoods() {
     for (output, sampling) in [
         ("Q=m.Q\noutputs=rand(Q,rnginit(s))", ExactIid),
         ("outputs=logdensityof(m.P,record(p=0.5))", NotUsed),
+        (
+            "outputs=logdensityof(normalize(m.P),record(p=0.5))",
+            NotUsed,
+        ),
+        ("outputs=log(totalmass(m.P))", NotUsed),
     ] {
         let updates = inspect(format!("{import}{output}"));
         assert_eq!(updates.len(), 1);

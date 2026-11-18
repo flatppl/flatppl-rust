@@ -125,7 +125,10 @@ The same command reports conjugate posterior updates reachable from `outputs`.
 For example, a `Beta(1, 1)` prior and one observed Bernoulli success give
 `Beta(2, 1)`. For `rand(normalize(P), state)` the report names the matched
 families and identifies the exact IID draw selected by Rust StableHLO lowering.
-A score can use the same posterior without requesting a draw.
+`logdensityof(normalize(P), point)` scores the matched posterior law.
+`totalmass(P)` and `log(totalmass(P))` give the evidence and log evidence for
+Beta priors with Bernoulli or Binomial observations. Each Binomial observation
+retains its own count coefficient.
 
 This optional Rust capability covers one named parameter with Beta–Bernoulli,
 Beta–Binomial, Gamma–Poisson, Normal–Normal (mean), InverseGamma–Normal

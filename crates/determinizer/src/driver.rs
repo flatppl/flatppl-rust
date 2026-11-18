@@ -187,6 +187,7 @@ fn determinize_inner(
     }
 
     let mut specialize_sequences = true;
+    let mut has_mass_queries = false;
     let mut sampling = SamplingInspection {
         observer,
         refresh: true,
@@ -256,6 +257,12 @@ fn determinize_inner(
                 // `roots` is given, drop bindings unreachable from them) before
                 // the conformance check and return.
                 crate::canon::canonicalize(&mut work, roots);
+                if has_mass_queries && crate::log_mass::lower(&mut work) {
+                    if let Some(roots) = roots {
+                        crate::canon::retain_reachable(&mut work, roots);
+                    }
+                    let _ = flatppl_infer::infer(&mut work);
+                }
                 if !options.disable_sufficient_statistics {
                     if let Some(report) = report.as_deref_mut() {
                         crate::sufficient_statistics_with_report(&mut work, report);
@@ -295,7 +302,8 @@ fn determinize_inner(
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(
+                has_mass_queries |= is_op(&work, node_id, "totalmass");
+                if let Err(error) = apply_rule(
                     &mut work,
                     bid,
                     node_id,
@@ -303,10 +311,42 @@ fn determinize_inner(
                     &mut imports,
                     options,
                     &mut sampling,
-                )?;
+                ) {
+                    if !needs_posterior_operands(&work, node_id)
+                        || !crate::crossmodule::resolve_crossmodule_values(
+                            &mut work,
+                            bundle,
+                            &mut imports,
+                        )?
+                    {
+                        return Err(error);
+                    }
+                    // Inspect locally constructed updates after imported operands have types.
+                    crate::stdfn::lower_std_module_functions(&mut work, options)?;
+                    sampling.refresh = true;
+                }
                 // Loop: re-scan after the rewrite.
             }
         }
+    }
+}
+
+fn needs_posterior_operands(m: &Module, id: NodeId) -> bool {
+    match crate::density::builtin_name(m, id) {
+        Some("totalmass") => true,
+        Some("logdensityof" | "densityof") => {
+            let Node::Call(call) = m.node(id) else {
+                return false;
+            };
+            call.args.first().is_some_and(|&measure| {
+                is_op(
+                    m,
+                    flatppl_core::graph::resolve_ref(m, measure).0,
+                    "normalize",
+                )
+            })
+        }
+        _ => false,
     }
 }
 
@@ -698,6 +738,13 @@ fn apply_rule(
         let root = crate::density::closed_form_totalmass(m, measure).ok_or_else(|| {
             crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
         })?;
+        let root = if let Some(exp) = flatppl_core::graph::expect_builtin_call(m, root, "exp")
+            && let [log_mass] = *exp.args
+        {
+            crate::density::build_call(m, flatppl_core::MASS_FROM_LOG, &[log_mass])
+        } else {
+            root
+        };
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, root);
         m.set_binding_rhs(bid, rhs);
         sweep_dead_measure_bindings(m);

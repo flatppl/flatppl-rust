@@ -51,6 +51,9 @@ pub const MASS_INTEGRAL: &str = "%mass_integral";
 /// Determinization resolves `(constructor, lower, upper)` before FlatPDL checks.
 pub const LOG_INTERVAL_MASS: &str = "%log_interval_mass";
 
+/// Exact mass represented by its logarithm until query arguments have been substituted.
+pub const MASS_FROM_LOG: &str = "%mass_from_log";
+
 /// A real coordinate owned by one scalar integral, with a unique integer token.
 /// It has no value outside its owning integral and no source-language spelling.
 pub const INTEGRATION_POINT: &str = "%integration_point";

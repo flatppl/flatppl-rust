@@ -103,20 +103,26 @@ module attributes {flatppl.runtime_status = 1 : i64} {
     %102 = stablehlo.log_plus_one %101 : tensor<f32>
     %103 = stablehlo.subtract %86, %6 : tensor<f32>
     %104 = stablehlo.multiply %103, %102 : tensor<f32>
-    %105 = stablehlo.multiply %16, %73 : tensor<f32>
-    %106 = stablehlo.add %104, %105 : tensor<f32>
-    %107 = stablehlo.subtract %16, %106 : tensor<f32>
-    %108 = stablehlo.add %100, %107 : tensor<f32>
-    %109 = stablehlo.add %85, %108 : tensor<f32>
-    %110 = chlo.lgamma %17 : tensor<f32> -> tensor<f32>
-    %111 = stablehlo.add %16, %17 : tensor<f32>
-    %112 = chlo.lgamma %111 : tensor<f32> -> tensor<f32>
-    %113 = stablehlo.add %85, %110 : tensor<f32>
-    %114 = stablehlo.subtract %113, %112 : tensor<f32>
-    %115 = stablehlo.select %20, %109, %114 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %116 = stablehlo.select %19, %84, %115 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %117 = stablehlo.add %11, %14 : tensor<f32>
-    %118 = stablehlo.subtract %117, %116 : tensor<f32>
-    return %118, %5 : tensor<f32>, tensor<i32>
+    %105 = stablehlo.constant dense<0.0000000000000002220446049250313> : tensor<f32>
+    %106 = stablehlo.compare LT, %101, %105 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %107 = stablehlo.subtract %16, %6 : tensor<f32>
+    %108 = stablehlo.multiply %107, %102 : tensor<f32>
+    %109 = stablehlo.add %16, %108 : tensor<f32>
+    %110 = stablehlo.select %106, %109, %104 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %111 = stablehlo.multiply %16, %73 : tensor<f32>
+    %112 = stablehlo.add %110, %111 : tensor<f32>
+    %113 = stablehlo.subtract %16, %112 : tensor<f32>
+    %114 = stablehlo.add %100, %113 : tensor<f32>
+    %115 = stablehlo.add %85, %114 : tensor<f32>
+    %116 = chlo.lgamma %17 : tensor<f32> -> tensor<f32>
+    %117 = stablehlo.add %16, %17 : tensor<f32>
+    %118 = chlo.lgamma %117 : tensor<f32> -> tensor<f32>
+    %119 = stablehlo.add %85, %116 : tensor<f32>
+    %120 = stablehlo.subtract %119, %118 : tensor<f32>
+    %121 = stablehlo.select %20, %115, %120 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %122 = stablehlo.select %19, %84, %121 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %123 = stablehlo.add %11, %14 : tensor<f32>
+    %124 = stablehlo.subtract %123, %122 : tensor<f32>
+    return %124, %5 : tensor<f32>, tensor<i32>
   }
 }
