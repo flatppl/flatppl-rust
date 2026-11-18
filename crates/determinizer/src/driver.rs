@@ -735,9 +735,12 @@ fn apply_rule(
             .ok_or_else(|| {
                 crate::density::refuse(target_node, m, "totalmass expects one positional measure")
             })?;
-        let root = crate::density::closed_form_totalmass(m, measure).ok_or_else(|| {
-            crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
-        })?;
+        let root = crate::density::closed_form_totalmass(m, measure)
+            .map(Ok)
+            .or_else(|| crate::density::integral::rectangular_totalmass(m, measure))
+            .ok_or_else(|| {
+                crate::density::refuse(target_node, m, "totalmass needs a closed-form mass")
+            })??;
         let root = if let Some(exp) = flatppl_core::graph::expect_builtin_call(m, root, "exp")
             && let [log_mass] = *exp.args
         {

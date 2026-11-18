@@ -557,6 +557,66 @@ fn weighted_unary_weight_receives_the_whole_variate() {
 }
 
 #[test]
+fn bounded_rectangle_mass_and_iid_normalizer_require_opt_in() {
+    use flatppl_determinizer::{LoweringOptions, determinize_with_options};
+
+    for (operator, weight, integral) in [
+        ("weighted", "1 + p * v[1] * v[2]", "%mass_integral"),
+        ("logweighted", "p * v[1] * v[2]", "%log_integral"),
+    ] {
+        for query in [
+            "totalmass(M)",
+            "logdensityof(iid(normalize(M), 3), [[0.1, 0.2], [0.4, 0.3], [0.2, 0.5]])",
+        ] {
+            let source = format!(
+                "a = elementof(posreals)\n\
+                 w(v, p) = {weight}\n\
+                 S = cartprod(interval(0, 1), interval(0, a))\n\
+                 M = {operator}(w, Lebesgue(S), a)\n\
+                 score = {query}\ninputs = a\noutputs = score"
+            );
+            let module = parse_infer(&source);
+            let error = determinize(&module).expect_err("numerical integration requires opt-in");
+            assert_eq!(error.construct, "NumericalIntegral", "{error:?}");
+            let output = determinize_with_options(
+                &module,
+                &flatppl_infer::ModuleBundle::new(),
+                None,
+                &LoweringOptions {
+                    numerical_integrals: true,
+                    ..Default::default()
+                },
+            )
+            .expect("rectangle lowers with numerical opt-in");
+            let pir = flatppl_flatpir::write(&output);
+            assert_eq!(pir.matches(integral).count(), 1, "{pir}");
+            assert!(pir.contains("(%ref self a)"), "live bound: {pir}");
+        }
+    }
+}
+
+#[test]
+fn rectangular_integral_refuses_a_statically_unbounded_axis() {
+    use flatppl_determinizer::{LoweringOptions, determinize_with_options};
+
+    let module = parse_infer(
+        "M = logweighted(v -> -v[1] - v[2], Lebesgue(cartprod(interval(0, inf), interval(0, 1))))\n\
+         mass = totalmass(M)\noutputs = mass",
+    );
+    let error = determinize_with_options(
+        &module,
+        &flatppl_infer::ModuleBundle::new(),
+        None,
+        &LoweringOptions {
+            numerical_integrals: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("quadrature requires bounded rectangles");
+    assert_eq!(error.construct, "totalmass", "{error:?}");
+}
+
+#[test]
 fn normalize_truncated_normal_structure() {
     // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5 →
     //   sub(density_with_gate, log(sub(touniform(base, hi), touniform(base, lo))))

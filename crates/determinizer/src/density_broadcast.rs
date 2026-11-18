@@ -67,7 +67,7 @@ pub(crate) fn lower_held_measure(m: &mut Module, id: NodeId, op: Symbol) -> Opti
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Capture {
     Reference(Ref),
-    Projection(NodeId),
+    Expression(NodeId),
 }
 
 /// Find the root reference of a literal record or tuple projection path.
@@ -90,12 +90,37 @@ fn capture_projection(m: &Module, id: NodeId) -> Option<Ref> {
     }
 }
 
-fn captures(m: &Module, root: NodeId, inputs: &[(Symbol, Ref)]) -> Vec<(Capture, NodeId)> {
+fn captures(
+    m: &Module,
+    root: NodeId,
+    inputs: &[(Symbol, Ref)],
+    lift_integrals: bool,
+) -> Vec<(Capture, NodeId)> {
+    let mut cell_inputs = None;
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
+            continue;
+        }
+        // An invariant rectangle normalizer belongs outside the observation broadcast.
+        // Pass its result once, without lifting its parameters into cell scope.
+        if lift_integrals
+            && matches!(m.node(id), Node::Call(c) if c.args.len() == 7)
+            && crate::canon::is_integral(m, id)
+            && crate::canon::integral_is_closed(
+                m,
+                id,
+                cell_inputs.get_or_insert_with(|| {
+                    inputs
+                        .iter()
+                        .map(|&(_, reference)| reference)
+                        .collect::<Vec<_>>()
+                }),
+            )
+        {
+            result.push((Capture::Expression(id), id));
             continue;
         }
         // Capture the used leaf rather than an enclosing record or tuple.
@@ -104,7 +129,7 @@ fn captures(m: &Module, root: NodeId, inputs: &[(Symbol, Ref)]) -> Vec<(Capture,
             && !inputs.iter().any(|(_, r)| *r == reference)
             && !matches!(m.type_of(id), Some(Type::Record(_)))
         {
-            result.push((Capture::Projection(id), id));
+            result.push((Capture::Expression(id), id));
             continue;
         }
         match m.node(id) {
@@ -322,7 +347,7 @@ fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
         let body = crate::canon::inline_expression(m, body);
         // Inlined helpers may expose further object aliases or projections.
         let body = expand_objects(m, body, &mut std::collections::HashMap::new());
-        let live: Vec<_> = captures(m, body, &function.inputs)
+        let live: Vec<_> = captures(m, body, &function.inputs, false)
             .into_iter()
             .filter(|(_, value)| {
                 let resolved = resolve_ref_chain(m, *value).0;
@@ -372,7 +397,7 @@ fn specialize_sequences(m: &mut Module, callable_only: bool) -> bool {
                 .find_map(|(capture, value)| {
                     let matches = match capture {
                         Capture::Reference(reference) => m.node(id) == &Node::Ref(*reference),
-                        Capture::Projection(projection) => *projection == id,
+                        Capture::Expression(expression) => *expression == id,
                     };
                     matches.then_some(*value)
                 })
@@ -839,7 +864,7 @@ pub(crate) fn closed_function(
 ) -> (NodeId, Vec<NodeId>) {
     let mut replacements = Vec::new();
     let mut parameters = Vec::new();
-    for (capture, value) in captures(m, body, &inputs) {
+    for (capture, value) in captures(m, body, &inputs, matches!(lift, Lift::Cells(_))) {
         let (resolved, _) = resolve_ref_chain(m, value);
         // Closed support sets and other fixed module bindings remain global.
         // In particular, a set must not become a runtime tensor argument.
@@ -863,7 +888,7 @@ pub(crate) fn closed_function(
             .unwrap_or(Type::Any);
         let actual = match capture {
             Capture::Reference(reference) => m.alloc(Node::Ref(reference)),
-            Capture::Projection(id) => id,
+            Capture::Expression(id) => id,
         };
         m.set_type(actual, ty.clone());
         let Lift::Cells(rank) = lift else {
@@ -908,7 +933,7 @@ pub(crate) fn closed_function(
             .find_map(|(capture, value)| {
                 let matches = match capture {
                     Capture::Reference(reference) => m.node(id) == &Node::Ref(*reference),
-                    Capture::Projection(projection) => *projection == id,
+                    Capture::Expression(expression) => *expression == id,
                 };
                 matches.then_some(*value)
             })

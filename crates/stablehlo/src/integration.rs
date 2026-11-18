@@ -8,6 +8,11 @@
 
 use super::*;
 
+use crate::IntegrationOptions;
+
+#[path = "integration/rectangle.rs"]
+mod rectangle;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntegralKind {
     Log,
@@ -87,10 +92,10 @@ impl Emitter<'_> {
         args: &[NodeId],
         kind: IntegralKind,
     ) -> Result<Value, EmitError> {
-        if args.len() != 4 || self.integrating {
+        if !matches!(args.len(), 4 | 7) || self.integrating {
             return Err(EmitError::at(
                 id,
-                "numerical integration requires a non-nested scalar integral",
+                "numerical integration requires a non-nested integral with one or two coordinates",
             ));
         }
         let inputs = self.integral_inputs(args);
@@ -102,19 +107,18 @@ impl Emitter<'_> {
             // Independent inner normalizers dominate adaptation and mesh replay.
             self.lower_integral_dependencies(args[0])?;
             self.integrating = true;
-            self.lower_scalar_integral(id, args, kind)
+            if args.len() == 4 {
+                self.lower_scalar_integral(id, args, kind)
+            } else {
+                self.lower_rectangle_integral(id, args, kind)
+            }
         })();
         self.integrating = false;
         self.broadcast_frame = frame;
         result
     }
 
-    fn lower_scalar_integral(
-        &mut self,
-        id: NodeId,
-        args: &[NodeId],
-        kind: IntegralKind,
-    ) -> Result<Value, EmitError> {
+    fn checked_integration(&self, id: NodeId) -> Result<IntegrationOptions, EmitError> {
         let options = self
             .integration
             .ok_or_else(|| EmitError::at(id, "numerical integration requires explicit opt-in"))?;
@@ -130,6 +134,16 @@ impl Emitter<'_> {
                 "integration requires finite nonnegative tolerances, at least one positive tolerance, and 2..=i32::MAX intervals",
             ));
         }
+        Ok(options)
+    }
+
+    fn lower_scalar_integral(
+        &mut self,
+        id: NodeId,
+        args: &[NodeId],
+        kind: IntegralKind,
+    ) -> Result<Value, EmitError> {
+        let options = self.checked_integration(id)?;
         let lo = self.lower_node(args[2])?;
         let hi = self.lower_node(args[3])?;
         if lo.ty != MlirTy::Scalar || hi.ty != MlirTy::Scalar {
@@ -140,7 +154,7 @@ impl Emitter<'_> {
         }
         let lo = self.convert(&lo, ElemKind::Real);
         let hi = self.convert(&hi, ElemKind::Real);
-        let cuts = self.integral_breakpoints(args[0], args[1])?;
+        let cuts = self.integral_breakpoints(args[0], args[1], true)?;
         let mut bounds = vec![lo.clone()];
         let mut seen = HashSet::from([lo.ssa.clone(), hi.ssa.clone()]);
         for cut in cuts {
@@ -371,10 +385,19 @@ impl Emitter<'_> {
     fn integral_inputs(&self, args: &[NodeId]) -> Vec<(IntegralInput, Value)> {
         let mut inputs = Vec::new();
         let mut bound = HashSet::new();
-        let mut pending = vec![args[0], args[2], args[3]];
+        let (coordinates, bounds) = if args.len() == 4 {
+            (vec![args[1]], vec![args[2], args[3]])
+        } else {
+            (
+                vec![args[1], args[4]],
+                vec![args[2], args[3], args[5], args[6]],
+            )
+        };
+        let mut pending = bounds;
+        pending.push(args[0]);
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {
-            if id == args[1] || !seen.insert(id) {
+            if coordinates.contains(&id) || !seen.insert(id) {
                 continue;
             }
             if let Some(value) = self.memo.get(&id) {
@@ -583,6 +606,7 @@ impl Emitter<'_> {
         &mut self,
         body: NodeId,
         point: NodeId,
+        allow_cuts: bool,
     ) -> Result<Vec<Value>, EmitError> {
         let mut pending = vec![body];
         let mut seen = HashSet::new();
@@ -604,6 +628,12 @@ impl Emitter<'_> {
                         let a = self.integral_depends_on(c.args[0], point);
                         let b = self.integral_depends_on(c.args[1], point);
                         if a || b {
+                            if !allow_cuts {
+                                return Err(EmitError::at(
+                                    id,
+                                    "rectangle integration requires a smooth integrand without coordinate-dependent cuts",
+                                ));
+                            }
                             let (coordinate, cut) = if a {
                                 (c.args[0], c.args[1])
                             } else {
@@ -622,6 +652,12 @@ impl Emitter<'_> {
                     "in" if c.args.len() == 2
                         && c.args.iter().any(|&n| self.integral_depends_on(n, point)) =>
                     {
+                        if !allow_cuts {
+                            return Err(EmitError::at(
+                                id,
+                                "rectangle integration requires a smooth integrand without coordinate-dependent cuts",
+                            ));
+                        }
                         let set = self.resolve_ref_one(c.args[1]);
                         if self.resolve_ref_one(c.args[0]) == point
                             && let Node::Call(set) = self.node(set).clone()
@@ -766,72 +802,12 @@ impl Emitter<'_> {
         let above = self.compare("GT", &x, &lo);
         let below = self.compare("LT", &x, &hi);
         let physical_interior = self.and(&above, &below);
-        let count = shape(&x.ty).iter().map(|d| d.unwrap()).product::<u64>();
-        let x = self.reshape(&x, MlirTy::Ranked(vec![Some(count)]));
-        let parent = std::mem::replace(&mut self.broadcast_frame, vec![Some(count)]);
-        let x = self.axes_view(
-            &x,
-            Axes {
-                batch: 1,
-                layers: vec![],
-            },
-        );
-        let log = self.lower_with_bindings(body, vec![(point, x)]);
-        self.broadcast_frame = parent;
-        let log = log?;
-        if self.cell_ty(&log) != MlirTy::Scalar || log.elem != ElemKind::Real {
-            return Err(EmitError::at(
-                body,
-                "numerical integrand must be a real scalar",
-            ));
-        }
-        let log = if log.ty == MlirTy::Scalar {
-            self.expand_axes(
-                &log,
-                &[],
-                MlirTy::Ranked(vec![Some(count)]),
-                Axes {
-                    batch: 1,
-                    layers: vec![],
-                },
-            )
-        } else {
-            log
-        };
-        let body = self.reshape(&log, t.ty.clone());
-        let body = self.axes_view(&body, self.axes_of(&t));
+        let body = self.quadrature_body(body, [(point, x)])?;
         let inf = self.scalar(f64::INFINITY);
         let (log, raw_valid, linear) = if kind == IntegralKind::Mass {
-            let nonnegative = self.compare("GE", &body, &zero);
-            let finite = self.compare("LT", &body, &inf);
-            let valid = self.and(&nonnegative, &finite);
-            let positive = self.compare("GT", &body, &zero);
-            let safe = self.select(&positive, &body, &one);
-            let log = self.log(&safe);
-            let scale = self.floor(&log);
-            let neg_inf = self.scalar(f64::NEG_INFINITY);
-            let log = self.select(&positive, &log, &neg_inf);
-            // Replay a scaled linear quadrature sum so AD sees the raw
-            // integrand, including at zero. The per-node discrete scale does
-            // not couple a large weight at one node to another node's factor.
-            // Dividing by a huge scale can lower to a subnormal reciprocal on
-            // XLA. Two balanced multiplications keep both factors representable.
-            let half_scale = self.mul(&scale, &half);
-            let half_scale = self.neg(&half_scale);
-            let half_scale = self.exp(&half_scale);
-            let normalized = self.mul(&body, &half_scale);
-            let normalized = self.mul(&normalized, &half_scale);
-            // Combine all positive scale factors before exponentiation: an
-            // intermediate normalized * width may overflow even if the
-            // Kronrod-weighted term and final integral are finite.
             let log_radius = self.log(&radius);
-            let log_kronrod = self.log(&kronrod);
-            let factor = self.add(&scale, &jacobian);
-            let factor = self.add(&factor, &log_radius);
-            let factor = self.add(&factor, &log_kronrod);
-            let factor = self.exp(&factor);
-            let weighted = self.mul(&normalized, &factor);
-            let mass = self.reduce_sum(&weighted);
+            let (log, valid, mass) =
+                self.quadrature_raw_mass(&body, &jacobian, &log_radius, &kronrod);
             let mass = self.select(&nonempty, &mass, &zero);
             (log, Some(valid), mass)
         } else {
@@ -875,27 +851,7 @@ impl Emitter<'_> {
         let variation = self.reduce_sum(&deviation);
         let difference = self.sub(&k, &g);
         let difference = self.abs(&difference);
-        let changing = self.compare("GT", &variation, &zero);
-        let disagree = self.compare("GT", &difference, &zero);
-        let scalable = self.and(&changing, &disagree);
-        let denominator = self.select(&scalable, &variation, &one);
-        let ratio = self.div(&difference, &denominator);
-        let ratio = self.select(&scalable, &ratio, &one);
-        let ratio = self.min(&ratio, &one);
-        let inflation = self.scalar(200.0);
-        let ratio = self.mul(&inflation, &ratio);
-        let ratio = self.min(&ratio, &one);
-        let power = self.scalar(1.5);
-        let ratio = self.pow(&ratio, &power);
-        let rescaled = self.mul(&variation, &ratio);
-        let error = self.select(&scalable, &rescaled, &difference);
-        let epsilon = match self.dtype {
-            Dtype::F32 => f32::EPSILON as f64,
-            Dtype::F64 => f64::EPSILON,
-        };
-        let floor = self.scalar(50.0 * epsilon);
-        let floor = self.mul(&floor, &k);
-        let error = self.max(&error, &floor);
+        let error = self.quadrature_error(&difference, &variation, &k);
         let safe_k = self.select(&nonzero, &k, &one);
         let safe_error = self.select(&nonzero, &error, &one);
         let log_radius = self.log(&radius);
@@ -911,6 +867,120 @@ impl Emitter<'_> {
             valid,
             linear,
         ))
+    }
+
+    /// Scale the Gauss–Kronrod discrepancy by the sampled absolute deviation.
+    fn quadrature_error(&mut self, difference: &Value, variation: &Value, mass: &Value) -> Value {
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let changing = self.compare("GT", variation, &zero);
+        let disagree = self.compare("GT", difference, &zero);
+        let scalable = self.and(&changing, &disagree);
+        let denominator = self.select(&scalable, variation, &one);
+        let ratio = self.div(difference, &denominator);
+        let ratio = self.select(&scalable, &ratio, &one);
+        let ratio = self.min(&ratio, &one);
+        let inflation = self.scalar(200.0);
+        let ratio = self.mul(&inflation, &ratio);
+        let ratio = self.min(&ratio, &one);
+        let power = self.scalar(1.5);
+        let ratio = self.pow(&ratio, &power);
+        let rescaled = self.mul(variation, &ratio);
+        let error = self.select(&scalable, &rescaled, difference);
+        let epsilon = match self.dtype {
+            Dtype::F32 => f32::EPSILON as f64,
+            Dtype::F64 => f64::EPSILON,
+        };
+        let floor = self.scalar(50.0 * epsilon);
+        let floor = self.mul(&floor, mass);
+        self.max(&error, &floor)
+    }
+
+    /// Evaluate the scalar integrand in a flat node batch, then restore the
+    /// panel prefix and node axis so reductions leave each panel intact.
+    fn quadrature_body<const N: usize>(
+        &mut self,
+        body: NodeId,
+        points: [(NodeId, Value); N],
+    ) -> Result<Value, EmitError> {
+        let template = points[0].1.clone();
+        let count = shape(&template.ty)
+            .iter()
+            .map(|d| d.unwrap())
+            .product::<u64>();
+        let ty = MlirTy::Ranked(vec![Some(count)]);
+        let node_axes = Axes {
+            batch: 1,
+            layers: vec![],
+        };
+        let bindings = points
+            .into_iter()
+            .map(|(point, value)| {
+                (
+                    point,
+                    self.reshape_axes(&value, ty.clone(), node_axes.clone()),
+                )
+            })
+            .collect();
+        let parent = std::mem::replace(&mut self.broadcast_frame, vec![Some(count)]);
+        let output = self.lower_with_bindings(body, bindings);
+        self.broadcast_frame = parent;
+        let output = output?;
+        if self.cell_ty(&output) != MlirTy::Scalar || output.elem != ElemKind::Real {
+            return Err(EmitError::at(
+                body,
+                "numerical integrand must be a real scalar",
+            ));
+        }
+        let output = if output.ty == MlirTy::Scalar {
+            self.expand_axes(&output, &[], ty, node_axes)
+        } else {
+            output
+        };
+        Ok(self.reshape_axes(&output, template.ty.clone(), self.axes_of(&template)))
+    }
+
+    fn quadrature_raw_mass(
+        &mut self,
+        body: &Value,
+        jacobian: &Value,
+        log_radius: &Value,
+        kronrod: &Value,
+    ) -> (Value, Value, Value) {
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let half = self.scalar(0.5);
+        let inf = self.scalar(f64::INFINITY);
+        let nonnegative = self.compare("GE", body, &zero);
+        let finite = self.compare("LT", body, &inf);
+        let valid = self.and(&nonnegative, &finite);
+        let positive = self.compare("GT", body, &zero);
+        let safe = self.select(&positive, body, &one);
+        let log = self.log(&safe);
+        let scale = self.floor(&log);
+        let neg_inf = self.scalar(f64::NEG_INFINITY);
+        let log = self.select(&positive, &log, &neg_inf);
+        // Replay a scaled linear quadrature sum so AD sees the raw
+        // integrand, including at zero. The per-node discrete scale does
+        // not couple a large weight at one node to another node's factor.
+        // Dividing by a huge scale can lower to a subnormal reciprocal on
+        // XLA. Two balanced multiplications keep both factors representable.
+        let half_scale = self.mul(&scale, &half);
+        let half_scale = self.neg(&half_scale);
+        let half_scale = self.exp(&half_scale);
+        let normalized = self.mul(body, &half_scale);
+        let normalized = self.mul(&normalized, &half_scale);
+        // Combine all positive scale factors before exponentiation: an
+        // intermediate normalized * width may overflow even if the
+        // Kronrod-weighted term and final integral are finite.
+        let log_kronrod = self.log(kronrod);
+        let factor = self.add(&scale, jacobian);
+        let factor = self.add(&factor, log_radius);
+        let factor = self.add(&factor, &log_kronrod);
+        let factor = self.exp(&factor);
+        let weighted = self.mul(&normalized, &factor);
+        let mass = self.reduce_sum(&weighted);
+        (log, valid, mass)
     }
 
     fn quadrature_constants(&mut self, xs: &[f64]) -> Value {

@@ -39,12 +39,14 @@ pub use ty::{Dim, Mass, Phase, ScalarType, Type, ValueSet};
 pub const FLATPPL_COMPAT: &str = "0.1";
 
 /// Compiler-only positive integral: `(log_body, bound_point, lower, upper)`.
+/// A bounded rectangle appends `(second_point, second_lower, second_upper)`.
 /// Backends must explicitly admit numerical evaluation. This is not FlatPDL.
 pub const LOG_INTEGRAL: &str = "%log_integral";
 /// Log of the difference of two CDF values supplied in log space.
 pub const LOG_CDF_DIFFERENCE: &str = "%log_cdf_difference";
 
 /// Compiler-only integral of a nonnegative scalar body, returning its mass.
+/// Uses the same coordinate and endpoint layout as `LOG_INTEGRAL`.
 pub const MASS_INTEGRAL: &str = "%mass_integral";
 
 /// Deferred log mass of a continuous constructor on `(lower, upper)`.
@@ -54,7 +56,7 @@ pub const LOG_INTERVAL_MASS: &str = "%log_interval_mass";
 /// Exact mass represented by its logarithm until query arguments have been substituted.
 pub const MASS_FROM_LOG: &str = "%mass_from_log";
 
-/// A real coordinate owned by one scalar integral, with a unique integer token.
+/// A real coordinate owned by one integral, with a unique integer token.
 /// It has no value outside its owning integral and no source-language spelling.
 pub const INTEGRATION_POINT: &str = "%integration_point";
 

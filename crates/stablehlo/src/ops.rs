@@ -3313,7 +3313,7 @@ fn lower_membership(
         && c.named.is_empty()
     {
         let sets = c.args.clone();
-        if v.ty != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
+        if e.cell_ty(&v) != MlirTy::Ranked(vec![Some(sets.len() as u64)]) {
             return Err(EmitError::at(
                 id,
                 "'in' over cartprod needs a vector with one scalar per set",
@@ -3322,8 +3322,8 @@ fn lower_membership(
         let mut members = Vec::with_capacity(sets.len());
         for (i, set) in sets.into_iter().enumerate() {
             let set = classify_elem_set(e, id, set)?;
-            let cell = e.slice(&v, &[i as u64], &[i as u64 + 1], &[1]);
-            let cell = e.reshape(&cell, MlirTy::Scalar);
+            let index = e.int_value_const(i as i64);
+            let cell = e.gather_cells(&v, &index, 0);
             members.push(elem_membership(e, id, &cell, set)?);
         }
         return members
