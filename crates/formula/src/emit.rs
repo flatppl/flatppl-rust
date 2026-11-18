@@ -280,6 +280,30 @@ fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::Predictor
             external_vector(b, &by.index, "posintegers");
         }
     }
+    for (i, smooth) in recipe.tensor_smooths.iter_mut().enumerate() {
+        let mut inputs = |part: &str, count| {
+            (1..=count)
+                .map(|j| {
+                    let name = b.alloc_name(&predictor_name(
+                        dpar,
+                        &format!("tensor_{}_{part}_{j}", i + 1),
+                    ));
+                    external_vector(b, &name, "reals");
+                    name
+                })
+                .collect()
+        };
+        smooth.fixed = inputs("fixed", crate::tensor::FIXED_COLS);
+        let sizes = smooth.block_sizes();
+        for ((block, name), size) in smooth
+            .blocks
+            .iter_mut()
+            .zip(crate::tensor::BLOCKS)
+            .zip(sizes)
+        {
+            block.inputs = inputs(name, size);
+        }
+    }
     if !recipe.formula.offsets.is_empty() {
         external_vector(b, &predictor_name(dpar, "offset"), "reals");
     }
@@ -412,6 +436,32 @@ fn predictor_parameters(
             let normal = b.call("Normal", &[zero, one]);
             let law = b.call("iid", &[normal, rank]);
             declare_parameter(b, z, law, parameters);
+        }
+    }
+    for (smooth, term) in recipe
+        .tensor_smooths
+        .iter_mut()
+        .zip(&recipe.formula.tensor_smooths)
+    {
+        let name = term.name();
+        for (block, label) in smooth.blocks.iter_mut().zip(crate::tensor::BLOCKS) {
+            block.sds = b.alloc_name(&predictor_name(dpar, &format!("sds_{name}_{label}")));
+            block.z = b.alloc_name(&predictor_name(dpar, &format!("zs_{name}_{label}")));
+            let support = lower_bound(b, 0.0);
+            parameter(
+                b,
+                &block.sds,
+                scale_priors.next().unwrap(),
+                Some(support),
+                parameters,
+                family,
+            )?;
+            let zero = b.lit_real(0.0);
+            let one = b.lit_real(1.0);
+            let normal = b.call("Normal", &[zero, one]);
+            let rank = b.lit_int(block.inputs.len() as i64);
+            let law = b.call("iid", &[normal, rank]);
+            declare_parameter(b, &block.z, law, parameters);
         }
     }
     for (i, coding) in recipe.monotonic.iter().enumerate() {
@@ -608,6 +658,27 @@ fn predictor_values(
         let contribution = smooth_effect(b, dpar, smooth, smooth_offset);
         eta = broadcast(b, "add", &[eta, contribution]);
         smooth_offset += smooth.curve_count();
+    }
+    for smooth in &recipe.tensor_smooths {
+        let bs = b.self_ref(&predictor_name(dpar, "bs"));
+        for (i, input) in smooth.fixed.iter().enumerate() {
+            let index = b.lit_int((smooth_offset + i + 1) as i64);
+            let coefficient = b.call("get", &[bs, index]);
+            let values = b.self_ref(input);
+            let term = broadcast(b, "mul", &[values, coefficient]);
+            eta = broadcast(b, "add", &[eta, term]);
+        }
+        smooth_offset += smooth.fixed.len();
+        for block in &smooth.blocks {
+            let sds = b.self_ref(&block.sds);
+            let z = b.self_ref(&block.z);
+            let weights = broadcast(b, "mul", &[sds, z]);
+            let columns: Vec<_> = block.inputs.iter().map(|name| b.self_ref(name)).collect();
+            let columns = b.array(&columns);
+            let basis = b.call("colstack", &[columns]);
+            let term = b.call("mul", &[basis, weights]);
+            eta = broadcast(b, "add", &[eta, term]);
+        }
     }
     for (i, coding) in recipe.monotonic.iter().enumerate() {
         let index = i + 1;
@@ -1337,6 +1408,56 @@ fn predictor_info(
                 &[j],
                 ParameterRole::Sampled,
             );
+        }
+    }
+    let mut smooth_index: usize = recipe.smooths.iter().map(crate::Smooth::curve_count).sum();
+    for (smooth, term) in recipe
+        .tensor_smooths
+        .iter()
+        .zip(&recipe.formula.tensor_smooths)
+    {
+        let name = term.name();
+        for j in 1..=crate::tensor::FIXED_COLS {
+            smooth_index += 1;
+            let coefficient = format!("{name}_{j}");
+            if !names.insert(coefficient.clone()) {
+                return Err(Error(format!(
+                    "design columns have duplicate brms name `{coefficient}`"
+                )));
+            }
+            let component = predictor_name(dpar, &format!("bs_{smooth_index}"));
+            if sampled(module, &component) {
+                add(
+                    format!("b_{prefix}{coefficient}"),
+                    &component,
+                    &[],
+                    ParameterRole::Sampled,
+                );
+            } else {
+                let binding = predictor_name(dpar, "bs");
+                add(
+                    format!("b_{prefix}{coefficient}"),
+                    &binding,
+                    &[smooth_index],
+                    parameter_role(module, &binding),
+                );
+            }
+        }
+        for (block, label) in smooth.blocks.iter().zip(crate::tensor::BLOCKS) {
+            add(
+                format!("sds_{prefix}{name}_{label}"),
+                &block.sds,
+                &[],
+                parameter_role(module, &block.sds),
+            );
+            for j in 1..=block.inputs.len() {
+                add(
+                    format!("zs_{prefix}{name}_{label}[{j}]"),
+                    &block.z,
+                    &[j],
+                    ParameterRole::Sampled,
+                );
+            }
         }
     }
     for (i, (coding, column)) in recipe

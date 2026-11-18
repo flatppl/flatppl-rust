@@ -523,6 +523,23 @@ fn prepare_predictor(
             constants.insert(name.clone(), values);
         }
     }
+    for (smooth, term) in recipe
+        .tensor_smooths
+        .iter()
+        .zip(&recipe.formula.tensor_smooths)
+    {
+        let values = smooth.values(term, table, rows)?;
+        let inputs = smooth
+            .fixed
+            .iter()
+            .chain(smooth.blocks.iter().flat_map(|block| &block.inputs));
+        for (j, name) in inputs.enumerate() {
+            constants.insert(
+                name.clone(),
+                DataValue::Real64(values.iter().map(|row| row[j]).collect()),
+            );
+        }
+    }
     for (i, predictor) in recipe.design.predictors.iter().enumerate() {
         if let Some(expression) = recipe.formula.expressions.get(&predictor.column) {
             constants.insert(

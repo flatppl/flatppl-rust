@@ -22,6 +22,7 @@ mod prior_model;
 mod priors;
 mod response;
 mod splines;
+mod tensor;
 mod text;
 
 use flatppl_core::Module;
@@ -201,6 +202,8 @@ pub struct PredictorRecipe {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub smooths: Vec<Smooth>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tensor_smooths: Vec<tensor::TensorSmooth>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monotonic: Vec<Monotonic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +591,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             .iter()
             .map(|term| Smooth::fit(term, table, &rows))
             .collect::<Result<Vec<_>>>()?;
+        let tensor_smooths = formula
+            .tensor_smooths
+            .iter()
+            .map(|term| tensor::TensorSmooth::fit(term, table, &rows))
+            .collect::<Result<Vec<_>>>()?;
         let offset_mean = formula
             .offset()
             .map(|offset| offset.values(table, &rows))
@@ -690,6 +698,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 means,
                 groups,
                 smooths,
+                tensor_smooths,
                 monotonic,
                 monotonic_design,
                 priors,

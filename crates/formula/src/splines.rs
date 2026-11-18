@@ -332,7 +332,7 @@ fn raw_basis(x: &[f64], shift: f64, centers: &[f64]) -> DMatrix<f64> {
     })
 }
 
-fn complete_q(matrix: DMatrix<f64>) -> DMatrix<f64> {
+pub(crate) fn complete_q(matrix: DMatrix<f64>) -> DMatrix<f64> {
     let mut transpose = DMatrix::identity(matrix.nrows(), matrix.nrows());
     matrix.qr().q_tr_mul(&mut transpose);
     transpose.transpose()

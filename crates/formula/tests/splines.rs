@@ -266,3 +266,79 @@ fn factor_smooths_preserve_mgcv_curve_covariance_and_prediction() {
         }
     }
 }
+
+#[test]
+fn tensor_smooth_preserves_block_gram_matrices_for_new_rows() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ t2(x, z, k=c(3,4))",
+        "priors": [
+            {"class": "sds", "coef": "t2(x, z, k = c(3, 4))", "prior": "exponential(2)"}
+        ]
+    }))
+    .unwrap();
+    let training = flatppl_formula::read_json_table(
+        r#"{"x":[-2,-1,0,1,2,3,1,3,null],"z":[0,1,3,1,-1,2,3,0,0],"y":[1,2,1,3,4,2,1,2,3]}"#,
+    )
+    .unwrap();
+    let result = build(&spec, &training).unwrap();
+    assert_eq!(result.data.rows, (0..8).collect::<Vec<_>>());
+    let recipe: Recipe =
+        serde_json::from_value(serde_json::to_value(&result.recipe).unwrap()).unwrap();
+    assert_eq!(recipe.predictors["mu"].priors.bs.len(), 3);
+    assert_eq!(recipe.predictors["mu"].priors.sds.len(), 3);
+    assert!(
+        recipe.predictors["mu"]
+            .priors
+            .sds
+            .iter()
+            .all(|p| p.prior == "exponential(2)")
+    );
+    let new = flatppl_formula::read_json_table(r#"{"x":[-3,3.5],"z":[0.5,4]}"#).unwrap();
+    let held = prepare_data(&recipe, &new, DataMode::Prediction).unwrap();
+    // Independent mgcv 1.9.4 cubic margins, normalized with a constant and a
+    // centered unit-RMS linear null basis. The three entries per block are
+    // train/train, train/prediction and prediction/prediction Gram entries.
+    let checks = [
+        (
+            "fixed",
+            3,
+            [2.176582192409661, -0.171849103262374, -0.886816843058109],
+        ),
+        (
+            "rr",
+            2,
+            [-0.004672947707001, 0.044424213899920, -0.119362290605944],
+        ),
+        (
+            "nr",
+            4,
+            [0.033658399670824, -0.033268829465305, 0.100842277114581],
+        ),
+        (
+            "rn",
+            2,
+            [-0.003191363059250, -0.007993367162465, 0.000753642199716],
+        ),
+    ];
+    for (block, width, expected) in checks {
+        let mut gram = [0.0; 3];
+        for j in 1..=width {
+            let name = format!("tensor_1_{block}_{j}");
+            let DataValue::Real64(train) = &result.data.constants[&name] else {
+                panic!("expected real training column");
+            };
+            let DataValue::Real64(new) = &held.constants[&name] else {
+                panic!("expected real prediction column");
+            };
+            if block == "fixed" {
+                close(train.iter().sum(), 0.0);
+            }
+            gram[0] += train[0] * train[1];
+            gram[1] += train[2] * new[0];
+            gram[2] += new[0] * new[1];
+        }
+        for (actual, expected) in gram.into_iter().zip(expected) {
+            close(actual, expected);
+        }
+    }
+}
