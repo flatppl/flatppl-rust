@@ -198,7 +198,8 @@ fn check_node(
             flatppl_core::LOG_INTEGRAL
                 | flatppl_core::MASS_INTEGRAL
                 | flatppl_core::INTEGRATION_POINT
-        ) || (options.vector_sort && name == flatppl_core::SORT_VECTOR);
+        ) || (options.vector_sort && name == flatppl_core::SORT_VECTOR)
+            || (options.compact_log_cdf_difference && name == flatppl_core::LOG_CDF_DIFFERENCE);
         if !is_tag && !intrinsic && !flatppl_infer::builtins::is_base_name(name) {
             bad.push(NonConformance {
                 node: id,

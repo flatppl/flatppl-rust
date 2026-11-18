@@ -322,6 +322,7 @@ impl EmitOptions {
         flatppl_determinizer::LoweringOptions {
             disable_sufficient_statistics: !self.sufficient_statistics,
             numerical_integrals: self.integration.is_some(),
+            compact_log_cdf_difference: self.target == Target::Cpu,
             ..LOWERING_OPTIONS
         }
     }
@@ -344,6 +345,7 @@ impl Default for EmitOptions {
 /// The default determinizer still expands their portable reference definitions.
 pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
     flatppl_determinizer::LoweringOptions {
+        compact_log_cdf_difference: false,
         disable_sufficient_statistics: false,
         preserve_rand_tuple: false,
         numerical_integrals: false,

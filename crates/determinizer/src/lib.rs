@@ -55,6 +55,8 @@ pub struct LoweringOptions<'a> {
     /// Leave independent likelihood factors unreduced.
     pub disable_sufficient_statistics: bool,
     pub retain_standard_functions: &'a [(&'a str, &'a str)],
+    /// Keep log-CDF subtraction opaque for fixed one-sided interval lanes.
+    pub compact_log_cdf_difference: bool,
     /// Keep rand's (value, state) result even without a tuple projection.
     /// False preserves the legacy value-terminal convention.
     pub preserve_rand_tuple: bool,

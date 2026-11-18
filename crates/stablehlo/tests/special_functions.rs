@@ -12,6 +12,10 @@ use flatppl_stablehlo::{Dtype, EmitOptions, Mode, Target};
 const SF: &str = "sf = standard_module(\"special-functions\", \"0.1\")";
 
 fn determinize_abi(src: &str) -> Module {
+    determinize_with(src, &flatppl_stablehlo::LOWERING_OPTIONS)
+}
+
+fn determinize_with(src: &str, options: &flatppl_determinizer::LoweringOptions<'_>) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
     let diagnostics = flatppl_infer::infer(&mut m);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -20,7 +24,7 @@ fn determinize_abi(src: &str) -> Module {
         &m,
         &flatppl_infer::ModuleBundle::new(),
         Some(&roots),
-        &flatppl_stablehlo::LOWERING_OPTIONS,
+        options,
     )
     .expect("must determinize, not refuse")
 }
@@ -366,6 +370,37 @@ outputs = log(totalmass(truncate(Normal(mu, sigma), interval(lo, hi))))";
         2,
         "{out}"
     );
+}
+
+#[test]
+fn normal_interval_subtraction_skips_fixed_one_sided_lanes() {
+    let lower = (0..64)
+        .map(|i| if i % 4 == 0 { "-0.2" } else { "-inf" })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prefix = "mu = external(cartpow(reals, 64))\n\
+        f(x, a) = log(totalmass(truncate(Normal(x, 1.0), interval(a, 1.0))))\n";
+    let (fixed, dynamic) = (
+        format!("{prefix}lo = [{lower}]\ninputs = mu\noutputs = f.(mu, lo)"),
+        format!(
+            "{prefix}lo = external(cartpow(reals, 64))\ninputs = (mu, lo)\noutputs = f.(mu, lo)"
+        ),
+    );
+    let options = EmitOptions {
+        dtype: Dtype::F64,
+        ..Default::default()
+    };
+    for (source, width) in [(fixed, 16), (dynamic, 64)] {
+        let module = determinize_with(&source, &options.lowering_options());
+        let ir = flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).unwrap();
+        let difference = ir
+            .lines()
+            .find(|line| line.contains("stablehlo.exponential_minus_one"));
+        assert!(
+            difference.is_some_and(|line| line.contains(&format!("tensor<{width}xf64>"))),
+            "{difference:?}"
+        );
+    }
 }
 
 // Direct tails, logarithms and scaled Bessels must remain live arithmetic with

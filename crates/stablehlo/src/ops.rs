@@ -72,6 +72,14 @@ pub(crate) fn lower_builtin(
 ) -> Result<Value, EmitError> {
     match head {
         flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args, IntegralKind::Log),
+        flatppl_core::LOG_CDF_DIFFERENCE => {
+            let [upper, lower] = args else {
+                return Err(EmitError::at(id, "expected two log-CDF values"));
+            };
+            let upper = e.lower_node(*upper)?;
+            let lower = e.lower_node(*lower)?;
+            Ok(e.log_cdf_difference(id, &upper, &lower))
+        }
         flatppl_core::MASS_INTEGRAL => e.lower_integral(id, args, IntegralKind::Mass),
         flatppl_core::SORT_VECTOR => {
             let [arg] = args_exact(id, args)?;

@@ -344,6 +344,7 @@ fn op_rule(
 
     let ty = match name.as_str() {
         flatppl_core::LOG_INTEGRAL
+        | flatppl_core::LOG_CDF_DIFFERENCE
         | flatppl_core::MASS_INTEGRAL
         | flatppl_core::LOG_INTERVAL_MASS
         | flatppl_core::INTEGRATION_POINT => Type::Scalar(ScalarType::Real),
