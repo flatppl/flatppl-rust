@@ -1,7 +1,7 @@
 use crate::{
     DataDocument, DataValue, Design, DesignComponent, Error, Family, GroupInfo, ModelInfo,
-    Parameter, ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, data,
-    metadata, paired,
+    Parameter, ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, arma, autoregression,
+    data, metadata, paired,
     prior_model::ParameterPrior,
     priors::{self, PriorNode},
     shared_groups::{Block, Coefficients},
@@ -50,8 +50,12 @@ pub(crate) fn model_with_forecast(
         external_vector(&mut b, "se_data", "nonnegreals");
     }
     crate::response::declare(&mut b, &recipe.formula);
+    let order = recipe.formula.arma_order;
     if recipe.formula.ar.is_some() {
-        autoregression::declare(&mut b, forecast);
+        autoregression::declare(&mut b, forecast && order.stationary_ar1());
+        if forecast && !order.stationary_ar1() {
+            arma::declare_forecast(&mut b);
+        }
     }
     let predictor_n = if forecast {
         autoregression::DESIGN_N
@@ -145,17 +149,29 @@ pub(crate) fn model_with_forecast(
         )?;
     }
     if recipe.formula.ar.is_some() {
-        let lower = b.lit_real(-1.0);
-        let upper = b.lit_real(1.0);
-        let support = b.call("interval", &[lower, upper]);
-        parameter(
-            &mut b,
-            "ar",
-            &recipe.auxiliary_priors["ar"],
-            Some(support),
-            &mut parameters,
-            recipe.family,
-        )?;
+        if order.stationary_ar1() {
+            let lower = b.lit_real(-1.0);
+            let upper = b.lit_real(1.0);
+            let support = b.call("interval", &[lower, upper]);
+            parameter(
+                &mut b,
+                "ar",
+                &recipe.auxiliary_priors["ar"],
+                Some(support),
+                &mut parameters,
+                recipe.family,
+            )?;
+        } else {
+            for (name, order) in order.coefficients() {
+                arma_parameter(
+                    &mut b,
+                    name,
+                    order,
+                    &recipe.auxiliary_priors[name],
+                    &mut parameters,
+                )?;
+            }
+        }
     }
     if parameters.is_empty() {
         return Err(Error(
@@ -252,17 +268,24 @@ pub(crate) fn model_with_forecast(
     } else if is_paired {
         paired::draw(&mut b)?
     } else {
-        let law = if recipe.family == Family::Exgaussian {
-            crate::exgaussian::conditional_observation(&mut b, observation, predictor_n)
-        } else if recipe.formula.ar.is_some() {
-            autoregression::law(&mut b, mu, forecast)
-        } else if let Some(truncation) = &recipe.formula.truncation {
-            let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
-            crate::response::truncated_normal(&mut b, mu, sigma, truncation)
+        let y = if recipe.formula.ar.is_some() {
+            if order.stationary_ar1() {
+                let law = autoregression::law(&mut b, mu, forecast);
+                b.call("draw", &[law])
+            } else {
+                arma::draw(&mut b, order, mu, forecast)
+            }
         } else {
-            recipe.family.observation(&mut b, observation, false)
+            let law = if recipe.family == Family::Exgaussian {
+                crate::exgaussian::conditional_observation(&mut b, observation, predictor_n)
+            } else if let Some(truncation) = &recipe.formula.truncation {
+                let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+                crate::response::truncated_normal(&mut b, mu, sigma, truncation)
+            } else {
+                recipe.family.observation(&mut b, observation, false)
+            };
+            b.call("draw", &[law])
         };
-        let y = b.call("draw", &[law]);
         b.bind("y", y);
         let y = b.self_ref("y");
         b.call_fields("record", &[("y", y)])
@@ -276,8 +299,12 @@ pub(crate) fn model_with_forecast(
     b.bind("K_model", kernel);
     let expected = if is_paired {
         Some(paired::expected(&mut b))
-    } else if forecast {
-        Some(autoregression::forecast_mean(&mut b, mu))
+    } else if forecast && recipe.formula.ar.is_some() {
+        if order.stationary_ar1() {
+            Some(autoregression::forecast_mean(&mut b, mu))
+        } else {
+            Some(arma::forecast_mean(&mut b, order, mu))
+        }
     } else {
         crate::expectation::emit(&mut b, recipe, observation)
     };
@@ -292,7 +319,11 @@ pub(crate) fn model_with_forecast(
     let pointwise = if is_paired {
         paired::pointwise(&mut b)
     } else if recipe.formula.ar.is_some() {
-        autoregression::pointwise(&mut b, mu, forecast)
+        if order.stationary_ar1() {
+            autoregression::pointwise(&mut b, mu, forecast)
+        } else {
+            arma::pointwise(&mut b, order, mu, forecast)
+        }
     } else {
         pointwise_log_likelihood(&mut b, recipe, scale)
     };
@@ -1294,7 +1325,7 @@ pub(crate) fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
     external_vector_sized(b, name, set, "N");
 }
 
-fn external_vector_sized(b: &mut Builder<'_>, name: &str, set: &str, size: &str) {
+pub(crate) fn external_vector_sized(b: &mut Builder<'_>, name: &str, set: &str, size: &str) {
     let set = b.call_head(set);
     let n = b.self_ref(size);
     let domain = b.call("cartpow", &[set, n]);
@@ -1456,6 +1487,21 @@ fn lower_bound(b: &mut Builder<'_>, value: f64) -> NodeId {
     let lower = b.lit_real(value);
     let inf = b.call_head("inf");
     b.call("interval", &[lower, inf])
+}
+
+fn arma_parameter(
+    b: &mut Builder<'_>,
+    name: &str,
+    order: usize,
+    prior: &ResolvedPrior,
+    parameters: &mut Vec<ParameterPrior>,
+) -> Result<()> {
+    let names = scope(b, Family::Gaussian);
+    let bindings: Vec<_> = names.iter().map(String::as_str).collect();
+    let count = b.lit_int(order as i64);
+    let prior = priors::emit(b, prior, None, None, &bindings)?;
+    repeated_parameter(b, name, prior, count, parameters);
+    Ok(())
 }
 
 fn declare_parameter(
@@ -1623,10 +1669,7 @@ pub(crate) fn info(
             }
         }
     }
-    for name in recipe
-        .auxiliary_names()
-        .chain(recipe.formula.ar.is_some().then_some("ar"))
-    {
+    for name in recipe.auxiliary_names() {
         if !recipe.predictors.contains_key(name) {
             parameters.push(Parameter {
                 name: name.into(),
@@ -1636,6 +1679,28 @@ pub(crate) fn info(
                 role: parameter_role(module, name),
                 derived: !sampled(module, name),
             });
+        }
+    }
+    if recipe.formula.ar.is_some() {
+        let order = recipe.formula.arma_order;
+        let legacy = order.stationary_ar1();
+        for (name, lags) in order.coefficients() {
+            for lag in 1..=lags {
+                parameters.push(parameter_info(
+                    if legacy {
+                        name.into()
+                    } else {
+                        format!("{name}[{lag}]")
+                    },
+                    name,
+                    if legacy {
+                        &[]
+                    } else {
+                        std::slice::from_ref(&lag)
+                    },
+                    parameter_role(module, name),
+                ));
+            }
         }
     }
     let prior_factors = metadata::prior_factors(module, &parameters);

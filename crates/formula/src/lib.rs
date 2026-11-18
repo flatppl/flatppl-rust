@@ -5,6 +5,7 @@
 //! It does not fit a model.
 
 mod adjacent;
+mod arma;
 mod autoregression;
 mod categorical;
 mod contrasts;

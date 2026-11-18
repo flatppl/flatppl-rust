@@ -347,6 +347,15 @@ anchor. The same fitted predictor recipe and parameter point determine the
 anchor residual and the future means. Groups absent from history start from
 the stationary law. Prepared row indices refer to the future table.
 
+Use `ar(time=t, group=g, p=2)`, `ma(time=t, group=g, q=2)` or
+`arma(time=t, group=g, p=2, q=1)` as response additions for conditional
+Gaussian dependence. Each order can run up to 64. These models start each
+group with zero lagged residuals and innovations and require consecutive
+integer times. Coefficients in `ar` and `ma` follow lag order, with independent
+standard Normal priors by default. History forecasts replay each observed
+group before continuing with the future rows.
+Orders `p=1, q=0` use the stationary AR(1) model described above.
+
 For paired Gaussian responses, set `formula` and `paired_formula` to the
 two mean formulas. Training selects complete rows across both responses
 and their predictors. `K_model` returns outcome columns `y` and `y2`, in

@@ -1,5 +1,5 @@
 use crate::{
-    Error, Family, Formula, GroupInfo, GroupLevel, Recipe, Result, Trials, autoregression,
+    Error, Family, Formula, GroupInfo, GroupLevel, Recipe, Result, Trials, arma, autoregression,
     formula::ThresholdGroup,
 };
 use flatppl_data::{Column, ColumnValues, Table};
@@ -462,6 +462,7 @@ fn ar_time(column: &Column, row: usize) -> Result<i64> {
 
 fn prepare_ar(
     ar: &crate::Ar1,
+    conditional: bool,
     table: &Table,
     rows: &[usize],
     constants: &mut BTreeMap<String, DataValue>,
@@ -479,6 +480,11 @@ fn prepare_ar(
             let gap = ar_gap(time, previous_time)?;
             if gap == 0 {
                 return Err(Error("ar() times must be unique within a group".into()));
+            }
+            if conditional && gap != 1 {
+                return Err(Error(
+                    "conditional ARMA requires consecutive times within each group".into(),
+                ));
             }
             gaps.push(gap);
             predecessors.push(i as i64);
@@ -522,7 +528,7 @@ pub fn prepare_data_with_new_groups(
 
 /// Prepare strictly future AR(1) rows conditional on the supplied history.
 /// The history is encoded with the fitted recipe. Groups absent from the
-/// history keep stationary initial residuals.
+/// history start from stationary AR(1) residuals or zero conditional ARMA state.
 pub fn prepare_forecast(
     recipe: &Recipe,
     future: &Table,
@@ -531,7 +537,7 @@ pub fn prepare_forecast(
 ) -> Result<PreparedForecast> {
     let mut recipe = recipe.clone();
     if recipe.formula.ar.is_none() {
-        return Err(Error("history requires a Gaussian ar() formula".into()));
+        return Err(Error("history requires a Gaussian AR or MA formula".into()));
     }
     let shared = recipe.shared_groups.clone();
     let mut module = crate::emit::model_with_forecast(&mut recipe, &shared, true)?;
@@ -569,6 +575,9 @@ fn add_history(
         DataMode::Prediction,
         true,
     )?;
+    if !recipe.formula.arma_order.stationary_ar1() {
+        return add_arma_history(recipe, future, history, &history_rows, nonlinear, data);
+    }
     let history_groups = history.column(&ar.group)?;
     let history_times = history.column(&ar.time)?;
     let response = history.column(&recipe.formula.response)?;
@@ -632,15 +641,7 @@ fn add_history(
             observed.push(0.0);
         }
     }
-    if !anchor_rows.is_empty() {
-        let mut design = BTreeMap::new();
-        // Known history effects use exactly the fitted coordinates. Forecast
-        // extensions append their innovations after all the fitted levels.
-        prepare_design(recipe, history, &anchor_rows, nonlinear, &mut design, None)?;
-        for (name, history) in design {
-            append_history(data.constants.get_mut(&name).unwrap(), history);
-        }
-    }
+    append_history_design(recipe, history, &anchor_rows, nonlinear, data)?;
     data.constants.extend([
         (
             autoregression::DESIGN_N.into(),
@@ -654,6 +655,101 @@ fn add_history(
         (autoregression::ELAPSED.into(), DataValue::Integers(elapsed)),
         (autoregression::OBSERVED.into(), DataValue::Real64(observed)),
     ]);
+    Ok(())
+}
+
+fn add_arma_history(
+    recipe: &Recipe,
+    future: &Table,
+    history: &Table,
+    history_rows: &[usize],
+    nonlinear: &[String],
+    data: &mut DataDocument,
+) -> Result<()> {
+    let ar = recipe.formula.ar.as_ref().unwrap();
+    let history_groups = history.column(&ar.group)?;
+    let history_times = history.column(&ar.time)?;
+    let response = history.column(&recipe.formula.response)?;
+    let levels = history_rows
+        .iter()
+        .map(|&row| history_groups.level(row))
+        .collect::<Result<Vec<_>>>()?;
+    let mut grouped: HashMap<_, Vec<usize>> = HashMap::new();
+    for (&row, level) in history_rows.iter().zip(&levels) {
+        grouped.entry(level_key(level)).or_default().push(row);
+    }
+    let groups = future.column(&ar.group)?;
+    let times = future.column(&ar.time)?;
+    let DataValue::Integers(gaps) = &data.constants[autoregression::GAP] else {
+        unreachable!("AR preparation produces integer gaps");
+    };
+    let n = data.rows.len() as i64;
+    let mut prepared_history = Vec::new();
+    let mut order = Vec::new();
+    let mut future_indices = Vec::with_capacity(data.rows.len());
+    let mut observed = Vec::new();
+    let mut steps = Vec::new();
+    for (i, (&row, &gap)) in data.rows.iter().zip(gaps).enumerate() {
+        let mut step = gap;
+        if gap == 0 {
+            let group = groups.level(row)?;
+            if let Some(rows) = grouped.get(&level_key(&group)) {
+                let mut previous = None;
+                for (&history_row, value) in rows.iter().zip(response.numeric(rows)?) {
+                    let time = ar_time(history_times, history_row)?;
+                    if previous.is_some_and(|previous| time.checked_sub(previous) != Some(1)) {
+                        return Err(Error(
+                            "conditional ARMA requires consecutive history times within each group"
+                                .into(),
+                        ));
+                    }
+                    steps.push(i64::from(previous.is_some()));
+                    previous = Some(time);
+                    prepared_history.push(history_row);
+                    order.push(n + prepared_history.len() as i64);
+                    observed.push(value);
+                }
+                let time = ar_time(times, row)?;
+                if previous.and_then(|last| time.checked_sub(last)) != Some(1) {
+                    return Err(Error("conditional ARMA forecasts must start one time step after history within each group".into()));
+                }
+                step = 1;
+            }
+        }
+        order.push(i as i64 + 1);
+        future_indices.push(order.len() as i64);
+        observed.push(0.0);
+        steps.push(step);
+    }
+    append_history_design(recipe, history, &prepared_history, nonlinear, data)?;
+    data.constants.extend([
+        (
+            autoregression::DESIGN_N.into(),
+            DataValue::Integer(order.len() as i64),
+        ),
+        (arma::ORDER.into(), DataValue::Integers(order)),
+        (arma::FUTURE.into(), DataValue::Integers(future_indices)),
+        (arma::HISTORY.into(), DataValue::Real64(observed)),
+        (arma::STEP.into(), DataValue::Integers(steps)),
+    ]);
+    Ok(())
+}
+
+fn append_history_design(
+    recipe: &Recipe,
+    history: &Table,
+    rows: &[usize],
+    nonlinear: &[String],
+    data: &mut DataDocument,
+) -> Result<()> {
+    if !rows.is_empty() {
+        let mut design = BTreeMap::new();
+        // History uses the fitted group coordinates before any new levels.
+        prepare_design(recipe, history, rows, nonlinear, &mut design, None)?;
+        for (name, history) in design {
+            append_history(data.constants.get_mut(&name).unwrap(), history);
+        }
+    }
     Ok(())
 }
 
@@ -761,7 +857,8 @@ fn prepare_data_inner(
         &mut constants,
     )?;
     if let Some(ar) = &recipe.formula.ar {
-        prepare_ar(ar, table, &rows, &mut constants)?;
+        let conditional = !recipe.formula.arma_order.stationary_ar1();
+        prepare_ar(ar, conditional, table, &rows, &mut constants)?;
     }
     Ok(DataDocument { constants, rows })
 }

@@ -9,24 +9,64 @@ pub struct Ar1 {
     pub group: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ArmaOrder {
+    p: usize,
+    q: usize,
+}
+
+impl Default for ArmaOrder {
+    fn default() -> Self {
+        Self { p: 1, q: 0 }
+    }
+}
+
+impl ArmaOrder {
+    pub(crate) fn stationary_ar1(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn coefficients(self) -> impl Iterator<Item = (&'static str, usize)> {
+        [("ar", self.p), ("ma", self.q)]
+            .into_iter()
+            .filter(|(_, order)| *order > 0)
+    }
+}
+
 impl Ar1 {
-    pub(crate) fn parse(text: &str) -> Result<Self> {
-        let invalid = || Error("ar() expects `time = column, group = column`".into());
+    pub(crate) fn parse(term: &str, text: &str) -> Result<(Self, ArmaOrder)> {
+        let invalid = || {
+            Error(format!(
+                "{term}() expects time, group and applicable orders p and q"
+            ))
+        };
         let mut time = None;
         let mut group = None;
+        let mut p = None;
+        let mut q = None;
         for argument in text.split(',') {
             let (keyword, value) = argument.split_once('=').ok_or_else(invalid)?;
-            let column = crate::formula::name(value.trim()).map_err(|_| invalid())?;
+            let value = value.trim();
             match keyword.trim() {
-                "time" if time.is_none() => time = Some(column),
-                "group" if group.is_none() => group = Some(column),
+                "time" if time.is_none() => time = Some(crate::formula::name(value)?),
+                "group" | "gr" if group.is_none() => group = Some(crate::formula::name(value)?),
+                "p" if term != "ma" && p.is_none() => p = Some(order(value)?),
+                "q" if term != "ar" && q.is_none() => q = Some(order(value)?),
                 _ => return Err(invalid()),
             }
         }
-        Ok(Self {
-            time: time.ok_or_else(invalid)?,
-            group: group.ok_or_else(invalid)?,
-        })
+        let p = p.unwrap_or(usize::from(term != "ma"));
+        let q = q.unwrap_or(usize::from(term != "ar"));
+        if p == 0 && q == 0 {
+            return Err(Error("ARMA requires a positive AR or MA order".into()));
+        }
+        Ok((
+            Self {
+                time: time.ok_or_else(invalid)?,
+                group: group.ok_or_else(invalid)?,
+            },
+            ArmaOrder { p, q },
+        ))
     }
 
     pub(crate) fn validate(
@@ -55,6 +95,13 @@ impl Ar1 {
         }
         Ok(())
     }
+}
+
+fn order(text: &str) -> Result<usize> {
+    text.parse::<usize>()
+        .ok()
+        .filter(|&value| value <= 64)
+        .ok_or_else(|| Error("AR and MA orders must be integers from 0 to 64".into()))
 }
 
 pub(crate) const GAP: &str = "ar_gap_data";

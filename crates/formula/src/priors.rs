@@ -242,7 +242,13 @@ pub(crate) fn resolve(
         .filter(|name| dpar.is_none() && !spec.dpars.contains_key(*name))
         .filter(|&name| name != "disc")
         .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
-        .chain((dpar.is_none() && formula.ar.is_some()).then_some("ar"))
+        .chain(
+            formula
+                .ar
+                .iter()
+                .filter(|_| dpar.is_none())
+                .flat_map(|_| formula.arma_order.coefficients().map(|(name, _)| name)),
+        )
         .chain(
             paired_sigma_scale
                 .iter()
@@ -475,7 +481,9 @@ pub(crate) fn resolve(
         .iter()
         .map(|&name| {
             let prior = selected.next().unwrap().unwrap_or_else(|| match name {
-                "ar" | "rescor" => ResolvedPrior::new("uniform(-1, 1)"),
+                "ar" if formula.arma_order.stationary_ar1() => ResolvedPrior::new("uniform(-1, 1)"),
+                "ar" | "ma" => ResolvedPrior::new("normal(0, 1)"),
+                "rescor" => ResolvedPrior::new("uniform(-1, 1)"),
                 "sigma2" => ResolvedPrior::new(
                     family.default_auxiliary("sigma", paired_sigma_scale.unwrap()),
                 ),
