@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+M = 3
+T = 3
+data = rowstack([[0, 2, 1], [1, 1, 0], [3, 0, 1]])
+history(i) = data[i, :]
+histories = history.(indicesof(zeros(M)))
+a ~ Exponential(1)
+b ~ Exponential(1)
+s ~ Normal(0, 1)
+step(previous, q) = NegativeBinomial2(ifelse(previous == 1, q.a, q.b), exp(q.s))
+y ~ iid(markovchain(step, 0, T, (a = a, b = b, s = s)), M)
+prior = lawof(record(a = a, b = b, s = s))
+L = likelihoodof(kernelof(record(y = y), a = a, b = b, s = s), record(y = histories))
+post = bayesupdate(L, prior)

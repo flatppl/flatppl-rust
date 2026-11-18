@@ -15,6 +15,7 @@ mod aggregate;
 mod elementwise;
 mod extents;
 mod functions;
+mod markovchain;
 mod mixture;
 mod pattern;
 mod ranges;
@@ -140,6 +141,11 @@ pub(crate) struct Emitter<'m> {
     flat: Option<Flat>,
     /// Restrict law rows to each law's general pattern (a `joint`'s parts).
     general_rows: bool,
+    /// Set while printing an observed value: `splitblocks(A, [1, n])` is
+    /// then A, its rows in order.
+    rows_ok: bool,
+    /// `ifelse` index arrays already filled, by the `ifelse` node.
+    selects: HashMap<NodeId, String>,
     /// Parameters declared from their law's sets (`ordered[K]`): only these
     /// may take a law whose restriction the declaration carries.
     set_declared: HashSet<String>,
@@ -229,6 +235,8 @@ impl<'m> Emitter<'m> {
             owner: None,
             flat: None,
             general_rows: false,
+            rows_ok: false,
+            selects: HashMap::new(),
             set_declared: HashSet::new(),
             weights: vec![],
             placed: HashMap::new(),
@@ -1098,6 +1106,13 @@ impl<'m> Emitter<'m> {
                     Ok(Ex::atom(format!("to_matrix({}')", e.at(P_ATOM))))
                 }
             }
+            // `splitblocks(A, [1, n])` observed: the 1×n blocks are A's rows
+            // in order, so the observation is A itself (spec §07 "Array and
+            // table operations"). Elsewhere it stays refused.
+            ("splitblocks", _) if self.rows_ok && self.row_blocks(id).is_some() => {
+                let a = self.row_blocks(id).unwrap();
+                self.expr(a)
+            }
             ("colstack", [cols]) => self.stack(id, *cols, "append_col", false),
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
             ("%call", _) => match self.is_user_call(id) {
@@ -1186,6 +1201,31 @@ impl<'m> Emitter<'m> {
         let s = self.fill(&row.stan, &binds, &|_| false, None)?;
         let prec = if is_call(&s) { P_ATOM } else { P_TERNARY };
         Ok(Ex { s, prec })
+    }
+
+    /// The matrix A of `splitblocks(A, [1, n])` when n is A's whole row,
+    /// one block per row. The inferred type carries spec §07's quotient:
+    /// blocks of one row each give an outer shape `[M, 1]` of `[1, n]`
+    /// blocks. Any other block shape is not A's rows.
+    pub(super) fn row_blocks(&self, id: NodeId) -> Option<NodeId> {
+        let r = self.resolve(id);
+        if self.head(r) != Some("splitblocks") {
+            return None;
+        }
+        let [a, _] = self.call(r)?.args[..] else {
+            return None;
+        };
+        if self.shape(a).is_none_or(|s| s.rank != 2) {
+            return None;
+        }
+        let Some(Type::Array { shape, elem }) = self.ty(r) else {
+            return None;
+        };
+        let one = |d: &Dim| matches!(d, Dim::Static(1));
+        let rows = shape.len() == 2 && one(&shape[1]);
+        let block =
+            matches!(elem.as_ref(), Type::Array { shape: b, .. } if b.len() == 2 && one(&b[0]));
+        (rows && block).then_some(a)
     }
 
     /// The `functions.ron` row of a call Stan can evaluate: `builtin` or
@@ -1517,6 +1557,11 @@ impl<'m> Emitter<'m> {
         if let Some(e) = self.outer_broadcast(id, fname, row, args)? {
             return Ok(e);
         }
+        if fname == "ifelse"
+            && let Some(e) = self.ifelse_select(id, args)?
+        {
+            return Ok(e);
+        }
         let scalar = |me: &Self, a: NodeId| me.shape(a).is_some_and(|s| s.rank == 0);
         match (fname, args) {
             // The operators keep their precedence-aware printing.
@@ -1709,6 +1754,60 @@ impl<'m> Emitter<'m> {
             },
             name => self.table_fn(id, name, None, parts)?,
         }))
+    }
+
+    /// `ifelse.(cond, a, b)` with a data condition and scalar branches, one
+    /// of them not data: `[b, a]'[sel]`, the branch picked by a data index
+    /// array filled once in `transformed data`. With data branches the
+    /// value is data too and keeps its `transformed data` fill.
+    fn ifelse_select(&mut self, id: NodeId, args: &[NodeId]) -> Result<Option<Ex>> {
+        let [cond, a, b] = args[..] else {
+            return Ok(None);
+        };
+        let fixed = |me: &Self, x: NodeId| me.m.phase_of(x) == Some(Phase::Fixed);
+        let scalar = |me: &Self, x: NodeId| me.shape(x).is_some_and(|s| s.rank == 0);
+        if self.fctx.is_some()
+            || self.shape(id)
+                != Some(Shape {
+                    rank: 1,
+                    int: false,
+                })
+            || !fixed(self, cond)
+            || self.shape(cond).is_none_or(|s| s.rank != 1)
+            || !scalar(self, a)
+            || !scalar(self, b)
+            || (fixed(self, a) && fixed(self, b))
+        {
+            return Ok(None);
+        }
+        let sel = match self.selects.get(&id) {
+            Some(sel) => sel.clone(),
+            None => {
+                let Some(n) = self.sym_extent(id, 0, 0) else {
+                    return Ok(None);
+                };
+                let n = n.print();
+                let base = match &self.owner {
+                    Some((name, _)) => format!("{name}_select"),
+                    None => "select".to_string(),
+                };
+                let sel = self.fresh(&base);
+                let i = self.loop_var();
+                let at = self.at_module(|me| me.elem(cond, std::slice::from_ref(&i)));
+                self.used.remove(&i);
+                let at = at?;
+                self.tdata.push(format!("array[{n}] int {sel};"));
+                self.tdata.push(format!(
+                    "for ({i} in 1:{n}) {{\n  {sel}[{i}] = {} ? 2 : 1;\n}}",
+                    at.at(P_CMP)
+                ));
+                self.selects.insert(id, sel.clone());
+                sel
+            }
+        };
+        let (ra, rb) = (self.real(a)?, self.real(b)?);
+        // Stan indexes a parenthesized literal, not `[b, a]'[i]`.
+        Ok(Some(Ex::atom(format!("([{}, {}]')[{sel}]", rb.s, ra.s))))
     }
 
     fn call_expr_bin(&mut self, op: &str, prec: u8, a: NodeId, b: NodeId) -> Result<Ex> {

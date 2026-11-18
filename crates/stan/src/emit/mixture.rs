@@ -27,6 +27,92 @@ enum Part {
     Dirac(Option<NodeId>, NodeId),
 }
 
+/// Stands for a row index (or the rest rows) in a [`RowArg`] template.
+pub(super) const ROW: &str = "\u{7}";
+
+/// One argument of a law over the rows of a data matrix.
+pub(super) enum RowArg {
+    /// The same for every row.
+    Shared(String),
+    /// A row-length vector, the same for every row.
+    Repeated(String),
+    /// Per row: `row` at one row index, `rest` over an index array of rows,
+    /// flattened row by row. [`ROW`] marks the index. `atom`: the value at
+    /// every atom row, when they all share one.
+    PerRow {
+        row: String,
+        rest: String,
+        atom: Option<String>,
+    },
+}
+
+/// A discrete law over each row of a data matrix: `name(y | args…)`.
+pub(super) struct RowLaw {
+    /// `bernoulli_lpmf`.
+    pub name: String,
+    pub args: Vec<RowArg>,
+}
+
+/// Which rows a [`RowLaw`] density covers.
+#[derive(Clone, Copy)]
+pub(super) enum Render<'a> {
+    /// One row, at a row index.
+    Row,
+    /// Index-selected rows flattened, with this many rows.
+    Rest(&'a str),
+    /// All rows flattened, with this many rows.
+    All(&'a str),
+    /// Any one atom row, where every atom row has the same arguments.
+    Atom,
+}
+
+impl RowLaw {
+    /// The argument texts for `render`, [`ROW`] replaced by `rows`.
+    fn args_text(&self, rows: &str, render: Render<'_>) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|a| match (a, render) {
+                (RowArg::Shared(s), _) => s.clone(),
+                (RowArg::Repeated(v), Render::Row | Render::Atom) => v.clone(),
+                (RowArg::Repeated(v), Render::Rest(n) | Render::All(n)) => {
+                    format!("to_vector(rep_matrix({v}, {n}))")
+                }
+                (RowArg::PerRow { atom: Some(t), .. }, Render::Atom) => t.clone(),
+                (RowArg::PerRow { row, .. }, Render::Row | Render::Atom) => row.replace(ROW, rows),
+                (RowArg::PerRow { rest, .. }, Render::Rest(_)) => rest.replace(ROW, rows),
+                (RowArg::PerRow { rest, .. }, Render::All(_)) => {
+                    rest.replace(&format!("[{ROW}]"), "")
+                }
+            })
+            .collect()
+    }
+
+    /// `name(y | args)` with [`ROW`] replaced by `rows`.
+    pub(super) fn density(&self, y: &str, rows: &str, render: Render<'_>) -> String {
+        let args = self.args_text(rows, render);
+        if args.is_empty() {
+            format!("{}({y})", self.name)
+        } else {
+            format!("{}({y} | {})", self.name, args.join(", "))
+        }
+    }
+
+    /// `y ~ dist(args)` over all `n` rows of `y`, flattened row by row.
+    pub(super) fn statement(&self, y: &str, n: &str) -> String {
+        let dist = self.name.trim_end_matches("_lpmf");
+        let args = self.args_text("", Render::All(n));
+        format!("to_array_1d({y}) ~ {dist}({});", args.join(", "))
+    }
+
+    /// `true` when every atom row has the same arguments: no per-row
+    /// argument, or each one's value at an atom row is known.
+    fn atom_shared(&self) -> bool {
+        self.args
+            .iter()
+            .all(|a| !matches!(a, RowArg::PerRow { atom: None, .. }))
+    }
+}
+
 impl<'m> Emitter<'m> {
     /// `(normalize, superpose-or-ksuperpose node)` when `m` is a mixture.
     fn mixture(&self, m: NodeId) -> Option<(bool, NodeId)> {
@@ -112,11 +198,50 @@ impl<'m> Emitter<'m> {
         out
     }
 
+    /// `true` when `x` reads only literals and fixed module values.
+    fn fixed_value(&self, x: NodeId) -> bool {
+        let mut stack = vec![x];
+        while let Some(id) = stack.pop() {
+            match self.m.node(id) {
+                Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
+                    let fixed = self.m.binding_by_name(r.name).is_some_and(|b| {
+                        self.m.phase_of(self.m.binding(b).rhs) == Some(flatppl_core::Phase::Fixed)
+                    });
+                    if !fixed {
+                        return false;
+                    }
+                }
+                Node::Ref(_) => return false,
+                _ => {}
+            }
+            self.m.for_each_child(id, |c| stack.push(c));
+        }
+        true
+    }
+
+    /// `fill(c, [1, n])`: a 1×n block of one value, the atom of a row.
+    pub(super) fn row_fill(&self, atom: NodeId) -> bool {
+        let f = self.resolve(atom);
+        if self.head(f) != Some("fill") {
+            return false;
+        }
+        let n = self.resolve(self.call(f).unwrap().args[1]);
+        self.call(n).is_some_and(|c| {
+            self.head(n) == Some("vector")
+                && c.args.len() == 2
+                && matches!(
+                    self.m.node(c.args[0]),
+                    Node::Lit(flatppl_core::Scalar::Int(1))
+                )
+        })
+    }
+
     /// The Dirac split over the rows of a two-dimensional data variate: an
-    /// atom `fill(c, T)` against a broadcast law over each row. A row is at
-    /// the atom when its largest and smallest values are `c`. The other rows
-    /// score in one call, flattened row by row, each row-length argument
-    /// repeated once per row.
+    /// atom `fill(c, T)` (or `fill(c, [1, T])`) against a law over each row.
+    /// A row is at the atom when its largest and smallest values are `c`.
+    /// With arguments shared by all rows, the atom rows are one term; with
+    /// per-row arguments, one term per atom row (Stan has no per-row
+    /// `_lpmf`). The other rows score in one call, flattened row by row.
     #[allow(clippy::too_many_arguments)]
     fn dirac_split_rows(
         &mut self,
@@ -136,11 +261,7 @@ impl<'m> Emitter<'m> {
             .decls
             .get(lhs)
             .is_some_and(|t| t.is_int() && t.array.len() == 2);
-        if self.head(fill) != Some("fill")
-            || self.head(row_law) != Some("broadcast")
-            || !data
-            || !shaped
-        {
+        if self.head(fill) != Some("fill") || !data || !shaped {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` atom over a vector variate in this form",
@@ -152,44 +273,164 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` mixture with these weights",
             ));
         }
+        let [cv, fill_n] = self.call(fill).unwrap().args[..] else {
+            unreachable!()
+        };
+        // The atom test runs in `transformed data`: its value must be data.
+        if !self.fixed_value(cv) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom whose value is not data",
+            ));
+        }
+        // The atom is one whole row: `fill(c, n)` or `fill(c, [1, n])` with n
+        // the rows' length.
+        let len_node = if self.row_fill(atom) {
+            self.call(self.resolve(fill_n)).unwrap().args[1]
+        } else {
+            fill_n
+        };
+        let row_len = self.ext_lin.get(lhs).and_then(|e| e.get(1)).cloned();
+        let same = match (self.lin_int(len_node), row_len) {
+            (Some(a), Some(b)) => self.same_size(&a, &b),
+            _ => false,
+        };
+        if !same {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom of another length than its rows",
+            ));
+        }
+        let c = self.expr(cv)?;
+        let rl = match self.head(row_law) {
+            Some("broadcast") => self.broadcast_row_law(mix, law)?,
+            Some("markovchain") => self.markovchain_row_law(lhs, row_law, Some(&c.s))?,
+            _ => {
+                return Err(Refusal::not_yet(
+                    Some(mix),
+                    "a `Dirac` mixture with this row law",
+                ));
+            }
+        };
+        let n = self.extent_text(lhs);
+        let per_row = !rl.atom_shared();
+        let count = self.fresh(&format!("{lhs}_n_atom"));
+        let at_idx = per_row.then(|| self.fresh(&format!("{lhs}_atom")));
+        let rest = self.fresh(&format!("{lhs}_rest"));
+        let i = self.fresh_loop();
+        let (a, b) = (self.fresh("a"), self.fresh("b"));
+        let at = format!("max({lhs}[{i}]) == {c} && min({lhs}[{i}]) == {c}", c = c.s);
+        self.tdata.push(format!(
+            "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {at};\n}}"
+        ));
+        match &at_idx {
+            Some(at_idx) => {
+                self.tdata.push(format!("array[{count}] int {at_idx};"));
+                self.tdata.push(format!("array[{n} - {count}] int {rest};"));
+                self.tdata.push(format!(
+                    "{{\n  int {a} = 1;\n  int {b} = 1;\n  for ({i} in 1:{n}) {{\n    if ({at}) {{\n      {at_idx}[{a}] = {i};\n      {a} += 1;\n    }} else {{\n      {rest}[{b}] = {i};\n      {b} += 1;\n    }}\n  }}\n}}"
+                ));
+            }
+            None => {
+                self.tdata.push(format!("array[{n} - {count}] int {rest};"));
+                self.tdata.push(format!(
+                    "{{\n  int {b} = 1;\n  for ({i} in 1:{n}) {{\n    if (!({at})) {{\n      {rest}[{b}] = {i};\n      {b} += 1;\n    }}\n  }}\n}}"
+                ));
+            }
+        }
+        for v in [&i, &a, &b] {
+            self.used.remove(v);
+        }
+        let wlx = self.real(wl.unwrap())?.s;
+        let wdx = self.real(wd.unwrap())?.s;
+        if wlx.contains(super::structure::LOOP) || wdx.contains(super::structure::LOOP) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` row mixture with a weight per row",
+            ));
+        }
+        let mix_with = |me: &mut Self, lp: &str| -> Result<String> {
+            Ok(if dirac_first {
+                format!("log_mix({}, 0, {lp})", me.real(wd.unwrap())?.s)
+            } else {
+                format!("log_mix({wlx}, {lp}, 0)")
+            })
+        };
+        let mut out = Vec::new();
+        match &at_idx {
+            Some(at_idx) => {
+                let k = self.fresh_loop();
+                let row = format!("{at_idx}[{k}]");
+                let lp = rl.density(&format!("{lhs}[{row}]"), &row, Render::Row);
+                let term = mix_with(self, &lp)?;
+                out.push(format!(
+                    "for ({k} in 1:{count}) {{\n  target += {term};\n}}"
+                ));
+                self.used.remove(&k);
+            }
+            None => {
+                // Every atom row scores the same: the atom itself.
+                let atom_x = if self.row_fill(atom) {
+                    let len = self
+                        .decls
+                        .get(lhs)
+                        .and_then(|t| t.array.get(1).cloned())
+                        .unwrap_or_else(|| format!("size({lhs}[1])"));
+                    format!("rep_array({}, {len})", c.s)
+                } else {
+                    self.expr(atom)?.s
+                };
+                let lp = rl.density(&atom_x, "", Render::Atom);
+                let term = mix_with(self, &lp)?;
+                out.push(format!("target += {count} * {term};"));
+            }
+        }
+        let reps = format!("{n} - {count}");
+        let lp_rest = rl.density(
+            &format!("to_array_1d({lhs}[{rest}])"),
+            &rest,
+            Render::Rest(&reps),
+        );
+        out.push(format!(
+            "target += ({n} - {count}) * log({wlx}) + {lp_rest};"
+        ));
+        Ok(out)
+    }
+
+    /// The row law of a broadcast `D.(args…)` over one row: each argument
+    /// shared, a vector repeated per row, or a per-row matrix row `X[i]`.
+    fn broadcast_row_law(&mut self, mix: NodeId, law: NodeId) -> Result<RowLaw> {
+        let row_law = self.resolve(law);
         let l = self.law_any(law)?;
-        if !l.discrete || !l.vectorized || l.trunc.is_some() || l.support.is_some() || l.declared {
+        if !l.discrete
+            || !l.vectorized
+            || l.trunc.is_some()
+            || l.support.is_some()
+            || l.declared
+            || l.lhs("{y}") != "{y}"
+        {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with this row law",
             ));
         }
-        let c = self.expr(self.call(fill).unwrap().args[0])?;
-        let atom_x = self.expr(atom)?;
-        let n = self.extent_text(lhs);
-        let count = self.fresh(&format!("{lhs}_n_atom"));
-        let rest = self.fresh(&format!("{lhs}_rest"));
-        let i = self.fresh_loop();
-        let b = self.fresh("b");
-        let at = format!("max({lhs}[{i}]) == {c} && min({lhs}[{i}]) == {c}", c = c.s);
-        self.tdata.push(format!(
-            "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {at};\n}}"
-        ));
-        self.tdata.push(format!("array[{n} - {count}] int {rest};"));
-        self.tdata.push(format!(
-            "{{\n  int {b} = 1;\n  for ({i} in 1:{n}) {{\n    if (!({at})) {{\n      {rest}[{b}] = {i};\n      {b} += 1;\n    }}\n  }}\n}}"
-        ));
-        self.used.remove(&i);
-        self.used.remove(&b);
-        let wlx = self.real(wl.unwrap())?.s;
-        let lp_atom = self.law_density(law, &l, &atom_x.s, None)?;
-        let mix_at = if dirac_first {
-            format!("log_mix({}, 0, {lp_atom})", self.real(wd.unwrap())?.s)
-        } else {
-            format!("log_mix({wlx}, {lp_atom}, 0)")
-        };
-        // The other rows: row-major `to_array_1d` against each vector
-        // argument repeated per row (`to_vector` of `rep_matrix` is
-        // column-major, one copy of the vector per column).
+        let loop_ = super::structure::LOOP;
         let mut repeated = Vec::new();
         for &arg in &self.call(row_law).unwrap().args[1..].to_vec() {
             if self.shape(arg).is_some_and(|s| s.rank == 1) {
-                repeated.push(self.real(arg)?.s);
+                let e = self.real(arg)?.s;
+                if !e.contains(loop_) {
+                    // A row-length vector the law printed in another form
+                    // (`invlogit.(v)` as `bernoulli_logit(v)`) cannot be
+                    // repeated per row by its text.
+                    if !l.call.contains(&e) {
+                        return Err(Refusal::not_yet(
+                            Some(mix),
+                            "a `Dirac` mixture whose row law rewrites a vector argument",
+                        ));
+                    }
+                    repeated.push(e);
+                }
             } else if self.shape(arg).is_some_and(|s| s.rank > 1) {
                 return Err(Refusal::not_yet(
                     Some(mix),
@@ -198,28 +439,46 @@ impl<'m> Emitter<'m> {
             }
         }
         let open = l.call.find('(').unwrap_or(l.call.len());
-        let (name, inner) = (
-            &l.call[..open],
-            l.call[open..].trim_start_matches('(').trim_end_matches(')'),
-        );
-        let args: Vec<String> = split_args(inner)
-            .into_iter()
-            .map(|a| {
-                if repeated.contains(&a) {
-                    format!("to_vector(rep_matrix({a}, {n} - {count}))")
-                } else {
-                    a
+        let name = l.call[..open].to_string();
+        let inner = l.call[open..]
+            .strip_prefix('(')
+            .and_then(|x| x.strip_suffix(')'))
+            .unwrap_or("");
+        let mut args = Vec::new();
+        for a in split_args(inner) {
+            args.push(if a.contains(loop_) {
+                // Only a row of a named matrix: `X[i]`, and `X[rest]` for the
+                // other rows.
+                // `to_vector(X[rest]')` is row-major only for a matrix.
+                let base = a.strip_suffix(&format!("[{loop_}]")).filter(|b| {
+                    !b.is_empty()
+                        && b.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        && self
+                            .decls
+                            .get(*b)
+                            .is_some_and(|t| t.base == "matrix" && t.array.is_empty())
+                });
+                let Some(base) = base else {
+                    return Err(Refusal::not_yet(
+                        Some(mix),
+                        "a `Dirac` mixture with a per-row argument of this form",
+                    ));
+                };
+                RowArg::PerRow {
+                    row: format!("{base}[{ROW}]"),
+                    rest: format!("to_vector({base}[{ROW}]')"),
+                    atom: None,
                 }
-            })
-            .collect();
-        let flat = format!(
-            "{name}_lpmf(to_array_1d({lhs}[{rest}]) | {})",
-            args.join(", ")
-        );
-        Ok(vec![
-            format!("target += {count} * {mix_at};"),
-            format!("target += ({n} - {count}) * log({wlx}) + {flat};"),
-        ])
+            } else if repeated.contains(&a) {
+                RowArg::Repeated(a)
+            } else {
+                RowArg::Shared(a)
+            });
+        }
+        Ok(RowLaw {
+            name: format!("{name}_lpmf"),
+            args,
+        })
     }
 
     fn fresh_loop(&mut self) -> String {
@@ -563,6 +822,15 @@ impl<'m> Emitter<'m> {
             [Part::Law(wl, l), Part::Dirac(wd, c)] => (false, (*wd, *c), (*wl, *l)),
             _ => return Ok(None),
         };
+        // A chain's law is per row: only the row split takes it.
+        if self.head(self.resolve(law)) == Some("markovchain") {
+            if !(self.shape(atom).is_some_and(|s| s.rank == 1) || self.row_fill(atom)) {
+                return Err(Refusal::not_yet(Some(mix), "a `Dirac` atom of this shape"));
+            }
+            return self
+                .dirac_split_rows(lhs, mix, norm, dirac_first, (wd, atom), (wl, law))
+                .map(Some);
+        }
         let l = self.law_any(law)?;
         if l.declared {
             return Err(Refusal::not_yet(
@@ -578,7 +846,7 @@ impl<'m> Emitter<'m> {
                 "a `Dirac` atom beside a continuous law mixes two reference measures (§06)",
             ));
         }
-        if self.shape(atom).is_some_and(|s| s.rank == 1) {
+        if self.shape(atom).is_some_and(|s| s.rank == 1) || self.row_fill(atom) {
             return self
                 .dirac_split_rows(lhs, mix, norm, dirac_first, (wd, atom), (wl, law))
                 .map(Some);
@@ -605,6 +873,12 @@ impl<'m> Emitter<'m> {
             return Err(Refusal::not_yet(
                 Some(mix),
                 "a `Dirac` mixture with these weights",
+            ));
+        }
+        if !self.fixed_value(atom) {
+            return Err(Refusal::not_yet(
+                Some(mix),
+                "a `Dirac` atom whose value is not data",
             ));
         }
         let c = self.at_module(|me| me.expr(atom))?;
@@ -661,7 +935,7 @@ impl<'m> Emitter<'m> {
 }
 
 /// The top-level comma-separated arguments of a call's argument text.
-fn split_args(inner: &str) -> Vec<String> {
+pub(super) fn split_args(inner: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0i32, 0);
     for (i, ch) in inner.char_indices() {

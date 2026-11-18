@@ -243,6 +243,28 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `true` when two sizes are the same, recording it where one is an
+    /// unsourced data size (as an `iid` count records its variate's size).
+    /// Two different sourced sizes are never the same.
+    pub(super) fn same_size(&mut self, a: &Lin, b: &Lin) -> bool {
+        if a == b {
+            return true;
+        }
+        match (as_var(a), as_var(b)) {
+            (Some(x), Some(y)) => {
+                self.unify(a, b);
+                self.find(x) == self.find(y)
+            }
+            (Some(x), None) | (None, Some(x)) => {
+                let other = if as_var(a).is_some() { b } else { a };
+                self.unify(a, b);
+                let r = self.find(x);
+                self.svars[r].bound.as_ref() == Some(other)
+            }
+            _ => false,
+        }
+    }
+
     /// Name each size class and write the names into the program. A class
     /// that took a sourced size prints it; any other is one `data` size, `N`
     /// first, then `N_<first member>`.
