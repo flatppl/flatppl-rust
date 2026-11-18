@@ -2,18 +2,15 @@
 //! `*.data.json`. Set `FLATPPL_BLESS=1` to rewrite the expected files. A first
 //! line `# emit: derived=transformed-parameters target=NAME` sets options.
 //!
-//! These goldens check structural translation with data summaries disabled.
-//! The statistics tests cover the optimized form. The posteriordb round trip in
-//! flatppl-testsuite checks the numbers.
+//! These goldens check structural translation with the default options (no
+//! `--reduce`). The statistics tests cover `--reduce sufficient`. The
+//! posteriordb round trip in flatppl-testsuite checks the numbers.
 
 use std::path::Path;
 
 /// Options from a leading `# emit: derived=transformed-parameters` line.
 fn options(source: &str) -> flatppl_stan::EmitOptions {
-    let mut opts = flatppl_stan::EmitOptions {
-        sufficient_statistics: false,
-        ..Default::default()
-    };
+    let mut opts = flatppl_stan::EmitOptions::default();
     if let Some(rest) = source
         .lines()
         .next()

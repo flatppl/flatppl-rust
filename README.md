@@ -105,9 +105,11 @@ non-interactive use unless `FLATPPL_TRUST=1`).
 ## Building and testing (developers)
 
 Independent likelihood factors use shared data summaries where supported.
-`flatppl stan` prepares observed IID Normal summaries in Stan's `transformed data`
-block. A change in the observation count selects Stan's vectorized Normal density.
-Disable the reduction with `--sufficient-statistics=false`. For runtime data,
+`flatppl stan --reduce sufficient` prepares observed IID Normal summaries in Stan's
+`transformed data` block; without it, the program states Stan's vectorized Normal
+density. A change in the observation count also selects that density. For
+`determinize` and `stablehlo`, disable the reduction with
+`--sufficient-statistics=false`. For runtime data,
 emit a preparation query and a scoring query in either portable or StableHLO form:
 
 ```sh
