@@ -1,3 +1,4 @@
+use crate::autoregression::ArmaOrder;
 use crate::{Ar1, Arithmetic, Censoring, ColumnExpression, Error, Result, Truncation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -19,6 +20,8 @@ pub struct Formula {
     pub truncation: Option<Truncation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ar: Option<Ar1>,
+    #[serde(default, skip_serializing_if = "ArmaOrder::stationary_ar1")]
+    pub(crate) arma_order: ArmaOrder,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) threshold_group: Option<ThresholdGroup>,
     pub intercept: bool,
@@ -239,6 +242,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         decision: additions.decision,
         truncation: additions.truncation,
         ar: additions.ar,
+        arma_order: additions.arma_order,
         threshold_group: additions.threshold_group,
         intercept,
         variables,
@@ -335,6 +339,7 @@ struct ResponseAdditions {
     decision: Option<String>,
     truncation: Option<Truncation>,
     ar: Option<Ar1>,
+    arma_order: ArmaOrder,
     threshold_group: Option<ThresholdGroup>,
 }
 
@@ -344,7 +349,7 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
         return Ok((name(text.trim())?, additions));
     };
     let fail = || {
-        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)`, `ar(...)`, `thres(...)` and `dec(...)`".into())
+        Error("response additions support trials(), weights(), se(), cens(), trunc(), ar(), ma(), arma(), thres() and dec()".into())
     };
     let mut depth = 0i32;
     for addition in addition.split(|c| {
@@ -403,8 +408,10 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
             "trunc" if additions.truncation.is_none() => {
                 additions.truncation = Some(Truncation::parse(argument)?);
             }
-            "ar" if additions.ar.is_none() => {
-                additions.ar = Some(Ar1::parse(argument)?);
+            term @ ("ar" | "ma" | "arma") if additions.ar.is_none() => {
+                let (ar, order) = Ar1::parse(term, argument)?;
+                additions.ar = Some(ar);
+                additions.arma_order = order;
             }
             "thres" if additions.threshold_group.is_none() => {
                 additions.threshold_group = Some(threshold_group(argument)?);
