@@ -360,7 +360,84 @@ pub(crate) fn model_rows(
     if rows.is_empty() {
         return Err(Error("no complete model rows remain".into()));
     }
+    if let Some(ar) = &formula.ar {
+        let group = table.column(&ar.group)?;
+        let time = table.column(&ar.time)?;
+        if rows
+            .iter()
+            .any(|&row| !group.present(row) || !time.present(row))
+        {
+            return Err(Error("ar() group and time cannot be missing".into()));
+        }
+        let levels = group.levels(&rows)?;
+        let indices: HashMap<_, _> = levels
+            .iter()
+            .enumerate()
+            .map(|(index, level)| (level_key(level), index))
+            .collect();
+        let mut ordered = rows
+            .into_iter()
+            .map(|row| {
+                let level = group.level(row)?;
+                Ok((indices[&level_key(&level)], ar_time(time, row)?, row))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_unstable();
+        rows = ordered.into_iter().map(|(_, _, row)| row).collect();
+    }
     Ok(rows)
+}
+
+fn ar_time(column: &Column, row: usize) -> Result<i64> {
+    match column.level(row)? {
+        GroupLevel::Integer(value) => Ok(value),
+        GroupLevel::Real(value)
+            if value.fract() == 0.0 && value >= i64::MIN as f64 && value < -(i64::MIN as f64) =>
+        {
+            Ok(value as i64)
+        }
+        _ => Err(Error("ar() time must contain integer-valued times".into())),
+    }
+}
+
+fn prepare_ar(
+    ar: &crate::Ar1,
+    table: &Table,
+    rows: &[usize],
+    constants: &mut BTreeMap<String, DataValue>,
+) -> Result<()> {
+    let groups = table.column(&ar.group)?;
+    let times = table.column(&ar.time)?;
+    let mut gaps = vec![0];
+    let mut predecessors = vec![1];
+    let mut previous_group = groups.level(rows[0])?;
+    let mut previous_time = ar_time(times, rows[0])?;
+    for (i, &row) in rows.iter().enumerate().skip(1) {
+        let group = groups.level(row)?;
+        let time = ar_time(times, row)?;
+        if group == previous_group {
+            let gap = time
+                .checked_sub(previous_time)
+                .filter(|&gap| gap <= i32::MAX as i64)
+                .ok_or_else(|| Error("ar() time gap exceeds the supported integer range".into()))?;
+            if gap == 0 {
+                return Err(Error("ar() times must be unique within a group".into()));
+            }
+            gaps.push(gap);
+            predecessors.push(i as i64);
+        } else {
+            gaps.push(0);
+            predecessors.push(i as i64 + 1);
+        }
+        previous_group = group;
+        previous_time = time;
+    }
+    constants.insert(crate::autoregression::GAP.into(), DataValue::Integers(gaps));
+    constants.insert(
+        crate::autoregression::PREVIOUS.into(),
+        DataValue::Integers(predecessors),
+    );
+    Ok(())
 }
 
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
@@ -428,6 +505,9 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
         constants.insert("se_data".into(), values);
     }
     crate::response::prepare(&recipe.formula, table, &rows, mode, &mut constants)?;
+    if let Some(ar) = &recipe.formula.ar {
+        prepare_ar(ar, table, &rows, &mut constants)?;
+    }
     Ok(DataDocument { constants, rows })
 }
 

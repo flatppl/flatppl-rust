@@ -233,6 +233,7 @@ pub(crate) fn resolve(
         .copied()
         .filter(|name| dpar.is_none() && !spec.dpars.contains_key(*name))
         .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
+        .chain((dpar.is_none() && formula.ar.is_some()).then_some("ar"))
         .collect();
     let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
     if thresholds > 0 {
@@ -420,10 +421,13 @@ pub(crate) fn resolve(
     let aux = auxiliaries
         .iter()
         .map(|&name| {
-            let prior = selected
-                .next()
-                .unwrap()
-                .unwrap_or_else(|| ResolvedPrior::new(family.default_auxiliary(name, sigma_scale)));
+            let prior = selected.next().unwrap().unwrap_or_else(|| {
+                if name == "ar" {
+                    ResolvedPrior::new("uniform(-1, 1)")
+                } else {
+                    ResolvedPrior::new(family.default_auxiliary(name, sigma_scale))
+                }
+            });
             (name.into(), prior)
         })
         .collect();

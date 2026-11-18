@@ -1,6 +1,6 @@
 use crate::{
     DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter,
-    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, metadata,
+    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, metadata,
     prior_model::ParameterPrior,
     priors::{self, PriorNode},
 };
@@ -33,6 +33,9 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         external_vector(&mut b, "se_data", "nonnegreals");
     }
     crate::response::declare(&mut b, &recipe.formula);
+    if recipe.formula.ar.is_some() {
+        autoregression::declare(&mut b);
+    }
     if let Some(nonlinear) = &recipe.nonlinear {
         for i in 0..nonlinear.columns.len() {
             external_vector(&mut b, &crate::nonlinear::data_name(i), "reals");
@@ -79,6 +82,19 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             &mut b,
             name,
             &recipe.auxiliary_priors[name],
+            Some(support),
+            &mut parameters,
+            recipe.family,
+        )?;
+    }
+    if recipe.formula.ar.is_some() {
+        let lower = b.lit_real(-1.0);
+        let upper = b.lit_real(1.0);
+        let support = b.call("interval", &[lower, upper]);
+        parameter(
+            &mut b,
+            "ar",
+            &recipe.auxiliary_priors["ar"],
             Some(support),
             &mut parameters,
             recipe.family,
@@ -139,7 +155,9 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         .map(|name| (name, b.self_ref(name)))
         .collect();
     let cuts = threshold_inputs(&mut b, recipe);
-    let law = if let Some(truncation) = &recipe.formula.truncation {
+    let law = if recipe.formula.ar.is_some() {
+        autoregression::law(&mut b, mu)
+    } else if let Some(truncation) = &recipe.formula.truncation {
         let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
         crate::response::truncated_normal(&mut b, mu, sigma, truncation)
     } else {
@@ -161,8 +179,12 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let response = b.call_fields("record", &[("y", y)]);
     let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
-    let pointwise = pointwise_log_likelihood(&mut b, recipe, scale);
-    let likelihood = if recipe.formula.censoring.is_some() {
+    let pointwise = if recipe.formula.ar.is_some() {
+        autoregression::pointwise(&mut b, mu)
+    } else {
+        pointwise_log_likelihood(&mut b, recipe, scale)
+    };
+    let likelihood = if recipe.formula.censoring.is_some() || recipe.formula.ar.is_some() {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
     } else {
         let y = b.self_ref("y_data");
@@ -877,7 +899,16 @@ fn parameter(
     let bindings: Vec<_> = names.iter().map(String::as_str).collect();
     match priors::emit(b, prior, support, None, &bindings)? {
         PriorNode::Measure(law) => declare_parameter(b, name, law, parameters),
-        PriorNode::Constant(value) => b.bind(name, value),
+        PriorNode::Constant(value) => {
+            if name == "ar"
+                && crate::prior_expr::scalar(b.m, value).is_some_and(|value| value.abs() >= 1.0)
+            {
+                return Err(Error(
+                    "ar() requires a coefficient strictly between -1 and 1".into(),
+                ));
+            }
+            b.bind(name, value);
+        }
     }
     Ok(())
 }
@@ -996,7 +1027,13 @@ pub(crate) fn info(
         )?);
         group_offset += predictor.groups.len();
     }
-    for &name in recipe.family.auxiliaries() {
+    for name in recipe
+        .family
+        .auxiliaries()
+        .iter()
+        .copied()
+        .chain(recipe.formula.ar.is_some().then_some("ar"))
+    {
         if !recipe.predictors.contains_key(name) {
             parameters.push(Parameter {
                 name: name.into(),

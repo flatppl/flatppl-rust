@@ -4,6 +4,7 @@
 //! numeric expressions, offsets, group effects and thin-plate smooths are supported.
 //! It does not fit a model.
 
+mod autoregression;
 mod categorical;
 mod contrasts;
 mod data;
@@ -27,6 +28,7 @@ use flatppl_core::Module;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
+pub use autoregression::Ar1;
 use data::ColumnModel;
 pub use data::{DataDocument, DataMode, DataValue, prepare_data};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
@@ -394,6 +396,9 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         return Err(Error(
             "`cens(...)` and `trunc(...)` are available for Gaussian responses".into(),
         ));
+    }
+    if let Some(ar) = &formula.ar {
+        ar.validate(&formula, family, spec.dpars.contains_key("sigma"))?;
     }
     if family.uses_trials() != formula.trials.is_some() {
         return Err(Error(

@@ -653,7 +653,7 @@ fn intersect(b: &mut Builder<'_>, a: NodeId, c: NodeId) -> Result<NodeId> {
     Ok(b.call("interval", &[lo, hi]))
 }
 
-fn scalar(module: &Module, id: NodeId) -> Option<f64> {
+pub(crate) fn scalar(module: &Module, id: NodeId) -> Option<f64> {
     match module.node(id) {
         Node::Lit(Scalar::Real(v)) => Some(*v),
         Node::Lit(Scalar::Int(v)) => Some(*v as f64),
