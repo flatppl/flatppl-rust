@@ -3,14 +3,19 @@
 
 use super::*;
 
-pub(crate) fn normal_interval(m: &Module, measure: NodeId) -> Option<[NodeId; 3]> {
+pub(crate) fn stable_interval(m: &Module, measure: NodeId) -> Option<[NodeId; 3]> {
     let (measure, _) = resolve_ref(m, measure);
     let truncate = expect_builtin_call(m, measure, "truncate")?;
     let [base, set] = *truncate.args else {
         return None;
     };
     let (base, _) = resolve_ref(m, base);
-    expect_builtin_call(m, base, "Normal")?;
+    if !matches!(
+        builtin_name(m, base),
+        Some("Normal" | "Exponential" | "Weibull")
+    ) {
+        return None;
+    }
     let (set, _) = resolve_ref(m, set);
     let [lo, hi] = *expect_builtin_call(m, set, "interval")?.args else {
         return None;
@@ -18,14 +23,14 @@ pub(crate) fn normal_interval(m: &Module, measure: NodeId) -> Option<[NodeId; 3]
     Some([base, lo, hi])
 }
 
-pub(crate) fn log_normal_interval_query(m: &Module, node: NodeId) -> Option<[NodeId; 3]> {
+pub(crate) fn log_stable_interval_query(m: &Module, node: NodeId) -> Option<[NodeId; 3]> {
     let [mass] = *expect_builtin_call(m, node, "log")?.args else {
         return None;
     };
     let [measure] = *expect_builtin_call(m, mass, "totalmass")?.args else {
         return None;
     };
-    normal_interval(m, measure)
+    stable_interval(m, measure)
 }
 
 fn point(m: &mut Module) -> NodeId {
@@ -515,6 +520,9 @@ pub(crate) fn lower_interval_mass(
             return Ok(normal_log_mass(m, mu, sigma, lo, hi, valid));
         }
     }
+    if let Some(log_mass) = survival_log_mass(m, ctor, input, lo, hi) {
+        return Ok(log_mass);
+    }
     if m.resolve(ctor) == "Gamma"
         && static_real(m, hi) == Some(f64::INFINITY)
         && let Some(log_mass) = erlang_log_survival(m, input, lo)
@@ -587,6 +595,124 @@ pub(crate) fn lower_interval_mass(
     // An empty intersection has exactly zero mass. Keep log's argument valid
     // before AD so its unused derivative cannot introduce 0/0 into a zero bin.
     Ok(log_nonnegative_mass(m, z))
+}
+
+/// For cumulative hazard H, the interval mass is exp(-H(lo)) times
+/// 1 - exp(-(H(hi) - H(lo))). Compute both differences in log space.
+fn survival_log_mass(
+    m: &mut Module,
+    ctor: Symbol,
+    input: NodeId,
+    lo: NodeId,
+    hi: NodeId,
+) -> Option<NodeId> {
+    let (rate, weibull) = match m.resolve(ctor) {
+        "Exponential" => (Some(find_field(m, input, "rate")?), None),
+        "Weibull" => (
+            None,
+            Some([
+                find_field(m, input, "shape")?,
+                find_field(m, input, "scale")?,
+            ]),
+        ),
+        _ => return None,
+    };
+    let real = |m: &mut Module, value| m.alloc(Node::Lit(Scalar::Real(value)));
+    let zero = real(m, 0.0);
+    let half = real(m, 0.5);
+    let one = real(m, 1.0);
+    let mut valid = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let mut parameter = |m: &mut Module, x| {
+        let positive = build_call(m, "gt", &[x, zero]);
+        let finite = build_call(m, "isfinite", &[x]);
+        let allowed = build_call(m, "land", &[positive, finite]);
+        valid = build_call(m, "land", &[valid, allowed]);
+        build_call(m, "ifelse", &[allowed, x, one])
+    };
+    let rate = rate.map(|rate| parameter(m, rate));
+    let weibull = weibull.map(|params| params.map(|x| parameter(m, x)));
+    let nan_lo = build_call(m, "isnan", &[lo]);
+    let nan_hi = build_call(m, "isnan", &[hi]);
+    let nan = build_call(m, "lor", &[nan_lo, nan_hi]);
+    let bounds_valid = build_call(m, "lnot", &[nan]);
+    let valid = build_call(m, "land", &[valid, bounds_valid]);
+    let lower = build_call(m, "max", &[lo, zero]);
+    let nonempty = build_call(m, "lt", &[lower, hi]);
+    let upper_finite = build_call(m, "isfinite", &[hi]);
+    let bounded = build_call(m, "land", &[nonempty, upper_finite]);
+    // Safe placeholders keep inactive endpoints out of log and power arithmetic.
+    let lower_positive = build_call(m, "gt", &[lower, zero]);
+    let positive = build_call(m, "land", &[nonempty, lower_positive]);
+    let hazard_at = build_call(m, "ifelse", &[positive, lower, one]);
+    let l = build_call(m, "ifelse", &[bounded, lower, half]);
+    let h = build_call(m, "ifelse", &[bounded, hi, one]);
+    let width = build_call(m, "sub", &[h, l]);
+    let (hazard, log_gap) = if let Some(rate) = rate {
+        let hazard = build_call(m, "mul", &[rate, hazard_at]);
+        let log_rate = build_call(m, "log", &[rate]);
+        let log_width = build_call(m, "log", &[width]);
+        (hazard, build_call(m, "add", &[log_rate, log_width]))
+    } else {
+        let [shape, scale] = weibull?;
+        let log_scale = build_call(m, "log", &[scale]);
+        let log_hazard = |m: &mut Module, x| {
+            let log_x = build_call(m, "log", &[x]);
+            let log_standardized = build_call(m, "sub", &[log_x, log_scale]);
+            build_call(m, "mul", &[shape, log_standardized])
+        };
+        let log_hazard_at = log_hazard(m, hazard_at);
+        let hazard = build_call(m, "exp", &[log_hazard_at]);
+        let log_h = log_hazard(m, h);
+        // The close-endpoint path preserves a small relative width before log1p.
+        let h_half = build_call(m, "mul", &[h, half]);
+        let near = build_call(m, "gt", &[l, h_half]);
+        let near_width = build_call(m, "ifelse", &[near, width, half]);
+        let near_upper = build_call(m, "ifelse", &[near, h, one]);
+        let relative = build_call(m, "divide", &[near_width, near_upper]);
+        let negative = build_call(m, "neg", &[relative]);
+        let near_ratio = build_call(m, "log1p", &[negative]);
+        let l_positive = build_call(m, "gt", &[l, zero]);
+        let not_near = build_call(m, "lnot", &[near]);
+        let far = build_call(m, "land", &[l_positive, not_near]);
+        let safe_l = build_call(m, "ifelse", &[far, l, half]);
+        let safe_h = build_call(m, "ifelse", &[far, h, one]);
+        let log_l = build_call(m, "log", &[safe_l]);
+        let log_h_input = build_call(m, "log", &[safe_h]);
+        let far_ratio = build_call(m, "sub", &[log_l, log_h_input]);
+        let ratio = build_call(m, "ifelse", &[near, near_ratio, far_ratio]);
+        let negative_ratio = build_call(m, "neg", &[ratio]);
+        let log_ratio = build_call(m, "log", &[negative_ratio]);
+        let log_shape = build_call(m, "log", &[shape]);
+        let log_hazard_ratio = build_call(m, "add", &[log_shape, log_ratio]);
+        let fraction = log_survival_gap(m, log_hazard_ratio);
+        let fraction = build_call(m, "ifelse", &[l_positive, fraction, zero]);
+        (hazard, build_call(m, "add", &[log_h, fraction]))
+    };
+    let hazard = build_call(m, "ifelse", &[positive, hazard, zero]);
+    let gap = log_survival_gap(m, log_gap);
+    let gap = build_call(m, "ifelse", &[upper_finite, gap, zero]);
+    let log_mass = build_call(m, "sub", &[gap, hazard]);
+    let neg_inf = real(m, f64::NEG_INFINITY);
+    let log_mass = build_call(m, "ifelse", &[nonempty, log_mass, neg_inf]);
+    Some(exponential_tilt::guard(m, log_mass, valid))
+}
+
+/// log(1 - exp(-exp(x))). Outside the cutoffs the limits are accurate to
+/// floating-point precision and avoid underflow or an overflowing derivative.
+fn log_survival_gap(m: &mut Module, x: NodeId) -> NodeId {
+    let real = |m: &mut Module, value| m.alloc(Node::Lit(Scalar::Real(value)));
+    let low = real(m, -36.0);
+    let high = real(m, 7.0);
+    let zero = real(m, 0.0);
+    let small = build_call(m, "lt", &[x, low]);
+    let large = build_call(m, "gt", &[x, high]);
+    let outside = build_call(m, "lor", &[small, large]);
+    let safe = build_call(m, "ifelse", &[outside, zero, x]);
+    let magnitude = build_call(m, "exp", &[safe]);
+    let negative = build_call(m, "neg", &[magnitude]);
+    let log_mass = exponential_tilt::log1mexp(m, negative);
+    let log_mass = build_call(m, "ifelse", &[small, x, log_mass]);
+    build_call(m, "ifelse", &[large, zero, log_mass])
 }
 
 fn normal_log_mass(

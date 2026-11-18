@@ -390,9 +390,19 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "`se(...)` is available for Gaussian and Student families".into(),
         ));
     }
-    if (formula.censoring.is_some() || formula.truncation.is_some()) && family != Family::Gaussian {
+    if formula.censoring.is_some()
+        && !matches!(
+            family,
+            Family::Gaussian | Family::Weibull | Family::Exponential
+        )
+    {
         return Err(Error(
-            "`cens(...)` and `trunc(...)` are available for Gaussian responses".into(),
+            "`cens(...)` is available for Gaussian, Weibull and exponential responses".into(),
+        ));
+    }
+    if formula.truncation.is_some() && family != Family::Gaussian {
+        return Err(Error(
+            "`trunc(...)` is available for Gaussian responses".into(),
         ));
     }
     if family.uses_trials() != formula.trials.is_some() {
