@@ -16,6 +16,10 @@ pub struct DataDocument {
     pub rows: Vec<usize>,
 }
 
+/// Shapes of standard normal innovations to append on the last axis of each
+/// affected group parameter. The fitted labels remain the leading entries.
+pub type NewGroupShapes = BTreeMap<String, Vec<usize>>;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DataValue {
@@ -366,6 +370,26 @@ pub(crate) fn model_rows(
 /// Prepare a fresh snapshot using training means, levels and prior defaults.
 /// Prediction needs neither responses nor weights and never refits the recipe.
 pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<DataDocument> {
+    prepare_data_inner(recipe, table, mode, None)
+}
+
+/// Prepare prediction data, assigning unseen labels indices after the fitted
+/// levels in each group and reporting the corresponding innovation shapes.
+pub fn prepare_data_with_new_groups(
+    recipe: &Recipe,
+    table: &Table,
+) -> Result<(DataDocument, NewGroupShapes)> {
+    let mut shapes = NewGroupShapes::new();
+    let data = prepare_data_inner(recipe, table, DataMode::Prediction, Some(&mut shapes))?;
+    Ok((data, shapes))
+}
+
+fn prepare_data_inner(
+    recipe: &Recipe,
+    table: &Table,
+    mode: DataMode,
+    mut new_groups: Option<&mut NewGroupShapes>,
+) -> Result<DataDocument> {
     let predictors: Vec<_> = recipe.predictors.values().map(|p| &p.formula).collect();
     let nonlinear_columns = recipe
         .nonlinear
@@ -385,6 +409,7 @@ pub fn prepare_data(recipe: &Recipe, table: &Table, mode: DataMode) -> Result<Da
             table,
             &rows,
             &mut constants,
+            new_groups.as_deref_mut(),
         )?;
     }
     if mode == DataMode::Training {
@@ -437,6 +462,7 @@ fn prepare_predictor(
     table: &Table,
     rows: &[usize],
     constants: &mut BTreeMap<String, DataValue>,
+    mut new_groups: Option<&mut NewGroupShapes>,
 ) -> Result<()> {
     for (i, (coding, column)) in recipe
         .monotonic
@@ -512,24 +538,49 @@ fn prepare_predictor(
             };
             constants.insert(name.clone(), values);
         }
-        let levels: HashMap<_, _> = group
+        let mut levels: HashMap<_, _> = group
             .levels
             .iter()
             .enumerate()
             .map(|(index, level)| (level_key(level), index as i64 + 1))
             .collect();
-        let indices = rows
-            .iter()
-            .map(|&row| {
-                let level = group_level(&term.columns, table, row)?;
-                levels.get(&level_key(&level)).copied().ok_or_else(|| {
-                    Error(format!(
-                        "unseen level {level:?} in group `{}`",
-                        group.column
-                    ))
+        let indices = if let Some(shapes) = new_groups.as_deref_mut() {
+            let row_levels = rows
+                .iter()
+                .map(|&row| group_level(&term.columns, table, row))
+                .collect::<Result<Vec<_>>>()?;
+            let fitted_count = levels.len();
+            let indices = row_levels
+                .iter()
+                .map(|level| {
+                    let index = levels.len() as i64 + 1;
+                    *levels.entry(level_key(level)).or_insert(index)
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect();
+            let new_count = levels.len() - fitted_count;
+            if new_count > 0 {
+                let coefficients = group.coefficients.len();
+                let shape = if coefficients == 1 {
+                    vec![new_count]
+                } else {
+                    vec![coefficients, new_count]
+                };
+                shapes.insert(group.z.clone(), shape);
+            }
+            indices
+        } else {
+            rows.iter()
+                .map(|&row| {
+                    let level = group_level(&term.columns, table, row)?;
+                    levels.get(&level_key(&level)).copied().ok_or_else(|| {
+                        Error(format!(
+                            "unseen level {level:?} in group `{}`",
+                            group.column
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         constants.insert(group.index.clone(), DataValue::Integers(indices));
     }
     Ok(())
