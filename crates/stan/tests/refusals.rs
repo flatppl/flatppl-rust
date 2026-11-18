@@ -587,3 +587,103 @@ fn broadcast_over_a_boolean_mask_is_no_gather() {
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
 }
+
+#[test]
+fn pushfwd_exp_is_not_yet() {
+    let r = refuse(&posterior(
+        "rho ~ pushfwd(fn(exp(_)), Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("not affine"), "{r}");
+}
+
+#[test]
+fn pushfwd_matrix_affine_is_not_yet() {
+    let r = refuse(&posterior(
+        "A = rowstack([[2.0, 0.0], [1.0, 3.0]])\nx ~ pushfwd(fn(A * _), iid(Normal(0, 1), 2))\n\
+         y ~ Normal(sum(x), 1)",
+        "lawof(record(x = x))",
+        "kernelof(record(y = y), x = x)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("array coefficient"), "{r}");
+}
+
+#[test]
+fn pushfwd_bounded_law_unknown_sign_is_not_yet() {
+    let r = refuse(&posterior(
+        "cs = [0.5, -2.0]\nrho ~ pushfwd(fn(cs[2] * _), Beta(2, 2))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("unknown sign"), "{r}");
+}
+
+#[test]
+fn pushfwd_zero_scale_is_never() {
+    let r = refuse(&posterior(
+        "rho ~ pushfwd(fn(0 * _ + 1), Normal(0, 1))\ny ~ Normal(rho, 1)",
+        "lawof(record(rho = rho))",
+        "kernelof(record(y = y), rho = rho)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NonBijectivePushfwd, "{r}");
+}
+
+#[test]
+fn pushfwd_array_variate_is_not_yet() {
+    let r = refuse(&posterior(
+        "x ~ pushfwd(fn(2 * _), iid(Normal(0, 1), 3))\ny ~ Normal(sum(x), 1)",
+        "lawof(record(x = x))",
+        "kernelof(record(y = y), x = x)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("array variate"), "{r}");
+}
+
+#[test]
+fn pushfwd_inside_iid_is_not_yet() {
+    let r = refuse(&posterior(
+        "x ~ iid(pushfwd(fn(2 * _), Normal(0, 1)), 3)\ny ~ Normal(sum(x), 1)",
+        "lawof(record(x = x))",
+        "kernelof(record(y = y), x = x)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("pushfwd"), "{r}");
+}
+
+#[test]
+fn pushfwd_of_discrete_law_is_not_yet() {
+    let r = refuse(
+        "lam ~ Exponential(1)\ny ~ pushfwd(fn(_ + 1), Poisson(lam))\n\
+         prior = lawof(record(lam = lam))\n\
+         L = likelihoodof(kernelof(record(y = y), lam = lam), record(y = 4))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("pushfwd of this law"), "{r}");
+}
+
+#[test]
+fn nested_iid_three_levels_is_not_yet() {
+    let r = refuse(&posterior(
+        "w ~ iid(iid(iid(Normal(0, 1), 2), 2), 2)\ny ~ Normal(sum(w[1][1]), 1)",
+        "lawof(record(w = w))",
+        "kernelof(record(y = y), w = w)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("nested more than twice"), "{r}");
+}
+
+#[test]
+fn nested_iid_of_vector_law_is_not_yet() {
+    let r = refuse(&posterior(
+        "w ~ iid(iid(Dirichlet(ones(3)), 2), 2)\ny ~ Normal(sum(w[1][1]), 1)",
+        "lawof(record(w = w))",
+        "kernelof(record(y = y), w = w)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("nested iid"), "{r}");
+}

@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+a ~ Gamma(2, 2)
+y ~ pushfwd(fn(2 * _ - 1), Beta(a, 2))
+prior = lawof(record(a = a))
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = 0.3))
+post = bayesupdate(L, prior)

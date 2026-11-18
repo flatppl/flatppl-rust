@@ -19,6 +19,7 @@ mod functions;
 mod markovchain;
 mod mixture;
 mod pattern;
+mod pushfwd;
 mod ranges;
 mod scan;
 mod statistics;

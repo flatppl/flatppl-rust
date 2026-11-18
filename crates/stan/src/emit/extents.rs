@@ -760,14 +760,25 @@ impl<'m> Emitter<'m> {
         };
         let args = c.args.to_vec();
         match self.head(m) {
+            // `iid(iid(D, m), k)`: the outer counts, then the inner ones.
             Some("iid") => {
-                let ns = self.extent_list(args[1]);
-                for (a, h) in ns.into_iter().enumerate() {
-                    if let (Some(h), Some(l)) = (h, axes.get(a))
-                        && let Some(x) = self.lin_int(h)
-                    {
-                        self.unify(l, &x);
+                let (mut args, mut offset) = (args, 0);
+                loop {
+                    let ns = self.extent_list(args[1]);
+                    let k = ns.len();
+                    for (a, h) in ns.into_iter().enumerate() {
+                        if let (Some(h), Some(l)) = (h, axes.get(offset + a))
+                            && let Some(x) = self.lin_int(h)
+                        {
+                            self.unify(l, &x);
+                        }
                     }
+                    offset += k;
+                    let inner = self.resolve(args[0]);
+                    if self.head(inner) != Some("iid") {
+                        break;
+                    }
+                    args = self.call(inner).unwrap().args.to_vec();
                 }
             }
             Some("broadcast") => {
