@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 pub(crate) fn levels(
     recipe: &PredictorRecipe,
 ) -> (BTreeMap<String, FactorInfo>, BTreeMap<String, GroupInfo>) {
-    let factors: BTreeMap<_, _> = std::iter::once(&recipe.design)
+    let mut factors: BTreeMap<_, _> = std::iter::once(&recipe.design)
         .chain(recipe.groups.iter().map(|group| &group.design))
         .flat_map(|design| &design.predictors)
         .filter_map(|predictor| {
@@ -26,6 +26,15 @@ pub(crate) fn levels(
             })
         })
         .collect();
+    for (coding, column) in recipe.monotonic.iter().zip(&recipe.formula.monotonic) {
+        if let crate::Monotonic::Ordered { levels } = coding {
+            factors.entry(column.clone()).or_insert_with(|| FactorInfo {
+                name: column.clone(),
+                levels: levels.clone(),
+                ordered: true,
+            });
+        }
+    }
     let groups: BTreeMap<_, _> = recipe
         .groups
         .iter()

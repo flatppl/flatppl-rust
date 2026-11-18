@@ -61,6 +61,10 @@ pub struct Priors {
     pub bs: Vec<ResolvedPrior>,
     #[serde(default)]
     pub sds: Vec<ResolvedPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bmo: Vec<ResolvedPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simo: Vec<ResolvedPrior>,
     pub sd: Vec<Vec<ResolvedPrior>>,
     pub cor: Vec<Option<ResolvedPrior>>,
 }
@@ -265,6 +269,27 @@ pub(crate) fn resolve(
         group: None,
         dpar,
     }));
+    let monotonic_names: Vec<_> = formula
+        .monotonic
+        .iter()
+        .map(|column| crate::monotonic::coefficient(column))
+        .collect();
+    let simplex_names: Vec<_> = monotonic_names
+        .iter()
+        .map(|name| format!("{name}1"))
+        .collect();
+    targets.extend(monotonic_names.iter().map(|name| PriorTarget {
+        class: "b",
+        coef: Some(name),
+        group: None,
+        dpar,
+    }));
+    targets.extend(simplex_names.iter().map(|name| PriorTarget {
+        class: "simo",
+        coef: Some(name),
+        group: None,
+        dpar,
+    }));
     targets.extend(group_targets(groups, formula, dpar));
     targets.extend(auxiliaries.iter().map(|name| PriorTarget {
         class: name,
@@ -347,6 +372,24 @@ pub(crate) fn resolve(
                 .unwrap_or_else(|| ResolvedPrior::new(format!("student_t(3, 0, {group_scale})")))
         })
         .collect();
+    let bmo = monotonic_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("Lebesgue(reals)"))
+        })
+        .collect();
+    let simo = simplex_names
+        .iter()
+        .map(|_| {
+            selected
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| ResolvedPrior::new("dirichlet(1)"))
+        })
+        .collect();
     let mut cor = Vec::new();
     for (group, term) in groups.iter().zip(&formula.groups) {
         sd.push(
@@ -386,6 +429,8 @@ pub(crate) fn resolve(
             b,
             bs,
             sds,
+            bmo,
+            simo,
             sd,
             cor,
         },
