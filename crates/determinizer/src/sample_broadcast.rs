@@ -200,6 +200,9 @@ impl Scope {
                 if let Some((tag, parameters)) = restricted::parameters(m, measure) {
                     return Ok(self.sample_constructor(m, tag, parameters, rng, sample_name));
                 }
+                if let Some(mixture) = zero_atom_mixture(m, measure) {
+                    return self.sample_zero_atom_mixture(m, mixture, rng, sample_name);
+                }
                 let (base, valid) = normalized_sample_base(m, measure)?;
                 return self.sample_map(m, base, rng, sample_name, |m, point| {
                     crate::density::exponential_tilt::guard(m, point, valid)
@@ -235,6 +238,40 @@ impl Scope {
         build_sample_term(m, kernel, input, rng, sample_name)
     }
 
+    fn sample_zero_atom_mixture(
+        &self,
+        m: &mut Module,
+        mixture: ZeroAtomMixture,
+        rng: NodeId,
+        sample_name: Option<Symbol>,
+    ) -> Result<(NodeId, NodeId), RefuseError> {
+        let ZeroAtomMixture {
+            weight,
+            atom,
+            base,
+            domain,
+        } = mixture;
+        let bernoulli = m.intern("Bernoulli");
+        let p = m.intern("p");
+        let (gate, next) = self.sample_constructor(m, bernoulli, vec![(p, weight)], rng, None);
+        let (variate, next) = self.sample(m, base, next, sample_name)?;
+
+        let (gate_name, gate_ref, gate_point) =
+            crate::density::broadcast::placeholder(m, Type::Scalar(ScalarType::Integer));
+        let (base_name, base_ref, base_point) = crate::density::broadcast::placeholder(m, domain);
+        let one = m.alloc(Node::Lit(Scalar::Int(1)));
+        let is_atom = build_call(m, "equal", &[gate_point, one]);
+        let selected = build_call(m, "ifelse", &[is_atom, atom, base_point]);
+        let value = map_body(
+            m,
+            selected,
+            vec![(gate_name, gate_ref), (base_name, base_ref)],
+            vec![gate, variate],
+            self.rank,
+        );
+        Ok((value, next))
+    }
+
     fn sample_map(
         &self,
         m: &mut Module,
@@ -265,4 +302,69 @@ impl Scope {
         let body = transform(m, point);
         Ok((map_body(m, body, inputs, actuals, self.rank), next))
     }
+}
+
+struct ZeroAtomMixture {
+    weight: NodeId,
+    atom: NodeId,
+    base: NodeId,
+    domain: Type,
+}
+
+/// Generated formula mixtures weigh a zero atom by p and a probability kernel
+/// by 1 - p. The Bernoulli gate validates p and an independent base draw is
+/// taken in every lane so key advancement is well defined at either endpoint.
+fn zero_atom_mixture(m: &mut Module, measure: NodeId) -> Option<ZeroAtomMixture> {
+    let [inner] = *expect_builtin_call(m, measure, "normalize")?.args else {
+        return None;
+    };
+    let [first, second] = *expect_builtin_call(m, resolve_ref(m, inner).0, "superpose")?.args
+    else {
+        return None;
+    };
+    let component = |node| {
+        let [weight, law] = *expect_builtin_call(m, resolve_ref(m, node).0, "weighted")?.args
+        else {
+            return None;
+        };
+        Some((resolve_ref(m, weight).0, resolve_ref(m, law).0))
+    };
+    let (weight, dirac) = component(first)?;
+    if crate::density::weight_is_variate_dependent(m, weight) {
+        return None;
+    }
+    let (complement, base) = component(second)?;
+    let [atom] = *expect_builtin_call(m, dirac, "Dirac")?.args else {
+        return None;
+    };
+    let atom = resolve_ref(m, atom).0;
+    if !matches!(m.node(atom), Node::Lit(Scalar::Int(0) | Scalar::Real(0.0))) {
+        return None;
+    }
+    let [one, probability] = *expect_builtin_call(m, complement, "sub")?.args else {
+        return None;
+    };
+    let probability = resolve_ref(m, probability).0;
+    // A reference can be duplicated by inlining without duplicating its value.
+    // Separate but identical stochastic expressions need not be the same draw.
+    let same_weight = weight == probability
+        || matches!(m.node(weight), Node::Ref(_) | Node::Lit(_))
+            && m.structural_eq(weight, probability);
+    if crate::density::static_real(m, one) != Some(1.0) || !same_weight {
+        return None;
+    }
+    flatppl_infer::distribution_param_ranks(builtin_name(m, base)?)?;
+    let Type::Measure {
+        domain,
+        mass: flatppl_core::Mass::Normalized,
+    } = crate::density::known_type(m, base)?
+    else {
+        return None;
+    };
+    matches!(domain.as_ref(), Type::Scalar(_)).then_some(ZeroAtomMixture {
+        weight,
+        atom,
+        base,
+        domain: *domain,
+    })
 }
