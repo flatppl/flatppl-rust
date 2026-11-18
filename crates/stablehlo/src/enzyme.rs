@@ -89,6 +89,7 @@ impl Emitter<'_> {
     /// keeping every other axis tensorized. On XLA:CPU the fork's reduction
     /// adjoint costs more than the tree only for rows of at least
     /// [`CPU_PRODUCT_TREE_MIN_WIDTH`] factors; narrower rows keep the reduction.
+    /// Complex products always use the tree, with each combine on real pairs.
     /// Public mode rejects dynamic shapes.
     pub(super) fn product_tree(
         &mut self,
@@ -101,8 +102,14 @@ impl Emitter<'_> {
             .iter()
             .copied()
             .collect::<Option<Vec<_>>>()?;
-        if dims[axis] < CPU_PRODUCT_TREE_MIN_WIDTH {
+        if input.elem != ElemKind::Complex && dims[axis] < CPU_PRODUCT_TREE_MIN_WIDTH {
             return None;
+        }
+        if dims[axis] == 0 {
+            let one = self.constant(1.0, result_ty.clone());
+            let zero = self.constant(0.0, result_ty.clone());
+            let value = self.join_complex(&one, &zero);
+            return Some(self.axes_view(&value, result_axes.clone()));
         }
         let mut current = input.clone();
         let strides = vec![1; dims.len()];
@@ -139,21 +146,7 @@ impl Emitter<'_> {
                 let mut next_dims = dims.clone();
                 next_dims[axis] = half + 1;
                 let ty = MlirTy::Ranked(next_dims.into_iter().map(Some).collect());
-                let lhs_ty = product.ty.render(self.dtype, product.elem);
-                let rhs_ty = tail.ty.render(self.dtype, tail.elem);
-                let output_ty = ty.render(self.dtype, product.elem);
-                let ssa = self.pure_like(
-                    format!(
-                        "stablehlo.concatenate {}, {}, dim = {axis} : ({lhs_ty}, {rhs_ty}) -> {output_ty}",
-                        product.ssa, tail.ssa
-                    ),
-                    &product,
-                );
-                product = Value {
-                    ssa,
-                    ty,
-                    elem: input.elem,
-                };
+                product = self.append_product_tail(&product, &tail, axis, ty);
             }
             dims[axis] = dims[axis].div_ceil(2);
             current = product;
@@ -161,9 +154,46 @@ impl Emitter<'_> {
         Some(self.reshape_axes(&current, result_ty.clone(), result_axes.clone()))
     }
 
+    fn append_product_tail(
+        &mut self,
+        product: &Value,
+        tail: &Value,
+        axis: usize,
+        ty: MlirTy,
+    ) -> Value {
+        if product.elem == ElemKind::Complex {
+            let (re, im) = crate::complex::split(self, product);
+            let (tail_re, tail_im) = crate::complex::split(self, tail);
+            let re = self.append_product_tail(&re, &tail_re, axis, ty.clone());
+            let im = self.append_product_tail(&im, &tail_im, axis, ty);
+            return self.join_complex(&re, &im);
+        }
+        let lhs_ty = product.ty.render(self.dtype, product.elem);
+        let rhs_ty = tail.ty.render(self.dtype, tail.elem);
+        let output_ty = ty.render(self.dtype, product.elem);
+        let ssa = self.pure_like(
+            format!(
+                "stablehlo.concatenate {}, {}, dim = {axis} : ({lhs_ty}, {rhs_ty}) -> {output_ty}",
+                product.ssa, tail.ssa
+            ),
+            product,
+        );
+        Value {
+            ssa,
+            ty,
+            elem: product.elem,
+        }
+    }
+
     /// A one-element contraction is multiplication, with no quotient in its
     /// adjoint. HIGHEST avoids dot's default reduced-precision accelerator path.
     pub(super) fn product_pair(&mut self, left: &Value, right: &Value) -> Value {
+        if left.elem == ElemKind::Complex {
+            let a = crate::complex::split(self, left);
+            let b = crate::complex::split(self, right);
+            let (re, im) = crate::complex::multiply_parts(self, a, b, Self::product_pair);
+            return self.join_complex(&re, &im);
+        }
         let mut dims = shape(&left.ty).to_vec();
         let axis = dims.len();
         let batch = (0..axis)

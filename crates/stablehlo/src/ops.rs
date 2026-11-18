@@ -70,6 +70,9 @@ pub(crate) fn lower_builtin(
     head: &str,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
+    if let Some(value) = crate::complex::lower_math(e, head, args) {
+        return value;
+    }
     match head {
         flatppl_core::LOG_INTEGRAL => e.lower_integral(id, args, IntegralKind::Log),
         flatppl_core::LOG_CDF_DIFFERENCE => {
@@ -122,9 +125,6 @@ pub(crate) fn lower_builtin(
         // table; each is elementwise and shape-preserving, so it batches under
         // `broadcast` for free like every other entry in this block.
         //
-        // §07 gives most of these a `complexes` domain as well, which
-        // `crate::types` refuses (no complex element type) — booked once as the
-        // §03 Complex row, not repeated per head.
         "sin" => unary(e, id, args, Emitter::sin),
         "floor" => unary(e, id, args, Emitter::floor),
         "ceil" => unary(e, id, args, Emitter::ceil),
@@ -191,18 +191,14 @@ pub(crate) fn lower_builtin(
         // §07 "Linear algebra" `transpose`/`adjoint`, domain "vectors, matrices".
         "transpose" | "adjoint" => lower_transpose(e, id, args, head),
         "cross" => lower_cross(e, id, args),
-        // §07 "Linear algebra", the entries that reduce to an `Emitter` matrix
-        // helper already in the crate. Every one of the daggers §07 writes
-        // ($\mathbf{A}\mathbf{A}^\dagger$, $\mathbf{x}\mathbf{x}^\dagger$,
-        // $\mathbf{x}^\dagger\mathbf{A}\mathbf{x}$) is a plain transpose here,
-        // for `lower_transpose`'s reason: this crate has no complex element type,
-        // so over the elements it emits conjugation is the identity.
         "lower_cholesky" => lower_cholesky_head(e, id, args),
         "linsolve" => lower_linsolve(e, id, args),
         "inv" => {
             let [arg] = args_exact(id, args)?;
             let a = e.lower_node(arg)?;
-            require_real_matrix(id, &a, "inv")?;
+            if a.elem != ElemKind::Complex {
+                require_real_matrix(id, &a, "inv")?;
+            }
             e.matrix_inverse(id, &a)
         }
         "det" | "logabsdet" => {
@@ -214,6 +210,9 @@ pub(crate) fn lower_builtin(
                     id,
                     "determinant requires a nonempty static matrix",
                 ));
+            }
+            if a.elem == ElemKind::Complex {
+                return e.complex_determinant(id, &a, n, head == "logabsdet");
             }
             require_real_matrix(id, &a, head)?;
             Ok(e.matrix_determinant(&a, n, head == "logabsdet"))
@@ -751,12 +750,7 @@ pub(crate) fn lower_bare_mul(
 /// here, since a peephole over `%N = transpose(transpose(x))` would be this
 /// crate's first such rewrite and buys nothing XLA does not already do.
 ///
-/// `adjoint` is the CONJUGATE transpose, but this crate has no complex element
-/// type at all — [`crate::mlir::ElemKind`] is Real/Int/Bool only, and
-/// `mlir_type_of` refuses a `Complex` scalar outright — so over the elements this
-/// crate emits the conjugation is the identity, and `adjoint` is exactly
-/// `transpose`. A complex operand cannot reach here today; if a complex element
-/// type is ever added, this arm must grow a conjugation before the permutation.
+/// Adjoint conjugates the entries before applying the same axis permutation.
 ///
 /// Rank 3 and above refuses: §07's domain is vectors and matrices, and there is
 /// no canonical permutation for a higher-rank array.
@@ -768,6 +762,11 @@ fn lower_transpose(
 ) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
     let v = e.lower_node(a)?;
+    let v = if head == "adjoint" {
+        crate::complex::conjugate(e, &v)
+    } else {
+        v
+    };
     match e.cell_ty(&v) {
         // A vector or a transposed vector: the distinction is type-level only.
         MlirTy::Ranked(d) if d.len() == 1 => Ok(v),
@@ -873,6 +872,9 @@ fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<V
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     square_dim(id, &e.cell_ty(&a), "lower_cholesky")?;
+    if a.elem == ElemKind::Complex {
+        return Ok(e.complex_cholesky(&a));
+    }
     require_real_matrix(id, &a, "lower_cholesky")?;
     Ok(e.cholesky(&a))
 }
@@ -906,7 +908,9 @@ fn lower_cross(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
             ));
         }
     }
-    let kind = if a.elem == ElemKind::Real || b.elem == ElemKind::Real {
+    let kind = if crate::complex::has_complex(&a, &b) {
+        ElemKind::Complex
+    } else if a.elem == ElemKind::Real || b.elem == ElemKind::Real {
         ElemKind::Real
     } else {
         ElemKind::Int
@@ -970,8 +974,7 @@ fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
         }
     }
     let a = e.lower_node(a_id)?;
-    square_dim(id, &a.ty, "diag")?;
-    require_real_matrix(id, &a, "diag")?;
+    square_dim(id, &e.cell_ty(&a), "diag")?;
     Ok(e.diag(&a))
 }
 
@@ -1006,8 +1009,7 @@ fn lower_diagmat(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, 
 fn lower_trace(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
-    square_dim(id, &a.ty, "trace")?;
-    require_real_matrix(id, &a, "trace")?;
+    square_dim(id, &e.cell_ty(&a), "trace")?;
     let d = e.diag(&a);
     Ok(e.reduce_sum(&d))
 }
@@ -1022,7 +1024,7 @@ fn lower_trace(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Em
 fn lower_self_outer(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [x_id] = args_exact(id, args)?;
     let x = e.lower_node(x_id)?;
-    match &x.ty {
+    match e.cell_ty(&x) {
         MlirTy::Ranked(d) if d.len() == 1 => {}
         other => {
             return Err(EmitError::at(
@@ -1034,7 +1036,8 @@ fn lower_self_outer(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Valu
             ));
         }
     }
-    Ok(e.outer_product(&x, &x))
+    let conjugate = crate::complex::conjugate(e, &x);
+    Ok(e.outer_product(&x, &conjugate))
 }
 
 /// Which §07 Gram matrix a head builds.
@@ -1062,24 +1065,29 @@ fn lower_gram(
     };
     let [a_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
-    matrix_dims(id, &a.ty, head)?;
+    matrix_dims(id, &e.cell_ty(&a), head)?;
     Ok(match which {
         Gram::Row => row_gram(e, &a),
         Gram::Col => {
-            let at = e.transpose(&a, &[1, 0]);
-            e.matmat(&at, &a)
+            let adjoint = adjoint_matrix(e, &a);
+            e.matmat(&adjoint, &a)
         }
     })
 }
 
 /// §07 row Gram of a matrix cell, preserving any independent batch prefix.
 pub(crate) fn row_gram(e: &mut Emitter, matrix: &Value) -> Value {
+    let adjoint = adjoint_matrix(e, matrix);
+    e.matmat(matrix, &adjoint)
+}
+
+fn adjoint_matrix(e: &mut Emitter, matrix: &Value) -> Value {
     let axes = e.axes_of(matrix);
     let mut permutation: Vec<_> = (0..axes.batch as u64 + 2).collect();
     permutation.swap(axes.batch, axes.batch + 1);
     let transposed = e.transpose(matrix, &permutation);
     let transposed = e.axes_view(&transposed, axes);
-    e.matmat(matrix, &transposed)
+    crate::complex::conjugate(e, &transposed)
 }
 
 /// §07 `quadform(A, x)` — "$\mathbf{x}^\dagger \mathbf{A} \mathbf{x}$", domain
@@ -1091,8 +1099,8 @@ fn lower_quadform(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value,
     let [a_id, x_id] = args_exact(id, args)?;
     let a = e.lower_node(a_id)?;
     let x = e.lower_node(x_id)?;
-    let n = square_dim(id, &a.ty, "quadform")?;
-    let len = match &x.ty {
+    let n = square_dim(id, &e.cell_ty(&a), "quadform")?;
+    let len = match e.cell_ty(&x) {
         MlirTy::Ranked(d) if d.len() == 1 => d[0],
         other => {
             return Err(EmitError::at(
@@ -1111,7 +1119,8 @@ fn lower_quadform(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value,
         ));
     }
     let ax = e.matvec(&a, &x);
-    Ok(e.inner_product(&x, &ax))
+    let conjugate = crate::complex::conjugate(e, &x);
+    Ok(e.inner_product(&conjugate, &ax))
 }
 
 /// Which matrix a §07 stack constructor builds out of its argument's vectors.
@@ -2415,6 +2424,24 @@ fn lower_finiteness(
              since a boolean is never NaN",
         ));
     }
+    if a.elem == ElemKind::Complex {
+        let (re, im) = crate::complex::split(e, &a);
+        let (re, im) = (e.abs(&re), e.abs(&im));
+        let inf = e.inf_like(&re);
+        return Ok(match which {
+            Finiteness::Finite => {
+                let re = e.compare("LT", &re, &inf);
+                let im = e.compare("LT", &im, &inf);
+                e.and(&re, &im)
+            }
+            Finiteness::Inf => {
+                let re = e.compare("EQ", &re, &inf);
+                let im = e.compare("EQ", &im, &inf);
+                e.or(&re, &im)
+            }
+            Finiteness::Nan => unreachable!("handled above"),
+        });
+    }
     let mag = e.abs(&a);
     let inf = e.inf_like(&mag);
     Ok(match which {
@@ -2444,12 +2471,14 @@ fn lower_iszero(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
 /// own lowered kind, not the node's name — the determiniser wraps `round` in `real` to
 /// stop `exp(round(x))` typing as `integers` and evaluating in integer arithmetic.
 ///
-/// A `Complex` operand (where §07 gives $\mathrm{Re}(x)$) has no tensor form
-/// at all and is refused upstream in `crate::types`.
 fn lower_real(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
-    Ok(e.convert(&a, ElemKind::Real))
+    Ok(if a.elem == ElemKind::Complex {
+        e.complex_part(&a, false)
+    } else {
+        e.convert(&a, ElemKind::Real)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3220,6 +3249,7 @@ fn literal_index(e: &Emitter, id: NodeId, index: NodeId) -> Result<i64, EmitErro
 #[derive(Clone, Copy)]
 enum ElemSet {
     Reals,
+    Complexes,
     /// §03 `interval(lo, hi)` — "denotes the closed interval $[lo, hi]$".
     Interval(NodeId, NodeId),
     /// §03 `posreals` — "$(0, +\infty]$, the positive reals including
@@ -3555,7 +3585,21 @@ fn elem_membership(
     v: &Value,
     set: ElemSet,
 ) -> Result<Value, EmitError> {
+    if matches!(set, ElemSet::Complexes) {
+        let (re, im) = crate::complex::split(e, v);
+        let re = e.abs(&re);
+        let im = e.abs(&im);
+        let inf = e.inf_like(&re);
+        let real = e.compare("LT", &re, &inf);
+        let imaginary = e.compare("LT", &im, &inf);
+        return Ok(e.and(&real, &imaginary));
+    }
+    if v.elem == ElemKind::Complex {
+        let zero = e.constant_like(0.0, v);
+        return Ok(e.compare("NE", &zero, &zero));
+    }
     match set {
+        ElemSet::Complexes => unreachable!("handled above"),
         ElemSet::Reals => Ok(e.compare("EQ", v, v)),
         ElemSet::PosReals => {
             let zero = e.constant_like(0.0, v);
@@ -3615,7 +3659,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
     let refuse = || {
         EmitError::at(
             id,
-            "'in': only an interval(lo, hi), reals, posreals, nonnegreals, unitinterval, \
+            "'in': only an interval(lo, hi), reals, complexes, posreals, nonnegreals, unitinterval, \
              integers, posintegers or nonnegintegers set is supported (optionally under one \
              cartpow), or stdsimplex(n), ordered(n) or zerosum(n)",
         )
@@ -3623,6 +3667,7 @@ fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet,
     match e.node(set_id) {
         Node::Const(sym) => match e.resolve(*sym) {
             "reals" => Ok(ElemSet::Reals),
+            "complexes" => Ok(ElemSet::Complexes),
             "posreals" => Ok(ElemSet::PosReals),
             "nonnegreals" => Ok(ElemSet::NonNegReals),
             "unitinterval" => Ok(ElemSet::UnitInterval),

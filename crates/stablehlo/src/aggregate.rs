@@ -107,8 +107,7 @@ impl Reduction {
         }
     }
 
-    /// Whether the reduction divides by a count, so its operand must be real
-    /// even when the body is integer-valued.
+    /// Whether the reduction divides by a count.
     fn is_moment(self) -> bool {
         matches!(self, Reduction::Mean | Reduction::Var | Reduction::Std)
     }
@@ -826,6 +825,17 @@ fn reduce(
     frame: &Frame,
 ) -> Result<Value, EmitError> {
     let n_red = frame.lens.len() - frame.n_out;
+    if cell.elem == ElemKind::Complex
+        && matches!(
+            reduction,
+            Reduction::Median | Reduction::Var | Reduction::Std
+        )
+    {
+        return Err(EmitError::at(
+            id,
+            "aggregate: this reduction requires a real body",
+        ));
+    }
     if reduction == Reduction::Median {
         let cell = e.convert(cell, ElemKind::Real);
         if n_red == 0 {
@@ -864,9 +874,8 @@ fn reduce(
     } else {
         cell.clone()
     };
-    // A moment divides by a count, which is real arithmetic whatever the body's
-    // kind.
-    let cell = if reduction.is_moment() {
+    // Promote integer moments before division. A complex mean keeps both components.
+    let cell = if reduction.is_moment() && cell.elem != ElemKind::Complex {
         e.convert(&cell, ElemKind::Real)
     } else {
         cell

@@ -45,6 +45,26 @@ fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
             Dim::Static(n) => n.checked_add(*offset).map_or(Dim::Dynamic, Dim::Static),
             _ => Dim::Dynamic,
         },
+        DimExpr::DiagonalLength { matrix, offset } => {
+            let dims = flatten_dims((ctx.arg_type)(*matrix).as_ref());
+            let [Dim::Static(rows), Dim::Static(cols)] = dims.as_slice() else {
+                return Dim::Dynamic;
+            };
+            let offset = if (ctx.arg_type)(*offset).is_none() {
+                0
+            } else if let Some(offset) = (ctx.written_integer)(*offset) {
+                offset
+            } else {
+                return Dim::Dynamic;
+            };
+            let remaining =
+                |dim: u32, count: u64| dim.saturating_sub(u32::try_from(count).unwrap_or(u32::MAX));
+            Dim::Static(if offset < 0 {
+                remaining(*rows, offset.unsigned_abs()).min(*cols)
+            } else {
+                (*rows).min(remaining(*cols, offset.unsigned_abs()))
+            })
+        }
     }
 }
 
@@ -404,6 +424,10 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
                         shape,
                         elem: Box::new(promote(*elem)),
                     },
+                    Type::TVector { len, elem } => Type::TVector {
+                        len,
+                        elem: Box::new(promote(*elem)),
+                    },
                     Type::Scalar(ScalarType::Complex) => Type::Scalar(ScalarType::Complex),
                     Type::Scalar(_) => Type::Scalar(ScalarType::Real),
                     _ => Type::Deferred,
@@ -427,6 +451,7 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
         ResultSig::ElemScalarKind(i) => {
             Type::Scalar(elem_scalar_kind((ctx.arg_type)(*i).as_ref()).unwrap_or(ScalarType::Real))
         }
+        ResultSig::ScalarElem(elem) => Type::Scalar(elem_of(elem, ctx)),
         ResultSig::Vector { len, elem } => Type::Array {
             shape: Box::new([dim_of(len, ctx)]),
             elem: Box::new(Type::Scalar(elem_of(elem, ctx))),

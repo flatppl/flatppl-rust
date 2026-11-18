@@ -25,6 +25,8 @@ pub(super) enum Pointwise {
     Compare(String, Value, Value),
     Select(Value, Value, Value),
     Convert(Value, ElemKind),
+    JoinComplex(Value, Value),
+    ComplexPart(Value, bool),
     Bitcast(Value, ElemKind),
     Broadcast(Value, Vec<u64>),
     Reshape(Value),
@@ -55,6 +57,7 @@ impl Pointwise {
             | Self::LogNdtr(a)
             | Self::ChloUnary(_, a)
             | Self::Convert(a, _)
+            | Self::ComplexPart(a, _)
             | Self::Bitcast(a, _)
             | Self::Broadcast(a, _)
             | Self::Reshape(a)
@@ -65,6 +68,7 @@ impl Pointwise {
             | Self::Cholesky(a) => vec![a],
             Self::Binary(_, a, b)
             | Self::ChloBinary(_, a, b)
+            | Self::JoinComplex(a, b)
             | Self::Compare(_, a, b)
             | Self::DynamicGather(a, b, _)
             | Self::Dot(a, b, ..)
@@ -92,6 +96,8 @@ impl Pointwise {
                 return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
             }
             Self::Bitcast(..)
+            | Self::JoinComplex(..)
+            | Self::ComplexPart(..)
             | Self::LogNdtr(_)
             | Self::Reshape(_)
             | Self::Slice(..)
@@ -132,6 +138,8 @@ impl Emitter<'_> {
         let elem = match &op {
             Pointwise::Compare(..) => ElemKind::Bool,
             Pointwise::Convert(_, target) | Pointwise::Bitcast(_, target) => *target,
+            Pointwise::JoinComplex(..) => ElemKind::Complex,
+            Pointwise::ComplexPart(..) => ElemKind::Real,
             _ => shape_source.elem,
         };
         let value = Value {
@@ -208,6 +216,8 @@ impl Emitter<'_> {
                 self.convert(&a, elem)
             }
             Pointwise::Bitcast(..)
+            | Pointwise::JoinComplex(..)
+            | Pointwise::ComplexPart(..)
             | Pointwise::Broadcast(..)
             | Pointwise::Reshape(_)
             | Pointwise::Slice(..)

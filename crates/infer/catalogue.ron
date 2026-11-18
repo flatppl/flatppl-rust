@@ -165,8 +165,8 @@ Catalogue(
         // `softmax | v`, `logsoftmax | v`. §07 gives `l1unit`/`l2unit`
         // "real/complex vectors" (hence `Vector(Complex)`, which embeds the
         // reals) and `softmax`/`logsoftmax` "real vectors".
-        Builtin(name: "l1unit",     sig: Structural(params: [Vector(Complex)], names: ["v"])),
-        Builtin(name: "l2unit",     sig: Structural(params: [Vector(Complex)], names: ["v"])),
+        Builtin(name: "l1unit",     sig: Function(params: [Vector(Complex)], names: ["v"], result: RealOrComplexOfArgShape(0))),
+        Builtin(name: "l2unit",     sig: Function(params: [Vector(Complex)], names: ["v"], result: RealOrComplexOfArgShape(0))),
         Builtin(name: "softmax",    sig: Structural(params: [Vector(Real)], names: ["v"])),
         Builtin(name: "logsoftmax", sig: Structural(params: [Vector(Real)], names: ["v"])),
 
@@ -307,12 +307,12 @@ Catalogue(
             ("R", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
         ]))),
         // diagmat(x): vector → diagonal matrix, element kind from the vector.
-        Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], names: ["x"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 0), elem: OfArg(0)))),
+        Builtin(name: "diagmat",        sig: Function(params: [Vector(Complex)], names: ["x"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 0), elem: OfArg(0)))),
         // diag(A, k=0): extract a diagonal as a vector, element kind from A.
         // §07 "Linear algebra": "when called as `diag(A)`, `k` defaults to `0`".
-        Builtin(name: "diag",           sig: Function(params: [Matrix, Optional(Scalar(Integer))], names: ["A", "k"], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "diag",           sig: Function(params: [Matrix, Optional(Scalar(Integer))], names: ["A", "k"], result: Vector(len: DiagonalLength(matrix: 0, offset: 1), elem: OfArg(0)))),
         // cross(a, b): 3-vector cross product, element kind from a.
-        Builtin(name: "cross",          sig: Function(params: [Vector(Real), Vector(Real)], names: ["a", "b"], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "cross",          sig: Function(params: [Vector(Complex), Vector(Complex)], names: ["a", "b"], result: Vector(len: Dyn, elem: OfArg(0)))),
         // linspace / extlinspace: real vector of grid points. §07: `n` points, and
         // `extlinspace` adds the two infinite end points.
         Builtin(name: "linspace",       sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], names: ["from", "to", "n"], result: Vector(len: WrittenSize(2), elem: Real))),
@@ -325,22 +325,22 @@ Catalogue(
         // -- more linear algebra / vector constructors (spec §07) --
         // boolean(x): set-restrict to booleans → boolean scalar.
         Builtin(name: "boolean",        sig: Function(params: [Scalar(Complex)], names: ["x"], result: Scalar(Boolean))),
-        // quadform(A, x) = xᵀ A x → scalar, element kind from A.
-        Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "x"], result: ElemScalarKind(0))),
+        // quadform(A, x) = x† A x. Either operand can give a complex result.
+        Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Complex)], names: ["A", "x"], result: ScalarElem(PromoteArgs([0, 1])))),
         // Gram / outer products → matrix, element kind preserved.
-        Builtin(name: "row_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "row_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 0), elem: OfArg(0)))),
         Builtin(name: "col_gram",       sig: Function(params: [Matrix], names: ["A"], result: MatrixElem(rows: Axis(0, 1), cols: Axis(0, 1), elem: OfArg(0)))),
-        Builtin(name: "self_outer",     sig: Function(params: [Vector(Real)], names: ["x"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "self_outer",     sig: Function(params: [Vector(Complex)], names: ["x"], result: MatrixElem(rows: Axis(0, 0), cols: Axis(0, 0), elem: OfArg(0)))),
         // Block / banded / stacked matrix constructors → matrix, element kind
         // drilled from the (nested) argument.
         Builtin(name: "blockdiagmat",   sig: Function(params: [Any], names: ["mats"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
-        Builtin(name: "bandedmat",      sig: Function(params: [Vector(Real), Scalar(Integer)], names: ["v", "rows"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "bandedmat",      sig: Function(params: [Vector(Complex), Scalar(Integer)], names: ["v", "rows"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         Builtin(name: "joinblocks",     sig: Function(params: [Any], names: ["A"], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // onehot(i, n): real basis vector.
         Builtin(name: "onehot",         sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["i", "n"], result: Vector(len: Dyn, elem: Real))),
         // conv / crosscorr: structural rule refines the result shape and element kind.
-        Builtin(name: "conv",           sig: Function(params: [Vector(Real), Vector(Real)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
-        Builtin(name: "crosscorr",      sig: Function(params: [Vector(Real), Vector(Real)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "conv",           sig: Function(params: [Vector(Complex), Vector(Complex)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "crosscorr",      sig: Function(params: [Vector(Complex), Vector(Complex)], names: ["v", "kernel"], result: Vector(len: Dyn, elem: OfArg(0)))),
         // bincounts(bins, data): integer counts per bin.
         Builtin(name: "bincounts",      sig: Function(params: [Any, Any], names: ["bins", "data"], result: Vector(len: Dyn, elem: Integer))),
         // transpose / adjoint: rank- and element-preserving (a matrix's dims
@@ -349,11 +349,11 @@ Catalogue(
         Builtin(name: "adjoint",        sig: Function(params: [Any], names: ["A"], result: TransposeOf(0))),
         // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
         // The structural rule returns a real or complex vector, widening integer b.
-        Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: SameAsArg(1))),
+        Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Complex)], names: ["A", "b"], result: SameAsArg(1))),
         // Polynomial / basis evaluations at a SCALAR x (§07 "Approximation functions"
         // Domains: "real or complex", `unitinterval`, "real"). An array of points is
         // `broadcast(fn(polynomial(c, _)), xs)`.
-        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Scalar(Complex)], names: ["coefficients", "x"], result: RealOfArgShape(1))),
+        Builtin(name: "polynomial",     sig: Function(params: [Vector(Complex), Scalar(Complex)], names: ["coefficients", "x"], result: ScalarElem(RealOrComplexOfArgs([0, 1])))),
         Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Scalar(Real)], param_sets: [Unconstrained, UnitInterval], names: ["coefficients", "x"], result: RealOfArgShape(1))),
         Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], names: ["edges", "values", "x"], result: RealOfArgShape(2))),
 

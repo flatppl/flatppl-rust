@@ -92,10 +92,11 @@ impl BatchSpec {
         let results = output_types.join(", ");
         let mut body = format!("  func.func @{name}({signature}) -> ({results}) {{\n");
         for (i, ((ty, elem), rendered)) in outputs.iter().zip(&output_types).enumerate() {
-            let zero = if matches!(ty, MlirTy::Key) || *elem != ElemKind::Real {
-                "0"
-            } else {
-                "0.0"
+            let zero = match (ty, elem) {
+                (MlirTy::Key, _) => "0",
+                (_, ElemKind::Real) => "0.0",
+                (_, ElemKind::Complex) => "(0.0,0.0)",
+                _ => "0",
             };
             body.push_str(&format!(
                 "    %out{i} = stablehlo.constant dense<{zero}> : {rendered}\n"

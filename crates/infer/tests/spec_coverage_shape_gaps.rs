@@ -567,8 +567,8 @@ fn vector_result_functions_infer() {
     );
     let out = ir("A = rowstack([[1.0, 2.0], [3.0, 4.0]])\nx = diag(A)");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(diag"),
-        "diag(real matrix) should infer a real vector, got:\n{out}"
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(diag"),
+        "diag(2x2 real matrix) should infer a length-2 real vector, got:\n{out}"
     );
 }
 
@@ -616,15 +616,9 @@ fn matrix_constructors_infer_matrices() {
         ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
     ] {
         let out = ir(src);
-        let shape = if op == "col_gram" {
-            "2 2"
-        } else {
-            "%dynamic %dynamic"
-        };
         assert!(
-            out.contains(&format!(
-                "(%bind x (%meta ((%array 2 ({shape}) (%scalar real))"
-            )) && out.contains(&format!("({op}")),
+            out.contains("(%bind x (%meta ((%array 2 (2 2) (%scalar real))")
+                && out.contains(&format!("({op}")),
             "{op} should infer a real matrix, got:\n{out}"
         );
     }

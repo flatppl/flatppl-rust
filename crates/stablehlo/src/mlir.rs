@@ -7,7 +7,7 @@
 //! FlatPDL `Type`/`Dim` → `MlirTy` mapping itself lives in `types.rs`.
 //!
 //! [`ElemKind`] is the orthogonal axis `MlirTy`/`Dtype` don't carry: which
-//! element *family* (boolean/integer/real, spec §03) a value's tensor holds.
+//! element *family* (spec §03) a value's tensor holds.
 //! Every [`Value`] carries one; [`MlirTy::render`] combines it with `Dtype`
 //! to pick the concrete element string.
 
@@ -30,11 +30,11 @@ pub enum MlirTy {
 
 /// The element family of a value's tensor, orthogonal to shape (`MlirTy`)
 /// and float precision (`Dtype`). Resolved from a value's inferred scalar
-/// kind (spec §03 boolean/integer/real categories); `Complex` has no tensor
-/// form and is refused before reaching here.
+/// kind (spec §03).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ElemKind {
     Real,
+    Complex,
     Int,
     Bool,
 }
@@ -104,15 +104,18 @@ impl MlirTy {
     /// Render as textual MLIR: `tensor<f32>` (rank-0), `tensor<3xf32>`,
     /// `tensor<2x3xf32>`, `tensor<?x3xf32>` for a dynamic leading dim, and
     /// `tuple<...>` for a tuple of MLIR types. `dtype` supplies the float
-    /// precision, `elem` the element family (`ElemKind::Real` renders
-    /// `f32`/`f64`, `Int` renders `i32`/`i64`, `Bool` renders `i1`
-    /// regardless of `dtype`); an empty `Ranked` shape renders the same as
+    /// precision, `elem` the element family. Complex tensors use
+    /// `complex<f32>` or `complex<f64>`. An empty `Ranked` shape renders the same as
     /// `Scalar` (both are rank-0).
     pub fn render(&self, dtype: Dtype, elem: ElemKind) -> String {
         let e = match elem {
             ElemKind::Real => match dtype {
                 Dtype::F32 => "f32",
                 Dtype::F64 => "f64",
+            },
+            ElemKind::Complex => match dtype {
+                Dtype::F32 => "complex<f32>",
+                Dtype::F64 => "complex<f64>",
             },
             ElemKind::Int => match dtype {
                 Dtype::F32 => "i32",

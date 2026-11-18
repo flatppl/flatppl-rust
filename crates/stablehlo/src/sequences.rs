@@ -743,6 +743,10 @@ impl Emitter<'_> {
             dims.insert(self.batch_rank(value), Some(n));
             let zero = match value.elem {
                 ElemKind::Real => self.scalar(0.0),
+                ElemKind::Complex => {
+                    let zero = self.scalar(0.0);
+                    self.convert(&zero, ElemKind::Complex)
+                }
                 ElemKind::Int => self.int_value_const(0),
                 ElemKind::Bool => self.bool_value_const(false),
             };

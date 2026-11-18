@@ -292,6 +292,15 @@ fn op_rule(
     }
 
     if matches!(name.as_str(), "weighted" | "logweighted")
+        && matches!(arg_ty(args, 0), Some(Type::Scalar(ScalarType::Complex)))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            args[0].0,
+            "measure weights must be real scalars (spec §06)",
+        ));
+        return Ready((Type::Failed("complex measure weight".into()), joined));
+    }
+    if matches!(name.as_str(), "weighted" | "logweighted")
         && (args.len() >= 3 || matches!(arg_ty(args, 0), Some(Type::Function { .. })))
     {
         let result_type = fresh_measure(arg_ty(args, 1));
@@ -437,7 +446,7 @@ fn op_rule(
             cumulative_bool_type(arg_ty(args, 0))
         }
         // Vector normalizations: same-shape real vector — shape must thread through.
-        "softmax" | "logsoftmax" | "l1unit" | "l2unit" => match arg_ty(args, 0) {
+        "softmax" | "logsoftmax" => match arg_ty(args, 0) {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
                 shape: shape.clone(),
                 elem: Box::new(Type::Scalar(ScalarType::Real)),
@@ -536,6 +545,19 @@ fn op_rule(
                 if let Some(failed) = metricsum_contraction_check(inf, args) {
                     return Ready((failed, joined));
                 }
+            } else if let Some((op, _, _)) = args.first()
+                && let Node::Const(head) = inf.module.node(*op)
+                && has_real_array_domain(inf.module.resolve(*head))
+                && args
+                    .get(2)
+                    .and_then(|body| aggregate_body_scalar_kind(inf, body.0))
+                    == Some(ScalarType::Complex)
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "aggregate: this reduction requires a real body (spec §07 \"Reductions\")",
+                ));
+                return Ready((Type::Failed("aggregate: requires real body".into()), joined));
             }
             let elem = Type::Scalar(aggregate_result_kind(inf, args).unwrap_or_else(|| {
                 arg_ty(args, 2)
@@ -1959,14 +1981,6 @@ fn promote2(a: Option<&Type>, b: Option<&Type>) -> Type {
     }
 }
 
-/// `reals, complexes` unary domain: complex in, complex out; else real.
-fn real_or_complex(a: Option<&Type>) -> Type {
-    match a {
-        Some(Type::Scalar(ScalarType::Complex)) => Type::Scalar(ScalarType::Complex),
-        _ => Type::Scalar(ScalarType::Real),
-    }
-}
-
 /// `divide(a, b) = a / b` (spec §07): true division over scalars that are real
 /// OR complex. The result is complex iff either operand is complex; otherwise
 /// it is real — even for integer operands, since `1 / 2 = 0.5` is real (integer
@@ -2056,8 +2070,17 @@ fn mul_type(args: &[ArgInfo]) -> Type {
     let scalar = |t: &Type| matches!(t, Type::Scalar(_));
     match (a, b) {
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
-        (Type::Array { .. }, s) if scalar(s) => a.clone(),
-        (s, Type::Array { .. }) if scalar(s) => b.clone(),
+        (Type::Array { shape, elem }, s) | (s, Type::Array { shape, elem }) if scalar(s) => {
+            let elem = if matches!(s, Type::Scalar(ScalarType::Complex)) {
+                complexify_array_elem(elem)
+            } else {
+                elem.clone()
+            };
+            Type::Array {
+                shape: shape.clone(),
+                elem,
+            }
+        }
         // Scaling a transposed vector keeps it a row (§07 lists scalar–transposed-vector
         // and transposed-vector–scalar).
         (Type::TVector { len, elem }, s) | (s, Type::TVector { len, elem }) if scalar(s) => {
@@ -4464,9 +4487,40 @@ fn trajectory_measure(init: Option<&Type>, len: Dim) -> Type {
 fn elem_scalar_kind_of(t: &Type) -> Option<ScalarType> {
     match t {
         Type::Scalar(s) => Some(*s),
-        Type::Array { elem, .. } => elem_scalar_kind_of(elem),
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => elem_scalar_kind_of(elem),
         _ => None,
     }
+}
+
+fn complexify_array_elem(ty: &Type) -> Box<Type> {
+    Box::new(match ty {
+        Type::Array { shape, elem } => Type::Array {
+            shape: shape.clone(),
+            elem: complexify_array_elem(elem),
+        },
+        Type::TVector { len, elem } => Type::TVector {
+            len: *len,
+            elem: complexify_array_elem(elem),
+        },
+        Type::Scalar(_) => Type::Scalar(ScalarType::Complex),
+        value => value.clone(),
+    })
+}
+
+fn has_complex_elements(ty: &Type) -> bool {
+    match ty {
+        Type::Table { columns, .. } | Type::Record(columns) => {
+            columns.iter().any(|(_, ty)| has_complex_elements(ty))
+        }
+        _ => elem_scalar_kind_of(ty) == Some(ScalarType::Complex),
+    }
+}
+
+fn has_real_array_domain(name: &str) -> bool {
+    matches!(
+        name,
+        "var" | "std" | "maximum" | "minimum" | "median" | "quantile"
+    )
 }
 
 /// `t` with every array dim (at every nesting level) replaced by `%dynamic`,
@@ -7527,10 +7581,35 @@ fn broadcast_type(
                 inf, id, &op_name, section, domain, &cell,
             ));
         }
-        if matches!(
+        if has_real_array_domain(&op_name) && has_complex_elements(&cell) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                id,
+                format!("`{op_name}` cannot reduce complex elements (spec §07 \"Reductions\")"),
+            ));
+            return Ready(Type::Failed(
+                format!("{op_name}: requires real elements").into(),
+            ));
+        }
+        let structural = matches!(
             op_name.as_str(),
             "linsolve" | "conv" | "crosscorr" | "cross"
-        ) && elems.len() == 2
+        ) && elems.len() == 2;
+        if structural
+            || matches!(
+                op_name.as_str(),
+                "l1unit"
+                    | "l2unit"
+                    | "adjoint"
+                    | "transpose"
+                    | "trace"
+                    | "row_gram"
+                    | "col_gram"
+                    | "self_outer"
+                    | "diagmat"
+                    | "diag"
+                    | "quadform"
+                    | "polynomial"
+            )
         {
             let cells: Vec<ArgInfo> = args[1..]
                 .iter()
@@ -7542,10 +7621,14 @@ fn broadcast_type(
                 .collect();
             let cells =
                 normalize_keyword_args(inf.module, &op_name, &cells, &cell_named).unwrap_or(cells);
+            if let Some(ty) = refuse_argument_outside_declared_shape(inf, &op_name, &cells, true) {
+                return Ready(ty);
+            }
             let inner = match op_name.as_str() {
-                "linsolve" => linsolve_type(inf, id, &cells),
-                "cross" => cross_type(inf, id, &cells),
-                _ => convolution_type(inf, id, &op_name, &cells),
+                "linsolve" if structural => linsolve_type(inf, id, &cells),
+                "cross" if structural => cross_type(inf, id, &cells),
+                "conv" | "crosscorr" if structural => convolution_type(inf, id, &op_name, &cells),
+                _ => function_result(inf.module, &op_name, &cells).unwrap_or(Type::Deferred),
             };
             if matches!(inner, Type::Failed(_)) {
                 return Ready(inner);
@@ -7611,17 +7694,18 @@ fn broadcast_type(
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
         ("builtin_logdensityof", [_, _, _]) => Type::Scalar(ScalarType::Real),
+        ("mul", [a, b]) if has_complex_elements(a) || has_complex_elements(b) => mul_type(&cells),
         ("add" | "sub" | "mul" | "pow" | "min" | "max", [a, b]) => promote2(Some(a), Some(b)),
         // §07 `divide` is `a / b`: integers divide as reals, cell by cell too.
         ("divide", [a, b]) => divide_type(Some(a), Some(b)),
         ("neg", [a]) => a.clone(),
-        ("loggamma" | "real" | "imag", [_]) => Type::Scalar(ScalarType::Real),
-        ("complex", [_, _]) | ("cis", [_]) => Type::Scalar(ScalarType::Complex),
         (
-            "exp" | "log" | "sqrt" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1" | "abs"
-            | "sin" | "cos" | "tan" | "atan" | "tanh",
-            [a],
-        ) => real_or_complex(Some(a)),
+            "complex" | "cis" | "real" | "imag" | "conj" | "abs" | "abs2" | "exp" | "log" | "sqrt"
+            | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+            | "acosh" | "atanh" | "invlogit" | "invprobit" | "logit" | "log1p" | "expm1"
+            | "loggamma",
+            _,
+        ) => function_result(inf.module, &op_name, &cells).unwrap_or(Type::Deferred),
         // The comparisons and the logical connectives, whose per-cell result is a
         // boolean whatever the cell kinds were (their catalogue rows all declare
         // `result: Scalar(Boolean)`). This is the ONLY route §07 gives an
@@ -9476,6 +9560,19 @@ fn refuse_shape_outside_sig(
             };
             let message = non_integral_message(&subject, *got, section, *want);
             inf.diags.push(crate::Diagnostic::error_at(*node, message));
+            refused = Some(which);
+            continue;
+        }
+        if (crate::catalogue::sig_param_excludes_complex(sig, i)
+            || i == 0 && has_real_array_domain(head))
+            && has_complex_elements(ty)
+        {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "{who}'s {which} has complex values, outside its declared real domain (spec {section})"
+                ),
+            ));
             refused = Some(which);
             continue;
         }

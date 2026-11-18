@@ -203,7 +203,11 @@ pub(crate) fn lower_linf_norm(
     if n == 0 {
         return Ok(e.scalar(0.0));
     }
-    let v = e.convert(&v, ElemKind::Real);
+    let v = if v.elem == ElemKind::Complex {
+        v
+    } else {
+        e.convert(&v, ElemKind::Real)
+    };
     let a = e.abs(&v);
     e.reduce_trailing_axes(id, AxisReduce::Max, &a, 1)
 }

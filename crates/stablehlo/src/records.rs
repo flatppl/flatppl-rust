@@ -97,6 +97,16 @@ impl Emitter<'_> {
                 .ok_or_else(|| unknown_field(container, name))?;
             return self.lower_value(entry);
         }
+        if matches!(self.type_of(resolved), Some(Type::Record(fields) | Type::Table { columns: fields, .. })
+            if fields.iter().any(|(field, ty)| self.m.resolve(*field) == name
+                && crate::complex::complex_leaf(Some(ty))))
+            && let Some(result) = crate::complex::user_field_parts(self, container, resolved, name)
+        {
+            let (re, im) = result?;
+            let value = Lowered::Tensor(self.join_complex(&re, &im));
+            self.bind_field(resolved, name.to_owned(), value.clone());
+            return Ok(value);
+        }
         if let Some(result) = self.lower_svd_record(resolved, name) {
             return result;
         }

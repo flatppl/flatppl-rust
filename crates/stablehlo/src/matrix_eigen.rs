@@ -254,14 +254,23 @@ impl Emitter<'_> {
     }
 
     /// Unit-normalized Householder vectors avoid column-scale overflow.
-    fn eig_qr(&mut self, input: &Pair, active: &Value, n: u64) -> Pair {
+    fn eig_qr(&mut self, input: &Pair, active: &Value, n: u64) -> (Pair, Pair) {
         let batch = self.batch_rank(&input.0);
         let axes = self.axes_of(&input.0);
-        let rows = self.axis_indices(&input.0, batch);
-        let cols = self.axis_indices(&input.0, batch + 1);
+        let shape = shape(&input.0.ty);
+        let initial_q = if shape[batch] == shape[batch + 1] {
+            input.0.clone()
+        } else {
+            let mut q_shape = shape.to_vec();
+            q_shape[batch + 1] = q_shape[batch];
+            let q = self.constant(0.0, super::batching::tensor(q_shape));
+            self.axes_view(&q, axes.clone())
+        };
+        let rows = self.axis_indices(&initial_q, batch);
+        let cols = self.axis_indices(&initial_q, batch + 1);
         let diagonal = self.compare("EQ", &rows, &cols);
         let identity = self.convert(&diagonal, ElemKind::Real);
-        let zero_matrix = self.constant_like(0.0, &input.0);
+        let zero_matrix = self.constant_like(0.0, &initial_q);
         let state = self.matrix_loop(
             n,
             0,
@@ -360,9 +369,39 @@ impl Emitter<'_> {
             },
         );
         (
-            self.axes_view(&state[2], axes.clone()),
-            self.axes_view(&state[3], axes),
+            (
+                self.axes_view(&state[2], axes.clone()),
+                self.axes_view(&state[3], axes.clone()),
+            ),
+            (
+                self.axes_view(&state[0], axes.clone()),
+                self.axes_view(&state[1], axes),
+            ),
         )
+    }
+
+    pub(super) fn matrix_complex_qr(&mut self, input: &Value, m: u64, n: u64) -> (Value, Value) {
+        let input = crate::complex::split(self, input);
+        let active = self.int_value_const(m as i64);
+        let (q, r) = self.eig_qr(&input, &active, n);
+        let batch = self.batch_rank(&q.0);
+        let mut q_limits: Vec<u64> = shape(&q.0.ty)[..batch].iter().map(|d| d.unwrap()).collect();
+        let mut r_limits = q_limits.clone();
+        q_limits.extend([m, n]);
+        r_limits.extend([n, n]);
+        let starts = vec![0; batch + 2];
+        let strides = vec![1; batch + 2];
+        let qr = self.slice(&q.0, &starts, &q_limits, &strides);
+        let qi = self.slice(&q.1, &starts, &q_limits, &strides);
+        let rr = self.slice(&r.0, &starts, &r_limits, &strides);
+        let ri = self.slice(&r.1, &starts, &r_limits, &strides);
+        let rows = self.axis_indices(&rr, batch);
+        let cols = self.axis_indices(&rr, batch + 1);
+        let upper = self.compare("LE", &rows, &cols);
+        let zero = self.scalar(0.0);
+        let rr = self.select(&upper, &rr, &zero);
+        let ri = self.select(&upper, &ri, &zero);
+        (self.join_complex(&qr, &qi), self.join_complex(&rr, &ri))
     }
 
     fn eig_complex_sqrt(&mut self, re: &Value, im: &Value) -> Pair {
@@ -721,7 +760,7 @@ impl Emitter<'_> {
                     let inside = e.and(&inside, &qr_step);
                     let shifted_r = e.select(&inside, &shifted_r, &initial[2]);
                     let shifted_i = e.select(&inside, &shifted_i, &zero_matrix);
-                    let q = e.eig_qr(&(shifted_r, shifted_i), &state[4], n);
+                    let (q, _) = e.eig_qr(&(shifted_r, shifted_i), &state[4], n);
                     let qr = e.eig_transpose(&q.0);
                     let qi = e.eig_transpose(&q.1);
                     let qh = (qr, e.neg(&qi));

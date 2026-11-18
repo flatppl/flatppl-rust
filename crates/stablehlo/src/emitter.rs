@@ -135,6 +135,7 @@ pub(crate) fn elem_rank(k: ElemKind) -> u8 {
         ElemKind::Bool => 0,
         ElemKind::Int => 1,
         ElemKind::Real => 2,
+        ElemKind::Complex => 3,
     }
 }
 
@@ -643,6 +644,26 @@ impl<'m> Emitter<'m> {
     /// internal invariant violation upstream type-checking should have ruled
     /// out, per this module's doc comment.
     pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        if crate::complex::has_complex(a, b)
+            && matches!(
+                op,
+                "stablehlo.add"
+                    | "stablehlo.subtract"
+                    | "stablehlo.multiply"
+                    | "stablehlo.divide"
+                    | "stablehlo.power"
+            )
+        {
+            let left = crate::complex::split(self, a);
+            if op == "stablehlo.divide" && b.elem != ElemKind::Complex {
+                let re = self.div(&left.0, b);
+                let im = self.div(&left.1, b);
+                return self.join_complex(&re, &im);
+            }
+            let right = crate::complex::split(self, b);
+            let (re, im) = crate::complex::binary_parts(self, op, left, right);
+            return self.join_complex(&re, &im);
+        }
         let target = if elem_rank(a.elem) >= elem_rank(b.elem) {
             a.elem
         } else {
@@ -674,6 +695,9 @@ impl<'m> Emitter<'m> {
     /// `Gamma(2, 1)`'s `rate^shape`) get this for free with no extra
     /// ceremony at the call site.
     fn binary_real(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        if crate::complex::has_complex(a, b) {
+            return self.binary(op, a, b);
+        }
         let a = self.convert(a, ElemKind::Real);
         let b = self.convert(b, ElemKind::Real);
         self.binary(op, &a, &b)
@@ -778,6 +802,10 @@ impl<'m> Emitter<'m> {
         self.unary_real("stablehlo.sqrt", a)
     }
     pub fn abs(&mut self, a: &Value) -> Value {
+        if a.elem == ElemKind::Complex {
+            let (re, im) = crate::complex::split(self, a);
+            return crate::complex::magnitude(self, &re, &im);
+        }
         self.unary("stablehlo.abs", a)
     }
     pub fn cos(&mut self, a: &Value) -> Value {
@@ -852,6 +880,10 @@ impl<'m> Emitter<'m> {
     /// polymorphic through [`Emitter::mul`], so an integer operand keeps an
     /// integer square.
     pub fn abs2(&mut self, a: &Value) -> Value {
+        if a.elem == ElemKind::Complex {
+            let (re, im) = crate::complex::split(self, a);
+            return crate::complex::squared_magnitude(self, &re, &im);
+        }
         self.mul(a, a)
     }
     /// Spec §07 `atan2(y, x)`, in the correct quadrant — the core
@@ -1036,6 +1068,17 @@ impl<'m> Emitter<'m> {
     /// already the same kind — every existing caller, all-`Real`) converts
     /// nothing, so the output stays byte-identical to before.
     pub fn compare(&mut self, dir: &str, a: &Value, b: &Value) -> Value {
+        if crate::complex::has_complex(a, b) && matches!(dir, "EQ" | "NE") {
+            let (ar, ai) = crate::complex::split(self, a);
+            let (br, bi) = crate::complex::split(self, b);
+            let re = self.compare(dir, &ar, &br);
+            let im = self.compare(dir, &ai, &bi);
+            return if dir == "EQ" {
+                self.and(&re, &im)
+            } else {
+                self.or(&re, &im)
+            };
+        }
         let target = if elem_rank(a.elem) >= elem_rank(b.elem) {
             a.elem
         } else {
@@ -1111,6 +1154,13 @@ impl<'m> Emitter<'m> {
         } else {
             b.elem
         };
+        if self.restrict_enzyme_compatible && elem_target == ElemKind::Complex {
+            let (ar, ai) = crate::complex::split(self, a);
+            let (br, bi) = crate::complex::split(self, b);
+            let re = self.select(c, &ar, &br);
+            let im = self.select(c, &ai, &bi);
+            return self.join_complex(&re, &im);
+        }
         let a = self.convert(a, elem_target);
         let b = self.convert(b, elem_target);
         let (a, b) = self.broadcast_pair(&a, &b);
@@ -1156,6 +1206,11 @@ impl<'m> Emitter<'m> {
         if v.elem == target {
             return v.clone();
         }
+        if target == ElemKind::Complex {
+            let re = self.convert(v, ElemKind::Real);
+            let im = self.constant_like(0.0, &re);
+            return self.join_complex(&re, &im);
+        }
         if let Some(value) = self.fold_convert(v, target) {
             return value;
         }
@@ -1168,6 +1223,80 @@ impl<'m> Emitter<'m> {
             ty: v.ty.clone(),
             elem: target,
         }
+    }
+
+    pub(crate) fn join_complex(&mut self, re: &Value, im: &Value) -> Value {
+        let re = self.convert(re, ElemKind::Real);
+        let im = self.convert(im, ElemKind::Real);
+        let (re, im) = self.broadcast_pair(&re, &im);
+        let from = re.ty.render(self.dtype, ElemKind::Real);
+        let to = re.ty.render(self.dtype, ElemKind::Complex);
+        let ssa = self.pure_like(
+            format!(
+                "stablehlo.complex {}, {} : ({from}, {from}) -> {to}",
+                re.ssa, im.ssa
+            ),
+            &re,
+        );
+        self.remember_pointwise(&ssa, &re, Pointwise::JoinComplex(re.clone(), im));
+        Value {
+            ssa,
+            ty: re.ty,
+            elem: ElemKind::Complex,
+        }
+    }
+
+    pub(crate) fn complex_part(&mut self, value: &Value, imaginary: bool) -> Value {
+        if let Some(Pointwise::JoinComplex(re, im)) =
+            self.pointwise.get(&value.ssa).map(|recipe| &recipe.op)
+        {
+            let part = if imaginary { im } else { re }.clone();
+            return self.axes_view(&part, self.axes_of(value));
+        }
+        let ty = value.ty.clone();
+        let from = ty.render(self.dtype, ElemKind::Complex);
+        let to = ty.render(self.dtype, ElemKind::Real);
+        let op = if imaginary { "imag" } else { "real" };
+        let ssa = self.pure_like(
+            format!("stablehlo.{op} {} : ({from}) -> {to}", value.ssa),
+            value,
+        );
+        self.remember_pointwise(
+            &ssa,
+            value,
+            Pointwise::ComplexPart(value.clone(), imaginary),
+        );
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
+    }
+
+    // Keep layout changes on real tensors for Enzyme's complex lowering.
+    pub(super) fn map_complex_shape(
+        &mut self,
+        value: &Value,
+        mut lower: impl FnMut(&mut Self, &Value) -> Value,
+    ) -> Option<Value> {
+        if !self.restrict_enzyme_compatible || value.elem != ElemKind::Complex {
+            return None;
+        }
+        let (re, im) = crate::complex::split(self, value);
+        let re = lower(self, &re);
+        let im = lower(self, &im);
+        Some(self.join_complex(&re, &im))
+    }
+
+    pub(super) fn split_complex_shapes(&mut self, values: &[Value]) -> (Vec<Value>, Vec<Value>) {
+        values
+            .iter()
+            .map(|v| crate::complex::split(self, v))
+            .unzip()
+    }
+
+    pub(crate) fn bound_tensor(&self, id: NodeId) -> Option<Value> {
+        self.memo.get(&id).cloned()
     }
 
     /// `%N = stablehlo.bitcast_convert %a : (from) -> to` between a real and
@@ -1208,6 +1337,11 @@ impl<'m> Emitter<'m> {
         strides: &[u64],
         reusable: bool,
     ) -> Value {
+        if let Some(value) = self.map_complex_shape(a, |e, v| {
+            e.slice_value(v, starts, limits, strides, reusable)
+        }) {
+            return value;
+        }
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims,
             other => panic!("slice expects a ranked operand, got {other:?}"),
@@ -1300,7 +1434,12 @@ impl<'m> Emitter<'m> {
         self.reshape_axes(a, ty, axes)
     }
 
-    fn reshape_axes(&mut self, a: &Value, ty: MlirTy, axes: Axes) -> Value {
+    pub(super) fn reshape_axes(&mut self, a: &Value, ty: MlirTy, axes: Axes) -> Value {
+        if let Some(value) =
+            self.map_complex_shape(a, |e, v| e.reshape_axes(v, ty.clone(), axes.clone()))
+        {
+            return value;
+        }
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = ty.render(self.dtype, a.elem);
         let ssa = self.pure_axes(
@@ -1331,6 +1470,11 @@ impl<'m> Emitter<'m> {
     /// broadcast). Shape-only — same element-type-preserving contract as
     /// [`Emitter::slice`], so the result `elem` copies `a`'s.
     pub fn broadcast_in_dim(&mut self, a: &Value, dims: &[u64], ty: MlirTy) -> Value {
+        if let Some(value) =
+            self.map_complex_shape(a, |e, v| e.broadcast_in_dim(v, dims, ty.clone()))
+        {
+            return value;
+        }
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = ty.render(self.dtype, a.elem);
         let dims_text = dims
@@ -1384,6 +1528,9 @@ impl<'m> Emitter<'m> {
     /// Select outer vector elements per callable batch, retaining inner cells.
     /// A scalar selector removes the outer axis; a vector replaces its extent.
     pub(crate) fn gather_cells(&mut self, operand: &Value, idx: &Value, base: i64) -> Value {
+        if let Some(value) = self.map_complex_shape(operand, |e, v| e.gather_cells(v, idx, base)) {
+            return value;
+        }
         if let MlirTy::Ranked(dims) = &operand.ty
             && dims.len() == 1
             && self.batch_rank(operand) == 0
@@ -1510,6 +1657,11 @@ impl<'m> Emitter<'m> {
         base: i64,
         cell_axis: usize,
     ) -> Value {
+        if let Some(value) =
+            self.map_complex_shape(operand, |e, v| e.gather_axis(v, idx, base, cell_axis))
+        {
+            return value;
+        }
         let cell_dims = match self.cell_ty(operand) {
             MlirTy::Ranked(dims) => dims,
             other => panic!("gather_axis expects ranked cells, got {other:?}"),
@@ -1761,6 +1913,12 @@ impl<'m> Emitter<'m> {
     /// tensor<1x3xf32>) -> tensor<2x3xf32>`).
     pub fn vector(&mut self, elems: &[Value]) -> Value {
         assert!(!elems.is_empty(), "vector: expected at least one element");
+        if self.restrict_enzyme_compatible && elems[0].elem == ElemKind::Complex {
+            let (re, im) = self.split_complex_shapes(elems);
+            let re = self.vector(&re);
+            let im = self.vector(&im);
+            return self.join_complex(&re, &im);
+        }
         if elems.iter().any(|v| self.batch_rank(v) != 0) {
             return self.vector_batched(elems);
         }
@@ -1843,6 +2001,12 @@ impl<'m> Emitter<'m> {
     /// Concatenate vector cells, preserving batch prefixes and nested cells.
     pub(crate) fn concatenate(&mut self, id: NodeId, values: &[Value]) -> Result<Value, EmitError> {
         let first = &values[0];
+        if self.restrict_enzyme_compatible && first.elem == ElemKind::Complex {
+            let (re, im) = self.split_complex_shapes(values);
+            let re = self.concatenate(id, &re)?;
+            let im = self.concatenate(id, &im)?;
+            return Ok(self.join_complex(&re, &im));
+        }
         let cell = self.cell_ty(first);
         let inner = match &cell {
             MlirTy::Ranked(dims) if self.axes_of(first).layers.first() == Some(&1) => &dims[1..],
@@ -1927,6 +2091,9 @@ impl<'m> Emitter<'m> {
     /// element-type-preserving contract as [`Emitter::slice`], so the result
     /// `elem` copies `a`'s.
     pub fn transpose(&mut self, a: &Value, perm: &[u64]) -> Value {
+        if let Some(value) = self.map_complex_shape(a, |e, v| e.transpose(v, perm)) {
+            return value;
+        }
         let in_dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
             other => panic!("transpose expects a ranked operand, got {other:?}"),
@@ -1965,6 +2132,9 @@ impl<'m> Emitter<'m> {
     /// `%N = stablehlo.reverse %a, dims = [...] : ty` — reverses `a` along `dims`.
     /// Shape- and element-type-preserving.
     pub fn reverse(&mut self, a: &Value, dims: &[u64]) -> Value {
+        if let Some(value) = self.map_complex_shape(a, |e, v| e.reverse(v, dims)) {
+            return value;
+        }
         let ty = a.ty.render(self.dtype, a.elem);
         let dims_text = dims
             .iter()
@@ -1991,6 +2161,9 @@ impl<'m> Emitter<'m> {
     /// — `a` placed `low[k]` cells from the start of axis `k` in a zero tensor
     /// `low[k] + n_k + high[k]` long. `a` must be static and unbatched.
     pub fn pad_zeros(&mut self, a: &Value, low: &[u64], high: &[u64]) -> Value {
+        if let Some(value) = self.map_complex_shape(a, |e, v| e.pad_zeros(v, low, high)) {
+            return value;
+        }
         let dims = shape(&a.ty);
         let out = MlirTy::Ranked(
             dims.iter()
@@ -2004,7 +2177,10 @@ impl<'m> Emitter<'m> {
                 let z = self.scalar(0.0);
                 self.convert(&z, ElemKind::Bool)
             }
-            ElemKind::Real => self.scalar(0.0),
+            ElemKind::Real | ElemKind::Complex => {
+                let zero = self.scalar(0.0);
+                self.convert(&zero, a.elem)
+            }
         };
         let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
         let interior = list(&vec![0; low.len()]);
@@ -2273,6 +2449,7 @@ impl<'m> Emitter<'m> {
         };
         let a = &promoted;
         let init_lit: &str = match a.elem {
+            ElemKind::Complex => "(0.000000e+00,0.000000e+00)",
             ElemKind::Real => identity_lit,
             ElemKind::Int => "0",
             // Unreachable: `Bool` was promoted to `Int` above.
@@ -2305,6 +2482,13 @@ impl<'m> Emitter<'m> {
         a: &Value,
         axis: usize,
     ) -> Value {
+        if combine_op == "stablehlo.add"
+            && let Some(value) = self.map_complex_shape(a, |e, v| {
+                e.reduce_axis_lit(combine_op, "0.000000e+00", v, axis)
+            })
+        {
+            return value;
+        }
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
             other => panic!("reduce_axis expects a ranked operand, got {other:?}"),
@@ -2346,9 +2530,9 @@ impl<'m> Emitter<'m> {
             return out;
         }
         if self.restrict_enzyme_compatible
-            && self.target == crate::Target::Cpu
             && combine_op == "stablehlo.multiply"
-            && a.elem == ElemKind::Real
+            && (a.elem == ElemKind::Complex
+                || (a.elem == ElemKind::Real && self.target == crate::Target::Cpu))
             && let Some(out) = self.product_tree(a, axis, &result_ty, &axes)
         {
             self.remember_pointwise(
@@ -2435,6 +2619,8 @@ impl<'m> Emitter<'m> {
         let (combine_op, identity) = match (kind, a.elem) {
             (AxisReduce::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
             (AxisReduce::Sum, ElemKind::Int) => ("stablehlo.add", "0"),
+            (AxisReduce::Sum, ElemKind::Complex) => ("stablehlo.add", "(0.0,0.0)"),
+            (AxisReduce::Prod, ElemKind::Complex) => ("stablehlo.multiply", "(1.0,0.0)"),
             (AxisReduce::Prod, ElemKind::Real) => ("stablehlo.multiply", "1.000000e+00"),
             (AxisReduce::Prod, ElemKind::Int) => ("stablehlo.multiply", "1"),
             (AxisReduce::Max, ElemKind::Real) => {
@@ -2927,6 +3113,14 @@ impl<'m> Emitter<'m> {
         lb: usize,
         result_ty: MlirTy,
     ) -> Value {
+        if crate::complex::has_complex(a, b) {
+            let left = crate::complex::split(self, a);
+            let right = crate::complex::split(self, b);
+            let (re, im) = crate::complex::multiply_parts(self, left, right, |e, a, b| {
+                e.dot_contract(a, b, la, lb, result_ty.clone())
+            });
+            return self.join_complex(&re, &im);
+        }
         let kind = if elem_rank(a.elem) >= elem_rank(b.elem) {
             a.elem
         } else {
@@ -4556,6 +4750,9 @@ impl<'m> Emitter<'m> {
         let f = *args
             .first()
             .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
+        if let Some(result) = crate::complex::lower_user(self, id, f, &args[1..], true) {
+            return result;
+        }
         if let Some(result) = self.lower_pyhf_call(id, f, &args[1..], true) {
             return result;
         }
@@ -5002,28 +5199,32 @@ impl<'m> Emitter<'m> {
                         crate::ops::lower_builtin(self, id, &name, &call.args)
                     }
                 }
-                CallHead::User(callee) => self
-                    .lower_pyhf_call(id, callee, &call.args, false)
-                    .or_else(|| self.lower_spline_call(id, callee, &call.args, false))
-                    .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
-                    .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
-                    .or_else(|| self.lower_ext_linalg_call(id, callee, &call.args, false))
-                    .or_else(|| self.lower_eigen_extremum(id, callee, &call.args, false))
-                    .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
-                    .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
-                    .unwrap_or_else(|| {
-                        Err(EmitError::at(
-                            id,
-                            match flatppl_determinizer::standard_function(self.m, callee) {
-                                Some((module, member)) => {
-                                    format!("{module}.{member} has no StableHLO lowering")
-                                }
-                                None => "user-callable application has no lowering (expected to \
+                CallHead::User(callee) => {
+                    crate::complex::lower_user(self, id, callee, &call.args, false)
+                        .or_else(|| self.lower_pyhf_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_spline_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_special_function_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_svd_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_ext_linalg_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_eigen_extremum(id, callee, &call.args, false))
+                        .or_else(|| self.lower_matrix_exp_call(id, callee, &call.args, false))
+                        .or_else(|| self.lower_kronecker_call(id, callee, &call.args, false))
+                        .unwrap_or_else(|| {
+                            Err(EmitError::at(
+                                id,
+                                match flatppl_determinizer::standard_function(self.m, callee) {
+                                    Some((module, member)) => {
+                                        format!("{module}.{member} has no StableHLO lowering")
+                                    }
+                                    None => {
+                                        "user-callable application has no lowering (expected to \
                                      be inlined by determinize)"
-                                    .to_string(),
-                            },
-                        ))
-                    }),
+                                            .to_string()
+                                    }
+                                },
+                            ))
+                        })
+                }
             },
         }
     }

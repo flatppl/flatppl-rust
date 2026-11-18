@@ -37,6 +37,25 @@ pub(crate) fn lower_integer(
         _ => false,
     };
     let x = e.lower_node(a)?;
+    if x.elem == ElemKind::Complex {
+        let Some(value) = written_complex_real(e, a) else {
+            return Err(EmitError::at(
+                id,
+                "`integer(x)` requires a provably real integral value",
+            ));
+        };
+        let limit = match e.dtype() {
+            Dtype::F32 => 2_f64.powi(31),
+            Dtype::F64 => 2_f64.powi(63),
+        };
+        if value.fract() == 0.0 && value >= -limit && value < limit {
+            return Ok(e.int_value_const(value as i64));
+        }
+        return Err(EmitError::at(
+            id,
+            "`integer(x)` requires an in-range integral value",
+        ));
+    }
     if x.elem == ElemKind::Real
         && let Some(value) = literal_real(e, a)
     {
@@ -101,7 +120,7 @@ pub(crate) fn lower_boolean(
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     let [a] = args_exact(id, args)?;
-    if let Some(v) = written_number(e, a)
+    if let Some(v) = written_number(e, a).or_else(|| written_complex_real(e, a))
         && (v == 0.0 || v == 1.0)
     {
         let x = e.scalar(v);
@@ -129,16 +148,37 @@ fn written_number(e: &Emitter, id: NodeId) -> Option<f64> {
     }
 }
 
-/// The real scalar cells of a static-length vector argument.
+fn written_complex_real(e: &Emitter, id: NodeId) -> Option<f64> {
+    let Node::Call(call) = e.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    let [re, im] = call.args.as_ref() else {
+        return None;
+    };
+    if e.resolve(head) != "complex" || !call.named.is_empty() || literal_real(e, *im)? != 0.0 {
+        return None;
+    }
+    literal_real(e, *re)
+}
+
+/// The scalar cells of a static-length vector argument.
 fn vector_cells(
     e: &mut Emitter,
     id: NodeId,
     arg: NodeId,
     what: &str,
+    complex: bool,
 ) -> Result<Vec<Value>, EmitError> {
     let v = e.lower_node(arg)?;
     let v = e.with_typed_axes(arg, v);
-    let v = e.convert(&v, ElemKind::Real);
+    let v = if complex && v.elem == ElemKind::Complex {
+        v
+    } else {
+        e.convert(&v, ElemKind::Real)
+    };
     let len = match e.cell_ty(&v) {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
         _ => None,
@@ -155,7 +195,13 @@ fn vector_cells(
 }
 
 /// The real scalar evaluation point.
-fn scalar_point(e: &mut Emitter, id: NodeId, arg: NodeId, head: &str) -> Result<Value, EmitError> {
+fn scalar_point(
+    e: &mut Emitter,
+    id: NodeId,
+    arg: NodeId,
+    head: &str,
+    complex: bool,
+) -> Result<Value, EmitError> {
     let x = e.lower_node(arg)?;
     if e.cell_ty(&x) != MlirTy::Scalar {
         return Err(EmitError::at(
@@ -163,34 +209,34 @@ fn scalar_point(e: &mut Emitter, id: NodeId, arg: NodeId, head: &str) -> Result<
             format!("`{head}` takes a scalar `x`; apply it elementwise with `{head}.(…)`"),
         ));
     }
-    Ok(e.convert(&x, ElemKind::Real))
+    Ok(if complex && x.elem == ElemKind::Complex {
+        x
+    } else {
+        e.convert(&x, ElemKind::Real)
+    })
 }
 
-/// `polynomial(c, x) = Σ c_{i+1} x^i`, by Horner's rule. A complex `x` would
-/// make a complex value, refused like every other complex result.
+/// `polynomial(c, x) = Σ c_{i+1} x^i`, by Horner's rule.
 pub(crate) fn lower_polynomial(
     e: &mut Emitter,
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     let [c, x] = args_exact(id, args)?;
-    if matches!(
-        e.type_of(x),
-        Some(flatppl_core::Type::Scalar(
-            flatppl_core::ScalarType::Complex
-        ))
-    ) {
-        return Err(EmitError::at(
-            id,
-            "`polynomial` at a complex `x` makes a complex value, which has no tensor form here",
-        ));
-    }
-    let cells = vector_cells(e, id, c, "polynomial coefficients")?;
-    let x = scalar_point(e, id, x, "polynomial")?;
-    let Some((last, rest)) = cells.split_last() else {
-        return Ok(e.scalar(0.0));
+    let cells = vector_cells(e, id, c, "polynomial coefficients", true)?;
+    let x = scalar_point(e, id, x, "polynomial", true)?;
+    let kind = if x.elem == ElemKind::Complex
+        || cells.first().is_some_and(|c| c.elem == ElemKind::Complex)
+    {
+        ElemKind::Complex
+    } else {
+        ElemKind::Real
     };
-    let mut acc = last.clone();
+    let Some((last, rest)) = cells.split_last() else {
+        let zero = e.scalar(0.0);
+        return Ok(e.convert(&zero, kind));
+    };
+    let mut acc = e.convert(last, kind);
     for c in rest.iter().rev() {
         let scaled = e.mul(&acc, &x);
         acc = e.add(&scaled, c);
@@ -207,8 +253,8 @@ pub(crate) fn lower_bernstein(
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     let [c, x] = args_exact(id, args)?;
-    let mut b = vector_cells(e, id, c, "bernstein coefficients")?;
-    let x = scalar_point(e, id, x, "bernstein")?;
+    let mut b = vector_cells(e, id, c, "bernstein coefficients", false)?;
+    let x = scalar_point(e, id, x, "bernstein", false)?;
     if b.is_empty() {
         return Ok(e.scalar(0.0));
     }
@@ -235,15 +281,15 @@ pub(crate) fn lower_stepwise(
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
     let [edges, values, x] = args_exact(id, args)?;
-    let edges = vector_cells(e, id, edges, "stepwise edges")?;
-    let values = vector_cells(e, id, values, "stepwise values")?;
+    let edges = vector_cells(e, id, edges, "stepwise edges", false)?;
+    let values = vector_cells(e, id, values, "stepwise values", false)?;
     if edges.len() != values.len() + 1 {
         return Err(EmitError::at(
             id,
             "stepwise: `edges` must be one longer than `values` (spec §07)",
         ));
     }
-    let x = scalar_point(e, id, x, "stepwise")?;
+    let x = scalar_point(e, id, x, "stepwise", false)?;
     let n = values.len();
     let mut acc = e.constant_like(f64::NAN, &x);
     for i in (0..n).rev() {
