@@ -403,6 +403,32 @@ fn normal_interval_subtraction_skips_fixed_one_sided_lanes() {
     }
 }
 
+#[test]
+fn normal_interval_mass_keeps_cdfs_compact_until_restoring_row_order() {
+    let lower = [vec!["-0.2"; 16], vec!["-inf"; 48]].concat().join(", ");
+    let upper = [vec!["1.0"; 32], vec!["inf"; 32]].concat().join(", ");
+    let source = format!(
+        "mu = external(cartpow(reals, 64))\n\
+         f(x, a, b) = log(totalmass(truncate(Normal(x, 1.0), interval(a, b))))\n\
+         lo = [{lower}]\nhi = [{upper}]\ninputs = mu\noutputs = f.(mu, lo, hi)"
+    );
+    let options = EmitOptions {
+        dtype: Dtype::F64,
+        ..Default::default()
+    };
+    let module = determinize_with(&source, &options.lowering_options());
+    let ir = flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).unwrap();
+    // The 32 upper cells, two sentinels, and 16 interval masses share one
+    // packet before a single gather restores the original 64 rows.
+    assert!(
+        ir.lines().any(
+            |line| line.contains("stablehlo.concatenate") && line.contains("-> tensor<50xf64>")
+        ),
+        "{ir}"
+    );
+    assert!(!ir.contains("tensor<80xf64>"), "{ir}");
+}
+
 // Direct tails, logarithms and scaled Bessels must remain live arithmetic with
 // every parameter exposed, including named argument binding and cell broadcasts.
 #[test]
