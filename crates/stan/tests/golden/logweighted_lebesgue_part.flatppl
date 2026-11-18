@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+N = 4
+node1 = [1, 2, 3]
+node2 = [2, 3, 4]
+y_obs = [1, 0, 3, 2]
+beta0 ~ Normal(0, 1)
+phi = elementof(cartpow(reals, N))
+icar(x) = -0.5 * sum((x.phi[node1] .- x.phi[node2]) .^ 2) + logdensityof(Normal(0, 0.001 * N), sum(x.phi))
+Pi_phi = logweighted(icar, Lebesgue(cartprod(phi = cartpow(reals, N))))
+y ~ Poisson.(exp.(beta0 .+ phi))
+prior = joint(lawof(record(beta0 = beta0)), Pi_phi)
+L = likelihoodof(kernelof(record(y = y), beta0 = beta0, phi = phi), record(y = y_obs))
+post = bayesupdate(L, prior)

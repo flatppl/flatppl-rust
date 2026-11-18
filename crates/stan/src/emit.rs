@@ -19,6 +19,7 @@ mod pattern;
 mod ranges;
 mod statistics;
 mod structure;
+mod weight;
 
 /// Expression precedence, loosest first, as Stan parses it.
 const P_TERNARY: u8 = 0;
@@ -94,6 +95,9 @@ struct PriorField {
     /// The law the field is drawn from; `None` for a flat (Lebesgue) part.
     law: Option<NodeId>,
     node: NodeId,
+    /// The sets a record-level `truncate(Lebesgue(…), …)` gives the field,
+    /// in order. When present they declare it (see `declare_params`).
+    sets: Vec<NodeId>,
 }
 
 pub(crate) struct Emitter<'m> {
@@ -130,6 +134,8 @@ pub(crate) struct Emitter<'m> {
     owner: Option<(String, NodeId)>,
     /// Set while a law fills its flattened arguments.
     flat: Option<Flat>,
+    /// `logweighted` log weights of the prior, with their base measures.
+    weights: Vec<(NodeId, NodeId)>,
     /// Values placed under their own name, by node: a law filled twice
     /// (whole and per element) computes each once.
     placed: HashMap<NodeId, String>,
@@ -210,6 +216,7 @@ impl<'m> Emitter<'m> {
             in_progress: HashSet::new(),
             owner: None,
             flat: None,
+            weights: vec![],
             placed: HashMap::new(),
             fctx: None,
             scratch: None,
@@ -1018,6 +1025,11 @@ impl<'m> Emitter<'m> {
                 None => self.module_call(id),
             },
             ("scan", [f, init, xs]) => self.additive_scan(id, *f, *init, *xs),
+            ("logdensityof", [m, x]) => self.log_density(id, *m, *x),
+            ("sum", [a]) if self.density_broadcast(*a).is_some() => {
+                let (m, x) = self.density_broadcast(*a).unwrap();
+                self.log_density(id, m, x)
+            }
             ("indicesof", [_]) if let Some(r) = self.range(id) => Ok(Ex::atom(r.array())),
             // functions.ron `transpose`: the operator `'`.
             ("transpose", [a]) => {
@@ -1290,6 +1302,14 @@ impl<'m> Emitter<'m> {
             if let Some(rec) = self.data_record(x) {
                 let f = f.to_string();
                 return Ok(Ex::atom(self.at_module(|me| me.leaf(rec, &f, id))?));
+            }
+            // A field of a log weight's record argument: its parameter.
+            if let Node::Ref(rf) = self.m.node(x)
+                && rf.ns == RefNs::Local
+                && self.fctx.as_ref().and_then(|c| c.record_local) == Some(rf.name)
+            {
+                let f = f.to_string();
+                return self.record_field(id, &f);
             }
             let r = self.resolve(x);
             if self.head(r) == Some("record")

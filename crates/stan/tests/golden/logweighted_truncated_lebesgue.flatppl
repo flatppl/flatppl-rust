@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+n = 5
+y_obs = [6.9, 7.1, 7.4, 7.2, 7.6]
+lo = mean(y_obs) - 3 * std(y_obs)
+hi = mean(y_obs) + 3 * std(y_obs)
+mu = elementof(cartpow(interval(lo, hi), n))
+sigma = elementof(ordered(2))
+y ~ Normal.(mu, sigma[2])
+log_prior(p) = sum(logdensityof.(Normal(7.0, 1.0), p.mu)) + sum(logdensityof.(StudentT(4), p.sigma))
+support = cartprod(mu = cartpow(interval(lo, hi), n), sigma = ordered(2))
+positive = cartprod(mu = cartpow(interval(lo, hi), n), sigma = cartpow(posreals, 2))
+prior = logweighted(log_prior, truncate(Lebesgue(support), positive))
+L = likelihoodof(kernelof(record(y = y), mu = mu, sigma = sigma), record(y = y_obs))
+post = bayesupdate(L, prior)
