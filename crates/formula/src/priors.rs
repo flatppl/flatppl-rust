@@ -238,6 +238,7 @@ pub(crate) fn resolve(
         .iter()
         .copied()
         .filter(|name| dpar.is_none() && !spec.dpars.contains_key(*name))
+        .filter(|&name| name != "disc")
         .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
         .chain((dpar.is_none() && formula.ar.is_some()).then_some("ar"))
         .chain(

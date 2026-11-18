@@ -763,7 +763,10 @@ impl<'a> Parser<'a> {
                 } else if self.peek() == Token::Left && text == "mo" {
                     self.monotonic()?
                 } else if self.peek() == Token::Left {
-                    if !matches!(text, "I" | "log" | "exp" | "offset") {
+                    if !matches!(
+                        text,
+                        "I" | "log" | "exp" | "inv_logit" | "invlogit" | "offset"
+                    ) {
                         return Err(Error(format!(
                             "formula call `{text}(...)` is not supported"
                         )));
@@ -781,6 +784,9 @@ impl<'a> Parser<'a> {
                         "I" => Atom::Expression(ColumnExpression::Identity(Box::new(expression))),
                         "log" => Atom::Expression(ColumnExpression::Log(Box::new(expression))),
                         "exp" => Atom::Expression(ColumnExpression::Exp(Box::new(expression))),
+                        "inv_logit" | "invlogit" => {
+                            Atom::Expression(ColumnExpression::InvLogit(Box::new(expression)))
+                        }
                         "offset" => Atom::Offset(expression),
                         _ => unreachable!(),
                     })?

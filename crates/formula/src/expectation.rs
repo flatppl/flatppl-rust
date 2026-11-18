@@ -79,7 +79,12 @@ pub(crate) fn emit(
             let mass = broadcast(b, "neg", &[neg_mass]);
             broadcast(b, "divide", &[mu, mass])
         }
-        Cumulative => crate::ordinal::probabilities(b, mu, cuts),
+        Cumulative => {
+            let disc = auxiliary
+                .iter()
+                .find_map(|&(name, value)| (name == "disc").then_some(value));
+            crate::ordinal::probabilities(b, mu, cuts, disc)
+        }
         Categorical => crate::categorical::probabilities(b, auxiliary),
         VonMises => return None,
     };

@@ -258,11 +258,16 @@ impl Recipe {
     }
 
     pub(crate) fn auxiliary_names(&self) -> impl Iterator<Item = &'static str> {
-        self.family.auxiliaries().iter().copied().chain(
-            self.paired_response
-                .iter()
-                .flat_map(|_| paired::AUXILIARIES),
-        )
+        self.family
+            .auxiliaries()
+            .iter()
+            .copied()
+            .filter(|&name| name != "disc" || self.predictors.contains_key(name))
+            .chain(
+                self.paired_response
+                    .iter()
+                    .flat_map(|_| paired::AUXILIARIES),
+            )
     }
 
     pub(crate) fn thresholds(&self) -> usize {
