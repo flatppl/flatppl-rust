@@ -250,6 +250,14 @@ fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<Nod
         return Ok(b.call("Lebesgue", &[support]));
     }
     if let Node::Call(call) = b.m.node(measure).clone() {
+        if matches!(call.head, CallHead::Builtin(s) if b.m.resolve(s) == "Uniform")
+            && let [base] = *call.args
+            && call.named.is_empty()
+            && let Ok(support) = intersect(b, base, support)
+        {
+            // A uniform law conditioned on a smaller interval stays uniform.
+            return Ok(b.call("Uniform", &[support]));
+        }
         if matches!(call.head, CallHead::Builtin(s) if b.m.resolve(s) == "locscale")
             && call.args.len() == 3
             && call.named.is_empty()
