@@ -15,6 +15,7 @@ use flatppl_core::{
 
 use flatppl_core::{graph, query};
 
+pub(crate) mod categorical;
 mod circular;
 mod correlation;
 mod grouped;
@@ -40,6 +41,13 @@ pub use structural::{IidNormalPlan, plan_iid_normal};
 
 const NORMAL_FINITE: &str = "all_finite";
 const PREFIX: &str = "__likelihood_summary_";
+
+/// Statistics already bound by earlier reductions in this module.
+pub(crate) fn summary_bindings(m: &Module) -> impl Iterator<Item = (Symbol, NodeId)> + '_ {
+    m.bindings()
+        .filter(|(_, b)| b.synthetic && m.resolve(b.name).starts_with(PREFIX))
+        .map(|(_, b)| (b.name, b.rhs))
+}
 
 /// Give a portable statistic a collision-free binding for explicit data preparation.
 pub(crate) fn bind_summary(m: &mut Module, rhs: NodeId, serial: &mut usize) -> (Symbol, NodeId) {
@@ -291,7 +299,7 @@ fn materialize(m: &mut Module, expr: Expr) -> NodeId {
     }
 }
 
-fn local_ref(m: &mut Module, name: Symbol) -> NodeId {
+pub(crate) fn local_ref(m: &mut Module, name: Symbol) -> NodeId {
     m.alloc(Node::Ref(Ref {
         ns: RefNs::SelfMod,
         name,
@@ -369,9 +377,9 @@ pub(crate) fn data_only(
 }
 
 type ProofKey = (NodeId, Vec<Symbol>);
-type ProofCache = HashMap<ProofKey, bool>;
+pub(crate) type ProofCache = HashMap<ProofKey, bool>;
 
-fn data_only_cached(
+pub(crate) fn data_only_cached(
     m: &Module,
     root: NodeId,
     allowed: &HashSet<Symbol>,
@@ -777,6 +785,11 @@ impl Reducer {
         }
         if let Some(result) = histogram::reduce(self, m, &factor) {
             self.rule = Some(("fixed histogram", None));
+            self.count += 1;
+            return Some(materialize(m, result));
+        }
+        if let Some(result) = categorical::reduce(self, m, &factor) {
+            self.rule = Some(("category counts", None));
             self.count += 1;
             return Some(materialize(m, result));
         }
@@ -1214,6 +1227,40 @@ impl Reducer {
                 let no = weighted_bernoulli(m, p_name, p, failures, false);
                 op("add", [yes, no])
             }
+            "Bernoulli"
+                if matches!(*elem, Type::Scalar(ScalarType::Integer | ScalarType::Real)) =>
+            {
+                let mut count = |m: &mut Module, key, value| {
+                    self.summary(
+                        m,
+                        observed,
+                        key,
+                        op(
+                            "sum",
+                            [map(
+                                "iszero",
+                                [map("sub", [x.clone(), Expr::Integer(value)])],
+                            )],
+                        ),
+                    )
+                };
+                let successes = count(m, "bernoulli_ones", 1);
+                let failures = count(m, "bernoulli_zeros", 0);
+                let supported = op(
+                    "equal",
+                    [
+                        op("add", [successes.clone(), failures.clone()]),
+                        Expr::Integer(i64::from(*size)),
+                    ],
+                );
+                let outside = self.anchor(m, f, &parameters, Expr::Integer(2));
+                let p = p?;
+                let p_name = parameters[0].0;
+                let yes = weighted_bernoulli(m, p_name, p.clone(), successes, true);
+                let no = weighted_bernoulli(m, p_name, p, failures, false);
+                let support = op("ifelse", [supported, num(0.), outside]);
+                op("add", [support, op("add", [yes, no])])
+            }
             "Geometric" if nonnegative && matches!(*elem, Type::Scalar(ScalarType::Integer)) => {
                 // Widen each count before summing: i32 accumulation can wrap
                 // even when each authored count fits the target integer type.
@@ -1238,7 +1285,7 @@ impl Reducer {
                     ],
                 )
             }
-            "Binomial" => {
+            "Binomial" if !matches!(*elem, Type::Scalar(ScalarType::Complex)) => {
                 let Expr::Node(trials) = trials? else {
                     return None;
                 };
@@ -1251,36 +1298,71 @@ impl Reducer {
                         return None;
                     }
                 };
-                if !fixed.as_ref().is_some_and(|v| {
-                    v.iter()
-                        .all(|x| *x >= 0.0 && *x <= trials && x.fract() == 0.0)
-                }) {
-                    self.fallback = "Binomial needs fixed integer observations between zero and its trial count";
-                    return None;
+                let keys = [observed, trials_id];
+                let mut valid = map(
+                    "land",
+                    [
+                        map("ge", [x.clone(), Expr::Integer(0)]),
+                        map("le", [x.clone(), Expr::Node(trials_id)]),
+                    ],
+                );
+                if real {
+                    valid = map(
+                        "land",
+                        [valid, map("le", [x.clone(), map("floor", [x.clone()])])],
+                    );
                 }
-                let total = self.summary(m, observed, "sum", op("sum", [x.clone()]));
-                let coefficients = self.summary(
+                let valid = Expr::Node(materialize(m, valid));
+                let successes = map("ifelse", [valid.clone(), map("real", [x]), num(0.0)]);
+                let successes = Expr::Node(materialize(m, successes));
+                let failures = map("sub", [num(trials), successes.clone()]);
+                let failures = map("ifelse", [valid.clone(), failures, num(0.0)]);
+                let failures = Expr::Node(materialize(m, failures));
+                let log_choose = map(
+                    "sub",
+                    [
+                        map(
+                            "sub",
+                            [
+                                op("loggamma", [num(trials + 1.0)]),
+                                map("loggamma", [map("add", [successes.clone(), num(1.0)])]),
+                            ],
+                        ),
+                        map("loggamma", [map("add", [failures.clone(), num(1.0)])]),
+                    ],
+                );
+                let total =
+                    self.summary_for(m, &keys, "binomial_successes", op("sum", [successes]));
+                let failures =
+                    self.summary_for(m, &keys, "binomial_failures", op("sum", [failures]));
+                let coefficients = self.summary_for(
                     m,
-                    observed,
+                    &keys,
                     "binomial_coefficients",
                     op(
                         "sum",
                         [map(
-                            "sub",
-                            [
-                                map(
-                                    "sub",
-                                    [
-                                        op("loggamma", [num(trials + 1.0)]),
-                                        map("loggamma", [map("add", [x.clone(), num(1.0)])]),
-                                    ],
-                                ),
-                                map("loggamma", [map("sub", [num(trials + 1.0), x])]),
-                            ],
+                            "ifelse",
+                            [valid, log_choose, op("neg", [Expr::Constant("inf")])],
                         )],
                     ),
                 );
-                let failures = op("sub", [op("mul", [n, num(trials)]), total.clone()]);
+                // An invalid row contributes a native zero-mass score. This keeps
+                // the parameter check even if every row is outside the support.
+                let outside = self.anchor(
+                    m,
+                    f,
+                    &parameters,
+                    op("add", [Expr::Node(trials_id), Expr::Integer(1)]),
+                );
+                let coefficients = op(
+                    "ifelse",
+                    [
+                        op("isfinite", [coefficients.clone()]),
+                        coefficients,
+                        outside,
+                    ],
+                );
                 let bernoulli_p = m.intern("p");
                 let p = p?;
                 let yes = weighted_bernoulli(m, bernoulli_p, p.clone(), total, true);
@@ -1514,14 +1596,9 @@ pub fn prepare_likelihood_with_options(
     let (_, added) = reduce(&mut score, allowed.clone(), true, report, true);
     let boundary = query::promoted_input_names(&score);
     let mut proofs = HashMap::new();
-    let mut summaries: Vec<_> = score
-        .bindings()
-        .filter(|(_, b)| {
-            b.synthetic
-                && score.resolve(b.name).starts_with(PREFIX)
-                && data_only_cached(&score, b.rhs, &allowed, &boundary, &mut proofs)
-        })
-        .map(|(_, b)| b.name)
+    let mut summaries: Vec<_> = summary_bindings(&score)
+        .filter(|&(_, rhs)| data_only_cached(&score, rhs, &allowed, &boundary, &mut proofs))
+        .map(|(name, _)| name)
         .collect();
     for name in added {
         if !summaries.contains(&name) {

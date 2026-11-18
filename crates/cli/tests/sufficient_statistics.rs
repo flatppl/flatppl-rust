@@ -135,7 +135,7 @@ fn explanations_cover_both_passes_and_leave_every_output_byte_unchanged() {
             "reduced by scalar moments",
         ),
         (
-            "a=elementof(interval(0.01,0.99))\ny=load_data(\"counts.json\",cartpow(nonnegintegers,3))\ninputs=a\noutputs=logdensityof(iid(Binomial(6,a),3),y)",
+            "a=elementof(interval(0.01,0.99))\ny=load_data(\"counts.json\",cartpow(nonnegintegers,3))\ninputs=a\noutputs=logdensityof(iid(NegativeBinomial(1e6,a),3),y)",
             false,
             "materialized data",
         ),

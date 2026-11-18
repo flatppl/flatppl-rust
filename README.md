@@ -128,8 +128,10 @@ families and identifies the exact IID draw selected by Rust StableHLO lowering.
 `logdensityof(normalize(P), point)` scores the matched posterior law.
 `totalmass(P)` and `log(totalmass(P))` give the evidence and log evidence for
 each matched update. Count evidence retains each observation’s count coefficient.
-Prepared Gamma, Dirichlet and Gaussian evidence scores can reuse summaries
-when only the prior or a fixed likelihood parameter changes.
+Ordinary `densityof` and `logdensityof` queries reuse fixed observation summaries.
+The same updates supply normalized scores, evidence and seeded draws. For live
+IID observations, prepare the query once per dataset to reuse its summaries.
+Binomial evidence with changing trial counts still needs the row allocations.
 
 This optional Rust capability covers one named parameter with Beta–Bernoulli,
 Beta–Binomial, Gamma–Poisson, Normal–Normal (mean), InverseGamma–Normal
@@ -143,6 +145,11 @@ Wishart require fixed finite data or explicitly bounded runtime inputs, for
 example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.
 Unbounded observations keep ordinary scoring. Use float64 for covariance
 matrices close to singularity.
+
+Categorical and Categorical0 likelihoods can reuse one count per category
+when observations outnumber categories. Bernoulli accepts Boolean or numeric
+observations. Binomial likelihoods can prepare live observations for fixed
+trial counts from 1 through 63.
 
 InverseWishart and small fixed-trial Multinomial likelihoods also support
 summaries. Fixed-design Gaussian regression supports matrix-vector means and

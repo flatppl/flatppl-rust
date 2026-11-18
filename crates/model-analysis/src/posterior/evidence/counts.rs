@@ -1,6 +1,6 @@
 //! Predictive count laws and the probability of the observed allocation given the total.
 
-use super::{Data, Evidence, UpdatedLaw, op, real, safe};
+use super::{Data, UpdatePlan, UpdatedLaw, op, real, safe};
 use crate::posterior::{category_counts, map, multinomial_data, supported_counts};
 use flatppl_core::graph::build_record;
 use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar};
@@ -54,7 +54,7 @@ fn density(
 }
 
 /// Each zero-rate cell here has count zero and contributes log(1).
-fn allocation_poisson(m: &mut Module, rate: NodeId, y: NodeId, array: bool) -> NodeId {
+pub(super) fn allocation_poisson(m: &mut Module, rate: NodeId, y: NodeId, array: bool) -> NodeId {
     let apply = if array { map } else { op };
     let zero = real(m, 0.);
     let one = real(m, 1.);
@@ -66,7 +66,7 @@ fn allocation_poisson(m: &mut Module, rate: NodeId, y: NodeId, array: bool) -> N
 
 pub(super) fn poisson(
     m: &mut Module,
-    plan: &mut Evidence,
+    plan: &mut UpdatePlan,
     law: &mut UpdatedLaw,
     prior: [NodeId; 2],
     data: Data,
@@ -82,6 +82,10 @@ pub(super) fn poisson(
     let n = data.count(m);
     let a = safe(m, valid, prior[0], 1.);
     let b = safe(m, valid, prior[1], 1.);
+    *law = UpdatedLaw::Gamma(op(m, "add", &[a, total]), op(m, "add", &[b, n]));
+    if !plan.with_evidence {
+        return (zero, observed);
+    }
     let rate = op(m, "divide", &[b, n]);
     let pooled = density(
         m,
@@ -102,7 +106,6 @@ pub(super) fn poisson(
         let correction = plan.summary(m, correction);
         op(m, "add", &[pooled, correction])
     };
-    *law = UpdatedLaw::Gamma(op(m, "add", &[a, total]), op(m, "add", &[b, n]));
     (score, observed)
 }
 
@@ -124,7 +127,7 @@ fn category_allocation(m: &mut Module, counts: NodeId, n: NodeId) -> NodeId {
 
 fn multinomial(
     m: &mut Module,
-    plan: &mut Evidence,
+    plan: &mut UpdatePlan,
     data: Data,
     d: u32,
     trials: NodeId,
@@ -148,7 +151,7 @@ fn multinomial(
     let zero = real(m, 0.);
     let counts = map(m, "ifelse", &[supported, raw.counts, zero]);
     let counts = plan.summary(m, counts);
-    if data.count.unwrap_or(1) == 1 || d == 1 {
+    if !plan.with_evidence || data.count.unwrap_or(1) == 1 || d == 1 {
         return (counts, observed, zero);
     }
 
@@ -179,7 +182,7 @@ fn multinomial(
 
 pub(super) fn categories(
     m: &mut Module,
-    plan: &mut Evidence,
+    plan: &mut UpdatePlan,
     law: &mut UpdatedLaw,
     alpha: NodeId,
     data: Data,
@@ -191,10 +194,10 @@ pub(super) fn categories(
     let (counts, observed, correction) = if let Some(n) = trials {
         multinomial(m, plan, data, d, n)
     } else {
-        let (counts, observed) = category_counts(m, data, d, None, one_based);
+        let (counts, observed) = category_counts(m, data, d, one_based);
         let counts = plan.summary(m, counts);
         let observed = plan.summary(m, observed);
-        let correction = if data.count.unwrap_or(1) == 1 || d == 1 {
+        let correction = if !plan.with_evidence || data.count.unwrap_or(1) == 1 || d == 1 {
             zero
         } else {
             let n = data.count(m);
@@ -206,7 +209,7 @@ pub(super) fn categories(
     let one = real(m, 1.);
     let alpha = map(m, "ifelse", &[valid, alpha, one]);
     *law = UpdatedLaw::Dirichlet(op(m, "add", &[alpha, counts]));
-    if d == 1 {
+    if !plan.with_evidence || d == 1 {
         return (zero, observed);
     }
     if trials.is_none() && data.count.unwrap_or(1) == 1 {

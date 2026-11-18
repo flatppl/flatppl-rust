@@ -575,9 +575,11 @@ fn weighted_and_ordinary_regressions_keep_distinct_summary_shapes()
 }
 
 #[test]
-fn conjugate_evidence_prepares_bounded_data_for_each_new_family()
+fn conjugate_evidence_prepares_bounded_data_for_each_family()
 -> Result<(), Box<dyn std::error::Error>> {
     for (prior, kernel, cell, latent) in [
+        ("Beta(h,3)", "Bernoulli(t)", "integers", "unitinterval"),
+        ("Beta(h,3)", "Binomial(5,t)", "integers", "unitinterval"),
         ("Gamma(h,3)", "Poisson(t)", "integers", "posreals"),
         ("Normal(0,h)", "Normal(t,h)", "reals", "reals"),
         (
@@ -620,5 +622,47 @@ fn conjugate_evidence_prepares_bounded_data_for_each_new_family()
         check_summary_schemas(&prep, &score, &prepared.summaries)?;
         assert!(!score.stablehlo.contains("tensor<31x"), "{kernel}");
     }
+    Ok(())
+}
+
+#[test]
+fn conjugate_queries_share_prepared_counts_and_keep_each_data_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = Context::default();
+    let source = "h=external(posreals)
+seed=external(nonnegintegers)
+t=elementof(posreals)
+y=external(cartpow(integers,17))
+z=external(cartpow(integers,17))
+K=functionof(iid(Poisson(t),17),t=t)
+P=bayesupdate(likelihoodof(K,y),joint(t=Gamma(h,2)))
+Q=bayesupdate(likelihoodof(K,z),joint(t=Gamma(h,2)))
+inputs=(h,seed,y,z)
+";
+    let mut count = |outputs: &str| -> Result<usize, Box<dyn std::error::Error>> {
+        let query = context.parse(&format!("{source}outputs={outputs}"), None, None)?;
+        let prepared = context.prepare_likelihood_with_options(
+            &query,
+            &["y".into(), "z".into()],
+            &flatppl_host::PreparationOptions {
+                pack_summaries: false,
+            },
+        )?;
+        let online = prepared.score.compile(&EmitOptions {
+            restrict_enzyme_compatible: false,
+            ..EmitOptions::default()
+        })?;
+        assert!(!online.stablehlo.contains("tensor<17x"));
+        Ok(prepared.summaries.len())
+    };
+    let score = "logdensityof(normalize(P),record(t=h))";
+    let density = "densityof(normalize(P),record(t=h))";
+    let other = "densityof(normalize(Q),record(t=h))";
+    let mass = "log(totalmass(P))";
+    let draw = "rand(normalize(P),rnginit(seed))";
+    let one = count(score)?;
+    assert_eq!(count(&format!("({score},{density},{draw})"))?, one);
+    assert_eq!(count(&format!("({mass},{score},{draw})"))?, count(mass)?);
+    assert_eq!(count(&format!("({score},{other})"))?, 2 * one);
     Ok(())
 }

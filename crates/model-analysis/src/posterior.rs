@@ -43,18 +43,15 @@ pub fn normalized_conjugate_posterior(
 pub fn conjugate_update(
     m: &mut Module,
     posterior: NodeId,
-    mut likelihoods: Option<&mut Vec<Symbol>>,
+    likelihoods: Option<&mut Vec<Symbol>>,
 ) -> Option<ConjugatePosterior> {
     let matched = match_update(m, posterior)?;
-    let mut law = matched.prior;
-    let mut valid = matched.model_valid;
-    for factor in matched.factors {
-        let ok = law.update(m, factor.row, factor.data)?;
-        valid = op(m, "land", &[valid, ok]);
-        if let Some(names) = &mut likelihoods {
-            names.push(factor.family);
-        }
+    let applied = evidence::apply(m, &matched, false)?;
+    if let Some(names) = likelihoods {
+        names.extend(matched.factors.iter().map(|factor| factor.family));
     }
+    let law = applied.law;
+    let valid = op(m, "land", &[matched.model_valid, applied.supported]);
     let updated = law.valid(m);
     let valid = op(m, "land", &[valid, updated]);
     let distribution = law.distribution(m, valid, matched.model_valid);
@@ -479,86 +476,6 @@ impl UpdatedLaw {
         let b = op(m, "ifelse", &[valid, b, fallback]);
         op(m, name, &[a, b])
     }
-
-    fn update(&mut self, m: &mut Module, row: Update, data: Data) -> Option<NodeId> {
-        if data.count == Some(0) {
-            return Some(m.alloc(Node::Lit(Scalar::Bool(true))));
-        }
-        let n = data.count(m);
-        match (self, row) {
-            (Self::Beta(a, b), Update::Binomial(trials)) => {
-                let trials = trials.unwrap_or_else(|| m.alloc(Node::Lit(Scalar::Int(1))));
-                let k = data.value;
-                let ok = supported_counts(m, k, data.integer, Some(trials), data.count.is_some());
-                let failures = data.apply(m, "sub", &[trials, k]);
-                let failures = data.apply(m, "real", &[failures]);
-                let failures = data.sum(m, failures);
-                let k = data.apply(m, "real", &[k]);
-                let k = data.sum(m, k);
-                *a = op(m, "add", &[*a, k]);
-                *b = op(m, "add", &[*b, failures]);
-                Some(ok)
-            }
-            (Self::Gamma(shape, rate), Update::Poisson) => {
-                let k = data.value;
-                let ok = supported_counts(m, k, data.integer, None, data.count.is_some());
-                let k = data.apply(m, "real", &[k]);
-                let k = data.sum(m, k);
-                *shape = op(m, "add", &[*shape, k]);
-                *rate = op(m, "add", &[*rate, n]);
-                Some(ok)
-            }
-            (Self::Normal(mean, sigma), Update::NormalMean(noise)) => {
-                let finite = data.apply(m, "isfinite", &[data.value]);
-                let all = data.reduce(m, "lall", finite);
-                if data.count != Some(0) {
-                    // Scale precisions before squaring. Both weights lie in [0,1].
-                    let scale = op(m, "min", &[*sigma, noise]);
-                    let a = op(m, "divide", &[scale, *sigma]);
-                    let a = op(m, "mul", &[a, a]);
-                    let b = op(m, "divide", &[scale, noise]);
-                    let b = op(m, "mul", &[b, b]);
-                    let nb = op(m, "mul", &[n, b]);
-                    let total = op(m, "add", &[a, nb]);
-                    let prior_weight = op(m, "divide", &[a, total]);
-                    let obs_weight = op(m, "divide", &[b, total]);
-                    let prior = op(m, "mul", &[*mean, prior_weight]);
-                    let weighted = data.apply(m, "mul", &[data.value, obs_weight]);
-                    let sum = data.sum(m, weighted);
-                    *mean = op(m, "add", &[prior, sum]);
-                    let root = op(m, "sqrt", &[total]);
-                    *sigma = op(m, "divide", &[scale, root]);
-                }
-                Some(all)
-            }
-            (Self::InverseGamma(shape, scale), Update::NormalVariance(mean)) => {
-                let finite = data.apply(m, "isfinite", &[data.value]);
-                let finite = data.reduce(m, "lall", finite);
-                let residual = data.apply(m, "sub", &[data.value, mean]);
-                let half = real(m, 0.5);
-                let half_residual = data.apply(m, "mul", &[residual, half]);
-                let square = data.apply(m, "mul", &[residual, half_residual]);
-                let ss = data.sum(m, square);
-                *scale = op(m, "add", &[*scale, ss]);
-                let half_n = op(m, "mul", &[n, half]);
-                *shape = op(m, "add", &[*shape, half_n]);
-                Some(finite)
-            }
-            (
-                Self::Dirichlet(alpha),
-                Update::Categories {
-                    dimensions,
-                    trials,
-                    one_based,
-                },
-            ) => {
-                let (counts, valid) = category_counts(m, data, dimensions, trials, one_based);
-                *alpha = op(m, "add", &[*alpha, counts]);
-                Some(valid)
-            }
-            _ => None,
-        }
-    }
 }
 
 fn valid_trials(m: &mut Module, n: NodeId) -> NodeId {
@@ -655,18 +572,20 @@ impl MultinomialData {
     }
 }
 
-fn category_counts(
-    m: &mut Module,
-    data: Data,
-    d: u32,
-    trials: Option<NodeId>,
-    one_based: bool,
-) -> (NodeId, NodeId) {
-    let size = m.alloc(Node::Lit(Scalar::Int(d.into())));
-    if let Some(trials) = trials {
-        let table = multinomial_data(m, data, size);
-        return (table.counts, table.supported(m, data, trials));
+fn category_counts(m: &mut Module, data: Data, d: u32, one_based: bool) -> (NodeId, NodeId) {
+    if data.count.is_some() {
+        let boundary = flatppl_core::query::promoted_input_names(m);
+        let (counts, valid) = crate::sufficient_statistics::categorical::label_counts(
+            m,
+            data.value,
+            data.integer,
+            d,
+            one_based,
+            &boundary,
+        );
+        return (map(m, "real", &[counts]), valid);
     }
+    let size = m.alloc(Node::Lit(Scalar::Int(d.into())));
     let offset = i64::from(one_based);
     let last = offset + i64::from(d) - 1;
     let upper = m.alloc(Node::Lit(Scalar::Int(last)));
@@ -687,27 +606,11 @@ fn category_counts(
         let n = data.count(m);
         return (op(m, "vector", &[n]), valid);
     }
-    let counts = if data.count.is_some() {
-        let edge_count = m.alloc(Node::Lit(Scalar::Int(i64::from(d) + 1)));
-        // Zero-based edges 0..=d remain exactly representable at the f32 dimension limit.
-        let start = real(m, 0.0);
-        let stop = real(m, f64::from(d));
-        let edges = op(m, "linspace", &[start, stop, edge_count]);
-        let labels = if one_based {
-            let one = real(m, 1.0);
-            map(m, "sub", &[data.value, one])
-        } else {
-            data.value
-        };
-        let counts = op(m, "bincounts", &[edges, labels]);
-        map(m, "real", &[counts])
-    } else {
-        let first = real(m, offset as f64);
-        let last = real(m, last as f64);
-        let labels = op(m, "linspace", &[first, last, size]);
-        let delta = map(m, "sub", &[labels, data.value]);
-        let same = map(m, "iszero", &[delta]);
-        map(m, "real", &[same])
-    };
+    let first = real(m, offset as f64);
+    let last = real(m, last as f64);
+    let labels = op(m, "linspace", &[first, last, size]);
+    let delta = map(m, "sub", &[labels, data.value]);
+    let same = map(m, "iszero", &[delta]);
+    let counts = map(m, "real", &[same]);
     (counts, valid)
 }

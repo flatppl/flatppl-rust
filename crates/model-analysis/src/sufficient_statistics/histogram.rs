@@ -3,7 +3,7 @@
 use super::{Expr, Factor, Reducer, call, num, op, resolve};
 use flatppl_core::{Module, Node, NodeId, Scalar, ScalarType, Type};
 
-fn fixed_scalar(m: &Module, id: NodeId, reducer: &Reducer) -> Option<Scalar> {
+pub(super) fn fixed_scalar(m: &Module, id: NodeId, reducer: &Reducer) -> Option<Scalar> {
     let id = resolve(m, id, &reducer.boundary);
     match m.node(id) {
         Node::Lit(value @ (Scalar::Int(_) | Scalar::Bool(_))) => Some(value.clone()),
