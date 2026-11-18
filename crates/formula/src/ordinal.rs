@@ -6,21 +6,28 @@ pub(crate) fn observation(
     b: &mut Builder<'_>,
     eta: NodeId,
     cuts: &[NodeId],
+    disc: Option<NodeId>,
     scalar: bool,
 ) -> NodeId {
-    emit_rows(b, eta, cuts, scalar, |b, probabilities| {
+    emit_rows(b, eta, cuts, disc, scalar, |b, probabilities| {
         b.call("Categorical", &[probabilities])
     })
 }
 
-pub(crate) fn probabilities(b: &mut Builder<'_>, eta: NodeId, cuts: &[NodeId]) -> NodeId {
-    emit_rows(b, eta, cuts, false, |_, probabilities| probabilities)
+pub(crate) fn probabilities(
+    b: &mut Builder<'_>,
+    eta: NodeId,
+    cuts: &[NodeId],
+    disc: Option<NodeId>,
+) -> NodeId {
+    emit_rows(b, eta, cuts, disc, false, |_, probabilities| probabilities)
 }
 
 fn emit_rows(
     b: &mut Builder<'_>,
     eta: NodeId,
     cuts: &[NodeId],
+    disc: Option<NodeId>,
     scalar: bool,
     finish: impl FnOnce(&mut Builder<'_>, NodeId) -> NodeId,
 ) -> NodeId {
@@ -36,6 +43,19 @@ fn emit_rows(
     };
     let mut inputs = vec![(name, input)];
     let mut args = vec![eta];
+    let disc = disc.map(|value| {
+        if scalar {
+            value
+        } else {
+            let input = Ref {
+                ns: RefNs::Local,
+                name: b.sym("_disc_"),
+            };
+            inputs.push((b.sym("disc"), input));
+            args.push(value);
+            b.m.alloc(Node::Ref(input))
+        }
+    });
     let mut differences = Vec::new();
     for (i, &cut) in cuts.iter().enumerate() {
         let cut = if scalar {
@@ -51,6 +71,7 @@ fn emit_rows(
             b.m.alloc(Node::Ref(input))
         };
         let difference = b.call("sub", &[cut, value]);
+        let difference = disc.map_or(difference, |disc| b.call("mul", &[disc, difference]));
         differences.push(difference);
     }
     let first = b.call("invlogit", &[differences[0]]);

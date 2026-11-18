@@ -13,6 +13,7 @@ pub enum ColumnExpression {
     Identity(Box<Self>),
     Log(Box<Self>),
     Exp(Box<Self>),
+    InvLogit(Box<Self>),
     Positive(Box<Self>),
     Negate(Box<Self>),
     Parentheses(Box<Self>),
@@ -41,6 +42,7 @@ impl ColumnExpression {
             Self::Identity(x)
             | Self::Log(x)
             | Self::Exp(x)
+            | Self::InvLogit(x)
             | Self::Positive(x)
             | Self::Negate(x)
             | Self::Parentheses(x) => {
@@ -60,6 +62,7 @@ impl ColumnExpression {
             Self::Identity(x)
             | Self::Log(x)
             | Self::Exp(x)
+            | Self::InvLogit(x)
             | Self::Positive(x)
             | Self::Negate(x)
             | Self::Parentheses(x) => x.uses_intercept(),
@@ -77,6 +80,18 @@ impl ColumnExpression {
             }
             Self::Log(x) => x.values(table, rows)?.into_iter().map(f64::ln).collect(),
             Self::Exp(x) => x.values(table, rows)?.into_iter().map(f64::exp).collect(),
+            Self::InvLogit(x) => x
+                .values(table, rows)?
+                .into_iter()
+                .map(|x| {
+                    let z = (-x.abs()).exp();
+                    if x < 0.0 {
+                        z / (1.0 + z)
+                    } else {
+                        1.0 / (1.0 + z)
+                    }
+                })
+                .collect(),
             Self::Negate(x) => x.values(table, rows)?.into_iter().map(|v| -v).collect(),
             Self::Binary(op, x, y) => x
                 .values(table, rows)?
@@ -131,6 +146,7 @@ impl fmt::Display for ColumnExpression {
             Self::Identity(x) => write!(f, "I({x})"),
             Self::Log(x) => write!(f, "log({x})"),
             Self::Exp(x) => write!(f, "exp({x})"),
+            Self::InvLogit(x) => write!(f, "inv_logit({x})"),
             Self::Positive(x) => write!(f, "+{x}"),
             Self::Negate(x) => write!(f, "-{x}"),
             Self::Parentheses(x) => write!(f, "({x})"),

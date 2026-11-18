@@ -193,6 +193,7 @@ impl Family {
             Self::VonMises => &["kappa"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
+            Self::Cumulative => &["disc"],
             _ => &[],
         }
     }
@@ -215,7 +216,7 @@ impl Family {
             })
             .transpose()?
             .unwrap_or(default);
-        let supported = link == Link::Identity
+        let supported = (link == Link::Identity && name != "disc")
             || link == default
             || (default == Link::Log && matches!(link, Link::Softplus | Link::Squareplus));
         if !supported {
@@ -234,6 +235,7 @@ impl Family {
         match name {
             "nu" => "normal(2.7, 0.8)".into(),
             "kappa" => "normal(5.0, 0.8)".into(),
+            "disc" => "normal(0, 1)".into(),
             "zi" | "hu" => "logistic(0, 1)".into(),
             _ => "student_t(3, 0, 2.5)".into(),
         }
@@ -280,7 +282,10 @@ impl Family {
             cuts,
         } = observation;
         if self == Self::Cumulative {
-            return crate::ordinal::observation(b, mu, cuts, scalar);
+            let disc = auxiliary
+                .iter()
+                .find_map(|&(name, value)| (name == "disc").then_some(value));
+            return crate::ordinal::observation(b, mu, cuts, disc, scalar);
         }
         if (!auxiliary.is_empty()
             || matches!(

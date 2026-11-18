@@ -1155,7 +1155,13 @@ fn observation_auxiliaries(recipe: &Recipe) -> Vec<&str> {
             .filter(|name| *name != "mu")
             .collect()
     } else {
-        recipe.family.auxiliaries().to_vec()
+        recipe
+            .family
+            .auxiliaries()
+            .iter()
+            .copied()
+            .filter(|&name| name != "disc" || recipe.predictors.contains_key(name))
+            .collect()
     }
 }
 

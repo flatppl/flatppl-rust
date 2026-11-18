@@ -95,10 +95,11 @@ fn emit_expression(
         Expr::Identity(x) | Expr::Positive(x) | Expr::Parentheses(x) => {
             emit_expression(b, x, binding)
         }
-        Expr::Log(x) | Expr::Exp(x) | Expr::Negate(x) => {
+        Expr::Log(x) | Expr::Exp(x) | Expr::InvLogit(x) | Expr::Negate(x) => {
             let op = match expression {
                 Expr::Log(_) => "log",
                 Expr::Exp(_) => "exp",
+                Expr::InvLogit(_) => "invlogit",
                 _ => "neg",
             };
             let x = emit_expression(b, x, binding);

@@ -120,10 +120,10 @@ Categorical models use separate category predictors.
 
 The whole expression supplies the predictor on the link scale. Use `y ~ exp(ld) * (theta - difficulty)`
 with the default Bernoulli logit link for a 2PL model. Arithmetic supports
-`+`, `-`, `*`, `/`, `^`, parentheses, `exp` and `log`. Each population
+`+`, `-`, `*`, `/`, `^`, parentheses, `exp`, `log` and `inv_logit`. Each population
 coefficient needs an explicit `b` prior scoped by `nlpar`, including the
-uncentred intercept (coefficient `Intercept`). Group effects are independent
-across nonlinear predictors. The recipe saves every parameter design and
+uncentred intercept (coefficient `Intercept`). Shared group IDs can correlate
+effects across nonlinear predictors. The recipe saves every parameter design and
 prepares the response expression’s data columns on new rows.
 
 ### Monotonic predictors
