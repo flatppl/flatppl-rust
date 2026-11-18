@@ -1,0 +1,9 @@
+# emit: target=lp
+flatppl_compat = "0.1"
+active = elementof(booleans)
+v = elementof(cartpow(integers, 3))
+mu = elementof(reals)
+center = ifelse(active, 2.0, -3.0)
+lp = logdensityof(Normal(center + sum(v) + mu, 2.0), 5.0)
+inputs = (active, v, mu)
+outputs = lp

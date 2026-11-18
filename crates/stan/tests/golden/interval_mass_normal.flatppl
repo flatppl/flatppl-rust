@@ -1,0 +1,10 @@
+# emit: target=outputs
+flatppl_compat = "0.1"
+mu = 0.7
+sigma = 1.3
+lo = 30.0
+hi = 31.0
+point = 30.4
+measure = normalize(truncate(Normal(mu, sigma), interval(lo, hi)))
+inputs = (mu, sigma, lo, hi, point)
+outputs = logdensityof(measure, point)

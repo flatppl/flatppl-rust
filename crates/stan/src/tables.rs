@@ -27,6 +27,15 @@ pub(crate) struct LawRow {
     pub lcdf: bool,
     pub normalized: bool,
     pub guard: String,
+    /// The pair the interval-mass helper takes far in the upper tail:
+    /// `lccdf`, or `mirror_lcdf` for a symmetric law. Set only where a
+    /// BridgeStan probe matched scipy; absent rows keep `T[lo, hi]`.
+    #[serde(default)]
+    pub tail: String,
+    /// The argument (`{scale}`) that is the support's lower end, where the
+    /// variate type has no literal one: the helper clamps the interval to it.
+    #[serde(default)]
+    pub floor: String,
     pub functions: String,
     pub status: String,
     pub note: String,

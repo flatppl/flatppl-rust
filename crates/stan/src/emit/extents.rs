@@ -294,10 +294,20 @@ impl<'m> Emitter<'m> {
             .filter_map(|l| l.trim_end_matches(';').rsplit(' ').next())
             .map(str::to_string)
             .collect();
-        let readable = |l: &Lin| {
+        // A size never names a value of its own class: `num_elements(y)`
+        // cannot size `y` itself.
+        let mut owners: HashMap<usize, HashSet<String>> = HashMap::new();
+        for k in 0..self.svars.len() {
+            let r = self.find(k);
+            owners
+                .entry(r)
+                .or_default()
+                .insert(self.svars[k].owner.clone());
+        }
+        let readable = |l: &Lin, own: &HashSet<String>| {
             super::functions::identifiers(&l.print())
                 .iter()
-                .all(|n| data_names.contains(n))
+                .all(|n| data_names.contains(n) && !own.contains(n))
         };
         for k in 0..self.svars.len() {
             let r = self.find(k);
@@ -307,7 +317,7 @@ impl<'m> Emitter<'m> {
                 continue;
             }
             let t = match self.svars[r].bound.clone() {
-                Some(l) if readable(&l) => l.print(),
+                Some(l) if readable(&l, &owners[&r]) => l.print(),
                 _ => {
                     let v = &self.svars[r];
                     let base = if self.used.contains("N") {

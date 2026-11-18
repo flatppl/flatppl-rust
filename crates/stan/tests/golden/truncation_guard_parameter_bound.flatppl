@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+t_obs = [0.3, 1.1, 0.7, 2.4]
+rate = elementof(posreals)
+tau = elementof(posreals)
+m = truncate(Exponential(rate = rate), interval(0.0, tau))
+L = likelihoodof(functionof(iid(m, 4)), t_obs)
+prior = joint(rate = Gamma(shape = 2.0, rate = 1.0), tau = Gamma(shape = 4.0, rate = 1.0))
+posterior = bayesupdate(L, prior)

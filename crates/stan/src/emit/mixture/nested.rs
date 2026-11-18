@@ -54,9 +54,7 @@ impl<'m> Emitter<'m> {
             return Ok(None);
         };
         let fill = self.resolve(atom);
-        let data = self.json.contains_key(lhs)
-            || self.deferred.iter().any(|d| d.stan == lhs)
-            || self.tdata.iter().any(|t| t.contains(&format!(" {lhs}")));
+        let data = self.is_data(lhs);
         let shaped = self
             .decls
             .get(lhs)

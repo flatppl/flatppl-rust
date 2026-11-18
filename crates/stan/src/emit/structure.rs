@@ -42,6 +42,10 @@ pub(super) struct Law {
     /// with `guard`, the support a Dirac atom beside this law is tested
     /// against.
     pub bounds: (Option<String>, Option<String>),
+    /// The row's `tail` flag (see `interval_mass`).
+    pub tail: String,
+    /// The position among the Stan arguments of the row's `floor` argument.
+    pub floor_arg: Option<usize>,
     /// Statements the law adds after its `~` line (`target += lgamma(K + 1);`).
     pub extra: Vec<String>,
     /// The restriction lives in the variate's declaration (`ordered[K]`):
@@ -485,6 +489,14 @@ impl<'m> Emitter<'m> {
                 Some(c) if self.head(rhs) == Some("elementof") => self.set_hints(c.args[0]),
                 _ => vec![],
             };
+            // An integer or boolean kernel input is data, as a free input is.
+            if self.m.type_of(rhs).is_some_and(ty_is_int) {
+                let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
+                self.data.push(format!("{};", t.render(&stan)));
+                self.record_decl(&stan, t);
+                self.env.insert(sym, stan);
+                continue;
+            }
             let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
@@ -578,6 +590,15 @@ impl<'m> Emitter<'m> {
             let stan = self.fresh(self.name(sym));
             let vs = self.m.valueset_of(rhs).cloned();
             let hints = self.set_hints(self.call(rhs).unwrap().args[0]);
+            // Stan has no integer parameters: an integer or boolean input is
+            // data, supplied with the query point.
+            if self.m.type_of(rhs).is_some_and(ty_is_int) {
+                let t = self.declare_data(rhs, vs.as_ref(), true, &stan, &hints)?;
+                self.data.push(format!("{};", t.render(&stan)));
+                self.record_decl(&stan, t);
+                self.env.insert(sym, stan);
+                continue;
+            }
             let t = self.declare(rhs, vs.as_ref(), true, &stan, &hints)?;
             self.params.push(format!("{};", t.render(&stan)));
             self.record_decl(&stan, t);
@@ -705,8 +726,13 @@ impl<'m> Emitter<'m> {
             if let Some(d) = o.draw {
                 self.env.insert(d, lhs.clone());
             }
-            self.bound_by_support(&lhs, o.law)?;
-            let lines = self.tilde(&lhs, o.law)?;
+            let support = self.truncation_support(o.law)?;
+            let mut lines = self.tilde(&lhs, o.law)?;
+            if let Some((lo, hi)) = support
+                && let Some(g) = self.guarded(&lhs, lo.as_deref(), hi.as_deref(), lines.clone())
+            {
+                lines = vec![g];
+            }
             let site = self.normal_site(&lhs, o.value, o.law, conditioned.len());
             factors.push((lines, site));
             if let Some(draw) = o.draw
@@ -726,38 +752,87 @@ impl<'m> Emitter<'m> {
         Ok(())
     }
 
-    /// Data observed under an unnormalized `truncate` outside its support
-    /// has zero density: its `data` declaration takes the support as bounds,
-    /// so Stan rejects such data instead of scoring it.
-    fn bound_by_support(&mut self, data: &str, law: NodeId) -> Result<()> {
+    /// The support an unnormalized `truncate` restricts observed data to:
+    /// outside it the density is zero (spec §06 `truncate`). A data bound
+    /// would make Stan reject the data instead (ruling of 2026-11-18).
+    #[allow(clippy::type_complexity)]
+    fn truncation_support(
+        &mut self,
+        law: NodeId,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
         // Through every `iid` level: `iid(iid(D, m), k)` holds D's variates.
         let mut r = self.resolve(law);
         while self.head(r) == Some("iid") {
             r = self.resolve(self.call(r).unwrap().args[0]);
         }
         if self.head(r) != Some("truncate") {
-            return Ok(());
+            return Ok(None);
         }
-        let Some((lo, hi)) = self.law(r, false)?.support else {
-            return Ok(());
-        };
-        let Some(t) = self.decls.get(data).cloned() else {
-            return Ok(());
-        };
-        let old = format!("{};", t.render(data));
-        let Some(pos) = self.data.iter().position(|l| *l == old) else {
-            return Ok(());
-        };
-        let mut t = t;
-        if t.bounds.lower.is_none() {
-            t.bounds.lower = lo;
+        Ok(self.law(r, false)?.support)
+    }
+
+    /// `body` for data inside [lo, hi], `target += negative_infinity();`
+    /// outside: the statements never see a value outside their law's
+    /// support. One whole-value test; an array of vectors (Stan 2.39 cannot
+    /// flatten it) is tested row by row into one flag.
+    pub(super) fn guarded(
+        &mut self,
+        data: &str,
+        lo: Option<&str>,
+        hi: Option<&str>,
+        body: Vec<String>,
+    ) -> Option<String> {
+        if lo.is_none() && hi.is_none() {
+            return None;
         }
-        if t.bounds.upper.is_none() {
-            t.bounds.upper = hi;
-        }
-        self.data[pos] = format!("{};", t.render(data));
-        self.record_decl(data, t);
-        Ok(())
+        let t = self.decls.get(data)?.clone();
+        let test = |v: &str, whole: bool| -> String {
+            let (small, big) = if whole {
+                (format!("min({v})"), format!("max({v})"))
+            } else {
+                (v.to_string(), v.to_string())
+            };
+            let mut parts = Vec::new();
+            if let Some(l) = lo {
+                parts.push(format!("{small} < {l}"));
+            }
+            if let Some(h) = hi {
+                parts.push(format!("{big} > {h}"));
+            }
+            parts.join(" || ")
+        };
+        let indent = |lines: &[String]| -> String {
+            lines
+                .iter()
+                .flat_map(|l| l.lines())
+                .map(|l| format!("  {l}\n"))
+                .collect()
+        };
+        let branch = |cond: &str| -> String {
+            let mut out = format!("if ({cond}) {{\n  target += negative_infinity();\n}}");
+            if !body.is_empty() {
+                out.push_str(&format!(" else {{\n{}}}", indent(&body)));
+            }
+            out
+        };
+        Some(match (t.array.len(), t.dims.len()) {
+            (0, 0) => branch(&test(data, false)),
+            (0, _) | (1, 0) => branch(&test(data, true)),
+            (_, 0) => branch(&test(&format!("to_array_1d({data})"), true)),
+            _ => {
+                let i = self.fresh_index();
+                let flag = self.fresh_local("outside");
+                let n = t.array[0].clone();
+                let rows = format!(
+                    "int {flag} = 0;\nfor ({i} in 1:{n}) {{\n  {flag} = {flag} || {};\n}}",
+                    test(&format!("{data}[{i}]"), true)
+                );
+                let inner = branch(&flag);
+                self.used.remove(&i);
+                self.used.remove(&flag);
+                format!("{{\n{}}}", indent(&[rows, inner]))
+            }
+        })
     }
 
     fn observed_value(&mut self, o: &Observation) -> Result<String> {
@@ -826,6 +901,14 @@ impl<'m> Emitter<'m> {
         // `iid(Lebesgue(S), n)` is `Lebesgue(S^n)` (§06 "Fundamental
         // measures"): density 1, no statement; the declaration carries S.
         if self.lebesgue_product(m) {
+            // Observed data outside S has zero density.
+            let data = self.is_data(lhs);
+            if data && let Some((lo, hi)) = self.support(m)? {
+                return Ok(self
+                    .guarded(lhs, lo.as_deref(), hi.as_deref(), vec![])
+                    .into_iter()
+                    .collect());
+            }
             return Ok(vec![]);
         }
         let flat = self.flat_order(lhs);
@@ -869,6 +952,9 @@ impl<'m> Emitter<'m> {
             _ => (self.law(m, false)?, false),
         };
         self.declared_variate(lhs, &law, m)?;
+        if let Some(lines) = self.interval_mass(lhs, &law, lhs_rank, per_element)? {
+            return Ok(lines);
+        }
         let elementwise = per_element || self.head(m) == Some("iid");
         let shifted = law.lhs("{y}") != "{y}";
         // A loop where Stan has no vectorized form: a law that does not
@@ -965,9 +1051,7 @@ impl<'m> Emitter<'m> {
     /// `y ~ iid(markovchain(…), M)` at observed rows: one statement over
     /// the flattened rows. A chain over parameters has no observed lag.
     fn markovchain_statement(&mut self, lhs: &str, mc: NodeId) -> Result<Vec<String>> {
-        let data = self.json.contains_key(lhs)
-            || self.deferred.iter().any(|d| d.stan == lhs)
-            || self.tdata.iter().any(|t| t.contains(&format!(" {lhs}")));
+        let data = self.is_data(lhs);
         if !data {
             return Err(Refusal::not_yet(Some(mc), "a markovchain as a prior"));
         }
@@ -1206,7 +1290,16 @@ impl<'m> Emitter<'m> {
                          closed-form normalizer",
                     ));
                 }
-                self.truncated(inner)
+                let set = c.args[1];
+                let law = self.truncated(inner)?;
+                // Stan's `T[L, U]` of a discrete law takes integer ends only.
+                if law.discrete && !self.integer_ends(set) {
+                    return Err(Refusal::not_yet(
+                        Some(inner),
+                        "a discrete law truncated at a non-integer end",
+                    ));
+                }
+                Ok(law)
             }
             // `tilt(iid(D, K), Lebesgue(ordered(K)))`: D's density on the ordered
             // cone, normalized (§06 "Normalization and mass").
@@ -1871,6 +1964,27 @@ impl<'m> Emitter<'m> {
     }
 
     /// The finite ends of an interval set; `None` for an open side.
+    /// `true` unless `s` is an `interval` with a finite end that is not
+    /// integer-typed (integers by type, not value).
+    fn integer_ends(&self, s: NodeId) -> bool {
+        let s = self.resolve(s);
+        if self.head(s) != Some("interval") {
+            return true;
+        }
+        self.call(s).unwrap().args.iter().all(|&a| {
+            let r = self.resolve(a);
+            let inf =
+                |n: NodeId| matches!(self.m.node(n), Node::Const(c) if self.name(*c) == "inf");
+            inf(r)
+                || (self.head(r) == Some("neg") && inf(self.call(r).unwrap().args[0]))
+                || self
+                    .m
+                    .type_of(a)
+                    .or_else(|| self.m.type_of(r))
+                    .is_some_and(ty_is_int)
+        })
+    }
+
     fn interval(&mut self, s: NodeId) -> Result<(Option<String>, Option<String>)> {
         match self.m.node(s) {
             Node::Const(c) => match self.name(*c) {
@@ -2074,6 +2188,10 @@ impl<'m> Emitter<'m> {
             support: None,
             guard,
             bounds: variate_bounds(&row.variate),
+            tail: row.tail.clone(),
+            floor_arg: (!row.floor.is_empty())
+                .then(|| row.args.split(", ").position(|a| a == row.floor))
+                .flatten(),
             extra: vec![],
             declared: false,
         })

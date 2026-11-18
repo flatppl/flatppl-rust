@@ -807,3 +807,25 @@ fn query_point_binding_another_input_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("while it is the input"), "{r}");
 }
+
+#[test]
+fn discrete_truncation_at_a_real_end_is_not_yet() {
+    // stanc 2.39 rejects `T[lo, hi]`, `T[lo, ]` and `T[, hi]` of a discrete
+    // law with a real end.
+    for set in ["interval(0.5, 6)", "interval(0.5, inf)", "interval(0, 5.5)"] {
+        let r = refuse_with(
+            &format!(
+                "lam = elementof(posreals)\nk = 3\n\
+                 m = normalize(truncate(Poisson(lam), {set}))\n\
+                 inputs = (lam, k)\nlp = logdensityof(m, k)"
+            ),
+            Some("lp"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{set}: {r}");
+        assert!(
+            r.reason
+                .contains("discrete law truncated at a non-integer end"),
+            "{set}: {r}"
+        );
+    }
+}

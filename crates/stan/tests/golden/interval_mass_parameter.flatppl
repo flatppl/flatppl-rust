@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+s ~ iid(normalize(truncate(Gamma(2.0, 1.0), interval(0.5, 3.0))), 2)
+z ~ Normal(s[1] - s[2], 1)
+prior = lawof(record(s = s))
+L = likelihoodof(kernelof(record(z = z), s = s), record(z = 0.4))
+post = bayesupdate(L, prior)
