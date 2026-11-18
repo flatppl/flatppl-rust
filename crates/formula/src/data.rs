@@ -462,7 +462,14 @@ fn prepare_data_inner(
         }
         constants.insert("se_data".into(), values);
     }
-    crate::response::prepare(&recipe.formula, table, &rows, mode, &mut constants)?;
+    crate::response::prepare(
+        &recipe.formula,
+        recipe.family,
+        table,
+        &rows,
+        mode,
+        &mut constants,
+    )?;
     Ok(DataDocument { constants, rows })
 }
 
@@ -713,7 +720,11 @@ pub(crate) fn response(
         }
         return Ok(DataValue::Integers(values));
     }
-    if matches!(
+    if matches!(family, Family::Exponential | Family::Weibull) && formula.censoring.is_some() {
+        if column.numeric(rows)?.iter().any(|&value| value < 0.0) {
+            return Err(Error("survival times must be nonnegative".into()));
+        }
+    } else if matches!(
         family,
         Family::Gamma | Family::Exponential | Family::Lognormal | Family::Weibull
     ) && column.numeric(rows)?.iter().any(|&value| value <= 0.0)

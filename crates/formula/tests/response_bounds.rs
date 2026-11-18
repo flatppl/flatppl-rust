@@ -41,3 +41,28 @@ fn censoring_keeps_events_that_overlap_a_one_sided_truncation_range() {
     let model = build(&spec, &table).unwrap();
     assert_eq!(model.data.rows, [0, 1, 2]);
 }
+
+#[test]
+fn survival_censoring_preserves_exact_and_censored_events() {
+    let data = read_json_table(
+        r#"{"y":[0.1,0.5,0.0,10.0], "c":["none","left","right","interval"],
+            "hi":[null,null,null,10.01]}"#,
+    )
+    .unwrap();
+    for family in ["exponential", "weibull"] {
+        let spec = read(&format!(
+            r#"{{"formula":"y | cens(c, hi) ~ 1","family":"{family}"}}"#
+        ))
+        .unwrap();
+        let model = build(&spec, &data).unwrap();
+        assert_eq!(model.data.rows, [0, 1, 2, 3]);
+        assert_eq!(
+            model.data.constants["cens_data"],
+            DataValue::Integers(vec![0, -1, 1, 2])
+        );
+        let prediction = read_json_table(r#"{"unused":[0,0]}"#).unwrap();
+        let prepared = prepare_data(&model.recipe, &prediction, DataMode::Prediction).unwrap();
+        assert_eq!(prepared.rows, [0, 1]);
+        assert!(!prepared.constants.contains_key("cens_data"));
+    }
+}

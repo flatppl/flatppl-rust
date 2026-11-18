@@ -1,4 +1,6 @@
-use crate::{DataMode, DataValue, Error, Formula, GroupLevel, Result, Table, data::ColumnModel};
+use crate::{
+    DataMode, DataValue, Error, Family, Formula, GroupLevel, Result, Table, data::ColumnModel,
+};
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 use serde::{Deserialize, Serialize};
@@ -126,6 +128,7 @@ const UPPER: &str = "trunc_upper_data";
 
 pub(crate) fn prepare(
     formula: &Formula,
+    family: Family,
     table: &Table,
     rows: &[usize],
     mode: DataMode,
@@ -175,6 +178,11 @@ pub(crate) fn prepare(
         let mut upper_values = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
             let code = censor_code(status.level(row)?)?;
+            if code == 0 && y[i] == 0.0 && matches!(family, Family::Exponential | Family::Weibull) {
+                return Err(Error(
+                    "exact survival times must be strictly positive".into(),
+                ));
+            }
             let end = match code {
                 2 => {
                     let upper = upper.filter(|col| col.present(row)).ok_or_else(|| {

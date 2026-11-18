@@ -259,8 +259,10 @@ rejects zero when `sigma=FALSE`, because the total likelihood scale would be zer
 with `sigma=TRUE`, zero known error is allowed. Prediction requires the columns used in `se()` and
 reuses the saved expression. Separate response additions with `+`.
 
-Gaussian formulas accept `y | cens(status, y2) ~ ...`. Status is `left`, `none`,
-`right` or `interval`, or the corresponding integer `-1`, `0`, `1` or `2`.
+Gaussian, Exponential and Weibull formulas accept `y | cens(status, y2) ~ ...`.
+Status is `left`, `none`, `right` or `interval`, or the corresponding integer
+`-1`, `0`, `1` or `2`. Exponential and Weibull models require positive exact
+times and allow zero as a censoring bound.
 The response gives the exact value, the upper boundary for left censoring, or
 the lower boundary for right and interval censoring. For interval rows, `y2`
 gives the upper end of `(y, y2]`. Other rows ignore `y2`, including missing
