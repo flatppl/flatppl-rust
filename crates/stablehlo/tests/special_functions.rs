@@ -409,8 +409,9 @@ fn normal_interval_mass_keeps_cdfs_compact_until_restoring_row_order() {
     let upper = [vec!["1.0"; 32], vec!["inf"; 32]].concat().join(", ");
     let source = format!(
         "mu = external(cartpow(reals, 64))\n\
-         f(x, a, b) = log(totalmass(truncate(Normal(x, 1.0), interval(a, b))))\n\
-         lo = [{lower}]\nhi = [{upper}]\ninputs = mu\noutputs = f.(mu, lo, hi)"
+         sigma = elementof(posreals)\n\
+         f(x, s, a, b) = log(totalmass(truncate(Normal(x, s), interval(a, b))))\n\
+         lo = [{lower}]\nhi = [{upper}]\ninputs = (mu, sigma)\noutputs = f.(mu, [sigma], lo, hi)"
     );
     let options = EmitOptions {
         dtype: Dtype::F64,
@@ -418,6 +419,14 @@ fn normal_interval_mass_keeps_cdfs_compact_until_restoring_row_order() {
     };
     let module = determinize_with(&source, &options.lowering_options());
     let ir = flatppl_stablehlo::emit(&module, Mode::LogDensity, &options).unwrap();
+    assert!(
+        ir.split_once("@logdensity(")
+            .unwrap()
+            .1
+            .lines()
+            .any(|line| line.contains("stablehlo.divide") && line.contains("tensor<32xf64>")),
+        "{ir}"
+    );
     // The 32 upper cells, two sentinels, and 16 interval masses share one
     // packet before a single gather restores the original 64 rows.
     assert!(
