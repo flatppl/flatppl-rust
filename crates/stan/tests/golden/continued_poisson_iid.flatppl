@@ -1,0 +1,5 @@
+# emit: target=L
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+r = elementof(posreals)
+L = likelihoodof(functionof(iid(hep.ContinuedPoisson(rate = r), 3)), [1.0, 2.5, 4.0])

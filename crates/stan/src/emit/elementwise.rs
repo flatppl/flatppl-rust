@@ -96,6 +96,16 @@ impl<'m> Emitter<'m> {
                     if self.user_callee(c.args[0]).is_some() {
                         return self.elem_indexed(node, node, idx);
                     }
+                    // A standard-module function prints only as its vector
+                    // overload (`broadcast` in emit.rs).
+                    if let (Node::Ref(r), Some(_)) =
+                        (self.m.node(c.args[0]), self.standard_module(c.args[0]))
+                    {
+                        return Err(Refusal::not_yet(
+                            Some(node),
+                            format!("`{}.(…)` with these argument shapes", self.name(r.name)),
+                        ));
+                    }
                     return Err(Refusal::not_yet(Some(node), "broadcast of a user function"));
                 };
                 let f = self.name(*f);

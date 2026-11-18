@@ -1,0 +1,6 @@
+# emit: target=L
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+observed = rowstack([[1, 2, 3], [4, 5, 6]])
+r = elementof(posreals)
+L = likelihoodof(functionof(iid(hep.ContinuedPoisson(rate = r), [2, 3])), observed)

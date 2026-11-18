@@ -1739,6 +1739,34 @@ impl<'m> Emitter<'m> {
     /// a `broadcast` template (`.*`, `./`, `.^`) gives the elementwise
     /// operator. Anything else refuses here and is filled by loops instead.
     fn broadcast(&mut self, id: NodeId, f: NodeId, args: &[NodeId]) -> Result<Ex> {
+        // A standard-module function: one call of its row's vector overload
+        // when the argument ranks match it.
+        if let (Node::Ref(r), Some(module)) = (self.m.node(f), self.standard_module(f)) {
+            let fname = self.name(r.name).to_string();
+            let row = self.fn_row(id, &fname, Some(&module))?;
+            let kinds: Vec<&str> = row.overload.split(", ").filter(|k| !k.is_empty()).collect();
+            let fits = kinds.len() == args.len()
+                && args.iter().zip(&kinds).all(|(&a, k)| {
+                    let rank = self.shape(a).map(|s| s.rank);
+                    matches!((*k, rank), ("vector", Some(1)) | ("real", Some(0)))
+                });
+            if !fits {
+                let form = if kinds.is_empty() {
+                    "no vector form".to_string()
+                } else {
+                    format!("a vector form for ({})", row.overload)
+                };
+                return Err(Refusal::not_yet(
+                    Some(id),
+                    format!("`{fname}.(…)` with these argument shapes ({form})"),
+                ));
+            }
+            let mut parts = Vec::new();
+            for &a in args {
+                parts.push(self.real(a)?);
+            }
+            return self.table_fn(id, &fname, Some(&module), parts);
+        }
         let Node::Const(fs) = self.m.node(f) else {
             if self.user_callee(f).is_none() {
                 return Err(Refusal::not_yet(Some(id), "broadcast of a user function"));

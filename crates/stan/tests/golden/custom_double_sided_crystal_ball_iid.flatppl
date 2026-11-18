@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+y_obs = [-2.5, -0.4, 0.1, 0.8, 3.1, 0.0]
+m ~ Normal(0, 1)
+y ~ iid(hep.DoubleSidedCrystalBall(m0 = m, sigmaL = 1.0, sigmaR = 0.7, alphaL = 1.2, alphaR = 1.8, nL = 2.5, nR = 4.0), 6)
+prior = lawof(record(m = m))
+L = likelihoodof(kernelof(record(y = y), m = m), record(y = y_obs))
+post = bayesupdate(L, prior)

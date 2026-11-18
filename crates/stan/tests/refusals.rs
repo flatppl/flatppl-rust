@@ -990,3 +990,172 @@ fn normalize_weighted_root_of_unbounded_parameter_is_not_yet() {
         "{r}"
     );
 }
+
+#[test]
+fn landau_is_never() {
+    let r = refuse(&posterior(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         mu ~ Normal(0, 1)\ny ~ hep.Landau(loc = mu, scale = 1.0)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NoStanFunction, "{r}");
+    assert!(r.kind.is_never());
+    assert!(r.reason.contains("Landau"), "{r}");
+}
+
+#[test]
+fn draw_from_continued_poisson_is_rejected() {
+    // §09: ContinuedPoisson is not normalized, so there is no draw from it
+    // (no `rand`); the module is rejected before any Stan emission.
+    let mut module = flatppl_syntax::parse(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\nx ~ hep.ContinuedPoisson(rate = 3.0)\n",
+    )
+    .expect("parse");
+    let diagnostics = flatppl_infer::infer(&mut module);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == flatppl_infer::Severity::Error),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn custom_density_with_array_parameters_is_not_yet() {
+    let r = refuse_with(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         m0s = [5.27, 5.28, 5.29]\ns ~ Exponential(rate = 200.0)\n\
+         y ~ hep.CrystalBall.(m0s, s, 1.5, 3.0)\nprior = lawof(record(s = s))\n\
+         L = likelihoodof(kernelof(record(y = y), s = s), record(y = [5.27, 5.28, 5.29]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("array parameters"), "{r}");
+}
+
+#[test]
+fn unnormalized_mixture_component_law_is_not_yet() {
+    let r = refuse_with(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+         w ~ Beta(2, 2)\ny ~ normalize(superpose(weighted(w, hep.ContinuedPoisson(rate = 3.0)), weighted(1 - w, Normal(3, 1))))\n\
+         prior = lawof(record(w = w))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w), record(y = 2.0))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("unnormalized law"), "{r}");
+}
+
+#[test]
+fn continued_poisson_outside_a_plain_statement_is_not_yet() {
+    // normalize, truncate and weighted would need its mass, which no row gives.
+    for (law, reason) in [
+        ("normalize(hep.ContinuedPoisson(rate = r))", "normalize"),
+        (
+            "truncate(hep.ContinuedPoisson(rate = r), interval(0.0, 5.0))",
+            "truncate",
+        ),
+        ("weighted(2.0, hep.ContinuedPoisson(rate = r))", "weighted"),
+    ] {
+        let r = refuse_with(
+            &format!(
+                "hep = standard_module(\"particle-physics\", \"0.1\")\nr = elementof(posreals)\n\
+                 L = likelihoodof(functionof({law}), 3.0)\n"
+            ),
+            Some("L"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{law}: {r}");
+        assert!(r.reason.contains(reason), "{law}: {r}");
+    }
+}
+
+#[test]
+fn real_typed_data_under_a_discrete_law_is_not_yet() {
+    let r = refuse_with(
+        "obs_data = [51.0, 48.0]\nmu = elementof(posreals)\n\
+         L = likelihoodof(functionof(Poisson.(mu .* [50.0, 40.0])), obs_data)\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("real-typed data under the discrete law `Poisson`"),
+        "{r}"
+    );
+}
+
+#[test]
+fn interpolator_broadcast_with_array_alpha_is_not_yet() {
+    let r = refuse_with(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\nalpha = elementof(cartpow(reals, 2))\n\
+         lo = [0.9, 0.95]\nc = [1.0, 1.0]\nhi = [1.1, 1.2]\nf = hep.interp_poly6_exp.(lo, c, hi, alpha)\n\
+         L = likelihoodof(functionof(Normal.(f, 1.0)), [1.0, 1.0])\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("argument shapes"), "{r}");
+}
+
+#[test]
+fn normalize_holding_continued_poisson_is_not_yet() {
+    // ContinuedPoisson has mass Z(rate) != 1; a normalize around it would
+    // print its density as if Z were 1.
+    let hep = "hep = standard_module(\"particle-physics\", \"0.1\")\n";
+    for model in [
+        // The hurdle split beside a Dirac atom.
+        "y_obs = [0.0, 1.3, 0.0, 0.4, 2.2]\nhu ~ Beta(2, 2)\nmu ~ Gamma(2, 1)\n\
+         m = normalize(superpose(weighted(hu, Dirac(0.0)), weighted(1 - hu, hep.ContinuedPoisson(rate = mu))))\n\
+         y ~ iid(m, 5)\nprior = lawof(record(hu = hu, mu = mu))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), hu = hu, mu = mu), record(y = y_obs)), prior)\n",
+        // R1's `normalize(weighted(c, M))`.
+        "y_obs = [1.3, 0.4, 2.2]\ns = 2.0\nmu ~ Gamma(2, 1)\n\
+         y ~ iid(normalize(weighted(ifelse(s > 0 && isfinite(s), 1, 0), hep.ContinuedPoisson(rate = mu))), 3)\n\
+         prior = lawof(record(mu = mu))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs)), prior)\n",
+        // A broadcast user law whose body is the hurdle.
+        "x = [0.2, -0.5, 1.0, 0.0, 0.7]\ny_obs = [0.0, 1.3, 0.0, 0.4, 2.2]\nhu ~ Beta(2, 2)\nb ~ Normal(0, 1)\n\
+         f = (r, h) -> normalize(superpose(weighted(h, Dirac(0.0)), weighted(1.0 - h, hep.ContinuedPoisson(rate = r))))\n\
+         y ~ f.(exp.(b .* x), hu)\nprior = lawof(record(hu = hu, b = b))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), hu = hu, b = b), record(y = y_obs)), prior)\n",
+    ] {
+        let r = refuse_with(&format!("{hep}{model}"), None);
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+        assert!(
+            r.reason.contains("unnormalized law `ContinuedPoisson`"),
+            "{r}"
+        );
+    }
+}
+
+#[test]
+fn real_typed_matrix_data_under_a_discrete_law_is_not_yet() {
+    let r = refuse_with(
+        "y_obs = [[1.0, 2.0, 0.0], [3.0, 4.0, 1.0]]\nmu ~ Gamma(2, 1)\ny ~ iid(iid(Poisson(mu), 3), 2)\n\
+         prior = lawof(record(mu = mu))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs)), prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason
+            .contains("real-typed data under the discrete law `Poisson`"),
+        "{r}"
+    );
+}
+
+#[test]
+fn custom_prior_bounded_by_a_derived_value_is_not_yet() {
+    // `upper=m` would read a model-block value in the parameters block.
+    let r = refuse_with(
+        "hep = standard_module(\"particle-physics\", \"0.1\")\nd ~ Normal(0, 0.1)\nm = 5.3 + d\n\
+         x ~ hep.Argus(resonance = m, slope = -20.0, power = 0.5)\ny ~ Normal(x, 1)\n\
+         prior = lawof(record(d = d, x = x))\n\
+         post = bayesupdate(likelihoodof(kernelof(record(y = y), d = d, x = x), record(y = 5.0)), prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("derived value"), "{r}");
+}

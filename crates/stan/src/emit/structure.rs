@@ -51,15 +51,30 @@ pub(super) struct Law {
     /// The restriction lives in the variate's declaration (`ordered[K]`):
     /// the law is exact only on a parameter declared from its sets.
     pub declared: bool,
+    /// A row with `normalized: false` (`ContinuedPoisson`): its statement is
+    /// `target += D_lpdf(y | …);`, not `~`.
+    pub unnormalized: bool,
+    /// The row's Stan name (`flatppl_continued_poisson`): `call` is
+    /// `name(args)`.
+    pub stan_name: String,
+    /// The FlatPPL law the row maps (`Poisson`), for messages.
+    pub flatppl: String,
+    /// A user-defined `_lpdf` row (`kind: custom_lpdf`): its overloads take
+    /// `vector` variates, not integer arrays.
+    pub custom: bool,
 }
 
 impl Law {
     pub(super) fn rhs(&self, index: Option<&str>) -> String {
-        let s = match index {
+        self.truncate(self.call_text(index))
+    }
+
+    /// `stan(args)` with no truncation, at `index` for a per-element law.
+    pub(super) fn call_text(&self, index: Option<&str>) -> String {
+        match index {
             Some(i) => self.indexed.replace(LOOP, i),
             None => self.call.clone(),
-        };
-        self.truncate(s)
+        }
     }
 
     fn truncate(&self, mut s: String) -> String {
@@ -131,6 +146,33 @@ impl Law {
     /// The variate side for `y`.
     pub(super) fn lhs(&self, y: &str) -> String {
         self.lhs.replace("{y}", y)
+    }
+
+    /// `y ~ call T[…];`, or `target += D_lpdf(y | args);` for an
+    /// unnormalized row. `call` is the bare `stan(args)` (`call_text`); its
+    /// name and arguments come from the row, not from a printed suffix.
+    pub(super) fn statement(&self, at: NodeId, y: &str, call: &str) -> Result<String> {
+        if !self.unnormalized {
+            return Ok(format!("{y} ~ {};", self.truncate(call.to_string())));
+        }
+        // An unnormalized row has no CDF, so it is never truncated here.
+        let args = call
+            .strip_prefix(self.stan_name.as_str())
+            .and_then(|a| a.strip_prefix('('))
+            .and_then(|a| a.strip_suffix(')'))
+            .filter(|_| self.trunc.is_none());
+        let Some(args) = args else {
+            return Err(Refusal::not_yet(
+                Some(at),
+                format!("the unnormalized law `{}` in this form", self.flatppl),
+            ));
+        };
+        let name = &self.stan_name;
+        Ok(if args.is_empty() {
+            format!("target += {name}_lpdf({y});")
+        } else {
+            format!("target += {name}_lpdf({y} | {args});")
+        })
     }
 }
 
@@ -997,11 +1039,11 @@ impl<'m> Emitter<'m> {
                             return Err(Refusal::not_yet(Some(m), "a joint of vector laws"));
                         }
                         self.declared_variate(lhs, &law, m)?;
-                        out.push(format!(
-                            "{} ~ {};",
-                            law.lhs(&format!("{lhs}[{}]", k + 1)),
-                            law.rhs(None)
-                        ));
+                        out.push(law.statement(
+                            m,
+                            &law.lhs(&format!("{lhs}[{}]", k + 1)),
+                            &law.call_text(None),
+                        )?);
                         out.extend(law.extra);
                     }
                     return Ok(out);
@@ -1010,6 +1052,7 @@ impl<'m> Emitter<'m> {
             _ => (self.law(m, false)?, false),
         };
         self.declared_variate(lhs, &law, m)?;
+        self.integer_data(m, &law, lhs)?;
         if let Some(lines) = self.interval_mass(lhs, &law, lhs_rank, per_element)? {
             return Ok(lines);
         }
@@ -1031,9 +1074,8 @@ impl<'m> Emitter<'m> {
             let n = self.extent_of(lhs);
             let index = per_element.then_some(i.as_str());
             let stmt = format!(
-                "for ({i} in 1:{n}) {{\n  {} ~ {};\n}}",
-                law.lhs(&format!("{lhs}[{i}]")),
-                law.rhs(index)
+                "for ({i} in 1:{n}) {{\n  {}\n}}",
+                law.statement(m, &law.lhs(&format!("{lhs}[{i}]")), &law.call_text(index))?
             );
             self.used.remove(&i);
             let mut out = vec![stmt];
@@ -1042,15 +1084,38 @@ impl<'m> Emitter<'m> {
         }
         let (target, rhs) = match (flat, &law.flat_call) {
             (Some(Flat::Row), Some(call)) if !law.multivariate => {
-                (format!("to_array_1d({lhs})"), law.truncate(call.clone()))
+                (format!("to_array_1d({lhs})"), call.clone())
             }
             (Some(Flat::Col), Some(call)) if !law.multivariate => {
-                (format!("to_vector({lhs})"), law.truncate(call.clone()))
+                (format!("to_vector({lhs})"), call.clone())
             }
-            _ if lhs_rank >= 2 && !law.multivariate => (format!("to_vector({lhs})"), law.rhs(None)),
-            _ => (lhs.to_string(), law.rhs(None)),
+            // A rank-2 variate flattened: a matrix by `to_vector`; an array
+            // (`array[2, 3] int`) by `to_array_1d`, which a discrete law takes
+            // as it is and a continuous one as a vector.
+            _ if lhs_rank >= 2 && !law.multivariate => {
+                let array = self.decls.get(lhs).is_some_and(|t| t.array.len() >= 2);
+                let target = match (array, law.discrete) {
+                    (true, true) => format!("to_array_1d({lhs})"),
+                    (true, false) => format!("to_vector(to_array_1d({lhs}))"),
+                    (false, _) => format!("to_vector({lhs})"),
+                };
+                (target, law.call_text(None))
+            }
+            // A user-defined `_lpdf` takes real variates: integer observations
+            // of a custom row (ContinuedPoisson counts) as a vector. Stan's
+            // built-in densities take the integer array itself.
+            _ if law.custom
+                && !law.discrete
+                && self
+                    .decls
+                    .get(lhs)
+                    .is_some_and(|t| t.is_int() && t.rank() == 1) =>
+            {
+                (format!("to_vector({lhs})"), law.call_text(None))
+            }
+            _ => (lhs.to_string(), law.call_text(None)),
         };
-        let mut out = vec![format!("{} ~ {rhs};", law.lhs(&target))];
+        let mut out = vec![law.statement(m, &law.lhs(&target), &rhs)?];
         out.extend(law.extra.iter().cloned());
         Ok(self.support_guarded(lhs, &law, out))
     }
@@ -1083,11 +1148,13 @@ impl<'m> Emitter<'m> {
         }
         let law = self.law(d, false)?;
         self.declared_variate(lhs, &law, m)?;
+        self.integer_data(m, &law, lhs)?;
         if law.multivariate
             || !law.vectorized
             || law.vector_per_element
             || law.lhs("{y}") != "{y}"
             || !law.extra.is_empty()
+            || law.unnormalized
         {
             return Err(Refusal::not_yet(Some(m), "a nested iid of this law"));
         }
@@ -1112,6 +1179,27 @@ impl<'m> Emitter<'m> {
 
     /// A law whose restriction the declaration carries is exact only on a
     /// parameter declared from its sets: elsewhere the restriction is lost.
+    /// Observed data under a discrete law must be integer-typed: Stan's
+    /// `_lpmf` takes `int` arguments only, and a real value is not cast
+    /// (integers by type, not value).
+    pub(super) fn integer_data(&self, at: NodeId, law: &Law, y: &str) -> Result<()> {
+        // `to_vector(y)` or `to_array_1d(y)`: the wrapper first, then the index.
+        let mut base = y;
+        for w in ["to_vector(", "to_array_1d("] {
+            if let Some(inner) = base.strip_prefix(w) {
+                base = inner.strip_suffix(')').unwrap_or(inner);
+            }
+        }
+        let base = base.split('[').next().unwrap_or(base);
+        if law.discrete && self.is_data(base) && self.decls.get(base).is_some_and(|t| !t.is_int()) {
+            return Err(Refusal::not_yet(
+                Some(at),
+                format!("real-typed data under the discrete law `{}`", law.flatppl),
+            ));
+        }
+        Ok(())
+    }
+
     fn declared_variate(&self, lhs: &str, law: &Law, at: NodeId) -> Result<()> {
         if law.declared && !self.set_declared.contains(lhs) {
             return Err(Refusal::not_yet(
@@ -1120,6 +1208,22 @@ impl<'m> Emitter<'m> {
             ));
         }
         Ok(())
+    }
+
+    /// The law of a `normalize(…)`: an unnormalized row inside it has no
+    /// mass the emitter can divide by (ContinuedPoisson's Z(λ) has no closed
+    /// form), so its density is not the normalized one.
+    pub(super) fn normalized(at: NodeId, law: Law) -> Result<Law> {
+        if law.unnormalized {
+            return Err(Refusal::not_yet(
+                Some(at),
+                format!(
+                    "`normalize` of a measure holding the unnormalized law `{}`",
+                    law.flatppl
+                ),
+            ));
+        }
+        Ok(law)
     }
 
     /// `y ~ iid(markovchain(…), M)` at observed rows: one statement over
@@ -1375,14 +1479,15 @@ impl<'m> Emitter<'m> {
                     ));
                 }
                 if self.head(inner) == Some("weighted") {
-                    return self.constant_weight_law(m, inner, broadcast);
+                    let law = self.constant_weight_law(m, inner, broadcast)?;
+                    return Self::normalized(m, law);
                 }
                 if self.head(inner) != Some("truncate") {
                     return Err(Refusal::not_yet(Some(m), "normalize of this measure"));
                 }
                 let c = self.call(inner).unwrap();
                 if let Some(law) = self.ordered_iid(m, c.args[0], c.args[1])? {
-                    return Ok(law);
+                    return Self::normalized(m, law);
                 }
                 // The mass of the ordered cone is 1/K! only for exchangeable
                 // components; P(X1 < … < XK) has no closed form otherwise.
@@ -1415,7 +1520,7 @@ impl<'m> Emitter<'m> {
                         "a discrete law truncated at a non-integer end",
                     ));
                 }
-                Ok(law)
+                Self::normalized(m, law)
             }
             // `tilt(iid(D, K), Lebesgue(ordered(K)))`: D's density on the ordered
             // cone, normalized (§06 "Normalization and mass").
@@ -1460,6 +1565,21 @@ impl<'m> Emitter<'m> {
             "joint" => self.joint_law(m),
             "broadcast" if broadcast => {
                 let c = self.call(m).unwrap();
+                // A standard-module law broadcast over arrays (`hep.ContinuedPoisson.(rate)`):
+                // its table row, as for a built-in law.
+                if let (Node::Ref(r), Some(module)) =
+                    (self.m.node(c.args[0]), self.standard_module(c.args[0]))
+                {
+                    if !c.named.is_empty() {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            "a module law broadcast with keyword arguments",
+                        ));
+                    }
+                    let member = self.name(r.name).to_string();
+                    let args = c.args[1..].to_vec();
+                    return self.table_law_in(m, &member, Some(&module), &args, true);
+                }
                 let Node::Const(f) = self.m.node(c.args[0]) else {
                     // A user law: one vectorized statement when it can be,
                     // else its body per element, in a loop.
@@ -1698,6 +1818,7 @@ impl<'m> Emitter<'m> {
                 self.interval(s).map(Some)
             }
             Some("pushfwd") => self.pushfwd_support(m),
+            Some("%call") => self.module_law_support(m),
             Some("locscale") => Ok(self.locscale_truncation(m)?.map(|(_, lo, hi)| (lo, hi))),
             // `Lebesgue(S)`: its variate ranges over S.
             Some("Lebesgue") => {
@@ -1719,6 +1840,79 @@ impl<'m> Emitter<'m> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The variate bounds of a standard-module law's row (`Argus`:
+    /// `lower=0, upper={resonance}`), its parameters filled in: a parameter
+    /// drawn from it is declared on its support.
+    fn module_law_support(
+        &mut self,
+        m: NodeId,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let c = self.call(m).unwrap();
+        let flatppl_core::CallHead::User(callee) = c.head else {
+            return Ok(None);
+        };
+        let (Node::Ref(r), Some(module)) = (self.m.node(callee), self.standard_module(callee))
+        else {
+            return Ok(None);
+        };
+        let member = self.name(r.name).to_string();
+        let Some(row) = tables::law_rows_by_head(&member, Some(&module))
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let (lo, hi) = variate_bounds(&row.variate);
+        if lo.is_none() && hi.is_none() {
+            return Ok(None);
+        }
+        let args = self.law_args(&member, m)?;
+        let fill = |me: &mut Self, b: Option<String>| -> Result<Option<String>> {
+            let Some(mut b) = b else {
+                return Ok(None);
+            };
+            for (k, p) in row.params.iter().enumerate() {
+                let key = format!("{{{p}}}");
+                if b.contains(&key) {
+                    let a = args.get(k).copied().ok_or_else(|| {
+                        Refusal::not_yet(Some(m), format!("{member} with a missing argument"))
+                    })?;
+                    // A declaration bound reads data or an earlier
+                    // parameter, not a model-block value.
+                    if !me.declarable_bound(a) {
+                        return Err(Refusal::not_yet(
+                            Some(m),
+                            format!(
+                                "a `{member}` parameter whose support bound `{p}` is a derived value"
+                            ),
+                        ));
+                    }
+                    b = b.replace(&key, &me.real(a)?.s);
+                }
+            }
+            Ok(Some(b))
+        };
+        let lo = fill(self, lo)?;
+        let hi = fill(self, hi)?;
+        Ok(Some((lo, hi)))
+    }
+
+    /// A value a parameter declaration may bound by: a literal, fixed data,
+    /// or a drawn parameter (declared in field order before its readers).
+    fn declarable_bound(&self, a: NodeId) -> bool {
+        if self.literal_number(a).is_some() {
+            return true;
+        }
+        let r = self.resolve(a);
+        if self.m.phase_of(r) == Some(flatppl_core::Phase::Fixed) {
+            return true;
+        }
+        // A module binding drawn by `~`: a parameter of the prior.
+        self.self_ref(a)
+            .and_then(|s| self.m.binding_by_name(s))
+            .is_some_and(|b| self.head(self.m.binding(b).rhs) == Some("draw"))
     }
 
     /// `iid(D, K)` restricted to `ordered(K)` and normalized: D's own
@@ -2434,11 +2628,9 @@ impl<'m> Emitter<'m> {
                     format!("`{name}` has no Stan density: {}", row.note),
                 ));
             }
-            "custom_lpdf" => {
-                return Err(Refusal::not_yet(
-                    Some(m),
-                    format!("the law `{name}` (a user-defined Stan density)"),
-                ));
+            // A user-defined `_lpdf`: its text goes into `functions` once.
+            "custom_lpdf" if !self.functions.contains(&row.functions) => {
+                self.functions.push(row.functions.clone());
             }
             _ => {}
         }
@@ -2448,7 +2640,7 @@ impl<'m> Emitter<'m> {
                 format!("the law `{name}` (its Stan mapping is unverified)"),
             ));
         }
-        if !row.normalized {
+        if !row.normalized && row.kind != "custom_lpdf" {
             return Err(Refusal::not_yet(
                 Some(m),
                 format!("the unnormalized law `{name}`"),
@@ -2519,6 +2711,17 @@ impl<'m> Emitter<'m> {
         let vector_per_element = per
             .iter()
             .any(|(v, &p)| p && expected.get(v).copied().unwrap_or(0) > 0);
+        // The normalized custom rows have overloads for scalar parameters
+        // only (a vector variate, scalar parameters).
+        if row.kind == "custom_lpdf"
+            && row.normalized
+            && binds.values().any(|b| rank_of(self, b) > 0)
+        {
+            return Err(Refusal::not_yet(
+                Some(m),
+                format!("the law `{name}` with array parameters"),
+            ));
+        }
         Ok(Law {
             call: format!("{}({args})", row.stan),
             flat_call: flat_args.map(|a| format!("{}({a})", row.stan)),
@@ -2539,6 +2742,10 @@ impl<'m> Emitter<'m> {
                 .flatten(),
             extra: vec![],
             declared: false,
+            unnormalized: !row.normalized,
+            stan_name: row.stan.clone(),
+            flatppl: row.flatppl.clone(),
+            custom: row.kind == "custom_lpdf",
         })
     }
 

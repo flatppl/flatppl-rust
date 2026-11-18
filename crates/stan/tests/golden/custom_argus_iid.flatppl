@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+y_obs = [5.10, 5.22, 5.27, 4.90, 5.25]
+c ~ Normal(-20, 5)
+y ~ iid(hep.Argus(resonance = 5.29, slope = c, power = 0.5), 5)
+prior = lawof(record(c = c))
+L = likelihoodof(kernelof(record(y = y), c = c), record(y = y_obs))
+post = bayesupdate(L, prior)

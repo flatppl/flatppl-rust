@@ -60,9 +60,13 @@
     (id: "generalized_normal", flatppl: "GeneralizedNormal", module: None, params: ["mean", "alpha", "beta"],
      pattern: "GeneralizedNormal(mean, alpha, beta)", vars: ["mean", "alpha", "beta"], kind: "custom_lpdf",
      stan: "flatppl_generalized_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {alpha}, {beta}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_generalized_normal_lpdf(real x, real mu, real alpha, real beta) {
   return log(beta) - log2() - log(alpha) - lgamma(1 / beta) - pow(abs(x - mu) / alpha, beta);
+}
+real flatppl_generalized_normal_lpdf(vector x, real mu, real alpha, real beta) {
+  return num_elements(x) * (log(beta) - log2() - log(alpha) - lgamma(1 / beta))
+         - sum((abs(x - mu) / alpha) .^ beta);
 }",
      status: "verified", note: ""),
     (id: "cauchy", flatppl: "Cauchy", module: None, params: ["location", "scale"],
@@ -295,7 +299,7 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
     (id: "crystal_ball", flatppl: "CrystalBall", module: Some("particle-physics 0.1"), params: ["m0", "sigma", "alpha", "n"],
      pattern: "CrystalBall(m0, sigma, alpha, n)", vars: ["m0", "sigma", "alpha", "n"], kind: "custom_lpdf",
      stan: "flatppl_crystal_ball", suffix: "lpdf", lhs: "{y}", args: "{m0}, {sigma}, {alpha}, {n}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_crystal_ball_lpdf(real x, real m0, real sigma, real alpha, real n) {
   real a = abs(alpha);
   real t = (x - m0) / sigma;
@@ -304,6 +308,18 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
   real log_norm = log(sigma) + log_sum_exp(log_tail, log_core);
   if (t < -a) return n * log(n / a) - 0.5 * square(a) - n * log(n / a - a - t) - log_norm;
   return -0.5 * square(t) - log_norm;
+}
+real flatppl_crystal_ball_lpdf(vector x, real m0, real sigma, real alpha, real n) {
+  // Piecewise in x: the normalizer once, the branch per element.
+  real a = abs(alpha);
+  real log_tail = log(n) - log(a) - log(n - 1) - 0.5 * square(a);
+  real log_core = 0.5 * log(pi() / 2) + log1p(erf(a / sqrt2()));
+  real lp = -num_elements(x) * (log(sigma) + log_sum_exp(log_tail, log_core));
+  for (i in 1:num_elements(x)) {
+    real t = (x[i] - m0) / sigma;
+    lp += t < -a ? n * log(n / a) - 0.5 * square(a) - n * log(n / a - a - t) : -0.5 * square(t);
+  }
+  return lp;
 }",
      status: "verified", note: "Requires n > 1, as §09 states."),
     (id: "double_sided_crystal_ball", flatppl: "DoubleSidedCrystalBall", module: Some("particle-physics 0.1"),
@@ -312,7 +328,7 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
      vars: ["m0", "sigmaL", "sigmaR", "alphaL", "alphaR", "nL", "nR"], kind: "custom_lpdf",
      stan: "flatppl_double_sided_crystal_ball", suffix: "lpdf", lhs: "{y}",
      args: "{m0}, {sigmaL}, {sigmaR}, {alphaL}, {alphaR}, {nL}, {nR}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_double_sided_crystal_ball_lpdf(real x, real m0, real sigmaL, real sigmaR,
                                               real alphaL, real alphaR, real nL, real nR) {
   real aL = abs(alphaL);
@@ -330,12 +346,33 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
   real t = (x - m0) / sigmaR;
   if (t > aR) return nR * log(nR / aR) - 0.5 * square(aR) - nR * log(nR / aR - aR + t) - log_norm;
   return -0.5 * square(t) - log_norm;
+}
+real flatppl_double_sided_crystal_ball_lpdf(vector x, real m0, real sigmaL, real sigmaR,
+                                            real alphaL, real alphaR, real nL, real nR) {
+  // Piecewise in x: the normalizer once, the branch per element.
+  real aL = abs(alphaL);
+  real aR = abs(alphaR);
+  real log_left = log(sigmaL) + log_sum_exp(log(nL) - log(aL) - log(nL - 1) - 0.5 * square(aL),
+                                            0.5 * log(pi() / 2) + log(erf(aL / sqrt2())));
+  real log_right = log(sigmaR) + log_sum_exp(log(nR) - log(aR) - log(nR - 1) - 0.5 * square(aR),
+                                             0.5 * log(pi() / 2) + log(erf(aR / sqrt2())));
+  real lp = -num_elements(x) * log_sum_exp(log_left, log_right);
+  for (i in 1:num_elements(x)) {
+    if (x[i] <= m0) {
+      real t = (x[i] - m0) / sigmaL;
+      lp += t < -aL ? nL * log(nL / aL) - 0.5 * square(aL) - nL * log(nL / aL - aL - t) : -0.5 * square(t);
+    } else {
+      real t = (x[i] - m0) / sigmaR;
+      lp += t > aR ? nR * log(nR / aR) - 0.5 * square(aR) - nR * log(nR / aR - aR + t) : -0.5 * square(t);
+    }
+  }
+  return lp;
 }",
      status: "verified", note: "Requires nL, nR > 1."),
     (id: "argus", flatppl: "Argus", module: Some("particle-physics 0.1"), params: ["resonance", "slope", "power"],
      pattern: "Argus(resonance, slope, power)", vars: ["resonance", "slope", "power"], kind: "custom_lpdf",
-     stan: "flatppl_argus", suffix: "lpdf", lhs: "{y}", args: "{resonance}, {slope}, {power}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     stan: "flatppl_argus", suffix: "lpdf", lhs: "{y}", args: "{resonance}, {slope}, {power}", variate: "real<lower=0, upper={resonance}>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_argus_lpdf(real x, real m0, real c, real p) {
   if (x <= 0 || x >= m0) return negative_infinity();
   real u = 1 - square(x / m0);
@@ -344,32 +381,70 @@ real flatppl_continued_poisson_lpdf(vector x, real rate) {
   // The integral is 1F1(p + 1; p + 2; c) / (p + 1). For c < 0 use Kummer's transform so the
   // series has positive terms. gamma_p is avoided: its gradient in the shape argument is off by
   // 3e-7 relative at (1.5, 20) in Stan 2.39. No c == 0 branch: a constant would zero d/dc.
-  if (c < 0) {
+  if (-c > p + 1 && -c + lgamma(p + 2) - (p + 1) * log(-c) >= 700) {
+    // For -c > p + 1 the Kummer series 1F1(1; p + 2; -c) grows like
+    // exp(-c) Gamma(p + 2) / (-c)^(p + 1) and overflows past exp(700); the integral
+    // is then Gamma(p + 1) P(p + 1, -c) / (-c)^(p + 1). For -c <= p + 1 it stays small.
+    log_int = lgamma(p + 1) + log(gamma_p(p + 1, -c)) - (p + 1) * log(-c);
+  } else if (c < 0) {
     log_int = c + log(hypergeometric_pFq([1]', [p + 2]', -c)) - log1p(p);
   } else {
     log_int = log(hypergeometric_pFq([p + 1]', [p + 2]', c)) - log1p(p);
   }
   return log(x) + p * log(u) + c * u - (2 * log(m0) - log2() + log_int);
+}
+real flatppl_argus_lpdf(vector x, real m0, real c, real p) {
+  int n = num_elements(x);
+  if (n == 0) return 0;
+  if (min(x) <= 0 || max(x) >= m0) return negative_infinity();
+  vector[n] u = 1 - square(x / m0);
+  real log_int;
+  if (-c > p + 1 && -c + lgamma(p + 2) - (p + 1) * log(-c) >= 700) {
+    // For -c > p + 1 the Kummer series 1F1(1; p + 2; -c) grows like
+    // exp(-c) Gamma(p + 2) / (-c)^(p + 1) and overflows past exp(700); the integral
+    // is then Gamma(p + 1) P(p + 1, -c) / (-c)^(p + 1). For -c <= p + 1 it stays small.
+    log_int = lgamma(p + 1) + log(gamma_p(p + 1, -c)) - (p + 1) * log(-c);
+  } else if (c < 0) {
+    log_int = c + log(hypergeometric_pFq([1]', [p + 2]', -c)) - log1p(p);
+  } else {
+    log_int = log(hypergeometric_pFq([p + 1]', [p + 2]', c)) - log1p(p);
+  }
+  return sum(log(x) + p * log(u) + c * u) - n * (2 * log(m0) - log2() + log_int);
 }",
-     status: "verified", note: "The normalizer is (m0^2 / 2) * integral_0^1 u^p exp(c u) du."),
+     status: "verified", note: "The normalizer is (m0^2 / 2) * integral_0^1 u^p exp(c u) du. A large positive slope (c above about 700) overflows the series. With the gamma_p branch taken and p >= -c / 10, the gradient in the power p is NaN, or the gradient call raises (grad_reg_lower_inc_gamma, seen for |c| >= 41750); a finite d/dp on that branch agrees with the exact value only to about 1e-8. The value stays finite."),
     (id: "relativistic_breit_wigner", flatppl: "RelativisticBreitWigner", module: Some("particle-physics 0.1"), params: ["mean", "width"],
      pattern: "RelativisticBreitWigner(mean, width)", vars: ["mean", "width"], kind: "custom_lpdf",
-     stan: "flatppl_relativistic_breit_wigner", suffix: "lpdf", lhs: "{y}", args: "{mean}, {width}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     stan: "flatppl_relativistic_breit_wigner", suffix: "lpdf", lhs: "{y}", args: "{mean}, {width}", variate: "real<lower=0>",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_relativistic_breit_wigner_lpdf(real x, real m, real w) {
   if (x <= 0) return negative_infinity();
   real g = sqrt(square(m) * (square(m) + square(w)));
   real log_norm = log(pi()) + 0.5 * log(square(m) + g) - log(2 * sqrt2()) - log(m) - log(w) - log(g);
   return -log(square(square(x) - square(m)) + square(m * w)) - log_norm;
+}
+real flatppl_relativistic_breit_wigner_lpdf(vector x, real m, real w) {
+  if (num_elements(x) > 0 && min(x) <= 0) return negative_infinity();
+  real g = sqrt(square(m) * (square(m) + square(w)));
+  real log_norm = log(pi()) + 0.5 * log(square(m) + g) - log(2 * sqrt2()) - log(m) - log(w) - log(g);
+  return -sum(log(square(square(x) - square(m)) + square(m * w))) - num_elements(x) * log_norm;
 }",
      status: "verified", note: "Uses the closed-form normalizer stated in §09."),
     (id: "bifurcated_normal", flatppl: "BifurcatedNormal", module: Some("particle-physics 0.1"), params: ["mean", "sigmaL", "sigmaR"],
      pattern: "BifurcatedNormal(mean, sigmaL, sigmaR)", vars: ["mean", "sigmaL", "sigmaR"], kind: "custom_lpdf",
      stan: "flatppl_bifurcated_normal", suffix: "lpdf", lhs: "{y}", args: "{mean}, {sigmaL}, {sigmaR}", variate: "real",
-     sizes: [], vectorized: false, lcdf: false, normalized: true, guard: "",
+     sizes: [], vectorized: true, lcdf: false, normalized: true, guard: "",
      functions: "real flatppl_bifurcated_normal_lpdf(real x, real mu, real sigmaL, real sigmaR) {
   real s = x < mu ? sigmaL : sigmaR;
   return 0.5 * log(2 / pi()) - log(sigmaL + sigmaR) - 0.5 * square((x - mu) / s);
+}
+real flatppl_bifurcated_normal_lpdf(vector x, real mu, real sigmaL, real sigmaR) {
+  // Piecewise in x: the width per element.
+  real lp = num_elements(x) * (0.5 * log(2 / pi()) - log(sigmaL + sigmaR));
+  for (i in 1:num_elements(x)) {
+    real s = x[i] < mu ? sigmaL : sigmaR;
+    lp -= 0.5 * square((x[i] - mu) / s);
+  }
+  return lp;
 }",
      status: "verified", note: ""),
     (id: "voigtian", flatppl: "Voigtian", module: Some("particle-physics 0.1"), params: ["mean", "width", "sigma"],

@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+y_obs = [-1.2, 0.3, 2.4, 0.0, -0.1]
+mu ~ Normal(0, 1)
+y ~ iid(hep.BifurcatedNormal(mean = mu, sigmaL = 0.8, sigmaR = 1.6), 5)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = y_obs))
+post = bayesupdate(L, prior)

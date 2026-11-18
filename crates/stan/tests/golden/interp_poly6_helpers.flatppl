@@ -1,0 +1,8 @@
+# emit: target=obs
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+alpha = elementof(reals)
+scale = hep.interp_poly6_exp(0.95, 1.0, 1.05, alpha)
+shift = hep.interp_poly6_lin(0.8, 1.0, 1.3, alpha)
+expected = 20.0 * scale + shift
+obs = likelihoodof(functionof(Normal(mu = expected, sigma = 1.0)), 21.5)

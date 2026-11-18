@@ -363,7 +363,8 @@ impl<'m> Emitter<'m> {
                 "if ({a} == 0) {{\n  reject(\"pushfwd of {lhs}: the scale {a} is 0, so the map is no bijection\");\n}}"
             ));
         }
-        let mut out = vec![format!("{y} ~ {};", law.rhs(None))];
+        // An unnormalized base prints `target += …_lpdf(…)` (`Law::statement`).
+        let mut out = vec![law.statement(m, &y, &law.call_text(None))?];
         out.extend(map.jacobian());
         Ok(out)
     }
