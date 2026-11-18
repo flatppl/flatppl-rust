@@ -97,6 +97,9 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     b.bind("Pi_prior", prior);
 
     for (name, predictor) in recipe.predictors() {
+        if name == "mu" && recipe.nonlinear.is_some() {
+            continue;
+        }
         predictor_values(
             &mut b,
             &recipe.predictor_suffix(name),
@@ -110,7 +113,13 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         let eta = nonlinear.emit(&mut b);
         b.bind("eta_mu", eta);
         let eta = b.self_ref("eta_mu");
-        let mu = recipe.link.inverse(&mut b, eta);
+        let mu = if thresholds > 0 {
+            let cuts = b.self_ref("cuts");
+            b.bind("b_Intercept", cuts);
+            eta
+        } else {
+            recipe.link.inverse(&mut b, eta)
+        };
         b.bind("mu", mu);
     }
     let mu = if recipe.family == Family::Categorical {

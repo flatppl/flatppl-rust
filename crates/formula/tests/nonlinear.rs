@@ -83,6 +83,40 @@ fn nonlinear_beta_also_prepares_a_precision_predictor() {
 }
 
 #[test]
+fn nonlinear_cumulative_retains_thresholds_and_prediction_data() {
+    let spec = serde_json::from_value(json!({
+        "family": "cumulative",
+        "formula": "y | weights(w) ~ exp(a) * x^2",
+        "nlpars": {"a": "a ~ 1"},
+        "priors": [
+            {"class": "Intercept", "prior": "normal(0, 2)"},
+            {"class": "b", "nlpar": "a", "prior": "normal(0, 1)"}
+        ]
+    }))
+    .unwrap();
+    let training = read_json_table(r#"{"x":[0.5,1,2],"y":[1,2,3],"w":[2,1,3]}"#).unwrap();
+    let model = build(&spec, &training).unwrap();
+    assert_eq!(
+        model
+            .info
+            .parameters
+            .iter()
+            .filter(|p| p.binding == "cuts")
+            .map(|p| p.index)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2)]
+    );
+    let recipe: Recipe =
+        serde_json::from_value(serde_json::to_value(&model.recipe).unwrap()).unwrap();
+    let held = read_json_table(r#"{"x":[1.5,-0.1]}"#).unwrap();
+    let prediction = prepare_data(&recipe, &held, DataMode::Prediction).unwrap();
+    assert_eq!(
+        prediction.constants["nl_data_1"],
+        DataValue::Real64(vec![1.5, -0.1])
+    );
+}
+
+#[test]
 fn nonlinear_coefficients_need_explicit_scoped_priors() {
     let data = read_json_table(r#"{"x":[0,1,2],"y":[2.2,3.8,8.5]}"#).unwrap();
     let mut spec = growth_spec();

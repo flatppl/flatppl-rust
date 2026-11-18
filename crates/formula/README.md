@@ -78,8 +78,9 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 Supply `nlpars` to treat the right side as arithmetic over named parameter
 predictors and numeric data columns. Each named predictor uses ordinary
 formula terms. All listed families with a scalar location or mean
-predictor support nonlinear expressions. Cumulative and categorical
-models use separate predictor forms.
+predictor support nonlinear expressions. Cumulative models use the
+expression on the logit scale with the usual ordered thresholds.
+Categorical models use separate category predictors.
 
 ```json
 {
@@ -92,7 +93,7 @@ models use separate predictor forms.
 }
 ```
 
-The family link applies to the whole expression. Use `y ~ exp(ld) * (theta - difficulty)`
+The whole expression supplies the predictor on the link scale. Use `y ~ exp(ld) * (theta - difficulty)`
 with the default Bernoulli logit link for a 2PL model. Arithmetic supports
 `+`, `-`, `*`, `/`, `^`, parentheses, `exp` and `log`. Each population
 coefficient needs an explicit `b` prior scoped by `nlpar`, including the

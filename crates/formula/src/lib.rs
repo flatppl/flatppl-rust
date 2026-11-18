@@ -515,7 +515,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 "the response cannot also be a predictor in this subset".into(),
             ));
         }
-        if predictor.intercept && !spec.options.center && !spec.nlpars.contains_key(*name) {
+        if predictor.intercept
+            && !spec.options.center
+            && !spec.nlpars.contains_key(*name)
+            && (*name != "mu" || nonlinear.is_none())
+        {
             return Err(Error("center=false with an intercept is not yet supported; use the default centred intercept or an explicit no-intercept formula".into()));
         }
     }
@@ -649,7 +653,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             },
         )?;
         auxiliary_priors.extend(aux);
-        if name == "mu" && nonlinear.is_some() {
+        if name == "mu" && nonlinear.is_some() && thresholds == 0 {
             continue;
         }
         predictors.insert(
