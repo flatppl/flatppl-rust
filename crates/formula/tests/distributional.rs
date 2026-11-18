@@ -1,4 +1,7 @@
-use flatppl_formula::{ColumnValues, DataMode, DataValue, Recipe, build, prepare_data, read};
+use flatppl_formula::{
+    ColumnValues, DataMode, DataValue, Recipe, Spec, build, prepare_data,
+    prepare_data_with_new_groups, read, read_json_table,
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -60,6 +63,55 @@ fn distributional_coordinates_and_priors_follow_brms() {
     spec.priors
         .push(serde_json::from_value(json!({"class":"sigma","prior":"normal(0,1)"})).unwrap());
     assert!(build(&spec, spec.data.as_ref().unwrap()).is_err());
+}
+
+#[test]
+fn shared_group_prediction_extends_joint_innovations_once_per_new_level() {
+    let spec: Spec = serde_json::from_value(json!({
+        "formula": "y ~ (1 + x | shared | g)",
+        "dpars": {"sigma": {"formula": "sigma ~ (1 | shared | g)"}},
+        "priors": [{"class": "cor", "group": "g", "prior": "lkj(2)"}]
+    }))
+    .unwrap();
+    let data = read_json_table(r#"{"y":[0.5,1,2,3],"x":[0,1,0,2],"g":["b","b","a","a"]}"#).unwrap();
+    let fitted = build(&spec, &data).unwrap();
+    let restored: Recipe =
+        serde_json::from_value(serde_json::to_value(&fitted.recipe).unwrap()).unwrap();
+    let groups = [
+        &restored.predictors["mu"].groups[0],
+        &restored.predictors["sigma"].groups[0],
+    ];
+    assert_eq!(groups[0].z, groups[1].z);
+    let cross = fitted
+        .info
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "cor_g__x__sigma_Intercept")
+        .unwrap();
+    assert_eq!(cross.indices.as_deref(), Some(&[2, 3][..]));
+    let prediction = read_json_table(r#"{"x":[1,2,3,0],"g":["c","b","d","c"]}"#).unwrap();
+    let (data, shapes) = prepare_data_with_new_groups(&restored, &prediction).unwrap();
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        [(groups[0].z.clone(), vec![3, 2])]
+    );
+    assert_eq!(
+        data.constants[&groups[0].index],
+        DataValue::Integers(vec![3, 2, 4, 3])
+    );
+    assert_eq!(groups[0].index, groups[1].index);
+}
+
+#[test]
+fn shared_ids_cannot_couple_different_grouping_factors() {
+    let spec: Spec = serde_json::from_value(json!({
+        "formula": "y ~ (1 | 3 | g)",
+        "dpars": {"sigma": {"formula": "sigma ~ (1 | 3 | h)"}}
+    }))
+    .unwrap();
+    let data =
+        read_json_table(r#"{"y":[1,2,3,4],"g":["a","a","b","b"],"h":["c","c","d","d"]}"#).unwrap();
+    assert!(build(&spec, &data).is_err());
 }
 
 #[test]

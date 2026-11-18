@@ -1,16 +1,26 @@
 use crate::{
     DataDocument, DataValue, Design, DesignComponent, Error, Family, ModelInfo, Parameter,
-    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, metadata,
+    ParameterRole, Recipe, ResolvedPrior, Result, Spec, Trials, autoregression, metadata, paired,
     prior_model::ParameterPrior,
     priors::{self, PriorNode},
+    shared_groups::{Block, Coefficients},
 };
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs};
 
-pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
+pub(crate) fn model(recipe: &mut Recipe, shared: &[Block]) -> Result<Module> {
+    model_with_forecast(recipe, shared, false)
+}
+
+pub(crate) fn model_with_forecast(
+    recipe: &mut Recipe,
+    shared: &[Block],
+    forecast: bool,
+) -> Result<Module> {
     let mut module = Module::new();
     let mut b = Builder::new(&mut module);
     b.stamp_compat();
+    let is_paired = recipe.paired_response.is_some();
     let count_set = b.call_head("posintegers");
     let size = b.call("external", &[count_set]);
     b.bind("N", size);
@@ -23,6 +33,9 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             "reals"
         },
     );
+    if is_paired {
+        external_vector(&mut b, paired::SECOND_DATA, "reals");
+    }
     if matches!(recipe.formula.trials, Some(Trials::Column(_))) {
         external_vector(&mut b, "trials_data", "nonnegintegers");
     }
@@ -34,20 +47,49 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     }
     crate::response::declare(&mut b, &recipe.formula);
     if recipe.formula.ar.is_some() {
-        autoregression::declare(&mut b);
+        autoregression::declare(&mut b, forecast);
     }
+    let predictor_n = if forecast {
+        autoregression::DESIGN_N
+    } else {
+        "N"
+    };
     if let Some(nonlinear) = &recipe.nonlinear {
         for i in 0..nonlinear.columns.len() {
-            external_vector(&mut b, &crate::nonlinear::data_name(i), "reals");
+            external_vector_sized(
+                &mut b,
+                &crate::nonlinear::data_name(i),
+                "reals",
+                predictor_n,
+            );
         }
     }
     let predictor_names: Vec<_> = recipe
         .predictors()
         .map(|(name, _)| name.to_owned())
         .collect();
+    for block in shared {
+        let index = b.alloc_name(&format!("index_{}_joint", block.group));
+        external_vector_sized(&mut b, &index, "posintegers", predictor_n);
+        let mut offset = 0;
+        for (name, i) in &block.members {
+            let group = &mut recipe.predictors.get_mut(name).unwrap().groups[*i];
+            group.index.clone_from(&index);
+            group.shared = Some(Coefficients {
+                offset,
+                width: block.width,
+            });
+            offset += group.coefficients.len();
+        }
+    }
     for name in &predictor_names {
         let suffix = recipe.predictor_suffix(name);
-        predictor_data(&mut b, &suffix, recipe.predictors.get_mut(name).unwrap());
+        predictor_data(
+            &mut b,
+            &suffix,
+            recipe.predictors.get_mut(name).unwrap(),
+            predictor_n,
+        );
     }
     let mut parameters = Vec::new();
     let thresholds = recipe.thresholds();
@@ -62,7 +104,10 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             &mut parameters,
         )?;
     }
-    for &name in recipe.family.auxiliaries() {
+    for block in shared {
+        shared_group_parameters(&mut b, recipe, block, &mut parameters)?;
+    }
+    for name in recipe.auxiliary_names() {
         if recipe.predictors.contains_key(name) {
             continue;
         }
@@ -71,10 +116,10 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             b.bind(name, zero);
             continue;
         }
-        let support = if matches!(name, "zi" | "hu") {
-            let zero = b.lit_real(0.0);
+        let support = if matches!(name, "zi" | "hu" | "rescor") {
+            let lower = b.lit_real(if name == "rescor" { -1.0 } else { 0.0 });
             let one = b.lit_real(1.0);
-            b.call("interval", &[zero, one])
+            b.call("interval", &[lower, one])
         } else {
             lower_bound(&mut b, if name == "nu" { 1.0 } else { 0.0 })
         };
@@ -105,6 +150,14 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             "a formula model needs at least one sampled parameter".into(),
         ));
     }
+    if let Some(fields) = parameters
+        .iter()
+        .map(|parameter| Some((parameter.name.as_str(), parameter.coordinate_set?)))
+        .collect::<Option<Vec<_>>>()
+    {
+        let domain = b.call_kw("cartprod", &fields);
+        b.bind("formula_parameter_domain", domain);
+    }
     let prior = crate::prior_model::build(&mut b, &parameters)?;
     let parameters: Vec<_> = parameters
         .into_iter()
@@ -123,6 +176,7 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             if name == "mu" { thresholds } else { 0 },
             recipe.family,
             recipe.is_nonlinear_parameter(name),
+            predictor_n,
         );
     }
     if let Some(nonlinear) = &recipe.nonlinear {
@@ -137,6 +191,9 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
             recipe.link.inverse(&mut b, eta)
         };
         b.bind("mu", mu);
+    }
+    if forecast {
+        forecast_mean_bindings(&mut b, recipe);
     }
     let mu = if recipe.family == Family::Categorical {
         b.lit_real(0.0)
@@ -171,38 +228,55 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         auxiliary: &auxiliary,
         cuts: &cuts,
     };
-    let law = if recipe.formula.ar.is_some() {
-        autoregression::law(&mut b, mu)
-    } else if let Some(truncation) = &recipe.formula.truncation {
-        let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
-        crate::response::truncated_normal(&mut b, mu, sigma, truncation)
+    let response = if is_paired {
+        paired::draw(&mut b)?
     } else {
-        recipe.family.observation(&mut b, observation, false)
+        let law = if recipe.formula.ar.is_some() {
+            autoregression::law(&mut b, mu, forecast)
+        } else if let Some(truncation) = &recipe.formula.truncation {
+            let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+            crate::response::truncated_normal(&mut b, mu, sigma, truncation)
+        } else {
+            recipe.family.observation(&mut b, observation, false)
+        };
+        let y = b.call("draw", &[law]);
+        b.bind("y", y);
+        let y = b.self_ref("y");
+        b.call_fields("record", &[("y", y)])
     };
-    let y = b.call("draw", &[law]);
-    b.bind("y", y);
-    let y = b.self_ref("y");
-    let response = b.call_fields("record", &[("y", y)]);
     let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
-    if let Some(expected) = crate::expectation::emit(&mut b, recipe, observation) {
+    let expected = if is_paired {
+        Some(paired::expected(&mut b))
+    } else if forecast {
+        Some(autoregression::forecast_mean(&mut b, mu))
+    } else {
+        crate::expectation::emit(&mut b, recipe, observation)
+    };
+    if let Some(expected) = expected {
         let expected = parameter_function(&mut b, "functionof", expected, &parameters);
         b.bind_doc(
             "expected_response",
             expected,
-            &["Conditional response means or category probabilities in training order."],
+            &["Conditional response means or category probabilities in model row order."],
         );
     }
-    let pointwise = if recipe.formula.ar.is_some() {
-        autoregression::pointwise(&mut b, mu)
+    let pointwise = if is_paired {
+        paired::pointwise(&mut b)
+    } else if recipe.formula.ar.is_some() {
+        autoregression::pointwise(&mut b, mu, forecast)
     } else {
         pointwise_log_likelihood(&mut b, recipe, scale)
     };
     let likelihood = if recipe.formula.censoring.is_some() || recipe.formula.ar.is_some() {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
     } else {
-        let y = b.self_ref("y_data");
-        let observation = b.call_fields("record", &[("y", y)]);
+        let observation = if is_paired {
+            paired::observation(&mut b)
+        } else {
+            let y = b.self_ref("y_data");
+            b.call_fields("record", &[("y", y)])
+        };
         let kernel = b.self_ref("K_model");
         b.call("likelihoodof", &[kernel, observation])
     };
@@ -267,7 +341,34 @@ pub(crate) fn predictor_name(dpar: &str, name: &str) -> String {
     }
 }
 
-fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::PredictorRecipe) {
+fn forecast_mean_bindings(b: &mut Builder<'_>, recipe: &Recipe) {
+    let eta = b.sym("eta_mu");
+    let eta = b.m.binding_by_name(eta).expect("Gaussian predictor");
+    let full_eta = b.m.binding(eta).rhs;
+    b.bind("ar_design_eta", full_eta);
+    let full_eta = b.self_ref("ar_design_eta");
+    let full_mu = recipe.link.inverse(b, full_eta);
+    b.bind(autoregression::DESIGN_MEAN, full_mu);
+    let full_mu = b.self_ref(autoregression::DESIGN_MEAN);
+    let gaps = b.self_ref(autoregression::GAP);
+    let future = b.call("indicesof", &[gaps]);
+    let eta_values = b.call("get", &[full_eta, future]);
+    b.m.set_binding_rhs(eta, eta_values);
+    let mu = b.sym("mu");
+    let mu = b.m.binding_by_name(mu).expect("Gaussian mean");
+    let mu_values = b.call("get", &[full_mu, future]);
+    b.m.set_binding_rhs(mu, mu_values);
+}
+
+fn predictor_data(
+    b: &mut Builder<'_>,
+    dpar: &str,
+    recipe: &mut crate::PredictorRecipe,
+    predictor_n: &str,
+) {
+    let external_vector = |b: &mut Builder<'_>, name: &str, set: &str| {
+        external_vector_sized(b, name, set, predictor_n);
+    };
     let monotonic_columns = recipe
         .monotonic_design
         .as_ref()
@@ -348,8 +449,10 @@ fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::Predictor
         .map(|(predictor, name)| (predictor.column.clone(), name.clone()))
         .collect();
     for (group_index, group) in recipe.groups.iter_mut().enumerate() {
-        group.index = b.alloc_name(&predictor_name(dpar, &format!("index_{}", group.column)));
-        external_vector(b, &group.index, "posintegers");
+        if group.shared.is_none() {
+            group.index = b.alloc_name(&predictor_name(dpar, &format!("index_{}", group.column)));
+            external_vector(b, &group.index, "posintegers");
+        }
         group.inputs = group
             .design
             .predictors
@@ -384,7 +487,7 @@ fn predictor_parameters(
     if thresholds > 0 {
         let names = scope(b, family);
         let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-        let PriorNode::Measure(prior) =
+        let PriorNode::Measure { law: prior, .. } =
             priors::emit(b, &recipe.priors.intercept, None, None, &bindings)?
         else {
             return Err(Error(
@@ -396,7 +499,7 @@ fn predictor_parameters(
         let domain = b.call("ordered", &[count]);
         let reference = b.call("Lebesgue", &[domain]);
         let prior = b.call("tilt", &[prior, reference]);
-        declare_parameter(b, "cuts", prior, parameters);
+        declare_parameter(b, "cuts", prior, Some(domain), parameters);
     } else if recipe.formula.intercept {
         parameter(
             b,
@@ -417,9 +520,13 @@ fn predictor_parameters(
             let prior = priors::emit(b, &priors[0], None, None, &bindings)?;
             let count = b.lit_int(priors.len() as i64);
             match prior {
-                PriorNode::Measure(prior) => {
+                PriorNode::Measure {
+                    law: prior,
+                    restriction,
+                } => {
                     let iid = b.call("iid", &[prior, count]);
-                    declare_parameter(b, &predictor_name(dpar, name), iid, parameters);
+                    let restriction = restriction.map(|set| b.call("cartpow", &[set, count]));
+                    declare_parameter(b, &predictor_name(dpar, name), iid, restriction, parameters);
                 }
                 PriorNode::Constant(value) => {
                     let values = b.call("fill", &[value, count]);
@@ -457,7 +564,7 @@ fn predictor_parameters(
             let one = b.lit_real(1.0);
             let normal = b.call("Normal", &[zero, one]);
             let law = b.call("iid", &[normal, rank]);
-            declare_parameter(b, z, law, parameters);
+            declare_parameter(b, z, law, None, parameters);
         }
     }
     for (smooth, term) in recipe
@@ -483,7 +590,7 @@ fn predictor_parameters(
             let normal = b.call("Normal", &[zero, one]);
             let rank = b.lit_int(block.inputs.len() as i64);
             let law = b.call("iid", &[normal, rank]);
-            declare_parameter(b, &block.z, law, parameters);
+            declare_parameter(b, &block.z, law, None, parameters);
         }
     }
     for (i, coding) in recipe.monotonic.iter().enumerate() {
@@ -521,9 +628,10 @@ fn predictor_parameters(
             let names = scope(b, family);
             let bindings: Vec<_> = names.iter().map(String::as_str).collect();
             match priors::emit(b, &sd_priors[0], Some(support), None, &bindings)? {
-                PriorNode::Measure(law) => {
+                PriorNode::Measure { law, restriction } => {
                     let law = b.call("iid", &[law, dimension]);
-                    declare_parameter(b, &group.sd, law, parameters);
+                    let restriction = restriction.map(|set| b.call("cartpow", &[set, dimension]));
+                    declare_parameter(b, &group.sd, law, restriction, parameters);
                 }
                 PriorNode::Constant(value) => {
                     let value = b.call("fill", &[value, dimension]);
@@ -540,37 +648,122 @@ fn predictor_parameters(
             let value = b.array(&values);
             b.bind(&group.sd, value);
         }
+        if group.shared.is_some() {
+            continue;
+        }
         group.z = b.alloc_name(&predictor_name(dpar, &format!("z_{}", group.column)));
         let iid = group_innovations(b, dimensions, group.levels.len());
-        declare_parameter(b, &group.z, iid, parameters);
+        declare_parameter(b, &group.z, iid, None, parameters);
         group.r = b.alloc_name(&predictor_name(dpar, &format!("r_{}", group.column)));
         let sd = b.self_ref(&group.sd);
         let z = b.self_ref(&group.z);
         let effect = if dimensions == 1 {
             broadcast(b, "mul", &[sd, z])
         } else {
-            let mut scale = b.call("diagmat", &[sd]);
-            if let Some(prior) = &recipe.priors.cor[i] {
-                let name = b.alloc_name(&predictor_name(dpar, &format!("L_{}", group.column)));
-                let names = scope(b, family);
-                let bindings: Vec<_> = names.iter().map(String::as_str).collect();
-                let law = priors::emit_correlation(b, prior, dimensions, &bindings)?;
-                declare_parameter(b, &name, law, parameters);
-                let cholesky = b.self_ref(&name);
-                scale = b.call("mul", &[scale, cholesky]);
-                group.correlation = Some(name);
-                let name = b.alloc_name(&predictor_name(dpar, &format!("Cor_{}", group.column)));
-                let transposed = b.call("transpose", &[cholesky]);
-                let correlation = b.call("mul", &[cholesky, transposed]);
-                b.bind(&name, correlation);
-                group.correlation_matrix = Some(name);
-            }
-            let effect = b.call("mul", &[scale, z]);
-            b.call("transpose", &[effect])
+            let lower = if let Some(prior) = &recipe.priors.cor[i] {
+                let (lower, correlation) = group_correlation(
+                    b,
+                    |kind| predictor_name(dpar, &format!("{kind}_{}", group.column)),
+                    prior,
+                    dimensions,
+                    family,
+                    parameters,
+                )?;
+                let value = b.self_ref(&lower);
+                group.correlation = Some(lower);
+                group.correlation_matrix = Some(correlation);
+                Some(value)
+            } else {
+                None
+            };
+            group_effect_matrix(b, sd, z, lower)
         };
         b.bind(&group.r, effect);
     }
     Ok(())
+}
+
+fn shared_group_parameters(
+    b: &mut Builder<'_>,
+    recipe: &mut Recipe,
+    block: &Block,
+    parameters: &mut Vec<ParameterPrior>,
+) -> Result<()> {
+    let name = format!("{}_joint", block.group);
+    let levels = {
+        let (predictor, i) = &block.members[0];
+        recipe.predictors[predictor].groups[*i].levels.len()
+    };
+    let z = b.alloc_name(&format!("z_{name}"));
+    let iid = group_innovations(b, block.width, levels);
+    declare_parameter(b, &z, iid, None, parameters);
+
+    let (lower, cor) = group_correlation(
+        b,
+        |kind| format!("{kind}_{name}"),
+        &block.prior,
+        block.width,
+        recipe.family,
+        parameters,
+    )?;
+
+    let r = b.alloc_name(&format!("r_{name}"));
+    let mut scales = Vec::with_capacity(block.width);
+    for (predictor, i) in &block.members {
+        let group = &mut recipe.predictors.get_mut(predictor).unwrap().groups[*i];
+        group.z.clone_from(&z);
+        group.r.clone_from(&r);
+        group.correlation = Some(lower.clone());
+        group.correlation_matrix = Some(cor.clone());
+        let scale = b.self_ref(&group.sd);
+        if group.coefficients.len() == 1 {
+            scales.push(scale);
+        } else {
+            for j in 1..=group.coefficients.len() {
+                let index = b.lit_int(j as i64);
+                scales.push(b.call("get", &[scale, index]));
+            }
+        }
+    }
+    let scales = b.array(&scales);
+    let innovations = b.self_ref(&z);
+    let cholesky = b.self_ref(&lower);
+    let effect = group_effect_matrix(b, scales, innovations, Some(cholesky));
+    b.bind(&r, effect);
+    Ok(())
+}
+
+fn group_correlation(
+    b: &mut Builder<'_>,
+    name: impl Fn(&str) -> String,
+    prior: &ResolvedPrior,
+    width: usize,
+    family: Family,
+    parameters: &mut Vec<ParameterPrior>,
+) -> Result<(String, String)> {
+    let lower = b.alloc_name(&name("L"));
+    let bindings = scope(b, family);
+    let bindings: Vec<_> = bindings.iter().map(String::as_str).collect();
+    let law = priors::emit_correlation(b, prior, width, &bindings)?;
+    declare_parameter(b, &lower, law, None, parameters);
+    let cholesky = b.self_ref(&lower);
+    let transposed = b.call("transpose", &[cholesky]);
+    let correlation = b.call("mul", &[cholesky, transposed]);
+    let cor = b.alloc_name(&name("Cor"));
+    b.bind(&cor, correlation);
+    Ok((lower, cor))
+}
+
+fn group_effect_matrix(
+    b: &mut Builder<'_>,
+    scales: NodeId,
+    innovations: NodeId,
+    lower: Option<NodeId>,
+) -> NodeId {
+    let diagonal = b.call("diagmat", &[scales]);
+    let scale = lower.map_or(diagonal, |lower| b.call("mul", &[diagonal, lower]));
+    let effect = b.call("mul", &[scale, innovations]);
+    b.call("transpose", &[effect])
 }
 
 fn group_innovations(b: &mut Builder<'_>, coefficients: usize, levels: usize) -> NodeId {
@@ -593,13 +786,20 @@ pub(crate) fn extend_group_draws(
     shapes: &crate::NewGroupShapes,
 ) -> Result<Module> {
     let mut b = Builder::new(&mut template);
+    let domain_name = b.sym("formula_parameter_domain");
+    let mut domain = b.m.binding_by_name(domain_name).map(|binding| {
+        let Node::Call(call) = b.m.node(b.m.binding(binding).rhs) else {
+            unreachable!("the converter emits the parameter domain as a Cartesian product")
+        };
+        (binding, call.clone())
+    });
     for (name, shape) in shapes {
         let group = recipe
             .predictors()
             .flat_map(|(_, predictor)| &predictor.groups)
             .find(|group| group.z == *name)
             .ok_or_else(|| Error(format!("unknown group parameter `{name}`")))?;
-        let coefficients = group.coefficients.len();
+        let coefficients = group.innovation_width();
         let new_count = match shape.as_slice() {
             [count] if coefficients == 1 => *count,
             [rows, count] if coefficients > 1 && *rows == coefficients => *count,
@@ -618,6 +818,15 @@ pub(crate) fn extend_group_draws(
         let iid = group_innovations(&mut b, coefficients, levels);
         let draw = b.call("draw", &[iid]);
         b.m.set_binding_rhs(binding, draw);
+        if let Some((_, cartprod)) = &mut domain
+            && let Some(field) = cartprod.named.iter_mut().find(|arg| arg.name == symbol)
+        {
+            field.value = crate::prior_model::parameter_support(&mut b, iid);
+        }
+    }
+    if let Some((binding, cartprod)) = domain {
+        let value = b.m.alloc(Node::Call(cartprod));
+        b.m.set_binding_rhs(binding, value);
     }
     Ok(template)
 }
@@ -629,11 +838,12 @@ fn predictor_values(
     thresholds: usize,
     family: Family,
     nonlinear_parameter: bool,
+    predictor_n: &str,
 ) {
     let fixed_inputs: Vec<_> = (0..recipe.design.predictors.len())
         .map(|i| predictor_name(dpar, &format!("x_{}", i + 1)))
         .collect();
-    let n = b.self_ref("N");
+    let n = b.self_ref(predictor_n);
     let zero = b.lit_real(0.0);
     let mut eta = b.call("fill", &[zero, n]);
     let mut intercept = recipe.formula.intercept.then(|| {
@@ -743,10 +953,10 @@ fn predictor_values(
             let values = b.self_ref(&name);
             let effect = b.self_ref(&group.r);
             let index = b.self_ref(&group.index);
-            let selected = if group.coefficients.len() == 1 {
+            let selected = if group.innovation_width() == 1 {
                 b.call("get", &[effect, index])
             } else {
-                let column = b.lit_int(j as i64 + 1);
+                let column = b.lit_int((group.coefficient_offset() + j + 1) as i64);
                 b.call("get", &[effect, index, column])
             };
             let contribution = broadcast(b, "mul", &[selected, values]);
@@ -960,8 +1170,12 @@ fn threshold_inputs(b: &mut Builder<'_>, recipe: &Recipe) -> Vec<NodeId> {
 }
 
 pub(crate) fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
+    external_vector_sized(b, name, set, "N");
+}
+
+fn external_vector_sized(b: &mut Builder<'_>, name: &str, set: &str, size: &str) {
     let set = b.call_head(set);
-    let n = b.self_ref("N");
+    let n = b.self_ref(size);
     let domain = b.call("cartpow", &[set, n]);
     let external = b.call("external", &[domain]);
     b.bind(name, external);
@@ -1061,13 +1275,23 @@ fn parameter(
     let names = scope(b, family);
     let bindings: Vec<_> = names.iter().map(String::as_str).collect();
     match priors::emit(b, prior, support, None, &bindings)? {
-        PriorNode::Measure(law) => declare_parameter(b, name, law, parameters),
+        PriorNode::Measure { law, restriction } => {
+            declare_parameter(b, name, law, restriction, parameters)
+        }
         PriorNode::Constant(value) => {
             if name == "ar"
                 && crate::prior_expr::scalar(b.m, value).is_some_and(|value| value.abs() >= 1.0)
             {
                 return Err(Error(
                     "ar() requires a coefficient strictly between -1 and 1".into(),
+                ));
+            }
+            if name == "rescor"
+                && crate::prior_expr::scalar(b.m, value).is_some_and(|value| value.abs() >= 1.0)
+            {
+                return Err(Error(
+                    "paired Gaussian residual correlation must lie strictly between -1 and 1"
+                        .into(),
                 ));
             }
             b.bind(name, value);
@@ -1089,7 +1313,7 @@ fn monotonic_simplex(
         let singleton = b.array(&[one]);
         b.bind(name, singleton);
     } else {
-        declare_parameter(b, name, law, parameters);
+        declare_parameter(b, name, law, None, parameters);
     }
     Ok(())
 }
@@ -1104,6 +1328,7 @@ fn declare_parameter(
     b: &mut Builder<'_>,
     name: &str,
     law: NodeId,
+    restriction: Option<NodeId>,
     parameters: &mut Vec<ParameterPrior>,
 ) {
     // Classify all priors after their parameter references exist. Only proper
@@ -1114,6 +1339,7 @@ fn declare_parameter(
     parameters.push(ParameterPrior {
         name: name.into(),
         measure: law,
+        coordinate_set: crate::prior_model::coordinate_set(b, law, restriction, support),
     });
 }
 
@@ -1160,7 +1386,7 @@ pub(crate) fn with_data_source(
                 .map(|(id, v)| (id, v.rhs))
                 .ok_or_else(|| Error(format!("missing prepared data binding `{column}`")))?;
         if let DataValue::Integer(value) = value {
-            if column != "N" {
+            if column != "N" && column != autoregression::DESIGN_N {
                 return Err(Error(format!("unexpected scalar data binding `{column}`")));
             }
             let value = b.lit_int(*value);
@@ -1193,26 +1419,72 @@ pub(crate) fn info(
     recipe: &Recipe,
     data: &DataDocument,
     module: &Module,
+    shared: &[Block],
 ) -> Result<ModelInfo> {
     let mut parameters = Vec::new();
-    let mut group_offset = 0;
+    let mut group_numbers = std::collections::HashMap::new();
     for (dpar, predictor) in recipe.predictors() {
         let thresholds = if dpar == "mu" { recipe.thresholds() } else { 0 };
+        let numbers: Vec<_> = predictor
+            .groups
+            .iter()
+            .map(|group| {
+                let next = group_numbers.len() + 1;
+                *group_numbers.entry(group.z.as_str()).or_insert(next)
+            })
+            .collect();
         parameters.extend(predictor_info(
             dpar,
             &recipe.predictor_suffix(dpar),
             predictor,
             module,
             thresholds,
-            group_offset,
+            &numbers,
         )?);
-        group_offset += predictor.groups.len();
+    }
+    for block in shared {
+        let (name, i) = &block.members[0];
+        let group = &recipe.predictors[name].groups[*i];
+        let number = group_numbers[group.z.as_str()];
+        let lower = group.correlation.as_deref().unwrap();
+        let correlation = group.correlation_matrix.as_deref().unwrap();
+        let coefficients: Vec<_> = block
+            .members
+            .iter()
+            .flat_map(|(name, i)| {
+                recipe.predictors[name].groups[*i]
+                    .coefficients
+                    .iter()
+                    .map(move |coef| {
+                        if name == "mu" {
+                            coef.clone()
+                        } else {
+                            format!("{name}_{coef}")
+                        }
+                    })
+            })
+            .collect();
+        for (i, coefficient) in coefficients.iter().enumerate() {
+            for j in 0..=i {
+                parameters.push(parameter_info(
+                    format!("L_{number}[{},{}]", i + 1, j + 1),
+                    lower,
+                    &[i + 1, j + 1],
+                    ParameterRole::Sampled,
+                ));
+            }
+            for (j, other) in coefficients.iter().enumerate().skip(i + 1) {
+                parameters.push(parameter_info(
+                    format!("cor_{}__{coefficient}__{other}", group.column),
+                    correlation,
+                    &[i + 1, j + 1],
+                    ParameterRole::Derived,
+                ));
+            }
+        }
     }
     for name in recipe
-        .family
-        .auxiliaries()
-        .iter()
-        .copied()
+        .auxiliary_names()
         .chain(recipe.formula.ar.is_some().then_some("ar"))
     {
         if !recipe.predictors.contains_key(name) {
@@ -1257,6 +1529,10 @@ pub(crate) fn info(
     };
     Ok(ModelInfo {
         formula: spec.formula.clone(),
+        response_columns: recipe
+            .paired_response
+            .as_ref()
+            .map(|second| [recipe.formula.response.clone(), second.clone()]),
         family: spec.family.clone(),
         link: recipe.link.name().into(),
         group_collation: "C".into(),
@@ -1288,10 +1564,13 @@ pub(crate) fn info(
             .keys()
             .filter(|name| name.as_str() != "mu" && !spec.nlpars.contains_key(*name))
             .map(|name| {
-                let formula = spec
-                    .dpars
-                    .get(name)
-                    .map_or(&spec.formula, |dpar| &dpar.formula);
+                let formula = if name == paired::SECOND_MEAN && recipe.paired_response.is_some() {
+                    spec.paired_formula.as_ref().unwrap()
+                } else {
+                    spec.dpars
+                        .get(name)
+                        .map_or(&spec.formula, |dpar| &dpar.formula)
+                };
                 (name.clone(), predictor_metadata(name, formula))
             })
             .collect(),
@@ -1324,7 +1603,7 @@ fn predictor_info(
     recipe: &crate::PredictorRecipe,
     module: &Module,
     thresholds: usize,
-    group_offset: usize,
+    group_numbers: &[usize],
 ) -> Result<Vec<Parameter>> {
     let prefix = if name == "mu" {
         String::new()
@@ -1333,14 +1612,7 @@ fn predictor_info(
     };
     let mut parameters = Vec::new();
     let mut add = |name: String, binding: &str, indices: &[usize], role| {
-        parameters.push(Parameter {
-            name,
-            binding: binding.into(),
-            index: (indices.len() == 1).then(|| indices[0]),
-            indices: (indices.len() > 1).then(|| indices.to_vec()),
-            role,
-            derived: role != ParameterRole::Sampled,
-        })
+        parameters.push(parameter_info(name, binding, indices, role))
     };
     if thresholds > 0 {
         for i in 1..=thresholds {
@@ -1555,7 +1827,7 @@ fn predictor_info(
             }
         }
     }
-    for (group_index, group) in recipe.groups.iter().enumerate() {
+    for (group, &number) in recipe.groups.iter().zip(group_numbers) {
         let k = group.coefficients.len();
         for (j, coefficient) in group.coefficients.iter().enumerate() {
             let name = format!("sd_{}__{prefix}{coefficient}", group.column);
@@ -1574,27 +1846,32 @@ fn predictor_info(
         for (i, level) in group.levels.iter().enumerate() {
             for (j, coefficient) in group.coefficients.iter().enumerate() {
                 let vector_index = [i + 1];
-                let z_index = [j + 1, i + 1];
-                let r_index = [i + 1, j + 1];
+                let coordinate = group.coefficient_offset() + j + 1;
+                let z_index = [coordinate, i + 1];
+                let r_index = [i + 1, coordinate];
+                let vector = group.innovation_width() == 1;
                 add(
-                    format!("z_{}[{},{}]", group_offset + group_index + 1, j + 1, i + 1),
+                    format!("z_{number}[{coordinate},{}]", i + 1),
                     &group.z,
-                    if k == 1 { &vector_index } else { &z_index },
+                    if vector { &vector_index } else { &z_index },
                     ParameterRole::Sampled,
                 );
                 add(
                     format!("r_{}[{level},{prefix}{coefficient}]", group.column),
                     &group.r,
-                    if k == 1 { &vector_index } else { &r_index },
+                    if vector { &vector_index } else { &r_index },
                     ParameterRole::Derived,
                 );
             }
+        }
+        if group.shared.is_some() {
+            continue;
         }
         if let Some(cholesky) = &group.correlation {
             for i in 0..k {
                 for j in 0..=i {
                     add(
-                        format!("L_{}[{},{}]", group_offset + group_index + 1, i + 1, j + 1),
+                        format!("L_{number}[{},{}]", i + 1, j + 1),
                         cholesky,
                         &[i + 1, j + 1],
                         ParameterRole::Sampled,
@@ -1619,6 +1896,22 @@ fn predictor_info(
         }
     }
     Ok(parameters)
+}
+
+fn parameter_info(
+    name: String,
+    binding: &str,
+    indices: &[usize],
+    role: ParameterRole,
+) -> Parameter {
+    Parameter {
+        name,
+        binding: binding.into(),
+        index: (indices.len() == 1).then(|| indices[0]),
+        indices: (indices.len() > 1).then(|| indices.to_vec()),
+        role,
+        derived: role != ParameterRole::Sampled,
+    }
 }
 
 fn sampled(module: &Module, name: &str) -> bool {

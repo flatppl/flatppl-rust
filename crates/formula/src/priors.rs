@@ -193,6 +193,8 @@ pub(crate) struct PriorContext<'a> {
     pub response: Option<&'a [f64]>,
     pub offset_mean: f64,
     pub group_scale: f64,
+    pub global_cor: bool,
+    pub paired_sigma_scale: Option<f64>,
 }
 
 pub(crate) fn resolve(
@@ -213,10 +215,13 @@ pub(crate) fn resolve(
         response,
         offset_mean,
         group_scale,
+        global_cor,
+        paired_sigma_scale,
     } = context;
+    let second_mean = spec.paired_formula.is_some() && dpar == Some(crate::paired::SECOND_MEAN);
     let scale_link = family.prior_scale_link(link);
     let (mut location, scale) = default_scale(scale_link, response);
-    if dpar.is_some() {
+    if dpar.is_some() && !second_mean {
         location = 0.0;
     } else if response.is_some() && scale_link.uses_response_scale() {
         location -= offset_mean;
@@ -235,6 +240,11 @@ pub(crate) fn resolve(
         .filter(|name| dpar.is_none() && !spec.dpars.contains_key(*name))
         .filter(|&name| name != "sigma" || formula.se.as_ref().is_none_or(|se| se.sigma))
         .chain((dpar.is_none() && formula.ar.is_some()).then_some("ar"))
+        .chain(
+            paired_sigma_scale
+                .iter()
+                .flat_map(|_| crate::paired::AUXILIARIES),
+        )
         .collect();
     let threshold_names: Vec<_> = (1..=thresholds).map(|i| i.to_string()).collect();
     if thresholds > 0 {
@@ -330,6 +340,7 @@ pub(crate) fn resolve(
         .priors
         .iter()
         .filter(|prior| prior.predictor() == dpar)
+        .filter(|prior| !(global_cor && dpar.is_none() && canonical_class(&prior.class) == "cor"))
         .cloned()
         .collect();
     let selected = select(&priors, &targets)?;
@@ -350,7 +361,7 @@ pub(crate) fn resolve(
         if nonlinear {
             // No intercept is emitted when the nonlinear design omits it.
             student(0.0)
-        } else if let Some(name) = dpar {
+        } else if let Some(name) = dpar.filter(|_| !second_mean) {
             ResolvedPrior::new(family.default_predictor_prior(name, link, scale))
         } else if family == Family::VonMises && link == Link::TanHalf {
             ResolvedPrior::new("student_t(1, 0, 1)")
@@ -432,22 +443,24 @@ pub(crate) fn resolve(
                 })
                 .collect(),
         );
-        cor.push((term.correlated && group.coefficients.len() > 1).then(|| {
-            selected
-                .next()
-                .unwrap()
-                .unwrap_or_else(|| ResolvedPrior::new("lkj(1)"))
-        }));
+        cor.push(
+            (term.id.is_none() && term.correlated && group.coefficients.len() > 1).then(|| {
+                selected
+                    .next()
+                    .unwrap()
+                    .unwrap_or_else(|| ResolvedPrior::new("lkj(1)"))
+            }),
+        );
     }
     let aux = auxiliaries
         .iter()
         .map(|&name| {
-            let prior = selected.next().unwrap().unwrap_or_else(|| {
-                if name == "ar" {
-                    ResolvedPrior::new("uniform(-1, 1)")
-                } else {
-                    ResolvedPrior::new(family.default_auxiliary(name, sigma_scale))
-                }
+            let prior = selected.next().unwrap().unwrap_or_else(|| match name {
+                "ar" | "rescor" => ResolvedPrior::new("uniform(-1, 1)"),
+                "sigma2" => ResolvedPrior::new(
+                    family.default_auxiliary("sigma", paired_sigma_scale.unwrap()),
+                ),
+                _ => ResolvedPrior::new(family.default_auxiliary(name, sigma_scale)),
             });
             (name.into(), prior)
         })
@@ -483,7 +496,7 @@ fn group_targets<'a>(
             group: Some(&group.column),
             dpar,
         }));
-        if term.correlated && group.coefficients.len() > 1 {
+        if term.id.is_none() && term.correlated && group.coefficients.len() > 1 {
             targets.push(PriorTarget {
                 class: "cor",
                 coef: None,
@@ -495,34 +508,52 @@ fn group_targets<'a>(
     targets
 }
 
-pub(crate) fn categorical_correlations(
+pub(crate) fn global_correlations(
     priors: &[Prior],
-    predictors: &mut BTreeMap<String, crate::PredictorRecipe>,
+    recipe: &mut crate::Recipe,
+    shared: &mut [crate::shared_groups::Block],
 ) -> Result<()> {
     let priors: Vec<_> = priors
         .iter()
-        .filter(|prior| canonical_class(&prior.class) == "cor")
+        .filter(|prior| prior.predictor().is_none() && canonical_class(&prior.class) == "cor")
         .cloned()
         .collect();
-    let targets: Vec<_> = predictors
-        .values()
-        .flat_map(|predictor| predictor.groups.iter().zip(&predictor.priors.cor))
-        .filter(|(_, prior)| prior.is_some())
-        .map(|(group, _)| PriorTarget {
+    // Categorical priors historically select a grouping factor across all
+    // category predictors. For other families keep the mean's legacy scope.
+    let local: Vec<_> = recipe
+        .predictors()
+        .filter(|(name, _)| *name == "mu" || recipe.family == Family::Categorical)
+        .flat_map(|(name, predictor)| {
+            predictor
+                .groups
+                .iter()
+                .zip(&predictor.priors.cor)
+                .enumerate()
+                .filter(|(_, (_, prior))| prior.is_some())
+                .map(move |(i, (group, _))| (name.to_owned(), i, group.column.as_str()))
+        })
+        .collect();
+    let targets: Vec<_> = local
+        .iter()
+        .map(|(_, _, group)| *group)
+        .chain(shared.iter().map(|block| block.group.as_str()))
+        .map(|group| PriorTarget {
             class: "cor",
             coef: None,
-            group: Some(&group.column),
+            group: Some(group),
             dpar: None,
         })
         .collect();
-    let selected = select(&priors, &targets)?;
-    for (prior, selected) in predictors
-        .values_mut()
-        .flat_map(|predictor| predictor.priors.cor.iter_mut().flatten())
-        .zip(selected)
-    {
+    let mut selected = select(&priors, &targets)?.into_iter();
+    let local: Vec<_> = local.into_iter().map(|(name, i, _)| (name, i)).collect();
+    for (name, i) in local {
+        if let Some(prior) = selected.next().unwrap() {
+            recipe.predictors.get_mut(&name).unwrap().priors.cor[i] = Some(prior);
+        }
+    }
+    for (block, selected) in shared.iter_mut().zip(selected) {
         if let Some(selected) = selected {
-            *prior = selected;
+            block.prior = selected;
         }
     }
     Ok(())

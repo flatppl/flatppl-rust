@@ -221,6 +221,28 @@ pub(crate) fn emit(module: &mut Module, info: &ModelInfo) -> Result<()> {
     let mut model = serde_json::to_value(info)?;
     model["parameters"] = names.clone();
     let mut b = Builder::new(module);
+    let report_fields = info
+        .parameters
+        .iter()
+        .map(|parameter| parameter.binding.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let fields = report_fields
+        .into_iter()
+        .map(|name| (name, b.self_ref(name)))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let sampled = info
+        .parameters
+        .iter()
+        .filter(|parameter| {
+            parameter.role == ParameterRole::Sampled && seen.insert(parameter.binding.as_str())
+        })
+        .map(|parameter| parameter.binding.clone())
+        .collect::<Vec<_>>();
+    let values = b.call_fields("record", &fields);
+    let values = crate::emit::parameter_function(&mut b, "functionof", values, &sampled);
+    b.bind("reported_parameters", values);
+
     let names = literal(&mut b, &names)?;
     b.bind("formula_parameter_names", names);
     let model = literal(&mut b, &model)?;

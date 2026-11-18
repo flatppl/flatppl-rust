@@ -7,7 +7,10 @@ use flatppl_core::{
 };
 
 pub(crate) enum PriorNode {
-    Measure(NodeId),
+    Measure {
+        law: NodeId,
+        restriction: Option<NodeId>,
+    },
     Constant(NodeId),
 }
 
@@ -107,7 +110,8 @@ pub(crate) fn emit_correlation(
             "correlation priors do not support scalar bounds".into(),
         ));
     }
-    let PriorNode::Measure(node) = emit(b, prior, None, Some(dimension), bindings)? else {
+    let PriorNode::Measure { law: node, .. } = emit(b, prior, None, Some(dimension), bindings)?
+    else {
         return Err(Error(
             "correlation priors require an LKJ law; matrix constants are unsupported".into(),
         ));
@@ -241,7 +245,10 @@ pub(crate) fn emit(
     } else {
         node
     };
-    Ok(PriorNode::Measure(measure))
+    Ok(PriorNode::Measure {
+        law: measure,
+        restriction,
+    })
 }
 
 fn restrict(b: &mut Builder<'_>, measure: NodeId, support: NodeId) -> Result<NodeId> {

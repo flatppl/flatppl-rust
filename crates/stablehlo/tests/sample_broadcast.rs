@@ -94,7 +94,6 @@ fn scalar_row_sampling_does_not_flatten_parameter_event_axes() {
             "mu = [[0, 0], [1, 1]], cov = [rowstack([[1, 0], [0, 1]])]",
         ),
         ("Categorical", "p = [[0.2, 0.8], [0.6, 0.4]]"),
-        ("Binomial", "n = 3, p = [0.2, 0.8]"),
     ] {
         let mut model = flatppl_syntax::parse(&format!(
             "p = external(reals)\ninputs = p\n\

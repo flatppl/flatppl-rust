@@ -18,10 +18,12 @@ mod metadata;
 mod monotonic;
 mod nonlinear;
 mod ordinal;
+mod paired;
 mod prior_expr;
 mod prior_model;
 mod priors;
 mod response;
+mod shared_groups;
 mod splines;
 mod tensor;
 mod text;
@@ -33,7 +35,8 @@ use std::{collections::BTreeMap, fmt};
 pub use autoregression::Ar1;
 use data::ColumnModel;
 pub use data::{
-    DataDocument, DataMode, DataValue, NewGroupShapes, prepare_data, prepare_data_with_new_groups,
+    DataDocument, DataMode, DataValue, NewGroupShapes, PreparedForecast, prepare_data,
+    prepare_data_with_new_groups, prepare_forecast,
 };
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
@@ -76,6 +79,9 @@ impl From<serde_json::Error> for Error {
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub formula: String,
+    /// A second response formula for a paired Gaussian model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_formula: Option<String>,
     #[serde(default = "gaussian")]
     pub family: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +185,8 @@ impl Conversion {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recipe {
     pub formula: Formula,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_response: Option<String>,
     pub family: Family,
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +198,8 @@ pub struct Recipe {
     pub nonlinear: Option<NonlinearPredictor>,
     pub predictors: BTreeMap<String, PredictorRecipe>,
     pub auxiliary_priors: BTreeMap<String, ResolvedPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) shared_groups: Vec<shared_groups::Block>,
 }
 
 /// Fitted coding, centring and priors for one distributional predictor.
@@ -236,6 +246,7 @@ impl Recipe {
 
     pub(crate) fn predictors(&self) -> impl Iterator<Item = (&str, &PredictorRecipe)> {
         std::iter::once("mu")
+            .chain(self.paired_response.as_ref().map(|_| paired::SECOND_MEAN))
             .chain(self.family.auxiliaries().iter().copied())
             .chain(self.category_predictors.iter().map(String::as_str))
             .chain(
@@ -244,6 +255,14 @@ impl Recipe {
                     .flat_map(|p| p.parameters.iter().map(String::as_str)),
             )
             .filter_map(|name| self.predictors.get(name).map(|predictor| (name, predictor)))
+    }
+
+    pub(crate) fn auxiliary_names(&self) -> impl Iterator<Item = &'static str> {
+        self.family.auxiliaries().iter().copied().chain(
+            self.paired_response
+                .iter()
+                .flat_map(|_| paired::AUXILIARIES),
+        )
     }
 
     pub(crate) fn thresholds(&self) -> usize {
@@ -268,6 +287,19 @@ pub struct Group {
     pub z: String,
     pub r: String,
     pub index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shared: Option<shared_groups::Coefficients>,
+}
+
+impl Group {
+    pub(crate) fn innovation_width(&self) -> usize {
+        self.shared
+            .map_or(self.coefficients.len(), |block| block.width)
+    }
+
+    pub(crate) fn coefficient_offset(&self) -> usize {
+        self.shared.map_or(0, |block| block.offset)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -301,6 +333,9 @@ impl fmt::Display for GroupLevel {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub formula: String,
+    /// Column names in paired prediction output order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_columns: Option<[String; 2]>,
     pub family: String,
     pub link: String,
     pub group_collation: String,
@@ -396,6 +431,10 @@ pub fn read(json: &str) -> Result<Spec> {
 pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let (family, link) = Family::resolve(&spec.family, spec.link.as_deref())?;
     let (formula, nonlinear) = nonlinear::parse(spec, family)?;
+    let second_formula = paired::parse(spec, family, &formula)?;
+    let paired_response = second_formula
+        .as_ref()
+        .map(|formula| formula.response.clone());
     if family == Family::Cumulative && !formula.intercept {
         return Err(Error(
             "cumulative models require threshold intercepts".into(),
@@ -451,6 +490,9 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     } else {
         vec![("mu", formula.clone(), link)]
     };
+    if let Some(second_formula) = second_formula {
+        formulas.push((paired::SECOND_MEAN, second_formula, link));
+    }
     for (name, spec) in &spec.dpars {
         let formula = parse_formula(&spec.formula)?;
         if formula.response != *name || formula.has_response_additions() {
@@ -529,7 +571,8 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     for (name, predictor, _) in &formulas {
         if predictor
             .predictor_columns()
-            .contains(&formula.response.as_str())
+            .iter()
+            .any(|&name| formula.response == name || paired_response.as_deref() == Some(name))
         {
             return Err(Error(
                 "the response cannot also be a predictor in this subset".into(),
@@ -544,11 +587,13 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     let predictor_formulas: Vec<_> = formulas.iter().map(|(_, formula, _)| formula).collect();
-    let nonlinear_columns = nonlinear.as_ref().map_or(&[][..], |p| p.columns.as_slice());
+    let extra_columns = nonlinear
+        .as_ref()
+        .map_or(paired_response.as_slice(), |p| p.columns.as_slice());
     let rows = data::model_rows(
         &formula,
         &predictor_formulas,
-        nonlinear_columns,
+        extra_columns,
         table,
         DataMode::Training,
     )?;
@@ -584,7 +629,21 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     };
     let (_, group_scale) =
         family::default_scale(family.prior_scale_link(link), response.as_deref());
+    let second_response = paired_response
+        .as_deref()
+        .map(|name| table.column(name)?.numeric(&rows))
+        .transpose()?;
+    let second_sigma_scale = second_response
+        .as_deref()
+        .map(|values| family::default_scale(Link::Identity, Some(values)).1);
+    let second_group_scale = second_response
+        .as_deref()
+        .map(|values| family::default_scale(family.prior_scale_link(link), Some(values)).1);
     let response_formula = formula;
+    let global_cor = family == Family::Categorical
+        || formulas
+            .iter()
+            .any(|(_, formula, _)| formula.groups.iter().any(|term| term.id.is_some()));
     let mut predictors = BTreeMap::new();
     let mut auxiliary_priors = BTreeMap::new();
     for (name, formula, link) in formulas {
@@ -653,6 +712,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                     z: String::new(),
                     r: String::new(),
                     index: String::new(),
+                    shared: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -682,11 +742,23 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 nonlinear: is_nonlinear,
                 response: if is_nonlinear {
                     None
+                } else if name == paired::SECOND_MEAN && paired_response.is_some() {
+                    second_response.as_deref()
                 } else {
                     response.as_deref()
                 },
                 offset_mean,
-                group_scale,
+                global_cor,
+                group_scale: if name == paired::SECOND_MEAN {
+                    second_group_scale.unwrap_or(group_scale)
+                } else {
+                    group_scale
+                },
+                paired_sigma_scale: if name == "mu" {
+                    second_sigma_scale
+                } else {
+                    None
+                },
             },
         )?;
         auxiliary_priors.extend(aux);
@@ -710,11 +782,9 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             },
         );
     }
-    if family == Family::Categorical {
-        priors::categorical_correlations(&spec.priors, &mut predictors)?;
-    }
     let mut recipe = Recipe {
         formula: response_formula,
+        paired_response,
         family,
         link,
         response_levels,
@@ -722,8 +792,13 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         nonlinear,
         predictors,
         auxiliary_priors,
+        shared_groups: Vec::new(),
     };
-    let module = emit::model(&mut recipe)?;
+    let mut shared = shared_groups::plan(&recipe)?;
+    if global_cor {
+        priors::global_correlations(&spec.priors, &mut recipe, &mut shared)?;
+    }
+    let module = emit::model(&mut recipe, &shared)?;
     let data = prepare_data(&recipe, table, DataMode::Training)?;
     let text = flatppl_syntax::print(&module);
     let mut module = flatppl_syntax::parse(&text)
@@ -736,11 +811,12 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             diagnostic.message
         )));
     }
-    let info = emit::info(spec, &recipe, &data, &validation)?;
+    let info = emit::info(spec, &recipe, &data, &validation, &shared)?;
     metadata::emit(&mut module, &info)?;
     let text = flatppl_syntax::print(&module);
     let module = flatppl_syntax::parse(&text)
         .map_err(|e| Error(format!("generated formula metadata failed to reparse: {e}")))?;
+    recipe.shared_groups = shared;
     Ok(Conversion {
         module,
         data,
