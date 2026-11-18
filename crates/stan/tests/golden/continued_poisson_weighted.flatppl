@@ -1,0 +1,11 @@
+# emit: target=post
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+x = [1.0, 2.0, 3.0]
+y_data = [1.0, 2.5, 4.0]
+w_data = [1.0, 0.5, 2.0]
+a ~ Exponential(1)
+mu = a .* x
+prior = lawof(record(a = a))
+log_lik = functionof(((m, v) -> logdensityof(hep.ContinuedPoisson(rate = m), v)).(mu, y_data), a = a)
+post = logweighted(point -> sum(w_data .* log_lik(a = point.a)), prior)

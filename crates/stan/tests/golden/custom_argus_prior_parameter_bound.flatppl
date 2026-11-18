@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+m0 ~ Uniform(interval(5.0, 6.0))
+x ~ hep.Argus(resonance = m0, slope = -20.0, power = 0.5)
+y ~ Normal(x, 1)
+prior = lawof(record(m0 = m0, x = x))
+post = bayesupdate(likelihoodof(kernelof(record(y = y), m0 = m0, x = x), record(y = 5.0)), prior)

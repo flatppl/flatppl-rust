@@ -617,6 +617,11 @@ impl<'m> Emitter<'m> {
             return Ok(ElementLp::One(lp));
         }
         let l = self.law_any(law)?;
+        // Outside a mixture an unnormalized density is exact as it is.
+        if l.unnormalized {
+            self.integer_data(law, &l, y)?;
+            return Ok(ElementLp::One(self.law_density(law, &l, y, None)?));
+        }
         Ok(ElementLp::One(self.law_lp(law, &l, y, None)?))
     }
 
@@ -991,6 +996,15 @@ impl<'m> Emitter<'m> {
                 "an ordered restriction as a mixture component",
             ));
         }
+        self.integer_data(at, law, y)?;
+        // A mixture component is a probability measure; an unnormalized row
+        // has no closed-form share of it.
+        if law.unnormalized {
+            return Err(Refusal::not_yet(
+                Some(at),
+                "an unnormalized law as a mixture component",
+            ));
+        }
         let lp = self.law_density(at, law, y, index)?;
         // A guard matters only where the support varies by component
         // (binomial `n` per component): Stan's lpmf throws outside it.
@@ -1096,6 +1110,7 @@ impl<'m> Emitter<'m> {
             ));
         }
         if !l.discrete {
+            let l = Self::normalized(mix, l)?;
             return self
                 .hurdle_split(lhs, mix, norm, (wd, atom), (wl, law), &l)
                 .map(Some);

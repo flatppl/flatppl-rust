@@ -56,6 +56,11 @@ pub(crate) struct FnRow {
     pub broadcast: String,
     pub caveat: String,
     pub status: String,
+    /// The argument kinds of the row's vector overload (`vector, vector,
+    /// vector, real`): a broadcast `f.(…)` whose argument ranks match is one
+    /// call of it. Empty: no vector overload.
+    #[serde(default)]
+    pub overload: String,
 }
 
 #[derive(Debug, Deserialize)]

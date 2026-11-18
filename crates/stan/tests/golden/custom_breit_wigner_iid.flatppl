@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+hep = standard_module("particle-physics", "0.1")
+y_obs = [91.0, 90.2, 92.5, 88.9, 91.3]
+w ~ Exponential(rate = 0.5)
+y ~ iid(hep.RelativisticBreitWigner(mean = 91.19, width = w), 5)
+prior = lawof(record(w = w))
+L = likelihoodof(kernelof(record(y = y), w = w), record(y = y_obs))
+post = bayesupdate(L, prior)
