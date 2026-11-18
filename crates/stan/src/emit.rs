@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 mod aggregate;
 mod elementwise;
 mod extents;
+mod filter;
 mod functions;
 mod markovchain;
 mod mixture;
@@ -144,6 +145,8 @@ pub(crate) struct Emitter<'m> {
     /// Set while printing an observed value: `splitblocks(A, [1, n])` is
     /// then A, its rows in order.
     rows_ok: bool,
+    /// `filter` count names, by the `filter` node.
+    filter_counts: HashMap<NodeId, String>,
     /// `ifelse` index arrays already filled, by the `ifelse` node.
     selects: HashMap<NodeId, String>,
     /// Parameters declared from their law's sets (`ordered[K]`): only these
@@ -237,6 +240,7 @@ impl<'m> Emitter<'m> {
             general_rows: false,
             rows_ok: false,
             selects: HashMap::new(),
+            filter_counts: HashMap::new(),
             set_declared: HashSet::new(),
             weights: vec![],
             placed: HashMap::new(),
@@ -411,6 +415,9 @@ impl<'m> Emitter<'m> {
         {
             return declare(ty, vs, bounded, &mut |n| n.to_string(), node);
         }
+        // A dynamic extent is declared only by a symbolic size.
+        let marked = crate::stan_type::mark_dynamic(ty);
+        let ty = &marked;
         let mut extents = Vec::new();
         declare(
             ty,
@@ -430,6 +437,11 @@ impl<'m> Emitter<'m> {
                 self.axis_name(n, hints.get(a).copied().flatten(), node, a, naxes, owner)
             })
             .collect();
+        for (&n, l) in extents.iter().zip(&lins) {
+            if n == crate::stan_type::DYNAMIC && (l.as_const().is_some() || l.terms.is_empty()) {
+                return Err(Refusal::not_yet(Some(node), "a dynamic extent"));
+            }
+        }
         let names: Vec<String> = lins.iter().map(extents::Lin::print).collect();
         self.ext_lin.insert(owner.to_string(), lins);
         self.extents.insert(
@@ -654,6 +666,37 @@ impl<'m> Emitter<'m> {
                 self.remember(rhs, &e.s);
                 return Ok(e.s);
             }
+        }
+        // A filter bound whole: its kept elements are the binding.
+        if self.head(rhs) == Some("filter") {
+            let out = self.filter_value(base, rhs);
+            self.owner = outer;
+            return out;
+        }
+        // `rowstack` of a map scan of vectors: its rows filled in place.
+        if self.head(rhs) == Some("rowstack")
+            && let Some(scan) = self.scan_of(self.call(rhs).unwrap().args[0])
+            && let Some(name) = self.stacked_map_scan(base, rhs, scan)?
+        {
+            self.owner = outer;
+            return Ok(name);
+        }
+        // A user call inlined to a name (a record argument's field): the
+        // binding is that name, with no copy.
+        if self.is_user_call(rhs).is_some()
+            && self.has_record_argument(&self.call(rhs).unwrap().args)
+        {
+            let e = self.expr(rhs);
+            self.owner = outer;
+            let e = e?;
+            if structure::is_identifier(&e.s) && self.decls.contains_key(&e.s) {
+                self.remember(rhs, &e.s);
+                return Ok(e.s);
+            }
+            let outer = self.owner.replace((base.to_string(), rhs));
+            let out = self.place(base, rhs, Ok(e));
+            self.owner = outer;
+            return out;
         }
         // A scan bound whole: its column is the binding.
         if self.head(rhs) == Some("scan") {
@@ -1120,6 +1163,13 @@ impl<'m> Emitter<'m> {
                 None => self.module_call(id),
             },
             ("scan", _) => self.scan_expr(id, &args),
+            ("filter", _) => {
+                let base = match &self.owner {
+                    Some((name, _)) => format!("{name}_kept"),
+                    None => "kept".to_string(),
+                };
+                Ok(Ex::atom(self.filter_value(&base, id)?))
+            }
             ("logdensityof", [m, x]) => self.log_density(id, *m, *x),
             ("sum", [a]) if self.density_broadcast(*a).is_some() => {
                 let (m, x) = self.density_broadcast(*a).unwrap();
@@ -1695,12 +1745,7 @@ impl<'m> Emitter<'m> {
         if !supported {
             return Ok(None);
         }
-        let extent = |me: &mut Self, axis: usize| -> Option<String> {
-            me.sym_extent(id, axis, 0).map(|l| l.print())
-        };
-        let (Some(rows), Some(cols)) = (extent(self, 0), extent(self, 1)) else {
-            return Ok(None);
-        };
+        let (rows, cols) = (self.size_text(id, 0, r0), self.size_text(id, 1, r1));
         // The vector inside `addaxes(u, …)`, when the operand is one.
         let addaxes_vector = |me: &Self, a: NodeId| -> Option<NodeId> {
             let r = me.resolve(a);
@@ -1710,6 +1755,7 @@ impl<'m> Emitter<'m> {
         };
         let mut parts = Vec::new();
         let mut full = Vec::new();
+        let mut outer: [Option<Ex>; 2] = [None, None];
         for (&a, side) in args.iter().zip(&sides) {
             let printed = match side {
                 Side::Column | Side::Row => match addaxes_vector(self, a) {
@@ -1723,6 +1769,14 @@ impl<'m> Emitter<'m> {
                 Err(r) if r.kind.is_never() => return Err(r),
                 Err(_) => return Ok(None),
             };
+            // One column times one row is the outer product `u * v'`.
+            match side {
+                Side::Column if vector => outer[0] = Some(e.clone()),
+                Side::Column => outer[0] = Some(Ex::atom(format!("to_vector({})", e.s))),
+                Side::Row if vector => outer[1] = Some(Ex::atom(format!("{}'", e.at(P_ATOM)))),
+                Side::Row => outer[1] = Some(Ex::atom(format!("to_row_vector({})", e.s))),
+                _ => {}
+            }
             parts.push(match (side, vector) {
                 (Side::Column, true) => Ex::atom(format!("rep_matrix({}, {cols})", e.s)),
                 (Side::Column, false) => {
@@ -1735,6 +1789,11 @@ impl<'m> Emitter<'m> {
                 _ => e,
             });
             full.push(!matches!(side, Side::Scalar));
+        }
+        if fname == "mul"
+            && let [Some(u), Some(v)] = outer
+        {
+            return Ok(Some(binary(&[u, v], "*", P_MUL)));
         }
         let both = full.iter().all(|f| *f);
         Ok(Some(match fname {

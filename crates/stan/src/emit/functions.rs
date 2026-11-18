@@ -11,8 +11,8 @@
 
 use super::{Emitter, Ex, P_ATOM};
 use crate::refuse::{Refusal, RefusalKind, Result};
-use crate::stan_type::{StanType, declare};
-use flatppl_core::{CallHead, Inputs, Node, NodeId, Phase, Ref, RefNs, Symbol, Type};
+use crate::stan_type::{StanType, declare, mark_dynamic};
+use flatppl_core::{CallHead, Inputs, Node, NodeId, Phase, Ref, RefNs, ScalarType, Symbol, Type};
 use std::collections::{HashMap, HashSet};
 
 /// The state of a function body being emitted.
@@ -407,7 +407,7 @@ impl<'m> Emitter<'m> {
         let mut names = Vec::new();
         for ((name, r), ty) in entries.iter().zip(arg_tys) {
             let p = self.fresh(self.name(*name));
-            let t = declare(ty, None, false, &mut |_| String::new(), at)?;
+            let t = declare(&mark_dynamic(ty), None, false, &mut |_| String::new(), at)?;
             params.push(format!("{} {p}", arg_type(&t)));
             self.record_decl(&p, t);
             let ctx = self.fctx.as_mut().unwrap();
@@ -427,7 +427,13 @@ impl<'m> Emitter<'m> {
         let ret_ty = self
             .ty(body)
             .ok_or_else(|| Refusal::not_yet(Some(fun), "a function with an untyped result"))?;
-        let ret_t = declare(&ret_ty, None, false, &mut |_| String::new(), body)?;
+        let ret_t = declare(
+            &mark_dynamic(&ret_ty),
+            None,
+            false,
+            &mut |_| String::new(),
+            body,
+        )?;
         let ctx = self.fctx.take().unwrap();
         let mut text_body: Vec<String> = ctx.lines.clone();
         text_body.push(format!("return {ret};"));
@@ -707,7 +713,7 @@ impl<'m> Emitter<'m> {
             let p = self.fresh(self.name(*name));
             let ty = ty.clone().unwrap();
             // A traversed argument is passed whole; a held one as it is.
-            let t = declare(&ty, None, false, &mut |_| String::new(), at)?;
+            let t = declare(&mark_dynamic(&ty), None, false, &mut |_| String::new(), at)?;
             params.push(format!("{} {p}", arg_type(&t)));
             let array = f && !t.array.is_empty();
             self.record_decl(&p, t);
@@ -750,7 +756,13 @@ impl<'m> Emitter<'m> {
             l.ex
         };
         let ret_ty = ret_ty.ok_or_else(|| Refusal::not_yet(Some(at), "an untyped broadcast"))?;
-        let ret_t = declare(&ret_ty, None, false, &mut |_| String::new(), at)?;
+        let ret_t = declare(
+            &mark_dynamic(&ret_ty),
+            None,
+            false,
+            &mut |_| String::new(),
+            at,
+        )?;
         let mut caps = Vec::new();
         for id in identifiers(&ex.s) {
             if !ctx.declared.contains(&id) && !caps.contains(&id) && self.decls.contains_key(&id) {
@@ -795,8 +807,14 @@ impl<'m> Emitter<'m> {
         let Some(fun) = self.user_callee(c.args[0]) else {
             return Ok(None);
         };
+        // Over a whole outer range the rows are A; over any other integer
+        // index array they are the gather `A[idx]`.
         let range = self.resolve(c.args[1]);
-        if self.head(range) != Some("indicesof") {
+        let whole = self.head(range) == Some("indicesof");
+        // `Shape.int` counts Booleans too; a mask is no index array.
+        let int_index = matches!(self.ty(c.args[1]), Some(Type::Array { shape, elem })
+            if shape.len() == 1 && matches!(*elem, Type::Scalar(ScalarType::Integer)));
+        if !whole && !int_index {
             return Ok(None);
         }
         let (body, entries) = self.callable_parts(fun)?;
@@ -833,6 +851,16 @@ impl<'m> Emitter<'m> {
             self.m.for_each_child(n, |k| stack.push(k));
         }
         let a = *a;
+        if !whole {
+            let idx = c.args[1];
+            let base = self.at_module(|me| me.expr(a))?;
+            let ix = self.expr(idx)?;
+            return Ok(Some(super::Ex::atom(format!(
+                "{}[{}]",
+                base.at(P_ATOM),
+                ix.s
+            ))));
+        }
         match (self.sym_extent(range, 0, 0), self.sym_extent(a, 0, 0)) {
             (Some(n), Some(m)) if n == m => {}
             _ => return Ok(None),

@@ -169,6 +169,10 @@ impl<'m> Emitter<'m> {
                 .filter(|l| !(data && l.as_const().is_some())),
         };
         self.data_sizes = data;
+        // A dynamic extent with no symbolic source stays unnamed (refused).
+        if n == crate::stan_type::DYNAMIC && found.is_none() {
+            return Lin::konst(i64::from(n));
+        }
         // A function sees no unnamed data size: its body takes the number.
         if self.fctx.is_some() && found.as_ref().is_some_and(has_token) {
             return Lin::konst(i64::from(n));
@@ -243,6 +247,16 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// The size of axis `axis` of `id` as Stan text, as a declaration names
+    /// it ([`Self::axis_name`]): the symbolic size, or the number `n` where
+    /// it has none, or where a body would need an unnamed data size.
+    pub(super) fn size_text(&mut self, id: NodeId, axis: usize, n: u32) -> String {
+        match self.sym_extent(id, axis, 0) {
+            Some(l) if !(self.fctx.is_some() && has_token(&l)) => l.print(),
+            _ => n.to_string(),
+        }
+    }
+
     /// `true` when two sizes are the same, recording it where one is an
     /// unsourced data size (as an `iid` count records its variate's size).
     /// Two different sourced sizes are never the same.
@@ -271,6 +285,20 @@ impl<'m> Emitter<'m> {
     pub(super) fn resolve_sizes(&mut self) {
         let mut text: HashMap<usize, String> = HashMap::new();
         let mut decls: Vec<(usize, String)> = Vec::new();
+        // A data size declares a `data` value, so it takes a sourced size
+        // only when the `data` block can read it (a `filter` count is
+        // computed in `transformed data`). Otherwise it keeps its own name.
+        let data_names: HashSet<String> = self
+            .data
+            .iter()
+            .filter_map(|l| l.trim_end_matches(';').rsplit(' ').next())
+            .map(str::to_string)
+            .collect();
+        let readable = |l: &Lin| {
+            super::functions::identifiers(&l.print())
+                .iter()
+                .all(|n| data_names.contains(n))
+        };
         for k in 0..self.svars.len() {
             let r = self.find(k);
             if text.contains_key(&r) {
@@ -279,7 +307,7 @@ impl<'m> Emitter<'m> {
                 continue;
             }
             let t = match self.svars[r].bound.clone() {
-                Some(l) => l.print(),
+                Some(l) if readable(&l) => l.print(),
                 _ => {
                     let v = &self.svars[r];
                     let base = if self.used.contains("N") {
@@ -534,6 +562,7 @@ impl<'m> Emitter<'m> {
                 None => self.law_extent(args[0], axis, d),
             },
             "eye" if axis < 2 => self.lin_int(args[0]),
+            "onehot" if axis == 0 => self.lin_int(*args.get(1)?),
             "zeros" | "ones" => {
                 let h = self.extent_list(args[0]).get(axis).copied().flatten()?;
                 self.lin_int(h)
@@ -627,6 +656,8 @@ impl<'m> Emitter<'m> {
                 Some(a.plus(&b))
             }
             "scan" if axis == 0 => self.sym_extent(*args.get(2)?, 0, d),
+            // A `filter` result: its count, computed in `transformed data`.
+            "filter" if axis == 0 => self.filter_counts.get(&id).map(|c| Lin::term(c.clone())),
             // A scalar or vector accumulator: each entry has the init's shape.
             "scan" if !self.record_scan(id) => self.sym_extent(*args.get(1)?, axis - 1, d),
             "get" => self.get_extent(&args, axis, d),

@@ -538,3 +538,52 @@ fn row_law_rewritten_vector_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("rewrites a vector argument"), "{r}");
 }
+
+#[test]
+fn filter_of_parameter_is_never() {
+    let r = refuse(&posterior(
+        "y_all = [0.3, -1.0, 2.0]\nmu ~ Normal(0, 1)\nvals = y_all .+ mu\n\
+         keep(x) = x > 0\nkept = filter(keep, vals)\ny ~ Normal(sum(kept), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::ParameterDependentExtent, "{r}");
+    assert!(r.kind.is_never());
+}
+
+#[test]
+fn filter_with_callback_parameter_is_not_yet() {
+    let r = refuse(&posterior(
+        "y_all = [0.3, -1.0, 2.0]\nkeep(i, p) = y_all[i] > p\n\
+         idx = filter(keep, indicesof(y_all), 0.0)\nshift(i) = 0.5 * i\n\
+         mu ~ Normal(0, 1)\ny ~ Normal(mu + sum(shift.(idx)), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("callback parameter"), "{r}");
+}
+
+#[test]
+fn filter_over_a_table_is_not_yet() {
+    let r = refuse(&posterior(
+        "rows = table(a = [1.0, 2.0], b = [3.0, -4.0])\n\
+         keep(row) = row.a + row.b > 0\nkept = filter(keep, rows)\n\
+         g(t) = 0.5\nmu ~ Normal(0, 1)\ny ~ Normal(mu + g(kept), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("filter over a table"), "{r}");
+}
+
+#[test]
+fn broadcast_over_a_boolean_mask_is_no_gather() {
+    let r = refuse(&posterior(
+        "y_all = [0.3, -1.0, 2.0]\nmask = [true, false, true]\npick(i) = y_all[i]\n\
+         ys = pick.(mask)\nmu ~ Normal(0, 1)\ny ~ Normal(mu + sum(ys), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+}

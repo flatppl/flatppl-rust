@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+y_all = [0.3, -1.0, 2.0, 0.5, -0.2]
+keep(i) = y_all[i] > 0
+idx = filter(keep, indicesof(y_all))
+pick(i) = y_all[i]
+ys = pick.(idx)
+shift(i) = 0.5 * i
+means = shift.(idx)
+mu ~ Normal(0, 1)
+y ~ Normal.(mu .+ means, 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = ys))
+post = bayesupdate(L, prior)
