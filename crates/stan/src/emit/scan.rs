@@ -53,6 +53,9 @@ struct Step {
     param: Option<NodeId>,
     /// The step body's fields, in order, for a record accumulator.
     fields: Option<Vec<(String, NodeId)>>,
+    /// Module bindings between the body and module-binding inputs
+    /// ([`super::functions::FnCtx::through`]).
+    through: HashSet<Symbol>,
 }
 
 impl<'m> Emitter<'m> {
@@ -153,15 +156,8 @@ impl<'m> Emitter<'m> {
         if entries.len() != args.len() - 1 {
             return Err(Refusal::not_yet(Some(id), "a scan step of another arity"));
         }
-        // `functionof(body, acc = a0, …)` binds its inputs to module values:
-        // the body reads them through other bindings, which this emitter
-        // does not substitute.
-        if entries.iter().any(|(_, r)| r.ns == RefNs::SelfMod) {
-            return Err(Refusal::not_yet(
-                Some(id),
-                "a scan step whose inputs are module values",
-            ));
-        }
+        let mut marks = FnCtx::default();
+        self.mark_boundary(&mut marks, id, body, &entries)?;
         let fields = if matches!(self.ty(init), Some(Type::Record(_))) {
             let rec = self.resolve(body);
             if self.head(rec) != Some("record") {
@@ -189,22 +185,46 @@ impl<'m> Emitter<'m> {
             xs,
             param,
             fields,
+            through: marks.through,
         })
     }
 
     fn reads_accumulator(&self, step: &Step) -> bool {
-        mentions(self, step.body, step.entries[0].1)
+        mentions(self, step.body, step.entries[0].1, &step.through)
     }
 
     /// The fields of `param` read under `root`: `get(param, "f")`, also
     /// through user functions it is passed to. `None` when it is used whole.
     fn fields_read(&self, root: NodeId, param: Ref, depth: u32) -> Option<BTreeSet<String>> {
+        self.fields_read_through(root, param, depth, &HashSet::new())
+    }
+
+    /// [`Self::fields_read`], also through the bindings in `through`.
+    fn fields_read_through(
+        &self,
+        root: NodeId,
+        param: Ref,
+        depth: u32,
+        through: &HashSet<Symbol>,
+    ) -> Option<BTreeSet<String>> {
         if depth > 16 {
             return None;
         }
         let mut out = BTreeSet::new();
         let mut stack = vec![(root, None::<NodeId>)];
+        let mut seen = HashSet::new();
         while let Some((id, parent)) = stack.pop() {
+            if let Node::Ref(r) = self.m.node(id)
+                && r.ns == RefNs::SelfMod
+                && *r != param
+                && through.contains(&r.name)
+            {
+                if seen.insert(r.name) {
+                    let b = self.m.binding_by_name(r.name)?;
+                    stack.push((self.m.binding(b).rhs, None));
+                }
+                continue;
+            }
             if matches!(self.m.node(id), Node::Ref(r) if *r == param) {
                 let p = parent?;
                 let pc = self.call(p)?;
@@ -228,6 +248,18 @@ impl<'m> Emitter<'m> {
             self.m.for_each_child(id, |c| stack.push((c, Some(id))));
         }
         Some(out)
+    }
+
+    /// The bindings between a callable's body and its module-binding inputs.
+    fn callable_through(
+        &self,
+        at: NodeId,
+        body: NodeId,
+        entries: &[(Symbol, Ref)],
+    ) -> Result<HashSet<Symbol>> {
+        let mut marks = FnCtx::default();
+        self.mark_boundary(&mut marks, at, body, entries)?;
+        Ok(marks.through)
     }
 
     // ------------------------------------------------------------- uses
@@ -332,11 +364,12 @@ impl<'m> Emitter<'m> {
                             .user_callee(pargs[0])
                             .ok_or_else(|| Refusal::not_yet(Some(p), "a broadcast over a table"))?;
                         let (body, entries) = self.callable_parts(fun)?;
+                        let through = self.callable_through(p, body, &entries)?;
                         for (k, &a) in pargs[1..].iter().enumerate() {
                             if a == r {
                                 let read = entries
                                     .get(k)
-                                    .and_then(|e| self.fields_read(body, e.1, 0))
+                                    .and_then(|e| self.fields_read_through(body, e.1, 0, &through))
                                     .ok_or_else(|| {
                                         Refusal::not_yet(
                                             Some(p),
@@ -386,10 +419,14 @@ impl<'m> Emitter<'m> {
             }
             let fun = self.is_user_call(p).ok_or_else(unsupported)?;
             let (body, entries) = self.callable_parts(fun)?;
+            let through = self.callable_through(p, body, &entries)?;
             for (k, &a) in pc.args.iter().enumerate() {
                 if a == get_node {
                     let e = entries.get(k).ok_or_else(unsupported)?;
-                    out.extend(self.fields_read(body, e.1, 0).ok_or_else(unsupported)?);
+                    out.extend(
+                        self.fields_read_through(body, e.1, 0, &through)
+                            .ok_or_else(unsupported)?,
+                    );
                 }
             }
         }
@@ -567,6 +604,7 @@ impl<'m> Emitter<'m> {
     /// The step's parameter argument `p`: a record's fields by name, or one
     /// expression.
     fn bind_param(&mut self, step: &Step, ctx: &mut FnCtx) -> Result<()> {
+        self.mark_boundary(ctx, step.at, step.body, &step.entries)?;
         let Some(p) = step.param else {
             return Ok(());
         };
@@ -636,9 +674,14 @@ impl<'m> Emitter<'m> {
             Some(fs) => {
                 let mut reads = HashMap::new();
                 for (f, v) in fs {
-                    let r = self.fields_read(*v, acc, 0).ok_or_else(|| {
-                        Refusal::not_yet(Some(*v), "a step that uses its record accumulator whole")
-                    })?;
+                    let r = self
+                        .fields_read_through(*v, acc, 0, &step.through)
+                        .ok_or_else(|| {
+                            Refusal::not_yet(
+                                Some(*v),
+                                "a step that uses its record accumulator whole",
+                            )
+                        })?;
                     reads.insert(f.clone(), r);
                 }
                 (fs.clone(), reads)
@@ -1084,6 +1127,7 @@ impl<'m> Emitter<'m> {
         };
         let row_ty = Type::Record(ctys.clone());
         let n = self.scan_length(self.call(scan).unwrap().args[2])?;
+        let n_text = n.print();
         let n = if n.atomic() {
             n.print()
         } else {
@@ -1144,6 +1188,7 @@ impl<'m> Emitter<'m> {
             .instantiate(id, body, &entries, &tys)
             .and_then(|scoped| {
                 ctx.scoped = scoped;
+                self.mark_boundary(&mut ctx, id, body, &entries)?;
                 let outer = self.fctx.replace(ctx);
                 let mut lines = Vec::new();
                 let v = self.step_value(body, &mut lines);
@@ -1154,7 +1199,13 @@ impl<'m> Emitter<'m> {
         self.used.remove(&var);
         let (v, mut lines) = out?;
         let stan = self.fresh(base);
-        let t = self.declare(id, None, false, &stan, &[])?;
+        let mut t = self.declare(id, None, false, &stan, &[])?;
+        // The rows are the scan's rows: its length names the outer extent.
+        match (t.array.first_mut(), t.dims.first_mut()) {
+            (Some(a), _) => *a = n_text.clone(),
+            (None, Some(d)) => *d = n_text.clone(),
+            _ => {}
+        }
         lines.push(format!("{stan}[{var}] = {v};"));
         let mut text = format!("for ({var} in 1:{n}) {{\n");
         for l in &lines {
@@ -1244,6 +1295,7 @@ impl<'m> Emitter<'m> {
             tys.push(t);
         }
         ctx.scoped = self.instantiate(id, body, &entries, &tys)?;
+        self.mark_boundary(&mut ctx, id, body, &entries)?;
         let name = self
             .m
             .bindings()
@@ -1291,11 +1343,22 @@ fn order(
 }
 
 /// `true` when `p` occurs under `root`.
-fn mentions(e: &Emitter<'_>, root: NodeId, p: Ref) -> bool {
+/// `true` when `p` occurs under `root`, also through the bindings in
+/// `through`.
+fn mentions(e: &Emitter<'_>, root: NodeId, p: Ref, through: &HashSet<Symbol>) -> bool {
     let mut stack = vec![root];
+    let mut seen = HashSet::new();
     while let Some(id) = stack.pop() {
-        if matches!(e.m.node(id), Node::Ref(r) if *r == p) {
-            return true;
+        match e.m.node(id) {
+            Node::Ref(r) if *r == p => return true,
+            Node::Ref(r) if r.ns == RefNs::SelfMod && through.contains(&r.name) => {
+                if seen.insert(r.name)
+                    && let Some(b) = e.m.binding_by_name(r.name)
+                {
+                    stack.push(e.m.binding(b).rhs);
+                }
+            }
+            _ => {}
         }
         e.m.for_each_child(id, |c| stack.push(c));
     }

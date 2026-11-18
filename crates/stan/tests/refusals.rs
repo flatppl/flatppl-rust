@@ -387,19 +387,6 @@ fn user_function_over_aggregate_frame_is_not_yet() {
 }
 
 #[test]
-fn scan_step_with_module_inputs_is_not_yet() {
-    let r = refuse(&posterior(
-        "x_obs = [0.1, 0.2, 0.3]\na0 = 2.0\nxv = 0.0\nmid = 0.5 * a0 + 1\n\
-         f = functionof(mid, acc = a0, x = xv)\nrun = scan(f, 0.0, x_obs)\n\
-         mu ~ Normal(0, 1)\ny ~ Normal(mu + run[1], 1)",
-        "lawof(record(mu = mu))",
-        "kernelof(record(y = y), mu = mu)",
-    ));
-    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
-    assert!(r.reason.contains("inputs are module values"), "{r}");
-}
-
-#[test]
 fn vector_scan_read_whole_is_not_yet() {
     let r = refuse(&posterior(
         "K = 2\nx_obs = [0.5, -1.0, 2.0]\nw ~ iid(Normal(0, 1), K)\n\
@@ -410,4 +397,17 @@ fn vector_scan_read_whole_is_not_yet() {
     ));
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("a scan of vectors read whole"), "{r}");
+}
+
+#[test]
+fn boundary_input_inside_nested_reification_is_not_yet() {
+    let r = refuse(&posterior(
+        "a0 = elementof(reals)\nzd ~ Normal(a0, 1)\ninner = lawof(zd)\n\
+         v = logdensityof(inner, 0.3)\nf = functionof(v, acc = a0)\nmu ~ Normal(0, 1)\n\
+         y ~ Normal(mu + f(1.0), 1)",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("nested `lawof`"), "{r}");
 }

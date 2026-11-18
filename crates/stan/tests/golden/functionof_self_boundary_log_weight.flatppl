@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+xw = elementof(cartprod(mu = reals))
+m = -0.5 * xw.mu ^ 2
+lw = functionof(m, x = xw)
+mu = elementof(reals)
+y ~ Normal(mu, 1)
+prior = logweighted(lw, Lebesgue(cartprod(mu = reals)))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = 0.5))
+post = bayesupdate(L, prior)

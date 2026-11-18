@@ -46,11 +46,13 @@ impl<'m> Emitter<'m> {
             Some(s) => self.name(s).to_string(),
             None => "weight".to_string(),
         };
-        let outer = self.fctx.replace(FnCtx {
+        let mut ctx = FnCtx {
             scoped,
             record_local: Some(entries[0].1.name),
             ..Default::default()
-        });
+        };
+        self.mark_boundary(&mut ctx, lw, body, &entries)?;
+        let outer = self.fctx.replace(ctx);
         let outer_owner = self.owner.replace((name.clone(), body));
         let value = match self.expr(body) {
             Ok(e) => Ok(e.s),

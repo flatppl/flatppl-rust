@@ -1,0 +1,12 @@
+flatppl_compat = "0.1"
+x_obs = [0.1, 0.2, 0.3]
+a0 = elementof(reals)
+xv = elementof(reals)
+mid = 0.5 * a0 + xv
+f = functionof(mid, acc = a0, x = xv)
+mu ~ Normal(0, 1)
+run = scan(f, 0.0, x_obs)
+y ~ Normal.(mu .+ run, 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.1, 0.2, 0.3]))
+post = bayesupdate(L, prior)

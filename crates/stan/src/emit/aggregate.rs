@@ -360,6 +360,18 @@ impl<'m> Emitter<'m> {
         {
             return Ok(l.clone());
         }
+        // A binding between the body and a module-binding input: its value
+        // in the body.
+        if let Node::Ref(r) = node
+            && r.ns == flatppl_core::RefNs::SelfMod
+            && self
+                .fctx
+                .as_ref()
+                .is_some_and(|c| c.through.contains(&r.name))
+        {
+            let rhs = self.m.binding(self.m.binding_by_name(r.name).unwrap()).rhs;
+            return self.lift(rhs, frame, vars, ext);
+        }
         let Node::Call(c) = node else {
             if self.shape(body).is_some_and(|s| s.rank == 0) {
                 return Ok(scalar(self.expr(body)?));
