@@ -5,13 +5,12 @@ functions {
 }
 data {
   int<lower=0> N;
-  int<lower=0> N_data__2;
   int<lower=0> T;
   int<lower=0> M;
-  array[N, N_data__2] int data_;
+  array[N, T] int data_;
 }
 transformed data {
-  array[M, N_data__2] int histories;
+  array[M, T] int histories;
   for (i in 1:M) {
     histories[i] = history(i, data_);
   }

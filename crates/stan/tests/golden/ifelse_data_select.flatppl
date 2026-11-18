@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+flag = [1, 0, 1, 1]
+y_obs = [0.3, -1.2, 0.8, 1.5]
+a ~ Normal(0, 1)
+b ~ Normal(0, 1)
+y ~ Normal.(ifelse.(flag .== 1, a, b), 1)
+prior = lawof(record(a = a, b = b))
+L = likelihoodof(kernelof(record(y = y), a = a, b = b), record(y = y_obs))
+post = bayesupdate(L, prior)

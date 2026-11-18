@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+M = 3
+T = 3
+data = rowstack([[0, 1, 1], [1, 1, 0], [0, 0, 1]])
+history(i) = data[i, :]
+histories = history.(indicesof(zeros(M)))
+p ~ Uniform(unitinterval)
+c ~ Uniform(unitinterval)
+step(previous, q) = Bernoulli(ifelse(previous == 1, q.c, q.p))
+y ~ iid(markovchain(step, 0, T, (p = p, c = c)), M)
+prior = lawof(record(p = p, c = c))
+L = likelihoodof(kernelof(record(y = y), p = p, c = c), record(y = histories))
+post = bayesupdate(L, prior)

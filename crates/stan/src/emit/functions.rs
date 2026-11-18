@@ -974,6 +974,20 @@ impl<'m> Emitter<'m> {
         let mut elem_tys = Vec::new();
         let mut locals = HashMap::new();
         for ((_, r), &a) in entries.iter().zip(&args) {
+            // `splitblocks(A, [1, n])`: element i is row i of A, typed as a
+            // row (a 1×n block and its row hold the same entries).
+            if let Some(m_) = self.row_blocks(a)
+                && let Some(Type::Array { shape, elem }) = self.ty(m_)
+                && shape.len() == 2
+            {
+                let e = self.expr(m_)?;
+                elem_tys.push(Type::Array {
+                    shape: vec![shape[1]].into(),
+                    elem,
+                });
+                locals.insert(r.name, format!("{}[{index}]", e.at(P_ATOM)));
+                continue;
+            }
             let t = self
                 .ty(a)
                 .ok_or_else(|| Refusal::not_yet(Some(a), "an untyped argument"))?;

@@ -1,0 +1,15 @@
+flatppl_compat = "0.1"
+M = 4
+T = 3
+y_obs = rowstack([[0, 1, 1], [0, 0, 0], [1, 1, 0], [0, 0, 0]])
+omega ~ Uniform(unitinterval)
+mean_p ~ iid(Uniform(unitinterval), T)
+sigma ~ Uniform(interval(0, 5))
+eps_raw ~ iid(Normal(0, 1), M)
+lp = addaxes(sigma .* eps_raw, 0, 1) .+ addaxes(logit.(mean_p), 1, 0)
+capture(row, omega) = normalize(superpose(
+    weighted(omega, Bernoulli.(invlogit.(row))), weighted(1 - omega, Dirac(fill(false, [1, T])))))
+y ~ capture.(splitblocks(lp, [1, T]), omega)
+prior = lawof(record(omega = omega, mean_p = mean_p, sigma = sigma, eps_raw = eps_raw))
+L = likelihoodof(kernelof(record(y = y), omega = omega, mean_p = mean_p, sigma = sigma, eps_raw = eps_raw), record(y = splitblocks(y_obs, [1, T])))
+post = bayesupdate(L, prior)

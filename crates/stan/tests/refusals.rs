@@ -411,3 +411,130 @@ fn boundary_input_inside_nested_reification_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("nested `lawof`"), "{r}");
 }
+
+#[test]
+fn markovchain_prior_is_not_yet() {
+    let r = refuse(
+        "T = 3\np ~ Uniform(unitinterval)\nstep(previous, q) = Normal(q * previous, 1)\n\
+         z ~ iid(markovchain(step, 0.0, T, p), 2)\ny ~ Normal(sum(z[1]), 1)\n\
+         prior = lawof(record(p = p, z = z))\n\
+         L = likelihoodof(kernelof(record(y = y), p = p, z = z), record(y = 0.5))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("markovchain as a prior"), "{r}");
+}
+
+#[test]
+fn markovchain_one_trajectory_is_not_yet() {
+    let r = refuse(
+        "T = 3\np ~ Uniform(unitinterval)\nstep(previous, q) = Bernoulli(q)\n\
+         y ~ markovchain(step, 0, T, p)\nprior = lawof(record(p = p))\n\
+         L = likelihoodof(kernelof(record(y = y), p = p), record(y = [0, 1, 1]))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("one trajectory"), "{r}");
+}
+
+#[test]
+fn markovchain_kernel_argument_of_other_form_is_not_yet() {
+    let r = refuse(
+        "M = 3\nT = 3\ndata = rowstack([[0, 1, 1], [1, 1, 0], [0, 0, 1]])\n\
+         history(i) = data[i, :]\nhistories = history.(indicesof(zeros(M)))\n\
+         a ~ Normal(0, 1)\nstep(previous, q) = Bernoulli(invlogit(q + previous))\n\
+         y ~ iid(markovchain(step, 0, T, a), M)\nprior = lawof(record(a = a))\n\
+         L = likelihoodof(kernelof(record(y = y), a = a), record(y = histories))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("markovchain kernel argument"), "{r}");
+}
+
+#[test]
+fn splitblocks_other_shape_is_not_yet() {
+    let r = refuse(
+        "M = 4\nT = 2\ny_obs = rowstack([[0, 1], [1, 1], [0, 0], [1, 0]])\n\
+         p ~ Uniform(unitinterval)\nblock(b, q) = Bernoulli.(fill(q, [2, T]))\n\
+         y ~ block.(splitblocks(y_obs, [2, T]), p)\nprior = lawof(record(p = p))\n\
+         L = likelihoodof(kernelof(record(y = y), p = p), record(y = splitblocks(y_obs, [2, T])))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+}
+
+#[test]
+fn splitblocks_partial_row_is_not_yet() {
+    let r = refuse(
+        "M = 2\ny_obs = rowstack([[0, 1, 1, 0, 1, 0], [1, 1, 0, 0, 0, 1]])\n\
+         p ~ Uniform(unitinterval)\nblock(b, q) = Bernoulli.(fill(q, [1, 3]))\n\
+         y ~ block.(splitblocks(y_obs, [1, 3]), p)\nprior = lawof(record(p = p))\n\
+         L = likelihoodof(kernelof(record(y = y), p = p), record(y = splitblocks(y_obs, [1, 3])))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("splitblocks"), "{r}");
+}
+
+/// Review case: blocks of one column are not rows. The spec value at
+/// omega = 0.5, lp = 0 is 3·log 0.75 + log 0.25 = −2.249340; reading the
+/// blocks as rows gave −2.549446.
+#[test]
+fn splitblocks_single_column_blocks_is_not_yet() {
+    let r = refuse(
+        "M = 2\nT = 2\ny_obs = rowstack([[0, 1], [0, 0]])\nomega ~ Uniform(unitinterval)\n\
+         e ~ iid(Normal(0, 1), M)\nlp = addaxes(e, 0, 1) .+ addaxes(zeros(T), 1, 0)\n\
+         capture(b, w) = normalize(superpose(weighted(w, Bernoulli.(invlogit.(b))), \
+         weighted(1 - w, Dirac(fill(false, [1, 1])))))\n\
+         y ~ capture.(splitblocks(lp, [1, 1]), omega)\nprior = lawof(record(omega = omega, e = e))\n\
+         L = likelihoodof(kernelof(record(y = y), omega = omega, e = e), \
+         record(y = splitblocks(y_obs, [1, 1])))\npost = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+}
+
+#[test]
+fn row_mixture_weight_per_row_is_not_yet() {
+    let r = refuse(
+        "M = 2\nT = 2\ny_obs = rowstack([[0, 1], [0, 0]])\nw ~ iid(Uniform(unitinterval), M)\n\
+         e ~ iid(Normal(0, 1), M)\nlp = addaxes(e, 0, 1) .+ addaxes(zeros(T), 1, 0)\n\
+         capture(b, q) = normalize(superpose(weighted(q, Bernoulli.(invlogit.(b))), \
+         weighted(1 - q, Dirac(fill(false, [1, T])))))\n\
+         y ~ capture.(splitblocks(lp, [1, T]), w)\nprior = lawof(record(w = w, e = e))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w, e = e), \
+         record(y = splitblocks(y_obs, [1, T])))\npost = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("weight per row"), "{r}");
+}
+
+#[test]
+fn dirac_atom_parameter_is_not_yet() {
+    let r = refuse(
+        "M = 2\nT = 2\ny_obs = rowstack([[0, 1], [0, 0]])\nhistory(i) = y_obs[i, :]\n\
+         histories = history.(indicesof(zeros(M)))\nomega ~ Uniform(unitinterval)\n\
+         p ~ iid(Uniform(unitinterval), T)\ntheta ~ Uniform(unitinterval)\n\
+         ch = normalize(superpose(weighted(omega, Bernoulli.(p)), \
+         weighted(1 - omega, Dirac(fill(ifelse(theta > 0.5, 1, 0), T)))))\n\
+         y ~ iid(ch, M)\nprior = lawof(record(omega = omega, p = p, theta = theta))\n\
+         L = likelihoodof(kernelof(record(y = y), omega = omega, p = p, theta = theta), \
+         record(y = histories))\npost = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("atom whose value is not data"), "{r}");
+}
+
+#[test]
+fn row_law_rewritten_vector_is_not_yet() {
+    let r = refuse(
+        "M = 2\nT = 2\ny_obs = rowstack([[0, 1], [0, 0]])\nhistory(i) = y_obs[i, :]\n\
+         histories = history.(indicesof(zeros(M)))\nomega ~ Uniform(unitinterval)\n\
+         v ~ iid(Normal(0, 1), T)\n\
+         ch = normalize(superpose(weighted(omega, Bernoulli.(invlogit.(v))), weighted(1 - omega, Dirac(fill(0, T)))))\n\
+         y ~ iid(ch, M)\nprior = lawof(record(omega = omega, v = v))\n\
+         L = likelihoodof(kernelof(record(y = y), omega = omega, v = v), record(y = histories))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("rewrites a vector argument"), "{r}");
+}

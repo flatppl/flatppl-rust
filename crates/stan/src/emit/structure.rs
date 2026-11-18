@@ -66,7 +66,7 @@ impl Law {
     }
 
     /// The variate side for `y`.
-    fn lhs(&self, y: &str) -> String {
+    pub(super) fn lhs(&self, y: &str) -> String {
         self.lhs.replace("{y}", y)
     }
 }
@@ -763,7 +763,10 @@ impl<'m> Emitter<'m> {
             ));
         }
         // A data path or fixed binding prints as its own data name.
-        let e: Ex = self.expr(o.value)?;
+        let outer = std::mem::replace(&mut self.rows_ok, true);
+        let e = self.expr(o.value);
+        self.rows_ok = outer;
+        let e: Ex = e?;
         if e.prec == P_ATOM && is_identifier(&e.s) {
             return Ok(e.s);
         }
@@ -793,6 +796,19 @@ impl<'m> Emitter<'m> {
         // variate: Stan has no observation-level vectorized mixture.
         if let Some(lines) = self.mixture_statements(lhs, m)? {
             return Ok(lines);
+        }
+        // A chain over each observed row (spec §06 "Dependent composition").
+        if self.head(m) == Some("iid")
+            && let inner = self.resolve(self.call(m).unwrap().args[0])
+            && self.head(inner) == Some("markovchain")
+        {
+            return self.markovchain_statement(lhs, inner);
+        }
+        if self.head(m) == Some("markovchain") {
+            return Err(Refusal::not_yet(
+                Some(m),
+                "a markovchain over one trajectory",
+            ));
         }
         let flat = self.flat_order(lhs);
         let (law, per_element) = match self.head(m) {
@@ -882,6 +898,24 @@ impl<'m> Emitter<'m> {
             ));
         }
         Ok(())
+    }
+
+    /// `y ~ iid(markovchain(…), M)` at observed rows: one statement over
+    /// the flattened rows. A chain over parameters has no observed lag.
+    fn markovchain_statement(&mut self, lhs: &str, mc: NodeId) -> Result<Vec<String>> {
+        let data = self.json.contains_key(lhs)
+            || self.deferred.iter().any(|d| d.stan == lhs)
+            || self.tdata.iter().any(|t| t.contains(&format!(" {lhs}")));
+        if !data {
+            return Err(Refusal::not_yet(Some(mc), "a markovchain as a prior"));
+        }
+        let rl = self.markovchain_row_law(lhs, mc, None)?;
+        let n = self
+            .decls
+            .get(lhs)
+            .and_then(|t| t.array.first().cloned())
+            .unwrap_or_else(|| format!("size({lhs})"));
+        Ok(vec![rl.statement(lhs, &n)])
     }
 
     fn fresh_index(&mut self) -> String {
