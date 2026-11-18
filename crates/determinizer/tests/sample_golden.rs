@@ -983,3 +983,21 @@ fn broadcast_zero_atom_mixture_lowers_portably() {
     assert!(pir.contains("(broadcasted Gamma)"), "{pir}");
     assert!(pir.contains("(ifelse "), "{pir}");
 }
+
+#[test]
+fn posterior_analysis_declines_unobserved_nuisance_draws() {
+    for model in [
+        "h ~ Normal(0,1)\nt ~ Normal(h,1)\nprior=lawof(record(t=t))\nK=functionof(Normal(t,1),t=t)",
+        "s ~ Gamma(2,1)\nt=elementof(reals)\nprior=joint(t=Normal(0,1))\ny ~ Normal(t,s)\nK=kernelof(y,t=t)",
+    ] {
+        let mut m = parse_infer(&format!(
+            "{model}\nL=likelihoodof(K,2.0)\nP=normalize(bayesupdate(L,prior))"
+        ));
+        let p = m.intern("P");
+        let rhs = m.binding(m.binding_by_name(p).unwrap()).rhs;
+        assert!(
+            flatppl_model_analysis::posterior::normalized_conjugate_posterior(&mut m, rhs)
+                .is_none()
+        );
+    }
+}

@@ -421,6 +421,14 @@ already observed by the query when checking other likelihood parameters for
 latent dependence. The determinizer uses the match to build the closed-form
 measure or log density for both `kchain` and `lawof`.
 
+`flatppl_model_analysis::posterior::normalized_conjugate_posterior` gives
+`rand(normalize(bayesupdate(L, prior)), state)` a native posterior law for a
+one-field prior. It combines single observations, fixed-length IID batches
+and joint likelihood factors for Beta–Bernoulli/Binomial, Gamma–Poisson,
+Normal means, inverse-gamma variances and Dirichlet–categorical/multinomial
+updates. The determinizer samples that law, retains the field and returns the
+native RNG successor. An unsupported likelihood leaves the posterior unsampled.
+
 `flatppl-model-analysis::plan_iid_normal` accepts an inferred IID Normal measure,
 its observed operand, and the structural target's scoring and data inputs. It
 uses the same moment rule as a lowered density query. Its result owns the

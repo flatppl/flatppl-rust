@@ -1,7 +1,21 @@
 //! Bind graph arguments using the §04 calling conventions.
 
 use crate::graph::{build_call, resolve_ref};
-use crate::{CallHead, Module, NamedArg, NamedKind, Node, NodeId, Scalar, Symbol, Type};
+use crate::{
+    CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, Scalar, Symbol, Type,
+};
+
+/// Ordered label/target pairs for an explicit or inferred reification boundary.
+pub fn reified_inputs<'a>(
+    m: &'a Module,
+    node: NodeId,
+    inputs: &'a Inputs,
+) -> Option<&'a [(Symbol, Ref)]> {
+    match inputs {
+        Inputs::Spec(entries) => Some(entries),
+        Inputs::Auto => m.auto_inputs_of(node),
+    }
+}
 
 /// §04 calling convention: leading positionals, then keywords, or one record/table
 /// splatted by name. Every input must bind exactly once before any substitution.

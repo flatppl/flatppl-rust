@@ -437,6 +437,11 @@ fn lower_normalized_weight_sample(
         let input = build_record(m, &params);
         return Ok(build_sample_term(m, ctor, input, rng, sample_name));
     }
+    if let Some(posterior) =
+        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, measure)
+    {
+        return sample_conjugate_posterior(m, posterior, rng, None);
+    }
     if let Some(sample) = lower_normalized_superpose_sample(m, measure, rng) {
         return sample;
     }
@@ -453,6 +458,37 @@ fn lower_normalized_weight_sample(
         crate::density::exponential_tilt::guard(m, value, valid)
     };
     Ok((value, next))
+}
+
+fn sample_conjugate_posterior(
+    m: &mut Module,
+    posterior: flatppl_model_analysis::posterior::ConjugatePosterior,
+    rng: NodeId,
+    size: Option<NodeId>,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let law = posterior.distribution;
+    let measure = match size {
+        Some(size) => build_call(m, "iid", &[law, size]),
+        None => law,
+    };
+    let (value, next) = lower_closed_measure_sample(m, measure, rng)?;
+    let mut missing = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
+    if let Some(dirichlet) = expect_builtin_call(m, law, "Dirichlet") {
+        let alpha = dirichlet.args[0];
+        let width = build_call(m, "lengthof", &[alpha]);
+        missing = build_call(m, "fill", &[missing, width]);
+    }
+    if let Some(size) = size {
+        missing = build_call(m, "fill", &[missing, size]);
+    }
+    let value = build_call(m, "ifelse", &[posterior.valid, value, missing]);
+    let record = build_record(m, &[(posterior.field, value)]);
+    let result = if size.is_some() {
+        build_call(m, "table", &[record])
+    } else {
+        record
+    };
+    Ok((result, next))
 }
 
 /// §06 `normalize(superpose(c₁, …, c_k))` with each `cᵢ` a probability measure
@@ -1043,6 +1079,28 @@ fn lower_iid_sample(
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| refuse(iid_node, m, "iid of a jointchain needs a fixed scalar size"))?;
         return crate::jointchain::lower_iid_jointchain_sample(m, kernel, n, rng);
+    }
+    if let Some(posterior) =
+        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, kernel)
+    {
+        let [_, size] = *expect_builtin_call(m, iid_node, "iid")
+            .expect("iid sample")
+            .args
+        else {
+            return Err(refuse(
+                iid_node,
+                m,
+                "iid of a posterior record requires a scalar size",
+            ));
+        };
+        if flatppl_infer::fixed_int_value(m, size).is_none() {
+            return Err(refuse(
+                iid_node,
+                m,
+                "iid of a posterior record requires a fixed scalar size",
+            ));
+        }
+        return sample_conjugate_posterior(m, posterior, rng, Some(size));
     }
     if m.type_of(iid_node).is_none()
         && let Some(ty) = flatppl_infer::infer_expression(m, iid_node, &[])
