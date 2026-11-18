@@ -476,6 +476,8 @@ impl Packer<'_, '_> {
                     self.out.broadcast_in_dim(&inputs[0], &dims, ty.clone())
                 }
                 Pointwise::Bitcast(..)
+                | Pointwise::JoinComplex(..)
+                | Pointwise::ComplexPart(..)
                 | Pointwise::LogNdtr(_)
                 | Pointwise::Reshape(_)
                 | Pointwise::Slice(..)
@@ -890,6 +892,12 @@ impl Packer<'_, '_> {
             return values[0].clone();
         }
         let elem = values[0].elem;
+        if self.out.restrict_enzyme_compatible() && elem == ElemKind::Complex {
+            let (re, im) = self.out.split_complex_shapes(values);
+            let re = self.concatenate(&re, axis);
+            let im = self.concatenate(&im, axis);
+            return self.out.join_complex(&re, &im);
+        }
         let mut dims = shape(&values[0].ty).to_vec();
         dims[axis] = Some(values.iter().map(|v| shape(&v.ty)[axis].unwrap()).sum());
         let ty = MlirTy::Ranked(dims);

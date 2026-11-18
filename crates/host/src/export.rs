@@ -488,6 +488,8 @@ fn layout(
                     (ElemKind::Int, Dtype::F64) => "int64",
                     (ElemKind::Real, Dtype::F32) => "float32",
                     (ElemKind::Real, Dtype::F64) => "float64",
+                    (ElemKind::Complex, Dtype::F32) => "complex64",
+                    (ElemKind::Complex, Dtype::F64) => "complex128",
                 }
             };
             let result = Schema::Tensor {

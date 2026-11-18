@@ -34,6 +34,15 @@ impl Emitter<'_> {
             ));
         }
         let (m, n) = (*m, *n);
+        if input.elem == ElemKind::Complex {
+            if shape(&input.ty)[..self.batch_rank(input)]
+                .iter()
+                .any(Option::is_none)
+            {
+                return Err(EmitError::at(id, "`qr` requires static batch dimensions"));
+            }
+            return Ok(self.matrix_complex_qr(input, m, n));
+        }
         // Small matrices do not repay a second pass. On GPU, rolled QR
         // also loses more launch time than the smaller workspace saves.
         let compact = m >= 64
@@ -284,6 +293,60 @@ impl Emitter<'_> {
         self.axes_view(&result[1], axes)
     }
 
+    /// Hermitian Cholesky through rank-one updates of the real and imaginary parts.
+    pub(crate) fn complex_cholesky(&mut self, input: &Value) -> Value {
+        let (real, imag) = crate::complex::split(self, input);
+        let batch = self.batch_rank(&real);
+        let axes = self.axes_of(&real);
+        let n = shape(&real.ty)[batch].expect("static Cholesky dimension");
+        let zero = self.constant_like(0.0, &real);
+        let cols = self.axis_indices(&real, batch + 1);
+        let result = self.matrix_loop(
+            n,
+            MATRIX_UNROLL_LIMIT,
+            &[real, imag, zero.clone(), zero],
+            |e, index, state| {
+                let [rr, ri, lr, li] =
+                    std::array::from_fn(|i| e.axes_view(&state[i], axes.clone()));
+                let re = e.indexed_matrix_axis(&rr, index, 1);
+                let im = e.indexed_matrix_axis(&ri, index, 1);
+                let indices = e.axis_indices(&re, batch);
+                let diagonal = e.compare("EQ", &indices, index);
+                let below = e.compare("GT", &indices, index);
+                let zero = e.constant_like(0.0, &re);
+                let pivot = e.select(&diagonal, &re, &zero);
+                let pivot = e.reduce_sum(&pivot);
+                let d = e.sqrt(&pivot);
+                let re = e.select(&below, &re, &zero);
+                let im = e.select(&below, &im, &zero);
+                let re = e.div(&re, &d);
+                let im = e.div(&im, &d);
+                let re = e.select(&diagonal, &d, &re);
+                let cr = e.matrix_expand(&re, &rr, batch);
+                let ci = e.matrix_expand(&im, &ri, batch);
+                let ar = e.matrix_expand(&re, &rr, batch + 1);
+                let ai = e.matrix_expand(&im, &ri, batch + 1);
+                let ai = e.neg(&ai);
+                let (dr, di) = crate::complex::multiply_parts(
+                    e,
+                    (cr.clone(), ci.clone()),
+                    (ar, ai),
+                    Emitter::mul,
+                );
+                let at_col = e.compare("EQ", &cols, index);
+                vec![
+                    e.sub(&rr, &dr),
+                    e.sub(&ri, &di),
+                    e.select(&at_col, &cr, &lr),
+                    e.select(&at_col, &ci, &li),
+                ]
+            },
+        );
+        let re = self.axes_view(&result[2], axes.clone());
+        let im = self.axes_view(&result[3], axes);
+        self.join_complex(&re, &im)
+    }
+
     /// Forward substitution for lower-triangular matrix cells and matrix RHSs.
     /// Unrolling avoids native kernel-launch overhead for small GPU matrices.
     pub(super) fn tri_solve_decomposed(&mut self, l: &Value, b: &Value) -> Value {
@@ -339,6 +402,32 @@ impl Emitter<'_> {
 
     /// Apply a matrix to one tensor cell axis, preserving its original position.
     pub(crate) fn transform_axis(&mut self, value: &Value, matrix: &Value, axis: usize) -> Value {
+        match (
+            value.elem == ElemKind::Complex,
+            matrix.elem == ElemKind::Complex,
+        ) {
+            (true, true) => {
+                let a = crate::complex::split(self, value);
+                let b = crate::complex::split(self, matrix);
+                let (re, im) = crate::complex::multiply_parts(self, a, b, |e, a, b| {
+                    e.transform_axis(a, b, axis)
+                });
+                return self.join_complex(&re, &im);
+            }
+            (true, false) => {
+                let (re, im) = crate::complex::split(self, value);
+                let re = self.transform_axis(&re, matrix, axis);
+                let im = self.transform_axis(&im, matrix, axis);
+                return self.join_complex(&re, &im);
+            }
+            (false, true) => {
+                let (re, im) = crate::complex::split(self, matrix);
+                let re = self.transform_axis(value, &re, axis);
+                let im = self.transform_axis(value, &im, axis);
+                return self.join_complex(&re, &im);
+            }
+            _ => {}
+        }
         let value = self.convert(value, ElemKind::Real);
         let matrix = self.convert(matrix, ElemKind::Real);
         let (value, matrix) = self.broadcast_batches(&value, &matrix);
@@ -936,10 +1025,13 @@ impl Emitter<'_> {
     /// the language's `linsolve` caller still requires a vector.
     pub(crate) fn matrix_solve(
         &mut self,
-        _id: NodeId,
+        id: NodeId,
         a: &Value,
         b: &Value,
     ) -> Result<Value, EmitError> {
+        if crate::complex::has_complex(a, b) {
+            return self.matrix_complex_solve(id, a, b);
+        }
         let a = self.convert(a, ElemKind::Real);
         let b = self.convert(b, ElemKind::Real);
         let (a, b) = self.broadcast_batches(&a, &b);
@@ -1191,6 +1283,14 @@ impl Emitter<'_> {
             ));
         }
         let n = *n;
+        if input.elem == ElemKind::Complex {
+            let batch = self.batch_rank(input);
+            let rows = self.axis_indices(input, batch);
+            let cols = self.axis_indices(input, batch + 1);
+            let diagonal = self.compare("EQ", &rows, &cols);
+            let identity = self.convert(&diagonal, ElemKind::Real);
+            return self.matrix_complex_solve(id, input, &identity);
+        }
         let input = self.convert(input, ElemKind::Real);
         if let Some(diagonal) = self.constant_diagonal(&input) {
             let rows = diagonal

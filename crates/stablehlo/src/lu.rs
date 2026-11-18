@@ -6,6 +6,7 @@ struct LuFactors {
     permutation: Value,
     lower: (Value, Option<Value>),
     upper: (Value, Option<Value>),
+    sign: Option<Value>,
 }
 
 impl Emitter<'_> {
@@ -117,7 +118,7 @@ impl Emitter<'_> {
         } else {
             None
         };
-        let factors = self.matrix_lu(id, &inputs[0], inputs.get(1))?;
+        let factors = self.matrix_lu(id, &inputs[0], inputs.get(1), false)?;
         let Some(parent) = parent else {
             return Ok(factors);
         };
@@ -127,6 +128,7 @@ impl Emitter<'_> {
             permutation: finish(factors.permutation),
             lower: (finish(factors.lower.0), factors.lower.1.map(&mut finish)),
             upper: (finish(factors.upper.0), factors.upper.1.map(&mut finish)),
+            sign: None,
         };
         self.broadcast_frame = parent;
         Ok(factors)
@@ -156,6 +158,7 @@ impl Emitter<'_> {
         id: NodeId,
         a: &Value,
         imaginary: Option<&Value>,
+        determinant: bool,
     ) -> Result<LuFactors, EmitError> {
         let MlirTy::Ranked(dims) = self.cell_ty(a) else {
             return Err(EmitError::at(id, "lu requires a static square matrix"));
@@ -178,30 +181,102 @@ impl Emitter<'_> {
         if let Some(im) = imaginary {
             initial.push(self.convert(im, ElemKind::Real));
         }
+        let scalar_axes = Axes {
+            batch,
+            layers: vec![],
+        };
+        let sign_index = initial.len();
+        let permutation = determinant.then(|| {
+            (0..batch as u64)
+                .chain([batch as u64 + 1, batch as u64])
+                .collect::<Vec<_>>()
+        });
+        if determinant {
+            let one = self.constant(
+                1.0,
+                super::batching::tensor(shape(&initial[0].ty)[..batch].to_vec()),
+            );
+            initial.push(self.axes_view(&one, scalar_axes.clone()));
+        }
         let packed = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &initial, |e, index, state| {
             let a = e.axes_view(&state[0], axes.clone());
             let p = e.axes_view(&state[1], axes.clone());
-            let ai = state.get(2).map(|v| e.axes_view(v, axes.clone()));
-            let column = e.indexed_matrix_axis(&a, index, 1);
-            let column_i = ai.as_ref().map(|v| e.indexed_matrix_axis(v, index, 1));
-            let indices = e.axis_indices(&column, batch);
-            let eligible = e.compare("GE", &indices, index);
-            let magnitude = e.lu_magnitude(&column, column_i.as_ref());
-            let infinity = e.inf_like(&column);
-            let minus_inf = e.neg(&infinity);
-            let candidates = e.select(&eligible, &magnitude, &minus_inf);
-            let largest = e.reduce_max(&candidates);
-            let candidates = e.compare("EQ", &candidates, &largest);
-            let limit = e.int_value_const(n as i64);
-            let candidates = e.select(&candidates, &indices, &limit);
-            let pivot = e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &candidates, batch);
-            let current = e.compare("EQ", &rows, index);
-            let pivot_rows = e.compare("EQ", &rows, &pivot);
-            let a = e.swap_rows(&a, &current, &pivot_rows);
-            let ai = ai.map(|v| e.swap_rows(&v, &current, &pivot_rows));
-            let p = e.swap_rows(&p, &current, &pivot_rows);
+            let ai = imaginary.map(|_| e.axes_view(&state[2], axes.clone()));
+            let (a, ai, p, sign) = if let Some(permutation) = &permutation {
+                // Complete pivoting leaves an exact zero in the final diagonal
+                // position at corank one, preserving its cofactor derivative.
+                let infinity = e.scalar(f64::INFINITY);
+                let minus_inf = e.neg(&infinity);
+                let limit = e.int_value_const(n as i64);
+                let current = e.compare("EQ", &rows, index);
+                let eligible = e.compare("GE", &rows, index);
+                let eligible_cols = e.compare("GE", &cols, index);
+                let eligible = e.and(&eligible, &eligible_cols);
+                let magnitude = e.lu_magnitude(&a, ai.as_ref());
+                let magnitude = e.select(&eligible, &magnitude, &minus_inf);
+                let largest = e.reduce_max(&magnitude);
+                let candidates = e.compare("EQ", &magnitude, &largest);
+                let candidate_rows = e.select(&candidates, &rows, &limit);
+                let row = e.reduce_axis_lit(
+                    "stablehlo.minimum",
+                    &n.to_string(),
+                    &candidate_rows,
+                    batch + 1,
+                );
+                let row = e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &row, batch);
+                let pivot_rows = e.compare("EQ", &rows, &row);
+                let on_row = e.and(&candidates, &pivot_rows);
+                let candidate_cols = e.select(&on_row, &cols, &limit);
+                let col = e.reduce_axis_lit(
+                    "stablehlo.minimum",
+                    &n.to_string(),
+                    &candidate_cols,
+                    batch + 1,
+                );
+                let col = e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &col, batch);
+                let swapped_row = e.compare("NE", &row, index);
+                let swapped_col = e.compare("NE", &col, index);
+                let odd = e.compare("NE", &swapped_row, &swapped_col);
+                let sign = e.axes_view(&state[sign_index], scalar_axes.clone());
+                let negated = e.neg(&sign);
+                let sign = e.select(&odd, &negated, &sign);
+                let pivot_cols = e.compare("EQ", &rows, &col);
+                let swap = |e: &mut Self, matrix: &Value| {
+                    let matrix = e.swap_rows(matrix, &current, &pivot_rows);
+                    let matrix = e.transpose(&matrix, permutation);
+                    let matrix = e.axes_view(&matrix, axes.clone());
+                    let matrix = e.swap_rows(&matrix, &current, &pivot_cols);
+                    let matrix = e.transpose(&matrix, permutation);
+                    e.axes_view(&matrix, axes.clone())
+                };
+                (swap(e, &a), ai.map(|v| swap(e, &v)), p, Some(sign))
+            } else {
+                let column = e.indexed_matrix_axis(&a, index, 1);
+                let column_i = ai.as_ref().map(|v| e.indexed_matrix_axis(v, index, 1));
+                let indices = e.axis_indices(&column, batch);
+                let eligible = e.compare("GE", &indices, index);
+                let magnitude = e.lu_magnitude(&column, column_i.as_ref());
+                let infinity = e.inf_like(&column);
+                let minus_inf = e.neg(&infinity);
+                let candidates = e.select(&eligible, &magnitude, &minus_inf);
+                let largest = e.reduce_max(&candidates);
+                let candidates = e.compare("EQ", &candidates, &largest);
+                let limit = e.int_value_const(n as i64);
+                let candidates = e.select(&candidates, &indices, &limit);
+                let pivot =
+                    e.reduce_axis_lit("stablehlo.minimum", &n.to_string(), &candidates, batch);
+                let current = e.compare("EQ", &rows, index);
+                let pivot_rows = e.compare("EQ", &rows, &pivot);
+                (
+                    e.swap_rows(&a, &current, &pivot_rows),
+                    ai.map(|v| e.swap_rows(&v, &current, &pivot_rows)),
+                    e.swap_rows(&p, &current, &pivot_rows),
+                    None,
+                )
+            };
             let column = e.indexed_matrix_axis(&a, index, 1);
             let row = e.indexed_matrix_axis(&a, index, 0);
+            let indices = e.axis_indices(&column, batch);
             let at_pivot = e.compare("EQ", &indices, index);
             let zero = e.constant_like(0.0, &row);
             let selected = e.select(&at_pivot, &row, &zero);
@@ -220,7 +295,7 @@ impl Emitter<'_> {
                 let reduced = e.select(&trailing, &reduced, matrix);
                 e.select(&store, factors, &reduced)
             };
-            if let Some(ai) = ai {
+            let mut next = if let Some(ai) = ai {
                 let column_i = e.indexed_matrix_axis(&ai, index, 1);
                 let row_i = e.indexed_matrix_axis(&ai, index, 0);
                 let selected = e.select(&at_pivot, &row_i, &zero);
@@ -270,7 +345,9 @@ impl Emitter<'_> {
                 let row = e.matrix_expand(&row, &a, batch + 1);
                 let change = e.mul(&factors, &row);
                 vec![update(e, &a, &factors, &change), p]
-            }
+            };
+            next.extend(sign);
+            next
         });
         let a = self.axes_view(&packed[0], axes.clone());
         let p = self.axes_view(&packed[1], axes.clone());
@@ -290,6 +367,104 @@ impl Emitter<'_> {
             permutation: p,
             lower: (lower, imaginary.as_ref().map(|(lower, _)| lower.clone())),
             upper: (upper, imaginary.map(|(_, upper)| upper)),
+            sign: packed
+                .get(sign_index)
+                .map(|v| self.axes_view(v, scalar_axes)),
         })
+    }
+
+    pub(super) fn matrix_complex_solve(
+        &mut self,
+        id: NodeId,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Value, EmitError> {
+        let ar = crate::complex::split(self, a);
+        let b = crate::complex::split(self, b);
+        let factors = self.matrix_lu(id, &ar.0, Some(&ar.1), false)?;
+        let l = (factors.lower.0, factors.lower.1.unwrap());
+        let u = (factors.upper.0, factors.upper.1.unwrap());
+        let p = &factors.permutation;
+        let rhs = if matches!(self.cell_ty(&b.0), MlirTy::Ranked(d) if d.len() == 1) {
+            (self.matvec(p, &b.0), self.matvec(p, &b.1))
+        } else {
+            (self.matmat(p, &b.0), self.matmat(p, &b.1))
+        };
+        let yes = self.bool_value_const(true);
+        let no = self.bool_value_const(false);
+        let y = self.matrix_factor_solve(id, &l, &rhs, &yes, &yes)?;
+        let (re, im) = self.matrix_factor_solve(id, &u, &y, &no, &no)?;
+        Ok(self.join_complex(&re, &im))
+    }
+
+    pub(crate) fn complex_determinant(
+        &mut self,
+        id: NodeId,
+        a: &Value,
+        n: u64,
+        logarithm: bool,
+    ) -> Result<Value, EmitError> {
+        let (ar, ai) = crate::complex::split(self, a);
+        let factors = self.matrix_lu(id, &ar, Some(&ai), true)?;
+        let re = self.diag(&factors.upper.0);
+        let im = self.diag(&factors.upper.1.unwrap());
+        let ar = self.abs(&re);
+        let ai = self.abs(&im);
+        let scale = self.max(&ar, &ai);
+        let zero = self.scalar(0.0);
+        let one = self.scalar(1.0);
+        let present = self.compare("GT", &scale, &zero);
+        let scale = self.select(&present, &scale, &one);
+        let re = self.div(&re, &scale);
+        let im = self.div(&im, &scale);
+        let square = crate::complex::squared_magnitude(self, &re, &im);
+        let not_nan = logarithm.then(|| self.compare("EQ", &square, &square));
+        let square = self.select(&present, &square, &one);
+        let norm = self.sqrt(&square);
+        let log_scale = self.log(&scale);
+        let log_norm = self.log(&norm);
+        let logs = self.add(&log_scale, &log_norm);
+        let log_magnitude = self.reduce_sum(&logs);
+        if let Some(not_nan) = not_nan {
+            let not_nan = self.reduce_all(&not_nan);
+            let valid = self.reduce_all(&present);
+            let neg_inf = self.scalar(f64::NEG_INFINITY);
+            let result = self.select(&valid, &log_magnitude, &neg_inf);
+            let nan = self.scalar(f64::NAN);
+            return Ok(self.select(&not_nan, &result, &nan));
+        }
+
+        // Multiply unit pivots first, then restore the scale in bounded steps.
+        // A zero pivot retains its input dependence and contributes no scale.
+        let re = self.div(&re, &norm);
+        let im = self.div(&im, &norm);
+        let sign = factors.sign.expect("determinant permutation sign");
+        let axes = self.axes_of(&sign);
+        let zero = self.constant_like(0.0, &sign);
+        let result = self.matrix_loop(n, MATRIX_UNROLL_LIMIT, &[sign, zero], |e, k, state| {
+            let a = (
+                e.axes_view(&state[0], axes.clone()),
+                e.axes_view(&state[1], axes.clone()),
+            );
+            let b = (e.scan_slice(&re, k), e.scan_slice(&im, k));
+            let (re, im) = crate::complex::multiply_parts(e, a, b, Emitter::mul);
+            vec![re, im]
+        });
+        let steps = 2 * n;
+        let divisor = self.scalar(steps as f64);
+        let log_step = self.div(&log_magnitude, &divisor);
+        let scale = self.exp(&log_step);
+        let result = self.matrix_loop(steps, MATRIX_UNROLL_LIMIT, &result, |e, _, state| {
+            state
+                .iter()
+                .map(|v| {
+                    let component = e.axes_view(v, axes.clone());
+                    e.mul(&component, &scale)
+                })
+                .collect()
+        });
+        let re = self.axes_view(&result[0], axes.clone());
+        let im = self.axes_view(&result[1], axes);
+        Ok(self.join_complex(&re, &im))
     }
 }

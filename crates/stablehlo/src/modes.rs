@@ -817,7 +817,7 @@ fn resolve_self_ref(m: &Module, id: NodeId) -> NodeId {
 /// (`external`/`load_data`), a `load_data` over `anything` (§07: engines must
 /// not infer the shape from the source, and §13's signature subsection says
 /// `anything` "declares none and cannot be promoted"), and a leaf with no
-/// tensor form (a complex field), naming its path.
+/// tensor form, naming its path.
 fn bind_input(
     m: &Module,
     e: &mut Emitter,

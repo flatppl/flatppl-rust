@@ -295,6 +295,7 @@ fn reduce_value(
     let target = match which {
         BareReduction::Prod if xs.elem == ElemKind::Bool => ElemKind::Int,
         BareReduction::Prod => xs.elem,
+        BareReduction::Mean if xs.elem == ElemKind::Complex => ElemKind::Complex,
         _ => ElemKind::Real,
     };
     let xs = e.convert(&xs, target);
@@ -422,7 +423,10 @@ pub(crate) fn lower_cumulative(
     if n == 0 {
         return Ok(xs);
     }
-    if e.restrict_enzyme_compatible() && which == Cumulative::Prod && xs.elem == ElemKind::Real {
+    if e.restrict_enzyme_compatible()
+        && which == Cumulative::Prod
+        && matches!(xs.elem, ElemKind::Real | ElemKind::Complex)
+    {
         return Err(EmitError::at(
             id,
             "cumprod has no qualified Enzyme derivative lowering",
@@ -431,6 +435,8 @@ pub(crate) fn lower_cumulative(
     let (op, identity) = match (which, xs.elem) {
         (Cumulative::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
         (Cumulative::Sum, ElemKind::Int) => ("stablehlo.add", "0"),
+        (Cumulative::Sum, ElemKind::Complex) => ("stablehlo.add", "(0.0,0.0)"),
+        (Cumulative::Prod, ElemKind::Complex) => ("stablehlo.multiply", "(1.0,0.0)"),
         (Cumulative::Prod, ElemKind::Real) => ("stablehlo.multiply", "1.000000e+00"),
         (Cumulative::Prod, ElemKind::Int) => ("stablehlo.multiply", "1"),
         // Unreachable: `Bool` was promoted to `Int` just above.
@@ -450,12 +456,6 @@ pub(crate) fn lower_cumulative(
 /// $\sum_i \lvert v_i\rvert$, $\sqrt{\sum_i \lvert v_i\rvert^2}$, and each
 /// vector divided by its own norm.
 ///
-/// The $\ell^2$ sum is `v * v`, with NO `stablehlo.abs` — over the reals this
-/// crate emits, squaring already discards the sign, so an `abs` first would be a
-/// wasted op (the same reasoning `crate::ops`' `abs2` head records). $\lvert
-/// v_i\rvert^2$ and $v_i^2$ differ only over the complexes, which
-/// `crate::types` has no element type for.
-///
 /// A zero vector is NOT special-cased: `l1unit`/`l2unit` divide by zero and
 /// emit the IEEE result. §07 states the quotient $v / \lVert v\rVert$ and puts
 /// no exclusion on it, so gating the zero would answer a different question than
@@ -470,11 +470,11 @@ pub(crate) fn lower_norm(
     let [v_id] = args_exact(id, args)?;
     let v = e.lower_node(v_id)?;
     require_static_vector(id, head, &e.cell_ty(&v))?;
-    // §07's domain is "real/complex vectors" and §03 admits an integer or
-    // boolean vector inside it; `infer` types `l1norm`/`l2norm` `Scalar(Real)`
-    // and the unit pair a real array, so widen once here and let every op below
-    // run in the kind the call is typed as.
-    let v = e.convert(&v, ElemKind::Real);
+    let v = if v.elem == ElemKind::Complex {
+        v
+    } else {
+        e.convert(&v, ElemKind::Real)
+    };
 
     let norm = match which {
         Norm::L1 | Norm::L1Unit => {
@@ -482,7 +482,7 @@ pub(crate) fn lower_norm(
             e.reduce_trailing_axes(id, AxisReduce::Sum, &a, 1)?
         }
         Norm::L2 | Norm::L2Unit => {
-            let sq = e.mul(&v, &v);
+            let sq = e.abs2(&v);
             let ssq = e.reduce_trailing_axes(id, AxisReduce::Sum, &sq, 1)?;
             e.sqrt(&ssq)
         }

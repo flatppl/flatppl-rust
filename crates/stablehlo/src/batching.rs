@@ -166,6 +166,10 @@ impl Emitter<'_> {
                             | "abs"
                             | "abs2"
                             | "real"
+                            | "imag"
+                            | "complex"
+                            | "conj"
+                            | "cis"
                             | "min"
                             | "max"
                             | "ifelse"
@@ -230,6 +234,12 @@ impl Emitter<'_> {
                             | "invlogit"
                             | "abs"
                             | "abs2"
+                            | "real"
+                            | "imag"
+                            | "complex"
+                            | "conj"
+                            | "cis"
+                            | "im"
                             | "sum"
                             | "prod"
                             | "maximum"
@@ -448,15 +458,7 @@ impl Emitter<'_> {
         if self.axes_of(v) == axes {
             return v.clone();
         }
-        let ty = v.ty.render(self.dtype, v.elem);
-        let ssa = self.pure_axes(
-            format!("stablehlo.reshape {} : ({ty}) -> {ty}", v.ssa),
-            axes,
-        );
-        let out = Value { ssa, ..v.clone() };
-        self.copy_constant(v, &out);
-        self.remember_pointwise(&out.ssa, &out, Pointwise::Reshape(v.clone()));
-        out
+        self.reshape_axes(v, v.ty.clone(), axes)
     }
 
     pub(crate) fn typed_axes(&mut self, id: NodeId, v: Value) -> Value {
@@ -492,6 +494,11 @@ impl Emitter<'_> {
             return self.axes_view(v, axes);
         }
         if let Some(value) = self.expand_pointwise(v, dims, &ty, &axes) {
+            return value;
+        }
+        if let Some(value) = self.map_complex_shape(v, |e, part| {
+            e.expand_axes(part, dims, ty.clone(), axes.clone())
+        }) {
             return value;
         }
         let from = v.ty.render(self.dtype, v.elem);

@@ -17,6 +17,7 @@ pub enum Constant {
     Real(#[serde(with = "real")] f64),
     /// Preserve binary32 source precision until fixed-data validation.
     Real32(#[serde(with = "real32")] f32),
+    Complex(#[serde(with = "real")] f64, #[serde(with = "real")] f64),
     String(String),
     /// Flat data in axis order from slowest to fastest (C order).
     #[serde(
@@ -76,12 +77,16 @@ mod packed {
     struct Real32(#[serde(with = "real32")] f32);
 
     #[derive(Deserialize, Serialize)]
+    struct Complex(#[serde(with = "real")] f64, #[serde(with = "real")] f64);
+
+    #[derive(Deserialize, Serialize)]
     #[serde(tag = "dtype", content = "data", rename_all = "snake_case")]
     enum Data {
         Bool(Vec<bool>),
         Integer(Vec<i64>),
         Real(Vec<Real>),
         Real32(Vec<Real32>),
+        Complex(Vec<Complex>),
     }
 
     #[derive(Deserialize, Serialize)]
@@ -142,6 +147,17 @@ mod packed {
                 })
                 .collect::<Option<_>>()
                 .map(Data::Real32),
+            Some(Constant::Complex(_, _)) => data
+                .iter()
+                .map(|x| {
+                    if let Constant::Complex(re, im) = x {
+                        Some(Complex(*re, *im))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()
+                .map(Data::Complex),
             Some(_) => None,
         }
         .ok_or_else(fail)?;
@@ -166,6 +182,10 @@ mod packed {
             Data::Real32(values) => values
                 .into_iter()
                 .map(|Real32(v)| Constant::Real32(v))
+                .collect(),
+            Data::Complex(values) => values
+                .into_iter()
+                .map(|Complex(re, im)| Constant::Complex(re, im))
                 .collect(),
         };
         Ok((shape, data))
@@ -204,7 +224,8 @@ impl Constant {
             (_, Type::Any) => Ok(self.clone()),
             (Self::Bool(_), Type::Scalar(ScalarType::Boolean))
             | (Self::Integer(_), Type::Scalar(ScalarType::Integer))
-            | (Self::Real(_) | Self::Real32(_), Type::Scalar(ScalarType::Real)) => Ok(self.clone()),
+            | (Self::Real(_) | Self::Real32(_), Type::Scalar(ScalarType::Real))
+            | (Self::Complex(_, _), Type::Scalar(ScalarType::Complex)) => Ok(self.clone()),
             (Self::Bool(value), Type::Scalar(ScalarType::Integer)) => {
                 Ok(Self::Integer(i64::from(*value)))
             }
@@ -213,6 +234,10 @@ impl Constant {
             }
             // An integer is a real (§03), rounded as any real literal is.
             (Self::Integer(value), Type::Scalar(ScalarType::Real)) => Ok(Self::Real(*value as f64)),
+            (_, Type::Scalar(ScalarType::Complex)) => self
+                .numeric_value()
+                .map(|re| Self::Complex(re, 0.0))
+                .ok_or_else(|| "complex constants require numeric values".into()),
             (
                 Self::Array { shape, data },
                 Type::Array {
@@ -274,14 +299,7 @@ impl Constant {
 
     fn in_set(&self, module: &Module, set: &ValueSet) -> Result<bool, String> {
         use ValueSet::*;
-        let number = match self {
-            Self::Bool(v) => Some(f64::from(*v)),
-            Self::Integer(v) => Some(*v as f64),
-            Self::Real(v) => Some(*v),
-            Self::Real32(v) => Some(f64::from(*v)),
-            _ => None,
-        };
-        if let Some(value) = number {
+        if let Some(value) = self.numeric_value() {
             let contains = match set {
                 Booleans => value == 0.0 || value == 1.0,
                 Integers => value.is_finite() && value.fract() == 0.0,
@@ -306,6 +324,7 @@ impl Constant {
         }
         Ok(match (self, set) {
             (_, Anything) => true,
+            (Self::Complex(re, im), Complexes) => re.is_finite() && im.is_finite(),
             (_, Deferred | Unknown) => {
                 return Err("external domain cannot be resolved after substitution".into());
             }
@@ -356,6 +375,13 @@ impl Constant {
             return Ok(module.alloc(Node::Lit(scalar)));
         }
         let (head, args, named) = match self {
+            Self::Complex(re, im) => {
+                let args = [re, im]
+                    .into_iter()
+                    .map(|&value| module.alloc(Node::Lit(Scalar::Real(value))))
+                    .collect();
+                ("complex", args, vec![])
+            }
             Self::Array { shape, data } => {
                 let size = shape
                     .iter()
@@ -437,9 +463,17 @@ impl Constant {
         }
     }
 
+    fn numeric_value(&self) -> Option<f64> {
+        match self {
+            Self::Bool(value) => Some(f64::from(*value)),
+            Self::Integer(value) => Some(*value as f64),
+            _ => self.real_value(),
+        }
+    }
+
     /// Read a binding's right-hand side back as a value, structurally.
     ///
-    /// Literals, `neg` of a number, `inf`, `pi`, and the `vector`, `array`,
+    /// Literals, `neg` of a number, `inf`, `pi`, `im`, and the `complex`, `vector`, `array`,
     /// `record`, `table`, `tuple` and `fixed` constructors read back. A
     /// reference to another binding reads as [`Constant::Reference`]. Nothing
     /// is evaluated, so any other expression is refused.
@@ -452,6 +486,7 @@ impl Constant {
             Node::Lit(Scalar::Str(v)) => Ok(Self::String(v.to_string())),
             Node::Const(s) if name(*s) == "inf" => Ok(Self::Real(f64::INFINITY)),
             Node::Const(s) if name(*s) == "pi" => Ok(Self::Real(std::f64::consts::PI)),
+            Node::Const(s) if name(*s) == "im" => Ok(Self::Complex(0.0, 1.0)),
             Node::Ref(r) if r.ns == RefNs::SelfMod => Ok(Self::Reference(name(r.name).into())),
             Node::Call(c) => {
                 let CallHead::Builtin(head) = c.head else {
@@ -473,8 +508,17 @@ impl Constant {
                     ("neg", 1, true) => match Self::read(module, c.args[0])? {
                         Self::Integer(v) => Ok(Self::Integer(-v)),
                         Self::Real(v) => Ok(Self::Real(-v)),
+                        Self::Complex(re, im) => Ok(Self::Complex(-re, -im)),
                         _ => Err("`neg` of a non-number is not a literal".into()),
                     },
+                    ("complex", 2, true) => {
+                        let part = |id| {
+                            Self::read(module, id)?.numeric_value().ok_or_else(|| {
+                                "complex parts must be literal real numbers".to_string()
+                            })
+                        };
+                        Ok(Self::Complex(part(c.args[0])?, part(c.args[1])?))
+                    }
                     ("fixed", 1, true) => Ok(Self::Fixed(Box::new(Self::read(module, c.args[0])?))),
                     ("tuple", _, true) => Ok(Self::Tuple(args()?)),
                     ("record", 0, _) => Ok(Self::Record(fields()?)),
@@ -495,11 +539,12 @@ impl Constant {
 fn scalars(values: Vec<Constant>) -> Result<Vec<Constant>, String> {
     let kind = std::mem::discriminant;
     match values.first() {
-        Some(first @ (Constant::Bool(_) | Constant::Integer(_) | Constant::Real(_)))
-            if values.iter().all(|v| kind(v) == kind(first)) =>
-        {
-            Ok(values)
-        }
+        Some(
+            first @ (Constant::Bool(_)
+            | Constant::Integer(_)
+            | Constant::Real(_)
+            | Constant::Complex(_, _)),
+        ) if values.iter().all(|v| kind(v) == kind(first)) => Ok(values),
         None => Ok(values),
         _ => Err("array elements must be literal numbers or booleans of one kind".into()),
     }

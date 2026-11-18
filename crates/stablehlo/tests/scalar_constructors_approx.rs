@@ -117,13 +117,10 @@ fn boolean_lowers_a_written_bit_or_a_boolean() {
 }
 
 #[test]
-fn a_complex_value_refuses_and_its_projections_lower() {
+fn complex_values_and_projections_lower() {
     for head in ["complex(z0, 1.0)", "cis(z0)", "conj(complex(z0, 1.0))"] {
-        let e = emitted(&format!("({head})")).expect_err("a complex output must refuse");
-        assert!(
-            e.contains("makes a complex value, which has no tensor form here"),
-            "{head}: {e}"
-        );
+        let out = emits(&format!("({head})"));
+        assert!(out.contains("tensor<complex<f32>>"), "{head}: {out}");
     }
     emits("(abs(complex(z0, 2.0) * cis(0.5)) + real(conj(complex(1.0, z0))))");
     // `conj` of a real is the identity.

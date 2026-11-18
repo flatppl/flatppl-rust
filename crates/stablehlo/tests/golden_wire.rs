@@ -734,21 +734,16 @@ fn diag_and_trace_refuse_a_non_square_matrix() {
     }
 }
 
-/// `diag`, `trace` and `lower_cholesky` refuse a non-`Real` matrix. This is the
-/// Real-hardcode family: `Emitter::diag` renders its iota/mask matrices and its
-/// reduction identity as floats unconditionally, and `Emitter::cholesky` renders
-/// `stablehlo.cholesky` at the operand's own kind while tagging the result
-/// `Real` — so an integer operand would emit a self-contradictory module IREE
-/// rejects outright. The head refuses instead of reaching the helper.
+/// Diagonal extraction and Cholesky require real or complex matrices.
 #[test]
-fn the_real_hardcode_family_refuses_an_integer_matrix() {
+fn diagonal_and_cholesky_lowerings_refuse_integer_matrices() {
     let abi = "N = elementof(cartpow(integers, [3, 3]))\n";
     for head in ["diag", "trace", "lower_cholesky"] {
         let msg = emit_err(&format!(
             "{abi}y = {head}(N)\ninputs = (N)\noutputs = (y)\n"
         ));
         assert!(
-            msg.contains("only a real matrix is supported") && msg.contains("Int"),
+            msg.contains("expected a real or complex matrix") && msg.contains("Int"),
             "`{head}` on an integer matrix: unexpected message: {msg}"
         );
     }

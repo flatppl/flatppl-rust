@@ -142,6 +142,8 @@ impl TensorBatch<'_, '_> {
             Pointwise::Compare(dir, ..) => self.out.compare(dir, a, &inputs[1]),
             Pointwise::Select(..) => self.out.select(a, &inputs[1], &inputs[2]),
             Pointwise::Convert(_, elem) => self.out.convert(a, *elem),
+            Pointwise::JoinComplex(..) => self.out.join_complex(a, &inputs[1]),
+            Pointwise::ComplexPart(_, imaginary) => self.out.complex_part(a, *imaginary),
             Pointwise::Bitcast(_, elem) => self.out.bitcast(a, *elem),
             Pointwise::Reshape(_) => self.out.reshape(a, target()),
             Pointwise::Broadcast(_, dims) => {

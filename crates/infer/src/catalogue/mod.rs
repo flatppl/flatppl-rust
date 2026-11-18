@@ -444,6 +444,8 @@ pub(crate) enum ResultSig {
     /// nesting (`det`, `trace`): a real matrix yields a real scalar, a complex
     /// matrix a complex scalar.
     ElemScalarKind(usize),
+    /// Scalar result whose kind follows the named operands' element kinds.
+    ScalarElem(ElemSig),
     /// Result is a rank-1 array (vector) of the given length and element type
     /// (`linspace`/`extlinspace` → real, `sizeof` → integer, `diag` → the
     /// argument's element kind via `ElemSig::OfArg`).
@@ -517,6 +519,8 @@ pub(crate) enum DimExpr {
     WrittenSize(usize),
     /// Full knot count minus the fixed degree and one.
     SplineCount { knots: usize, degree: usize },
+    /// Number of entries on a matrix diagonal, including offset zero by default.
+    DiagonalLength { matrix: usize, offset: usize },
 }
 
 /// Parse a catalogue from RON source.
@@ -710,6 +714,28 @@ pub(crate) fn sig_param_integral(sig: &Sig, count: usize) -> Vec<Option<ScalarTa
                 },
             })
             .collect(),
+    }
+}
+
+/// Whether the parameter's scalar or element domain excludes complex numbers.
+pub(crate) fn sig_param_excludes_complex(sig: &Sig, index: usize) -> bool {
+    fn real(p: &ParamSig) -> bool {
+        match p {
+            ParamSig::Scalar(ScalarTag::Real) | ParamSig::Vector(ScalarTag::Real) => true,
+            ParamSig::Optional(inner) | ParamSig::Variadic(inner) => real(inner),
+            _ => false,
+        }
+    }
+    match sig {
+        Sig::Distribution { param_sets, .. } => param_sets
+            .get(index)
+            .is_some_and(|set| *set != ParamSet::Unconstrained),
+        Sig::Function { params, .. } | Sig::Structural { params, .. } => {
+            params.get(index).map_or_else(
+                || matches!(params.last(), Some(ParamSig::Variadic(inner)) if real(inner)),
+                real,
+            )
+        }
     }
 }
 

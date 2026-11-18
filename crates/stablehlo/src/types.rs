@@ -30,9 +30,7 @@ use crate::refuse::EmitError;
 /// `Dtype` threading, but is unused here: the tensor *shape* never depends on
 /// the element dtype — that is only applied at [`MlirTy::render`] time, never
 /// baked into a FlatPPL `Type` (FlatPPL never mandates a precision). The
-/// returned [`ElemKind`] reflects the node's actual inferred scalar kind
-/// (spec §03 boolean/integer/real) via [`scalar_kind`]; a `Complex` scalar
-/// has no tensor form and is refused rather than mis-lowered.
+/// returned [`ElemKind`] reflects the node's inferred scalar kind (spec §03).
 pub fn mlir_type_of(m: &Module, id: NodeId, dtype: Dtype) -> Result<(MlirTy, ElemKind), EmitError> {
     let ty = m
         .type_of(id)
@@ -49,7 +47,7 @@ pub fn mlir_type_of_ty(
     _dtype: Dtype,
 ) -> Result<(MlirTy, ElemKind), EmitError> {
     match ty {
-        Type::Scalar(st) => Ok((MlirTy::Scalar, scalar_kind(id, *st)?)),
+        Type::Scalar(st) => Ok((MlirTy::Scalar, scalar_kind(*st))),
         Type::Array { shape, elem } => {
             let mut dims: Vec<Option<u64>> = shape.iter().map(dim_to_mlir).collect();
             let kind = flatten_elem(id, elem, &mut dims)?;
@@ -65,15 +63,13 @@ pub fn mlir_type_of_ty(
     }
 }
 
-/// Map a scalar leaf's spec §03 category to its [`ElemKind`]. `Complex` has
-/// no tensor form (StableHLO's tensor element types are real/integer/boolean
-/// only) — refused here, localized to `id`, rather than mis-lowered.
-fn scalar_kind(id: NodeId, st: ScalarType) -> Result<ElemKind, EmitError> {
+/// Map a scalar leaf's spec §03 category to its [`ElemKind`].
+fn scalar_kind(st: ScalarType) -> ElemKind {
     match st {
-        ScalarType::Real => Ok(ElemKind::Real),
-        ScalarType::Integer => Ok(ElemKind::Int),
-        ScalarType::Boolean => Ok(ElemKind::Bool),
-        ScalarType::Complex => Err(EmitError::at(id, "complex scalar has no tensor form")),
+        ScalarType::Real => ElemKind::Real,
+        ScalarType::Integer => ElemKind::Int,
+        ScalarType::Boolean => ElemKind::Bool,
+        ScalarType::Complex => ElemKind::Complex,
     }
 }
 
@@ -88,7 +84,7 @@ fn flatten_elem(
     dims: &mut Vec<Option<u64>>,
 ) -> Result<ElemKind, EmitError> {
     match elem {
-        Type::Scalar(st) => scalar_kind(id, *st),
+        Type::Scalar(st) => Ok(scalar_kind(*st)),
         Type::Array { shape, elem } => {
             dims.extend(shape.iter().map(dim_to_mlir));
             flatten_elem(id, elem, dims)
