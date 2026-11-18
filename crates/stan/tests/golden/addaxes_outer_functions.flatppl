@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+k = [1, 2, 4]
+v = [0.2, -0.4]
+x = [0.5, 1.0, 2.0]
+mu ~ Normal(0, 1)
+a = max.(addaxes(x, 0, 1), addaxes(v, 1, 0)) .+ min.(addaxes(k, 0, 1), 1.5)
+b = max.(addaxes(x, 0, 1) .+ addaxes(v, 1, 0), 0.5)
+c = addaxes(k, 0, 1) .+ addaxes(v, 1, 0)
+w = exp.(addaxes(v, 1, 0) .* mu) .+ addaxes(x, 0, 1)
+z ~ Normal(mu + sum(a .+ b .+ c .+ w), 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(z = z), mu = mu), record(z = 0.4))
+post = bayesupdate(L, prior)

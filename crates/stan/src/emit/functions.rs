@@ -770,10 +770,74 @@ impl<'m> Emitter<'m> {
     /// `base` holding `f.(args…)`: one vectorized call when the body lifts,
     /// else filled by loops over the broadcast axes.
     pub(super) fn user_broadcast_value(&mut self, base: &str, id: NodeId) -> Result<String> {
+        if let Some(e) = self.row_selector_broadcast(id)? {
+            if super::structure::is_identifier(&e.s) {
+                self.remember(id, &e.s);
+                return Ok(e.s);
+            }
+            return self.place(base, id, Ok(e));
+        }
         if let Ok(e) = self.vectorized_broadcast(id)? {
             return self.place(base, id, Ok(e));
         }
         self.looped_broadcast(base, id)
+    }
+
+    /// `f.(indicesof(…))` where `f(i) = A[i, :, …]` and the range covers A's
+    /// whole outer axis: the rows of A in order, which is A itself. Only for
+    /// an integer A or a vector, whose array-of-rows and whole-array Stan
+    /// types are the same.
+    pub(super) fn row_selector_broadcast(&mut self, id: NodeId) -> Result<Option<Ex>> {
+        let c = self.call(id).unwrap();
+        if !c.named.is_empty() || c.args.len() != 2 {
+            return Ok(None);
+        }
+        let Some(fun) = self.user_callee(c.args[0]) else {
+            return Ok(None);
+        };
+        let range = self.resolve(c.args[1]);
+        if self.head(range) != Some("indicesof") {
+            return Ok(None);
+        }
+        let (body, entries) = self.callable_parts(fun)?;
+        let [(_, param)] = entries[..] else {
+            return Ok(None);
+        };
+        let b = self.resolve(body);
+        if self.head(b) != Some("get") {
+            return Ok(None);
+        }
+        let gc = self.call(b).unwrap();
+        let [a, first, rest @ ..] = &gc.args[..] else {
+            return Ok(None);
+        };
+        let all =
+            |me: &Self, s: NodeId| matches!(me.m.node(s), Node::Const(k) if me.name(*k) == "all");
+        let is_param = matches!(self.m.node(*first), Node::Ref(r) if *r == param);
+        let Some(shape) = self.shape(*a) else {
+            return Ok(None);
+        };
+        if !is_param
+            || !rest.iter().all(|&s| all(self, s))
+            || rest.len() + 1 != shape.rank
+            || !(shape.int || shape.rank == 1)
+        {
+            return Ok(None);
+        }
+        // A must not read the selector anywhere else.
+        let mut stack = vec![*a];
+        while let Some(n) = stack.pop() {
+            if matches!(self.m.node(n), Node::Ref(r) if *r == param) {
+                return Ok(None);
+            }
+            self.m.for_each_child(n, |k| stack.push(k));
+        }
+        let a = *a;
+        match (self.sym_extent(range, 0, 0), self.sym_extent(a, 0, 0)) {
+            (Some(n), Some(m)) if n == m => {}
+            _ => return Ok(None),
+        }
+        Ok(Some(self.at_module(|me| me.expr(a))?))
     }
 
     /// `base` holding `f.(args…)`, filled by loops over the broadcast axes.
