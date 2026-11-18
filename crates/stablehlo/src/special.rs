@@ -600,17 +600,13 @@ impl Emitter<'_> {
         // Keep those rows in place and evaluate subtraction on the rest.
         let (width, prefix, batch) = compactable_rows(lower)?;
         let mut active = Vec::new();
-        let mut order = Vec::with_capacity(width);
         for lane in 0..width {
             let one_sided = (0..batch).all(|row| {
                 matches!(self.fixed_scalar_at(lower, row * width + lane),
                     Some(Scalar::Real(v)) if v == f64::NEG_INFINITY)
             });
-            if one_sided {
-                order.push(lane as i64);
-            } else {
-                order.push((width + active.len()) as i64);
-                active.push(lane as i64);
+            if !one_sided {
+                active.push(lane);
             }
         }
         if active.is_empty() {
@@ -624,16 +620,62 @@ impl Emitter<'_> {
             batch: prefix.len(),
             layers: vec![1],
         };
-        let upper = self.axes_view(upper, vector_axes.clone());
-        let lower = self.axes_view(lower, vector_axes);
-        let keep = self.fixed_lane_indices(active)?;
-        let partial_upper = self.gather_axis(&upper, &keep, 0, 0);
-        let partial_lower = self.gather_axis(&lower, &keep, 0, 0);
+        let (upper, mut order) = self
+            .cdf_row_layout(upper, prefix.len())
+            .unwrap_or_else(|| (upper.clone(), (0..width as u64).collect()));
+        let (lower, lower_order) = self
+            .cdf_row_layout(lower, prefix.len())
+            .unwrap_or_else(|| (lower.clone(), (0..width as u64).collect()));
+        let partial_upper = self.select_cdf_rows(&upper, &order, &active, &vector_axes)?;
+        let partial_lower = self.select_cdf_rows(&lower, &lower_order, &active, &vector_axes)?;
         let differences = self.log_cdf_difference_body(&partial_upper, &partial_lower);
+        let offset = shape(&upper.ty).last().copied().flatten()?;
+        for (index, lane) in active.into_iter().enumerate() {
+            order[lane] = offset + index as u64;
+        }
+        let upper = self.axes_view(&upper, vector_axes);
         let joined = self.concatenate(id, &[upper, differences]).ok()?;
-        let order = self.fixed_lane_indices(order)?;
+        let order = self.fixed_lane_indices(order.into_iter().map(|lane| lane as i64).collect())?;
         let result = self.gather_axis(&joined, &order, 0, 0);
         Some(self.axes_view(&result, original))
+    }
+
+    // Keep the inverse gather from CDF compaction as an index map until the
+    // interval results are ready to be returned in their original order.
+    fn cdf_row_layout(&self, value: &Value, axis: usize) -> Option<(Value, Vec<u64>)> {
+        let mut current = value;
+        loop {
+            match &self.pointwise.get(&current.ssa)?.op {
+                Pointwise::Reshape(input) if input.ty == current.ty => current = input,
+                Pointwise::Gather(input, selected, order) if *selected == axis => {
+                    return Some((input.clone(), order.clone()));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn select_cdf_rows(
+        &mut self,
+        value: &Value,
+        order: &[u64],
+        active: &[usize],
+        axes: &Axes,
+    ) -> Option<Value> {
+        let indices: Vec<_> = active.iter().map(|&lane| order[lane] as i64).collect();
+        let mut source = value.clone();
+        if let Some(producer) = self.pointwise.get(&source.ssa)
+            && let Pointwise::Concat(parts, axis) = &producer.op
+            && *axis == axes.batch
+            && let Some(first) = parts.first()
+            && let Some(width) = shape(&first.ty)[*axis]
+            && indices.iter().all(|&index| index < width as i64)
+        {
+            source = first.clone();
+        }
+        let source = self.axes_view(&source, axes.clone());
+        let indices = self.fixed_lane_indices(indices)?;
+        Some(self.gather_axis(&source, &indices, 0, 0))
     }
 
     /// Use the direct product near zero and Cody's rational tail beyond 4.
