@@ -1,5 +1,42 @@
 use crate::{Error, GroupLevel, Result};
+use flatppl_convert::Builder;
+use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 use std::collections::HashSet;
+
+pub(crate) fn row_probabilities(
+    b: &mut Builder<'_>,
+    logits: impl IntoIterator<Item = NodeId>,
+) -> NodeId {
+    let baseline = b.lit_real(0.0);
+    let logits: Vec<_> = std::iter::once(baseline).chain(logits).collect();
+    let logits = b.array(&logits);
+    b.call("softmax", &[logits])
+}
+
+pub(crate) fn probabilities(b: &mut Builder<'_>, logits: &[(&str, NodeId)]) -> NodeId {
+    let mut inputs = Vec::new();
+    let mut arguments = Vec::new();
+    let mut local_logits = Vec::new();
+    for &(name, value) in logits {
+        let input = Ref {
+            ns: RefNs::Local,
+            name: b.sym(&format!("_{name}_")),
+        };
+        inputs.push((b.sym(name), input));
+        arguments.push(value);
+        local_logits.push(b.m.alloc(Node::Ref(input)));
+    }
+    let output = row_probabilities(b, local_logits);
+    let head = CallHead::Builtin(b.sym("functionof"));
+    let row = b.m.alloc(Node::Call(Call {
+        head,
+        args: Box::new([output]),
+        named: Box::default(),
+        inputs: Some(Inputs::Spec(inputs.into())),
+    }));
+    arguments.insert(0, row);
+    b.call("broadcast", &arguments)
+}
 
 /// brms uses make.names(unique=TRUE), then removes dots and underscores.
 pub(crate) fn predictor_names(levels: &[GroupLevel]) -> Result<Vec<String>> {

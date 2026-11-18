@@ -139,21 +139,18 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         .map(|name| (name, b.self_ref(name)))
         .collect();
     let cuts = threshold_inputs(&mut b, recipe);
+    let observation = crate::family::Observation {
+        mu,
+        trials,
+        scale,
+        auxiliary: &auxiliary,
+        cuts: &cuts,
+    };
     let law = if let Some(truncation) = &recipe.formula.truncation {
         let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
         crate::response::truncated_normal(&mut b, mu, sigma, truncation)
     } else {
-        recipe.family.observation(
-            &mut b,
-            crate::family::Observation {
-                mu,
-                trials,
-                scale,
-                auxiliary: &auxiliary,
-                cuts: &cuts,
-            },
-            false,
-        )
+        recipe.family.observation(&mut b, observation, false)
     };
     let y = b.call("draw", &[law]);
     b.bind("y", y);
@@ -161,6 +158,14 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let response = b.call_fields("record", &[("y", y)]);
     let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
+    if let Some(expected) = crate::expectation::emit(&mut b, recipe, observation) {
+        let expected = parameter_function(&mut b, "functionof", expected, &parameters);
+        b.bind_doc(
+            "expected_response",
+            expected,
+            &["Conditional response means or category probabilities in training order."],
+        );
+    }
     let pointwise = pointwise_log_likelihood(&mut b, recipe, scale);
     let likelihood = if recipe.formula.censoring.is_some() {
         crate::response::observed_likelihood(&mut b, pointwise, &parameters)
