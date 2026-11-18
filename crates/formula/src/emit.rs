@@ -155,23 +155,20 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         .map(|name| (name, b.self_ref(name)))
         .collect();
     let cuts = threshold_inputs(&mut b, recipe);
+    let observation = crate::family::Observation {
+        mu,
+        trials,
+        scale,
+        auxiliary: &auxiliary,
+        cuts: &cuts,
+    };
     let law = if recipe.formula.ar.is_some() {
         autoregression::law(&mut b, mu)
     } else if let Some(truncation) = &recipe.formula.truncation {
         let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
         crate::response::truncated_normal(&mut b, mu, sigma, truncation)
     } else {
-        recipe.family.observation(
-            &mut b,
-            crate::family::Observation {
-                mu,
-                trials,
-                scale,
-                auxiliary: &auxiliary,
-                cuts: &cuts,
-            },
-            false,
-        )
+        recipe.family.observation(&mut b, observation, false)
     };
     let y = b.call("draw", &[law]);
     b.bind("y", y);
@@ -179,6 +176,14 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     let response = b.call_fields("record", &[("y", y)]);
     let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
+    if let Some(expected) = crate::expectation::emit(&mut b, recipe, observation) {
+        let expected = parameter_function(&mut b, "functionof", expected, &parameters);
+        b.bind_doc(
+            "expected_response",
+            expected,
+            &["Conditional response means or category probabilities in training order."],
+        );
+    }
     let pointwise = if recipe.formula.ar.is_some() {
         autoregression::pointwise(&mut b, mu)
     } else {
@@ -254,8 +259,23 @@ pub(crate) fn predictor_name(dpar: &str, name: &str) -> String {
 }
 
 fn predictor_data(b: &mut Builder<'_>, dpar: &str, recipe: &mut crate::PredictorRecipe) {
-    for i in 1..=recipe.monotonic.len() {
+    let monotonic_columns = recipe
+        .monotonic_design
+        .as_ref()
+        .map_or(recipe.monotonic.len(), |design| design.columns.len());
+    for i in 1..=monotonic_columns {
         external_vector(b, &predictor_name(dpar, &format!("mo_{i}")), "posintegers");
+    }
+    if let Some(design) = &recipe.monotonic_design {
+        for (i, effect) in design.effects.iter().enumerate() {
+            if effect.has_covariate {
+                external_vector(
+                    b,
+                    &predictor_name(dpar, &format!("mo_cov_{}", i + 1)),
+                    "reals",
+                );
+            }
+        }
     }
     for (i, smooth) in recipe.smooths.iter_mut().enumerate() {
         smooth.inputs = (0..smooth.basis.transform[0].len())
@@ -408,19 +428,19 @@ fn predictor_parameters(
         }
     }
     for (i, coding) in recipe.monotonic.iter().enumerate() {
-        let index = i + 1;
-        let name = predictor_name(dpar, &format!("bmo_{index}"));
+        let name = predictor_name(dpar, &format!("bmo_{}", i + 1));
         parameter(b, &name, &recipe.priors.bmo[i], None, parameters, family)?;
-        let name = predictor_name(dpar, &format!("simo_{index}"));
-        let steps = coding.steps();
-        let law = crate::prior_expr::emit_simplex(b, &recipe.priors.simo[i], steps)?;
-        if steps == 1 {
-            // A two-level predictor has only one possible simplex.
-            let one = b.lit_real(1.0);
-            let singleton = b.array(&[one]);
-            b.bind(&name, singleton);
-        } else {
-            declare_parameter(b, &name, law, parameters);
+        let name = predictor_name(dpar, &format!("simo_{}", i + 1));
+        monotonic_simplex(b, &name, &recipe.priors.simo[i], coding.steps(), parameters)?;
+    }
+    if let Some(design) = &recipe.monotonic_design {
+        for (i, prior) in recipe.priors.bmo.iter().enumerate() {
+            let name = predictor_name(dpar, &format!("bmo_{}", i + 1));
+            parameter(b, &name, prior, None, parameters, family)?;
+        }
+        for (i, simplex) in design.simplexes.iter().enumerate() {
+            let name = predictor_name(dpar, &format!("simo_{}", i + 1));
+            monotonic_simplex(b, &name, &recipe.priors.simo[i], simplex.steps, parameters)?;
         }
     }
     for (i, group) in recipe.groups.iter_mut().enumerate() {
@@ -462,16 +482,7 @@ fn predictor_parameters(
             b.bind(&group.sd, value);
         }
         group.z = b.alloc_name(&predictor_name(dpar, &format!("z_{}", group.column)));
-        let zero = b.lit_real(0.0);
-        let one = b.lit_real(1.0);
-        let standard = b.call("Normal", &[zero, one]);
-        let count = b.lit_int(group.levels.len() as i64);
-        let size = if dimensions == 1 {
-            count
-        } else {
-            b.array(&[dimension, count])
-        };
-        let iid = b.call("iid", &[standard, size]);
+        let iid = group_innovations(b, dimensions, group.levels.len());
         declare_parameter(b, &group.z, iid, parameters);
         group.r = b.alloc_name(&predictor_name(dpar, &format!("r_{}", group.column)));
         let sd = b.self_ref(&group.sd);
@@ -501,6 +512,55 @@ fn predictor_parameters(
         b.bind(&group.r, effect);
     }
     Ok(())
+}
+
+fn group_innovations(b: &mut Builder<'_>, coefficients: usize, levels: usize) -> NodeId {
+    let zero = b.lit_real(0.0);
+    let one = b.lit_real(1.0);
+    let standard = b.call("Normal", &[zero, one]);
+    let count = b.lit_int(levels as i64);
+    let size = if coefficients == 1 {
+        count
+    } else {
+        let dimension = b.lit_int(coefficients as i64);
+        b.array(&[dimension, count])
+    };
+    b.call("iid", &[standard, size])
+}
+
+pub(crate) fn extend_group_draws(
+    recipe: &Recipe,
+    mut template: Module,
+    shapes: &crate::NewGroupShapes,
+) -> Result<Module> {
+    let mut b = Builder::new(&mut template);
+    for (name, shape) in shapes {
+        let group = recipe
+            .predictors()
+            .flat_map(|(_, predictor)| &predictor.groups)
+            .find(|group| group.z == *name)
+            .ok_or_else(|| Error(format!("unknown group parameter `{name}`")))?;
+        let coefficients = group.coefficients.len();
+        let new_count = match shape.as_slice() {
+            [count] if coefficients == 1 => *count,
+            [rows, count] if coefficients > 1 && *rows == coefficients => *count,
+            _ => return Err(Error(format!("invalid innovation shape for `{name}`"))),
+        };
+        let levels = group
+            .levels
+            .len()
+            .checked_add(new_count)
+            .filter(|count| u32::try_from(*count).is_ok())
+            .ok_or_else(|| Error(format!("too many levels in group `{}`", group.column)))?;
+        let symbol = b.sym(name);
+        let binding =
+            b.m.binding_by_name(symbol)
+                .ok_or_else(|| Error(format!("missing group parameter `{name}`")))?;
+        let iid = group_innovations(&mut b, coefficients, levels);
+        let draw = b.call("draw", &[iid]);
+        b.m.set_binding_rhs(binding, draw);
+    }
+    Ok(template)
 }
 
 fn predictor_values(
@@ -564,19 +624,32 @@ fn predictor_values(
     }
     for (i, coding) in recipe.monotonic.iter().enumerate() {
         let index = i + 1;
-        let simplex = b.self_ref(&predictor_name(dpar, &format!("simo_{index}")));
-        let prefix = b.call("cumsum", &[simplex]);
-        let zero = b.lit_real(0.0);
-        let baseline = b.array(&[zero]);
-        let levels = b.call("cat", &[baseline, prefix]);
-        let codes = b.self_ref(&predictor_name(dpar, &format!("mo_{index}")));
-        let selected = b.call("get", &[levels, codes]);
         let slope = b.self_ref(&predictor_name(dpar, &format!("bmo_{index}")));
-        // brms defines the slope per step, so the total change is steps times the slope.
+        let selected = monotonic_values(b, dpar, i, i);
+        // brms defines the slope per step.
         let steps = b.lit_real(coding.steps() as f64);
         let total = b.call("mul", &[slope, steps]);
         let contribution = broadcast(b, "mul", &[selected, total]);
         eta = broadcast(b, "add", &[eta, contribution]);
+    }
+    if let Some(design) = &recipe.monotonic_design {
+        let mut factors = std::collections::HashMap::new();
+        for (i, effect) in design.effects.iter().enumerate() {
+            let mut contribution = b.self_ref(&predictor_name(dpar, &format!("bmo_{}", i + 1)));
+            for &(column, simplex) in &effect.factors {
+                let values = *factors.entry((column, simplex)).or_insert_with(|| {
+                    let values = monotonic_values(b, dpar, column, simplex);
+                    let steps = b.lit_real(design.simplexes[simplex].steps as f64);
+                    broadcast(b, "mul", &[values, steps])
+                });
+                contribution = broadcast(b, "mul", &[contribution, values]);
+            }
+            if effect.has_covariate {
+                let covariate = b.self_ref(&predictor_name(dpar, &format!("mo_cov_{}", i + 1)));
+                contribution = broadcast(b, "mul", &[contribution, covariate]);
+            }
+            eta = broadcast(b, "add", &[eta, contribution]);
+        }
     }
     for (i, group) in recipe.groups.iter().enumerate() {
         let mut columns = design_columns(b, &group.design, &group.inputs);
@@ -617,6 +690,16 @@ fn predictor_values(
     if let Some(intercept) = intercept {
         b.bind(&predictor_name(dpar, "b_Intercept"), intercept);
     }
+}
+
+fn monotonic_values(b: &mut Builder<'_>, dpar: &str, column: usize, simplex: usize) -> NodeId {
+    let simplex = b.self_ref(&predictor_name(dpar, &format!("simo_{}", simplex + 1)));
+    let prefix = b.call("cumsum", &[simplex]);
+    let zero = b.lit_real(0.0);
+    let baseline = b.array(&[zero]);
+    let levels = b.call("cat", &[baseline, prefix]);
+    let codes = b.self_ref(&predictor_name(dpar, &format!("mo_{}", column + 1)));
+    b.call("get", &[levels, codes])
 }
 
 fn smooth_effect(b: &mut Builder<'_>, dpar: &str, smooth: &crate::Smooth, offset: usize) -> NodeId {
@@ -909,6 +992,24 @@ fn parameter(
             }
             b.bind(name, value);
         }
+    }
+    Ok(())
+}
+
+fn monotonic_simplex(
+    b: &mut Builder<'_>,
+    name: &str,
+    prior: &ResolvedPrior,
+    steps: i64,
+    parameters: &mut Vec<ParameterPrior>,
+) -> Result<()> {
+    let law = crate::prior_expr::emit_simplex(b, prior, steps)?;
+    if steps == 1 {
+        let one = b.lit_real(1.0);
+        let singleton = b.array(&[one]);
+        b.bind(name, singleton);
+    } else {
+        declare_parameter(b, name, law, parameters);
     }
     Ok(())
 }
@@ -1294,6 +1395,34 @@ fn predictor_info(
                 &[j],
                 parameter_role(module, &simplex),
             );
+        }
+    }
+    if let Some(design) = &recipe.monotonic_design {
+        for (i, effect) in design.effects.iter().enumerate() {
+            if !names.insert(effect.name.clone()) {
+                return Err(Error(format!(
+                    "design columns have duplicate brms name `{}`",
+                    effect.name
+                )));
+            }
+            let binding = predictor_name(dpar, &format!("bmo_{}", i + 1));
+            add(
+                format!("b_{prefix}{}", effect.name),
+                &binding,
+                &[],
+                parameter_role(module, &binding),
+            );
+        }
+        for (i, simplex) in design.simplexes.iter().enumerate() {
+            let binding = predictor_name(dpar, &format!("simo_{}", i + 1));
+            for j in 1..=simplex.steps as usize {
+                add(
+                    format!("simo_{prefix}{}[{j}]", simplex.name),
+                    &binding,
+                    &[j],
+                    parameter_role(module, &binding),
+                );
+            }
         }
     }
     for (group_index, group) in recipe.groups.iter().enumerate() {

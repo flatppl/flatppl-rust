@@ -10,6 +10,7 @@ mod contrasts;
 mod data;
 mod design;
 mod emit;
+mod expectation;
 mod expression;
 mod family;
 mod formula;
@@ -30,7 +31,9 @@ use std::{collections::BTreeMap, fmt};
 
 pub use autoregression::Ar1;
 use data::ColumnModel;
-pub use data::{DataDocument, DataMode, DataValue, prepare_data};
+pub use data::{
+    DataDocument, DataMode, DataValue, NewGroupShapes, prepare_data, prepare_data_with_new_groups,
+};
 pub use design::{Contrast, Design, DesignColumn, DesignComponent, FactorEncoding, Predictor};
 pub use expression::{Arithmetic, ColumnExpression};
 pub use family::{Family, Link};
@@ -202,10 +205,18 @@ pub struct PredictorRecipe {
     pub smooths: Vec<Smooth>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monotonic: Vec<Monotonic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) monotonic_design: Option<monotonic::MonotonicDesign>,
     pub priors: Priors,
 }
 
 impl Recipe {
+    /// Expand noncentered group draws in this recipe's prediction template.
+    /// `shapes` comes from [`prepare_data_with_new_groups`].
+    pub fn extend_group_draws(&self, template: Module, shapes: &NewGroupShapes) -> Result<Module> {
+        emit::extend_group_draws(self, template, shapes)
+    }
+
     pub(crate) fn is_nonlinear_parameter(&self, name: &str) -> bool {
         self.nonlinear
             .as_ref()
@@ -392,9 +403,19 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "`se(...)` is available for Gaussian and Student families".into(),
         ));
     }
-    if (formula.censoring.is_some() || formula.truncation.is_some()) && family != Family::Gaussian {
+    if formula.censoring.is_some()
+        && !matches!(
+            family,
+            Family::Gaussian | Family::Weibull | Family::Exponential
+        )
+    {
         return Err(Error(
-            "`cens(...)` and `trunc(...)` are available for Gaussian responses".into(),
+            "`cens(...)` is available for Gaussian, Weibull and exponential responses".into(),
+        ));
+    }
+    if formula.truncation.is_some() && family != Family::Gaussian {
+        return Err(Error(
+            "`trunc(...)` is available for Gaussian responses".into(),
         ));
     }
     if let Some(ar) = &formula.ar {
@@ -528,6 +549,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         if !formulas.iter().any(|(_, formula, _)| {
             formula.variables.contains(name)
                 || formula.groups.iter().any(|g| g.variables.contains(name))
+                || formula
+                    .monotonic_terms
+                    .as_ref()
+                    .is_some_and(|terms| terms.variables.contains(name))
         }) {
             return Err(Error(format!(
                 "contrast supplied for unused predictor `{name}`"
@@ -574,6 +599,13 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             .iter()
             .map(|column| Monotonic::fit(table.column(column)?, &rows))
             .collect::<Result<Vec<_>>>()?;
+        let monotonic_design = formula
+            .monotonic_terms
+            .as_ref()
+            .map(|terms| {
+                monotonic::MonotonicDesign::fit(terms, table, &rows, &spec.options.contrasts)
+            })
+            .transpose()?;
         let groups = formula
             .groups
             .iter()
@@ -629,6 +661,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             &design,
             &groups,
             &smooths,
+            monotonic_design.as_ref(),
             priors::PriorContext {
                 family,
                 link,
@@ -659,6 +692,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 groups,
                 smooths,
                 monotonic,
+                monotonic_design,
                 priors,
             },
         );

@@ -175,11 +175,11 @@ fn a_run_time_bound_reaches_the_cdf_only_when_finite() {
     // the adjoint of the unselected branch. The placeholder is a support point.
     let source = lower(
         "a = external(reals)\nb = external(reals)\ninputs = (a, b)\n\
-         outputs = logdensityof(normalize(truncate(Exponential(2.0), interval(a, b))), 0.3)",
+         outputs = logdensityof(normalize(truncate(Gamma(2.5, 2.0), interval(a, b))), 0.3)",
     );
     for bound in ["a", "b"] {
         let guarded = format!(
-            "builtin_touniform(Exponential, record(rate = 2.0), ifelse(isfinite({bound}), {bound}, 1.0))"
+            "builtin_touniform(Gamma, record(shape = 2.5, rate = 2.0), ifelse(isfinite({bound}), {bound}, 1.0))"
         );
         assert!(source.contains(&guarded), "{source}");
     }

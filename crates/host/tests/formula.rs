@@ -92,6 +92,53 @@ fn formula_training_and_prediction_compile_from_distinct_snapshots()
 }
 
 #[test]
+fn prediction_appends_innovations_for_retained_unseen_groups()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spec = flatppl_formula::read(include_str!(
+        "../../formula/tests/fixtures/group-priors.formula.json"
+    ))?;
+    let mut context = Context::default();
+    let model = context.import_formula(&spec, spec.data.as_ref().unwrap(), None, None)?;
+    let data = flatppl_formula::read_json_table(
+        r#"{"x":[1,2,null,3,4],"g":["C","A","omitted","D","C"],"h":["1","2","1","1","2"]}"#,
+    )?;
+    assert!(
+        model
+            .prepare(&mut context, &data, DataMode::Prediction)
+            .is_err()
+    );
+    let prediction = model.prepare_with_new_groups(&mut context, &data)?;
+    assert_eq!(prediction.rows, [0, 1, 3, 4]);
+    assert_eq!(prediction.new_group_shapes.len(), 1);
+    assert_eq!(prediction.new_group_shapes["z_g"], [2, 2]);
+
+    let domain_shape = |module: &flatppl_host::LoadedModule, name: &str| {
+        let posterior = module
+            .bindings()
+            .into_iter()
+            .find(|binding| binding.name == "Pi_post")
+            .unwrap();
+        let Some(flatppl_host::Domain::Record { fields }) = posterior.domain else {
+            panic!("expected record posterior domain");
+        };
+        let field = fields.into_iter().find(|field| field.name == name).unwrap();
+        let flatppl_host::Domain::CartPow { shape, .. } = field.set else {
+            panic!("expected array posterior parameter `{name}`");
+        };
+        shape
+    };
+    assert_eq!(domain_shape(&model.module, "z_g"), [Some(2), Some(2)]);
+    assert_eq!(domain_shape(&prediction.module, "z_g"), [Some(2), Some(4)]);
+    assert_eq!(domain_shape(&prediction.module, "z_h"), [Some(2), Some(2)]);
+    assert!(
+        model
+            .prepare_with_new_groups(&mut Context::default(), &data)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn distributional_prediction_reuses_both_predictors_without_response()
 -> Result<(), Box<dyn std::error::Error>> {
     let oracle: serde_json::Value = serde_json::from_str(include_str!(

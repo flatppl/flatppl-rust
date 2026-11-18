@@ -1,4 +1,6 @@
-use crate::{DataMode, DataValue, Error, Formula, GroupLevel, Result, Table, data::ColumnModel};
+use crate::{
+    DataMode, DataValue, Error, Family, Formula, GroupLevel, Result, Table, data::ColumnModel,
+};
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
 use serde::{Deserialize, Serialize};
@@ -126,6 +128,7 @@ const UPPER: &str = "trunc_upper_data";
 
 pub(crate) fn prepare(
     formula: &Formula,
+    family: Family,
     table: &Table,
     rows: &[usize],
     mode: DataMode,
@@ -175,6 +178,11 @@ pub(crate) fn prepare(
         let mut upper_values = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
             let code = censor_code(status.level(row)?)?;
+            if code == 0 && y[i] == 0.0 && matches!(family, Family::Exponential | Family::Weibull) {
+                return Err(Error(
+                    "exact survival times must be strictly positive".into(),
+                ));
+            }
             let end = match code {
                 2 => {
                     let upper = upper.filter(|col| col.present(row)).ok_or_else(|| {
@@ -297,6 +305,28 @@ pub(crate) fn truncated_normal(
     scale: NodeId,
     truncation: &Truncation,
 ) -> NodeId {
+    truncated_normal_rows(
+        b,
+        mean,
+        scale,
+        truncation,
+        "truncated_response",
+        |b, mean, scale, bounds| {
+            let normal = b.call("Normal", &[mean, scale]);
+            let restricted = truncate(b, normal, bounds);
+            b.call("normalize", &[restricted])
+        },
+    )
+}
+
+pub(crate) fn truncated_normal_rows(
+    b: &mut Builder<'_>,
+    mean: NodeId,
+    scale: NodeId,
+    truncation: &Truncation,
+    name: &str,
+    row: impl FnOnce(&mut Builder<'_>, NodeId, NodeId, [NodeId; 2]) -> NodeId,
+) -> NodeId {
     let mut args = Vec::new();
     let mut inputs = Vec::new();
     let mut argument = |b: &mut Builder<'_>, name: &str, value| {
@@ -314,29 +344,27 @@ pub(crate) fn truncated_normal(
         let value = b.self_ref(name);
         argument(b, name, value)
     });
-    let normal = b.call("Normal", &[mean, scale]);
-    let restricted = truncate(b, normal, bounds);
-    let law = b.call("normalize", &[restricted]);
+    let result = row(b, mean, scale, bounds);
     let head = CallHead::Builtin(b.sym("functionof"));
     let callback = b.m.alloc(Node::Call(Call {
         head,
-        args: Box::new([law]),
+        args: Box::new([result]),
         named: Box::default(),
         inputs: Some(Inputs::Spec(inputs.into())),
     }));
-    let name = b.alloc_name("truncated_response");
+    let name = b.alloc_name(name);
     b.bind(&name, callback);
     let callback = b.self_ref(&name);
     args.insert(0, callback);
     b.call("broadcast", &args)
 }
 
-fn truncate(b: &mut Builder<'_>, law: NodeId, bounds: [NodeId; 2]) -> NodeId {
+pub(crate) fn truncate(b: &mut Builder<'_>, law: NodeId, bounds: [NodeId; 2]) -> NodeId {
     let interval = b.call("interval", &bounds);
     b.call("truncate", &[law, interval])
 }
 
-fn log_mass(b: &mut Builder<'_>, restricted: NodeId) -> NodeId {
+pub(crate) fn log_mass(b: &mut Builder<'_>, restricted: NodeId) -> NodeId {
     let mass = b.call("totalmass", &[restricted]);
     b.call("log", &[mass])
 }

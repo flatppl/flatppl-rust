@@ -98,3 +98,112 @@ fn monotonic_step_limit_rejects_sparse_scores_before_building_the_model() {
         .expect("oversized integer range");
     assert!(error.0.contains("limit of 4096 steps"), "{error}");
 }
+
+#[test]
+fn monotonic_interaction_reuses_a_shared_simplex_and_fitted_contrasts() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ mo(dose, id='dose_steps') * arm",
+        "priors": [{"class": "simo", "coef": "dose_steps", "prior": "dirichlet(c(2, 1))"}]
+    }))
+    .unwrap();
+    let training = read_json_table(
+        r#"{"dose":[1,2,3,1,2,3],"arm":["a","a","a","b","b","b"],"y":[0,1,2,0,2,4]}"#,
+    )
+    .unwrap();
+    let model = build(&spec, &training).unwrap();
+    let recipe: Recipe =
+        serde_json::from_value(serde_json::to_value(&model.recipe).unwrap()).unwrap();
+    assert_eq!(recipe.predictors["mu"].priors.simo.len(), 1);
+    assert_eq!(
+        recipe.predictors["mu"].priors.simo[0].prior,
+        "dirichlet(c(2, 1))"
+    );
+    let prediction = read_json_table(r#"{"dose":[3,2],"arm":["b","a"]}"#).unwrap();
+    let fitted = prepare_data(&recipe, &prediction, DataMode::Prediction).unwrap();
+    assert_eq!(fitted.constants["mo_1"], DataValue::Integers(vec![3, 2]));
+    assert_eq!(
+        fitted.constants["mo_cov_2"],
+        DataValue::Real64(vec![1.0, 0.0])
+    );
+}
+
+#[test]
+fn shared_monotonic_simplex_dimensions_must_match() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ mo(x, id='s'):mo(z, id='s')",
+    }))
+    .unwrap();
+    let training = read_json_table(r#"{"x":[0,1,2],"z":[0,1,3],"y":[0,1,2]}"#).unwrap();
+    let error = build(&spec, &training).err().unwrap();
+    assert!(
+        error.0.contains("requires the same number of steps"),
+        "{error}"
+    );
+}
+
+#[test]
+fn monotonic_interaction_omits_nan_expression_rows_before_fitting_or_encoding() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ mo(dose):log(x)",
+    }))
+    .unwrap();
+    let training = read_json_table(r#"{"dose":[10,11,13],"x":[-1,1,4],"y":[0,1,2]}"#).unwrap();
+    let model = build(&spec, &training).unwrap();
+    assert_eq!(model.data.rows, [1, 2]);
+    assert_eq!(
+        model.data.constants["mo_1"],
+        DataValue::Integers(vec![1, 3])
+    );
+
+    let held_out = read_json_table(r#"{"dose":[12,99,13],"x":[4,-1,1]}"#).unwrap();
+    let prediction = prepare_data(&model.recipe, &held_out, DataMode::Prediction).unwrap();
+    assert_eq!(prediction.rows, [0, 2]);
+    assert_eq!(
+        prediction.constants["mo_1"],
+        DataValue::Integers(vec![2, 3])
+    );
+    assert_eq!(
+        prediction.constants["mo_cov_1"],
+        DataValue::Real64(vec![4.0_f64.ln(), 0.0])
+    );
+}
+
+#[test]
+fn shared_monotonic_simplex_names_cannot_shadow_generated_names() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ mo(x, id='moz1') + mo(z)",
+    }))
+    .unwrap();
+    let training = read_json_table(r#"{"x":[0,1,2],"z":[0,1,2],"y":[0,1,2]}"#).unwrap();
+    let error = build(&spec, &training).err().unwrap();
+    assert!(
+        error
+            .0
+            .contains("monotonic simplex name `moz1` is ambiguous"),
+        "{error}"
+    );
+}
+
+#[test]
+fn monotonic_interaction_only_factors_accept_explicit_contrasts() {
+    let spec = serde_json::from_value(json!({
+        "formula": "y ~ mo(dose) + mo(dose):arm",
+        "options": {"contrasts": {"arm": "sum"}}
+    }))
+    .unwrap();
+    let training = read_json_table(
+        r#"{"dose":[1,2,3,1,2,3],"arm":["a","a","a","b","b","b"],"y":[0,1,2,0,2,4]}"#,
+    )
+    .unwrap();
+    let model = build(&spec, &training).unwrap();
+    assert_eq!(
+        model.data.constants["mo_cov_2"],
+        DataValue::Real64(vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0])
+    );
+    let held_out = read_json_table(r#"{"dose":[3,2],"arm":["b","a"]}"#).unwrap();
+    let prediction = prepare_data(&model.recipe, &held_out, DataMode::Prediction).unwrap();
+    assert_eq!(
+        prediction.constants["mo_cov_2"],
+        DataValue::Real64(vec![-1.0, 1.0])
+    );
+}

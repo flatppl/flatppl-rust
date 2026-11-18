@@ -56,3 +56,45 @@ pub const INTEGRATION_POINT: &str = "%integration_point";
 /// Compiler-only ascending vector sort used by exact ordered-law sampling.
 /// A backend must admit this intrinsic; it has no source-language spelling.
 pub const SORT_VECTOR: &str = "%sort_vector";
+
+/// Compiler-only `builtin_sample` tags for normalized restrictions and hurdle laws.
+#[derive(Clone, Copy)]
+pub enum RestrictedSample {
+    NormalInterval,
+    PositivePoisson,
+    PositiveNegativeBinomial,
+    HurdlePoisson,
+    HurdleNegativeBinomial,
+}
+
+impl RestrictedSample {
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        [
+            Self::NormalInterval,
+            Self::PositivePoisson,
+            Self::PositiveNegativeBinomial,
+            Self::HurdlePoisson,
+            Self::HurdleNegativeBinomial,
+        ]
+        .into_iter()
+        .find(|sample| sample.tag() == tag)
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NormalInterval => "%sample_normal_interval",
+            Self::PositivePoisson => "%sample_positive_poisson",
+            Self::PositiveNegativeBinomial => "%sample_positive_negative_binomial",
+            Self::HurdlePoisson => "%sample_hurdle_poisson",
+            Self::HurdleNegativeBinomial => "%sample_hurdle_negative_binomial",
+        }
+    }
+
+    pub fn constructor(self) -> &'static str {
+        match self {
+            Self::NormalInterval => "Normal",
+            Self::PositivePoisson | Self::HurdlePoisson => "Poisson",
+            Self::PositiveNegativeBinomial | Self::HurdleNegativeBinomial => "NegativeBinomial",
+        }
+    }
+}

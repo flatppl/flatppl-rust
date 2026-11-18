@@ -25,6 +25,8 @@ pub struct Formula {
     pub smooths: Vec<SmoothTerm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monotonic: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) monotonic_terms: Option<crate::monotonic::MonotonicTerms>,
     pub expressions: BTreeMap<String, ColumnExpression>,
     pub offsets: Vec<ColumnExpression>,
 }
@@ -129,7 +131,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
     let mut fixed = Vec::new();
     let mut groups = Vec::new();
     let mut smooths = Vec::new();
-    let mut monotonic = Vec::new();
+    let mut monotonic_terms = Vec::new();
     // R records offset calls separately from coefficient terms, including
     // calls appearing after subtraction. Negation belongs inside offset().
     let offsets = parser
@@ -141,11 +143,18 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         })
         .collect();
     for term in terms {
+        if term
+            .iter()
+            .any(|&id| matches!(parser.atoms[id], Atom::Monotonic(_)))
+        {
+            monotonic_terms.push(term);
+            continue;
+        }
         match &parser.atoms[term[0]] {
             Atom::Groups(terms) => groups.extend(terms.iter().cloned()),
             Atom::Variable(_) | Atom::Expression(_) => fixed.push(term),
             Atom::Offset(_) => {}
-            Atom::Monotonic(column) => monotonic.push(column.clone()),
+            Atom::Monotonic(_) => unreachable!(),
             Atom::Smooth(smooth) => {
                 if smooths
                     .iter()
@@ -160,6 +169,22 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
             }
         }
     }
+    let (monotonic, monotonic_terms) = if monotonic_terms.iter().all(|term| {
+        matches!(term.as_slice(), [id] if matches!(&parser.atoms[*id], Atom::Monotonic(call) if call.id.is_none()))
+    }) {
+        let columns = monotonic_terms.iter().map(|term| match &parser.atoms[term[0]] {
+            Atom::Monotonic(call) => call.column.clone(),
+            _ => unreachable!(),
+        }).collect();
+        (columns, None)
+    } else {
+        let calls = monotonic_terms.iter().flatten().filter_map(|&id| match &parser.atoms[id] {
+            Atom::Monotonic(call) => Some((call.label(), call.clone())),
+            _ => None,
+        }).collect();
+        let (variables, terms, expressions) = fixed_terms(monotonic_terms, &parser.atoms);
+        (Vec::new(), Some(crate::monotonic::MonotonicTerms { calls, variables, terms, expressions }))
+    };
     let (variables, fixed, expressions) = fixed_terms(fixed, &parser.atoms);
     groups.sort_by_key(GroupTerm::name);
     for (i, group) in groups.iter().enumerate() {
@@ -188,6 +213,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         groups,
         smooths,
         monotonic,
+        monotonic_terms,
         expressions,
         offsets,
     };
@@ -238,7 +264,8 @@ fn fixed_terms(mut fixed: Terms, atoms: &[Atom]) -> FixedTerms {
     let variable = |id| match &atoms[id] {
         Atom::Variable(name) => name.clone(),
         Atom::Expression(expression) => expression.to_string(),
-        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_) => unreachable!(),
+        Atom::Monotonic(call) => call.label(),
+        Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) => unreachable!(),
     };
     let variables = order.iter().map(|&id| variable(id)).collect();
     let expressions = order
@@ -401,6 +428,7 @@ enum Token<'a> {
     Right,
     Comma,
     Equals,
+    String(&'a str),
     Bar(bool),
     End,
 }
@@ -425,6 +453,15 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>> {
             b')' => Token::Right,
             b',' => Token::Comma,
             b'=' => Token::Equals,
+            b'\'' | b'"' => {
+                let end = bytes[at..]
+                    .iter()
+                    .position(|&b| b == ch)
+                    .ok_or_else(|| Error("unclosed string in formula".into()))?
+                    + at;
+                at = end + 1;
+                Token::String(&text[start + 1..end])
+            }
             b'|' => {
                 let independent = bytes.get(at) == Some(&b'|');
                 at += usize::from(independent);
@@ -478,7 +515,7 @@ enum Atom {
     Offset(ColumnExpression),
     Groups(Vec<GroupTerm>),
     Smooth(SmoothTerm),
-    Monotonic(String),
+    Monotonic(crate::monotonic::MonotonicCall),
 }
 
 struct Expr {
@@ -574,18 +611,46 @@ impl<'a> Parser<'a> {
     }
 
     fn monotonic(&mut self) -> Result<Expr> {
-        let fail = || Error("monotonic terms support `mo(column)`".into());
+        let fail =
+            || Error("monotonic terms support `mo(column)` with optional `id=\"label\"`".into());
         self.at += 1;
         let Token::Name(column) = self.peek() else {
             return Err(fail());
         };
         let column = name(column)?;
         self.at += 1;
+        let mut id = None;
+        if self.peek() == Token::Comma {
+            self.at += 1;
+            if self.peek() != Token::Name("id") {
+                return Err(fail());
+            }
+            self.at += 1;
+            if self.peek() != Token::Equals {
+                return Err(fail());
+            }
+            self.at += 1;
+            let Token::String(label) = self.peek() else {
+                return Err(fail());
+            };
+            if label.is_empty()
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            {
+                return Err(fail());
+            }
+            self.at += 1;
+            id = Some(label.to_owned());
+        }
         if self.peek() != Token::Right {
             return Err(fail());
         }
         self.at += 1;
-        self.atom(Atom::Monotonic(column))
+        self.atom(Atom::Monotonic(crate::monotonic::MonotonicCall {
+            column,
+            id,
+        }))
     }
 
     fn expression(&mut self, min_precedence: u8, depth: usize) -> Result<Expr> {
@@ -791,11 +856,11 @@ fn reject_group_interaction(terms: &Terms, atoms: &[Atom]) -> Result<()> {
     if terms.iter().flatten().any(|&id| {
         matches!(
             atoms[id],
-            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_) | Atom::Monotonic(_)
+            Atom::Groups(_) | Atom::Offset(_) | Atom::Smooth(_)
         )
     }) {
         return Err(Error(
-            "group terms, offsets, smooths and monotonic terms may only be added or removed".into(),
+            "group terms, offsets and smooths may only be added or removed".into(),
         ));
     }
     Ok(())
@@ -900,6 +965,11 @@ impl Formula {
     pub(crate) fn uses_intercept_column(&self) -> bool {
         self.expressions
             .values()
+            .chain(
+                self.monotonic_terms
+                    .iter()
+                    .flat_map(|terms| terms.expressions.values()),
+            )
             .chain(&self.offsets)
             .chain(self.se.as_ref().map(|se| &se.value))
             .chain(
@@ -941,6 +1011,21 @@ impl Formula {
         for column in &self.monotonic {
             if !names.contains(&column.as_str()) {
                 names.push(column);
+            }
+        }
+        if let Some(terms) = &self.monotonic_terms {
+            for variable in &terms.variables {
+                if let Some(expression) = terms.expressions.get(variable) {
+                    expression.columns(&mut names);
+                } else {
+                    let name = terms
+                        .calls
+                        .get(variable)
+                        .map_or(variable.as_str(), |call| &call.column);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
             }
         }
         names

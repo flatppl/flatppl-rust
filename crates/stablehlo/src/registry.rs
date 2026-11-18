@@ -10,7 +10,7 @@
 //! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
 //! refusal — see that module's doc comment.
 
-use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, Type, ValueSet};
+use flatppl_core::{CallHead, NamedKind, Node, NodeId, RestrictedSample, Scalar, Type, ValueSet};
 
 use crate::Dtype;
 use crate::emitter::{Axes, Emitter};
@@ -21,6 +21,7 @@ mod bessel;
 mod hep;
 mod regression;
 mod regression_broadcast;
+mod restricted;
 
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
 /// distribution's closed-form log-density/-mass builder (§08/§09/§12/§13).
@@ -1163,9 +1164,11 @@ pub(crate) fn lower_sample(
             ));
         }
     };
+    let restricted = RestrictedSample::from_tag(&ctor_name);
+    let base = restricted.map_or(ctor_name.as_str(), |sample| sample.constructor());
     if broadcasted
         && (ctor_name == "Binomial"
-            || !flatppl_infer::distribution_param_ranks(&ctor_name)
+            || !flatppl_infer::distribution_param_ranks(base)
                 .is_some_and(|ranks| ranks.iter().all(|&rank| rank == 0)))
     {
         // Vector parameters own event axes; Binomial owns an inner trial axis.
@@ -1175,7 +1178,7 @@ pub(crate) fn lower_sample(
             format!("broadcast sampling for '{ctor_name}' is not yet supported"),
         ));
     }
-    let dist = lookup(&ctor_name)
+    let dist = lookup(base)
         .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor_name}'")))?;
     let sample = dist
         .sample
@@ -1186,7 +1189,7 @@ pub(crate) fn lower_sample(
     // `FANOUT_SAFE`. Anything else (multivariate/vector-variate samplers, the
     // discrete `while`/inverse-CDF samplers) is not yet batch-shape-generic and
     // refuses here rather than mislower.
-    if batch_n.is_some() && !FANOUT_SAFE.contains(&ctor_name.as_str()) {
+    if batch_n.is_some() && restricted.is_none() && !FANOUT_SAFE.contains(&base) {
         return Err(EmitError::at(
             id,
             format!(
@@ -1211,13 +1214,16 @@ pub(crate) fn lower_sample(
     if matches!(ctor_name.as_str(), "Categorical" | "Categorical0") {
         check_categorical_sample(e, &params)?;
     }
-    check_parameters(e, &ctor_name, &params)?;
+    check_parameters(e, base, &params)?;
     // Existing samplers consume a flat product batch. Restore its outer axes
     // after sampling, keeping the inner event axes and RNG advances unchanged.
     if let Some(n) = batch_n {
         e.set_batch_shape(vec![n]);
     }
-    let result = sample(e, &params);
+    let result = match restricted {
+        Some(kind) => restricted::sample(e, &params, kind),
+        None => sample(e, &params),
+    };
     e.clear_batch_shape();
     let mut value = result?;
     if batch_shape.len() > 1 {

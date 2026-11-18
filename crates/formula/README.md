@@ -77,9 +77,9 @@ For example, `temp_Intercept_sigma` is the centred scale intercept and
 
 Supply `nlpars` to treat the right side as arithmetic over named parameter
 predictors and numeric data columns. Each named predictor uses ordinary
-formula terms. Gaussian, Student, Bernoulli, Binomial, Poisson, negative
-binomial, geometric, and the listed count hurdle and zero-inflated families
-support nonlinear predictors.
+formula terms. All listed families with a scalar location or mean
+predictor support nonlinear expressions. Cumulative and categorical
+models use separate predictor forms.
 
 ```json
 {
@@ -117,6 +117,15 @@ select the slope with `class = "b", coef = "modose"` and the simplex with
 Dirichlet. Use `dirichlet(2)` for a symmetric prior or
 `dirichlet(c(2, 1))` to specify each concentration for a two-step term.
 With one step, the simplex is fixed at `[1]`.
+
+Monotonic terms can interact with numeric predictors, factors, and other
+monotonic terms. For example, `y ~ mo(dose) * arm` adds an arm effect and
+an arm contrast on the monotonic effect. Each resulting coefficient has
+its own simplex per monotonic factor by default. Use
+`mo(dose, id="dose_steps") * arm` to share one simplex across the main
+effect and arm contrasts. Give shared simplexes a prior with
+`class = "simo", coef = "dose_steps"`. A shared ID requires the same
+number of steps in every occurrence.
 
 ### Families
 
@@ -250,8 +259,10 @@ rejects zero when `sigma=FALSE`, because the total likelihood scale would be zer
 with `sigma=TRUE`, zero known error is allowed. Prediction requires the columns used in `se()` and
 reuses the saved expression. Separate response additions with `+`.
 
-Gaussian formulas accept `y | cens(status, y2) ~ ...`. Status is `left`, `none`,
-`right` or `interval`, or the corresponding integer `-1`, `0`, `1` or `2`.
+Gaussian, Exponential and Weibull formulas accept `y | cens(status, y2) ~ ...`.
+Status is `left`, `none`, `right` or `interval`, or the corresponding integer
+`-1`, `0`, `1` or `2`. Exponential and Weibull models require positive exact
+times and allow zero as a censoring bound.
 The response gives the exact value, the upper boundary for left censoring, or
 the lower boundary for right and interval censoring. For interval rows, `y2`
 gives the upper end of `(y, y2]`. Other rows ignore `y2`, including missing
@@ -263,6 +274,13 @@ bound for one-sided truncation. `K_model` conditions the response law on this
 range. If `cens` and `trunc` both appear, censored rows score the event's
 intersection with the range, divided by the range's probability.
 `L` and `log_lik` score the observations before any `weights` apply.
+
+`expected_response` takes the same parameter arguments as `K_model`. It
+emits the conditional mean for each new row and response probabilities in
+training order for categorical and ordinal models. Binomial means count
+successes. Censoring predicts the latent response and truncation conditions
+on the supplied bounds. Student models with one degree of freedom return
+`nan`. Von Mises models use circular summaries and omit this function.
 Prediction requires truncation bound columns and omits censoring inputs.
 The StableHLO sampler currently refuses truncated Normal draws.
 
