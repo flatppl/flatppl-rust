@@ -18,6 +18,7 @@ pub(super) struct GatherDimensions {
 #[derive(Clone)]
 pub(super) enum Pointwise {
     Unary(String, Value),
+    LogNdtr(Value),
     ChloUnary(String, Value),
     ChloBinary(String, Value, Value),
     Binary(String, Value, Value),
@@ -51,6 +52,7 @@ impl Pointwise {
     pub(super) fn inputs(&self) -> Vec<&Value> {
         match self {
             Self::Unary(_, a)
+            | Self::LogNdtr(a)
             | Self::ChloUnary(_, a)
             | Self::Convert(a, _)
             | Self::Bitcast(a, _)
@@ -90,6 +92,7 @@ impl Pointwise {
                 return Some((format!("reduce {op} {init}"), vec![*axis as u64]));
             }
             Self::Bitcast(..)
+            | Self::LogNdtr(_)
             | Self::Reshape(_)
             | Self::Slice(..)
             | Self::Transpose(..)
@@ -177,7 +180,10 @@ impl Emitter<'_> {
         let out = match op {
             // Compute parameter-only functions once per point, then broadcast
             // their values instead of repeating them along every cell axis.
-            Pointwise::Unary(..) | Pointwise::ChloUnary(..) | Pointwise::ChloBinary(..) => {
+            Pointwise::Unary(..)
+            | Pointwise::LogNdtr(_)
+            | Pointwise::ChloUnary(..)
+            | Pointwise::ChloBinary(..) => {
                 return None;
             }
             Pointwise::Binary(op, a, b) => {
