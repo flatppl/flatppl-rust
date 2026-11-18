@@ -107,7 +107,7 @@ pub(crate) fn number(x: f64) -> String {
     }
 }
 
-fn bounds_of(vs: &ValueSet) -> Bounds {
+pub(crate) fn bounds_of(vs: &ValueSet) -> Bounds {
     let b = |l: Option<&str>, u: Option<&str>| Bounds {
         lower: l.map(str::to_string),
         upper: u.map(str::to_string),

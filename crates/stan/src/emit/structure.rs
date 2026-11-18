@@ -46,7 +46,7 @@ pub(super) struct Law {
 }
 
 impl Law {
-    fn rhs(&self, index: Option<&str>) -> String {
+    pub(super) fn rhs(&self, index: Option<&str>) -> String {
         let s = match index {
             Some(i) => self.indexed.replace(LOOP, i),
             None => self.call.clone(),
@@ -720,11 +720,11 @@ impl<'m> Emitter<'m> {
     /// has zero density: its `data` declaration takes the support as bounds,
     /// so Stan rejects such data instead of scoring it.
     fn bound_by_support(&mut self, data: &str, law: NodeId) -> Result<()> {
-        let r = self.resolve(law);
-        let r = match self.head(r) {
-            Some("iid") => self.resolve(self.call(r).unwrap().args[0]),
-            _ => r,
-        };
+        // Through every `iid` level: `iid(iid(D, m), k)` holds D's variates.
+        let mut r = self.resolve(law);
+        while self.head(r) == Some("iid") {
+            r = self.resolve(self.call(r).unwrap().args[0]);
+        }
         if self.head(r) != Some("truncate") {
             return Ok(());
         }
@@ -810,9 +810,17 @@ impl<'m> Emitter<'m> {
                 "a markovchain over one trajectory",
             ));
         }
+        if self.head(m) == Some("pushfwd") {
+            return self.pushfwd_statement(lhs, m, lhs_rank);
+        }
         let flat = self.flat_order(lhs);
         let (law, per_element) = match self.head(m) {
             Some("Lebesgue") => return Ok(vec![]),
+            Some("iid")
+                if self.head(self.resolve(self.call(m).unwrap().args[0])) == Some("iid") =>
+            {
+                return self.nested_iid(lhs, m);
+            }
             // An iid product of one law: the law's arguments are shared.
             Some("iid") => (self.law(self.call(m).unwrap().args[0], false)?, false),
             Some("broadcast") => {
@@ -886,6 +894,45 @@ impl<'m> Emitter<'m> {
         let mut out = vec![format!("{} ~ {rhs};", law.lhs(&target))];
         out.extend(law.extra);
         Ok(out)
+    }
+
+    /// `iid(iid(D, m), k)`, D^⊗(k·m) (spec §06 "Independent composition"),
+    /// is `iid(D, [k, m])` over the declared nesting. An `array[k, m]` or a
+    /// `matrix` variate is one flattened statement. Stan 2.39 cannot flatten
+    /// `array[k] vector[m]`, so that variate is one statement per row.
+    fn nested_iid(&mut self, lhs: &str, m: NodeId) -> Result<Vec<String>> {
+        let inner = self.resolve(self.call(m).unwrap().args[0]);
+        let d = self.call(inner).unwrap().args[0];
+        if self.head(self.resolve(d)) == Some("iid") {
+            return Err(Refusal::not_yet(Some(m), "an iid nested more than twice"));
+        }
+        let law = self.law(d, false)?;
+        self.declared_variate(lhs, &law, m)?;
+        if law.multivariate
+            || !law.vectorized
+            || law.vector_per_element
+            || law.lhs("{y}") != "{y}"
+            || !law.extra.is_empty()
+        {
+            return Err(Refusal::not_yet(Some(m), "a nested iid of this law"));
+        }
+        let rhs = law.rhs(None);
+        let Some(t) = self.decls.get(lhs).cloned() else {
+            return Err(Refusal::not_yet(Some(m), "a nested iid of this variate"));
+        };
+        match (self.flat_order(lhs), t.array.len(), t.base, t.dims.len()) {
+            (Some(Flat::Row), ..) => Ok(vec![format!("to_array_1d({lhs}) ~ {rhs};")]),
+            (Some(Flat::Col), ..) => Ok(vec![format!("to_vector({lhs}) ~ {rhs};")]),
+            (None, 1, "vector", 1) => {
+                let i = self.fresh_index();
+                let n = t.array[0].clone();
+                self.used.remove(&i);
+                Ok(vec![format!(
+                    "for ({i} in 1:{n}) {{\n  {lhs}[{i}] ~ {rhs};\n}}"
+                )])
+            }
+            _ => Err(Refusal::not_yet(Some(m), "a nested iid of this variate")),
+        }
     }
 
     /// A law whose restriction the declaration carries is exact only on a
@@ -1246,22 +1293,11 @@ impl<'m> Emitter<'m> {
                      marginalization integral",
                 ))
             }
+            // A bijective `pushfwd` is one scalar variate's statement (see
+            // `pushfwd_statement`); as a law inside another it would lose its
+            // Jacobian.
             "pushfwd" => {
-                let f = self.resolve(self.call(m).unwrap().args[0]);
-                let projection = self.head(f) == Some("functionof")
-                    && matches!(
-                        self.head(self.resolve(self.call(f).unwrap().args[0])),
-                        Some("get" | "record")
-                    );
-                if projection {
-                    return Err(Refusal::new(
-                        RefusalKind::NonBijectivePushfwd,
-                        Some(m),
-                        "pushfwd",
-                        "`pushfwd` through a non-bijective map (a field projection) has no density \
-                         Stan can express",
-                    ));
-                }
+                self.pushfwd_projection(m)?;
                 Err(Refusal::not_yet(Some(m), "pushfwd"))
             }
             "%call" => {
@@ -1344,7 +1380,10 @@ impl<'m> Emitter<'m> {
     }
 
     /// The interval a prior law restricts its variate to, when it names one.
-    fn support(&mut self, law: NodeId) -> Result<Option<(Option<String>, Option<String>)>> {
+    pub(super) fn support(
+        &mut self,
+        law: NodeId,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
         let m = self.resolve(law);
         match self.head(m) {
             // A positional joint: vector bounds, one end per component.
@@ -1377,6 +1416,7 @@ impl<'m> Emitter<'m> {
                 let s = self.resolve(self.law_args("Uniform", m)?[0]);
                 self.interval(s).map(Some)
             }
+            Some("pushfwd") => self.pushfwd_support(m),
             _ => Ok(None),
         }
     }

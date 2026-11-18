@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+lam ~ Exponential(1)
+y ~ iid(iid(Poisson(lam), 3), 2)
+prior = lawof(record(lam = lam))
+L = likelihoodof(kernelof(record(y = y), lam = lam), record(y = [[1, 0, 2], [3, 1, 0]]))
+post = bayesupdate(L, prior)
