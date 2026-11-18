@@ -41,6 +41,16 @@ pub(crate) const SPECIAL_FUNCTIONS: [(&str, usize); 25] = [
 const ERFCX_SPLIT: f64 = 4.0;
 const FRAC_1_SQRT_PI: f64 = 0.5641895835477563;
 
+fn compactable_rows(value: &Value) -> Option<(usize, &[Option<u64>], usize)> {
+    let (width, prefix) = shape(&value.ty).split_last()?;
+    let width = usize::try_from((*width)?).ok()?;
+    let batch = prefix.iter().try_fold(1usize, |count, n| {
+        count.checked_mul(usize::try_from((*n)?).ok()?)
+    })?;
+    ((64..=constants::MAX_FOLDED_ELEMENTS).contains(&width) && (1..=32).contains(&batch))
+        .then_some((width, prefix, batch))
+}
+
 impl Emitter<'_> {
     /// A static tape bound with a safe, runtime-budgeted prefix. Final
     /// convergence checks reject workspaces too small for the requested rule.
@@ -498,14 +508,7 @@ impl Emitter<'_> {
         if self.target != crate::Target::Cpu {
             return None;
         }
-        let (width, prefix) = shape(&x.ty).split_last()?;
-        let width = usize::try_from((*width)?).ok()?;
-        let batch = prefix.iter().try_fold(1usize, |count, n| {
-            count.checked_mul(usize::try_from((*n)?).ok()?)
-        })?;
-        if !(64..=constants::MAX_FOLDED_ELEMENTS).contains(&width) || !(1..=32).contains(&batch) {
-            return None;
-        }
+        let (width, prefix, batch) = compactable_rows(x)?;
         let endpoint = |e: &Self, i| match e.fixed_scalar_at(x, i) {
             Some(Scalar::Real(v)) if v.is_infinite() => Some(v.is_sign_negative()),
             _ => None,
@@ -524,14 +527,6 @@ impl Emitter<'_> {
             return None;
         }
         let n = active.len() as i64;
-        let indices = |e: &mut Self, values: Vec<i64>| {
-            let ty = MlirTy::Ranked(vec![Some(values.len() as u64)]);
-            e.folded_constant(
-                values.into_iter().map(Scalar::Int).collect(),
-                ty,
-                Axes::default(),
-            )
-        };
         let original = self.axes_of(x);
         let vector_axes = Axes {
             batch: prefix.len(),
@@ -540,7 +535,7 @@ impl Emitter<'_> {
         let rows = self.axes_view(x, vector_axes.clone());
         let mut parts = Vec::with_capacity(3);
         if n != 0 {
-            let keep = indices(self, active)?;
+            let keep = self.fixed_lane_indices(active)?;
             let rows = self.gather_axis(&rows, &keep, 0, 0);
             parts.push(self.normal_log_cdf(&rows, masks_nan));
         }
@@ -563,9 +558,82 @@ impl Emitter<'_> {
                 }
             })
             .collect();
-        let restore = indices(self, layout)?;
+        let restore = self.fixed_lane_indices(layout)?;
         let restored = self.gather_axis(&merged, &restore, 0, 0);
         Some(self.axes_view(&restored, original))
+    }
+
+    fn fixed_lane_indices(&mut self, values: Vec<i64>) -> Option<Value> {
+        let ty = MlirTy::Ranked(vec![Some(values.len() as u64)]);
+        self.folded_constant(
+            values.into_iter().map(Scalar::Int).collect(),
+            ty,
+            Axes::default(),
+        )
+    }
+
+    pub(crate) fn log_cdf_difference(&mut self, id: NodeId, upper: &Value, lower: &Value) -> Value {
+        let (upper, lower) = self.broadcast_pair(upper, lower);
+        self.compact_cdf_difference(id, &upper, &lower)
+            .unwrap_or_else(|| self.log_cdf_difference_body(&upper, &lower))
+    }
+
+    fn log_cdf_difference_body(&mut self, upper: &Value, lower: &Value) -> Value {
+        let difference = self.sub(lower, upper);
+        let zero = self.scalar(0.0);
+        let minus_one = self.scalar(-1.0);
+        let nonempty = self.compare("LT", &difference, &zero);
+        let safe = self.select(&nonempty, &difference, &minus_one);
+        let log_ratio = self.special_log1mexp(&safe);
+        let value = self.add(upper, &log_ratio);
+        let empty = self.scalar(f64::NEG_INFINITY);
+        self.select(&nonempty, &value, &empty)
+    }
+
+    fn compact_cdf_difference(
+        &mut self,
+        id: NodeId,
+        upper: &Value,
+        lower: &Value,
+    ) -> Option<Value> {
+        // A lower log-CDF of -inf leaves the upper log-CDF unchanged.
+        // Keep those rows in place and evaluate subtraction on the rest.
+        let (width, prefix, batch) = compactable_rows(lower)?;
+        let mut active = Vec::new();
+        let mut order = Vec::with_capacity(width);
+        for lane in 0..width {
+            let one_sided = (0..batch).all(|row| {
+                matches!(self.fixed_scalar_at(lower, row * width + lane),
+                    Some(Scalar::Real(v)) if v == f64::NEG_INFINITY)
+            });
+            if one_sided {
+                order.push(lane as i64);
+            } else {
+                order.push((width + active.len()) as i64);
+                active.push(lane as i64);
+            }
+        }
+        if active.is_empty() {
+            return Some(upper.clone());
+        }
+        if active.len() > width * 3 / 4 {
+            return None;
+        }
+        let original = self.axes_of(upper);
+        let vector_axes = Axes {
+            batch: prefix.len(),
+            layers: vec![1],
+        };
+        let upper = self.axes_view(upper, vector_axes.clone());
+        let lower = self.axes_view(lower, vector_axes);
+        let keep = self.fixed_lane_indices(active)?;
+        let partial_upper = self.gather_axis(&upper, &keep, 0, 0);
+        let partial_lower = self.gather_axis(&lower, &keep, 0, 0);
+        let differences = self.log_cdf_difference_body(&partial_upper, &partial_lower);
+        let joined = self.concatenate(id, &[upper, differences]).ok()?;
+        let order = self.fixed_lane_indices(order)?;
+        let result = self.gather_axis(&joined, &order, 0, 0);
+        Some(self.axes_view(&result, original))
     }
 
     /// Use the direct product near zero and Cody's rational tail beyond 4.

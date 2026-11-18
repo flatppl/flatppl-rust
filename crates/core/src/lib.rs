@@ -41,6 +41,8 @@ pub const FLATPPL_COMPAT: &str = "0.1";
 /// Compiler-only positive integral: `(log_body, bound_point, lower, upper)`.
 /// Backends must explicitly admit numerical evaluation. This is not FlatPDL.
 pub const LOG_INTEGRAL: &str = "%log_integral";
+/// Log of the difference of two CDF values supplied in log space.
+pub const LOG_CDF_DIFFERENCE: &str = "%log_cdf_difference";
 
 /// Compiler-only integral of a nonnegative scalar body, returning its mass.
 pub const MASS_INTEGRAL: &str = "%mass_integral";

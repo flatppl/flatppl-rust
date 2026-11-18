@@ -517,7 +517,15 @@ pub(crate) fn lower_interval_mass(
             // CDF difference with a log-space calculation.
             let witness = build_touniform(m, kernel, input, mu);
             let valid = build_call(m, "isfinite", &[witness]);
-            return Ok(normal_log_mass(m, mu, sigma, lo, hi, valid));
+            return Ok(normal_log_mass(
+                m,
+                mu,
+                sigma,
+                lo,
+                hi,
+                valid,
+                options.compact_log_cdf_difference,
+            ));
         }
     }
     if let Some(log_mass) = survival_log_mass(m, ctor, input, lo, hi) {
@@ -722,6 +730,7 @@ fn normal_log_mass(
     lo: NodeId,
     hi: NodeId,
     valid: NodeId,
+    compact_difference: bool,
 ) -> NodeId {
     let real = |m: &mut Module, value| m.alloc(Node::Lit(Scalar::Real(value)));
     let zero = real(m, 0.0);
@@ -752,7 +761,7 @@ fn normal_log_mass(
         let reflected = build_call(m, "neg", &[lo]);
         apply(m, reflected)
     } else {
-        normal_log_mass_difference(m, lo, hi, bound_hi, apply)
+        normal_log_mass_difference(m, lo, hi, bound_hi, compact_difference, apply)
     };
     let nan_lo = build_call(m, "isnan", &[bound_lo]);
     let nan_hi = build_call(m, "isnan", &[bound_hi]);
@@ -784,6 +793,7 @@ fn normal_log_mass_difference(
     lo: NodeId,
     hi: NodeId,
     bound_hi: NodeId,
+    compact_difference: bool,
     log_cdf: impl Fn(&mut Module, NodeId) -> NodeId,
 ) -> NodeId {
     let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
@@ -805,6 +815,9 @@ fn normal_log_mass_difference(
     let y = build_call(m, "ifelse", &[right, lower_inf, y]);
     let log_x = log_cdf(m, x);
     let log_y = log_cdf(m, y);
+    if compact_difference {
+        return build_call(m, flatppl_core::LOG_CDF_DIFFERENCE, &[log_x, log_y]);
+    }
     let difference = build_call(m, "sub", &[log_y, log_x]);
     let nonempty = build_call(m, "lt", &[difference, zero]);
     let minus_one = m.alloc(Node::Lit(Scalar::Real(-1.0)));
