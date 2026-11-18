@@ -216,6 +216,22 @@ rejects zero when `sigma=FALSE`, because the total likelihood scale would be zer
 with `sigma=TRUE`, zero known error is allowed. Prediction requires the columns used in `se()` and
 reuses the saved expression. Separate response additions with `+`.
 
+Gaussian formulas accept `y | cens(status, y2) ~ ...`. Status is `left`, `none`,
+`right` or `interval`, or the corresponding integer `-1`, `0`, `1` or `2`.
+The response gives the exact value, the upper boundary for left censoring, or
+the lower boundary for right and interval censoring. For interval rows, `y2`
+gives the upper end of `(y, y2]`. Other rows ignore `y2`, including missing
+values. Censored rows score the observed event mass.
+
+Use `y | trunc(lb = 0, ub = limit) ~ ...` for a Gaussian response drawn from
+a known range. Bounds can be constants or finite numeric columns. Omit one
+bound for one-sided truncation. `K_model` conditions the response law on this
+range. If `cens` and `trunc` both appear, censored rows score the event's
+intersection with the range, divided by the range's probability.
+`L` and `log_lik` score the observations before any `weights` apply.
+Prediction requires truncation bound columns and omits censoring inputs.
+The StableHLO sampler currently refuses truncated Normal draws.
+
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
 `{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and

@@ -284,6 +284,22 @@ fn digamma_and_polygamma_lower_to_their_chlo_ops() {
     );
 }
 
+#[test]
+fn normal_log_cdf_keeps_a_status_free_abi_for_checked_inputs() {
+    let prior = "\
+x = elementof(posreals)
+inputs = x
+P = normalize(truncate(Normal(0.0, 1.0), interval(0.0, inf)))
+outputs = logdensityof(P, x)";
+    let masked = format!(
+        "{SF}\nx = external(reals)\ninputs = x\noutputs = sf.log_ndtr(ifelse(isnan(x), 0.0, x))"
+    );
+    for source in [prior, masked.as_str()] {
+        let out = emit_with(source, Mode::LogDensity, Dtype::F64).unwrap();
+        assert!(!out.contains("flatppl.runtime_status"), "{out}");
+    }
+}
+
 // Direct tails, logarithms and scaled Bessels must remain live arithmetic with
 // every parameter exposed, including named argument binding and cell broadcasts.
 #[test]

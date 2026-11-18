@@ -245,7 +245,7 @@ impl Emitter<'_> {
                 let value = self.bessel_modified_log(&values[0], &values[1], modified_i, scaled);
                 if scaled { self.exp(&value) } else { value }
             }
-            "log_ndtr" => self.normal_log_cdf(&values[0]),
+            "log_ndtr" => self.normal_log_cdf(&values[0], self.masks_nan(args[0])),
             "bessel_j" | "bessel_i" | "bessel_i_scaled" => {
                 return Err(EmitError::at(
                     id,
@@ -275,7 +275,32 @@ impl Emitter<'_> {
         self.compare("LT", &magnitude, &infinity)
     }
 
-    fn normal_log_cdf(&mut self, x: &Value) -> Value {
+    /// A real value explicitly replaced at NaN does not need a second check.
+    fn masks_nan(&self, id: NodeId) -> bool {
+        let call = |id, name| {
+            let (id, _) = flatppl_core::graph::resolve_ref(self.m, id);
+            match self.m.node(id) {
+                Node::Call(call) if matches!(call.head, CallHead::Builtin(s) if self.m.resolve(s) == name) => {
+                    Some(call)
+                }
+                _ => None,
+            }
+        };
+        let Some([condition, fallback, value]) = call(id, "ifelse").map(|call| call.args.as_ref())
+        else {
+            return false;
+        };
+        let Some([input]) = call(*condition, "isnan").map(|call| call.args.as_ref()) else {
+            return false;
+        };
+        let resolve = |&id| flatppl_core::graph::resolve_ref(self.m, id).0;
+        let (input, value) = (resolve(input), resolve(value));
+        let same = input == value
+            || matches!((self.m.node(input), self.m.node(value)), (Node::Ref(a), Node::Ref(b)) if a == b);
+        same && matches!(self.m.node(resolve(fallback)), Node::Lit(Scalar::Real(x)) if !x.is_nan())
+    }
+
+    fn normal_log_cdf(&mut self, x: &Value, masks_nan: bool) -> Value {
         let x = self.convert(x, ElemKind::Real);
         let zero = self.constant_like(0.0, &x);
         let negative = self.compare("LT", &x, &zero);
@@ -298,7 +323,15 @@ impl Emitter<'_> {
         let minus_infinity = self.constant_like(f64::NEG_INFINITY, &x);
         let endpoint = self.select(&negative, &minus_infinity, &zero);
         let value = self.select(&finite, &value, &endpoint);
+        if masks_nan {
+            return value;
+        }
         let not_nan = self.compare("EQ", &x, &x);
+        if not_nan.ty == MlirTy::Scalar
+            && self.fixed_scalar_at(&not_nan, 0) == Some(Scalar::Bool(true))
+        {
+            return value;
+        }
         self.record_runtime_error(&not_nan, 12);
         let nan = self.constant_like(f64::NAN, &x);
         self.select(&not_nan, &value, &nan)

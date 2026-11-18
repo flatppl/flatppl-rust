@@ -352,6 +352,7 @@ pub const LOWERING_OPTIONS: flatppl_determinizer::LoweringOptions<'static> =
             registry::lookup(ctor).is_some_and(|dist| dist.touniform.is_some())
         }),
         retain_standard_functions: &[
+            ("special-functions", "log_ndtr"),
             ("splines", "interp_linear"),
             ("splines", "interp_cubic"),
             ("splines", "interp_pchip"),

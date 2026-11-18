@@ -32,6 +32,7 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
     if recipe.formula.se.is_some() {
         external_vector(&mut b, "se_data", "nonnegreals");
     }
+    crate::response::declare(&mut b, &recipe.formula);
     if let Some(nonlinear) = &recipe.nonlinear {
         for i in 0..nonlinear.columns.len() {
             external_vector(&mut b, &crate::nonlinear::data_name(i), "reals");
@@ -138,29 +139,38 @@ pub(crate) fn model(recipe: &mut Recipe) -> Result<Module> {
         .map(|name| (name, b.self_ref(name)))
         .collect();
     let cuts = threshold_inputs(&mut b, recipe);
-    let law = recipe.family.observation(
-        &mut b,
-        crate::family::Observation {
-            mu,
-            trials,
-            scale,
-            auxiliary: &auxiliary,
-            cuts: &cuts,
-        },
-        false,
-    );
+    let law = if let Some(truncation) = &recipe.formula.truncation {
+        let sigma = scale.unwrap_or_else(|| b.self_ref("sigma"));
+        crate::response::truncated_normal(&mut b, mu, sigma, truncation)
+    } else {
+        recipe.family.observation(
+            &mut b,
+            crate::family::Observation {
+                mu,
+                trials,
+                scale,
+                auxiliary: &auxiliary,
+                cuts: &cuts,
+            },
+            false,
+        )
+    };
     let y = b.call("draw", &[law]);
     b.bind("y", y);
     let y = b.self_ref("y");
     let response = b.call_fields("record", &[("y", y)]);
     let kernel = parameter_function(&mut b, "kernelof", response, &parameters);
     b.bind("K_model", kernel);
-    let y = b.self_ref("y_data");
-    let observation = b.call_fields("record", &[("y", y)]);
-    let kernel = b.self_ref("K_model");
-    let likelihood = b.call("likelihoodof", &[kernel, observation]);
-    b.bind("L", likelihood);
     let pointwise = pointwise_log_likelihood(&mut b, recipe, scale);
+    let likelihood = if recipe.formula.censoring.is_some() {
+        crate::response::observed_likelihood(&mut b, pointwise, &parameters)
+    } else {
+        let y = b.self_ref("y_data");
+        let observation = b.call_fields("record", &[("y", y)]);
+        let kernel = b.self_ref("K_model");
+        b.call("likelihoodof", &[kernel, observation])
+    };
+    b.bind("L", likelihood);
     let log_lik = parameter_function(&mut b, "functionof", pointwise, &parameters);
     b.bind_doc(
         "log_lik",
@@ -623,6 +633,9 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
     let cuts: Vec<_> = (1..=recipe.thresholds())
         .map(|i| argument(b, &format!("cut{i}")))
         .collect();
+    let score_inputs: Vec<_> = crate::response::score_columns(&recipe.formula)
+        .map(|(name, _)| (name, argument(b, name)))
+        .collect();
     let law = recipe.family.observation(
         b,
         crate::family::Observation {
@@ -634,7 +647,7 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
         },
         true,
     );
-    let score = b.call("logdensityof", &[law, value]);
+    let score = crate::response::score(b, &recipe.formula, law, value, &score_inputs);
     let head = b.sym("functionof");
     let row_score = b.m.alloc(Node::Call(Call {
         head: CallHead::Builtin(head),
@@ -660,6 +673,7 @@ fn pointwise_log_likelihood(b: &mut Builder<'_>, recipe: &Recipe, scale: Option<
             .map(|name| b.self_ref(name)),
     );
     args.extend(threshold_inputs(b, recipe));
+    args.extend(score_inputs.iter().map(|(name, _)| b.self_ref(name)));
     b.call("broadcast", &args)
 }
 
@@ -685,7 +699,7 @@ fn threshold_inputs(b: &mut Builder<'_>, recipe: &Recipe) -> Vec<NodeId> {
         .collect()
 }
 
-fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
+pub(crate) fn external_vector(b: &mut Builder<'_>, name: &str, set: &str) {
     let set = b.call_head(set);
     let n = b.self_ref("N");
     let domain = b.call("cartpow", &[set, n]);
