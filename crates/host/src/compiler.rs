@@ -803,6 +803,17 @@ impl Context {
         module: &LoadedModule,
         logdensity: bool,
     ) -> Result<crate::TransformedQueries, Diagnostic> {
+        self.transform_with_correlation_factors(module, logdensity, &[])
+    }
+
+    /// Wrap a formula query, using LKJ Cholesky coordinates for named input fields.
+    #[doc(hidden)]
+    pub fn transform_with_correlation_factors(
+        &mut self,
+        module: &LoadedModule,
+        logdensity: bool,
+        correlation_factors: &[String],
+    ) -> Result<crate::TransformedQueries, Diagnostic> {
         let fail = |message: String| Diagnostic::new("transform", module.source_name(), message);
         if !self.owns(module) {
             return Err(fail("the module belongs to a different context".into()));
@@ -855,7 +866,9 @@ impl Context {
         let domain = typed
             .valueset_of(rhs)
             .ok_or_else(|| fail("the input has no known domain".into()))?;
-        let chart = Domain::of(typed, domain).chart("point").map_err(fail)?;
+        let chart = Domain::of(typed, domain)
+            .chart_with_correlation_factors("point", correlation_factors)
+            .map_err(fail)?;
         let registered = loop {
             let name = format!("__flatppl_coordinates_{}.flatppl", self.next_inline);
             self.next_inline += 1;

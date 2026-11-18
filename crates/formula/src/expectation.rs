@@ -40,6 +40,7 @@ pub(crate) fn emit(
         | Negbinomial
         | Geometric
         | Gamma
+        | Exgaussian
         | Exponential
         | Weibull
         | Beta
@@ -87,6 +88,13 @@ pub(crate) fn emit(
         }
         Acat => crate::adjacent::probabilities(b, mu, cuts),
         Categorical => crate::categorical::probabilities(b, auxiliary),
+        Wiener => crate::wiener::expected_time(
+            b,
+            mu,
+            auxiliary_value("bs"),
+            auxiliary_value("ndt"),
+            auxiliary_value("bias"),
+        ),
         VonMises => return None,
     };
     let zero_probability = match recipe.family {

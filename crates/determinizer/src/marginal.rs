@@ -924,7 +924,15 @@ fn build_exponential_mean_marginal(
     }))
 }
 
-/// The exponentially modified Gaussian log-density at `y`, from `params = [λ, σ]`,
+fn build_exponentially_modified_normal_logpdf(
+    m: &mut Module,
+    params: &[NodeId],
+    variates: &[NodeId],
+) -> NodeId {
+    exponentially_modified_normal_logpdf(m, params[0], params[1], sole_variate(variates))
+}
+
+/// Build the log-density of the sum of Exponential(λ) and Normal(0, σ) at `y`,
 /// with `z = (λσ² − y)/(√2·σ)`:
 ///
 /// ```text
@@ -938,14 +946,12 @@ fn build_exponential_mean_marginal(
 /// range. Each side reads `z` clamped to its own half-line, so the side `ifelse`
 /// drops is finite and adds no `NaN` to a gradient. Both functions are §09
 /// `special-functions` members, reached through [`flatppl_core::graph::special_functions_alias`].
-fn build_exponentially_modified_normal_logpdf(
+pub fn exponentially_modified_normal_logpdf(
     m: &mut Module,
-    params: &[NodeId],
-    variates: &[NodeId],
+    rate: NodeId,
+    sigma: NodeId,
+    y: NodeId,
 ) -> NodeId {
-    let y = sole_variate(variates);
-    let [rate, sigma] = [params[0], params[1]];
-
     let rate_sigma = build_call(m, "mul", &[rate, sigma]);
     let center = build_call(m, "mul", &[rate_sigma, sigma]);
     let dev = build_call(m, "sub", &[center, y]);

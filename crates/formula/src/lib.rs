@@ -11,6 +11,7 @@ mod contrasts;
 mod data;
 mod design;
 mod emit;
+mod exgaussian;
 mod expectation;
 mod expression;
 mod family;
@@ -28,6 +29,8 @@ mod shared_groups;
 mod splines;
 mod tensor;
 mod text;
+mod wiener;
+mod wiener_sample;
 
 use flatppl_core::Module;
 use serde::{Deserialize, Serialize};
@@ -344,6 +347,8 @@ pub struct ModelInfo {
     /// Column names in paired prediction output order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_columns: Option<[String; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_column: Option<String>,
     pub family: String,
     pub link: String,
     pub group_collation: String,
@@ -458,6 +463,12 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             "{} models require threshold intercepts",
             spec.family
         )));
+    }
+    if (family == Family::Wiener) != formula.decision.is_some() {
+        return Err(Error(
+            "`dec(...)` is required for Wiener responses and is unavailable for other families"
+                .into(),
+        ));
     }
     if formula.se.is_some() && !matches!(family, Family::Gaussian | Family::Student) {
         return Err(Error(

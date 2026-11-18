@@ -9,6 +9,7 @@ pub enum Family {
     #[default]
     Gaussian,
     Student,
+    Exgaussian,
     Lognormal,
     #[serde(rename = "hurdle_lognormal")]
     HurdleLognormal,
@@ -41,6 +42,7 @@ pub enum Family {
     Cumulative,
     Acat,
     Categorical,
+    Wiener,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -72,11 +74,22 @@ pub(crate) struct Observation<'a> {
     pub cuts: &'a [NodeId],
 }
 
+impl Observation<'_> {
+    pub(crate) fn parameter(self, name: &str) -> NodeId {
+        self.auxiliary
+            .iter()
+            .find(|(key, _)| *key == name)
+            .expect("validated family parameter")
+            .1
+    }
+}
+
 impl Family {
     pub(crate) fn resolve(name: &str, link: Option<&str>) -> Result<(Self, Link)> {
         let family = match name {
             "gaussian" => Self::Gaussian,
             "student" => Self::Student,
+            "exgaussian" => Self::Exgaussian,
             "lognormal" => Self::Lognormal,
             "hurdle_lognormal" => Self::HurdleLognormal,
             "bernoulli" => Self::Bernoulli,
@@ -99,12 +112,15 @@ impl Family {
             "cumulative" => Self::Cumulative,
             "acat" => Self::Acat,
             "categorical" => Self::Categorical,
+            "wiener" => Self::Wiener,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
         let default = match family {
-            Self::Gaussian | Self::Student | Self::Lognormal | Self::HurdleLognormal => {
-                Link::Identity
-            }
+            Self::Gaussian
+            | Self::Student
+            | Self::Exgaussian
+            | Self::Lognormal
+            | Self::HurdleLognormal => Link::Identity,
             Self::Bernoulli
             | Self::Binomial
             | Self::ZeroInflatedBinomial
@@ -114,6 +130,7 @@ impl Family {
             | Self::Acat
             | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
+            Self::Wiener => Link::Identity,
             _ => Link::Log,
         };
         let link = link
@@ -126,6 +143,7 @@ impl Family {
         use Link::*;
         let supported = match family {
             Self::Gaussian | Self::Student => !matches!(link, Sqrt | TanHalf | Logm1),
+            Self::Exgaussian => matches!(link, Identity | Log | Inverse | Softplus | Squareplus),
             Self::Lognormal | Self::HurdleLognormal => matches!(link, Identity | Inverse),
             Self::Bernoulli
             | Self::Binomial
@@ -150,6 +168,7 @@ impl Family {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
+            Self::Wiener => matches!(link, Identity | Log),
             Self::Cumulative | Self::Acat | Self::Categorical => link == Logit,
         };
         if !supported {
@@ -192,6 +211,7 @@ impl Family {
         match self {
             Self::Gaussian | Self::Lognormal => &["sigma"],
             Self::Student => &["sigma", "nu"],
+            Self::Exgaussian => &["sigma", "beta"],
             Self::Gamma | Self::Negbinomial | Self::Weibull => &["shape"],
             Self::Beta => &["phi"],
             Self::ZeroInflatedBeta => &["phi", "zi"],
@@ -199,6 +219,7 @@ impl Family {
             Self::HurdleNegbinomial | Self::HurdleGamma => &["shape", "hu"],
             Self::HurdleLognormal => &["sigma", "hu"],
             Self::VonMises => &["kappa"],
+            Self::Wiener => &["bs", "ndt", "bias"],
             Self::ZeroInflatedPoisson | Self::ZeroInflatedBinomial => &["zi"],
             Self::ZeroInflatedNegbinomial => &["shape", "zi"],
             Self::Cumulative => &["disc"],
@@ -214,7 +235,7 @@ impl Family {
         }
         let default = match name {
             "nu" => Link::Logm1,
-            "zi" | "hu" => Link::Logit,
+            "zi" | "hu" | "bias" => Link::Logit,
             _ => Link::Log,
         };
         let link = link
@@ -237,6 +258,9 @@ impl Family {
     }
 
     pub(crate) fn default_predictor_prior(self, name: &str, link: Link, scale: f64) -> String {
+        if name == "bias" && link == Link::Identity {
+            return "Beta(1, 1)".into();
+        }
         if name == "sigma" || link == Link::Identity {
             return self.default_auxiliary(name, scale);
         }
@@ -244,7 +268,8 @@ impl Family {
             "nu" => "normal(2.7, 0.8)".into(),
             "kappa" => "normal(5.0, 0.8)".into(),
             "disc" => "normal(0, 1)".into(),
-            "zi" | "hu" => "logistic(0, 1)".into(),
+            "beta" => "normal(1.7, 1.3)".into(),
+            "zi" | "hu" | "bias" => "logistic(0, 1)".into(),
             _ => "student_t(3, 0, 2.5)".into(),
         }
     }
@@ -271,7 +296,11 @@ impl Family {
             }
             "shape" | "phi" => "Gamma(0.01, 0.01)".into(),
             "kappa" => "Gamma(2, 0.01)".into(),
+            "beta" => "gamma(1, 0.1)".into(),
             "zi" | "hu" => "Beta(1, 1)".into(),
+            "bs" => "LogNormal(0, 1)".into(),
+            "ndt" => "Gamma(2, 10)".into(),
+            "bias" => "constant(0.5)".into(),
             _ => unreachable!("auxiliary belongs to the family"),
         }
     }
@@ -501,6 +530,8 @@ impl Family {
                 let kappa = auxiliary(b, "kappa");
                 apply(b, "VonMises", &[mu, kappa])
             }
+            Self::Wiener => unreachable!("Wiener observations require the recorded decision"),
+            Self::Exgaussian => unreachable!("ex-Gaussian uses an explicit two-stage draw"),
             Self::Cumulative | Self::Acat => {
                 unreachable!("ordinal observations use explicit cut inputs")
             }

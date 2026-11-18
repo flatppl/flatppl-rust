@@ -1,5 +1,6 @@
 use crate::{
-    DataMode, DataValue, Error, Family, Formula, GroupLevel, Result, Table, data::ColumnModel,
+    Column, ColumnValues, DataMode, DataValue, Error, Family, Formula, GroupLevel, Result, Table,
+    data::ColumnModel,
 };
 use flatppl_convert::Builder;
 use flatppl_core::{Call, CallHead, Inputs, Node, NodeId, Ref, RefNs};
@@ -121,6 +122,7 @@ impl Truncation {
     }
 }
 
+pub(crate) const DECISION: &str = "dec_data";
 const CENSOR_CODE: &str = "cens_data";
 const CENSOR_UPPER: &str = "cens_upper_data";
 const LOWER: &str = "trunc_lower_data";
@@ -134,6 +136,12 @@ pub(crate) fn prepare(
     mode: DataMode,
     constants: &mut BTreeMap<String, DataValue>,
 ) -> Result<()> {
+    if mode == DataMode::Training
+        && let Some(name) = &formula.decision
+    {
+        let decisions = decision_codes(table.column(name)?, rows)?;
+        constants.insert(DECISION.into(), DataValue::Integers(decisions));
+    }
     let truncation = formula
         .truncation
         .as_ref()
@@ -253,6 +261,27 @@ fn bound_data(
     })
 }
 
+fn decision_codes(column: &Column, rows: &[usize]) -> Result<Vec<i64>> {
+    match &column.values {
+        ColumnValues::Bool(values) => Ok(rows.iter().map(|&i| i64::from(values[i])).collect()),
+        ColumnValues::Factor { levels, codes, .. } => rows
+            .iter()
+            .map(|&i| match levels[codes[i] as usize].as_str() {
+                "lower" => Ok(0),
+                "upper" => Ok(1),
+                _ => Err(Error(
+                    "Wiener decision labels must be lower or upper".into(),
+                )),
+            })
+            .collect(),
+        _ => Ok(column
+            .numeric(rows)?
+            .into_iter()
+            .map(|value| i64::from(value != 0.0))
+            .collect()),
+    }
+}
+
 fn censor_code(level: GroupLevel) -> Result<i64> {
     Ok(match level {
         GroupLevel::Text(name) => match name.as_str() {
@@ -288,7 +317,8 @@ pub(crate) fn score_columns(formula: &Formula) -> impl Iterator<Item = (&str, &s
                 matches!(bound, Some(TruncationBound::Column(_))).then_some((name, "reals"))
             })
     });
-    censor.chain(truncation)
+    let decision = formula.decision.as_ref().map(|_| (DECISION, "integers"));
+    censor.chain(truncation).chain(decision)
 }
 
 pub(crate) fn declare(b: &mut Builder<'_>, formula: &Formula) {

@@ -14,6 +14,8 @@ pub struct Formula {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub censoring: Option<Censoring>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ar: Option<Ar1>,
@@ -234,6 +236,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         weights: additions.weights,
         se: additions.se,
         censoring: additions.censoring,
+        decision: additions.decision,
         truncation: additions.truncation,
         ar: additions.ar,
         threshold_group: additions.threshold_group,
@@ -329,6 +332,7 @@ struct ResponseAdditions {
     weights: Option<String>,
     se: Option<StandardError>,
     censoring: Option<Censoring>,
+    decision: Option<String>,
     truncation: Option<Truncation>,
     ar: Option<Ar1>,
     threshold_group: Option<ThresholdGroup>,
@@ -340,7 +344,7 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
         return Ok((name(text.trim())?, additions));
     };
     let fail = || {
-        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)`, `ar(...)` and `thres(...)`".into())
+        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)`, `ar(...)`, `thres(...)` and `dec(...)`".into())
     };
     let mut depth = 0i32;
     for addition in addition.split(|c| {
@@ -392,6 +396,9 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
             }
             "cens" if additions.censoring.is_none() => {
                 additions.censoring = Some(Censoring::parse(argument)?);
+            }
+            "dec" if additions.decision.is_none() => {
+                additions.decision = Some(name(argument).map_err(|_| fail())?);
             }
             "trunc" if additions.truncation.is_none() => {
                 additions.truncation = Some(Truncation::parse(argument)?);
@@ -1139,6 +1146,7 @@ impl Formula {
             || self.weights.is_some()
             || self.se.is_some()
             || self.censoring.is_some()
+            || self.decision.is_some()
             || self.truncation.is_some()
             || self.ar.is_some()
             || self.threshold_group.is_some()
