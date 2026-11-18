@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+J = 3
+X = [[1, 0, 2], [0, 3, 1]]
+counts = cat(X, fill(fill(0, J), 2), [[4, 4, 4]])
+lam ~ Exponential(1)
+y ~ iid(iid(Poisson(lam), J), 5)
+prior = lawof(record(lam = lam))
+L = likelihoodof(kernelof(record(y = y), lam = lam), record(y = counts))
+post = bayesupdate(L, prior)

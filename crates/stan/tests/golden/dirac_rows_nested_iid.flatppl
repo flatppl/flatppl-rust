@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+J = 3
+K = 5
+counts = [[0, 0, 0], [1, 0, 2], [0, 0, 0], [0, 3, 0]]
+Omega ~ Beta(2, 2)
+u ~ iid(Normal(0, 1), 4)
+v ~ iid(Normal(0, 1), 4)
+site(psi, theta) = normalize(superpose(weighted(psi, Binomial(K, theta)), weighted(1 - psi, Dirac(0))))
+species(psi, theta, omega) = normalize(superpose(weighted(omega, iid(site(psi, theta), J)),
+    weighted(1 - omega, Dirac(fill(0, J)))))
+y ~ species.(invlogit.(u), invlogit.(v), Omega)
+prior = lawof(record(Omega = Omega, u = u, v = v))
+L = likelihoodof(kernelof(record(y = y), Omega = Omega, u = u, v = v), record(y = counts))
+post = bayesupdate(L, prior)

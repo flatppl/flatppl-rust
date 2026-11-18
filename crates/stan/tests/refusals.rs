@@ -687,3 +687,76 @@ fn nested_iid_of_vector_law_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("nested iid"), "{r}");
 }
+
+/// A zero-inflated row of zero-inflated sites, observed at `counts`.
+fn nested_rows(site: &str, count: &str) -> String {
+    format!(
+        "J = 3\ncounts = [[0, 0, 0], [1, 0, 2]]\nw ~ Beta(2, 2)\nq ~ Beta(1, 3)\n\
+         lam ~ Exponential(1)\nsite(q, lam) = {site}\n\
+         y ~ iid(normalize(superpose(weighted(w, iid(site(q, lam), {count})), \
+         weighted(1 - w, Dirac(fill(0, J))))), 2)\n\
+         prior = lawof(record(w = w, q = q, lam = lam))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w, q = q, lam = lam), record(y = counts))\n\
+         post = bayesupdate(L, prior)\n"
+    )
+}
+
+#[test]
+fn nested_dirac_split_other_atom_is_not_yet() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, Poisson(lam)), weighted(1 - q, Dirac(1))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("differs from the row atom"), "{r}");
+}
+
+#[test]
+fn nested_dirac_split_other_weights_is_not_yet() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, Poisson(lam)), weighted(0.5, Dirac(0))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("these weights"), "{r}");
+}
+
+#[test]
+fn nested_dirac_split_continuous_site_is_never() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, Normal(lam, 1)), weighted(1 - q, Dirac(0))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::MixedReference, "{r}");
+}
+
+#[test]
+fn nested_dirac_split_truncated_site_is_not_yet() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, normalize(truncate(Poisson(lam), interval(0, 5)))), \
+         weighted(1 - q, Dirac(0))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("truncated mixture component"), "{r}");
+}
+
+#[test]
+fn nested_dirac_split_unnormalized_site_is_never() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, truncate(Poisson(lam), interval(0, 5))), \
+         weighted(1 - q, Dirac(0))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::NumericNormalizer, "{r}");
+}
+
+#[test]
+fn nested_dirac_split_shifted_site_is_not_yet() {
+    let r = refuse(&nested_rows(
+        "normalize(superpose(weighted(q, Categorical0([0.2, 0.3, 0.5])), weighted(1 - q, Dirac(0))))",
+        "J",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("iid mixture with this law"), "{r}");
+}
