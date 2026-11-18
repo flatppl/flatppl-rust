@@ -959,3 +959,27 @@ fn a_normalized_superpose_draws_a_component_by_mass() {
         err.reason
     );
 }
+
+#[test]
+fn broadcast_zero_atom_mixture_lowers_portably() {
+    let model = "p = external(cartpow(unitinterval, 4))\n\
+                 row(h) = normalize(superpose(weighted(h, Dirac(0.0)),\n\
+                     weighted(1 - h, Gamma(2.5, 3))))\n\
+                 value, next = rand(row.(p), rnginit(123))\n\
+                 follow, _ = rand(Normal(0, 1), next)\n\
+                 inputs = p\noutputs = (value, follow)";
+    let mut m = parse_infer(model);
+    let roots = [m.intern("inputs"), m.intern("outputs")];
+    let out = flatppl_determinizer::determinize_with_options(
+        &m,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&roots),
+        &Default::default(),
+    )
+    .unwrap();
+    let pir = flatppl_flatpir::write(&out);
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok(), "{pir}");
+    assert!(pir.contains("(broadcasted Bernoulli)"), "{pir}");
+    assert!(pir.contains("(broadcasted Gamma)"), "{pir}");
+    assert!(pir.contains("(ifelse "), "{pir}");
+}
