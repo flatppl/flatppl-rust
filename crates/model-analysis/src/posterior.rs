@@ -1,6 +1,6 @@
 //! Exact normalized posterior laws for one latent parameter (§06 posterior construction).
 
-use flatppl_core::calling::{record_field, reified_inputs};
+use flatppl_core::calling::reified_inputs;
 use flatppl_core::graph::{
     build_call as op, declared_binding, draw_argument, expect_builtin_call, resolve_ref,
 };
@@ -12,6 +12,9 @@ use flatppl_infer::constructors::{find_parameter, split_kernel_constructor};
 use crate::conjugacy::match_scalar_row;
 use crate::record_marginals::match_dirichlet_observation;
 use crate::{ConjugateRowId, measure_stochastic_ancestors, references_latent};
+
+mod evidence;
+pub use evidence::beta_log_evidence;
 
 /// The posterior record contains one field with this native probability law.
 /// The posterior has a probability law only when `valid` holds.
@@ -42,6 +45,38 @@ pub fn conjugate_update(
     posterior: NodeId,
     mut likelihoods: Option<&mut Vec<Symbol>>,
 ) -> Option<ConjugatePosterior> {
+    let matched = match_update(m, posterior, |_, _, family, _, _, _| {
+        if let Some(names) = &mut likelihoods {
+            names.push(family);
+        }
+        Some(())
+    })?;
+    let valid = op(m, "land", &[matched.model_valid, matched.supported]);
+    let updated = matched.law.valid(m);
+    let valid = op(m, "land", &[valid, updated]);
+    let distribution = matched.law.distribution(m, valid, matched.model_valid);
+    Some(ConjugatePosterior {
+        update: matched.update,
+        field: matched.field,
+        distribution,
+        valid,
+    })
+}
+
+struct MatchedUpdate {
+    update: NodeId,
+    field: Symbol,
+    law: UpdatedLaw,
+    model_valid: NodeId,
+    supported: NodeId,
+}
+
+/// Visit each factor with its incoming prior and the validity of the observations so far.
+fn match_update(
+    m: &mut Module,
+    posterior: NodeId,
+    mut visit: impl FnMut(&mut Module, UpdatedLaw, Symbol, Update, Data, [NodeId; 2]) -> Option<()>,
+) -> Option<MatchedUpdate> {
     let update = resolve_ref(m, posterior).0;
     let [likelihood, prior] = operands(m, update, "bayesupdate")? else {
         return None;
@@ -63,7 +98,12 @@ pub fn conjugate_update(
     let mut factors = Vec::new();
     likelihood_factors(m, likelihood, &mut Vec::new(), &mut factors)?;
     for (kernel, observed) in factors {
-        let (latent, body, data, count) = observation(m, kernel, observed, field)?;
+        let Observation {
+            latent,
+            body,
+            data,
+            batch,
+        } = observation(m, kernel, observed, field)?;
         let (observations, options) = split_kernel_constructor(m, resolve_ref(m, body).0)?;
         let row = if matches!(law, UpdatedLaw::Dirichlet(_)) {
             let (_, dimensions, component) =
@@ -99,26 +139,35 @@ pub fn conjugate_update(
                 .0
                 .remove(&data)
         })?;
-        let data = Data::new(m, data, count, &row, &ty)?;
+        if let Some((n, size)) = batch {
+            let n = m.alloc(Node::Lit(Scalar::Int(n.into())));
+            let delta = op(m, "sub", &[size, n]);
+            let agrees = op(m, "iszero", &[delta]);
+            model_valid = op(m, "land", &[model_valid, agrees]);
+        }
+        let data = Data::new(m, data, batch.map(|(n, _)| n), &row, &ty)?;
         if let Some(check) = row.parameter_domain(m) {
             model_valid = op(m, "land", &[model_valid, check]);
         }
+        let prior = law;
         let ok = law.update(m, row, data)?;
-        if let Some(names) = &mut likelihoods {
-            names.push(observations);
-        }
         supported = op(m, "land", &[supported, ok]);
+        visit(m, prior, observations, row, data, [model_valid, supported])?;
     }
-    let valid = op(m, "land", &[model_valid, supported]);
-    let updated = law.valid(m);
-    let valid = op(m, "land", &[valid, updated]);
-    let distribution = law.distribution(m, valid, model_valid);
-    Some(ConjugatePosterior {
+    Some(MatchedUpdate {
         update,
         field,
-        distribution,
-        valid,
+        law,
+        model_valid,
+        supported,
     })
+}
+
+struct Observation {
+    latent: Symbol,
+    body: NodeId,
+    data: NodeId,
+    batch: Option<(u32, NodeId)>,
 }
 
 /// Open a kernel at its declared boundary and pair its event with the data.
@@ -127,7 +176,7 @@ fn observation(
     kernel: NodeId,
     observed: NodeId,
     field: Symbol,
-) -> Option<(Symbol, NodeId, NodeId, Option<u32>)> {
+) -> Option<Observation> {
     let kernel = resolve_ref(m, kernel).0;
     let Node::Call(call) = m.node(kernel) else {
         return None;
@@ -154,24 +203,33 @@ fn observation(
             if flatppl_core::calling::splat_fields(m, data)?.as_slice() != [label] {
                 return None;
             }
-            data = record_field(m, data, label)?;
+            // An input record can replace a literal record bound in the source.
+            data = flatppl_core::calling::project_field(m, data, label);
             body = declared_binding(m, value).0;
         }
         body = draw_argument(m, body)?;
     }
-    let (body, count) = if let Some([base, size]) = operands(m, body, "iid") {
+    let (body, batch) = if let Some([base, size]) = operands(m, body, "iid") {
         let (base, size) = (*base, *size);
         if references_latent(m, size, latent, &[]) {
             return None;
         }
         (
             base,
-            Some(u32::try_from(flatppl_infer::fixed_int_value(m, size)?).ok()?),
+            Some((
+                u32::try_from(flatppl_infer::fixed_int_value(m, size)?).ok()?,
+                size,
+            )),
         )
     } else {
         (body, None)
     };
-    Some((latent, body, data, count))
+    Some(Observation {
+        latent,
+        body,
+        data,
+        batch,
+    })
 }
 
 fn operands<'a>(m: &'a Module, node: NodeId, name: &str) -> Option<&'a [NodeId]> {
@@ -208,6 +266,7 @@ fn likelihood_factors(
     Some(())
 }
 
+#[derive(Clone, Copy)]
 enum UpdatedLaw {
     Beta(NodeId, NodeId),
     Gamma(NodeId, NodeId),
@@ -216,6 +275,7 @@ enum UpdatedLaw {
     Dirichlet(NodeId),
 }
 
+#[derive(Clone, Copy)]
 enum Update {
     Binomial(Option<NodeId>),
     Poisson,
@@ -269,7 +329,9 @@ impl Data {
             let Type::Array { shape, elem } = ty else {
                 return None;
             };
-            if shape.as_ref() != [Dim::Static(n)] {
+            // A fixed size that evaluates to zero has a dynamic axis in FlatPIR.
+            let empty = n == 0 && shape.as_ref() == [Dim::Dynamic];
+            if !empty && shape.as_ref() != [Dim::Static(n)] {
                 return None;
             }
             elem.as_ref()
@@ -413,6 +475,9 @@ impl UpdatedLaw {
     }
 
     fn update(&mut self, m: &mut Module, row: Update, data: Data) -> Option<NodeId> {
+        if data.count == Some(0) {
+            return Some(m.alloc(Node::Lit(Scalar::Bool(true))));
+        }
         let n = data.count(m);
         match (self, row) {
             (Self::Beta(a, b), Update::Binomial(trials)) => {

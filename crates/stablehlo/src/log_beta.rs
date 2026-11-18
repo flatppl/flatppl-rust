@@ -128,6 +128,14 @@ impl Emitter<'_> {
             let log1p_ratio = e.log1p(&ratio);
             let sum_minus_half = e.sub(&sum, &half);
             let t1 = e.mul(&sum_minus_half, &log1p_ratio);
+            // If x/y is tiny, y*log1p(x/y) rounds to x, even on targets
+            // that flush the ratio to zero. Keep the (x-1/2) component.
+            let epsilon = e.scalar(f64::EPSILON);
+            let tiny = e.compare("LT", &ratio, &epsilon);
+            let x_minus_half = e.sub(x, &half);
+            let residual = e.mul(&x_minus_half, &log1p_ratio);
+            let limit = e.add(x, &residual);
+            let t1 = e.select(&tiny, &limit, &t1);
             let log_y = e.log(&y_big);
             let t2 = e.mul(x, &log_y);
             let t = e.add(&t1, &t2);

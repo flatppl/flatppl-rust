@@ -191,6 +191,11 @@ pub fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId>
     if !splat_fields(m, rec)?.contains(&name) {
         return None;
     }
+    Some(project_field(m, rec, name))
+}
+
+/// Project a field from the supplied record, preserving any named input boundary.
+pub fn project_field(m: &mut Module, rec: NodeId, name: Symbol) -> NodeId {
     let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).into())));
-    Some(build_call(m, "get", &[rec, key]))
+    build_call(m, "get", &[rec, key])
 }

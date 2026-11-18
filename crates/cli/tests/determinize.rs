@@ -1,5 +1,7 @@
 use std::process::Command;
 
+mod common;
+
 fn flatppl() -> Command {
     Command::new(env!("CARGO_BIN_EXE_flatppl"))
 }
@@ -265,6 +267,38 @@ fn determinize_keep_flag_drops_unreachable_binding() {
         !stdout_keep.contains("dead1"),
         "--keep __score__ must drop the unreachable binding:\n{stdout_keep}"
     );
+}
+
+#[test]
+fn log_mass_prunes_the_bypassed_mass_binding_for_explicit_roots() {
+    let dir = common::Scratch::new("keep-log-mass");
+    let input = dir.path("posterior.flatppl");
+    std::fs::write(
+        &input,
+        "p=elementof(unitinterval)\na=external(posreals)\nK=functionof(Bernoulli(p),p=p)\n\
+         P=bayesupdate(likelihoodof(K,true),joint(p=Beta(a,1.0)))\nZ=totalmass(P)\n\
+         inputs=a\noutputs=log(Z)",
+    )
+    .unwrap();
+    for (roots, keep_mass) in [
+        (vec![], true),
+        (vec!["--keep", "inputs", "--keep", "outputs"], false),
+    ] {
+        let out = flatppl()
+            .args(["determinize", "--emit", "flatpir"])
+            .args(roots)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ir = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(ir.contains("(%bind Z "), keep_mass);
+        assert!(ir.contains("(%bind outputs "));
+    }
 }
 
 #[test]

@@ -3706,6 +3706,21 @@ fn lower_normalize(
     v: NodeId,
     atoms: &[f64],
 ) -> Result<NodeId, RefuseError> {
+    if let Some(posterior) =
+        flatppl_model_analysis::posterior::normalized_conjugate_posterior(m, node)
+    {
+        if flatppl_core::calling::splat_fields(m, v).as_deref() != Some(&[posterior.field]) {
+            return Err(refuse(
+                v,
+                m,
+                "a conjugate posterior point must have the prior's field",
+            ));
+        }
+        let point = flatppl_core::calling::project_field(m, v, posterior.field);
+        let score =
+            lower_measure_density_at(m, posterior.distribution, point, VariateOrigin::Other)?;
+        return Ok(exponential_tilt::guard(m, score, posterior.valid));
+    }
     if let Some(law) = exponential_tilt::recognize(m, node) {
         if !atoms.is_empty() && !law.integer {
             let score =
@@ -8032,6 +8047,10 @@ fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<
 /// two is left out of this change.
 pub(crate) fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
     let (node, _) = resolve_ref(m, measure);
+
+    if let Some(log_mass) = flatppl_model_analysis::posterior::beta_log_evidence(m, node) {
+        return Some(build_call(m, "exp", &[log_mass]));
+    }
 
     if let Some(mass) = recognize_markov_ksuperpose(m, node) {
         return Some(mass);

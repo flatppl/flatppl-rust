@@ -114,6 +114,47 @@ pub fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
     }))
 }
 
+/// Reuse or introduce the standard special-functions module for generated expressions.
+pub fn special_functions_alias(m: &mut Module) -> Symbol {
+    const NAME: &str = "special-functions";
+    const VERSION: &str = "0.1";
+    let is_load = |m: &Module, rhs: NodeId| match m.node(rhs) {
+        Node::Call(c) => {
+            matches!(c.head, CallHead::Builtin(h) if m.resolve(h) == "standard_module")
+                && matches!(c.args.as_ref(), [n, v]
+                    if matches!(m.node(*n), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == NAME)
+                        && matches!(m.node(*v), Node::Lit(crate::Scalar::Str(s)) if s.as_ref() == VERSION))
+        }
+        _ => false,
+    };
+    if let Some(name) = m
+        .bindings()
+        .find(|(_, b)| is_load(m, b.rhs))
+        .map(|(_, b)| b.name)
+    {
+        return name;
+    }
+    let mut index = 0;
+    let name = loop {
+        let name = m.intern(&format!("__special_functions_{index}"));
+        if m.binding_by_name(name).is_none() {
+            break name;
+        }
+        index += 1;
+    };
+    let module = m.alloc(Node::Lit(crate::Scalar::Str(NAME.into())));
+    let version = m.alloc(Node::Lit(crate::Scalar::Str(VERSION.into())));
+    let rhs = build_call(m, "standard_module", &[module, version]);
+    m.add_binding(crate::Binding {
+        name,
+        rhs,
+        doc: None,
+        public: false,
+        synthetic: true,
+    });
+    name
+}
+
 /// Allocate a `record(%field name value ...)` call from `(name, value)` pairs.
 pub fn build_record(m: &mut Module, fields: &[(Symbol, NodeId)]) -> NodeId {
     let named: Vec<NamedArg> = fields

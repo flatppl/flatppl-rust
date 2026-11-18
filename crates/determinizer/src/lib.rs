@@ -13,6 +13,7 @@ mod free_draw;
 mod invert;
 mod jointchain;
 mod kernel;
+mod log_mass;
 mod marginal;
 mod preparation;
 mod primitives;

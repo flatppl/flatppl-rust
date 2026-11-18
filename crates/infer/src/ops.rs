@@ -347,6 +347,7 @@ fn op_rule(
         | flatppl_core::LOG_CDF_DIFFERENCE
         | flatppl_core::MASS_INTEGRAL
         | flatppl_core::LOG_INTERVAL_MASS
+        | flatppl_core::MASS_FROM_LOG
         | flatppl_core::INTEGRATION_POINT => Type::Scalar(ScalarType::Real),
         flatppl_core::SORT_VECTOR => arg_ty(args, 0).cloned().unwrap_or(Type::Deferred),
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
