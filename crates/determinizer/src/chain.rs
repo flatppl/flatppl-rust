@@ -48,7 +48,8 @@
 
 use crate::density::broadcast::{Lift, cell_input, closed_function, map_body, placeholder};
 use crate::density::{
-    build_call, build_record, lower_measure_density_at_point, refuse, trajectory_static_len,
+    build_call, build_record, known_type, lower_measure_density_at_point, refuse,
+    trajectory_static_len,
 };
 use crate::kernel::resolve_reified;
 use crate::refuse::RefuseError;
@@ -114,6 +115,14 @@ fn chain_parts(m: &mut Module, node: NodeId, op: &str) -> Result<ChainParts, Ref
 
     // The step count. `None` covers a dynamic length AND a record-state chain
     // (whose trajectory is a table, left with a deferred domain by inference).
+    // Substitution into an applied kernel can create a chain without annotations.
+    if trajectory_static_len(m, node).is_none()
+        && let Some(ty) = flatppl_infer::infer_expression(m, node, &[])
+            .0
+            .remove(&node)
+    {
+        m.set_type(node, ty);
+    }
     let n = trajectory_static_len(m, node).ok_or_else(|| {
         refuse(
             node,
@@ -321,7 +330,16 @@ pub(crate) fn lower_chain_sample(
                 let idx = m.alloc(Node::Lit(Scalar::Int(0)));
                 build_call(m, "get0", &[extra, idx])
             }
-            Some(_) => cell_input(m, extra, &mut inputs, &mut args)?,
+            Some(_) => {
+                if let Some(Type::Table { columns, .. }) = known_type(m, extra) {
+                    let (label, reference, row) = placeholder(m, Type::Record(columns));
+                    inputs.push((label, reference));
+                    args.push(extra);
+                    row
+                } else {
+                    cell_input(m, extra, &mut inputs, &mut args)?
+                }
+            }
             None => extra,
         });
     }

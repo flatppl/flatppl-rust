@@ -39,6 +39,19 @@ fn kscan_sample_carries_the_rng_through_one_scan() {
 }
 
 #[test]
+fn kscan_sample_keeps_table_rows_and_applied_shape() {
+    let pir = lower(
+        "mu = elementof(reals)\nrho = elementof(reals)\n\
+         rows = table(x = [mu, 2 * mu], w = [1.0, 2.0])\n\
+         W = kscan((state, row) -> Normal(state + row.x, row.w), 0.0, rows)\n\
+         y ~ W\nK = kernelof(record(y = y), mu = mu)\n\
+         d, s2 = rand(K(rho), rnginit(0))\ninputs = rho\noutputs = (d, s2)",
+    );
+    assert_eq!(pir.matches("(scan ").count(), 1, "{pir}");
+    assert!(pir.contains("(table "), "{pir}");
+}
+
+#[test]
 fn markovchain_sample_walks_an_index_vector() {
     let pir = lower(
         "rho = elementof(interval(-1.0, 1.0))\n\

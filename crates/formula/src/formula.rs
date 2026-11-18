@@ -1,4 +1,4 @@
-use crate::{Arithmetic, Censoring, ColumnExpression, Error, Result, Truncation};
+use crate::{Ar1, Arithmetic, Censoring, ColumnExpression, Error, Result, Truncation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,6 +15,8 @@ pub struct Formula {
     pub censoring: Option<Censoring>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ar: Option<Ar1>,
     pub intercept: bool,
     pub variables: Vec<String>,
     pub fixed: Vec<Term>,
@@ -219,6 +221,7 @@ pub fn parse_formula(text: &str) -> Result<Formula> {
         se: additions.se,
         censoring: additions.censoring,
         truncation: additions.truncation,
+        ar: additions.ar,
         intercept,
         variables,
         fixed,
@@ -307,6 +310,7 @@ struct ResponseAdditions {
     se: Option<StandardError>,
     censoring: Option<Censoring>,
     truncation: Option<Truncation>,
+    ar: Option<Ar1>,
 }
 
 fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
@@ -315,7 +319,7 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
         return Ok((name(text.trim())?, additions));
     };
     let fail = || {
-        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)` and `trunc(...)`".into())
+        Error("response additions support `trials(...)`, `weights(...)`, `se(...)`, `cens(...)`, `trunc(...)` and `ar(...)`".into())
     };
     let mut depth = 0i32;
     for addition in addition.split(|c| {
@@ -370,6 +374,9 @@ fn response_additions(text: &str) -> Result<(String, ResponseAdditions)> {
             }
             "trunc" if additions.truncation.is_none() => {
                 additions.truncation = Some(Truncation::parse(argument)?);
+            }
+            "ar" if additions.ar.is_none() => {
+                additions.ar = Some(Ar1::parse(argument)?);
             }
             _ => return Err(fail()),
         }
@@ -1047,6 +1054,7 @@ impl Formula {
             || self.se.is_some()
             || self.censoring.is_some()
             || self.truncation.is_some()
+            || self.ar.is_some()
     }
 
     pub(crate) fn uses_intercept_column(&self) -> bool {

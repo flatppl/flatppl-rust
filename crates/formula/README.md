@@ -302,6 +302,18 @@ on the supplied bounds. Student models with one degree of freedom return
 Prediction requires truncation bound columns and omits censoring inputs.
 The StableHLO sampler currently refuses truncated Normal draws.
 
+Use `y | ar(time = visit, group = subject) ~ x` for Gaussian residual AR(1).
+Group and integer time columns are required. Times must be unique within each
+group and can have gaps. Rows are ordered by group and time, with their input
+indices saved in `rows`. Each group starts from the stationary residual
+distribution. Across a gap of `d` time steps the residual has conditional
+mean `ar^d` times the last residual and innovation variance
+`sigma^2 * (1 + ar^2 + ... + ar^(2*d-2))`. The `ar` prior defaults to uniform
+on `(-1, 1)`, and `sigma` is a scalar innovation standard deviation.
+`log_lik` reports each conditional log density in model row order.
+Prediction requires both columns and starts a fresh stationary trajectory
+in each group, including groups that appeared in training.
+
 Unordered factors use treatment contrasts. Ordered factors use polynomial
 contrasts. Set `options.contrasts` per column, for example
 `{"treatment": "sum"}`. Accepted values are `treatment`, `sum`, `helmert` and
