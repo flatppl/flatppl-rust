@@ -78,7 +78,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Report structural parameter components and advisory Normal coordinates.
+    /// Report structural components, Normal coordinates, and Rust StableHLO posterior sampling.
     #[cfg(feature = "determinize")]
     Analyze {
         input: PathBuf,
@@ -1240,10 +1240,16 @@ fn analyze_cmd(input: &Path, data_inputs: &[String]) -> Result<(), Failure> {
     let module = context
         .load(&input.to_string_lossy())
         .map_err(|error| Failure::Plain(error.to_string()))?;
+    let updates = module
+        .posterior_updates()
+        .map_err(|error| Failure::Plain(error.to_string()))?;
     let (_, report) = context
         .analyze_model(&module, data_inputs)
         .map_err(|error| Failure::Plain(error.to_string()))?;
     print!("{report}");
+    for update in updates {
+        println!("{update}");
+    }
     Ok(())
 }
 

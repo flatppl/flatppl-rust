@@ -16,6 +16,7 @@ mod formula;
 mod incremental;
 mod inspect;
 mod normal_coordinates;
+mod posterior;
 mod readers;
 mod transforms;
 
@@ -41,4 +42,5 @@ pub use inspect::{BindingKind, Bound, Domain, DomainField, InputInfo};
 pub use normal_coordinates::{
     NormalCoordinateExports, PreparedNormalCoordinate, PreparedNormalCoordinates,
 };
+pub use posterior::{PosteriorSampling, PosteriorUpdate};
 pub use transforms::TransformedQueries;

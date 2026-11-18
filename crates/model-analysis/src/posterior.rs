@@ -16,6 +16,7 @@ use crate::{ConjugateRowId, measure_stochastic_ancestors, references_latent};
 /// The posterior record contains one field with this native probability law.
 /// The posterior has a probability law only when `valid` holds.
 pub struct ConjugatePosterior {
+    pub update: NodeId,
     pub field: Symbol,
     pub distribution: NodeId,
     pub valid: NodeId,
@@ -31,7 +32,18 @@ pub fn normalized_conjugate_posterior(
     let [posterior] = operands(m, measure, "normalize")? else {
         return None;
     };
-    let [likelihood, prior] = operands(m, *posterior, "bayesupdate")? else {
+    conjugate_update(m, *posterior, None)
+}
+
+/// Inspect the same update that sampling lowers. A failed match leaves the
+/// mathematical question open. Factor names are collected only for inspection.
+pub fn conjugate_update(
+    m: &mut Module,
+    posterior: NodeId,
+    mut likelihoods: Option<&mut Vec<Symbol>>,
+) -> Option<ConjugatePosterior> {
+    let update = resolve_ref(m, posterior).0;
+    let [likelihood, prior] = operands(m, update, "bayesupdate")? else {
         return None;
     };
     let (likelihood, prior) = (*likelihood, *prior);
@@ -92,6 +104,9 @@ pub fn normalized_conjugate_posterior(
             model_valid = op(m, "land", &[model_valid, check]);
         }
         let ok = law.update(m, row, data)?;
+        if let Some(names) = &mut likelihoods {
+            names.push(observations);
+        }
         supported = op(m, "land", &[supported, ok]);
     }
     let valid = op(m, "land", &[model_valid, supported]);
@@ -99,6 +114,7 @@ pub fn normalized_conjugate_posterior(
     let valid = op(m, "land", &[valid, updated]);
     let distribution = law.distribution(m, valid, model_valid);
     Some(ConjugatePosterior {
+        update,
         field,
         distribution,
         valid,

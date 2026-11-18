@@ -70,6 +70,9 @@ pub struct Module {
     /// value, but must not reopen its draw provenance when restoring its own law.
     /// Per expression: one binding may contain several queries. Not serialized.
     sample_results: HashSet<NodeId>,
+    /// Optional analysis provenance from a lowered sampling expression to its source measure.
+    /// Kept out of serialized IR and ordinary compilation.
+    sample_origins: Option<Box<SampleOrigins>>,
     /// Binding names the reification currently being scored declares as its
     /// INPUTS (`flatppl-determinizer`). A measure parameterized by one of these
     /// is CONDITIONED on it, so a density lowering must not marginalize it out:
@@ -78,6 +81,14 @@ pub struct Module {
     /// `densityof(likelihoodof(K, obs), theta)` as `pdf(K(theta), obs)`. A stack,
     /// because reifications nest. Not projected into any output format.
     conditioned_inputs: Vec<Symbol>,
+}
+
+/// Source measures, concrete instantiations and the primitives that sample them.
+#[derive(Clone, Debug, Default)]
+struct SampleOrigins {
+    sources: HashMap<NodeId, NodeId>,
+    draws: HashMap<NodeId, NodeId>,
+    pending: Vec<NodeId>,
 }
 
 /// A top-level binding `name = rhs`.
@@ -189,6 +200,47 @@ impl Module {
     /// Whether `id` is a concrete `rand` result rather than a generative trace.
     pub fn is_sample_result(&self, id: NodeId) -> bool {
         self.sample_results.contains(&id)
+    }
+
+    /// Seed source identities so a rewritten copy of a measure retains its origin.
+    pub fn trace_sample_origins(&mut self, sources: impl Iterator<Item = NodeId>) {
+        self.sample_origins
+            .get_or_insert_with(Box::default)
+            .sources
+            .extend(sources.map(|node| (node, node)));
+    }
+
+    pub fn record_sample_origin(&mut self, sample: NodeId, measure: NodeId) {
+        if let Some(origins) = &mut self.sample_origins {
+            origins.draws.insert(sample, measure);
+            origins.pending.push(measure);
+        }
+    }
+
+    pub fn sample_origin(&self, sample: NodeId) -> Option<NodeId> {
+        self.sample_origins.as_ref()?.sources.get(&sample).copied()
+    }
+
+    pub fn sampled_measure(&self, sample: NodeId) -> Option<NodeId> {
+        self.sample_origins.as_ref()?.draws.get(&sample).copied()
+    }
+
+    pub fn take_sampled_measures(&mut self) -> Vec<NodeId> {
+        self.sample_origins
+            .as_mut()
+            .map(|trace| std::mem::take(&mut trace.pending))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn inherit_sample_origin(&mut self, old: NodeId, new: NodeId) {
+        if let Some(trace) = &mut self.sample_origins {
+            if let Some(&source) = trace.sources.get(&old) {
+                trace.sources.insert(new, source);
+            }
+            if let Some(&measure) = trace.draws.get(&old) {
+                trace.draws.insert(new, measure);
+            }
+        }
     }
 
     /// Declare `names` as the inputs of the reification whose body is about to be

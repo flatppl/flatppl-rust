@@ -12,6 +12,46 @@ pub(super) type Constant = Arc<[Scalar]>;
 pub(super) const MAX_FOLDED_ELEMENTS: usize = 4096;
 
 impl Emitter<'_> {
+    /// Read statically valid scalar posterior parameters at reporting precision.
+    /// Runtime data and vector parameters keep the symbolic family in the report.
+    pub fn fixed_distribution_parameters(
+        m: &Module,
+        valid: NodeId,
+        parameters: &[NodeId],
+    ) -> Option<Vec<f64>> {
+        let inputs = flatppl_core::query::promoted_input_names(m);
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = parameters.to_vec();
+        todo.push(valid);
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Node::Ref(r) = m.node(id) {
+                if r.ns != flatppl_core::RefNs::SelfMod || inputs.contains(&r.name) {
+                    return None;
+                }
+                todo.push(m.binding(m.binding_by_name(r.name)?).rhs);
+            } else {
+                m.for_each_child(id, |child| todo.push(child));
+            }
+        }
+        let mut emitter = Emitter::new(m, Dtype::F64);
+        let valid = emitter.lower_node(valid).ok()?;
+        if emitter.fixed_scalar_at(&valid, 0)? != Scalar::Bool(true) {
+            return None;
+        }
+        parameters
+            .iter()
+            .map(|&parameter| {
+                let value = emitter.lower_node(parameter).ok()?;
+                emitter
+                    .constant_real(&value)
+                    .or_else(|| emitter.constant_int(&value).map(|x| x as f64))
+            })
+            .collect()
+    }
+
     /// Read a fixed element without expanding its views. Also follow fixed
     /// conditions, comparisons, conversions, and sign operations.
     pub(crate) fn fixed_scalar_at(&self, value: &Value, index: usize) -> Option<Scalar> {

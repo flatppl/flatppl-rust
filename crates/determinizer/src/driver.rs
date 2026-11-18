@@ -97,7 +97,7 @@ pub fn determinize_with_options(
     roots: Option<&[Symbol]>,
     options: &crate::LoweringOptions<'_>,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, None)
+    determinize_inner(m, bundle, roots, options, None, None)
 }
 
 /// Trace the actual lowering-time reductions without changing the result.
@@ -108,7 +108,31 @@ pub fn determinize_with_options_and_report(
     options: &crate::LoweringOptions<'_>,
     report: &mut crate::ReductionReport,
 ) -> Result<Module, RefuseError> {
-    determinize_inner(m, bundle, roots, options, Some(report))
+    determinize_inner(m, bundle, roots, options, Some(report), None)
+}
+
+/// Inspect source measures after dependency resolution and inference, before
+/// query lowering. Track returned identities through copies and sampled outputs.
+pub fn determinize_with_sampling_report(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+    options: &crate::LoweringOptions<'_>,
+    reductions: &mut crate::ReductionReport,
+    inspect: &mut dyn SamplingObserver,
+) -> Result<Module, RefuseError> {
+    determinize_inner(m, bundle, roots, options, Some(reductions), Some(inspect))
+}
+
+/// Observe the same source and instantiated measures consumed by lowering.
+pub trait SamplingObserver {
+    fn source_measures(&mut self, m: &Module) -> Vec<NodeId>;
+    fn sampled_measures(&mut self, m: &Module, owner: Symbol, measures: &[NodeId]);
+}
+
+struct SamplingInspection<'a> {
+    observer: Option<&'a mut dyn SamplingObserver>,
+    refresh: bool,
 }
 
 fn determinize_inner(
@@ -117,6 +141,7 @@ fn determinize_inner(
     roots: Option<&[Symbol]>,
     options: &crate::LoweringOptions<'_>,
     mut report: Option<&mut crate::ReductionReport>,
+    mut observer: Option<&mut dyn SamplingObserver>,
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
     let mut imports = crate::crossmodule::GraftState::default();
@@ -151,13 +176,30 @@ fn determinize_inner(
         crate::stdfn::lower_std_module_functions(&mut work, options)?;
     }
     crate::canon::normalize_call_wrappers(&mut work);
-    crate::free_draw::refuse_measure_roots(&work, roots)?;
-    crate::free_draw::refuse_free_draws(&work, roots)?;
+    if let Err(error) = crate::free_draw::refuse_measure_roots(&work, roots)
+        .and_then(|()| crate::free_draw::refuse_free_draws(&work, roots))
+    {
+        if let Some(observer) = observer.as_mut() {
+            let _ = flatppl_infer::infer(&mut work);
+            let _ = observer.source_measures(&work);
+        }
+        return Err(error);
+    }
 
     let mut specialize_sequences = true;
+    let mut sampling = SamplingInspection {
+        observer,
+        refresh: true,
+    };
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
+        if std::mem::take(&mut sampling.refresh)
+            && let Some(observer) = sampling.observer.as_mut()
+        {
+            let origins = observer.source_measures(&work);
+            work.trace_sample_origins(origins.into_iter());
+        }
         // A closed built-in measure in a primitive's kernel slot splits into its
         // kernel and input (spec §07).
         if crate::primitives::split_measure_kernels(&mut work) {
@@ -201,6 +243,7 @@ fn determinize_inner(
         // pass, so a `logdensityof`/`bayesupdate` never consumes them (see
         // `desugar_restrict_or_disintegrate_once`).
         if desugar_restrict_or_disintegrate_once(&mut work, true)? {
+            sampling.refresh = true;
             continue;
         }
 
@@ -235,6 +278,7 @@ fn determinize_inner(
                             )?
                         {
                             crate::stdfn::lower_std_module_functions(&mut work, options)?;
+                            sampling.refresh = true;
                             continue;
                         }
                         // Residual conformance issue not covered by the
@@ -251,7 +295,15 @@ fn determinize_inner(
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(&mut work, bid, node_id, bundle, &mut imports, options)?;
+                apply_rule(
+                    &mut work,
+                    bid,
+                    node_id,
+                    bundle,
+                    &mut imports,
+                    options,
+                    &mut sampling,
+                )?;
                 // Loop: re-scan after the rewrite.
             }
         }
@@ -615,6 +667,7 @@ fn apply_rule(
     bundle: &ModuleBundle,
     imports: &mut crate::crossmodule::GraftState,
     options: &crate::LoweringOptions<'_>,
+    sampling: &mut SamplingInspection<'_>,
 ) -> Result<(), RefuseError> {
     if let Some(query) = crate::density::lower_broadcast_query(m, target_node) {
         let rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, query);
@@ -680,6 +733,7 @@ fn apply_rule(
         {
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
+            sampling.refresh = true;
             // The initial standard-function pass could not see this dependency.
             crate::stdfn::lower_std_module_functions(m, options)?;
             // The intermediate `x = m.L` self-ref binding (if any) and the
@@ -709,6 +763,12 @@ fn apply_rule(
     // replacing each `draw(mᵢ)` with `builtin_sample(rngᵢ, mᵢ, inputᵢ)` (spec §07).
     if is_op(m, target_node, "rand") {
         let new_root = crate::sample::lower_rand(m, bid, target_node, options.preserve_rand_tuple)?;
+        if let Some(observer) = &mut sampling.observer {
+            let measures = m.take_sampled_measures();
+            if !measures.is_empty() {
+                observer.sampled_measures(m, m.binding(bid).name, &measures);
+            }
+        }
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`

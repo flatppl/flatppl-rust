@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::Constant;
 use crate::export::{Export, emit_query};
 use crate::inspect::{self, BindingKind, Domain, InputInfo};
+use crate::posterior::{PosteriorTrace, PosteriorUpdate};
 
 /// A compiler error. `span` holds byte offsets into the text of `source`.
 #[derive(Debug, Serialize)]
@@ -27,8 +28,10 @@ pub struct Diagnostic {
     pub span: Option<(u32, u32)>,
     /// Written as the keys `line`, `column` and `excerpt` when the span is known.
     #[serde(flatten)]
-    pub position: Option<Position>,
+    pub position: Option<Box<Position>>,
     pub import_chain: Vec<String>,
+    #[serde(skip_serializing_if = "<[PosteriorUpdate]>::is_empty")]
+    pub posterior_updates: Box<[PosteriorUpdate]>,
 }
 
 /// Where a span starts: the line and column count from 1, the column in
@@ -41,6 +44,15 @@ pub struct Position {
 }
 
 impl Diagnostic {
+    pub(crate) fn with_posteriors(mut self, updates: Vec<PosteriorUpdate>) -> Self {
+        use std::fmt::Write;
+        for update in &updates {
+            let _ = write!(self.message, "\n{update}");
+        }
+        self.posterior_updates = updates.into_boxed_slice();
+        self
+    }
+
     pub(crate) fn new(stage: &'static str, source: &str, message: impl ToString) -> Self {
         Self {
             stage,
@@ -49,6 +61,7 @@ impl Diagnostic {
             span: None,
             position: None,
             import_chain: Vec::new(),
+            posterior_updates: Box::default(),
         }
     }
 
@@ -62,10 +75,12 @@ impl Diagnostic {
         self.span = span;
         self.position = span
             .and_then(|(start, _)| inspect::locate(text, start))
-            .map(|(line, column, excerpt)| Position {
-                line,
-                column,
-                excerpt: excerpt.into(),
+            .map(|(line, column, excerpt)| {
+                Box::new(Position {
+                    line,
+                    column,
+                    excerpt: excerpt.into(),
+                })
             });
         self
     }
@@ -281,25 +296,62 @@ impl LoadedModule {
         })
     }
 
-    pub(crate) fn compilation_reductions(
+    pub(crate) fn may_have_posteriors(&self) -> bool {
+        fn contains_update(m: &Module) -> bool {
+            (0..m.node_count()).any(|i| matches!(m.node(NodeId::from_usize(i)), Node::Call(c)
+                if matches!(c.head, CallHead::Builtin(s) if matches!(m.resolve(s), "bayesupdate" | "restrict"))))
+        }
+        if contains_update(&self.typed) {
+            return true;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut imports: Vec<_> = self.definition.imports.iter().collect();
+        while let Some((_, definition)) = imports.pop() {
+            if seen.insert(&definition.identity) {
+                if contains_update(&definition.parsed) {
+                    return true;
+                }
+                imports.extend(&definition.imports);
+            }
+        }
+        false
+    }
+
+    /// Inspect posterior updates and the native samplers retained by Rust StableHLO lowering.
+    pub fn posterior_updates(&self) -> Result<Vec<PosteriorUpdate>, Diagnostic> {
+        if !self.may_have_posteriors() {
+            return Ok(Vec::new());
+        }
+        self.compilation_analysis(true).map(|(_, updates)| updates)
+    }
+
+    pub(crate) fn compilation_analysis(
         &self,
         enabled: bool,
-    ) -> Result<flatppl_determinizer::ReductionReport, Diagnostic> {
+    ) -> Result<(flatppl_determinizer::ReductionReport, Vec<PosteriorUpdate>), Diagnostic> {
         let mut report = flatppl_determinizer::ReductionReport::default();
-        self.lower_query(
+        let mut trace = PosteriorTrace::default();
+        let lowered = self.lower_query(
             &EmitOptions {
                 sufficient_statistics: enabled,
                 ..Default::default()
             },
-            Some(&mut report),
-        )?;
-        Ok(report)
+            Some((&mut report, &mut trace)),
+        );
+        let updates = trace.finish(lowered.as_ref().ok());
+        match lowered {
+            Ok(_) => Ok((report, updates)),
+            Err(error) => Err(error.with_posteriors(updates)),
+        }
     }
 
     fn lower_query(
         &self,
         options: &EmitOptions,
-        mut report: Option<&mut flatppl_determinizer::ReductionReport>,
+        mut report: Option<(
+            &mut flatppl_determinizer::ReductionReport,
+            &mut PosteriorTrace,
+        )>,
     ) -> Result<Module, Diagnostic> {
         let typed = &self.typed;
         let roots: Vec<_> = typed
@@ -318,13 +370,14 @@ impl LoadedModule {
             preserve_rand_tuple: true,
             ..options.lowering_options()
         };
-        let mut lowered = match report.as_deref_mut() {
-            Some(report) => flatppl_determinizer::determinize_with_options_and_report(
+        let mut lowered = match report.as_mut() {
+            Some((reductions, trace)) => flatppl_determinizer::determinize_with_sampling_report(
                 typed,
                 &self.bundle,
                 Some(&roots),
                 &lowering,
-                report,
+                reductions,
+                *trace,
             ),
             None => flatppl_determinizer::determinize_with_options(
                 typed,
@@ -351,7 +404,7 @@ impl LoadedModule {
             )
         })?;
         if options.sufficient_statistics {
-            if let Some(report) = report {
+            if let Some((report, _)) = report {
                 flatppl_determinizer::sufficient_statistics_with_report(&mut lowered, report);
             } else {
                 flatppl_determinizer::sufficient_statistics(&mut lowered);

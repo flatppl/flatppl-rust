@@ -472,6 +472,11 @@ fn sample_conjugate_posterior(
         None => law,
     };
     let (value, next) = lower_closed_measure_sample(m, measure, rng)?;
+    // Both projections refer to the same native draw. Track the primitive so
+    // either the returned value or its successor state can witness this rewrite.
+    if let Some(projection) = expect_builtin_call(m, next, "get0") {
+        m.record_sample_origin(projection.args[0], posterior.update);
+    }
     let mut missing = m.alloc(Node::Lit(Scalar::Real(f64::NAN)));
     if let Some(dirichlet) = expect_builtin_call(m, law, "Dirichlet") {
         let alpha = dirichlet.args[0];
