@@ -14,7 +14,7 @@ use crate::record_marginals::match_dirichlet_observation;
 use crate::{ConjugateRowId, measure_stochastic_ancestors, references_latent};
 
 mod evidence;
-pub use evidence::beta_log_evidence;
+pub use evidence::{beta_log_evidence, conjugate_log_evidence};
 
 /// The posterior record contains one field with this native probability law.
 /// The posterior has a probability law only when `valid` holds.
@@ -45,16 +45,19 @@ pub fn conjugate_update(
     posterior: NodeId,
     mut likelihoods: Option<&mut Vec<Symbol>>,
 ) -> Option<ConjugatePosterior> {
-    let matched = match_update(m, posterior, |_, _, family, _, _, _| {
+    let matched = match_update(m, posterior)?;
+    let mut law = matched.prior;
+    let mut valid = matched.model_valid;
+    for factor in matched.factors {
+        let ok = law.update(m, factor.row, factor.data)?;
+        valid = op(m, "land", &[valid, ok]);
         if let Some(names) = &mut likelihoods {
-            names.push(family);
+            names.push(factor.family);
         }
-        Some(())
-    })?;
-    let valid = op(m, "land", &[matched.model_valid, matched.supported]);
-    let updated = matched.law.valid(m);
+    }
+    let updated = law.valid(m);
     let valid = op(m, "land", &[valid, updated]);
-    let distribution = matched.law.distribution(m, valid, matched.model_valid);
+    let distribution = law.distribution(m, valid, matched.model_valid);
     Some(ConjugatePosterior {
         update: matched.update,
         field: matched.field,
@@ -66,17 +69,19 @@ pub fn conjugate_update(
 struct MatchedUpdate {
     update: NodeId,
     field: Symbol,
-    law: UpdatedLaw,
+    prior: UpdatedLaw,
     model_valid: NodeId,
-    supported: NodeId,
+    factors: Vec<MatchedFactor>,
 }
 
-/// Visit each factor with its incoming prior and the validity of the observations so far.
-fn match_update(
-    m: &mut Module,
-    posterior: NodeId,
-    mut visit: impl FnMut(&mut Module, UpdatedLaw, Symbol, Update, Data, [NodeId; 2]) -> Option<()>,
-) -> Option<MatchedUpdate> {
+struct MatchedFactor {
+    family: Symbol,
+    row: Update,
+    data: Data,
+}
+
+/// Check the complete update before a consumer constructs any summaries.
+fn match_update(m: &mut Module, posterior: NodeId) -> Option<MatchedUpdate> {
     let update = resolve_ref(m, posterior).0;
     let [likelihood, prior] = operands(m, update, "bayesupdate")? else {
         return None;
@@ -92,11 +97,11 @@ fn match_update(
         return None;
     }
     let (family, args) = split_kernel_constructor(m, resolve_ref(m, prior).0)?;
-    let mut law = UpdatedLaw::from_prior(m, family, &args)?;
+    let law = UpdatedLaw::from_prior(m, family, &args)?;
     let mut model_valid = law.valid(m);
-    let mut supported = m.alloc(Node::Lit(Scalar::Bool(true)));
     let mut factors = Vec::new();
     likelihood_factors(m, likelihood, &mut Vec::new(), &mut factors)?;
+    let mut matched = Vec::with_capacity(factors.len());
     for (kernel, observed) in factors {
         let Observation {
             latent,
@@ -149,17 +154,18 @@ fn match_update(
         if let Some(check) = row.parameter_domain(m) {
             model_valid = op(m, "land", &[model_valid, check]);
         }
-        let prior = law;
-        let ok = law.update(m, row, data)?;
-        supported = op(m, "land", &[supported, ok]);
-        visit(m, prior, observations, row, data, [model_valid, supported])?;
+        matched.push(MatchedFactor {
+            family: observations,
+            row,
+            data,
+        });
     }
     Some(MatchedUpdate {
         update,
         field,
-        law,
+        prior: law,
         model_valid,
-        supported,
+        factors: matched,
     })
 }
 
@@ -598,21 +604,20 @@ fn supported_counts(
     }
 }
 
-fn multinomial_counts(
-    m: &mut Module,
-    data: Data,
-    trials: NodeId,
-    size: NodeId,
-) -> (NodeId, NodeId) {
+struct MultinomialData {
+    cells: NodeId,
+    counts: NodeId,
+    totals: NodeId,
+    real_totals: NodeId,
+}
+
+fn multinomial_data(m: &mut Module, data: Data, size: NodeId) -> MultinomialData {
     let cells = if data.count.is_some() {
         op(m, "rowstack", &[data.value])
     } else {
         data.value
     };
-    let valid_cells = supported_counts(m, cells, data.integer, Some(trials), true);
     let totals = data.apply(m, "sum", &[data.value]);
-    let diff = data.apply(m, "sub", &[totals, trials]);
-    let matches = data.apply(m, "iszero", &[diff]);
     let reals = map(m, "real", &[cells]);
     let (counts, real_totals) = if let Some(rows) = data.count {
         let rows = m.alloc(Node::Lit(Scalar::Int(rows.into())));
@@ -627,13 +632,27 @@ fn multinomial_counts(
     } else {
         (reals, op(m, "sum", &[reals]))
     };
-    // Nonnegative integer totals that wrap back to n exceed 2n in real arithmetic.
-    let two = real(m, 2.0);
-    let limit = op(m, "mul", &[trials, two]);
-    let no_wrap = data.apply(m, "le", &[real_totals, limit]);
-    let rows_valid = data.apply(m, "land", &[matches, no_wrap]);
-    let rows_valid = data.reduce(m, "lall", rows_valid);
-    (counts, op(m, "land", &[valid_cells, rows_valid]))
+    MultinomialData {
+        cells,
+        counts,
+        totals,
+        real_totals,
+    }
+}
+
+impl MultinomialData {
+    fn supported(&self, m: &mut Module, data: Data, trials: NodeId) -> NodeId {
+        let valid_cells = supported_counts(m, self.cells, data.integer, Some(trials), true);
+        let diff = data.apply(m, "sub", &[self.totals, trials]);
+        let matches = data.apply(m, "iszero", &[diff]);
+        // Nonnegative integer totals that wrap back to n exceed 2n in real arithmetic.
+        let two = real(m, 2.0);
+        let limit = op(m, "mul", &[trials, two]);
+        let no_wrap = data.apply(m, "le", &[self.real_totals, limit]);
+        let rows_valid = data.apply(m, "land", &[matches, no_wrap]);
+        let rows_valid = data.reduce(m, "lall", rows_valid);
+        op(m, "land", &[valid_cells, rows_valid])
+    }
 }
 
 fn category_counts(
@@ -645,7 +664,8 @@ fn category_counts(
 ) -> (NodeId, NodeId) {
     let size = m.alloc(Node::Lit(Scalar::Int(d.into())));
     if let Some(trials) = trials {
-        return multinomial_counts(m, data, trials, size);
+        let table = multinomial_data(m, data, size);
+        return (table.counts, table.supported(m, data, trials));
     }
     let offset = i64::from(one_based);
     let last = offset + i64::from(d) - 1;

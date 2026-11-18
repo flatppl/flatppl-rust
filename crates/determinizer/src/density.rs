@@ -8069,7 +8069,7 @@ fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<
 pub(crate) fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
     let (node, _) = resolve_ref(m, measure);
 
-    if let Some(log_mass) = flatppl_model_analysis::posterior::beta_log_evidence(m, node) {
+    if let Some(log_mass) = flatppl_model_analysis::posterior::conjugate_log_evidence(m, node) {
         return Some(build_call(m, "exp", &[log_mass]));
     }
 

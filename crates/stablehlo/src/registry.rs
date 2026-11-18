@@ -2873,6 +2873,43 @@ fn log_count_choose(e: &mut Emitter, k: &Value, r: &Value) -> Value {
     e.sub(&neg_log_k_plus_r, &log_beta)
 }
 
+/// For large shapes and counts, the combinatorial and probability terms nearly
+/// cancel at the mean. Conditional Poisson deviances retain their small difference.
+fn concentrated_negative_binomial(e: &mut Emitter, a: &Value, k: &Value, beta: &Value) -> Value {
+    let one = e.scalar(1.);
+    let total = e.add(a, k);
+    let denom = e.add(beta, &one);
+    let p = e.div(beta, &denom);
+    let mean_a = e.mul(&total, &p);
+    let mean_k = e.div(&total, &denom);
+    let deviance = |e: &mut Emitter, x: &Value, mean: &Value| {
+        let log_x = e.log(x);
+        let log_mean = e.log(mean);
+        let log_ratio = log_ratio(e, x, &log_x, mean, &log_mean);
+        e.native_products(|e| poisson_deviance(e, x, mean, &log_ratio))
+    };
+    let da = deviance(e, a, &mean_a);
+    let dk = deviance(e, k, &mean_k);
+    // log(a/total) + log Pois(a;mean_a) + log Pois(k;mean_k) - log Pois(total;total),
+    // using the gamma continuation for a and total and cancelling the leading terms.
+    let k_over_a = e.div(k, a);
+    let log_total_over_a = e.log1p(&k_over_a);
+    let log_k = e.log(k);
+    let log_variance = e.add(&log_k, &log_total_over_a);
+    let log_tau = e.scalar((2. * std::f64::consts::PI).ln());
+    let normalizer = e.add(&log_tau, &log_variance);
+    let minus_half = e.scalar(-0.5);
+    let value = e.mul(&minus_half, &normalizer);
+    let rt = e.log_gamma_correction(&total);
+    let ra = e.log_gamma_correction(a);
+    let rk = e.log_gamma_correction(k);
+    let correction = e.sub(&rt, &ra);
+    let correction = e.sub(&correction, &rk);
+    let value = e.add(&value, &correction);
+    let value = e.sub(&value, &da);
+    e.sub(&value, &dk)
+}
+
 /// §08 NegativeBinomial: `log f = logC(k + alpha - 1, alpha - 1) +
 /// alpha * (log(beta) - log(beta + 1)) - k * log(beta + 1)`, computed as
 /// `-alpha * log1p(1 / beta) - k * log1p(beta)`, with the coefficient from
@@ -2881,6 +2918,10 @@ fn log_count_choose(e: &mut Emitter, k: &Value, r: &Value) -> Value {
 fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
+    let small_fixed = |x: &Value| {
+        e.constant_real(x).is_some_and(|x| x < 64.) || e.constant_int(x).is_some_and(|x| x < 64)
+    };
+    let always_small = small_fixed(v) || small_fixed(&alpha);
     let (supported, v) = count_support(e, v, None);
     let v = &v;
 
@@ -2901,6 +2942,19 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
 
     let t3 = e.add(&t2, &alpha_log_ratio);
     let score = e.add(&t3, &neg_k_log_beta_plus_one);
+    let score = if always_small {
+        score
+    } else {
+        let cutoff = e.scalar(64.);
+        let big_a = e.compare("GE", &alpha, &cutoff);
+        let big_k = e.compare("GE", v, &cutoff);
+        let large = e.and(&big_a, &big_k);
+        let a = e.select(&large, &alpha, &cutoff);
+        let k = e.select(&large, v, &cutoff);
+        let rate = e.select(&large, &beta, &one);
+        let centered = concentrated_negative_binomial(e, &a, &k, &rate);
+        e.select(&large, &centered, &score)
+    };
     Ok(outside_count_support(e, &supported, &score))
 }
 
