@@ -28,6 +28,9 @@ pub enum RefusalKind {
     /// A mixture of components with different reference measures (a `Dirac`
     /// atom beside a continuous law).
     MixedReference,
+    /// A container whose length depends on parameters (`filter` with a
+    /// parameter predicate): Stan sizes are data.
+    ParameterDependentExtent,
     /// A law or function with no Stan counterpart (`kind: "none"` in the
     /// mapping tables).
     NoStanFunction,

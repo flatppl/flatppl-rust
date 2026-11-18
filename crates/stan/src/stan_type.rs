@@ -58,6 +58,29 @@ impl Bounds {
     }
 }
 
+/// Stands for a `Dim::Dynamic` extent while a declaration names its axes:
+/// the axis must then take a symbolic size (a `filter` count).
+pub(crate) const DYNAMIC: u32 = u32::MAX;
+
+/// `ty` with every dynamic extent marked [`DYNAMIC`].
+pub(crate) fn mark_dynamic(ty: &Type) -> Type {
+    let d = |x: &Dim| match x {
+        Dim::Dynamic => Dim::Static(DYNAMIC),
+        s => *s,
+    };
+    match ty {
+        Type::Array { shape, elem } => Type::Array {
+            shape: shape.iter().map(d).collect(),
+            elem: Box::new(mark_dynamic(elem)),
+        },
+        Type::TVector { len, elem } => Type::TVector {
+            len: d(len),
+            elem: Box::new(mark_dynamic(elem)),
+        },
+        t => t.clone(),
+    }
+}
+
 /// Renders a static extent; the caller may substitute a size name.
 pub(crate) type SizeName<'a> = &'a mut dyn FnMut(u32) -> String;
 

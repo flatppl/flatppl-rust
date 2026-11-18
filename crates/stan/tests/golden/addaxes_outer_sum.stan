@@ -17,7 +17,7 @@ parameters {
 }
 model {
   matrix[M, T] lp = rep_matrix(s * e, T) + rep_matrix(logit(mean_p)', M);
-  matrix[M, T] q = rep_matrix(e, T) .* rep_matrix(mean_p', M);
+  matrix[M, T] q = e * mean_p';
 
   mean_p ~ uniform(0, 1);
   s ~ uniform(0, 5);

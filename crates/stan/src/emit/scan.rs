@@ -970,7 +970,7 @@ impl<'m> Emitter<'m> {
         }
         if !looped.is_empty() {
             let var = self.loop_var();
-            let out = self.map_loop(step, types, &var, &looped);
+            let out = self.map_loop(step, types, &var, &looped, false);
             self.used.remove(&var);
             lines.push(out?);
         }
@@ -1023,12 +1023,50 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `rowstack(scan(…))` of a map scan whose entries are vectors: a
+    /// matrix filled row by row from the step's body (the design's "stacked
+    /// by rows"). `None` for a recurrence or other entries.
+    pub(super) fn stacked_map_scan(
+        &mut self,
+        base: &str,
+        stack: NodeId,
+        scan: NodeId,
+    ) -> Result<Option<String>> {
+        if self.record_scan(scan) {
+            return Ok(None);
+        }
+        let step = self.step(scan)?;
+        if self.reads_accumulator(&step) {
+            return Ok(None);
+        }
+        let types = self.step_types(&step)?;
+        if !matches!(types.get(&step.body), Some(Type::Array { shape, .. }) if shape.len() == 1) {
+            return Ok(None);
+        }
+        let name = self.fresh(base);
+        let t = self.declare(stack, None, false, &name, &[])?;
+        if t.base != "matrix" || !t.array.is_empty() {
+            self.used.remove(&name);
+            return Ok(None);
+        }
+        let var = self.loop_var();
+        let text = self.map_loop(&step, types, &var, &[(name.clone(), step.body)], true);
+        self.used.remove(&var);
+        let text = text?;
+        let fixed = self.m.phase_of(stack) == Some(Phase::Fixed);
+        self.put(fixed, vec![format!("{};", t.render(&name)), text]);
+        self.record_decl(&name, t);
+        self.remember(stack, &name);
+        Ok(Some(name))
+    }
+
     fn map_loop(
         &mut self,
         step: &Step,
         types: HashMap<NodeId, Type>,
         var: &str,
         looped: &[(String, NodeId)],
+        matrix_rows: bool,
     ) -> Result<String> {
         let (lo, hi, x, row) = self.scan_loop(step.xs, var)?;
         let mut ctx = FnCtx {
@@ -1044,6 +1082,8 @@ impl<'m> Emitter<'m> {
         let mut failed = None;
         for (name, v) in looped {
             match self.step_value(*v, &mut body) {
+                // A matrix row takes the vector entry as a row_vector.
+                Ok(e) if matrix_rows => body.push(format!("{name}[{row}] = ({e})';")),
                 Ok(e) => body.push(format!("{name}[{row}] = {e};")),
                 Err(e) => {
                     failed = Some(e);

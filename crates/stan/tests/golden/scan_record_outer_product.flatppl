@@ -1,0 +1,15 @@
+flatppl_compat = "0.1"
+N = 3
+M = 2
+v_obs = [0.5, -0.2]
+r ~ Normal(0, 1)
+step(s, t, p) = record(
+    a = s.a .+ addaxes(onehot(t, N), 0, 1) .* addaxes(p.r .* s.b, 1, 0),
+    b = s.b .+ v_obs)
+history = scan(step, record(a = fill(0.0, [N, M]), b = fill(1.0, M)), indicesof(zeros(N)), record(r = r))
+final(s) = s.a
+a_last = final(history[N])
+z ~ Normal(sum(a_last), 1)
+prior = lawof(record(r = r))
+L = likelihoodof(kernelof(record(z = z), r = r), record(z = 0.6))
+post = bayesupdate(L, prior)

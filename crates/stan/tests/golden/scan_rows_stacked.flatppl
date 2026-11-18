@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+K = 2
+T = 3
+w ~ iid(Normal(0, 1), K)
+row(acc, t, p) = p.w .* t .+ 1.0
+rows = rowstack(scan(row, zeros(K), indicesof(zeros(T)), record(w = w)))
+z ~ Normal(sum(rows), 1)
+prior = lawof(record(w = w))
+L = likelihoodof(kernelof(record(z = z), w = w), record(z = 0.4))
+post = bayesupdate(L, prior)
