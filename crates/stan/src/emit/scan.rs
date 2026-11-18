@@ -762,11 +762,7 @@ impl<'m> Emitter<'m> {
             }
         }
 
-        let module_t = self
-            .m
-            .bindings()
-            .any(|(_, b)| super::sanitize(self.name(b.name)) == "t");
-        let var = if self.used.contains("t") || module_t {
+        let var = if self.used.contains("t") || self.reserved.contains("t") {
             self.loop_var()
         } else {
             self.used.insert("t".to_string());

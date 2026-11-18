@@ -320,7 +320,7 @@ impl<'m> Emitter<'m> {
         let at_idx = per_row.then(|| self.fresh(&format!("{lhs}_atom")));
         let rest = self.fresh(&format!("{lhs}_rest"));
         let i = self.fresh_loop();
-        let (a, b) = (self.fresh("a"), self.fresh("b"));
+        let (a, b) = (self.fresh_local("a"), self.fresh_local("b"));
         let at = format!("max({lhs}[{i}]) == {c} && min({lhs}[{i}]) == {c}", c = c.s);
         self.tdata.push(format!(
             "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {at};\n}}"
@@ -485,12 +485,12 @@ impl<'m> Emitter<'m> {
 
     fn fresh_loop(&mut self) -> String {
         for c in ["i", "j", "n", "k"] {
-            if !self.used.contains(c) {
+            if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
                 return c.to_string();
             }
         }
-        self.fresh("idx")
+        self.fresh_local("idx")
     }
 
     fn extent_text(&self, name: &str) -> String {
@@ -943,7 +943,7 @@ impl<'m> Emitter<'m> {
         let at_idx = self.fresh(&format!("{lhs}_atom"));
         let rest = self.fresh(&format!("{lhs}_rest"));
         let i = self.fresh_loop();
-        let (a, b) = (self.fresh("a"), self.fresh("b"));
+        let (a, b) = (self.fresh_local("a"), self.fresh_local("b"));
         self.tdata.push(format!(
             "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {lhs}[{i}] == {c};\n}}",
             c = c.s

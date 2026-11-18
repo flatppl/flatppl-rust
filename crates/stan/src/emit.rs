@@ -109,6 +109,10 @@ pub(crate) struct Emitter<'m> {
     m: &'m Module,
     opts: &'m EmitOptions,
     used: HashSet<String>,
+    /// The module's binding and record field names: loop variables and
+    /// block locals avoid them, so a value declared later under one of
+    /// these names never meets a loop or local of the same name.
+    reserved: HashSet<String>,
     /// FlatPPL binding → the Stan name it is bound to.
     env: HashMap<Symbol, String>,
     /// Prior field or kernel input name → its Stan parameter.
@@ -188,6 +192,29 @@ pub(crate) struct Emitter<'m> {
     manifest: Vec<ManifestParam>,
 }
 
+/// Every binding name and record field name of `m`, as Stan names.
+fn module_names(m: &Module) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack = Vec::new();
+    for (_, b) in m.bindings() {
+        out.insert(sanitize(m.resolve(b.name)));
+        stack.push(b.rhs);
+    }
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Node::Call(c) = m.node(id) {
+            for na in c.named.iter() {
+                out.insert(sanitize(m.resolve(na.name)));
+            }
+        }
+        m.for_each_child(id, |k| stack.push(k));
+    }
+    out
+}
+
 pub(crate) fn sanitize(name: &str) -> String {
     let mut s: String = name
         .chars()
@@ -227,6 +254,7 @@ impl<'m> Emitter<'m> {
             m,
             opts,
             used: HashSet::new(),
+            reserved: module_names(m),
             env: HashMap::new(),
             fields: HashMap::new(),
             decls: HashMap::new(),
@@ -290,6 +318,20 @@ impl<'m> Emitter<'m> {
 
     fn name(&self, s: Symbol) -> &'m str {
         self.m.resolve(s)
+    }
+
+    /// A loop variable or block local: a fresh name that is no module
+    /// binding or record field name either.
+    fn fresh_local(&mut self, base: &str) -> String {
+        let base = sanitize(base);
+        let mut name = base.clone();
+        let mut k = 2;
+        while self.used.contains(&name) || self.reserved.contains(&name) {
+            name = format!("{base}_{k}");
+            k += 1;
+        }
+        self.used.insert(name.clone());
+        name
     }
 
     fn fresh(&mut self, base: &str) -> String {
