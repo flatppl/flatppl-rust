@@ -864,3 +864,129 @@ fn continuous_truncation_to_integers_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("zero measure"), "{r}");
 }
+
+fn weighted_model(log_lik: &str, call: &str) -> String {
+    format!(
+        "x = [0.5, -1.0, 2.0]\ny_data = [1.1, -0.4, 2.7]\nw_data = [1.0, 0.5, 2.0]\n\
+         a ~ Normal(0, 2)\nsigma ~ Exponential(1)\nmu = a .+ x\n\
+         prior = lawof(record(a = a, sigma = sigma))\nlog_lik = {log_lik}\n\
+         post = logweighted(point -> sum(w_data .* {call}), prior)\n"
+    )
+}
+
+#[test]
+fn keyword_call_with_other_fields_is_not_yet() {
+    let r = refuse_with(
+        &weighted_model(
+            "functionof(((m, v, s) -> logdensityof(Normal(m, s), v)).(mu, y_data, sigma), a = a, sigma = sigma)",
+            "log_lik(a = point.sigma, sigma = point.a)",
+        ),
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("matching fields"), "{r}");
+}
+
+#[test]
+fn weighted_law_reading_the_value_is_not_yet() {
+    let r = refuse_with(
+        &weighted_model(
+            "functionof(((m, v, s) -> logdensityof(Normal(m + v, s), v)).(mu, y_data, sigma), a = a, sigma = sigma)",
+            "log_lik(a = point.a, sigma = point.sigma)",
+        ),
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("reads the observed value"), "{r}");
+}
+
+#[test]
+fn normalize_weighted_other_weight_is_not_yet() {
+    let r = refuse(&posterior(
+        "mu ~ Normal(0, 1)\ny ~ normalize(weighted(2.0, Normal(mu, 1)))",
+        "lawof(record(mu = mu))",
+        "kernelof(record(y = y), mu = mu)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("weighted measure with this weight"),
+        "{r}"
+    );
+}
+
+#[test]
+fn normalize_weighted_unbounded_parameter_is_not_yet() {
+    // `s` may be negative: R1 needs a declared `lower=0` or a positive set.
+    let r = refuse(&posterior(
+        "mu ~ Normal(0, 1)\ns ~ Normal(1, 1)\n\
+         y ~ normalize(weighted(ifelse(s > 0.0 && isfinite(s), 1.0, 0.0), Normal(mu, ifelse(s > 0.0 && isfinite(s), s, 1.0))))",
+        "lawof(record(mu = mu, s = s))",
+        "kernelof(record(y = y), mu = mu, s = s)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("weighted measure with this weight"),
+        "{r}"
+    );
+}
+
+#[test]
+fn keyword_call_of_a_valued_input_is_not_yet() {
+    // `b = 3.0` has its own value: the body would read it, not `point.b`.
+    let r = refuse_with(
+        "x = [0.5, -1.0, 2.0]\ny_data = [1.1, -0.4, 2.7]\nw_data = [1.0, 0.5, 2.0]\nb = 3.0\n\
+         prior = joint(b = Normal(0, 1))\n\
+         log_lik = functionof(((m, v) -> logdensityof(Normal(m, 1), v)).(b .+ x, y_data), b = b)\n\
+         post = logweighted(point -> sum(w_data .* log_lik(b = point.b)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("matching fields"), "{r}");
+}
+
+#[test]
+fn keyword_call_of_a_derived_input_is_not_yet() {
+    // `a = 2 * alpha` is not the prior field `a` (which is alpha's draw):
+    // the body would read 2·alpha, not `point.a`.
+    let r = refuse_with(
+        "x = [0.5, -1.0, 2.0]\ny_data = [1.1, -0.4, 2.7]\nw_data = [1.0, 0.5, 2.0]\n\
+         alpha ~ Normal(0, 2)\nsigma ~ Exponential(1)\na = 2 * alpha\nmu = a .+ x\n\
+         prior = lawof(record(a = alpha, sigma = sigma))\n\
+         log_lik = functionof(((m, v, s) -> logdensityof(Normal(m, s), v)).(mu, y_data, sigma), a = a, sigma = sigma)\n\
+         post = logweighted(point -> sum(w_data .* log_lik(a = point.a, sigma = point.sigma)), prior)\n",
+        Some("post"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("matching fields"), "{r}");
+}
+
+#[test]
+fn unnormalized_discrete_component_at_a_real_end_is_not_yet() {
+    // `interval(0.0, inf)` would reach `poisson_lccdf(0.0 - 1 | …)`, which
+    // stanc rejects.
+    let r = refuse_with(
+        "k = 2\nm = normalize(superpose(weighted(0.3, truncate(Poisson(3.0), interval(0.0, inf))), \
+         weighted(0.7, Poisson(1.5))))\ninputs = (k)\nlp = logdensityof(m, k)\n",
+        Some("lp"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("non-integer end"), "{r}");
+}
+
+#[test]
+fn normalize_weighted_root_of_unbounded_parameter_is_not_yet() {
+    // `sqrt(se^2 + p^2)` is positive only with p > 0: p here may be 0.
+    let r = refuse_with(
+        "x = [0.5, -1.0]\nse = [0.5, 1.2]\nmu ~ Normal(0, 1)\np ~ Normal(1, 1)\n\
+         f = (m, s) -> normalize(weighted(ifelse(s > 0.0 && isfinite(s), 1.0, 0.0), Normal(m, ifelse(s > 0.0 && isfinite(s), s, 1.0))))\n\
+         y ~ f.(mu .+ x, sqrt.(se .* se .+ p .* p))\nprior = lawof(record(mu = mu, p = p))\n\
+         L = likelihoodof(kernelof(record(y = y), mu = mu, p = p), record(y = [0.4, -1.2]))\n\
+         post = bayesupdate(L, prior)\n",
+        None,
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(
+        r.reason.contains("weighted measure with this weight"),
+        "{r}"
+    );
+}

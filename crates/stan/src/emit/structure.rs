@@ -1374,6 +1374,9 @@ impl<'m> Emitter<'m> {
                         ),
                     ));
                 }
+                if self.head(inner) == Some("weighted") {
+                    return self.constant_weight_law(m, inner, broadcast);
+                }
                 if self.head(inner) != Some("truncate") {
                     return Err(Refusal::not_yet(Some(m), "normalize of this measure"));
                 }
@@ -1986,6 +1989,182 @@ impl<'m> Emitter<'m> {
     }
 
     /// A positive literal, or a value of a positive set.
+    /// `normalize(weighted(c, M))` with `c = ifelse(s > 0.0 && isfinite(s),
+    /// 1.0, 0.0)` (ruling R1). With c > 0 and constant in the variate,
+    /// `normalize` gives M back (§06 `normalize`): M·c / (c·Z_M). It holds for
+    /// a positive parameter `s`, and for data `s` that `transformed data`
+    /// checks once (a validation, not a density term). Inside M, an `ifelse`
+    /// on the same condition takes its first branch.
+    fn constant_weight_law(&mut self, m: NodeId, inner: NodeId, broadcast: bool) -> Result<Law> {
+        let refuse =
+            || Refusal::not_yet(Some(m), "normalize of a weighted measure with this weight");
+        let (c, base) = {
+            let wc = self.call(inner).unwrap();
+            (wc.args[0], wc.args[1])
+        };
+        let (cond, s) = self.positive_finite_indicator(c).ok_or_else(refuse)?;
+        // A local of a broadcast user law stands for its argument.
+        let arg = match self.m.node(self.resolve(s)) {
+            Node::Ref(r) if r.ns == flatppl_core::RefNs::Local => self
+                .fctx
+                .as_ref()
+                .and_then(|x| x.args.get(&r.name).copied())
+                .ok_or_else(refuse)?,
+            _ => s,
+        };
+        let text = self.at_module(|me| me.expr(arg))?.s;
+        if self.positive_parameter(arg)? {
+            // s > 0 and finite by its declaration or value set.
+        } else if let Some(checks) = self.root_of_squares(arg)? {
+            for check in checks {
+                if !self.tdata.contains(&check) {
+                    self.tdata.push(check);
+                }
+            }
+        } else if self.is_data(&text) {
+            let check = match self.shape(arg).map(|sh| sh.rank) {
+                Some(0) => format!(
+                    "if (!({text} > 0) || is_inf({text})) {{\n  reject(\"normalize(weighted(c, M)) has weight 0: {text} is \", {text});\n}}"
+                ),
+                Some(1) => {
+                    let i = self.fresh_index();
+                    let n = self.extent_of(&text);
+                    self.used.remove(&i);
+                    format!(
+                        "for ({i} in 1:{n}) {{\n  if (!({text}[{i}] > 0) || is_inf({text}[{i}])) {{\n    reject(\"normalize(weighted(c, M)) has weight 0 at {text}[\", {i}, \"]\");\n  }}\n}}"
+                    )
+                }
+                _ => return Err(refuse()),
+            };
+            if !self.tdata.contains(&check) {
+                self.tdata.push(check);
+            }
+        } else {
+            return Err(refuse());
+        }
+        self.true_conds.push(cond);
+        let out = self.law(base, broadcast);
+        self.true_conds.pop();
+        out
+    }
+
+    /// A parameter declared `lower=0`, or a `posreals` value: positive and
+    /// finite.
+    fn positive_parameter(&mut self, x: NodeId) -> Result<bool> {
+        if self.positive_value(x) {
+            return Ok(true);
+        }
+        let text = self.at_module(|me| me.expr(x))?.s;
+        Ok(!self.is_data(&text)
+            && self.decls.get(&text).is_some_and(|t| {
+                t.bounds
+                    .lower
+                    .as_deref()
+                    .and_then(|l| l.parse::<f64>().ok())
+                    .is_some_and(|l| l >= 0.0)
+            }))
+    }
+
+    /// `s = sqrt(a .* a .+ p .* p)` (either summand first, elementwise or
+    /// scalar) with p a positive parameter and a data. Then p > 0 gives
+    /// p² > 0, so a² + p² > 0 and s > 0; s is finite where a and p are, and
+    /// p is a declared real. The `transformed data` checks returned test
+    /// that a is finite (not inf, not NaN). `None`: not this form.
+    fn root_of_squares(&mut self, s: NodeId) -> Result<Option<Vec<String>>> {
+        let op = |me: &Self, x: NodeId, name: &str| -> Option<Vec<NodeId>> {
+            let x = me.resolve(x);
+            let c = me.call(x)?;
+            if me.head(x) == Some(name) {
+                return Some(c.args.to_vec());
+            }
+            if me.head(x) == Some("broadcast")
+                && matches!(me.m.node(c.args[0]), Node::Const(f) if me.name(*f) == name)
+            {
+                return Some(c.args[1..].to_vec());
+            }
+            None
+        };
+        let square = |me: &Self, x: NodeId| -> Option<NodeId> {
+            match op(me, x, "mul")?[..] {
+                [u, v] if me.m.structural_eq(u, v) => Some(u),
+                _ => None,
+            }
+        };
+        let Some(&[inner]) = op(self, s, "sqrt").as_deref() else {
+            return Ok(None);
+        };
+        let Some(&[u, v]) = op(self, inner, "add").as_deref() else {
+            return Ok(None);
+        };
+        let (Some(a), Some(b)) = (square(self, u), square(self, v)) else {
+            return Ok(None);
+        };
+        let data = if self.positive_parameter(b)? {
+            a
+        } else if self.positive_parameter(a)? {
+            b
+        } else {
+            return Ok(None);
+        };
+        let text = self.at_module(|me| me.expr(data))?.s;
+        if !self.is_data(&text) {
+            return Ok(None);
+        }
+        let check = match self.shape(data).map(|sh| sh.rank) {
+            Some(0) => format!(
+                "if (is_inf({text}) || is_nan({text})) {{\n  reject(\"{text} is not finite: \", {text});\n}}"
+            ),
+            Some(1) => {
+                let i = self.fresh_index();
+                let n = self.extent_of(&text);
+                self.used.remove(&i);
+                format!(
+                    "for ({i} in 1:{n}) {{\n  if (is_inf({text}[{i}]) || is_nan({text}[{i}])) {{\n    reject(\"{text}[\", {i}, \"] is not finite\");\n  }}\n}}"
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(vec![check]))
+    }
+
+    /// `ifelse(s > 0.0 && isfinite(s), 1.0, 0.0)`, either order of the two
+    /// tests: the condition and `s`.
+    pub(super) fn positive_finite_indicator(&self, c: NodeId) -> Option<(NodeId, NodeId)> {
+        let c = self.resolve(c);
+        if self.head(c) != Some("ifelse") {
+            return None;
+        }
+        let [cond, one, zero] = self.call(c)?.args[..] else {
+            return None;
+        };
+        if self.literal_number(one) != Some(1.0) || self.literal_number(zero) != Some(0.0) {
+            return None;
+        }
+        let cr = self.resolve(cond);
+        if self.head(cr) != Some("land") {
+            return None;
+        }
+        let [p, q] = self.call(cr)?.args[..] else {
+            return None;
+        };
+        let gt = |x: NodeId| {
+            let x = self.resolve(x);
+            let a = &self.call(x)?.args;
+            (self.head(x) == Some("gt") && a.len() == 2 && self.literal_number(a[1]) == Some(0.0))
+                .then(|| a[0])
+        };
+        let finite = |x: NodeId| {
+            let x = self.resolve(x);
+            let a = &self.call(x)?.args;
+            (self.head(x) == Some("isfinite") && a.len() == 1).then(|| a[0])
+        };
+        let (a, b) = match (gt(p), finite(q), finite(p), gt(q)) {
+            (Some(a), Some(b), _, _) | (_, _, Some(b), Some(a)) => (a, b),
+            _ => return None,
+        };
+        self.m.structural_eq(a, b).then_some((cond, a))
+    }
+
     fn positive_value(&self, x: NodeId) -> bool {
         match self.literal_number(x) {
             Some(v) => v > 0.0,
@@ -2132,7 +2311,7 @@ impl<'m> Emitter<'m> {
     /// The finite ends of an interval set; `None` for an open side.
     /// `true` unless `s` is an `interval` with a finite end that is not
     /// integer-typed (integers by type, not value).
-    fn integer_ends(&self, s: NodeId) -> bool {
+    pub(super) fn integer_ends(&self, s: NodeId) -> bool {
         let s = self.resolve(s);
         if self.head(s) != Some("interval") {
             return true;
@@ -2552,6 +2731,15 @@ pub(super) fn is_identifier(s: &str) -> bool {
 /// The larger (or smaller) of two ends, folded when both are literals.
 fn pick(x: &str, b: &str, larger: bool, discrete: bool) -> String {
     match (x.parse::<f64>(), b.parse::<f64>()) {
+        // A tie keeps the end as written, or the integer literal for a
+        // discrete law (`0`, not `0.0`, reaches an integer CDF argument).
+        (Ok(xv), Ok(bv)) if xv == bv => {
+            if discrete && x.parse::<i64>().is_err() && b.parse::<i64>().is_ok() {
+                b.to_string()
+            } else {
+                x.to_string()
+            }
+        }
         (Ok(xv), Ok(bv)) if (xv >= bv) == larger => x.to_string(),
         (Ok(_), Ok(_)) => b.to_string(),
         _ => {
