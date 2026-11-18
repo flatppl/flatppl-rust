@@ -174,7 +174,7 @@ impl<'m> Emitter<'m> {
             return Lin::konst(i64::from(n));
         }
         // A function sees no unnamed data size: its body takes the number.
-        if self.fctx.is_some() && found.as_ref().is_some_and(has_token) {
+        if self.function_depth > 0 && found.as_ref().is_some_and(has_token) {
             return Lin::konst(i64::from(n));
         }
         if let Some(l) = found {
@@ -252,7 +252,7 @@ impl<'m> Emitter<'m> {
     /// it has none, or where a body would need an unnamed data size.
     pub(super) fn size_text(&mut self, id: NodeId, axis: usize, n: u32) -> String {
         match self.sym_extent(id, axis, 0) {
-            Some(l) if !(self.fctx.is_some() && has_token(&l)) => l.print(),
+            Some(l) if !(self.function_depth > 0 && has_token(&l)) => l.print(),
             _ => n.to_string(),
         }
     }
@@ -932,6 +932,26 @@ impl<'m> Emitter<'m> {
                     .value;
                 let h = self.set_hints(fset).get(axis).copied().flatten()?;
                 return self.lin_int(h);
+            }
+            // A field of a record written in place: the field's value.
+            if self.head(rec) == Some("record") {
+                let v = self
+                    .call(rec)?
+                    .named
+                    .iter()
+                    .find(|na| self.name(na.name) == f)?
+                    .value;
+                return self.sym_extent(v, axis, d);
+            }
+            // A field of a parameter of a body being sized: of its argument.
+            if let Node::Ref(rf) = self.m.node(x)
+                && rf.ns == RefNs::Local
+                && let Some(&(arg, 0)) = self.esubst.last().and_then(|m| m.get(&rf.name))
+            {
+                let top = self.esubst.pop();
+                let out = self.get_extent(&[arg, sels[0]], axis, d);
+                self.esubst.extend(top);
+                return out;
             }
             // A field of a record argument: the extent of its Stan name.
             if let Node::Ref(rf) = self.m.node(x)

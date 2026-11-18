@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+vs = [0.5, -1.0, 2.0]
+xs = [1.0, 2.0, 3.0, 4.0]
+h(r) = r.v .* r.s
+step(acc, x) = 0.5 * acc + x * sum(h(record(v = vs, s = acc))) / 10
+means = scan(step, 0.1, xs)
+mu ~ Normal(0, 1)
+y ~ Normal.(mu .+ means, 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.3, -0.2, 1.0, 0.5]))
+post = bayesupdate(L, prior)

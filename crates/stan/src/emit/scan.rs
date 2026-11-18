@@ -994,6 +994,7 @@ impl<'m> Emitter<'m> {
         let int = self.shape(step.xs).is_some_and(|s| s.int);
         let mut ctx = FnCtx {
             scoped: types.clone(),
+            inline_only: true,
             ..Default::default()
         };
         self.bind_param(step, &mut ctx)?;
@@ -1069,8 +1070,11 @@ impl<'m> Emitter<'m> {
         matrix_rows: bool,
     ) -> Result<String> {
         let (lo, hi, x, row) = self.scan_loop(step.xs, var)?;
+        // A map step is one expression per element: an inlined call keeps
+        // its text, as in the lifted map.
         let mut ctx = FnCtx {
             scoped: types,
+            inline_only: true,
             ..Default::default()
         };
         ctx.locals.insert(step.entries[1].1.name, x.at(P_ATOM));
@@ -1312,6 +1316,13 @@ impl<'m> Emitter<'m> {
     /// A user function called with a record argument, inlined: Stan functions
     /// take no records. Each record parameter reads the argument's fields.
     pub(super) fn inline_call(&mut self, id: NodeId, fun: NodeId, args: &[NodeId]) -> Result<Ex> {
+        // A non-scalar result is one local per callee and arguments (design
+        // ruling 3); a scalar one stays its text.
+        let inline_only = self.fctx.as_ref().is_some_and(|c| c.inline_only);
+        let nonscalar = !inline_only && self.shape(id).is_some_and(|s| s.rank > 0);
+        if nonscalar && let Some(name) = self.inlined_name(fun, args) {
+            return Ok(Ex::atom(name));
+        }
         let (body, entries) = self.callable_parts(fun)?;
         if entries.len() != args.len() {
             return Err(Refusal::not_yet(
@@ -1319,7 +1330,11 @@ impl<'m> Emitter<'m> {
                 "a user function called with another arity",
             ));
         }
-        let mut ctx = FnCtx::default();
+        // An expression-only body keeps every call inside it inline too.
+        let mut ctx = FnCtx {
+            inline_only,
+            ..Default::default()
+        };
         let mut tys = Vec::new();
         for ((_, r), &a) in entries.iter().zip(args) {
             let t = self
@@ -1352,7 +1367,49 @@ impl<'m> Emitter<'m> {
             let fixed = self.m.phase_of(id) == Some(Phase::Fixed);
             self.put(fixed, ctx.lines);
         }
-        v
+        let v = v?;
+        if !nonscalar {
+            return Ok(v);
+        }
+        let stan = if super::structure::is_identifier(&v.s) {
+            v.s
+        } else {
+            let base = self.owner_name_of(fun);
+            self.place(&base, id, Ok(v))?
+        };
+        let entry = (fun, args.to_vec(), stan.clone());
+        match &mut self.fctx {
+            Some(c) => c.inlined.push(entry),
+            None => self.inlined.push(entry),
+        }
+        Ok(Ex::atom(stan))
+    }
+
+    /// The local of an inlined call with the same callee and structurally
+    /// equal arguments, in this body.
+    fn inlined_name(&self, fun: NodeId, args: &[NodeId]) -> Option<String> {
+        let list = match &self.fctx {
+            Some(c) => &c.inlined,
+            None => &self.inlined,
+        };
+        list.iter()
+            .find(|(f, a, _)| {
+                *f == fun
+                    && a.len() == args.len()
+                    && a.iter()
+                        .zip(args)
+                        .all(|(x, y)| self.m.structural_eq(*x, *y))
+            })
+            .map(|(_, _, n)| n.clone())
+    }
+
+    /// The binding name of a callee, for its locals.
+    fn owner_name_of(&self, fun: NodeId) -> String {
+        self.m
+            .bindings()
+            .find(|(_, b)| b.rhs == fun)
+            .map(|(_, b)| self.name(b.name).to_string())
+            .unwrap_or_else(|| "inline".to_string())
     }
 
     /// `true` when a call passes a record argument.
