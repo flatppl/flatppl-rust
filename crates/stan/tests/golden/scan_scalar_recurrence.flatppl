@@ -1,0 +1,14 @@
+flatppl_compat = "0.1"
+T = 5
+y_obs = [0.3, -0.2, 0.5, 0.1, -0.4]
+s1 = 1.0
+mu ~ Normal(0, 1)
+a0 ~ Exponential(1)
+a1 ~ Beta(1, 2)
+step(sigma, y_previous, p) = sqrt(p.a0 + p.a1 * (y_previous - p.mu)^2 + 0.5 * sigma^2)
+previous = y_obs[indicesof(zeros(T - 1))]
+sigma = cat([s1], scan(step, s1, previous, record(mu = mu, a0 = a0, a1 = a1)))
+y ~ Normal.(mu, sigma)
+prior = lawof(record(mu = mu, a0 = a0, a1 = a1))
+L = likelihoodof(kernelof(record(y = y), mu = mu, a0 = a0, a1 = a1), record(y = y_obs))
+post = bayesupdate(L, prior)

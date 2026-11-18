@@ -37,6 +37,12 @@ impl Range {
         }
     }
 
+    /// The first and last entries of a unit-step range, as loop bounds, and
+    /// the first entry itself.
+    pub(super) fn unit_loop(&self) -> Option<(String, String, Lin)> {
+        (self.step == 1).then(|| (bound(&self.start), bound(&self.last()), self.start.clone()))
+    }
+
     /// The range as an integer array.
     pub(super) fn array(&self) -> String {
         let n = self.n.print();

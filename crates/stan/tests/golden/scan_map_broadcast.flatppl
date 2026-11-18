@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+x_obs = [1.0, 2.0, 3.0]
+y_obs = [1.2, 2.9, 4.1]
+a ~ Normal(0, 1)
+step(acc, x, p) = p.a * x + 1
+y ~ Normal.(scan(step, 0.0, x_obs, record(a = a)), 1)
+prior = lawof(record(a = a))
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = y_obs))
+post = bayesupdate(L, prior)

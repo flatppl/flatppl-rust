@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+x_obs = [1.0, 2.0, 3.0]
+y_obs = [0.5, 1.5, 2.0]
+b ~ iid(Normal(0, 1), 2)
+g(x, c) = ifelse(x > c, x, c)
+m = aggregate(sum, [.i, .k], g(x_obs[.i], b[.k]))
+y ~ Normal.(m[:, 1] .- m[:, 2], 1)
+prior = lawof(record(b = b))
+L = likelihoodof(kernelof(record(y = y), b = b), record(y = y_obs))
+post = bayesupdate(L, prior)
