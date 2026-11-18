@@ -34,6 +34,12 @@ pub(crate) struct PositiveDefiniteFactor {
 const MAX_STATIC_FACTOR: usize = 64;
 
 impl Emitter<'_> {
+    pub(crate) fn record_parameter_validity(&mut self, valid: &Value) {
+        if self.check_parameters {
+            self.record_runtime_error(valid, PARAMETER_DOMAIN_STATUS);
+        }
+    }
+
     pub(crate) fn check_finite_parameter(
         &mut self,
         id: NodeId,

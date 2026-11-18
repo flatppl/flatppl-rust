@@ -339,9 +339,10 @@ pub fn is_base_name(name: &str) -> bool {
 /// ([`kernel_tag_node`]); the name alone would exempt a constructor sitting in the
 /// observed-value or rngstate argument.
 pub fn is_kernel_tag_name(name: &str) -> bool {
-    crate::catalogue::builtin()
-        .distribution_param_names(name)
-        .is_some()
+    flatppl_core::RestrictedSample::from_tag(name).is_some()
+        || crate::catalogue::builtin()
+            .distribution_param_names(name)
+            .is_some()
 }
 
 /// True iff `name` is one of spec §03's sixteen "Predefined constants" —

@@ -167,7 +167,7 @@ impl Emitter<'_> {
     }
 
     /// log(1-exp(x)) for x≤0, without cancellation near zero.
-    fn special_log1mexp(&mut self, x: &Value) -> Value {
+    pub(crate) fn special_log1mexp(&mut self, x: &Value) -> Value {
         let split = self.constant_like(-std::f64::consts::LN_2, x);
         let far = self.compare("LT", x, &split);
         let safe_far = self.select(&far, x, &split);

@@ -189,7 +189,10 @@ fn check_node(
         // name alone would exempt a constructor sitting in the observed-value,
         // params or rngstate argument, and `kallen` (a §09 non-constructor) is
         // caught in every position.
-        let is_tag = tags.contains(&id) && flatppl_infer::builtins::is_kernel_tag_name(name);
+        let is_tag = tags.contains(&id)
+            && flatppl_infer::builtins::is_kernel_tag_name(name)
+            && (options.restricted_sampling
+                || flatppl_core::RestrictedSample::from_tag(name).is_none());
         let intrinsic = matches!(
             name,
             flatppl_core::LOG_INTEGRAL
