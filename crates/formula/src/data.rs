@@ -341,12 +341,22 @@ pub(crate) fn model_rows(
     for expression in predictors
         .iter()
         .flat_map(|formula| {
-            formula.expressions.values().chain(&formula.offsets).chain(
-                formula
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.expressions.values()),
-            )
+            formula
+                .expressions
+                .values()
+                .chain(
+                    formula
+                        .monotonic_terms
+                        .iter()
+                        .flat_map(|terms| terms.expressions.values()),
+                )
+                .chain(&formula.offsets)
+                .chain(
+                    formula
+                        .groups
+                        .iter()
+                        .flat_map(|group| group.expressions.values()),
+                )
         })
         .chain(formula.se.as_ref().map(|se| &se.value))
     {
@@ -438,6 +448,14 @@ fn prepare_predictor(
     rows: &[usize],
     constants: &mut BTreeMap<String, DataValue>,
 ) -> Result<()> {
+    if let Some(design) = &recipe.monotonic_design {
+        let terms = recipe
+            .formula
+            .monotonic_terms
+            .as_ref()
+            .ok_or_else(|| Error("invalid retained monotonic design".into()))?;
+        design.prepare(terms, dpar, table, rows, constants)?;
+    }
     for (i, (coding, column)) in recipe
         .monotonic
         .iter()

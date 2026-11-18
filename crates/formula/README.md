@@ -118,6 +118,15 @@ Dirichlet. Use `dirichlet(2)` for a symmetric prior or
 `dirichlet(c(2, 1))` to specify each concentration for a two-step term.
 With one step, the simplex is fixed at `[1]`.
 
+Monotonic terms can interact with numeric predictors, factors, and other
+monotonic terms. For example, `y ~ mo(dose) * arm` adds an arm effect and
+an arm contrast on the monotonic effect. Each resulting coefficient has
+its own simplex per monotonic factor by default. Use
+`mo(dose, id="dose_steps") * arm` to share one simplex across the main
+effect and arm contrasts. Give shared simplexes a prior with
+`class = "simo", coef = "dose_steps"`. A shared ID requires the same
+number of steps in every occurrence.
+
 ### Families
 
 Set `family` to `gaussian`, `student`, `lognormal`, `bernoulli`, `binomial`, `poisson`,

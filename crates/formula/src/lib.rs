@@ -200,6 +200,8 @@ pub struct PredictorRecipe {
     pub smooths: Vec<Smooth>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monotonic: Vec<Monotonic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) monotonic_design: Option<monotonic::MonotonicDesign>,
     pub priors: Priors,
 }
 
@@ -523,6 +525,10 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         if !formulas.iter().any(|(_, formula, _)| {
             formula.variables.contains(name)
                 || formula.groups.iter().any(|g| g.variables.contains(name))
+                || formula
+                    .monotonic_terms
+                    .as_ref()
+                    .is_some_and(|terms| terms.variables.contains(name))
         }) {
             return Err(Error(format!(
                 "contrast supplied for unused predictor `{name}`"
@@ -569,6 +575,13 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             .iter()
             .map(|column| Monotonic::fit(table.column(column)?, &rows))
             .collect::<Result<Vec<_>>>()?;
+        let monotonic_design = formula
+            .monotonic_terms
+            .as_ref()
+            .map(|terms| {
+                monotonic::MonotonicDesign::fit(terms, table, &rows, &spec.options.contrasts)
+            })
+            .transpose()?;
         let groups = formula
             .groups
             .iter()
@@ -624,6 +637,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
             &design,
             &groups,
             &smooths,
+            monotonic_design.as_ref(),
             priors::PriorContext {
                 family,
                 link,
@@ -654,6 +668,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
                 groups,
                 smooths,
                 monotonic,
+                monotonic_design,
                 priors,
             },
         );
