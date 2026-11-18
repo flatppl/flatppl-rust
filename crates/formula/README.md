@@ -229,7 +229,16 @@ sets their common prior. Coefficient selectors `"1"`, `"2"`, etc. are accepted
 when they match after alias expansion and exact numeric-literal comparison.
 Different parameterizations of the same law may still be refused, such as
 `cauchy(0, 2)` versus native `Cauchy(0, 2)`. Unequal threshold
-priors and other ordinal links or threshold parameterizations are not supported.
+priors and other ordinal links are not supported.
+
+Use `y | thres(gr=item) ~ x` for a separate ordered threshold vector per
+item. Groups use a common response scale. When the inferred categories differ
+by item, give the shared threshold count explicitly as in
+`y | thres(2, gr=item) ~ x` for three categories. Prediction needs the
+grouping column and uses the fitted group labels. Read their ordering from
+`threshold_groups.levels`. The sampled bindings `cuts_1`, `cuts_2`, etc.
+follow this order, with names such as `Intercept[item_a,1]` and
+`b_Intercept[item_a,1]`. The score offset includes one `log(m!)` per group.
 
 Categorical responses accept factors, logical values or numeric labels. The first
 retained level is the reference category, with logit zero. Every other category

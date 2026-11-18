@@ -85,6 +85,7 @@ pub(crate) fn emit(
                 .find_map(|&(name, value)| (name == "disc").then_some(value));
             crate::ordinal::probabilities(b, mu, cuts, disc)
         }
+        Acat => crate::adjacent::probabilities(b, mu, cuts),
         Categorical => crate::categorical::probabilities(b, auxiliary),
         VonMises => return None,
     };

@@ -4,6 +4,7 @@
 //! numeric expressions, offsets, group effects and thin-plate smooths are supported.
 //! It does not fit a model.
 
+mod adjacent;
 mod autoregression;
 mod categorical;
 mod contrasts;
@@ -191,6 +192,8 @@ pub struct Recipe {
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_levels: Option<Vec<GroupLevel>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) threshold_groups: Option<GroupInfo>,
     /// Predictor names in nonreference response-category order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub category_predictors: Vec<String>,
@@ -271,7 +274,7 @@ impl Recipe {
     }
 
     pub(crate) fn thresholds(&self) -> usize {
-        if self.family == Family::Cumulative {
+        if self.family.ordinal() {
             self.response_levels.as_ref().unwrap().len() - 1
         } else {
             0
@@ -352,6 +355,8 @@ pub struct ModelInfo {
     pub group_levels: BTreeMap<String, GroupInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_levels: Option<Vec<GroupLevel>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_groups: Option<GroupInfo>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dpars: BTreeMap<String, PredictorInfo>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -436,14 +441,23 @@ pub fn read(json: &str) -> Result<Spec> {
 pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     let (family, link) = Family::resolve(&spec.family, spec.link.as_deref())?;
     let (formula, nonlinear) = nonlinear::parse(spec, family)?;
+    if let Some(group) = &formula.threshold_group {
+        if family != Family::Cumulative {
+            return Err(Error("thres(gr=...) requires a cumulative response".into()));
+        }
+        if group.column == formula.response {
+            return Err(Error("thres() requires a separate grouping column".into()));
+        }
+    }
     let second_formula = paired::parse(spec, family, &formula)?;
     let paired_response = second_formula
         .as_ref()
         .map(|formula| formula.response.clone());
-    if family == Family::Cumulative && !formula.intercept {
-        return Err(Error(
-            "cumulative models require threshold intercepts".into(),
-        ));
+    if family.ordinal() && !formula.intercept {
+        return Err(Error(format!(
+            "{} models require threshold intercepts",
+            spec.family
+        )));
     }
     if formula.se.is_some() && !matches!(family, Family::Gaussian | Family::Student) {
         return Err(Error(
@@ -574,6 +588,11 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         }
     }
     for (name, predictor, _) in &formulas {
+        if !predictor.category_specific.is_empty() && (family != Family::Acat || *name != "mu") {
+            return Err(Error(
+                "`cs(...)` is available in the `acat` response predictor".into(),
+            ));
+        }
         if predictor
             .predictor_columns()
             .iter()
@@ -618,10 +637,25 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
     }
     let response_column = table.column(&formula.response)?;
     let response_levels = data::response_levels(family, response_column, &rows)?;
+    let threshold_groups = formula
+        .threshold_group
+        .as_ref()
+        .map(|group| {
+            data::fit_threshold_groups(
+                group,
+                table.column(&group.column)?,
+                response_column,
+                &rows,
+                response_levels
+                    .as_deref()
+                    .expect("validated cumulative family"),
+            )
+        })
+        .transpose()?;
     if family == Family::Categorical && initial_levels != response_levels {
         return Err(Error("missing-row omission removed an entire categorical response level; filter rows and refit the formula explicitly".into()));
     }
-    let thresholds = if family == Family::Cumulative {
+    let thresholds = if family.ordinal() {
         response_levels.as_ref().unwrap().len() - 1
     } else {
         0
@@ -793,6 +827,7 @@ pub fn build(spec: &Spec, table: &Table) -> Result<Conversion> {
         family,
         link,
         response_levels,
+        threshold_groups,
         category_predictors,
         nonlinear,
         predictors,

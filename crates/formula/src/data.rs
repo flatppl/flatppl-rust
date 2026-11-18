@@ -1,7 +1,12 @@
-use crate::{Error, Family, Formula, GroupLevel, Recipe, Result, Trials, autoregression};
+use crate::{
+    Error, Family, Formula, GroupInfo, GroupLevel, Recipe, Result, Trials, autoregression,
+    formula::ThresholdGroup,
+};
 use flatppl_data::{Column, ColumnValues, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+pub(crate) const THRESHOLD_GROUP_INDEX: &str = "threshold_group_index_data";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataMode {
@@ -346,6 +351,12 @@ fn observation_rows(
             Some(Trials::Column(name)) => Some(name.as_str()),
             _ => None,
         })
+        .chain(
+            formula
+                .threshold_group
+                .as_ref()
+                .map(|group| group.column.as_str()),
+        )
         .chain(
             (mode == DataMode::Training)
                 .then_some(formula.weights.as_deref())
@@ -716,6 +727,11 @@ fn prepare_data_inner(
             DataValue::Integers(table.column(name)?.counts(&rows)?),
         );
     }
+    if let Some(group) = &recipe.threshold_groups {
+        let column = table.column(&group.name)?;
+        let indices = threshold_group_indices(column, &group.levels, &rows)?;
+        constants.insert(THRESHOLD_GROUP_INDEX.into(), DataValue::Integers(indices));
+    }
     if let Some(se) = &recipe.formula.se {
         let values = se.value.data(table, &rows)?;
         let valid = |value: f64| value >= 0.0 && (se.sigma || value > 0.0);
@@ -756,6 +772,10 @@ fn prepare_design(
     for (i, name) in nonlinear_columns.iter().enumerate() {
         let values = crate::ColumnExpression::Column(name.clone()).data(table, rows)?;
         constants.insert(crate::nonlinear::data_name(i), values);
+    }
+    for (i, name) in recipe.formula.category_specific.iter().enumerate() {
+        let values = crate::ColumnExpression::Column(name.clone()).data(table, rows)?;
+        constants.insert(crate::adjacent::data_name(i), values);
     }
     for (dpar, predictor) in recipe.predictors() {
         prepare_predictor(
@@ -928,6 +948,68 @@ fn prepare_predictor(
     Ok(())
 }
 
+pub(crate) fn fit_threshold_groups(
+    group: &ThresholdGroup,
+    column: &Column,
+    response: &Column,
+    rows: &[usize],
+    common_levels: &[GroupLevel],
+) -> Result<GroupInfo> {
+    let levels = column.levels(rows)?;
+    let count = common_levels.len() - 1;
+    if let Some(requested) = group.count {
+        if requested != count {
+            return Err(Error(format!(
+                "thres() requested {requested} thresholds, but the retained response has {count}"
+            )));
+        }
+    } else {
+        let mut group_rows = vec![Vec::new(); levels.len()];
+        for (&row, index) in rows
+            .iter()
+            .zip(threshold_group_indices(column, &levels, rows)?)
+        {
+            group_rows[index as usize - 1].push(row);
+        }
+        for (level, rows) in levels.iter().zip(group_rows) {
+            if !matches!(response_levels(Family::Cumulative, response, &rows), Ok(Some(ref inferred)) if inferred == common_levels)
+            {
+                return Err(Error(format!(
+                    "threshold group `{level}` in `{}` does not share the fitted response levels; use thres({count}, gr={}) to use the common response scale",
+                    column.name, column.name
+                )));
+            }
+        }
+    }
+    Ok(GroupInfo {
+        name: group.column.clone(),
+        levels,
+    })
+}
+
+fn threshold_group_indices(
+    column: &Column,
+    levels: &[GroupLevel],
+    rows: &[usize],
+) -> Result<Vec<i64>> {
+    let indices: HashMap<_, _> = levels
+        .iter()
+        .enumerate()
+        .map(|(i, level)| (level_key(level), i as i64 + 1))
+        .collect();
+    rows.iter()
+        .map(|&row| {
+            let level = column.level(row)?;
+            indices.get(&level_key(&level)).copied().ok_or_else(|| {
+                Error(format!(
+                    "unseen threshold group `{level}` in `{}`",
+                    column.name
+                ))
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn response_levels(
     family: Family,
     column: &Column,
@@ -942,18 +1024,23 @@ pub(crate) fn response_levels(
         }
         return Ok(Some(levels));
     }
-    if family == Family::Cumulative {
+    if family.ordinal() {
+        let name = if family == Family::Cumulative {
+            "cumulative"
+        } else {
+            "acat"
+        };
         let levels = match &column.values {
             ColumnValues::Factor { ordered: true, .. } => column.levels(rows)?,
             ColumnValues::Factor { .. } | ColumnValues::Bool(_) => {
-                return Err(Error(
-                    "cumulative responses require ordered factors or positive integer codes".into(),
-                ));
+                return Err(Error(format!(
+                    "{name} responses require ordered factors or positive integer codes"
+                )));
             }
             _ => {
                 let values = column.counts(rows)?;
                 if values.contains(&0) {
-                    return Err(Error("cumulative response codes must be positive".into()));
+                    return Err(Error(format!("{name} response codes must be positive")));
                 }
                 // Integer category labels retain gaps, unlike dropped factor levels.
                 (1..=*values.iter().max().unwrap())
@@ -962,9 +1049,9 @@ pub(crate) fn response_levels(
             }
         };
         if levels.len() < 2 {
-            return Err(Error(
-                "cumulative responses require at least two categories".into(),
-            ));
+            return Err(Error(format!(
+                "{name} responses require at least two categories"
+            )));
         }
         return Ok(Some(levels));
     }
@@ -997,7 +1084,7 @@ pub(crate) fn response(
     let column = table.column(&formula.response)?;
     if matches!(
         family,
-        Family::Bernoulli | Family::Cumulative | Family::Categorical
+        Family::Bernoulli | Family::Cumulative | Family::Acat | Family::Categorical
     ) {
         let first = i64::from(family != Family::Bernoulli);
         let indices: HashMap<_, _> = levels

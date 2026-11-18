@@ -39,6 +39,7 @@ pub enum Family {
     #[serde(rename = "von_mises")]
     VonMises,
     Cumulative,
+    Acat,
     Categorical,
 }
 
@@ -96,6 +97,7 @@ impl Family {
             "zero_inflated_beta" => Self::ZeroInflatedBeta,
             "von_mises" => Self::VonMises,
             "cumulative" => Self::Cumulative,
+            "acat" => Self::Acat,
             "categorical" => Self::Categorical,
             _ => return Err(Error(format!("unsupported response family `{name}`"))),
         };
@@ -109,6 +111,7 @@ impl Family {
             | Self::Beta
             | Self::ZeroInflatedBeta
             | Self::Cumulative
+            | Self::Acat
             | Self::Categorical => Link::Logit,
             Self::VonMises => Link::TanHalf,
             _ => Link::Log,
@@ -147,7 +150,7 @@ impl Family {
                 matches!(link, Log | Identity | Inverse | Softplus | Squareplus)
             }
             Self::VonMises => matches!(link, TanHalf | Identity),
-            Self::Cumulative | Self::Categorical => link == Logit,
+            Self::Cumulative | Self::Acat | Self::Categorical => link == Logit,
         };
         if !supported {
             return Err(Error(format!(
@@ -172,8 +175,13 @@ impl Family {
                 | Self::ZeroInflatedNegbinomial
                 | Self::Geometric
                 | Self::Cumulative
+                | Self::Acat
                 | Self::Categorical
         )
+    }
+
+    pub(crate) fn ordinal(self) -> bool {
+        matches!(self, Self::Cumulative | Self::Acat)
     }
 
     pub(crate) fn uses_trials(self) -> bool {
@@ -286,6 +294,9 @@ impl Family {
                 .iter()
                 .find_map(|&(name, value)| (name == "disc").then_some(value));
             return crate::ordinal::observation(b, mu, cuts, disc, scalar);
+        }
+        if self == Self::Acat {
+            return crate::adjacent::observation(b, mu, cuts, scalar);
         }
         if (!auxiliary.is_empty()
             || matches!(
@@ -490,7 +501,9 @@ impl Family {
                 let kappa = auxiliary(b, "kappa");
                 apply(b, "VonMises", &[mu, kappa])
             }
-            Self::Cumulative => unreachable!("ordinal observations use explicit cut inputs"),
+            Self::Cumulative | Self::Acat => {
+                unreachable!("ordinal observations use explicit cut inputs")
+            }
             Self::Categorical => {
                 let probabilities = crate::categorical::row_probabilities(
                     b,
