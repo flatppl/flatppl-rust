@@ -446,6 +446,7 @@ impl NativeContext {
                 "path": path_parts(&array.path), "shape": array.shape,
             })).collect::<Vec<_>>(),
             "normal_coordinates": coordinates, "reductions": reductions,
+            "posterior_updates": report.posterior_updates,
             "summaries": report.summaries, "preparation_refusal": report.preparation_refusal,
             "preparing": preparing, "sufficient_statistics": sufficient_statistics,
         })

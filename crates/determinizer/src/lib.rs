@@ -24,8 +24,9 @@ pub use canon::{has_alias_chains, prepare_serialization, resolve_alias_chains};
 pub use conformance::{is_flatpdl, is_flatpdl_with_options};
 pub use disintegrate::{rewrite_restrict, split_disintegrate};
 pub use driver::{
-    desugar_restrict_and_disintegrate, determinize, determinize_with, determinize_with_options,
-    determinize_with_options_and_report, determinize_with_roots,
+    SamplingObserver, desugar_restrict_and_disintegrate, determinize, determinize_with,
+    determinize_with_options, determinize_with_options_and_report, determinize_with_roots,
+    determinize_with_sampling_report,
 };
 pub use flatppl_model_analysis::{
     AnalysisError, ConjugateMatch, ConjugateRowId, CoordinatePrecision, GroupPartition,
@@ -35,13 +36,14 @@ pub use flatppl_model_analysis::{
     sufficient_statistics, sufficient_statistics_with_report,
 };
 
+pub use flatppl_model_analysis::posterior::conjugate_update;
 pub use marginal::match_conjugate_marginal;
 pub use preparation::{
     prepare_likelihood, prepare_likelihood_with_options, prepare_likelihood_with_report,
 };
 pub use query_analysis::{
     analyze_model, prepare_incremental_score, prepare_normal_coordinate,
-    prepare_normal_coordinate_at_path, prepare_normal_coordinates,
+    prepare_normal_coordinate_at_path, prepare_normal_coordinates, projected_child,
 };
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
 pub use stdfn::{expand_spline, standard_function};

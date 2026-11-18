@@ -121,6 +121,19 @@ flatppl stablehlo query.flatppl --dtype f64 --data-input y --prepare-data prepar
 components, additive terms and advisory Normal coordinates without changing
 the query. Data classification is explicit. The report lists required map checks.
 
+The same command reports conjugate posterior updates reachable from `outputs`.
+For example, a `Beta(1, 1)` prior and one observed Bernoulli success give
+`Beta(2, 1)`. For `rand(normalize(P), state)` the report names the matched
+families and identifies the exact IID draw selected by Rust StableHLO lowering.
+A score can use the same posterior without requesting a draw.
+
+This optional Rust capability covers one named parameter with Beta–Bernoulli,
+Beta–Binomial, Gamma–Poisson, Normal–Normal (mean), InverseGamma–Normal
+(variance), or Dirichlet–Categorical, Categorical0 or Multinomial updates.
+Each likelihood factor must match. “No matching rule” leaves conjugacy
+undetermined. Runtime data can determine the posterior parameters and its
+validity. Other FlatPPL engines choose their own sampling methods.
+
 MvNormal, Dirichlet and Wishart support vector/matrix summaries. MvNormal and
 Wishart require fixed finite data or explicitly bounded runtime inputs, for
 example `y = external(cartpow(cartpow(interval(-100, 100), 3), 1000))`.

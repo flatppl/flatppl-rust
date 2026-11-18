@@ -1,5 +1,120 @@
 use flatppl_host::{Context, EmitOptions, ModelAnalysis};
 
+#[test]
+fn posterior_reports_distinguish_the_update_from_the_retained_sampler() {
+    use flatppl_host::PosteriorSampling::{ExactIid, LoweringRefused, NotUsed};
+    let mut context = Context::default();
+    let source = "p=elementof(unitinterval)\nseed=elementof(nonnegintegers)\nK=functionof(Bernoulli(p),p=p)\nP=bayesupdate(likelihoodof(K,true),joint(p=Beta(1,1)))\nQ=normalize(P)\ninputs=seed\n";
+    let mut inspect = |output: &str| {
+        let module = context
+            .parse(&format!("{source}outputs={output}"), None, None)
+            .unwrap();
+        context.analyze_query(&module, &[], false, true)
+    };
+    let report = inspect("rand(Q,rnginit(seed))").unwrap();
+    let [update] = report.posterior_updates.as_slice() else {
+        panic!("one update")
+    };
+    assert_eq!(
+        (
+            &*update.binding,
+            update.field.as_deref(),
+            update.family.as_deref()
+        ),
+        ("P", Some("p"), Some("Beta"))
+    );
+    assert_eq!(update.likelihoods, ["Bernoulli"]);
+    assert_eq!(update.parameters.as_deref(), Some([2.0, 1.0].as_slice()));
+    assert_eq!(update.sampling, ExactIid);
+    let law_output = inspect("Q").err().unwrap();
+    assert_eq!(
+        law_output.posterior_updates[0].parameters,
+        Some(vec![2.0, 1.0])
+    );
+    assert_eq!(
+        inspect("get0(rand(iid(Q,3),rnginit(seed)),1)")
+            .unwrap()
+            .posterior_updates[0]
+            .sampling,
+        ExactIid
+    );
+    let score = "logdensityof(P,record(p=0.5))";
+    assert!(
+        inspect("get0((rand(Q,rnginit(seed)),rand(Beta(2,1),rnginit(seed))),1)")
+            .unwrap()
+            .posterior_updates
+            .iter()
+            .all(|entry| entry.sampling == NotUsed)
+    );
+    assert_eq!(
+        inspect(&format!("({score},rand(Beta(2,1),rnginit(seed)))"))
+            .unwrap()
+            .posterior_updates[0]
+            .sampling,
+        NotUsed
+    );
+    assert!(
+        inspect("rand(Beta(2,1),rnginit(seed))")
+            .unwrap()
+            .posterior_updates
+            .is_empty()
+    );
+    let err = inspect("rand(iid(Q,seed),rnginit(seed))").err().unwrap();
+    assert_eq!(err.posterior_updates[0].family.as_deref(), Some("Beta"));
+    assert_eq!(err.posterior_updates[0].sampling, LoweringRefused);
+    assert!(err.message.contains("fixed scalar size"));
+    let unsupported = source.replace("Bernoulli(p)", "Bernoulli(p*p)");
+    let module = context
+        .parse(&(unsupported + "outputs=rand(Q,rnginit(seed))"), None, None)
+        .unwrap();
+    let err = context
+        .analyze_query(&module, &[], false, true)
+        .err()
+        .unwrap();
+    assert_eq!(err.posterior_updates[0].family, None);
+    assert_eq!(err.posterior_updates[0].sampling, LoweringRefused);
+    assert!(err.message.contains("no matching rule"));
+}
+
+#[test]
+fn posterior_reports_follow_imports_restrictions_and_specialized_likelihoods() {
+    use flatppl_host::PosteriorSampling::{ExactIid, NotUsed};
+    let mut ctx = Context::default();
+    let source = "p=elementof(unitinterval)\nd=true\nK=functionof(Bernoulli(p),p=p)\nL=likelihoodof(K,d)\nP=bayesupdate(L,joint(p=Beta(1,1)))\nQ=normalize(P)";
+    let model = ctx.parse(source, None, None).unwrap();
+    ctx.register("model.flatppl", &model).unwrap();
+    let mut inspect = |source: String| {
+        let query = ctx.parse(&source, None, None).unwrap();
+        query.posterior_updates().unwrap()
+    };
+    let import = "m=load_module(\"model.flatppl\")\ns=elementof(nonnegintegers)\ninputs=s\n";
+    for (output, sampling) in [
+        ("Q=m.Q\noutputs=rand(Q,rnginit(s))", ExactIid),
+        ("outputs=logdensityof(m.P,record(p=0.5))", NotUsed),
+    ] {
+        let updates = inspect(format!("{import}{output}"));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            (updates[0].family.as_deref(), updates[0].sampling),
+            (Some("Beta"), sampling)
+        );
+    }
+    let updates = inspect(format!(
+        "{source}\ns=elementof(nonnegintegers)\ninputs=s\nF=functionof(Q,obs=d)\nG=functionof(Q,ell=L)\nL2=likelihoodof(functionof(Binomial(10,p),p=p),9)\noutputs=(rand(F(obs=false),rnginit(s)),rand(G(ell=L2),rnginit(s)))"
+    ));
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    for (factor, a) in [("Bernoulli", 1.0), ("Binomial", 10.0)] {
+        let update = updates.iter().find(|u| u.likelihoods == [factor]).unwrap();
+        assert_eq!(update.sampling, ExactIid);
+        assert_eq!(update.parameters, Some(vec![a, 2.0]));
+    }
+    let updates = inspect("p=draw(Beta(1,1))\ny=draw(Bernoulli(p))\nJ=lawof(record(p=p,y=y))\nP=restrict(J,record(y=true))\ns=elementof(nonnegintegers)\ninputs=s\noutputs=rand(normalize(P),rnginit(s))".into());
+    assert_eq!(
+        (updates[0].parameters.as_deref(), updates[0].sampling),
+        (Some([2.0, 1.0].as_slice()), ExactIid)
+    );
+}
+
 fn analyze(source: &str, data: &[&str]) -> ModelAnalysis {
     let mut context = Context::default();
     let module = context.parse(source, None, None).unwrap();

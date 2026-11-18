@@ -1,5 +1,13 @@
 use flatppl_core::Module;
+use flatppl_core::{NodeId, Symbol};
 use flatppl_model_analysis as analysis;
+use std::collections::HashSet;
+
+/// Follow a statically selected tuple slot, record field or vector cell without
+/// reading through a promoted input. Analysis and lowering use the same projections.
+pub fn projected_child(m: &Module, node: NodeId, inputs: &HashSet<Symbol>) -> Option<NodeId> {
+    crate::canon::project_tuple(m, node, inputs).or_else(|| crate::canon::project(m, node, inputs))
+}
 
 use analysis::{
     AnalysisError, CoordinatePrecision, IncrementalScorePlan, InputPath, ModelAnalysis,
