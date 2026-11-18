@@ -201,6 +201,7 @@ pub(crate) fn resolve(
     design: &Design,
     groups: &[Group],
     smooths: &[crate::Smooth],
+    monotonic_design: Option<&crate::monotonic::MonotonicDesign>,
     context: PriorContext<'_>,
 ) -> Result<(Priors, BTreeMap<String, ResolvedPrior>)> {
     let PriorContext {
@@ -276,15 +277,29 @@ pub(crate) fn resolve(
         group: None,
         dpar,
     }));
-    let monotonic_names: Vec<_> = formula
-        .monotonic
-        .iter()
-        .map(|column| crate::monotonic::coefficient(column))
-        .collect();
-    let simplex_names: Vec<_> = monotonic_names
-        .iter()
-        .map(|name| format!("{name}1"))
-        .collect();
+    let (monotonic_names, simplex_names): (Vec<_>, Vec<_>) = match monotonic_design {
+        Some(design) => (
+            design
+                .effects
+                .iter()
+                .map(|effect| effect.name.clone())
+                .collect(),
+            design
+                .simplexes
+                .iter()
+                .map(|simplex| simplex.name.clone())
+                .collect(),
+        ),
+        None => {
+            let names: Vec<_> = formula
+                .monotonic
+                .iter()
+                .map(|column| crate::monotonic::coefficient(column))
+                .collect();
+            let simplexes = names.iter().map(|name| format!("{name}1")).collect();
+            (names, simplexes)
+        }
+    };
     targets.extend(monotonic_names.iter().map(|name| PriorTarget {
         class: "b",
         coef: Some(name),

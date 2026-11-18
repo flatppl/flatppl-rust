@@ -12,6 +12,7 @@ pub(crate) fn levels(
 ) -> (BTreeMap<String, FactorInfo>, BTreeMap<String, GroupInfo>) {
     let mut factors: BTreeMap<_, _> = std::iter::once(&recipe.design)
         .chain(recipe.groups.iter().map(|group| &group.design))
+        .chain(recipe.monotonic_design.iter().map(|terms| &terms.design))
         .flat_map(|design| &design.predictors)
         .filter_map(|predictor| {
             predictor.factor.as_ref().map(|factor| {
@@ -44,7 +45,18 @@ pub(crate) fn levels(
                 }),
         )
         .collect();
-    for (coding, column) in recipe.monotonic.iter().zip(&recipe.formula.monotonic) {
+    for (column, coding) in recipe
+        .formula
+        .monotonic
+        .iter()
+        .zip(&recipe.monotonic)
+        .chain(recipe.monotonic_design.iter().flat_map(|terms| {
+            terms
+                .columns
+                .iter()
+                .map(|(column, coding)| (column, coding))
+        }))
+    {
         if let crate::Monotonic::Ordered { levels } = coding {
             factors.entry(column.clone()).or_insert_with(|| FactorInfo {
                 name: column.clone(),

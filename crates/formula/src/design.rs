@@ -225,48 +225,13 @@ fn means(
     table: &Table,
     rows: &[usize],
 ) -> Result<Vec<f64>> {
-    let inputs = design
-        .predictors
-        .iter()
-        .map(|predictor| {
-            if let Some(expression) = formula.expressions.get(&predictor.column) {
-                return expression.values(table, rows);
-            }
-            let column = table.column(&predictor.column)?;
-            if let Some(factor) = &predictor.factor {
-                column
-                    .factor_codes(&factor.levels, rows)
-                    .map(|codes| codes.into_iter().map(|code| (code - 1) as f64).collect())
-            } else {
-                column.numeric(rows)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let inputs = numeric_inputs(design, formula.expressions, table, rows)?;
     design
         .columns
         .iter()
         .map(|column| {
             let mean = (0..rows.len())
-                .map(|row| {
-                    column
-                        .components
-                        .iter()
-                        .map(|component| match *component {
-                            DesignComponent::Numeric { predictor } => inputs[predictor][row],
-                            DesignComponent::Contrast { predictor, column } => {
-                                let factor = design.predictors[predictor].factor.as_ref().unwrap();
-                                factor.matrix[inputs[predictor][row] as usize][column]
-                            }
-                            DesignComponent::Indicator { predictor, level } => {
-                                if inputs[predictor][row] as usize == level {
-                                    1.0
-                                } else {
-                                    0.0
-                                }
-                            }
-                        })
-                        .product::<f64>()
-                })
+                .map(|row| column_value(design, column, &inputs, row))
                 .sum::<f64>()
                 / rows.len() as f64;
             if !mean.is_finite() {
@@ -278,4 +243,51 @@ fn means(
             Ok(mean)
         })
         .collect()
+}
+
+pub(crate) fn numeric_inputs(
+    design: &Design,
+    expressions: &BTreeMap<String, ColumnExpression>,
+    table: &Table,
+    rows: &[usize],
+) -> Result<Vec<Vec<f64>>> {
+    design
+        .predictors
+        .iter()
+        .map(|predictor| {
+            if let Some(expression) = expressions.get(&predictor.column) {
+                return expression.values(table, rows);
+            }
+            let column = table.column(&predictor.column)?;
+            if let Some(factor) = &predictor.factor {
+                column
+                    .factor_codes(&factor.levels, rows)
+                    .map(|codes| codes.into_iter().map(|code| (code - 1) as f64).collect())
+            } else {
+                column.numeric(rows)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn column_value(
+    design: &Design,
+    column: &DesignColumn,
+    inputs: &[Vec<f64>],
+    row: usize,
+) -> f64 {
+    column
+        .components
+        .iter()
+        .map(|component| match *component {
+            DesignComponent::Numeric { predictor } => inputs[predictor][row],
+            DesignComponent::Contrast { predictor, column } => {
+                let factor = design.predictors[predictor].factor.as_ref().unwrap();
+                factor.matrix[inputs[predictor][row] as usize][column]
+            }
+            DesignComponent::Indicator { predictor, level } => {
+                f64::from(u8::from(inputs[predictor][row] as usize == level))
+            }
+        })
+        .product()
 }
