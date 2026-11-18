@@ -217,3 +217,28 @@ fn explanations_cover_both_passes_and_leave_every_output_byte_unchanged() {
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn fixed_category_files_fold_after_loading_and_promoted_labels_stay_live() {
+    let directory =
+        std::env::temp_dir().join(format!("flatppl-file-labels-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("query.flatppl");
+    std::fs::write(directory.join("labels.json"), "[0,1,2,0,1,2,0]").unwrap();
+    for (inputs, live) in [("p", false), ("(p,y)", true)] {
+        let query = format!(
+            "p=elementof(stdsimplex(3))\nt=elementof(stdsimplex(3))\ny=load_data(\"labels.json\",cartpow(integers,7))\nL=likelihoodof(functionof(iid(Categorical0(t),7),t=t),y)\nP=bayesupdate(L,joint(t=Dirichlet([1.,1.,1.])))\ninputs={inputs}\noutputs=logdensityof(normalize(P),record(t=p))"
+        );
+        std::fs::write(&source, query).unwrap();
+        let flatpdl = run(&[
+            "determinize".as_ref(),
+            "--keep".as_ref(),
+            "inputs".as_ref(),
+            "--keep".as_ref(),
+            "outputs".as_ref(),
+            source.as_os_str(),
+        ]);
+        assert_eq!(flatpdl.contains("bincounts("), live, "{flatpdl}");
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}

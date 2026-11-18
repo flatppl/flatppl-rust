@@ -237,6 +237,14 @@ pub(super) fn reduce(reducer: &mut Reducer, m: &mut Module, id: NodeId) -> Optio
             if count > (1 << 24) || count.checked_mul(*trial_count as usize)? > i32::MAX as usize {
                 return None;
             }
+            // Defer file-backed tables to the existing materialized-data pass.
+            let source = resolve(m, observed, &reducer.boundary);
+            let source = call(m, source, "splitblocks")
+                .and_then(|c| c.args.first().copied())
+                .map_or(source, |data| resolve(m, data, &reducer.boundary));
+            if !reducer.preparing && call(m, source, "load_data").is_some() {
+                return None;
+            }
             let fixed = fixed_multinomial::summaries(reducer, m, observed, count, d, *trial_count);
             let trials = Expr::Node(trials);
             let probs = parameter("p")?;

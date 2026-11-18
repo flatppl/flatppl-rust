@@ -5,6 +5,11 @@ use super::{Expr, Factor, Reducer, call, fixed_values, map, materialize, num, op
 use flatppl_core::{Dim, Module, Node, NodeId, Scalar, ScalarType, Symbol, Type};
 use std::collections::HashSet;
 
+mod materialized;
+pub(super) use materialized::fold;
+
+const MAX_CATEGORIES: u32 = 1 << 24;
+
 fn fixed_counts(
     values: Vec<f64>,
     categories: u32,
@@ -132,7 +137,11 @@ pub(super) fn reduce(r: &mut Reducer, m: &mut Module, f: &Factor) -> Option<Expr
         _ => return None,
     };
     // Keep the data ABI smaller and the edges and counts exact in both target precisions.
-    if categories == 0 || categories >= rows || categories > 1 << 24 || rows > i32::MAX as u32 {
+    if categories == 0
+        || categories >= rows
+        || categories > MAX_CATEGORIES
+        || rows > i32::MAX as u32
+    {
         return None;
     }
     let (counts, valid) = label_counts(m, f.observed, integer, categories, one_based, &r.boundary);

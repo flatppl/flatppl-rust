@@ -1484,6 +1484,15 @@ fn reduce(
     enabled: bool,
 ) -> (usize, Vec<Symbol>) {
     let boundary = query::promoted_input_names(m);
+    let summaries: Vec<_> = summary_bindings(m).filter(|_| enabled).collect();
+    let mut folded = false;
+    for (name, rhs) in summaries {
+        if let Some(value) = categorical::fold(m, rhs, &boundary) {
+            let binding = m.binding_by_name(name).expect("collected summary");
+            m.set_binding_rhs(binding, value);
+            folded = true;
+        }
+    }
     let mut reducer = Reducer::new(boundary, allowed);
     reducer.preparing = preparing;
     reducer.enabled = enabled;
@@ -1505,7 +1514,7 @@ fn reduce(
         let rhs = reducer.walk(m, rhs, &mut mapped);
         m.set_binding_rhs(bid, rhs);
     }
-    if reducer.count > 0 {
+    if reducer.count > 0 || folded {
         let _ = flatppl_infer::infer(m);
     }
     if let Some(report) = report {
