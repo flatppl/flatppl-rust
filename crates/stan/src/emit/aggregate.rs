@@ -10,7 +10,7 @@
 use super::{Emitter, Ex, P_ADD, P_ATOM, P_MUL, P_POW, P_UNARY};
 use crate::refuse::{Refusal, Result};
 use crate::tables;
-use flatppl_core::{Node, NodeId, Phase, Symbol};
+use flatppl_core::{Node, NodeId, Phase, Scalar, Symbol};
 use std::collections::HashMap;
 
 /// A body value over the lifted axes: either a scalar or the whole frame.
@@ -61,6 +61,13 @@ impl<'m> Emitter<'m> {
             }
         }
 
+        // `sum` over one axis of a squared matrix: one dot-self call.
+        if fname == "sum"
+            && let ([out], [red]) = (outs.as_slice(), reduced.as_slice())
+            && let Some(e) = self.dot_self(body, *out, *red)?
+        {
+            return self.place(base, id, Ok(e));
+        }
         if reduced.is_empty()
             && outs.len() <= 2
             && let Ok(l) = self.lift(body, &outs, &HashMap::new(), &ext)
@@ -133,6 +140,49 @@ impl<'m> Emitter<'m> {
         self.put(fixed, lines);
         self.remember(id, &stan);
         Ok(stan)
+    }
+
+    /// `X[.out, .red]^2` summed over `.red` is `rows_dot_self(X)`, and
+    /// `X[.red, .out]^2` is `columns_dot_self(X)'` (Functions Reference,
+    /// "Dot products and specialized products"), for a declared `matrix` X.
+    fn dot_self(&mut self, body: NodeId, out: Symbol, red: Symbol) -> Result<Option<Ex>> {
+        let b = self.resolve(body);
+        let Some(c) = self.call(b).filter(|_| self.head(b) == Some("pow")) else {
+            return Ok(None);
+        };
+        let [site, k] = c.args[..] else {
+            return Ok(None);
+        };
+        let two = matches!(self.m.node(self.resolve(k)), Node::Lit(Scalar::Int(2)))
+            || matches!(self.m.node(self.resolve(k)), Node::Lit(Scalar::Real(x)) if *x == 2.0);
+        if !two || !self.indexes_axis(site) {
+            return Ok(None);
+        }
+        let sc = self.call(site).unwrap();
+        let axis = |me: &Self, n: NodeId| match me.m.node(n) {
+            Node::Axis(ax) if ax.variance.is_none() => Some(ax.name),
+            _ => None,
+        };
+        let [x, s0, s1] = sc.args[..] else {
+            return Ok(None);
+        };
+        let x = self.expr(x)?;
+        let matrix = self
+            .decls
+            .get(&x.s)
+            .is_some_and(|t| t.base == "matrix" && t.array.is_empty());
+        if !matrix {
+            return Ok(None);
+        }
+        Ok(match (axis(self, s0), axis(self, s1)) {
+            (Some(a), Some(r)) if (a, r) == (out, red) => {
+                Some(Ex::atom(format!("rows_dot_self({})", x.s)))
+            }
+            (Some(r), Some(a)) if (a, r) == (out, red) => {
+                Some(Ex::atom(format!("columns_dot_self({})'", x.s)))
+            }
+            _ => None,
+        })
     }
 
     /// `stan[i] = f(…)'` or `stan[:, k] = f(…)` in one loop, when the body is

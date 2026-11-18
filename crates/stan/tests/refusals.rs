@@ -760,3 +760,15 @@ fn nested_dirac_split_shifted_site_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("iid mixture with this law"), "{r}");
 }
+
+#[test]
+fn dirac_atom_beside_argument_dependent_support_is_not_yet() {
+    let r = refuse(
+        "w ~ Beta(2, 2)\ny ~ iid(normalize(superpose(weighted(w, Categorical([0.2, 0.3, 0.5])), \
+         weighted(1 - w, Dirac(2)))), 3)\nprior = lawof(record(w = w))\n\
+         L = likelihoodof(kernelof(record(y = y), w = w), record(y = [2, 1, 3]))\n\
+         post = bayesupdate(L, prior)\n",
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("support depends on its arguments"), "{r}");
+}

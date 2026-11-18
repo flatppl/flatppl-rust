@@ -759,6 +759,53 @@ impl<'m> Emitter<'m> {
         self.law_lp(law, &l, y, index)
     }
 
+    /// The law's log density at a Dirac atom `c` beside it, or `None` when
+    /// `c` is outside the law's support: the mixture's density there is the
+    /// atom's weight alone, and `lpmf(c | …)` would throw. The support is the
+    /// row's variate bounds and its guard. A literal atom is decided here; any
+    /// other is tested where it is scored.
+    pub(super) fn atom_lp(
+        &mut self,
+        mix: NodeId,
+        law: NodeId,
+        l: &Law,
+        c: &str,
+    ) -> Result<Option<String>> {
+        let lp = self.law_lp(law, l, c, None)?;
+        let num = |s: &str| s.trim().parse::<f64>().ok();
+        let cv = num(c);
+        let (lo, hi) = (l.bounds.0.as_deref(), l.bounds.1.as_deref());
+        let mut tests = Vec::new();
+        for (bound, below) in [(lo, true), (hi, false)] {
+            let Some(b) = bound else { continue };
+            let outside = |x: f64, y: f64| if below { x < y } else { x > y };
+            match (cv, num(b)) {
+                (Some(x), Some(y)) if outside(x, y) => return Ok(None),
+                (Some(_), Some(_)) => {}
+                // A literal atom at the lower bound is inside for any valid
+                // upper bound.
+                (Some(x), None) if !below && lo.and_then(num) == Some(x) => {}
+                (_, Some(_)) => tests.push(format!("{c} {} {b}", if below { "<" } else { ">" })),
+                (_, None) => {
+                    return Err(Refusal::not_yet(
+                        Some(mix),
+                        "a `Dirac` atom beside a law whose support depends on its arguments",
+                    ));
+                }
+            }
+        }
+        if let Some((whole, _)) = &l.guard
+            && !(cv.is_some() && cv == lo.and_then(num))
+        {
+            tests.push(format!("({})", whole.replace("{y}", c)));
+        }
+        Ok(Some(if tests.is_empty() {
+            lp
+        } else {
+            format!("({} ? negative_infinity() : {lp})", tests.join(" || "))
+        }))
+    }
+
     /// `D_lpdf(y | args)` of a component, with its support guard. A
     /// component must be a probability measure: an unnormalized truncation
     /// has no closed-form share of the mixture.
@@ -912,11 +959,12 @@ impl<'m> Emitter<'m> {
         }
         let loop_ = super::structure::LOOP;
         let wlx = self.real(wl.unwrap())?.s;
-        let lp_atom = self.law_lp(law, &l, &c.s, None)?;
-        let mix_at = if dirac_first {
-            format!("log_mix({}, 0, {lp_atom})", self.real(wd.unwrap())?.s)
-        } else {
-            format!("log_mix({wlx}, {lp_atom}, 0)")
+        let mix_at = match self.atom_lp(mix, law, &l, &c.s)? {
+            None => format!("log({})", self.real(wd.unwrap())?.s),
+            Some(lp_atom) if dirac_first => {
+                format!("log_mix({}, 0, {lp_atom})", self.real(wd.unwrap())?.s)
+            }
+            Some(lp_atom) => format!("log_mix({wlx}, {lp_atom}, 0)"),
         };
         let mut out = Vec::new();
         if mix_at.contains(loop_) {

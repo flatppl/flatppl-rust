@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+N = 4
+w ~ Beta(2, 2)
+p ~ Beta(1, 1)
+y ~ iid(normalize(superpose(weighted(w, Binomial(N, p)), weighted(1 - w, Dirac(3)))), 5)
+prior = lawof(record(w = w, p = p))
+L = likelihoodof(kernelof(record(y = y), w = w, p = p), record(y = [3, 1, 3, 0, 4]))
+post = bayesupdate(L, prior)

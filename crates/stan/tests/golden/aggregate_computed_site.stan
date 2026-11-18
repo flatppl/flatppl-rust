@@ -11,10 +11,7 @@ model {
     stacked[i] = w[i]';
   }
   matrix[N, 2] lw_site = A * stacked';
-  vector[N] lw_agg;
-  for (i in 1:N) {
-    lw_agg[i] = sum(lw_site[i, :]' .^ 2);
-  }
+  vector[N] lw_agg = rows_dot_self(lw_site);
 
   for (i in 1:2) {
     w[i] ~ std_normal();

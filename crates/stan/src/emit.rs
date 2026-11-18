@@ -1211,6 +1211,32 @@ impl<'m> Emitter<'m> {
                 }
                 Ok(Ex::atom(out))
             }
+            // `cat` appends along the outer axis, left to right (§07): an
+            // array of vectors with `append_array` (append_row takes vectors
+            // and matrices only), vectors and matrices with `append_row` past
+            // the two-argument table template.
+            ("cat", [first, rest @ ..])
+                if !rest.is_empty()
+                    && self.shape(id).is_some_and(|s| !s.int)
+                    && let Some(join) = match self.ty(id) {
+                        Some(Type::Array { shape, elem }) if shape.len() == 1 => match *elem {
+                            Type::Array { .. } => Some("append_array"),
+                            Type::Scalar(_) if rest.len() >= 2 => Some("append_row"),
+                            _ => None,
+                        },
+                        Some(Type::Array { shape, .. }) if shape.len() == 2 && rest.len() >= 2 => {
+                            Some("append_row")
+                        }
+                        _ => None,
+                    } =>
+            {
+                let mut out = self.real(*first)?.s;
+                for a in rest {
+                    let r = self.real(*a)?;
+                    out = format!("{join}({out}, {})", r.s);
+                }
+                Ok(Ex::atom(out))
+            }
             ("aggregate", _) => {
                 let base = match &self.owner {
                     Some((name, _)) => format!("{name}_agg"),

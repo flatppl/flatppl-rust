@@ -356,6 +356,13 @@ impl<'m> Emitter<'m> {
         } else {
             law.lhs(&format!("({inverse})"))
         };
+        // A data scale that is 0 makes the map no bijection: name it at load.
+        if map.a.num.is_none() {
+            let a = &map.a.ex.s;
+            self.tdata.push(format!(
+                "if ({a} == 0) {{\n  reject(\"pushfwd of {lhs}: the scale {a} is 0, so the map is no bijection\");\n}}"
+            ));
+        }
         let mut out = vec![format!("{y} ~ {};", law.rhs(None))];
         out.extend(map.jacobian());
         Ok(out)
