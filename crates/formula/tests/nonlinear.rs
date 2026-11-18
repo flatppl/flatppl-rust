@@ -45,6 +45,25 @@ fn nonlinear_arithmetic_accepts_real_division() {
 }
 
 #[test]
+fn nonlinear_binomial_prepares_new_trials_and_predictor_values() {
+    let mut spec = growth_spec();
+    spec.family = "binomial".into();
+    spec.formula = "y | trials(n) ~ a + b * x^2".into();
+    let data = read_json_table(r#"{"x":[0.5,1,2],"y":[0,2,3],"n":[2,4,5]}"#).unwrap();
+    let model = build(&spec, &data).unwrap();
+    let new_data = read_json_table(r#"{"x":[1.5,0],"n":[6,2]}"#).unwrap();
+    let fitted = prepare_data(&model.recipe, &new_data, DataMode::Prediction).unwrap();
+    assert_eq!(
+        fitted.constants["trials_data"],
+        DataValue::Integers(vec![6, 2])
+    );
+    assert_eq!(
+        fitted.constants["nl_data_1"],
+        DataValue::Real64(vec![1.5, 0.0])
+    );
+}
+
+#[test]
 fn nonlinear_coefficients_need_explicit_scoped_priors() {
     let data = read_json_table(r#"{"x":[0,1,2],"y":[2.2,3.8,8.5]}"#).unwrap();
     let mut spec = growth_spec();
