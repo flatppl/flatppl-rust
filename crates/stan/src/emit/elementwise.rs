@@ -67,12 +67,12 @@ impl<'m> Emitter<'m> {
 
     pub(super) fn loop_var(&mut self) -> String {
         for c in ["i", "j", "k", "l", "m", "n"] {
-            if !self.used.contains(c) {
+            if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
                 return c.to_string();
             }
         }
-        self.fresh("idx")
+        self.fresh_local("idx")
     }
 
     /// The element of `node` at the loop indices `idx` (one per axis).

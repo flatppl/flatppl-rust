@@ -25,11 +25,11 @@ transformed data {
   }
   vector[a_n] a;
   {
-    int b = 1;
+    int b_2 = 1;
     for (i in 1:N) {
       if (lambda(y_all[i])) {
-        a[b] = y_all[i];
-        b += 1;
+        a[b_2] = y_all[i];
+        b_2 += 1;
       }
     }
   }

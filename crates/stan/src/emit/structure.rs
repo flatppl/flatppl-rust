@@ -971,12 +971,12 @@ impl<'m> Emitter<'m> {
 
     fn fresh_index(&mut self) -> String {
         for c in ["i", "j", "k", "n"] {
-            if !self.used.contains(c) {
+            if !self.used.contains(c) && !self.reserved.contains(c) {
                 self.used.insert(c.to_string());
                 return c.to_string();
             }
         }
-        self.fresh("idx")
+        self.fresh_local("idx")
     }
 
     /// The declared outer extent of a Stan variable.

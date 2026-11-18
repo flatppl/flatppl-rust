@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+xs = [0.3, -1.0, 2.0]
+keep(x) = x > 0
+k = filter(keep, xs)
+mu ~ Normal(0, 1)
+i = [1.5, 2.5]
+z ~ Normal(mu + sum(k) + sum(i), 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(z = z), mu = mu), record(z = 0.4))
+post = bayesupdate(L, prior)

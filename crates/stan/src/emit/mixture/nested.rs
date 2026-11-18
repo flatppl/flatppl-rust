@@ -133,7 +133,7 @@ impl<'m> Emitter<'m> {
             let n_other = self.fresh(&format!("{lhs}_n_other"));
             let other = self.fresh(&format!("{lhs}_other"));
             let (i, j) = (self.fresh_loop(), self.fresh_loop());
-            let (r, b) = (self.fresh("r"), self.fresh("b"));
+            let (r, b) = (self.fresh_local("r"), self.fresh_local("b"));
             self.tdata.push(format!(
                 "int {count} = 0;\nint {rest_n} = 0;\nint {n_other} = 0;\nfor ({i} in 1:{n}) {{\n  int {r} = 0;\n  for ({j} in 1:{len}) {{\n    {r} += {lhs}[{i}, {j}] == {c};\n  }}\n  if ({r} == {len}) {{\n    {count} += 1;\n  }} else {{\n    {rest_n} += {r};\n  }}\n  {n_other} += {len} - {r};\n}}"
             ));
@@ -168,7 +168,7 @@ impl<'m> Emitter<'m> {
         let start = self.fresh(&format!("{lhs}_other_start"));
         let i = self.fresh_loop();
         let j = self.fresh_loop();
-        let (a, b) = (self.fresh("a"), self.fresh("b"));
+        let (a, b) = (self.fresh_local("a"), self.fresh_local("b"));
         let at_row = format!("max({lhs}[{i}]) == {c} && min({lhs}[{i}]) == {c}");
         self.tdata.push(format!(
             "int {count} = 0;\nfor ({i} in 1:{n}) {{\n  {count} += {at_row};\n}}"
@@ -193,7 +193,7 @@ impl<'m> Emitter<'m> {
 
         let row = self.fresh_loop();
         let k = self.fresh_loop();
-        let m = self.fresh("m");
+        let m = self.fresh_local("m");
         let at_row_lp = format!("{len} * {}", inner.at_atom).replace(loop_, &row);
         let outer_at = if dirac_first {
             format!("log_mix({}, 0, {at_row_lp})", wdx.replace(loop_, &row))

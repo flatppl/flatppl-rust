@@ -73,7 +73,7 @@ impl<'m> Emitter<'m> {
         };
         let test = Self::apply_user(&fname, vec![x.s.clone()], &caps);
         let t = self.declare(id, None, false, &name, &[])?;
-        let b = self.fresh("b");
+        let b = self.fresh_local("b");
         self.tdata.push(format!("int {count} = 0;"));
         self.tdata.push(format!(
             "for ({var} in 1:{hi}) {{\n  {count} += {test};\n}}"
