@@ -1,0 +1,10 @@
+flatppl_compat = "0.1"
+x = [0.5, -1.0, 2.0]
+mu ~ Normal(0, 1)
+b = elementof(cartpow(reals, 3))
+Pi_improper = joint(b = Lebesgue(cartpow(reals, 3)))
+Pi_prior = joint(Pi_improper, lawof(record(mu = mu)))
+y ~ Normal.(mu .+ b .* x, 1)
+K_model = kernelof(record(y = y), mu = mu, b = b)
+L = likelihoodof(K_model, record(y = [0.3, -0.8, 1.9]))
+Pi_post = bayesupdate(L, Pi_prior)

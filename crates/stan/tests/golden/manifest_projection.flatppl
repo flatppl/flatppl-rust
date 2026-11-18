@@ -1,0 +1,17 @@
+# emit: target=Pi_post
+flatppl_compat = "0.1"
+rate = 2.0
+r = rate
+x = [0.5, -1.0, 2.0]
+mu ~ Normal(0, 1)
+b ~ iid(Normal(0, 2), 2)
+s ~ LogNormal(0, 1)
+y ~ Normal.(mu .+ b[1] .* x .+ b[2], s * rate)
+prior = lawof(record(mu = mu, b = b, s = s))
+L = likelihoodof(kernelof(record(y = y), mu = mu, b = b, s = s), record(y = [0.3, -0.8, 1.9]))
+Pi_post = bayesupdate(L, prior)
+theta = elementof(cartpow(reals, 3))
+t = theta
+inputs = (t, r)
+point = record(mu = theta[1], b = theta[[2, 3]], s = exp(theta[1]))
+outputs = logdensityof(Pi_post, point)

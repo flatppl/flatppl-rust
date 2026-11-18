@@ -1,0 +1,31 @@
+{
+  "data": [
+    {
+      "input": "r",
+      "stan": "rate",
+      "type": "real"
+    }
+  ],
+  "parameters": [
+    {
+      "field": "mu",
+      "index": 1,
+      "input": "t",
+      "stan": "mu"
+    },
+    {
+      "field": "b",
+      "index": [
+        2,
+        3
+      ],
+      "input": "t",
+      "stan": "b"
+    },
+    {
+      "field": "s",
+      "stan": "s"
+    }
+  ],
+  "target": "Pi_post"
+}

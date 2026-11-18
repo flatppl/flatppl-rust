@@ -2130,6 +2130,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
     }
     model.extend(e.prior.iter().cloned());
     model.extend(e.lik.iter().cloned());
+    let data_inputs = e.data_inputs();
     let mut code = String::new();
     block(&mut code, "functions", &e.functions);
     block(&mut code, "data", &e.data);
@@ -2143,6 +2144,7 @@ pub(crate) fn program(m: &Module, opts: &EmitOptions) -> Result<crate::StanProgr
         deferred_data: e.deferred,
         manifest: crate::Manifest {
             target: m.resolve(target).to_string(),
+            data: data_inputs,
             parameters: e.manifest,
         },
     })

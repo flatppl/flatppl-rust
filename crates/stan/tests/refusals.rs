@@ -772,3 +772,26 @@ fn dirac_atom_beside_argument_dependent_support_is_not_yet() {
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("support depends on its arguments"), "{r}");
 }
+
+#[test]
+fn locscale_truncated_scale_of_unknown_sign_is_not_yet() {
+    let r = refuse(&posterior(
+        "cs = [2.0, -1.0]\nsigma ~ locscale(normalize(truncate(StudentT(3), interval(0, inf))), 0, cs[1])\n\
+         y ~ Normal(0, sigma)",
+        "lawof(record(sigma = sigma))",
+        "kernelof(record(y = y), sigma = sigma)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("scale of unknown sign"), "{r}");
+}
+
+#[test]
+fn locscale_scale_of_unknown_sign_is_not_yet() {
+    let r = refuse(&posterior(
+        "m ~ Normal(0, 1)\nsigma ~ locscale(Cauchy(0, 1), 0, m)\ny ~ Normal(sigma, 1)",
+        "lawof(record(m = m, sigma = sigma))",
+        "kernelof(record(y = y), m = m, sigma = sigma)",
+    ));
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("scale of unknown sign"), "{r}");
+}

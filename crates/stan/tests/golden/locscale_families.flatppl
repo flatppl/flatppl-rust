@@ -1,0 +1,11 @@
+flatppl_compat = "0.1"
+m ~ Normal(0, 1)
+s ~ LogNormal(0, 1)
+a ~ locscale(Normal(0, 1), m, 2)
+b ~ locscale(Cauchy(0.5, 2.0), 1, s)
+c ~ locscale(Logistic(0.0, 1.0), m, s)
+d ~ locscale(Laplace(-1, 0.5), 3, 2)
+z ~ Normal(a + b + c + d, 1)
+prior = lawof(record(m = m, s = s, a = a, b = b, c = c, d = d))
+L = likelihoodof(kernelof(record(z = z), m = m, s = s, a = a, b = b, c = c, d = d), record(z = 0.4))
+post = bayesupdate(L, prior)

@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+m ~ Normal(1, 2)
+sigma ~ locscale(normalize(truncate(StudentT(3), interval(0, inf))), 0, 3)
+tau ~ locscale(normalize(truncate(StudentT(4), interval(-0.3333333333333333, inf))), 1, 3)
+kappa ~ locscale(normalize(truncate(StudentT(5), interval((0.0 - m) / 2, inf))), m, 2)
+z ~ Normal(m, sigma + tau + kappa)
+prior = lawof(record(m = m, sigma = sigma, tau = tau, kappa = kappa))
+L = likelihoodof(kernelof(record(z = z), m = m, sigma = sigma, tau = tau, kappa = kappa), record(z = 0.4))
+post = bayesupdate(L, prior)
