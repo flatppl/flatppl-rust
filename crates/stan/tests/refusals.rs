@@ -1088,15 +1088,124 @@ fn real_typed_data_under_a_discrete_law_is_not_yet() {
 }
 
 #[test]
-fn interpolator_broadcast_with_array_alpha_is_not_yet() {
+fn interpolator_broadcast_with_matrix_arguments_is_not_yet() {
+    // The interpolators have scalar and vector forms only.
     let r = refuse_with(
-        "hep = standard_module(\"particle-physics\", \"0.1\")\nalpha = elementof(cartpow(reals, 2))\n\
-         lo = [0.9, 0.95]\nc = [1.0, 1.0]\nhi = [1.1, 1.2]\nf = hep.interp_poly6_exp.(lo, c, hi, alpha)\n\
-         L = likelihoodof(functionof(Normal.(f, 1.0)), [1.0, 1.0])\n",
+        "hep = standard_module(\"particle-physics\", \"0.1\")\nalpha = elementof(reals)\n\
+         lo = rowstack([[0.9, 0.95], [0.9, 0.95]])\nc = rowstack([[1.0, 1.0], [1.0, 1.0]])\n\
+         hi = rowstack([[1.1, 1.2], [1.1, 1.2]])\nf = hep.interp_poly6_exp.(lo, c, hi, alpha)\n\
+         L = likelihoodof(functionof(Normal.(f[1, :], 1.0)), [1.0, 1.0])\n",
         Some("L"),
     );
     assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
     assert!(r.reason.contains("argument shapes"), "{r}");
+}
+
+#[test]
+fn histosys_broadcast_with_a_matrix_alpha_is_not_yet() {
+    // The matrix form takes one alpha per row (`addaxes(u, 0, 1)`), not a
+    // full matrix.
+    let r = refuse_with(
+        "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\nalpha = elementof(cartpow(reals, [2, 2]))\n\
+         lo = rowstack([[0.9, 0.95], [0.9, 0.95]])\nnom = rowstack([[1.0, 1.0], [1.0, 1.0]])\n\
+         hi = rowstack([[1.1, 1.2], [1.1, 1.2]])\nf = pyhf.histosys_shift.(lo, nom, hi, alpha)\n\
+         L = likelihoodof(functionof(Normal.(f[1, :], 1.0)), [1.0, 1.0])\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("argument shapes"), "{r}");
+}
+
+#[test]
+fn rank3_array_forms_without_a_stan_type_are_not_yet() {
+    for (array, reason) in [
+        (
+            "array(fill(mu, 4), [s, 1, 2], [1, 2, 3])",
+            "non-literal size",
+        ),
+        (
+            "array(fill(mu, 4), [1, 2, 2], [3, 2, 1])",
+            "another dimorder",
+        ),
+    ] {
+        let r = refuse_with(
+            &format!(
+                "mu = elementof(reals)\ns = sum([1, 1])\nx = {array}\n\
+                 L = likelihoodof(functionof(Normal.(x[1, 1, :], 1.0)), [1.0, 1.0])\n"
+            ),
+            Some("L"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+        assert!(r.reason.contains(reason), "{array}: {r}");
+    }
+}
+
+#[test]
+fn arithmetic_on_a_rank3_value_is_not_yet() {
+    // Stan has no arithmetic on an array of matrices, and element loops over a
+    // broadcast are not an answer.
+    for (x2, reason) in [
+        ("x .* 2.0", "arithmetic on a rank-3 value"),
+        ("exp.(x)", "arithmetic on a rank-3 value"),
+        (
+            "array([1.0, 2.0], [1, 1, 2], [1, 2, 3]) .+ x",
+            "arithmetic on a rank-3 value",
+        ),
+        (
+            "aggregate(sum, [.s, .k, .b], x[.s, .k, .b] * 2.0)",
+            "aggregate with a rank-3 result",
+        ),
+        ("f.(x)", "broadcast with a rank-3 result"),
+    ] {
+        let r = refuse_with(
+            &format!(
+                "pyhf = standard_module(\"pyhf-helpers\", \"0.1\")\nmu = elementof(reals)\n\
+                 x = fill(mu, [1, 1, 2])\nn = rowstack([[10.0, 20.0]])\ns0 = fill(0.0, [1, 1, 2])\n\
+                 f(t) = t * 2.0\nx2 = {x2}\ny = pyhf.sample_yields(n, s0, x2)\n\
+                 L = likelihoodof(functionof(Normal.(y[1, :], 1.0)), [1.0, 2.0])\n"
+            ),
+            Some("L"),
+        );
+        assert_eq!(r.kind, RefusalKind::NotYetSupported, "{x2}: {r}");
+        assert!(r.reason.contains(reason), "{x2}: {r}");
+    }
+}
+
+#[test]
+fn rank3_slice_across_the_array_axis_with_the_last_axis_fixed_is_not_yet() {
+    // `x[:, :, k]` of an array of matrices is an `array[] vector`, and Stan
+    // has no `to_matrix` of one.
+    let r = refuse_with(
+        "mu = elementof(reals)\nx = fill(mu, [2, 1, 2])\ny = x[:, :, 1]\n\
+         L = likelihoodof(functionof(Normal.(y[:, 1], 1.0)), [1.0, 2.0])\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("x[:, :, k]"), "{r}");
+}
+
+#[test]
+fn law_over_a_rank3_variate_is_not_yet() {
+    // Stan flattens a matrix or a rank-2 array in one statement, not an array
+    // of matrices.
+    let r = refuse_with(
+        "mu = elementof(reals)\nx = array(fill(mu, 4), [1, 2, 2], [1, 2, 3])\n\
+         L = likelihoodof(functionof(Normal.(x, 1.0)), fill(1.0, [1, 2, 2]))\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("rank-3 variate"), "{r}");
+}
+
+#[test]
+fn iid_of_a_broadcast_law_over_an_array_of_vectors_is_not_yet() {
+    let r = refuse_with(
+        "mu = elementof(reals)\ny = [[1.0, 2.0], [3.0, 4.0]]\n\
+         L = likelihoodof(functionof(iid(Normal.(fill(mu, 2), 1.0), 2)), y)\n",
+        Some("L"),
+    );
+    assert_eq!(r.kind, RefusalKind::NotYetSupported, "{r}");
+    assert!(r.reason.contains("broadcast"), "{r}");
 }
 
 #[test]

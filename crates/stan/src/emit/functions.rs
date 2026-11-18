@@ -895,6 +895,13 @@ impl<'m> Emitter<'m> {
     /// `f.(args…)` declared as the value `decl` (itself, or the `rowstack`
     /// of it) and filled by loops over the broadcast axes.
     fn looped_broadcast_into(&mut self, base: &str, id: NodeId, decl: NodeId) -> Result<String> {
+        // A rank-3 result has no whole-array form, and element loops are no answer.
+        if self.shape(id).is_some_and(|s| s.rank == 3) {
+            return Err(Refusal::not_yet(
+                Some(id),
+                "a broadcast with a rank-3 result",
+            ));
+        }
         self.ensure_broadcast_type(id);
         let c = self.call(id).unwrap();
         if !c.named.is_empty() {

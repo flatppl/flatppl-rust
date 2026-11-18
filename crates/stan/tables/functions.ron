@@ -13,6 +13,7 @@
 //              "construct" a structural mapping (indexing, blocks, declarations); no numeric check.
 //              "todo"      no form yet, but a loop or helper can express it: the emitter refuses with
 //                          not-yet. `caveat` states the intended Stan shape.
+//              "core"      no FlatPPL function: Stan definitions that `uses` rows share, printed once.
 //              "none"      Stan has no form and no helper can give one: the emitter refuses for good.
 //                          `caveat` states the reason.
 //   stan:      Stan expression template. Each {arg} is substituted with an atomic Stan expression.
@@ -29,13 +30,16 @@
 //              Checked numerically by verify.py (vector-vector, vector-scalar, scalar-vector).
 //   caveat:    where Stan semantics differ from the spec, and what the template does about it.
 //   status:    "verified" (verify.py PASS, Stan 2.40.0) | "unverified: <reason>" | "n/a".
+//   overload:  optional; the argument kinds of a helper's array overloads, `;`-separated
+//              (real, vector, matrix, or column for `addaxes(u, 0, 1)` passed as u).
+//   uses:      optional; ids of `core` rows whose definitions the `functions` text calls.
 [
     // ------------------------------------------------------------ identities and generation
     (id: "identity", flatppl: "identity", module: None, args: ["x"], kind: "operator", stan: "{x}", functions: "", data_only: false, vectorized: true, broadcast: "", caveat: "", status: "verified"),
     (id: "vector", flatppl: "vector", module: None, args: ["x1", "..."], kind: "construct", stan: "[{x1}, ...]'", functions: "", data_only: false, vectorized: false, broadcast: "",
      caveat: "Row-vector literal, transposed. Use {...} for an int array.", status: "n/a"),
     (id: "array", flatppl: "array", module: None, args: ["data", "size", "dimorder"], kind: "construct", stan: "to_matrix({data}, {m}, {n})", functions: "", data_only: false, vectorized: false, broadcast: "",
-     caveat: "Rank 2 only. to_matrix fills column-major; pass a 4th argument 0 for row-major. Rank > 2: none.", status: "n/a"),
+     caveat: "Rank 2: to_matrix fills column-major; pass a 4th argument 0 for row-major. Rank 3 with dimorder [1, 2, 3]: array[S] matrix[K, B].", status: "n/a"),
     (id: "fill", flatppl: "fill", module: None, args: ["x", "size"], kind: "builtin", stan: "rep_vector({x}, {size})", functions: "", data_only: false, vectorized: false, broadcast: "",
      caveat: "Template is for an integer size. size [m, n]: rep_matrix({x}, m, n). Higher rank: rep_array.", status: "verified"),
     (id: "zeros", flatppl: "zeros", module: None, args: ["size"], kind: "builtin", stan: "zeros_vector({size})", functions: "", data_only: false, vectorized: false, broadcast: "",
@@ -406,12 +410,21 @@ vector flatppl_round(vector x) {
      caveat: "Recurrence helpers for legendre, hermite, laguerre, chebyshev.", status: "n/a"),
     (id: "splines", flatppl: "thinplate_basis, thinplate_penalty", module: Some("splines 0.1"), args: ["x", "centers"], kind: "todo", stan: "", functions: "", data_only: false, vectorized: false, broadcast: "",
      caveat: "Helpers from the §09 formulas.", status: "n/a"),
-    (id: "interp_poly6_exp", flatppl: "interp_poly6_exp", module: Some("particle-physics 0.1"), args: ["left", "center", "right", "alpha"], kind: "helper", stan: "flatppl_interp_poly6_exp({left}, {center}, {right}, {alpha})",
-     functions: "real flatppl_interp_poly6_exp(real left, real center, real right, real alpha) {
-  // §09: center times pyhf code4 with anchors left / center and right / center.
-  real lo = left / center;
-  real hi = right / center;
-  if (abs(alpha) >= 1) return center * exp(alpha > 0 ? alpha * log(hi) : -alpha * log(lo));
+    (id: "matrices", flatppl: "", module: None, args: [], kind: "core", stan: "",
+     functions: "array[] matrix flatppl_matrices(array[,,] int x) {
+  // §09 promotes integer entries to real: Stan converts one array[,] at a time.
+  array[size(x)] matrix[size(x[1]), size(x[1, 1])] out;
+  for (s in 1:size(x)) {
+    out[s] = to_matrix(x[s]);
+  }
+  return out;
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "An integer rank-3 value (array[S, K, B] int) where a helper takes array[] matrix: §09 promotes integer entries to real.", status: "verified"),
+    (id: "code4", flatppl: "", module: None, args: [], kind: "core", stan: "",
+     functions: "real flatppl_code4(real lo, real hi, real alpha) {
+  // pyhf code4 (§09 normsys_factor): 1 at alpha = 0, lo and hi at -1 and +1,
+  // exponential tails, the C^2 polynomial inside.
+  if (abs(alpha) >= 1) return exp(alpha > 0 ? alpha * log(hi) : -alpha * log(lo));
   real loglo = log(lo);
   real loghi = log(hi);
   real s0 = (hi + lo) / 2;
@@ -420,21 +433,15 @@ vector flatppl_round(vector x) {
   real a1 = (hi * loghi + lo * loglo) / 2;
   real s2 = (hi * square(loghi) + lo * square(loglo)) / 2;
   real a2 = (hi * square(loghi) - lo * square(loglo)) / 2;
-  real c1 = (15 * a0 - 7 * s1 + a2) / 8;
-  real c2 = (24 * (s0 - 1) - 9 * a1 + s2) / 8;
-  real c3 = (-5 * a0 + 5 * s1 - a2) / 4;
-  real c4 = (-12 * (s0 - 1) + 7 * a1 - s2) / 4;
-  real c5 = (3 * a0 - 3 * s1 + a2) / 8;
-  real c6 = (8 * (s0 - 1) - 5 * a1 + s2) / 8;
   real x = alpha;
-  return center * (1 + x * (c1 + x * (c2 + x * (c3 + x * (c4 + x * (c5 + x * c6))))));
+  return 1 + x * ((15 * a0 - 7 * s1 + a2) / 8 + x * ((24 * (s0 - 1) - 9 * a1 + s2) / 8
+         + x * ((-5 * a0 + 5 * s1 - a2) / 4 + x * ((-12 * (s0 - 1) + 7 * a1 - s2) / 4
+         + x * ((3 * a0 - 3 * s1 + a2) / 8 + x * (8 * (s0 - 1) - 5 * a1 + s2) / 8)))));
 }
-vector flatppl_interp_poly6_exp(vector left, vector center, vector right, real alpha) {
+vector flatppl_code4(vector lo, vector hi, real alpha) {
   // Elementwise in the anchors: the branch depends on alpha alone.
-  int n = rows(left);
-  vector[n] lo = left ./ center;
-  vector[n] hi = right ./ center;
-  if (abs(alpha) >= 1) return center .* exp(alpha > 0 ? alpha * log(hi) : -alpha * log(lo));
+  int n = rows(lo);
+  if (abs(alpha) >= 1) return exp(alpha > 0 ? alpha * log(hi) : -alpha * log(lo));
   vector[n] loglo = log(lo);
   vector[n] loghi = log(hi);
   vector[n] s0 = (hi + lo) / 2;
@@ -443,36 +450,121 @@ vector flatppl_interp_poly6_exp(vector left, vector center, vector right, real a
   vector[n] a1 = (hi .* loghi + lo .* loglo) / 2;
   vector[n] s2 = (hi .* square(loghi) + lo .* square(loglo)) / 2;
   vector[n] a2 = (hi .* square(loghi) - lo .* square(loglo)) / 2;
-  vector[n] c1 = (15 * a0 - 7 * s1 + a2) / 8;
-  vector[n] c2 = (24 * (s0 - 1) - 9 * a1 + s2) / 8;
-  vector[n] c3 = (-5 * a0 + 5 * s1 - a2) / 4;
-  vector[n] c4 = (-12 * (s0 - 1) + 7 * a1 - s2) / 4;
-  vector[n] c5 = (3 * a0 - 3 * s1 + a2) / 8;
-  vector[n] c6 = (8 * (s0 - 1) - 5 * a1 + s2) / 8;
   real x = alpha;
-  return center .* (1 + x * (c1 + x * (c2 + x * (c3 + x * (c4 + x * (c5 + x * c6))))));
-}", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, vector, real",
-     caveat: "§09 interp_poly6_exp(left, center, right, alpha) = center * normsys_factor(left / center, right / center, alpha): the C^2 conditions scale with the center.", status: "verified"),
+  return 1 + x * ((15 * a0 - 7 * s1 + a2) / 8 + x * ((24 * (s0 - 1) - 9 * a1 + s2) / 8
+         + x * ((-5 * a0 + 5 * s1 - a2) / 4 + x * ((-12 * (s0 - 1) + 7 * a1 - s2) / 4
+         + x * ((3 * a0 - 3 * s1 + a2) / 8 + x * (8 * (s0 - 1) - 5 * a1 + s2) / 8)))));
+}
+vector flatppl_code4(vector lo, vector hi, vector alpha) {
+  // One alpha per element. §09 evaluates the polynomial at the clamped alpha, so
+  // on positive anchors both pieces are finite and a 0/1 mask selects per element.
+  int n = rows(lo);
+  vector[n] loglo = log(lo);
+  vector[n] loghi = log(hi);
+  vector[n] s0 = (hi + lo) / 2;
+  vector[n] a0 = (hi - lo) / 2;
+  vector[n] s1 = (hi .* loghi - lo .* loglo) / 2;
+  vector[n] a1 = (hi .* loghi + lo .* loglo) / 2;
+  vector[n] s2 = (hi .* square(loghi) + lo .* square(loglo)) / 2;
+  vector[n] a2 = (hi .* square(loghi) - lo .* square(loglo)) / 2;
+  vector[n] x = fmin(fmax(alpha, -1), 1);
+  vector[n] poly = 1 + x .* ((15 * a0 - 7 * s1 + a2) / 8 + x .* ((24 * (s0 - 1) - 9 * a1 + s2) / 8
+         + x .* ((-5 * a0 + 5 * s1 - a2) / 4 + x .* ((-12 * (s0 - 1) + 7 * a1 - s2) / 4
+         + x .* ((3 * a0 - 3 * s1 + a2) / 8 + x .* (8 * (s0 - 1) - 5 * a1 + s2) / 8)))));
+  vector[n] tail = exp(fmax(alpha, 0) .* loghi + fmax(-alpha, 0) .* loglo);
+  vector[n] m = fmin(floor(abs(alpha)), 1);
+  return m .* tail + (1 - m) .* poly;
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "pyhf code4, the §09 normsys_factor polynomial: normsys_factor and interp_poly6_exp use it.", status: "verified"),
+    (id: "code4p", flatppl: "", module: None, args: [], kind: "core", stan: "",
+     functions: "real flatppl_code4p(real down, real up, real alpha) {
+  // pyhf code4p (§09 histosys_shift): 0 at alpha = 0, -down and up at -1 and +1,
+  // linear tails, the C^2 polynomial inside.
+  if (abs(alpha) >= 1) return alpha * (alpha > 0 ? up : down);
+  return alpha * ((up + down) / 2 + alpha * (up - down) * (15 - 10 * square(alpha) + 3 * alpha ^ 4) / 16);
+}
+vector flatppl_code4p(vector down, vector up, real alpha) {
+  if (abs(alpha) >= 1) return alpha * (alpha > 0 ? up : down);
+  return alpha * ((up + down) / 2 + alpha * (up - down) * (15 - 10 * square(alpha) + 3 * alpha ^ 4) / 16);
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "pyhf code4p, the §09 histosys_shift polynomial: histosys_shift and interp_poly6_lin use it.", status: "verified"),
+    (id: "code4p_alpha", flatppl: "", module: None, args: [], kind: "core", stan: "",
+     functions: "vector flatppl_code4p(vector down, vector up, vector alpha) {
+  // One alpha per element. §09 evaluates the polynomial at the clamped alpha, so
+  // both pieces are finite and a 0/1 mask selects per element.
+  int n = rows(down);
+  vector[n] x = fmin(fmax(alpha, -1), 1);
+  vector[n] poly = x .* ((up + down) / 2 + x .* (up - down) .* (15 - 10 * square(x) + 3 * x .^ 4) / 16);
+  vector[n] m = fmin(floor(abs(alpha)), 1);
+  return m .* (fmax(alpha, 0) .* up + fmin(alpha, 0) .* down) + (1 - m) .* poly;
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "code4p with one alpha per element (interp_poly6_lin with an array alpha).", status: "verified"),
+    (id: "interp_poly6_exp", flatppl: "interp_poly6_exp", module: Some("particle-physics 0.1"), args: ["left", "center", "right", "alpha"], kind: "helper", stan: "flatppl_interp_poly6_exp({left}, {center}, {right}, {alpha})",
+     functions: "real flatppl_interp_poly6_exp(real left, real center, real right, real alpha) {
+  return center * flatppl_code4(left / center, right / center, alpha);
+}
+vector flatppl_interp_poly6_exp(vector left, vector center, vector right, real alpha) {
+  return center .* flatppl_code4(left ./ center, right ./ center, alpha);
+}
+vector flatppl_interp_poly6_exp(vector left, vector center, vector right, vector alpha) {
+  return center .* flatppl_code4(left ./ center, right ./ center, alpha);
+}", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, vector, real; vector, vector, vector, vector", uses: ["code4"],
+     caveat: "§09 interp_poly6_exp(left, center, right, alpha) = center * normsys_factor(left / center, right / center, alpha): the C^2 conditions scale with the center. Shares flatppl_code4 with normsys_factor.", status: "verified"),
     (id: "interp_poly6_lin", flatppl: "interp_poly6_lin", module: Some("particle-physics 0.1"), args: ["left", "center", "right", "alpha"], kind: "helper", stan: "flatppl_interp_poly6_lin({left}, {center}, {right}, {alpha})",
      functions: "real flatppl_interp_poly6_lin(real left, real center, real right, real alpha) {
-  // §09: center plus pyhf code4p with down = center - left and up = right - center.
-  real down = center - left;
-  real up = right - center;
-  if (abs(alpha) >= 1) return center + alpha * (alpha > 0 ? up : down);
-  return center + alpha * ((up + down) / 2
-                           + alpha * (up - down) * (15 - 10 * square(alpha) + 3 * alpha ^ 4) / 16);
+  return center + flatppl_code4p(center - left, right - center, alpha);
 }
 vector flatppl_interp_poly6_lin(vector left, vector center, vector right, real alpha) {
-  // Elementwise in the anchors: the branch depends on alpha alone.
-  vector[rows(left)] down = center - left;
-  vector[rows(left)] up = right - center;
-  if (abs(alpha) >= 1) return center + alpha * (alpha > 0 ? up : down);
-  return center + alpha * ((up + down) / 2
-                           + alpha * (up - down) * (15 - 10 * square(alpha) + 3 * alpha ^ 4) / 16);
-}", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, vector, real",
-     caveat: "§09 interp_poly6_lin(left, center, right, alpha) = center + histosys_shift(left - center, 0, right - center, alpha): the C^2 conditions translate with the center.", status: "verified"),
+  return center + flatppl_code4p(center - left, right - center, alpha);
+}
+vector flatppl_interp_poly6_lin(vector left, vector center, vector right, vector alpha) {
+  return center + flatppl_code4p(center - left, right - center, alpha);
+}", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, vector, real; vector, vector, vector, vector", uses: ["code4p", "code4p_alpha"],
+     caveat: "§09 interp_poly6_lin(left, center, right, alpha) = center + histosys_shift(left - center, 0, right - center, alpha): the C^2 conditions translate with the center. Shares flatppl_code4p with histosys_shift.", status: "verified"),
     (id: "particle_physics_functions", flatppl: "interp_*, resonance_breitwigner, kallen, breakup_momentum, blatt_weisskopf, wigner*", module: Some("particle-physics 0.1"), args: [], kind: "todo", stan: "", functions: "", data_only: false, vectorized: false, broadcast: "",
      caveat: "Helpers from the §09 formulas.", status: "n/a"),
-    (id: "pyhf_helpers", flatppl: "normsys_factor, histosys_shift, sample_yields, expected_counts", module: Some("pyhf-helpers 0.1"), args: [], kind: "todo", stan: "", functions: "", data_only: false, vectorized: false, broadcast: "",
-     caveat: "Helpers from the §09 formulas; pyhf fast paths are allowed.", status: "n/a"),
+    (id: "normsys_factor", flatppl: "normsys_factor", module: Some("pyhf-helpers 0.1"), args: ["lo", "hi", "alpha"], kind: "helper", stan: "flatppl_code4({lo}, {hi}, {alpha})",
+     functions: "", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, real; vector, vector, vector", uses: ["code4"],
+     caveat: "§09 normsys_factor is pyhf code4, lowered directly (the pyhf fast path §09 allows).", status: "verified"),
+    (id: "histosys_shift", flatppl: "histosys_shift", module: Some("pyhf-helpers 0.1"), args: ["lo", "nominal", "hi", "alpha"], kind: "helper", stan: "flatppl_histosys_shift({lo}, {nominal}, {hi}, {alpha})",
+     functions: "real flatppl_histosys_shift(real lo, real nominal, real hi, real alpha) {
+  return flatppl_code4p(nominal - lo, hi - nominal, alpha);
+}
+vector flatppl_histosys_shift(vector lo, vector nominal, vector hi, real alpha) {
+  return flatppl_code4p(nominal - lo, hi - nominal, alpha);
+}
+vector flatppl_histosys_shift(vector lo, vector nominal, vector hi, vector alpha) {
+  return flatppl_code4p(nominal - lo, hi - nominal, alpha);
+}
+matrix flatppl_histosys_shift(matrix lo, matrix nominal, matrix hi, vector alpha) {
+  // Row m takes alpha[m]: the per-element form over the column-major entries.
+  int r = rows(lo);
+  int c = cols(lo);
+  return to_matrix(flatppl_code4p(to_vector(nominal - lo), to_vector(hi - nominal),
+                                  to_vector(rep_matrix(alpha, c))), r, c);
+}", data_only: false, vectorized: false, broadcast: "", overload: "vector, vector, vector, real; vector, vector, vector, vector; matrix, matrix, matrix, column", uses: ["code4p", "code4p_alpha"],
+     caveat: "§09 histosys_shift is pyhf code4p, lowered directly (the pyhf fast path §09 allows).", status: "verified"),
+    (id: "sample_yields", flatppl: "sample_yields", module: Some("pyhf-helpers 0.1"), args: ["nominal", "shifts", "factors"], kind: "helper", stan: "flatppl_sample_yields({nominal}, {shifts}, {factors})",
+     functions: "matrix flatppl_sample_yields(matrix nominal, array[] matrix shifts, array[] matrix factors) {
+  // §09: (nominal + shifts summed over a) .* factors multiplied over m, per sample.
+  // The sample index s reaches each matrix of an array: Stan maps no operation
+  // over an array of matrices. The factor index m is a product over rows: Stan has
+  // no column-wise product, and exp(sum(log(...))) fails at the zero factors §09 allows.
+  matrix[rows(nominal), cols(nominal)] out;
+  for (s in 1:rows(nominal)) {
+    row_vector[cols(nominal)] y = nominal[s] + rep_row_vector(1, rows(shifts[s])) * shifts[s];
+    for (m in 1:rows(factors[s])) {
+      y = y .* factors[s][m];
+    }
+    out[s] = y;
+  }
+  return out;
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "§09 sample_yields on array[S] matrix[A, B] and array[S] matrix[M, B].", status: "verified"),
+    (id: "expected_counts", flatppl: "expected_counts", module: Some("pyhf-helpers 0.1"), args: ["samples"], kind: "helper", stan: "flatppl_expected_counts({samples})",
+     functions: "vector flatppl_expected_counts(matrix samples) {
+  // §09: the sum over the sample rows, as one row-vector product.
+  return (rep_row_vector(1, rows(samples)) * samples)';
+}", data_only: false, vectorized: false, broadcast: "",
+     caveat: "§09 expected_counts.", status: "verified"),
 ]

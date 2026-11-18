@@ -56,11 +56,16 @@ pub(crate) struct FnRow {
     pub broadcast: String,
     pub caveat: String,
     pub status: String,
-    /// The argument kinds of the row's vector overload (`vector, vector,
-    /// vector, real`): a broadcast `f.(…)` whose argument ranks match is one
-    /// call of it. Empty: no vector overload.
+    /// The argument kinds of the row's array overloads, `;`-separated
+    /// (`vector, vector, vector, real; matrix, matrix, matrix, column`): a
+    /// broadcast `f.(…)` whose arguments match one is one call of it. A
+    /// `column` is `addaxes(u, 0, 1)`, passed as `u`. Empty: no array overload.
     #[serde(default)]
     pub overload: String,
+    /// The `core` rows whose definitions this row's `functions` text calls:
+    /// a program prints them first, each once.
+    #[serde(default)]
+    pub uses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +123,30 @@ pub(crate) fn function(name: &str, module: Option<&str>) -> Option<&'static FnRo
     functions().iter().find(|r| {
         module_matches(r.module.as_deref(), module) && r.flatppl.split(", ").any(|n| n == name)
     })
+}
+
+/// The `core` row `id`: Stan definitions that other rows share.
+pub(crate) fn core(id: &str) -> Option<&'static FnRow> {
+    functions().iter().find(|r| r.kind == "core" && r.id == id)
+}
+
+/// A `functions` text split into its top-level definitions.
+pub(crate) fn definitions(text: &str) -> Vec<String> {
+    let mut defs: Vec<String> = Vec::new();
+    let (mut cur, mut depth) = (String::new(), 0i32);
+    for line in text.lines() {
+        cur.push_str(line);
+        cur.push('\n');
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if depth == 0 && line.contains('}') {
+            defs.push(cur.trim_end().to_string());
+            cur.clear();
+        }
+    }
+    if !cur.trim().is_empty() {
+        defs.push(cur.trim_end().to_string());
+    }
+    defs
 }
 
 /// A table module is `"<name> <version>"`; a call names the module only.
@@ -232,5 +261,46 @@ mod tests {
             super::law_rows_by_head("Bernoulli", None)[0].kind,
             "composition"
         );
+    }
+
+    /// A Stan definition lives in one row: rows that share one name a `core`
+    /// row in `uses`, so two texts of one signature cannot drift apart.
+    #[test]
+    fn each_definition_lives_in_one_row() {
+        let mut seen = std::collections::HashMap::new();
+        let texts = super::functions()
+            .iter()
+            .map(|r| (r.id.as_str(), r.functions.as_str()))
+            .chain(
+                super::laws()
+                    .iter()
+                    .map(|r| (r.id.as_str(), r.functions.as_str())),
+            );
+        for (id, text) in texts {
+            // The split counts braces, so a comment must hold none.
+            for line in text.lines() {
+                if let Some((_, comment)) = line.split_once("//") {
+                    assert!(
+                        !comment.contains(['{', '}']),
+                        "row `{id}`: a brace in the comment `{comment}` breaks the definition split"
+                    );
+                }
+            }
+            for d in super::definitions(text) {
+                let signature = d.lines().next().unwrap_or_default().to_string();
+                if let Some(other) = seen.insert(signature.clone(), id) {
+                    panic!("`{signature}` is defined in rows `{other}` and `{id}`");
+                }
+            }
+        }
+        for r in super::functions() {
+            for u in &r.uses {
+                assert!(
+                    super::core(u).is_some(),
+                    "row `{}` uses `{u}`, not a core row",
+                    r.id
+                );
+            }
+        }
     }
 }

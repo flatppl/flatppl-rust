@@ -1,0 +1,70 @@
+# emit: target=likelihood
+flatppl_compat = "0.1"
+hepphys = standard_module("particle-physics", "0.1")
+pyhf_helpers = standard_module("pyhf-helpers", "0.1")
+mu = elementof(reals)
+t = elementof(reals)
+% Observed event counts for channel "c".
+c_observed = [72.0, 68.0]
+% Nominal yields for sample "a".
+c_a_nominal = [20.0, 10.0]
+% Nominal yields for sample "b".
+c_b_nominal = [50.0, 60.0]
+% Additive histosys shifts: modifier rows in sample order, bin columns.
+c_histosys_shifts = pyhf_helpers.histosys_shift.(
+  rowstack([[18.0, 9.0], [45.0, 55.0]]),
+  rowstack([c_a_nominal, c_b_nominal]),
+  rowstack([[22.0, 11.0], [56.0, 64.0]]),
+  addaxes([t, t], 0, 1),
+)
+% Multiplicative factors: sample, factors in multiplication order, bin.
+c_factors = array(cat(fill(mu, 2)), [1, 1, 2], [1, 2, 3])
+% Expected yields: sample rows, bin columns.
+c_yields = pyhf_helpers.sample_yields(
+  rowstack([c_a_nominal]),
+  array(cat(aggregate(sum, [.col], c_histosys_shifts[[1], :][.row, .col])), [1, 1, 2], [1, 2, 3]),
+  c_factors,
+)
+% Multiplicative factors: sample, factors in multiplication order, bin.
+c_factors_2 = fill(1.0, [1, 1, 2])
+% Expected yields: sample rows, bin columns.
+c_yields_2 = pyhf_helpers.sample_yields(
+  rowstack([c_b_nominal]),
+  array(cat(aggregate(sum, [.col], c_histosys_shifts[[2], :][.row, .col])), [1, 1, 2], [1, 2, 3]),
+  c_factors_2,
+)
+% Total expected counts per bin (sum over samples).
+c_expected = pyhf_helpers.expected_counts(rowstack([c_yields[1, :], c_yields_2[1, :]]))
+% Per-bin continued-Poisson observation model for channel "c".
+c_model = functionof(hepphys.ContinuedPoisson.(c_expected))
+% Observation likelihood term for channel "c".
+c_likelihood = likelihoodof(c_model, c_observed)
+% Auxiliary Gaussian constraint on the nuisance parameter.
+t_constraint = functionof(Normal(mu = t, sigma = 1.0))
+% Constraint likelihood term (observed at 0).
+t_constraint_likelihood = likelihoodof(t_constraint, 0.0)
+% Full likelihood: observation and constraint terms.
+likelihood = joint_likelihood(c_likelihood, t_constraint_likelihood)
+% pyhf measurement "m": fit settings and channel layout.
+pyhf_measurement_m = record(
+  name = "m",
+  selected = true,
+  poi = "mu",
+  parameters = record(
+    t = record(
+      pyhf = "t",
+      type = "histosys",
+      init = 0.0,
+      lo = -5.0,
+      hi = 5.0,
+      fixed = false,
+      constraint = "normal",
+      width = 1.0,
+      auxdata = 0.0,
+    ),
+    mu = record(pyhf = "mu", type = "normfactor", init = 1.0, lo = 0.0, hi = 10.0, fixed = false),
+  ),
+  channels = record(
+    c = record(name = "c", bins = 2, observed = "c_observed", expected = "c_expected"),
+  ),
+)
