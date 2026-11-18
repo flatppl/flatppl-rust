@@ -5,12 +5,7 @@ data {
   vector[N] x;
 }
 transformed data {
-  matrix[N, N] distance_sq;
-  for (i in 1:N) {
-    for (j in 1:N) {
-      distance_sq[i, j] = (x[i] - x[j]) ^ 2;
-    }
-  }
+  matrix[N, N] distance_sq = (rep_matrix(x, N) - rep_matrix(x', N)) .^ 2;
 }
 parameters {
   real<lower=0> rho;

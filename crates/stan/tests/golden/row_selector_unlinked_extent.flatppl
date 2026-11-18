@@ -1,0 +1,13 @@
+flatppl_compat = "0.1"
+M = 3
+T = 2
+data = rowstack([[0, 1], [1, 1], [0, 0]])
+history(i) = data[i, :]
+histories = history.(indicesof(zeros(M)))
+omega ~ Uniform(unitinterval)
+p ~ iid(Uniform(unitinterval), T)
+capture = normalize(superpose(weighted(omega, Bernoulli.(p)), weighted(1 - omega, Dirac(fill(0, T)))))
+y ~ iid(capture, M)
+prior = lawof(record(omega = omega, p = p))
+L = likelihoodof(kernelof(record(y = y), omega = omega, p = p), record(y = histories))
+post = bayesupdate(L, prior)

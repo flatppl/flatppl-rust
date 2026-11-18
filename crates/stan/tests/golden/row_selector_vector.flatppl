@@ -1,0 +1,9 @@
+flatppl_compat = "0.1"
+x_obs = [0.3, -0.2, 0.5]
+pick(i) = x_obs[i]
+xs = pick.(indicesof(x_obs))
+mu ~ Normal(0, 1)
+y ~ Normal.(mu .+ xs, 1)
+prior = lawof(record(mu = mu))
+L = likelihoodof(kernelof(record(y = y), mu = mu), record(y = [0.1, 0.4, -0.3]))
+post = bayesupdate(L, prior)

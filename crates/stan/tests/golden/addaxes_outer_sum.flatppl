@@ -1,0 +1,15 @@
+flatppl_compat = "0.1"
+M = 3
+T = 2
+x = [0.5, 1.0, 2.0]
+v = [0.2, -0.4]
+mean_p ~ iid(Uniform(unitinterval), T)
+s ~ Uniform(interval(0, 5))
+e ~ iid(Normal(0, 1), M)
+lp = addaxes(s .* e, 0, 1) .+ addaxes(logit.(mean_p), 1, 0)
+q = addaxes(e, 0, 1) .* addaxes(mean_p, 1, 0)
+d2 = (addaxes(x, 0, 1) .- addaxes(v, 1, 0)).^2
+z ~ Normal(sum(lp .+ q .- d2), 1)
+prior = lawof(record(mean_p = mean_p, s = s, e = e))
+L = likelihoodof(kernelof(record(z = z), mean_p = mean_p, s = s, e = e), record(z = 0.5))
+post = bayesupdate(L, prior)

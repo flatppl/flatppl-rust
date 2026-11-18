@@ -6,7 +6,7 @@ use crate::stan_type::{StanType, declare};
 use crate::tables;
 use crate::{EmitOptions, ManifestParam, Placement};
 use flatppl_core::{
-    CallHead, Module, Node, NodeId, Phase, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
+    CallHead, Dim, Module, Node, NodeId, Phase, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
 };
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -879,6 +879,24 @@ impl<'m> Emitter<'m> {
 
     /// An expression used in real arithmetic: integer arrays become vectors.
     fn real(&mut self, id: NodeId) -> Result<Ex> {
+        // An integer vector as one column or row of a real matrix.
+        let r = self.resolve(id);
+        if self.head(r) == Some("addaxes")
+            && let [x, lead, trail] = self.call(r).unwrap().args[..]
+            && self.shape(x).is_some_and(|s| s.rank == 1 && s.int)
+        {
+            match (self.m.node(lead), self.m.node(trail)) {
+                (Node::Lit(Scalar::Int(0)), Node::Lit(Scalar::Int(1))) => {
+                    let e = self.expr(x)?;
+                    return Ok(Ex::atom(format!("to_matrix(to_vector({}))", e.s)));
+                }
+                (Node::Lit(Scalar::Int(1)), Node::Lit(Scalar::Int(0))) => {
+                    let e = self.expr(x)?;
+                    return Ok(Ex::atom(format!("to_matrix(to_vector({})')", e.s)));
+                }
+                _ => {}
+            }
+        }
         let e = self.expr(id)?;
         match self.shape(id) {
             Some(Shape { rank: 1, int: true }) => Ok(Ex::atom(format!("to_vector({})", e.s))),
@@ -1061,6 +1079,24 @@ impl<'m> Emitter<'m> {
             ("fill", [x, n]) => {
                 let v = self.expr(*x)?;
                 self.filled(id, &v.at(P_ATOM), *n)
+            }
+            // A real vector as one matrix column (`addaxes(u, 0, 1)`) or row
+            // (`addaxes(v, 1, 0)`). An integer vector has no Stan integer
+            // matrix: it is filled elementwise (or read through `real`).
+            ("addaxes", [x, lead, trail])
+                if self.shape(*x).is_some_and(|s| s.rank == 1 && !s.int)
+                    && matches!(
+                        (self.m.node(*lead), self.m.node(*trail)),
+                        (Node::Lit(Scalar::Int(0)), Node::Lit(Scalar::Int(1)))
+                            | (Node::Lit(Scalar::Int(1)), Node::Lit(Scalar::Int(0)))
+                    ) =>
+            {
+                let e = self.real(*x)?;
+                if matches!(self.m.node(*lead), Node::Lit(Scalar::Int(0))) {
+                    Ok(Ex::atom(format!("to_matrix({})", e.s)))
+                } else {
+                    Ok(Ex::atom(format!("to_matrix({}')", e.at(P_ATOM))))
+                }
             }
             ("colstack", [cols]) => self.stack(id, *cols, "append_col", false),
             ("rowstack", [rows]) => self.stack(id, *rows, "append_row", true),
@@ -1452,6 +1488,9 @@ impl<'m> Emitter<'m> {
             if self.user_callee(f).is_none() {
                 return Err(Refusal::not_yet(Some(id), "broadcast of a user function"));
             }
+            if let Some(e) = self.row_selector_broadcast(id)? {
+                return Ok(e);
+            }
             let base = match &self.owner {
                 Some((name, _)) => format!("{name}_values"),
                 None => "values".to_string(),
@@ -1473,6 +1512,11 @@ impl<'m> Emitter<'m> {
         }
         let row = tables::function(fname, None)
             .ok_or_else(|| Refusal::not_yet(Some(id), format!("{fname}.(…)")))?;
+        // An outer broadcast through `addaxes` (a column against a row): each
+        // operand repeated to the full matrix, then the matrix operation.
+        if let Some(e) = self.outer_broadcast(id, fname, row, args)? {
+            return Ok(e);
+        }
         let scalar = |me: &Self, a: NodeId| me.shape(a).is_some_and(|s| s.rank == 0);
         match (fname, args) {
             // The operators keep their precedence-aware printing.
@@ -1544,6 +1588,129 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `f.(a, b)` of rank 2 where an operand has a singleton axis the result
+    /// does not (`addaxes(u, 0, 1)`, a column, or `addaxes(v, 1, 0)`, a row):
+    /// that operand is repeated to the full matrix (`rep_matrix(u, n)`,
+    /// `rep_matrix(v', m)`, or `rep_matrix(to_vector(X), n)` for any other
+    /// column), then the elementwise matrix operation. `None` when no operand
+    /// has such an axis or the operation has no matrix form; the caller then
+    /// fills by loops.
+    fn outer_broadcast(
+        &mut self,
+        id: NodeId,
+        fname: &str,
+        row: &tables::FnRow,
+        args: &[NodeId],
+    ) -> Result<Option<Ex>> {
+        let dims = |me: &Self, x: NodeId| -> Option<(u32, u32)> {
+            match me.ty(x)? {
+                Type::Array { shape, elem }
+                    if shape.len() == 2 && matches!(*elem, Type::Scalar(_)) =>
+                {
+                    match (&shape[0], &shape[1]) {
+                        (Dim::Static(a), Dim::Static(b)) => Some((*a, *b)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        // A real matrix result: `rep_matrix` and the matrix operations are real.
+        let real_matrix = matches!(self.ty(id), Some(Type::Array { shape, elem })
+            if shape.len() == 2 && matches!(*elem, Type::Scalar(ScalarType::Real)));
+        let Some((r0, r1)) = dims(self, id).filter(|_| real_matrix) else {
+            return Ok(None);
+        };
+        // How each operand reaches the full matrix.
+        enum Side {
+            Scalar,
+            Full,
+            Column,
+            Row,
+        }
+        let mut sides = Vec::new();
+        for &a in args {
+            let rank = self.shape(a).map(|s| s.rank);
+            sides.push(match (rank, dims(self, a)) {
+                (Some(0), _) => Side::Scalar,
+                (_, Some((d0, d1))) if d0 == r0 && d1 == r1 => Side::Full,
+                (_, Some((d0, 1))) if d0 == r0 && r1 != 1 => Side::Column,
+                (_, Some((1, d1))) if d1 == r1 && r0 != 1 => Side::Row,
+                _ => return Ok(None),
+            });
+        }
+        if !sides.iter().any(|s| matches!(s, Side::Column | Side::Row)) {
+            return Ok(None);
+        }
+        let supported = match fname {
+            "add" | "sub" | "mul" | "divide" | "pow" => args.len() == 2,
+            "neg" => args.len() == 1,
+            _ => row.vectorized && row.kind != "operator",
+        };
+        if !supported {
+            return Ok(None);
+        }
+        let extent = |me: &mut Self, axis: usize| -> Option<String> {
+            me.sym_extent(id, axis, 0).map(|l| l.print())
+        };
+        let (Some(rows), Some(cols)) = (extent(self, 0), extent(self, 1)) else {
+            return Ok(None);
+        };
+        // The vector inside `addaxes(u, …)`, when the operand is one.
+        let addaxes_vector = |me: &Self, a: NodeId| -> Option<NodeId> {
+            let r = me.resolve(a);
+            (me.head(r) == Some("addaxes"))
+                .then(|| me.call(r).unwrap().args[0])
+                .filter(|&u| me.shape(u).is_some_and(|s| s.rank == 1))
+        };
+        let mut parts = Vec::new();
+        let mut full = Vec::new();
+        for (&a, side) in args.iter().zip(&sides) {
+            let printed = match side {
+                Side::Column | Side::Row => match addaxes_vector(self, a) {
+                    Some(u) => self.real(u).map(|e| (e, true)),
+                    None => self.real(a).map(|e| (e, false)),
+                },
+                _ => self.real(a).map(|e| (e, false)),
+            };
+            let (e, vector) = match printed {
+                Ok(p) => p,
+                Err(r) if r.kind.is_never() => return Err(r),
+                Err(_) => return Ok(None),
+            };
+            parts.push(match (side, vector) {
+                (Side::Column, true) => Ex::atom(format!("rep_matrix({}, {cols})", e.s)),
+                (Side::Column, false) => {
+                    Ex::atom(format!("rep_matrix(to_vector({}), {cols})", e.s))
+                }
+                (Side::Row, true) => Ex::atom(format!("rep_matrix({}', {rows})", e.at(P_ATOM))),
+                (Side::Row, false) => {
+                    Ex::atom(format!("rep_matrix(to_row_vector({}), {rows})", e.s))
+                }
+                _ => e,
+            });
+            full.push(!matches!(side, Side::Scalar));
+        }
+        let both = full.iter().all(|f| *f);
+        Ok(Some(match fname {
+            "add" => binary(&parts, "+", P_ADD),
+            "sub" => binary(&parts, "-", P_ADD),
+            "mul" if both => binary(&parts, ".*", P_MUL),
+            "mul" => binary(&parts, "*", P_MUL),
+            "divide" if full[1] => binary(&parts, "./", P_MUL),
+            "divide" => binary(&parts, "/", P_MUL),
+            "pow" => Ex {
+                s: format!("{} .^ {}", parts[0].at(P_POW + 1), parts[1].at(P_POW)),
+                prec: P_POW,
+            },
+            "neg" => Ex {
+                s: format!("-{}", parts[0].at(P_UNARY)),
+                prec: P_UNARY,
+            },
+            name => self.table_fn(id, name, None, parts)?,
+        }))
+    }
+
     fn call_expr_bin(&mut self, op: &str, prec: u8, a: NodeId, b: NodeId) -> Result<Ex> {
         let l = self.real(a)?;
         let r = self.real(b)?;
@@ -1551,6 +1718,14 @@ impl<'m> Emitter<'m> {
             s: format!("{} {op} {}", l.at(prec), r.at(prec + 1)),
             prec,
         })
+    }
+}
+
+/// `a op b` at precedence `prec`, left-associative.
+fn binary(parts: &[Ex], op: &str, prec: u8) -> Ex {
+    Ex {
+        s: format!("{} {op} {}", parts[0].at(prec), parts[1].at(prec + 1)),
+        prec,
     }
 }
 
